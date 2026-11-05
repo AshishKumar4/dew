@@ -6,6 +6,7 @@ import gc
 import itertools
 import os
 import resource
+import sys
 import threading
 import time
 import tracemalloc
@@ -58,35 +59,114 @@ def open_files() -> int:
     return len(os.listdir("/proc/self/fd"))
 
 
-def test_a_thousand_sources_compile_and_step_without_a_cost_per_source(record_property):
-    """A step reads the records it batches and nothing of the sources it does not draw: a thousand
-    sources cost a step what ten do, and compiling them costs memory linear in their count."""
+class Documents:
+    """A source's token documents, each 3 to 12 tokens of its own, saying which source, document and
+    token it is, and how many reads reach them: a packer of 16 tokens a row lays some whole and leaves
+    others to the next row."""
+
+    reads = 0
+
+    def __init__(self, tag: int, records: int = RECORDS):
+        self.tag, self.records = tag, records
+
+    def __repr__(self) -> str:
+        return f"Documents(tag={self.tag}, records={self.records})"
+
+    def __len__(self) -> int:
+        return self.records
+
+    def __getitem__(self, index: int) -> dict:
+        if not 0 <= index < self.records:
+            raise IndexError(index)
+        Documents.reads += 1
+        length = 3 + (self.tag * 7 + index * 5) % 10
+        return {"text": np.arange(length, dtype=np.int32) + self.tag * 1000 + index * 20}
+
+
+def packed(count: int, *, by: str = "records", examples: int | None = 10**6):
+    """A mix of `count` sources of documents, seeded by records or each next from the source furthest below
+    its share of tokens (`by`), packed into rows of 16 tokens by the default packer (first fit), read as a
+    stream under the default loading and bounded in examples, which counts each member's examples where its
+    rows are delivered (`MEMBERS`): a user's packed mixture, whose packer asks the mix's position before
+    every document."""
+    chains = [Pipeline(Memory(Documents(tag)), name=f"source-{tag}").repeat() for tag in range(count)]
+    mixed = mix(chains, seed=0) if by == "records" else mix(chains, by="tokens")
+    return compile(mixed.pack(16, fields=("text",)).batch(BATCH), read="streamed", examples=examples)
+
+
+def asked(stream, batches: int) -> int:
+    """The positions `stream` asks while it gives `batches`: the calls of any read's `get_state` and any
+    count's `state`, on every thread the read runs on."""
+    calls: list[None] = []
+
+    def counted(frame, event, argument):
+        if event == "call" and frame.f_code.co_name in ("get_state", "state"):
+            calls.append(None)
+
+    threading.setprofile_all_threads(counted)
+    try:
+        texts(stream, batches)
+    finally:
+        threading.setprofile_all_threads(None)
+    return len(calls)
+
+
+def texts(stream, batches: int) -> list[list[int]]:
+    return [np.asarray(batch["text"]).tolist() for batch in itertools.islice(stream, batches)]
+
+
+def drawn(stream, count: int) -> None:
+    """`stream` read until it has given a row of each of its `count` sources, each opened as the mix first
+    draws from it: what a step costs once a run has read from every source."""
+    left = set(range(count))
+    while left:
+        for batch in texts(stream, 8):
+            left -= {value // 1000 for row in batch for value in row if value}
+
+
+@pytest.mark.parametrize("by", ["records", "tokens"])
+def test_a_thousand_sources_compile_and_step_without_a_cost_per_source(by, record_property):
+    """A user's packed mixture, the default packer and loading (`packed`), steps once it has read from every
+    source at no cost per source: a thousand sources' step reads the records it packs and nothing of the
+    sources it does not draw, asks the positions the packer asks before each document in the calls ten
+    do (a mix's position captured copy-on-write, `Shared`, each capture asking again only what the
+    document moved), holds the threads ten do (its members read under their share of the loading, one
+    after another on the thread that draws from them), and keeps no block a step, and compiling them
+    costs memory linear in their count (row 4079: each document's capture asked and copied every
+    member's position and counts, and each member's shard read on sixteen threads of its own)."""
     measured = {}
     for count in (10, SOURCES):
         gc.collect()
         tracemalloc.start()
         began = time.perf_counter()
-        data = compile(mix(sources(count)).batch(BATCH), read="memory", loading=READ)
+        data = packed(count, by=by)
         built = time.perf_counter() - began
         _, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
         stream = data.train(DataPartition())
         try:
-            ids(stream, 4)
-            Counted.reads = 0
+            drawn(stream, count)
+            gc.collect()
+            Documents.reads, blocks = 0, sys.getallocatedblocks()
             began = time.perf_counter()
-            ids(stream, 64)
+            asks = asked(stream, 64)
             stepped = (time.perf_counter() - began) / 64
-            reads = Counted.reads
+            reads = Documents.reads
+            gc.collect()
+            kept = (sys.getallocatedblocks() - blocks) / 64
+            threads = threading.active_count()
         finally:
             stream.close()
         measured[count] = {"compile_s": built, "compile_peak_mib": peak / 2**20, "step_ms": 1e3 * stepped,
-                           "reads_per_step": reads / 64}
+                           "reads_per_step": reads / 64, "positions_asked_per_step": asks / 64,
+                           "threads": threads, "blocks_kept_per_step": kept}
         record_property(f"sources_{count}", measured[count])
         print(f"sources={count}", measured[count])
-    # A read buffer reads at most its depth ahead, so 64 steps reach no more than 64 batches and it.
-    for count in (10, SOURCES):
-        assert measured[count]["reads_per_step"] <= BATCH + READ.read_buffer * BATCH / 64
+    few, many = measured[10], measured[SOURCES]
+    assert many["reads_per_step"] < 2 * few["reads_per_step"], measured
+    assert many["positions_asked_per_step"] < 2 * few["positions_asked_per_step"], measured
+    assert many["threads"] <= few["threads"], measured
+    assert many["blocks_kept_per_step"] < 1, measured
     record_property("rss_mib", resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
     print("rss_mib", resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
 
@@ -223,94 +303,6 @@ def test_a_mixtures_rejection_merges_its_members_counts_only_where_a_log_or_refu
     for at in range(300):
         counter(Rejected("short", member=f"member-{at % SOURCES}"))
     assert Merged.merges == 0
-
-
-class Documents:
-    """A source's token documents, each 3 to 12 tokens of its own, saying which source, document and
-    token it is: a packer of 16 tokens a row lays some whole and leaves others to the next row."""
-
-    def __init__(self, tag: int, records: int = RECORDS):
-        self.tag, self.records = tag, records
-
-    def __repr__(self) -> str:
-        return f"Documents(tag={self.tag}, records={self.records})"
-
-    def __len__(self) -> int:
-        return self.records
-
-    def __getitem__(self, index: int) -> dict:
-        if not 0 <= index < self.records:
-            raise IndexError(index)
-        length = 3 + (self.tag * 7 + index * 5) % 10
-        return {"text": np.arange(length, dtype=np.int32) + self.tag * 1000 + index * 20}
-
-
-def packed(count: int, *, by: str = "records", examples: int | None = 10**6):
-    """A mix of `count` sources of documents, seeded by records or each next from the source furthest below
-    its share of tokens (`by`), packed first-fit into rows of 16 tokens, read as a stream bounded in
-    examples, which counts each member's examples where its rows are delivered (`MEMBERS`): the read a
-    packer asks the mix's position of before every document."""
-    chains = [Pipeline(Memory(Documents(tag)), name=f"source-{tag}").repeat() for tag in range(count)]
-    mixed = mix(chains, seed=0) if by == "records" else mix(chains, by="tokens")
-    return compile(mixed.pack(16, fields=("text",)).batch(BATCH), read="streamed", loading=READ,
-                   examples=examples)
-
-
-def asked(stream, batches: int) -> int:
-    """The positions `stream` asks while it gives `batches`: the calls of any read's `get_state` and any
-    count's `state`, on every thread the read runs on."""
-    calls: list[None] = []
-
-    def counted(frame, event, argument):
-        if event == "call" and frame.f_code.co_name in ("get_state", "state"):
-            calls.append(None)
-
-    threading.setprofile_all_threads(counted)
-    try:
-        texts(stream, batches)
-    finally:
-        threading.setprofile_all_threads(None)
-    return len(calls)
-
-
-def texts(stream, batches: int) -> list[list[int]]:
-    return [np.asarray(batch["text"]).tolist() for batch in itertools.islice(stream, batches)]
-
-
-@pytest.mark.parametrize("by", ["records", "tokens"])
-def test_a_packed_thousand_source_mixture_asks_its_position_at_no_cost_per_source(by, record_property):
-    """A packer asks its read's position before every document, to resume at the one that did not fit, and
-    the position of a mix counting its members' examples holds every member's position and counts:
-    captured copy-on-write (`Shared`), each capture asks again only what the document moved, so a thousand
-    sources ask a step's positions in the calls ten do, where asking every member's position and copying
-    its counts at each document made a step ask a thousand sources' worth (row 4079)."""
-    per_step = {}
-    for count in (10, SOURCES):
-        stream = packed(count, by=by).train(DataPartition())
-        try:
-            texts(stream, 4)
-            per_step[count] = asked(stream, 16) / 16
-        finally:
-            stream.close()
-        record_property(f"positions_asked_per_step_{count}", per_step[count])
-    assert per_step[SOURCES] < 2 * per_step[10], per_step
-
-
-def test_a_thousand_source_mixture_reads_on_no_thread_per_source():
-    """A mix's members read under their share of the run's loading, a thousand sharing one thread reading
-    on the thread that draws from them, each source's shards one after another: a packed thousand-source mix
-    that has drawn from every source holds the threads a ten-source one does, where each source's shard read
-    on sixteen threads of its own and a row ahead on one more (row 4079: 9,249 threads after 190 steps of a
-    thousand-member mix)."""
-    held = {}
-    for count in (10, SOURCES):
-        stream = packed(count).train(DataPartition())
-        try:
-            texts(stream, 96)
-            held[count] = threading.active_count()
-        finally:
-            stream.close()
-    assert held[SOURCES] <= held[10], held
 
 
 @pytest.mark.parametrize("by", ["records", "tokens"])
