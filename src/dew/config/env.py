@@ -14,8 +14,8 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-from collections.abc import Callable, Mapping, Sequence
-from typing import Annotated, ClassVar, Self, TypedDict
+from collections.abc import Callable, Mapping
+from typing import Annotated, ClassVar, Self
 
 import jax
 import numpy as np
@@ -29,6 +29,19 @@ from dew.nn.sharding import abstract
 from dew.objectives.base import Shown
 from dew.objectives.rl.control import ControlPPOObjective
 from dew.objectives.rl.dreamer import DreamerV3Objective
+from dew.objectives.rl.run import (
+    Agent,
+    Environment,
+    batched,
+    built,
+    filled,
+    flights,
+    imitates_labels,
+    observed,
+    reads,
+    seen,
+    taught,
+)
 from dew.registry import (
     Configured,
     ModelConfig,
@@ -41,15 +54,8 @@ from dew.registry import (
     record_argument,
     rollouts,
 )
-from dew.rl.aggregation import LABEL, Teacher
-from dew.rl.env import Batched, Driven, Env, Observation, TimeLimit, view
-from dew.rl.evaluation import episodes
-from dew.rl.simulator import DrivenSimulator, Simulator, received
 from dew.training.evaluation import Episodes
 from dew.training.rollout import Rollout
-
-type Agent = DreamerV3Objective | ControlPPOObjective
-"""What an environment run trains: an agent that acts, a world-model learner's or a policy's."""
 
 _BUILT = ("objective", "env", "replay", "teacher", "demonstrator")
 """A rollout's arguments the run builds, or no record holds (a replay), which its settings leave out."""
@@ -79,20 +85,10 @@ class EnvConfig(Registered):
     def _member(name: str) -> type | Callable[..., Configured]:
         return envs[name]
 
-    def build(self) -> Env | Simulator:
-        """The environment the record names, wrapped as it says."""
-        built = envs.build(self.name, self.arguments)
-        if isinstance(built, Simulator):
-            if self.count is not None or self.episode_length is not None or self.action_repeat != 1:
-                raise ValueError(f"{self.name} is a Simulator, a batch of environments stepped from the host "
-                                 "that cuts its own episodes; leave count, episode_length and action_repeat "
-                                 "unset")
-            return built
-        if self.episode_length is not None:
-            built = TimeLimit(built, self.episode_length, self.action_repeat)
-        elif self.action_repeat != 1:
-            raise ValueError("action_repeat repeats an action within a time limit's step; set episode_length")
-        return built if self.count is None else Batched(built, self.count)
+    def build(self) -> Environment:
+        """The environment the record names, wrapped as it says (`dew.objectives.rl.run.built`)."""
+        return built(self.name, self.arguments, count=self.count, episode_length=self.episode_length,
+                     action_repeat=self.action_repeat)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -111,7 +107,7 @@ class RolloutConfig(Registered):
     def _member(name: str) -> type:
         return rollouts[name]
 
-    def build(self, objective: Agent, env: Env | Simulator, **taught: Teacher) -> Rollout:
+    def build(self, objective: Agent, env: Environment, **taught: object) -> Rollout:
         """The rollout of `objective` in `env`, with the teacher and demonstrator `taught` names. Refuses a
         setting the run builds, an objective of another class than the rollout's, and a teacher it takes
         none of."""
@@ -162,19 +158,10 @@ class EpisodesConfig:
     reached: tuple[str, ...] = ()
     drawn: bool = False
 
-    def split(self, objective: Agent, env: Env | Simulator) -> Episodes:
+    def split(self, objective: Agent, env: Environment) -> Episodes:
         """The split of `objective`'s flights, in `env` where the record names no environment of its own."""
-        flown = env if self.env is None else self.env.build()
-        if isinstance(flown, Simulator) and self.env is None:
-            raise ValueError("a run's simulator holds its rollout's environments mid episode, which a flight "
-                             "would move; name a simulator of the split's own (env)")
-        policy = objective.act if self.drawn else objective.greedy
-        if isinstance(objective, DreamerV3Objective):
-            driven = DrivenSimulator(flown) if isinstance(flown, Simulator) else Driven(flown)
-            score = episodes(policy, driven, self.steps, memory=objective.memory, reached=self.reached,
-                             models=objective.towers())
-        else:
-            score = episodes(policy, flown, self.steps, reached=self.reached, models=objective.towers())
+        score = flights(objective, env if self.env is None else self.env.build(), self.steps,
+                        reached=self.reached, drawn=self.drawn, own=self.env is None)
         reached = {view: Shown(better="higher") for view in self.reached}
         return Episodes(score, {"return": Shown(better="higher"), "steps": Shown(), **reached})
 
@@ -238,7 +225,7 @@ class EnvRunConfig(RunConfig):
         if self.env is None:
             raise ValueError("EnvRunConfig names no environment; name one, as --env.name flight")
         env = self.env.build()
-        if not isinstance(env, Simulator) and not jax.eval_shape(env.reset, jax.random.key(0))[1].reward.ndim:
+        if not batched(env):
             raise ValueError(f"a rollout steps a batch of environments, and {self.env.name} is one; set "
                              "env.count")
         objective = self.agent(env, self.started())
@@ -250,20 +237,20 @@ class EnvRunConfig(RunConfig):
         """The model the run trains: its own, or where it starts from a saved run that run's."""
         return self.model if self.pretrained is None else EnvRunConfig.load(self.pretrained).trained_model()
 
-    def agent(self, env: Env | Simulator, variables: Variables | None = None) -> Agent:
+    def agent(self, env: Environment, variables: Variables | None = None) -> Agent:
         """The run's objective over its model (`trained_model`) acting in `env`, from `variables`, a fresh
         draw where None: each width `env` states derived for both, and refused where the record states it.
         Variables that do not fit the agent are refused."""
         model = self.trained_model()
-        observation = _observed(env)
-        model = dataclasses.replace(model, fields={**model.fields, **_filled(observation, model.fields)})
+        observation = observed(env)
+        model = dataclasses.replace(model, fields={**model.fields, **filled(observation, model.fields)})
         declared = {field.name for field in dataclasses.fields(models[model.name])}
         derived: dict[str, Configured] = {"action_size": env.action_size}
         if declared & {"observation_size", "image"}:
             # A world model's encoder reads a vector of `observation_size`, or an image of its shape.
-            seen = _seen(observation, _reads({**model.defaults, **model.fields}))
-            derived |= {"observation_size": seen[0] if len(seen) == 1 else 0,
-                        "image": seen if len(seen) == 3 else None}
+            shape = seen(observation, reads({**model.defaults, **model.fields}))
+            derived |= {"observation_size": shape[0] if len(shape) == 1 else 0,
+                        "image": shape if len(shape) == 3 else None}
         derived = {name: value for name, value in derived.items() if name in declared}
         stated = sorted(set(model.fields) & set(derived))
         if stated:
@@ -271,7 +258,7 @@ class EnvRunConfig(RunConfig):
         built = dataclasses.replace(self, model=model).numerics_fields()
         widths = {}
         if "observation_size" in parameters(self.objective.member)[0]:
-            read = _seen(observation, _reads({**self.objective.defaults, **self.objective.fields}))
+            read = seen(observation, reads({**self.objective.defaults, **self.objective.fields}))
             if len(read) != 1:
                 raise ValueError(f"{self.objective.name} reads a flat observation, and its views are {read}")
             widths["observation_size"] = read[0]
@@ -305,12 +292,12 @@ class EnvRunConfig(RunConfig):
         with Checkpoints(self.pretrained) as checkpoints:
             return checkpoints.variables(step=self.source.step, ema=bool(self.source.ema))
 
-    def taught(self, objective: Agent, env: Env | Simulator) -> dict[str, Teacher]:
+    def taught(self, objective: Agent, env: Environment) -> dict[str, object]:
         """The rollout's teacher and demonstrator (`TeacherConfig`), each the teacher run's policy acting in
         `env`: its greedy action labelling each step where `objective` imitates labels, and its draws flying
         the prefill where it demonstrates. An objective imitating labels with no teacher, a teacher that
         neither labels nor demonstrates, and a teacher run of another objective than PPO's are refused."""
-        labels = isinstance(objective, DreamerV3Objective) and objective.imitates == LABEL
+        labels = imitates_labels(objective)
         held = self.teacher
         if held is None:
             if labels:
@@ -319,17 +306,12 @@ class EnvRunConfig(RunConfig):
             return {}
         if not labels and not held.demonstrates:
             raise ValueError("a teacher labels the steps of an objective that imitates its labels "
-                             f"(imitates={LABEL!r}) or demonstrates the prefill (teacher.demonstrates), and "
+                             "(imitates='label') or demonstrates the prefill (teacher.demonstrates), and "
                              "this run's does neither")
         saved = EnvRunConfig.load(held.run)
         with Checkpoints(held.run) as checkpoints:
             variables = checkpoints.variables(step=held.step, ema=False)
-        policy = saved.agent(env, variables)
-        if not isinstance(policy, ControlPPOObjective):
-            raise ValueError(f"{held.run} trained a {type(policy).__name__}; a teacher is a PPO policy, "
-                             "which acts from the environment's observation alone")
-        taught = {"teacher": Teacher(policy.greedy, variables)} if labels else {}
-        return taught | ({"demonstrator": Teacher(policy.act, variables)} if held.demonstrates else {})
+        return taught(saved.agent(env, variables), variables, labels=labels, demonstrates=held.demonstrates)
 
     def pinned(self) -> Self:
         """This run with its sources pinned (`RunConfig.pinned`), and its teacher's step and the step of the
@@ -351,68 +333,6 @@ def _pinned(directory: str, step: int | str | None) -> int:
     """The step of the saved run in `directory` that `step` selects now (`Checkpoints.pinned`)."""
     with Checkpoints(directory) as checkpoints:
         return checkpoints.pinned(step)
-
-
-def _observed(env: Env | Simulator) -> Observation:
-    """Every environment's observation as an episode of `env` starts, its arrays' shapes the facts read of
-    it: an `Env`'s traced, a `Simulator`'s reset, which its rollout resets again as it begins."""
-    if isinstance(env, Simulator):
-        return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), received(env.reset(0)))
-    return jax.eval_shape(env.reset, jax.random.key(0))[1].observation
-
-
-class Filled(TypedDict, total=False):
-    """A world model's proprioceptive entries and auxiliary heads with their widths (`_filled`)."""
-
-    proprio: tuple[tuple[str, int], ...]
-    auxiliary: tuple[tuple[str, int, int], ...]
-
-
-def _filled(observation: Observation, fields: Mapping[str, object]) -> Filled:
-    """A world model's proprioceptive entries (`proprio`, by name) and auxiliary heads (`auxiliary`, each its
-    entry's name and its units) as its record names them, each with the width of the environment's view of
-    it, one environment's flattened; a record that states a width is refused, the environment declaring
-    it."""
-    def width(name: str) -> int:
-        return int(np.prod(np.shape(view(observation, name))[1:]))
-
-    filled: Filled = {}
-    proprio = fields.get("proprio")
-    if proprio is not None:
-        if not isinstance(proprio, Sequence) or not all(isinstance(entry, str) for entry in proprio):
-            raise ValueError(f"a record names a world model's proprioceptive entries, whose widths the "
-                             f"environment declares: {proprio}")
-        filled["proprio"] = tuple((name, width(name)) for name in proprio)
-    auxiliary = fields.get("auxiliary")
-    if auxiliary is not None:
-        heads = list(auxiliary) if isinstance(auxiliary, Sequence) else [auxiliary]
-        if not all(isinstance(head, Sequence) and not isinstance(head, str) and len(head) == 2
-                   for head in heads):
-            raise ValueError(f"a record names each auxiliary head's entry and its units, the environment "
-                             f"declaring its width: {auxiliary}")
-        filled["auxiliary"] = tuple((str(head[0]), width(str(head[0])), int(head[1])) for head in heads
-                                    if isinstance(head, Sequence))
-    return filled
-
-
-def _reads(arguments: Mapping[str, object]) -> tuple[str, ...]:
-    """The views a reader's recorded `arguments` name it reading (`reads`): a world model's one, a
-    policy's several, or none, where it reads the observation whole."""
-    reads = arguments.get("reads")
-    if reads is None or isinstance(reads, str):
-        return () if reads is None else (reads,)
-    if not isinstance(reads, Sequence):
-        raise TypeError(f"reads names views, not {reads!r}")
-    return tuple(str(name) for name in reads)
-
-
-def _seen(observation: Observation, names: tuple[str, ...]) -> tuple[int, ...]:
-    """The shape a reader of the views `names` sees of each environment's `observation`: the one view a
-    world model reads, the views a policy reads joined along their last axis, or the observation whole
-    where it names none."""
-    shapes = [tuple(np.shape(view(observation, name))[1:]) for name in names] or [
-        tuple(np.shape(view(observation))[1:])]
-    return shapes[0] if len(shapes) == 1 else (sum(shape[-1] for shape in shapes),)
 
 
 def idle() -> Loader:
