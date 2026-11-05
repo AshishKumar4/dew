@@ -28,7 +28,7 @@ import math
 from collections.abc import Mapping
 
 import numpy as np
-from map_judge import pooled_units, record_units
+from map_judge import sharded
 from sampling_gate import FALSE_RED
 from scipy import stats
 
@@ -98,12 +98,11 @@ def assert_learns(contrasts_of, label: str, *, units: int) -> None:
     the judge pools them, every unit from zero once, and judges them as one task that took them all."""
     if units < FEWEST_UNITS:
         raise ValueError(f"{label}: {units} units, fewer than {FEWEST_UNITS}; declare more")
-    if record_units(label, lambda start, stop: contrasts_of(np.arange(start, stop)), upto=units):
+    pooled = sharded(label, lambda start, stop: contrasts_of(np.arange(start, stop)), units, upto=units)
+    if pooled is None:
         return
-    pooled = pooled_units(label, units)
-    contrasts = contrasts_of(np.arange(units)) if pooled is None else {
-        claim: np.concatenate([np.asarray(payload[claim]) for _, _, payload in pooled])
-        for claim in pooled[0][2]}
+    contrasts = {claim: np.concatenate([np.asarray(payload[claim]) for payload in pooled])
+                 for claim in pooled[0]}
     claims, table = _table(contrasts, label)
     if table.shape[0] != units:
         raise ValueError(f"{label}: {table.shape[0]} contrasts a claim for {units} units")

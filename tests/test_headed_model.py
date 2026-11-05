@@ -49,6 +49,17 @@ def test_a_verbalizers_label_logits_are_the_backbones_full_head_at_its_labels_to
     assert_as_exact(read, full, draw, "verbalizer", seeds=LABEL_SEEDS)
 
 
+class Forwardless(nn.Module):
+    """A module that gives no final states: no `hidden_states` and no forward of its own, one method of
+    another name."""
+
+    @nn.compact
+    def encode(self, tokens):
+        return nn.Embed(8, 4)(tokens)
+
+
 def test_a_head_over_a_backbone_without_final_states_is_refused():
+    """A head reads its backbone's final states by its `hidden_states` or its own forward
+    (`HeadedModel.states_method`): a backbone with neither is refused at construction."""
     with pytest.raises(TypeError):
-        HeadedModel(nn.Dense(4), nn.Dense(2))
+        HeadedModel(Forwardless(), nn.Dense(2))

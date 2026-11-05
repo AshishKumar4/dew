@@ -194,6 +194,19 @@ def load_balance_update(counts: jax.Array, rate: jax.typing.ArrayLike) -> jax.Ar
     return jnp.asarray(rate) * direction
 
 
+def sqrt_softplus(logits: jax.Array) -> jax.Array:
+    """DeepSeek V4's score, `sqrt(softplus(logits))`, the plain formula wherever `exp(logits)` is above its
+    dtype's epsilon, and below it its tail `exp(logits / 2)`, which the formula equals there to within
+    the epsilon: where softplus underflows, the plain formula's derivative, `sqrt`'s at zero, is infinite
+    and an unselected expert's zero cotangent made the router's gradient NaN; a selected expert far down
+    the tail keeps its score where the plain formula rounded it to zero. Each branch reads only the
+    logits its side takes, so neither's derivative is evaluated past its range."""
+    tail = jnp.log(jnp.finfo(logits.dtype).eps)
+    below = logits < tail
+    plain = jnp.sqrt(jax.nn.softplus(jnp.where(below, tail, logits)))
+    return jnp.where(below, jnp.exp(jnp.minimum(logits, tail) / 2), plain)
+
+
 class Router(nn.Module):
     """Choose which experts a token goes to, and with what weight: `[..., k]`.
 
@@ -415,7 +428,7 @@ class Router(nn.Module):
         if self.score_function == 'softmax':
             return jax.nn.softmax(logits, axis=-1)
         if self.score_function == 'sqrtsoftplus':
-            return jnp.sqrt(jax.nn.softplus(logits))
+            return sqrt_softplus(logits)
         return jax.nn.sigmoid(logits)
 
     def group_mask(self, selection):
@@ -560,8 +573,6 @@ def expert_projection(x: jax.Array, kernel: jax.Array | Layered, group_sizes: ja
     measures it against float64 sums and three Adam steps on every expert/fsdp
     layout.
     """
-    if implementation not in GROUPED_MATMULS:
-        raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     stack, layer = (kernel.stack, kernel.layer) if isinstance(kernel, Layered) else (kernel, None)
     compute = canonicalize_dtype(x, stack, *(() if bias is None else (bias,)), dtype=dtype)
     with _named(implementation):
@@ -601,8 +612,6 @@ def paired_projections(x: jax.Array, first: jax.Array | Layered, second: jax.Arr
     if isinstance(first, Layered) or isinstance(second, Layered):
         return (expert_projection(x, first, group_sizes, compute, implementation, precision),
                 expert_projection(x, second, group_sizes, compute, implementation, precision))
-    if implementation not in GROUPED_MATMULS:
-        raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     with _named(implementation):
         return gemm.gemm(x, first, group_sizes, compute=compute, out_dtype=compute,
                              out_dtypes=(compute, compute), precision=precision, paired=second)
@@ -610,7 +619,9 @@ def paired_projections(x: jax.Array, first: jax.Array | Layered, second: jax.Arr
 
 def _named(implementation: str) -> contextlib.AbstractContextManager:
     """The launch choice an expert projection's `implementation` names: XLA's ragged dot for 'xla', the
-    template's own for 'auto' and 'pallas' (`expert_projection`)."""
+    template's own for 'auto' and 'pallas' (`expert_projection`); any other name is refused."""
+    if implementation not in GROUPED_MATMULS:
+        raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     return generation.chosen(grouped_matmul='xla') if implementation == 'xla' else contextlib.nullcontext()
 
 

@@ -36,6 +36,7 @@ from dew.decision import (
     StateFirstLayout,
     Weights,
 )
+from dew.decision.model import DecisionModel
 from dew.decision.task import usage_of
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -241,6 +242,48 @@ def test_a_held_pass_packs_its_rows_and_scores_every_row_once():
 def tiny_backbone() -> CausalTransformer:
     return CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=48,
                              max_seq_len=128, attention_impl="xla")
+
+
+class NativeEncoder(nn.Module):
+    """A Linen encoder as one writes it with no Dew contract in mind: its `__call__` gives its final states
+    `[B, S, features]`, each token's own, and it names no `hidden_states`."""
+
+    @nn.compact
+    def __call__(self, tokens, *, train=False, **fields):
+        return nn.Dense(16)(jnp.tanh(nn.Embed(256, 16)(tokens)))
+
+
+class AliasedEncoder(NativeEncoder):
+    """`NativeEncoder` with the method that only forwards to its call, which a decision required."""
+
+    def hidden_states(self, tokens, **fields):
+        return self(tokens, **fields)
+
+
+def test_a_decision_reads_a_native_encoders_states_with_no_method_that_forwards_to_it():
+    """A backbone whose `__call__` gives its final states and which names no `hidden_states` is read by its
+    own forward (`forward_method`, `HeadedModel.states_method`): its head is sized and drawn over it, and a
+    decision's loss and its gradient are the ones the same encoder with a `hidden_states` that only forwards
+    to `__call__` gives, bit for bit, where a decision refused it at construction (row 171)."""
+    from dew.objectives.base import Step
+
+    native, aliased = NativeEncoder(), AliasedEncoder()
+    assert DecisionModel.head_size(native) == DecisionModel.head_size(aliased) == (16, None)
+    scored = []
+    for model in (native, aliased):
+        objective = DecisionObjective(model, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
+                                      shuffle_options=False)
+        assert objective.model.states_method == ("__call__" if model is native else "hidden_states")
+        data = decision_rows(EXAMPLES, 8, EXAMPLES, objective=objective.data())
+        batch = next(iter(data.train(DataPartition())))
+        variables = nn.unbox(objective.init(jax.random.key(0)))
+
+        def loss(variables, objective=objective, batch=batch):
+            return objective.scalar_loss(variables, batch, Step(jnp.asarray(0), jax.random.key(1), None))[0]
+
+        scored.append(jax.jit(jax.value_and_grad(loss))(variables))
+    for native_leaf, aliased_leaf in zip(*map(jax.tree.leaves, scored), strict=True):
+        np.testing.assert_array_equal(np.asarray(native_leaf), np.asarray(aliased_leaf))
 
 
 def leaves(tree, *path):

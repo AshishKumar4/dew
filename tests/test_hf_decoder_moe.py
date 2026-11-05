@@ -17,7 +17,7 @@ from interop_support import (
     transformers_arms,
     transformers_model,
 )
-from model_support import decode_steps, flat_tree, stepped_outputs
+from model_support import decode_steps, flat_tree, prediction_logits, stepped_outputs
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
@@ -346,8 +346,7 @@ def mtp_depth(directory, *, experts):
     assert depth["block"]["mlp"]["experts"]["gate_proj"]["kernel"].shape == experts
 
     def depth_logits(held):
-        hidden = model.apply(held, ids, method=CausalTransformer.hidden_states)
-        return np.asarray(model.apply(held, hidden, ids, method=CausalTransformer.mtp_logits)[0])
+        return np.asarray(prediction_logits(model, held, ids))
 
     logits, reference = depth_logits(variables), np.load(directory / "mtp_logits.npy")
     difference = float(np.max(np.abs(logits - reference)))

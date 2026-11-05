@@ -221,6 +221,27 @@ def test_a_record_keyed_by_site_replays_each_routed_site_its_own(mixed):
     assert_as_exact(replayed(obj), natively(obj), draw, label, seeds=SEEDS['own keyed routing'],
                     truth_fn=natively(parallel_routed(mixed, jnp.float64)))
 
+def test_a_composites_record_is_partitioned_by_its_routed_children_alone():
+    """`protocols.partitioned_routes`, the one partition of a layer's and a parallel mixer's record: a single
+    record replays exactly one routed site and is refused for none or several, a keyed one gives each
+    composed child its own sites below its name and each leaf its entry, beside the coverage as it is, and
+    a keyed record that names not every routed site is refused."""
+    from dew.nn.protocols import partitioned_routes
+
+    record, covered = np.arange(3), np.ones(3, bool)
+    for routed in ({}, {"a": ("a",), "b": ("b",)}):
+        with pytest.raises(ValueError):
+            partitioned_routes(routed, record, covered)
+    (single,) = partitioned_routes({"a": ("a",)}, record, covered).values()
+    assert single[0] is record and single[1] is covered
+    keyed = {"m/x": 1, "m/y": 2, "f": 3}
+    assert partitioned_routes({"m": ("m/x", "m/y"), "f": ("f",)}, keyed, None) == {
+        "m": ({"x": 1, "y": 2}, None), "f": (3, None)}
+    with pytest.raises(ValueError):
+        partitioned_routes({"f": ("f",)}, {"g": 1}, None)
+    assert partitioned_routes({"a": ("a",)}, None, covered) == {}
+
+
 def test_gpt_oss_experts_in_a_mixer_slot_replay_the_record():
     """GPT OSS's experts, which a mixture builds under swigluoai (`Mixture.build`), replay a record
     in a mixer's slot as in a feed-forward's: two records score the tokens differently, where a

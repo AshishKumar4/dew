@@ -43,6 +43,7 @@ from jax.typing import DTypeLike
 
 from dew.nn.derivatives import Protected, bound_span, declared_derivative, declared_tangent, surrogate
 from dew.nn.nested import nested
+from dew.nn.programs import equations
 from dew.nn.sharding import explicit_spec
 
 __all__ = [
@@ -350,10 +351,9 @@ _OWN_DERIVATIVES = (core.primitives.custom_vjp_call_p, core.primitives.custom_jv
 def _own_backward(jaxpr) -> bool:
     """Whether a product's trace states a derivative of its own (a `jax.custom_vjp`, as Qwix's
     quantized products are when Qwix quantizes a model directly, or a `jax.custom_jvp`), in it or any
-    program inside it (`jax.extend.core.subjaxprs`): a product its library owns, which `accumulated`
+    program inside it (`dew.nn.programs.equations`): a product its library owns, which `accumulated`
     neither widens nor transposes, since a transpose would differentiate its primal instead."""
-    return (any(eqn.primitive in _OWN_DERIVATIVES for eqn in jaxpr.eqns)
-            or any(_own_backward(program) for program in core.subjaxprs(jaxpr)))
+    return any(eqn.primitive in _OWN_DERIVATIVES for eqn in equations(jaxpr))
 
 
 FP32_SUMS = "F32_F32_F32"

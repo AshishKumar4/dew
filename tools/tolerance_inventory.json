@@ -341,10 +341,6 @@
    "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_host_placement.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_host_training.py": {
    "comparisons": 4,
    "lane": "Models, Serving & RL"

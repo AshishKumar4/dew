@@ -62,7 +62,7 @@ from dew.nn.inputs import (
     unruled_fields,
 )
 from dew.nn.kernels.options import program
-from dew.nn.protocols import Logits, ShiftsLogits, TokenModel
+from dew.nn.protocols import ShiftsLogits, TokenModel, forward_method
 from dew.nn.sharding import explicit_spec
 
 MDLM_STEPS = 128
@@ -289,8 +289,8 @@ class DiscreteDenoiser:
     The denoiser ignores `t`, because the masked model is conditioned on the
     corruption it sees and not on the time. `Unmask.step` reads the time
     from the process. `t` stays in the signature because `sample` calls
-    every denoiser as `(x_t, t)`. A model with full-sequence logits
-    (`Logits`) is read through them, and any other through its call.
+    every denoiser as `(x_t, t)`. The model's full-sequence logits are read
+    through its `logits`, or a native module's own forward (`forward_method`).
 
     The model's own logits at an unmasked position do not matter, since the
     position keeps its token (MDLM's carry-over parameterization). The mask
@@ -333,7 +333,7 @@ class DiscreteDenoiser:
             fields = {**fields, "attention_pairwise_mask": self.visible}
         logits = self.model.apply(self.params, x_t, **fields, rngs=None, mutable=False,
                                   capture_intermediates=False,
-                                  method="logits" if isinstance(self.model, Logits) else None)
+                                  method=forward_method(self.model, "logits"))
         assert not isinstance(logits, tuple)  # no mutable collections were asked for
         # Normalized in at least fp32 (`dew.nn.categorical`) over the logits each position reads
         # (`aligned`): the reveal draws its categorical from these, and a bf16 log partition would
@@ -501,12 +501,13 @@ class MDLM:
 
 def refuse_causal(model: nn.Module) -> None:
     """Raise ValueError unless `model` can fill a masked row: MDLM draws each
-    masked slot from the row's full-sequence logits (`Logits`), so every
-    position must read the ones after it (`TokenModel` with `causal` False)."""
+    masked slot from the row's full-sequence logits (its `logits`, or a native
+    module's own forward: `forward_method`), so every position must read the
+    ones after it (`TokenModel` with `causal` False)."""
     name = type(model).__name__
-    if not isinstance(model, Logits):
+    if forward_method(model, "logits") is None:
         raise ValueError(f"masked generation requires a bidirectional model, and this {name} gives no "
-                         f"full-sequence logits (Logits)")
+                         f"full-sequence logits: no logits and no forward")
     if not isinstance(model, TokenModel):
         raise ValueError(f"masked generation requires a bidirectional model, and this {name} does not say "
                          f"whether a position reads the ones after it (TokenModel)")

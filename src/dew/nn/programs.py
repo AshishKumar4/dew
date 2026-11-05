@@ -10,7 +10,7 @@ which branch a platform runs and which bodies XLA sees.
 from __future__ import annotations
 
 import functools
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from typing import TypeGuard
 
 import jax
@@ -82,6 +82,15 @@ def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
         found.extend(each for each in (value if isinstance(value, tuple | list) else (value,))
                      if isinstance(each, jcore.Jaxpr))
     return found
+
+
+
+def equations(jaxpr: jcore.Jaxpr) -> Iterator[jcore.JaxprEqn]:
+    """Every equation of `jaxpr` and of every program within it, at any depth (`jax.extend.core.subjaxprs`):
+    a call's, a loop's, a branch's, a custom derivative's, a kernel's."""
+    yield from jaxpr.eqns
+    for inner in jcore.subjaxprs(jaxpr):
+        yield from equations(inner)
 
 
 @functools.cache
