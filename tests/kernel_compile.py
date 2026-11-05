@@ -764,6 +764,24 @@ def mosaic_failures(found: list[dict]) -> list[str]:
     return failed
 
 
+def model_failures(found: list[dict]) -> list[str]:
+    """Each kernel whose register model decides otherwise than ptxas (its admission or its residency, at
+    the model that decided its launch: `_register_evidence`) and each launch no model states: what a
+    family's gate fails once its models match the compiler (row 1971, bible §6), beside `mosaic_failures`'
+    spills and allocations."""
+    failed = []
+    for record in found:
+        for row in _register_evidence(record):
+            if row.get("kind") == "unmodelled":
+                failed.append(f"{row['case_id']}: a launch no register model states ({row['reason']})")
+            elif row.get("agrees") is False:
+                predicted, compiled = row["predicted"], row["compiled"]
+                failed.append(f"{row['case_id']}: the model's {predicted['total']} registers decide "
+                              f"{predicted['admits']} at {predicted['detail']} programs, ptxas's "
+                              f"{compiled['quantities']} decide {compiled['admits']} at {compiled['detail']}")
+    return failed
+
+
 def compiled_kernels(record: dict) -> set[str]:
     """The names of the kernels `record` compiled, as its models name them (`Report.kernel`)."""
     return {_report(kernel).kernel for kernel in record.get("kernels", ())}

@@ -630,14 +630,17 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
     """Every distinct GEMM Mosaic GPU kernel a generation runs at a real projection (`_gate_cases`), a test
     each, at the tile its launch derives from the generation's facts and at each tile the derivation refused
     for its registers, compiled by Mosaic for a compile-only device of the generation on this CPU through
-    ptxas. Required launches must spill nothing. Rejected configurations supply model evidence; their spills
-    are refusals, never qualified launches. Compiler errors and missing reports fail either."""
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+    ptxas. Required launches must spill nothing, and their register model decide as ptxas does
+    (`model_failures`: the GEMM's models match the compiler on every case, row 1971). Rejected
+    configurations supply model evidence; their spills are refusals, never qualified launches. Compiler
+    errors and missing reports fail either."""
+    from kernel_compile import compile_mosaic_kernels, model_failures, mosaic_failures
 
     cases = _gate_cases(generation_name)[index:index + 1]
     found = compile_mosaic_kernels(cases, generation_name)
     failed = failures(found)
-    failed += mosaic_failures([record for case, record in zip(cases, found, strict=True) if case.required])
+    required = [record for case, record in zip(cases, found, strict=True) if case.required]
+    failed += mosaic_failures(required) + model_failures(required)
     assert not failed, "\n".join(failed)
     assert all(record["kernels"] and all(not kernel["unread"] for kernel in record["kernels"])
                for record in found)
