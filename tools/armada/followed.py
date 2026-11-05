@@ -39,6 +39,13 @@ HIDDEN_INPUTS = (".github", ".armada.json", ".python-version", ".gitattributes",
 """The checkout's hidden entries a test may read as any of its files (a workflow, the run's settings,
 thresh's annotations), each the input of the files that read it alone; any other hidden entry (.git, an
 environment, a cache) is none."""
+HARNESS_MODULES = ("tools/armada/session.py", "tools/armada/child_groups.py", "tools/armada/split.py",
+                   "tools/armada/executed.py", "tools/armada/followed.py", "tools/armada/lifetime.py",
+                   "tools/armada/watched.py")
+"""The harness's Python files, which every test process or its supervisor runs: ci.py's `SHARED` covers each
+by its code, so the recorder logs none of their automatic execution (`harness`), which a comment or a
+docstring edit would otherwise key into every file's row. What a test observes of one stays logged: the text
+it reads, the `__code__` it takes."""
 READS = {"open", "os.listdir", "os.scandir"}
 LIMITS = {"cpu.max": "limit:cpu", "memory.max": "limit:memory"}
 """The cgroup files that set a process's execution limits, by the input a run that read one keys: host.py's
@@ -91,6 +98,12 @@ def checkout(name: str, root: str) -> bool:
     """Whether `name` is a Python file of the checkout at `root`. The environment's packages, which CI
     installs in the checkout, are the locks' to key."""
     return name.startswith(root) and name.endswith(".py") and "site-packages" not in name
+
+
+def harness(name: str, root: str) -> bool:
+    """Whether `name` is a file of `HARNESS_MODULES` of the checkout at `root`: absolute, as a code object's
+    file is."""
+    return name.startswith(root) and name[len(root):] in HARNESS_MODULES
 
 
 def code_unit(code: types.CodeType, root: str) -> str:
@@ -172,7 +185,26 @@ def read(event: str, args: tuple, root: str) -> str | None:
     cgroup = os.environ.get("DEW_CGROUP_ROOT", "/sys/fs/cgroup")
     if os.path.basename(name) in LIMITS and name.startswith(cgroup.rstrip(os.sep) + os.sep):
         return LIMITS[os.path.basename(name)]
-    return placed(name, root)
+    found = placed(name, root)
+    # A harness plugin's text (executed.py, split.py) that pytest's assertion rewriter reads to execute it, as
+    # the loader reads any module's: the harness's code is every key's (`HARNESS_MODULES`).
+    if event == "open" and found in HARNESS_MODULES and rewriting():
+        return None
+    return found
+
+
+REWRITER = os.path.join("_pytest", "assertion", "rewrite.py")
+"""The file of pytest's assertion rewriter, which executes the modules it rewrites itself."""
+
+
+def rewriting() -> bool:
+    """Whether pytest's assertion rewriter is on this thread's stack."""
+    frame = sys._getframe(1)
+    while frame is not None:
+        if frame.f_code.co_filename.endswith(REWRITER):
+            return True
+        frame = frame.f_back
+    return False
 
 
 def placed(name: str, root: str) -> str | None:
@@ -418,7 +450,10 @@ def follow() -> None:
                 atexit.register(held)
             return None
         name = code.co_filename
-        if checkout(name, root):
+        if harness(name, root):
+            # Its code is every key's (ci.py's `SHARED`): it stays among the modules the closing guard lets in.
+            seen.add(name[len(root):])
+        elif checkout(name, root):
             recorded(code_unit(code, root))
             if reads_backend(code):
                 write("read", f"{name[len(root):]}:{code.co_qualname}")
