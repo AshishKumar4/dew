@@ -178,7 +178,9 @@ class Architecture:
     (`register_raises`, None where it takes none). Their defaults are the facts every CUDA compute capability
     from 7.5 to 12.x shares (CUDA C++ Programming Guide §5.1, Tables 33 and 34; its "Arithmetic Instructions"
     throughput table; 128 bytes a clock measured 126 to 128 on an A100 and an H800, Luo et al. 2025,
-    "Dissecting the NVIDIA Hopper Architecture through Microbenchmarking", Table 3); a TPU states none."""
+    "Dissecting the NVIDIA Hopper Architecture through Microbenchmarking", Table 3), and setmaxnreg's range,
+    which the architectures before Hopper state as None; a target of no architecture (the CPU interpreting a
+    launch) reads the defaults, under which every family's launch interprets. A TPU states none."""
 
     family: str | None
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
@@ -190,7 +192,7 @@ class Architecture:
     reserved_shared: int | None = 1024
     shared_bytes_per_clock: int | None = 128
     exponentials_per_clock: int | None = 16
-    register_raises: RegisterRaises | None = None
+    register_raises: RegisterRaises | None = SETMAXNREG
     wgmma: bool = False
     tma: bool = False
     dependent_launch: bool = False
@@ -216,22 +218,21 @@ class Architecture:
 # 7.5 16 and 1024, 8.0 32 and 2048, 8.6 16 and 1536, 8.9 24 and 1536, 9.0 and 10.0 32 and 2048, 12.x 24 and
 # 1536; setmaxnreg is sm_90a's, sm_100f's and sm_120f's (PTX ISA, `SETMAXNREG`).
 _AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128}, resident_threads=2048,
-                       resident_blocks=32)
-_AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256})
-_ADA = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256}, resident_blocks=24)
+                       resident_blocks=32, register_raises=None)
+_AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256}, register_raises=None)
+_ADA = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256}, resident_blocks=24,
+                    register_raises=None)
 # Turing's MMA takes no bf16 operands, which every template computes in: it is outside every family.
-_TURING = Architecture(None, {'16bit': 1024, 'fp32': 128}, resident_threads=1024)
+_TURING = Architecture(None, {'16bit': 1024, 'fp32': 128}, resident_threads=1024, register_raises=None)
 _HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, '8bit': 8192, 'fp32': 256},
-                       resident_threads=2048, resident_blocks=32, register_raises=SETMAXNREG, wgmma=True,
-                       tma=True, dependent_launch=True)
+                       resident_threads=2048, resident_blocks=32, wgmma=True, tma=True, dependent_launch=True)
 # Blackwell's tcgen05 family.
 _BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, '8bit': 16384, 'fp32': 256},
-                          resident_threads=2048, resident_blocks=32, register_raises=SETMAXNREG,
-                          tmem_columns=512, tma=True, dependent_launch=True)
+                          resident_threads=2048, resident_blocks=32, tmem_columns=512, tma=True,
+                          dependent_launch=True)
 # Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms, its blocks moved by TMA: Ada's rates.
 _BLACKWELL_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
-                                   resident_blocks=24, register_raises=SETMAXNREG, tma=True,
-                                   dependent_launch=True)
+                                   resident_blocks=24, tma=True, dependent_launch=True)
 # A TPU's: its MXU's FLOPs a clock (v5e 197 TF over 1.5 GHz -> 131072) and the scoped VMEM limit at XLA's
 # default (v5e 16 MiB, read from a Mosaic kernel's refusal: "limit 16.00M"; v6e's pending GEMMTPU-VMEM's).
 # v6e: two 256x256 MXUs, 918 TF over its clock -> 524288. T4: 65 TF fp16 summed in fp32 and 8.1 TF fp32
@@ -240,7 +241,7 @@ _BLACKWELL_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bi
 # GEMMTPU-GRIDSTEP@v6e1); v5e 128 MiB by Google's specification, pending GEMMTPU-VMEM@v5e1's refusal.
 _TPU = {'resident_threads': None, 'resident_blocks': None, 'registers': None, 'thread_registers': None,
         'register_step': None, 'reserved_shared': None, 'shared_bytes_per_clock': None,
-        'exponentials_per_clock': None}
+        'exponentials_per_clock': None, 'register_raises': None}
 """A TPU's core states none of a CUDA multiprocessor's resources."""
 _TPUS = {'v5e': Architecture('tpu', {'16bit': 131072}, scoped_vmem=16 * 2 ** 20, vmem_bytes=128 * 2 ** 20,
                              **_TPU),
