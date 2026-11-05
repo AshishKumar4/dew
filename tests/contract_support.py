@@ -160,7 +160,8 @@ EDGES = {"normal": 1.0, "near the largest": 2.0**63, "near the least normal": 2.
 pairs) reach float32's largest or its least normal."""
 
 
-def normal_draw(seed: int, *shapes, scale: float = 1.0) -> tuple:
-    """Standard normal float32 arrays of `shapes` at `scale`, from `seed`."""
+def normal_draw(seed, *shapes, scale: float = 1.0, dtype=jnp.float32) -> tuple:
+    """Standard normal arrays of `shapes` at `scale` in `dtype`, from `seed` (a seed, or a site's salt and
+    a seed: NumPy's `SeedSequence` entropy)."""
     rng = np.random.default_rng(seed)
-    return tuple(jnp.asarray(rng.standard_normal(shape) * scale, jnp.float32) for shape in shapes)
+    return tuple(jnp.asarray(rng.standard_normal(shape) * scale, dtype) for shape in shapes)

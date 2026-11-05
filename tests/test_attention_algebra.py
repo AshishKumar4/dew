@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import as_given, assert_as_exact
+from reference_error import assert_as_exact
 from test_attention_template import CASES, ROWS, arguments
 from test_attention_triton import (
     BACKWARD_FORMS,
@@ -273,20 +273,17 @@ def test_an_extreme_fp32_backward_is_as_exact_as_the_reference(peak0, scale, key
             attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2)}
     draw, reference = _scaled_draw(query, key, value, dout), _reference_dq(spans, hooks, scale)
 
-    @as_given
     def triton_dq(query, key, value, dout):
         with tuning.pinned(pins):
-            return np.asarray(attention_triton.backward(query, key, value, spans, hooks, dout, scale=scale,
-                                                        interpret=True).query)
+            return attention_triton.backward(query, key, value, spans, hooks, dout, scale=scale,
+                                             interpret=True).query
 
-    @as_given
     def portable_dq(query, key, value, dout):
-        return np.asarray(attention_portable.backward(query, key, value, spans, hooks, dout, block_q=32,
-                                                      block_k=32, pad=attention_triton.BLOCK,
-                                                      scale=scale).query)
+        return attention_portable.backward(query, key, value, spans, hooks, dout, block_q=32, block_k=32,
+                                           pad=attention_triton.BLOCK, scale=scale).query
 
     for name, run in (("triton", triton_dq), ("portable", portable_dq)):
-        assert np.isfinite(run(*draw(0))).all(), name
+        assert np.isfinite(np.asarray(run(*draw(0)))).all(), name
         assert_as_exact(run, reference, draw, f"dq at fp32's edges, {name}", seeds=EDGE_SEEDS)
 
 
@@ -700,21 +697,18 @@ def _accurate_dq(query, key, value, spans, hooks, dout, scale, name):
     tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
     form = {"scale": scale, "natural": True, "accurate": True}
 
-    @as_given
     def triton(query, key, value, dout):
         with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
-            return np.asarray(attention_triton.backward(query, key, value, spans, hooks, dout, interpret=True,
-                                                        **form).query)
+            return attention_triton.backward(query, key, value, spans, hooks, dout, interpret=True,
+                                             **form).query
 
-    @as_given
     def portable(query, key, value, dout):
-        return np.asarray(attention_portable.backward(query, key, value, spans, hooks, dout, **tiles,
-                                                      **form).query)
+        return attention_portable.backward(query, key, value, spans, hooks, dout, **tiles, **form).query
 
     draw, reference = _scaled_draw(query, key, value, dout), _reference_dq(spans, hooks, scale)
-    found = triton(*draw(0))
+    found = np.asarray(triton(*draw(0)))
     assert np.isfinite(found).all(), name
-    np.testing.assert_array_equal(found, portable(*draw(0)), err_msg=name)
+    np.testing.assert_array_equal(found, np.asarray(portable(*draw(0))), err_msg=name)
     theirs = np.asarray(jax.jit(reference)(*draw(0)))
     with jax.enable_x64(new_val=True):
         want = np.asarray(reference(*(jnp.asarray(x, jnp.float64) for x in draw(0))))

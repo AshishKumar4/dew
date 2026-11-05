@@ -199,7 +199,7 @@ SEEDS = 8
 """Each released checkpoint's declared check-1 seeds, sized by `seeds_for` paired on armada."""
 
 
-def drawn_ids(batch, vocab: int, salt: int, avoid: int | None = None):
+def batch_draw(batch, vocab: int, salt: int, avoid: int | None = None):
     """Check 1's draw of the batch's ids: each real position a token below `vocab` (never `avoid`, the
     fill), the padding, mask and positions the batch's own."""
     inputs, _, _ = batch
@@ -216,7 +216,7 @@ def drawn_ids(batch, vocab: int, salt: int, avoid: int | None = None):
 
 def assert_logits_as_exact(model, variables, reference, batch, label, salt):
     """Dew's fp32 logits of `model` over `variables` as exact as transformers' `reference` (check 1) over
-    drawn ids (`drawn_ids`) at the batch's mask and positions, real positions alone, the truth the
+    drawn ids (`batch_draw`) at the batch's mask and positions, real positions alone, the truth the
     reference's float64 twin."""
     inputs, _, _ = batch
     valid = np.asarray(inputs.token_fields["attention_mask"]).astype(bool)
@@ -225,7 +225,7 @@ def assert_logits_as_exact(model, variables, reference, batch, label, salt):
     assert_as_exact(
         as_given(lambda ids: np.asarray(forward(variables, ids, **inputs.kwargs()), np.float64)[valid]),
         as_given(lambda ids: reference_logits(reference, ids, valid, positions).astype(np.float64)[valid]),
-        drawn_ids(batch, reference.config.vocab_size, salt), label, seeds=SEEDS,
+        batch_draw(batch, reference.config.vocab_size, salt), label, seeds=SEEDS,
         truth_fn=as_given(lambda ids: wide_logits(reference, ids, valid, positions)[valid]))
 
 
@@ -255,7 +255,7 @@ def test_the_objectives_token_scores_are_the_references_cross_entropy(
     real[:, :width] = valid.astype(bool)
 
     def draw(seed):
-        (ids,) = drawn_ids(batch, reference.config.vocab_size, 0x5E2, avoid=fill)(seed)
+        (ids,) = batch_draw(batch, reference.config.vocab_size, 0x5E2, avoid=fill)(seed)
         drawn = rows.copy()
         drawn[:, :width] = ids
         return (np.where(real, drawn, rows),)

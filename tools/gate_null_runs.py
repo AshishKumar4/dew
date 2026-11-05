@@ -591,11 +591,11 @@ def main(argv: list[str]) -> int:
 
     if options.amplified and options.rows is None:
         parser.error("--amplified is the worst-row controls' (--rows)")
+    if not options.amplified and (options.shared or options.steepest != 24):
+        parser.error("--shared and --steepest shape --amplified's element, which they need")
     if options.rows is not None:
         if options.today or options.paired or options.orders or options.fault or options.seeds is None:
             parser.error("--rows takes the rows a draw as its name and --seeds, and no other mode's flags")
-        if not options.amplified and (options.shared or options.steepest != 24):
-            parser.error("--shared and --steepest shape --amplified's element, which they need")
         verdicts, statistics = row_controls(options.rows, int(options.name), options.seeds, options.runs,
                                             options.chunk, options.amplified, options.shared,
                                             options.steepest)

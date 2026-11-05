@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 from arm_arithmetic import float64_held
 from attention_oracle import attention_on_par, exact_attention, float64_weights
+from contract_support import normal_draw
 from model_support import as_stepped
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, assert_fp32_reduction_bound
 
@@ -69,10 +70,14 @@ def test_folded_attention_is_jax_nn_attention(dtype, heads):
         key, value = rng.normal(size=(2, 3, 40, heads, 256)) * np.array([0.3, 1.0])[:, None, None, None, None]
         return tuple(jnp.asarray(x, dtype) for x in (query, key, value))
 
+    # The truth attention written out over each row's keys: raw jax.nn takes its softmax in fp32 whatever
+    # its operands (src/dew/nn/attention.py).
+    reads = np.arange(40)[None, None, None, :] < np.asarray(lengths)[:, None, None, None]
     assert_as_exact(lambda q, k, v: folded_attention(q, k, v, with_key_lengths(None, lengths, 40)),
                     lambda q, k, v: jax.nn.dot_product_attention(q, k, v, key_value_seq_lengths=lengths,
                                                                  implementation='xla'),
-                    draw, "folded", seeds=FOLDED_SEEDS, terms=True)
+                    draw, "folded", seeds=FOLDED_SEEDS, terms=True,
+                    truth_fn=lambda q, k, v: exact_attention(q, k, v, keep=reads))
 
 
 ON_GPU = jax.default_backend() == "gpu"
@@ -148,7 +153,7 @@ def test_the_decode_kernel_reads_each_row_to_its_length_at_every_config(dtype, w
         out = jax.jit(attend)(*draw(0))
         assert out.shape == jax.eval_shape(plain, *draw(0)).shape and out.dtype == draw(0)[0].dtype
         assert_as_exact(attend, plain, draw, f"decode kernel, {config}", seeds=DECODE_KERNEL_SEEDS,
-                        terms=True)
+                        terms=True, truth_fn=lambda q, k, v: exact_attention(q, k, v, keep=np.asarray(mask)))
 
 
 SINKS = (0.5, -1.0, 2.0, -3.0)
@@ -423,9 +428,7 @@ def test_a_grouped_query_attends_as_its_heads_do_alone(implementation):
     lengths = jnp.asarray([1, 9, 32], jnp.int32)
 
     def draw(seed):
-        rng = np.random.default_rng([3, seed])
-        return tuple(jnp.asarray(rng.normal(size=shape), jnp.float32)
-                     for shape in ((3, 1, 8, 32), (3, 32, 2, 32), (3, 32, 2, 32)))
+        return normal_draw([3, seed], (3, 1, 8, 32), (3, 32, 2, 32), (3, 32, 2, 32))
 
     def alone(query, key, value):
         mask = (jnp.arange(key.shape[1]) < lengths[:, None])[:, None, None, :]
@@ -556,9 +559,7 @@ def test_key_starts_keep_the_arithmetic_auto_is_asked_for_where_the_decode_kerne
     kept = ((keys >= starts[:, None]) & (keys < lengths[:, None]))[:, None, None, :]
 
     def draw(seed):
-        rng = np.random.default_rng([6, seed])
-        return tuple(jnp.asarray(rng.normal(size=shape), jnp.float32)
-                     for shape in ((3, 1, 4, 16), (3, 64, 2, 16), (3, 64, 2, 16)))
+        return normal_draw([6, seed], (3, 1, 4, 16), (3, 64, 2, 16), (3, 64, 2, 16))
 
     def by_starts(query, key, value):
         with assumed("sm80"):
@@ -839,8 +840,13 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_confi
 
     out = jax.jit(attend)(*draw(0))
     assert out.shape == jax.eval_shape(plain, *draw(0)).shape and out.dtype == query.dtype
+    def exact(query, key_pages, value_pages):
+        key, value = gathered(key_pages), gathered(value_pages)
+        return exact_attention(query[:, None], key, value,
+                               keep=np.asarray(spanned(starts, lengths, key.shape[1])))[:, 0]
+
     assert_as_exact(attend, plain, draw, f"paged decode kernel, natural {natural}, {config}",
-                    seeds=PAGED_SEEDS, terms=True)
+                    seeds=PAGED_SEEDS, terms=True, truth_fn=exact)
 
 
 COMPILED = [(kernel, variant, splits) for kernel, variants in
@@ -998,8 +1004,5 @@ def flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask(with
         attended = jax.nn.dot_product_attention(query, key, value, mask=mask, implementation="xla")
         return jnp.where(real, attended, 0)
 
-    def truth(query, key, value):
-        return jnp.where(real, exact_attention(query, key, value, keep=np.asarray(mask)), 0)
-
     attention_on_par(flash, plain, draw, f"flash over a cache call's documents, window {window}",
-                     truth=truth)
+                     keep=np.asarray(mask) & np.asarray(positions >= 0)[:, None, :, None])

@@ -26,6 +26,7 @@ from attention_oracle import (
     qkv,
     value_and_grads,
 )
+from contract_support import normal_draw
 from flax import linen as nn
 from reference_error import as_given, assert_as_exact, widened, with_gradients
 
@@ -35,6 +36,7 @@ from dew.nn.attention_blocks import NormalAttention
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import attention as template
 from dew.nn.precision import FP32_SUMS, WIDE_CPU_ARITHMETIC, at_least_fp32
+from dew.nn.visibility import window_sides
 
 pytestmark = pytest.mark.kernel
 
@@ -112,7 +114,8 @@ def flash_through_dews_attention_refuses_rows_it_would_misread(without_determini
 
     for packed in ({}, own):
         attention_on_par(attend('flash', **packed), attend('xla', **packed), draw,
-                          f"flash {'packed' if packed else 'dense'}")
+                         f"flash {'packed' if packed else 'dense'}",
+                         keep=kept(32, 32, causal=True, segment_ids=packed.get("segment_ids")))
 
 
 SHARDED_SEEDS = 8
@@ -324,30 +327,34 @@ def packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_ti
     starts = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int32)
     documents = [slice(begin, end) for begin, end in itertools.pairwise(starts.tolist()) if end > begin]
     window = (63, 0 if causal else 63) if sunk else (-1, -1)
+    ids = np.repeat(np.arange(1, len(lengths) + 1), lengths)[None]
 
     def draw(seed):
         rows = int(starts[-1])
         streams = np.random.default_rng([0x9AC, seed])
         q, k, v, dy = (jnp.asarray(streams.normal(size=(rows, heads, head_dim)), jnp.bfloat16)
                        for heads in (8, 2, 2, 8))
-        return q, k, v, jnp.asarray(streams.normal(size=(8,)) * 2, jnp.float32), dy
+        sinks = (jnp.asarray(streams.normal(size=(8,)) * 2, jnp.float32),) if sunk else ()
+        return q, k, v, *sinks, dy
 
     def options(sinks):
-        return {"is_causal": causal, "window_size": window, "sinks": sinks if sunk else None}
+        return {"is_causal": causal, "window_size": window, "sinks": sinks[0] if sinks else None}
 
-    def packed(q, k, v, s):
+    def packed(q, k, v, *s):
         return flash.flash_mha_varlen(q, k, v, starts, max(lengths), **options(s))
 
-    def by_document(attend):
+    def dense(q, k, v, *s):
         # Each document alone, its rows put back where the packed call holds them.
-        return lambda q, k, v, s: jnp.concatenate([attend(q[at], k[at], v[at], s) for at in documents])
+        return jnp.concatenate([flash.flash_mha(q[None, at], k[None, at], v[None, at], **options(s))[0]
+                                for at in documents])
 
-    def dense(q, k, v, s):
-        return flash.flash_mha(q[None], k[None], v[None], **options(s))[0]
+    def by_document(leaves):
+        # Each document's rows a leaf of their own, so a document's error answers to its own budget (a
+        # one-token document's exactly zero where the reference's is); the sinks' gradient summed whole.
+        return (*(leaf[at] for leaf in leaves[:4] for at in documents), *leaves[4:])
 
-    attention_on_par(packed, by_document(dense), draw, "packed documents",
-                      truth=by_document(lambda q, k, v, s: float64_attention(q, k, v, causal, window,
-                                                                             s if sunk else None)))
+    attention_on_par(packed, dense, draw, "packed documents", split=by_document,
+                     keep=kept(len(ids[0]), len(ids[0]), causal=causal, window=window, segment_ids=ids))
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
@@ -376,16 +383,22 @@ def queries_packed_against_keys_of_their_own_lengths_attend_their_own_documents(
         return flash.flash_mha_varlen(q, k, v, starts, max(queries), key_cu_seqlens=key_starts,
                                       key_max_seqlen=max(keys))
 
-    def by_document(attend):
+    def dense(q, k, v):
         # Each document's queries against its own keys, the rows put back where the packed call holds
         # them; an empty document's keys read by no query.
-        return lambda q, k, v: jnp.concatenate([
-            attend(q[begin:end], k[key_begin:key_end], v[key_begin:key_end])
+        return jnp.concatenate([
+            flash.flash_mha(q[None, begin:end], k[None, key_begin:key_end], v[None, key_begin:key_end])[0]
             for (begin, end), (key_begin, key_end) in pairs if end > begin])
 
-    dense = by_document(lambda q, k, v: flash.flash_mha(q[None], k[None], v[None])[0])
-    attention_on_par(packed, dense, draw, "documents against their own keys",
-                      truth=by_document(lambda q, k, v: float64_attention(q, k, v, causal=False)))
+    def by_document(leaves):
+        # Each document's query rows, and its key and value rows, a leaf of their own.
+        out, dq, dk, dv = leaves
+        return (*(x[begin:end] for x in (out, dq) for (begin, end), _ in pairs if end > begin),
+                *(x[begin:end] for x in (dk, dv) for _, (begin, end) in pairs))
+
+    query_ids, key_ids = (np.repeat(np.arange(len(lengths)), lengths) for lengths in (queries, keys))
+    attention_on_par(packed, dense, draw, "documents against their own keys", split=by_document,
+                     keep=kept(len(query_ids), len(key_ids), mask=query_ids[:, None] == key_ids[None, :]))
     # A document no query reads leaves its keys and values no gradient.
     q, k, v, dy = draw(0)
     _, dk, dv = jax.vjp(packed, q, k, v)[1](dy)
@@ -434,6 +447,7 @@ def fused_kernels_are_as_exact_as_the_xla_kernel_from_float64(implementation, he
             pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80, sm90 and sm1xx")
     elif head_dim > cudnn_max_head_dim():
         pytest.skip(f"cudnn takes heads at most {cudnn_max_head_dim()} wide on {kernels.device_generation()}")
+
     def draw(seed):
         streams = np.random.default_rng([0xF05, seed])
         return tuple(jnp.asarray(streams.normal(size=(1, 1024, heads, head_dim)), jnp.bfloat16)
@@ -443,7 +457,8 @@ def fused_kernels_are_as_exact_as_the_xla_kernel_from_float64(implementation, he
         return lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=implementation,
                                                             causal=True)
 
-    attention_on_par(kernel(implementation), kernel('xla'), draw, f"{implementation} at {head_dim}")
+    attention_on_par(kernel(implementation), kernel('xla'), draw, f"{implementation} at {head_dim}",
+                     keep=kept(1024, 1024, causal=True))
 
 
 @pytest.mark.parametrize("width, value_width, kv_heads, causal, window, sinks", [
@@ -466,19 +481,23 @@ def flash_with_a_window_and_sinks_is_as_exact_as_the_xla_kernel_from_float64(
         q, k, v, dy = (jnp.asarray(streams.normal(size=(1, 1024, heads, size)), jnp.bfloat16)
                        for heads, size in ((8, width), (kv_heads, width), (kv_heads, value_width),
                                            (8, value_width)))
-        return q, k, v, jnp.asarray(streams.normal(size=(8,)) * 2, jnp.float32), dy
+        sunk = (jnp.asarray(streams.normal(size=(8,)) * 2, jnp.float32),) if sinks else ()
+        return q, k, v, *sunk, dy
 
     def kernel(implementation):
-        return lambda q, k, v, s: scaled_dot_product_attention(
+        return lambda q, k, v, *s: scaled_dot_product_attention(
             q, k, v, implementation=implementation, causal=causal, sliding_window=window,
-            sinks=s if sinks else None)
+            sinks=s[0] if s else None)
 
     if sinks:
         q, k, v, s, _ = draw(0)
         with pytest.raises(KernelRefused):
             jax.jit(kernel('flash'))(q, k, v, s)
     attention_on_par(kernel('auto' if sinks else 'flash'), kernel('xla'), draw,
-                      f"flash at width {width}, window {window}, sinks {sinks}")
+                     f"flash at width {width}, window {window}, sinks {sinks}",
+                     keep=kept(1024, 1024, causal=causal,
+                               window=None if window is None else window_sides(causal=causal,
+                                                                               sliding_window=window)))
 
 
 MAPPED_FLASH_SEEDS = 32
@@ -582,11 +601,18 @@ def a_window_over_more_keys_than_queries_keeps_the_keys_each_row_centres(without
                                                             sliding_window=33)
 
     attention_on_par(kernel('auto'), kernel('xla'), draw, "a window over more keys than queries",
-                      truth=kernel('reference'))
+                     truth=kernel('reference'))
     query, key, value, _ = draw(0)
     with pytest.raises(ValueError):
         jax.jit(kernel('flash'))(query, key, value)
     kernel('flash')(query, key[:, :256], value[:, :256]).block_until_ready()
+
+
+def read_by_documents(queries, keys) -> np.ndarray:
+    """The keys each query keeps, `[B, 1, q, k]`, where queries packed by their documents' ids
+    (`segment_ids`) read keys packed by theirs (`key_segment_ids`): its own document's, none for padding."""
+    queries, keys = np.asarray(queries), np.asarray(keys)
+    return ((queries[:, :, None] == keys[:, None, :]) & (queries[:, :, None] != 0))[:, None]
 
 
 def documents(lengths) -> np.ndarray:
@@ -615,20 +641,24 @@ def packed_rows_on_flash_are_as_exact_as_the_document_mask_from_float64(window, 
         q, k, v, dy = (jnp.asarray(streams.normal(size=(2, 1024, heads, 64)), jnp.bfloat16)
                        for heads in (8, 2, 2, 8))
         # The padding's rows take no cotangent: its output is no token's.
-        return q, k, v, jnp.asarray(streams.normal(size=(8,)) * 2, jnp.float32), jnp.where(real, dy, 0)
+        sunk = (jnp.asarray(streams.normal(size=(8,)) * 2, jnp.float32),) if sinks else ()
+        return q, k, v, *sunk, jnp.where(real, dy, 0)
 
     def kernel(implementation):
         # The padding's rows read as zero: flash attends it among itself, the mask to nothing.
-        return lambda q, k, v, s: jnp.where(real, scaled_dot_product_attention(
+        return lambda q, k, v, *s: jnp.where(real, scaled_dot_product_attention(
             q, k, v, implementation=implementation, causal=True, sliding_window=window,
-            sinks=s if sinks else None, segment_ids=jnp.asarray(segments), max_segments=3), 0)
+            sinks=s[0] if s else None, segment_ids=jnp.asarray(segments), max_segments=3), 0)
 
     if sinks:
         q, k, v, s, _ = draw(0)
         with pytest.raises(KernelRefused):
             jax.jit(kernel('flash'))(q, k, v, s)
     attention_on_par(kernel('auto' if sinks else 'flash'), kernel('xla'), draw,
-                      f"packed rows on flash, window {window}, sinks {sinks}")
+                     f"packed rows on flash, window {window}, sinks {sinks}",
+                     keep=kept(1024, 1024, causal=True, segment_ids=segments,
+                               window=None if window is None else window_sides(causal=True,
+                                                                               sliding_window=window)))
 
 
 def queries_reading_another_sequences_documents_on_flash_are_as_exact_as_the_document_mask(
@@ -656,7 +686,8 @@ def queries_reading_another_sequences_documents_on_flash_are_as_exact_as_the_doc
             q, k, v, implementation=implementation, segment_ids=jnp.asarray(queries),
             key_segment_ids=jnp.asarray(keys), max_segments=3)
 
-    attention_on_par(kernel('flash'), kernel('xla'), draw, "queries reading another sequence's documents")
+    attention_on_par(kernel('flash'), kernel('xla'), draw, "queries reading another sequence's documents",
+                     keep=read_by_documents(queries, keys))
     query, key, value, _ = draw(0)
     found = np.asarray(jax.jit(kernel('flash'))(query, key, value))
     np.testing.assert_array_equal(found[~np.asarray(real[..., 0, 0])], 0)
@@ -719,8 +750,7 @@ def test_queries_reading_another_sequences_documents_on_the_tpu_kernels_are_as_e
     queries = jnp.asarray([[1] * 40 + [2] * 30 + [3] * 30 + [0] * 28])
     keys = jnp.asarray([[1] * 50 + [3] * 50 + [0] * 28])
     def draw(seed):
-        streams = jax.random.split(jax.random.key(seed), 4)
-        return tuple(jax.random.normal(stream, (1, 128, 2, 128), jnp.float32) for stream in streams)
+        return normal_draw([0x7B0, seed], *[(1, 128, 2, 128)] * 4)
 
     def attend(implementation):
         def run(q, k, v):
@@ -731,7 +761,7 @@ def test_queries_reading_another_sequences_documents_on_the_tpu_kernels_are_as_e
         return run
 
     attention_on_par(attend("tpu"), attend("xla"), draw, "the tpu kernels over another sequence's documents",
-                      truth=attend("reference"), seeds=TPU_DOCUMENT_SEEDS)
+                     keep=read_by_documents(queries, keys), seeds=TPU_DOCUMENT_SEEDS)
 
 
 def key_length_call(implementation, query, key, value, lengths, **kwargs):
@@ -836,8 +866,7 @@ def test_cpu_fp32_attention_summed_in_float64_takes_forward_mode():
     from dew.nn.attention import forward_mode_attention
 
     def draw(seed):
-        streams = jax.random.split(jax.random.key(seed), 7)
-        return tuple(jax.random.normal(stream, (1, 300, 2, 16), jnp.float32) for stream in streams)
+        return normal_draw([0xF0D, seed], *[(1, 300, 2, 16)] * 7)
 
     def reference(q, k, v):
         return scaled_dot_product_attention(q, k, v, implementation="reference", causal=True)
@@ -854,8 +883,11 @@ def test_cpu_fp32_attention_summed_in_float64_takes_forward_mode():
             return {"out": out, "tangent": tangent, "gradients": pull(cotangent)}
         return run
 
+    # The truth the reference path's own float64 run: raw jax.nn takes its softmax in fp32 whatever its
+    # operands (src/dew/nn/attention.py), which Dew's reference path does not.
     assert_as_exact(jax.jit(derivatives(reference)), jax.jit(derivatives(plain)), draw,
-                    "reference attention in forward mode", seeds=FORWARD_MODE_SEEDS, terms=True)
+                    "reference attention in forward mode", seeds=FORWARD_MODE_SEEDS,
+                    truth_fn=derivatives(reference), terms=True)
 
 
 @pytest.mark.parametrize(("dtype", "key_dtype"), [(jnp.float16, jnp.float16), (jnp.float32, jnp.float64),
@@ -932,13 +964,14 @@ def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_r
                 force_fp32_for_softmax=forced, dropout_rate=dropout_rate, dropout_rng=dropped(seed),
                 deterministic=not dropout_rate)
 
-    def flax(*, softmax_in_fp32):
+    def flax(*, softmax_in_fp32, precision=FP32_SUMS):
         def run(query, key, value, bias, seed):
-            return flax_attention(query, key, value, bias, seed, softmax_in_fp32=softmax_in_fp32)
+            return flax_attention(query, key, value, bias, seed, softmax_in_fp32=softmax_in_fp32,
+                                  precision=precision)
         return run
 
-    def flax_attention(query, key, value, bias, seed, *, softmax_in_fp32):
-        with jax.default_matmul_precision(FP32_SUMS):
+    def flax_attention(query, key, value, bias, seed, *, softmax_in_fp32, precision):
+        with jax.default_matmul_precision(precision):
             weights = nn.dot_product_attention_weights(
                 query, jnp.repeat(key, 2, axis=2), bias=bias,
                 mask=jnp.tril(jnp.ones((6, 6), bool))[None, None], force_fp32_for_softmax=softmax_in_fp32,
@@ -952,10 +985,12 @@ def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_r
             return weighted_values('...hqk,...khd->...qhd', weights, jnp.repeat(value, 2, axis=2))
 
     # Two programs, so on par from float64 over the draws (check 1), not bit for bit (bible §6).
-    # The truth's softmax in float64: flax's forced one would narrow it to fp32.
+    # The truth's softmax and products in float64: flax's forced softmax would narrow it to fp32, and so
+    # would the measured arms' fp32-sums preset its products.
     assert_as_exact(jax.jit(ours), jax.jit(flax(softmax_in_fp32=forced)), draw,
                     f"the reference path against flax, {jnp.dtype(dtype).name}, forced {forced}, "
-                    f"rate {dropout_rate}", seeds=FLAX_SEEDS, truth_fn=flax(softmax_in_fp32=False))
+                    f"rate {dropout_rate}", seeds=FLAX_SEEDS,
+                    truth_fn=flax(softmax_in_fp32=False, precision="highest"))
 
 
 @pytest.mark.skipif(jax.default_backend() != 'cpu', reason="'auto' takes jax.nn's xla kernel on a CPU")
