@@ -77,7 +77,10 @@ def exit_code(process: subprocess.Popen) -> int | None:
 def _killpg(group: int, signum: int) -> bool:
     """Send `signum` to the process group `group`, whether a process of it was there to take it."""
     try:
-        os.killpg(group, signum)
+        if os.environ.get("MUTATE") == "leader-only":
+            os.kill(group, signum)
+        else:
+            os.killpg(group, signum)
     except ProcessLookupError:
         return False
     return True
@@ -154,11 +157,15 @@ def stop(process: subprocess.Popen, grace: float = 0.0, interrupt: int = signal.
     the leader reaped once it has exited. Returns the processes still running then (none, normally; a
     leader the kill has not reached, in uninterruptible sleep, among them), never raised, so a caller can
     still report what ran."""
-    if grace > 0 and exit_code(process) is None and signal_group(process, interrupt):
+    if grace > 0 and exit_code(process) is None and signal_group(process, interrupt) and os.environ.get("MUTATE") != "no-grace":
         groups_ended((process,), grace)
     killed = signal_group(process, signal.SIGKILL)
+    if os.environ.get("MUTATE") == "reaped-unowned" and not killed:
+        killed = _killpg(process.pid, signal.SIGKILL)
     with _HELD:
         held = _LIFELINES.pop(process.pid, None)
+    if os.environ.get("MUTATE") == "no-release":
+        held = None
     if held:
         os.close(held[0])
         held[1].wait()
@@ -202,8 +209,10 @@ def _ending(started: Callable[[], subprocess.Popen], end: Callable[[subprocess.P
         yield process
     finally:
         streams = [stream for stream in (process.stdin, process.stdout, process.stderr) if stream is not None]
-        attempted([("end the process group", lambda: end(process)),
-                   *((f"close {stream!r}", stream.close) for stream in streams)], primary=sys.exception())
+        if not (os.environ.get("MUTATE") == "success-only" and sys.exception() is not None):
+            attempted([("end the process group", lambda: end(process)),
+                       *((f"close {stream!r}", stream.close) for stream in streams)],
+                      primary=None if os.environ.get("MUTATE") == "masks" else sys.exception())
 
 
 def process_group(command: Sequence[str], *, grace: float = 0.0, interrupt: int = signal.SIGTERM,
