@@ -367,7 +367,7 @@ def test_a_run_names_a_method_that_builds_its_objective_and_its_rollout(tmp_path
 
 
 def test_a_grpo_run_draws_its_rollouts_ahead_from_dews_own_server(tmp_path):
-    """A GRPO run whose rollout names a served draw (`--rollout.served.slots 2`, `ServedRollout`) trains
+    """A GRPO run whose rollout names a served draw (`--rollout.served.slots 8`, `ServedRollout`) trains
     on completions Dew's own server draws ahead of the trainer (`RolloutScheduler.served`), its first
     weights the run's first snapshot's: by its third step a batch submitted a step ahead trails the
     trainer's weights (`rollout/lag/mean` above 0, which each step's own generation never does), each
@@ -394,9 +394,9 @@ def test_a_grpo_run_draws_its_rollouts_ahead_from_dews_own_server(tmp_path):
     config = LMRunConfig.cli(["--trainer.steps", "3", "--trainer.name", "served", "--trainer.checkpoint-dir",
                               str(tmp_path), "--trainer.compilation-cache-dir", "None",
                               "--trainer.multi-host", "False", "--trainer.log-every", "1",
-                              "--rollout.served.slots", "2", "--objective.behavior-importance", "2.0"],
+                              "--rollout.served.slots", "8", "--objective.behavior-importance", "2.0"],
                              default=default)
-    assert config.rollout is not None and config.rollout.served == ServedRollout(slots=2)
+    assert config.rollout is not None and config.rollout.served == ServedRollout(slots=8)
     state = config.run()
     assert int(state.step) == 3
     with LocalTracker(tmp_path / "served" / "tracking") as journal:

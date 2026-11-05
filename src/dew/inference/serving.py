@@ -554,8 +554,6 @@ class Server:
                  progress: Progress = END) -> None:
         if type(slots) is not int or slots < 1:
             raise ValueError("slots must be a positive number of resident rows")
-        if type(admission) is not int or not 1 <= admission <= slots:
-            raise ValueError("admission must be between one and the slot count")
         _refuse_unserved_modes(
             model, paged=isinstance(rows, PagedRows), chunked=rows.chunk is not None,
             prefix=isinstance(rows, PagedRows) and any(part.prefix_cache for part in rows.pages),
@@ -568,6 +566,8 @@ class Server:
         if slots % self.groups or admission % self.groups:
             raise ValueError(f"slots ({slots}) and admission ({admission}) must divide by the "
                              f"{self.groups} groups the mesh splits rows into")
+        if type(admission) is not int or not 1 <= admission <= slots:
+            raise ValueError("admission must be between one and the slot count")
         self.model = model
         self.cross: tuple[CrossBlocks, int, np.dtype] | None = None
         """The model's cross-attention layers and its context's width and dtype, where a request may
