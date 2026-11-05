@@ -36,7 +36,7 @@ import numpy as np
 import pytest
 import qualification_worker as worker
 import torch
-from map_judge import pooled_units, record_units
+from map_judge import sharded
 from process_support import ProcessGroup
 from remote_cache import HOST
 from token_support import encoded_token_fixture
@@ -182,15 +182,14 @@ def ran(directory: Path) -> dict[str, bytes]:
 @pytest.mark.parametrize("kind", ["dense", "moe"])
 @pytest.mark.shards(units=1, per_task=1)
 def test_a_loaded_source_resumes_mid_accumulation_and_exports_as_transformers_reads_it(kind, tmp_path):
-    """The module's claims for a source of `kind`: its runs (`ran`), one map task's unit
-    (`map_judge.record_units`), which its judge holds to transformers (`pooled_units`); run whole, the
-    runs then the judge."""
+    """The module's claims for a source of `kind`: its runs (`ran`), one map task's unit, which its
+    judge holds to transformers (`map_judge.sharded`); run whole, the runs then the judge."""
     directory = prepared(tmp_path / "qualification", kind)
     label = f"the {kind} source's qualification runs"
-    if record_units(label, lambda start, stop: [ran(directory) for _ in range(start, stop)]):
+    pooled = sharded(label, lambda start, stop: [ran(directory) for _ in range(start, stop)], 1)
+    if pooled is None:
         return
-    pooled = pooled_units(label, 1)
-    units = [ran(directory)] if pooled is None else [unit for _, _, payload in pooled for unit in payload]
+    units = [unit for payload in pooled for unit in payload]
     for files in units:
         for name, content in files.items():
             (directory / name).parent.mkdir(parents=True, exist_ok=True)

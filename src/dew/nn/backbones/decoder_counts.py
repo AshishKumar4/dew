@@ -14,6 +14,7 @@ from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projectio
 from ..gemma3n import AltUpLayer
 from ..hyper_connections import stream_head
 from .decoder_block import gate_flops
+from .layer_names import group_layers, layer_index
 
 if TYPE_CHECKING:
     import flax.linen as nn
@@ -168,8 +169,10 @@ def matrix_usage(decoder: CausalTransformer, path: tuple[str, ...], lengths, *, 
     head = _head_scope(relative[0])
     if head != logits or relative[0].startswith(('mtp_', 'dspark_')):
         return np.zeros(np.shape(lengths), np.int64)
-    passes = layer_passes(decoder, int(relative[0].removeprefix('layers_'))) if relative[0].startswith(
-        'layers_') else 1
+    index = layer_index(relative[0])
+    if index is None and group_layers(relative[0]) is not None:
+        raise ValueError(f"adapter matrix scope {relative[0]!r} names a run of layers, not one layer")
+    passes = 1 if index is None else layer_passes(decoder, index)
     if decoder.altup is not None and relative[-1] == 'modality_router':
         site = AltUpLayer(decoder.altup, decoder.emb_features, parent=None)
         passes *= site.projection_uses()['modality_router']

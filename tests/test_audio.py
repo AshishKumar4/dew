@@ -39,17 +39,16 @@ def _audio(kind):
     model = config.build().clone(precision=jax.lax.Precision.HIGHEST)
     tensors = load_file(str(path / "projector.safetensors"))
     if kind == "gemma3n":
+        # As the wrapper builds its audio embedder (`hf_decoders._wrapper_audio`): its features unscaled.
         projector = Gemma3nProjector(config.hidden_size, 32, vocab_size=record["vocab_size"],
                                            vocab_offset=record["vocab_offset"], norm_eps=config.rms_norm_eps,
-                                           precision=jax.lax.Precision.HIGHEST)
-        method = projector.soft_embeddings
+                                           precision=jax.lax.Precision.HIGHEST, scales_soft=False)
         projector_variables = {"params": translate_gemma3n_projector_weights(tensors)[0]}
     else:
         projector = Gemma4Projector(text_width=32, norm_eps=config.rms_norm_eps,
                                           precision=jax.lax.Precision.HIGHEST)
-        method = projector.__call__
         projector_variables = {"params": translate_gemma4_projector_weights(tensors)[0]}
-    return path, config, variables, model, projector, method, projector_variables
+    return path, config, variables, model, projector, projector_variables
 
 
 @pytest.fixture(params=("gemma3n", "gemma4"), scope="module")
@@ -57,7 +56,7 @@ def audio(request):
     return _audio(request.param)
 
 def test_waveform_preprocessing_encoder_and_projection_match_reference(audio):
-    path, config, variables, model, projector, method, projector_variables = audio
+    path, config, variables, model, projector, projector_variables = audio
     data = np.load(path / "reference.npz")
     preprocessor = json.loads((path / "preprocessor_config.json").read_text())
     kind = "gemma3n_audio" if isinstance(config, Gemma3nAudio) else "gemma4_audio"
@@ -68,7 +67,7 @@ def test_waveform_preprocessing_encoder_and_projection_match_reference(audio):
     encoded = jax.jit(model.apply)(variables, **features)
     np.testing.assert_array_equal(encoded.mask, data["valid"])
     np.testing.assert_allclose(encoded.features, data["encoded"], rtol=0, atol=1e-4)
-    projected = projector.apply(projector_variables, encoded.features, method=method)
+    projected = projector.apply(projector_variables, encoded.features)
     np.testing.assert_allclose(projected, data["projected"], rtol=0, atol=1e-4)
     assert encoded.mask.dtype == jnp.bool_
     assert encoded.features.dtype == jnp.float32
@@ -179,14 +178,14 @@ def encoder_compiles_on_gpu_with_the_mask_built_in_the_same_jit(audio):
 
 
 def test_audio_input_gradients_and_sgd_step_match_reference(audio):
-    path, _, variables, model, projector, method, projector_variables = audio
+    path, _, variables, model, projector, projector_variables = audio
     data = np.load(path / "reference.npz")
     state = {"encoder": variables["params"], "projector": projector_variables["params"]}
 
     def forward(params, inputs):
         encoded = model.apply({**variables, "params": params["encoder"]}, inputs,
                                data["input_features_mask"])
-        return projector.apply({"params": params["projector"]}, encoded.features, method=method)
+        return projector.apply({"params": params["projector"]}, encoded.features)
 
     def loss(variables, inputs):
         return jnp.mean(forward(variables, inputs) * data["coefficient"])

@@ -290,8 +290,8 @@ class MultimodalTransformer(DecoderWrapper):
         return self._over(self.language_model.with_dex(extension))
 
     @nn.nowrap
-    def with_scanned_layers(self, *, scanned: bool = True) -> Self:
-        return self._over(self.language_model.with_scanned_layers(scanned=scanned))
+    def with_scanned_layers(self) -> Self:
+        return self._over(self.language_model.with_scanned_layers())
 
     @nn.nowrap
     def dex_exported(self, variables: Mapping[str, Mapping]) -> dict[str, Mapping]:

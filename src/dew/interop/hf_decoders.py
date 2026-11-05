@@ -131,7 +131,8 @@ _TEXT_TYPES = {"lfm3_vl": "lfm3"}
 defaults its text_config to Lfm3Config (configuration_lfm3_vl.py, `__post_init__`)."""
 
 
-def _typed(hf_config: Mapping[str, object], nested: Mapping[str, object], part: str) -> Mapping[str, object]:
+def typed_part(hf_config: Mapping[str, object], nested: Mapping[str, object],
+               part: str) -> Mapping[str, object]:
     """A wrapper's nested `part` config (text, vision or audio), typed as its wrapper declares it where it
     names no type: `<wrapper model_type>_<part>` (a text config `_TEXT_TYPES`' type), the class the
     wrapper config builds from a raw dict (its `sub_configs`), so a checkpoint's copy need not repeat the
@@ -178,7 +179,7 @@ def vlm_text(hf_config: Mapping[str, object], used: set[str]) -> Mapping[str, ob
         text = {field: hf_config[field] for field in _QWEN_VL_TEXT_FIELDS if field in hf_config}
         dtype = hf_config.get("torch_dtype", hf_config.get("dtype"))
         nested = {**text, **({} if dtype is None else {"torch_dtype": dtype})}
-    return {**dict(_typed(hf_config, _records.record(nested, "text_config"), "text")),
+    return {**dict(typed_part(hf_config, _records.record(nested, "text_config"), "text")),
             "tie_word_embeddings": vlm_tied(hf_config)}
 
 
@@ -230,7 +231,7 @@ def plain_text_rope(text: Mapping[str, object]) -> dict:
 
 def _text_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     """The decoder config a wrapper's language model is: its text_config, typed as the wrapper declares
-    it (`_typed`), a VLM text decoder's as the family it follows (`TEXT_FAMILIES`), with the wrapper's own
+    it (`typed_part`), a VLM text decoder's as the family it follows (`TEXT_FAMILIES`), with the wrapper's own
     head policy."""
     if hf_config.get("model_type") in _TEXT_VLMS:
         text = dict(vlm_text(hf_config, set()))
@@ -240,7 +241,7 @@ def _text_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     if not isinstance(text, Mapping):
         refuse("text_config",
                 f"a wrapper carries its decoder under text_config, got {text!r}")
-    text = dict(_typed(hf_config, text, "text"))
+    text = dict(typed_part(hf_config, text, "text"))
     if hf_config.get("model_type") != "llama4":
         # These conditional models own their lm_head at wrapper scope; the
         # nested text model has no head. Llama4 nests a complete causal LM.
@@ -320,7 +321,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int,
                    audio_token_id: int) -> AudioFields:
     """Read the optional audio tower and its embedder for a Gemma wrapper, beside the placeholder id
     the wrapper read for it (`audio_token_id`), its audio_config typed as the wrapper declares it
-    (`_typed`).
+    (`typed_part`).
 
     Gemma 4 projects encoded frames through the same norm-and-project
     embedder as its images, at the encoder's output width; the processor
@@ -333,7 +334,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int,
     used.update(("audio_config", "audio_soft_tokens_per_image"))
     if stated is None:
         return NO_AUDIO.copy()
-    audio = _typed(hf_config, _records.record(stated, "audio_config"), "audio")
+    audio = typed_part(hf_config, _records.record(stated, "audio_config"), "audio")
     if audio["model_type"] == "gemma4_unified_audio":
         # No encoder: the embedder projects raw frames of audio_embed_dim samples each, one placeholder
         # a frame (Gemma4UnifiedAudioConfig's default 640, configuration_gemma4_unified.py:46 at 5.17.0).
@@ -394,7 +395,7 @@ def _gemma4_unified_wrapper(hf_config: Mapping[str, object], used: set[str]) -> 
     vision = hf_config.get('vision_config')
     tower = projector = None
     if vision is not None:
-        vision = _typed(hf_config, _records.record(vision, 'vision_config'), 'vision')
+        vision = typed_part(hf_config, _records.record(vision, 'vision_config'), 'vision')
         tower = translate_gemma4_unified_vision_config(vision)
         projector = translate_gemma4_projector_config(vision, width,
                                                       record_int(tower['fields'], 'mm_embed_dim'))

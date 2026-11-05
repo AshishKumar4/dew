@@ -22,10 +22,10 @@ import pytest
 from flax import linen as nn
 from model_support import (
     TINY_DECODER,
+    as_stepped,
     decode_logits,
     decode_steps,
     model_draw,
-    stepped_logits,
     with_logit_cotangent,
 )
 from reference_error import (
@@ -330,7 +330,8 @@ def decoded_against_full(model, prompt: int, label: str, seeds: int, length=SEQ,
     forward = jax.jit(model.apply)
 
     def stepped(params, ids):
-        return stepped_logits(lambda tokens: forward(params, tokens), ids, prompt)
+        # The widths a cached decode of the prefill computes, from its last prompt position on.
+        return as_stepped(lambda tokens: forward(params, tokens), ids, prompt)[:, prompt - 1:]
 
     def full(model, divided=1.0):
         return jax.jit(lambda params, ids: model.apply(params, ids)[:, prompt - 1:] / divided)

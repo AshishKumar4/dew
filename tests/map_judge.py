@@ -115,11 +115,13 @@ def record_units(label: str, payload: Callable[[int, int], object], upto: int | 
     return True
 
 
-def sharded(label: str, payload: Callable[[int, int], object], units: int | None = None) -> list | None:
+def sharded(label: str, payload: Callable[[int, int], object], units: int | None = None, *,
+            upto: int | None = None) -> list | None:
     """A site's units over armada's map tasks, each `payload(start, stop)`: a map task records its units'
-    (`record_units`) and gets None, the judge gets the tasks' payloads in order (`pooled_units`, refused
-    short of `units`), and a run whole gets `[payload(0, units)]`."""
-    if record_units(label, payload):
+    (`record_units`, cut at `upto` where a site takes at most that many) and gets None, the judge gets the
+    tasks' payloads in order (`pooled_units`, refused short of `units`), and a run whole gets
+    `[payload(0, units)]`."""
+    if record_units(label, payload, upto=upto):
         return None
     pooled = pooled_units(label, units)
     if pooled is not None:

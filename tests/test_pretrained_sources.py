@@ -75,6 +75,17 @@ def test_a_saved_processor_record_reloads_its_selected_folder(tmp_path):
 """The commit of SFconvertbot's refs/pr/1 on state-spaces/mamba2-130m."""
 
 
+def test_a_wrappers_untyped_text_config_keeps_its_families_depths():
+    """A wrapper's text config that names no type is read by the type its wrapper declares for it
+    (`hf_decoders.typed_part`), so keeping no prediction depth clears the text family's own count, as
+    a checkpoint saved without its depths must state (row 4141's review)."""
+    from dew.interop.pretrained import _kept_depths
+
+    config = {"model_type": "qwen3_5", "text_config": {"mtp_num_hidden_layers": 1, "num_hidden_layers": 4}}
+    assert _kept_depths(config, 0)["text_config"]["mtp_num_hidden_layers"] == 0
+    assert config["text_config"]["mtp_num_hidden_layers"] == 1
+
+
 def test_the_r1_0528_qwen3_yarn_is_the_references_table():
     """deepseek-ai/DeepSeek-R1-0528-Qwen3-8B's rope_scaling is YaRN factor 4
     over 32768 positions at base 1e6, plus vLLM's attn_factor, which
