@@ -33,6 +33,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.typing import DTypeLike
 
+from dew.nn.kernels import launches
+
 from ..precision import exact_float32
 from . import generation
 
@@ -267,12 +269,12 @@ def _interpreting(platform: str) -> bool:
     return generation.backend() != platform
 
 
-def _call(body, platform: str, grid: tuple[int, ...], in_specs, out_specs, out_shape):
-    """One Mosaic `pallas_call`, interpreted where the process holds no TPU."""
+def _call(body, name: str, platform: str, grid: tuple[int, ...], in_specs, out_specs, out_shape):
+    """One Mosaic `pallas_call` named `name`, interpreted where the process holds no TPU."""
     params = pltpu.CompilerParams(dimension_semantics=("parallel", "parallel", "arbitrary"))
-    return pl.pallas_call(body, grid=grid, in_specs=list(in_specs), out_specs=list(out_specs),
-                          out_shape=out_shape, compiler_params=params,
-                          interpret=_interpreting(platform))
+    return launches.pallas_call(body, grid=grid, in_specs=list(in_specs), out_specs=list(out_specs),
+                                out_shape=out_shape, compiler_params=params,
+                                interpret=_interpreting(platform), name=name)
 
 
 def _forward(x, b, c, a, state, chunk_size: int, platform: str, *, keep_entered: bool):
@@ -290,7 +292,7 @@ def _forward(x, b, c, a, state, chunk_size: int, platform: str, *, keep_entered:
         out_shape.append(jax.ShapeDtypeStruct((batch, heads, chunks, head_dim, state_size),
                                               jnp.float32))
         out_specs.append(entered_spec)
-    run = _call(_tpu_forward, platform, (batch, heads, chunks),
+    run = _call(_tpu_forward, "ssd_forward", platform, (batch, heads, chunks),
                 (x_spec, b_spec, c_spec, a_spec, carry_spec), out_specs, out_shape)
     y, final, *entered = run(_heads_first(x), _heads_first(b), _heads_first(c), _decay_blocks(a, chunk_size),
                              state)
@@ -307,7 +309,7 @@ def _backward(x, b, c, a, entered, dy, dfinal, chunk_size: int, platform: str):
     out_shape = [jax.ShapeDtypeStruct((batch, heads, total, width), jnp.float32) for width in widths]
     out_shape.append(jax.ShapeDtypeStruct((batch, heads, chunks, 1, chunk_size), jnp.float32))
     out_shape.append(jax.ShapeDtypeStruct(dfinal.shape, jnp.float32))
-    run = _call(_tpu_backward, platform, (batch, heads, chunks),
+    run = _call(_tpu_backward, "ssd_backward", platform, (batch, heads, chunks),
                 (x_spec, b_spec, c_spec, a_spec, entered_spec, x_spec, carry_spec),
                 (x_spec, b_spec, c_spec, a_spec, carry_spec), out_shape)
     dx, db, dc, da, dstate = run(_heads_first(x), _heads_first(b), _heads_first(c),

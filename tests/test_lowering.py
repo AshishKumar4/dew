@@ -565,8 +565,23 @@ def _selective_step(rows: int):
     return loss, (variables, x)
 
 
+def _attention_step(rows: int):
+    """Causal attention over `[2, rows / 2, 8 heads, 128]` bf16 through the attention template, the kernel
+    its generation's launch is."""
+    from dew.nn.attention import attention_kernel
+
+    shape = jax.ShapeDtypeStruct((2, rows // 2, 8, 128), jnp.bfloat16)
+
+    def loss(query, key, value):
+        return attention_kernel(query, key, value, causal=True, implementation="template").astype(
+            jnp.float32).sum()
+
+    return loss, (shape, shape, shape)
+
+
 PER_SHARD_STEPS = {"expert layer": _expert_layer_step, "rms norm": _norm_step, "swiglu": _swiglu_step,
-                   "short conv": _short_conv_step, "selective scan": _selective_step}
+                   "short conv": _short_conv_step, "selective scan": _selective_step,
+                   "attention": _attention_step}
 """Each op whose kernels run per shard (row 1923, bible §7), its step at a number of rows. Each lane adds its
 ops here."""
 

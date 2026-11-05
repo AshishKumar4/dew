@@ -79,6 +79,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 from dew.mesh import logical_spec
+from dew.nn.kernels import launches
 
 from ..precision import (
     activation_and_slope,
@@ -653,7 +654,7 @@ def _launched(*operands, kernel, name: str, outputs, grid: tuple[int, ...], warp
     """`kernel` launched over `operands` (None where a call has none) with its `arithmetic`'s keyword
     arguments, lowered once a configuration (`tuning.lowered_once`): its outputs' shapes and dtypes, its grid,
     warps and arithmetic static."""
-    return pl.pallas_call(
+    return launches.pallas_call(
         functools.partial(kernel, interpret=interpret, **dict(arithmetic)), grid=grid, out_shape=outputs,
         compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=1),
         interpret=interpret, name=name,
