@@ -2,6 +2,8 @@
 (`dew.nn.derivatives.marked`), which every transform keeps a call of that kind, so the algebra pass reads a
 span's kind from the program it rewrites, its forward, tangent and cotangent alike."""
 
+import typing
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -85,8 +87,8 @@ def _scaled_backward(scale: float):
     return primal, forward, backward
 
 
-KINDS = [KernelGlue(), Protected(), Algebra(), Surrogate()]
-"""Every kind a site declares its derivative as, each through either builder."""
+KINDS = [kind() for kind in typing.get_args(derivatives.Kind.__value__)]
+"""Every kind a site declares its derivative as (`derivatives.Kind`'s), each through either builder."""
 
 
 @pytest.mark.parametrize("kind", KINDS, ids=lambda kind: type(kind).__name__)
