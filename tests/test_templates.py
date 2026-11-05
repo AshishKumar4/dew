@@ -179,6 +179,19 @@ class Unpriced(Doubling):
         raise ValueError("no cost facts")
 
 
+def test_a_selector_serves_a_choice_chosen_may_name_and_no_other():
+    """A selector (`selection.Op`) is built for a choice `generation.chosen` may name, and one built for a
+    name it may not is refused as it is built, naming the choices: no selector serves a choice no call
+    can name. A choice no selector or site reads (a decode once named 'ssd_decode') is none `chosen` takes."""
+    kernels = (Kernel("xla", (), generic=True),)
+    assert Op("swiglu", kernels).choice == "swiglu"
+    with pytest.raises(ValueError, match="no kernel choice is named swiglu_packed"):
+        Op("swiglu_packed", kernels)
+    refused = pytest.raises(ValueError, match="no kernel choice is named ssd_decode")
+    with refused, generation.chosen(ssd_decode="xla"):
+        pass
+
+
 def choose(implementations, x) -> Template:
     """The implementation of `implementations` a selector over them runs for a call on `x`: each its
     kernel where it runs the call (`Template.eligible`), in their order."""
