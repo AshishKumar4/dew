@@ -1366,6 +1366,21 @@ def _on_a_v5e():
     return generation.assumed("v5e"), jax.sharding.use_abstract_mesh(mesh)
 
 
+def test_a_tpu_launch_takes_a_legal_pin_and_names_why_it_refuses_another():
+    """A TPU launch's pin is judged by its own legality on a TPU, which has no CUDA multiprocessor whose
+    registers a thread's budget would read: the block it derives is pinnable, and a block of no config
+    type is refused with its reason (`unpinnable`), not a CUDA multiprocessor's error."""
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    launch = grouped_matmul.MosaicTpuGmm()
+    args = (bf16((2048, 1536)), bf16((8, 1536, 1536)), jax.ShapeDtypeStruct((8,), jnp.int32))
+    assumed, mesh = _on_a_v5e()
+    with assumed, mesh:
+        ba = launch.bind(*args, out_dtype="bfloat16", trans_rhs=False, interpret=False)
+        target = generation.gpu_target()
+        assert launch.pinnable(ba, launch.derived(ba, target))
+        assert "no Blocks" in launch.unpinnable(ba, mosaic_gpu.Tiles(64, 64, 64, 2, 1))
+
+
 @pytest.mark.parametrize("side_dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("launch", [grouped_matmul.MosaicTpuGmm(), grouped_matmul.MosaicTpuTgmm()],
                          ids=lambda launch: type(launch).__name__)
