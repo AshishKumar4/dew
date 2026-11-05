@@ -486,22 +486,50 @@ def test_a_window_whose_manifest_is_not_written_leaves_the_run_training(caplog):
                for record in caplog.records)
 
 
-def test_a_run_saved_with_its_own_window_as_its_profile_reads_it_as_its_run_profile(tmp_path):
-    """A run a Dew saved while a run's own window was its `profile` naming no directory (train 607 to 610's)
-    loads with no window of its own named and its own window as `run_profile`, trace-only, so it resumes
-    on a plain install asking no XProf and converting no reports (row 4255)."""
+@pytest.mark.parametrize(("saved", "expected"), [
+    ({"directory": None, "steps": 2, "warmup": 10}, "default"),
+    ({"directory": None, "steps": 25, "warmup": 50, "capture": {"host_tracer_level": 1}}, "customized"),
+    (None, "none"),
+])
+def test_a_run_saved_before_its_own_window_was_a_field_traces_as_it_was_configured(tmp_path, saved, expected):
+    """A run a Dew saved before a run's own window was its `run_profile` (row 4255) loads as it traced: a
+    window naming no directory, the run's own, as its `run_profile` with its steps, warmup and capture,
+    trace-only, so it resumes on a plain install asking no XProf; no window at all as none of its own."""
+    from dew.telemetry.profile import CaptureOptions
     from dew.training.profiling import RunProfile
 
     record = RunConfig(trainer=TrainerConfig(name="saved", checkpoint_dir=str(tmp_path))).record()
     trainer = record["fields"]["trainer"]
     held = trainer.get("fields", trainer)
     held.pop("run_profile", None)
-    held["profile"] = {"directory": None, "steps": 2, "warmup": 10}
+    held["profile"] = saved
     (tmp_path / "run.json").write_text(json.dumps(record))
     loaded = RunConfig.load(str(tmp_path / "run.json")).trainer
-    assert loaded.profile is None and loaded.run_profile == RunProfile()
     window = loaded.window(str(tmp_path / "saved"), "saved")
-    assert window is not None and window.directory is not None and not window.reports
+    assert loaded.profile is None
+    if expected == "none":
+        assert loaded.run_profile is None and window is None
+        return
+    own = RunProfile() if expected == "default" else RunProfile(25, 50, CaptureOptions(host_tracer_level=1))
+    assert loaded.run_profile == own
+    assert window is not None and (window.steps, window.warmup, window.capture) == (own.steps, own.warmup,
+                                                                                  own.capture)
+    assert not window.reports
+
+
+def test_a_runs_own_window_and_a_named_one_round_trip_through_its_record(tmp_path):
+    """A run's own window, customized, and a window the run names each read back from the run's record as
+    they were saved (row 4255's review)."""
+    from dew.telemetry.profile import CaptureOptions
+    from dew.training import ProfileWindow
+    from dew.training.profiling import RunProfile
+
+    for trainer in (TrainerConfig(run_profile=RunProfile(3, 4, CaptureOptions(host_tracer_level=1))),
+                    TrainerConfig(profile=ProfileWindow(str(tmp_path / "named"), 5, warmup=6)),
+                    TrainerConfig(run_profile=None)):
+        run = RunConfig(trainer=trainer)
+        run.save(str(tmp_path / "run.json"))
+        assert RunConfig.load(str(tmp_path / "run.json")).trainer == trainer
 
 
 def test_a_saved_runs_profile_window_reads_its_capture_options_as_its_captures(tmp_path):
