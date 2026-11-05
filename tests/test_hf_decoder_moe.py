@@ -540,7 +540,7 @@ def test_kimi_k25_reads_raw_images_through_its_releases_own_processor(tmp_path):
     from tool_support import run_from
     from transformers import AutoProcessor
 
-    from dew.batch import VALIDITY_FIELD
+    from dew.nn.inputs import pad_token_rows
 
     source = tmp_path / "source"
     shutil.copytree(KIMI_K25, source)
@@ -566,26 +566,31 @@ def test_kimi_k25_reads_raw_images_through_its_releases_own_processor(tmp_path):
     rows = ["w5 <|media_pad|> w7", "<|media_pad|> w2 w3 <|media_pad|>"]
     called = loaded.processor(rows, images=images)
     image_id = fixture_config("kimi-k25-tiny")["image_token_id"]
-    tokens = np.asarray(called.tokens)
-    valid = np.asarray(called.token_fields.get(VALIDITY_FIELD, np.ones(tokens.shape, bool)), bool)
-    pixels, grids = [], []
+    expanded, pixels, grids = [], [], []
     # The release's call reads PIL images (its `_to_pil`), as Dew hands it the arrays.
     pictures = [Image.fromarray(image) for image in images]
-    for row, taken, ours, real in zip(rows, ([pictures[0]], pictures[1:]), tokens, valid, strict=True):
+    for row, taken in zip(rows, ([pictures[0]], pictures[1:]), strict=True):
         theirs = release(medias=[{"type": "image", "image": image} for image in taken], text=row,
                          return_tensors="np")
         ids = np.asarray(theirs["input_ids"]).reshape(-1)
-        counts = [release.media_processor.media_tokens_calculator({"type": "image", "image": image})
-                  for image in taken]
         repeats = np.ones(ids.shape, np.int64)
-        repeats[ids == image_id] = counts
-        np.testing.assert_array_equal(ours[real], np.repeat(ids, repeats))
+        repeats[ids == image_id] = [
+            release.media_processor.media_tokens_calculator({"type": "image", "image": image})
+            for image in taken]
+        expanded.append(np.repeat(ids, repeats))
         pixels.append(np.asarray(theirs["pixel_values"]))
         grids.append(np.asarray(theirs["grid_thws"]))
-    np.testing.assert_array_equal(np.asarray(called.conditioning["pixel_values"]).reshape(-1),
-                                  np.concatenate(pixels).reshape(-1))
-    np.testing.assert_array_equal(np.asarray(called.conditioning["image_grid_thw"]).reshape(-1, 3),
-                                  np.concatenate(grids))
+    tokenizer = release.tokenizer
+    padded, fields = pad_token_rows(expanded, pad_id=tokenizer.pad_token_id,
+                                    padding_side=tokenizer.padding_side)
+    given = loaded.processor.from_hf({"input_ids": padded, **fields, "pixel_values": np.concatenate(pixels),
+                                      "image_grid_thw": np.concatenate(grids)})
+    np.testing.assert_array_equal(np.asarray(called.tokens), np.asarray(given.tokens))
+    for kind, ours, theirs in (("token", called.token_fields, given.token_fields),
+                               ("conditioning", called.conditioning, given.conditioning)):
+        assert sorted(ours) == sorted(theirs), kind
+        for name in theirs:
+            np.testing.assert_array_equal(np.asarray(ours[name]), np.asarray(theirs[name]), err_msg=name)
 
     messages = [{"role": "user", "content": [{"type": "image", "image": images[1]},
                                              {"type": "text", "text": "w5"}]}]
