@@ -1610,7 +1610,8 @@ def test_closing_a_compiled_from_iter_reader_finalizes_its_native_generators(cyc
     reader = compile(source, read="streamed", loading=Loading(workers=0, threads=1, read_buffer=1)
                      ).train(DataPartition())
     try:
-        assert next(reader)["id"].tolist() == [0, 1]
+        # A pass's first two rows, or, interleaved, each pass's first.
+        assert next(reader)["id"].tolist() == ([0, 1] if cycle == 1 else [0, 0])
         if cycle > 1:
             assert both_started.wait(timeout=5)
         assert sorted(opened) == list(range(cycle)) and not closed
