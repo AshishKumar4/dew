@@ -69,10 +69,23 @@ def _conditioner_modules(tower: None, projector: ProjectorBase, dtype, precision
                           ) -> tuple[None, ProjectorBase]: ...
 
 
-def _conditioner_modules(tower: TowerBase | None, projector: ProjectorBase, dtype, precision):
-    """A media tower and native projector in the conditioner's compute policy."""
+@overload
+def _conditioner_modules(tower: TowerBase, projector: None, dtype, precision) -> tuple[nn.Module, None]: ...
+
+
+@overload
+def _conditioner_modules(tower: TowerBase | None, projector: ProjectorBase | None, dtype, precision
+                         ) -> tuple[nn.Module | None, ProjectorBase | None]: ...
+
+
+def _conditioner_modules(tower: TowerBase | None, projector: ProjectorBase | None, dtype, precision):
+    """A media tower and native projector in the conditioner's compute policy: either may be absent, a
+    projector of raw inputs or a tower whose encoding is the decoder's width (MiMo-V2.6's audio), not
+    both."""
+    if tower is None and projector is None:
+        raise ValueError("media are read by a tower, a projector or both")
     return (None if tower is None else tower.build().clone(dtype=dtype, precision=precision),
-            projector.clone(dtype=dtype, precision=precision))
+            None if projector is None else projector.clone(dtype=dtype, precision=precision))
 
 
 class VisionConditioner(nn.Module):
@@ -159,14 +172,8 @@ class AudioConditioner(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        if self.projection is None:
-            if self.audio is None:
-                raise ValueError("audio is read by its tower, its projector or both")
-            self.audio_tower = self.audio.build().clone(dtype=self.dtype, precision=self.precision)
-            self.audio_projector = None
-        else:
-            self.audio_tower, self.audio_projector = _conditioner_modules(
-                self.audio, self.projection, self.dtype, self.precision)
+        self.audio_tower, self.audio_projector = _conditioner_modules(
+            self.audio, self.projection, self.dtype, self.precision)
 
     def __call__(self, conditioning: Mapping[str, jax.Array]) -> jax.Array:
         features = conditioning["input_features"]
