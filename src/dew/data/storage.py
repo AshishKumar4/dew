@@ -33,6 +33,7 @@ from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 from s3fs import S3FileSystem
 
 from dew._records import JSON, json_value, record, text
+from dew.batch import Batch
 from dew.cache import dew_cache_dir
 from dew.data.retention import LocalRetention, evictable, read_pin
 from dew.files import write_atomically
@@ -358,21 +359,24 @@ def mirrored() -> dict[str, float]:
     return {name: float(sum(stats[name] for stats in held)) for name in held[0]} if held else {}
 
 
-def mirror_metrics(state: object = None) -> dict[str, float]:
+def mirror_metrics(state: JSON = None) -> dict[str, float]:
     """What the mirrors of a run's reading processes did, as a run logs it beside its data metrics
     (`data/mirror/...`, row 4299): this process's, and each loading worker's its position `state` states
     (`MIRRORED`), none where none opened one."""
     totals = dict(mirrored())
 
-    def found(value: object) -> None:
-        if isinstance(value, Mapping):
-            for name, held in value.get(MIRRORED, {}).items():
-                totals[name] = totals.get(name, 0.0) + held
-            for child in value.values():
-                found(child)
-        elif isinstance(value, (list, tuple)):
-            for child in value:
-                found(child)
+    def found(value: JSON) -> None:
+        match value:
+            case {**fields}:
+                match fields.get(MIRRORED):
+                    case {**stated}:
+                        for name, held in stated.items():
+                            totals[name] = totals.get(name, 0.0) + float(held)
+                for child in fields.values():
+                    found(child)
+            case [*children]:
+                for child in children:
+                    found(child)
 
     found(state)
     return {f"data/mirror/{name}": held for name, held in totals.items()}
@@ -388,7 +392,7 @@ class Mirrored(grain.IterDataset):
 
 
 class _MirroredIterator(grain.DatasetIterator):
-    def __next__(self) -> object:
+    def __next__(self) -> Batch:
         return next(self._parent)
 
     def get_state(self) -> dict:

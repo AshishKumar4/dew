@@ -447,8 +447,8 @@ def test_distinct_transport_misses_download_concurrently_within_the_shared_budge
 
 def test_a_runs_statistics_count_what_its_loading_workers_mirrors_read(tmp_path):
     """A run's data metrics count what its loading workers' mirrors read, beside the reading process's
-    own (`data/mirror/...`, row 4299): files read through a mirror by two workers count more downloaded
-    bytes than the reading process's mirror read, as many as the files hold or more."""
+    own (`data/mirror/...`, row 4299): files read through a mirror by two workers count more reads than
+    the reading process's mirror made alone, each worker finding a file the mirror holds."""
     from dew.data import Files, Loading
     from dew.data.compile import compile
     from dew.data.dataset import DataPartition
@@ -469,11 +469,13 @@ def test_a_runs_statistics_count_what_its_loading_workers_mirrors_read(tmp_path)
     reader = loader.train(DataPartition())
     try:
         assert len(list(reader)) == 12
-        downloaded = loader.statistics()["data/mirror/downloaded_bytes"]
+        statistics = loader.statistics()
     finally:
         reader.close()
-    assert downloaded > mirrored().get("downloaded_bytes", 0.0)
-    assert downloaded >= sum(path.stat().st_size for path in paths)
+    own = mirrored()
+    reads = statistics["data/mirror/hits"] + statistics["data/mirror/misses"]
+    assert reads > own.get("hits", 0.0) + own.get("misses", 0.0)
+    assert statistics["data/mirror/downloaded_bytes"] >= sum(path.stat().st_size for path in paths)
 
 
 def test_url_chain_reads_and_writes_memory(tmp_path):
