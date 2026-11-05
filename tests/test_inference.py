@@ -867,7 +867,7 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
 @pytest.mark.mesh
 def test_a_scoring_server_answers_image_requests_as_each_draws_alone(tmp_path):
     """A text-to-image task served by a `ScoringServer` (`TextToImage.scoring`), as an `Engine` serves it
-    beside other kinds: requests alike share a pass up to its four images, a request of another prompt
+    beside other kinds: requests alike share a pass up to its six images, a request of another prompt
     count or other settings (its steps, its negative prompt) walks in a pass of its own, one prepared
     under a key and step count apart from its walk's among them, and each request's images are those
     its lone call draws under its keys and settings, on par with that call
@@ -880,16 +880,19 @@ def test_a_scoring_server_answers_image_requests_as_each_draws_alone(tmp_path):
     make_run(tmp_path)
     pipe = TextToImage.from_run(str(tmp_path))
     requests = ({"prompts": ("a water lily", "a sunflower")}, {"prompts": ("a rose", "a tulip")},
-                {"prompts": ("a daisy",)},
+                {"prompts": ("a water lily", "a sunflower")}, {"prompts": ("a daisy",)},
                 {"prompts": ("an iris", "a lotus"), "steps": 4, "negative": "blurry", "prepare_steps": 2})
-    # The last request's noise is prepared under a key of its own, apart from its walk's.
-    apart = 1000
-    server = ScoringServer.from_task(*pipe.scoring(steps=3, guidance=2.0, images=4))
+    # The third request is the first again, under the first's key; the last's noise is prepared under a
+    # key of its own, apart from its walk's.
+    again, apart = 2, 1000
+    server = ScoringServer.from_task(*pipe.scoring(steps=3, guidance=2.0, images=6))
     wide = dataclasses.replace(pipe, model=pipe.model.clone(dtype=jnp.float64),
                                variables=widened(pipe.variables))
 
     def draw(seed):
-        return (np.arange(len(requests)) + len(requests) * seed,)
+        keys = np.arange(len(requests)) + len(requests) * seed
+        keys[again] = keys[0]
+        return (keys,)
 
     def preparing(request, key):
         """The key and steps the request's noise and conditions are prepared under."""
@@ -906,20 +909,28 @@ def test_a_scoring_server_answers_image_requests_as_each_draws_alone(tmp_path):
 
     @as_given
     def served(keys):
-        futures, streamed = [], []
+        futures, streamed = [], {index: [] for index in range(len(requests) - 1)}
         for index, (request, key) in enumerate(zip(requests, keys, strict=True)):
             prepare_key, prepare_steps = preparing(request, int(key))
-            # The second request streams its walk: each step's number and its two rows' clean predictions.
-            on_step = (lambda step, rows: streamed.append((step, rows.shape))) if index == 1 else None
+            # Every request but the last streams its walk: each step's number and rows' clean predictions.
+            on_step = None if index not in streamed else (
+                lambda step, rows, held=streamed[index]: held.append((step, np.array(rows))))
             futures.append(server.submit(ImageRequest(**{**request, "prepare_steps": prepare_steps},
                                                       key=int(key), prepare_key=prepare_key,
                                                       on_step=on_step)))
         server.run()
         admitted = [future.admitted for future in futures]
-        assert admitted[0] == admitted[1] and len(set(admitted[1:])) == 3
-        # A walk's solver steps between its grid's points; the closing denoise is no step.
-        assert [step for step, _ in streamed] == list(range(1, len(pipe.process.times(3))))
-        assert {shape[0] for _, shape in streamed} == {2}
+        assert admitted[0] == admitted[1] == admitted[2] and len(set(admitted[2:])) == 3
+        # A walk's solver steps between its grid's points; the closing denoise is no step. Each stream is
+        # whole before its request is answered, and its own: the request repeated beside the first in its
+        # pass streams the first's predictions, the second another's.
+        walked = list(range(1, len(pipe.process.times(3))))
+        for held, rows in zip(streamed.values(), (2, 2, 2, 1), strict=True):
+            assert [step for step, _ in held] == walked and {latent.shape[0] for _, latent in held} == {rows}
+        for (_, first), (_, second), (_, repeated) in zip(streamed[0], streamed[1], streamed[again],
+                                                          strict=True):
+            np.testing.assert_array_equal(repeated, first)
+            assert not np.array_equal(second, first)
         return tuple(future.result().host().images for future in futures)
 
     @as_given
