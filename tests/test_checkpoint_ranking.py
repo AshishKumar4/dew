@@ -404,6 +404,8 @@ def test_older_kept_steps_hold_their_model_alone_and_the_latest_resumes(tmp_path
                                   np.asarray(state.variables['params']['w']))
     with pytest.raises(ValueError, match="weights"):
         checkpoints.restore(run.initial_state(), 4)
+    with pytest.raises(ValueError, match="data position"):
+        checkpoints.position(4, DataPartition(0, 1))
     resumed, _ = checkpoints.restore(run.initial_state())
     assert int(resumed.step) == 5
     for held, expected in zip(jax.tree.leaves(resumed.opt_state), jax.tree.leaves(state.opt_state),

@@ -11,7 +11,7 @@ from affine_run import Regression, dataset
 from model_support import largest_difference
 
 from dew.averaging import coefficients, exponent, power_decay
-from dew.checkpoints import Checkpoints, Ranking
+from dew.checkpoints import Checkpoints, Keep, Ranking
 from dew.config import RunConfig
 from dew.objectives.base import EMASpec
 from dew.optim import OptimConfig, PowerProfilesState, power_profiles
@@ -116,6 +116,23 @@ def test_an_older_snapshot_keeps_its_profiles_alone_and_rebuilds_the_same_averag
     for got, want in zip(jax.tree.leaves(alone.posthoc_ema(0.07)), jax.tree.leaves(whole.posthoc_ema(0.07)),
                          strict=True):
         np.testing.assert_array_equal(got, want)
+
+
+def test_a_snapshot_kept_for_its_model_reads_its_model_and_its_profiles(tmp_path):
+    """A step its retention keeps for its model, a profiled run's past the latest under
+    `Keep(weights_only=True)`, reads as its model to the model's readers and as its profiles to the
+    post-hoc EMA's, neither read refused for the payload the other keeps."""
+    keep = Keep(latest=1, every=4, weights_only=True)
+    trainer = Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0),
+                      layout=Layout(min_shard=1, tolerance=1.0),
+                      checkpoints=Checkpoints(str(tmp_path / "run"), keep=keep))
+    trainer.fit(dataset(), steps=8, log_every=8, checkpoint_every=4)
+    trainer.checkpoints.wait()
+    checkpoints = Checkpoints(str(tmp_path / "run"), keep=keep)
+    assert {entry.step: entry.kind for entry in checkpoints.kept()} == {4: "weights", 8: "state"}
+    assert set(checkpoints.stored(4)) == {"step", "microstep", "updates", "variables", "ema"}
+    assert jax.tree.leaves(checkpoints.variables(step=4))
+    assert len(checkpoints.restore_profiles(4)) == 2
 
 
 def test_a_checkpoint_writes_the_averages_once_and_restores_them(tmp_path):

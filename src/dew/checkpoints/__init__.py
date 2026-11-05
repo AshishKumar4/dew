@@ -1215,12 +1215,21 @@ _PAYLOADS = {MODEL: "its model (counters, variables and EMA)", PROFILES: "its po
 
 
 def _refuse_profiles_alone(step: int, facts: _StepFacts) -> None:
-    """Refuse a read of a step's named state where it holds its profiles' averages without the optimizer
-    state they are part of (its retention keeps it for its profiles alone), which only
-    `Checkpoints.restore_profiles` reads."""
-    if PROFILES in facts.items and RESUME not in facts.items:
+    """Refuse a read of a step's named state where it holds no model and no state a resume reads, only its
+    profiles' averages (its retention keeps it for them alone), which `Checkpoints.restore_profiles`
+    reads. A step kept for its model reads as its model; the profiles it keeps beside are read there too."""
+    if facts.items and not {MODEL, RESUME, ONE_ITEM} & set(facts.items):
         raise ValueError(f"step {step} holds {_payload(facts.items)} alone, which its retention keeps it "
                          "for; its profiles' averages are read by Checkpoints.restore_profiles")
+
+
+def _refuse_cut_resume(step: int, facts: _StepFacts, field: str) -> None:
+    """Refuse a read of `field`, state only a resume reads (its data position, its rollout), at a step its
+    retention cut to its model or its profiles, which held it once and holds it no longer: so a cut step
+    is not read as one saved without it."""
+    if facts.items and not {RESUME, ONE_ITEM} & set(facts.items):
+        raise ValueError(f"step {step} holds {_payload(facts.items)} alone, which its retention keeps it "
+                         f"for, and no {field}: read it from a step a resume reads (Checkpoints.latest)")
 
 
 def _payload(items) -> str:
@@ -2306,7 +2315,10 @@ class Checkpoints:
         """Return what the checkpoint at `step` holds, without reading its values.
 
         `step` defaults to the latest. Each state field comes back as a
-        shape/dtype tree, and an unset field as None.
+        shape/dtype tree, and an unset field as None. A step its retention
+        keeps for its model holds the model's fields (its post-hoc EMA
+        profiles, where it keeps them too, are `restore_profiles`'s); one kept
+        for its profiles alone is refused.
         """
         step = self.pinned(step)
         snapshot = self._step_metadata(step, local=step == self._local_latest())
@@ -2351,6 +2363,7 @@ class Checkpoints:
         while its state is still unplaced (`Trainer.fit`). None where the step saved no position."""
         from_local = step == self._local_latest()
         snapshot = self._step_metadata(step, local=from_local)
+        _refuse_cut_resume(step, snapshot, 'data position')
         metadata = _item_metadata(snapshot)
         if 'position' not in metadata or (snapshot.custom_metadata or {}).get('tree'):
             return None
@@ -2369,7 +2382,9 @@ class Checkpoints:
         """The rollout's tree the step at `step` holds (`save`'s `rollout`), read alone and placed as
         `template`'s leaves (`jax.ShapeDtypeStruct`s) are; None for a step saved without one."""
         from_local = step == self._local_latest()
-        metadata = _item_metadata(self._step_metadata(step, local=from_local))
+        snapshot = self._step_metadata(step, local=from_local)
+        _refuse_cut_resume(step, snapshot, "rollout's state")
+        metadata = _item_metadata(snapshot)
         if 'rollout' not in metadata:
             return None
         # A step saved before the rollout held a key holds the rest, which the rollout reads without it.
