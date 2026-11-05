@@ -676,6 +676,10 @@ class RolloutScheduler:
 
         from .sources import PromptSource
 
+        if jax.process_count() > 1:
+            raise ValueError("a served rollout's engine steps one process's server, and a run over several "
+                             "processes places its policy over all of them; draw each step's own completions "
+                             "(no --rollout.served)")
         drawing = objective.sampled(Sampling() if sampling is None else sampling)
         width = objective.seq_len + 1
 
