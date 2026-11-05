@@ -186,28 +186,28 @@ def test_the_short_convs_kernels_compile_on_tritons_compiler_within_each_gpus_bl
 def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources():
     """The GEMM template's Mosaic GPU grouped matmul, lone and cooperative, compiled by Mosaic for a
     compile-only H100 on this CPU through ptxas (tests/kernel_compile.py): within the multiprocessor's
-    shared memory, no register spilled. The resource gate every Mosaic GPU mainloop takes."""
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+    shared memory, no register spilled, its register model deciding as ptxas does (`model_failures`, row
+    1971). The resource gate every Mosaic GPU mainloop takes."""
+    from kernel_compile import compile_mosaic_kernels, model_failures, mosaic_failures
 
     from dew.nn.kernels.templates.gemm import mosaic_gpu
 
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    args = (bf16((1024, 512)), bf16((4, 512, 1024)), jax.ShapeDtypeStruct((4,), jnp.int32))
+    launch = grouped_matmul.MosaicGmm()
+    with generation.assumed("sm90"):
+        ba = launch.bind(*args, out_dtype="bfloat16", trans_rhs=False, interpret=False)
+
     def case(tiles):
-        def call():
-            def gmm(lhs, rhs, sizes):
-                hopper = generation.gpu_target("sm90")
-                return mosaic_gpu.gmm(lhs, rhs, sizes, tiles=tiles, transpose_rhs=False,
-                                      out_dtype=jnp.bfloat16, multiprocessors=hopper.multiprocessors)
-
-            return gmm, (jax.ShapeDtypeStruct((1024, 512), jnp.bfloat16),
-                         jax.ShapeDtypeStruct((4, 512, 1024), jnp.bfloat16),
-                         jax.ShapeDtypeStruct((4,), jnp.int32))
-
-        return support.KernelCase(f"gmm {tiles}", call)
+        with generation.assumed("sm90"):
+            model = _model(launch, ba, tiles)
+        return support.KernelCase(f"gmm {tiles}", lambda: launch.lowering(ba, tiles), {"dew_gmm": model})
 
     found = compile_mosaic_kernels([case(mosaic_gpu.Tiles(128, 128, 64, 3, 1)),
                                     case(mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2))], "sm90")
     assert len(found) == 2 and all(record.get("kernels") for record in found), found
-    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+    failed = mosaic_failures(found) + model_failures(found)
+    assert not failed, "\n".join(failed)
 
 
 @lowers("sm90")
