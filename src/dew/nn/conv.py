@@ -280,9 +280,10 @@ class Conv(nn.Conv):
     @nn.nowrap
     def spatial_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
         """The native convolution's output geometry, without allocating its arrays, as `__call__` computes
-        it: an input padded by wrapping, reflecting or causally first, then dilated
-        (`input_dilation`, the input's extent `(size - 1) * rate + 1`), padded as stated or as 'SAME' pads
-        that extent, and read by the dilated kernel at its strides (ledger 4399)."""
+        it: an input padded by wrapping, reflecting or causally first, or as stated or as 'SAME' pads it,
+        and read by the dilated kernel at its strides; an input dilated (`input_dilation`, its extent
+        `(size - 1) * rate + 1`) padded by the amounts stated, and refused padded by name, as
+        `lax.conv_general_dilated` computes none so (ledger 4399)."""
         kernel = (self.kernel_size,) if isinstance(self.kernel_size, int) else tuple(self.kernel_size)
 
         def each(value: int | Sequence[int] | None) -> tuple[int, ...]:
@@ -293,6 +294,9 @@ class Conv(nn.Conv):
         effective = tuple((tap - 1) * rate + 1 for tap, rate in zip(kernel, each(self.kernel_dilation),
                                                                     strict=True))
         padding = canonicalize_padding(self.padding, len(kernel))
+        if isinstance(padding, str) and any(rate != 1 for rate in rates):
+            raise ValueError(f"a convolution over an input dilated by {rates} pads it by amounts stated, "
+                             f"not {padding!r}, as lax.conv_general_dilated pads it")
         spatial = shape[:-1]
         if padding in ('CIRCULAR', 'REFLECT', 'CAUSAL'):
             # `__call__` pads the undilated input by the dilated kernel's extent less one, then reads it
@@ -301,7 +305,7 @@ class Conv(nn.Conv):
             padding = 'VALID'
         extents = tuple((size - 1) * rate + 1 for size, rate in zip(spatial, rates, strict=True))
         if padding == 'SAME':
-            sizes = tuple((extent + step - 1) // step for extent, step in zip(extents, strides, strict=True))
+            sizes = tuple((size + step - 1) // step for size, step in zip(spatial, strides, strict=True))
             return (*sizes, self.features)
         if padding == 'VALID':
             padding = ((0, 0),) * len(kernel)
