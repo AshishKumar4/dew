@@ -40,6 +40,7 @@ the same weights. Without `OPENAI_BASE_URL` the SDK would address
 api.openai.com, so an unset variable skips.
 """
 
+import functools
 import json
 import os
 from pathlib import Path
@@ -49,7 +50,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from float64_terms import float64_forward
-from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact
 
 from dew.inference import OpenAICompletion
 from dew.interop import Pretrained
@@ -63,6 +64,8 @@ pytestmark = pytest.mark.network
 
 PROMPTS = ("The trainer", "Dew trains", "The model", "This recipe")
 DRAWN = 8
+LOGPROB_SEEDS = 8
+"""Check 1's declared seeds for the served logprobs, drawn prompts of 4 to 8 ids."""
 GREEDY = Sampling(temperature=0.0)
 """Argmax on both sides. vLLM overrides top-p/top-k/min-p at temperature
 zero, so a control's effect is only observable at a live temperature."""
@@ -205,32 +208,49 @@ def test_the_server_reports_dews_own_logprobs(client, reference):
 
     A logprob is a number rather than a decision, so it moves before an
     argmax flips. Both engines score in fp32 here and the kernels differ:
-    the server's logprobs are as exact as Dew's own fp32 ones
-    (`assert_as_exact_as_the_reference`), the truth Dew's float64 forward of
-    the same weights over the same tokens.
+    the server's logprobs are as exact as Dew's own fp32 ones over drawn
+    prompts (check 1), the truth Dew's float64 forward of the same weights
+    over the same tokens.
     """
     tokenizer, loaded = reference
-    served, ours, truth = [], [], []
+    forward = jax.jit(loaded.model.apply)
 
-    for prompt in PROMPTS:
-        head = tokenizer.encode(prompt, add_special_tokens=False)
-        answer = client(prompt, DRAWN, sampling=GREEDY, logprobs=1,
-                        extra_body={"return_token_ids": True})
-        choice = answer.responses[0].choices[0]
-        reported = choice.logprobs.token_logprobs
-        assert len(reported) == DRAWN, prompt
+    def draw(seed):
+        rng = np.random.default_rng([0x7117, seed])
+        return (rng.integers(0, tokenizer.vocab_size, int(rng.integers(4, 9))).astype(np.int32),)
 
-        ids = jnp.asarray([head + choice.token_ids], jnp.int32)
-        logits = np.asarray(loaded.model.apply(loaded.variables, ids))[0]
-        wide = np.asarray(float64_forward(loaded.model, loaded.variables, ids)[0])[0]
-        for offset, token in enumerate(choice.token_ids):
-            place = len(head) + offset - 1
-            served.append(float(reported[offset]))
-            ours.append(float(jax.nn.log_softmax(logits[place])[token]))
-            truth.append(float(wide[place, token] - np.logaddexp.reduce(wide[place])))
+    @functools.cache
+    def answered(prompt: tuple) -> tuple[list[int], list[int], list[float]]:
+        """The server's greedy answer to the drawn ids' text: the prompt's ids, its tokens, their logprobs."""
+        text = tokenizer.decode(list(prompt))
+        choice = client(text, DRAWN, sampling=GREEDY, logprobs=1,
+                        extra_body={"return_token_ids": True}).responses[0].choices[0]
+        assert len(choice.logprobs.token_logprobs) == DRAWN, text
+        return (tokenizer.encode(text, add_special_tokens=False), list(choice.token_ids),
+                [float(value) for value in choice.logprobs.token_logprobs])
 
-    assert_as_exact_as_the_reference(np.asarray(served), np.asarray(ours), np.asarray(truth),
-                                     "vLLM's reported logprobs")
+    def scored(logits, head, tokens):
+        logits = np.asarray(logits, np.float64)
+        places = len(head) + np.arange(len(tokens)) - 1
+        return logits[places, tokens] - np.logaddexp.reduce(logits[places], axis=-1)
+
+    @as_given
+    def served(ids):
+        return np.asarray(answered(tuple(np.asarray(ids).tolist()))[2])
+
+    @as_given
+    def dews(ids):
+        head, tokens, _ = answered(tuple(np.asarray(ids).tolist()))
+        logits = np.asarray(forward(loaded.variables, jnp.asarray([head + tokens], jnp.int32)))[0]
+        return scored(np.asarray(jax.nn.log_softmax(logits), np.float64), head, tokens)
+
+    @as_given
+    def wide(ids):
+        head, tokens, _ = answered(tuple(np.asarray(ids).tolist()))
+        ids = jnp.asarray([head + tokens], jnp.int32)
+        return scored(np.asarray(float64_forward(loaded.model, loaded.variables, ids)[0])[0], head, tokens)
+
+    assert_as_exact(served, dews, draw, "vLLM's reported logprobs", seeds=LOGPROB_SEEDS, truth_fn=wide)
 
 
 def test_streaming_replays_the_completion_it_would_have_returned(client, continuation):
