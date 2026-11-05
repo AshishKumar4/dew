@@ -694,9 +694,15 @@ def test_a_runs_persistent_and_local_checkpoints_hold_one_envelope(tmp_path):
     run.checkpoints.wait()
     (persistent_args, persistent), (local_args, local_fields) = (Recorded.submitted["save"],
                                                                  Recorded.submitted["save_local"])
-    assert not persistent_args and not local_args and set(local_fields) == local
-    assert {name: type(value) for name, value in persistent.items() if name in local} == {
-        name: type(value) for name, value in local_fields.items()}
+    assert not persistent_args and not local_args and set(local_fields) == local <= set(persistent)
+    # What a step does not move, each tier holds alike: the partition, the rung, the artifact, the axes; the
+    # state, its position and the rollout as trees of one structure.
+    for name in ("share", "rung", "artifact", "boxed"):
+        assert persistent[name] == local_fields[name], name
+    for name in ("state", "rollout"):
+        assert jax.tree.structure(persistent[name]) == jax.tree.structure(local_fields[name]), name
+    assert isinstance(persistent["saved"], bytes) and isinstance(local_fields["saved"], bytes)
+    assert persistent["control"].keys() == local_fields["control"].keys()
 
 
 def test_tile_head_invalidates_validation_trace_for_the_same_batch_shape():
