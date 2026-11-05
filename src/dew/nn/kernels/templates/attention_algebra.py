@@ -1952,9 +1952,10 @@ def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
             # mainloop's accumulators hold.
             assert isinstance(added, Added) and held_by is not None
             total = states[fields.index("total")] * added.factor + added.terms.sum(axis=keys.coords.key_axis)
+            factor = accumulated.factor
 
             def scale(held):
-                return keys.coords.queries(accumulated.factor, held) * held
+                return keys.coords.queries(factor, held) * held
 
             acc = held_by(states[fields.index("acc")], scale, (accumulated.weights,), accumulated.values)
             return tuple(acc if field == "acc" else total if field == "total" else None for field in fields)
