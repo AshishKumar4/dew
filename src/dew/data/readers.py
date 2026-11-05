@@ -127,22 +127,32 @@ class _CanonicalPass:
 
 
 @dataclasses.dataclass
+class _Published:
+    """A position a reader published, and its counts (`state_counts`) once they are asked."""
+
+    state: Mapping[str, object] | None
+    read: Mapping[str, CorpusCounts] | None = None
+
+
+@dataclasses.dataclass
 class _PublishedCounts:
     """Reader-owned snapshots retained without retaining its Grain iterator: the position last published,
-    whose counts (`state_counts`) are read from it as they are asked, a run logging them every few steps,
-    not read from each batch's position (row 4079)."""
+    whose counts are read from it as they are asked, a run logging them every few steps, not read from
+    each batch's position (row 4079). A publication replaces the whole `_Published`, so counts read off
+    one, on another thread than the reader's, are that one's and kept on it alone."""
 
-    state: Mapping[str, object] | None = None
-    read: Mapping[str, CorpusCounts] | None = None
+    published: _Published = dataclasses.field(default_factory=lambda: _Published(None))
 
     @property
     def counts(self) -> Mapping[str, CorpusCounts]:
-        if self.read is None:
-            self.read = MappingProxyType({} if self.state is None else state_counts(self.state))
-        return self.read
+        published = self.published
+        if published.read is None:
+            state = published.state
+            published.read = MappingProxyType({} if state is None else state_counts(state))
+        return published.read
 
     def publish(self, state: Mapping[str, object] | None) -> None:
-        self.state, self.read = state, None
+        self.published = _Published(state)
 
 
 class _PerShare(Forwarding):
