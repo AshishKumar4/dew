@@ -206,16 +206,15 @@ def test_a_split_the_derivation_refuses_is_still_asked_at_its_half_rung():
     """The halving past a miss asks no compile of a split the derivation judges short at the objective's
     rung, and still asks one at its half rung (`remat_half`), judged on its own (review of row 3341's
     search): a refusal of the base rung says nothing of the half."""
+    from test_plan import DELTA, lm
+
     from dew.training.memory import remat_half
 
-    for policy in REMAT_POLICIES.values():
-        objective = deep(policy, split=None).objective
-        held = remat_half(objective)
-        if held is not None:
-            objective.substitute(held)
-            break
-    else:
-        raise AssertionError("no remat rung of the decoder has a half rung")
+    # A delta rule's decoder at no recomputation, whose next rung is the half rung 'all_but_delta_memory'.
+    objective = lm(**DELTA).objective
+    held = remat_half(objective)
+    assert held is not None
+    objective.substitute(held)
     search = bare_search(objective)
     base = search.remat_rung()
     search.judged_at[search.candidate_key(2, narrow=False)] = -1
