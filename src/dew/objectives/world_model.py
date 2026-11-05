@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import functools
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -27,31 +27,41 @@ from flax import linen as nn
 
 from dew.batch import Batch, Variables, unboxed
 from dew.inputs import unit_range
-from dew.nn.attention import reference_attention
+from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
+from dew.nn.inputs import AttentionMetadata
+from dew.nn.mixer_base import MixerContext
+from dew.nn.mixers.attention import CausalSelfAttention
+from dew.nn.mlp import GatedMLP
 from dew.nn.scan_orders import patchify, unpatchify
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step
 
+RMS_EPSILON = 1e-6
+"""The world model's RMS norms' epsilon, every one of them (Flax's `nn.RMSNorm` default, which its blocks
+were drawn with)."""
 
-class _Block(nn.Module):
-    """A pre-RMSNorm transformer block: QK-normed attention under `mask` (`reference_attention`), then a
-    SwiGLU MLP."""
 
-    width: int
-    heads: int
+def _block(width: int, heads: int, tokens: int, name: str) -> DecoderBlock:
+    """A pre-RMSNorm `DecoderBlock` of `width` features over `tokens` tokens: unrotated attention of `heads`
+    biased heads (`nope`), each head's queries and keys RMS-normed, under the call's pairwise mask
+    (`AttentionMetadata.pairwise_mask`) in the reference implementation, whose logits are at least float32;
+    then a biased SwiGLU of four times the width (`GatedMLP`)."""
+    attention = functools.partial(CausalSelfAttention, nope=True, ctx=MixerContext(
+        emb_features=width, num_heads=heads, num_kv_heads=heads, head_dim=width // heads, max_seq_len=tokens,
+        causal=False, qk_norm=True, norm_eps=RMS_EPSILON, attention_bias=True, attention_impl="reference"))
+    mlp = functools.partial(GatedMLP, hidden_features=4 * width, out_features=width, use_bias=True)
+    return DecoderBlock(attention, mlp, width, BlockWiring(), norm_eps=RMS_EPSILON, name=name)
 
-    @nn.compact
-    def __call__(self, x: jax.Array, mask: jax.Array) -> jax.Array:
-        head = self.width // self.heads
-        h = nn.RMSNorm()(x)
-        q, k, v = (nn.DenseGeneral((self.heads, head))(h) for _ in range(3))
-        q, k = nn.RMSNorm()(q), nn.RMSNorm()(k)
-        # In at least float32, as TSSM's blocks attend (`reference_attention`); any leading axes of the
-        # tokens are batch axes, which `mask` `[tokens, tokens]` is shared across.
-        attended = reference_attention(q, k, v, mask=mask, wide_logits=True)
-        x = x + nn.DenseGeneral(self.width, axis=(-2, -1))(attended)
-        h = nn.RMSNorm()(x)
-        gate, up = nn.Dense(4 * self.width)(h), nn.Dense(4 * self.width)(h)
-        return x + nn.Dense(self.width)(nn.silu(gate) * up)
+
+def _attended(blocks: Sequence[DecoderBlock], tokens: jax.Array, mask: jax.Array) -> jax.Array:
+    """`tokens` `[..., S, D]` through `blocks`, each token reading the tokens `mask` `[S, S]` lets it, any
+    leading axes of the tokens batch axes it is shared across, flattened into one for the blocks and
+    restored."""
+    *lead, count, width = tokens.shape
+    flat = tokens.reshape(-1, count, width)
+    metadata = AttentionMetadata(pairwise_mask=jnp.broadcast_to(mask, (flat.shape[0], count, count)))
+    for block in blocks:
+        flat = block(flat, attention_metadata=metadata)
+    return flat.reshape(*lead, count, width)
 
 
 class CausalTokenizer(nn.Module):
@@ -93,12 +103,15 @@ class CausalTokenizer(nn.Module):
                                         (self.latents, self.width))
         self.patch_positions = self.param("patch_positions", nn.initializers.normal(0.02),
                                           (self.patches, self.width))
-        self.encoder = [_Block(self.width, self.heads) for _ in range(self.depth)]
+        tokens = self.patches + self.latents
+        self.encoder = [_block(self.width, self.heads, tokens, f"encoder_{index}")
+                        for index in range(self.depth)]
         self.squeeze = nn.Dense(self.bottleneck)
         self.unsqueeze = nn.Dense(self.width)
         self.readout_tokens = self.param("readout_tokens", nn.initializers.normal(0.02),
                                          (self.patches, self.width))
-        self.decoder = [_Block(self.width, self.heads) for _ in range(self.depth)]
+        self.decoder = [_block(self.width, self.heads, tokens, f"decoder_{index}")
+                        for index in range(self.depth)]
         self.pixels = nn.Dense(self.patch * self.patch * self.frame[2])
 
     def __call__(self, frames: jax.Array) -> jax.Array:
@@ -121,9 +134,7 @@ class CausalTokenizer(nn.Module):
         count = self.patches
         index = jnp.arange(tokens.shape[-2])
         # Latents read everything; patches read only patches.
-        mask = (index[:, None] >= count) | (index[None, :] < count)
-        for block in self.encoder:
-            tokens = block(tokens, mask)
+        tokens = _attended(self.encoder, tokens, (index[:, None] >= count) | (index[None, :] < count))
         return jnp.tanh(self.squeeze(tokens[..., count:, :]))
 
     def decode(self, latents: jax.Array) -> jax.Array:
@@ -133,9 +144,7 @@ class CausalTokenizer(nn.Module):
         index = jnp.arange(tokens.shape[-2])
         count = self.latents
         # Latents read only latents; readout tokens read themselves and the latents.
-        mask = (index[None, :] < count) | (index[:, None] >= count)
-        for block in self.decoder:
-            tokens = block(tokens, mask)
+        tokens = _attended(self.decoder, tokens, (index[None, :] < count) | (index[:, None] >= count))
         return self._unpatchify(self.pixels(tokens[..., count:, :]))
 
 
@@ -228,11 +237,11 @@ class Dynamics(nn.Module):
         tokens = tokens + times[:frames, None]
         tokens = tokens.reshape(batch, frames * per_frame, self.width)
         time = jnp.repeat(jnp.arange(frames), per_frame)
-        mask = time[:, None] >= time[None, :]
-        for _ in range(self.depth):
-            tokens = _Block(self.width, self.heads)(tokens, mask)
+        blocks = [_block(self.width, self.heads, self.frames * per_frame, f"block_{index}")
+                  for index in range(self.depth)]
+        tokens = _attended(blocks, tokens, time[:, None] >= time[None, :])
         spatial_out = tokens.reshape(batch, frames, per_frame, -1)[:, :, 2:]
-        out = nn.Dense(grouped.shape[-1])(nn.RMSNorm()(spatial_out))
+        out = nn.Dense(grouped.shape[-1])(nn.RMSNorm(epsilon=RMS_EPSILON)(spatial_out))
         return out.reshape(noisy.shape)
 
 
