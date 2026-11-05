@@ -20,7 +20,7 @@ from data_support import Logged, WideDraw, listed
 from reader_support import assert_resumes_where_it_stopped
 from token_support import write_token_corpus
 
-from dew import position
+from dew import _position
 from dew.batch import VALID_ROWS
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate, validation
@@ -619,9 +619,9 @@ def test_a_position_saved_under_another_plan_version_is_refused(order):
     finally:
         stopped.close()
     if order == "global":
-        place = position.read(saved)
+        place = _position.read(saved)
         assert place.plan is not None
-        earlier = position.encode(dataclasses.replace(place, plan={**place.plan, "version": 1}))
+        earlier = _position.encode(dataclasses.replace(place, plan={**place.plan, "version": 1}))
     else:
         state = json.loads(saved)
         earlier = json.dumps({**state, "dew_data_plan": {**state["dew_data_plan"], "version": 1}}).encode()

@@ -12,9 +12,9 @@ from typing import Any
 
 import pytest
 
-from dew.builds import PACKAGE_INDEX
-from dew.cli import config as tpu_config, tpu as tpu_cli, tpu_setup
-from dew.cli.launch import remote_script
+from dew._builds import PACKAGE_INDEX
+from dew._cli import config as tpu_config, tpu as tpu_cli, tpu_setup
+from dew._cli.launch import remote_script
 
 #: Stands in for gcloud and rsync. Records every argv, answers from a state file. Where the state names
 #: `hosts`, each worker is a home directory under it, and what reaches a worker reaches that home: a
@@ -350,7 +350,7 @@ def test_a_queued_spot_slice_is_created_once_its_node_is_ready_and_a_preempted_o
 def test_a_wait_on_a_gcloud_that_never_answers_ends_at_its_deadline(fake):
     """Each readiness probe has what is left of the wait, so a listing that hangs is killed there and
     the wait ends with the TPU unready, instead of running past its deadline."""
-    from dew.cli.gcloud import Gcloud, Tpu
+    from dew._cli.gcloud import Gcloud, Tpu
 
     fake.offer("slice", "us-central2-b")
     fake.hang_on("list")
@@ -554,7 +554,7 @@ def test_attach_disk_mounts_the_disk_on_every_worker_once_it_is_attached(fake, p
 
 
 def launch(*argv: str) -> int:
-    from dew.cli.main import main
+    from dew._cli.main import main
 
     return main(["launch", *argv])
 
@@ -811,7 +811,7 @@ def test_init_writes_the_config_from_flags(fake):
 def _write_process_zone_cache(directory, worker):
     import os
 
-    from dew.cli import config
+    from dew._cli import config
 
     os.environ["DEW_CONFIG_DIR"] = directory
     for index in range(12):
@@ -871,7 +871,7 @@ def test_the_disk_script_opens_and_records_the_mount_once_the_disk_is_mounted(tm
     import shutil
     import subprocess
 
-    from dew.cli import tpu_setup
+    from dew._cli import tpu_setup
 
     tools = tmp_path / "bin"
     tools.mkdir()

@@ -183,7 +183,7 @@ def test_another_threads_quantized_trace_leaves_this_threads_products_dews():
     float64: the ownership is the tracing thread's alone."""
     import threading
 
-    from dew.cache import QUANTIZED_TRACE
+    from dew._cache import QUANTIZED_TRACE
 
     product = jax.jit(lambda lhs, rhs: float32_einsum("ik,kj->ij", lhs, rhs))
     lhs, rhs = CANCELLING[None], np.ones((3, 1), np.float32)

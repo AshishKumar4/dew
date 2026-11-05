@@ -12,7 +12,7 @@ import os
 from collections.abc import Sequence
 from pathlib import Path
 
-from dew.files import replacing
+from dew._files import replacing
 
 
 def path() -> Path:

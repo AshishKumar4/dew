@@ -45,8 +45,8 @@ from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 
+from dew._logging import display_console
 from dew.data.pipeline import cut_unit
-from dew.logging import display_console
 from dew.mesh import EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
 from dew.objectives.base import Shown
 from dew.telemetry.records import FitStarted

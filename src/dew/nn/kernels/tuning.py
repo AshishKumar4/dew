@@ -24,12 +24,12 @@ In a tuning run, `tune` reads a program's launches from a lowering that
 describes them (`launches`), and the pool's process 0 decides every distinct
 launch's config, which the others take exactly, so every process compiles the
 same program: its pick, or the heuristic. With `measure`, on a GPU the
-process has to itself (`dew.cache.measures_picks`), every variant of a launch
+process has to itself (`dew._cache.measures_picks`), every variant of a launch
 without a pick compiles on a thread pool and runs alone, its kernel's device
 time read by CUPTI after `FLUSH_BYTES` are read, and the fastest is kept;
 a win over the derived config is a gap in the derivation, fixed there for
 the whole family, which `gaps` names for maintainers. Picks persist per GPU model, jaxlib and jax beside XLA's
-own (`dew.cache.kernel_picks_path`; Pallas lowers a kernel in jax, which a release moves without jaxlib), in
+own (`dew._cache.kernel_picks_path`; Pallas lowers a kernel in jax, which a release moves without jaxlib), in
 Dew's own JSON (`encoded`, `decoded`), which tokamax's public
 API leaves to its callers. Wall-clock timing is
 `dew.telemetry.benchmark.samples`, which every benchmark tool in Dew measures with.
@@ -72,10 +72,10 @@ from jax._src import config as jax_config
 from jax.extend import core as jax_core
 from jax.extend.backend import get_default_device
 
-from dew import _coordination, _records, cache
+from dew import _cache, _coordination, _records
+from dew._files import write_atomically
 from dew._records import JSON
 from dew.algebra.terms import opaque, parameter_key
-from dew.files import write_atomically
 from dew.nn.kernels.options import owned_program
 
 from . import generation
@@ -397,7 +397,7 @@ def gaps(device_kind: str) -> list[Gap]:
     """The launches stored for GPUs of `device_kind` under this jax whose derived config lost
     (`Gap`), each named once."""
     found = []
-    ours, _ = _partitioned(cache.kernel_picks_path(device_kind))
+    ours, _ = _partitioned(_cache.kernel_picks_path(device_kind))
     for entry, (ba, timings) in ours:
         derived, fastest = _key(decoded(entry["derived"])), timings.fastest_config
         if fastest == derived:
@@ -517,7 +517,7 @@ class KernelOp(tokamax.Op):
         ba = self.bind(*args, **kwargs)
         config = self.config
         if config is None:
-            if (collected := cache.KERNEL_SEEN.value) is not None:
+            if (collected := _cache.KERNEL_SEEN.value) is not None:
                 collected.found.append((self, self.keyed(ba)))
             config = self._chosen(ba)
             if collected is not None:
@@ -530,7 +530,7 @@ class KernelOp(tokamax.Op):
         # template's `bind`: a grouped launch's hooks' dtypes and accumulators) as its key reads them; its
         # kernels carry it in their names, so a compile's reports name it (`report.launching`).
         with report.launching(self, ba, config):
-            if cache.KERNEL_LAUNCHES.value:
+            if _cache.KERNEL_LAUNCHES.value:
                 # Dew chose the launch for this GPU (`generation`); tokamax's device check would ask
                 # each traced array for its devices (`keyed`).
                 return tokamax.Op.__call__(self.replace(config=config, bypass_device_check=True), *ba.args,
@@ -538,7 +538,7 @@ class KernelOp(tokamax.Op):
             return self._fwd(*ba.args, config=config, **ba.kwargs)[0]
 
     def _chosen(self, ba: tokamax.BoundArguments) -> Hashable:
-        pins = dict(cache.KERNEL_PINS.value)
+        pins = dict(_cache.KERNEL_PINS.value)
         if type(self) in pins:
             pin = self.completed(ba, pins[type(self)])
             # A pin holds for the call's own shapes, as an explicit config does (`__call__`).
@@ -1051,10 +1051,10 @@ def _stored(path: str) -> list:
 
 def _stored_picks(kind: str) -> dict[tuple[tokamax.Op, str], _Picks]:
     """The picks stored for GPUs of `kind` that this checkout reads (`_read`), by op,
-    none where the process keeps no picks (`dew.cache.keeps_picks`)."""
-    if not cache.keeps_picks():
+    none where the process keeps no picks (`dew._cache.keeps_picks`)."""
+    if not _cache.keeps_picks():
         return {}
-    stored, _ = _read(cache.kernel_picks_path(kind))
+    stored, _ = _read(_cache.kernel_picks_path(kind))
     picks: dict[tuple[tokamax.Op, str], _Picks] = {}
     for op, key, fastest in _kernel_launches(stored):
         picks.setdefault((_identity(op), kind), _Picks())[key] = fastest
@@ -1066,7 +1066,7 @@ def _store(device_kind: str, picks) -> None:
     picks for that model, one writer at a time, a launch's newer timings replacing its older, the
     entries this checkout does not read kept as they are (`_read`). The file is replaced whole
     (`write_atomically`), so no reader on the shared filesystem sees a part of it."""
-    path = cache.kernel_picks_path(device_kind)
+    path = _cache.kernel_picks_path(device_kind)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with filelock.FileLock(path + '.lock'):
         stored, foreign = _read(path)
@@ -1079,8 +1079,8 @@ def _store(device_kind: str, picks) -> None:
 def launches() -> Iterator[None]:
     """Each kernel launch traced within carries tokamax's description of
     itself, which `tokamax.autotuning.get_bound_args` reads out of the
-    lowered program (`dew.cache.KERNEL_LAUNCHES`)."""
-    with cache.KERNEL_LAUNCHES(new_value=True):
+    lowered program (`dew._cache.KERNEL_LAUNCHES`)."""
+    with _cache.KERNEL_LAUNCHES(new_value=True):
         yield
 
 
@@ -1097,7 +1097,7 @@ class Seen(list[Launch]):
 
 class _Seen:
     """The launches a lowering traced under `seen` (`Seen`); hashed by identity, as
-    `dew.cache.KERNEL_SEEN` keys on it."""
+    `dew._cache.KERNEL_SEEN` keys on it."""
 
     def __init__(self) -> None:
         self.found = Seen()
@@ -1110,7 +1110,7 @@ def seen() -> Iterator[Seen]:
     (`Seen.taken`), recorded as it traces: a fresh collection each time, so
     a trace cached before traces again."""
     collected = _Seen()
-    with cache.KERNEL_SEEN(collected):
+    with _cache.KERNEL_SEEN(collected):
         yield collected.found
 
 
@@ -1131,12 +1131,12 @@ def tune(lower: Callable[[], jax.stages.Lowered], *,
     if not generation.triton_runs():
         return lower(), "[]"
     with reading():
-        tuned = cache.KERNEL_TUNES.get_global()
+        tuned = _cache.KERNEL_TUNES.get_global()
         with seen() as found:
             lowered = lower()
         distinct = _distinct(found)
         _settle(distinct, measure=measure)
-        if cache.KERNEL_TUNES.get_global() != tuned:
+        if _cache.KERNEL_TUNES.get_global() != tuned:
             lowered = lower()
     return lowered, dumps_launches([ba for _, ba in distinct])
 
@@ -1182,7 +1182,7 @@ def _settle(found: list[Launch], *, measure: bool) -> int:
             if (fastest := _pick(ba)) is not None:
                 decisions.append((ba, fastest))
                 continue
-            if measure and cache.measures_picks():
+            if measure and _cache.measures_picks():
                 timings = _measured(op, ba)
                 if timings.prune_errors():
                     timed.append((ba, timings))
@@ -1213,7 +1213,7 @@ def _settle(found: list[Launch], *, measure: bool) -> int:
     changed = launched() != traced
     if any(_coordination.from_every_process(changed)):
         # A program lowered again traces again, with the picks it now reads.
-        cache.KERNEL_TUNES.set_global(cache.KERNEL_TUNES.get_global() + 1)
+        _cache.KERNEL_TUNES.set_global(_cache.KERNEL_TUNES.get_global() + 1)
     return sum(_pick(ba) is None for _, ba in found)
 
 
@@ -1223,5 +1223,5 @@ def pinned(configs: Mapping[type[KernelOp], Hashable]) -> Iterator[None]:
     config where its space at the launch's key holds it, any stored pick
     or heuristic set aside: for the float64 gate at every config of a space,
     and for a lab that times one."""
-    with cache.KERNEL_PINS(tuple(configs.items())):
+    with _cache.KERNEL_PINS(tuple(configs.items())):
         yield

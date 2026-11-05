@@ -40,10 +40,10 @@ class Assumption:
 
 def assumption() -> Assumption | None:
     """The device `assumed` stands in for in this thread, None outside it: one value, which JAX's trace
-    and compile caches key on (`dew.cache.KERNEL_ASSUMED`) and every choice reads."""
-    from dew import cache
+    and compile caches key on (`dew._cache.KERNEL_ASSUMED`) and every choice reads."""
+    from dew import _cache
 
-    return cache.KERNEL_ASSUMED.value
+    return _cache.KERNEL_ASSUMED.value
 
 
 @contextlib.contextmanager
@@ -54,14 +54,14 @@ def assumed(generation: str | GpuTarget | None) -> Iterator[None]:
     a CPU (`dew.training._lowering`). Given a target's facts (a GPU no row names, its multiprocessors,
     shared memory, clock and bandwidth its own), `gpu_target` answers with them, so every launch is sized
     and costed by them alone. None assumes nothing. JAX keys its trace and compile caches on the device
-    assumed (`dew.cache.KERNEL_ASSUMED`), so a function jitted for one traces again for another."""
-    from dew import cache
+    assumed (`dew._cache.KERNEL_ASSUMED`), so a function jitted for one traces again for another."""
+    from dew import _cache
 
     if isinstance(generation, GpuTarget):
         value = Assumption(generation.generation, generation, _facts(generation))
     else:
         value = None if generation is None else Assumption(generation)
-    with cache.KERNEL_ASSUMED(value):
+    with _cache.KERNEL_ASSUMED(value):
         yield
 
 
@@ -98,23 +98,23 @@ def chosen(**kernels: str) -> Iterator[None]:
     """Within the block, a choice named in `kernels` runs that kernel whatever its selector would
     take, for an A/B of two kernels or a test of a kernel the selector does not take on this device.
     Nested blocks keep the outer block's other choices and restore its choices on exit. JAX keys its
-    trace and compile caches on the choices (`dew.cache.KERNEL_CHOICES`), so a function jitted
+    trace and compile caches on the choices (`dew._cache.KERNEL_CHOICES`), so a function jitted
     outside the block traces again within it."""
-    from dew import cache
+    from dew import _cache
 
     known_choices(kernels)
-    with cache.KERNEL_CHOICES(tuple(sorted({**dict(cache.KERNEL_CHOICES.value), **kernels}.items()))):
+    with _cache.KERNEL_CHOICES(tuple(sorted({**dict(_cache.KERNEL_CHOICES.value), **kernels}.items()))):
         yield
 
 
 def numerics() -> Numerics:
     """The run's numerics in effect (`run_precision`), the defaults outside any: JAX keys its trace and
-    compile caches on them (`dew.cache.NUMERICS`), so a function jitted under one run's traces again
+    compile caches on them (`dew._cache.NUMERICS`), so a function jitted under one run's traces again
     under another's."""
-    from dew import cache
+    from dew import _cache
     from dew.nn.precision import Numerics
 
-    held = cache.NUMERICS.value
+    held = _cache.NUMERICS.value
     return Numerics() if held is None else held
 
 
@@ -127,10 +127,10 @@ def run_precision(policy: Numerics) -> Iterator[None]:
     among them, which reads them here (`numerics`, the one seam of a run's forms). The dtypes are the
     model's and the optimizer's own fields, which the run sets from the numerics: a bf16 operand has
     lost its bits before any product reads it, whatever its precision."""
-    from dew import cache
+    from dew import _cache
     from dew.nn.precision import configured_precision
 
-    with configured_precision(policy.matmul), cache.NUMERICS(policy):
+    with configured_precision(policy.matmul), _cache.NUMERICS(policy):
         yield
 
 
@@ -741,9 +741,9 @@ def _shared_memory(device) -> int | None:
 def _clocks(ordinal: int) -> tuple[tuple[str, float], ...]:
     """The visible GPU `ordinal`'s multiprocessor clock and device-memory bandwidth (twice the memory
     clock times the bus's bytes, as CUDA's deviceQuery derives it), which jax's Device does not carry,
-    from the CUDA driver (`dew.devices.gpu_attribute`), read once a process; none where no
+    from the CUDA driver (`dew._devices.gpu_attribute`), read once a process; none where no
     driver loads."""
-    from dew.devices import CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH, MEMORY_CLOCK_RATE, gpu_attribute
+    from dew._devices import CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH, MEMORY_CLOCK_RATE, gpu_attribute
 
     clock, memory_clock, bus = (gpu_attribute(ordinal, attribute)
                                 for attribute in (CLOCK_RATE, MEMORY_CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH))
@@ -851,10 +851,10 @@ def _resolved(device, generation: str, real: bool) -> GpuTarget:
 def chosen_kernel(choice: str, default: str) -> str:
     """The kernel `chosen` names for `choice` within its block, else `default`: a choice a site decides
     without a selector (the attention template's form, a step's narrow copies)."""
-    from dew import cache
+    from dew import _cache
 
     known_choices((choice,))
-    return dict(cache.KERNEL_CHOICES.value).get(choice, default)
+    return dict(_cache.KERNEL_CHOICES.value).get(choice, default)
 
 
 
@@ -883,7 +883,7 @@ class Route:
 
 
 class _Routes:
-    """The routes a `routes` block collected; hashed by identity, as `dew.cache.KERNEL_ROUTES` keys
+    """The routes a `routes` block collected; hashed by identity, as `dew._cache.KERNEL_ROUTES` keys
     on it."""
 
     def __init__(self) -> None:
@@ -894,12 +894,12 @@ class _Routes:
 def routes() -> Iterator[list[Route]]:
     """Collect every `Route` a dispatch reports while code runs or traces in the block, in order: what
     a step's trace within `assumed(target)` on a CPU shows of that target's kernels. Each block is a
-    fresh collection JAX keys its traces on (`dew.cache.KERNEL_ROUTES`), so a function traced before
+    fresh collection JAX keys its traces on (`dew._cache.KERNEL_ROUTES`), so a function traced before
     traces, and reports, again; a block nested in another reports to both."""
-    from dew import cache
+    from dew import _cache
 
     collected = _Routes()
-    with cache.KERNEL_ROUTES((*cache.KERNEL_ROUTES.value, collected)):
+    with _cache.KERNEL_ROUTES((*_cache.KERNEL_ROUTES.value, collected)):
         yield collected.found
 
 
@@ -922,13 +922,13 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
     `kernel`; `ran` is what this host executes, `kernel` by default. Every `routes` block open records it.
     A call off its preferred kernel is logged once a process for each kernel and refusal at INFO, naming
     both and the refusal's reason; one that runs the preferred kernel logs nothing."""
-    from dew import cache
+    from dew import _cache
 
     known_choices((choice,))
     generation = device_generation()
-    preferred = preferred or dict(cache.KERNEL_CHOICES.value).get(choice) or kernel
+    preferred = preferred or dict(_cache.KERNEL_CHOICES.value).get(choice) or kernel
     found = Route(choice, kernel, preferred, refusal, ran or kernel, generation, _site(), forced)
-    for collected in cache.KERNEL_ROUTES.value:
+    for collected in _cache.KERNEL_ROUTES.value:
         collected.found.append(found)
     detail = '' if refusal is None else refusal.detail
     if preferred != kernel and (choice, kernel, detail) not in _logged:

@@ -22,9 +22,9 @@ from typing import Annotated, ClassVar
 
 import tyro
 
-from dew.cache import dew_config_dir
-from dew.cli import config, ssh_config, tpu_setup
-from dew.cli.gcloud import Gcloud, Node, Tpu, emit, exit_code
+from dew._cache import dew_config_dir
+from dew._cli import config, ssh_config, tpu_setup
+from dew._cli.gcloud import Gcloud, Node, Tpu, emit, exit_code
 
 #: States a create never recovers from.
 

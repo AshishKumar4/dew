@@ -29,7 +29,7 @@ READ_ONLY = "--xla_gpu_experimental_autotune_cache_mode=AUTOTUNE_CACHE_MODE_READ
 
 def keeping_picks() -> str:
     """This process's XLA flags without the cuda lane's deterministic-ops flag: a process keeps and
-    measures picks only without it (`dew.cache.keeps_picks`)."""
+    measures picks only without it (`dew._cache.keeps_picks`)."""
     return without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))
 
 
@@ -241,7 +241,7 @@ def assert_exits_cleanly(program: str) -> None:
 
 def dew_train(directory, environment: Mapping[str, str], *arguments: str) -> None:
     """`dew train *arguments` run from `directory` in `environment`, as a user types it; it must succeed."""
-    finished = subprocess.run([sys.executable, "-m", "dew.cli.main", "train", *arguments],
+    finished = subprocess.run([sys.executable, "-m", "dew._cli.main", "train", *arguments],
                               cwd=directory, env=environment, capture_output=True, text=True, timeout=900)
     assert finished.returncode == 0, f"--- stdout ---\n{finished.stdout}\n--- stderr ---\n{finished.stderr}"
 

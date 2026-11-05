@@ -21,7 +21,7 @@ from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 from recording import RecordingTracker
 
-from dew.cache import enable_compilation_cache
+from dew._cache import enable_compilation_cache
 from dew.data.dataset import Loader
 from dew.distributed.batches import shard_batch
 from dew.objectives.lm import LMObjective
