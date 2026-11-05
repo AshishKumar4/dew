@@ -41,7 +41,7 @@ import contextvars
 import dataclasses
 import math
 import types
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import jax
@@ -445,6 +445,19 @@ def manual_map[**Arguments, Result](local: Callable[Arguments, Result], in_specs
         return local
     return jax.shard_map(local, in_specs=in_specs, out_specs=out_specs, axis_names=manual,
                          check_vma=False)
+
+
+def on_shards(local: Callable, spec: jax.sharding.PartitionSpec, operands: Sequence[jax.Array | None],
+              whole: Collection[int] = (), out_specs=None):
+    """`local(*operands)` on each shard (`manual_map`), each operand placed by its role: as `spec` along its
+    leading dimensions (a token mask `[B, S]` beside activations `[B, S, D]`), whole on every shard where
+    its index is in `whole` (a weight or a conv's taps, whose gradient the transpose sums over the
+    shards), or absent (None); the outputs placed as `out_specs`, `spec` unless given (row 1923: one
+    builder of a kernel's per-shard specs from its operands' roles)."""
+    specs = tuple(None if operand is None else jax.sharding.PartitionSpec() if index in whole
+                  else jax.sharding.PartitionSpec(*spec[:operand.ndim])
+                  for index, operand in enumerate(operands))
+    return manual_map(local, specs, spec if out_specs is None else out_specs)(*operands)
 
 
 def grouped_heads(shape: tuple[int, ...], groups: int) -> tuple[MeshAxes, MeshAxes]:

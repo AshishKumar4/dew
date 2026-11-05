@@ -91,7 +91,7 @@ from ..precision import (
     rounded_to,
     two_product,
 )
-from ..sharding import automatic_axes, manual_map
+from ..sharding import automatic_axes, manual_map, on_shards
 from . import generation, tuning
 from .generation import INHERENT, device_generation
 from .selection import Kernel, Op, Requirement, select
@@ -282,15 +282,13 @@ def _placed(axes, operands, *, whole_last: bool) -> bool:
 
 def _per_shard(local, axes, operands, replicated):
     """`local(*operands)` as it runs: whole where no mesh axis splits, else on
-    each shard (`manual_map`), the operands placed as `axes` names and those
+    each shard (`on_shards`), the operands placed as `axes` names and those
     marked `replicated` (a norm's weight) whole on every shard, so the weight's
     gradient sums over the shards. Every output takes the first operand's place."""
     if not automatic_axes():
         return local(*operands)
-    spec = logical_spec(axes, operands[0].shape)
-    specs = tuple(None if operand is None else jax.sharding.PartitionSpec() if whole else spec
-                  for operand, whole in zip(operands, replicated, strict=True))
-    return manual_map(local, specs, spec)(*operands)
+    whole = {index for index, replicated in enumerate(replicated) if replicated}
+    return on_shards(local, logical_spec(axes, operands[0].shape), operands, whole)
 
 
 @dataclasses.dataclass(frozen=True)

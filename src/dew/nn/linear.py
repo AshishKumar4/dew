@@ -71,6 +71,7 @@ from .sharding import (
     constrain,
     grouped_heads,
     manual_map,
+    on_shards,
     rows_like,
     seen_whole,
     sequence_shards,
@@ -123,7 +124,7 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
     and one backward (`short_conv`), which save only `x`; elsewhere, and for
     a conv they turn down (`short_conv.CONV`), `xla_conv1d`. On a mesh whose
     axes split only the rows of the conv's operands, as data and fsdp axes
-    do, each shard convolves its own rows (`manual_map`), so the kernels
+    do, each shard convolves its own rows (`on_shards`), so the kernels
     take an fsdp run's convs too; a mesh splitting the time or channel axis
     leaves the conv to XLA's partitioner.
     """
@@ -164,7 +165,7 @@ def _row_split(x) -> MeshAxes | None:
 
 
 def _per_row_shard(x, kernel, activation, bias, valid, segments, parts, dtype, rows: MeshAxes):
-    """`causal_conv1d` with each shard of `rows` convolving its own rows (`manual_map`); the taps and
+    """`causal_conv1d` with each shard of `rows` convolving its own rows (`on_shards`); the taps and
     bias are whole on every shard, and their gradients sum over the shards' rows."""
     row = P(rows, None, None)
     pieces = 1 if parts is None else len(tuple(parts))
@@ -173,10 +174,8 @@ def _per_row_shard(x, kernel, activation, bias, valid, segments, parts, dtype, r
         return causal_conv1d(x, kernel, activation, bias, valid=valid, segments=segments, parts=parts,
                              dtype=dtype)
 
-    tokens = [None if given is None else P(rows, None) for given in (valid, segments)]
-    in_specs = (row, P(), None if bias is None else P(), *tokens)
-    return manual_map(local, in_specs, row if parts is None else (row,) * pieces)(x, kernel, bias, valid,
-                                                                                 segments)
+    return on_shards(local, row, (x, kernel, bias, valid, segments), whole={1, 2},
+                     out_specs=row if parts is None else (row,) * pieces)
 
 
 def xla_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, segments=None,
@@ -373,17 +372,17 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
 
 
 def over_sequence(local, shards: int, tokens: tuple, whole: tuple):
-    """`local(*tokens, *whole)` in a `manual_map` that splits the rows and the sequence of each of `tokens`
-    (`[B, S, ...]` or None) as the rule table places a `[batch, length, ...]` activation, `whole` on every
-    shard, its output placed as the tokens are: a recurrent mixer's conv and scan over its shard's slice
-    of whole training sequences (`sequence_conv`), its projections and norms token by token outside with
-    GSPMD."""
+    """`local(*tokens, *whole)` on shards (`on_shards`) that split the rows and the sequence of each of
+    `tokens` (`[B, S, ...]` or None) as the rule table places a `[batch, length, ...]` activation, `whole`
+    on every shard, its output placed as the tokens are: a recurrent mixer's conv and scan over its
+    shard's slice of whole training sequences (`sequence_conv`), its projections and norms token by token
+    outside with GSPMD."""
     length = tokens[0].shape[1]
     if length % shards:
         raise LayoutRefused(f"the sequence of {length} tokens splits {shards} ways over the mesh's sequence "
                             f"axis, and it does not divide")
     spec = logical_spec(("activation_batch", "activation_length"), tokens[0].shape[:2])
-    return manual_map(local, (*(spec,) * len(tokens), *(P(),) * len(whole)), spec)(*tokens, *whole)
+    return on_shards(local, spec, (*tokens, *whole), whole=range(len(tokens), len(tokens) + len(whole)))
 
 
 def sequence_conv(mixed, taps, bias, segments, valid, *, parts=None, dtype=None):
