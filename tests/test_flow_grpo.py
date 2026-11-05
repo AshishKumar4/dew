@@ -1411,6 +1411,9 @@ class Branched:
             return jax.lax.cond(jnp.asarray(1) > 0, denoise.predict, denoise.predict, x, t)
         return Walk.stateless(lambda index: predict)
 
+    def modules(self):
+        return ()
+
 
 @pytest.mark.parametrize("guided", ["unguided", "unguided-over-a-guide", "autoguidance", "branched"])
 def test_a_watched_flow_step_summarizes_its_policys_own_first_call(guided):

@@ -38,6 +38,7 @@ __all__ = [
     "Kind",
     "Protected",
     "Surrogate",
+    "TangentKind",
     "bound_span",
     "declared_derivative",
     "declared_tangent",
@@ -87,13 +88,14 @@ def declared_derivative[Value](kind: Kind, primal: Callable[..., Value], forward
     return bound_span(kind, rule, static=nondiff_argnums)
 
 
-def declared_tangent[Value](kind: Kind, primal: Callable[..., Value], tangent: Callable, *,
+def declared_tangent[Value](kind: TangentKind, primal: Callable[..., Value], tangent: Callable, *,
                             nondiff_argnums: Sequence[int] = (),
                             symbolic_zeros: bool = False) -> Callable[..., Value]:
     """`primal` with a declared tangent rule (`tangent(primals, tangents)` returning the primal's value and
     its tangent, as `jax.custom_jvp.defjvp` takes it, which reverse mode transposes; with `symbolic_zeros`,
     an operand no tangent reaches is a `SymbolicZero` there, as `defjvp` gives it), one marked call of
-    `kind` (`bound_span`), as `declared_derivative` takes it."""
+    `kind` (`bound_span`), as `declared_derivative` takes it; a surrogate's tangent is `surrogate`'s, whose
+    rule reads the surrogate's own value, so a second order meets the rule again (`TangentKind`)."""
     rule = jax.custom_jvp(primal, nondiff_argnums=tuple(nondiff_argnums))
     rule.defjvp(tangent, symbolic_zeros=symbolic_zeros)
     return bound_span(kind, rule, static=nondiff_argnums)
@@ -156,6 +158,10 @@ class Algebra:
 
 type Kind = Protected | Surrogate | KernelGlue | Algebra
 """What a marked span is to the algebra pass, read as an object, never a name."""
+
+type TangentKind = Protected | KernelGlue | Algebra
+"""The kinds a tangent rule is declared as (`declared_tangent`): a surrogate's forward mode is `surrogate`'s
+alone, the one route whose rule reads the surrogate's own value."""
 
 marked_call_p = create_call_primitive("marked_call")
 """A marked span: a call of its body's jaxpr (`call_jaxpr`) under its `kind`, whose JVP, linearization,

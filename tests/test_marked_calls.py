@@ -14,9 +14,10 @@ from jax.sharding import Mesh, PartitionSpec
 from reference_error import equations
 
 from dew.nn import derivatives
-from dew.nn.derivatives import Algebra, KernelGlue, Protected, Surrogate, marked, marked_call_p
+from dew.nn.derivatives import KernelGlue, Protected, Surrogate, marked, marked_call_p
 
-KINDS = [Protected(), Surrogate(), KernelGlue(), Algebra()]
+KINDS = [kind() for kind in typing.get_args(derivatives.Kind.__value__)]
+"""Every kind a span is marked as, each through either builder (`derivatives.Kind`'s)."""
 
 
 def kinds_of(closed) -> list:
@@ -88,10 +89,6 @@ def _scaled_backward(scale: float):
     return primal, forward, backward
 
 
-KINDS = [kind() for kind in typing.get_args(derivatives.Kind.__value__)]
-"""Every kind a site declares its derivative as (`derivatives.Kind`'s), each through either builder."""
-
-
 @pytest.mark.parametrize("kind", KINDS, ids=lambda kind: type(kind).__name__)
 def test_a_declared_derivative_is_one_marked_call_and_differentiates_as_its_rule(kind):
     """A custom derivative declared with its kind (`declared_derivative`: no bare `jax.custom_vjp`) is one
@@ -127,11 +124,12 @@ def test_a_declared_derivative_is_one_marked_call_and_differentiates_as_its_rule
                                   np.asarray(jax.vmap(bare)(x[:, None], factor[:, None])))
 
 
-@pytest.mark.parametrize("kind", KINDS, ids=lambda kind: type(kind).__name__)
+@pytest.mark.parametrize("kind", [kind() for kind in typing.get_args(derivatives.TangentKind.__value__)],
+                         ids=lambda kind: type(kind).__name__)
 def test_a_declared_tangent_is_one_marked_call_and_differentiates_as_its_rule(kind):
-    """A tangent rule declared with its kind (`declared_tangent`: no bare `jax.custom_jvp`) is one marked
-    call of that kind, which forward mode and reverse mode (its tangent transposed) keep, each from the
-    declared tangent (doubled here, so a test sees it ran)."""
+    """A tangent rule declared with its kind (`declared_tangent`: no bare `jax.custom_jvp`; a surrogate's is
+    `surrogate`'s) is one marked call of that kind, which forward mode and reverse mode (its tangent
+    transposed) keep, each from the declared tangent (doubled here, so a test sees it ran)."""
     def primal(x):
         return jnp.sin(x)
 

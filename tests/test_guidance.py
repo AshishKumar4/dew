@@ -101,6 +101,50 @@ def test_apg_keeps_diffusers_projection_precision_on_raw_predictions(name):
     assert_as_exact(dew, recorded, draw, f"APG projection {name}", seeds=seeds, truth_fn=truth)
 
 
+@pytest.mark.parametrize("guidance, conditional, unconditional, guided, dtype", [
+    (CFG(0.5), 40000.0, -40000.0, 0.0, jnp.float16),
+    (CFG(0.0), 40000.0, -40000.0, -40000.0, jnp.float16),
+    (CFG(0.0), 40000.0, 0.001, 0.001, jnp.float16),
+    (APG(2.0), 1000.0, 0.0, 30.0, jnp.float16),
+    (APG(2.0 ** 124), [0.0] * 4, [-2.0 ** 127] * 4, -2.0 ** 123, jnp.float32),
+], ids=["cfg-half", "cfg-zero", "cfg-zero-apart", "apg-clipped", "apg-norm-past-float32"])
+def test_finite_predictions_guide_finitely(guidance, conditional, unconditional, guided, dtype):
+    """CFG and APG combine finite predictions whose guided result is finite without overflowing on the
+    way, each eager operation rounding as it goes (ledger 3944, 3945): CFG's fp16 40000 and -40000,
+    whose difference passes fp16's largest, guide to 0 at a scale of one half and to the unconditional
+    exactly at zero, as a small unconditional beside a large conditional does; APG clips an fp16
+    direction of 1000, whose square passes fp16's largest, to its threshold of 15, guiding 0 to 30 at a
+    scale of 2, and four float32 coordinates of 2**127, whose norm passes float32's largest, to 7.5 each,
+    guiding -2**127 to -2**123 at a scale of 2**124 (every step exact)."""
+    process = Process(FlowMatchingScheduler(), DirectPredictionTransform())
+
+    def row(value):
+        return jnp.asarray(value, dtype).reshape(1, -1)
+
+    denoise = process.denoiser(RawPrediction(), {}, {"prediction": row(conditional)},
+                               {"prediction": row(unconditional)})
+    walk = guidance.walk(denoise, 1)
+    x = jnp.zeros_like(row(conditional))
+    # At alpha=0 and sigma=1 DirectPredictionTransform's clean prediction is the raw one.
+    clean = np.asarray(walk.step(x, jnp.ones(1), 0, walk.init(x))[0][0])
+    np.testing.assert_array_equal(clean, np.full(clean.shape, guided, clean.dtype))
+
+
+def test_apg_momentum_carries_a_direction_past_half_precision():
+    """APG's running average of the direction keeps a finite fp16 walk's direction of 80000, past fp16's
+    largest, so the next step clips the averaged 120000 to the same 15 along it: both steps guide -40000 to
+    fp16's nearest of -39970, where an fp16 average turned infinite and the next step NaN (ledger 3945)."""
+    process = Process(FlowMatchingScheduler(), DirectPredictionTransform())
+    denoise = process.denoiser(RawPrediction(), {}, {"prediction": jnp.full((1, 1), 40000.0, jnp.float16)},
+                               {"prediction": jnp.full((1, 1), -40000.0, jnp.float16)})
+    walk = APG(2.0, momentum=0.5).walk(denoise, 2)
+    x = jnp.zeros((1, 1), jnp.float16)
+    state = walk.init(x)
+    for index in range(2):
+        (clean, _), state = walk.step(x, jnp.ones(1), index, state)
+        np.testing.assert_array_equal(np.asarray(clean), np.full((1, 1), -39970.0, np.float16))
+
+
 class Strength(nn.Module):
     """EDM's closed-form D(x; sigma) at a strength, as the reference's main
     network and its weaker guide."""

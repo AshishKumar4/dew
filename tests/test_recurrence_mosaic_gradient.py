@@ -33,9 +33,10 @@ from test_recurrence_mosaic import (
 
 from dew.nn.backbones.decoder_block import RematPolicy
 from dew.nn.kernels import generation, recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk, mosaic_rule, recomputing
+from dew.nn.kernels.recurrence_chunk import Chunk, recomputing
 from dew.nn.kernels.templates import bundles
 from dew.nn.kernels.templates.recurrence import mainloop, template
+from dew.nn.kernels.templates.recurrence.template import mosaic_rule
 from dew.nn.mixer_base import DELTA_RULE_RESIDUALS
 
 pytestmark = pytest.mark.kernel

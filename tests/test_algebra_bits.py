@@ -152,11 +152,37 @@ def test_a_transform_kept_off_the_fma_pipe_takes_its_shifts_on_the_alu():
     assert form.price == (len(form.steps), len(form.steps))
 
 
-def test_a_forms_traced_decode_is_its_decode():
-    """The NVFP4 decode's form traced in JAX's integer operations (`BitForm.traced`, a kernel's portable
-    path and its interpreter's) gives every register of every drawn stored word as the form's own decode
-    does, under a jit."""
-    form = _nvfp4_form()
+def _nibbles(units=frozenset(bits.Unit)) -> bits.BitTransform:
+    """A fixed 16-bit layout's transform, each byte's high nibble moved to its low one, its form issued on
+    `units`."""
+    placement = {4 + 8 * byte + bit: (0, 8 * byte + bit) for byte in range(2) for bit in range(4)}
+    return dataclasses.replace(
+        bits.BitTransform.placed("high-nibbles", 16, (0x0F0F,), placement, free=False), units=units)
+
+
+ALU = frozenset({bits.Unit.ALU})
+FORMS = {
+    "nvfp4": _nvfp4_form,
+    "nvfp4-alu": lambda: bits.synthesized(dataclasses.replace(_nvfp4(), units=ALU), reach=6),
+    "nibbles": lambda: bits.synthesized(_nibbles()),
+    "nibbles-alu": lambda: bits.synthesized(_nibbles(ALU)),
+}
+"""Forms whose steps together take every instruction a form's PTX writes (`BitForm.ptx`): a rotation, left
+and right shifts on either pipe, and a mask of one value and of two values' XOR."""
+
+
+def test_the_forms_take_every_instruction_the_ptx_writes():
+    """`FORMS` reach every (instruction, pipe) PTX writes, so the tests below run each of them."""
+    taken = {(step.op, step.unit) for form in FORMS.values() for step in form().steps}
+    assert taken == set(bits._PTX)
+
+
+@pytest.mark.parametrize("name", FORMS)
+def test_a_forms_traced_decode_is_its_decode(name):
+    """A form traced in JAX's integer operations (`BitForm.traced`, a kernel's portable path and its
+    interpreter's) gives every register of every drawn stored word as the form's own decode does, under a
+    jit."""
+    form = FORMS[name]()
     words = np.random.default_rng(3733).integers(0, 1 << 32, size=4096, dtype=np.uint64)
     traced = jax.jit(form.traced)(jnp.asarray(words.astype(np.uint32)))
     for got, expected in zip(traced, form.decoded(words), strict=True):
@@ -188,22 +214,24 @@ def _inline_decode(form: bits.BitForm):
     return decode
 
 
+@pytest.mark.parametrize("name", FORMS)
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
-def test_a_forms_ptx_compiles_for_the_gpu(generation):
-    """The NVFP4 decode's PTX in a Triton kernel's inline assembly, lowered and compiled by XLA for a
-    compile-only GPU of `generation` (`tests/kernel_compile.py`): ptxas takes every instruction of it, each
-    shift on its pipe's (SHF, or IMAD by a power of two) and each register a LOP3."""
+def test_a_forms_ptx_compiles_for_the_gpu(generation, name):
+    """A form's PTX in a Triton kernel's inline assembly, lowered and compiled by XLA for a compile-only GPU
+    of `generation` (`tests/kernel_compile.py`): ptxas takes every instruction PTX writes for a form
+    (`FORMS` take them all)."""
     from kernel_compile import lowered_for
 
     words = jax.ShapeDtypeStruct((1024,), jnp.uint32)
-    lowered_for(_inline_decode(_nvfp4_form()), (words,), generation).compile()
+    lowered_for(_inline_decode(FORMS[name]()), (words,), generation).compile()
 
 
 @pytest.mark.gpu(reason="runs a form's PTX on this host's GPU")
-def test_a_forms_ptx_decodes_on_the_gpu_as_its_form_does():
-    """The NVFP4 decode's PTX run on the GPU (`BitForm.ptx` in a Triton kernel's inline assembly) gives
-    every register of every drawn stored word as the form's own decode does."""
-    form = _nvfp4_form()
+@pytest.mark.parametrize("name", FORMS)
+def test_a_forms_ptx_decodes_on_the_gpu_as_its_form_does(name):
+    """A form's PTX run on the GPU (`BitForm.ptx` in a Triton kernel's inline assembly) gives every register
+    of every drawn stored word as the form's own decode does, each instruction PTX writes among them."""
+    form = FORMS[name]()
     words = np.random.default_rng(3734).integers(0, 1 << 32, size=1 << 16, dtype=np.uint64)
     decoded = jax.jit(_inline_decode(form))(jnp.asarray(words.astype(np.uint32)))
     for got, expected in zip(decoded, form.decoded(words), strict=True):
