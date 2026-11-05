@@ -683,6 +683,49 @@ def _captured(states: Variables, resident: Slots, carried: Slots, slots: jax.Arr
     return jax.tree.map(captured, states, cache, is_leaf=lambda x: x is None)
 
 
+def _pooled(cache: Variables) -> Variables:
+    """The paged pool's leaves of `cache` (`POOLED`), `[heads, pages, page_size, ...]`, None elsewhere."""
+    return jax.tree_util.tree_map_with_path(lambda path, leaf: leaf if leaf_name(path) in POOLED else None,
+                                            cache)
+
+
+def _read_pages(resident: Slots, carried: Slots, pages: jax.Array) -> Variables:
+    """The pool's `pages`, each leaf's `[heads, len(pages), page_size, ...]`, None off the pool."""
+    return jax.tree.map(lambda leaf: None if leaf is None else jnp.take(leaf, pages, axis=1),
+                        _pooled(joined(resident, carried).decoder.cache), is_leaf=lambda x: x is None)
+
+
+def page_shapes(resident: Slots, carried: Slots, count: int) -> Variables:
+    """The shapes `count` of the pool's pages take as `_read_pages` reads them."""
+    return jax.eval_shape(_read_pages, resident, carried, jax.ShapeDtypeStruct((count,), jnp.int32))
+
+
+def _written_pages(resident: Slots, carried: Slots, pages: jax.Array, held: Variables) -> tuple[Slots, Slots]:
+    """The state with the pool's `pages`, `[groups, count]`, each group's own, set to `held`'s, each leaf
+    `[groups, heads, count, ...]`, a group's pages in its row; a page past the pool is dropped."""
+    state = joined(resident, carried)
+
+    def written(leaf, values):
+        if values is None:
+            return leaf
+        flat = jnp.moveaxis(values, 0, 1).reshape(values.shape[1], -1, *values.shape[3:])
+        return leaf.at[:, pages.reshape(-1)].set(flat.astype(leaf.dtype), mode="drop")
+
+    cache = jax.tree.map(written, state.decoder.cache, held, is_leaf=lambda x: x is None)
+    return split_donated(dataclasses.replace(state, decoder=dataclasses.replace(state.decoder, cache=cache)))
+
+
+def page_programs(formats: Formats, rows: NamedSharding | None) -> tuple[OuterProgram, OuterProgram]:
+    """The programs that move a paged pool's pages between the resident state, kept in `formats`, and the
+    host (`dew.inference.pages.Transfers`): reading pages out, and writing pages in, the pages handed in a
+    row per group placed as the server's admitted rows are (`rows`), the resident matrices donated. JAX
+    writes no slice into an array in host memory, so the host keeps the pages it reads."""
+    resident, carried = split_donated(formats)
+    return (outer_program(_read_pages, in_shardings=(resident, carried, None)),
+            outer_program(_written_pages, donate_argnums=(0,), in_shardings=(resident, carried, None, rows),
+                          out_shardings=(resident, carried)))
+
+
 def state_programs(formats: Formats, states: Variables) -> tuple[OuterProgram, OuterProgram]:
     """The programs that move row states between the resident state, kept in `formats`, and a store of
     them placed as `states` is: restoring a store's entries into slots, the resident matrices donated, and

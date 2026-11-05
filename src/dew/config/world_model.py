@@ -2,7 +2,7 @@
 dynamics over the frozen tokenizer's latents.
 
 Both stages read a clip's `video` from the run's data, so both are runs over data, not over an environment
-(`dew.objectives.rl.config`). The tokenizer's stage (`TokenizerObjective`) trains `CausalTokenizer`. The
+(`dew.config.env`). The tokenizer's stage (`TokenizerObjective`) trains `CausalTokenizer`. The
 dynamics' stage (`WorldModelObjective`) trains `Dynamics` over a tokenizer that no field of the record can
 hold as a value: its weights are the saved tokenizer run's, read at the step the record pins
 (`TokenizerConfig`), as an environment run reads its teacher's.

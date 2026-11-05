@@ -1,4 +1,4 @@
-"""Environment runs built from their records (`dew.objectives.rl.config.EnvRunConfig`): an agent trained in
+"""Environment runs built from their records (`dew.config.env.EnvRunConfig`): an agent trained in
 the gate race as the same run composed in Python trains, its record read back training it again, a teacher
 saved as a run labelling and demonstrating the steps its own policy would, stages chained from the run before
 them, a resume ending where the run that never stopped ends, and each setup the kind refuses."""
@@ -16,8 +16,8 @@ from recording import bits
 from test_env_rollout import evaluation_key
 
 from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
+from dew.config.env import EnvConfig, EnvRunConfig, EpisodesConfig, RolloutConfig, TeacherConfig
 from dew.nn.kernels import generation
-from dew.objectives.rl.config import EnvConfig, EnvRunConfig, EpisodesConfig, RolloutConfig, TeacherConfig
 from dew.objectives.rl.control import ActorCritic, ControlPPOObjective, ControlRollout
 from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, WorldModel
 from dew.objectives.rl.tssm import TSSM
@@ -251,26 +251,26 @@ def test_a_pretraining_stage_from_its_record_learns_from_its_saved_teacher_as_co
     assert_bitwise(prepared.objective.variables, pretrained.variables)
 
 
-def test_a_dagger_stage_from_its_record_imitates_its_saved_teachers_labels_as_composed_in_python(tmp_path):
-    """A teacher trained as an environment run, then a student's DAgger stage built from its record, the
-    student flying and the teacher labelling each step with its greedy action, which the student imitates:
-    it trains, every leaf of its state and of its replay bit for bit, as the stage composed in Python does
-    with the teacher's own policy and weights, its labels the teacher's, not the actions flown."""
+def test_a_dagger_stage_from_its_record_labels_its_flights_with_its_saved_teachers_actions(tmp_path):
+    """A teacher trained as an environment run, then a student's DAgger stage built from its record: the
+    student flies, the teacher read from its saved run labels each step with its greedy action, and the
+    stage's replay holds those labels beside the actions flown, which they differ from, its labeller the
+    saved teacher's weights bit for bit. The labelling composed in Python is test_aggregation's; this
+    stage's record wires it to the saved teacher."""
     teacher = teacher_run(tmp_path).prepare().train("teacher")
     dagger = student(tmp_path, 2, teacher=TeacherConfig(str(tmp_path / "teacher")),
                      objective=ObjectiveConfig(DREAMER_V3, {"imitation": 1.0, "imitates": LABEL}))
     prepared = dagger.prepare()
-    state = prepared.train("dagger")
-    objective = DreamerV3Objective(world_model(), imitation=1.0, imitates=LABEL)
-    rollout = DreamerRollout(objective, Batched(FlightEnv(racing(), VIEWS), 8), capacity=64, batch=8,
-                             length=8, train_ratio=16.0, prefill=8,
-                             teacher=Teacher(teacher_policy().greedy, teacher.variables))
-    assert_bitwise(state, fitted(dagger, objective, rollout, 2))
+    assert prepared.run.teacher is not None and prepared.run.teacher.step == 2
+    assert int(prepared.train("dagger").step) == 2
     assert isinstance(prepared.rollout, DreamerRollout)
     labelled = jax.device_get(prepared.rollout.held_replay)
-    assert_bitwise(labelled, rollout.held_replay)
     filled = int(labelled.filled)
-    assert not np.array_equal(labelled.held[LABEL][:filled], labelled.held["action"][:filled])
+    assert filled and not np.array_equal(labelled.held[LABEL][:filled], labelled.held["action"][:filled])
+    # The labeller is the saved teacher: its weights, bit for bit.
+    labeller = prepared.rollout.teacher
+    assert labeller is not None
+    assert_bitwise(labeller.variables, teacher.variables)
 
 
 @pytest.mark.parametrize("agent", ["ppo", "dreamer"])

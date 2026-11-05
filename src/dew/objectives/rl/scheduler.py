@@ -676,6 +676,10 @@ class RolloutScheduler:
 
         from .sources import PromptSource
 
+        if jax.process_count() > 1:
+            raise ValueError("a served rollout's engine steps one process's server, and a run over several "
+                             "processes places its policy over all of them; draw each step's own completions "
+                             "(no --rollout.served)")
         drawing = objective.sampled(Sampling() if sampling is None else sampling)
         width = objective.seq_len + 1
 
@@ -1002,12 +1006,10 @@ class RolloutScheduler:
         each first reader's rollouts repacked with each call's penalty (`reference_penalties`), which
         its share's later readers take from it. `rollouts` is None on a later reader."""
         assert self.reference is not None
-        from dew.training.transaction import with_ema
-
-        frozen = with_ema(state.variables, state.ema)
-        if frozen is None:
+        if state.ema is None:
             raise ValueError("the rewards' reference penalty reads the frozen starting policy, and the "
                              "state holds none; build it from the objective that names the penalty")
+        frozen = state.averaged
         # At the progress the proximal column is read at, so the penalty is nil where the weights are alike.
         reference = scored_rows(self.reference, frozen, packed, Progress(state.updates))
         shaping = (None if rollouts is None else

@@ -1529,7 +1529,7 @@ schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {
 runs: Aliases[Callable[..., Any], Any] = Aliases("run", {
     "decision": "dew.decision.config:DecisionRunConfig",
     "diffusion": "dew.config.diffusion:DiffusionRunConfig",
-    "env": "dew.objectives.rl.config:EnvRunConfig",
+    "env": "dew.config.env:EnvRunConfig",
     "jepa": "dew.config.jepa:JepaRunConfig",
     "lm": "dew.config.lm:LMRunConfig",
     "world_model": "dew.config.world_model:WorldModelRunConfig",
@@ -1544,12 +1544,12 @@ envs: Aliases[type | Callable[..., Configured], Any] = Aliases("env", {
     "playground": "dew.rl.playground:Playground.load",
     "skydreamer": "dew.rl.skydreamer:SkyDreamerRace",
 }, base="dew.rl.env:Env")
-"""The environments an environment run names (`dew.objectives.rl.config.EnvConfig`): a JAX `Env` class, a
+"""The environments an environment run names (`dew.config.env.EnvConfig`): a JAX `Env` class, a
 host `Simulator` class, or a function or classmethod that returns one; any other by its import path."""
 rollouts: Aliases[type[DreamerRollout] | type[ControlRollout], DreamerRollout | ControlRollout] = Aliases(
     "rollout", {"control": "dew.objectives.rl.control:ControlRollout",
                 "dreamer": "dew.objectives.rl.dreamer:DreamerRollout"})
-"""The rollouts an environment run collects its batches with (`dew.objectives.rl.config.RolloutConfig`)."""
+"""The rollouts an environment run collects its batches with (`dew.config.env.RolloutConfig`)."""
 
 
 KINDS: tuple[Aliases, ...] = (models, presets, solvers, encoders, metrics, objectives, mixers, towers,
