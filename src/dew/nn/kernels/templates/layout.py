@@ -8,9 +8,8 @@ from typing import Any
 
 import jax
 import jax.extend.core as jax_core
-from jax.interpreters import ad
 
-from dew.nn.programs import CALLS
+from dew.nn.programs import CALLS, jax_name
 
 
 class Untransposable(NotImplementedError):
@@ -192,19 +191,6 @@ def _tiles_in(closed) -> bool:
             or literal_tiles(closed.jaxpr))
 
 
-_JAX_OWN = {primitive: primitive.name for attribute, primitive in vars(jax.lax).items()
-            if attribute.endswith("_p") and isinstance(primitive, jax_core.Primitive)} | {
-    ad.add_jaxvals_p: ad.add_jaxvals_p.name}
-"""JAX's own operations by their objects: `jax.lax`'s, and the sum JAX's derivatives add with (`add_any`)."""
-
-
-def jax_name(primitive) -> str | None:
-    """`primitive`'s name where it is JAX's own operation (`_JAX_OWN`), None for any other: a primitive
-    of another library or of a user's takes any name, whatever it computes, so a reader that knows an
-    operation by its name knows it by its object."""
-    return _JAX_OWN.get(primitive)
-
-
 def entrywise(eqn) -> bool:
     """Whether `eqn` acts one entry at a time: one of `ENTRYWISE`, or a scalar's broadcast. The one test of
     an equation's kind its readers share, each with its own of the shapes it reads (`_axis_free`, the
@@ -276,13 +262,14 @@ def _run(jaxpr: jax_core.Jaxpr, consts, operands) -> list:
         if any(_rank(var) > 2 for var in (*eqn.invars, *eqn.outvars)):
             raise Untransposable(f"{eqn.primitive.name} of a value past a tile's two axes")
         operands_of = [read(var) for var in eqn.invars]
-        name = eqn.primitive.name
+        # A call by its name, which runs the program it holds; any other by its object (`jax_name`).
+        name = eqn.primitive.name if eqn.primitive.name in CALLS else jax_name(eqn.primitive)
         if name in RULES:
             out = RULES[name](eqn, *operands_of, **eqn.params)
-        elif name in ENTRYWISE:
+        elif entrywise(eqn):
             out = eqn.primitive.bind(*operands_of, **eqn.primitive.get_bind_params(eqn.params))
         else:
-            raise Untransposable(f"{name}, which no layout rule takes")
+            raise Untransposable(f"{eqn.primitive.name}, which no layout rule takes")
         values.update(zip(eqn.outvars, out if eqn.primitive.multiple_results else [out], strict=True))
     return [read(var) for var in jaxpr.outvars]
 
