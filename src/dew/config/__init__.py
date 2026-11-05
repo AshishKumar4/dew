@@ -852,9 +852,20 @@ def _closed(tracker, checkpoints: Checkpoints | None, primary: BaseException | N
     own failure is the one a caller wants; without one, the first failure is
     raised with the others noted on it.
     """
-    closes = [*([] if rollout is None else [("closing the rollout", rollout.close)]),
-              *([] if tracker is None else
-                [("closing the tracker", functools.partial(tracker.__exit__, type(primary), primary, None))])]
+    def labelled(label: str, close: Callable[[], object]) -> tuple[str, Callable[[], None]]:
+        """`close` under `label`, which a failure of it carries, whichever close fails first."""
+        def closing() -> None:
+            try:
+                close()
+            except BaseException as failure:
+                failure.add_note(f"{label} failed")
+                raise
+
+        return label, closing
+
+    closes = [*([] if rollout is None else [labelled("closing the rollout", rollout.close)]),
+              *([] if tracker is None else [labelled("closing the tracker", functools.partial(
+                  tracker.__exit__, type(primary), primary, None))])]
     error = None
     try:
         attempted(closes)
@@ -862,12 +873,12 @@ def _closed(tracker, checkpoints: Checkpoints | None, primary: BaseException | N
         error = failure
     failed = None
     try:
-        agree_process_phase(error, phase="tracker close")
+        agree_process_phase(error, phase="run close")
     except BaseException as failure:
         if primary is None:
             failed = failure
         else:
-            primary.add_note(f"Tracker close failed: {failure!r}")
+            primary.add_note(f"Closing the run failed: {failure!r}")
     raised = primary if primary is not None else failed
     if checkpoints is not None:
         checkpoints.__exit__(None if raised is None else type(raised), raised, None)
