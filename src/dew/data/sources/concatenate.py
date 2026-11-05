@@ -17,7 +17,6 @@ from dew.data.sources.base import (
     Read,
     Shard,
     ShardManifest,
-    ShardRows,
     Source,
     _consumed,
     stated,
@@ -116,6 +115,6 @@ class Concatenate(Dataset):
                                    for identifier, (_, shard) in self._shards.items()), self._reader,
                              index_ordered=ordered)
 
-    def _reader(self, shard: Shard) -> ShardRows:
+    def _reader(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
         manifest, original = self._shards[shard.id]
-        return manifest.reader(original)
+        return manifest.reader(original, options)

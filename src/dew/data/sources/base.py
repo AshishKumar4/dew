@@ -101,17 +101,20 @@ def _uncounted(metadata: Mapping[str, object]) -> Mapping[str, object]:
     return {name: value for name, value in metadata.items() if name not in _COUNTS}
 
 
-type ShardRows = pygrain.MapDataset | pygrain.IterDataset
-"""A shard's records as its reader gives them (`ShardManifest.reader`): read by index, or streamed."""
+class ShardReader(Protocol):
+    """Opens a shard (`ShardManifest.reader`): its records in order, read under the grain `ReadOptions` its
+    reading gives (`dew.data.shards`: the run's loading, or a mix member's share of it), Grain's own where
+    it gives none."""
+
+    def __call__(self, shard: Shard, options: pygrain.ReadOptions | None = None) -> pygrain.IterDataset: ...
 
 
 @dataclasses.dataclass(frozen=True)
 class ShardManifest:
     """A streamed source's shards, in canonical order, and the reader that
-    opens one: a picklable function returning the shard's records in order, a
-    grain `MapDataset` where they are read by index, which the reading streams
-    under its own loading (`dew.data.shards.iterated`), else a checkpointable
-    `IterDataset`.
+    opens one: a picklable function of a shard and the grain `ReadOptions` its
+    reading reads it under (None for Grain's own), returning a checkpointable
+    grain `IterDataset` over the shard's records in order.
 
     When physical shards cannot fill the readers and workers, `subdivide`
     receives the needed count and returns exactly that many `Shard`s, each
@@ -123,7 +126,7 @@ class ShardManifest:
     (`_indexed_manifest`)."""
 
     shards: tuple[Shard, ...]
-    reader: Callable[[Shard], ShardRows]
+    reader: ShardReader
     subdivide: Callable[[int], tuple[Shard, ...]] | None = None
     index_ordered: bool = False
 
@@ -291,7 +294,7 @@ def materialized(source: Source) -> TypeGuard[Materialized]:
 
 
 def _indexed_manifest(source: Source, uri: str, rows: int,
-                      reader: Callable[[Shard], ShardRows] | None = None) -> ShardManifest:
+                      reader: ShardReader | None = None) -> ShardManifest:
     """The records `source` reads by index as a stream: consecutive ranges of
     at most `rows` records, each `Shard` named by the record it starts at,
     which no copy of the source names otherwise, wherever it is, and read at
@@ -316,10 +319,11 @@ class _IndexedSlice:
 
     source: Source
 
-    def __call__(self, shard: Shard) -> pygrain.MapDataset:
+    def __call__(self, shard: Shard, options: pygrain.ReadOptions | None = None) -> pygrain.IterDataset:
         import grain.python as pygrain
 
-        return pygrain.MapDataset.source(self.source.records("indexed"))[shard.start : shard.stop]
+        records = pygrain.MapDataset.source(self.source.records("indexed"))
+        return records[shard.start : shard.stop].to_iter_dataset(options)
 
 
 __all__ = ["READS", "Consumed", "Read", "Shard", "ShardManifest", "Source"]

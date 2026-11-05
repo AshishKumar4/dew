@@ -77,10 +77,11 @@ class Shared[V](Mapping[str, V]):
         return self
 
     def __deepcopy__(self, memo: dict) -> Shared[V]:
-        """Itself: neither it nor the positions it holds are written once held, each a snapshot of its own,
-        so a copy of it holds them as it does. Grain's prefetch copies a read's position deep for each
-        element it reads ahead (`ThreadPrefetchDatasetIterator`), which, member by member, cost an element
-        a mixture's size (row 4079)."""
+        """Itself: neither it nor the positions it holds are written once held, each a snapshot of its own
+        (a mix's captured positions copied as they are captured, `dew.data.mixing._Captured`, its counts
+        made afresh), so a copy of it holds them as it does. Grain's prefetch copies a read's position
+        deep for each element it reads ahead (`ThreadPrefetchDatasetIterator`), which, member by member,
+        cost an element a mixture's size (row 4079)."""
         return self
 
 

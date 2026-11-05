@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import functools
 import itertools
@@ -927,7 +928,10 @@ class _Captured:
         self._moved = set(self._reads)
 
     def captured(self) -> Shared[Mapping[str, object]]:
-        changed = {key: self._reads[key].get_state() for key in self._moved}
+        # Each moved corpus's position copied whole as it is captured, a snapshot no read of it moves on
+        # (Grain's iterators may hand back what they keep), which the shared mapping holds as it is, and a
+        # copy of it with it (`Shared.__deepcopy__`).
+        changed = {key: copy.deepcopy(self._reads[key].get_state()) for key in self._moved}
         self._held = Shared.of(changed) if self._held is None else self._held.replaced(changed)
         self._moved.clear()
         return self._held
