@@ -852,20 +852,9 @@ def _closed(tracker, checkpoints: Checkpoints | None, primary: BaseException | N
     own failure is the one a caller wants; without one, the first failure is
     raised with the others noted on it.
     """
-    def labelled(label: str, close: Callable[[], bool | None]) -> tuple[str, Callable[[], None]]:
-        """`close` under `label`, which a failure of it carries, whichever close fails first."""
-        def closing() -> None:
-            try:
-                close()
-            except BaseException as failure:
-                failure.add_note(f"{label} failed")
-                raise
-
-        return label, closing
-
-    closes = [*([] if rollout is None else [labelled("closing the rollout", rollout.close)]),
-              *([] if tracker is None else [labelled("closing the tracker", functools.partial(
-                  tracker.__exit__, type(primary), primary, None))])]
+    closes = [*([] if rollout is None else [("closing the rollout", rollout.close)]),
+              *([] if tracker is None else
+                [("closing the tracker", functools.partial(tracker.__exit__, type(primary), primary, None))])]
     error = None
     try:
         attempted(closes)

@@ -21,8 +21,8 @@ SETTLE_SECONDS = 10.0
 def attempted(steps: Sequence[tuple[str, Callable[[], None]]], *,
               primary: BaseException | None = None) -> None:
     """Run every step, even after one fails. Each failure is noted on `primary`, the error its
-    caller is already raising, which stays the one raised; without one the first failure is raised
-    with the later ones noted on it."""
+    caller is already raising, which stays the one raised; without one the first failure is raised,
+    noted with its own step, with the later ones noted on it."""
     error = primary
     for label, step in steps:
         try:
@@ -30,6 +30,7 @@ def attempted(steps: Sequence[tuple[str, Callable[[], None]]], *,
         except BaseException as failure:
             if error is None:
                 error = failure
+                error.add_note(f"{label} failed")
             else:
                 error.add_note(f"{label} failed: {failure!r}")
     if primary is None and error is not None:
