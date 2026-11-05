@@ -164,9 +164,11 @@ class Multiprocessor:
     (`shared_bytes_per_clock`), the base-2 exponentials its special-function units return a clock
     (`exponentials_per_clock`), and the range its warpgroups' `setmaxnreg` moves a thread's registers in
     (`register_raises`, None before Hopper). The defaults are the facts every CUDA compute capability from 7.5
-    to 12.x shares (CUDA C++ Programming Guide §5.1, Tables 33 and 34; its "Arithmetic Instructions"
-    throughput table; 128 bytes a clock measured 126 to 128 on an A100 and an H800, Luo et al. 2025,
-    "Dissecting the NVIDIA Hopper Architecture through Microbenchmarking", Table 3) and setmaxnreg's range,
+    to 12.x shares (CUDA C++ Programming Guide §5.1, Tables 33 and 34; the exponentials the CUDA C++ Best
+    Practices Guide 13's §12.1.1 Table 5, `lg2.approx.f32`'s row, where CUDA 13 moved the throughput table,
+    15.97 measured on an H200, the kernel challenge's MUFU.EX2; 128 bytes a clock measured 126 to 128 on an
+    A100 and an H800, Luo et al. 2025, "Dissecting the NVIDIA Hopper Architecture through Microbenchmarking",
+    Table 3) and setmaxnreg's range,
     which a target of no architecture (the CPU interpreting a launch) reads too, under which every family's
     launch interprets."""
 
@@ -535,7 +537,10 @@ TARGETS = {target.generation: target for target in (
               measured={'NVIDIA A100-SXM4-40GB': Measured(6.04e-6, 1.486e12, launch=2.11e-6, shared_cycles=29,
                                                           l2_cycles=208)}),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024,
-              {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}, multiprocessors=72,
+              # The RTX A6000's 154.8 TF dense (its datasheet's 309.7 with sparsity; the RTX PRO Blackwell
+              # architecture whitepaper's Table 4), a real one's other facts its driver's (`runtime_facts`).
+              {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12},
+               'NVIDIA RTX A6000': {'bf16': 154.8e12}}, multiprocessors=72,
               clock_hz=1695e6, memory_bandwidth=600e9),
     GpuTarget('sm89', 'NVIDIA L4', 99 * 1024,
               {'NVIDIA L4': {'bf16': 121e12, 'fp8': 242.5e12},
@@ -555,14 +560,17 @@ TARGETS = {target.generation: target for target in (
               # -gh200's, their launches and hand-offs FS-DEVICEFACTS4's; the H200's stream the same line
               # through the kernel challenge's best read at each size, 16.8 MB to 805 MB, cold L2 under graph
               # replay (judge-facts.md:3-18).
-              # The H100 PCIe's two rounds of tools/device_facts.py agreed to 1% (ET-DEVICEFACTS-h100pcie).
+              # The H100 PCIe's two rounds of tools/device_facts.py agreed to 1% (ET-DEVICEFACTS-h100pcie),
+              # its hand-off 0.695 us in both; its launch fit no line (negative slopes).
               # The GH100 die's shared-memory and near-L2 latencies an H800 PCIe's (Luo et al. 2025,
               # arXiv:2501.12084, Tables 3 and 4); the H200's the kernel challenge's calibration on the
-              # judge's H200 (h200-lean calibration/params.md: mbarrier 66, cluster arrive 67, LDS 39, L2
-              # 20 and 49, fence.acq_rel.gpu 71, the cp.async gather at two blocks a multiprocessor 59).
+              # judge's H200 (h200-lean calibration/params.md, lines 39, 49, 59, 66, 67 and 71: the shared
+              # load, the near L2 hit at 260 to 280, the cp.async gather at two blocks a multiprocessor, the
+              # mbarrier arrival in a block and across a cluster, the GPU-scope acquire-release fence).
               measured={'NVIDIA H100 80GB HBM3': Measured(1.87e-6, 3.190e12, launch=1.02e-6, handoff=0.78e-6,
                                                           shared_cycles=29, l2_cycles=258),
-                        'NVIDIA H100 PCIe': Measured(2.11e-6, 1.980e12, shared_cycles=29, l2_cycles=258),
+                        'NVIDIA H100 PCIe': Measured(2.11e-6, 1.980e12, handoff=0.695e-6, shared_cycles=29,
+                                                     l2_cycles=258),
                         'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6,
                                                        shared_cycles=29, l2_cycles=258),
                         'NVIDIA H200': Measured(2.81e-6, 4.617e12, barrier_cycles=65,
@@ -582,7 +590,10 @@ TARGETS = {target.generation: target for target in (
               clock_hz=1965e6, memory_bandwidth=8e12),
     GpuTarget('sm120', 'NVIDIA RTX PRO 6000 Blackwell Server Edition', 99 * 1024,
               dense_peaks={'NVIDIA RTX PRO 6000 Blackwell': {'bf16': 500e12, 'fp8': 1000e12}},
-              aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1792e9,
+              # The Server Edition's 1.597 TB/s (NVIDIA's RTX PRO 6000 Blackwell Server Edition page and
+              # datasheet); 1.792 TB/s is the Workstation part's (the RTX PRO Blackwell architecture
+              # whitepaper, p.12).
+              aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1597e9,
               step_seconds=3.68e-6),
     GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}),
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),

@@ -41,6 +41,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.nn import derivatives
 from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.options import program
 from dew.nn.kernels.templates.attention_algebra import power2
@@ -134,8 +135,7 @@ def _cumulated(g, documents=None, restarts=None):
     return hi, lo
 
 
-@jax.custom_jvp
-def decays(g, documents=None):
+def _decays(g, documents=None):
     """Cumulate per-chunk log decays and build the pairwise decay between positions.
 
     `g` is `[..., C, F]`: the C positions of a chunk and F decay channels. Returns the decay from the chunk's
@@ -340,7 +340,6 @@ def _ranged_transpose(decay, cotangent):
     return jnp.moveaxis(jnp.diagonal(after, axis1=-3, axis2=-2), -1, -2)
 
 
-@decays.defjvp
 def _decays_tangent(primals, tangents):
     """The pairs' own tangent, in forward and reverse mode alike: the decay's is each pair's range
     (`_ranged`), and its transpose sums only the pairs spanning a position (`_ranged_transpose`). On a tiny
@@ -355,6 +354,9 @@ def _decays_tangent(primals, tangents):
     grown, decay = decays(g, documents)
     return (grown, decay), (grown * _cumulated(dg, documents)[0],
                             linear_map(_ranged, _ranged_transpose, decay, dg))
+
+
+decays = derivatives.declared_tangent(derivatives.Protected(), _decays, _decays_tangent)
 
 
 def factor(a, issue: Issue = portable):
@@ -424,8 +426,7 @@ def _halved(summed: Callable[[slice], jax.Array], depth: int) -> jax.Array:
     return summed(slice(None, half)) + summed(slice(half, None))
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(0, 1))
-def _decayed_product(name: str, issue: Issue, left, right, decay):
+def _decayed_primal(name: str, issue: Issue, left, right, decay):
     """`(left @ right^T) * decay` of the pairs whose decay is nonzero, zero elsewhere (`paired`), its depth in
     two halves (`_halved`)."""
     return jnp.where(decay != 0, _product(name, issue, left, right) * decay, 0.0)
@@ -437,7 +438,6 @@ def _product(name: str, issue: Issue, left, right) -> jax.Array:
                    left.shape[-1])
 
 
-@_decayed_product.defjvp
 def _decayed_product_tangent(name: str, issue: Issue, primals, tangents):
     """The product's tangent with each term weighed by its pair's decay before they are summed: the terms'
     sum before the decay overflowed fp32 where the decayed tangent is finite (keys and queries near 2^63, the
@@ -449,6 +449,10 @@ def _decayed_product_tangent(name: str, issue: Issue, primals, tangents):
                + issue(name, left, jnp.swapaxes(d_right, -1, -2)) * decay + product * d_decay)
     kept = decay != 0
     return jnp.where(kept, product * decay, 0.0), jnp.where(kept, weighed, 0.0)
+
+
+_decayed_product = derivatives.declared_tangent(derivatives.Protected(), _decayed_primal,
+                                                  _decayed_product_tangent, nondiff_argnums=(0, 1))
 
 
 def intra(key, keyed, pairs, issue: Issue = portable):
@@ -512,8 +516,7 @@ def readout(query, entering, entered, key, pairs, corrected, issue: Issue = port
     return memory + local
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(2, 3))
-def remembered(decayed, entered, issue: Issue = portable, name: str = "memory"):
+def _remembered(decayed, entered, issue: Issue = portable, name: str = "memory"):
     """A chunk's tokens reading through their decays, `decayed @ entered` (the product `name`): the memory the
     chunk entered read through its decayed queries ('memory'), or its corrected values through its scores
     ('local'). The gradient in `entered` sums the chunk's tokens from its last (`_remembered_transpose`):
@@ -539,7 +542,6 @@ def readout_entered_gradient(decayed_query, weights, scores, cotangent, issue: I
     return memory - issue("corrected", jnp.swapaxes(weights, -1, -2), corrected)
 
 
-@remembered.defjvp
 def _remembered_tangent(issue, name, primals, tangents):
     """The product's tangent, its `entered` side linear in `entered` with the transpose
     `_remembered_transpose`, in forward and reverse mode alike."""
@@ -548,6 +550,10 @@ def _remembered_tangent(issue, name, primals, tangents):
     read = linear_map(lambda decayed, entered: issue(name, decayed, entered),
                       functools.partial(_remembered_transpose, issue=issue, name=name), decayed, d_entered)
     return remembered(decayed, entered, issue, name), issue(name, d_decayed, entered) + read
+
+
+remembered = derivatives.declared_tangent(derivatives.Protected(), _remembered, _remembered_tangent,
+                                          nondiff_argnums=(2, 3))
 
 
 class Span(NamedTuple):

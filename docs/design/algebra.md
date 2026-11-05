@@ -189,8 +189,11 @@ Each form is priced in time from the device facts Dew already owns, never from f
   `Architecture`.
 
 A region's seconds are computed once, from its composed terms over the chosen DAG (§6.5): bytes over bandwidth,
-FLOPs over the dtype's rate, collective bytes over the link, and the longest chain of dependent reductions as
-latency, combined as `templates.cost` combines a launch's. Prices are checked against measured profiles, not
+FLOPs over the dtype's rate, collective bytes over the link, each kernel XLA's fusion makes of it (a reduction's
+and a product's, each a fusion's root) at the part's measured fixed latency (its launch and first byte), and
+the longest chain of dependent reductions as latency, combined as `templates.cost` combines a launch's. Row
+4072's validation priced 1,580 profiled kernels: without a kernel's fixed latency an H100's XLA fusions came
+to 0.02 of their measured time, with it 0.51 (p10 0.40). Prices are checked against measured profiles, not
 fitted to them, and a rule set ships only with measured receipts.
 
 ## 2. Where it applies
