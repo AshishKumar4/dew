@@ -200,6 +200,14 @@ def derived_terms(loss: Callable, params, arguments: Sequence, *, platform: str,
             _peak(lowered, count, platform, workspace, consumed, deferred))
 
 
+def operand_key(value: jcore.Var | jcore.Literal) -> Hashable:
+    """An equation's operand as two equal equations read it: a variable itself, a literal by its type and
+    value (`parameter_key`)."""
+    if isinstance(value, jcore.Literal):
+        return ("literal", str(value.aval), parameter_key(value.val))
+    return value
+
+
 def deduplicated(program: jcore.Jaxpr) -> jcore.Jaxpr:
     """`program` with each equation that repeats an earlier one, its primitive and parameters over the
     same operands (`parameters_key`), read as that one, as XLA computes it once (`HloCSE`,
@@ -214,9 +222,8 @@ def deduplicated(program: jcore.Jaxpr) -> jcore.Jaxpr:
     for equation in program.eqns:
         operands = [renamed.get(value, value) if computed(value) else value for value in equation.invars]
         own = equation.effects or equation.primitive.name == "optimization_barrier"
-        key = None if own else (parameters_key(equation.primitive, equation.params), tuple(
-            value if computed(value) else ("literal", str(value.aval), parameter_key(value.val))
-            for value in operands))
+        key = None if own else (parameters_key(equation.primitive, equation.params),
+                                tuple(map(operand_key, operands)))
         if key is not None and key in first:
             renamed.update(zip(equation.outvars, first[key], strict=True))
             continue
@@ -282,12 +289,11 @@ def _peak(lowered: jcore.Jaxpr, count: int, platform: str, workspace: Workspace,
 
 def hoisted(program: jcore.Jaxpr) -> jcore.Jaxpr:
     """`program` with each output computed from literals alone run first, with the equations that compute
-    it, in their order, and each such constant computed once (equal equations over equal operands one,
-    the first's, `parameters_key`): a constant the program returns and no equation of its work reads,
-    which XLA computes once (`HloCSE`, xla/hlo/transforms/simplifiers/hlo_cse.cc) and schedules ahead of
-    that work, holding it to its reader past the program. The gradient of a parameter the loss reads none
-    of is such a constant, a broadcast zero JAX writes at the backward's end, which XLA made during the
-    forward, one a shape: Qwen3.5-4B's step at 4 x 2048 tokens under 'minimal_with_scan_and_conv',
+    it, in their order: a constant the program returns and no equation of its work reads, which XLA
+    schedules ahead of that work, holding it to its reader past the program, each one computed once
+    where equal ones repeat (`deduplicated`, which the derivation reads it through). The gradient of a
+    parameter the loss reads none of is such a constant, a broadcast zero JAX writes at the backward's
+    end, which XLA made during the forward, one a shape: Qwen3.5-4B's step at 4 x 2048 tokens under 'minimal_with_scan_and_conv',
     compiled for an H100, held one zero gradient of each of 25 shapes of its multi-token head's and its
     vision tower's 312, 0.48 GiB of 1.69, from step 2,480 of its schedule to the update at 15,091, its
     peak at 4,863 among them (row 4089, its buffer dump). A constant the work reads (a loop's zero
@@ -310,24 +316,8 @@ def hoisted(program: jcore.Jaxpr) -> jcore.Jaxpr:
         if any(out in returned or readers[out] for out in made) and all(
                 reader in early for out in made for reader in readers[out]):
             early.add(index)
-    # Equal constants are one, the first's.
-    renamed: dict[jcore.Var, jcore.Var] = {}
-    first: dict[Hashable, list] = {}
-    kept = []
-    for index in sorted(early):
-        equation = program.eqns[index]
-        operands = [renamed.get(value, value) if computed(value) else value for value in equation.invars]
-        key = (parameters_key(equation.primitive, equation.params),
-               tuple(value if computed(value) else ("literal", str(value.aval), parameter_key(value.val))
-                     for value in operands))
-        if key in first:
-            renamed.update(zip(equation.outvars, first[key], strict=True))
-            continue
-        first[key] = equation.outvars
-        kept.append(equation.replace(invars=operands))
-    rest = [program.eqns[index] for index in range(len(program.eqns)) if index not in early]
-    return program.replace(eqns=kept + rest, outvars=[renamed.get(value, value) if computed(value) else value
-                                                       for value in program.outvars])
+    ordered = sorted(range(len(program.eqns)), key=lambda index: index not in early)
+    return program.replace(eqns=[program.eqns[index] for index in ordered])
 
 
 def sunk(program: jcore.Jaxpr) -> jcore.Jaxpr:
