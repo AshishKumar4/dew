@@ -86,8 +86,9 @@ class Report:
     binary carries, or a field no report states, is no evidence the kernel is within its resources; and its
     `module`, its kernel hash, which two compiles of one module share: Mosaic compiles a module once a
     process, so a later compile of it prints no PTX of its own; the digest of the launch that traced it
-    (`launching`), which its name carried, or None; and ptxas's notes of a performance loss it fails for
-    (`ptxas_read`, `LOSSES`)."""
+    (`launching`), which its name carried, or None; ptxas's notes of a performance loss it fails for
+    (`ptxas_read`, `LOSSES`); and what its machine code breaks of the SASS rules (`report.sass_findings`,
+    read where nvdisasm is installed)."""
     kernel: str
     shared: int | None
     tmem: int | None
@@ -97,6 +98,7 @@ class Report:
     module: str | None = None
     launch: str | None = None
     losses: tuple[str, ...] = ()
+    sass: tuple[str, ...] = ()
 
     @property
     def traced(self) -> str:
@@ -113,6 +115,8 @@ class Report:
             return f"its reports state no {', '.join(self.unread)}"
         if self.losses:
             return "ptxas " + "; ".join(f"{LOSSES[code]} ({code})" for code in self.losses)
+        if self.sass:
+            return "its machine code holds " + "; ".join(self.sass)
         if (self.shared is not None and self.tmem is not None and self.shared <= shared_limit
                 and self.tmem <= tmem_limit and self.spilled == 0):
             return None
@@ -148,7 +152,8 @@ def reports(estimates: dict[str, str], binaries: list[report.Binary],
         found_reports.append(Report(
             kernel, binary.shared if binary is not None else None,
             sum(map(int, tmem.groups())) if tmem else None,
-            None, None, unread, (modules or {}).get(name), launch))
+            None, None, unread, (modules or {}).get(name), launch,
+            sass=tuple(binary.sass) if binary is not None else ()))
     return found_reports
 
 
@@ -300,7 +305,8 @@ def _compiled(case, generation: str, record: dict,
                 record["shared"] = asked
             return None
         if directory is not None:
-            record["binaries"] = [dataclasses.asdict(found) for found in report.binaries(executable)]
+            record["binaries"] = [dataclasses.asdict(found)
+                                  for found in report.binaries(executable, decoded=True)]
             write_modules("".join(printed), directory)
         return [path.read_text() for path in Path(dump).glob("*thunk_sequence.txt")], triton_kernels(lowered)
 
