@@ -910,6 +910,23 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
     assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
 
 
+def test_samples_of_one_prompt_prefill_it_once_and_each_draws_what_it_draws_alone():
+    """Four samples of one prompt submitted together to a paged server with a prefix cache: the first writes
+    the prompt's full pages and the other three wait one step and read them once written, as vLLM shares a
+    running prompt's blocks, so 3 x 16 of the 19 prompt tokens come from shared pages; each sample draws
+    under its own key what its lone call draws (ledger 1423)."""
+    bound = task(Sampling(temperature=1.0))
+    prompt, budget = "1234567812345678912", 6
+    alone = [bound(prompt, budget, key=index) for index in range(4)]
+    server = Server.from_task(bound, slots=4, capacity=128, admission=4,
+                              kv_cache=KVCache(page_size=4, pages=64), prefix_cache=True)
+    tickets = [server.submit(prompt, budget, key=index) for index in range(4)]
+    server.run()
+    assert server.prefix_hits == 3 * 16
+    for ticket, lone in zip(tickets, alone, strict=True):
+        assert_same_generation(ticket.result(), lone)
+
+
 @pytest.mark.parametrize("prefix_cache", [False, True], ids=["unshared", "prefix"])
 @pytest.mark.parametrize("fields", [{"position_embedding": "alibi"},
                                     {"layer_types": ("chunked_attention",),
@@ -979,6 +996,23 @@ def test_a_server_drafts_speculative_blocks_as_a_lone_call_does(temperature, dec
     server.step()
     with pytest.raises(ValueError):
         server.reload(params)
+
+
+@pytest.mark.distributed
+def test_a_server_over_a_pool_draws_what_each_request_draws_alone(tmp_path):
+    """One server over a mesh that spans two processes, each seating and reading its own groups of rows and
+    the pool stepping it together, each step's admission agreed: every process's requests draw what one
+    process serving them all draws (ledger 1423)."""
+    from pathlib import Path
+
+    from process_support import run_pool, run_worker
+
+    worker = Path(__file__).with_name("serving_worker.py")
+    reports = run_pool("pooled_server", tmp_path / "pool", 2, script=worker, devices=2, fsdp_size=4,
+                       timeout=300)
+    single = run_worker("pooled_server", tmp_path / "single.json", script=worker, fsdp_size=1, devices=1)
+    assert reports[0]["tokens"] + reports[1]["tokens"] == single["tokens"]
+    assert reports[0]["lengths"] + reports[1]["lengths"] == single["lengths"]
 
 
 @pytest.mark.mesh(devices=4)
