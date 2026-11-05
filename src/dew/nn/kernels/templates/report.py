@@ -250,6 +250,18 @@ def traced(digest: str) -> Launch | None:
     return _LAUNCHES.get(digest)
 
 
+def derivation_inputs(op, arguments: tokamax.BoundArguments, target) -> Hashable:
+    """What a launch's derivation of its config for `arguments` on `target` reads of the launch and its
+    compiles: the launch's identity (`_identity`: the op, its arguments' shapes and dtypes, its hooks), the
+    whole target, whose facts price its schedules, and each config this context's compiles refused it
+    (`refused`), so a refusal recorded after a derivation derives it again."""
+    identity = _identity(op, arguments)
+    with _GUARD:
+        refusals = frozenset((config, kernels) for (launch, config), kernels in _registry().refused.items()
+                             if launch == identity)
+    return identity, target, refusals
+
+
 def refused(op, arguments: tokamax.BoundArguments, config: Hashable) -> bool:
     """Whether a compile of this process refused `op`'s launch of `arguments` at `config`: its kernel
     spilled (`compiled`). A template's legality reads it, so its derivation takes the next config."""
@@ -501,13 +513,13 @@ class Binary:
     stack frame's bytes a thread, nonzero where its registers spill (`REGISTER_COUNT`, `FRAME_SIZE`), the
     dynamic shared memory its launch asks for (a Mosaic kernel proto's `smem_bytes`, a custom kernel's
     `shared_memory_bytes`), None where its proto states none, and, read `decoded`, what its machine code
-    breaks of the SASS rules (`sass_findings`)."""
+    breaks of the SASS rules (`sass_findings`), None where no disassembler read it."""
     kernel: str
     launch: str | None
     registers: int
     frame: int
     shared: int | None = None
-    sass: tuple[str, ...] = ()
+    sass: tuple[str, ...] | None = ()
 
 
 def binaries(executable: jax.stages.Compiled, *, decoded: bool = False) -> list[Binary]:
@@ -642,9 +654,8 @@ def _binary(function: str, elf: bytes, decoded: bool = False) -> Binary:
 
 def disassembler() -> Path | None:
     """NVIDIA's nvdisasm, which the SASS rules read a kernel's machine code through (`sass_findings`): the
-    nvdisasm wheel's (`nvidia/cu13/bin`, the kernel-compile extra's, beside the nvcc wheel's ptxas) or the
-    PATH's; None where neither is installed, a user's install among them, where the gate reads ptxas's
-    notes alone."""
+    nvdisasm wheel's (`nvidia/cu13/bin`), which the `ci` extra installs in every lock the suite runs on, or
+    the PATH's; None where neither is installed, a user's install among them."""
     spec = importlib.util.find_spec("nvidia")
     for root in (spec.submodule_search_locations or ()) if spec else ():
         if (found := Path(root) / "cu13" / "bin" / "nvdisasm").is_file():
@@ -653,12 +664,12 @@ def disassembler() -> Path | None:
     return None if found is None else Path(found)
 
 
-def sass_findings(elf: bytes) -> tuple[str, ...]:
+def sass_findings(elf: bytes) -> tuple[str, ...] | None:
     """What the machine code of the cubin `elf` breaks of the SASS rules (`sass_findings_of`, nvdisasm's
-    listing of it), none where no disassembler is installed (`disassembler`)."""
+    listing of it); None where no disassembler is installed (`disassembler`), the rules unread."""
     tool = disassembler()
     if tool is None:
-        return ()
+        return None
     with tempfile.NamedTemporaryFile(suffix=".cubin") as cubin:
         cubin.write(elf)
         cubin.flush()

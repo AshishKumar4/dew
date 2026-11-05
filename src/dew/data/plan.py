@@ -529,15 +529,53 @@ def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[s
 
     if written.get("version") == 7:
         iterator = counted(iterator)
-    if integer(saved.get("counters", 1), "a position's counters format") < COUNTERS:
+    counters = integer(saved.get("counters", 1), "a position's counters format")
+    if counters < 2:
         iterator = _by_member(iterator, plan)
+    if counters < 3:
+        iterator = _tokens_counted(iterator)
     return earlier_plan(written, plan), iterator
 
 
-COUNTERS = 2
+COUNTERS = 3
 """The format of a per-share position's counters (`dew.data.readers`): 2 counts a mixture a run bounds in
 examples by member where its rows are delivered (row 3312), which a position of an earlier format, holding
-no `counters`, does not (`_by_member`)."""
+no `counters`, does not (`_by_member`); 3 counts the valid target tokens each corpus and member delivered
+(row 4119), which a position of format 2 does not (`_tokens_counted`)."""
+
+
+def _tokens_counted(iterator: JSON) -> JSON:
+    """A per-share position of the counters' format 2 as format 3 holds it (`COUNTERS`): each corpus's and
+    member's counts with the valid target tokens they delivered, none, so a resumed run counts them afresh
+    from the resume. Carried to 1.0 (ledger 1552)."""
+    from dew.data.mixing import COUNTER
+
+    def counted(counts: dict[str, JSON]) -> dict[str, JSON]:
+        return counts if "tokens" in counts else {**counts, "tokens": 0}
+
+    def filled(branch: JSON) -> JSON:
+        match branch:
+            case list():
+                return [filled(child) for child in branch]
+            case dict():
+                node = {name: filled(child) for name, child in branch.items()}
+            case _:
+                return branch
+        match node.get(COUNTER):
+            case {"counts": {**counts}, "members": {**members}} as counter:
+                held: dict[str, JSON] = {}
+                for key, member in members.items():
+                    match member:
+                        case {"counts": {**counted_member}}:
+                            held[key] = {**member, "counts": counted(counted_member)}
+                        case _:
+                            held[key] = member
+                node[COUNTER] = {**counter, "counts": counted(counts), "members": held}
+            case {"counts": {**counts}} as counter:
+                node[COUNTER] = {**counter, "counts": counted(counts)}
+        return node
+
+    return filled(iterator)
 
 _PLACED = frozenset({"dew.data.pipeline.Shuffle", "dew.data.pipeline.Repeat", "dew.data.pipeline.Limit",
                      "dew.data.pipeline.Slice"})

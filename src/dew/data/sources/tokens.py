@@ -273,6 +273,10 @@ class TokenFiles(Dataset):
     def can_provision(self, read: Read) -> bool:
         return True
 
+    def preparation_bytes(self) -> int:
+        """None to read: the producer's length index states every document's end."""
+        return 0
+
     def provision(self) -> TokenFiles:
         """Nothing to write: the producer's length index, which every export carries, states where each
         document ends (`document_ends`)."""

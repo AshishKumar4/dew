@@ -45,7 +45,7 @@ from reference_error import as_given, assert_as_exact, torch_with_gradients, wid
 from selection_margins import indexer_margins
 from tool_support import load
 
-from dew.batch import coordinates
+from dew.batch import coordinates, prefix_groups
 from dew.data.dataset import Loader
 from dew.interop.decoder_parts import yarn_record
 from dew.interop.hf_decoders import translate_weights
@@ -68,7 +68,6 @@ from dew.nn.rope import (
     yarn_query_scale,
 )
 from dew.nn.sharding import down_projection
-from dew.nn.visibility import prefix_groups
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 from dew.training import Layout, MeshSpec, Trainer

@@ -200,7 +200,7 @@ class Process(schedule: NoiseScheduler, prediction: PredictionTransform, weighti
   .times(self, steps: int) -> jax.Array
   .variances(self, t, *, like: jax.Array) -> tuple[jax.Array, jax.Array]
   .weight(self, t) -> jax.Array
-class ProfileWindow(directory: str | None, steps: int, warmup: int = 2, capture: dew.telemetry.profile.CaptureOptions = <factory>) -> None  [dew.training.profiling]
+class ProfileWindow(directory: str, steps: int, warmup: int = 2, capture: dew.telemetry.profile.CaptureOptions = <factory>, reports: bool = True) -> None  [dew.training.profiling]
 class Profiler(directory: str | os.PathLike[str] | None = None, *, options: jax.profiler.ProfileOptions | None = None, reports: bool = True) -> None  [dew.telemetry.profile]
   .captures: property -> tuple[Path, ...]
   .directory: property -> Path | None
@@ -419,7 +419,8 @@ dew.config.TrainerConfig
   mesh: dew.distributed.placement.MeshSpec = dew.distributed.placement.MeshSpec()
   microbatches: int | None = None
   layout: dew.distributed.placement.Layout = dew.distributed.placement.Layout()
-  profile: dew.training.profiling.ProfileWindow | None = dew.training.profiling.run_window()
+  profile: dew.training.profiling.ProfileWindow | None = None
+  run_profile: dew.training.profiling.RunProfile | None = dew.training.profiling.RunProfile()
   compilation_cache_dir: str | None = None
   wandb: dew.training.tracker.Wandb | None = None
   publish: bool = False
@@ -459,6 +460,45 @@ dew.config.diffusion.FlowRolloutConfig
   groups: int = 4
   steps: int = 11
   train_steps: int | None = None
+dew.config.env.EnvConfig
+  name: str
+  fields: JsonDict = builtins.dict()
+  defaults: JsonDict = builtins.dict()
+  count: int | None = None
+  episode_length: int | None = None
+  action_repeat: int = 1
+dew.config.env.EnvRunConfig
+  model: ModelConfig = (lambda: ModelConfig('dew.objectives.rl.dreamer:WorldModel'))()
+  data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
+  validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
+  data_seed: int = 0
+  data_plan: int | None = None
+  source: dew.config.SourceOptions = dew.config.SourceOptions()
+  optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
+  trainer: TrainerConfig = (lambda: TrainerConfig(eval_every=None, checkpoint_every=None))()
+  objective: ObjectiveConfig = (lambda: ObjectiveConfig('dew.objectives.rl.dreamer:DreamerV3Objective'))()
+  lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
+  val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
+  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec] = ()
+  env: Annotated[EnvConfig, tyro.conf.subcommand('env')] | None = None
+  rollout: RolloutConfig = dew.config.env.RolloutConfig()
+  teacher: Annotated[TeacherConfig, tyro.conf.subcommand('teacher')] | None = None
+  pretrained: str | None = None
+  episodes: Annotated[Mapping[str, EpisodesConfig], record_argument(Mapping[str, EpisodesConfig])] = builtins.dict()
+dew.config.env.EpisodesConfig
+  steps: int
+  env: EnvConfig | None = None
+  reached: tuple[str, ...] = ()
+  drawn: bool = False
+dew.config.env.RolloutConfig
+  name: str = 'dreamer'
+  fields: JsonDict = builtins.dict()
+  defaults: JsonDict = builtins.dict()
+dew.config.env.TeacherConfig
+  run: str
+  step: int | str | None = None
+  demonstrates: bool = False
 dew.config.jepa.JepaRunConfig
   model: ModelConfig = (lambda: ModelConfig('jepa_encoder', {'precision': 'default'}))()
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
@@ -514,6 +554,13 @@ dew.config.lm.PromptRollout
   admit: int | None = None
   overlong_cache: int | None = None
   generation_batches: int = 1
+  served: Annotated[ServedRollout, tyro.conf.subcommand('served')] | None = None
+dew.config.lm.ServedRollout
+  slots: int = 8
+  ahead: int = 1
+  max_lag: int = 1
+  sync_every: int = 1
+  page_size: int | None = None
 dew.config.sweep.GridSearch
 dew.config.sweep.OptunaSearch
   seed: int = 0
@@ -588,45 +635,6 @@ dew.decision.config.Letters
   labels: Labels = dew.decision.layout.Labels()
   count: int | None = None
   untied: bool = False
-dew.objectives.rl.config.EnvConfig
-  name: str
-  fields: JsonDict = builtins.dict()
-  defaults: JsonDict = builtins.dict()
-  count: int | None = None
-  episode_length: int | None = None
-  action_repeat: int = 1
-dew.objectives.rl.config.EnvRunConfig
-  model: ModelConfig = (lambda: ModelConfig('dew.objectives.rl.dreamer:WorldModel'))()
-  data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
-  validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
-  data_seed: int = 0
-  data_plan: int | None = None
-  source: dew.config.SourceOptions = dew.config.SourceOptions()
-  optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
-  trainer: TrainerConfig = (lambda: TrainerConfig(eval_every=None, checkpoint_every=None))()
-  objective: ObjectiveConfig = (lambda: ObjectiveConfig('dew.objectives.rl.dreamer:DreamerV3Objective'))()
-  lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
-  val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
-  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
-  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec] = ()
-  env: Annotated[EnvConfig, tyro.conf.subcommand('env')] | None = None
-  rollout: RolloutConfig = dew.objectives.rl.config.RolloutConfig()
-  teacher: Annotated[TeacherConfig, tyro.conf.subcommand('teacher')] | None = None
-  pretrained: str | None = None
-  episodes: Annotated[Mapping[str, EpisodesConfig], record_argument(Mapping[str, EpisodesConfig])] = builtins.dict()
-dew.objectives.rl.config.EpisodesConfig
-  steps: int
-  env: EnvConfig | None = None
-  reached: tuple[str, ...] = ()
-  drawn: bool = False
-dew.objectives.rl.config.RolloutConfig
-  name: str = 'dreamer'
-  fields: JsonDict = builtins.dict()
-  defaults: JsonDict = builtins.dict()
-dew.objectives.rl.config.TeacherConfig
-  run: str
-  step: int | str | None = None
-  demonstrates: bool = False
 -- cli --
 dew  [tyro config: FlagCreatePairsOff, PositionalMetavarFromFieldName]
 dew export  [dew.cli.main.Export]

@@ -12,6 +12,7 @@ import dataclasses
 import functools
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import interop_support
 import jax
@@ -517,6 +518,16 @@ def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loo
 
     assert_as_exact(steps(deep), steps(plain), draw, "periodic decode steps", seeds=PERIODIC_SEEDS,
                     truth_fn=truth)
+
+
+def test_a_stacks_layer_states_are_kept_by_the_one_layer_name_parser():
+    """The capture that keeps every layer's output takes a module for a layer as the stack's one parser
+    of its names does (`layer_names.group_layers`): a layer and a scanned run, and not a name that only
+    starts as one does (row 4138: a prefix's reading kept `layers_auxiliary`)."""
+    model = hybrid(1)
+    for name, kept in (("layers_3", True), ("layers_3_7", True), ("layers_auxiliary", False),
+                       ("layers_", False), (None, False)):
+        assert model.capture_layers(SimpleNamespace(name=name), "__call__") is kept, name
 
 
 BANKED_EXPERT_SEEDS = 8

@@ -42,9 +42,14 @@ def evictable(path: Path) -> Iterator[bool]:
             yield True
 
 
+DISK_HEADROOM = 2 * 2**30
+"""The bytes a local cache leaves free on its disk whatever its budget, for what else a run writes there
+(its checkpoints, logs, compiled programs): a write that would leave less evicts, or is refused (row 4263)."""
+
+
 class LocalRetention:
-    def __init__(self, directory: Path, max_bytes: int):
-        self.directory, self.max_bytes = directory, max_bytes
+    def __init__(self, directory: Path, max_bytes: int, *, evicts: bool = True):
+        self.directory, self.max_bytes, self.evicts = directory, max_bytes, evicts
 
     @staticmethod
     def pin(directory: Path) -> BinaryIO:
@@ -111,6 +116,10 @@ class LocalRetention:
                     if segments.is_dir():
                         shutil.rmtree(segments)
 
+    def _spare(self, needed: int) -> bool:
+        """Whether the disk holding the root has `needed` bytes free beyond `DISK_HEADROOM` (row 4263)."""
+        return shutil.disk_usage(self.directory).free - needed >= DISK_HEADROOM
+
     @contextlib.contextmanager
     def reserve(self, target: Path, byte_count: int) -> Iterator[None]:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -122,7 +131,7 @@ class LocalRetention:
             held = self._held()
             if held + needed > self.max_bytes:
                 held = self._size()
-            if held + needed <= self.max_bytes:
+            if held + needed <= self.max_bytes and self._spare(needed):
                 write_atomically(self._ledger, str(held + needed))
                 yield
                 return
@@ -132,10 +141,10 @@ class LocalRetention:
                 (manifest.stat().st_atime_ns, manifest.parent)
                 for key in self._keys()
                 for manifest in (key / "generations").glob("*/manifest.json")
-                if re.fullmatch(r"[a-f0-9]{32}", manifest.parent.name)
+                if self.evicts and re.fullmatch(r"[a-f0-9]{32}", manifest.parent.name)
             )
             for _, generation in candidates:
-                if self._size() + needed <= self.max_bytes:
+                if self._size() + needed <= self.max_bytes and self._spare(needed):
                     break
                 if target.is_relative_to(generation):
                     continue
@@ -155,10 +164,12 @@ class LocalRetention:
                     shutil.rmtree(generation)
                     self._reclaim(key)
             held = self._size()
-            if held + needed > self.max_bytes:
+            if held + needed > self.max_bytes or not self._spare(needed):
                 raise OSError(
                     f"local cache {self.directory} cannot admit {needed} bytes within "
-                    f"keep_local_bytes={self.max_bytes}; its remaining generations or writers are pinned"
+                    f"keep_local_bytes={self.max_bytes} (holding {held}) and the disk's "
+                    f"{shutil.disk_usage(self.directory).free} free bytes less {DISK_HEADROOM} kept for "
+                    "the run; what it could evict is gone or pinned"
                 )
             write_atomically(self._ledger, str(held + needed))
             yield

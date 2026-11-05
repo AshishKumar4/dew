@@ -6,7 +6,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import cached_property
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import numpy as np
 
@@ -15,7 +15,7 @@ from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
 
 from .base import Read, ShardManifest, Source, preparing
-from .files import Files, Format
+from .files import Files, Format, inferred_format
 from .hf import arrow_rows, class_names
 
 
@@ -202,7 +202,7 @@ class Hub(Dataset):
             if self.revision is not None:
                 raise FileNotFoundError(
                     f"HF {self.repo!r}@{self.commit} split {self.split!r} "
-                    "has no native Parquet or JSONL files; "
+                    "has no native Parquet or JSON files; "
                     "pin the converted branch's own commit explicitly, "
                     "or provision=True for Arrow at this revision"
                 )
@@ -315,15 +315,25 @@ class Hub(Dataset):
             paths = split_files(listed, self.split, configs[self._configuration(configs)], roots)
         else:
             paths = split_files(listed, self.split) if self.name in (None, "default") else []
-        # Not Arrow: the `.arrow` files a dataset repo holds are what `save_to_disk` and
-        # `push_to_hub` write, Arrow's stream format, which no reader can cut into shards or count
-        # without reading it whole; such a split streams its Parquet conversion, or is prepared.
-        formats: tuple[Format, ...] = ("parquet", "jsonl")
-        for format in formats:
-            matches = [path for path in paths if path.endswith("." + format)]
-            if matches:
-                return matches, format
-        return [], "parquet"
+        # The module `datasets` reads the split by, from its files' most common extension: its Parquet or
+        # JSON files are read natively, compressed or not (row 2402). Not Arrow: the `.arrow` files a
+        # dataset repo holds are what `save_to_disk` and `push_to_hub` write, Arrow's stream format, which no
+        # reader can cut into shards or count without reading it whole; such a split streams its Parquet
+        # conversion, or is prepared.
+        # An archive's module is what it holds, which only reading it says: such a split streams no files of
+        # its own, as datasets' inference would open each archive to learn it.
+        from datasets.data_files import DataFilesList
+        from datasets.load import infer_module_for_data_files_list
+
+        if any(PurePosixPath(path).suffix.lower() == ".zip" for path in paths):
+            return [], "parquet"
+        module, _ = infer_module_for_data_files_list(DataFilesList(paths, [() for _ in paths]))
+        kinds: Mapping[str, tuple[Format, ...]] = {"parquet": ("parquet",), "json": ("jsonl", "json")}
+        matches = [path for path in paths if inferred_format(path) in kinds.get(module or "", ())]
+        if not matches:
+            return [], "parquet"
+        return matches, ("jsonl" if all(inferred_format(path) == "jsonl" for path in matches)
+                         else "json" if module == "json" else "parquet")
 
     def label(self) -> str:
         return self.repo.rsplit("/", 1)[-1]
@@ -358,8 +368,12 @@ class Hub(Dataset):
     def can_provision(self, read: Read) -> bool:
         return read != "streamed"
 
+    def preparation_bytes(self) -> int | None:
+        """What `datasets` downloads to prepare the split, as its builder's info states it."""
+        return self.builder.info.download_size
+
     def provision(self) -> Hub:
-        preparing(self, self.builder.info.download_size, self.builder.cache_dir)
+        preparing(self, self.preparation_bytes(), self.builder.cache_dir)
         self.builder.download_and_prepare()
         return self
 

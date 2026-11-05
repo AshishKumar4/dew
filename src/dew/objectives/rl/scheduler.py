@@ -143,6 +143,7 @@ from dataclasses import dataclass, field
 from typing import ClassVar, Protocol
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 from dew._coordination import agreed, agreed_count, from_every_process
@@ -193,9 +194,10 @@ class Publisher(Protocol):
     """Serves the trainer's weights to the rollout engines.
 
     `load(variables, version)` makes the engines serve `variables` under
-    `version`, and the `version` property is the version they serve now. A
-    `RolloutServer` is a publisher, and so is an engine fleet's publish
-    sequence.
+    `version`, and the `version` property is the version they serve now,
+    below zero while they serve none (`NativeRolloutServer.deferred`), which
+    the first call loads whatever `sync_every` says. A `RolloutServer` is a
+    publisher, and so is an engine fleet's publish sequence.
     """
 
     @property
@@ -451,8 +453,8 @@ class Asynchronous:
                  for word in np.asarray(jax.device_get(jax.random.key_data(snapshot.key))).reshape(-1)]
         self._key = functools.reduce(jax.random.fold_in, (*words, partition.index), jax.random.key(0))
         self._submissions = 0
-        updates = snapshot.updates
-        if 0 <= updates - self.weights.version < self.sync_every:
+        updates, served = snapshot.updates, self.weights.version
+        if served >= 0 and 0 <= updates - served < self.sync_every:
             return
         self.weights.load(snapshot.variables, updates)
         if self.weights.version != updates:
@@ -610,6 +612,8 @@ class RolloutScheduler:
         self.generation_batches = generation_batches
         self.metrics: dict[str, float] = {}
         self._branch: str | None = None
+        self._owned: tuple[Callable[[], None], ...] = ()
+        """What it built itself and closes at its end (`served`'s source and server)."""
 
     @property
     def draws_further(self) -> bool:
@@ -647,6 +651,60 @@ class RolloutScheduler:
                    else None, generation_batches=generation_batches)
 
     @classmethod
+    def served(cls, objective: GRPOObjective, reward: Reward, *, tasks: int, slots: int,
+               decode: Callable[[Sequence[int]], str] = lambda ids: " ".join(str(token) for token in ids),
+               groups: int = 4, max_new_tokens: int = 32, estimator: str = "group", truncation: str = "score",
+               sampling: Sampling | None = None, ahead: int = 1, max_lag: int = 1, sync_every: int = 1,
+               page_size: int | None = None,
+               log: Callable[[SchedulerRecord], None] | None = None, varied: bool = False,
+               overlong: tuple[int, int] | None = None, admit: int | None = None,
+               generation_batches: int = 1) -> RolloutScheduler:
+        """Draw `groups` completions of each of a batch's `tasks` prompt rows ahead of the trainer from
+        Dew's own server over `objective`'s policy, `slots` rows decoding at once, and train on them
+        (`Asynchronous` over a `PromptSource` of a `NativeRolloutServer`, its first weights the run's
+        first snapshot's): `ahead` batches submitted before the trainer reads them, a rollout at most
+        `max_lag` updates behind it, the weights pushed every `sync_every` updates, each version drawn
+        at the run's progress at its updates (`LMObjective.policy`). The proximal policy is rescored
+        under the trainer's weights, so a `max_lag` above 0 needs `objective.behavior_importance`. A
+        reward-side reference penalty (`GRPOObjective.reward_kl`) is `objective`'s own, as `sampled`'s.
+        With `page_size` the server pages its cache in pages of that many slots and shares prompt pages,
+        so a group's samples of one prompt prefill it once (`dew.inference.pages.Pages.waits`)."""
+        from dew.inference.rollouts import NativeRolloutServer
+        from dew.inference.serving import Server
+        from dew.nn.kv_cache import KVCache
+        from dew.nn.protocols import Layered
+
+        from .sources import PromptSource
+
+        if jax.process_count() > 1:
+            raise ValueError("a served rollout's engine steps one process's server, and a run over several "
+                             "processes places its policy over all of them; draw each step's own completions "
+                             "(no --rollout.served)")
+        drawing = objective.sampled(Sampling() if sampling is None else sampling)
+        width = objective.seq_len + 1
+
+        def built(variables: Variables, version: int) -> Server:
+            policy = objective.policy(variables, drawing, Progress(jnp.asarray(version, jnp.int32)))
+            if page_size is None:
+                return Server.from_task(policy, slots=slots, capacity=width)
+            # The policy's own cache layout, its format kept, in pages.
+            declared = policy.model.kv_cache if isinstance(policy.model, Layered) else KVCache()
+            return Server.from_task(policy, slots=slots, capacity=width, prefix_cache=True,
+                                    kv_cache=dataclasses.replace(declared, page_size=page_size))
+
+        server = NativeRolloutServer.deferred(built, drawing)
+        source = PromptSource(server, reward, decode=decode, max_new_tokens=max_new_tokens)
+        acquisition = Asynchronous(source, server, objective, width=width, rows=tasks * groups, ahead=ahead,
+                                   max_lag=max_lag, sync_every=sync_every)
+        scheduler = cls(acquisition, tasks=prompt_tasks, groups=groups, estimator=estimator,
+                        truncation=truncation, log=log, varied=varied, overlong=overlong, admit=admit,
+                        reference=objective if objective.reward_kl > 0 else None,
+                        generation_batches=generation_batches)
+        # The source and the server it built end with it: the reward pool, then the engine.
+        scheduler._owned = (source.close, server.close)
+        return scheduler
+
+    @classmethod
     def episodes(cls, policy: EpisodeInference, environment: EnvironmentFactory, verifier: Verifier, *,
                  max_prompt_tokens: int, max_new_tokens: int, max_turns: int, sampling: Sampling,
                  groups: int = 2, credit: str = "session", record: EpisodeRecorder | None = None,
@@ -663,9 +721,16 @@ class RolloutScheduler:
         batch ahead of the step; synchronously, `dataset` itself."""
         return self.acquisition.tasks(dataset, self.tasks_of)
 
-    def close(self) -> None:
-        """Cancel every rollout in flight. The caller closes the source; this method does not."""
+    def cancel(self) -> None:
+        """Cancel every rollout in flight, as a branch's end does; what it serves from stays up."""
         self.acquisition.close()
+
+    def close(self) -> None:
+        """Cancel every rollout in flight, and end what it built itself (`served`'s source and server);
+        a source its caller built, its caller closes."""
+        self.cancel()
+        for close in self._owned:
+            close()
 
     @contextlib.contextmanager
     def branch(self, name: str) -> Iterator[None]:
@@ -684,10 +749,10 @@ class RolloutScheduler:
             yield
         except BaseException as failure:
             # The branch's failure stays the one raised; a cancellation's is noted on it.
-            attempted([("cancelling the branch's rollouts", self.close)], primary=failure)
+            attempted([("cancelling the branch's rollouts", self.cancel)], primary=failure)
             raise
         else:
-            self.close()
+            self.cancel()
         finally:
             self.metrics, self.log, self._branch = metrics, log, branch
 
@@ -941,12 +1006,10 @@ class RolloutScheduler:
         each first reader's rollouts repacked with each call's penalty (`reference_penalties`), which
         its share's later readers take from it. `rollouts` is None on a later reader."""
         assert self.reference is not None
-        from dew.training.transaction import with_ema
-
-        frozen = with_ema(state.variables, state.ema)
-        if frozen is None:
+        if state.ema is None:
             raise ValueError("the rewards' reference penalty reads the frozen starting policy, and the "
                              "state holds none; build it from the objective that names the penalty")
+        frozen = state.averaged
         # At the progress the proximal column is read at, so the penalty is nil where the weights are alike.
         reference = scored_rows(self.reference, frozen, packed, Progress(state.updates))
         shaping = (None if rollouts is None else

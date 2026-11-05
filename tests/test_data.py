@@ -31,7 +31,6 @@ from dew.data.dataset import (
     Checkpointable,
     DataPartition,
     Records as IndexedRows,
-    SourceSlice,
     describe,
     take_batch,
     take_rows,
@@ -66,9 +65,11 @@ class _Indexed:
 def _indexed(length: int = 32, held: int = 0) -> tuple[Pipeline, Pipeline | None]:
     """Records that carry their own index, untouched, so a test can read which records a batch
     holds: the ones a run trains on, and its first `held` held out to validate on."""
-    source = _Indexed(length)
-    val = Pipeline(Memory(SourceSlice(source, 0, held))) if held else None
-    return Pipeline(Memory(SourceSlice(source, held, length))), val
+    records = Pipeline(Memory(_Indexed(length)))
+    if not held:
+        return records, None
+    train, val = records.holdout(records=held)
+    return train, val
 
 
 def _trained(train: Pipeline, batch: int = 8, *, seed: int = 0, read: str = "indexed",
@@ -571,12 +572,11 @@ def _augmenting(length: int = 16, batch: int = 4, *, held_out: int = 0, seed: in
     """A run over `length` of `_Images`, its first `held_out` held out to validate on unaugmented,
     the rest shuffled by `seed`, repeated and augmented (`_pictures`); `linger` makes each worker
     process take that many seconds to exit once stopped, as a worker finishing a slow batch does."""
-    pictures = _Images(length)
-    rows = Pipeline(Memory(SourceSlice(pictures, held_out, length)))
+    rows, held = Pipeline(Memory(_Images(length))).holdout(records=held_out) if held_out else (
+        Pipeline(Memory(_Images(length))), None)
     if linger is not None:
         rows = rows.map(_LingeringRecord(linger))
-    val = _pictures(Pipeline(Memory(SourceSlice(pictures, 0, held_out))), batch, augment=False) if held_out \
-        else None
+    val = None if held is None else _pictures(held, batch, augment=False)
     return compile(_pictures(rows.shuffle(seed).repeat(), batch), validation=val, read="indexed", seed=seed,
                    loading=loading or Loading(workers=0))
 
