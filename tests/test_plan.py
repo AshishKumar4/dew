@@ -396,7 +396,10 @@ class Handed(Trials):
 
 
 def live_executables() -> int:
-    """The executables the backend holds once the garbage they are part of is collected."""
+    """The executables the backend holds once the garbage they are part of is collected, the objects a plan
+    search holds out of the collector among it (`dew.nn.kernels.options.held_objects`, which freezes them
+    while it runs)."""
+    gc.unfreeze()
     gc.collect()
     return len(get_backend().live_executables())
 
@@ -872,28 +875,39 @@ def a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monk
 
 
 def test_a_plan_at_no_recomputation_stops_before_any_optional_frontier(monkeypatch):
-    """An A100's plan: no recomputation fits the batch at four microbatches and the half rung never
-    fits it in fewer, so the plan is four at no recomputation. The half rung's failed fit probes
-    remain in the record, but no optional full-batch frontier is compiled."""
+    """An A100's plan: no recomputation fits the batch at four microbatches and not in fewer, so the plan
+    is four at no recomputation, which the derivation picks and its one compile confirms (row 3341): no
+    split it refuses, no half rung and no optional full-batch frontier is compiled."""
     free(monkeypatch, needs(monkeypatch, lm(split=4, **DELTA)))
     trainer = lm(**DELTA)
     state, _, _ = trainer.place()
     trials = Trials(state, BATCH)
     trainer.compile(state, BATCH, trials)
     assert (trainer.plan["split"], trainer.plan["remat"]) == (4, None)
-    assert_searched(asked(trainer), (4, None), 2, half="all_but_delta_memory")
+    assert asked(trainer) == [(4, None, True)]
 
 
 def test_a_decoder_without_a_half_rung_asks_its_splits_at_no_recomputation(monkeypatch):
-    """Without a delta rule no rung is a half rung: the search asks the batch whole and the splits
-    that find the fewest microbatches that fit, each at no recomputation, and stops there."""
+    """Without a delta rule no rung is a half rung: where the derivation cannot judge the step (its
+    devices state no memory to judge it against), the search asks the batch whole and the splits that
+    find the fewest microbatches that fit, each at no recomputation, and stops there; where it can, the
+    derivation picks the fewest that fit, four, and its one compile confirms them (row 3341)."""
+    from dew.training.planning import FitSearch
+
     free(monkeypatch, needs(monkeypatch, lm(split=4)))
-    trainer = lm()
-    state, _, _ = trainer.place()
-    trials = Trials(state, BATCH)
-    trainer.compile(state, BATCH, trials)
-    assert_searched(asked(trainer), (4, None), 2)
-    assert all(remat is None for _, remat, _ in asked(trainer))
+    for judging in (False, True):
+        with monkeypatch.context() as unjudged:
+            if not judging:
+                unjudged.setattr(FitSearch, "judging", lambda search: False)
+            trainer = lm()
+            state, _, _ = trainer.place()
+            trials = Trials(state, BATCH)
+            trainer.compile(state, BATCH, trials)
+        if judging:
+            assert asked(trainer) == [(4, None, True)]
+        else:
+            assert_searched(asked(trainer), (4, None), 2)
+            assert all(remat is None for _, remat, _ in asked(trainer))
 
 
 def test_a_step_that_fails_on_its_first_run_states_the_room_outside_xla_s_pool():

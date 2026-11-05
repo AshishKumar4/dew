@@ -758,7 +758,17 @@ class FitSearch[LossT, EffectsT]:
         derivation trusted where it refuses one, so the one compile at the most performant plan it admits
         decides (row 3341). `first` where the run starts from a plan (a recorded one, or a checkpoint's
         rung), where the derivation cannot judge the step, or where no candidate it reads fits."""
-        if self.derive is None or self.resumed is not None or first != 0 or not self.judging():
+        if self.derive is None or self.resumed is not None or first != 0:
+            return first
+        if not self.judging():
+            if not self.derived:
+                # A run that sets its remat reads no rung's walk (`derived_start`), so its record and its
+                # log say here what a walk would: nothing is judged, and the compiles decide.
+                self.derived.append({**self.current(), "narrow": self.narrow, "split": candidates[-1],
+                                     "headroom": None, "label": "unstated", "terms": None})
+            _log.warning("the devices state no memory to judge the step's footprint against (a CPU, or a "
+                         "compile-only GPU given no capacity), so the derivation picks no plan and the "
+                         "compiles decide it")
             return first
         headroom = self.judged(candidates[-1], self.narrow)
         if headroom is None or headroom < 0:
