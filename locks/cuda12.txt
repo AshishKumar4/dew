@@ -932,6 +932,8 @@ nvidia-cuda-cupti-cu12==12.9.79
     # via jax-cuda12-plugin
 nvidia-cuda-nvcc-cu12==12.9.86
     # via jax-cuda12-plugin
+nvidia-cuda-nvdisasm==13.4.92
+    # via dewml (pyproject.toml)
 nvidia-cuda-nvrtc-cu12==12.9.86
     # via
     #   jax-cuda12-plugin
