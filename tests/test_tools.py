@@ -2105,6 +2105,49 @@ def test_a_fixture_archive_names_nothing_of_the_machine_that_wrote_it_and_packs_
     assert destination.read_bytes()[13:17] == bytes([0x00, 0x21, 0x01, 0x1C])
 
 
+def test_every_fixture_archive_names_nothing_of_the_machine_that_wrote_it():
+    """Every xz archive the suite holds (tests/fixtures), each written through tools/fixture_archive: no
+    member names its writer's user, group or time (rows 2866, 2873)."""
+    import tarfile
+
+    stamped = {}
+    for path in sorted((REPO_ROOT / "tests" / "fixtures").rglob("*.tar.xz")):
+        with tarfile.open(path) as archive:
+            owners = {(member.uid, member.gid, member.uname, member.gname, member.mtime)
+                      for member in archive.getmembers()}
+        if owners != {(0, 0, "", "", 0)}:
+            stamped[path.name] = sorted(owners)[:2]
+    assert stamped == {}
+
+
+def test_a_saved_run_archive_takes_the_fixture_writer_with_its_own_cleaning_and_modes():
+    """tools/saved_runs_reference's archive is fixture_archive's (`write`) with the run's places read as a
+    later checkout reads them, every text member's, and one mode a member kind: its members in name order,
+    anonymous, a directory 0o755 and a file 0o644, a binary member as it was written."""
+    import io
+    import tarfile
+    import tempfile
+
+    saved = load("saved_runs_reference")
+    with tempfile.TemporaryDirectory() as scratch:
+        run = Path(scratch) / "run"
+        (run / "checkpoints").mkdir(parents=True)
+        (run / "checkpoints" / "metadata.json").write_text(f'{{"directory": "{scratch}/run/checkpoints"}}')
+        (run / "weights.bin").write_bytes(bytes([0xff, 0xfe, 0x00]) + scratch.encode())
+        packed = saved.anonymous(run, "lm", {scratch: "."})
+    with tarfile.open(fileobj=io.BytesIO(packed)) as archive:
+        members = archive.getmembers()
+        metadata = archive.extractfile("lm/checkpoints/metadata.json").read().decode()
+        weights = archive.extractfile("lm/weights.bin").read()
+    assert [(member.name, member.mode) for member in members] == [
+        ("lm", 0o755), ("lm/checkpoints", 0o755), ("lm/checkpoints/metadata.json", 0o644),
+        ("lm/weights.bin", 0o644)]
+    assert {(member.uid, member.gid, member.uname, member.gname, member.mtime) for member in members} == {
+        (0, 0, "", "", 0)}
+    assert metadata == '{"directory": "./run/checkpoints"}'
+    assert weights == bytes([0xff, 0xfe, 0x00]) + scratch.encode()
+
+
 def test_a_data_scaling_receipt_names_no_directory_of_the_host_that_ran_it(tmp_path):
     """The scaling receipt records its config's paths by their names outside the checkout (relative to it
     within), so a receipt written on a CI host or a workstation names none of its directories (bible §2: a
