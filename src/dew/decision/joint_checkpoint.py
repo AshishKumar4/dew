@@ -24,7 +24,7 @@ from flax import linen as nn
 from dew.batch import unboxed
 from dew.decision.laya import IN_PROJ
 from dew.decision.layout import DecisionInputs
-from dew.interop.safetensors_io import MAX_SHARD_SIZE, write_file
+from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, write_file
 from dew.nn.sharding import abstract
 
 if TYPE_CHECKING:
@@ -124,23 +124,27 @@ def _stored(path: tuple[str, ...], leaf: np.ndarray) -> np.ndarray:
     return leaf
 
 
-def head_tensors(params: Mapping[str, object]) -> dict[str, np.ndarray]:
-    """`JointSchemaHead`'s parameters under the release's tensor names and shapes."""
+def head_tensors(params: Mapping[str, object]) -> LazyTensors[np.ndarray]:
+    """`JointSchemaHead`'s parameters under the release's tensor names and shapes, each built as it is
+    read: its leaves read home then (`WeightLayout.export`, `read_home`: the pool's processes together
+    where a leaf spans them, inside the writer's `reading_home`), its name, shape and dtype known before
+    any is, as a weight push plans its chunks (ledger 4370)."""
     from flax.traverse_util import flatten_dict, unflatten_dict
 
     from dew.interop.decoder_parts import packed_layouts
     from dew.interop.weights import in_params, native_layouts
 
-    stored = unflatten_dict({path: _stored(path, np.asarray(jax.device_get(leaf)))
-                             for path, leaf in flatten_dict(dict(params)).items()})
-    variables = {"params": stored}
+    # The leaves where they are, in the shapes the release stores, none read.
+    variables = {"params": unflatten_dict({path: _stored(path, leaf)
+                                           for path, leaf in flatten_dict(dict(params)).items()})}
     layouts = packed_layouts({layout.name: layout for layout in native_layouts(
         variables, lambda path: _name(path[1:]), in_params(_path))}, IN_PROJ)
-    return {name: layout.export(variables) for name, layout in layouts.items()}
+    return LazyTensors({name: jax.ShapeDtypeStruct(layout.shape, layout.stored_dtype(variables))
+                        for name, layout in layouts.items()}, lambda name: layouts[name].export(variables))
 
 
 def export(bundle: "PretrainedDecision", variables: Mapping[str, object] | None = None
-           ) -> dict[str, np.ndarray]:
+           ) -> Mapping[str, np.ndarray]:
     """Every tensor of the joint-head release `save` writes: the backbone's under their checkpoint names
     and the head's under the release's (`joint_head.safetensors`), with `variables` in place of the
     backbone's."""
