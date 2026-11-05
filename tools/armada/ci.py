@@ -1832,9 +1832,12 @@ def rewritten(depends: list[str], wrote: Container[str]) -> list[str]:
     """The inputs among `depends` that a task wrote (`wrote`, the task's watch): a file its processes read
     and changed, or a directory they listed and changed, whose bytes where the key is made are no longer the
     ones read (row 2559: a test that read a fixture and wrote it left a key over what it wrote, which a later
-    checkout holding those bytes reused). A probe or a unit of a module is its file's."""
+    checkout holding those bytes reused). A unit of a module is its file's; a probe is its path's, but a
+    directory's, which its key holds by its kind alone (`contents`): every Python's `site` probes the
+    checkout's own."""
     return sorted({path for each in depends
-                   if (path := each.removeprefix(followed.PROBED).partition(followed.CODE)[0]) in wrote})
+                   if (path := each.removeprefix(followed.PROBED).partition(followed.CODE)[0]) in wrote
+                   and not (each.startswith(followed.PROBED) and Path(path).is_dir())})
 
 
 def record(python: str, rows: list[dict], log: Path, common: str, network: bool = False,
