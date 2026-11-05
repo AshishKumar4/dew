@@ -1503,11 +1503,14 @@ def _cancelling_terms(draw, truth, program=None):
     # terms are not zero too gains a size, so a site whose zero rows sum nothing (a query that keeps no key)
     # keeps the reference's residue rule without tracing its terms a draw.
     run = program or unrewritten(jax.jit(truth))
+    # The draw as every seed's is drawn, outside float64, then widened (under x64 a draw's own defaults
+    # would draw float64 values the arms never see).
+    inputs = widened(draw(0))
     with jax.enable_x64(new_val=True):
-        leaves = [*map(np.asarray, jax.tree.leaves(run(*widened(draw(0)))))]
+        leaves = [*map(np.asarray, jax.tree.leaves(run(*inputs)))]
         if not np.any(_LaidTruths.of(leaves).sizes == 0):
             return None
-        truths, terms = float64_terms(truth, *widened(draw(0)))
+        truths, terms = float64_terms(truth, *inputs)
     plain, termed = _LaidTruths.of(jax.tree.leaves(truths)), _LaidTruths.of(
         jax.tree.leaves(truths), _term_leaves(terms, truths))
     return truth if bool(np.any((plain.sizes == 0) & (termed.sizes > 0))) else None

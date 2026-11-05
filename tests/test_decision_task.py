@@ -762,7 +762,7 @@ def test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh(decide):
     assert_as_exact(as_given(lambda variables: evaluated(spread(variables))),
                     as_given(lambda variables: evaluated(replace(task, variables=variables))), draw,
                     "evaluated on a mesh", seeds=MESH_SEEDS,
-                    truth_fn=lambda variables: evaluated(replace(wide, variables=variables)))
+                    truth_fn=as_given(lambda variables: evaluated(replace(wide, variables=variables))))
     alone, scores = task.score(examples), spread(decide.variables).score(examples)
     assert set(scores) == set(alone) and all(np.isfinite(value) for value in scores.values())
     assert scores["accuracy"] == alone["accuracy"]
