@@ -947,21 +947,24 @@ def test_a_host_tier_reads_back_a_prefix_whose_upload_reclaims_the_last_device_p
     assert (owed.spills, owed.uploads, pages.shared(first)) == ([], [], [-1])
 
 
-@pytest.mark.parametrize("stateful", [False, True], ids=["attention", "hybrid"])
-@pytest.mark.parametrize("host_pages, hits", [(0, 0), (1, 4), (8, 8)], ids=["device", "one-slot", "host"])
-def test_a_host_tier_keeps_prefix_pages_the_pool_reclaims(host_pages, hits, stateful):
+@pytest.mark.parametrize("stateful, host_pages, hits", [
+    (False, 0, 0), (False, 1, 4), (False, 8, 8), (True, 1, 0), (True, 8, 8),
+], ids=["device", "one-slot", "host", "hybrid-one-slot", "hybrid-host"])
+def test_a_host_tier_keeps_prefix_pages_the_pool_reclaims(stateful, host_pages, hits):
     """A prefix cache of eight pages of four tokens, one slot: a prompt's two shared pages are cached as it
     ends, then two other prompts take the pool's pages and it reclaims them. With a host tier the reclaimed
     pages go to host memory and the prompt again reads its 8 tokens back from there, or its first 4 where
-    one host slot keeps the page reclaimed last; without one it prefills them again. Every request draws
-    what its lone call draws, a hybrid stack's rows reading the prefix with the recurrent state kept
-    after it (ledger 874)."""
+    one host slot keeps the page reclaimed last; without one it prefills them again. A hybrid stack's rows
+    read a prefix with the recurrent state kept after its deepest page (four states kept), so one slot,
+    which keeps the first page alone, reads nothing back. Every request draws what its lone call draws
+    (ledger 874)."""
     bound = hybrid_task() if stateful else task(Sampling(temperature=1.0))
     shared, others, budget = "123456781", ["987654329876", "555544443333"], 6
     requests = [shared, *others, shared]
     alone = [bound(held, budget, key=index) for index, held in enumerate(requests)]
     server = Server.from_task(bound, slots=1, capacity=64, admission=1, prefix_cache=True,
-                              kv_cache=KVCache(page_size=4, pages=8), host_pages=host_pages)
+                              kv_cache=KVCache(page_size=4, pages=8), host_pages=host_pages,
+                              prefix_states=4 if stateful else None)
     drawn = []
     for index, held in enumerate(requests):
         ticket = server.submit(held, budget, key=index)
