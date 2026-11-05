@@ -456,9 +456,11 @@ class CausalTransformer(LinearProducts):
     (Dream-v0); False reads each position's own (LLaDA). The forward ignores it: it says how
     the checkpoint's logits line up, which `dew.diffusion.discrete.aligned` applies for the
     masked loss and the sampler alike."""
-    scan_layers: bool = False
-    """Runs of like layers under flax's scan; a decode step over resident weights scans a period's repeats as
-    one body too (`scan_groups(periodic=True)`), so its program grows with the period, not the depth."""
+    scan_layers: bool = True
+    """Runs of like layers under flax's scan, and a step over resident weights, training's or a decode
+    step's, a period's repeats as one body too (`scan_groups(periodic=True)`), so its program grows with
+    the period, not the depth (a hybrid's GDN x 3 + attention period scanned eight times where Qwen3.5-4B
+    unrolled its 32 layers); False runs the plain loop, a layer at a time."""
     bank_layers: int | None = None
     """The most layers one scanned run holds, which is also how many layers its
     parameter bank stacks. A longer run of like layers is split into
@@ -1811,11 +1813,12 @@ class CausalTransformer(LinearProducts):
                 raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
                                     f"by run holds whole runs; {list(banked)} arrived banked")
             groups = self.groups if span is None else spanned
-            # A decode step over resident weights scans by period; weights a step reads a layer at
-            # a time (banked, streamed from disk or in host memory) keep the runs their banks hold,
-            # and a layer that leaves what a later one reads (`_provides`) runs alone.
-            if decode and not (banked or self._provides or 'streaming' in self.variables
-                               or on_host(self.variables.get('params', {}))):
+            # A step over resident weights, training's or a decode step's, scans by period, its program
+            # one period's body however deep the stack; weights a step reads a layer at a time (banked,
+            # streamed from disk or in host memory) keep the runs their banks hold, and a layer that
+            # leaves what a later one reads (`_provides`) runs alone.
+            if not (banked or self._provides or 'streaming' in self.variables
+                    or on_host(self.variables.get('params', {}))):
                 keys = self.scan_keys[first:end]
                 groups = tuple((first + start, count) for start, count in scan_groups(keys, periodic=True))
             periods = tuple(run_period(self.scan_keys, start, count) for start, count in groups)
@@ -2236,9 +2239,10 @@ class CausalTransformer(LinearProducts):
         return self.clone(dex=extension)
 
     @nn.nowrap
-    def with_scanned_layers(self) -> Self:
-        """This decoder running its like and periodic runs under the scan (`scan_layers`)."""
-        return self.clone(scan_layers=True)
+    def with_scanned_layers(self, scanned: bool = True) -> Self:
+        """This decoder running its like and periodic runs under the scan (`scan_layers`), or with
+        `scanned` False the plain loop."""
+        return self.clone(scan_layers=scanned)
 
     @nn.nowrap
     def reads_progress(self) -> bool:

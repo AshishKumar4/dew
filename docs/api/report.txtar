@@ -382,7 +382,7 @@ dew.config.SourceOptions
   prediction_depths: int | None = None
   attention: dict[str, Literal['causal', 'block_bidirectional']] | None = None
   dex: Annotated[dew.nn.dex.DifferentialExtension, PrimitiveConstructorSpec] | None = None
-  scan_layers: bool = False
+  scan_layers: bool = True
   param_dtype: str | None = None
   step: int | str | None = None
   ema: bool | None = None
