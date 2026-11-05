@@ -1003,7 +1003,7 @@ def test_a_tiles_transient_hook_is_released_once_its_trace_is_done():
 
 
 @pytest.mark.parametrize("name, inverse, kind", [
-    ("a negation negated", lambda x: -(-x), jax.lax.neg_p),
+    ("a negation negated", lambda x: jnp.negative(jnp.negative(x)), jax.lax.neg_p),
     ("a negation's magnitude", lambda x: jnp.abs(-x), jax.lax.neg_p),
     ("a magnitude's magnitude", lambda x: jnp.abs(jnp.abs(x)), jax.lax.abs_p),
     ("a value times its sign", lambda x: jnp.sign(x) * x, jax.lax.sign_p)])
