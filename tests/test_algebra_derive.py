@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from check1_statistics import GateFailure
 from reference_error import assert_as_exact
 
 from dew import algebra
@@ -258,6 +259,21 @@ def test_an_accurate_declarations_own_forms_walk_as_its_function(stated):
     forms = derive.derive(declaration, accurate=True, saturation=SATURATION)
     assert_as_exact(jax.jit(walked_whole(forms)), jax.jit(whole(function)), draw, f"{stated} walked",
                     seeds=16)
+
+
+def test_a_declared_exponential_is_the_one_its_walk_computes_by():
+    """A declaration's exponential (`Reduction.exponential`) is what its derived walk computes its weights and
+    rescales by: one stated in bfloat16, its declaration's function computing in fp32, walks off par with it
+    (check 1 refuses the walk), where a walk that took JAX's own exponential would be on par."""
+    def rounded(x):
+        return jnp.exp(x.astype(jnp.bfloat16)).astype(jnp.float32)
+
+    declaration = derive.Reduction(attention, AXES, walked="keys", exponent="e", exponential=rounded,
+                                   rescale=lambda carried, now: rounded(carried - now))
+    forms = derive.derive(declaration, accurate=True, saturation=SATURATION)
+    with pytest.raises(GateFailure):
+        assert_as_exact(jax.jit(walked_whole(forms)), jax.jit(whole(attention)), draw, "bfloat16 exponential",
+                        seeds=16)
 
 
 def unshifted(q, k, v, rows, keys):
