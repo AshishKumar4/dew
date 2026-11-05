@@ -798,9 +798,8 @@ class _Branch:
             # (`CausalTransformer.drawn_like`): a scanned run stacks one factor pair over its layers.
             index = args[0] if args else kwargs["index"]
             layer = (*root, *module.path, f"layers_{index}")
-            # A set's layers draw apart where their adapters' scales differ (`_Bound.scales`).
-            own = tuple(sorted((path[len(layer):], target, self.bound.scales.get(path))
-                               for path, target in self.targets.items() if path[:len(layer)] == layer))
+            own = tuple(sorted((path[len(layer):], target) for path, target in self.targets.items()
+                               if path[:len(layer)] == layer))
             return next_fun(*args, **kwargs), own
         if context.method_name == "nonlinear_input":
             # A layer asks whether its submodule is linear in its input on

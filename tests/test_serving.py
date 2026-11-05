@@ -1083,10 +1083,11 @@ def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(t
 
 
 def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own():
-    """An adapter set of two adapters over different layers of a decoder that scans its like layers, one
-    over layer 0's q and one over layer 1's: the two layers, which the set adapts alike in shape, scan
-    apart where the adapters' scales differ, and each row's logits are those of its adapter alone, on par
-    with that adapter against its float64 twin (check 1)."""
+    """An adapter set of two adapters over different layers of one decoder, one over layer 0's q and one
+    over layer 1's: each layer's update is its own adapter's or none, and each row's logits are those of
+    its adapter alone, on par with that adapter against its float64 twin (check 1). A scanned stack, which
+    runs its like layers under one factor pair, refuses layers whose adapters differ, as it refuses one
+    adapter's uneven targets (test_lora's test_the_branch_reaches_every_layer_of_a_scanned_run)."""
     from pathlib import Path
 
     from arm_arithmetic import widened
@@ -1096,7 +1097,7 @@ def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own
     from dew.lora import AdapterSet, LoRA, selected
 
     decoder = Pretrained.load(Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny",
-                              dtype="float32", attention_impl="reference", scan_layers=True)
+                              dtype="float32", attention_impl="reference")
 
     def drawn(layer: int, key: int):
         adapter = LoRA(rank=2, modules=(f"layers.{layer}.self_attn.q_proj",)).apply(
