@@ -708,7 +708,7 @@ def stocked() -> Mapping[str, tuple[jcore.Primitive, Mapping]]:
     # device it does not hold (a compile-only GPU) places no array.
     scalar = jax.ShapeDtypeStruct((), jnp.float32)
     traced = jax.make_jaxpr(lambda a: (a / a, a - a, a + a, a * a, jnp.maximum(a, a), jnp.exp(a),
-                                       jnp.log1p(a), jnp.expm1(a)))(scalar)
+                                       jnp.log1p(a), jnp.expm1(a), jnp.abs(a)))(scalar)
     return {equation.primitive.name: (equation.primitive, dict(equation.params))
             for equation in traced.jaxpr.eqns}
 

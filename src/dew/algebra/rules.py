@@ -255,6 +255,7 @@ def _drawn(*shapes, scale: Callable[[np.random.Generator, tuple[int, ...]], np.n
 
 
 _ROWS, _SCALED = _drawn((64, 1024), (64, 1024), (64, 1024)), _drawn((64, 1024), (64,))
+_ROWS_ONE = _drawn((64, 1024))
 _SMALL = _drawn((64, 1024), scale=lambda rng, shape: (rng.uniform(-0.5, 0.5, shape)
                                                       * 10.0 ** rng.uniform(-6, 0, shape)))
 _FOLDED = _drawn((64, 1024), (64, 1), (64, 1), scale=lambda rng, shape: (
@@ -470,6 +471,27 @@ each bound as the primitive it names (its params'), the multiply priced nothing 
 (`cost.work`)."""
 
 
+def _inverses() -> tuple[RuleFamily, ...]:
+    """An operation its inverse cancels, each an exact identity of IEEE arithmetic (a sign flip or a magnitude
+    loses no bit): a negation negated is the value, the magnitude of a negation or of a magnitude is the
+    value's magnitude, and a value times its sign is its magnitude (zeros, infinities and NaNs alike)."""
+    x, t = vars_("x t", Term)
+    first, second, multiplied, magnitude = vars_("first second multiplied magnitude", i64)
+    signed = (x.unary("sign", first).binary("mul", x, multiplied), x.binary("mul", x.unary("sign", first),
+                                                                         multiplied))
+    return (
+        RuleFamily("a negation negated", (rewrite(x.unary("neg", first).unary("neg", second)).to(x),),
+                   (lambda x: jnp.negative(jnp.negative(x)), lambda x: x, _ROWS_ONE)),
+        RuleFamily("a negation's magnitude", (rewrite(x.unary("neg", first).unary("abs", second)).to(
+            x.unary("abs", second)),), (lambda x: jnp.abs(jnp.negative(x)), jnp.abs, _ROWS_ONE)),
+        RuleFamily("a magnitude's magnitude", (rewrite(x.unary("abs", first).unary("abs", second)).to(
+            x.unary("abs", first)),), (lambda x: jnp.abs(jnp.abs(x)), jnp.abs, _ROWS_ONE)),
+        RuleFamily("a value times its sign", tuple(
+            rule(eq(t).to(product), plain(multiplied), eq(magnitude).to(stock("abs"))).then(
+                union(t).with_(x.unary("abs", magnitude))) for product in signed),
+            (lambda x: jnp.sign(x) * x, jnp.abs, _ROWS_ONE)))
+
+
 def _contracted() -> tuple[RuleFamily, ...]:
     """A multiply an add or a subtract reads first, contracted into it as a fused multiply-add: the compiler
     fuses the two into one instruction rounding the product once (NVPTX's `fma`), so the pair costs one
@@ -519,6 +541,7 @@ def register(rules: Rules) -> None:
 
 
 register(Rules.declared("identities", "exact", _identities(), "docs/design/algebra.md §1", aid=True))
+register(Rules.declared("inverses", "exact", _inverses(), "docs/design/algebra.md §1.4; row 4008"))
 register(Rules.declared("contracted", "exact", _contracted(),
                         "docs/design/algebra.md §6.5; the scaled softmax's maximum, ledger 3721", aid=True))
 register(Rules.declared("stable", "bounded", _stable(),
@@ -530,11 +553,14 @@ register(Rules.declared("joined", "reorders", _joined(), "docs/design/algebra.md
 
 HEADS = {"add": frozenset({"reduce_sum", "mul", "dot_general"}), "reduce_sum": frozenset({"mul"}),
          "reduce_max": frozenset({"mul"}), "reduce_min": frozenset({"mul"}),
-         "mul": frozenset({"dot_general"}), "dot_general": frozenset({"mul"})}
+         "mul": frozenset({"dot_general", "sign"}), "dot_general": frozenset({"mul"}),
+         "neg": frozenset({"neg"}), "abs": frozenset({"neg", "abs"})}
 """What a rule's left side that may lower a price reads at its head: a sum (`add`) of two reductions, two
 products or two contractions of one kind (`linear`), a reduction of a product (a sum's, or an extremum's of a
 positive scale), a contraction scaled, or a contraction of a scaled operand (a dequant's matrix scale, its
-broadcast within `program.WINDOW`). Commutativity alone (`identities`) leaves every price as it was."""
+broadcast within `program.WINDOW`), and an operation its inverse cancels (`inverses`: a negation or a
+magnitude over a negation or a magnitude, a value times its sign). Commutativity alone (`identities`) leaves
+every price as it was."""
 
 
 def heads(primitive: str, operands: Sequence[str | None]) -> bool:
