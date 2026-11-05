@@ -676,8 +676,7 @@ class Server:
         if not isinstance(rows, DenseRows) or rows.chunk is not None or rows.placement.plan is not None:
             raise ValueError("a server that prefills on a mesh of its own prefills each prompt whole over a "
                              "dense cache; serve it without page_size, chunk or a speculative plan")
-        self._prefill_rows = NamedSharding(mesh, P(batch_axes(mesh) or None))
-        self._prefill = prefill_program(self._prefill_rows)
+        self._prefill = prefill_program()
         self._prefill_variables = _on_mesh(self.variables, mesh)
 
     def _keep_states(self, formats) -> None:
@@ -1106,9 +1105,12 @@ class Server:
     def _prefilled_elsewhere(self, admission: Admission) -> Admission:
         """`admission` with its rows prefilled on the prefill mesh (`Dense.rows_prefilled`) and their decoder
         state moved onto the decoding mesh's rows, which the admitting step seats."""
-        assert isinstance(self.rows.placement, Dense)
-        rows = jax.device_put(admission, self._prefill_rows)
-        with jax.set_mesh(self.prefill_mesh), whole():
+        assert isinstance(self.rows.placement, Dense) and self.prefill_mesh is not None
+        mesh = self.prefill_mesh
+        # The rows split over the prefill mesh's row groups where they divide, else each device prefills all.
+        split = admission.slots.shape[0] % _row_groups(mesh) == 0
+        rows = jax.device_put(admission, NamedSharding(mesh, P(batch_axes(mesh) or None) if split else P()))
+        with jax.set_mesh(mesh), whole():
             prefilled = self._prefill(self.model, self._prefill_variables, self.pad_id, self.rows.placement,
                                       rows, self.progress)
         # Onto the decoding rows: the server's mesh's, or the default device's without one.

@@ -268,10 +268,10 @@ def _prefilled_rows(model: nn.Module, params: Variables, pad_id: int, placement:
     return placement.rows_prefilled(model, params, pad_id, admission, progress)
 
 
-def prefill_program(rows: NamedSharding) -> OuterProgram:
-    """The program a server that prefills on a mesh of its own runs there (`Dense.rows_prefilled`), every
-    leaf of an admission placed by `rows`, the prefill mesh's rows."""
-    return outer_program(_prefilled_rows, static_argnums=(0, 2, 3), in_shardings=(None, rows, None))
+def prefill_program() -> OuterProgram:
+    """The program a server that prefills on a mesh of its own runs there (`Dense.rows_prefilled`), over
+    the admission where its caller places it on that mesh (`Server._prefilled_elsewhere`)."""
+    return outer_program(_prefilled_rows, static_argnums=(0, 2, 3))
 
 
 @dataclasses.dataclass(frozen=True)
