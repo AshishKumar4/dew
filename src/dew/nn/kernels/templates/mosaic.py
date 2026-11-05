@@ -345,10 +345,10 @@ def tiled(tiles: tuple[int, ...], schedule: Callable, visit: Callable, *, axis: 
     active, steps, views, tile)` at the step its streams are at across the tiles (`counter`: the steps of the
     active tiles before it). Returns the counter past the last tile."""
     @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=jnp.int32(0))
-    def ended(loop: plgpu.NDLoopInfo, counter):
+    def ended(loop: plgpu.NDLoopInfo, carry):  # nd_loop passes its carry by this name
         active, steps, views, tile = schedule(loop.index)
-        visit(counter, active, steps, views, tile)
-        return counter + jnp.where(active, steps, 0)
+        visit(carry, active, steps, views, tile)
+        return carry + jnp.where(active, steps, 0)
 
     return ended
 
