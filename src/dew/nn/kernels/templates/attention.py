@@ -770,24 +770,6 @@ def logit_scale(width: int, scale: float | None) -> float:
     return width ** -0.5 if scale is None else scale
 
 
-def grouped_rows(query: jax.Array, kv_heads: int) -> jax.Array:
-    """`query` `[B, T, H, D]` as `[B, T·G, KV, D]` over its `kv_heads` key heads, `G = H // KV`: row `t·G + g`
-    query head `k·G + g` of position `t`, so a key head's query heads are rows of its one walk over its keys
-    (a decode step's grouped query, which both decode kernels take, row 4135)."""
-    batch, positions, heads, width = query.shape
-    group = heads // kv_heads
-    rows = query.reshape(batch, positions, kv_heads, group, width).transpose(0, 1, 3, 2, 4)
-    return rows.reshape(batch, positions * group, kv_heads, width)
-
-
-def ungrouped_rows(out: jax.Array, heads: int) -> jax.Array:
-    """`grouped_rows`' inverse on an output `[B, T·G, KV, Dv]`: `[B, T, H, Dv]`."""
-    batch, rows, kv_heads, width = out.shape
-    group = heads // kv_heads
-    shaped = out.reshape(batch, rows // group, group, kv_heads, width).transpose(0, 1, 3, 2, 4)
-    return shaped.reshape(batch, rows // group, heads, width)
-
-
 def prescale(dtype, width: int, scale: float | None) -> tuple[float, float]:
     """The power of two a call's queries take before their products with the keys, and the scale left after it
     (`scale` the call's, `logit_scale`): where the products of `dtype` operands `width` wide can pass fp32's
