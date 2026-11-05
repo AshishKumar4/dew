@@ -15,6 +15,7 @@ from reference_error import as_given, assert_as_exact
 import dew.config
 from dew.config import RunConfig, TrainerConfig
 from dew.data.dataset import Loader
+from dew.data.plan import PLAN_VERSIONS
 from dew.objectives import Aux, Objective
 from dew.optim import Cosine, OptimConfig
 from dew.training import Trainer, Wandb, WandbTracker
@@ -278,7 +279,9 @@ def test_run_record_names_the_package_checkout_and_hardware(tmp_path, monkeypatc
     monkeypatch.chdir(tmp_path)
     config.train(Squared(), targets([1., 3.]), name='telemetry')
     record = run.configuration['run_record']
-    assert record['config'] == config.recorded(Squared()).to_dict()
+    # The run as it trained: by the data plan version it resolved and records (`RunConfig.resumed`).
+    assert record['config'] == config.resumed(('data_plan_version',)).recorded(Squared()).to_dict()
+    assert record['config']['data_plan_version'] == PLAN_VERSIONS[-1]
     assert record['dew_sha'] == expected_sha
     assert record['device_kind'] == jax.devices()[0].device_kind
     assert record['devices'] == jax.device_count()
