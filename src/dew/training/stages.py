@@ -421,7 +421,7 @@ def whole_reading(optimizer: optax.GradientTransformation | None, shapes, local:
     if optimizer is None or not local.sites:
         return []
     with local.held():
-        params = local.staged(shapes)["params"]
+        params = local.staged_shapes(shapes)["params"]
         arguments = (params, jax.eval_shape(optimizer.init, params), params)
         given, structure = jax.tree_util.tree_flatten_with_path(arguments)
         stacked = [layers_of(path)[1] for path, _ in given]
