@@ -456,7 +456,7 @@ def test_every_run_profiles_a_short_window_of_its_own_steps_kept_with_its_record
     assert remote is not None and remote.directory == local_records("gs://bucket/runs/remote", "remote",
                                                                     "profile")
     assert "://" not in remote.directory
-    plain = trained("plain", profile=None)
+    plain = trained("plain", run_profile=None)
     assert not (plain / "profile").exists()
     with dew.Profiler(tmp_path / "outer"):
         inside = trained("inside")
@@ -465,14 +465,14 @@ def test_every_run_profiles_a_short_window_of_its_own_steps_kept_with_its_record
     assert not (inside / "profile").exists()
 
 
-def test_a_runs_own_window_whose_manifest_is_not_written_leaves_the_run_training(caplog):
-    """A run's own profile window is a diagnostic of the run's: where its capture's manifest cannot be
-    written as it stops (`dew.telemetry.profile.ExportFailed`), the stop logs it and the run trains on,
-    where a window that reports fails the run as before (train 607's review)."""
+def test_a_window_whose_manifest_is_not_written_leaves_the_run_training(caplog):
+    """A profile window that reports nothing writes its manifest as it stops, a diagnostic of the run's:
+    where it cannot be written (`dew.telemetry.profile.ExportFailed`, which only such a window's stop
+    raises), the stop logs it and the run trains on (train 607's and 610's reviews)."""
     import logging
 
     from dew.telemetry.profile import ExportFailed
-    from dew.training.profiling import ProfileWindow, run_window, stop_capture
+    from dew.training.profiling import stop_capture
 
     class Unwritten:
         """A profiler whose capture stopped and whose manifest could not be written."""
@@ -481,28 +481,27 @@ def test_a_runs_own_window_whose_manifest_is_not_written_leaves_the_run_training
             raise ExportFailed("writing the capture's manifest failed", [OSError("read-only directory")])
 
     with caplog.at_level(logging.WARNING, logger="dew"):
-        stop_capture(Unwritten(), None, run_window())
+        stop_capture(Unwritten(), None)
     assert any(record.name == "dew.training.profiling" and record.levelno == logging.WARNING
                for record in caplog.records)
-    with pytest.raises(ExportFailed):
-        stop_capture(Unwritten(), None, ProfileWindow("asked", 2))
 
 
-def test_a_trainer_given_a_window_naming_no_directory_traces_into_one_of_its_own(tmp_path):
-    """A trainer given a profile window that names no directory traces it into a directory of the
-    profiler's own (`dew.Profiler`'s), which its `ProfileTraced` record names, where it refused to run
-    (train 607's review)."""
-    from dew.training import LocalTracker, ProfileWindow
+def test_a_run_saved_with_its_own_window_as_its_profile_reads_it_as_its_run_profile(tmp_path):
+    """A run a Dew saved while a run's own window was its `profile` naming no directory (train 607 to 610's)
+    loads with no window of its own named and its own window as `run_profile`, trace-only, so it resumes
+    on a plain install asking no XProf and converting no reports (row 4255)."""
+    from dew.training.profiling import RunProfile
 
-    tracking = tmp_path / "tracking"
-    config = TrainerConfig(steps=4, eval_every=None, checkpoint_every=None)
-    trainer = RunConfig(trainer=config).built(Regression(), config.mesh, None,
-                                              tracker=LocalTracker(str(tracking)),
-                                              profile=ProfileWindow(None, 1, warmup=1, reports=False))
-    trainer.fit(Loader(lambda partition: batches(), None, None, 8), steps=4)
-    records = [json.loads(line) for line in (tracking / "records.jsonl").read_text().splitlines()]
-    (traced,) = [row["value"] for row in records if row["type"] == "ProfileTraced"]
-    assert traced["steps"] == 1 and any(path.is_file() for path in Path(traced["directory"]).rglob("*"))
+    record = RunConfig(trainer=TrainerConfig(name="saved", checkpoint_dir=str(tmp_path))).record()
+    trainer = record["fields"]["trainer"]
+    held = trainer.get("fields", trainer)
+    held.pop("run_profile", None)
+    held["profile"] = {"directory": None, "steps": 2, "warmup": 10}
+    (tmp_path / "run.json").write_text(json.dumps(record))
+    loaded = RunConfig.load(str(tmp_path / "run.json")).trainer
+    assert loaded.profile is None and loaded.run_profile == RunProfile()
+    window = loaded.window(str(tmp_path / "saved"), "saved")
+    assert window is not None and window.directory is not None and not window.reports
 
 
 def test_a_saved_runs_profile_window_reads_its_capture_options_as_its_captures(tmp_path):
