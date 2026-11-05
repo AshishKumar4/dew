@@ -66,7 +66,8 @@ def _jax_own() -> Mapping[jcore.Primitive, str]:
     JAX's exports (`random_wrap`, `random_split`, `random_fold_in`, `random_bits`, `random_unwrap`), read
     off a trace of them once asked."""
     def drawn(seed_words):
-        first, _ = jax.random.split(jax.random.wrap_key_data(seed_words))
+        # A key of its own implementation, whichever the process's default is (`jax_default_prng_impl`).
+        first, _ = jax.random.split(jax.random.wrap_key_data(seed_words, impl="threefry2x32"))
         return jax.random.bits(jax.random.fold_in(first, 1), ()), jax.random.key_data(first)
 
     def each(jaxpr: jcore.Jaxpr):

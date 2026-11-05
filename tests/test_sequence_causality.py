@@ -9,6 +9,7 @@ program merely named like one is walked inside."""
 import jax
 import jax.numpy as jnp
 import pytest
+from process_support import assert_exits_cleanly
 
 from dew.interop.sequence_causality import CAUSAL_ATTENTION, TOKENWISE, attested, causality_refusal
 
@@ -133,6 +134,20 @@ REFUSED = {
         lambda h, w: (h @ w - (h @ w).mean(axis=1, keepdims=True), None), embedded(tokens),
         jnp.ones((3, D, D)))[0],
 }
+
+
+def test_an_operation_is_known_by_its_object_whatever_the_processs_random_keys():
+    """JAX's own operations are read by their objects, its random ones off a trace of its public random
+    functions (`dew.nn.programs.jax_name`), in a process whose keys are another implementation's too
+    (`jax_default_prng_impl`), where the trace's key is its own."""
+    assert_exits_cleanly("""
+import jax
+jax.config.update("jax_default_prng_impl", "rbg")
+from dew.nn.programs import jax_name
+assert jax_name(jax.lax.exp_p) == "exp"
+folded = jax.make_jaxpr(lambda key: jax.random.fold_in(key, 1))(jax.random.key(0)).jaxpr.eqns
+assert "random_fold_in" in {jax_name(equation.primitive) for equation in folded}, folded
+""")
 
 
 def refusal(function, lengths=LENGTHS):
