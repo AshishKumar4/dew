@@ -95,7 +95,7 @@ from dew.training.diloco import DiLoCo
 from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Split, Summary
 from dew.training.inspection import Inspection
-from dew.training.profiling import ProfileReport, ProfileWindow, run_window
+from dew.training.profiling import ProfileReport, ProfileWindow, RunProfile
 from dew.training.quantization import quantize_trunk
 from dew.training.rollout import Rollout
 from dew.training.selection import Best
@@ -571,7 +571,7 @@ class TrainerConfig:
     """Microbatches a pipelined step feeds through the mesh's stages, a
     multiple of `mesh.stage`; unset feeds one a stage."""
     layout: Layout = dataclasses.field(default_factory=Layout)
-    profile: ProfileWindow | None = dataclasses.field(default_factory=run_window)
+    profile: ProfileWindow | RunProfile | None = dataclasses.field(default_factory=RunProfile)
     """One profiler window: the steps to trace, the warmup before them and the output directory.
 
     By default every run traces two of its steps once ten have run past its first compile, through Dew's
@@ -755,18 +755,17 @@ class TrainerConfig:
         return os.path.join(self.checkpoint_dir, name)
 
     def window(self, directory: str, name: str) -> ProfileWindow | None:
-        """The profile window the run `name` under `directory` traces: `profile` as it names its directory,
-        a run's own (no directory) kept with the run's local records (`local_records`: its directory's
-        `profile`, or Dew's cache for a run in a bucket) where the process can take a capture
-        (`capturable`), none where it cannot or the run traces none."""
+        """The profile window the run `name` under `directory` traces: `profile` as it names it, or a run's
+        own (`RunProfile`) kept with the run's local records (`local_records`: its directory's `profile`,
+        or Dew's cache for a run in a bucket) where the process can take a capture (`capturable`), none
+        where it cannot; none where the run traces none. A trainer is given a window naming its directory
+        alone (row 4246)."""
         from dew.training.profiling import capturable
 
         window = self.profile
-        if window is None or window.directory is not None:
+        if not isinstance(window, RunProfile):
             return window
-        if not capturable():
-            return None
-        return dataclasses.replace(window, directory=local_records(directory, name, "profile"))
+        return window.window(local_records(directory, name, "profile")) if capturable() else None
 
     def checkpoints(self, name: str, directory: str | None = None) -> Checkpoints:
         """The checkpoints of the run `name` in `checkpoint_dir` (`directory`), or in `directory` where

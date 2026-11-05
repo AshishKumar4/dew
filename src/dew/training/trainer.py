@@ -1557,7 +1557,7 @@ class Trainer(Generic[Loss, Effects]):
                 if run.traced == profile.steps:
                     run.tracing = False
                     assert profiler is not None
-                    run.close_window(profiler, profile)
+                    run.close_window(profiler)
             if stopped:
                 break
         return self._wind_down(plan, run, interval, state, shardings, position, profiler)
@@ -1580,7 +1580,7 @@ class Trainer(Generic[Loss, Effects]):
         if run.tracing and profile is not None:
             run.tracing = False
             assert profiler is not None
-            stop_trace = functools.partial(run.close_window, profiler, profile)
+            stop_trace = functools.partial(run.close_window, profiler)
         error = primary
         # A run's last log is written at its cleanup, a failed run's only where no write waits on a step
         # its peers may never finish (`LogWriter.raise_failure`).
@@ -2091,7 +2091,7 @@ class Trainer(Generic[Loss, Effects]):
             run.tracing = False
             # The window outlived the run, and a trace left running takes the next one down with it.
             assert profiler is not None
-            run.close_window(profiler, profile)
+            run.close_window(profiler)
         interval.check_finite(current, self._display)
         if loss is not None:
             # The last step has to land before the wall time is read.
