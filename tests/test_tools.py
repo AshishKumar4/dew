@@ -23,11 +23,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import assert_as_exact, chain_roundings
 from test_chunked_cross_entropy import EXERCISED, eighths
 from test_moe import OUTPUT_TOLERANCE, ROUTER_TOLERANCE
-from test_text_encoders import transformers_clip
 from test_vae_16ch import TOLERANCE as VAE_TOLERANCE
 from tool_support import FIXTURES, REPO_ROOT, load
 
@@ -37,8 +35,7 @@ CLAIMS = json.loads((FIXTURES / "provenance.json").read_text())["references"]
 
 # The family parity contracts, read from the tests that hold Dew to these fixtures, not bounds fitted
 # to a CI CPU: test_moe.py (routers and expert sums), test_vae_16ch.py (raw encode/decode). The CLIP
-# towers' outputs are held as their own test holds them, to the reference's float64 run
-# (`transformers_clip`).
+# towers' outputs are held where they are consumed (tests/test_text_encoders.py).
 MOE_OUTPUTS = {
     "mixtral.npz": {"router_weights": ROUTER_TOLERANCE, "block_output": OUTPUT_TOLERANCE},
     "deepseek.npz": {"router_weights": ROUTER_TOLERANCE, "block_output": OUTPUT_TOLERANCE},
@@ -49,11 +46,8 @@ CLIP_OUTPUTS = ("last_hidden_state", "pooler_output", "text_embeds", "image_embe
 VAE_OUTPUTS = {"latent": VAE_TOLERANCE, "decoded": VAE_TOLERANCE}
 
 
-def assert_fixture_arrays(written: Path, committed: Path, numerical: dict[str, float],
-                          truth: dict[str, np.ndarray] | None = None) -> None:
-    """Only named arithmetic outputs use the family's fp32 parity bound, or, where `truth` gives
-    their float64 values, are held as exact as the committed float32 output from them
-    (tests/reference_error.py).
+def assert_fixture_arrays(written: Path, committed: Path, numerical: dict[str, float]) -> None:
+    """Only named arithmetic outputs use the family's fp32 parity bound.
 
     Seeds do not promise cross-platform bit identity for arithmetic:
     https://docs.pytorch.org/docs/2.14/notes/randomness.html
@@ -64,16 +58,12 @@ def assert_fixture_arrays(written: Path, committed: Path, numerical: dict[str, f
     """
     with np.load(written) as ours, np.load(committed) as theirs:
         assert set(ours.files) == set(theirs.files)
-        truth = {} if truth is None else truth
-        assert numerical.keys() <= set(theirs.files) and truth.keys() <= set(theirs.files)
+        assert numerical.keys() <= set(theirs.files)
         for name in theirs.files:
             actual, expected = ours[name], theirs[name]
             assert actual.shape == expected.shape, name
             assert actual.dtype == expected.dtype, name
-            if name in truth:
-                assert_as_exact_as_the_reference(actual.astype(np.float64), expected.astype(np.float64),
-                                                 truth[name], name)
-            elif name in numerical:
+            if name in numerical:
                 assert np.isfinite(actual).all() and np.isfinite(expected).all(), name
                 difference = float(np.max(np.abs(actual - expected)))
                 assert difference < numerical[name], f"{name}: max error {difference:.3e}"
@@ -140,18 +130,21 @@ def test_moe_fixtures_are_what_the_generator_writes(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_clip_tiny_fixture_is_what_the_generator_writes(tmp_path):
-    """Exact checkpoint, tokenizer and pixels; both towers' outputs as exact as the committed ones,
-    both from the reference's float64 run."""
-    import torch
-
+    """Exact checkpoint, tokenizer and pixels, and the recorded outputs' names, shapes and dtypes. The
+    outputs are transformers' float32 run of that checkpoint on those inputs, both exact here; their
+    accuracy is the consumers' to hold (check 1 against the towers' float64 run), not a second float32
+    run's to repeat (ledger 1305: no one-draw comparison)."""
     load("clip_reference").write_tiny(tmp_path)
 
     committed = FIXTURES / "clip" / "tiny"
     assert_fixture_json(tmp_path, committed, "clip_reference")
     assert_same_tensors(tmp_path / "model.safetensors", committed / "model.safetensors")
-    with np.load(committed / "reference.npz") as inputs:
-        truth = transformers_clip(tmp_path, dict(inputs), torch.float64, CLIP_OUTPUTS)
-    assert_fixture_arrays(tmp_path / "reference.npz", committed / "reference.npz", {}, truth)
+    with np.load(tmp_path / "reference.npz") as ours, np.load(committed / "reference.npz") as theirs:
+        assert set(ours.files) == set(theirs.files) and set(CLIP_OUTPUTS) <= set(theirs.files)
+        for name in theirs.files:
+            assert (ours[name].shape, ours[name].dtype) == (theirs[name].shape, theirs[name].dtype), name
+            if name not in CLIP_OUTPUTS:
+                np.testing.assert_array_equal(ours[name], theirs[name], err_msg=name)
 
 
 # ---------------------------------------------------------------------------
