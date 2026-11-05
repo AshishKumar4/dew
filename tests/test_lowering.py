@@ -566,14 +566,15 @@ def _selective_step(rows: int):
 
 
 def _attention_step(rows: int):
-    """Causal attention over `[2, rows / 2, 8 heads, 128]` bf16, under 'auto': each device's kernel the
-    template or the vendored kernel the generation's cells name."""
+    """Causal attention over `[2, rows / 2, 8 heads, 128]` bf16 through the attention template, the kernel
+    its generation's launch is."""
     from dew.nn.attention import attention_kernel
 
     shape = jax.ShapeDtypeStruct((2, rows // 2, 8, 128), jnp.bfloat16)
 
     def loss(query, key, value):
-        return attention_kernel(query, key, value, causal=True).astype(jnp.float32).sum()
+        return attention_kernel(query, key, value, causal=True, implementation="template").astype(
+            jnp.float32).sum()
 
     return loss, (shape, shape, shape)
 
