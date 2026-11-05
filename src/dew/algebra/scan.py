@@ -46,7 +46,7 @@ from jax.extend import core as jcore
 from dew._cache import ALGEBRA
 from dew.algebra import carry, cost, derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate, read_by
-from dew.nn.derivatives import Protected
+from dew.nn.derivatives import KernelGlue, Protected, declared_derivative
 from dew.nn.precision import at_least_fp32, float32_einsum, float32_matmul, two_sum, vanishing
 
 Axes = tuple[str, ...]
@@ -123,8 +123,9 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
     `readout_memory` and `readout_local` mapped (`carry.EMIT_ROLES`); `transfer_compose` (a chunk's prepared
     transition on the transfer, and two transfers joined), `transfer_apply` and `transfer_decay` (`rhs *
     lhs`, a decay's column scale, the one role no product) forming and joining a walk's transfer. The same
-    forms without one take Dew's products, the portable route's; a chunk's prepared transition is always
-    Dew's, formed chunk-parallel."""
+    forms without one take Dew's products, the portable route's; a chunk's transition, which a walk that
+    carries its transfer composes (`prepare(chunk, transition=True)`), is always Dew's, formed
+    chunk-parallel."""
     names = tuple(name for name in declaration.operands if name != declaration.reset)
     shape, dtype = declaration.state
     if len(shape) != 2:
@@ -167,7 +168,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
 
     splits: collections.OrderedDict = collections.OrderedDict()  # the least recently prepared first
 
-    def prepare(chunk, issue=None):
+    def prepare(chunk, issue=None, transition: bool = False):
         affine, (exponent, *values) = parts(chunk)
         decays = _decays(exponent, affine.base2)
         natural = _walked(exponent, affine.base2)
@@ -191,7 +192,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
                 splits.popitem(last=False)
         splits.move_to_end(key)
         prepared = Prepared((natural, split.prepare(*given)), split, corrected)
-        if not corrected:
+        if not (corrected and transition):
             return prepared
         return dataclasses.replace(prepared, transition=_transition(prepared, jnp.zeros(shape, carried)))
 
@@ -204,6 +205,9 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
             return decay, leaving
         if prepared.corrected and state.transfer is None:
             raise Refused("a walk started for tokens that do not correct the state steps a chunk whose do")
+        if state.transfer is not None and prepared.transition is None:
+            raise Refused("a walk that carries its transfer steps a chunk prepared without its transition "
+                          "(`prepare(chunk, transition=True)`)")
         transfer = (None if state.transfer is None
                     else (issue or _issued)("transfer_compose", prepared.transition, state.transfer))
         return Walk(decay, leaving, transfer)
@@ -220,13 +224,16 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         del operands
         return state[1].astype(dtype)
 
-    def backward(chunk, state, d_state, d_outputs):
+    def backward(chunk, state, d_state, d_outputs, issue=None):
         # The chunk's forms' adjoint: the reverse scan's step, each chunk's transition transposed, as the
-        # forward forms' derivative (their prefix, substitution and Dew products differentiated).
+        # forward forms' derivative (their prefix, substitution and Dew products differentiated), each
+        # product's adjoint the issuer's where one is given (`_adjoined`).
         # The reset's booleans held, no operand of the derivative.
+        issued = None if issue is None else _adjoined(issue)
+
         def forward(h, operands):
-            entering, prepared = (state[0], h), prepare({**chunk, **operands})
-            return mapped(prepared, entering), step(entering, prepared)[1]
+            entering, prepared = (state[0], h), prepare({**chunk, **operands}, issued)
+            return mapped(prepared, entering, issued), step(entering, prepared, issued)[1]
 
         _, pullback = jax.vjp(forward, state[1], {name: chunk[name] for name in names})
         d_h, d_chunk = pullback((d_outputs, d_state))
@@ -595,6 +602,30 @@ def _doubled(overlaps, issue: Callable | None = None):
         return _below(recurrence_algebra.doubled(-overlaps, _issued))
     return _below(recurrence_algebra.doubled(-overlaps, lambda name, left, right: issue(
         "inverse_" + name, left, right)))
+
+
+def _adjoined(issue: Callable) -> Callable:
+    """`issue` (a mainloop's issuer) as its products' adjoints take it too: each `issue(role, lhs, rhs)`
+    differentiated by the issuer's own products, `d lhs = issue(role + "_dlhs", d, rhsᵀ)` and `d rhs =
+    issue(role + "_drhs", lhsᵀ, d)` (`transfer_decay`'s, a column scale, by its own scales), a declared
+    derivative of a kernel's glue (`dew.nn.derivatives`)."""
+    @functools.cache
+    def rule(role: str) -> Callable:
+        def forward(left, right):
+            return issue(role, left, right), (left, right)
+
+        def backward(saved, d):
+            left, right = saved
+            if role == "transfer_decay":
+                return (jnp.sum(d * right, axis=0), d * left[None, :])
+            return issue(role + "_dlhs", d, right.T), issue(role + "_drhs", left.T, d)
+
+        return declared_derivative(KernelGlue(), functools.partial(issue, role), forward, backward)
+
+    def issued(role: str, left, right):
+        return rule(role)(left, right)
+
+    return issued
 
 
 def _issued(name: str, left, right):
