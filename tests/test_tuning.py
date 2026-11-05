@@ -494,15 +494,15 @@ def test_a_checkout_whose_kernel_drops_an_operand_keeps_the_others_picks_of_it(t
     wide = str(versioned_op(tmp_path / "wide", ("x", "shift")))
     narrow = str(versioned_op(tmp_path / "narrow", ("x",)))
     path, theirs, _ = fresh(STORES, "[4, 2]", wide, cache_dir=cache_dir, flags=flags)
-    assert theirs == {json.dumps(["shift", "x"]): [4, 2]}
+    assert theirs == {json.dumps(["return_residuals", "shift", "x"]): [4, 2]}
     with open(path) as file:
         [entry] = json.load(file)["data"]
     _, ours, foreign = fresh(STORES, "[2, 8]", narrow, cache_dir=cache_dir, flags=flags)
-    assert (ours, foreign) == ({json.dumps(["x"]): [2, 8]}, 1)
+    assert (ours, foreign) == ({json.dumps(["return_residuals", "x"]): [2, 8]}, 1)
     with open(path) as file:
         assert entry in json.load(file)["data"]
     _, theirs, foreign = fresh(STORES, "[4, 2]", wide, cache_dir=cache_dir, flags=flags)
-    assert (theirs, foreign) == ({json.dumps(["shift", "x"]): [4, 2]}, 1)
+    assert (theirs, foreign) == ({json.dumps(["return_residuals", "shift", "x"]): [4, 2]}, 1)
 
 
 def test_a_launch_is_chosen_for_the_gpu_its_operands_or_its_mesh_name():
