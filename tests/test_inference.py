@@ -664,6 +664,56 @@ def test_a_run_on_a_mesh_packs_the_projections_its_layout_keeps_whole(tmp_path):
         np.testing.assert_array_equal(there.tokens, here.tokens, err_msg=str(spec))
 
 
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("spec", [{"sequence": 2}, {"fsdp": 2, "stage": 2}, {"tensor": 2, "sequence": 2}],
+                         ids=["sequence", "fsdp-stage", "tensor-sequence"])
+def test_a_run_samples_on_every_trainer_layout_what_one_device_samples(tmp_path, spec):
+    """A trained decoder placed on each layout the trainer runs, a sequence axis, a pipeline's stage axis
+    and their products, draws what it draws on one device, on par with that draw against its float64
+    twin (check 1); a server on the layout serves what a call draws (ledger 1817)."""
+    from arm_arithmetic import widened
+    from reference_error import as_given, assert_as_exact, seeds_for
+
+    from dew.inference import Server
+    from dew.sampling import Sampling
+    from dew.training import Layout, MeshSpec
+
+    run = tmp_path / "run"
+    run.mkdir()
+    make_lm_run(run, ema_decay=None, fields={"num_layers": 2})
+    layout = Layout(min_shard=1, tolerance=1.0)
+    sampling = Sampling(temperature=1.0, eos_token_ids=255)
+    devices = jax.devices()[:4]
+    alone = dew.pipeline(str(run), mesh=MeshSpec().build(devices[:1]), layout=layout)
+    placed = dew.pipeline(str(run), mesh=MeshSpec(**spec).build(devices), layout=layout)
+    wide = dataclasses.replace(alone, model=alone.model.clone(dtype=jnp.float64),
+                               variables=widened(alone.variables))
+    server = Server.from_task(placed, slots=2, capacity=64)
+
+    def draw(seed):
+        return (np.asarray([2 * seed, 2 * seed + 1]),)
+
+    def drawn(task, dtype="float32"):
+        @as_given
+        def likelihoods(keys):
+            with jax.enable_x64(new_val=dtype == "float64"):
+                return tuple(task("the ", 4, key=int(key), sampling=sampling).host().raw_log_probs
+                             for key in keys)
+
+        return likelihoods
+
+    @as_given
+    def served(keys):
+        tickets = [server.submit("the ", 4, key=int(key)) for key in keys]
+        server.run()
+        return tuple(ticket.result().host().raw_log_probs for ticket in tickets)
+
+    label = f"sampled on {spec}"
+    count = seeds_for(drawn(alone), draw, label, truth_fn=drawn(wide, "float64"), dew_fn=drawn(placed))
+    assert_as_exact(drawn(placed), drawn(alone), draw, label, seeds=count, truth_fn=drawn(wide, "float64"))
+    assert_as_exact(served, drawn(alone), draw, label, seeds=count, truth_fn=drawn(wide, "float64"))
+
+
 def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
     """A just-trained state is the pipeline: the averaged weights when the
     objective keeps them, the live ones on request, the objective's own
