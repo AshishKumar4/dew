@@ -664,6 +664,11 @@ def with_unstacked_axes(tree, count: int):
     return tree
 
 
+def _one_stage(leaf: jax.Array) -> jax.Array:
+    """A one-stage state's leaf without its stage axis, a reshape (`StackView.staged_shape`)."""
+    return leaf.reshape(leaf.shape[1:])
+
+
 def stacked_rows(rows: Sequence[jax.Array], shape: tuple[int, ...]) -> jax.Array:
     """A run's rows (`StackView.stage_form`'s order) as one array whose leading `shape` they fill."""
     return jnp.stack(rows).reshape((*shape, *jnp.shape(rows[0])))
@@ -761,6 +766,13 @@ class StackView:
         own layers, each where there is more than one."""
         return tuple(size for size in (self.stages, count) if size > 1)
 
+    def staged_shape(self, count: int) -> tuple[int, ...]:
+        """The leading dimensions a run of `count` layers takes in a stage-local state (`stage_form`): the
+        stages, one on one stage, then the run's own layers where there is more than one. A state reads
+        as stacked by stage whatever its count (`stage_count`), and the scan on one stage reads its run
+        through the one stage's index, which costs no copy."""
+        return (self.stages, *((count,) if count > 1 else ()))
+
     def _inside_name(self, first: int, count: int, prefix: str = 'layers_') -> str | None:
         """A run's name inside, None for a layer the view leaves as it is."""
         if count > 1:
@@ -799,12 +811,25 @@ class StackView:
                 if (name := self._inside_name(first, count, prefix)) is not None
                 and self._period(first, count) == 1]
 
+    def _periodic_runs(self) -> list[tuple[str, str, list[list[str]]]]:
+        """Every run that repeats a period on one stage, `(name, prefix, positions)`: its name inside, its
+        stored layers' prefix and those layers per position of its period, each in repeat order
+        (`_stacked_periods`)."""
+        if self.stages > 1:
+            return []
+        return [(name, prefix, self._positions(first, count, period, prefix))
+                for first, count, prefix in self._runs()
+                if (name := self._inside_name(first, count, prefix)) is not None
+                and (period := self._period(first, count)) > 1]
+
     def holds(self, tree: Mapping) -> bool:
         """Whether `tree`, a collection's subtree where the stack is stored, holds some run of the view,
         on its stored layers or stacked by stage (`stage_form`)."""
         staged = tree.get('stages', {})
-        return any(name in staged or any(layer in tree for layer in layers)
-                   for name, layers, _ in self._named_runs())
+        runs = [(name, layers) for name, layers, _ in self._named_runs()] + [
+            (name, [layer for position in positions for layer in position])
+            for name, _, positions in self._periodic_runs()]
+        return any(name in staged or any(layer in tree for layer in layers) for name, layers in runs)
 
     def splits(self, tree: Mapping) -> bool:
         """Whether `tree` holds some of a run's stored layers and not the others, as a collection
@@ -859,6 +884,15 @@ class StackView:
             if collection in self.banked:
                 inside[collection] = tree
                 continue
+            if self.stages == 1 and collection in self.staged:
+                # A stage-local state on one stage holds each run as the scan reads it, under the one
+                # stage's index (`staged_shape`), its run's name beside the layers outside it: read in
+                # place, the index a reshape.
+                runs = {name: with_unstacked_axes(jax.tree.map(_one_stage, run), 1)
+                        for name, run in tree['stages'].items()}
+                outside = {name: value for name, value in tree.items() if name != 'stages'}
+                inside[collection] = {**outside, **runs}
+                continue
             # A periodic run's positions stack on their own (`_stacked_periods`), whatever the stages.
             self._stacked_periods(collection, tree)
             if self.stages == 1:
@@ -880,7 +914,14 @@ class StackView:
 
     def unstack(self, variables: Mapping[str, Mapping]) -> dict:
         outside = {}
+        runs = {name for name, _, _ in self._named_runs()} | {name for name, _, _ in self._periodic_runs()}
         for collection, tree in variables.items():
+            if self.stages == 1 and collection in self.staged:
+                held = {name: with_stacked_axes(jax.tree.map(lambda leaf: leaf[None], value), 1)
+                        for name, value in tree.items() if name in runs}
+                outside[collection] = {**{name: value for name, value in tree.items() if name not in runs},
+                                       'stages': held}
+                continue
             if collection in self.banked or collection in self.staged:
                 outside[collection] = dict(tree)
                 continue
@@ -899,9 +940,11 @@ class StackView:
         one under the run's inside name below `stages`, the rows stage-major, a run's own layers
         inside each stage, and `shape` the leading dimensions they fill (`stacked_shape`). That is a
         stage-local state's form (`staged`), which `layer_form` takes back; `stack` takes arrays,
-        their shapes or their shardings alike."""
+        their shapes or their shardings alike. On one stage that is the scan's own form, a periodic run
+        stacked by position of its period (`_stacked_periods`), which the scan reads in place."""
         tree = dict(tree)
-        runs = self._stacked_runs(collection, tree, stack)
+        runs = {**self._stacked_runs(collection, tree, stack, staged=True),
+                **self._stacked_positions(collection, tree, stack)}
         if runs:
             tree['stages'] = {**tree.get('stages', {}), **runs}
         return tree
@@ -911,11 +954,26 @@ class StackView:
         leaf's rows in `stage_form`'s order: under `stages` in a pipeline's form, under the run's
         bank name on one stage. What a run leaves beside its layers stays."""
         tree = dict(tree)
-        held = dict(tree.pop('stages', {})) if self.stages > 1 else tree
+        staged = self.stages > 1 or 'stages' in tree
+        held = dict(tree.pop('stages', {})) if staged else tree
+        for name, prefix, positions in self._periodic_runs():
+            if name not in held:
+                continue
+            run = held.pop(name)
+            for offset, layers in enumerate(positions):
+                position = run.get(f'{prefix}{offset}')
+                if position is None:
+                    continue
+                shape = (self.stages, len(layers)) if staged else (len(layers),)
+                leaves, structure = jax.tree_util.tree_flatten_with_path(position)
+                rows = [tuple(cut(path, leaf, shape)) for path, leaf in leaves]
+                for index, layer in enumerate(layers):
+                    tree[layer] = with_unstacked_axes(structure.unflatten([cuts[index] for cuts in rows]),
+                                                      len(shape))
         for name, layers, count in self._named_runs():
             if name not in held:
                 continue
-            shape = self.stacked_shape(count)
+            shape = self.staged_shape(count) if staged else self.stacked_shape(count)
 
             def rows_of(path, leaf, shape=shape, layers=layers):
                 rows = tuple(cut(path, leaf, shape))
@@ -931,11 +989,12 @@ class StackView:
             for index, layer in enumerate(layers):
                 tree[layer] = with_unstacked_axes(structure.unflatten([cuts[index] for cuts in rows]),
                                                   len(shape))
-        if self.stages > 1 and held:
+        if held is not tree and held:
             tree['stages'] = held
         return tree
 
-    def _stacked_runs[Leaf](self, collection: str, tree: dict, stack: RowStack[Leaf]) -> dict:
+    def _stacked_runs[Leaf](self, collection: str, tree: dict, stack: RowStack[Leaf], *,
+                            staged: bool = False) -> dict:
         """Pop each run `tree` holds out of it, its rows stacked by `stack` (`stage_form`), by the
         run's inside name. A collection holding some of a run's layers and not the others is
         refused, and so are layers whose structures differ (`_refuse_unlike`)."""
@@ -949,9 +1008,33 @@ class StackView:
                     f"collection {collection!r} holds some of the layers {sorted(layers)} and not "
                     "the others; a run reads every one of its layers or none")
             _refuse_unlike(collection, [tree[layer] for layer in layers], layers)
-            shape = self.stacked_shape(count)
+            shape = self.staged_shape(count) if staged else self.stacked_shape(count)
             runs[name] = with_stacked_axes(jax.tree.map(lambda *rows, shape=shape: stack(list(rows), shape),
                                                         *[tree.pop(layer) for layer in layers]), len(shape))
+        return runs
+
+    def _stacked_positions[Leaf](self, collection: str, tree: dict, stack: RowStack[Leaf]) -> dict:
+        """Pop each periodic run `tree` holds out of it (`_periodic_runs`), each position of its period
+        stacked by `stack` over its repeats, by the run's inside name: `stage_form`'s periodic runs on one
+        stage, as `_stacked_periods` stacks them for the scan."""
+        runs = {}
+        for name, prefix, positions in self._periodic_runs():
+            stacked = {}
+            for offset, layers in enumerate(positions):
+                held = [layer in tree for layer in layers]
+                if not any(held):
+                    continue
+                if not all(held):
+                    raise ValueError(
+                        f"collection {collection!r} holds some of the layers {sorted(layers)} and not "
+                        "the others; a run reads every one of its layers or none")
+                _refuse_unlike(collection, [tree[layer] for layer in layers], layers)
+                shape = (self.stages, len(layers))
+                rows = [tree.pop(layer) for layer in layers]
+                stacked[f'{prefix}{offset}'] = with_stacked_axes(
+                    jax.tree.map(lambda *rows, shape=shape: stack(list(rows), shape), *rows), len(shape))
+            if stacked:
+                runs[name] = stacked
         return runs
 
     def _stacked_periods(self, collection: str, tree: dict) -> None:

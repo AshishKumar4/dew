@@ -241,7 +241,7 @@ Cached autoregressive generation needs `sequence=1`. A mesh that trains with seq
 
 ## Layer scan and pipeline
 
-A decoder scans by default (`scan_layers=True`): it groups compatible consecutive layers, and a hybrid's layers repeating one period (Qwen3.5's three GDN layers and an attention layer), into a Flax scan whose body is one run's layer or one period, so a step's program grows with the period rather than the depth; the stored variables stay per layer. `scan_layers=False` runs the plain loop, a layer at a time. A step that reads its weights a layer at a time (banked, streamed or in host memory) scans the runs its banks hold.
+`scan_layers=True` groups compatible consecutive decoder layers into a Flax scan, and the stored variables stay per layer. Scanning can cut compile time, but it adds stacking and loop overhead, and it does not promise a flat compile time or faster steps. Measure it at the model size and on the backend you plan to use.
 
 Whatever `scan_layers` says, `init` draws each run of two or more like layers under one scan, so its program has one draw per run instead of one per layer. At a given seed those layers get new values from the same distribution, and the draw depends on `bank_layers`, which splits the runs. So a run recorded with a Dew version that initialized layer by layer starts from different weights at the same seed. Init under a stage mesh or with `decode=True` still runs the plain loop.
 

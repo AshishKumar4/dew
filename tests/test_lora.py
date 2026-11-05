@@ -571,6 +571,21 @@ def test_an_adapter_on_gate_and_up_keeps_its_branch_where_the_row_joins_them(dec
         assert np.max(np.abs(adapted - base)) > 1e-2, joins
 
 
+def test_layers_adapted_at_their_own_ranks_scan_apart(decoder, loaded, reference):
+    """PEFT's rank pattern adapts layer 1's v_proj at rank 2 beside layer 0's 4: their factors cannot
+    stack, so a scanned stack runs the two as runs of their own (`StackView.layer_structures` keys a layer
+    by its leaves' shapes too, row 4095: as one run, their factors' stack raised), and the adapter's
+    branch moves its logits off the base model's as in the plain loop."""
+    model = loaded.model.clone(scan_layers=True)
+    variables = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jax.random.normal(jax.random.key(7), leaf.shape, leaf.dtype)
+        if path[-1].key == "lora_B" else leaf, loaded.variables)
+    assert model.bind(variables).groups == ((0, 1), (1, 1))
+    tokens = jnp.asarray(reference["input_ids"])
+    base = np.asarray(decoder.model.apply(decoder.variables, tokens))
+    assert not np.array_equal(np.asarray(model.apply(variables, tokens)), base)
+
+
 class _BranchHost(nn.Module):
     """A target Dense carried as a submodule, the way models carry one."""
 
