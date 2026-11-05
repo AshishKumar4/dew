@@ -888,6 +888,30 @@ def test_a_bounded_mixtures_member_counts_resume_as_the_uninterrupted_read_count
     assert _member_counts([*batches, *after], expected) == _member_counts([*batches, *again], statistics)
 
 
+def test_a_streamed_position_an_earlier_dew_saved_in_its_shards_interleave_resumes():
+    """A streamed mix's position Dew saved on main before a pass of one shard at a time read its shards one
+    after another (`shards._Sequential`), its shards' rows in Grain's interleave of one place at a time:
+    it resumes there, read on by that interleave, and the read gives the batches it gave after it (row
+    4079)."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+
+    saved = json.loads((Path(__file__).parent / "fixtures" / "interleaved_shard_position.json").read_text())
+    assert "iterators_in_use" in saved["state"]
+    left = Memory([{"id": np.int32(index)} for index in range(1, 13)], shard_rows=4).named("left")
+    right = Memory([{"id": np.int32(index)} for index in range(101, 113)], shard_rows=4).named("right")
+    data = compile(mix([left, right]).batch(2), read="streamed",
+                   loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1))
+    stream = data.train(DataPartition())
+    try:
+        assert [np.asarray(batch["id"]).tolist() for batch, _ in zip(stream, range(3))] == saved["before"]
+        assert "iterators_in_use" not in stream.get_state().decode()
+        stream.set_state(saved["state"].encode())
+        assert [np.asarray(batch["id"]).tolist() for batch, _ in zip(stream, range(8))] == saved["after_ids"]
+    finally:
+        stream.close()
+
+
 @pytest.mark.parametrize("native", [False, True])
 def test_a_bounded_mixtures_position_saved_before_its_members_counts_resumes_on_its_clock(native):
     """The streamed read of the resume test above, behind a Grain step of the mixture's own that keeps
