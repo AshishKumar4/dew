@@ -403,6 +403,97 @@ def test_a_family_reads_quantized_weights_through_the_shared_codec(tmp_path, nam
     np.testing.assert_array_equal(*logits)
 
 
+KIMI_K25_MEDIA = {"image": ((1, 6, 4), (3,)), "video": ((2, 4, 4), (2,))}
+"""Each Kimi K2.5 media site's item grid `(t, h, w)` in 2-pixel patches and where its placeholder run
+starts: an image of 6 merge blocks, and a two-frame video whose frames pool into 4 (`sd2_tpool`)."""
+
+KIMI_K25_MEDIA_SEEDS = 8
+"""The media sites' declared check-1 seeds, sized by `seeds_for` on armada paired with Dew's arm: 8 for
+each site (22 s the image's, 14 s the video's)."""
+
+
+def kimi_k25_media_case(site):
+    """Check 1's arms for Kimi K2.5 whole over a row a drawn image, or a drawn video's frames, fill (row
+    855): Dew's bundle (`Pretrained.load`: MoonViT, its patch merger, the decoder), its processor reading
+    the fields transformers' processor gives (`Processor.from_hf`: the placeholder run as long as the
+    item's merged blocks, its patches `[N, 3, 2, 2]` with their grid), and transformers' own
+    Kimi_K25ForConditionalGeneration over the same checkpoint, in float32 and as its float64 twin
+    (`transformers_arms`); each draw's tokens redrawn until the decoder's routing clears its margin."""
+    import selection_margins
+    import torch
+    from transformers import Kimi_K25ForConditionalGeneration
+
+    from dew.nn.inputs import ModelInputs
+
+    grid, starts = KIMI_K25_MEDIA[site]
+    config = fixture_config("kimi-k25-tiny")
+    token = config["image_token_id" if site == "image" else "video_token_id"]
+    count = grid[1] * grid[2] // 4
+    ids_shape = np.load(KIMI_K25 / "input_ids.npy")[:1].shape
+    pixels, grids = ("pixel_values", "image_grid_thw") if site == "image" else (
+        "pixel_values_videos", "video_grid_thw")
+
+    def draw(seed):
+        rng = np.random.default_rng([0x855, len(site), seed])
+        ids = rng.integers(0, min(config["image_token_id"], config["video_token_id"]) - 8, ids_shape)
+        for start in starts:
+            ids[0, start:start + count] = token
+        patches = rng.normal(size=(int(np.prod(grid)), 3, 2, 2)).astype(np.float32)
+        return ids.astype(np.int32), patches
+
+    source = Pretrained.load(KIMI_K25, dtype="float32", attention_impl="reference")
+    model, variables = source.model, source.variables
+
+    def batch(ids, patches):
+        fields = source.processor.from_hf({"input_ids": ids, pixels: patches, grids: np.asarray([grid])})
+        inputs = ModelInputs(jnp.asarray(ids), fields.token_fields, fields.conditioning)
+        return inputs.tokens, inputs.kwargs()
+
+    @as_given
+    def dew(ids, patches):
+        tokens, fields = batch(ids, patches)
+        return np.asarray(model.apply(variables, tokens, **fields))
+
+    network = Kimi_K25ForConditionalGeneration.from_pretrained(
+        str(KIMI_K25), dtype=torch.float32, local_files_only=True, experts_implementation="eager")
+    network.set_attn_implementation("eager")
+
+    def logits(network, ids, patches):
+        dtype = next(network.parameters()).dtype
+        if site == "image":
+            return network(input_ids=ids, **{pixels: patches.to(dtype), grids: torch.tensor([grid])}).logits
+        # transformers 5.17 splits a video's projected tokens by t·h·w/4 where its tower pools the frames (row
+        # 4368) to h·w/4 (`get_image_features`), so its forward refuses a clip of more than one frame: its own
+        # tower, projector and decoder, placed as its forward places them (`Kimi_K25Model.forward`: the
+        # placeholders read token 0, then the projected tokens scattered over them).
+        inner, placed = network.model, ids == token
+        embeds = inner.get_input_embeddings()(ids.masked_fill(placed, 0))
+        tower = inner.vision_tower(patches.to(dtype), grid_thw=torch.tensor([grid])).pooler_output
+        projected = inner.mm_projector(tower).squeeze(1).to(embeds.dtype)
+        embeds = embeds.masked_scatter(placed[..., None], projected)
+        return network(inputs_embeds=embeds).logits
+
+    reference, truth = transformers_arms(network.eval(), logits)
+    # The decoder's routing over the row with its media, as the compared runs route it.
+    captured = selection_margins.capture(model, lambda module, tokens, fields: module(tokens, **fields))
+    decoder = translate_config(config)
+
+    def clears(drawn):
+        selections = captured(variables, *batch(*drawn))
+        return (selection_margins.margin(decoder, selections, f"kimi-k25 {site}", stable=False)
+                > selection_margins.MARGIN)
+    return dew, reference, selection_margins.clearing(draw, clears), truth
+
+
+@pytest.mark.parametrize("site", sorted(KIMI_K25_MEDIA))
+def test_kimi_k25_reads_its_media_whole_on_par_with_transformers(site):
+    """Kimi K2.5 loads whole (row 855): its MoonViT, attending over an item's every frame, its frames pooled,
+    its patch merger and the decoder compute transformers' logits over a row a drawn image or a drawn
+    video fills, on par with transformers' own model from its float64 twin (check 1)."""
+    dew, reference, draw, truth = kimi_k25_media_case(site)
+    assert_as_exact(dew, reference, draw, f"kimi-k25 {site}", seeds=KIMI_K25_MEDIA_SEEDS, truth_fn=truth)
+
+
 def test_kimi_k25_text_only_placeholders_match_reference():
     import torch
 
