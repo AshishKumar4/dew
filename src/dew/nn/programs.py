@@ -34,11 +34,11 @@ ENTRYWISE = frozenset({
     "abs", "acos", "acosh", "add", "add_any", "and", "asin", "asinh", "atan", "atan2", "atanh", "bessel_i0e",
     "bessel_i1e", "cbrt", "ceil", "clamp", "clz", "complex", "conj", "convert_element_type", "copy", "copy_p",
     "cos", "cosh", "digamma", "div", "eq", "erf", "erf_inv", "erfc", "exp", "exp2", "expm1", "floor", "ge",
-    "gt", "igamma", "igammac", "imag", "integer_pow", "is_finite", "le", "lgamma", "log", "log1p", "logistic",
-    "lt", "max", "min", "mul", "ne", "neg", "nextafter", "not", "or", "polygamma", "population_count", "pow",
-    "real", "reduce_precision", "rem", "round", "rsqrt", "select_n", "shift_left", "shift_right_arithmetic",
-    "shift_right_logical", "sign", "sin", "sinh", "sqrt", "square", "stop_gradient", "sub", "tan", "tanh",
-    "threefry2x32", "xor", "zeta",
+    "gt", "igamma", "igammac", "imag", "integer_pow", "is_finite", "le", "lgamma", "log", "log1p", "log2",
+    "logistic", "lt", "max", "min", "mul", "ne", "neg", "nextafter", "not", "or", "polygamma",
+    "population_count", "pow", "real", "reduce_precision", "rem", "round", "rsqrt", "select_n", "shift_left",
+    "shift_right_arithmetic", "shift_right_logical", "sign", "sin", "sinh", "sqrt", "square", "stop_gradient",
+    "sub", "tan", "tanh", "threefry2x32", "xor", "zeta",
 })
 """The operations whose every output entry reads its operands' entries at its own index (each operand of
 the output's shape, or a scalar) and nothing else, by JAX's name (`jax_name`): the one vocabulary the
