@@ -22,7 +22,6 @@ from dew.batch import Variables
 from dew.nn.kernels.options import program
 
 if TYPE_CHECKING:
-    from dew.checkpoints import StateLeaf
     from dew.checkpoints._payloads import _StepFacts
 
 
@@ -232,7 +231,7 @@ def _averages_held(tree) -> list[TreePath]:
             if name in fields and _at(tree, (*holder, name)) is not None]
 
 
-def _with_ema_deltas(state_tree: dict[str, StateLeaf]) -> tuple[dict[str, StateLeaf], dict[str, list[str]]]:
+def _with_ema_deltas(state_tree: Mapping[str, object]) -> tuple[Mapping[str, object], dict[str, list[str]]]:
     """Return `state_tree` with each average's leaves (`_averages_held`), where `_stored_as_delta`
     allows, as byte planes of their difference from the weights they follow, and the paths of those leaves
     in each average's tree, by its name, which the checkpoint's metadata records (`deltas`).

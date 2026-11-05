@@ -415,17 +415,19 @@ def test_older_kept_steps_hold_their_model_alone_and_the_latest_resumes(tmp_path
 
 def test_a_step_cut_at_its_own_save_is_read_as_cut(tmp_path):
     """A step its retention cuts the moment its save lands (no latest kept whole) is read as cut by every
-    selector at once: a resume finds no step, and a model's reader reads its model."""
+    selector at once: a resume reads the step a rule keeps whole (the fit's own, the run's best by its
+    training loss), and a model's reader the newest model, the cut step's."""
     directory = tmp_path / 'run'
     run = trainer(directory, keep=Keep(latest=0, every=1, weights_only=True))
     state = run.fit(dataclasses.replace(data(), val=None), steps=1, log_every=1)
     checkpoints = run.checkpoints
     checkpoints.save(2, state.replace(step=jnp.int32(2)), None)
     checkpoints.wait()
-    assert checkpoints.latest is None
+    assert {kept.step: kept.kind for kept in checkpoints.kept()} == {1: 'state', 2: 'weights'}
+    assert checkpoints.latest == 1
     assert checkpoints.pinned() == 2
-    with pytest.raises(FileNotFoundError):
-        checkpoints.restore(run.initial_state())
+    resumed, _ = checkpoints.restore(run.initial_state())
+    assert int(resumed.step) == 1
 
 
 def test_a_step_whose_projection_was_cut_short_reads_as_projected_and_finishes_later(tmp_path, monkeypatch):

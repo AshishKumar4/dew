@@ -1541,7 +1541,7 @@ class Checkpoints:
             self._metadata = None
 
     def _frozen(self, state_tree: dict[str, StateLeaf]
-                ) -> tuple[dict[str, object], dict[str, dict[str, str]]]:
+                ) -> tuple[Mapping[str, object], dict[str, dict[str, str]]]:
         """Return `state_tree` with the collections but `params` of each of its variables trees
         (`_variable_trees`: the variables and the EMA, the run's and each DiLoCo group's, stacked) held
         in the store (`FROZEN_STORE`), and each one's digest under its tree's name, which the step records.
@@ -1579,7 +1579,7 @@ class Checkpoints:
                     with region("checkpoint.frozen"), ocp.Checkpointer(_handler()) as checkpointer:
                         checkpointer.save(root / digest, args=ocp.args.PyTreeSave(value))
                     written.add(digest)
-        kept_tree = dict(state_tree)
+        kept_tree: Mapping[str, object] = state_tree
         for path, collections in trees.items():
             values = held[_named(path)]
             kept_tree = _with(kept_tree, path, {name: value for name, value in collections.items()
