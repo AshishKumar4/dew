@@ -73,7 +73,82 @@ def mode_pooled_server(args) -> dict:
                       for index, generation in drawn}}
 
 
-MODES = {"pooled_server": mode_pooled_server}
+def mode_pooled_host_tier(args) -> dict:
+    """Each process's prompt served four rounds through one server over the pool's mesh with a host tier,
+    a group of rows a process: the prompt, two others that take its group's pages, then the prompt again,
+    which reads its prefix back from its process's host slots; one process serves every round's prompts."""
+    import jax
+    import jax.numpy as jnp
+    from flax import linen as nn
+    from model_support import serving_task
+
+    from dew.inference.loading import place
+    from dew.inference.serving import Server
+    from dew.interop.decoder_parts import decoder_axes
+    from dew.nn.kv_cache import KVCache
+    from dew.nn.sharding import boxed
+    from dew.training import Layout, MeshSpec
+
+    rank, processes = jax.process_index(), jax.process_count()
+    bound = serving_task()
+    bound = bound.bind(nn.unbox(bound.model.init(jax.random.key(3), jnp.ones((1, 2), jnp.int32))))
+    if args.fsdp_size > 1:
+        with boxed(decoder_axes(bound.model)):
+            bound = bound.bind(place(bound.variables, MeshSpec(fsdp=args.fsdp_size),
+                                     Layout(min_shard=1, tolerance=1.0)))
+    groups = args.fsdp_size
+    server = Server.from_task(bound, slots=groups, capacity=64, admission=groups, prefix_cache=True,
+                              kv_cache=KVCache(page_size=4, pages=8 * groups), host_pages=2 * groups)
+    shared = ["123456781", "432143211"]
+    others = ["987654329876", "555544443333"]
+    rounds = [shared, [others[0]] * 2, [others[1]] * 2, shared]
+    drawn = []
+    for number, prompts in enumerate(rounds):
+        mine = range(len(prompts)) if processes == 1 else [rank]
+        tickets = [(f"{number}/{index}", server.submit(prompts[index], 6, key=10 * number + index))
+                   for index in mine]
+        server.run()
+        drawn += [(name, ticket.result().host()) for name, ticket in tickets]
+    return {"shared": server.prefix_hits,
+            "drawn": {name: {"tokens": generation.tokens[0].tolist(), "length": int(generation.lengths[0])}
+                      for name, generation in drawn}}
+
+
+def mode_pooled_prefill_apart(args) -> dict:
+    """`PROMPTS` served through one server that decodes on a mesh of each process's first device and
+    prefills on a mesh of each process's second, both over the pool, each process submitting its share,
+    the pool stepping it together; one process serves every prompt, decoding on its first device and
+    prefilling on its second."""
+    import jax
+    import jax.numpy as jnp
+    from flax import linen as nn
+    from model_support import serving_task
+
+    from dew.inference.loading import place
+    from dew.inference.serving import Server
+    from dew.interop.decoder_parts import decoder_axes
+    from dew.nn.sharding import boxed
+    from dew.training import Layout, MeshSpec
+
+    rank, processes = jax.process_index(), jax.process_count()
+    devices = jax.devices()
+    first = [device for device in devices if device.id % 2 == 0]
+    second = [device for device in devices if device.id % 2 == 1]
+    bound = serving_task()
+    bound = bound.bind(nn.unbox(bound.model.init(jax.random.key(3), jnp.ones((1, 2), jnp.int32))))
+    with boxed(decoder_axes(bound.model)):
+        bound = bound.bind(place(bound.variables, MeshSpec(fsdp=len(first)).build(first),
+                                 Layout(min_shard=1, tolerance=1.0)))
+    server = Server.from_task(bound, slots=2 * len(first), capacity=128, admission=len(first),
+                              prefill_mesh=MeshSpec(fsdp=len(second)).build(second))
+    mine = range(rank, len(PROMPTS), processes)
+    tickets = [(index, server.submit(PROMPTS[index], BUDGETS[index], key=index)) for index in mine]
+    server.run()
+    return {"drawn": {str(index): ticket.result().host().tokens[0].tolist() for index, ticket in tickets}}
+
+
+MODES = {"pooled_server": mode_pooled_server, "pooled_host_tier": mode_pooled_host_tier,
+         "pooled_prefill_apart": mode_pooled_prefill_apart}
 
 
 if __name__ == "__main__":

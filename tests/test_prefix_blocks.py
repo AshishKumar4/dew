@@ -226,7 +226,9 @@ def test_a_saved_prefix_runs_bundle_serves_as_the_runs_own_task(tmp_path):
     declaration (ledger 3007), as the run's own loader does (`TextGeneration.from_run`): its prefix and the
     numerics its step trained in, where the bundle had built a task from the generation config its
     export writes, which states neither. Their greedy rollouts agree bit for bit, and a bundle loaded from
-    that export, which holds no run's declaration, builds its task from the export's files."""
+    the export, which writes the run's declaration beside its config, builds the run's own task again
+    in the run's own dtypes where the load states none, from the folder a load selects (row 4314), where
+    it had built a causal one in bfloat16 from the generation config alone."""
     import json
 
     from affine_run import Replaying
@@ -269,7 +271,28 @@ def test_a_saved_prefix_runs_bundle_serves_as_the_runs_own_task(tmp_path):
     assert given.temperature == 0.5
     assert (given.eos_token_ids, given.pad_token_id) == ((VOCAB - 1,), VOCAB - 2)
     bundle.save(tmp_path / "export")
-    assert Pretrained.load(tmp_path / "export", dtype="float32").settings is None
+    # Loaded stating no dtypes: the run's own, which the export carries beside its declaration, where a
+    # load of a source with none computes in bfloat16; and from a folder of a release, its own.
+    (tmp_path / "release").mkdir()
+    bundle.save(tmp_path / "release" / "model")
+    selected = Pretrained.load(tmp_path / "release", subfolder="model")
+    loaded = Pretrained.load(tmp_path / "export")
+    assert jnp.dtype(loaded.model.dtype) == jnp.dtype(selected.model.dtype) == jnp.float32
+    assert jax.tree.map(lambda leaf: leaf.dtype, loaded.variables) == jax.tree.map(
+        lambda leaf: leaf.dtype, jax.device_get(bundle.variables))
+    # Dtypes a load states take the run's place, each on its own.
+    stated = Pretrained.load(tmp_path / "export", dtype=jnp.bfloat16)
+    narrow = Pretrained.load(tmp_path / "export", param_dtype=jnp.bfloat16)
+    assert (jnp.dtype(stated.model.dtype), jnp.dtype(narrow.model.dtype)) == (jnp.bfloat16, jnp.float32)
+    assert {leaf.dtype for leaf in jax.tree.leaves(narrow.variables["params"])} == {jnp.dtype(jnp.bfloat16)}
+    exported = loaded.pipeline()
+    assert (exported.prefix, exported.precision) == (PREFIX, trained_in)
+    assert (selected.settings, selected.numerics) == (loaded.settings, loaded.numerics)
+    # The run's own task over the same weights on the host, where the export's loads them: one program.
+    home = dataclasses.replace(bundle, variables=jax.device_get(bundle.variables)).pipeline()
+    again, run = exported(prompt, NEW, key=0), home(prompt, NEW, key=0)
+    np.testing.assert_array_equal(again.tokens, run.tokens)
+    np.testing.assert_array_equal(again.raw_log_probs, run.raw_log_probs)
 
 
 def test_with_no_prefix_the_loss_is_the_causal_one_bitwise():
