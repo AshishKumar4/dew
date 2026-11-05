@@ -2,10 +2,10 @@
 
 Lanes add entries at the head of `## Unreleased` side by side, so two merged branches often insert lines at
 the same place: a 3-way merge calls that a conflict though neither side removed anything. The driver joins
-such a hunk, ours then theirs, as git's union merge would. A hunk where either side deleted or rewrote a line
-the base had stays a conflict: union kept the other side's copy there, so a corrected entry came back beside
-its correction and a head's deletion vanished in its train's merge (rows 3284, 3297). Everything else is
-git's own 3-way merge (`git merge-file --diff3`).
+such a hunk, ours then theirs, as git's union merge would, an entry both sides carry once (row 3431). A hunk
+where either side deleted or rewrote a line the base had stays a conflict: union kept the other side's copy
+there, so a corrected entry came back beside its correction and a head's deletion vanished in its train's
+merge (rows 3284, 3297). Everything else is git's own 3-way merge (`git merge-file --diff3`).
 
 Git runs it once a clone names it (the land queue does the same on its merges):
 
@@ -20,10 +20,30 @@ import sys
 from pathlib import Path
 
 
+def entries(lines: list[bytes]) -> list[list[bytes]]:
+    """`lines` as the changelog's entries: each an item (`- ` at its first column) and the continuation lines
+    under it, and every other line a block of its own."""
+    blocks: list[list[bytes]] = []
+    for line in lines:
+        if blocks and blocks[-1][0].startswith(b"- ") and line[:1] == b" ":
+            blocks[-1].append(line)
+        else:
+            blocks.append([line])
+    return blocks
+
+
+def unshared(ours: list[bytes], theirs: list[bytes]) -> list[bytes]:
+    """`theirs`, a side's new lines, without the entries `ours` holds too (`entries`): an entry both sides
+    carry, main having taken a train's and a head carrying the same as a commit of its own, is joined once,
+    wherever each side holds it (row 3431)."""
+    held = {tuple(block) for block in entries(ours) if block[0].startswith(b"- ")}
+    return [line for block in entries(theirs) if tuple(block) not in held for line in block]
+
+
 def joined(base: Path, ours: Path, theirs: Path, size: int) -> tuple[bytes, int]:
     """The merge of `ours` and `theirs` from `base`, each conflict hunk whose base side is empty joined (ours,
-    then theirs), and the number of hunks left in conflict, marked as git marks them (`size` its markers'
-    width)."""
+    then theirs' entries ours lacks, `unshared`), and the number of hunks left in conflict, marked as git
+    marks them (`size` its markers' width)."""
     merged = subprocess.run(["git", "merge-file", "--stdout", "--diff3", f"--marker-size={size}",
                              "-L", "ours", "-L", "base", "-L", "theirs", str(ours), str(base), str(theirs)],
                             capture_output=True)
@@ -49,7 +69,7 @@ def joined(base: Path, ours: Path, theirs: Path, size: int) -> tuple[bytes, int]
                          *hunk["theirs"], line]
                 left += 1
             else:
-                text += hunk["ours"] + hunk["theirs"]
+                text += hunk["ours"] + unshared(hunk["ours"], hunk["theirs"])
             side = None
         elif side is None:
             text.append(line)

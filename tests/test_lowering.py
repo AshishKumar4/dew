@@ -622,6 +622,66 @@ def test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh(gen
     assert set(COLLECTIVES.findall(text)) <= {"all_reduce"}
 
 
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_per_group_bias_reaches_its_launch_at_its_groups_extent(generation):
+    """Row 3963 (kernel-templates.md §3, Appendix C row 10): a grouped product's bias of each group's own,
+    `[G, N]` on the axes `('groups', 'columns')`, lowered for the GPU, reaches the product's launch as
+    `[G, N]`: the launch reads no `[rows, N]` operand, the buffer of each row's bias the epilogue's fusion
+    exists to remove."""
+    from dew.nn.kernels import gemm
+    from dew.telemetry.instrumentation import custom_call_kind
+
+    rows, depth, width, groups = 384, 128, 256, 4
+
+    def biased(x, w, sizes, b):
+        return gemm.gemm(x, w, sizes, epilogue=lambda acc, bias: acc + bias,
+                         epilogue_operands=((b, ("groups", "columns")),), out_dtype=jnp.bfloat16)
+
+    args = (jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16),
+            jax.ShapeDtypeStruct((groups, depth, width), jnp.bfloat16),
+            jax.ShapeDtypeStruct((groups,), jnp.int32), jax.ShapeDtypeStruct((groups, width), jnp.float32))
+    from jax.sharding import AbstractMesh, AxisType
+
+    mesh = gpu_mesh(AbstractMesh((1,), ("data",), axis_types=(AxisType.Auto,)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(biased).trace(*args).lower(lowering_platforms=("cuda",))
+    launches = [call.operands for call in custom_calls(lowered)
+                if custom_call_kind(call.target) in ("triton", "mosaic_gpu")]
+    assert launches
+    assert all((rows, width) not in operands for operands in launches), launches
+
+
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_fused_epilogues_intermediates_never_reach_global_memory(generation):
+    """Row 1705: a grouped product's consumers fused into its epilogue (`fuser.fuse` over
+    `fused_gemm.fusible_gemm`: a SiLU of the scaled product plus a residual, cast to bf16), lowered for the
+    GPU, write only their bf16 result: no `[rows, N]` fp32 value, the product's accumulator or anything the
+    consumers compute from it, is a tensor of the program, so none is ever stored to global memory, and the
+    launch's results are the consumers' output alone."""
+    from jax.experimental.pallas import fuser
+    from jax.sharding import AbstractMesh, AxisType
+
+    from dew.nn.kernels import fused_gemm
+    from dew.telemetry.instrumentation import custom_call_kind
+
+    rows, depth, width = 384, 128, 256
+
+    def fused(x, w, sizes, residual):
+        product = fused_gemm.fusible_gemm(x, w, sizes)
+        return (jax.nn.silu(product * 2) + residual.astype(jnp.float32)).astype(jnp.bfloat16)
+
+    args = (jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16),
+            jax.ShapeDtypeStruct((2, depth, width), jnp.bfloat16), jax.ShapeDtypeStruct((2,), jnp.int32),
+            jax.ShapeDtypeStruct((rows, width), jnp.bfloat16))
+    mesh = gpu_mesh(AbstractMesh((1,), ("data",), axis_types=(AxisType.Auto,)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(fuser.fuse(fused)).trace(*args).lower(lowering_platforms=("cuda",))
+    calls = custom_calls(lowered)
+    launches = [call for call in calls if custom_call_kind(call.target) in ("triton", "mosaic_gpu")]
+    assert len(launches) == 1, [call.target for call in calls]
+    assert f"tensor<{rows}x{width}xf32>" not in lowered.as_text()
+
+
 @pytest.mark.parametrize("generation", GPUS)
 def test_an_expert_layer_lowers_for_every_gpu(generation):
     """An expert layer's bf16 forward and backward under 'auto', its grouped matmul and SiLU product as

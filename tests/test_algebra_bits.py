@@ -3,8 +3,9 @@ codes' fields, its cheapest instruction form found by the price-ordered search a
 the decoded registers read as the consumer reads them, values its format defines."""
 
 import dataclasses
-import functools
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -23,23 +24,6 @@ def _e4m3(code: int) -> float:
     return -magnitude if sign else magnitude
 
 
-def _nvfp4():
-    """Eight E2M1 codes of a 32-bit word (code `i` at bits `4i` to `4i + 3`: mantissa, the exponent's two
-    bits, sign) decoded into four registers of two bfloat16s, code `2i` the low half of register `i` and code
-    `2i + 1` the high: its mantissa at bit 6, its exponent at 7 and 8, its sign at 15, so the bfloat16 times
-    2^126 is the code's value (the exponent's bias, folded into the block scale's multiply)."""
-    fields = {0: 6, 1: 7, 2: 8, 3: 15}
-    placement = {4 * code + field: (code // 2, 16 * (code % 2) + bit)
-                 for code in range(8) for field, bit in fields.items()}
-    return bits.BitTransform.placed("nvfp4-bf16", 32, (0x81C081C0,) * 4, placement)
-
-
-@functools.cache
-def _nvfp4_form() -> bits.BitForm:
-    """The NVFP4 decode's form over shifts of at most 6 places, found once for the tests that read it."""
-    return bits.synthesized(_nvfp4(), reach=6)
-
-
 def _bfloat16(halves: np.ndarray) -> np.ndarray:
     """16-bit words read as bfloat16s, widened to float32."""
     return (halves.astype(np.uint32) << 16).view(np.float32)
@@ -51,8 +35,9 @@ def test_a_formats_decode_is_found_at_the_cheapest_price_and_reads_back_its_valu
     issues, 8 instructions), is proven on every basis word (`bits.proven`), and every code of every place,
     encoded and decoded, reads back as the bfloat16 whose value times 2^126 is the code's (E2M1's own
     values)."""
-    form = _nvfp4_form()
+    form = bits.synthesized(bits.NVFP4_BFLOAT16, reach=6)
     assert form.price <= (5, 8)
+    assert form == bits.NVFP4_BFLOAT16_FORM
     rng = np.random.default_rng(3731)
     codes = rng.integers(0, 16, size=(4096, 8))
     codes[:16, :] = np.arange(16)[:, None]
@@ -65,6 +50,26 @@ def test_a_formats_decode_is_found_at_the_cheapest_price_and_reads_back_its_valu
             halves = (value >> np.uint64(16 * half)) & np.uint64(0xFFFF)
             got = _bfloat16(halves).astype(np.float64) * 2.0 ** 126
             np.testing.assert_array_equal(got, expected)
+
+
+def test_nvfp4_words_stored_in_the_forms_layout_decode_to_their_codes_in_order():
+    """NVFP4 words packed in their natural order (code `i` at bits `4i`), stored in the checked-in form's
+    layout as a prepare step stores them on the device (`BitForm.prepared`) and decoded to bfloat16 elements
+    as the GEMM's portable path reads them (`BitForm.values`), under a jit: every code of every place reads
+    back in its place as its E2M1 value times 2^-126, the bit pattern NumPy's encoder stores."""
+    form = bits.NVFP4_BFLOAT16_FORM
+    rng = np.random.default_rng(3621)
+    codes = rng.integers(0, 16, size=(512, 8))
+    codes[:16, :] = np.arange(16)[:, None]
+    words = (codes.astype(np.uint64) << (4 * np.arange(8, dtype=np.uint64))).sum(axis=1)
+    natural = jnp.asarray(words.astype(np.uint32).reshape(64, 8))
+    stored = jax.jit(form.prepared)(natural)
+    np.testing.assert_array_equal(np.asarray(stored).astype(np.uint64).ravel(), form.encoded(words))
+    decoded = jax.jit(lambda stored: form.values(stored, jnp.bfloat16))(stored)
+    assert decoded.shape == (64, 64)
+    expected = np.where(codes >= 8, -1.0, 1.0) * np.asarray(E2M1)[codes & 7]
+    got = np.asarray(decoded).astype(np.float64).reshape(512, 8) * 2.0 ** 126
+    np.testing.assert_array_equal(got, expected)
 
 
 def test_an_fp8_decode_reads_back_every_finite_code_in_every_place():
@@ -107,7 +112,7 @@ def test_a_fixed_layout_reads_the_input_as_stored():
 def test_a_form_wrong_on_one_bit_is_unproven(fault):
     """The proof refuses a form one bit off its transform: the NVFP4 decode's first register masked one bit
     short, or a shift one place over, each wrong on some basis word."""
-    transform, form = _nvfp4(), _nvfp4_form()
+    transform, form = bits.NVFP4_BFLOAT16, bits.NVFP4_BFLOAT16_FORM
     steps = list(form.steps)
     index = (form.outputs[0] - 1 if fault == "mask"
              else next(i for i, step in enumerate(steps) if step.op is not bits.BitOp.LOP3))
@@ -144,7 +149,93 @@ def test_a_fixed_layouts_form_reads_the_input_as_stored():
 def test_a_transform_kept_off_the_fma_pipe_takes_its_shifts_on_the_alu():
     """The NVFP4 decode declared for a consumer whose FMA pipe is its own (`units`): its form's every shift
     issues on the ALU, its price the ALU's, and it is proven."""
-    transform = dataclasses.replace(_nvfp4(), units=frozenset({bits.Unit.ALU}))
+    transform = dataclasses.replace(bits.NVFP4_BFLOAT16, units=frozenset({bits.Unit.ALU}))
     form = bits.synthesized(transform, reach=6)
     assert form.issues[bits.Unit.FMA] == 0
     assert form.price == (len(form.steps), len(form.steps))
+
+
+def _nibbles(units=frozenset(bits.Unit)) -> bits.BitTransform:
+    """A fixed 16-bit layout's transform, each byte's high nibble moved to its low one, its form issued on
+    `units`."""
+    placement = {4 + 8 * byte + bit: (0, 8 * byte + bit) for byte in range(2) for bit in range(4)}
+    return dataclasses.replace(
+        bits.BitTransform.placed("high-nibbles", 16, (0x0F0F,), placement, free=False), units=units)
+
+
+ALU = frozenset({bits.Unit.ALU})
+FORMS = {
+    "nvfp4": lambda: bits.NVFP4_BFLOAT16_FORM,
+    "nvfp4-alu": lambda: bits.synthesized(dataclasses.replace(bits.NVFP4_BFLOAT16, units=ALU), reach=6),
+    "nibbles": lambda: bits.synthesized(_nibbles()),
+    "nibbles-alu": lambda: bits.synthesized(_nibbles(ALU)),
+}
+"""Forms whose steps together take every instruction a form's PTX writes (`BitForm.ptx`): a rotation, left
+and right shifts on either pipe, and a mask of one value and of two values' XOR."""
+
+
+def test_the_forms_take_every_instruction_the_ptx_writes():
+    """`FORMS` reach every (instruction, pipe) PTX writes, so the tests below run each of them."""
+    taken = {(step.op, step.unit) for form in FORMS.values() for step in form().steps}
+    assert taken == set(bits._PTX)
+
+
+@pytest.mark.parametrize("name", FORMS)
+def test_a_forms_traced_decode_is_its_decode(name):
+    """A form traced in JAX's integer operations (`BitForm.traced`, a kernel's portable path and its
+    interpreter's) gives every register of every drawn stored word as the form's own decode does, under a
+    jit."""
+    form = FORMS[name]()
+    words = np.random.default_rng(3733).integers(0, 1 << 32, size=4096, dtype=np.uint64)
+    traced = jax.jit(form.traced)(jnp.asarray(words.astype(np.uint32)))
+    for got, expected in zip(traced, form.decoded(words), strict=True):
+        np.testing.assert_array_equal(np.asarray(got).astype(np.uint64), expected)
+
+
+def _inline_decode(form: bits.BitForm):
+    """A Triton kernel decoding a block of stored words (uint32) through the form's PTX (`BitForm.ptx`), a
+    register's block apiece, its words int32 inside, as Triton's inline assembly types a 32-bit register (a
+    signless integer)."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as plgpu
+
+    count = len(form.outputs)
+
+    def body(words_ref, *out_refs):
+        shape = jax.ShapeDtypeStruct(words_ref.shape, jnp.int32)
+        words = words_ref[...]
+        for output, ref in enumerate(out_refs):
+            ref[...] = plgpu.elementwise_inline_asm(form.ptx(output), args=(words,), constraints="=r,r",
+                                                    pack=1, result_shape_dtypes=(shape,))[0]
+
+    def decode(words):
+        shape = jax.ShapeDtypeStruct(words.shape, jnp.int32)
+        signed = jax.lax.bitcast_convert_type(words, jnp.int32)
+        return tuple(jax.lax.bitcast_convert_type(value, jnp.uint32)
+                     for value in pl.pallas_call(body, out_shape=(shape,) * count)(signed))
+
+    return decode
+
+
+@pytest.mark.parametrize("name", FORMS)
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_forms_ptx_compiles_for_the_gpu(generation, name):
+    """A form's PTX in a Triton kernel's inline assembly, lowered and compiled by XLA for a compile-only GPU
+    of `generation` (`tests/kernel_compile.py`): ptxas takes every instruction PTX writes for a form
+    (`FORMS` take them all)."""
+    from kernel_compile import lowered_for
+
+    words = jax.ShapeDtypeStruct((1024,), jnp.uint32)
+    lowered_for(_inline_decode(FORMS[name]()), (words,), generation).compile()
+
+
+@pytest.mark.gpu(reason="runs a form's PTX on this host's GPU")
+@pytest.mark.parametrize("name", FORMS)
+def test_a_forms_ptx_decodes_on_the_gpu_as_its_form_does(name):
+    """A form's PTX run on the GPU (`BitForm.ptx` in a Triton kernel's inline assembly) gives every register
+    of every drawn stored word as the form's own decode does, each instruction PTX writes among them."""
+    form = FORMS[name]()
+    words = np.random.default_rng(3734).integers(0, 1 << 32, size=1 << 16, dtype=np.uint64)
+    decoded = jax.jit(_inline_decode(form))(jnp.asarray(words.astype(np.uint32)))
+    for got, expected in zip(decoded, form.decoded(words), strict=True):
+        np.testing.assert_array_equal(np.asarray(got).astype(np.uint64), expected)

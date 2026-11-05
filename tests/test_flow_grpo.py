@@ -768,38 +768,25 @@ def test_a_clip_reward_scores_each_sample_against_its_prompts_caption():
 
 
 def test_multihost_flow_rollout_reassembles_owned_groups(tmp_path):
-    import subprocess
     import sys
 
-    from test_multiprocess import (
-        assert_same_parameters,
-        dumped_params,
-        free_port,
-        report_of,
-        terminate,
-        worker_env,
-    )
+    from process_support import run_pool, start_process
+    from test_multiprocess import assert_same_parameters, dumped_params
 
     worker = Path(__file__).with_name("flow_grpo_worker.py")
-    coordinator = f"127.0.0.1:{free_port()}"
-    outputs = [tmp_path / f"rank{rank}.json" for rank in range(2)]
-    running = [subprocess.Popen(
-        [sys.executable, str(worker), str(rank), "2", coordinator, str(output)],
-        env={**worker_env(1), "JAX_ENABLE_X64": "0"}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, start_new_session=True) for rank, output in enumerate(outputs)]
-    try:
-        reports = [report_of(process, output, timeout=120)
-                   for process, output in zip(running, outputs, strict=True)]
-    finally:
-        for process in running:
-            if process.poll() is None:
-                terminate(process)
-    baseline_path = tmp_path / "single.json"
-    baseline_process = subprocess.Popen(
-        [sys.executable, str(worker), "0", "1", "unused", str(baseline_path)],
-        env={**worker_env(1), "JAX_ENABLE_X64": "0"}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, start_new_session=True)
-    baseline = report_of(baseline_process, baseline_path, timeout=120)
+
+    def started(mode, out, *, processes, process_id, coordinator):
+        # Each rank an owned group of one CPU device (`process_support.run_pool`); one process needs no
+        # coordinator.
+        return start_process([sys.executable, str(worker), str(process_id), str(processes),
+                              coordinator if processes > 1 else "unused", str(out)], 1,
+                             environment={"JAX_ENABLE_X64": "0"})
+
+    reports = run_pool("flow", tmp_path / "pool", 2, timeout=120, start=started)
+    [baseline] = run_pool("flow", tmp_path / "single", 1, timeout=120, start=started)
+    # Where run_pool has each rank write its report, its parameters beside it.
+    outputs = [tmp_path / "pool" / f"process{rank}.json" for rank in range(2)]
+    baseline_path = tmp_path / "single" / "process0.json"
     local_rewards = np.concatenate([report["local_rewards"] for report in reports])
     assert local_rewards.shape == (12,)
     raw_callback = np.asarray(reports[0]["callback_rewards"], np.float64)
@@ -1410,6 +1397,9 @@ class Branched:
         def predict(x, t):
             return jax.lax.cond(jnp.asarray(1) > 0, denoise.predict, denoise.predict, x, t)
         return Walk.stateless(lambda index: predict)
+
+    def modules(self):
+        return ()
 
 
 @pytest.mark.parametrize("guided", ["unguided", "unguided-over-a-guide", "autoguidance", "branched"])

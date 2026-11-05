@@ -28,7 +28,6 @@ import io
 import json
 import subprocess
 import sys
-import tarfile
 import tempfile
 from pathlib import Path
 
@@ -45,26 +44,18 @@ def anonymous(run: Path, name: str, places: dict[str, str]) -> bytes:
     of the writer's; a binary file, which a later main reads as it was written, is kept as it is."""
     import fixture_archive
 
+    def placed(member: str, data: bytes) -> bytes:
+        try:
+            text = data.decode()
+        except UnicodeDecodeError:
+            return data
+        # The longest place first, so a checkout within a scratch directory is read whole.
+        for place in sorted(places, key=len, reverse=True):
+            text = text.replace(place, places[place])
+        return text.encode()
+
     packed = io.BytesIO()
-    with tarfile.open(fileobj=packed, mode="w:xz", preset=fixture_archive.PRESET) as archive:
-        for path in sorted([run, *run.rglob("*")]):
-            info = fixture_archive.anonymous(tarfile.TarInfo((Path(name) / path.relative_to(run)).as_posix()))
-            if path.is_dir():
-                info.type, info.mode = tarfile.DIRTYPE, 0o755
-                archive.addfile(info)
-                continue
-            data = path.read_bytes()
-            try:
-                text = data.decode()
-            except UnicodeDecodeError:
-                text = None
-            if text is not None:
-                # The longest place first, so a checkout within a scratch directory is read whole.
-                for place in sorted(places, key=len, reverse=True):
-                    text = text.replace(place, places[place])
-                data = text.encode()
-            info.size, info.mode = len(data), 0o644
-            archive.addfile(info, io.BytesIO(data))
+    fixture_archive.write(packed, [(run, name)], cleaning=placed, modes=(0o755, 0o644))
     return packed.getvalue()
 
 

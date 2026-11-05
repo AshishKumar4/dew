@@ -314,6 +314,36 @@ def test_a_chunks_form_is_the_one_its_target_derives():
                 extents, corrects=True, schedule=cost.fused(cost.target()))
 
 
+def test_a_scans_carry_derived_for_one_target_serves_no_other():
+    """One derived scan's chunk prepared under an H100, an A100 and an H100 again takes each target's own
+    carry split (their chunk form alike), and the H100's again where its target returns: a split priced for
+    one GPU is not another's."""
+    forms = scan.derive_scan(scan.Scan(gated_delta, gated_readout, GATED, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    chunk = chunk_of(dict(zip(GATED, gated_draw(0), strict=True)), 0, GATED)
+    splits = []
+    for target in ("sm90", "sm80", "sm90"):
+        with generation.assumed(target):
+            splits.append(forms.prepare(chunk).split)
+    assert splits[1] is not splits[0]
+    assert splits[2] is splits[0]
+
+
+def test_a_derived_scan_holds_its_latest_splits_alone():
+    """A derived scan keeps its latest carry splits alone (`splits_held`), the least recently prepared
+    dropped: held to one, an H100's split prepared after an A100's is derived again."""
+    forms = scan.derive_scan(scan.Scan(gated_delta, gated_readout, GATED, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)),
+                             saturation=SATURATION, splits_held=1)
+    chunk = chunk_of(dict(zip(GATED, gated_draw(0), strict=True)), 0, GATED)
+    splits = []
+    for target in ("sm90", "sm90", "sm80", "sm90"):
+        with generation.assumed(target):
+            splits.append(forms.prepare(chunk).split)
+    assert splits[1] is splits[0]
+    assert splits[3] is not splits[0]
+
+
 @pytest.mark.parametrize(("update_fn", "operands", "draw_fn"),
                          [(gated_delta, GATED, gated_draw), (kimi_delta, KIMI, kimi_draw)],
                          ids=["gated_delta", "kimi_delta"])

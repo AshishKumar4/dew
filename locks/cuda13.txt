@@ -291,6 +291,8 @@ deprecated==1.3.1
     # via
     #   daytona
     #   deltalake
+dew-cutlass-cu13==0.1.0
+    # via dewml (pyproject.toml)
 dew-flash-attn-cu13==0.3.7
     # via dewml (pyproject.toml)
 diffusers==0.39.0
@@ -627,6 +629,7 @@ jax==0.12.0.1.post51
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
+    #   dew-cutlass-cu13
     #   dew-flash-attn-cu13
     #   flax
     #   optax
@@ -931,6 +934,8 @@ nvidia-cuda-cupti==13.4.92
     # via jax-cuda13-plugin
 nvidia-cuda-nvcc==13.4.92
     # via jax-cuda13-plugin
+nvidia-cuda-nvdisasm==13.4.92
+    # via dewml (pyproject.toml)
 nvidia-cuda-nvrtc==13.4.92
     # via
     #   jax-cuda13-plugin

@@ -18,8 +18,10 @@ import math
 import re
 import sys
 import threading
+import weakref
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import jax
 import numpy as np
@@ -854,6 +856,36 @@ class StepFlops:
 
 NO_FLOPS = StepFlops(0.0, 0.0)
 """The FLOPs of no step, where an interval's sum starts."""
+
+
+class CompiledMemory(NamedTuple):
+    """A compiled step's memory as XLA analyses it (`Compiled.memory_analysis`), each in bytes: its
+    arguments', its outputs', the outputs aliasing a donated argument, its temporaries' and its code's."""
+
+    argument: int
+    output: int
+    alias: int
+    temp: int
+    generated_code: int
+
+
+_ANALYSED: weakref.WeakKeyDictionary[jax.stages.Compiled, CompiledMemory | None] = (
+    weakref.WeakKeyDictionary())
+
+
+def compiled_memory(executable: jax.stages.Compiled) -> CompiledMemory | None:
+    """`executable`'s memory as XLA analyses it, None where its backend states none, read once an
+    executable: the planner's probe and forecast, the step's headroom and the run's record
+    (`dew.training.memory`), a step compiled ahead, and a GPU program's admission to the host's
+    communicators (`dew.communicators`, its code's bytes) each read one compiled step, and each read walked
+    its program again (0.2 to 0.5 s of a CPU U-Net step's, row 3763)."""
+    if executable not in _ANALYSED:
+        stats = executable.memory_analysis()
+        _ANALYSED[executable] = None if stats is None else CompiledMemory(
+            int(stats.argument_size_in_bytes), int(stats.output_size_in_bytes),
+            int(stats.alias_size_in_bytes), int(stats.temp_size_in_bytes),
+            int(stats.generated_code_size_in_bytes))
+    return _ANALYSED[executable]
 
 
 def step_flops(compiled: jax.stages.Compiled) -> StepFlops | None:

@@ -226,17 +226,30 @@ def test_a_run_that_sets_another_option_text_than_its_saved_run_trained_is_refus
 def test_a_decision_run_this_dew_saves_resumes_when_its_command_runs_again_or_from_its_record(tmp_path,
                                                                                               kind):
     """A decision run saved by this Dew, its option text left to its layout (a release's named, a fresh
-    lettered head's described) and so recorded None, resumes when its command runs again and when read
-    back from its record: the writing each resolves to is the one the saved run trained."""
+    lettered head's described), records the writing its build resolved, as a pinned source's step is, so
+    a later Dew's default writes none of its rows otherwise (row 3867); it resumes when its command runs
+    again and when read back from its record. A record a Dew before that wrote holds None, which a resume
+    reads off its checkpoint's layout (`dew.config.earlier_option_writing`), and it resumes either way."""
     from run_kinds import trained
 
+    from dew.decision.config import DecisionRunConfig
+
     first = SAVED_KINDS[kind](tmp_path, drawn=False)
+    assert isinstance(first, DecisionRunConfig) and first.option_text is None
     trained(first, tmp_path, kind, trainer={"name": kind, "checkpoint_final": True})
     directory = tmp_path / "runs" / kind
-    assert json.loads((directory / "run.json").read_text())["fields"]["option_text"] is None
-    for steps, run in ((2, first), (3, RunConfig.load(str(directory)))):
+    written = {"decision": "named", "decision-lettered": "described"}[kind]
+    saved = json.loads((directory / "run.json").read_text())
+    assert saved["fields"]["option_text"] == written
+    unresolved = json.dumps({**saved, "fields": {**saved["fields"], "option_text": None}})
+    for steps in (2, 3):
+        (directory / "run.json").write_text(unresolved)
+        loaded = DecisionRunConfig.load(str(directory))
+        assert loaded.option_text == written
+        run = first if steps == 2 else loaded
         trained(run, tmp_path, kind, trainer={"name": kind, "steps": steps, "checkpoint_final": True})
         assert str(steps) in {path.name for path in directory.iterdir()}
+        assert json.loads((directory / "run.json").read_text())["fields"]["option_text"] == written
 
 
 def test_a_packed_projections_products_count_at_each_of_its_members():

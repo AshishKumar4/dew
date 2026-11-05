@@ -35,6 +35,7 @@ from jax.sharding import PartitionSpec as P
 from dew.batch import leaves_by_path
 from dew.mesh import EXPERT_AXIS, STAGE_AXIS, LayoutRefused, LogicalAxes, batch_axes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
+from dew.nn.derivatives import KernelGlue, declared_tangent
 
 from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
 from .blocks import normal_kernel
@@ -463,18 +464,6 @@ class Router(nn.Module):
         return flat.reshape(selection.shape)
 
 
-def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> jax.Array:
-    """Expert-major biases in compute dtype, with master-precision cotangent sums.
-
-    Out-of-range IDs are transport padding, contributing neither a value
-    nor a gradient. Promotion before gathering prevents a bf16 scatter-add
-    or scan carry from rounding partial bias gradients.
-    """
-    work = jnp.result_type(bias.dtype, dtype, jnp.float32)
-    values = jnp.asarray(rounded_operand(bias, dtype)).astype(work)
-    return values.at[expert_ids].get(mode='fill', fill_value=0).astype(dtype)
-
-
 BANKED_EXPERTS = 'banked_experts'
 """The collection a run over a bank in device memory hands its experts' kernels in: each `ExpertLinear`'s
 kernel the bank's whole `[layers, experts, in, out]` and the layer read (`experts_apart`, `at_iteration`),
@@ -536,7 +525,7 @@ def at_iteration(variables: Mapping[str, Mapping], layer: jax.Array) -> dict:
 
 def expert_projection(x: jax.Array, kernel: jax.Array | Layered, group_sizes: jax.Array,
                       dtype: Dtype | None, implementation: str,
-                      precision: PrecisionLike) -> jax.Array:
+                      precision: PrecisionLike, bias: jax.Array | None = None) -> jax.Array:
     """The grouped matmul of `x`'s expert-sorted rows, `[rows, in]`, through
     each expert's matrix in `kernel`, `[experts, in, out]`, `group_sizes`
     counting each expert's leading rows, under one precision contract for both
@@ -547,7 +536,12 @@ def expert_projection(x: jax.Array, kernel: jax.Array | Layered, group_sizes: ja
     split width rounds no partial sum. The tangent is `dx @ Q(kernel) + Q(x) @
     dkernel` with `Q` the rounded operands: a kernel gradient keeps the master
     dtype, an input gradient its input's, both accumulating over the widest of
-    the compute, input and kernel dtypes, whatever the placement.
+    the compute, input and kernel dtypes, whatever the placement. `bias`, each
+    expert's `[experts, out]` where given, is added to its rows' fp32 sums
+    before their one rounding (the template's epilogue, which reads it at each
+    row's expert: row 3963), rounded to the compute dtype as an operand is, its
+    gradient summed over each expert's rows in at least fp32 before it meets
+    the bias's own dtype.
 
     Every implementation runs the GEMM template
     (`dew.nn.kernels.gemm.gemm`), which selects each of its
@@ -569,10 +563,26 @@ def expert_projection(x: jax.Array, kernel: jax.Array | Layered, group_sizes: ja
     if implementation not in GROUPED_MATMULS:
         raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     stack, layer = (kernel.stack, kernel.layer) if isinstance(kernel, Layered) else (kernel, None)
-    compute = canonicalize_dtype(x, stack, dtype=dtype)
+    compute = canonicalize_dtype(x, stack, *(() if bias is None else (bias,)), dtype=dtype)
     with _named(implementation):
         return gemm.gemm(x, stack, group_sizes, compute=compute, out_dtype=compute, precision=precision,
-                             layer=layer)
+                         layer=layer, **_biased(bias, compute))
+
+
+def _biased(bias: jax.Array | None, compute) -> dict:
+    """The template's epilogue adding each expert's bias to its rows' sums (`expert_projection`): the bias
+    rounded to `compute` as an operand is, held in at least fp32, so its gradient sums each expert's rows so
+    before it meets the bias's dtype (`rounded_operand`)."""
+    if bias is None:
+        return {}
+    work = jnp.result_type(bias.dtype, compute, jnp.float32)
+    held = jnp.asarray(rounded_operand(bias, compute)).astype(work)
+    return {'epilogue': _plus_bias, 'epilogue_operands': ((held, ('groups', 'columns')),)}
+
+
+def _plus_bias(acc: jax.Array, bias: jax.Array) -> jax.Array:
+    """An expert's rows' sums plus its bias, before their one rounding (`_biased`)."""
+    return acc + bias
 
 
 def paired_projections(x: jax.Array, first: jax.Array | Layered, second: jax.Array | Layered,
@@ -727,13 +737,15 @@ def expert_dispatch[Parameters](
     return _stored_primal(run, x, indices, parameters, input_weights)
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(0,))
-def _stored_primal(run, x, indices, parameters, input_weights):
+def _stored(run, x, indices, parameters, input_weights):
     """`run` over the parameters as stored, and differentiated over them at
     least fp32 (`_widened`), so a gradient summed across devices or over
-    the exchange's rounds meets the master dtype once, after the sum. A
-    forward that nothing differentiates, serving above all, reads the
-    stored kernels: widened, every layer's experts were copied to fp32 in
+    the exchange's rounds meets the master dtype once, after the sum: a
+    kernel's glue (`_stored_primal`, `dew.nn.derivatives.declared_tangent`),
+    the whole expert layer, which the algebra pass rewrites as any other math
+    around its launches (a protected span would hold every MoE layer out of
+    the pass). A forward that nothing differentiates, serving above all, reads
+    the stored kernels: widened, every layer's experts were copied to fp32 in
     the step, 14.35 GiB of live temporaries for gpt-oss-20b served over an
     expert axis of four RTX 3090s."""
     return run(x, indices, parameters, input_weights)
@@ -784,7 +796,8 @@ def _stored_primal_jvp(run, primals, tangents):
                    tuple(directions[index] for index in live))
 
 
-_stored_primal.defjvp(_stored_primal_jvp, symbolic_zeros=True)
+_stored_primal = declared_tangent(KernelGlue(), _stored, _stored_primal_jvp, nondiff_argnums=(0,),
+                                  symbolic_zeros=True)
 
 
 def _dispatched[Parameters](

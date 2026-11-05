@@ -17,7 +17,7 @@ from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor, Qwen2Tokenizer, Qwen3_5Config
 from transformers import Qwen3_5MoeTextConfig
 from make_tiny_tokenizer import qwen_byte_tokenizer
-from qwen_mtp_reference import QwenMTP, prediction_inputs
+from qwen_mtp_reference import QwenMTP, published_mtp_logits
 
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 SOURCES = ROOT / "qwen38-source"
@@ -86,10 +86,8 @@ def write_video_reference(model, processor, destination: Path) -> None:
     with torch.no_grad():
         generated = model.generate(**encoded, max_new_tokens=3, do_sample=False,
                                    eos_token_id=None, pad_token_id=processor.tokenizer.pad_token_id)
-    logits, hidden, embeddings, positions = prediction_inputs(model, encoded)
+    logits, mtp_logits, admitted, _ = published_mtp_logits(model, encoded)
     valid = encoded["attention_mask"].bool()
-    admitted = valid[:, :-1] & valid[:, 1:]
-    mtp_logits = model.lm_head(model.mtp(hidden[:, :-1], embeddings[:, 1:], positions[..., 1:], admitted))
     main_ce = torch.nn.functional.cross_entropy(logits[:, :-1].reshape(-1, logits.shape[-1]),
                                                 encoded["input_ids"][:, 1:].reshape(-1), reduction="none")
     depth_ce = torch.nn.functional.cross_entropy(mtp_logits[:, :-1].reshape(-1, logits.shape[-1]),
@@ -177,10 +175,7 @@ def write_reference(kind: str) -> None:
     # Independently qualify the shipped MTP composition and its trainable loss.
     model.load_state_dict(initial_state, strict=True)
     model.zero_grad(set_to_none=True)
-    main, hidden, embeddings, positions = prediction_inputs(model, encoded)
-    admitted = valid[:, :-1] & valid[:, 1:]
-    mtp_hidden = model.mtp(hidden[:, :-1], embeddings[:, 1:], positions[..., 1:], admitted)
-    mtp_logits = model.lm_head(mtp_hidden)
+    main, mtp_logits, admitted, (hidden, embeddings, positions) = published_mtp_logits(model, encoded)
     mtp_expected = mtp_logits.detach().numpy()
     main_ce = torch.nn.functional.cross_entropy(main[:, :-1].reshape(-1, main.shape[-1]),
                                                 encoded["input_ids"][:, 1:].reshape(-1), reduction="none")
@@ -195,9 +190,7 @@ def write_reference(kind: str) -> None:
         for parameter in model.parameters():
             if parameter.grad is not None:
                 parameter.add_(parameter.grad, alpha=-1e-4)
-        main_after, hidden_after, embed_after, pos_after = prediction_inputs(model, encoded)
-        mtp_after = model.lm_head(model.mtp(hidden_after[:, :-1], embed_after[:, 1:],
-                                           pos_after[..., 1:], admitted))
+        main_after, mtp_after, _, _ = published_mtp_logits(model, encoded)
     np.savez(destination / "mtp_reference.npz", logits=mtp_expected,
              hidden=hidden.detach().numpy(), embeddings=embeddings.detach().numpy(),
              positions=positions.detach().numpy(), valid=admitted.numpy(),

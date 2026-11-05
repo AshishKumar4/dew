@@ -29,7 +29,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas.ops.tpu.megablox.gmm import make_group_metadata
 
 from dew.nn.kernels import launches
-from dew.nn.kernels.templates.axes import named
+from dew.nn.kernels.templates.axes import GROUPS, at_group, by_rows, held, named
 from dew.nn.kernels.templates.cost import estimate
 from dew.nn.kernels.templates.gemm import rows_padded
 
@@ -105,7 +105,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
         def _():
             tile = lhs_ref[...]
             if prologue is not None:
-                tile = prologue(tile, *(side[...] for side in prologue_refs)).astype(lhs_ref.dtype)
+                tile = prologue(tile, *_held(prologue_refs, prologue_axes, block_m)).astype(lhs_ref.dtype)
             acc_ref[...] += lax.dot_general(tile, rhs_ref[...], (((1,), (int(transpose_rhs),)), ((), ())),
                                             precision=_exact(tile.dtype), preferred_element_type=jnp.float32)
 
@@ -113,7 +113,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
         def _():
             acc = acc_ref[...]
             outs = (acc,) if epilogue is None else _as_tuple(
-                epilogue(acc, *(side[...] for side in epilogue_refs)))
+                epilogue(acc, *_held(epilogue_refs, epilogue_axes, block_m)))
             start, end = group_offsets[group], group_offsets[group + 1]
             row = m_tile_ids[slot] * block_m + lax.broadcasted_iota(jnp.int32, (block_m, block_n), 0)
             mine = (row >= start) & (row < end)
@@ -127,13 +127,14 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
         group = jnp.minimum(group_ids[slot], groups - 1)
         return (group, column, step) if transpose_rhs else (group, step, column)
 
-    def side_spec(side_axes):
-        extent = {'rows': block_m, 'depth': block_k, 'columns': block_n}
+    def origin(column, slot, step, group_offsets, group_ids, m_tile_ids):
+        # The unrouted rows' slot reads the last group's, as XLA's program repeats it there.
+        return {'rows': m_tile_ids[slot], 'depth': step, 'columns': column,
+                GROUPS: jnp.minimum(group_ids[slot], groups - 1)}
 
-        def index(column, slot, step, group_offsets, group_ids, m_tile_ids):
-            return named(side_axes, {'rows': m_tile_ids[slot], 'depth': step, 'columns': column})
-
-        return pl.BlockSpec(named(side_axes, extent), index)
+    laid = [_laid(side, axes, {'rows': block_m, 'depth': block_k, 'columns': block_n}, origin)
+            for side, axes in zip((*prologue_operands, *epilogue_operands), (*prologue_axes, *epilogue_axes),
+                                  strict=True)]
 
     def out_index(column, slot, step, group_offsets, group_ids, m_tile_ids):
         return m_tile_ids[slot], column
@@ -147,7 +148,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
             in_specs=[pl.BlockSpec((block_m, block_k), lhs_index),
                       pl.BlockSpec((None, block_n, block_k) if transpose_rhs else (None, block_k, block_n),
                                    rhs_index),
-                      *(side_spec(axes) for axes in (*prologue_axes, *epilogue_axes))],
+                      *(spec for _, spec in laid)],
             out_specs=tuple(pl.BlockSpec((block_m, block_n), out_index) for _ in dtypes),
             grid=(width // block_n, active, steps),
             scratch_shapes=[pltpu.VMEM((block_m, block_n), jnp.float32)]),
@@ -156,7 +157,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
         cost_estimate=estimate(2 * rows * depth * width, lhs, rhs, *prologue_operands, *epilogue_operands,
                            *out_shape),
         name="dew_gmm",
-    )(*metadata, lhs, rhs, *prologue_operands, *epilogue_operands)
+    )(*metadata, lhs, rhs, *(side for side, _ in laid))
     outs = tuple(out[:rows] for out in outs)
     return outs if out_dtypes else outs[0]
 
@@ -200,7 +201,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Bloc
         def _():
             tile = lhs_ref[...]
             if prologue is not None:
-                tile = prologue(tile, *(side[...] for side in side_refs)).astype(lhs_ref.dtype)
+                tile = prologue(tile, *_held(side_refs, prologue_axes, block_k)).astype(lhs_ref.dtype)
             row = m_tile_ids[slot] * block_k + lax.broadcasted_iota(jnp.int32, (block_k, 1), 0)
             mine = (row >= start) & (row < end)
             # Upstream's selection, in fp32: a neighbour's rows, a NaN or an infinity among them, are zeros.
@@ -219,13 +220,11 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Bloc
     def cotangent_index(column, block, slot, group_offsets, group_ids, m_tile_ids):
         return m_tile_ids[slot], column
 
-    def side_spec(side_axes):
-        extent = {'rows': block_k, 'depth': block_m}
+    def origin(column, block, slot, group_offsets, group_ids, m_tile_ids):
+        return {'rows': m_tile_ids[slot], 'depth': block, GROUPS: group_ids[slot]}
 
-        def index(column, block, slot, group_offsets, group_ids, m_tile_ids):
-            return named(side_axes, {'rows': m_tile_ids[slot], 'depth': block})
-
-        return pl.BlockSpec(named(side_axes, extent), index)
+    laid = [_laid(side, axes, {'rows': block_k, 'depth': block_m}, origin)
+            for side, axes in zip(prologue_operands, prologue_axes, strict=True)]
 
     def out_index(column, block, slot, group_offsets, group_ids, m_tile_ids):
         return group_ids[slot], block, column
@@ -238,7 +237,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Bloc
             num_scalar_prefetch=3,
             in_specs=[pl.BlockSpec((block_k, block_m), rows_index),
                       pl.BlockSpec((block_k, block_n), cotangent_index),
-                      *(side_spec(axes) for axes in prologue_axes)],
+                      *(spec for _, spec in laid)],
             out_specs=pl.BlockSpec((None, block_m, block_n), out_index),
             grid=(width // block_n, depth // block_m, active),
             scratch_shapes=[pltpu.VMEM((block_m, block_n), jnp.float32)]),
@@ -246,7 +245,33 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Bloc
         interpret=interpret,
         cost_estimate=estimate(2 * rows * depth * width, lhs, rhs, *prologue_operands, out_shape),
         name="dew_tgmm",
-    )(*metadata, lhs, rhs, *prologue_operands)
+    )(*metadata, lhs, rhs, *(side for side, _ in laid))
+
+
+def _laid(side: jax.Array, side_axes: tuple, extent: dict, origin) -> tuple[jax.Array, pl.BlockSpec]:
+    """A side operand as the launch passes it, and its block: along each launch axis its `extent`, at the
+    block `origin` names from the grid's indices and scalars (by axis, `groups` the slot's group). A side
+    operand by group goes as its groups' vectors end to end, each group's block at its group's offset: a
+    vector's layout (`grouped_matmul._MosaicTpu._lays_out`), where Mosaic TPU lays out no block of one
+    group's row of `[groups, extent]`, its second-minor dimension neither the array's nor a multiple of 8."""
+    if GROUPS not in side_axes:
+        return side, pl.BlockSpec(named(side_axes, extent), lambda *at: named(side_axes, origin(*at)))
+    axis, = held(side_axes)
+    position = side_axes.index(axis)
+    blocks = side.shape[position] // extent[axis]
+
+    def index(*at):
+        origins = origin(*at)
+        return (at_group(side_axes, side.shape, origins[GROUPS])[GROUPS] * blocks + origins[axis],)
+
+    vectors = jnp.moveaxis(side, side_axes.index(GROUPS), 0).reshape(-1)
+    return vectors, pl.BlockSpec((extent[axis],), index)
+
+
+def _held(refs, axes_of: tuple, rows: int) -> tuple:
+    """Each side operand's block as its hook takes it at a block of `rows` rows: a side operand by group's,
+    its group's block (`_laid`), at each row (`axes.by_rows`)."""
+    return tuple(by_rows(ref[...], axes, rows) for ref, axes in zip(refs, axes_of, strict=True))
 
 
 def _as_tuple(outs) -> tuple:

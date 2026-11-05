@@ -6,6 +6,7 @@ class Aux(metrics: dict[str, jax.Array], variables: Variables | None = None, qk_
 class Best(metric: str | Metric | TrainingScalar | Summary | types.MethodType | Callable[[Mapping], float], top: int = 1, mode: Literal['min', 'max'] | None = None, threshold: float | None = None, weights_only: bool = False, split: str | None = None, *, _source: Metric | TrainingScalar | Summary | Callable[[Mapping], float] | None = None)  [dew.training.selection]
   .resolved(self, scored: Mapping[str, Sequence[Metric | Summary]]) -> Best
 class CFG(scale: float, interval: tuple[float, float] = (0.0, 1.0), rescale: float = 0.0) -> None  [dew.sampling.guidance]
+  .modules(self) -> tuple[nn.Module, ...]
   .replace(self, **updates)
   .walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk
 class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str | None = None, local_every: int | str | None = None)  [dew.checkpoints]
@@ -294,7 +295,7 @@ class Trackers(*trackers: Tracker)  [dew.training.tracker]
   .artifact(self, value: Reported, step: int) -> None
   .close(self) -> None
   .log(self, scalars: Mapping[str, float], step: int) -> None
-class TrainState(step: jax.Array, microstep: jax.Array, updates: jax.Array, variables: Variables, opt_state: optax.OptState, ema: Variables | None, key: jax.Array, scale: DynamicScale | None, window_size: jax.Array, accumulation: Accumulation | None = None, consumed: jax.Array | None = None, deferred: jax.Array | None = None, inner: Replicas | None = None, compute: Variables | None = None) -> None  [dew.state]
+class TrainState(step: jax.Array, microstep: jax.Array, updates: jax.Array, variables: Variables, opt_state: optax.OptState, ema: Variables | None, key: jax.Array, scale: DynamicScale | None, window_size: jax.Array, accumulation: Accumulation | None = None, consumed: jax.Array | None = None, deferred: jax.Array | None = None, inner: ReplicaState | None = None, compute: Variables | None = None) -> None  [dew.state]
   .averaged: property -> Variables
   .pending_tokens: property -> jax.Array | None
   .replace(self, **updates)
@@ -334,6 +335,7 @@ dew.config.DecoderRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
+  data_plan: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
@@ -369,6 +371,7 @@ dew.config.RunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
+  data_plan: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
@@ -435,6 +438,7 @@ dew.config.diffusion.DiffusionRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
+  data_plan: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
@@ -460,6 +464,7 @@ dew.config.jepa.JepaRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
+  data_plan: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: OptimConfig = (lambda: OptimConfig(learning_rate=0.001))()
   trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
@@ -479,6 +484,7 @@ dew.config.lm.LMRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
+  data_plan: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: OptimConfig = (lambda: OptimConfig(learning_rate=0.0006, weight_decay=0.1, clip_grads=1.0))()
   trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
@@ -521,6 +527,7 @@ dew.config.world_model.WorldModelRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
+  data_plan: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
@@ -535,6 +542,7 @@ dew.decision.config.DecisionRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
+  data_plan: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: OptimConfig = (lambda: OptimConfig(learning_rate=2.5e-05))()
   trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
@@ -592,6 +600,7 @@ dew.objectives.rl.config.EnvRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
+  data_plan: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: TrainerConfig = (lambda: TrainerConfig(eval_every=None, checkpoint_every=None))()

@@ -55,7 +55,7 @@ CONTRACTED = {
     "src/dew/diffusion/schedules/flow.py::time_shift":
         ("test_a_time_shift_holds_every_order", NUMERICS),
     "src/dew/nn/inspection.py::tapped":
-        ("test_a_probes_tap_holds_its_orders", KERNEL),
+        ("test_a_probes_tap_holds_its_orders", SURROGATE),
     "src/dew/nn/categorical.py::_probabilities":
         ("test_the_categorical_losses_hold_every_order", NUMERICS),
     "src/dew/nn/categorical.py::label_terms":
@@ -94,7 +94,7 @@ CONTRACTED = {
         ("test_the_decode_step_holds_every_order", KERNEL),
     "src/dew/nn/kernels/recurrence_chunk.py::_per_product.linear_tangent":
         ("test_the_chunked_op_holds_every_order", KERNEL),
-    "src/dew/nn/kernels/recurrence_chunk.py::mosaic_rule.rule":
+    "src/dew/nn/kernels/templates/recurrence/template.py::mosaic_rule.rule":
         ("test_the_template_rule_holds_its_orders", KERNEL),
     "src/dew/nn/kernels/short_conv.py::conv.linear_tangent":
         ("test_the_short_conv_holds_every_order", KERNEL),
@@ -147,7 +147,7 @@ CONTRACTED = {
     "src/dew/nn/derivatives.py::surrogate.rule":
         ("test_a_surrogate_holds_every_order", SURROGATE),
     "src/dew/nn/derivatives.py::declared_derivative.rule":
-        ("test_a_declared_derivative_holds_every_order", KERNEL),
+        ("test_a_declared_derivative_holds_every_order", NUMERICS),
     "src/dew/nn/derivatives.py::declared_tangent.rule":
         ("test_a_declared_derivative_holds_every_order", NUMERICS),
 }
@@ -162,13 +162,24 @@ def _named(node) -> str | None:
     return getattr(node, "attr", None) or getattr(node, "id", None)
 
 
-def _maker(node) -> str | None:
-    """The custom derivative `node`, a decorator or a call's function, makes (`CUSTOM`), or None."""
+BUILDERS = frozenset({"declared_derivative", "declared_tangent"})
+"""Dew's declaring builders, whose first argument is the kind declared (`dew.nn.derivatives`)."""
+
+
+def _maker(node, given: tuple = ()) -> str | None:
+    """The custom derivative `node`, a decorator or a call, makes (`CUSTOM`), or None: a builder's with the
+    kind its first argument constructs (`declared_derivative:Surrogate`), read from the site, as the
+    algebra pass reads it (docs/design/algebra.md §1.3); `given`, a partial's arguments past the function."""
     if isinstance(node, ast.Call):
         if _named(node.func) == "partial" and node.args:
-            return _maker(node.args[0])
+            return _maker(node.args[0], tuple(node.args[1:]))
+        if _named(node.func) in BUILDERS:
+            return _maker(node.func, tuple(node.args))
         return _maker(node.func)
     name = _named(node)
+    if name in BUILDERS:
+        kind = given[0] if given else None
+        return f"{name}:{_named(kind.func) if isinstance(kind, ast.Call) else None}"
     return name if name in CUSTOM else None
 
 
@@ -190,7 +201,7 @@ def seams_of(relative: str, text: str) -> dict[str, str]:
             target = (child.targets[0] if isinstance(child, ast.Assign)
                       else child.target if isinstance(child, ast.AnnAssign) else None)
             if (isinstance(target, ast.Name) and isinstance(child.value, ast.Call)
-                    and (maker := _maker(child.value.func))):
+                    and (maker := _maker(child.value))):
                 found.setdefault(".".join([*scope, target.id]), maker)
             if isinstance(child, ast.Call) and _named(child.func) == "linear_tangent":
                 found.setdefault(".".join([*scope, "linear_tangent"]), "linear_tangent")
@@ -220,21 +231,24 @@ def test_every_custom_derivative_is_under_a_contract():
 
 
 def test_each_seams_kind_is_its_declaration():
-    """A seam is a surrogate exactly where it is declared one (`surrogate`), every other a kernel's or a
+    """A seam is a surrogate exactly where it is declared one (`surrogate`, or a builder's `Surrogate()`
+    kind, `_maker`), every other a kernel's or a
     numerics derivative: a derivative that is not its value's cannot hide in a custom rule of its own,
     and the safely written true derivatives (time_shift, a guided prediction, a held hook's, a gemm
     prologue's) are not surrogates. The declaration's own custom rule is the surrogate kind's."""
     kinds = {seam: kind for seam, (_, kind) in CONTRACTED.items()}
     assert set(kinds.values()) <= {KERNEL, NUMERICS, SURROGATE}
     marked = {seam for seam, kind in kinds.items() if kind == SURROGATE}
-    declared = {seam for seam, maker in seams().items() if maker == "surrogate"}
+    declared = {seam for seam, maker in seams().items()
+                if maker == "surrogate" or maker.endswith(":Surrogate")}
     assert marked == declared | {"src/dew/nn/derivatives.py::surrogate.rule"}
 
 
 def test_the_scan_finds_each_form_of_a_custom_derivative():
     """`seams_of` on each form a seam takes, and its maker: a decorator, one within functools.partial, an
     assignment of a call, an annotated one, a nested function's, a linear_tangent call within an
-    expression, and a surrogate's declaration, assigned or decorating."""
+    expression, a surrogate's declaration, assigned or decorating, and a builder's, its kind read from its
+    first argument."""
     text = (
         "import functools\nimport jax\n"
         "@jax.custom_jvp\ndef a(x): return x\n"
@@ -246,11 +260,16 @@ def test_the_scan_finds_each_form_of_a_custom_derivative():
         "e = surrogate(lambda x: x, lambda primals, tangents, value: tangents[0])\n"
         "@functools.partial(surrogate, derivative=lambda primals, tangents, value: tangents[0])\n"
         "def f(x): return x\n"
+        "g = declared_derivative(Surrogate(), p, forward, backward)\n"
+        "h = derivatives.declared_tangent(derivatives.Protected(), p, rule, nondiff_argnums=(1,))\n"
+        "@functools.partial(declared_tangent, KernelGlue(), tangent=rule)\n"
+        "def k(x): return x\n"
         "def plain(x): return x\n")
     assert seams_of("m.py", text) == {
         "m.py::a": "custom_jvp", "m.py::b": "custom_vjp", "m.py::c": "custom_jvp", "m.py::d": "custom_vjp",
         "m.py::outer.inner": "custom_vjp", "m.py::tangent.linear_tangent": "linear_tangent",
-        "m.py::e": "surrogate", "m.py::f": "surrogate"}
+        "m.py::e": "surrogate", "m.py::f": "surrogate", "m.py::g": "declared_derivative:Surrogate",
+        "m.py::h": "declared_tangent:Protected", "m.py::k": "declared_tangent:KernelGlue"}
 
 
 def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():
