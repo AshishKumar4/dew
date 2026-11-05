@@ -11,16 +11,14 @@ from jax.experimental import pallas as pl
 from dew.nn.sharding import per_shard
 
 
-def pallas_call(kernel: Callable, **params) -> Callable:
-    """`jax.experimental.pallas.pallas_call(kernel, **params)`, each call raising unless it runs per shard
-    (`per_shard`), named by the call's `name` or the kernel's own."""
-    call = pl.pallas_call(kernel, **params)
-    named = params.get("name") or getattr(kernel, "__name__", None) or getattr(
-        getattr(kernel, "func", None), "__name__", "a Pallas kernel")
+def pallas_call(kernel: Callable, *, name: str, **params) -> Callable:
+    """`jax.experimental.pallas.pallas_call(kernel, name=name, **params)`, each call raising unless it runs
+    per shard (`per_shard`), the refusal naming the launch by its `name`, which its profile names it by."""
+    call = pl.pallas_call(kernel, name=name, **params)
 
     @functools.wraps(call)
     def launched(*operands, **options):
-        per_shard(named)
+        per_shard(name)
         return call(*operands, **options)
 
     return launched

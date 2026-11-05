@@ -16,6 +16,7 @@ import re
 import struct
 import threading
 from collections.abc import Callable, Hashable, Iterator
+from typing import overload
 
 import jax
 import tokamax
@@ -201,6 +202,14 @@ def relaunched(digest: str | None) -> Iterator[None]:
         yield
     finally:
         _TRACING.reset(token)
+
+
+@overload
+def named(name: str) -> str: ...
+
+
+@overload
+def named(name: None) -> str | None: ...
 
 
 def named(name: str | None) -> str | None:
