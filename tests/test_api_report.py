@@ -1,4 +1,7 @@
 """Dew's public surface as committed (docs/api/report.txtar, tools/api_report.py; ledger 3037)."""
+import importlib
+
+import pytest
 from tool_support import load
 
 
@@ -8,6 +11,19 @@ def test_the_api_report_reads_every_section_and_names_no_address():
     sections = [line[3:-3] for line in report.splitlines() if line.startswith("-- ") and line.endswith(" --")]
     assert sections == ["exports", "config", "cli", "records"]
     assert " at 0x" not in report
+
+
+@pytest.mark.parametrize("module, name", [("dew.optim", "OptimConfig"), ("dew.lora", "LoRA"),
+                                          ("dew.optim", "ParamGroup")])
+def test_a_dataclass_a_config_field_names_is_listed_with_its_fields_wherever_it_is_defined(module, name):
+    """A run config's field typed by another module's dataclass lists that dataclass's fields and defaults,
+    so changing one moves a line: `optim` names OptimConfig outright, `lora` names LoRA in an `Annotated`
+    optional, and OptimConfig's `param_groups` names ParamGroup in a tuple."""
+    report = load("api_report")
+    expected = [f"  {line}" for line in report.fields(getattr(importlib.import_module(module), name))]
+    lines = report.config()
+    start = lines.index(f"{module}.{name}")
+    assert lines[start + 1:start + 1 + len(expected)] == expected
 
 
 def test_a_field_the_constructor_takes_by_keyword_or_not_at_all_is_marked():
