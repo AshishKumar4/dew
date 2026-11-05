@@ -233,8 +233,18 @@ def _calibrated(directory: str, weights: Weights | None = None
     saved = kept if kept is not None and kept.exists() else epath.Path(directory) / TASK_FILE
     if not saved.exists():
         return None
-    settings = _records.record(json.loads(saved.read_text()), TASK_FILE)
+    settings = _earlier_settings(_records.record(json.loads(saved.read_text()), TASK_FILE))
     return settings, from_record(Weights, _records.json_value(settings["weights"], "weights"))
+
+
+def _earlier_settings(settings: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved task's settings (`TASK_FILE`) in the shapes `Decide.save` writes now, read here and nowhere
+    else (`_calibrated`): a budget saved before a pass's question slots were its windows' (ledger 2385)
+    names the questions it padded to, which no pass reads now. Carried to 1.0 (ledger 1552)."""
+    budget = settings.get("budget")
+    if not isinstance(budget, Mapping) or "questions" not in budget:
+        return settings
+    return {**settings, "budget": {name: value for name, value in budget.items() if name != "questions"}}
 
 
 @dataclass(frozen=True)
@@ -393,11 +403,7 @@ class Decide(SavedRunTask, InItsForm):
                 f"{TASK_FILE} was fitted on step {fitted.step}'s {'averaged' if fitted.ema else 'live'} "
                 f"weights, and this loads step {step}'s {'averaged' if averaged else 'live'} ones; "
                 "fit them again with `calibrated` and `save`, or load the step it was fitted on")
-        saved = dict(_records.record(settings["budget"], "budget"))
-        # A budget saved before a pass's question slots were its windows' (ledger 2385) names the questions
-        # it padded to, which no pass reads now.
-        saved.pop("questions", None)
-        budget = from_record(Budget, _records.json_value(saved, "budget"))
+        budget = from_record(Budget, _records.json_value(settings["budget"], "budget"))
         # An options width the saved budget leaves None is the run's recorded one (`DecideSettings.options`).
         if budget.options is None:
             budget = replace(budget, options=task.budget.options)
