@@ -23,9 +23,11 @@ from dew.nn.precision import float32_dot_general
 
 class Accumulated(NamedTuple):
     """A reduction's step a mainloop's accumulator takes (`Derived.step`'s `stepped`): its state rescaled by
-    the row `factor` plus the tile's `weights @ values`, each value as the step evaluates it."""
+    the row `factor` (None for a sum that takes no rescale) plus the tile's product of `weights` and
+    `values`, under the declaration's own dimension numbers (`a @ b`, or `aᵀ @ b` for a sum over the
+    weights' rows), each value as the step evaluates it."""
 
-    factor: jax.Array
+    factor: jax.Array | None
     weights: jax.Array
     values: jax.Array
 
