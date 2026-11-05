@@ -1429,6 +1429,11 @@ class Transport[Allocated, Opened](abc.ABC):
     registers hold, and a one-dimensional side operand's block, untiled, is at most it
     (`grouped_matmul._Mosaic.fitting`); None where cp.async moves a block (mma.sync's)."""
 
+    copies_in_pieces: bool = True
+    """Whether a step's block may arrive in several copies, each into its own rows of the slot (`streams`'
+    `copies`, `Pieces`: TMA's, each awaited at the slot's one barrier), where cp.async's pipeline copies a
+    step's block whole from one view: a paged call's key tile of several pages takes a copy a page."""
+
     copies_vectors: bool = True
     """Whether its copies move a one-dimensional block untiled (TMA's), where cp.async spreads a copy over a
     warpgroup's threads, 128 elements at least ('CP_ASYNC requires the number of elements to be a multiple

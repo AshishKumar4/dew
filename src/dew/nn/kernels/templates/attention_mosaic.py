@@ -543,11 +543,11 @@ def _peaks_registers(family: mosaic.Family, tiles: Tiles, dtype, *, params: tupl
 def _pages_hold(page: int, tile: int, family: mosaic.Family) -> bool:
     """Whether a paged call's key tiles of `tile` keys lie in its pages of `page`: whole tiles a page, each
     read where it lies (`attention_mosaic_forward._paged_views`), or whole pages a tile, each its own copy
-    into a slot's whole swizzled rows (`mosaic.Pieces`, `mosaic.TILE_ROWS`) where `family` streams
-    through rings."""
+    into a slot's whole swizzled rows (`mosaic.Pieces`, `mosaic.TILE_ROWS`) where `family` loads a step's
+    block in pieces (`mosaic.Transport.copies_in_pieces`)."""
     if page % tile == 0:
         return True
-    return tile % page == 0 and page % mosaic.TILE_ROWS == 0 and isinstance(family, mosaic.RingFamily)
+    return tile % page == 0 and page % mosaic.TILE_ROWS == 0 and family.copies_in_pieces
 
 
 def streams(query, target: generation.GpuTarget) -> bool:
