@@ -24,8 +24,10 @@ from tools import grouped_oracle as oracle
 pytestmark = pytest.mark.kernel
 
 SIZES = {"ragged": [0, 70, 1, 100, 0], "one-group": [200], "all-empty": [0, 0, 0], "aligned": [64, 64, 64, 8],
-         "unrouted-tail": [3, 0, 120]}
+         "unrouted-tail": [3, 0, 120], "tile-boundaries": [100, 0, 128, 129, 3, 40]}
 ROWS, DEPTH, WIDTH = 200, 128, 256
+"""The rows a draw holds at least (`operands`): its groups' rows where they are more (`tile-boundaries`: 400,
+groups that start inside a 128-row tile, end past one, and an empty one between)."""
 SEEDS = 8
 """Each site's declared draws (`reference_error.seeds_for` of the plain program on them)."""
 
@@ -35,13 +37,14 @@ def rounded(values, dtype) -> np.ndarray:
 
 
 def operands(sizes, dtype, seed=0):
-    """Rows, per-group matrices and a cotangent, rounded to `dtype`, and the group of each row (-1 past the
-    routed ones)."""
+    """Rows (`ROWS`, or the groups' where they are more), per-group matrices and a cotangent, rounded to
+    `dtype`, and the group of each row (-1 past the routed ones)."""
     rng = np.random.default_rng(seed)
-    x = rounded(rng.normal(size=(ROWS, DEPTH)), dtype)
+    rows = max(ROWS, sum(sizes))
+    x = rounded(rng.normal(size=(rows, DEPTH)), dtype)
     w = rounded(rng.normal(size=(len(sizes), DEPTH, WIDTH)) / np.sqrt(DEPTH), dtype)
-    dy = rounded(rng.normal(size=(ROWS, WIDTH)), dtype)
-    group = np.full(ROWS, -1)
+    dy = rounded(rng.normal(size=(rows, WIDTH)), dtype)
+    group = np.full(rows, -1)
     group[:sum(sizes)] = np.repeat(np.arange(len(sizes)), sizes)
     return x, w, dy, group
 
@@ -571,19 +574,6 @@ def test_a_cooperative_tile_stores_each_of_several_outputs():
 
     assert_as_exact(run, jax.jit(plain), draw, "a cooperative tile's two outputs", seeds=SEEDS,
                     truth_fn=truth)
-
-
-def test_each_groups_row_tiles_start_at_its_first_row():
-    """A group's row tiles start at its first row, rounded down to the 8 a TMA descriptor tiles rows by,
-    whole tiles after it, as CUTLASS's grouped GEMM tiles each group: a group within a tile's rows from
-    there takes one tile, reading its matrix once, an empty group none, and the tiles fit the launch's
-    bound (`mosaic_gpu.tile_groups`)."""
-    lengths = jnp.asarray([100, 0, 128, 129, 3, 40], jnp.int32)
-    bound = -(-int(lengths.sum()) // 128) + len(lengths) - 1
-    table = np.asarray(mosaic_gpu.tile_groups(lengths, 128, bound))
-    assert table.tolist() == [[0, 0, 0, 100], [2, 96, 100, 228], [2, 224, 100, 228], [3, 224, 228, 357],
-                              [3, 352, 228, 357], [4, 352, 357, 360], [5, 360, 360, 400], [0, 0, 0, 0],
-                              [0, 0, 0, 0]]
 
 
 @pytest.mark.parametrize("sizes, row_tile", [([120, 8], 64), ([3, 200, 1, 0, 57], 128), ([0, 0, 13], 256),
