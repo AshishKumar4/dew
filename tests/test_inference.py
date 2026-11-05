@@ -710,7 +710,7 @@ def test_a_run_samples_on_every_trainer_layout_what_one_device_samples(tmp_path,
     label = f"sampled on {spec}"
     count = seeds_for(drawn(alone), draw, label, truth_fn=drawn(wide, "float64"), dew_fn=drawn(placed))
     assert_as_exact(drawn(placed), drawn(alone), draw, label, seeds=count, truth_fn=drawn(wide, "float64"))
-    server = Server.from_task(placed, slots=2, capacity=16)
+    server = Server.from_task(dataclasses.replace(placed, sampling=sampling), slots=2, capacity=16)
     assert_as_exact(served, drawn(alone), draw, label, seeds=count, truth_fn=drawn(wide, "float64"))
 
 
