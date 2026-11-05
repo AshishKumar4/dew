@@ -420,7 +420,7 @@ def _dkv_refs(refs, treedef, leaves: int, graded: list[Kind], groups: tuple, *, 
     views = mosaic.stacked_views(grad_refs, groups)
     dk_ref, dv_ref, *refs = refs
     keyed = tuple([ref for ref, kind in zip(views, graded, strict=True) if kind == wanted]
-                  for wanted in (Kind.KEY, Kind.TILE))
+                  for wanted in DKV_GRADS)
     return inputs, unflattened, (dq_ref, dk_ref, dv_ref), _dkv_scoped(refs, widths=widths, split=split), keyed
 
 def _shared_views(outputs, grad_refs, graded: list[Kind], block_k: int) -> tuple:

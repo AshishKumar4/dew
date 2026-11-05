@@ -22,7 +22,12 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation, launches
 from dew.nn.kernels.selection import Refusal
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_gradient as gradient, report
+from dew.nn.kernels.templates import (
+    attention_algebra as algebra,
+    attention_gradient as gradient,
+    axes,
+    report,
+)
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     DKV_GRADS,
@@ -45,6 +50,7 @@ from dew.nn.kernels.templates.attention import (
     output_split,
     padded_call,
     prescaled,
+    scored,
     within,
 )
 from dew.nn.kernels.templates.base import Template, dividing
@@ -117,19 +123,20 @@ def unfitted(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
 
 
 def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: pl.Slice | None):
-    """A hook parameter's values for a tile, as `kind` lays them out: the head's scalar, the tile's
-    queries' `[block_q, 1]`, its keys' `[1, block_k]`, its entries' or its output rows'."""
-    match kind:
-        case Kind.HEAD:
-            return ref[head]
-        case Kind.QUERY:
-            return ref[...][:, None]
-        case Kind.KEY:
-            return ref[keys][None, :]
-        case Kind.TILE:
-            return ref[:, keys]
-        case Kind.OUTPUT:
-            return ref[...]
+    """A hook parameter's values for a tile, as `kind` lays them out (`Kind.axes`, its block
+    `_param_spec`'s): the head's scalar, the tile's entries over its keys `keys` (a score tile's, a
+    singleton along an axis it does not vary on, `scored`) or its output rows'."""
+    del queries
+    if kind is Kind.HEAD:
+        return ref[head]
+    tile = ref[axes.placed(_held(kind), {} if keys is None else {"keys": keys})]
+    return tile if kind is Kind.OUTPUT else scored(tile, kind)
+
+
+def _held(kind: Kind) -> tuple[str, ...]:
+    """A parameter's axes a program's block holds (`_param_spec`, `_key_param_spec`): all but its batch row's
+    and head's, which the block indexes away."""
+    return tuple(axis for axis in kind.axes if axis not in ("batch", "heads"))
 
 
 def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
@@ -443,19 +450,13 @@ def _derived[T: (Tiles, BackwardTiles)](launch: Template[T], steps: tuple[T, ...
 
 
 def _param_spec(kind: Kind, param: jax.Array, block_q: int, keys: int) -> pl.BlockSpec:
-    """How a program reads a hook parameter of `kind`: a head's scalar from the whole `[H]`, its
-    queries' or its output rows' block, every key of its row and head."""
-    match kind:
-        case Kind.HEAD:
-            return pl.BlockSpec(param.shape, lambda i, b, h: (0,))
-        case Kind.QUERY:
-            return pl.BlockSpec((None, None, block_q), lambda i, b, h: (b, h, i))
-        case Kind.KEY:
-            return pl.BlockSpec((None, None, keys), lambda i, b, h: (b, h, 0))
-        case Kind.TILE:
-            return pl.BlockSpec((None, None, block_q, keys), lambda i, b, h: (b, h, i, 0))
-        case Kind.OUTPUT:
-            return pl.BlockSpec((None, block_q, None, param.shape[-1]), lambda i, b, h: (b, i, h, 0))
+    """How a program reads a hook parameter of `kind` (`Kind.axes`): a head's scalar from the whole `[H]`,
+    else its batch row's and head's block of its queries' block, every key and the whole width."""
+    if kind is Kind.HEAD:
+        return pl.BlockSpec(param.shape, lambda i, b, h: (0,))
+    extents = {"batch": None, "heads": None, "queries": block_q, "keys": keys, "width": param.shape[-1]}
+    return pl.BlockSpec(axes.named(kind.axes, extents),
+                        lambda i, b, h: axes.placed(kind.axes, {"batch": b, "heads": h, "queries": i}, 0))
 
 
 @overload
@@ -527,19 +528,14 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
 
 
 def _key_param(ref, kind: Kind, head, rows):
-    """A hook parameter's values for a dK/dV program's tile, its queries `rows` of the whole row: the
-    head's scalar, the rows' `[block_q, 1]`, its keys' `[1, block_k]`, the rows' entries."""
-    match kind:
-        case Kind.HEAD:
-            return ref[head]
-        case Kind.QUERY:
-            return ref[rows][:, None]
-        case Kind.KEY:
-            return ref[...][None, :]
-        case Kind.TILE:
-            return ref[rows, :]
-        case Kind.OUTPUT:
-            raise ValueError("an output hook's parameter has no score tile")
+    """A hook parameter's values for a dK/dV program's tile, its queries `rows` of the whole row
+    (`_key_param_spec`'s block): the head's scalar, else the tile's entries, a singleton along an axis it
+    does not vary on (`scored`)."""
+    if kind is Kind.OUTPUT:
+        raise ValueError("an output hook's parameter has no score tile")
+    if kind is Kind.HEAD:
+        return ref[head]
+    return scored(ref[axes.placed(_held(kind), {"queries": rows})], kind)
 
 
 def _tile_scores(score_mod, query, key, value, dout, peak, total, anchor, delta, seen, q_pos, k_pos, params,
@@ -624,7 +620,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
                                                             shares[1], key_index, shift)
     peak = maximum
     index_out_ref[...] = key_index
-    summed = tuple(kind in (Kind.HEAD, Kind.QUERY) for kind in score_kinds)
+    summed = tuple(kind in DQ_GRADS for kind in score_kinds)
 
     def step(index, carry):
         # Each cotangent over the prior denominator, in the reference's order, and taken to the pass's
@@ -965,19 +961,15 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
 
 
 def _key_param_spec(kind: Kind, param: jax.Array, queries: int, block_k: int) -> pl.BlockSpec:
-    """How a dK/dV program reads a hook parameter of `kind`: a head's scalar from the whole `[H]`, its
-    head's whole row of queries, its key block, its key block's columns of every query."""
-    match kind:
-        case Kind.HEAD:
-            return pl.BlockSpec(param.shape, lambda j, b, h: (0,))
-        case Kind.QUERY:
-            return pl.BlockSpec((None, None, queries), lambda j, b, h: (b, h, 0))
-        case Kind.KEY:
-            return pl.BlockSpec((None, None, block_k), lambda j, b, h: (b, h, j))
-        case Kind.TILE:
-            return pl.BlockSpec((None, None, queries, block_k), lambda j, b, h: (b, h, 0, j))
-        case Kind.OUTPUT:
-            raise ValueError("an output hook's parameter has no score tile")
+    """How a dK/dV program reads a hook parameter of `kind` (`Kind.axes`): a head's scalar from the whole
+    `[H]`, else its batch row's and head's block of every query and its key block."""
+    if kind is Kind.OUTPUT:
+        raise ValueError("an output hook's parameter has no score tile")
+    if kind is Kind.HEAD:
+        return pl.BlockSpec(param.shape, lambda j, b, h: (0,))
+    extents = {"batch": None, "heads": None, "queries": queries, "keys": block_k}
+    return pl.BlockSpec(axes.named(kind.axes, extents),
+                        lambda j, b, h: axes.placed(kind.axes, {"batch": b, "heads": h, "keys": j}, 0))
 
 
 def _backward_op(*, score_mod, score_kinds: tuple[Kind, ...], score_dtypes: tuple[str, ...], scale: float,

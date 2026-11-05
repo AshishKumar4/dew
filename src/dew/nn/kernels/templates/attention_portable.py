@@ -10,7 +10,7 @@ from typing import Literal, overload
 import jax
 import jax.numpy as jnp
 
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_gradient as gradient
+from dew.nn.kernels.templates import attention_algebra as algebra, attention_gradient as gradient, axes
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     DKV_GRADS,
@@ -38,34 +38,24 @@ from dew.nn.kernels.templates.attention_backward_algebra import backward_derived
 
 def _tile_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array, keys: jax.Array):
     """A score hook parameter's values for a tile of query rows `rows` and keys `keys` (index arrays) of
-    batch row `row` and query head `head`, as `kind` lays them out: `_tile_param` in the Triton
-    mainloop."""
-    if kind in (Kind.QUERY, Kind.KEY, Kind.TILE):
+    batch row `row` and query head `head`, as `kind` lays them out (`Kind.axes`): a head's scalar, else the
+    tile's `[block_q, block_k]` entries, a singleton along an axis it does not vary on."""
+    if kind is Kind.OUTPUT:
+        raise ValueError("an output hook's parameter has no score tile")
+    if kind is not Kind.HEAD:
         row, head = shared_place(value.shape, row, head)
-    match kind:
-        case Kind.HEAD:
-            return value[head]
-        case Kind.QUERY:
-            return value[row, head, rows][:, None]
-        case Kind.KEY:
-            return value[row, head, keys][None, :]
-        case Kind.TILE:
-            return value[row, head][rows[:, None], keys[None, :]]
-        case Kind.OUTPUT:
-            raise ValueError("an output hook's parameter has no score tile")
+    places = {"batch": row, "heads": head, "queries": rows[:, None], "keys": keys[None, :]}
+    return value[axes.named(kind.axes, places)]
 
 
 def _output_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array):
-    """An output hook parameter's values for query rows `rows` of batch row `row` and query head `head`."""
-    match kind:
-        case Kind.HEAD:
-            return value[head]
-        case Kind.QUERY:
-            return value[row, head, rows][:, None]
-        case Kind.OUTPUT:
-            return value[row, rows, head]
-        case Kind.KEY | Kind.TILE:
-            raise ValueError("an output hook's parameter has no key axis")
+    """An output hook parameter's values for query rows `rows` of batch row `row` and query head `head`, as
+    `kind` lays them out (`Kind.axes`): a head's scalar, else the output tile's `[block_q, Dv]` entries, a
+    query's a singleton along the width."""
+    if "keys" in kind.axes:
+        raise ValueError("an output hook's parameter has no key axis")
+    queries = rows if "width" in kind.axes else rows[:, None]
+    return value[axes.placed(kind.axes, {"batch": row, "heads": head, "queries": queries})]
 
 
 def _identity(step: jax.Array) -> jax.Array:
@@ -305,7 +295,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
     blocks = queries // block_q
     start, end, query_ids, key_ids = spans
     bounds = block_map(KeySpans(start, end, query_ids, key_ids, keys), block_q, block_k)
-    summed = tuple(kind in (Kind.HEAD, Kind.QUERY) for kind in score_kinds)
+    summed = tuple(kind in DQ_GRADS for kind in score_kinds)
 
     def program(index):
         i, rest = index // (batch * heads), index % (batch * heads)
