@@ -497,7 +497,8 @@ def test_a_run_saved_with_its_own_window_as_its_profile_reads_it_as_its_run_prof
     held = trainer.get("fields", trainer)
     held.pop("run_profile", None)
     held["profile"] = {"directory": None, "steps": 2, "warmup": 10}
-    loaded = RunConfig.read(record).trainer
+    (tmp_path / "run.json").write_text(json.dumps(record))
+    loaded = RunConfig.load(str(tmp_path / "run.json")).trainer
     assert loaded.profile is None and loaded.run_profile == RunProfile()
     window = loaded.window(str(tmp_path / "saved"), "saved")
     assert window is not None and window.directory is not None and not window.reports
