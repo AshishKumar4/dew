@@ -112,6 +112,16 @@ def test_a_run_that_inspects_nothing_compiles_its_step_alone(inspection):
     assert summarized == (inspection is not None)
 
 
+def test_a_run_that_inspects_compiles_its_sampled_step_at_once_with_its_step():
+    """A run that inspects compiles its sampled step beside its step, at once, each in a thread of its own
+    (`report.compiled_at_once`): XLA's compile releases the GIL, so the two take about the time of one
+    on a host with the cores, where they compiled one after the other."""
+    with Compiles("step") as compiles:
+        trained(Inspection(paths=("w",), every=1), 1)
+    threads = [program.thread for program in compiles.programs if program.kind == "compiled"]
+    assert len(threads) == 2 and all(thread.startswith("dew-compile") for thread in threads), threads
+
+
 def test_a_loaded_runs_view_is_the_live_runs():
     """The view of one sampled step offline (`inspected`), from the trainer's start, is what a live run
     logs at its first step, bit for bit."""
