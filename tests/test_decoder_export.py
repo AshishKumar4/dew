@@ -92,6 +92,7 @@ import jax
 import ml_dtypes
 import numpy as np
 import pytest
+from lane_environment import outside_suite
 from flax import linen as nn
 from float64_terms import float64_forward
 from interop_support import assert_restores, assert_same_stored_tensors, written_tensors
@@ -556,7 +557,7 @@ def test_a_failed_export_ends_with_its_own_error(tmp_path):
     1579). The deadline is the test's own, past the tiny checkpoint's seconds."""
     out = tmp_path / "out"
     out.write_text("a file where the export's directory goes\n")
-    environment = {name: value for name, value in os.environ.items() if name != "XLA_FLAGS"}
+    environment = outside_suite(os.environ)
     run = subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "benchmark_streaming_export.py"),
                           str(FIXTURES / "qwen3-tiny"), "main", str(out)], capture_output=True, text=True,
                          env=environment | {"JAX_PLATFORMS": "cpu", "PYTHONPATH": str(REPO_ROOT / "src")},

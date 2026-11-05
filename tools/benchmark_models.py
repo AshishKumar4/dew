@@ -52,6 +52,7 @@ from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
+from dew.optim import OptimConfig
 from dew.registry import models, projectors, read_arguments, resolve_dtype, towers
 from dew.state import TrainState
 from dew.telemetry.benchmark import carried
@@ -273,17 +274,15 @@ def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
     return objective
 
 
-OPTIMIZERS = {"adam": optax.adam, "adamw": optax.adamw}
-"""A case's optimizer by name (`Case.optimizer`), each at a learning rate."""
-
-
 def build_trainer(case: Case, attention_impl: AttentionImpl = 'auto',
                   optimizer: optax.GradientTransformation | None = None) -> Trainer:
     """The trainer a recipe would build for this case, minus the tracker and the
-    checkpoints, on the case's device order. A case measures its own batch,
-    so the step reads it whole and climbs the remat ladder where it must."""
+    checkpoints, on the case's device order, stepping the optimizer `dew train`
+    builds for the case's at 1e-4 (`OptimConfig.build`). A case measures its own
+    batch, so the step reads it whole and climbs the remat ladder where it must."""
     trainer = Trainer(
-        build_objective(case, attention_impl), optimizer or OPTIMIZERS[case.optimizer](1e-4),
+        build_objective(case, attention_impl),
+        optimizer or OptimConfig(optimizer=case.optimizer, learning_rate=1e-4).build(None),
         key=jax.random.key(0),
         **trainer_mesh(case.mesh), layout=Layout(min_shard=case.fsdp_min_param_size),
         accumulation=case.accumulation, split=1, checkpoints=None, tracker=None)
