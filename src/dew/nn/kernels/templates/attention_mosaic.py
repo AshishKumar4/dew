@@ -401,16 +401,23 @@ class MosaicForward(_Mainloop[Tiles]):
         return resources.shared_bytes(family, _scope(family, allocations, reducing(
             family, config.consumers, self.score_mod, self.output_mod, guarded=guarded)))
 
-    def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
+    def registers(self, ba: tokamax.BoundArguments, config: Tiles, *, peaks: bool = False,
+                  columns: int | None = None) -> int:
+        """A consumer's registers at `config`: its walk's (`_forward_registers`) over the values' columns
+        its launch walks (`columns`, a block of them; the config's own by default), or its peak walk's
+        (`peaks`, `_peaks_registers`), which a training call takes first."""
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
         natural = config.natural_form or self._natural(ba.arguments["query"])
-        value_width = config.columns or _width(value.shape[-1], family, query.dtype)
+        width = _width(query.shape[-1], family, query.dtype)
         params = tuple(zip(self.score_kinds,
                            (kept_dtype(param.dtype) for param in ba.arguments["score_params"]), strict=True))
+        if peaks:
+            return _peaks_registers(family, config, query.dtype, params=params, width=width)
+        value_width = columns or config.columns or _width(value.shape[-1], family, query.dtype)
         return _forward_registers(family, config, value_width, query.dtype,
                                   ba.arguments.get("residuals") is Kept.SPLIT, natural=natural, params=params,
-                                  width=_width(query.shape[-1], family, query.dtype))
+                                  width=width)
 
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
@@ -514,6 +521,23 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     # A training walk's per-query rows (`TRAINING_ROWS`), in the accumulator's row layout.
     rows = TRAINING_ROWS * family.row_registers(block_q, jnp.float32) if residuals else 0
     return max(resources.live_registers(family, carried, *phases, *products), scored) + rows
+
+
+def _peaks_registers(family: mosaic.Family, tiles: Tiles, dtype, *, params: tuple, width: int) -> int:
+    """The registers a peak walk's consumer holds (`attention_mosaic_forward._launch`'s `peaks`, a training
+    call's first walk): it reads the keys alone for each row's largest logit, so it carries a row's maximum
+    and holds a step's logits fp32 and its score hook's parameters (`_hook_live`), its masks' places where
+    the keys' indices do not fold, and its logits' product's fragments where its family reads operands from
+    registers; no weighted values, weights or exponentials (FS-1971-LEAST-ATTN: the forward's walk priced it
+    238 where ptxas's least spill-free cap was 112)."""
+    block_q, block_k = tiles.block_q, tiles.block_k
+    hooked, vectors = _hook_live(family, block_q, block_k, params)
+    logits, bits = (block_q, block_k, jnp.float32), (block_q, block_k, jnp.int32)
+    step = [logits, *([] if family.folds_indices(block_k) else [bits, bits])]
+    products = _products(family, dtype, (block_q, width, block_k, [logits], False, True), narrow=tiles.narrow)
+    carried = [(block_q, 1, jnp.float32)]
+    scored = resources.live_registers(family, carried, [logits, *hooked]) + vectors
+    return max(resources.live_registers(family, carried, step, *products), scored)
 
 
 def _pages_hold(page: int, tile: int, family: mosaic.Family) -> bool:
