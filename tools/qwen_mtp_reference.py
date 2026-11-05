@@ -77,3 +77,15 @@ def prediction_inputs(model, encoded):
     if positions is None:
         positions = encoded["attention_mask"].long().cumsum(-1) - 1
     return outputs.logits, hidden, captured["embeddings"], positions
+
+
+def published_mtp_logits(model, encoded):
+    """The published composition's prediction-depth logits over `encoded`: the decoder's outputs and the
+    depth's inputs (`prediction_inputs`), the depth over each admitted pair of tokens (both real), and the
+    language head. Returns the main logits, the depth's logits, the admitted pairs' mask and the depth's
+    inputs (the final hidden states, the embeddings and the positions)."""
+    main, hidden, embeddings, positions = prediction_inputs(model, encoded)
+    mask = encoded["attention_mask"].bool()
+    admitted = mask[:, :-1] & mask[:, 1:]
+    depth = model.mtp(hidden[:, :-1], embeddings[:, 1:], positions[..., 1:], admitted)
+    return main, model.lm_head(depth), admitted, (hidden, embeddings, positions)

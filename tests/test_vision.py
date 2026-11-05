@@ -141,27 +141,52 @@ def test_a_siglip_tower_runs_any_layer_activation_and_an_inactive_dropout_as_the
                     "siglip quick_gelu features", seeds=SIGLIP_SEEDS, truth_fn=truth)
 
 
-def test_gemma_projector_matches_the_reference_implementation():
-    """fp32 parity on the tiny Gemma projector over the reference trunk
-    output, and the norm is live: with its scale zeroed the soft tokens leave
-    the reference by more than 0.1."""
-    fixture = load_fixture("siglip-tiny")
+def _gemma_projector(fixture):
     trunk = siglip.translate_siglip_vision_config(fixture["config"])
     record = siglip.translate_gemma_projector_config(
-        trunk["fields"], fixture["projector"]["text_width"],
-        fixture["projector"]["mm_tokens_per_image"])
-    projector = projectors.from_record(record)
-    variables = {"params": siglip.translate_gemma_projector_weights(
+        trunk["fields"], fixture["projector"]["text_width"], fixture["projector"]["mm_tokens_per_image"])
+    return projectors.from_record(record), {"params": siglip.translate_gemma_projector_weights(
         fixture["projector_tensors"])[0]}
-    assert np.max(np.abs(np.asarray(
-        projector.apply(variables, fixture["tower_ref"]))
-        - fixture["projector_ref"])) < 1e-4
-    unnormed = jax.tree_util.tree_map_with_path(
-        lambda path, leaf: jnp.zeros_like(leaf)
-        if path[-1].key == "scale" else leaf, variables)
-    assert np.max(np.abs(np.asarray(
-        projector.apply(unnormed, fixture["tower_ref"]))
-        - fixture["projector_ref"])) > 0.1
+
+
+def _gemma4_projector(fixture):
+    trunk = gemma4.translate_gemma4_vision_config(fixture["config"])
+    record = gemma4.translate_gemma4_projector_config(trunk["fields"], fixture["projector"]["text_width"])
+    return projectors.from_record(record), {"params": gemma4.translate_gemma4_projector_weights(
+        fixture["projector_tensors"])[0]}
+
+
+def _qwen35_projector(fixture):
+    record = qwen35.translate_qwen35_projector_config(fixture["config"], fixture["projector"]["text_width"])
+    return projectors.from_record(record), {
+        "params": projector_variables("qwen3_5", fixture["projector_tensors"], "float32")[0]}
+
+
+PROJECTORS = {
+    "gemma": ("siglip-tiny", _gemma_projector, lambda path: path[-1].key == "scale", 0.1),
+    "gemma4": ("gemma4-vision-tiny", _gemma4_projector, lambda path: path[-1].key == "kernel", 3.0),
+    "qwen35": ("qwen35-vision-tiny", _qwen35_projector, lambda path: path[-2].key == "fc1", 10.0),
+}
+"""Each family's tiny projector: its fixture, its build from the fixture's tensors, the leaf whose zeroing
+shows the projector live (Gemma's norm scale, Gemma 4's map, Qwen 3.5's merger's first map) and how far
+the zeroed projector's soft tokens leave the reference."""
+
+
+@pytest.mark.parametrize("name", sorted(PROJECTORS))
+def test_a_projector_matches_the_reference_implementation(name):
+    """fp32 parity on each family's tiny projector over the reference trunk output, and the projector is
+    live: with its leaf zeroed the soft tokens leave the reference by the family's margin (`PROJECTORS`)."""
+    fixture_name, built, zeroed, margin = PROJECTORS[name]
+    fixture = load_fixture(fixture_name)
+    projector, variables = built(fixture)
+
+    def gap(variables):
+        output = np.asarray(projector.apply(variables, fixture["tower_ref"]))
+        return np.max(np.abs(output - fixture["projector_ref"]))
+
+    assert gap(variables) < 1e-4
+    assert gap(jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jnp.zeros_like(leaf) if zeroed(path) else leaf, variables)) > margin
 
 
 def test_llama4_projector_matches_the_reference_implementation():
@@ -213,28 +238,6 @@ def test_gemma4_tower_matches_the_reference_implementation():
         - fixture["tower_ref"])) > 23.0
 
 
-def test_gemma4_projector_matches_the_reference_implementation():
-    """fp32 parity on the tiny Gemma 4 embedder over the reference trunk
-    output, and the map is live: with it zeroed the soft tokens leave the
-    reference by more than 3.0."""
-    fixture = load_fixture("gemma4-vision-tiny")
-    trunk = gemma4.translate_gemma4_vision_config(fixture["config"])
-    record = gemma4.translate_gemma4_projector_config(
-        trunk["fields"], fixture["projector"]["text_width"])
-    projector = projectors.from_record(record)
-    variables = {"params": gemma4.translate_gemma4_projector_weights(
-        fixture["projector_tensors"])[0]}
-    assert np.max(np.abs(np.asarray(
-        projector.apply(variables, fixture["tower_ref"]))
-        - fixture["projector_ref"])) < 1e-4
-    unmapped = jax.tree_util.tree_map_with_path(
-        lambda path, leaf: jnp.zeros_like(leaf)
-        if path[-1].key == "kernel" else leaf, variables)
-    assert np.max(np.abs(np.asarray(
-        projector.apply(unmapped, fixture["tower_ref"]))
-        - fixture["projector_ref"])) > 3.0
-
-
 def test_gemma4_widened_head_computes_the_reference_features():
     from flax.errors import ScopeParamShapeError
 
@@ -268,26 +271,6 @@ def test_qwen35_tower_matches_the_reference_implementation():
         np.testing.assert_allclose(
             np.asarray(tower.apply(unpositioned, fixture["pixels"])),
             fixture["tower_ref"], atol=1e-4, rtol=0)
-
-
-def test_qwen35_projector_matches_the_reference_implementation():
-    """fp32 parity on the tiny Qwen 3.5 merger over the reference trunk
-    output, and the merger is live: with its first map zeroed the soft
-    tokens leave the reference by more than 10.0."""
-    fixture = load_fixture("qwen35-vision-tiny")
-    record = qwen35.translate_qwen35_projector_config(
-        fixture["config"], fixture["projector"]["text_width"])
-    projector = projectors.from_record(record)
-    variables = {"params": projector_variables("qwen3_5", fixture["projector_tensors"], "float32")[0]}
-    assert np.max(np.abs(np.asarray(
-        projector.apply(variables, fixture["tower_ref"]))
-        - fixture["projector_ref"])) < 1e-4
-    unmerged = jax.tree_util.tree_map_with_path(
-        lambda path, leaf: jnp.zeros_like(leaf)
-        if path[-2].key == "fc1" else leaf, variables)
-    assert np.max(np.abs(np.asarray(
-        projector.apply(unmerged, fixture["tower_ref"]))
-        - fixture["projector_ref"])) > 10.0
 
 
 @pytest.mark.parametrize("name", ["gemma4-vision-tiny", "gemma4-vision-wide-tiny",

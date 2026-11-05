@@ -250,7 +250,7 @@ def published_mtp_arms(loaded):
     from safetensors.torch import load_file
     from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText
 
-    from tools.qwen_mtp_reference import QwenMTP, prediction_inputs
+    from tools.qwen_mtp_reference import QwenMTP, published_mtp_logits
     from tools.torch_precision import float64
 
     config = AutoConfig.from_pretrained(loaded.source)
@@ -267,11 +267,7 @@ def published_mtp_arms(loaded):
         return model.to(dtype).eval()
 
     def predicted(network, *fields):
-        encoded = dict(zip(names, fields, strict=True))
-        _, hidden, embeddings, positions = prediction_inputs(network, encoded)
-        mask = encoded["attention_mask"].bool()
-        admitted = mask[:, :-1] & mask[:, 1:]
-        logits = network.lm_head(network.mtp(hidden[:, :-1], embeddings[:, 1:], positions[..., 1:], admitted))
+        _, logits, admitted, _ = published_mtp_logits(network, dict(zip(names, fields, strict=True)))
         return logits[admitted]
 
     def twin():
