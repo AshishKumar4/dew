@@ -35,7 +35,6 @@ from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes
 from dew.mesh import LayoutRefused
 from dew.nn.kernels.options import compiler_options, program
 from dew.nn.kernels.templates import report
-from dew.nn.protocols import RematChoosing
 from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
 from dew.telemetry.profile import Profiler, active_profile
@@ -55,7 +54,6 @@ from dew.training.memory import (
     recompute_more,
     recompute_record,
     remat_half,
-    remat_more,
     remat_offloaded,
     rung_record,
     step_fits,
@@ -597,6 +595,14 @@ class FitSearch[LossT, EffectsT]:
     for a run that starts from a plan, recorded, compiled ahead or resumed, which the search tries first."""
     derived: list[dict[str, JSON]] = dataclasses.field(default_factory=list)
     """Each rung the derivation read before the first compile: its rung, terms, headroom and label."""
+    judged_at: dict[tuple[str, int], int | None] = dataclasses.field(default_factory=dict)
+    """The derived headroom of each candidate the derivation read, by its rung (`rung`) and split: what
+    orders the compiles (`derived_likely`), a compile's measure correcting it (`under`)."""
+    copies_at: dict[tuple[str, int], bool] = dataclasses.field(default_factory=dict)
+    """Whether each candidate the derivation read keeps narrow copies (`Candidate.copies`)."""
+    under: dict[str, int] = dataclasses.field(default_factory=dict)
+    """By remat rung (`remat_rung`), the most bytes a compile there needed past its derived headroom: a
+    candidate there is judged to fit only where its derived headroom holds that much more."""
     kernels: dict[str, JSON] = dataclasses.field(default_factory=dict)
     """What the templates' reports found where the search compiled (`admitted`): each kernel its compiles
     found spilling (`report.misses`, `spill_record`) and each launch config they refused
@@ -617,11 +623,13 @@ class FitSearch[LossT, EffectsT]:
         """The first fitting plan found by the split-and-rung search, and every compile it made, its
         first rung the one the derivation picks (`derived_start`). Once admission succeeds, no optional
         alternate policy is compiled."""
-        # A rung fits where its most microbatches do; the search then finds its split there.
+        # A rung fits where its most microbatches do; the derivation then finds its split there, which
+        # alone is compiled where it is right (`derived_split`).
         self.derived_start(candidates[-1])
+        first = self.derived_split(candidates, first)
         seen, held, traced = len(report.misses()), set(report.refused_launches()), len(report.rewrites())
         split = planned(candidates, first, self.fits, self.climb,
-                        lambda split: self.forecast.likely(self.rung(), split))
+                        lambda split: self.forecast.likely(self.rung(), split) or self.derived_likely(split))
         spills: list[JSON] = [spill_record(miss) for miss in report.misses()[seen:]]
         refused: list[JSON] = [refusal_record(*refusal) for refusal in report.refused_launches()
                                if refusal not in held]
@@ -680,12 +688,9 @@ class FitSearch[LossT, EffectsT]:
         rungs read are `derived`. A rung the derivation cannot judge ('unknown': residuals over several
         devices) or devices that state no memory to judge one against ('unstated') end the walk where it
         started, at the base rung, as does a ladder no rung of which fits. A run that sets its remat
-        compiles at it alone, told first where the derivation fits a lighter rung (`advise`). The
-        derivation names no XLA workspace, so a 'fits' is a first guess and the compile the decision."""
-        if self.derive is None or self.resumed is not None:
-            return
-        if self.remat_set:
-            self.advise(split)
+        compiles at it alone; its split is read there (`derived_split`). A 'fits' is the derivation's
+        judgment, which the one compile confirms."""
+        if self.derive is None or self.resumed is not None or self.remat_set:
             return
         base = self.configuration()
         label, narrow = self.walked(split)
@@ -697,13 +702,12 @@ class FitSearch[LossT, EffectsT]:
                       self.remat_rung())
         self.narrow = narrow
 
-    def walked(self, split: int, until: str | None = None) -> tuple[str, bool]:
+    def walked(self, split: int) -> tuple[str, bool]:
         """Climb the objective from its rung to the least-recompute one whose derived footprint at `split`
-        fits the devices, each rung read appended to `derived`: the label the walk ends on, and whether
-        the rung keeps the narrow copies. It ends where a rung fits, where the derivation cannot judge one
-        ("unknown"), where the ladder ends, and, with `until`, at that remat (`remat_rung`), which it does not
-        read; where no device states memory to judge a rung against (`judging`), it reads none
-        ("unstated")."""
+        fits the devices, each rung read appended to `derived` (`judged`): the label the walk ends on, and
+        whether the rung keeps the narrow copies. It ends where a rung fits, where the derivation cannot
+        judge one ("unknown") and where the ladder ends; where no device states memory to judge a rung
+        against (`judging`), it reads none ("unstated")."""
         assert self.derive is not None
         narrow, label = self.narrow, "refuses"
         if not self.judging():
@@ -712,18 +716,13 @@ class FitSearch[LossT, EffectsT]:
             self.derived.append({**self.current(), "narrow": narrow, "split": split, "headroom": None,
                                  "label": "unstated", "terms": None})
             return "unstated", narrow
-        while until is None or self.remat_rung() != until:
-            candidate = self.derive(split, narrow)
-            footprint = candidate.footprint
-            headroom = None if footprint is None else derived_headroom(
-                footprint, local_devices(self.mesh), self.capacity, candidate.built)
+        while True:
+            headroom = self.judged(split, narrow)
             label = "unknown" if headroom is None else "fits" if headroom >= 0 else "refuses"
-            self.derived.append({**self.current(), "narrow": narrow, "split": split, "headroom": headroom,
-                                 "label": label, "terms": None if footprint is None else footprint.record()})
             if label != "refuses":
                 break
             # The search's own climb drops the narrow copies first, at the same head and remat.
-            if narrow and candidate.copies:
+            if narrow and self.copies_at[self.candidate_key(split, narrow)]:
                 narrow = False
                 continue
             narrow = False
@@ -731,47 +730,52 @@ class FitSearch[LossT, EffectsT]:
                 break
         return label, narrow
 
-    def advise(self, split: int) -> None:
-        """Tell a run that sets its remat, before it compiles there alone (row 2111), the least-recompute
-        rung its derivation finds fits where that recomputes less (row 2536): each trained module that
-        chooses its remat (`RematChoosing`) is read from no remat up to the run's own, which the walk
-        never reads, and the run's own modules and head are put back. A run whose remat the ladder's climb
-        from none never reaches (a policy off `DECODER_REMAT`, or a rung the climb passes over) is told
-        nothing, and traces nothing for it: no rung below its own is known. A layout the derivation cannot
-        judge (`walked`'s "unknown"), and devices that state no memory to judge it against ("unstated"), are
-        told so."""
-        entries = self.objective.program_key()
-        if not any(entry.trained and isinstance(entry.module, RematChoosing) for entry in entries):
-            return
-        held, own = self.configuration(), self.remat_rung()
-        lightest = [entry.module.with_remat(None) if entry.trained and isinstance(entry.module, RematChoosing)
-                    else entry.module for entry in entries]
-        label = found = None
-        try:
-            # The rungs the climb takes, read off the modules alone, which trace nothing.
-            self.objective.substitute(lightest)
-            climbed = [self.remat_rung()]
-            while remat_more(self.objective):
-                climbed.append(self.remat_rung())
-            if own in climbed:
-                self.objective.substitute(lightest)
-                label, _ = self.walked(split, until=own)
-                found = self.remat_rung()
-        finally:
-            self.restore(held)
-        if label == "fits" and found != own:
-            _log.warning("the run sets remat %s, and the derivation says the step fits from remat %s, which "
-                         "recomputes less: leave the remat unset and the run compiles there first", own,
-                         found)
-        elif label == "unstated":
-            _log.warning("the run sets remat %s, and its devices state no memory to judge a rung by (a CPU, "
-                         "or a compile-only GPU given no capacity), so it says nothing of a rung that "
-                         "recomputes less", own)
-        elif label == "unknown":
-            # The derivation reads per-device residuals only where each split axis is data or fsdp (row 2615).
-            _log.warning("the run sets remat %s, and the derivation cannot judge its layout's footprint (a "
-                         "tensor, sequence, stage or expert axis), so it says nothing of a rung that "
-                         "recomputes less", own)
+    def judged(self, split: int, narrow: bool) -> int | None:
+        """The derived headroom of the step at `split` and `narrow` at the objective's rung, traced once a
+        candidate (`judged_at`), and recorded beside the rungs `walked` reads; None where the derivation
+        cannot judge it or no device states memory to judge it against."""
+        key = self.candidate_key(split, narrow)
+        if key not in self.judged_at:
+            assert self.derive is not None
+            candidate = self.derive(split, narrow)
+            footprint = candidate.footprint
+            headroom = None if footprint is None else derived_headroom(
+                footprint, local_devices(self.mesh), self.capacity, candidate.built)
+            label = "unknown" if headroom is None else "fits" if headroom >= 0 else "refuses"
+            self.derived.append({**self.current(), "narrow": narrow, "split": split, "headroom": headroom,
+                                 "label": label, "terms": None if footprint is None else footprint.record()})
+            self.judged_at[key], self.copies_at[key] = headroom, bool(candidate.copies)
+        return self.judged_at[key]
+
+    def candidate_key(self, split: int, narrow: bool) -> tuple[str, int]:
+        """The step at `split` and `narrow` at the objective's rung, as the derivation's judgments keep it."""
+        return json.dumps({**self.current(), "narrow": narrow}, sort_keys=True), split
+
+    def derived_split(self, candidates: Sequence[int], first: int) -> int:
+        """The index of the candidate the search compiles first: at the rung the derivation picked, the
+        fewest microbatches whose derived footprint fits the devices, found by halving the range below
+        the most, which fits (`derived_start`, memory falling with the split as `planned` assumes); the
+        derivation trusted where it refuses one, so the one compile at the most performant plan it admits
+        decides (row 3341). `first` where the run starts from a plan (a recorded one, or a checkpoint's
+        rung), where the derivation cannot judge the step, or where no candidate it reads fits."""
+        if self.derive is None or self.resumed is not None or first != 0 or not self.judging():
+            return first
+        headroom = self.judged(candidates[-1], self.narrow)
+        if headroom is None or headroom < 0:
+            return first
+        low, high = -1, len(candidates) - 1
+        while high - low > 1:
+            middle = (low + high) // 2
+            fits = (self.judged(candidates[middle], self.narrow) or -1) >= 0
+            low, high = (low, middle) if fits else (middle, high)
+        return high
+
+    def derived_likely(self, split: int) -> bool:
+        """Whether the derivation judged the step at `split` at the objective's rung to fit, past the most
+        a compile at this remat needed beyond its derivation (`under`): the next compile asked after a
+        miss, so the derivation, corrected by what the compiles measured, orders them."""
+        headroom = self.judged_at.get(self.candidate_key(split, self.narrow))
+        return headroom is not None and headroom - self.under.get(self.remat_rung(), 0) >= 0
 
     def judging(self) -> bool:
         """Whether this process's devices judge a derived footprint (`memory.judged`) at the search's
@@ -858,6 +862,11 @@ class FitSearch[LossT, EffectsT]:
         foreseen = None if candidate.footprint is None else derived_headroom(
             candidate.footprint, local_devices(self.mesh), self.capacity, candidate.built)
         probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, derived_headroom=foreseen)
+        if foreseen is not None and headroom is not None and foreseen > headroom:
+            # What this compile needed past its derivation corrects the derivation's next judgments at its
+            # remat (`derived_likely`).
+            rung = self.remat_rung()
+            self.under[rung] = max(self.under.get(rung, 0), foreseen - headroom)
         if foreseen is not None and (foreseen >= 0) != fit:
             # A derived peak bounded from below (`Footprint.exact`) admits provisionally: its miss names
             # the need the compile found, which a sourced rule is to reach.
