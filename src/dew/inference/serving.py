@@ -673,6 +673,13 @@ class Server:
         self.prefill_mesh = mesh
         if mesh is None:
             return
+        spans = {device.process_index for device in mesh.devices.flat}
+        if spans != ({jax.process_index()} if self.mesh is None else
+                     {device.process_index for device in self.mesh.devices.flat}):
+            # Each process's requests reach the prefill mesh through the server's own steps, which the
+            # processes take together only where the server's mesh spans them all.
+            raise ValueError("a server prefills on a mesh over the processes its own mesh spans; place its "
+                             "weights over the same processes as prefill_mesh")
         rows = self.rows
         if not isinstance(rows, DenseRows) or rows.chunk is not None or rows.placement.plan is not None:
             raise ValueError("a server that prefills on a mesh of its own prefills each prompt whole over a "
