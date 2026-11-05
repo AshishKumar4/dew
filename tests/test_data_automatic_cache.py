@@ -130,6 +130,41 @@ def test_a_chain_reads_the_same_records_and_plan_with_or_without_its_automatic_c
     assert plan(cache=True) == plan(cache=False)
 
 
+@pytest.mark.parametrize("workers", [0, 2])
+@pytest.mark.parametrize("saved_with", [True, False], ids=["saved-cached", "saved-uncached"])
+def test_a_rejecting_chain_resumes_across_its_automatic_cache_turned_on_or_off(saved_with, workers):
+    """A read by index of a leading map that rejects saves a position with its automatic cache that a
+    run without it resumes, and the reverse, in the reading process or its loading workers: each reads
+    what the run nobody stopped reads (row 803)."""
+    def loader(cache: bool):
+        chain = mapped(Counted(rejects=frozenset({1, 4}))).repeat(2).batch(2, drop_remainder=False)
+        loading = Loading(workers=workers, threads=1, read_buffer=1, cache=cache)
+        return compile(chain, read="indexed", loading=loading)
+
+    def ids(stream) -> list[list[int]]:
+        return [[int(row) for row in batch["id"]] for batch in stream]
+
+    read(mapped(Counted(rejects=frozenset({1, 4}))), "indexed")
+    assert generations()
+    whole = loader(saved_with).train(DataPartition())
+    try:
+        expected = ids(whole)
+    finally:
+        whole.close()
+    stopped = loader(saved_with).train(DataPartition())
+    try:
+        assert ids(itertools.islice(stopped, 3)) == expected[:3]
+        state = stopped.get_state()
+    finally:
+        stopped.close()
+    resumed = loader(not saved_with).train(DataPartition())
+    try:
+        resumed.set_state(state)
+        assert ids(resumed) == expected[3:]
+    finally:
+        resumed.close()
+
+
 @dataclass(frozen=True)
 class Kept:
     """The records whose id is no multiple of three."""
