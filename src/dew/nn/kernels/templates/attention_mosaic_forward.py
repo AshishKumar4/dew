@@ -100,6 +100,14 @@ def _out_types(batch: int, queries: int, heads: int, value_width: int, out_dtype
     return out_type
 
 
+def _stores_through_query(family: mosaic.Family, width: int, value_width: int, dtype, out_dtype) -> bool:
+    """Whether an inference launch's output stores through its query's stage: where the two are as wide
+    and as narrow, and the query's stage is staged as an output's is (`query_swizzle` None; a register
+    family's 8-row tiles 32 bytes wide refuse the store ladder's rungs of fewer rows, FS-4324-DIAG1: "slice
+    size (4) ... divisible by the tile size (8)" on an A100)."""
+    return (value_width == width and out_dtype in (None, jnp.dtype(dtype)) and query_swizzle(family) is None)
+
+
 def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_width: int, dtype,
                          residuals: bool, stages: int, *, peaks: bool = False, out_dtype=None,
                          pieces: int = 1) -> tuple[list, dict]:
@@ -116,7 +124,7 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
               plgpu.SMEM((consumers, block_q), jnp.float32)]
     if residuals:
         scoped.append(plgpu.SMEM((consumers, block_q, value_width), jnp.float32))
-    elif not peaks and (value_width != width or out_dtype not in (None, dtype)):
+    elif not peaks and not _stores_through_query(family, width, value_width, dtype, out_dtype):
         scoped.append(plgpu.SMEM((consumers, block_q, value_width), out_dtype or dtype))
     if residuals or peaks:
         scoped.append(plgpu.SMEM((consumers, block_q), jnp.int32))
@@ -1110,7 +1118,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     # The output stores through the query's stage where the two are as wide (its rows are read before the
     # store); else it takes a stage of its own beside the query's and the rings (`_forward_allocations`).
     out_dtype = query.dtype if out_dtype is None else jnp.dtype(out_dtype)
-    reuse = value_width == width and out_dtype == query.dtype
+    reuse = _stores_through_query(family, width, value_width, query.dtype, out_dtype)
     # A paged call's key tile of several pages loaded a page at a time (`_paged_views`).
     pieces = block_k // page if page is not None and page < block_k else 1
     scoped, rings = _forward_allocations(family, tiles, width, value_width, query.dtype, training,
