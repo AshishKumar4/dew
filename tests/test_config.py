@@ -425,6 +425,7 @@ def test_every_run_profiles_a_short_window_of_its_own_steps_kept_with_its_record
     holds the process's one profiling session, a run's own window yields where one naming its directory
     refuses (row 4112)."""
     import dew
+    from dew.config import local_records
     from dew.training import ProfileWindow
 
     def trained(name: str, **fields) -> Path:
@@ -440,6 +441,12 @@ def test_every_run_profiles_a_short_window_of_its_own_steps_kept_with_its_record
     records = [json.loads(line) for line in written]
     (traced,) = [row["value"] for row in records if row["type"] == "ProfileTraced"]
     assert traced["steps"] == 2
+    # A run in a bucket keeps its capture with its other local records, in Dew's cache (`local_records`).
+    remote = TrainerConfig(name="remote", checkpoint_dir="gs://bucket/runs").window("gs://bucket/runs/remote",
+                                                                                   "remote")
+    assert remote is not None and remote.directory == local_records("gs://bucket/runs/remote", "remote",
+                                                                    "profile")
+    assert "://" not in remote.directory
     plain = trained("plain", profile=None)
     assert not (plain / "profile").exists()
     with dew.Profiler(tmp_path / "outer"):

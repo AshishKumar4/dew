@@ -754,9 +754,10 @@ class TrainerConfig:
         """The directory of the run `name`'s checkpoints and record, in `checkpoint_dir`."""
         return os.path.join(self.checkpoint_dir, name)
 
-    def window(self, directory: str) -> ProfileWindow | None:
-        """The profile window the run under `directory` traces: `profile` as it names its directory, a run's
-        own (no directory) kept under the run's (`directory/profile`) where the process can take a capture
+    def window(self, directory: str, name: str) -> ProfileWindow | None:
+        """The profile window the run `name` under `directory` traces: `profile` as it names its directory,
+        a run's own (no directory) kept with the run's local records (`local_records`: its directory's
+        `profile`, or Dew's cache for a run in a bucket) where the process can take a capture
         (`capturable`), none where it cannot or the run traces none."""
         from dew.training.profiling import capturable
 
@@ -765,7 +766,7 @@ class TrainerConfig:
             return window
         if not capturable():
             return None
-        return dataclasses.replace(window, directory=os.path.join(directory, "profile"))
+        return dataclasses.replace(window, directory=local_records(directory, name, "profile"))
 
     def checkpoints(self, name: str, directory: str | None = None) -> Checkpoints:
         """The checkpoints of the run `name` in `checkpoint_dir` (`directory`), or in `directory` where
@@ -843,18 +844,22 @@ class TrainerConfig:
         return dataset.epoch_steps(window=self.accumulation)
 
 
-def _local_tracker(directory: str, name: str):
-    """Return the journal directory for a run, beside its checkpoints where it can be.
+def local_records(directory: str, name: str, kind: str) -> str:
+    """Where the run `name` under `directory` keeps its local records of `kind` (its journal, `tracking`,
+    or its profile's capture, `profile`), beside its checkpoints where it can be.
 
-    A bucket URI is not a directory this process can write journals into, so a
-    remote run journals under Dew's cache (`dew_cache_dir`), keyed by the run name and
-    a digest of the bucket path.
+    A bucket URI is not a directory this process can write into, so a remote run keeps them under Dew's
+    cache (`dew_cache_dir`), keyed by the run name and a digest of the bucket path.
     """
     if "://" not in directory:
-        return LocalTracker(os.path.join(directory, "tracking"))
-    return LocalTracker(os.path.join(dew_cache_dir(), "tracking",
-                                     _artifact_name(name) + "-"
-                                     + hashlib.sha256(directory.encode()).hexdigest()[:12]))
+        return os.path.join(directory, kind)
+    return os.path.join(dew_cache_dir(), kind,
+                        _artifact_name(name) + "-" + hashlib.sha256(directory.encode()).hexdigest()[:12])
+
+
+def _local_tracker(directory: str, name: str):
+    """Return the journal of a run, kept where its local records are (`local_records`)."""
+    return LocalTracker(local_records(directory, name, "tracking"))
 
 
 def _closed(tracker, checkpoints: Checkpoints | None, primary: BaseException | None) -> None:
@@ -2096,8 +2101,8 @@ class RunConfig:
             # and the rest are fit's arguments or built the checkpoints and the tracker.
             ahead = None if trainer.ahead is None else AheadOfTime.load(trainer.ahead)
             built = self.built(objective, trainer.mesh, rollout, checkpoints=checkpoints, tracker=tracker,
-                               profile=trainer.window(checkpoints.directory), lower_for=trainer.lower_for,
-                               ahead=ahead)
+                               profile=trainer.window(checkpoints.directory, name),
+                               lower_for=trainer.lower_for, ahead=ahead)
 
             def record_run() -> None:
                 """Write the run's record and name where it is tracked, on rank zero."""
