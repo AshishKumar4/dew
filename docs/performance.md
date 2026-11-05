@@ -3095,7 +3095,9 @@ Each kernel's implementation is chosen in one place and keyed by hardware genera
 
 A call that runs another kernel where a row here measured one fastest logs a warning, once a process for each kernel and reason, on the `dew` logger: `attention runs 'cudnn', not 'flash', the kernel measured fastest on sm80: dew_flash_attn is not installed` (`dew.nn.kernels.generation.route`). A change that sends calls off the measured kernel shows in a run's log, not only in its step time.
 
-### The MoE grouped matmul: `KERNELS['grouped_matmul']`
+### The MoE grouped matmul
+
+These measurements chose the grouped matmul's earlier kernels. Which kernel a launch runs now is the GEMM template selector's, each route reported with its reason ([Kernel templates: choice](design/kernel-templates.md#7-choice-the-one-kernel-each-template-derives), [Mixture of experts](concepts/moe.md#expert-kernels)).
 
 | device | path | ms/step | p50 ms | peak GiB |
 |---|---|---|---|---|

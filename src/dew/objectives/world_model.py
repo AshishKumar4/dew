@@ -26,12 +26,10 @@ from flax import linen as nn
 
 from dew.batch import Batch, Variables, unboxed
 from dew.inputs import unit_range
-from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
+from dew.nn.backbones.decoder_block import DecoderBlock
 from dew.nn.inputs import AttentionMetadata
-from dew.nn.mixer_base import MixerContext
-from dew.nn.mixers.attention import CausalSelfAttention
-from dew.nn.mlp import GatedMLP
 from dew.nn.scan_orders import patchify, unpatchify
+from dew.nn.text_encoders import clip_layer
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step
 
 RMS_EPSILON = 1e-6
@@ -40,17 +38,12 @@ were drawn with)."""
 
 
 def _block(width: int, heads: int, tokens: int, name: str) -> DecoderBlock:
-    """A pre-RMSNorm `DecoderBlock` of `width` features over `tokens` tokens: unrotated attention of `heads`
-    biased heads (`nope`), each head's queries and keys RMS-normed, under the call's pairwise mask
-    (`AttentionMetadata.pairwise_mask`) in the reference implementation, its logits formed in at least
-    float32 (`MixerContext.wide_logits`), as TSSM's blocks attend; then a biased SwiGLU of four times the
-    width (`GatedMLP`)."""
-    attention = functools.partial(CausalSelfAttention, nope=True, ctx=MixerContext(
-        emb_features=width, num_heads=heads, num_kv_heads=heads, head_dim=width // heads, max_seq_len=tokens,
-        causal=False, qk_norm=True, norm_eps=RMS_EPSILON, attention_bias=True, attention_impl="reference",
-        wide_logits=True))
-    mlp = functools.partial(GatedMLP, hidden_features=4 * width, out_features=width, use_bias=True)
-    return DecoderBlock(attention, mlp, width, BlockWiring(), norm_eps=RMS_EPSILON, name=name)
+    """A pre-RMSNorm tower layer (`dew.nn.text_encoders.clip_layer`) of `width` features over `tokens`
+    tokens: unrotated attention of `heads` biased heads, each head's queries and keys RMS-normed, under the
+    call's pairwise mask (`AttentionMetadata.pairwise_mask`), its logits formed in at least float32
+    (`wide_logits`), as TSSM's blocks attend; then a biased SwiGLU of four times the width."""
+    return clip_layer(width, heads, 4 * width, tokens, activation="swiglu", eps=RMS_EPSILON, norm_type="rms",
+                      norm_bias=False, qk_norm=True, wide_logits=True, name=name)
 
 
 def _attended(blocks: Sequence[DecoderBlock], tokens: jax.Array, mask: jax.Array) -> jax.Array:
