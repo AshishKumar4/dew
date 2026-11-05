@@ -320,6 +320,7 @@ because its Python API is still marked as subject to change.
 | `dew.algebra.program` | The compile-time pass (`rewritten`), its switch (`passes`) and its report |
 | `dew.algebra.derive` | Template declarations and their derived forms |
 | `dew.algebra.generate` | The dev-time generator and its `--check` |
+| `dew.algebra.bits` | Bit-level forms (§7): a declared GF(2)-linear transform of a stored word, its cheapest instruction form over the integer pipes and its proof |
 
 ### 6.2 Terms
 
@@ -936,3 +937,92 @@ def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tupl
 - `--check` regenerates in memory and fails where the checked-in output differs, in CI's lint lane; a changed
   rule or declaration therefore lands as a reviewed diff of generated code.
 - Sampling is seeded and its families fixed, so generation is deterministic across processes (§3).
+
+## 7. Bit-level forms
+
+Design record, 2026-11-05 (theme T82). The e-graph engine derives real-valued forms; this part derives the
+cheapest instruction form of a declared bit-level transform, a low-precision format's decode first, over a
+GPU's integer pipes, and proves it exact on every input. Its output is a form a template takes, so nothing
+about it is an estimate.
+
+### 7.1 What it derives
+
+- **A transform** (`BitTransform`) maps a stored word of at most 32 bits to registers, each with a mask: the
+  bits its consumer reads, every other bit zero. It is GF(2)-linear, each bit read the parity of some input
+  bits (`rows`), so a format's decode is one: its codes' fields placed where the consumer's multiply reads
+  them (`BitTransform.placed`), the exponent's bias folded into the block scale's multiply (an E2M1 code at a
+  bfloat16's mantissa's top bit and its exponent's two low bits is the code's value times 2^-126). A transform
+  that is not linear is not declarable: its proof over a 32-bit word would need a solver, and no consumer has
+  one yet (a rounding pack's own search waits for its consumer).
+- **Its layout** is fixed (the stored word is the input) or free: the stored word may be any invertible
+  re-encoding of the input, chosen with the form. The encoder runs once where the weights are stored (Dew's
+  quantization codec), the decoder each time they are read.
+- **A form** (`Form`) is a list of instructions over the stored word, the register each output is, and the
+  encoder (its bit `j` the parity of the input's bits `encoder[j]` names).
+
+### 7.2 Vocabulary and price
+
+- The instructions are those a decode needs, each GF(2)-linear (`Op`): a logical right shift and a left shift
+  (SHF on the ALU, or IMAD.HI and IMAD.SHL, a multiply by a power of two, on the FMA pipe), a rotation (SHF's
+  funnel shift, the ALU's alone), and LOP3 masking the XOR of one or two values (the mask an immediate). Every
+  architecture from sm75 to sm120 issues them alike.
+- **Price** (`Form.price`): the busiest pipe's issues, then the instruction count. Nsight Compute's Kernel
+  Profiling Guide (its pipelines) puts logic, shifts and every integer instruction but IMAD and IMUL on the
+  ALU, and IMAD and IMUL on the FMA pipe; the CUDA C++ Best Practices Guide 13 (Table 5) gives a shift, a
+  bitwise operation and an integer multiply-add 64 results a clock per multiprocessor on every compute
+  capability from 7.5 to 12.1. A decoder's words are many and independent, so throughput prices it, not its
+  chain's latency, and a shift goes on whichever pipe balances the two. A form is checked against measured
+  kernels where a consumer takes it, never against instruction counts alone (§7.4).
+
+### 7.3 Search and proof
+
+- **Search** (`synthesized`): one LOP3 per output register, `mask & (u ^ v)` or `mask & u`, over the stored
+  word, at most one right shift or rotation of it, and up to `lefts` left shifts of it or of that, each by at
+  most `reach` places; a register may read an earlier one. Shapes (which shifts) are walked in increasing price,
+  so the first form found is the cheapest the vocabulary holds. A free layout's registers need only be
+  independent over GF(2) (an invertible read), checked row by row as each register is chosen, after a
+  necessary count (each register's bit a parity of the sources' bits at its place) rejects most shift sets
+  before any; a fixed layout's must equal the transform's rows. Every shift must be read, else a cheaper
+  shape reads the same. The encoder is the form's map inverted, after the transform.
+- **Proof** (`proven`): every instruction is GF(2)-linear, so a form and its encoder are linear maps, and two
+  linear maps that agree on each basis word agree on all 2^width; a word of 16 bits or fewer is checked on
+  every word besides. A form not proven is never returned, and a checked-in form is proven again by its
+  consumer's tests. That proof replaces the sampled checks a real-valued form gets.
+- The fp4 challenge, the evidence for the technique, searched this space in C: its NVFP4 decode into
+  bfloat16 pairs takes 4 LOP3 + 1 SHF + 3 IMAD.SHL against the 7 + 2 before, bit-identical, +0.4% end to end.
+  The search here re-derives it from the decode's declaration (2026-11-05, one armada core): at shifts of up
+  to 31 places it walks every shape of four issues on the busiest pipe and finds none, then returns a form of
+  that price, a rotation by 6, shifts by 2 and 6 and the rotation's by 2 and four masked XORs, in 27 seconds
+  (6 places: 2.3 seconds, the test's). No form without a right-moving shift exists within three left shifts.
+
+### 7.4 Interface with the GEMM template (its first consumer, row 3733)
+
+Agreed with the GEMM template's owner (2026-11-03):
+
+- A declaration names the fragment layout the family's MMA reads, which the family bundle supplies: on sm90
+  the wgmma A-operand fragment, the weight taken as A and swapped onto M at decode shapes so the decoder writes
+  straight into it; on sm100 the tcgen05 and tensor-memory layouts. A thread's input is the packed words it
+  loads: a 32-bit word holds 8 E2M1 codes.
+- Block scales (NVFP4's 1×16, MX's 1×32) are a separate transform of a fixed layout, which feeds the
+  template's promotion and epilogue: a form may re-encode the codes, never the scales.
+- The consumer checks in each form it takes: its instructions, its encoder and the encoder's version (in the
+  checkpoint), the decoder's live registers per thread (which `resources.py` prices before a tile is admitted)
+  and its instruction mix in `Work`'s units (which `cost.py` prices). Its tests prove it again.
+- The decoder is emitted inline (Mosaic GPU takes inline asm through `plgpu.inline_mgpu`) at a matrix-operand
+  hook the GEMM template adds (row 3621).
+- Scope: NVFP4 and MXFP4 on sm90 and sm80; FP8 on sm80, which has no FP8 MMA; FP8 and FP4 packing in the
+  epilogue. FP8 on sm90 needs no decode: wgmma multiplies E4M3 and E5M2 from shared memory.
+- A form is taken only where it is bit-identical over its whole domain and timed no slower on the real GEMM.
+
+### 7.5 Prior art
+
+- Massalin's superoptimizer (ASPLOS 1987): exhaustive search over short instruction sequences, which this
+  generalises.
+- STOKE (Schkufza, Sharma and Aiken, "Stochastic Superoptimization", ASPLOS 2013): long sequences explored by
+  MCMC and verified by a solver; forms this short are found exhaustively, their optimum included.
+- Souper (Sasnauskas et al., arXiv 1711.04422): LLVM IR rewrites synthesized with SMT, on IR rather than target
+  instructions, with no layout freedom.
+- Rosette (Torlak and Bodik, Onward! 2013 and PLDI 2014): bit-vector synthesis by symbolic evaluation into
+  SMT, the kind of query a non-linear transform's search would make.
+- New here: the search is joint with a free invertible re-encoding of the stored word, which none of the above
+  search, and it is priced per pipe for a GPU's ALU and FMA.
