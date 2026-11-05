@@ -379,12 +379,12 @@ def _mimo_v2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         # `MiMoV2MTPLayer`, one layer for the Pro and the Flash alike), each the sliding kind's attention
         # over a dense feed-forward at `intermediate_size`. A checkpoint without their tensors holds none
         # (`hf_decoders.held_depths`).
-        kinds[_PREDICTION_FEEDFORWARD] = native_fields(LayerKind)(mixer=MLPMixer(
-            intermediate_size=_records.integer(config['mlp_features'], 'intermediate_size'),
-            activation=_records.text(config['mlp'], 'hidden_act')))
         depths = _records.integer(hf.get('num_nextn_predict_layers', 1), 'num_nextn_predict_layers')
         used.add('num_nextn_predict_layers')
         if depths:
+            kinds[_PREDICTION_FEEDFORWARD] = native_fields(LayerKind)(mixer=MLPMixer(
+                intermediate_size=_records.integer(config['mlp_features'], 'intermediate_size'),
+                activation=_records.text(config['mlp'], 'hidden_act')))
             config.update(num_nextn_predict_layers=depths, mtp_layer_type='sliding_attention',
                           mtp_feedforward_type=_PREDICTION_FEEDFORWARD)
     return _attention_and_experts(config, hf, used, kinds, value_dim=value_dim,
