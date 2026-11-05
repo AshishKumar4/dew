@@ -296,13 +296,13 @@ def test_a_packed_mixture_resumes_at_the_document_that_did_not_fit(stop):
         texts(whole, stop)
         state = whole.get_state()
         expected = texts(whole, 6)
-        counted = whole.statistics()
+        counted = data.statistics()
     finally:
         whole.close()
     resumed = data.train(DataPartition())
     try:
         resumed.set_state(state)
         assert texts(resumed, 6) == expected
-        assert resumed.statistics() == counted
+        assert data.statistics() == counted
     finally:
         resumed.close()
