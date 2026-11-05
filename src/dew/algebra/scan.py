@@ -142,17 +142,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
 
     def parts(chunk: Mapping):
         affine = affine_of(chunk)
-        # An operand with no walked axis (a rate, a skip) is every token's.
-        axes = [declaration.operands[name].index(declaration.walked)
-                if declaration.walked in declaration.operands[name] else None for name in names]
-        exponent, *values = jax.vmap(lambda *xs: _token(affine, xs), in_axes=axes)(
-            *[chunk[name] for name in names])
-        # The exponents summed in float32 at least: a narrower prefix loses a decay's digits to its partials'
-        # magnitude, and float16's overflows past six resets (65504).
-        exponent = exponent.astype(at_least_fp32(exponent.dtype))
-        if declaration.reset is not None:
-            exponent = jnp.where(chunk[declaration.reset][:, None], RESET_DECAY, exponent)
-        return affine, (exponent, *values)
+        return affine, _token_parts(declaration, names, affine, chunk)
 
     # A walk's decay and state carried in its chunks' accumulation (`parts`' float32 at least; a float64
     # state's, float64), the state rounded to its declared dtype once, at the finish: a 16-bit state carried
@@ -225,22 +215,43 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         return state[1].astype(dtype)
 
     def backward(chunk, state, d_state, d_outputs, issue=None, inverse=None):
-        # The chunk's forms' adjoint: the reverse scan's step, each chunk's transition transposed, as the
-        # forward forms' derivative (their prefix, substitution and Dew products differentiated), each
-        # product's adjoint the issuer's where one is given (`_adjoined`).
-        # The reset's booleans held, no operand of the derivative.
-        issued = None if issue is None else _adjoined(issue)
-
-        def forward(h, operands):
-            entering, prepared = (state[0], h), prepare({**chunk, **operands}, issued, inverse=inverse)
-            return mapped(prepared, entering, issued), step(entering, prepared, issued)[1]
-
-        _, pullback = jax.vjp(forward, state[1], {name: chunk[name] for name in names})
-        d_h, d_chunk = pullback((d_outputs, d_state))
-        return d_h, d_chunk
+        return _backward((prepare, mapped, step), names, chunk, state, d_state, d_outputs, issue, inverse)
 
     return Derived(init, step, merge, finish, mapped,
                    {"rounding": "compensated prefix", "walked": declaration.walked}, backward, prepare)
+
+
+def _token_parts(declaration: Scan, names: Sequence[str], affine, chunk: Mapping) -> tuple:
+    """A chunk's tokens' exponents and the affine map's parts at each (`_token`), the exponents in float32
+    at least: a narrower prefix loses a decay's digits to its partials' magnitude, and float16's overflows
+    past six resets (65504); a reset token's decay `RESET_DECAY`."""
+    # An operand with no walked axis (a rate, a skip) is every token's.
+    axes = [declaration.operands[name].index(declaration.walked)
+            if declaration.walked in declaration.operands[name] else None for name in names]
+    exponent, *values = jax.vmap(lambda *xs: _token(affine, xs), in_axes=axes)(
+        *[chunk[name] for name in names])
+    exponent = exponent.astype(at_least_fp32(exponent.dtype))
+    if declaration.reset is not None:
+        exponent = jnp.where(chunk[declaration.reset][:, None], RESET_DECAY, exponent)
+    return exponent, *values
+
+
+def _backward(forms: tuple, names: Sequence[str], chunk, state, d_state, d_outputs, issue, inverse):
+    """A chunk's forms' adjoint (`derive_scan`'s `backward`, `forms` its prepare, mapped and step): the
+    reverse scan's step, each chunk's transition transposed, as the forward forms' derivative (their prefix,
+    substitution and Dew products differentiated), each product's adjoint the issuer's where one is given
+    (`_adjoined`), the solve the forward's kept `inverse` where given. The reset's booleans held, no operand
+    of the derivative."""
+    prepare, mapped, step = forms
+    issued = None if issue is None else _adjoined(issue)
+
+    def forward(h, operands):
+        entering, prepared = (state[0], h), prepare({**chunk, **operands}, issued, inverse=inverse)
+        return mapped(prepared, entering, issued), step(entering, prepared, issued)[1]
+
+    _, pullback = jax.vjp(forward, state[1], {name: chunk[name] for name in names})
+    d_h, d_chunk = pullback((d_outputs, d_state))
+    return d_h, d_chunk
 
 
 @functools.partial(jax.tree_util.register_dataclass, data_fields=["values", "transition", "inverse"],
