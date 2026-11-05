@@ -164,8 +164,8 @@ def test_a_forms_traced_decode_is_its_decode():
 
 
 def _inline_decode(form: bits.BitForm):
-    """A Triton kernel decoding a block of stored words through the form's PTX (`BitForm.ptx`), one
-    instruction stream a word."""
+    """A Triton kernel decoding a block of stored words through the form's PTX (`BitForm.ptx`), a register's
+    block apiece."""
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import triton as plgpu
 
@@ -173,11 +173,10 @@ def _inline_decode(form: bits.BitForm):
 
     def body(words_ref, *out_refs):
         shape = jax.ShapeDtypeStruct(words_ref.shape, jnp.uint32)
-        decoded = plgpu.elementwise_inline_asm(form.ptx, args=(words_ref[...],),
-                                               constraints=",".join(["=r"] * count + ["r"]),
-                                               pack=1, result_shape_dtypes=(shape,) * count)
-        for ref, value in zip(out_refs, decoded, strict=True):
-            ref[...] = value
+        words = words_ref[...]
+        for output, ref in enumerate(out_refs):
+            ref[...] = plgpu.elementwise_inline_asm(form.ptx(output), args=(words,), constraints="=r,r",
+                                                    pack=1, result_shape_dtypes=(shape,))[0]
 
     def decode(words):
         shape = jax.ShapeDtypeStruct(words.shape, jnp.uint32)
