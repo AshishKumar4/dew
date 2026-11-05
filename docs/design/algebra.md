@@ -958,16 +958,16 @@ about it is an estimate.
   re-encoding of the input, chosen with the form. The encoder runs once where the weights are stored (Dew's
   quantization codec), the decoder each time they are read. Its `units` are the pipes its form may issue on:
   the ALU always (every LOP3's), the FMA pipe unless the consumer's own math holds it.
-- **A form** (`Form`) is a list of instructions over the stored word, the register each output is, and the
+- **A form** (`BitForm`) is a list of instructions over the stored word, the register each output is, and the
   encoder (its bit `j` the parity of the input's bits `encoder[j]` names).
 
 ### 7.2 Vocabulary and price
 
-- The instructions are those a decode needs, each GF(2)-linear (`Op`): a logical right shift and a left shift
+- The instructions are those a decode needs, each GF(2)-linear (`BitOp`): a logical right shift and a left shift
   (SHF on the ALU, or IMAD.HI and IMAD.SHL, a multiply by a power of two, on the FMA pipe), a rotation (SHF's
   funnel shift, the ALU's alone), and LOP3 masking the XOR of one or two values (the mask an immediate). Every
   architecture from sm75 to sm120 issues them alike.
-- **Price** (`Form.price`): the busiest pipe's issues, then the instruction count. Nsight Compute's Kernel
+- **Price** (`BitForm.price`): the busiest pipe's issues, then the instruction count. Nsight Compute's Kernel
   Profiling Guide (its pipelines) puts logic, shifts and every integer instruction but IMAD and IMUL on the
   ALU, and IMAD and IMUL on the FMA pipe; the CUDA C++ Best Practices Guide 13 (Table 5) gives a shift, a
   bitwise operation and an integer multiply-add 64 results a clock per multiprocessor on every compute
