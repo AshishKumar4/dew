@@ -6,6 +6,7 @@ import gc
 import itertools
 import os
 import resource
+import threading
 import time
 import tracemalloc
 
@@ -244,53 +245,66 @@ class Documents:
         return {"text": np.arange(length, dtype=np.int32) + self.tag * 1000 + index * 20}
 
 
-def packed(count: int, *, examples: int | None = 10**6):
-    """A seeded mix of `count` sources of documents, packed first-fit into rows of 16 tokens, read as a
-    stream bounded in examples, which counts each member's examples where its rows are delivered
-    (`MEMBERS`): the read a packer asks the mix's position of before every document."""
+def packed(count: int, *, by: str = "records", examples: int | None = 10**6):
+    """A mix of `count` sources of documents, seeded by records or each next from the source furthest below
+    its share of tokens (`by`), packed first-fit into rows of 16 tokens, read as a stream bounded in
+    examples, which counts each member's examples where its rows are delivered (`MEMBERS`): the read a
+    packer asks the mix's position of before every document."""
     chains = [Pipeline(Memory(Documents(tag)), name=f"source-{tag}").repeat() for tag in range(count)]
-    return compile(mix(chains, seed=0).pack(16, fields=("text",)).batch(BATCH), read="streamed",
-                   loading=READ, examples=examples)
+    mixed = mix(chains, seed=0) if by == "records" else mix(chains, by="tokens")
+    return compile(mixed.pack(16, fields=("text",)).batch(BATCH), read="streamed", loading=READ,
+                   examples=examples)
+
+
+def asked(stream, batches: int) -> int:
+    """The positions `stream` asks while it gives `batches`: the calls of any read's `get_state` and any
+    count's `state`, on every thread the read runs on."""
+    calls: list[None] = []
+
+    def counted(frame, event, argument):
+        if event == "call" and frame.f_code.co_name in ("get_state", "state"):
+            calls.append(None)
+
+    threading.setprofile_all_threads(counted)
+    try:
+        texts(stream, batches)
+    finally:
+        threading.setprofile_all_threads(None)
+    return len(calls)
 
 
 def texts(stream, batches: int) -> list[list[int]]:
     return [np.asarray(batch["text"]).tolist() for batch in itertools.islice(stream, batches)]
 
 
-def test_a_packed_thousand_source_mixture_asks_its_position_at_no_cost_per_source(record_property):
-    """A packer asks its read's position before every document, to resume at the one that did not fit,
-    and the position of a mix counting its members' examples holds every member's counts and position:
-    captured copy-on-write, each capture copies what the document moved, so a thousand sources allocate
-    a step what ten do, give or take the two levels of a thousand's trie against one (`Shared`), where
-    copying every member's counts at each document made a step allocate a thousand sources' worth
-    (row 4079)."""
-    allocated = {}
+@pytest.mark.parametrize("by", ["records", "tokens"])
+def test_a_packed_thousand_source_mixture_asks_its_position_at_no_cost_per_source(by, record_property):
+    """A packer asks its read's position before every document, to resume at the one that did not fit, and
+    the position of a mix counting its members' examples holds every member's position and counts:
+    captured copy-on-write (`Shared`), each capture asks again only what the document moved, so a thousand
+    sources ask a step's positions in the calls ten do, where asking every member's position and copying
+    its counts at each document made a step ask a thousand sources' worth (row 4079)."""
+    per_step = {}
     for count in (10, SOURCES):
-        stream = packed(count).train(DataPartition())
+        stream = packed(count, by=by).train(DataPartition())
         try:
             texts(stream, 4)
-            gc.collect()
-            tracemalloc.start()
-            began = tracemalloc.take_snapshot()
-            texts(stream, 16)
-            after = tracemalloc.take_snapshot()
-            tracemalloc.stop()
+            per_step[count] = asked(stream, 16) / 16
         finally:
             stream.close()
-        made = sum(stat.count_diff for stat in after.compare_to(began, "filename") if stat.count_diff > 0)
-        allocated[count] = made / 16
-        record_property(f"allocations_per_step_{count}", allocated[count])
-        print(f"sources={count} allocations_per_step={allocated[count]:.0f}")
-    assert allocated[SOURCES] < 2 * allocated[10], allocated
+        record_property(f"positions_asked_per_step_{count}", per_step[count])
+    assert per_step[SOURCES] < 2 * per_step[10], per_step
 
 
+@pytest.mark.parametrize("by", ["records", "tokens"])
 @pytest.mark.parametrize("stop", [1, 3, 7])
-def test_a_packed_mixture_resumes_at_the_document_that_did_not_fit(stop):
+def test_a_packed_mixture_resumes_at_the_document_that_did_not_fit(stop, by):
     """A packed mix's rows leave documents that do not fit to the next row, which its position begins at,
-    the mix's and its counters' positions as they stood before that document: a run stopped after `stop`
-    steps and resumed reads what the run that never stopped reads next, row for row, and counts what it
-    counts (row 4079: positions captured copy-on-write, never the live counts)."""
-    data = packed(SOURCES)
+    the mix's and its counters' positions as they stood before that document: a run of a mix by records
+    or by tokens stopped after `stop` steps and resumed reads what the run that never stopped reads next,
+    row for row, and counts what it counts (row 4079: positions captured copy-on-write, never the live
+    counts, nor a token mix's live deliveries)."""
+    data = packed(SOURCES, by=by)
     whole = data.train(DataPartition())
     try:
         texts(whole, stop)

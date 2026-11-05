@@ -13,6 +13,7 @@ members.
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
+from typing import cast
 
 WIDTH = 32
 """The slots of a trie node: a thousand values two nodes deep."""
@@ -20,8 +21,8 @@ WIDTH = 32
 
 class Shared[V](Mapping[str, V]):
     """An immutable mapping of `keys`, in their order, to values held in a trie shared with the mappings
-    it was `replaced` from. It reads as any mapping (`dict(shared)` is its copy, which a position's JSON
-    is written from, `plain`)."""
+    it was `replaced` from. It reads as any mapping (`dict(shared)` is its copy, as a position's JSON is
+    written, `dew._records.json_value`)."""
 
     __slots__ = ("_depth", "_index", "_keys", "_root")
 
@@ -39,8 +40,8 @@ class Shared[V](Mapping[str, V]):
         self._root = _built(tuple(values), depth)
 
     @classmethod
-    def of(cls, items: Mapping[str, V]) -> Shared[V]:
-        return cls(tuple(items), tuple(items.values()))
+    def of(cls, given: Mapping[str, V]) -> Shared[V]:
+        return cls(tuple(given), tuple(given.values()))
 
     def replaced(self, changes: Mapping[str, V]) -> Shared[V]:
         """This mapping with each of `changes`' keys, every one among its own, holding its new value: the
@@ -59,7 +60,7 @@ class Shared[V](Mapping[str, V]):
         node = self._root
         for level in range(self._depth - 1, -1, -1):
             node = node[place // WIDTH ** level % WIDTH]
-        return node
+        return cast(V, node)
 
     def __iter__(self) -> Iterator[str]:
         return iter(self._keys)
@@ -82,15 +83,9 @@ def _built(values: tuple, depth: int) -> tuple:
     return tuple(_built(values[start:start + span], depth - 1) for start in range(0, len(values), span))
 
 
-def _set(node: tuple, place: int, value: object, depth: int) -> tuple:
+def _set[V](node: tuple, place: int, value: V, depth: int) -> tuple:
     """`node`, a trie of `depth` levels, with the value at `place` replaced: the nodes on its path copied."""
     slot = place // WIDTH ** (depth - 1) % WIDTH
     held = value if depth == 1 else _set(node[slot], place, value, depth - 1)
     return (*node[:slot], held, *node[slot + 1:])
 
-
-def plain(value: object) -> object:
-    """`value` as JSON writes it, where a position holds a `Shared` mapping (`json.dumps`'s `default`)."""
-    if isinstance(value, Mapping):
-        return dict(value)
-    raise TypeError(f"{type(value).__name__} is not JSON serializable")

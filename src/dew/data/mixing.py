@@ -507,6 +507,8 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         super().__init__(reads)
         self._reads, self._weights, self._tokens, self._keys = tuple(reads), weights, tokens, keys
         self._delivered = [0] * len(reads)
+        # The targets each corpus delivered as a position holds them, the one corpus a row read replaced.
+        self._sent: Shared[int] = Shared(keys, self._delivered)
         self._positions = _Captured(dict(zip(keys, self._reads, strict=True)))
 
     def __next__(self) -> Batch:
@@ -524,11 +526,11 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
                 "token deficit mix received a window without valid targets; filter it before mixing"
             )
         self._delivered[chosen] += tokens
+        self._sent = self._sent.replaced({self._keys[chosen]: self._delivered[chosen]})
         return value
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parents": self._positions.captured(),
-                "delivered": dict(zip(self._keys, self._delivered, strict=True))}
+        return {"parents": self._positions.captured(), "delivered": self._sent}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         """Restore each corpus the state keeps by its key, and start one it keeps none of where its
@@ -551,6 +553,7 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         total, weight = sum(restored), sum(w for w, held in zip(self._weights, kept, strict=True) if held)
         self._delivered = [delivered[key] if held else (w * total // weight if weight else 0)
                            for key, w, held in zip(self._keys, self._weights, kept, strict=True)]
+        self._sent = Shared(self._keys, self._delivered)
 
     def close(self) -> None:
         for read in self._reads:
