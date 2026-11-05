@@ -374,15 +374,19 @@ def _mimo_v2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         # factor (`LayerKind`); MiMoV2Attention turns the same third of both.
         kinds['sliding_attention'].update(num_kv_heads=swa_kv_heads, partial_rotary_factor=factor)
     if 'sliding_attention' in kinds:
-        # One prediction depth, which the release's code skips on load and vLLM drafts with
-        # (mimo_v2_mtp.py at 19aba3e, `MiMoV2MTPLayer`, one layer for the Pro and the Flash alike): the
-        # sliding kind's attention over a dense feed-forward at `intermediate_size`. A checkpoint
-        # without its tensors holds none (`hf_decoders.held_depths`).
+        # The prediction depths: the count a config states (Dew's export of one without them, 0), else the
+        # one depth the release's code skips on load and vLLM drafts with (mimo_v2_mtp.py at 19aba3e,
+        # `MiMoV2MTPLayer`, one layer for the Pro and the Flash alike), each the sliding kind's attention
+        # over a dense feed-forward at `intermediate_size`. A checkpoint without their tensors holds none
+        # (`hf_decoders.held_depths`).
         kinds[_PREDICTION_FEEDFORWARD] = native_fields(LayerKind)(mixer=MLPMixer(
             intermediate_size=_records.integer(config['mlp_features'], 'intermediate_size'),
             activation=_records.text(config['mlp'], 'hidden_act')))
-        config.update(num_nextn_predict_layers=1, mtp_layer_type='sliding_attention',
-                      mtp_feedforward_type=_PREDICTION_FEEDFORWARD)
+        depths = _records.integer(hf.get('num_nextn_predict_layers', 1), 'num_nextn_predict_layers')
+        used.add('num_nextn_predict_layers')
+        if depths:
+            config.update(num_nextn_predict_layers=depths, mtp_layer_type='sliding_attention',
+                          mtp_feedforward_type=_PREDICTION_FEEDFORWARD)
     return _attention_and_experts(config, hf, used, kinds, value_dim=value_dim,
                                   scale=None, factor=factor, count=count,
                                   sparse=sparse)
@@ -463,12 +467,15 @@ def _mimo_v2_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
     width = record_int(text, 'emb_features')
     vision = hf_config.get('vision_config') is not None
     audio = dict(NO_AUDIO)
+    unported: dict[str, str] = {}
     stated = hf_config.get('audio_config')
-    if stated is not None:
-        tokenizer = hf_config.get(folder_config(_AUDIO_TOKENIZER))
-        if tokenizer is None:
-            refuse('audio_config', f"its encoder reads the codes of the tokenizer in the release's "
-                                   f"{_AUDIO_TOKENIZER} folder, which this source lacks")
+    tokenizer = hf_config.get(folder_config(_AUDIO_TOKENIZER))
+    if stated is not None and tokenizer is None:
+        # The language model alone loads (`text_only`); a whole load is refused by the encoder's name.
+        unported = dict.fromkeys(('audio_encoder.', 'speech_embeddings.'),
+                                 f"the audio encoder reads the codes of the tokenizer in the release's "
+                                 f"{_AUDIO_TOKENIZER} folder, which this source lacks")
+    elif stated is not None:
         record = translate_mimo_audio_config(_records.record(stated, 'audio_config'),
                                              _records.record(tokenizer, folder_config(_AUDIO_TOKENIZER)))
         projected = record_int(_records.record(record['fields'], 'audio fields'), 'out_hidden_size')
@@ -483,7 +490,7 @@ def _mimo_v2_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
         'video_token_id': (None if hf_config.get('video_token_id') is None
                            else record_int(hf_config, 'video_token_id')),
         'extra_placeholder_ids': (), 'text_unprefixed': ('embed_tokens.', 'layers.', 'norm.', 'mtp.'),
-        **audio}
+        **({'unported': unported} if unported else {}), **audio}
 
 
 def _mimo_v2_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -513,7 +520,9 @@ def _mimo_v2_export(model: CausalTransformer) -> Mapping[str, object]:
         'v_head_dim': model.value_head_dim, 'attention_value_scale': model.value_scale,
         'partial_rotary_factor': model.partial_rotary_factor or 1.0,
         'attention_projection_layout': 'split', 'scoring_func': 'sigmoid', 'topk_method': 'noaux_tc',
-        'attention_dropout': model.attention_dropout_rate, **_experts(model)}
+        'attention_dropout': model.attention_dropout_rate,
+        # The depths it holds, which the release's config does not state: a reader takes one where none is.
+        'num_nextn_predict_layers': model.num_nextn_predict_layers, **_experts(model)}
 
 
 MIMO_V2 = DecoderFamily(
