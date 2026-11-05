@@ -204,11 +204,14 @@ REPLICA_FIELDS = tuple(field.name for field in dataclasses.fields(TrainState)
                        if all(field.metadata.get(key) == value for key, value in REPLICA.items()))
 """The `TrainState` fields each DiLoCo replica holds its own of, in their order (`REPLICA`)."""
 
-Replicas = struct.dataclass(dataclasses.make_dataclass(
-    "Replicas", [(field.name, field.type) for field in dataclasses.fields(TrainState)
-                 if field.name in REPLICA_FIELDS], frozen=True, module=__name__))
-"""DiLoCo's inner copies (`ReplicaState`), a pytree of the `REPLICA_FIELDS`, each replica group's own
-stacked on a first axis."""
+Replicas = struct.dataclass(type("Replicas", (), {
+    "__module__": __name__,
+    "__doc__": "DiLoCo's inner copies (`ReplicaState`), a pytree of the `REPLICA_FIELDS`, each replica "
+               "group's own stacked on a first axis.",
+    "__annotations__": {field.name: field.type for field in dataclasses.fields(TrainState)
+                        if field.name in REPLICA_FIELDS}}))
+"""DiLoCo's inner copies (`ReplicaState`), made as `TrainState` declares the `REPLICA_FIELDS`: a class of
+their annotations alone, which `struct.dataclass` makes the pytree."""
 """The checkpointed train-state fields a run may hold none of, as a run on another clock holds no
 examples consumed: a checkpoint that holds none restores None (`dew.checkpoints`), whichever Dew wrote it."""
 
