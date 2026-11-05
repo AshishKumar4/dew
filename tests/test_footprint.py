@@ -371,10 +371,15 @@ def test_a_tied_embeddings_gradient_holds_its_heads_product_alone():
     def tied(ids, hidden, logits, rows):
         return head(ids, hidden, logits, rows) + jnp.zeros((vocab, width), jnp.float32).at[ids].add(rows)
 
+    # And where the head's product is read through a view of its buffer (a scanned head's stacked carry).
+    def viewed(ids, hidden, logits, rows):
+        product = jax.lax.squeeze(jax.lax.reshape(head(ids, hidden, logits, rows), (1, vocab, width)), (0,))
+        return product + jnp.zeros((vocab, width), jnp.float32).at[ids].add(rows)
+
     def peak(function):
         return peak_bytes(simplified(jax.make_jaxpr(function)(*shapes).jaxpr, "gpu"), "gpu", Workspace(0, 0))
 
-    assert peak(tied) == peak(head)
+    assert peak(tied) == peak(viewed) == peak(head)
 
 
 def test_a_gradient_added_to_a_zero_carry_holds_the_gradient_alone():
