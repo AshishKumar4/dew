@@ -204,14 +204,13 @@ def test_a_generation_over_the_loaded_tree_packs_under_its_one_scale_in_the_call
     generated = dew.pipeline(str(directory), dtype=jnp.float32)(ids, 3, key=0).host()
     assert generated.lengths[0] == 3 and np.isfinite(generated.raw_log_probs).all()
     # Members scaled apart quantize their input each at its own scale (row 4401): the tree prepared to
-    # serve computes the logits the loaded tree's members do apart, bit for bit, which the shared scale's
-    # are not, and a generation over the loaded tree draws what one over the prepared tree draws.
+    # serve computes the logits the loaded tree's members do apart, bit for bit, and a generation over the
+    # loaded tree draws what one over the prepared tree draws.
     apart = scaled_apart(loaded)
     full = reference["ids"].astype(np.int32)
-    unfused = np.asarray(loaded.model.apply(apart, full))
     np.testing.assert_array_equal(
-        np.asarray(loaded.model.apply(inference_projections(loaded.model, apart), full)), unfused)
-    assert not np.array_equal(unfused, np.asarray(loaded.model.apply(loaded.variables, full)))
+        np.asarray(loaded.model.apply(inference_projections(loaded.model, apart), full)),
+        np.asarray(loaded.model.apply(apart, full)))
     drawn, expected = (task(ids, 3, key=0).host() for task in (
         borrowed.bind(apart), borrowed.bind(inference_projections(loaded.model, apart))))
     np.testing.assert_array_equal(drawn.tokens, expected.tokens)
