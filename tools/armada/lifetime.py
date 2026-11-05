@@ -117,6 +117,10 @@ def started(code, offset):
     name = code.co_filename
     if not followed.checkout(name, root):
         return sys.monitoring.DISABLE
+    if followed.harness(name, root):
+        # Its code is every key's (ci.py's `SHARED`): it stays among the modules the closing guard lets in.
+        seen.add(name[len(root):])
+        return sys.monitoring.DISABLE
     write(owner(), followed.code_unit(code, root))
     if Path(name).name == "conftest.py":
         return sys.monitoring.DISABLE
@@ -196,7 +200,10 @@ def boot() -> None:
     for name, module in list(sys.modules.items()):
         write(SHARED, f"{followed.IMPORTED}{name.partition('.')[0]}")
         if followed.checkout(file := getattr(module, "__file__", None) or "", root):
-            write(SHARED, file[len(root):])
+            if followed.harness(file, root):
+                seen.add(file[len(root):])
+            else:
+                write(SHARED, file[len(root):])
     importer = followed.imports(lambda item: write(owner(), item))
     sys.meta_path.insert(0, importer)
     followed.opening(kept, root)

@@ -208,13 +208,16 @@ SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 across the containers of an armada gang."""
 HARNESS = "tools/armada/"
 """The harness's directory: the recorder, plugins and cache client every test process runs, beside this file."""
-SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
-          "tools/armada/split.py", "tools/armada/executed.py", "tools/armada/followed.py",
-          "tools/armada/lifetime.py", "tools/armada/watched.py")
-"""The files every test file's key covers whole, beside every lock (a GPU node builds its environment
+SHARED = ("pyproject.toml", "constraints.txt", *followed.HARNESS_MODULES)
+"""The files every test file's key covers, beside every lock (a GPU node builds its environment
 from its CUDA lock), the environment's own inputs, which .armada.json names (`environment_files`),
 and .armada.json's parts a test process sees (`armada_seen`): what every test process runs or reads,
-the session it runs in, the process group it runs as and the plugins loaded into it among them. The
+the session it runs in, the process group it runs as and the plugins loaded into it among them. A Python
+file among them is covered by its code (`code_digest`), not its bytes: a comment or a docstring changes no
+run, and a head that edits only those (train 350's, in three of them) runs the suite warm. The recorder logs
+none of the harness's own execution (`followed.HARNESS_MODULES`), which its code here covers, but what a test
+observes of it: a text it reads, a `__code__` it takes. A test that reads a harness module's `__doc__`
+without its text is out of contract: no event shows it, so its row is not rerun by a docstring edit. The
 plan's own code (this file) runs outside the tests, so a change to it reruns none of them; nor does
 the durations record (`session.DURATIONS`), which only a split file's groups are cut from, so a
 group's key covers its own file's entries alone (`cache_key`); nor does a fixture or a package's data,
@@ -289,7 +292,7 @@ def shared(python: str) -> str:
     armada = Path(".armada.json")
     digest.update(armada_seen(armada.read_text() if armada.is_file() else None).encode())
     for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), "src"}):
-        digest.update(name.encode() + contents(name))
+        digest.update(name.encode() + shared_contents(name))
     return digest.hexdigest()
 
 
@@ -440,6 +443,39 @@ def shapes(module: types.CodeType) -> list[list]:
                 found.append([const.co_qualname, const.co_flags if outer else list(const.co_cellvars)])
                 pending.append(const)
     return sorted(found, key=json.dumps)
+
+
+class Prose(ast.NodeTransformer):
+    """A module's tree with every statement that is a bare string left out, whatever body holds it: its
+    docstrings, and the notes written after a constant, which run nothing. A body it empties keeps a `pass`."""
+
+    def generic_visit(self, node):
+        node = super().generic_visit(node)
+        for field in ("body", "orelse", "finalbody"):
+            held = getattr(node, field, None)
+            if isinstance(held, list) and held:
+                kept = [each for each in held if not (
+                    isinstance(each, ast.Expr) and isinstance(each.value, ast.Constant)
+                    and isinstance(each.value.value, str))]
+                setattr(node, field, kept or [ast.Pass()])
+        return node
+
+
+@functools.cache
+def code_digest(source: bytes, path: str) -> bytes:
+    """The digest of the code of Python module text `source` (the file `path`'s): its tree without comments,
+    formatting or docstrings (`Prose`), so an edit to them is none; the text's own digest where it does not
+    compile (`compiled`), as `units` does, since a body left out would hide what fails it. Read once a text."""
+    if isinstance(compiled(source, path), str):
+        return hashlib.sha256(source).digest()
+    return hashlib.sha256(ast.dump(Prose().visit(ast.parse(source))).encode()).digest()
+
+
+def shared_contents(name: str) -> bytes:
+    """What `shared` hashes of `name`: a `SHARED` Python file's code (`code_digest`), else `contents`."""
+    if name in SHARED and name.endswith(".py") and Path(name).is_file():
+        return code_digest(Path(name).read_bytes(), name)
+    return contents(name)
 
 
 @dataclasses.dataclass
@@ -968,9 +1004,11 @@ def policy(base: str) -> str:
     """The test cache's policy (DEW_TEST_CACHE) for this checkout's change from `base`: 'off', every file
     run, for a change to what every test process runs or reads (`SHARED`, a lock, the environment's
     files) or to a file the records do not place (`PLACED`); else 'on', each file run where its inputs
-    changed. A tool is such an input of each file whose run executed or read it, which its key hashes, so
-    a changed tool runs those files again and no other (train 115 reran its whole suite for five tools
-    no pulled head had touched, under a policy that reran every file that read any tool)."""
+    changed. A `SHARED` Python file whose code is `base`'s (`code_digest`) is no change, as its key
+    (`shared`) says: a head of comments and docstrings runs the suite warm. A tool is such an input of each
+    file whose run executed or read it, which its key hashes, so a changed tool runs those files again and
+    no other (train 115 reran its whole suite for five tools no pulled head had touched, under a policy that
+    reran every file that read any tool)."""
     changed = subprocess.run(["git", "diff", "--name-only", f"{base}...HEAD"], check=True,
                              capture_output=True, text=True).stdout.split()
     if ".armada.json" in changed:
@@ -980,6 +1018,11 @@ def policy(base: str) -> str:
         if armada_seen(before.stdout if before.returncode == 0 else None) == armada_seen(
                 armada.read_text() if armada.is_file() else None):
             changed.remove(".armada.json")  # where and when tasks run, never what a test sees
+    for name in [name for name in changed if name in SHARED and name.endswith(".py")]:
+        before = subprocess.run(["git", "show", f"{base}:{name}"], capture_output=True, check=False)
+        if before.returncode == 0 and Path(name).is_file() and code_digest(
+                before.stdout, name) == code_digest(Path(name).read_bytes(), name):
+            changed.remove(name)  # comments and docstrings, which run nothing
     whole = {*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), ".armada.json"}
     if any(name in whole or not (name.startswith(PLACED) or name in PLACED_FILES) for name in changed):
         return "off"
