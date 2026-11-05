@@ -65,8 +65,8 @@ def _jax_own() -> Mapping[jcore.Primitive, str]:
     derivatives add with (`add_any`), and those its public random functions bind, which no module of
     JAX's exports (`random_wrap`, `random_split`, `random_fold_in`, `random_bits`, `random_unwrap`), read
     off a trace of them once asked."""
-    def drawn(data):
-        first, _ = jax.random.split(jax.random.wrap_key_data(data))
+    def drawn(seed_words):
+        first, _ = jax.random.split(jax.random.wrap_key_data(seed_words))
         return jax.random.bits(jax.random.fold_in(first, 1), ()), jax.random.key_data(first)
 
     def each(jaxpr: jcore.Jaxpr):
