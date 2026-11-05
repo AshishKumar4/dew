@@ -962,10 +962,15 @@ def tabled(wg, table: tuple, producer) -> None:
     total = sum(count for count, _ in table)
     first = 0
     for count, body in table:
-        @pl.when((wg >= first) & (wg < first + count))
+        # The first row's warpgroups are those below its count, each its own index: no bound and no shift
+        # is traced for it, so a one-row table builds the same kernel `roles` built (an attention
+        # forward's spill-free registers on an H100 turn on it, test_attention_mosaic's compile gate).
+        within = wg < first + count if first == 0 else (wg >= first) & (wg < first + count)
+
+        @pl.when(within)
         def _(body=body, first=first):
             plgpu.set_max_registers(resources.raised_registers(total, _RESIDENT.get()), action="increase")
-            body(wg - first)
+            body(wg if first == 0 else wg - first)
 
         first += count
 
