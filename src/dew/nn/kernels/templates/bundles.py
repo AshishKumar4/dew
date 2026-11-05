@@ -3,17 +3,18 @@ registry keyed by the device's instruction family (`generation.family`), each bu
 an execution policy: Hopper's warpgroup MMA's (`mosaic_sm90.WGMMA`, and its layout without a producer,
 `mosaic_sm90.FED`), Ampere's mma.sync's on cp.async (`mosaic_sm80.Mma`) and consumer Blackwell's mma.sync on
 TMA rings (`MmaFed`); a launch names its bundle by the bundle's `name` (`named`). Blackwell's tcgen05, whose
-products accumulate in tensor memory, has its own bundle (`mosaic_sm100.TCGEN05`), which the templates'
-Blackwell mainloops, not yet in any route, import themselves. A device of a family with no bundle here (a
-TPU's) runs no Mosaic GPU mainloop: every template's Mosaic launch is ineligible there, and its call takes the
-next route by legality."""
+products accumulate in tensor memory, composes its issuer with the TMA rings (`mosaic_sm100.RINGS`), which a
+launch names; `of` gives it to sm100 and sm103 once the templates' persistent launches state their
+accumulators (`Transport.persist`'s `accumulators`). A device of a family with no bundle here (a TPU's) runs
+no Mosaic GPU mainloop: every template's Mosaic launch is ineligible there, and its call takes the next route
+by legality."""
 
 import dataclasses
 
 import jax.numpy as jnp
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import mosaic, mosaic_sm80, mosaic_sm90
+from dew.nn.kernels.templates import mosaic, mosaic_sm80, mosaic_sm90, mosaic_sm100
 
 INTERPRETED = mosaic_sm90.WGMMA
 """The bundle Mosaic GPU's interpreter runs a template's mainloop by off a GPU of a family a bundle claims (a
@@ -66,7 +67,7 @@ def named(name: str, dtype) -> mosaic.Family:
     for composed in (mosaic_sm80.Mma, MmaFed):
         if composed.name == name:
             return composed(jnp.dtype(dtype))
-    for bundle in (mosaic_sm90.WGMMA, mosaic_sm90.FED):
+    for bundle in (mosaic_sm90.WGMMA, mosaic_sm90.FED, mosaic_sm100.RINGS):
         if bundle.name == name:
             return bundle
     raise ValueError(f"no Mosaic GPU bundle is named {name!r}")

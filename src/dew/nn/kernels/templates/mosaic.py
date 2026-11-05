@@ -339,16 +339,18 @@ def unwalked(family: "Family") -> Callable:
     return walk
 
 
-def tiled(tiles: tuple[int, ...], schedule: Callable, visit: Callable, *, axis: str) -> jax.Array:
+def tiled(tiles: tuple[int, ...], schedule: Callable, visit: Callable, *, axis: str) -> tuple[jax.Array, ...]:
     """A persistent kernel's tiles (`Family.persist`'s): the grid `tiles` spread over the launch's programs
     along `axis`, each tile's `schedule(index)`, `(active, steps, views, tile)`, visited as `visit(counter,
-    active, steps, views, tile)` at the step its streams are at across the tiles (`counter`: the steps of the
-    active tiles before it). Returns the counter past the last tile."""
-    @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=jnp.int32(0))
+    active, steps, views, tile, done)` at the step its streams are at across the tiles (`counter`: the steps
+    of the active tiles before it) and its turn round accumulators a tile takes whole (`done`: the active
+    tiles before it). Returns both past the last tile."""
+    @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=(jnp.int32(0), jnp.int32(0)))
     def ended(loop: plgpu.NDLoopInfo, carry):  # nd_loop passes its carry by this name
+        counter, done = carry
         active, steps, views, tile = schedule(loop.index)
-        visit(carry, active, steps, views, tile)
-        return carry + jnp.where(active, steps, 0)
+        visit(counter, active, steps, views, tile, done)
+        return counter + jnp.where(active, steps, 0), done + jnp.where(active, 1, 0)
 
     return ended
 
@@ -360,7 +362,8 @@ def consumed(family: "Family", tiles: tuple[int, ...], schedule: Callable, issue
     active=...)`, `walk` its steps' (`walking(counter, active, steps, views)`, built where the tile is
     visited) where it streams any, a walk of none (`unwalked`) where not, then `finish(index, tile, accs,
     store, active=...)`. Returns the counter past the last tile."""
-    def visit(counter, active, steps, views, tile):
+    def visit(counter, active, steps, views, tile, done):
+        del done
         walk = walking(counter, active, steps, views)
 
         def run(walk, *, active: bool):
@@ -369,7 +372,7 @@ def consumed(family: "Family", tiles: tuple[int, ...], schedule: Callable, issue
         pl.when(active)(lambda: run(walk, active=True))
         pl.when(~active)(lambda: run(unwalked(family), active=False))
 
-    return tiled(tiles, schedule, visit, axis=axis)
+    return tiled(tiles, schedule, visit, axis=axis)[0]
 
 
 class Pieces(tuple):
@@ -392,6 +395,17 @@ def viewed(view: tuple, block: tuple, step):
         part = (block[0] // len(indices), *block[1:])
         return Pieces(at(piece, part) for piece in indices)
     return at(indices, block)
+
+
+def loads(rings: dict, counter, active, steps, views: dict, tile, done) -> None:
+    """A producer's loads of one persistent tile (`tiled`'s visit): each of its steps' blocks into its
+    stream's ring at the step the rings are at (`counter`), none where it streams nothing."""
+    del tile, done
+
+    @pl.loop(0, jnp.where(active, steps, 0))
+    def _(step):
+        for name, ring in rings.items():
+            ring.load(ring.turn(counter + step), viewed(views[name], ring.block, step))
 
 
 def streamed(rings: tuple, views, lo, hi, *, adds: tuple | None = None) -> None:
@@ -829,13 +843,20 @@ def drained(barriers, end, stages: int) -> None:
 
 
 def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, multicast: bool = False,
-         swizzle: int | None = None, copies: int = 1) -> dict:
+         swizzle: int | None = None, copies: int = 1, released_by_products: bool = False) -> dict:
     """A `Ring`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype` (their rows staged
     at `swizzle`, `staged`), a load barrier each that a step's `copies` arrive at (`Pieces`), and a release
     barrier each that `consumers` arrive at, with `multicast` the `consumers` of each program of the cluster
-    (`CLUSTER`), whose programs share the ring's blocks. `Ring(**allocated)` once scoped."""
-    consumed = (plgpu.ClusterBarrier(collective_axes=(CLUSTER,), num_arrivals=consumers, num_barriers=stages)
-                if multicast else plgpu.Barrier(num_arrivals=consumers, num_barriers=stages))
+    (`CLUSTER`), whose programs share the ring's blocks; or, `released_by_products`, that the products
+    reading a slot arrive at once by their commit (tensor-core ordered: tcgen05's). `Ring(**allocated)` once
+    scoped."""
+    if released_by_products:
+        consumed = plgpu.Barrier(num_barriers=stages, orders_tensor_core=True)
+    elif multicast:
+        consumed = plgpu.ClusterBarrier(collective_axes=(CLUSTER,), num_arrivals=consumers,
+                                        num_barriers=stages)
+    else:
+        consumed = plgpu.Barrier(num_arrivals=consumers, num_barriers=stages)
     return {'smem': staged((stages, *block), dtype, swizzle),
             'full': plgpu.Barrier(num_arrivals=copies, num_barriers=stages), 'consumed': consumed}
 
@@ -1103,8 +1124,10 @@ class Issuer[Accumulator](abc.ABC):
         del transposed, swizzle
         return self.fragment_depth(depth)
 
-    def lhs_fragment_depth(self, depth: int) -> int:
-        """The left operand's depth held in registers by a product at the family's default staging."""
+    def lhs_fragment_depth(self, depth: int, *, swizzle: int | None = None) -> int:
+        """The left operand's depth held in registers by a product, by its stage's swizzle (bytes; the
+        family's default staging where None)."""
+        del swizzle
         return depth
 
     widest_product: int | None = None
@@ -1178,6 +1201,17 @@ class Issuer[Accumulator](abc.ABC):
     def added_into(self, acc: Accumulator, value: jax.Array, interpret: bool) -> Accumulator:
         """The accumulator `acc` a walk carries with `value` (fp32, its shape, a scaled product restored,
         `operands.Issuer.summed`) added in."""
+
+    def chunk_columns(self, columns: int) -> int:
+        """The columns of a tile's accumulator a consumer holds in registers at once (`chunks`): all of them,
+        where the issuer accumulates in registers or in a ref its walk reads out whole."""
+        return columns
+
+    def chunks(self, accumulators: tuple) -> tuple:
+        """A tile's accumulators (its walk's) as its consumer reads them out: `(first_column, values)` a
+        chunk of `chunk_columns` columns each, `values` each accumulator's: the accumulators themselves,
+        one chunk, where the walk returns their values."""
+        return ((0, accumulators),)
 
     def started(self, shapes: tuple, initial: tuple | None = None) -> tuple[jax.Array, ...]:
         """Register accumulators of `shapes` as a walk starts: their `initial` values, zero where None."""
@@ -1552,7 +1586,7 @@ class Transport[Allocated, Opened](abc.ABC):
     @abc.abstractmethod
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
-                unrolled: bool = False) -> None:
+                unrolled: bool = False, accumulators: tuple = ()) -> None:
         """A persistent kernel's tiles, the grid `tiles` spread over the launch's programs along `axis`, its
         streams (`streams`, as `scoped` hands them) running on across them: `schedule(index)` gives a tile's
         `(active, steps, views, tile)`, whether it streams anything, its step count, each stream's view
@@ -1569,7 +1603,9 @@ class Transport[Allocated, Opened](abc.ABC):
         loads, the step counter across tiles, the streams' drain, the outputs' staging and the stores'
         completion. A cluster's programs run the same tiles: where a stream is multicast (`streams`),
         `schedule` gives each of them the same `active`, `steps` and view of it. `walk`'s `in_flight` and
-        `unrolled` are its consumers' walks'."""
+        `unrolled` are its consumers' walks'. `accumulators` are the shapes of the fp32 accumulators a
+        tile's walk issues into, which a family holding them outside its consumers' registers allocates
+        (tcgen05's tensor memory, read out by `Issuer.chunks`); a register family's walk carries its own."""
 
     @abc.abstractmethod
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
@@ -1799,23 +1835,15 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
-                unrolled: bool = False) -> None:
+                unrolled: bool = False, accumulators: tuple = ()) -> None:
+        del accumulators  # its consumers' walks carry their own
         # The producer loads every tile's steps into the rings at a counter running across the tiles, so
         # a tile's first loads go out while the consumers store the last one (`_tiled`).
         rings = self.opened(streams)
         staging = self.output_staging(outputs, consumers)
 
         def producer():
-            def load(counter, active, steps, views, tile):
-                # `counter`: the step every ring is at.
-                del tile
-
-                @pl.loop(0, jnp.where(active, steps, 0))
-                def _(step):
-                    for name, ring in rings.items():
-                        ring.load(ring.turn(counter + step), viewed(views[name], ring.block, step))
-
-            loaded = tiled(tiles, schedule, load, axis=axis)
+            loaded, _ = tiled(tiles, schedule, functools.partial(loads, rings), axis=axis)
             for ring in rings.values():
                 ring.drain(loaded)
 
@@ -1830,20 +1858,9 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                finish: Callable, smems, *, axis: str, interpret: bool, in_flight: int,
                unrolled: bool) -> Callable:
         """`persist`'s consumers: each walks its tiles' steps at a counter running across the tiles
-        (`_tile_walk`), stages its share of each output in chunks (`output_staging`: two buffers of
-        `staged_columns`) and stores each by TMA, waiting only for a buffer's last store to read it before
-        it writes it again; the rings are left as `_ended` leaves them."""
+        (`_tile_walk`) and stores its outputs (`_stores`); the rings are left as `_ended` leaves them."""
         def run(index):
-            def store(output, value, ref, place):
-                smem = smems[output].at[index]
-                buffers, width = smem.shape[0], smem.shape[-1]
-                row_start, first, stored, column, *ladder = place
-                for chunk, (start, piece) in enumerate(column_chunks(value, width)):
-                    if chunk == 0 or chunk >= buffers:
-                        # The buffer's last store (the last tile's, at its first chunk) has read it.
-                        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-                    buffer = smem.at[chunk % buffers]
-                    staged_rows(buffer, piece, ref, row_start, first, stored, column + start, *ladder)
+            store = self._stores(smems, index)
 
             def walking(counter, active, steps, views):
                 # `counter`: the step every ring is at.
@@ -1855,6 +1872,24 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
         return run
+
+    @staticmethod
+    def _stores(smems, index) -> Callable:
+        """Consumer `index`'s `store(output, value, ref, place)` (`persist`'s): its share of each output
+        staged in chunks (`output_staging`: two buffers of `staged_columns`, `smems`) and stored by TMA,
+        waiting only for a buffer's last store to read it before it writes it again."""
+        def store(output, value, ref, place):
+            smem = smems[output].at[index]
+            buffers, width = smem.shape[0], smem.shape[-1]
+            row_start, first, stored, column, *ladder = place
+            for chunk, (start, piece) in enumerate(column_chunks(value, width)):
+                if chunk == 0 or chunk >= buffers:
+                    # The buffer's last store (the last tile's, at its first chunk) has read it.
+                    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+                buffer = smem.at[chunk % buffers]
+                staged_rows(buffer, piece, ref, row_start, first, stored, column + start, *ladder)
+
+        return store
 
     def _tile_walk(self, rings: dict[str, Ring], counter, steps, views: dict, wg, *, interpret: bool,
                    in_flight: int, unrolled: bool) -> Callable:
