@@ -153,7 +153,7 @@ def test_a_declared_tangent_is_one_marked_call_and_differentiates_as_its_rule(de
 def test_a_surrogate_is_one_surrogate_call():
     """A surrogate (`surrogate`: a value and its declared derivative rule) is one marked call of its kind,
     which reverse mode keeps, its derivative its rule's."""
-    rounded = derivatives.surrogate(jnp.round, lambda primals, tangents, value: tangents[0])
+    rounded = derivatives.surrogate(lambda x: jnp.round(x), lambda primals, tangents, value: tangents[0])
     x = jnp.linspace(0.1, 4.0, 8)
     assert kinds_of(jax.make_jaxpr(rounded)(x)) == [Surrogate()]
     np.testing.assert_array_equal(np.asarray(jax.grad(lambda x: jnp.sum(rounded(x)))(x)), np.ones(8))
