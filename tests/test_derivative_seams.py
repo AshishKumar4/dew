@@ -26,7 +26,7 @@ CONTRACTED = {
         ("test_an_embedding_lookup_holds_every_order", KERNEL),
     "src/dew/nn/kernels/generation.py::linear_tangent.pulled":
         ("test_an_embedding_lookup_holds_every_order", KERNEL),
-    "src/dew/nn/kernels/generation.py::linear_tangent.bounded":
+    "src/dew/nn/kernels/generation.py::linear_tangent":
         ("test_an_embedding_lookup_holds_every_order", KERNEL),
     "src/dew/nn/blocks.py::_rows.linear_tangent":
         ("test_an_embedding_lookup_holds_every_order", NUMERICS),
@@ -130,7 +130,7 @@ CONTRACTED = {
         ("test_a_gemm_prologue_holds_every_order", KERNEL),
     "src/dew/nn/kernels/templates/layout.py::_custom.held":
         ("test_a_transposed_hooks_custom_vjp_holds_every_reverse_order", KERNEL),
-    "src/dew/nn/kernels/templates/layout.py::_held_jvp.held":
+    "src/dew/nn/kernels/templates/layout.py::_held_jvp":
         ("test_a_transposed_hooks_custom_derivative_holds_every_order", KERNEL),
     "src/dew/nn/moe.py::_stored_primal":
         ("test_a_stored_expert_primal_holds_every_order", NUMERICS),
@@ -187,8 +187,8 @@ def _maker(node, given: tuple = ()) -> str | None:
 
 def seams_of(relative: str, text: str) -> dict[str, str]:
     """`relative`'s seams in `text`, each `relative::qualified name`, and what makes each: a function
-    decorated a custom derivative, a name assigned one (`CUSTOM`'s maker), and each enclosing function's
-    call of linear_tangent (`<scope>.linear_tangent`)."""
+    decorated a custom derivative, a name assigned one (`CUSTOM`'s maker), a function returning one (its
+    own name), and each enclosing function's call of linear_tangent (`<scope>.linear_tangent`)."""
     found: dict[str, str] = {}
 
     def walk(node, scope: list[str]) -> None:
@@ -205,6 +205,9 @@ def seams_of(relative: str, text: str) -> dict[str, str]:
             if (isinstance(target, ast.Name) and isinstance(child.value, ast.Call)
                     and (maker := _maker(child.value))):
                 found.setdefault(".".join([*scope, target.id]), maker)
+            if (isinstance(child, ast.Return) and isinstance(child.value, ast.Call)
+                    and (maker := _maker(child.value))):
+                found.setdefault(".".join(scope), maker)
             if isinstance(child, ast.Call) and _named(child.func) == "linear_tangent":
                 found.setdefault(".".join([*scope, "linear_tangent"]), "linear_tangent")
             walk(child, scope)
@@ -249,8 +252,8 @@ def test_each_seams_kind_is_its_declaration():
 def test_the_scan_finds_each_form_of_a_custom_derivative():
     """`seams_of` on each form a seam takes, and its maker: a decorator, one within functools.partial, an
     assignment of a call, an annotated one, a nested function's, a linear_tangent call within an
-    expression, a surrogate's declaration, assigned or decorating, and a builder's, its kind read from its
-    first argument."""
+    expression, a surrogate's declaration, assigned or decorating, and a builder's, assigned, decorating or
+    returned, its kind read from its first argument."""
     text = (
         "import functools\nimport jax\n"
         "@jax.custom_jvp\ndef a(x): return x\n"
@@ -266,12 +269,14 @@ def test_the_scan_finds_each_form_of_a_custom_derivative():
         "h = derivatives.declared_tangent(derivatives.Protected(), p, rule, nondiff_argnums=(1,))\n"
         "@functools.partial(declared_tangent, KernelGlue(), tangent=rule)\n"
         "def k(x): return x\n"
+        "def returned(x):\n    return declared_tangent(Algebra(), p, rule)\n"
         "def plain(x): return x\n")
     assert seams_of("m.py", text) == {
         "m.py::a": "custom_jvp", "m.py::b": "custom_vjp", "m.py::c": "custom_jvp", "m.py::d": "custom_vjp",
         "m.py::outer.inner": "custom_vjp", "m.py::tangent.linear_tangent": "linear_tangent",
         "m.py::e": "surrogate", "m.py::f": "surrogate", "m.py::g": "declared_derivative:Surrogate",
-        "m.py::h": "declared_tangent:Protected", "m.py::k": "declared_tangent:KernelGlue"}
+        "m.py::h": "declared_tangent:Protected", "m.py::k": "declared_tangent:KernelGlue",
+        "m.py::returned": "declared_tangent:Algebra"}
 
 
 def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():

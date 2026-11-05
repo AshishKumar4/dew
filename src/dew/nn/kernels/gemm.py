@@ -143,7 +143,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
         return tuple(leaves[index] for index in live)
 
     differentiable = generation.linear_tangent(forward, grouped_matmul.GROUPED.bound(backward), portable,
-                                                live_cotangents=True)
+                                                live_cotangents=True, kind=KernelGlue())
     return differentiable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired)
 
 

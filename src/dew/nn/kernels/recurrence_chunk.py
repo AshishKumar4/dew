@@ -38,6 +38,7 @@ from jax.sharding import PartitionSpec as P
 from dew.algebra.forms import derived_on
 from dew.algebra.scan import RESET_DECAY
 from dew.nn.attention_masks import repeat_kv_heads
+from dew.nn.derivatives import KernelGlue, Protected
 from dew.nn.inputs import cu_seqlens
 from dew.nn.precision import at_least_fp32, l2norm
 from dew.nn.sharding import grouped_heads, manual_map, rows_like, varying_like
@@ -458,7 +459,7 @@ def _portable_rule(chunk_size: int, delta: bool, scale: float, dtype: jnp.dtype)
     def portable(query, key, value, g, beta, state, starts):
         return _chunk_delta_rule(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
 
-    return generation.linear_tangent(forward, backward, portable)
+    return generation.linear_tangent(forward, backward, portable, kind=Protected())
 
 
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
@@ -906,7 +907,7 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands):
         return pullback(cotangent)
 
     return generation.linear_tangent(functools.partial(jax.vjp, training), pulled, portable, primal=primal,
-                                     nested=False)(*operands)
+                                     nested=False, kind=KernelGlue())(*operands)
 
 
 def _refusing(refusal: KernelRefused, *operands):
