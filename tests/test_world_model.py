@@ -173,11 +173,11 @@ def test_a_padded_batch_scores_its_real_clips_alone():
 
 
 def test_an_updates_corruption_is_each_clips_own_however_the_update_is_split():
-    """Each clip's corruption (the tokenizer's patch mask, the world model's step size, signal level and
-    noise) is drawn from the update's example key at the clip's place (`Step.sample`) and kept at its
-    boundary, so an update of four clips read whole or as two microbatches of two, each attempt's key its
-    own, records the same corruption for every clip (row 4147: it was drawn batch-wide from each attempt's
-    key)."""
+    """Each clip's corruption (the tokenizer's mask rate and patch mask, the world model's step size,
+    signal level and noise) is drawn from the update's example key at the clip's place (`Step.sample`),
+    what it derives kept at its boundaries, so an update of four clips read whole or as two microbatches of
+    two, each attempt's key its own, records the same draws and boundaries for every clip (row 4147: they
+    were drawn batch-wide from each attempt's key)."""
     from dew.objectives.base import Recorder, Step
 
     video = jnp.asarray(np.random.default_rng(13).uniform(-1, 1, (4, 4, 8, 8, 1)), jnp.float32)
@@ -189,7 +189,7 @@ def test_an_updates_corruption_is_each_clips_own_however_the_update_is_split():
             step = Step(jnp.asarray(0), jax.random.key(attempt), None, example_key=update,
                         example_index=jnp.asarray(rows, jnp.int32), example_count=4, recorder=recorder)
             objective.loss(variables, {"video": video[np.asarray(rows)]}, step)
-        return {name: tape for name, tape in recorder.tape(4).items() if recorder.kinds[name] == "boundary"}
+        return recorder.tape(4)
 
     for objective, variables in _objectives():
         whole = recorded(objective, variables, [([0, 1, 2, 3], 15)])
