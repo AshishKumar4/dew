@@ -145,13 +145,9 @@ CONTRACTED = {
         ("test_a_guided_prediction_holds_every_order", NUMERICS),
     "src/dew/nn/derivatives.py::surrogate.rule":
         ("test_a_surrogate_holds_every_order", SURROGATE),
-    "src/dew/nn/derivatives.py::kernel_derivative.rule":
+    "src/dew/nn/derivatives.py::_derivative.rule":
         ("test_a_declared_derivative_holds_every_order", KERNEL),
-    "src/dew/nn/derivatives.py::kernel_tangent.rule":
-        ("test_a_declared_derivative_holds_every_order", KERNEL),
-    "src/dew/nn/derivatives.py::numerics_derivative.rule":
-        ("test_a_declared_derivative_holds_every_order", NUMERICS),
-    "src/dew/nn/derivatives.py::numerics_tangent.rule":
+    "src/dew/nn/derivatives.py::_tangent.rule":
         ("test_a_declared_derivative_holds_every_order", NUMERICS),
 }
 """Each contracted seam, `path::qualified name`, the test of tests/test_contracts_*.py that holds it, and its

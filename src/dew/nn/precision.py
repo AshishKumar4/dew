@@ -41,7 +41,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.extend import core
 from jax.typing import DTypeLike
 
-from dew.nn.derivatives import Protected, spanned, surrogate
+from dew.nn.derivatives import Protected, bound_span, surrogate
 from dew.nn.nested import nested
 from dew.nn.sharding import explicit_spec
 
@@ -827,9 +827,9 @@ def rounded_to(x: jax.Array, dtype: Dtype) -> jax.Array:
 
 def _protected(transform: Callable) -> Callable:
     """`transform` as one span the algebra pass keeps as it is (`dew.nn.derivatives.Protected`), as
-    reassociation would cancel the residual an error-free transform keeps (`spanned`: its arrays the span's
+    reassociation would cancel the residual an error-free transform keeps (`bound_span`: its arrays the span's
     operands, its constants bound in, so a constant still splits where it is known, `two_product`)."""
-    return spanned(Protected(), transform)
+    return bound_span(Protected(), transform)
 
 
 @_protected

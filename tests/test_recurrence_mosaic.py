@@ -518,9 +518,7 @@ def test_a_launch_states_the_part_pairs_it_issues_and_declares_the_models_produc
         jax.ShapeDtypeStruct((rows, length, value_heads), jnp.float32),
         jax.ShapeDtypeStruct((rows, length, value_heads), dtype)]
 
-    def rule(*operands):
-        return mosaic_rule(*operands, tiles=mainloop.Tiles(32, 1), bound=1.0)[0].astype(jnp.float32).sum()
-
+    rule = functools.partial(mosaic_rule, tiles=mainloop.Tiles(32, 1), bound=1.0)
     mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), generation.run_precision(ACCURATE), jax.sharding.use_abstract_mesh(mesh):
         text = jax.jit(rule).trace(*operands).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")

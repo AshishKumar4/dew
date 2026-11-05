@@ -29,8 +29,21 @@ from collections.abc import Callable, Sequence
 import jax
 from jax.extend.core import create_call_primitive
 
-__all__ = ["Algebra", "KernelGlue", "Kind", "Protected", "Surrogate", "kernel_derivative", "kernel_tangent",
-           "marked", "marked_call_p", "numerics_derivative", "numerics_tangent", "spanned", "surrogate"]
+__all__ = [
+    "Algebra",
+    "KernelGlue",
+    "Kind",
+    "Protected",
+    "Surrogate",
+    "bound_span",
+    "kernel_derivative",
+    "kernel_tangent",
+    "marked",
+    "marked_call_p",
+    "numerics_derivative",
+    "numerics_tangent",
+    "surrogate",
+]
 
 
 def surrogate[Value](forward: Callable[..., Value], derivative: Callable[..., Value], *,
@@ -57,50 +70,30 @@ def surrogate[Value](forward: Callable[..., Value], derivative: Callable[..., Va
         return value, derivative(*fixed, primals, tangents, value)
 
     rule.defjvp(tangent)
-    return spanned(Surrogate(), rule)
+    return bound_span(Surrogate(), rule)
 
 
-def kernel_derivative[Value](primal: Callable[..., Value], forward: Callable, backward: Callable, *,
+def _derivative[Value](kind: Kind, primal: Callable[..., Value], forward: Callable, backward: Callable, *,
                       nondiff_argnums: Sequence[int] = ()) -> Callable[..., Value]:
-    """`primal` with the reverse-mode rule a kernel's derivative states (`forward` saving its residuals,
-    `backward` taking them and the cotangent, as `jax.custom_vjp.defvjp` takes them), one marked call of
-    `KernelGlue` (`spanned`): the pass rewrites its glue within the call, and every transform keeps it a
-    call of its kind. Forward mode refuses it as a bare `jax.custom_vjp` does."""
+    """`primal` with a declared reverse-mode rule (`forward` saving its residuals, `backward` taking them and
+    the cotangent, as `jax.custom_vjp.defvjp` takes them), one marked call of `kind` (`bound_span`). Forward
+    mode refuses it as a bare `jax.custom_vjp` does."""
     rule = jax.custom_vjp(primal, nondiff_argnums=tuple(nondiff_argnums))
     rule.defvjp(forward, backward)
-    return spanned(KernelGlue(), rule)
+    return bound_span(kind, rule)
 
 
-def kernel_tangent[Value](primal: Callable[..., Value], tangent: Callable, *,
-                          nondiff_argnums: Sequence[int] = ()) -> Callable[..., Value]:
-    """`primal` with the tangent rule a kernel's derivative states (`tangent(primals, tangents)` returning
-    the primal's value and its tangent, as `jax.custom_jvp.defjvp` takes it, which reverse mode transposes),
-    one marked call of `KernelGlue`: a GEMM prologue's, whose glue the pass rewrites within the call."""
+def _tangent[Value](kind: Kind, primal: Callable[..., Value], tangent: Callable, *,
+                    nondiff_argnums: Sequence[int] = ()) -> Callable[..., Value]:
+    """`primal` with a declared tangent rule (`tangent(primals, tangents)` returning the primal's value and
+    its tangent, as `jax.custom_jvp.defjvp` takes it, which reverse mode transposes), one marked call of
+    `kind` (`bound_span`)."""
     rule = jax.custom_jvp(primal, nondiff_argnums=tuple(nondiff_argnums))
     rule.defjvp(tangent)
-    return spanned(KernelGlue(), rule)
+    return bound_span(kind, rule)
 
 
-def numerics_derivative[Value](primal: Callable[..., Value], forward: Callable, backward: Callable, *,
-                        nondiff_argnums: Sequence[int] = ()) -> Callable[..., Value]:
-    """`primal` with a reverse-mode rule its numerics need as written (`forward`, `backward`, as
-    `kernel_derivative`'s), one `Protected` call the pass keeps as it is."""
-    rule = jax.custom_vjp(primal, nondiff_argnums=tuple(nondiff_argnums))
-    rule.defvjp(forward, backward)
-    return spanned(Protected(), rule)
-
-
-def numerics_tangent[Value](primal: Callable[..., Value], tangent: Callable, *,
-                     nondiff_argnums: Sequence[int] = ()) -> Callable[..., Value]:
-    """`primal` with a tangent rule its numerics need as written (`tangent(primals, tangents)` returning the
-    primal's value and its tangent, as `jax.custom_jvp.defjvp` takes it), one `Protected` call the pass keeps
-    as it is, which reverse mode transposes."""
-    rule = jax.custom_jvp(primal, nondiff_argnums=tuple(nondiff_argnums))
-    rule.defjvp(tangent)
-    return spanned(Protected(), rule)
-
-
-def spanned[Result](kind: Kind, function: Callable[..., Result]) -> Callable[..., Result]:
+def bound_span[Result](kind: Kind, function: Callable[..., Result]) -> Callable[..., Result]:
     """`function` as one marked call of `kind` (`marked`) over its arrays, passed by position or by name: its
     other arguments (a static factor, a dtype, a Python number, an option) bound in, so a constant still
     splits where it is known; a call of no array, `function` itself."""
@@ -168,3 +161,16 @@ def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[...,
         outputs = marked_call_p.bind(*flat, call_jaxpr=closed, kind=kind)
         return jax.tree.unflatten(jax.tree.structure(shaped), outputs)
     return call
+
+
+kernel_derivative = functools.partial(_derivative, KernelGlue())
+"""A kernel's reverse-mode derivative (`_derivative`): its glue the pass rewrites within its call."""
+
+kernel_tangent = functools.partial(_tangent, KernelGlue())
+"""A kernel's tangent (`_tangent`), a GEMM prologue's: its glue the pass rewrites within its call."""
+
+numerics_derivative = functools.partial(_derivative, Protected())
+"""A reverse-mode rule its numerics need as written (`_derivative`): one call the pass keeps as it is."""
+
+numerics_tangent = functools.partial(_tangent, Protected())
+"""A tangent rule its numerics need as written (`_tangent`): one call the pass keeps as it is."""
