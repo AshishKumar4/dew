@@ -44,7 +44,7 @@ from jax.custom_derivatives import SymbolicZero
 from jax.experimental.pallas import mosaic_gpu as plgpu, tpu as pltpu
 from jax.extend import core as jax_core
 
-from ..derivatives import marked_call_p
+from ..derivatives import Protected, declared_tangent, marked_call_p
 from ..precision import at_least_fp32, rounded_operand
 from . import generation, selection, tuning
 from .generation import INHERENT
@@ -1654,8 +1654,7 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     return jnp.where(grouped, out, 0)
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(3, 4, 5))
-def portable_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
+def _portable_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
                 dtype: Dtype | None, precision: PrecisionLike, out_dtype: Dtype | None = None) -> jax.Array:
     """The grouped projection on `xla_ragged_dot`, in every differentiation mode: `x`'s rows `[rows, in]`
     through each group's matrix of `kernel` `[groups, in, out]`, both cast to `dtype` (flax's promotion
@@ -1664,7 +1663,9 @@ def portable_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     so an input gradient keeps its input's dtype and a kernel gradient its master's: the portable
     projection `dew.nn.moe.expert_projection`'s XLA route and the GEMM template's portable branch run.
     `out_dtype`, where given, is the dtype its sum rounds to in place of the products' (the template's
-    fp32 accumulator, which its epilogue reads)."""
+    fp32 accumulator, which its epilogue reads). A protected span (`portable_projection`,
+    `dew.nn.derivatives.declared_tangent`): each rounded operand and barrier holds a rounding the algebra
+    pass must not move."""
     x, kernel = promote_dtype(x, kernel, dtype=dtype)
     accumulated = xla_ragged_dot(x, kernel, group_sizes, precision=precision,
                                  preferred_element_type=at_least_fp32(x.dtype))
@@ -1709,6 +1710,7 @@ def _portable_projection_jvp(dtype: Dtype | None, precision: PrecisionLike, out_
     return output, tangent
 
 
-portable_projection.defjvp(_portable_projection_jvp, symbolic_zeros=True)
+portable_projection = declared_tangent(Protected(), _portable_projection, _portable_projection_jvp,
+                                       nondiff_argnums=(3, 4, 5), symbolic_zeros=True)
 
 
