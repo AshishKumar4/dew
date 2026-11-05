@@ -111,8 +111,8 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
 
 
 def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
-                        refusals: list[RuntimeError], *, relower: Callable[[], jax.stages.Lowered]
-                        ) -> jax.stages.Compiled | None:
+                        refusals: list[RuntimeError], *, relower: Callable[[], jax.stages.Lowered],
+                        first: report.Attempt | None = None) -> jax.stages.Compiled | None:
     """Return `program` compiled under `options`, or None if XLA refuses it for memory (`refused_for_memory`).
 
     It compiles through the kernel templates' reports (`report.compiled`): where a launch's kernel
@@ -122,10 +122,10 @@ def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.Compile
     returning an executable whose memory `step_fits` could read, so the refusal means the step does
     not fit. For example, on a v6e, Qwen3-0.6B at 16 x 1024
     tokens asked for 38.47G of temporaries next to 31.24G of HBM. Any other
-    compile error is raised.
+    compile error is raised. `first` is its first compile where another thread made it (`report.attempts`).
     """
     try:
-        return report.compiled(program, options, relower=relower)
+        return report.compiled(program, options, relower=relower, first=first)
     except jax.errors.JaxRuntimeError as error:
         if not refused_for_memory(error.error_code_string, str(error)):
             raise
