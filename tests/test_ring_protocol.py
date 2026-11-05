@@ -56,15 +56,19 @@ def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: 
                 views = {"a": (x_gmem, lambda step: (at(tile, starts) + step, 0))}
                 return steps > 0, steps, views, tile
 
-            def consumer(wg, tile, walk, store, *, active):
+            def issue(wg, tile, walk, *, active):
                 def step(index, slots, carry, accumulators):
                     slots["a"][0, 0]
                     return carry, accumulators
 
                 walk(step, None, ())
 
-            family.persist(streams, (len(tiles),), schedule, consumer, consumers=consumers, axis="programs",
-                           outputs=(), interpret=False, in_flight=in_flight, unrolled=unrolled)
+            def finish(*_, **__):
+                pass
+
+            family.persist(streams, (len(tiles),), schedule, issue, finish, consumers=consumers,
+                           axis="programs", outputs=(), interpret=False, in_flight=in_flight,
+                           unrolled=unrolled)
 
         family.scoped(scope, streams=family.streams({"a": (BLOCK, jnp.bfloat16)}, stages, consumers))
 

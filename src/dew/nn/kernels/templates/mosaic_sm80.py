@@ -394,8 +394,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     def stream(self, streams, views, lo, hi, *, adds: tuple | None = None) -> None:
         del streams, views, lo, hi, adds
 
-    def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
-                consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
+    def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
+                *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False) -> None:
         # Each tile's pipeline fills and drains before its output copy. Synchronize at that lifetime
         # boundary so the output's shared memory can reuse the pipeline's slots.
@@ -428,7 +428,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
             return walk
 
-        mosaic.consumed(self, tiles, schedule, consumer, store, 0, walking, axis=axis)
+        mosaic.consumed(self, tiles, schedule, issue, finish, store, 0, walking, axis=axis)
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,

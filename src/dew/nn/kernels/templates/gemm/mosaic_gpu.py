@@ -578,10 +578,10 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
             interpreted=bool(interpret), transpose_lhs=transpose_lhs)
 
         def scope(side_smems, side_barriers, fixed_smems, fixed_barriers, *, streams):
-            def consumer(wg, tile, walk, store, *, active):
-                group, row_start, ni, start, gathered, program = tile
+            def issue(wg, tile, walk, *, active):
+                _, row_start, _, start, *_ = tile
                 if tail is not None and not active:
-                    return  # past its program's range: another program walks the tile
+                    return None  # past its program's range: another program walks the tile
                 fixed_refs = [smem.at[wg] for smem in fixed_smems]
                 if active:
                     _fixed_loaded(family, prologue_gmems, prologue_axes, fixed, fixed_refs, fixed_barriers,
@@ -594,7 +594,12 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                          matrices=matrices, interpret=bool(interpret), first=start,
                                          transpose_lhs=transpose_lhs)
                 # The unrouted rows, and a slot past the last tile, multiply nothing: zeros.
-                accs = _walked_products(family, walk, step, part, len(matrices), exact_sums)
+                return _walked_products(family, walk, step, part, len(matrices), exact_sums)
+
+            def finish(wg, tile, accs, store, *, active):
+                group, row_start, ni, start, gathered, program = tile
+                if tail is not None and not active:
+                    return
                 # This consumer's share of the tile: its first row, and its group's rows there.
                 part_row, column = row_start + wg * share, ni * block_n
                 first, stored = _stored_rows(group, part_row, part[0], m, dense=dense,
@@ -618,7 +623,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
             # a rotation of them spilled as the ring deepened (row 3620: FP8 at 128 x 128 x 128 spilled 152
             # bytes at five stages and 424 at six, a tile 34% slower than at four, FS-3620-SERIAL2,
             # FS-3620-STAGES1-h100).
-            family.persist(streams, walks, schedule, consumer, consumers=consumers,
+            family.persist(streams, walks, schedule, issue, finish, consumers=consumers,
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
                            in_flight=family.in_flight, unrolled=prologue is None and not exact_sums)
 
@@ -913,10 +918,10 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
         def scope(fixed_smems, fixed_barriers, halves, *, streams):
             names = tuple(allocations.blocks)
 
-            def consumer(wg, tile, walk, store, *, active):
-                g_i, depth, columns, steps, start, gathered, program = tile
+            def issue(wg, tile, walk, *, active):
+                g_i, depth, _, steps, start, *_ = tile
                 if tail is not None and not active:
-                    return  # past its program's range: another program walks the tile
+                    return None  # past its program's range: another program walks the tile
                 mine_depth = pl.ds(wg * depth_half, depth_half)
                 mine_columns = (wg * atoms_each, atoms_each, atoms_each * consumers > block_n // atom)
                 fixed_refs = [smem.at[wg] for smem in fixed_smems]
@@ -940,7 +945,12 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                                           halves if consumers == 2 else None)
 
                 # An empty group's tile reads none and stores zeros.
-                summed = _walked_gradient(family, walk, staged_at, part, exact_sums, bool(interpret))
+                return _walked_gradient(family, walk, staged_at, part, exact_sums, bool(interpret))
+
+            def finish(wg, tile, summed, store, *, active):
+                g_i, depth, columns, _, start, gathered, program = tile
+                if tail is not None and not active:
+                    return
                 place = (depth.start + wg * depth_half, 0, depth_half, columns.start, depth_half)
                 if tail is None:
                     store(0, summed, o_gmem.at[g_i], place)
@@ -950,7 +960,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                           lambda value: store(0, value, o_gmem.at[g_i], place))
 
             walks = (g * grid[0] * grid[1],) if tail is None else (tail.segments, multiprocessors)
-            family.persist(streams, walks, schedule, consumer, consumers=consumers,
+            family.persist(streams, walks, schedule, issue, finish, consumers=consumers,
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
                            in_flight=family.in_flight)
 

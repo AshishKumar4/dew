@@ -353,16 +353,21 @@ def tiled(tiles: tuple[int, ...], schedule: Callable, visit: Callable, *, axis: 
     return ended
 
 
-def consumed(family: "Family", tiles: tuple[int, ...], schedule: Callable, consumer: Callable,
+def consumed(family: "Family", tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
              store: Callable, index, walking: Callable, *, axis: str) -> jax.Array:
-    """Consumer role `index`'s tiles of a persistent kernel (`tiled`'s): each tile's `consumer(index, tile,
-    walk, store, active=...)`, `walk` its steps' (`walking(counter, active, steps, views)`, built where the
-    tile is visited) where it streams any, a walk of none (`unwalked`) where not. Returns the counter past
-    the last tile."""
+    """Consumer role `index`'s tiles of a persistent kernel (`tiled`'s), issued and finished in turn
+    (`Family.persist`'s `issue` and `finish`): each tile's accumulators `issue(index, tile, walk,
+    active=...)`, `walk` its steps' (`walking(counter, active, steps, views)`, built where the tile is
+    visited) where it streams any, a walk of none (`unwalked`) where not, then `finish(index, tile, accs,
+    store, active=...)`. Returns the counter past the last tile."""
     def visit(counter, active, steps, views, tile):
         walk = walking(counter, active, steps, views)
-        pl.when(active)(lambda: consumer(index, tile, walk, store, active=True))
-        pl.when(~active)(lambda: consumer(index, tile, unwalked(family), store, active=False))
+
+        def run(walk, *, active: bool):
+            finish(index, tile, issue(index, tile, walk, active=active), store, active=active)
+
+        pl.when(active)(lambda: run(walk, active=True))
+        pl.when(~active)(lambda: run(unwalked(family), active=False))
 
     return tiled(tiles, schedule, visit, axis=axis)
 
@@ -1521,19 +1526,22 @@ class Transport[Allocated, Opened](abc.ABC):
         and with `adds` each step's sum the consumers stage added (`streamed`)."""
 
     @abc.abstractmethod
-    def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
-                consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
+    def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
+                *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False) -> None:
         """A persistent kernel's tiles, the grid `tiles` spread over the launch's programs along `axis`, its
         streams (`streams`, as `scoped` hands them) running on across them: `schedule(index)` gives a tile's
         `(active, steps, views, tile)`, whether it streams anything, its step count, each stream's view
         (`viewed`: a ref and the block indices of the tile's step `j`, counted from 0) and what its
-        consumers are given. Each consumer role runs `consumer(index, tile, walk, store, active=...)` a tile,
-        once for each value of `active`: `walk(step, start, shapes, *, initial=None)` walks the tile's steps
-        as `walk` does, a step's index the tile's own (where not active it takes none, its accumulators as
-        they start), and `store(output, value, ref, place)` stores a consumer's `value` of output `output`
-        (`outputs`' `(shape, dtype)`) to `ref` at `place`, `store_rows`' `(row_start, first, stored,
-        column, most)` and, where the stored rows come in whole multiples, `least`. The family owns the
+        consumers are given. Each tile of each consumer role is issued, then finished, once for each value
+        of `active`: `issue(index, tile, walk, active=...)` walks the tile's steps by `walk(step, start,
+        shapes, *, initial=None)`, as `walk` does, a step's index the tile's own (where not active it takes
+        none, its accumulators as they start), and returns the accumulators the walk returns;
+        `finish(index, tile, accs, store, active=...)` stores them by `store(output, value, ref, place)`,
+        a consumer's `value` of output `output` (`outputs`' `(shape, dtype)`) to `ref` at `place`,
+        `store_rows`' `(row_start, first, stored, column, most)` and, where the stored rows come in whole
+        multiples, `least`. A family whose products a role of their own issues runs `issue` in that role
+        and `finish` in its consumers'; a register family runs both in each consumer. The family owns the
         loads, the step counter across tiles, the streams' drain, the outputs' staging and the stores'
         completion. A cluster's programs run the same tiles: where a stream is multicast (`streams`),
         `schedule` gives each of them the same `active`, `steps` and view of it. `walk`'s `in_flight` and
@@ -1770,8 +1778,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                             output_staging(shape[1], (dtype,))[0]), dtype)
                 for shape, dtype in outputs]
 
-    def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
-                consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
+    def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
+                *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False) -> None:
         # The producer loads every tile's steps into the rings at a counter running across the tiles, so
         # a tile's first loads go out while the consumers store the last one (`_tiled`).
@@ -1793,14 +1801,15 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                 ring.drain(loaded)
 
         def consuming(smems):
-            return self._tiled(rings, tiles, schedule, consumer, smems, axis=axis, interpret=interpret,
+            return self._tiled(rings, tiles, schedule, issue, finish, smems, axis=axis, interpret=interpret,
                                in_flight=in_flight, unrolled=unrolled)
 
         pl.run_scoped(lambda *smems: self.roles(consumers, consuming(smems), producer), *staging,
                       collective_axes="wg")
 
-    def _tiled(self, rings: dict[str, Ring], tiles: tuple[int, ...], schedule: Callable, consumer: Callable,
-               smems, *, axis: str, interpret: bool, in_flight: int, unrolled: bool) -> Callable:
+    def _tiled(self, rings: dict[str, Ring], tiles: tuple[int, ...], schedule: Callable, issue: Callable,
+               finish: Callable, smems, *, axis: str, interpret: bool, in_flight: int,
+               unrolled: bool) -> Callable:
         """`persist`'s consumers: each walks its tiles' steps at a counter running across the tiles
         (`_tile_walk`), stages its share of each output in chunks (`output_staging`: two buffers of
         `staged_columns`) and stores each by TMA, waiting only for a buffer's last store to read it before
@@ -1822,7 +1831,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                 return self._tile_walk(rings, counter, jnp.where(active, steps, 0), views, index,
                                        interpret=interpret, in_flight=in_flight, unrolled=unrolled)
 
-            ended = consumed(self, tiles, schedule, consumer, store, index, walking, axis=axis)
+            ended = consumed(self, tiles, schedule, issue, finish, store, index, walking, axis=axis)
             self._ended(rings, ended, index)
             plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
