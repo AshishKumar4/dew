@@ -20,20 +20,29 @@ import sys
 from pathlib import Path
 
 
-def apart(ours: list[bytes], theirs: list[bytes]) -> list[bytes]:
-    """`theirs`, a side's new lines, without the lines it begins and ends with that `ours` begins and ends
-    with too: entries both sides carry (main took a train's, and a head carries them as a commit of its own)
-    are joined once (row 3431)."""
-    shared = min(len(ours), len(theirs))
-    start = next((index for index in range(shared) if ours[index] != theirs[index]), shared)
-    end = next((index for index in range(shared - start) if ours[-1 - index] != theirs[-1 - index]),
-               shared - start)
-    return theirs[start:len(theirs) - end]
+def entries(lines: list[bytes]) -> list[list[bytes]]:
+    """`lines` as the changelog's entries: each an item (`- ` at its first column) and the continuation lines
+    under it, and every other line a block of its own."""
+    blocks: list[list[bytes]] = []
+    for line in lines:
+        if blocks and blocks[-1][0].startswith(b"- ") and line[:1] == b" ":
+            blocks[-1].append(line)
+        else:
+            blocks.append([line])
+    return blocks
+
+
+def unshared(ours: list[bytes], theirs: list[bytes]) -> list[bytes]:
+    """`theirs`, a side's new lines, without the entries `ours` holds too (`entries`): an entry both sides
+    carry, main having taken a train's and a head carrying the same as a commit of its own, is joined once,
+    wherever each side holds it (row 3431)."""
+    held = {tuple(block) for block in entries(ours) if block[0].startswith(b"- ")}
+    return [line for block in entries(theirs) if tuple(block) not in held for line in block]
 
 
 def joined(base: Path, ours: Path, theirs: Path, size: int) -> tuple[bytes, int]:
     """The merge of `ours` and `theirs` from `base`, each conflict hunk whose base side is empty joined (ours,
-    then theirs' lines apart from ours', `apart`), and the number of hunks left in conflict, marked as git
+    then theirs' entries ours lacks, `unshared`), and the number of hunks left in conflict, marked as git
     marks them (`size` its markers' width)."""
     merged = subprocess.run(["git", "merge-file", "--stdout", "--diff3", f"--marker-size={size}",
                              "-L", "ours", "-L", "base", "-L", "theirs", str(ours), str(base), str(theirs)],
@@ -60,7 +69,7 @@ def joined(base: Path, ours: Path, theirs: Path, size: int) -> tuple[bytes, int]
                          *hunk["theirs"], line]
                 left += 1
             else:
-                text += hunk["ours"] + apart(hunk["ours"], hunk["theirs"])
+                text += hunk["ours"] + unshared(hunk["ours"], hunk["theirs"])
             side = None
         elif side is None:
             text.append(line)
