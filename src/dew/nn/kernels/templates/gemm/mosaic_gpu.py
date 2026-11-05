@@ -595,24 +595,13 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                 return _walked_products(family, walk, step, part, len(matrices), exact_sums)
 
             def finish(wg, tile, accs, store, *, active):
-                group, row_start, ni, start, gathered, program = tile
                 if tail is not None and not active:
                     return
-                # This consumer's share of the tile: its first row, and its group's rows there.
-                part_row, column = row_start + wg * share, ni * block_n
-                first, stored = _stored_rows(group, part_row, part[0], m, dense=dense,
-                                             row_tile=block_m * pair)
-                finished = functools.partial(
-                    _finished, family=family, wg=wg, epilogue=epilogue, o_gmems=o_gmems, store=store,
-                    sides=tuple(zip(side_gmems, epilogue_axes, side_smems, side_barriers, strict=True)),
-                    origins={'rows': pl.ds(part_row, part[0]), 'columns': pl.ds(column, part[1])},
-                    group=jnp.minimum(group.group_id, g - 1),
-                    place=(part_row, first, stored, column, min(part[0], m), TMA_ROWS if dense else 1))
-                if tail is None or workspace is None:
-                    finished(*accs)
-                    return
-                family.fixed_up(accs[0], workspace.at[:, wg], None if ready is None else ready.at[:, wg],
-                                program, start, gathered, finished)
+                _gmm_finished(accs, tile, wg, store, family=family, part=part, m=m, g=g, dense=dense,
+                              row_tile=block_m * pair, epilogue=epilogue, o_gmems=o_gmems,
+                              sides=tuple(zip(side_gmems, epilogue_axes, side_smems, side_barriers,
+                                              strict=True)),
+                              partials=None if tail is None else (workspace, ready))
 
             walks = (grid[0] * grid[1],) if tail is None else (tail.segments, multiprocessors)
             # Its step is its products and its waits (the prologue's rewrite apart), small enough that a
@@ -642,6 +631,28 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                                    *prologue_operands, *epilogue_operands, *out_type))
     outs = kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands)
     return outs[:len(out_type)] if tail is not None else outs
+
+
+def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family, part: tuple, m: int, g: int,
+                  dense: bool, row_tile: int, epilogue, o_gmems: tuple, sides: tuple, partials) -> None:
+    """Dew: a consumer's share of a `gmm` tile stored (`_finished`) from its accumulators: at once, or,
+    a balanced tail's tile (`partials`: its workspace and readiness flags), once its program's partial and
+    the other programs' are added (`mosaic.Family.fixed_up`)."""
+    group, row_start, ni, start, gathered, program = tile
+    # This consumer's share of the tile: its first row, and its group's rows there.
+    part_row, column = row_start + wg * part[0], ni * part[1]
+    first, stored = _stored_rows(group, part_row, part[0], m, dense=dense, row_tile=row_tile)
+    finished = functools.partial(
+        _finished, family=family, wg=wg, epilogue=epilogue, o_gmems=o_gmems, store=store, sides=sides,
+        origins={'rows': pl.ds(part_row, part[0]), 'columns': pl.ds(column, part[1])},
+        group=jnp.minimum(group.group_id, g - 1),
+        place=(part_row, first, stored, column, min(part[0], m), TMA_ROWS if dense else 1))
+    if partials is None or partials[0] is None:
+        finished(*accs)
+        return
+    workspace, ready = partials
+    family.fixed_up(accs[0], workspace.at[:, wg], None if ready is None else ready.at[:, wg], program, start,
+                    gathered, finished)
 
 
 def _stored_rows(group, part_row, rows: int, m: int, *, dense: bool, row_tile: int) -> tuple:
