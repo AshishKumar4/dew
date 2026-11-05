@@ -54,7 +54,7 @@ from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, WEIGHT_SUM_EPSILON, Sparse
 from ..ngpt import NGPT, stepped
 from ..norms import GatedRMSNorm, LayerNorm, OffsetLayerNorm, RMSNorm
 from ..precision import float32_dot_general, scaled
-from ..protocols import ProjectionGroup, ReadsTrain, RoutesBySite, RoutesExperts, declared_groups
+from ..protocols import ProjectionGroup, ReadsTrain, declared_groups, partitioned_routes, routed_children
 from ..sharding import RESIDUAL, constrain, declared
 
 if TYPE_CHECKING:
@@ -1277,30 +1277,15 @@ class DecoderBlock(nn.Module):
         layer's one record, its one routed site."""
         if per_layer_input is None or per_layer_input.experts is None:
             return {}, {}
-        experts, routed = per_layer_input.experts, per_layer_input.routed
-        mixer = isinstance(self.self_attn, RoutesExperts) and self.self_attn.routes_experts
-        if not isinstance(experts, Mapping):
-            if mixer and self.routed:
-                raise ValueError("a layer's one routing record replays one routed site, and this layer "
-                                 "routes in both its mixer and its feed-forward; key the record by site path "
-                                 f"({FEEDFORWARD_ROUTES!r}, {MIXER_ROUTES!r})")
-            record = {"routes": (experts, routed)}
-            return (record if mixer else {}), (record if self.routed else {})
-        sites = ([f"{MIXER_ROUTES}/{site}" for site in self.self_attn.routed_sites]
-                 if isinstance(self.self_attn, RoutesBySite) else [MIXER_ROUTES]) if mixer else []
-        wanted = [*sites, *([FEEDFORWARD_ROUTES] if self.routed else [])]
-        missing = [site for site in wanted if site not in experts]
-        if missing:
-            raise ValueError(f"the routing record names {sorted(experts)}, not this layer's routed sites "
-                             f"{missing}")
-        if not mixer:
-            mixed = {}
-        elif isinstance(self.self_attn, RoutesBySite):
-            below = len(MIXER_ROUTES) + 1
-            mixed = {"routes": ({site[below:]: experts[site] for site in sites}, routed)}
-        else:
-            mixed = {"routes": (experts[MIXER_ROUTES], routed)}
-        return mixed, ({"routes": (experts[FEEDFORWARD_ROUTES], routed)} if self.routed else {})
+        routed = {**routed_children({MIXER_ROUTES: self.self_attn}),
+                  **({FEEDFORWARD_ROUTES: (FEEDFORWARD_ROUTES,)} if self.routed else {})}
+        if not routed:
+            # A dense layer of a routed stack reads none of the stack's record.
+            return {}, {}
+        parts = partitioned_routes(routed, per_layer_input.experts, per_layer_input.routed)
+        mixer, feedforward = ({"routes": parts[site]} if site in parts else {}
+                              for site in (MIXER_ROUTES, FEEDFORWARD_ROUTES))
+        return mixer, feedforward
 
     def _per_layer_residual(self, x, per_layer_input):
         """Gemma 3n/4's per-layer residual (modeling_gemma4.py,

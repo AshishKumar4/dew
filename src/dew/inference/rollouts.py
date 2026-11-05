@@ -354,9 +354,37 @@ class NativeRolloutServer:
     budget or by a criterion that truncates it (`MaxNewTokens`). A server
     whose task ends rows on a criterion of its own besides those, which a
     draw's policy cannot name, raises ValueError.
+
+    `deferred` builds one whose server is built from the first version it is
+    loaded with, as a run that builds its rollout before its weights are drawn
+    serves them (`RolloutScheduler.served`).
     """
 
     def __init__(self, server: Server, *, version: int = 0):
+        self._build: Callable[[Variables, int], Server] | None = None
+        self._sampling = server.sampling
+        self._served(server, version)
+        self._loading = threading.Lock()
+        self._futures = threading.Lock()
+        self._outstanding: set[Future[Draw]] = set()
+        self._closed = False
+        self._started = False
+
+    @classmethod
+    def deferred(cls, build: Callable[[Variables, int], Server], sampling: Sampling) -> NativeRolloutServer:
+        """A server that draws nothing until its first `load`, which builds its `Server` with `build` from
+        the loaded variables and version, the policy drawing under `sampling`: a run's rollout built before
+        the run draws its weights. Its version before then is -1, behind every update."""
+        server = cls.__new__(cls)
+        server._build, server._sampling, server._server, server._engine = build, sampling, None, None
+        server._version = -1
+        server._loading, server._futures = threading.Lock(), threading.Lock()
+        server._outstanding, server._closed, server._started = set(), False, False
+        return server
+
+    def _served(self, server: Server, version: int) -> None:
+        """Serve `server`, its weights at `version`, refused where its draws would end on a criterion no
+        draw's policy names or would draw a model that reads the run's progress at the run's end."""
         ending, sampling = server.stopping.ending, server.sampling
         named = [criterion for criterion in ending if isinstance(criterion, EndOfSequence)
                  and set(np.asarray(criterion.eos).reshape(-1).tolist()) == set(sampling.stops)]
@@ -373,22 +401,18 @@ class NativeRolloutServer:
                              "(`load`), and this server draws at the run's end; build it from the task at "
                              "the version's progress (LMObjective.policy(..., Progress(version)), "
                              "Server.from_task)")
-        self._server = server
+        self._server: Server | None = server
         self._version = version
-        self._engine = Engine(server, name="dew-rollout-server")
-        self._loading = threading.Lock()
-        self._futures = threading.Lock()
-        self._outstanding: set[Future[Draw]] = set()
-        self._closed = False
-        self._started = False
+        self._engine: Engine | None = Engine(server, name="dew-rollout-server")
 
     @property
     def sampling(self) -> Sampling:
-        return self._server.sampling
+        return self._sampling
 
     @property
-    def engine(self) -> Engine:
-        """The engine that steps the server, and orders a load with its steps."""
+    def engine(self) -> Engine | None:
+        """The engine that steps the server, and orders a load with its steps; None for a deferred server
+        not yet loaded."""
         return self._engine
 
     @property
@@ -405,6 +429,8 @@ class NativeRolloutServer:
         ids, budget = _prompt(prompt), _budget(max_new_tokens)
         future: Future[Draw] = Future()
         with self._futures:
+            if self._engine is None or self._server is None:
+                raise RuntimeError("a deferred rollout server draws once its first version is loaded")
             if self._engine.failure is not None:
                 raise RuntimeError("the rollout server stopped") from self._engine.failure
             if self._closed:
@@ -413,9 +439,10 @@ class NativeRolloutServer:
                 self._engine.start()
                 self._started = True
             self._outstanding.add(future)
+            server = self._server
         try:
             with self._loading:
-                ticket = self._server.submit(np.asarray(ids, np.int32), budget, key=request)
+                ticket = server.submit(np.asarray(ids, np.int32), budget, key=request)
                 version = self._version
         except BaseException:
             self._claimed(future)
@@ -446,23 +473,36 @@ class NativeRolloutServer:
             return True
 
     def load(self, variables: Variables, version: int) -> None:
+        if self._server is None:
+            assert self._build is not None, "a server is given or deferred"
+            # A copy of its own, as every later load copies its weights (`Server.reload`): the trainer
+            # donates the arrays it hands over to its next update.
+            owned = jax.tree.map(lambda leaf: jnp.array(leaf, copy=True), thaw(variables))
+            with self._futures:
+                if self._closed:
+                    raise RuntimeError("the rollout server is closed")
+                self._served(self._build(owned, version), version)
+            return
+        server, engine = self._server, self._engine
+        assert engine is not None, "a served server has its engine"
         # A version is the updates the run committed (`Snapshot.updates`), which a model that reads the
         # run's progress draws at (`Server.reload`).
         at = Progress(jnp.asarray(version, jnp.int32))
-        progress = at if progressed(self._server.model, at) else None
+        progress = at if progressed(server.model, at) else None
 
         def loading() -> None:
             with self._loading:
-                self._server.reload(thaw(variables), progress)
+                server.reload(thaw(variables), progress)
                 self._version = version
 
-        self._engine.reload(loading)
+        engine.reload(loading)
 
     def close(self) -> None:
         """Stop after the step in progress; every draw still outstanding fails."""
         with self._futures:
             self._closed = True
-        self._engine.stop()
+        if self._engine is not None:
+            self._engine.stop()
         with self._futures:
             detached = list(self._outstanding)
             self._outstanding.clear()
