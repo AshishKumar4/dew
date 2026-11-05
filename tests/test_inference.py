@@ -664,6 +664,56 @@ def test_a_run_on_a_mesh_packs_the_projections_its_layout_keeps_whole(tmp_path):
         np.testing.assert_array_equal(there.tokens, here.tokens, err_msg=str(spec))
 
 
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("spec", [{"sequence": 2}, {"fsdp": 2, "stage": 2}, {"tensor": 2, "sequence": 2}],
+                         ids=["sequence", "fsdp-stage", "tensor-sequence"])
+def test_a_run_samples_on_every_trainer_layout_what_one_device_samples(tmp_path, spec):
+    """A trained decoder placed on each layout the trainer runs, a sequence axis, a pipeline's stage axis
+    and their products, draws what it draws on one device, on par with that draw against its float64
+    twin (check 1); a server on the layout serves what a call draws (ledger 1817)."""
+    from arm_arithmetic import widened
+    from reference_error import as_given, assert_as_exact, seeds_for
+
+    from dew.inference import Server
+    from dew.sampling import Sampling
+    from dew.training import Layout, MeshSpec
+
+    run = tmp_path / "run"
+    run.mkdir()
+    make_lm_run(run, ema_decay=None, fields={"num_layers": 2})
+    layout = Layout(min_shard=1, tolerance=1.0)
+    sampling = Sampling(temperature=1.0, eos_token_ids=255)
+    devices = jax.devices()[:4]
+    alone = dew.pipeline(str(run), mesh=MeshSpec().build(devices[:1]), layout=layout)
+    placed = dew.pipeline(str(run), mesh=MeshSpec(**spec).build(devices), layout=layout)
+    wide = dataclasses.replace(alone, model=alone.model.clone(dtype=jnp.float64),
+                               variables=widened(alone.variables))
+
+    def draw(seed):
+        return (np.asarray([2 * seed, 2 * seed + 1]),)
+
+    def drawn(task, dtype="float32"):
+        @as_given
+        def likelihoods(keys):
+            with jax.enable_x64(new_val=dtype == "float64"):
+                return tuple(task("the ", 4, key=int(key), sampling=sampling).host().raw_log_probs
+                             for key in keys)
+
+        return likelihoods
+
+    @as_given
+    def served(keys):
+        tickets = [server.submit("the ", 4, key=int(key)) for key in keys]
+        server.run()
+        return tuple(ticket.result().host().raw_log_probs for ticket in tickets)
+
+    label = f"sampled on {spec}"
+    count = seeds_for(drawn(alone), draw, label, truth_fn=drawn(wide, "float64"), dew_fn=drawn(placed))
+    assert_as_exact(drawn(placed), drawn(alone), draw, label, seeds=count, truth_fn=drawn(wide, "float64"))
+    server = Server.from_task(dataclasses.replace(placed, sampling=sampling), slots=2, capacity=16)
+    assert_as_exact(served, drawn(alone), draw, label, seeds=count, truth_fn=drawn(wide, "float64"))
+
+
 def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
     """A just-trained state is the pipeline: the averaged weights when the
     objective keeps them, the live ones on request, the objective's own
@@ -1000,6 +1050,58 @@ def test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images(tmp_path):
     assert result.rows == 3
     np.testing.assert_allclose(result.host().images, plain(["a", "b", "c"], steps=3, key=7).host().images,
                                atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("spec", [{"tensor": 2}, {"sequence": 2}, {"fsdp": 2, "stage": 2}],
+                         ids=["tensor", "sequence", "fsdp-stage"])
+def test_a_run_draws_images_on_every_trainer_layout_as_one_device_does(tmp_path, spec):
+    """A trained text-to-image run placed on each layout the trainer runs, a tensor axis, a sequence axis
+    and a pipeline's stage axis with FSDP, draws the images it draws on one device, called and served
+    (`TextToImage.scoring`), on par with one device against its float64 twin over the same prepared noise
+    and conditions (check 1) (ledger 1817)."""
+    from arm_arithmetic import widened
+    from reference_error import as_given, assert_as_exact, seeds_for
+
+    from dew.inference import ImageRequest, ScoringServer
+    from dew.training import Layout, MeshSpec
+
+    make_run(tmp_path)
+    devices = jax.devices()[:4]
+    layout = Layout(min_shard=1, tolerance=1.0)
+    alone = dew.pipeline(str(tmp_path), mesh=MeshSpec().build(devices[:1]), layout=layout)
+    placed = dew.pipeline(str(tmp_path), mesh=MeshSpec(**spec).build(devices), layout=layout)
+    server = ScoringServer.from_task(*placed.scoring(steps=3, images=2))
+    wide = dataclasses.replace(alone, model=alone.model.clone(dtype=jnp.float64),
+                               variables=widened(alone.variables))
+    prompts = ["a", "b"]
+
+    def draw(seed):
+        return (np.asarray([seed]),)
+
+    def drawn(task):
+        @as_given
+        def images(keys):
+            return task(prompts, steps=3, key=int(keys[0])).host().images
+
+        return images
+
+    @as_given
+    def served(keys):
+        answer = server.submit(ImageRequest(prompts, int(keys[0]), steps=3))
+        server.run()
+        return answer.result().host().images
+
+    @as_given
+    def truth(keys):
+        held = widened(alone.prepare(prompts, key=int(keys[0]), steps=3))
+        with jax.enable_x64(new_val=True):
+            return wide(held, steps=3, key=int(keys[0])).host().images
+
+    label = f"images on {spec}"
+    count = seeds_for(drawn(alone), draw, label, truth_fn=truth, dew_fn=drawn(placed))
+    assert_as_exact(drawn(placed), drawn(alone), draw, label, seeds=count, truth_fn=truth)
+    assert_as_exact(served, drawn(alone), draw, label, seeds=count, truth_fn=truth)
 
 
 def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajectory(tmp_path):
