@@ -750,11 +750,11 @@ class TrainerConfig:
         """The directory of the run `name`'s checkpoints and record, in `checkpoint_dir`."""
         return os.path.join(self.checkpoint_dir, name)
 
-    def checkpoints(self, name: str) -> Checkpoints:
-        """The checkpoints of the run `name` in `checkpoint_dir` (`directory`), keeping `keep`, with its
-        local tier under `name` in `local_directory`, so runs sharing a local disk resume each only its
-        own."""
-        return Checkpoints(self.directory(name), keep=self.keep,
+    def checkpoints(self, name: str, directory: str | None = None) -> Checkpoints:
+        """The checkpoints of the run `name` in `checkpoint_dir` (`directory`), or in `directory` where
+        given (a saved run read where it lies), keeping `keep`, with its local tier under `name` in
+        `local_directory`, so runs sharing a local disk resume each only its own."""
+        return Checkpoints(self.directory(name) if directory is None else directory, keep=self.keep,
                            local_directory=None if self.local_directory is None else os.path.join(
                                self.local_directory, name), local_every=self.local_every)
 
@@ -1394,7 +1394,10 @@ class RunConfig:
     (`data_plan`), and in a kind of run that adds them its own
     (a decision run's option text). A run that leaves one None and resumes a saved run under its name
     takes the saved run's value (`resumed`), so running the same command again resumes what it trained;
-    one it sets is its own, and a resume refuses it where it differs (`check_resume`)."""
+    one it sets is its own, and a resume refuses it where it differs (`check_resume`). A saved run whose
+    record holds one None left it to its build unresolved, which nothing it saved resolves (each earlier
+    shape's translation resolves what it can, `earlier_run`), so the value this build resolves is its
+    value."""
 
     UNSEEDED: ClassVar[str] = SCHEDULE
     """How a run of this kind reads a mix saved unseeded and seeded now, as the refusal of its resume names
@@ -1757,9 +1760,8 @@ class RunConfig:
         run = cls.read(held, trust=trust)
         # Its checkpoints' tiers as the run kept them, under the directory it was saved in.
         saved = str(path.parent if named_file else path)
-        local = run.trainer.local_directory
-        with Checkpoints(saved, local_directory=None if local is None else os.path.join(
-                local, os.path.basename(saved.rstrip("/")))) as checkpoints:
+        name = run.trainer.name or os.path.basename(saved.rstrip("/"))
+        with run.trainer.checkpoints(name, directory=saved) as checkpoints:
             settled = earlier_option_writing(held, checkpoints)
         return run if settled is held else cls.read(settled, trust=trust)
 

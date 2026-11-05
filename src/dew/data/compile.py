@@ -83,6 +83,7 @@ from dew.data.lowering import (
     _Build,
     _epoch_records,
     _Locality,
+    _member_key,
     _order_records,
     _Present,
     _split_spans,
@@ -692,11 +693,19 @@ def _made(prepared: Sequence[Pipeline], read: Read, counts: Sequence[dict[str, C
     return made
 
 
-def _own_key(branch: Pipeline) -> str | None:
+def _own_key(branch: Pipeline) -> int | None:
     """A named chain's own key, read outside any mixture: the key a mixture keys it by as its first member
-    of that name (`_member_keys`), which its shuffles draw by from plan version 9 (`_Build.ordered`); None
-    for a chain given no name."""
-    return None if branch.name is None else _member_keys(_members([branch]))[0]
+    of that name (`_member_key`), which its shuffles draw by from plan version 9 (`_Build.ordered`), so it
+    reads one order mixed and alone; None for a chain given no name."""
+    return None if branch.name is None else _member_key(_members([branch]), 0)
+
+
+def _keys_shuffles(build: _Build) -> bool:
+    """Whether `build` shuffles its chain by the chain's own name (`_own_key`): from plan version 9, a named
+    chain whose order shuffles at its root; one that shuffles nothing reads alike under any name."""
+    stages = build.lowering.order.get("stages", [])
+    return build.version >= 9 and build.named is not None and isinstance(stages, list) and any(
+        isinstance(stage, str) and stage.startswith("Shuffle(") for stage in stages)
 
 
 def _build(branch: Pipeline, read: Read, loading: Loading, *, batch: int, training: bool, seed: int = 0,
@@ -1044,7 +1053,7 @@ def _compiled(
         manifest,
         # A named chain's own key, which its shuffles draw by from version 9 (`_own_key`), so a position
         # saved under another name is refused, as another permutation of its records.
-        {"read": read, "seed": seed, **({"named": build.named} if build.version >= 9 and build.named else {}),
+        {"read": read, "seed": seed, **({"named": build.named} if _keys_shuffles(build) else {}),
          **build.lowering.order},
         _derived(train, build),
         cache=_cache_references(original, read),
