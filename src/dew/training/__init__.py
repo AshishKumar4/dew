@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from dew._exports import lookup as _lookup
 
 if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
+    from dew._devices import CPUOnlyJax
     from dew.averaging import ema_update
     from dew.checkpoints import Checkpoints, Keep
     from dew.distributed.placement import Layout, MeshSpec
@@ -41,6 +42,7 @@ _EXPORTS = {
     "Aux": "dew.objectives.base",
     "Best": "dew.training.selection",
     "Checkpoints": "dew.checkpoints",
+    "CPUOnlyJax": "dew._devices",
     "Cooldowns": "dew.training.cooldown",
     "DiLoCo": "dew.training.diloco",
     "Inspection": "dew.training.inspection",
@@ -84,6 +86,7 @@ __getattr__, __dir__ = _lookup(__name__, _EXPORTS)
 __all__ = [
     "Aux",
     "Best",
+    "CPUOnlyJax",
     "Checkpoints",
     "Cooldowns",
     "DiLoCo",

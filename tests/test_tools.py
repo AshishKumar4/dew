@@ -245,7 +245,7 @@ LINES = [f"line {i}: the quick brown fox jumps over the lazy dog" for i in range
 def token_directory(tmp_path: Path) -> Path:
     """A byte-tokenized corpus, as the curve's documented producer writes it: `dew data export` over
     a text file's lines, each a document closed by EOS."""
-    from dew.cli.main import DataExport
+    from dew._cli.main import DataExport
 
     corpus = tmp_path / "corpus.txt"
     corpus.write_text("".join(f"{line}\n" for line in LINES))

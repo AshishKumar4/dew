@@ -196,25 +196,25 @@ print(json.dumps(sorted(sys.modules)))
 
 
 FEATURES = ("dew.nn", "dew.data", "dew.inputs", "dew.objectives", "dew.training", "dew.inference",
-            "dew.interop", "dew.rl", "dew.decision", "dew.cli", "dew.config", "dew.checkpoints",
+            "dew.interop", "dew.rl", "dew.decision", "dew._cli", "dew.config", "dew.checkpoints",
             "dew.diffusion", "dew.sampling", "dew.eval", "dew.lora", "dew.quantization", "dew.telemetry",
-            "dew.io", "dew.cleanup", "dew.figures")
+            "dew.io", "dew._cleanup", "dew.figures")
 """Dew's feature packages, which the layers below them import none of."""
 
 LAYERS: dict[str, tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = {
     "conditioning inputs import no objective or trainer": (
         ("dew.inputs",), (), ("dew.objectives", "dew.training", "dew.inference", "dew.rl", "dew.decision",
-                              "dew.cli", "dew.config", "dew.checkpoints", "dew.sampling", "dew.eval",
-                              "dew.lora", "dew.quantization", "dew.io", "dew.cleanup", "dew.figures")),
+                              "dew._cli", "dew.config", "dew.checkpoints", "dew.sampling", "dew.eval",
+                              "dew.lora", "dew.quantization", "dew.io", "dew._cleanup", "dew.figures")),
     "telemetry imports nothing above the network layer": (
         ("dew.telemetry",), (), tuple(name for name in FEATURES if name not in ("dew.nn", "dew.telemetry"))),
-    "training imports no front end": (("dew.training",), (), ("dew.cli", "dew.decision")),
+    "training imports no front end": (("dew.training",), (), ("dew._cli", "dew.decision")),
     "checkpoints import no front end or configuration": (
-        ("dew.checkpoints",), (), ("dew.cli", "dew.decision", "dew.config")),
+        ("dew.checkpoints",), (), ("dew._cli", "dew.decision", "dew.config")),
     # A run's source is loaded as its record states it, so inference reads the run record's own types
     # (`SourceOptions`, dew.config): the contract allows dew.config (row 4268, Serving & RL).
     "inference imports no trainer or front end": (
-        ("dew.inference",), (), ("dew.training", "dew.cli", "dew.decision", "dew.io")),
+        ("dew.inference",), (), ("dew.training", "dew._cli", "dew.decision", "dew.io")),
     "reinforcement learning imports no trainer": (("dew.rl",), (), ("dew.training",)),
     "only the reinforcement-learning packages import dew.rl": (
         ("dew",), ("dew.rl", "dew.objectives.rl"), ("dew.rl",)),

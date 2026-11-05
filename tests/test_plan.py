@@ -28,7 +28,7 @@ from reference_error import as_given, assert_as_exact, seeds_for
 from sharded import collectives
 from token_support import write_token_corpus
 
-from dew import cache
+from dew import _cache
 from dew.checkpoints import Checkpoints
 from dew.data import Loading, presets
 from dew.data.compile import compile
@@ -353,14 +353,14 @@ def a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_for_th
             lowered.append(seconds)
 
     counts = []
-    settled = cache.KERNEL_TUNES.get_global()
+    settled = _cache.KERNEL_TUNES.get_global()
     jax.monitoring.register_event_duration_secs_listener(lowering)
     try:
         for _ in range(2):
             trained(lm(), steps=0)
             counts.append(len(lowered))
             lowered.clear()
-            changed, settled = cache.KERNEL_TUNES.get_global() != settled, cache.KERNEL_TUNES.get_global()
+            changed, settled = _cache.KERNEL_TUNES.get_global() != settled, _cache.KERNEL_TUNES.get_global()
             assert counts[-1] == 1 + changed
     finally:
         jax.monitoring.unregister_event_duration_listener(lowering)

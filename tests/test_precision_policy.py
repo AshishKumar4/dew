@@ -485,7 +485,7 @@ def test_any_einsum_at_the_bf16_algorithm_multiplies_bf16_operands(subscripts, s
 
 def the_gpu_divides_fp32_to_the_nearest_float():
     """`import dew` has XLA:GPU divide fp32 to the nearest float
-    (`dew.devices.divide_exactly`): over 2^20 quotients of operands
+    (`dew._devices.divide_exactly`): over 2^20 quotients of operands
     from 1e-4 to 10 apart, each is the float64 quotient rounded to fp32, as a
     CPU's and the references' are. XLA's own `div.full` left 28% of them off
     by up to 2 ulps on an H100."""

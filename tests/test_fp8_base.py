@@ -509,14 +509,14 @@ def test_a_process_sharing_its_gpu_measures_no_site(monkeypatch):
     H100 has them, so the read-only autotune cache is what refuses it. The
     control is a process that would measure: neither read-only nor under
     the cuda lane's deterministic ops, which keep no picks at all."""
-    from dew import cache
+    from dew import _cache
 
     variables = decoder().init(jax.random.key(0), ids())
     flags = without_flags(keeping_picks(), READ_ONLY.split("=")[0])
     monkeypatch.setenv("XLA_FLAGS", flags)
-    assert cache.measures_picks()
+    assert _cache.measures_picks()
     monkeypatch.setenv("XLA_FLAGS", f"{flags} {READ_ONLY}")
-    assert not cache.measures_picks()
+    assert not _cache.measures_picks()
     with assumed("sm90"), pytest.raises(ValueError):
         measured_fp8_sites(variables, record(variables).frozen_fp8, 8192)
 
@@ -526,12 +526,12 @@ import json
 import jax
 import jax.numpy as jnp
 import numpy as np
-from dew import cache
+from dew import _cache
 from dew.nn.kernels.generation import device_generation
 from dew.quantization import frozen_fp8_leaves, frozen_fp8_product, measured_fp8_sites
 from dew.telemetry.instrumentation import hlo_instructions
 
-if not cache.measures_picks():
+if not _cache.measures_picks():
     print(json.dumps(None))
     raise SystemExit
 variables = {"params": {"wide": {"kernel": jnp.zeros((4096, 12288), jnp.float32)},
@@ -553,7 +553,7 @@ print(json.dumps({"sites": list(measured.frozen_fp8), "measured_on": measured.me
                   "generation": device_generation(), "fp8_gemms": gemms}))
 """
 """The qualification, run by a process of its own (`fresh`): the suite's deterministic ops keep its
-own process from measuring (`dew.cache.keeps_picks`)."""
+own process from measuring (`dew._cache.keeps_picks`)."""
 
 
 def a_frozen_sites_products_take_no_fp8_gemm_whose_sum_is_narrower(tmp_path):

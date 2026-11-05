@@ -635,7 +635,7 @@ def _patched(node: ast.Call, table: dict[str, str]) -> str:
 
 def _seam(target: str) -> bool:
     """Does `target` leave the process: does it hold one of `SEAMS` as whole parts
-    between its dots and underscores, so `dew.cli.tpu.time.sleep` and
+    between its dots and underscores, so `dew._cli.tpu.time.sleep` and
     `dew.interop.sources.snapshot` do and `dew.training.narrow.narrowed_paths` does not?
     A private attribute is its owner's: of a seam's owner it leaves the process as
     the owner does (`dew._coordination.os._exit`), and of a first-party object it
@@ -1507,12 +1507,12 @@ EXTERNAL = ("subprocess.", "socket.", "ssl.", "select.", "urllib.", "http.", "re
             "aiohttp.", "grpc.", "huggingface_hub.", "fsspec.", "gcsfs.", "google.", "boto3.", "botocore.",
             "filelock.", "multiprocessing.", "concurrent.futures.ProcessPoolExecutor.", "os.kill.",
             "os.killpg.", "os.waitpid.", "os.waitid.", "os.fork.", "os.posix_spawn.", "jax.distributed.",
-            "dew.cleanup.signal_group.", "dew.cleanup.exit_code.", "dew.cleanup.groups_ended.",
-            "dew.cleanup.end_group.", "dew.cleanup.process_group.",
+            "dew._cleanup.signal_group.", "dew._cleanup.exit_code.", "dew._cleanup.groups_ended.",
+            "dew._cleanup.end_group.", "dew._cleanup.process_group.",
             "IPython.display.display.", "IPython.display.update_display.", "IPython.display.clear_output.")
 """What leaves the process: a subprocess, the network, a remote service, another process (a
 notebook's frontend, which IPython's display functions publish to over the kernel's socket; its
-representations, such as `HTML`, are built in the process; a process group `dew.cleanup` signals)."""
+representations, such as `HTML`, are built in the process; a process group `dew._cleanup` signals)."""
 
 
 WAITS = {"wait", "wait_for", "join", "get", "put", "acquire"}
