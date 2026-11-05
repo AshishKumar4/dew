@@ -895,12 +895,13 @@ def test_a_bounded_mixtures_position_saved_before_its_members_counts_resumes_on_
     were counted where their rows are delivered (tests/fixtures/bounded_mixture_position.json,
     bounded_native_mixture_position.json): restored, it delivers the batches that read did after them, each
     consuming the source examples it did there, and counts each member afresh from the resume, its examples
-    counted where they are delivered (row 3312)."""
+    counted where they are delivered (row 3312). Its members shuffled, it was saved under data plan version
+    8, which it reads by (`plan_version`, row 3840), as a run config's resume reads its saved run by."""
     name = "bounded_native_mixture_position.json" if native else "bounded_mixture_position.json"
     recorded = json.loads((Path(__file__).with_name("fixtures") / name).read_text())
     objective = ObjectiveData(train=(Questioned(), ThirdQuestionRefused()))
     data = compile(_members_asked("streamed", native=native), objective=objective, read="streamed",
-                   loading=READ, examples=18)
+                   loading=READ, examples=18, plan_version=8)
     stream = data.train(DataPartition())
     stream.set_state(recorded["state"].encode())
     after = list(stream)
