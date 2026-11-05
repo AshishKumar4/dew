@@ -651,6 +651,37 @@ def test_a_per_group_bias_reaches_its_launch_at_its_groups_extent(generation):
     assert all((rows, width) not in operands for operands in launches), launches
 
 
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_fused_epilogues_intermediates_never_reach_global_memory(generation):
+    """Row 1705: a grouped product's consumers fused into its epilogue (`fuser.fuse` over
+    `fused_gemm.fusible_gemm`: a SiLU of the scaled product plus a residual, cast to bf16), lowered for the
+    GPU, write only their bf16 result: no `[rows, N]` fp32 value, the product's accumulator or anything the
+    consumers compute from it, is a tensor of the program, so none is ever stored to global memory, and the
+    launch's results are the consumers' output alone."""
+    from jax.experimental.pallas import fuser
+    from jax.sharding import AbstractMesh, AxisType
+
+    from dew.nn.kernels import fused_gemm
+    from dew.telemetry.instrumentation import custom_call_kind
+
+    rows, depth, width = 384, 128, 256
+
+    def fused(x, w, sizes, residual):
+        product = fused_gemm.fusible_gemm(x, w, sizes)
+        return (jax.nn.silu(product * 2) + residual.astype(jnp.float32)).astype(jnp.bfloat16)
+
+    args = (jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16),
+            jax.ShapeDtypeStruct((2, depth, width), jnp.bfloat16), jax.ShapeDtypeStruct((2,), jnp.int32),
+            jax.ShapeDtypeStruct((rows, width), jnp.bfloat16))
+    mesh = gpu_mesh(AbstractMesh((1,), ("data",), axis_types=(AxisType.Auto,)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(fuser.fuse(fused)).trace(*args).lower(lowering_platforms=("cuda",))
+    calls = custom_calls(lowered)
+    launches = [call for call in calls if custom_call_kind(call.target) in ("triton", "mosaic_gpu")]
+    assert len(launches) == 1, [call.target for call in calls]
+    assert f"tensor<{rows}x{width}xf32>" not in lowered.as_text()
+
+
 @pytest.mark.parametrize("generation", GPUS)
 def test_an_expert_layer_lowers_for_every_gpu(generation):
     """An expert layer's bf16 forward and backward under 'auto', its grouped matmul and SiLU product as
