@@ -1181,18 +1181,18 @@ def test_a_fused_norm_lowers_for_an_h100(producer):
 
 def _three_gemms(sizes):
     """A fused producer's product three ways: under `fuser.fuse`, unfused, and its float64 truth."""
-    def fused_gemm(operand, w):
+    def fused_product(operand, w):
         return fused_gemm.fusible_gemm(operand, w, sizes, interpret_on_cpu=True)
 
-    def plain_gemm(operand, w):
+    def plain_product(operand, w):
         return gemm.gemm(operand, w, sizes, out_dtype=jnp.float32)
 
-    def truth_gemm(operand, w):
+    def truth_product(operand, w):
         # The matrix's value rounded as the program rounds it; its gradient not (straight through).
         matrix = (w + jax.lax.stop_gradient(w.astype(jnp.bfloat16).astype(w.dtype) - w)).astype(operand.dtype)
         return jax.lax.ragged_dot(operand, matrix, sizes, preferred_element_type=operand.dtype)
 
-    return fused_gemm, plain_gemm, truth_gemm
+    return fused_product, plain_product, truth_product
 
 
 @runs("sm80")
@@ -1216,11 +1216,11 @@ def test_a_fused_producers_gradients_are_its_own(producer):
             return _wide(out)  # fp32, or the truth's float64, as the drawn cotangent is widened
         return with_gradients(transform(value))
 
-    fused_gemm, plain_gemm, truth_gemm = _three_gemms(sizes)
+    fused, plain, truth = _three_gemms(sizes)
 
     with generation.assumed("sm80"):
-        assert_as_exact(jax.jit(loss(fused_gemm, fuser.fuse)), jax.jit(loss(plain_gemm)), draw,
-                        f"{producer.__name__} gradients", seeds=SEEDS, truth_fn=loss(truth_gemm))
+        assert_as_exact(jax.jit(loss(fused, fuser.fuse)), jax.jit(loss(plain)), draw,
+                        f"{producer.__name__} gradients", seeds=SEEDS, truth_fn=loss(truth))
 
 
 @runs("sm80")
@@ -1253,11 +1253,11 @@ def test_a_fused_producers_forward_and_higher_derivatives_are_its_own(compositio
             return jax.jvp(lambda x: program(x, w, weight), (x,), along)[1]
         return run
 
-    fused_gemm, plain_gemm, truth_gemm = _three_gemms(sizes)
+    fused, plain, truth = _three_gemms(sizes)
 
     with generation.assumed("sm80"):
-        assert_as_exact(jax.jit(derivative(fused_gemm, fuser.fuse)), jax.jit(derivative(plain_gemm)), draw,
-                        f"normed operand {composition}", seeds=SEEDS, truth_fn=derivative(truth_gemm))
+        assert_as_exact(jax.jit(derivative(fused, fuser.fuse)), jax.jit(derivative(plain)), draw,
+                        f"normed operand {composition}", seeds=SEEDS, truth_fn=derivative(truth))
 
 
 @runs("sm80")
