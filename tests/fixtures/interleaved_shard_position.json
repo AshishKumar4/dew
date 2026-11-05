@@ -1,0 +1,52 @@
+{
+ "commit": "1af304d0242fe541350e49c67643f80ab1e2a36e",
+ "state": "{\"dew_data_plan\": {\"version\": 8, \"lowering\": \"per-share\", \"manifest\": {\"source\": {\"sources\": [{\"store\": \"memory\", \"identity\": null, \"rows\": 12, \"shard_rows\": 4, \"sha256\": \"11be1566582e24ce80bea155d1f58a895c3544be734d28e18068eada68d60d6a\"}, {\"store\": \"memory\", \"identity\": null, \"rows\": 12, \"shard_rows\": 4, \"sha256\": \"41cb16c72eca7dffb2232e808a47240c559c1ce7bfd4dab2ac77ca29dc89c4ad\"}]}, \"tokenizer\": {}, \"fill\": {}, \"codec\": 1, \"schema\": 1, \"steps\": [{\"name\": \"dew.data.pipeline.BatchStage\", \"config\": \"BatchStage(size=2, drop_remainder=True, batch_fn=None)\", \"exact\": true, \"declared\": null, \"dependencies\": {}}]}, \"environment\": {\"revision\": \"1af304d0242fe541350e49c67643f80ab1e2a36e\", \"lock\": \"845125234c80eb224d24b7a7d2e1bba5fb8a333429b147fbe77d56680d179a56\", \"python\": \"3.12.15\", \"platform\": \"Linux-6.18.56-cloudflare-microvm-2026.10.9-x86_64-with-glibc2.41\", \"clean\": true, \"modules\": [[]]}, \"order\": {\"read\": \"streamed\", \"seed\": 0, \"corpora\": [{\"source\": \"memory:11be1566582e24ce80bea155d1f58a895c3544be734d28e18068eada68d60d6a\", \"stages\": []}, {\"source\": \"memory:41cb16c72eca7dffb2232e808a47240c559c1ce7bfd4dab2ac77ca29dc89c4ad\", \"stages\": []}], \"members\": [\"name:left\", \"name:right\"], \"weights\": [1.0, 1.0], \"shares\": \"accepted rows\", \"stages\": [\"BatchStage(size=2, drop_remainder=True, batch_fn=None)\"]}, \"derived\": {}, \"topology\": {\"shares\": 1, \"share\": 0, \"workers\": 0, \"row_multiple\": 1, \"cycle_lengths\": []}, \"rejections\": \"drop\", \"cache\": [], \"volatile\": false, \"members\": {\"\": \"a63bc0df5ced1ff8deff10a8c034d2df15e26a0cb58967fe87ae3bb93f34fe6a\", \"0:name:left\": \"ad8da81803a45b9753ee09a4349e1c9900b20be44c53a1bfb7cc47ba6daaf847\", \"0:name:right\": \"ff481834a402e9aa6cb325b60aa83e451ec5799a823e9bfdf7f38873d1d7a29b\"}, \"exact\": true}, \"counters\": 2, \"iterator\": {\"parents\": {\"0:name:left\": {\"parent\": {\"parent\": {\"parent\": {\"next_index_in_cycle\": 0, \"next_index_in_datasets\": 1, \"iterators_in_use_indices\": [0], \"iterators_in_use_states\": [{\"parent\": {\"next_index\": 4}, \"yielded\": true}], \"exhausted\": [0], \"future_states\": {}}, \"dew.corpus_counts\": {\"corpus\": \"left\", \"label\": \"left\", \"counts\": {\"attempted\": 4, \"accepted\": 4, \"truncated\": 0, \"delivered_rows\": 4, \"chunks\": 0, \"chunk_records\": 0, \"rejected\": {}, \"left_out\": {}, \"cut_examples\": {}, \"cut_rows\": {}, \"cut_removed\": {}, \"rejected_cut\": {}, \"left_out_cut\": {}, \"declined\": {}}, \"consecutive\": 0, \"warned\": false, \"consumed\": 0, \"members\": {}}}, \"dew.corpus_counts\": {\"corpus\": \"left\", \"label\": \"left\", \"counts\": {\"attempted\": 4, \"accepted\": 4, \"truncated\": 0, \"delivered_rows\": 4, \"chunks\": 0, \"chunk_records\": 0, \"rejected\": {}, \"left_out\": {}, \"cut_examples\": {}, \"cut_rows\": {}, \"cut_removed\": {}, \"rejected_cut\": {}, \"left_out_cut\": {}, \"declined\": {}}, \"consecutive\": 0, \"warned\": false, \"consumed\": 0, \"members\": {}}}}, \"0:name:right\": {\"parent\": {\"parent\": {\"parent\": {\"next_index_in_cycle\": 0, \"next_index_in_datasets\": 1, \"iterators_in_use_indices\": [0], \"iterators_in_use_states\": [{\"parent\": {\"next_index\": 4}, \"yielded\": true}], \"exhausted\": [0], \"future_states\": {}}, \"dew.corpus_counts\": {\"corpus\": \"right\", \"label\": \"right\", \"counts\": {\"attempted\": 4, \"accepted\": 4, \"truncated\": 0, \"delivered_rows\": 4, \"chunks\": 0, \"chunk_records\": 0, \"rejected\": {}, \"left_out\": {}, \"cut_examples\": {}, \"cut_rows\": {}, \"cut_removed\": {}, \"rejected_cut\": {}, \"left_out_cut\": {}, \"declined\": {}}, \"consecutive\": 0, \"warned\": false, \"consumed\": 0, \"members\": {}}}, \"dew.corpus_counts\": {\"corpus\": \"right\", \"label\": \"right\", \"counts\": {\"attempted\": 4, \"accepted\": 4, \"truncated\": 0, \"delivered_rows\": 4, \"chunks\": 0, \"chunk_records\": 0, \"rejected\": {}, \"left_out\": {}, \"cut_examples\": {}, \"cut_rows\": {}, \"cut_removed\": {}, \"rejected_cut\": {}, \"left_out_cut\": {}, \"declined\": {}}, \"consecutive\": 0, \"warned\": false, \"consumed\": 0, \"members\": {}}}}}, \"index\": 8, \"stop\": false}}",
+ "before": [
+  [
+   1,
+   101
+  ],
+  [
+   2,
+   102
+  ],
+  [
+   3,
+   103
+  ]
+ ],
+ "after_ids": [
+  [
+   9,
+   109
+  ],
+  [
+   10,
+   110
+  ],
+  [
+   11,
+   111
+  ],
+  [
+   12,
+   112
+  ],
+  [
+   5,
+   105
+  ],
+  [
+   6,
+   106
+  ],
+  [
+   7,
+   107
+  ],
+  [
+   8,
+   108
+  ]
+ ]
+}

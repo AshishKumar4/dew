@@ -107,7 +107,8 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
                 splits_held: int = derive.FORMS_HELD) -> Derived:
     """`declaration`'s chunk forms (the module's account), split into what every chunk computes at once and
     what its carry computes in sequence (`carry.split`, under `saturation`'s limits, the latest
-    `splits_held` contexts' and shapes' splits kept, as a declaration's forms are, `derive.FORMS_HELD`):
+    `splits_held` contexts' and shapes' splits kept: the bound `derive.FORMS_HELD` sets a declaration's
+    forms, given apart only so a test reaches eviction without 65 derivations, never a knob to tune):
     `init(shapes)` a zero state and no decay, `prepare(chunk)` a chunk's values that read no state
     (`Prepared`), `step(state, prepared)` the state after the chunk, `mapped(prepared, state)` the chunk's
     outputs from the state entering it, `merge(a, b)` two consecutive walks' states joined (the later walk's
