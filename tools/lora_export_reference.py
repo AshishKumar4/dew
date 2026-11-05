@@ -251,6 +251,7 @@ def pipeline_outputs(family: str, adapter: Path, *, wide: bool):
     from tools.diffusers_consumer import precision
 
     component = "unet" if family == "sd" else "transformer"
+    # The float64 context only while loading and running: the other precision's pipelines run between.
     with source_directory(family) as source, precision(wide):
         pipes = [_pipeline(family, source, torch.float64 if wide else torch.float32) for _ in range(2)]
         for pipe in pipes:
@@ -258,17 +259,17 @@ def pipeline_outputs(family: str, adapter: Path, *, wide: bool):
             weights = load_file(str(adapter / "pytorch_lora_weights.safetensors"))
             assert_landed(getattr(pipe, component), weights, f"{component}.")
         pipes[1].fuse_lora()
-        model, fused = (getattr(pipe, component) for pipe in pipes)
+    model, fused = (getattr(pipe, component) for pipe in pipes)
 
-        def run(arrays):
-            with torch.no_grad(), precision(wide):
-                adapted = _prediction(family, model, arrays, wide)
-                pipes[0].disable_lora()
-                plain = _prediction(family, model, arrays, wide)
-                pipes[0].enable_lora()
-                return {"adapted": adapted, "merged": _prediction(family, fused, arrays, wide), "base": plain}
+    def run(arrays):
+        with torch.no_grad(), precision(wide):
+            adapted = _prediction(family, model, arrays, wide)
+            pipes[0].disable_lora()
+            plain = _prediction(family, model, arrays, wide)
+            pipes[0].enable_lora()
+            return {"adapted": adapted, "merged": _prediction(family, fused, arrays, wide), "base": plain}
 
-        yield run
+    yield run
 
 
 def consume() -> None:
