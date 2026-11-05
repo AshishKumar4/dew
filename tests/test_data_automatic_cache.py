@@ -113,8 +113,7 @@ def test_a_chain_reads_the_same_records_and_plan_with_or_without_its_automatic_c
     """An automatic cache holds what its maps make, a rejection included, so a run reads the same
     records in the same order whether it fills the cache, reads it back or opts out, and its plan,
     which names no automatic cache, is the same: a position one run saves resumes in either. A read
-    by index caches no map that rejects, whose cache it would read back as a stream, slower than it
-    reruns the map."""
+    by index caches a map that rejects too, reading each input's outputs back (row 803)."""
     def chain():
         return mapped(Counted(rejects=rejects))
 
@@ -126,7 +125,7 @@ def test_a_chain_reads_the_same_records_and_plan_with_or_without_its_automatic_c
 
     uncached = read(chain(), how, cache=False, passes=2)
     assert read(chain(), how, passes=2) == uncached
-    assert bool(generations()) == (how == "memory" or not rejects)
+    assert generations()
     assert read(chain(), how, passes=2) == uncached
     assert plan(cache=True) == plan(cache=False)
 
