@@ -324,8 +324,8 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
             arrays += [m0, total0, acc0]
         out_shape = [jax.ShapeDtypeStruct((batch, queries, heads, value_width), query.dtype)]
         out_specs = [pl.BlockSpec((None, block_q, None, value_width), lambda i, b, h: (b, i, h, 0))]
+        per_row = pl.BlockSpec((None, None, block_q), lambda i, b, h: (b, h, i))
         if residuals is not Kept.NONE:
-            per_row = pl.BlockSpec((None, None, block_q), lambda i, b, h: (b, h, i))
             out_shape += [jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)] * 2
             out_specs += [per_row, per_row]
         if residuals is Kept.SPLIT:
@@ -354,7 +354,6 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         # The plain launch writes which rows overflowed; the second, issued only where one did, walks again
         # only the programs with one, its outputs the plain launch's (`_forward_kernel`): ordinary inputs
         # take the one launch and a check.
-        per_row = pl.BlockSpec((None, None, block_q), lambda i, b, h: (b, h, i))
         flagged = jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)
         *out, flags = launch(functools.partial(kernel, guard="flag"), in_specs=in_specs,
                              out_specs=[*out_specs, per_row], out_shape=[*out_shape, flagged],
