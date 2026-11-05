@@ -217,10 +217,13 @@ def test_a_zero_gradient_is_held_from_the_programs_start_where_its_gradients_are
     def loss(params, rows):
         return jnp.sum(jnp.tanh(jnp.tanh(rows @ params["used"]) @ params["used"])), ()
 
-    held = gradient_peak(loss, params, (rows,), platform="gpu", workspace=Workspace(0, 0)).bytes
-    read = gradient_peak(loss, {"used": params["used"]}, (rows,), platform="gpu",
-                         workspace=Workspace(0, 0)).bytes
-    assert held == read + 128 * 128 * 4, (held, read)
+    # However the weight gradients run, after the backward too (`sunk`, `late_weight_gradients`).
+    for deferred in (False, True):
+        held = gradient_peak(loss, params, (rows,), platform="gpu", workspace=Workspace(0, 0),
+                             deferred=deferred).bytes
+        read = gradient_peak(loss, {"used": params["used"]}, (rows,), platform="gpu",
+                             workspace=Workspace(0, 0), deferred=deferred).bytes
+        assert held == read + 128 * 128 * 4, (deferred, held, read)
 
 
 def test_a_loops_zero_carry_is_made_where_the_loop_needs_it():
@@ -265,6 +268,31 @@ def test_a_tied_weights_cast_twice_and_held_by_a_barrier_holds_one_cast():
     peaks = [peak_bytes(deduplicated(compiled(jax.make_jaxpr(function)(weights, rows).jaxpr, "cuda")), "gpu",
                         Workspace(0, 0)) for function in (tied, once)]
     assert peaks[0] == peaks[1], peaks
+
+
+def test_two_callbacks_of_one_factory_are_each_their_own():
+    """Equal equations are one where XLA computes them once, which it never does for two callbacks: JAX
+    lowers each to a custom call of its own host callback's index (`emit_python_callback`,
+    jax/_src/callback.py), and two closures of one factory share the module and qualified name their
+    parameters are keyed by (`parameter_key`), so each callback holds its own result (review of row 4089)."""
+    from dew.training.compiled_program import compiled
+    from dew.training.footprint import deduplicated
+
+    def scaled(scale):
+        def callback(rows):
+            return rows * scale
+        return callback
+
+    rows = jax.ShapeDtypeStruct((256, 256), jnp.float32)
+
+    def two(rows):
+        first = jax.pure_callback(scaled(2.0), rows, rows)
+        second = jax.pure_callback(scaled(3.0), rows, rows)
+        return first @ second
+
+    program = compiled(jax.make_jaxpr(two)(rows).jaxpr, "cuda")
+    assert [equation.primitive.name for equation in program.eqns].count("pure_callback") == 2
+    assert len(deduplicated(program).eqns) == len(program.eqns)
 
 
 def test_a_loops_carry_read_and_written_through_an_axis_of_one_holds_one_buffer():
