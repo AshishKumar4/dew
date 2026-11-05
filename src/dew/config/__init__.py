@@ -1069,53 +1069,12 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     (`earlier_newton_schulz`); a profile window's capture options as its capture's (`earlier_profile`); a
     decision run's option text as its rows wrote it (`earlier_option_text`); its data plan version as the
     one it read by (`earlier_data_plan`); a chain's store under the
-    fields its class renamed since, by today's names (`dew.data.records.earlier_chains`); a trainer's
-    stop that held a Pause alone as that Pause (`earlier_stop`); and its model's components in today's
-    fields, as its checkpoint's record reads them (`dew.inference.tasks.earlier_model`, ledger 2423).
-    Every reader of a saved run's record reads it through here (`saved_record`): its rebuild
-    (`RunConfig.load`) and its resume (`RunConfig.resumed`, `check_resume`), all but the param groups
-    read alone, which no earlier shape changed (`recorded_param_groups`); `RunConfig.from_dict` reads
-    today's shapes alone.
+    fields its class renamed since, by today's names (`dew.data.records.earlier_chains`).
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
-    return earlier_run_model(earlier_stop(records.earlier_chains(earlier_data_plan(earlier_option_text(
-        earlier_profile(earlier_newton_schulz(earlier_trainer(record))))), _CHAINS)))
-
-
-def saved_record(path: epath.Path) -> Mapping[str, object] | None:
-    """The record of the saved run whose run.json is `path` (`RUN_FILE`), in the shapes Dew writes now
-    (`earlier_run`); None where none was saved. The packages it trusts are imported first
-    (`dew.registry.import_trusted`), by its reader."""
-    if not path.exists():
-        return None
-    return earlier_run(json.loads(path.read_text()))
-
-
-def earlier_stop(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A saved run's record whose trainer's `stop` names no class: written while `stop` held a Pause alone,
-    its fields are a Pause's (row 2239). Carried to 1.0 (ledger 1552)."""
-    fields = record.get("fields")
-    trainer = fields.get("trainer") if isinstance(fields, Mapping) else None
-    inner = trainer.get("fields", trainer) if isinstance(trainer, Mapping) else None
-    stop = inner.get("stop") if isinstance(inner, Mapping) else None
-    if not isinstance(stop, Mapping) or "class" in stop:
-        return record
-    assert isinstance(fields, Mapping) and isinstance(trainer, Mapping) and isinstance(inner, Mapping)
-    inner = {**inner, "stop": {"class": f"{Pause.__module__}:Pause", "fields": stop}}
-    return {**record, "fields": {**fields, "trainer": {**trainer, "fields": inner} if "fields" in trainer
-                                 else inner}}
-
-
-def earlier_run_model(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A saved run's record with its model's components in today's fields, as its checkpoint's record
-    reads them (`dew.inference.tasks.earlier_model`, ledger 2423). Carried to 1.0 (ledger 1552)."""
-    fields = record.get("fields")
-    if not isinstance(fields, Mapping) or not isinstance(fields.get("model"), Mapping):
-        return record
-    from dew.inference.tasks import earlier_model
-
-    return {**record, "fields": {**fields, "model": earlier_model({"model": fields["model"]})["model"]}}
+    return records.earlier_chains(earlier_data_plan(earlier_option_text(earlier_profile(
+        earlier_newton_schulz(earlier_trainer(record))))), _CHAINS)
 
 
 def earlier_data_plan(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -1589,9 +1548,23 @@ class RunConfig:
         """Read back what `to_dict` wrote, for subclasses too. A field the
         record lacks takes its default; an unknown field raises. A chain
         recorded as unrecorded, or a recipe's record written before runs
-        recorded chains, is refused by name. A saved run's record is read in
-        today's shapes first (`saved_record`)."""
+        recorded chains, is refused by name. A model recorded with an earlier
+        main's fields reads as its checkpoint's record does."""
+        from dew.inference.tasks import earlier_model
+
         rest = {name: value for name, value in values.items() if name not in _CHAINS}
+        trainer = rest.get("trainer")
+        fields = trainer.get("fields", trainer) if isinstance(trainer, Mapping) else {}
+        stop = fields.get("stop")
+        if isinstance(trainer, Mapping) and isinstance(stop, Mapping) and "class" not in stop:
+            # A record written while `stop` held a Pause alone names no class: its fields are a Pause's.
+            # Carried until 1.0 (ledger 1552).
+            fields = {**fields, "stop": {"class": f"{Pause.__module__}:Pause", "fields": stop}}
+            rest = {**rest, "trainer": {**trainer, "fields": fields} if "class" in trainer else fields}
+        # A model recorded before its components' fields changed reads as today's, as its checkpoint's
+        # record does (`earlier_model`, ledger 2423).
+        if isinstance(rest.get("model"), Mapping):
+            rest["model"] = earlier_model({"model": rest["model"]})["model"]
         chains = {name: _read_chain(name, values[name]) for name in _CHAINS if name in values}
         return dataclasses.replace(from_record(cls, rest, dtypes=False), **chains)
 
@@ -1741,10 +1714,12 @@ class RunConfig:
 
     @staticmethod
     def _saved_record(directory: str, checkpoints: Checkpoints) -> Mapping[str, object] | None:
-        """The record of the saved run in its checkpoints' `directory` (`saved_record`), its option text
-        as its checkpoints wrote it (`earlier_option_writing`); None where none was saved."""
-        saved = saved_record(epath.Path(directory) / RUN_FILE)
-        return None if saved is None else earlier_option_writing(saved, checkpoints)
+        """The record of the saved run in its checkpoints' `directory`, read as every earlier shape of a
+        saved run is (`earlier_run`); None where none was saved."""
+        saved = epath.Path(directory) / RUN_FILE
+        if not saved.exists():
+            return None
+        return earlier_option_writing(earlier_run(json.loads(saved.read_text())), checkpoints)
 
     @classmethod
     def cli(cls, args: Sequence[str] | None = None, *, default: Self | None = None) -> Self:
@@ -1827,7 +1802,7 @@ class RunConfig:
         `trust` names the packages outside Dew the record may import."""
         path = epath.Path(directory)
         named_file = str(directory).endswith(".json")
-        file = path if named_file else path / RUN_FILE
+        record = json.loads((path if named_file else path / RUN_FILE).read_text())
         # The packages trusted first, so the record's earlier shapes are read with its classes imported.
         registry.import_trusted(record, trust)
         # A field its record left to its checkpoints (`earlier_option_writing`) is read where the run resumes
