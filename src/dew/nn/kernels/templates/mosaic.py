@@ -1449,6 +1449,11 @@ class Transport[Allocated, Opened](abc.ABC):
     threads (mma.sync's row and column layouts): a program writes such a sum to a place of its own
     instead."""
 
+    adds_through_shared: bool = True
+    """Whether `added` reads its value through its `smem` (TMA's reduction from a staged tile), which is then
+    live wherever a walk adds; an atomic add from registers (cp.async's `red.global`) reads none, so a tile
+    staged for the program's stores alone may be scoped after its walks (`scoped`'s `after_walks`)."""
+
     cluster: int = 1
     """The programs a cluster of the family's launch takes where they read a block in common (`kernel`'s
     `cluster`), each loading its share of the block multicast into every one's shared memory (`streams`'
@@ -1498,10 +1503,29 @@ class Transport[Allocated, Opened](abc.ABC):
         `reducing_warpgroups` (the block's, where its arithmetic may reduce across warps implicitly) each
         reserving its share of reduction scratch (`warpgroup_reduction_scratch`)."""
 
-    @abc.abstractmethod
-    def scoped(self, body, *allocations, streams):
+    def scoped(self, body, *allocations, streams, after_walks: tuple = ()):
         """`body(*refs, streams=...)` with `allocations` scoped across the program's roles and its streams'
-        (`streams`), and what it returns."""
+        (`streams`), and what it returns. With `after_walks`, allocations no walk reads, `body` takes
+        `after` too: `after(fn)` runs `fn(*refs)` of them once a role's walks have ended, in a scope of their
+        own where the family scopes its walks apart (`walks_scoped`: the walks' slots reused, as
+        `resources.Scope.after` counts them), the program's otherwise."""
+        if not after_walks:
+            return self.program_scoped(body, *allocations, streams=streams)
+        if self.walks_scoped:
+            return self.program_scoped(
+                functools.partial(body, after=lambda fn: pl.run_scoped(fn, *after_walks)), *allocations,
+                streams=streams)
+        held = len(allocations)
+
+        def program(*refs, streams):
+            return body(*refs[:held], streams=streams, after=lambda fn: fn(*refs[held:]))
+
+        return self.program_scoped(program, *allocations, *after_walks, streams=streams)
+
+    @abc.abstractmethod
+    def program_scoped(self, body, *allocations, streams):
+        """`body(*refs, streams=...)` with `allocations` scoped across the program's roles and its streams'
+        (`streams`), and what it returns: the program's one scope (`scoped`'s)."""
 
     @abc.abstractmethod
     def roles(self, consumers: int, consumer, producer) -> None:
@@ -1788,7 +1812,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                       reduction_scratch=(self.reduction_scratch
                                          + self.warpgroup_reduction_scratch * reducing_warpgroups))
 
-    def scoped(self, body, *allocations, streams):
+    def program_scoped(self, body, *allocations, streams):
         return pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams,
                              collective_axes="wg")
 
