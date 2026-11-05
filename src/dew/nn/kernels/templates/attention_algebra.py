@@ -1143,8 +1143,9 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     forms' (`dew.algebra.forms.derived`, `_derived_step`), but for a dropping call's: the derivation narrows a
     dropped weight unnormalized, past fp16's largest at a rate near 1 (a multiplier of 2^16), where this
     step's scaled parts (`weights_parts`) keep it, a representation the declaration states none of."""
-    # A compensated walk's step takes its state's dropped roundings through the derived step's hooks.
-    if states_derived(spec, state._replace(low=None)) and keys.coords.drop is None:
+    # A compensated or guarded walk's step takes its dropped roundings and its shifts through the derived
+    # step's own hook (`_derived_step`); only its merges and its finish are the template's.
+    if states_derived(spec, state._replace(low=None, guard=None)) and keys.coords.drop is None:
         return _derived_step(spec, state, keys)
     m, factor, p, value, held = _softmax(spec, state, keys)
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
@@ -1881,47 +1882,50 @@ def _stated(spec: Forward, state: Partial) -> tuple[tuple, dict]:
 
 def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     """`plain_step` by the derived forms: the tile's logits (-inf where a query does not see a key, as
-    `modify` writes them) and values; the weighted values' sums the mainloop's own where it holds them
-    (`Keys.accumulate`), every product the mainloop's (`Keys.dot`). A compensated walk's
-    (`Forward.compensated`, the state's `Low`) takes its sums' additions through the derived step's hooks as
-    `stepped` takes them: the tile's products a chunk of keys each (`products_of`), each sum's additions with
-    their roundings kept (`kept_in_turn`), what earlier ones dropped taken by the same factor."""
+    `modify` writes them) and values, its maximum, rescale and weights the forms'; the weighted values' sums
+    the mainloop's own where it holds them (`Keys.accumulate`), every product the mainloop's (`Keys.dot`). A
+    compensated walk's (the state's `Low`) and a guarded one's (its `Guard`) take their sums as the template's
+    step takes them (`stepped`, the one owner of both): the tile's products a chunk of keys each, each
+    addition's rounding kept, and on the guarded walk each live row's shift (`room`, from the forms' weights
+    and the tile's values) with the unshifted sums beside them."""
     # Over the raw products where the mainloop gives them (`logits_of`), their factor the declaration's own.
     raw = keys.products is not None
     key = (spec.base2, bool(keys.coords.keys_first), spec.factor if raw else None, *_form_key(spec))
     forms = derived_forms(*key)
     tiles = {"logits": keys.products if raw else keys.logits, "values": keys.values}
     fields = _slotted(key, {name: (value.shape, value.dtype) for name, value in tiles.items()})
-    held_by, low = keys.accumulate, state.low
-    dropped: dict[str, jax.Array] = {}
-
-    def accumulate(acc, factor, weights, values):
-        def scale(held):
-            return keys.coords.queries(factor, held) * held
-
-        if low is not None:
-            sums = products_of((weights,), values, keys.dot, chunk_of(spec))
-            acc, dropped["acc"] = kept_in_turn(scale(acc), scale(low.acc), sums)
-            return acc
-        assert held_by is not None
-        return held_by(acc, scale, (weights,), values)
-
-    def add(total, factor, summed):
-        total, dropped["total"] = kept_in_turn(total * factor, low.total * factor, (summed,))
-        return total
+    held_by, plain = keys.accumulate, state.low is None and state.guard is None
+    after: list[Partial] = []
 
     def own(states, parts):
-        # The weighted values' sums the mainloop's or a compensated walk's, its denominator a compensated
-        # walk's; every other state the forms'.
-        return tuple(accumulate(current, *part) if isinstance(part, Accumulated)
-                     else add(current, part.factor, part.sum)
-                     if isinstance(part, Added) and low is not None else None
-                     for current, part in zip(states, parts, strict=True))
+        taken = dict(zip(fields, parts, strict=True))
+        accumulated, added = taken["acc"], taken["total"]
+        assert isinstance(accumulated, Accumulated)
+        if plain:
+            # The weighted values' sums the mainloop's accumulators hold; every other state the forms'.
+            def scale(held):
+                return keys.coords.queries(accumulated.factor, held) * held
 
-    stepped = forms.step(tuple(getattr(state, field) for field in fields), tiles, product=keys.dot,
-                         stepped=None if held_by is None and low is None else own)
-    kept = None if low is None else Low(dropped["acc"], dropped["total"])
-    return Partial(**dict(zip(fields, stepped, strict=True)), low=kept)
+            assert held_by is not None
+            acc = held_by(states[fields.index("acc")], scale, (accumulated.weights,), accumulated.values)
+            return tuple(acc if field == "acc" else None for field in fields)
+        assert isinstance(added, Added)
+        # The template's step over the forms' weights (the denominator's terms, before their narrowing for
+        # the product) and rescale.
+        value, p, factor = accumulated.values, added.terms, added.factor
+        held = None
+        if state.guard is not None:
+            largest = keys.largest if keys.largest is not None else functools.partial(magnitudes, value)
+            held = room(state.guard, state.total, factor, p, largest())
+        weights = p if held is None else held.weights
+        times = functools.partial(_times, keys.dot, value, multiplier=None, chunk=chunk_of(spec))
+        after.append(stepped(state, state.m, factor, weights, times(weights), held, times))
+        return tuple(getattr(after[0], field) if field in ("acc", "total") else None for field in fields)
+
+    derived = forms.step(tuple(getattr(state, field) for field in fields), tiles, product=keys.dot,
+                         stepped=None if held_by is None and plain else own)
+    found = Partial(**dict(zip(fields, derived, strict=True)))
+    return found if not after else found._replace(guard=after[0].guard, low=after[0].low)
 
 
 def _rows(state: Partial) -> Partial:
