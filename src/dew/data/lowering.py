@@ -163,7 +163,8 @@ def _dropping(pipeline: Pipeline, lowering: _Lowering) -> bool:
     """Whether a read can drop records before its batch: a step that drops or expands records, a
     Grain step of the caller's, or a cache read as each input's outputs, in it or in a corpus it
     mixes."""
-    if lowering.cache is not None and not lowering.one_to_one:
+    if lowering.cache is not None and not lowering.one_to_one and not _transparent(pipeline, lowering.cache):
+        # A transparent cache drops what the steps it stands for drop, which the stages below count.
         return True
     if any(_dropping(child, analyzed)
            for child, analyzed in zip(children(pipeline), lowering.children, strict=True)):

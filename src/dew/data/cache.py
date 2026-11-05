@@ -258,7 +258,10 @@ class Cache:
         except (OSError, sqlite3.Error) as error:
             if not self.read_on(error, "looks up nothing"):
                 raise
-            return computed
+            if not transparent:
+                return computed
+            # A transparent read computes its records in the form it saves with the cache read.
+            return _CachedReader(reader, self, key, transform, _Computed(), source, transparent=True)
         return _CachedReader(reader, self, key, transform,
                              None if published is None
                              else _Published(published, transform, self if self.optional else None), source,
@@ -872,7 +875,7 @@ class _CachedReader:
     cache: Cache
     key: DependencyManifest
     transform: Transform | None
-    published: _Published | None
+    published: _Published | _Computed | None
     source: Source | None = None
     transparent: bool = False
 
@@ -889,7 +892,7 @@ class _CachedIter(grain.IterDataset):
         key: DependencyManifest,
         shard: Shard,
         transform: Transform | None,
-        published: _Published | None,
+        published: _Published | _Computed | None,
         source: Source | None,
         transparent: bool,
     ):
@@ -908,9 +911,11 @@ class _CachedIter(grain.IterDataset):
         another ID (another mount, a stream cut into more shards than it has) runs its steps and
         writes nothing, so the key holds no rows under its IDs."""
         published = self.published
-        return (_opened_writer(self.cache, self.key, source=self.source) if published is None
-                else published if published.generation.holds((self.shard.id, 0))
-                else _Computed())
+        if published is None:
+            return _opened_writer(self.cache, self.key, source=self.source)
+        if isinstance(published, _Computed) or published.generation.holds((self.shard.id, 0)):
+            return published
+        return _Computed()
 
 
 class _CachedIterator(grain.DatasetIterator):

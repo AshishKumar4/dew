@@ -190,6 +190,10 @@ def _automatic(pipeline: Pipeline, read: Read, root: str | None) -> Pipeline:
 
     if root is None:
         return pipeline
+    if read == "streamed" and any(isinstance(stage, MapWithIndex) for stage in pipeline.stages):
+        # A stream positions its records once, under the steps that read their places, which a cache
+        # standing for some of them would split.
+        return pipeline
     if isinstance(pipeline.source, (Mixture, Phases)):
         return with_children(pipeline, lambda child: _automatic(child, read, root))
     if any(isinstance(stage, Artifact) for stage in _steps(pipeline)):
