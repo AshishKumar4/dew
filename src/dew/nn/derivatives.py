@@ -190,6 +190,17 @@ def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[...,
         flat, structure = jax.tree.flatten(arguments)
         closed, shaped = jax.make_jaxpr(lambda *leaves: function(*jax.tree.unflatten(structure, leaves)),
                                         return_shape=True)(*flat)
+        # A value of the enclosing trace the function closes over (a kernel's mask, a reference's operand) is
+        # one of the call's operands, leading its arguments, as a closed-over value is no constant there.
+        held = [isinstance(const, jax.core.Tracer) for const in closed.consts]
+        if any(held):
+            lifted = [const for const, is_held in zip(closed.consts, held, strict=True) if is_held]
+            closed = closed.replace(
+                constvars=[var for var, is_held in zip(closed.constvars, held, strict=True) if not is_held],
+                invars=[*(var for var, is_held in zip(closed.constvars, held, strict=True) if is_held),
+                        *closed.invars],
+                consts=[const for const, is_held in zip(closed.consts, held, strict=True) if not is_held])
+            flat = [*lifted, *flat]
         outputs = marked_call_p.bind(*flat, call_jaxpr=closed, kind=kind)
         return jax.tree.unflatten(jax.tree.structure(shaped), outputs)
     return call
