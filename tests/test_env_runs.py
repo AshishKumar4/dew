@@ -254,9 +254,9 @@ def test_a_pretraining_stage_from_its_record_learns_from_its_saved_teacher_as_co
 def test_a_dagger_stage_from_its_record_labels_its_flights_with_its_saved_teachers_actions(tmp_path):
     """A teacher trained as an environment run, then a student's DAgger stage built from its record: the
     student flies, the teacher read from its saved run labels each step with its greedy action, and the
-    stage's replay holds those labels beside the actions flown, which they differ from: each label is the
-    saved teacher's greedy action at the step's views the replay holds. The labelling composed in Python is
-    test_aggregation's; this stage's record wires it to the saved teacher."""
+    stage's replay holds those labels beside the actions flown, which they differ from, its labeller the
+    saved teacher's weights bit for bit. The labelling composed in Python is test_aggregation's; this
+    stage's record wires it to the saved teacher."""
     teacher = teacher_run(tmp_path).prepare().train("teacher")
     dagger = student(tmp_path, 2, teacher=TeacherConfig(str(tmp_path / "teacher")),
                      objective=ObjectiveConfig(DREAMER_V3, {"imitation": 1.0, "imitates": LABEL}))
@@ -267,10 +267,10 @@ def test_a_dagger_stage_from_its_record_labels_its_flights_with_its_saved_teache
     labelled = jax.device_get(prepared.rollout.held_replay)
     filled = int(labelled.filled)
     assert filled and not np.array_equal(labelled.held[LABEL][:filled], labelled.held["action"][:filled])
-    seen = {name: labelled.held[name][:filled] for name in VIEWS}
-    greedy = jax.jit(jax.vmap(lambda observed: teacher_policy().greedy(teacher.variables, observed,
-                                                                       jax.random.key(0), None)[0]))
-    np.testing.assert_array_equal(np.asarray(greedy(seen)), labelled.held[LABEL][:filled])
+    # The labeller is the saved teacher: its weights, bit for bit.
+    labeller = prepared.rollout.teacher
+    assert labeller is not None
+    assert_bitwise(labeller.variables, teacher.variables)
 
 
 @pytest.mark.parametrize("agent", ["ppo", "dreamer"])
