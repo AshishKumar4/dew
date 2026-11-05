@@ -425,6 +425,7 @@ JEPA_STAGE_CELLS = [cell for cell in cells_of("jepa_encoder") if cell[2] == "2x2
 VIDEO_DIT_CELLS = [cell for cell in cells_of("video_dit") if cell[2] == "2x4 fsdp"]
 GEMMA4_MOE_CELLS = [cell for cell in cells_of("causal_transformer+gemma4_moe") if cell[2] == "2x4 fsdp"]
 MLA_CELLS = [cell for cell in cells_of("causal_transformer+mla") if cell[2] == "2x4 fsdp"]
+HYBRID_DIT_CELLS = cells_of("hybrid_dit")
 """The cases whose layout cells' draws run as armada's map tasks (`check1_shards`), each a test of its own
 with the seeds a task draws within 120 s on one core: a map task records its draws (70 to 93 s fixed,
 `map_judge.drawing`), and the one that draws an arm's placed seed checks that arm's `fit` beside them
@@ -432,10 +433,12 @@ with the seeds a task draws within 120 s on one core: a map task records its dra
 cells took 188 and 198 s whole and GLM-4 MoE's 95 and 140 s (CI's durations record); a map task of 64
 seeds of one GPT-OSS cell took 38 to 75 s, of 32 seeds of a GLM-4 MoE cell 40 to 68 s (armada, 11-03),
 each task drawing every cell of its test. The video DiT's, Gemma 4 MoE's and MLA's fsdp cells took 138,
-129 and 114 s whole (CI's durations record, train 569), each the test's one cell, as a task draws them."""
+129 and 114 s whole (CI's durations record, train 569), each the test's one cell, as a task draws them;
+the hybrid DiT's data and fsdp cells 84 and 201 s (CI, train 581)."""
 
 SHARDED_CELLS = [*THREE_D_UNET_CELLS, *UNET_CELLS, *HIERARCHICAL_MMDIT_CELLS, *QWEN35_CELLS, *GPT_OSS_CELLS,
-                 *GLM4_MOE_CELLS, *JEPA_STAGE_CELLS, *VIDEO_DIT_CELLS, *GEMMA4_MOE_CELLS, *MLA_CELLS]
+                 *GLM4_MOE_CELLS, *JEPA_STAGE_CELLS, *VIDEO_DIT_CELLS, *GEMMA4_MOE_CELLS, *MLA_CELLS,
+                 *HYBRID_DIT_CELLS]
 UNSHARDED_CELLS = [cell for cell in LAYOUT_CELLS if cell not in SHARDED_CELLS]
 
 
@@ -494,6 +497,13 @@ def test_a_hierarchical_mmdit_trains_on_every_layout_as_on_one_device(case, step
 @pytest.mark.check1_shards(seeds=64, per_task=16)
 def test_a_qwen35_decoder_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
     """`test_architecture_trains_on_every_layout_as_on_one_device` over the Qwen3.5 decoder."""
+    assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
+
+
+@pytest.mark.parametrize(("case", "steps", "layout"), HYBRID_DIT_CELLS, ids=cell_ids(HYBRID_DIT_CELLS))
+@pytest.mark.check1_shards(seeds=8, per_task=2)
+def test_a_hybrid_dit_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
+    """`test_architecture_trains_on_every_layout_as_on_one_device` over the hybrid DiT."""
     assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
 
 

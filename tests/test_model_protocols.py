@@ -479,11 +479,11 @@ def _reference(name: str, call: tuple) -> tuple[Callable, Callable]:
 @pytest.mark.parametrize("name", PATHS)
 def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name):
     """The resized model reads the same variables to the model's logits, both in one program, bit for bit,
-    and a causal one decodes into a cache of `CAPACITY` slots and draws the same tokens. Its attention
-    reduces over the shorter cache, so the cached logits are the model's bits or as exact as them
-    (`as_exact`). Each call is compiled, where op by op the logits took a minute of the test, and the
-    greedy decodes run as the check runs its arms (`summed_as_run`), whose programs they share (ledger
-    2957)."""
+    and a causal one decodes into a cache of `CAPACITY` slots and draws the same tokens. Each call is
+    compiled, where op by op the logits took a minute of the test, and the greedy decodes run as the check
+    of its cached logits runs its arms (`summed_as_run`,
+    `test_a_models_cached_logits_at_a_cache_capacity_are_as_exact_as_within_it`), whose programs they
+    share (ledger 2957)."""
     source, rows = loaded(name), tokens(name)
     model, variables = source.model, source.variables
     sized = model.with_cache_capacity(CAPACITY)
@@ -500,8 +500,22 @@ def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name)
     assert (any(CAPACITY in leaf.shape for leaf in jax.tree.leaves(sized_cache))
             == any(model.max_seq_len in leaf.shape for leaf in jax.tree.leaves(cache)))
     np.testing.assert_array_equal(np.asarray(sized_drawn), np.asarray(drawn))
+
+
+@pytest.mark.parametrize("name", PATHS)
+def test_a_models_cached_logits_at_a_cache_capacity_are_as_exact_as_within_it(name):
+    """A causal model decoding into a cache of `CAPACITY` slots reduces its attention over the shorter
+    cache, so its cached logits are the model's bits or as exact as them (`as_exact`, check 1). Apart from
+    `test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it`, whose deepseek-v41-tiny cell
+    took 61 to 143 s whole in CI, its fixed part (the checkpoint loaded, seven programs compiled) 69 s of
+    87 on armada (ledger 4052)."""
+    source = loaded(name)
+    model, variables = source.model, source.variables
+    if not model.causal:
+        return
+    call = tuple(_decoding(name).items())
     reference, truth = _reference(name, call)
-    assert_as_exact(_scored(at_capacity, variables), reference, _continued(model),
+    assert_as_exact(_scored(_programs(name, "sized", call), variables), reference, _continued(model),
                     f"{name} cached logits at a capacity", seeds=CACHED_SEEDS, truth_fn=truth)
 
 
