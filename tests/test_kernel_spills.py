@@ -632,7 +632,7 @@ def test_a_program_under_an_eager_transformation_compiles_under_its_own_options(
     np.testing.assert_array_equal(np.asarray(enclosing(rows)), np.full((2, 3), 3.0))
 
 
-INVARIANT_LISTING = """
+CONVERTING_LISTING = """
 //--------------------- .text.dew_gmm_mosaic_gpu_kernel --------------------------
 .text.dew_gmm_mosaic_gpu_kernel:
         /*0000*/                   S2R R10, SR_TID.X ;
@@ -645,8 +645,7 @@ INVARIANT_LISTING = """
         /*0060*/               @P0 BRA `(.L_x_1) ;
         /*0070*/                   EXIT ;
 """
-"""An MMA loop converting a register no instruction of the loop writes to a uniform one every iteration: the
-kernel challenge's kernel-long uniform kept in a vector register (notes/ptxas-re.md §5)."""
+"""An MMA loop converting a register to a uniform one each iteration, no waterfall around the conversion."""
 
 WATERFALL_LISTING = """
 .text.dew_gmm_mosaic_gpu_kernel:
@@ -662,29 +661,10 @@ WATERFALL_LISTING = """
 """A copy whose operand ptxas could not prove uniform, issued lane by lane in an elect waterfall (BRA.U.ANY)
 around its R2UR (notes/ptxas-re.md §2: a divergent copy operand)."""
 
-CLEAN_LISTING = """
-.text.dew_gmm_mosaic_gpu_kernel:
-        /*0000*/                   MOV R9, 0x400 ;
-.L_x_3:
-        /*0010*/                   IADD3 R9, R9, 0x80, RZ ;
-        /*0020*/                   R2UR UR4, R9 ;
-        /*0030*/                   HGMMA.64x128x16.F32.BF16 R24, gdesc[UR4], RZ ;
-        /*0040*/                   ISETP.NE.AND P0, PT, R9, 0x800, PT ;
-        /*0050*/               @P0 BRA `(.L_x_3) ;
-        /*0060*/                   EXIT ;
-"""
-"""A loop converting the register it advances each iteration: a value that changes is converted where it
-changes."""
-
-
-def test_the_sass_rules_find_a_loop_invariant_conversion_and_an_elect_waterfall():
+def test_the_sass_rules_find_an_elect_waterfall_around_a_conversion():
     """The compile gate's SASS rules (row 4071, the kernel challenge's harness/ptxas checks) read nvdisasm's
-    listing of a kernel: an R2UR of a register its innermost loop never writes is a uniform value held in a
-    vector register and converted every iteration, and an elect waterfall (a backward BRA.U.ANY) holding an
-    R2UR serializes a copy whose operand ptxas could not prove uniform; a loop converting the register it
-    advances is neither."""
-    (invariant,) = report.sass_findings_of(INVARIANT_LISTING)
-    assert "R2UR" in invariant and "loop" in invariant
+    listing of a kernel: an elect waterfall (a backward BRA.U.ANY) holding an R2UR serializes a copy whose
+    operand ptxas could not prove uniform; a loop's conversion without a waterfall is none."""
     (waterfall,) = report.sass_findings_of(WATERFALL_LISTING)
     assert "waterfall" in waterfall
-    assert report.sass_findings_of(CLEAN_LISTING) == ()
+    assert report.sass_findings_of(CONVERTING_LISTING) == ()

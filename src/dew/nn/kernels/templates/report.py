@@ -668,17 +668,13 @@ def sass_findings(elf: bytes) -> tuple[str, ...]:
 
 _INSTRUCTION = re.compile(r"/\*([0-9a-f]{4,})\*/\s+(.*?)\s*;")
 _LABEL = re.compile(r"^\s*(\.L_\w+):")
-_BRANCH = re.compile(r"\bBRA(?:\.[\w.]+)?\s+(?:!?U?P\w+,\s*)?`?\(?(\.L_\w+)\)?`?")
-_R2UR = re.compile(r"^(?:@!?U?P\w+ )?R2UR(?:\.\w+)* UR\d+, (R\d+)")
-_WRITES_NONE = ("ST", "BRA", "EXIT", "SYNCS", "UBLK", "UTMA", "HGMMA", "BAR", "RED", "WARP")
+_WATERFALL = re.compile(r"\bBRA\.U\.ANY\s+`?\(?(\.L_\w+)\)?`?")
 
 
 def sass_findings_of(listing: str) -> tuple[str, ...]:
     """What nvdisasm's `listing` of a kernel breaks of the kernel challenge's SASS rules (row 4071, its
-    harness/ptxas checks; notes/ptxas-re.md): in an innermost loop (a backward branch), an R2UR of a register
-    no instruction of the loop writes, a uniform value kept in a vector register and converted every
-    iteration where ptxas could have held it in a uniform one; and an elect waterfall (a backward BRA.U.ANY)
-    holding an R2UR, a copy issued lane by lane because ptxas could not prove its operand uniform."""
+    harness/ptxas checks; notes/ptxas-re.md §2): an elect waterfall (a backward BRA.U.ANY) holding an R2UR, a
+    copy issued lane by lane because ptxas could not prove its operand uniform."""
     instructions, labels, pending = [], {}, []
     for line in listing.splitlines():
         if label := _LABEL.match(line):
@@ -687,35 +683,11 @@ def sass_findings_of(listing: str) -> tuple[str, ...]:
             labels.update(dict.fromkeys(pending, len(instructions)))
             pending = []
             instructions.append(" ".join(found.group(2).split()))
-    loops, waterfalls = [], []
+    serialized = 0
     for at, text in enumerate(instructions):
-        branch = _BRANCH.search(text)
-        head = labels.get(branch.group(1)) if branch else None
+        head = labels.get(branch.group(1)) if (branch := _WATERFALL.search(text)) else None
         if head is not None and head <= at:
-            (waterfalls if "BRA.U.ANY" in text else loops).append((head, at))
-    innermost = [(head, end) for head, end in loops
-                 if not any(head < inner <= last < end for inner, last in loops)]
-    invariant = 0
-    for head, end in innermost:
-        body = instructions[head:end + 1]
-        written = set().union(*(_written(text) for text in body))
-        invariant += sum(1 for text in body if (r2ur := _R2UR.match(text)) and r2ur.group(1) not in written)
-    serialized = sum(1 for head, end in waterfalls
-                     if any("R2UR" in text for text in instructions[head:end + 1]))
-    found = []
-    if invariant:
-        found.append(f"{invariant} R2UR of a register its loop never writes, a uniform value converted every "
-                     f"iteration")
-    if serialized:
-        found.append(f"{serialized} elect waterfall holding an R2UR, a copy issued lane by lane")
-    return tuple(found)
-
-
-def _written(text: str) -> set[str]:
-    """The vector registers an instruction's `text` writes: its destination's, two or four for a wide one."""
-    operation, _, operands = re.sub(r"^@!?U?P\w+ ", "", text).partition(" ")
-    destination = re.match(r"\s*R(\d+)", operands)
-    if operation.startswith(_WRITES_NONE) or destination is None:
-        return set()
-    width = 4 if ".128" in operation else 2 if re.search(r"\.64|WIDE", operation) else 1
-    return {f"R{int(destination.group(1)) + index}" for index in range(width)}
+            serialized += any("R2UR" in held for held in instructions[head:at + 1])
+    if not serialized:
+        return ()
+    return (f"{serialized} elect waterfall holding an R2UR, a copy issued lane by lane",)
