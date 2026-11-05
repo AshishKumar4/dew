@@ -7,10 +7,12 @@ refusals derived from its interval's separation from the call's (`separated`, `a
 2's per-primitive contracts are tests/certified.py's."""
 
 import dataclasses
+import itertools
 
 import numpy as np
 from certified import allowance, rounded_on_lane
 from op_certificates import (
+    BFLOAT16,
     FORMATS,
     TFLOAT32,
     Format,
@@ -225,3 +227,43 @@ TF32_SHARES = {True: (0.85, 0.85, 0.75), False: (0.85, 0.85, 0.95)}
 """The same, on Gaussian draws and on draws of one sign, of an fp32 forward's elements where its operands'
 bf16 values are multiplied and TF32 is declared, its TF32 values where bf16 is, and its truncated TF32 values
 where they are rounded: 92.5%, 92.5% and 79.8%, and 89.3%, 89.3% and all."""
+
+
+def groups(sizes) -> np.ndarray:
+    """Each row's group."""
+    return np.repeat(np.arange(len(sizes)), sizes)
+
+
+def spans(sizes) -> list[tuple[int, int]]:
+    """Each group's first row and its end."""
+    return list(itertools.pairwise(np.cumsum((0, *sizes)).tolist()))
+
+
+def forward_products(x, w, sizes, fmt: Format = BFLOAT16) -> Terms:
+    """`[rows, width, depth]`: each output element's exact products of operands of `fmt` (`terms`),
+    its row times its group's column."""
+    return terms(lambda x, w: x[:, None, :] * np.swapaxes(w[groups(sizes)], 1, 2), x, w, fmt=fmt)
+
+
+def input_gradient_products(dy, w, sizes, fmt: Format = BFLOAT16) -> Terms:
+    """`[rows, depth, width]`: each input gradient element's exact products, the row's cotangent times its
+    group's matrix row."""
+    return terms(lambda dy, w: dy[:, None, :] * w[groups(sizes)], dy, w, fmt=fmt)
+
+
+def rows_products(x, dy, fmt: Format = BFLOAT16) -> Terms:
+    """`[depth, width, rows]`: the exact products of rows of `x` and of the cotangent `dy` a kernel gradient
+    sums, each element's its rows' column of `x` times theirs of `dy`."""
+    return terms(lambda x, dy: x.T[:, None, :] * dy.T[None, :, :], x, dy, fmt=fmt)
+
+
+def kernel_gradient_products(x, dy, sizes, fmt: Format = BFLOAT16) -> list[Terms]:
+    """Each group's kernel gradient's exact products (`rows_products` of its rows)."""
+    return [rows_products(x[start:end], dy[start:end], fmt) for start, end in spans(sizes)]
+
+
+def kernel_gradient_holds(native, products: list, out) -> np.ndarray:
+    """`[groups, depth, width]`: whether each element of a native kernel gradient is a value its group's exact
+    `products` admit (`native_dot_holds`)."""
+    return np.stack([native_dot_holds(each, group, out, flushes=False)
+                     for each, group in zip(native, products, strict=True)])
