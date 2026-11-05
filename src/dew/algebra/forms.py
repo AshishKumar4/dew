@@ -25,9 +25,8 @@ class Derived(NamedTuple):
     their walked axis a tile's), `step(state, tiles)` the state after one tile of each walked operand (and the
     whole of each other), `merge(a, b, operands)` two states of disjoint walks joined (its unwalked operands
     whole beside them), `finish(state, operands)` the declaration's outputs that the walk reduces,
-    `mapped(tiles, product=)` its outputs along the walked axis, a tile's own (each reads no walked
-    reduction: a backward's dK and dV, walking keys), their products a mainloop's own where it gives one
-    (`evaluator`), each form None in the other's outputs' places; `report` what the
+    `mapped(tiles)` its outputs along the walked axis, a tile's own (each reads no walked reduction: a
+    backward's dQ, walking queries), each form None in the other's outputs' places; `report` what the
     derivation decoupled and its rounding class; `prepare(tiles)` a tile's values that read no state, which a
     walk computes for every tile at once (a reduction's tiles as they are). A scan's (`scan.derive_scan`)
     `step(state, prepared)` and `mapped(prepared, state)` read a chunk's prepared values and the state alone
@@ -204,10 +203,6 @@ def evaluated(region: terms.Region, form: terms.Term, leaves: Sequence,
 PLAIN_PRODUCT = (((1,), (0,)), ((), ()))
 """A matrix product's dimension numbers, `a @ b`: the left's last axis with the right's first, no batch."""
 
-TRANSPOSED_PRODUCT = (((0,), (0,)), ((), ()))
-"""A matrix product of the left's transpose, `aᵀ @ b`: both operands' first axes contracted, no batch (a key
-tile's share of its keys' gradients over a query tile, `einsum("qk,qd->kd")`)."""
-
 
 class Operand(NamedTuple):
     """A leaf's value given by its type and the call that acquires it (`load`), which an evaluation calls
@@ -227,9 +222,8 @@ def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping
     values (`leaves`, by index; None for one no form reads) and the outputs of the region's equations
     outside the language over them, their inputs in the forms `chosen` names for them (by `terms.key`)
     where given, each term `known` names (by `terms.key`) its value there, each matrix product
-    `product(a, b)` where a caller holds its own (a mainloop's issuer; a product of the left's transpose as
-    `product(aᵀ, b)`, as a mainloop issues it) and every other product Dew's (`float32_dot_general`), every
-    other term the engine's (`terms.value_of`)."""
+    `product(a, b)` where a caller holds its own (a mainloop's issuer) and every other product Dew's
+    (`float32_dot_general`), every other term the engine's (`terms.value_of`)."""
     values = dict(known)
     outside = {leaf: opaque for opaque in region.opaque for leaf in opaque.outputs}
     given = dict(enumerate(leaves))
@@ -257,8 +251,6 @@ def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping
             numbers = jax.tree.map(int, params["dimension_numbers"])
             if product is not None and numbers == PLAIN_PRODUCT:
                 made = product(value(left), value(right))
-            elif product is not None and numbers == TRANSPOSED_PRODUCT:
-                made = product(value(left).T, value(right))
             else:
                 made = float32_dot_general(value(left), value(right), params["dimension_numbers"],
                                            precision=params.get("precision"),

@@ -240,38 +240,54 @@ def forward_rows(form: str):
 def derived_backward(form: str, along: str):
     """The backward declaration's derived forms walked `along` key tiles (queries first) or query tiles (keys
     first), from the template forward's residual rows (`forward_rows`): its logits the tile's, -inf where
-    unseen, and D about no anchor (its whole `delta`), each product the template's CPU mainloop's issuer
-    (`attention.interpreted_dot`), as its portable mainloop gives the derived forms theirs."""
+    unseen, and D about no anchor (its whole `delta`), each step's products the template's CPU mainloop's
+    issuer (`attention.interpreted_dot`), scheduled as a mainloop tiles the walk: keys first, a key tile's dK
+    and dV the walk's over the query tiles; queries first, each query tile walking the key tiles, its dQ the
+    walk's and each key tile's dK and dV its share, summed over the query tiles in order (row 3310: one
+    contraction over a key tile's every query at once, no mainloop's schedule, erred 1.63 times the
+    template's in dV)."""
     forms = derive.derive(attention_backward_algebra.backward_declaration(scale=SCALE, walked=along),
                           accurate=False, saturation=SATURATION)
     seen = seen_of(form)
     rows_of = forward_rows(form)
+    tiles = LENGTH // BLOCK
+    by_row = ("q", "dout", "peak", "total", "anchor", "delta", "logits", "seen")
 
     def tile(values: dict, index: int) -> dict:
         part = slice(index * BLOCK, (index + 1) * BLOCK)
-        tiled = (("q", "dout", "peak", "total", "anchor", "delta", "logits", "seen") if along == "rows"
-                 else ("k", "values"))
 
         def part_of(name, value):
-            if along == "keys" and name in ("logits", "seen"):
+            if along == "rows":
+                return value[part] if name in by_row else value
+            if name in ("logits", "seen"):
                 return value[:, part]
-            return value[part] if name in tiled else value
+            return value[part] if name in ("k", "values") else value
 
         return {name: part_of(name, value) for name, value in values.items()}
+
+    def walk(values: dict):
+        parts = [tile(values, index) for index in range(tiles)]
+        mapped = [forms.mapped(part) for part in parts]
+        return forms.finish(walked(forms, parts, template.interpreted_dot), values,
+                            shapes=shaped(parts[0])), mapped
 
     def run(q, k, v, d):
         _, peak, total, delta = rows_of(q, k, v, d)
         logits = jnp.where(seen, float32_einsum("qd,kd->qk", q, k) * SCALE, -jnp.inf)
         values = {"logits": logits, "q": q, "k": k, "values": v, "dout": d, "peak": peak, "total": total,
                   "anchor": jnp.zeros_like(delta), "delta": delta, "seen": seen}
-        parts = [tile(values, index) for index in range(LENGTH // BLOCK)]
-        mapped = [forms.mapped(part, product=template.interpreted_dot) for part in parts]
-        dq, dk, dv, *_ = forms.finish(walked(forms, parts, template.interpreted_dot), values,
-                                      shapes=shaped(parts[0]))
         if along == "rows":
+            (_, dk, dv, *_), mapped = walk(values)
             return jnp.concatenate([parts[0] for parts in mapped]), dk, dv
-        return (dq, jnp.concatenate([parts[1] for parts in mapped]),
-                jnp.concatenate([parts[2] for parts in mapped]))
+        dq, dk, dv = [], 0.0, 0.0
+        for block in range(tiles):
+            part = slice(block * BLOCK, (block + 1) * BLOCK)
+            rows = {name: value[part] if name in by_row else value for name, value in values.items()}
+            (block_dq, *_), mapped = walk(rows)
+            dq.append(block_dq)
+            dk = dk + jnp.concatenate([parts[1] for parts in mapped])
+            dv = dv + jnp.concatenate([parts[2] for parts in mapped])
+        return jnp.concatenate(dq), dk, dv
 
     return run
 
@@ -298,9 +314,8 @@ def oracle_backward(form: str):
 @pytest.mark.parametrize("form", list(SPANS))
 def test_the_derived_backward_is_on_par_in_every_cell(form, walked):
     """The backward's derived forms on par against the float64 gradients (check 1) in every cell: the backward
-    declaration's forms, walked queries first or keys first, held to the template's own backward at the same
-    tiles, each product the mainloop's issuer (row 3310: a queries-first walk's dV over all of a key tile's
-    queries at once, by Dew's fp32 product in place of the issuer's, erred 1.63 times the template's)."""
+    declaration's forms, walked queries first or keys first as a mainloop schedules them
+    (`derived_backward`), held to the template's own backward at the same tiles."""
     served, reference = derived_backward(form, walked), oracle_backward(form)
     assert_as_exact(jax.jit(served), jax.jit(reference), backward_draw,
                     f"attention backward {form} {walked}", seeds=16, truth_fn=xla_backward(form))
