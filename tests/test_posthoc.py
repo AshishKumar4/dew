@@ -91,6 +91,30 @@ def test_an_accumulating_run_snapshotted_every_step_reconstructs_its_average(tmp
         np.testing.assert_array_equal(got, want)
 
 
+def test_an_older_snapshot_keeps_its_profiles_alone_and_rebuilds_the_same_average(tmp_path):
+    """A snapshot no other rule keeps, past the latest, holds its profiles' averages alone, none of the
+    weights, optimizer state or position its whole step held (row 4311; docs/guides/checkpoints.md's 176M
+    run: ~190 GB of profiles against ~570 GB of whole snapshots), and the post-hoc EMA rebuilt from such
+    snapshots is the one whole snapshots rebuild, bit for bit."""
+    def kept(name, keep):
+        trainer = Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0),
+                          layout=Layout(min_shard=1, tolerance=1.0),
+                          checkpoints=Checkpoints(str(tmp_path / name), keep=keep))
+        trainer.fit(dataset(), steps=32, log_every=32, checkpoint_every=4)
+        trainer.checkpoints.wait()
+        return Checkpoints(str(tmp_path / name), keep=keep)
+
+    alone, whole = kept("alone", 1), kept("whole", 100)
+    assert {entry.step: entry.kind for entry in alone.kept()} == {
+        **dict.fromkeys(range(4, 32, 4), "profiles"), 32: "state"}
+    assert {entry.kind for entry in whole.kept()} == {"state"}
+    with pytest.raises(ValueError, match="model"):
+        alone.variables(step=4)
+    for got, want in zip(jax.tree.leaves(alone.posthoc_ema(0.07)), jax.tree.leaves(whole.posthoc_ema(0.07)),
+                         strict=True):
+        np.testing.assert_array_equal(got, want)
+
+
 def test_a_checkpoint_writes_the_averages_once_and_restores_them(tmp_path):
     """A snapshot is the ordinary checkpoint itself: averages are stored
     once in opt_state, retained, and every restore reads them bit for bit."""
