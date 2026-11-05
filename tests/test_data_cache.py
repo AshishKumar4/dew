@@ -1220,6 +1220,25 @@ def test_a_streamed_cache_reads_the_generation_published_under_its_key(tmp_path)
     assert republished.calls == []
 
 
+def test_a_streamed_chain_publishes_its_own_cache_once_it_reads_the_store_whole(tmp_path):
+    """A streamed chain's own cache publishes its store's generation once its read has filled every
+    shard, so its next streamed read reads the generation back, running no step (row 4211)."""
+    from dew.data.compile import iterate
+    from dew.data.pipeline import Pipeline
+
+    source = Memory([{"id": index} for index in range(6)], shard_rows=2)
+    cache = Cache(str(tmp_path / "cache"))
+    filled, reading = Offset(10), Offset(10)
+
+    def values(step: Offset) -> list[int]:
+        rows = iterate(Pipeline(source).map(step).cache(cache), read="streamed")
+        return sorted(int(row["value"]) for row in rows)
+
+    first, again = values(filled), values(reading)
+    assert first == again == [index + 10 for index in range(6)]
+    assert sorted(filled.calls) == list(range(6)) and reading.calls == []
+
+
 def test_a_fill_whose_spool_drops_its_last_shard_reads_on_and_publishes_nothing(tmp_path):
     """A spool too small for the fill's one shard (on_full='stop') stops admitting it: the pass
     reads every row, and the next run, with nothing published, runs the steps again."""
