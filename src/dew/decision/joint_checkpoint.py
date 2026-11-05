@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+from dew._coordination import read_home
 from dew.batch import unboxed
 from dew.decision.laya import IN_PROJ
 from dew.decision.layout import DecisionInputs
@@ -131,7 +132,9 @@ def head_tensors(params: Mapping[str, object]) -> dict[str, np.ndarray]:
     from dew.interop.decoder_parts import packed_layouts
     from dew.interop.weights import in_params, native_layouts
 
-    stored = unflatten_dict({path: _stored(path, np.asarray(jax.device_get(leaf)))
+    # Each leaf read home (`read_home`): the pool's processes together where it spans them (a readout
+    # partitioned over a pool), inside the writer's `reading_home`.
+    stored = unflatten_dict({path: _stored(path, read_home(leaf))
                              for path, leaf in flatten_dict(dict(params)).items()})
     variables = {"params": stored}
     layouts = packed_layouts({layout.name: layout for layout in native_layouts(
@@ -140,7 +143,7 @@ def head_tensors(params: Mapping[str, object]) -> dict[str, np.ndarray]:
 
 
 def export(bundle: "PretrainedDecision", variables: Mapping[str, object] | None = None
-           ) -> dict[str, np.ndarray]:
+           ) -> Mapping[str, np.ndarray]:
     """Every tensor of the joint-head release `save` writes: the backbone's under their checkpoint names
     and the head's under the release's (`joint_head.safetensors`), with `variables` in place of the
     backbone's."""

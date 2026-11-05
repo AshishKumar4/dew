@@ -12,6 +12,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew import _records
+from dew._coordination import read_home
 from dew.batch import Variables
 from dew.data.text import HFTokenizer
 from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
@@ -172,17 +173,19 @@ class SlotSource(SourceKind):
     @staticmethod
     def readout(bundle: PretrainedDecision) -> dict[str, np.ndarray]:
         """The slot-and-pointer head's tensors under the release's names (`readout_head.pt`), host
-        arrays in C order; none for the tied label readout, which reads the backbone's own head."""
+        arrays in C order, each read home (`read_home`: the pool's processes together where it spans
+        them, inside the writer's `reading_home`); none for the tied label readout, which reads the
+        backbone's own head."""
         if _records.text(_records.record(bundle.head.record(), "head")["class"], "head.class") != import_path(
                 SlotReadout):
             return {}
         params = bundle.head_variables["params"]
-        return {name: np.array(jax.device_get(params[path[0]]), copy=True, order="C")
+        return {name: np.array(read_home(params[path[0]]), copy=True, order="C")
                 for name, path in _PATHS.items()}
 
     @staticmethod
     def export(bundle: PretrainedDecision, variables: Mapping[str, object] | None = None
-               ) -> dict[str, np.ndarray]:
+               ) -> Mapping[str, np.ndarray]:
         """Every tensor of the slot release `save` writes: the backbone's under their checkpoint names
         and the slot-and-pointer head's under the release's (`readout_head.pt`), with `variables` in
         place of the backbone's."""
