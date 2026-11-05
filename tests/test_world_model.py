@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 from reference_error import assert_computes_the_oracle, chain_roundings
 
-from dew.objectives.world_model import Dynamics, sampled_steps, shortcut_forcing_loss
+from dew.objectives.world_model import Dynamics, shortcut_forcing_loss
 
 
 def test_shortcut_forcing_is_the_papers_bootstrap():
@@ -54,9 +54,22 @@ def test_shortcut_forcing_is_the_papers_bootstrap():
 
 
 def test_step_sizes_are_powers_of_two_and_levels_lie_on_their_grid():
-    """Eq. 4: every step size is the reciprocal of a power of two up to K_max, every one is drawn, and
-    each signal level is a multiple of its frame's step size below 1."""
-    tau, d = (np.asarray(x) for x in sampled_steps(jax.random.key(1), (4096,), 64))
+    """Eq. 4, as the world model's loss draws them for each clip's frames (its recorded boundaries): every
+    step size is the reciprocal of a power of two up to K_max, every one is drawn, and each signal level is
+    a multiple of its frame's step size below 1 (row 4225: the test held a function no loss called)."""
+    from dew.objectives.base import Recorder, Step
+    from dew.objectives.world_model import CausalTokenizer, WorldModelObjective
+
+    tokenizer = CausalTokenizer((8, 8, 1), patch=4, width=16, depth=1, heads=2, latents=4, bottleneck=4)
+    dynamics = Dynamics(latents=4, bottleneck=4, spatial=2, width=16, depth=1, heads=2, levels=7, frames=32)
+    objective = WorldModelObjective(dynamics, tokenizer,
+                                    tokenizer.init(jax.random.key(1), jnp.zeros((1, 8, 8, 1))))
+    recorder = Recorder()
+    step = Step(jnp.asarray(0), jax.random.key(2), None, recorder=recorder)
+    video = jnp.zeros((128, 32, 8, 8, 1), jnp.float32)
+    objective.loss(objective.init(jax.random.key(3)), {"video": video}, step)
+    tape = recorder.tape(128)
+    tau, d = tape["signal level"].ravel(), tape["step size"].ravel()
     exponents = -np.log2(d)
     np.testing.assert_array_equal(exponents, np.round(exponents))
     assert set(exponents.astype(int)) == set(range(7))
@@ -221,16 +234,21 @@ def test_a_world_models_tokenizer_rides_in_its_state_and_its_loss_reads_it_there
     outside the tree placement and checkpoints share): the drawn tree holds the given weights beside the
     dynamics' under its own collection, which the optimizer never sees, and the loss encodes with the
     weights the tree holds, other weights giving another loss."""
+    from dew.batch import unboxed
     from dew.objectives.base import Step
     from dew.objectives.world_model import TOKENIZER, WorldModelObjective
 
     tokenizer, tokens, dynamics = _tiny_models()
     objective = WorldModelObjective(dynamics, tokenizer, tokens)
     variables = objective.init(jax.random.key(5))
+    tokens = unboxed(tokens)
     assert jax.tree.structure(variables[TOKENIZER]) == jax.tree.structure(tokens)
     for held, given in zip(jax.tree.leaves(variables[TOKENIZER]), jax.tree.leaves(tokens), strict=True):
         np.testing.assert_array_equal(np.asarray(held), np.asarray(given))
     assert TOKENIZER not in variables["params"]
+    # The dynamics model's own tree, what another objective over it starts from, holds no tokenizer (row
+    # 4224: `model_variables` returned it too).
+    assert set(objective.model_variables(variables)) == set(variables) - {TOKENIZER}
     video = jnp.asarray(np.random.default_rng(18).uniform(-1, 1, (2, 4, 8, 8, 1)), jnp.float32)
     step = Step(jnp.asarray(0), jax.random.key(19), None)
     other = tokenizer.init(jax.random.key(20), jnp.zeros((1, 8, 8, 1)))
