@@ -646,7 +646,10 @@ def test_a_per_group_bias_reaches_its_launch_at_its_groups_extent(generation):
     args = (jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16),
             jax.ShapeDtypeStruct((groups, depth, width), jnp.bfloat16),
             jax.ShapeDtypeStruct((groups,), jnp.int32), jax.ShapeDtypeStruct((groups, width), jnp.float32))
-    with assumed(generation):
+    from jax.sharding import AbstractMesh, AxisType
+
+    mesh = gpu_mesh(AbstractMesh((1,), ("data",), axis_types=(AxisType.Auto,)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(biased).trace(*args).lower(lowering_platforms=("cuda",))
     launches = [call.operands for call in custom_calls(lowered)
                 if custom_call_kind(call.target) in ("triton", "mosaic_gpu")]
