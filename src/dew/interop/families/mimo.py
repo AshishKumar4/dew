@@ -385,8 +385,8 @@ def _mimo_v2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
             kinds[_PREDICTION_FEEDFORWARD] = native_fields(LayerKind)(mixer=MLPMixer(
                 intermediate_size=_records.integer(config['mlp_features'], 'intermediate_size'),
                 activation=_records.text(config['mlp'], 'hidden_act')))
-            config.update(num_nextn_predict_layers=depths, mtp_layer_type='sliding_attention',
-                          mtp_feedforward_type=_PREDICTION_FEEDFORWARD)
+        config.update(num_nextn_predict_layers=depths, mtp_layer_type='sliding_attention' if depths else None,
+                      mtp_feedforward_type=_PREDICTION_FEEDFORWARD if depths else None)
     return _attention_and_experts(config, hf, used, kinds, value_dim=value_dim,
                                   scale=None, factor=factor, count=count,
                                   sparse=sparse)
