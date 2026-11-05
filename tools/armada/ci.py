@@ -1608,6 +1608,14 @@ def reused_rows(python: str, tests: list[str], group: str, common: str, network:
     return rows
 
 
+def missing_imports(own: list[ET.Element]) -> list[str]:
+    """The reds of a file's cases (`own`) that pytest skipped on an import its environment lacks: a skip
+    that greens nothing."""
+    return [f"SKIPPED on a missing import {case.get('classname')}::{case.get('name')}: {node.get('message')}"
+            for case in own for node in case.iter("skipped")
+            if "could not import" in f"{node.get('message')} {node.text}"]
+
+
 def exit_red(code: int, cases: list[ET.Element], own: list[ET.Element], deselected: bool,
              name: str) -> list[str]:
     """Why pytest's exit `code` reddens file `name`'s row, whose own cases are `own` among the process's
@@ -1737,9 +1745,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                   if (node := case.find(kind)) is not None]
         red = [f"{kind.upper()} {case.get('classname')}::{case.get('name')}: {node.get('message')}"
                for case, kind, node in failed]
-        skipped = [f"SKIPPED on a missing import {case.get('classname')}::{case.get('name')}: "
-                   f"{node.get('message')}" for case in own for node in case.iter("skipped")
-                   if "could not import" in f"{node.get('message')} {node.text}"]
+        skipped = missing_imports(own)
         counted = counts.get(name, {})
         deselected = bool(counted) and counted["collected"] == counted["deselected"]
         exited = exit_red(done.returncode, cases, own, deselected, name)
