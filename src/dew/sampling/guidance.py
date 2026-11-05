@@ -44,6 +44,7 @@ from flax import linen as nn, struct
 from dew.batch import Variables
 from dew.diffusion.process import Denoiser
 from dew.diffusion.schedules import expand
+from dew.nn.derivatives import surrogate
 from dew.nn.precision import at_least_fp32, compensated_add, two_product
 from dew.sampling.solvers.common import given
 
@@ -172,8 +173,7 @@ def _spread(conditional: jax.Array, unconditional: jax.Array) -> tuple[jax.Array
     return held, unheld, jnp.where(large, 0.5, 1.0).astype(wide)
 
 
-@jax.custom_jvp
-def _guided(conditional: jax.Array, unconditional: jax.Array, scale: jax.Array) -> jax.Array:
+def _guided_value(conditional: jax.Array, unconditional: jax.Array, scale: jax.Array) -> jax.Array:
     """`guide`'s value: the conditional prediction exactly at a unit scale and the unconditional at a zero
     one, the affine combination elsewhere, formed `_spread` and rounded once, so finite predictions whose
     combination is finite never overflow on the way (half precision's 40000 and -40000 at a scale of one
@@ -184,10 +184,10 @@ def _guided(conditional: jax.Array, unconditional: jax.Array, scale: jax.Array) 
     return jnp.where(scale == 1, conditional, jnp.where(scale == 0, unconditional, combined))
 
 
-@_guided.defjvp
-def _guided_jvp(primals, tangents):
+def _guided_derivative(primals, tangents, value):
     """The affine combination's derivative at every scale, the endpoints' included, where the exact
     prediction the value selects would leave the scale's out."""
+    del value
     conditional, unconditional, scale = primals
     along_conditional, along_unconditional, along_scale = tangents
     # The predictions' direction in the affine order, the conditional's own at a unit scale.
@@ -196,7 +196,12 @@ def _guided_jvp(primals, tangents):
     # The scale's: the predictions' difference, formed `_spread` as the value is.
     held, unheld, half = _spread(conditional, unconditional)
     along = ((half * held - half * unheld) * along_scale.astype(held.dtype) / half).astype(conditional.dtype)
-    return _guided(*primals), predicted + along
+    return predicted + along
+
+
+_guided = surrogate(_guided_value, _guided_derivative)
+"""`guide`'s value (`_guided_value`), differentiated as the affine combination at every scale
+(`_guided_derivative`): a derivative of the guidance rule's, not the value's own at its endpoints."""
 
 
 @struct.dataclass
