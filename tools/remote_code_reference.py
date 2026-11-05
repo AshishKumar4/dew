@@ -173,8 +173,9 @@ def released_classes(name: str, workspace: Path):
     return configured, model
 
 
-OMITTED = {"mimo-v2-vl-tiny": ("visual.merger.ln_q.bias", "visual.merger.mlp.0.bias",
-                                "visual.merger.mlp.2.bias", "audio_encoder.input_local_transformer.embed_tokens.weight")}
+OMITTED = {"mimo-v2-vl-tiny": (
+    "visual.merger.ln_q.bias", "visual.merger.mlp.0.bias", "visual.merger.mlp.2.bias",
+    "audio_encoder.input_local_transformer.embed_tokens.weight")}
 """Each fixture's tensors its release's checkpoint does not store, which its loader initializes as a missing
 key: MiMo-V2.6's merger's biases, zeros (transformers' `_init_weights`), and its audio encoder's unused
 token table (`_keys_to_ignore_on_load_missing`)."""
