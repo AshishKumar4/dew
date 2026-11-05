@@ -174,7 +174,7 @@ def test_imagination_from_each_step_reads_the_window_up_to_it():
         following = np.random.default_rng([2202, 3]).normal(size=(2, ROWS * LENGTH, WIDTH))
 
         def imagined(following):
-            cache = model.apply(held, x, first, 2, method=TSSM.window_cache)
+            cache = model.window_cache(model.apply(held, x, first, method=TSSM.window)[1], first, 2)
             found = []
             for step in range(2):
                 h, cache = model.apply(held, following[step], jnp.zeros(ROWS * LENGTH, bool), cache,
@@ -206,7 +206,7 @@ def test_imagination_that_restarts_reads_nothing_of_its_window():
         restarts = np.arange(ROWS * LENGTH) % 3 == 0
 
         def imagined(following):
-            cache = model.apply(held, x, first, 2, method=TSSM.window_cache)
+            cache = model.window_cache(model.apply(held, x, first, method=TSSM.window)[1], first, 2)
             found = []
             for step, starts in enumerate((restarts, np.zeros_like(restarts))):
                 h, cache = model.apply(held, following[step], jnp.asarray(starts), cache, method=TSSM.step)

@@ -118,15 +118,16 @@ def as_service(held):
         sys.meta_path[:] = finders
 
 
-def live_kernel(service, tmp_path):
+def live_kernel(service, tmp_path, served=None):
     """The live page's two sides over a tiny run: the guest's client (its contract read from Dew), the tiny
-    run's pipeline, and the shared process's native models serving it, behind the progress reporter, as
-    "model" at "pinned", with the guidance record and solvers it takes from Dew."""
+    run's pipeline, and the shared process's native models serving it through an engine, as "model" at
+    "pinned", with the guidance record and solvers it takes from Dew. `served` makes the engine's image
+    kind of the pipeline's (`TextToImage.scoring`), a double of it where a test hands one."""
     import numpy as np
     from test_inference import make_run
 
     from dew import sampling
-    from dew.inference import TextToImage
+    from dew.inference import Engine, ScoringServer, TextToImage
 
     progress = load("progress", "site/live/container")
     client = load("model_client", "site/live/container")
@@ -134,7 +135,11 @@ def live_kernel(service, tmp_path):
     make_run(tmp_path)
     pipe = TextToImage.from_run(str(tmp_path))
     native = service.NativeModels.__new__(service.NativeModels)
-    native.np, native.progress, native.pipe = np, progress, progress.Reporting(pipe)
+    native.np, native.progress, native.pipe = np, progress, pipe
+    scoring, variables = pipe.scoring(images=1)
+    native.images = ScoringServer.from_task(scoring if served is None else served(scoring), variables)
+    native.engine = Engine(native.images)
+    native.engine.start()
     native.cfg = sampling.CFG
     native.solvers = {name: getattr(sampling, name)
                       for name in ("DPMSolverMultistep", "EulerAncestral", "Heun")}
@@ -196,3 +201,175 @@ def test_a_live_cell_takes_dews_arguments_and_is_refused_only_what_the_service_d
     with pytest.raises(ValueError):
         service.validate(request)
 
+
+
+SLOW = {"op": "sample", "repo": "model", "revision": "pinned", "prompt": "a lake", "negative": None,
+        "prepare_key": 3, "prepare_steps": 40, "key": 5, "steps": 40, "solver": None}
+"""An image request whose 40-step walk compiles past a shortened wait."""
+DESCRIBE = {"op": "describe", "repo": "model", "revision": "pinned"}
+
+
+def connected(path, payload):
+    """A guest's connection to the service at `path` carrying `payload`, and its lines."""
+    import json
+    import socket
+
+    client = socket.socket(socket.AF_UNIX)
+    client.connect(str(path))
+    client.sendall(json.dumps(payload).encode() + b"\n")
+    return client, client.makefile()
+
+
+def reply(lines):
+    """A connection's reply, after the progress before it."""
+    import json
+
+    return next(message for message in map(json.loads, lines) if "result" in message or "error" in message)
+
+
+@contextlib.contextmanager
+def serving(service, native, path):
+    """The service over `native`, admitting this process's uid as a guest's."""
+    import os
+
+    shared = service.ModelService(path, native, uids=(os.getuid(),))
+    try:
+        yield shared
+    finally:
+        shared.server_close()
+
+
+@contextlib.contextmanager
+def held_in_its_walk(native, monkeypatch):
+    """The engine held inside the next image request's first step until the context ends: its preview
+    signals `running` and waits for the release, so a test knows the request runs, not by a clock."""
+    import threading
+
+    running, release = threading.Event(), threading.Event()
+    preview = native.progress.preview_png
+
+    def holding(latent):
+        running.set()
+        release.wait()
+        return preview(latent)
+
+    monkeypatch.setattr(native.progress, "preview_png", holding)
+    try:
+        yield running
+    finally:
+        release.set()
+
+
+def spied_submissions(native, monkeypatch):
+    """The futures the service hands the engine, in order."""
+    submitted, held = [], native.submitted
+
+    def spied(request, emit):
+        future, answered = held(request, emit)
+        submitted.append(future)
+        return future, answered
+
+    monkeypatch.setattr(native, "submitted", spied)
+    return submitted
+
+
+def test_a_guest_whose_request_outlasts_its_connection_stays_admitted_until_the_engine_settles_it(
+        service, tmp_path, monkeypatch):
+    """A guest's image request the engine runs when its connection's wait runs out keeps the guest's one
+    admission: its connection hears the timeout and nothing after it, a second request is refused while
+    the first runs, and the guest is admitted again once the engine has settled it, so a slow pass never
+    lets one guest queue a second job past the service's bounds. The service's real models run it
+    (`live_kernel`), held inside its walk while the test looks (`held_in_its_walk`), and the connection's
+    wait runs out once the walk runs, not by a clock."""
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    _, _, native = live_kernel(service, tmp_path)
+    submitted = spied_submissions(native, monkeypatch)
+    path = tmp_path / "model.sock"
+    with serving(service, native, path):
+        with held_in_its_walk(native, monkeypatch) as running:
+            engine = native.submitted
+
+            def outlasted(request, emit):
+                """The engine's future, whose wait runs out once its walk runs."""
+                future, answered = engine(request, emit)
+
+                # A walk that fails before its first step ends the wait with its failure.
+                future.add_done_callback(lambda _: running.set())
+
+                class Waited:
+                    def __getattr__(self, name):
+                        return getattr(future, name)
+
+                    def result(self, timeout=None):
+                        assert running.wait(timeout=600)
+                        if future.done():
+                            return future.result()
+                        raise FuturesTimeout
+
+                return Waited(), answered
+
+            monkeypatch.setattr(native, "submitted", outlasted)
+            first, lines = connected(path, SLOW)
+            with first:
+                assert reply(lines)["error"]["name"] == "TimeoutError"
+                second, refused = connected(path, SLOW)
+                with second:
+                    assert reply(refused)["error"]["name"] == "ValueError"
+                assert len(submitted) == 1
+        # Released: the walk finishes, and its progress reaches no one after the reply.
+        submitted[0].result()
+        assert lines.read() == ""
+        third, lines = connected(path, DESCRIBE)
+        with third:
+            assert "result" in reply(lines)
+
+
+def test_a_guest_whose_queued_request_times_out_frees_its_admission_and_its_request_never_runs(
+        service, tmp_path, monkeypatch):
+    """A guest's request still queued behind a running one when its connection's wait runs out is
+    cancelled: the guest is admitted again at once, and the engine drops the request where it would take
+    it, never running it, while the request ahead runs on."""
+    _, _, native = live_kernel(service, tmp_path)
+    monkeypatch.setattr(service, "REQUEST_SECONDS", 0.05)
+    submitted = spied_submissions(native, monkeypatch)
+    path = tmp_path / "model.sock"
+    with serving(service, native, path):
+        with held_in_its_walk(native, monkeypatch) as running:
+            native.submitted(service.validate({**SLOW, "key": 6}), lambda _: None)
+            assert running.wait(timeout=600)
+            queued, lines = connected(path, SLOW)
+            with queued:
+                assert reply(lines)["error"]["name"] == "TimeoutError"
+            described, lines = connected(path, DESCRIBE)
+            with described:
+                assert "result" in reply(lines)
+        ahead, behind = submitted
+        ahead.result()
+    assert behind.cancelled() and not ahead.cancelled()
+
+
+def test_a_guest_whose_request_fails_in_the_engine_hears_why_and_is_admitted_again(service, tmp_path):
+    """A request whose pass fails stops the engine: its connection hears the failure and nothing after it,
+    and the guest is admitted again."""
+    import dataclasses
+
+    from dew.inference.images import ImageScoring
+
+    class Failing(ImageScoring):
+        def forward(self, variables, rows):
+            raise RuntimeError("an injected pass failure")
+
+    def failing(scoring):
+        return Failing(**{field.name: getattr(scoring, field.name) for field in dataclasses.fields(scoring)})
+
+    _, _, native = live_kernel(service, tmp_path, served=failing)
+    path = tmp_path / "model.sock"
+    with serving(service, native, path):
+        failed, lines = connected(path, SLOW)
+        with failed:
+            assert reply(lines)["error"]["name"] == "RuntimeError"
+            assert lines.read() == ""
+        described, lines = connected(path, DESCRIBE)
+        with described:
+            assert "result" in reply(lines)
