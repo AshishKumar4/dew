@@ -351,6 +351,32 @@ def test_a_scatter_into_zeros_holds_its_result_alone():
     assert peak_bytes(program, "gpu", Workspace(0, 0)) == vocab * width * 4
 
 
+def test_a_tied_embeddings_gradient_holds_its_heads_product_alone():
+    """A tied embedding's gradient, its head's product summed with the scatter of its rows' cotangents
+    into zeros, is the product's buffer alone: XLA folds the sum into the scatter (`A + scatter(B, I, U) =>
+    scatter(A + B, I, U)`, `A + 0 => A`, `AlgebraicSimplifierVisitor::HandleAdd`) and the scatter writes
+    in the product's buffer (`CanShareOperandBufferWithUser`), so the gradient holds what the product
+    alone does, where the derivation held the product, the scatter and their sum (Qwen3.5-4B's step under
+    'full', 7.1 GiB against XLA's 4.4 at its end: row 4089)."""
+    from dew.training.footprint import peak_bytes, simplified
+
+    vocab, width, tokens = 4096, 256, 512
+    shapes = (jax.ShapeDtypeStruct((tokens,), jnp.int32), jax.ShapeDtypeStruct((tokens, width), jnp.float32),
+              jax.ShapeDtypeStruct((tokens, vocab), jnp.float32),
+              jax.ShapeDtypeStruct((tokens, width), jnp.float32))
+
+    def head(ids, hidden, logits, rows):
+        return jax.lax.dot_general(logits, hidden, (((0,), (0,)), ((), ())))
+
+    def tied(ids, hidden, logits, rows):
+        return head(ids, hidden, logits, rows) + jnp.zeros((vocab, width), jnp.float32).at[ids].add(rows)
+
+    def peak(function):
+        return peak_bytes(simplified(jax.make_jaxpr(function)(*shapes).jaxpr, "gpu"), "gpu", Workspace(0, 0))
+
+    assert peak(tied) == peak(head)
+
+
 def test_a_transposed_input_returned_flat_is_a_copy():
     """A transpose of an input whose layout is fixed reorders its elements into a buffer of their own,
     which a flattening of it returned holds, where a transpose of a value the program computes is laid
