@@ -345,6 +345,15 @@ class BoundedFileCache(WholeFileCacheFileSystem):
         }
 
 
+def mirror_metrics() -> dict[str, float]:
+    """What this process's mirrors (`dewcache::`) did, summed over every one it opened, as a run logs it
+    beside its data metrics (`data/mirror/...`, row 4299): none where it opened none."""
+    held = [mirror.metrics() for mirror in BoundedFileCache._cache.values()]
+    if not held:
+        return {}
+    return {f"data/mirror/{name}": float(sum(stats[name] for stats in held)) for name in held[0]}
+
+
 # Registered as this module loads, which reads no configuration, so `dewcache::` URLs open through
 # fsspec itself from the moment the data layer is imported.
 fsspec.register_implementation("dewcache", BoundedFileCache, clobber=True)
