@@ -953,6 +953,24 @@ def a_run_takes_the_saved_offline_split_before_loading_its_executable(tmp_path):
     assert plan["split"] == 2 and first["ahead"] is True
 
 
+def test_programs_compiled_ahead_compile_at_once():
+    """Named programs compiled ahead (`compile_programs`) are lowered in turn and compiled at once, each in a
+    thread of its own (`report.compiled_at_once`), the programs the same as compiled one by one."""
+    from dew.telemetry.compiles import Compiles
+    from dew.training.ahead import compile_programs
+
+    square = jax.ShapeDtypeStruct((128, 128), jnp.float32)
+    programs = {"dot": (lambda x, y: x @ y, [square, square]),
+                "sum": (lambda x: jnp.sum(jnp.tanh(x)), [square])}
+    with Compiles(None) as compiles:
+        built = compile_programs(programs, "sm90")
+    threads = {program.thread for program in compiles.programs if program.kind == "compiled"}
+    assert threads and all(thread.startswith("dew-compile") for thread in threads), threads
+    alone = {name: compile_programs({name: program}, "sm90").programs[name]
+             for name, program in programs.items()}
+    assert built.programs == alone
+
+
 def test_programs_compiled_ahead_save_and_load_whole_and_load_only_on_their_own_target(tmp_path):
     """Named programs compiled ahead for a GPU this CPU host lacks (`compile_programs`), one of them reading
     no argument, are the programs loaded after saving, each an executable this host's CPU is no target of:
