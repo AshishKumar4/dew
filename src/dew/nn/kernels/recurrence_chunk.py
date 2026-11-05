@@ -38,6 +38,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.algebra.forms import derived_on
 from dew.algebra.scan import RESET_DECAY
+from dew.nn import derivatives
 from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.inputs import cu_seqlens
 from dew.nn.precision import at_least_fp32, l2norm
@@ -1098,8 +1099,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
 
     # The documents' starts and firsts operands, not closed over (a custom VJP's function closes over no
     # tracer).
-    @jax.custom_vjp
-    def rule(query, key, value, g, beta, state, starts, firsts, skip):
+    def primal(query, key, value, g, beta, state, starts, firsts, skip):
         # A forward without a gradient at its own tiles, no fast backward narrowing them (`Tiles.forward`).
         alone = {**run, "tiles": tiles.forward or tiles}
         return mainloop.forward(query, key, value, g, beta, state, starts=starts, firsts=firsts,
@@ -1108,7 +1108,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
 
     def forward(*operands):
         if not fast:
-            return rule(*operands), (operands, (None, None))
+            return primal(*operands), (operands, (None, None))
         # The chunks' inverses kept for the fast backward, as fla's keeps its `A`, and the launches' memories,
         # weighted keys and corrected values, as the port keeps its memory, but where the block's remat rung
         # recomputes them (`RECOMPUTED`). Each is named as the port names its own, so a rung that saves names
@@ -1139,7 +1139,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         return (*grads, None if state is None else dh0, None, None,
                 None if dskip is None else dskip.astype(skip.dtype))
 
-    rule.defvjp(forward, backward)
+    rule = derivatives.declared_derivative(derivatives.KernelGlue(), primal, forward, backward)
     return rule(query, key, value, g, beta, state, starts, firsts, skip)
 
 

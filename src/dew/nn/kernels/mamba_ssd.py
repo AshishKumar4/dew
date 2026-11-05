@@ -43,6 +43,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
+from dew.nn import derivatives
 from dew.nn.kernels import launches, recurrence_algebra as algebra, tuning
 from dew.nn.kernels.chunked_launch import read_rows, write_rows
 from dew.nn.kernels.fla_gdn import _dot
@@ -1233,7 +1234,8 @@ def _scan_bwd(chunk: int, interpret: bool, residual, cotangent):
             dh0.reshape(shape).astype(h0.dtype), None)
 
 
-ssd_scan = jax.custom_vjp(_scan, nondiff_argnums=(8, 9))
+ssd_scan = derivatives.declared_derivative(derivatives.KernelGlue(), _scan, _scan_fwd, _scan_bwd,
+                                           nondiff_argnums=(8, 9))
 """mamba_ssm's chunked SSD scan on the ported kernels: `(y, final)` for `x` `[B, T, H, P]`, the step
 `dt` `[B, T, H]` through its bias, softplus and limit, `A` `[H]`, `B` and `C` `[B, T, G, N]` in `x`'s
 dtype, `D` `[H]`, each row's initial state `h0` `[B, H, P, N]` and each token's document `seq` `[B, T]`
@@ -1242,4 +1244,3 @@ tokens. `y` and the final state are fp32. P, N and the chunk are powers of two o
 numbers are mamba_ssm's: operands in their own dtype into fp32 accumulation, the states the chunks enter
 in the operands' dtype, the decay and the states across chunks in fp32; the output's cotangent is
 rounded to the operands' dtype for its products, as mamba_ssm's arrives."""
-ssd_scan.defvjp(_scan_fwd, _scan_bwd)

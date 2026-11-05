@@ -29,6 +29,7 @@ import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
+from dew.nn import derivatives
 from dew.nn.kernels import launches, recurrence, recurrence_algebra as algebra
 from dew.nn.kernels.chunked_launch import (
     _CHUNK,
@@ -1191,7 +1192,8 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, wide: bool,
     return dq, dk, dv, dg.astype(jnp.float32), db, dh0, None
 
 
-chunk_gated_delta_rule = jax.custom_vjp(_rule, nondiff_argnums=(7, 8, 9, 10, 11))
+chunk_gated_delta_rule = derivatives.declared_derivative(derivatives.KernelGlue(), _rule, _rule_fwd,
+                                                         _rule_bwd, nondiff_argnums=(7, 8, 9, 10, 11))
 """fla's chunked gated delta rule on the ported kernels: `(o, final)` for `q`, `k` `[B, T, H, K]`
 (normalized as the caller wants them), `v` `[B, T, HV, V]`, the per-token natural log decay `g`
 `[B, T, HV]` fp32, `beta` `[B, T, HV]` and each row's initial memory `h0` `[B, HV, K, V]` fp32, the
@@ -1201,4 +1203,3 @@ each row as one. `keep` keeps the rule's memory for the backward, which otherwis
 fla's does (`_rule_fwd`). Its numbers are fla's: bf16 operands store `A`, `w`, `u`, `h` and the
 corrected values in bf16, with fp32 accumulation and fp32 decay, the memory fp32 across chunks; the
 output in the values' dtype, or fp32 where `wide`, for an epilogue to read unrounded."""
-chunk_gated_delta_rule.defvjp(_rule_fwd, _rule_bwd)

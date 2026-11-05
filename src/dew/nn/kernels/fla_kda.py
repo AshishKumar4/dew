@@ -34,6 +34,7 @@ import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
+from dew.nn import derivatives
 from dew.nn.kernels import fla_gdn, launches, recurrence, recurrence_algebra as algebra
 from dew.nn.kernels.chunked_launch import (
     _CHUNK,
@@ -987,7 +988,8 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, wide: bool,
     return (dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype), dg, db.astype(beta.dtype), dh0, None)
 
 
-chunk_kda = jax.custom_vjp(_rule, nondiff_argnums=(7, 8, 9, 10, 11))
+chunk_kda = derivatives.declared_derivative(derivatives.KernelGlue(), _rule, _rule_fwd, _rule_bwd,
+                                            nondiff_argnums=(7, 8, 9, 10, 11))
 """fla's chunked Kimi delta attention on the ported kernels: `(o, final)` for `q`, `k` `[B, T, H, K]`
 (normalised as the caller wants them), `v` `[B, T, HV, V]`, the per-token natural log decay `g` `[B,
 T, HV, K]` fp32, `beta` `[B, T, HV]` and each row's initial memory `h0` `[B, HV, K, V]` fp32, the
@@ -996,4 +998,3 @@ rows into sequences, the memory starting from zero at each one a row does not be
 each row as one. Its numbers are fla's: bf16 operands store `A`, `w`, `u`, the gated keys and the
 memory each chunk enters in bf16, with fp32 accumulation, fp32 decay and the memory fp32 across
 chunks; the output in the values' dtype, or fp32 where `wide`, and the final memory fp32."""
-chunk_kda.defvjp(_rule_fwd, _rule_bwd)
