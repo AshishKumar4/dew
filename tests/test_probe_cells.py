@@ -6,7 +6,8 @@ from armada_support import loaded
 from test_armada_ci import armada_task, cached_checkout
 
 
-def test_probe(ci, tmp_path, monkeypatch, cache_worker):
+def test_probe(tmp_path, monkeypatch, cache_worker):
+    ci = loaded(tmp_path, monkeypatch)
     (tmp_path / "tests/helper.py").write_text("VALUE = 1\n")
     (tmp_path / "tests/test_mixed.py").write_text(
         "import pytest\nfrom pathlib import Path\n"
