@@ -110,8 +110,7 @@ def unfitted(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     shared memory they stage), or None. The route then takes another mainloop rather than a launch that
     cannot run (`attention_route._mainloop`); the backward's own launches hold the same tiles' operands."""
     op, args, _ = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
-    kept = {False: Kept.NONE, True: Kept.SPLIT}.get(residuals, residuals)
-    if op.fits(op.bind(*args, residuals=kept, interpret=False), generation.gpu_target()):
+    if op.fits(op.bind(*args, residuals=_kept(residuals), interpret=False), generation.gpu_target()):
         return None
     return Refusal('resources',
                    "no config of the Triton mainloop's forward fits the GPU's block and registers")
@@ -278,8 +277,10 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
     natural: bool = NATURAL
 
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, m0, total0,
-             acc0, *, residuals: Kept, interpret: bool, config: Tiles, return_residuals: bool = False):
+             acc0, *, residuals: bool | Kept, interpret: bool, config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
+
+        residuals = _kept(residuals)
 
         # The query taken by its scale's power of two before its products (`prescale`).
         query, scale, power = prescaled(query, self.scale)
@@ -393,7 +394,7 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         query_tile, weights = config.block_q * width * size, config.block_q * config.block_k * size
         shared = config.block_q >= 128 and width <= 128
         plain = streamed + (max(query_tile, weights) if shared else query_tile + weights)
-        if not (ba.arguments.get("residuals") is Kept.SPLIT and algebra.headroom(value.dtype)):
+        if not (_split(ba) and algebra.headroom(value.dtype)):
             return plain
         key_stages = (config.stages - 1) * config.block_k * width * size
         normalized = config.block_k * (width + value_width) * size
@@ -410,12 +411,26 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         rows, value = config.block_q, ba.arguments["value"]
         sums = 2 if algebra.compensates(value.dtype) else 1
         words = sums * rows * value.shape[-1] + rows * config.block_k
-        if ba.arguments.get("residuals") is Kept.SPLIT:
+        if _split(ba):
             words += rows * value.shape[-1]
         return words // (32 * config.warps)
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         return _eligible(ba, target)
+
+
+def _kept(residuals: bool | Kept | None) -> Kept:
+    """What a forward keeps (`Kept`), a bound `residuals` as `forward` takes it: True the training walk's
+    split sums, False or None nothing."""
+    if isinstance(residuals, Kept):
+        return residuals
+    return Kept.SPLIT if residuals else Kept.NONE
+
+
+def _split(ba: tokamax.BoundArguments) -> bool:
+    """Whether a bound forward walks the training walk's split sums (`Kept.SPLIT`), which its resources
+    price."""
+    return _kept(ba.arguments.get("residuals")) is Kept.SPLIT
 
 
 def _derived[T: (Tiles, BackwardTiles)](launch: Template[T], steps: tuple[T, ...], ba: tokamax.BoundArguments,
@@ -473,7 +488,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
         raise NotImplementedError(reason)
     op, args, queries = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
     value_width = value.shape[-1]
-    kept = {False: Kept.NONE, True: Kept.SPLIT}.get(residuals, residuals)
+    kept = _kept(residuals)
     out = op(*args, residuals=kept, interpret=interpret)
     if kept is Kept.NONE:
         return out[:, :queries, :, :value_width]

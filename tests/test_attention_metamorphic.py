@@ -144,7 +144,7 @@ def test_a_far_short_rows_slices_merge_through_its_masked_rewalk_interpreted():
                     residuals=Kept.OUTPUT, interpret=True, out_dtype=jnp.float32, masked=True, splits=8)[:3]
             spec = attention_decode._spec(rows, row_spans, template.Hooks(), scale=None)
             merged = attention_decode.merged(spec, out, maximum, total)
-            return attention_decode.unpacked(merged, DECODE_HEADS).astype(query.dtype)
+            return template.ungrouped_rows(merged, DECODE_HEADS).astype(query.dtype)
 
     assert_as_exact(jax.jit(sliced), jax.jit(lambda q, k, v: template.reference(q, k, v, spans)), far,
                     "a far short row's slices through its masked rewalk", seeds=SEEDS)
@@ -175,7 +175,7 @@ def test_a_decode_steps_keys_cut_into_any_slice_count_merge_to_its_attention_int
                 out, maximum, total = out[:, None], maximum[:, :, None], total[:, :, None]
             spec = attention_decode._spec(rows, row_spans, template.Hooks(), scale=None)
             merged = attention_decode.merged(spec, out, maximum, total)
-            return attention_decode.unpacked(merged, DECODE_HEADS).astype(query.dtype)
+            return template.ungrouped_rows(merged, DECODE_HEADS).astype(query.dtype)
 
     assert_as_exact(jax.jit(sliced), jax.jit(lambda q, k, v: template.reference(q, k, v, spans)),
                     _decode_draw, f"decode step cut into {slices} slices", seeds=SEEDS)
