@@ -259,7 +259,7 @@ def test_sites_past_one_judges_jobs_inputs_together_are_planned_and_one_past_it_
         return f"import pytest\n\n@pytest.mark.{mark}\ndef test_site():\n    pass\n"
 
     # Two sites a Python, each within one job's inputs and past them together on every Python.
-    seeds = ci.MAX_INPUTS // (2 * ci.check1_wire.staged_units(1))
+    seeds = ci.MAX_INPUTS // (2 * ci.check1_wire().staged_units(1))
     units = ci.MAX_INPUTS - 1
     written(tmp_path, {"test_a.py": marked(f"check1_shards(seeds={seeds}, per_task=1)"),
                        "test_b.py": marked(f"shards(units={units}, per_task=1)")})

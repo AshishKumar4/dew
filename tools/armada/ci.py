@@ -138,10 +138,13 @@ def _loaded(path: Path):
 
 
 HERE = Path(__file__).resolve().parent
-check1_wire = _loaded(HERE.parents[1] / "tests" / "check1_wire.py")
-"""Check 1's map and judge contract, its one owner: what runs a site's test as a map task (DRAWS, RECORDS), as
-their judge (POOL), a judge's ask for its later map tasks (LATER), its stages log (STAGES) and the units its
-stages draw (`staged_units`)."""
+@functools.cache
+def check1_wire():
+    """Check 1's map and judge contract, its one owner (tests/check1_wire.py): what runs a site's test as a
+    map task (DRAWS, RECORDS), as their judge (POOL), a judge's ask for its later map tasks (LATER), its
+    stages log (STAGES) and the units its stages draw (`staged_units`). Loaded where a plan shards a site,
+    so a checkout of the harness alone (a page generator's scratch copy) imports this file."""
+    return _loaded(HERE.parents[1] / "tests" / "check1_wire.py")
 child_groups = _loaded(HERE / "child_groups.py")
 session = _loaded(HERE / "session.py")
 coverage_report = _loaded(HERE / "coverage_report.py")
@@ -1103,8 +1106,8 @@ def marked_sites(name: str, text: str) -> dict[str, Mark]:
         if (not mark.args and len(counts) == len(mark.keywords) and set(counts) in allowed
                 and all(type(count) is int and count > 0 for count in counts.values()) and test not in found):
             declared = counts[SHARDS[kind]]
-            units = check1_wire.staged_units(declared) if kind == "check1_shards" else declared
-            weighed = check1_wire.staged_units(counts.get("conditioning", 0))
+            units = check1_wire().staged_units(declared) if kind == "check1_shards" else declared
+            weighed = check1_wire().staged_units(counts.get("conditioning", 0))
             found[test] = Mark(units, counts["per_task"], mark.lineno, declared, weighed,
                                counts.get("conditioning_per_task", 0))
             read.add(id(mark.func))
@@ -1523,10 +1526,12 @@ def site_environment(site: re.Match | None) -> dict[str, str]:
         stages_file().unlink(missing_ok=True)
         # Check 1 appends to its log where the directory is (`_logged`).
         stages_file().parent.mkdir(parents=True, exist_ok=True)
-        return {check1_wire.POOL: str(armada_dir("ARMADA_INPUTS", INPUTS)),
-                check1_wire.LATER: str(later_file()), check1_wire.STAGES: str(stages_file())}
-    return {check1_wire.DRAWS: f"{site['start']}:{site['stop']}",
-            check1_wire.RECORDS: str(armada_dir("ARMADA_ARTIFACTS", ARTIFACTS))}
+        wire = check1_wire()
+        return {wire.POOL: str(armada_dir("ARMADA_INPUTS", INPUTS)), wire.LATER: str(later_file()),
+                wire.STAGES: str(stages_file())}
+    wire = check1_wire()
+    return {wire.DRAWS: f"{site['start']}:{site['stop']}",
+            wire.RECORDS: str(armada_dir("ARMADA_ARTIFACTS", ARTIFACTS))}
 
 
 def asked(site: re.Match | None) -> dict[str, bool]:

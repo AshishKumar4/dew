@@ -660,7 +660,7 @@ def verdict(args, pool):
             log_softmax(np.asarray(loaded[phase][name], np.float64)) for name in names])}
 
     original = functools.partial(log_probabilities, "author")
-    exact = functools.partial(log_probabilities, "truth")
+    exact = as_given(functools.partial(log_probabilities, "truth"))
 
     def recorded(index):
         return {"log_probabilities": leaf_summary(original(index)["log_probabilities"],
