@@ -703,9 +703,8 @@ def _own_key(branch: Pipeline) -> int | None:
 def _keys_shuffles(build: _Build) -> bool:
     """Whether `build` shuffles its chain by the chain's own name (`_own_key`): from plan version 9, a named
     chain whose order shuffles at its root; one that shuffles nothing reads alike under any name."""
-    stages = build.lowering.order.get("stages", [])
-    return build.version >= 9 and build.named is not None and isinstance(stages, list) and any(
-        isinstance(stage, str) and stage.startswith("Shuffle(") for stage in stages)
+    return build.version >= 9 and build.named is not None and any(
+        isinstance(stage, Shuffle) for stage in build.lowering.stages)
 
 
 def _build(branch: Pipeline, read: Read, loading: Loading, *, batch: int, training: bool, seed: int = 0,
