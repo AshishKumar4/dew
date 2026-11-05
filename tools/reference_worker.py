@@ -100,7 +100,7 @@ def received(stream: BinaryIO) -> dict[str, np.ndarray] | None:
     """The arrays of the next frame the other end sent (`send`), or None where it closed the pipe between
     frames. A frame cut short, in its size or its bytes, is an EOFError."""
     header = stream.read(8)
-    if not header:
+    if not header or (len(header) < 8 and os.environ.get("MUTATE") == "short-header"):
         return None
     if len(header) < 8:
         raise EOFError(f"the pipe closed {len(header)} bytes into a frame's 8-byte size")
@@ -120,7 +120,8 @@ def reserved() -> BinaryIO:
     copy would be a copy of stderr: `session` has a worker's script run under this file, which calls it
     before the script imports anything, and `serve` calls it again."""
     answers = os.fdopen(os.dup(sys.stdout.fileno()), "wb")
-    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    if os.environ.get("MUTATE") != "reserve":
+        os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
     return answers
 
 
@@ -161,9 +162,9 @@ class Session:
         self.process, self.script, self.directory = process, Path(script).name, directory
         line = process.stdout.readline().decode().strip()
         words = line.split(maxsplit=2)
-        if words[:1] != ["ready"] or words[1:2] not in (["paths"], ["frames"]):
+        if (words[:1] != ["ready"] or words[1:2] not in (["paths"], ["frames"])) and os.environ.get("MUTATE") != "ready":
             raise self._ended("did not say it was ready", line)
-        self.frames = words[1] == "frames"
+        self.frames = words[1:2] == ["frames"]
         self.started = words[2] if len(words) > 2 else ""
         """The worker's account of how it started (`serve`'s `ready`)."""
 
@@ -182,6 +183,8 @@ class Session:
         except (BrokenPipeError, EOFError) as error:
             raise self._ended("ended on a request") from error
         if answer is None:
+            if os.environ.get("MUTATE") == "wait":
+                self.process.wait()
             raise self._ended("ended on a request")
         return answer
 
@@ -197,7 +200,7 @@ class Session:
         reply = self.process.stdout.readline()
         if not reply:
             return None
-        if reply != b"done\n":
+        if reply != b"done\n" and os.environ.get("MUTATE") != "ack":
             raise self._ended("answered a request with something else than done", reply.decode().strip())
         with np.load(out) as answer:
             return dict(answer)
@@ -213,6 +216,9 @@ def session(command: Sequence[str], *, env: Mapping[str, str] | None = None) -> 
     among them, the group is stopped and reaped, its pipes closed and the directory removed, each step
     attempted whichever fail, the block's own error the one raised."""
     from dew.cleanup import attempted, owned_group
+    if os.environ.get("MUTATE") == "plain-popen":
+        import dew.cleanup as _c
+        _c.start = lambda command, **options: subprocess.Popen(command, start_new_session=True, **options)
 
     python, script, *arguments = command
     root = Path(tempfile.mkdtemp(prefix="reference-"))
@@ -220,12 +226,17 @@ def session(command: Sequence[str], *, env: Mapping[str, str] | None = None) -> 
         (root / "io").mkdir()
         (root / "tmp").mkdir()
         environment = {**(os.environ if env is None else env), "TMPDIR": str(root / "tmp")}
+        if os.environ.get("MUTATE") == "tmpdir":
+            environment = {**(os.environ if env is None else env)}
         started = [python, __file__, script, *arguments]
+        if os.environ.get("MUTATE") == "bootstrap":
+            started = [python, script, *arguments]
         with owned_group(started, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=environment) as process:
             yield Session(process, script, root / "io")
     finally:
-        attempted([("remove the session's scratch directory", lambda: shutil.rmtree(root))],
-                  primary=sys.exception())
+        if os.environ.get("MUTATE") != "scratch":
+            attempted([("remove the session's scratch directory", lambda: shutil.rmtree(root))],
+                      primary=sys.exception())
 
 
 __all__ = ["Applied", "Session", "answered", "arms", "paired", "received", "reserved", "send", "serve",

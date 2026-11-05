@@ -147,6 +147,10 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
 def _still_owned(process: subprocess.Popen) -> bool:
     """Whether the group `process` led was `start`ed, its lifeline still alive, and a process of it still
     runs: the group is then still its owner's, though its leader was reaped, and its id names it."""
+    if os.environ.get("MUTATE") == "reaped-owned":
+        return False
+    if os.environ.get("MUTATE") == "reaped-unowned":
+        return bool(members(process.pid))
     with _HELD:
         held = _LIFELINES.get(process.pid)
     return held is not None and held[1].poll() is None and bool(members(process.pid))
@@ -210,8 +214,10 @@ def _ending(started: Callable[[], subprocess.Popen], end: Callable[[subprocess.P
         yield process
     finally:
         streams = [stream for stream in (process.stdin, process.stdout, process.stderr) if stream is not None]
-        attempted([("end the process group", lambda: end(process)),
-                   *((f"close {stream!r}", stream.close) for stream in streams)], primary=sys.exception())
+        if not (os.environ.get("MUTATE") == "success-only" and sys.exception() is not None):
+            attempted([("end the process group", lambda: end(process)),
+                       *((f"close {stream!r}", stream.close) for stream in streams)],
+                      primary=None if os.environ.get("MUTATE") == "masks" else sys.exception())
 
 
 def process_group(command: Sequence[str], *, grace: float = 0.0, interrupt: int = signal.SIGTERM,
