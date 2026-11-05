@@ -220,18 +220,25 @@ class BitForm:
             values.append(value)
         return tuple(values[index] for index in self.outputs)
 
-    @property
-    def ptx(self) -> str:
-        """The form as one PTX block over its stored word `$N` (N the outputs' count) into its outputs `$0` to
-        `$N-1`, each instruction on the pipe its step names (`_PTX`), for a kernel's inline assembly (Pallas's
-        `elementwise_inline_asm`, constraints `=r` an output and `r` the word)."""
-        count = len(self.outputs)
-        names = [f"${count}", *(f"v{index}" for index in range(1, len(self.steps) + 1))]
-        lines = [f".reg .b32 {', '.join(names[1:])};"] if self.steps else []
-        for index, step in enumerate(self.steps, start=1):
-            operands = [names[arg] for arg in step.args]
-            lines.append(_PTX[step.op, step.unit](names[index], operands, step.immediate))
-        lines += [f"mov.b32 ${position}, {names[value]};" for position, value in enumerate(self.outputs)]
+    def ptx(self, output: int) -> str:
+        """Output register `output` of the form as one PTX block over its stored word `$1` into `$0`, the
+        steps it reads each on the pipe its step names (`_PTX`), for a kernel's inline assembly (Pallas's
+        `elementwise_inline_asm`, constraints `=r,r`, which takes one result a block): a register's block
+        apiece, whose shared steps ptxas computes once, as it optimizes the kernel's PTX whole."""
+        needed: set[int] = set()
+        pending = [self.outputs[output]]
+        while pending:
+            value = pending.pop()
+            if value and value not in needed:
+                needed.add(value)
+                pending.extend(self.steps[value - 1].args)
+        names = {0: "$1", **{value: f"v{value}" for value in needed}}
+        lines = [f".reg .b32 {', '.join(names[value] for value in sorted(needed))};"] if needed else []
+        for value in sorted(needed):
+            step = self.steps[value - 1]
+            lines.append(_PTX[step.op, step.unit](names[value], [names[arg] for arg in step.args],
+                                                  step.immediate))
+        lines.append(f"mov.b32 $0, {names[self.outputs[output]]};")
         return "{\n" + "\n".join(lines) + "\n}"
 
     @property
