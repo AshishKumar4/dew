@@ -171,8 +171,7 @@ COMPARISONS = {
                           "assert_as_exact_as_the_reference(mine, theirs, truth, 'a site')", 1),
     "the one-draw rule over leaves": (
         "import one_draw\n"
-        "one_draw.assert_leaves_as_exact(mine, theirs, truth)\n"
-        "one_draw.assert_no_less_exact(mine, theirs, truth, 'a site')", 2),
+        "one_draw.assert_no_less_exact(mine, theirs, truth, 'a site')", 1),
     "check 1 over drawn seeds": ("from reference_error import assert_as_exact\n"
                                  "assert_as_exact(dew, reference, draw, 'a site', seeds=8)", 0),
 }

@@ -52,8 +52,6 @@ FEWEST_SEEDS = 8
 seeds a bootstrap has so few distinct resamples that its interval can sit wholly to one side of PARITY by
 the draws' luck, so fewer is Inconclusive whatever their ratio reads; above it the measured interval
 decides. `seeds_for` never declares fewer."""
-REDRAW = 4
-"""A failing site's pooled ratio is drawn again over REDRAW times its seeds before it fails."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -527,6 +525,26 @@ with n and with the sum's cancellation (for standard normal terms, the smallest 
 review's measurement, the median over 200 sums, was 37 units in the sum's last place at 16 terms, 918 at
 128 and 22,966 at 1,024): past a few dozen terms of that kind an error in this window passes both checks
 wherever the pooled ratio does not see it."""
+
+
+RULED_SHARE = 0.9
+"""The share of a worst row's squared error its largest element carries past which one value rules the row:
+where both Dew's worst row and the reference's, over a stage's draws, are so ruled, a leaf of more than two
+values a row judges its maximum at a row of one value's factor (NARROW_FACTORS[1]; `_Draws.factor`, row
+3684). Such rows (an input amplified through 2^k, the weighed check's case) part as one value's error does:
+at a share s each row's RMS error is within sqrt(1/s) of its largest element's over the row's width, so the
+two rows' ratio is the two elements' within 1.054 either way at 0.9. Calibrated through the gate's own
+verdict (`tools/gate_null_runs.py` `row_controls`, equally exact pairs, one element a row amplified by 2^k,
+8 seeds, 32,000 runs a layout over 1 and 4 rows a draw, 3, 4 and 16 values a row, k apart in each arm or
+shared; armada vq-g17-calib against vq-g17-calib-base): with k up to 24 (rows ruled far past the cutoff)
+it fails at most 2 of 32,000 runs, where the width's factor alone failed up to 154 of 4,000; with k up to
+4, which holds the shares about the cutoff, at most 14 of 32,000 (1 row of 3 values, k apart), where the
+width's factor alone failed 185, and 0 to 3 at 16 values. Dew's worst row must be ruled too, so a row of
+Dew's spread over its values (a row fault) keeps its width's factor beside a reference one value rules. A
+Gaussian row of eight values or more is almost never ruled; rows of three or four values sometimes are,
+where a fault ruled alike is refused less often. A value's own error in a ruled row is check 2's to bound.
+A stacked-examples site's paired rows keep their width's factor (`_judgement`), and a recording's summary,
+which keeps no row's elements, keeps it too."""
 
 
 def row_factor(width: int) -> float:

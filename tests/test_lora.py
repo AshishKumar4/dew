@@ -700,7 +700,7 @@ def test_a_clipped_linear_adapts_once_inside_its_bounds_and_reloads(tmp_path):
     model, variables, adapter, draw, forward, reference = clipped_adapter_case()
     assert_as_exact(forward, as_given(lambda *args: reference(torch.float32, *args)), draw,
                     "clipped linear adapter", seeds=CLIPPED_SEEDS,
-                    truth_fn=lambda *args: reference(torch.float64, *args))
+                    truth_fn=as_given(lambda *args: reference(torch.float64, *args)))
     factors, inputs, _ = draw(3)
     def loss(params):
         return jnp.mean(jnp.square(adapter.model.apply({**adapter.variables, "params": params}, inputs)))
@@ -1005,6 +1005,7 @@ def test_a_registry_model_adapts_through_the_names_its_own_kernels_carry(tmp_pat
     def draw(seed):
         return (np.random.default_rng([0x10A, seed]).integers(0, REGISTRY_FIELDS["vocab_size"], (2, 8)),)
 
+    @as_given
     def truth(tokens):
         with jax.enable_x64(new_val=True):
             return np.asarray(wide.apply(widened(variables), jnp.asarray(tokens)))

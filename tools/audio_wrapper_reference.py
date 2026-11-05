@@ -28,7 +28,7 @@ from audio_reference import audio_config, perturb, waveforms
 from safetensors.torch import save_file
 from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import (Gemma3nAudioFeatureExtractor, Gemma3nConfig, Gemma3nProcessor,
-                          Gemma3nTextConfig, Gemma3nVisionConfig, Gemma4AudioFeatureExtractor, Gemma4Config,
+                          Gemma3nVisionConfig, Gemma4AudioFeatureExtractor, Gemma4Config,
                           Gemma4ImageProcessor, Gemma4Processor, Gemma4TextConfig, Gemma4VideoProcessor,
                           Gemma4VisionConfig, PreTrainedTokenizerFast, SiglipImageProcessor)
 from transformers.models.gemma3n.modeling_gemma3n import Gemma3nForConditionalGeneration
@@ -55,16 +55,9 @@ def tokenizer():
 
 
 def gemma3n():
-    text = Gemma3nTextConfig(
-        vocab_size=64, vocab_size_per_layer_input=48, hidden_size=32,
-        intermediate_size=[48, 48, 64, 64], num_hidden_layers=4, num_attention_heads=4,
-        num_key_value_heads=2, head_dim=8,
-        layer_types=["sliding_attention", "sliding_attention", "full_attention", "sliding_attention"],
-        sliding_window=4, max_position_embeddings=64, rms_norm_eps=1e-6, rope_theta=1e6,
-        rope_local_base_freq=1e4, final_logit_softcapping=5.0, hidden_size_per_layer_input=8,
-        altup_num_inputs=3, altup_active_idx=0, altup_coef_clip=120.0, altup_correct_scale=True,
-        num_kv_shared_layers=1, laurel_rank=8, activation_sparsity_pattern=[0.0, 0.0, 0.0, 0.0],
-        tie_word_embeddings=True)
+    from hf_reference_b import gemma3n_wrapper_text_config
+
+    text = gemma3n_wrapper_text_config()
     vision = Gemma3nVisionConfig(hidden_size=2048, vocab_size=8, vocab_offset=48,
                                  model_args={"channel_multiplier": 1 / 64, "stem_size": 8, "msfa_output_resolution": 2})
     config = Gemma3nConfig(text_config=text, vision_config=vision, audio_config=audio_config("gemma3n"),
