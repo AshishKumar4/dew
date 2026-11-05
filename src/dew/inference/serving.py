@@ -85,7 +85,7 @@ from jax.experimental import checkify
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
-from dew._coordination import agreed_reads, collective_host
+from dew._coordination import agreed_reads, collective_host, pinned_get
 from dew._hashing import array_fingerprint
 from dew._records import JSON
 from dew.batch import (
@@ -1114,30 +1114,35 @@ class Server:
         reclaimed prefix page out to its host slot, then each shared one back from its slot into its fresh
         page, a fixed number a call so one program of each serves every step. A process keeps the slots of
         its own groups, and hands the pages written in a row per group, its groups' rows its own
-        (`_placed`)."""
+        (`_placed`), each group's at most as many as its share of an admission reads."""
         if self._host is None:
             return
         assert isinstance(self.rows, PagedRows)
-        width, host = self.admission * self.rows.width, self.rows.pages[0].host
+        host, width = self.rows.pages[0].host, self.admission * self.rows.width
         for start in range(0, len(spills), width):
             batch = spills[start:start + width]
             pages, _ = _padded(batch, width, 1)
-            leaves = jax.tree.leaves(collective_host(self._read_pages(self._resident, self._carried, pages),
-                                                     phase="the prefix cache's spilled pages"))
+            read = self._read_pages(self._resident, self._carried, pages)
+            # A pool's pages come home with every process agreeing; a server of one process's alone.
+            leaves = (jax.tree.leaves(collective_host(read, phase="the prefix cache's spilled pages"))
+                      if self.pooled else pinned_get(jax.tree.leaves(read)))
             for index, (_, slot) in enumerate(batch):
                 if slot // host in self._local:
                     self._host[slot] = [np.asarray(leaf)[:, index].copy() for leaf in leaves]
-        for start in range(0, len(uploads), width):
-            batch = uploads[start:start + width]
-            slots, pages = _padded(batch, width, 1)
-            shapes = page_shapes(self._resident, self._carried, width)
+        share = width // self.groups
+        by_group = [[pair for pair in uploads if pair[0] // host == group] for group in range(self.groups)]
+        shapes = page_shapes(self._resident, self._carried, share)
+        for start in range(0, max(map(len, by_group)), share):
+            pages = np.full((self.groups, share), DROPPED, np.int32)
             held = [np.zeros((len(self._local), *leaf.shape), leaf.dtype) for leaf in jax.tree.leaves(shapes)]
-            for index, (slot, _) in enumerate(batch):
-                if slot // host in self._local:
-                    for rows, page in zip(held, self._host[slot], strict=True):
-                        rows[self._local.index(slot // host), :, index] = page
+            for group, pairs in enumerate(by_group):
+                for index, (slot, page) in enumerate(pairs[start:start + share]):
+                    pages[group, index] = page
+                    if group in self._local:
+                        for rows, held_page in zip(held, self._host[slot], strict=True):
+                            rows[self._local.index(group), :, index] = held_page
             self._resident, self._carried = self._written_pages(
-                self._resident, self._carried, pages, slots // host,
+                self._resident, self._carried, pages,
                 jax.tree.unflatten(jax.tree.structure(shapes), self._placed(held)))
 
     def run(self) -> None:

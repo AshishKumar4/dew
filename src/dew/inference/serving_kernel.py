@@ -700,18 +700,16 @@ def page_shapes(resident: Slots, carried: Slots, count: int) -> Variables:
     return jax.eval_shape(_read_pages, resident, carried, jax.ShapeDtypeStruct((count,), jnp.int32))
 
 
-def _written_pages(resident: Slots, carried: Slots, pages: jax.Array, groups: jax.Array,
-                   held: Variables) -> tuple[Slots, Slots]:
-    """The state with the pool's `pages` set to `held`'s, each leaf `[groups, heads, len(pages), ...]` with
-    page `i` in the row of its group (`groups[i]`), the group whose rows hold its slot; a page past the
-    pool is dropped."""
+def _written_pages(resident: Slots, carried: Slots, pages: jax.Array, held: Variables) -> tuple[Slots, Slots]:
+    """The state with the pool's `pages`, `[groups, count]`, each group's own, set to `held`'s, each leaf
+    `[groups, heads, count, ...]`, a group's pages in its row; a page past the pool is dropped."""
     state = joined(resident, carried)
 
     def written(leaf, values):
         if values is None:
             return leaf
-        own = jnp.take_along_axis(values, groups.reshape(1, 1, -1, *(1,) * (values.ndim - 3)), axis=0)[0]
-        return leaf.at[:, pages].set(own.astype(leaf.dtype), mode="drop")
+        flat = jnp.moveaxis(values, 0, 1).reshape(values.shape[1], -1, *values.shape[3:])
+        return leaf.at[:, pages.reshape(-1)].set(flat.astype(leaf.dtype), mode="drop")
 
     cache = jax.tree.map(written, state.decoder.cache, held, is_leaf=lambda x: x is None)
     return split_donated(dataclasses.replace(state, decoder=dataclasses.replace(state.decoder, cache=cache)))
@@ -724,8 +722,7 @@ def page_programs(formats: Formats, rows: NamedSharding | None) -> tuple[OuterPr
     writes no slice into an array in host memory, so the host keeps the pages it reads."""
     resident, carried = split_donated(formats)
     return (outer_program(_read_pages, in_shardings=(resident, carried, None)),
-            outer_program(_written_pages, donate_argnums=(0,),
-                          in_shardings=(resident, carried, None, None, rows),
+            outer_program(_written_pages, donate_argnums=(0,), in_shardings=(resident, carried, None, rows),
                           out_shardings=(resident, carried)))
 
 
