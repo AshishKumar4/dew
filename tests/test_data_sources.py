@@ -1714,6 +1714,25 @@ def test_two_unnamed_grain_stores_keep_their_own_rows_and_counts_in_phases_and_a
     assert sorted(value for name, value in counts.items() if name.startswith("data/rows/")) == [5, 5]
 
 
+@pytest.mark.parametrize("threads", [0, 2])
+def test_a_filtered_grain_source_streams_its_kept_records_on_any_share_of_threads(threads):
+    """A Grain dataset filtered by index (`MapDataset.filter`, which leaves a dropped index None) streams the
+    records it keeps, in order, whatever share of the loading's threads it reads on: none, as a member of
+    a mix of more members than threads reads on the thread that draws it, or some (4079's review: a reader
+    of its own for no threads returned the dropped indices)."""
+    from dew.data import from_grain
+    from dew.data.pipeline import Pipeline
+
+    rows = grain.MapDataset.source([{"id": index} for index in range(12)])
+    kept = rows.filter(lambda row: row["id"] % 3 == 0)
+    stream = compile(Pipeline(from_grain(kept)).batch(1), read="streamed",
+                     loading=Loading(workers=0, threads=threads, read_buffer=2)).train(DataPartition())
+    try:
+        assert [int(batch["id"][0]) for batch in itertools.islice(stream, 4)] == [0, 3, 6, 9]
+    finally:
+        stream.close()
+
+
 @pytest.mark.parametrize("table", ["pandas", "arrow"])
 def test_memory_reads_a_table_of_lists_bytes_and_nulls_as_records_hold_them(table):
     """A table whose columns hold token lists, encoded bytes and a missing value reads as the same

@@ -332,9 +332,7 @@ class _IndexedSlice:
         import grain.python as pygrain
 
         records = pygrain.MapDataset.source(self.source.records("indexed"))
-        from dew.data.sources.rows import streamed_rows
-
-        return streamed_rows(records[shard.start : shard.stop], options)
+        return records[shard.start : shard.stop].to_iter_dataset(options)
 
 
 __all__ = ["READS", "Consumed", "Read", "Shard", "ShardManifest", "Source"]

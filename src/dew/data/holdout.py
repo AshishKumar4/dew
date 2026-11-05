@@ -403,6 +403,4 @@ class _Placed:
         return grain.MapDataset.source(self.indices).map(_SelectedRow(self.generation))
 
     def __call__(self, shard: Shard, options=None):
-        from dew.data.sources.rows import streamed_rows
-
-        return streamed_rows(self.rows()[shard.start : shard.stop], options)
+        return self.rows()[shard.start : shard.stop].to_iter_dataset(options)
