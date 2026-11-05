@@ -397,10 +397,15 @@ def test_a_gradient_added_to_a_zero_carry_holds_the_gradient_alone():
     def carried(logits, hidden):
         return jnp.zeros((4096, 256), jnp.float32) + product(logits, hidden)
 
+    # And a zero read through a view and a cast, as a loop of one turn reads its zero carry unstacked.
+    def unstacked(logits, hidden):
+        (zeros,) = jnp.unstack(jnp.zeros((1, 4096, 256), jnp.bfloat16).astype(jnp.float32), axis=0)
+        return zeros + product(logits, hidden)
+
     def peak(function):
         return peak_bytes(simplified(jax.make_jaxpr(function)(*shapes).jaxpr, "gpu"), "gpu", Workspace(0, 0))
 
-    assert peak(carried) == peak(product)
+    assert peak(carried) == peak(unstacked) == peak(product)
 
 
 def test_a_scatter_whose_updates_read_its_base_holds_them_apart():
