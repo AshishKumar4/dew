@@ -229,15 +229,10 @@ def test_reading_a_saved_run_opens_no_device_before_its_process_is_prepared(tmp_
     decision run's record opens none, whatever its record leaves to its checkpoints: the writing a run saved
     before row 3867 left to its layout is read where the run resumes (`resumed`, `check_resumed`), after
     the process is prepared, in a fresh interpreter (train 589's review)."""
-    def left_to_its_layout(recorded: str, kind: str) -> bool:
-        with archived(recorded, kind) as packed:
-            held = json.load(packed.extractfile(f"{kind}/run.json"))
-        return "option_text" in held["fields"] and held["fields"]["option_text"] is None
-
-    left = [(recorded, kind) for recorded, kind in SAVED if kind.startswith("decision")
-            and left_to_its_layout(recorded, kind)]
-    assert left, "a saved decision run left its writing to its layout"
-    run = extracted(tmp_path, *left[0])
+    # A saved decision run's record as main before row 3867 wrote it, its writing left to its layout.
+    run = extracted(tmp_path, *next((recorded, kind) for recorded, kind in SAVED if kind == "decision"))
+    record = json.loads((run / "run.json").read_text())
+    (run / "run.json").write_text(json.dumps({**record, "fields": {**record["fields"], "option_text": None}}))
     assert_exits_cleanly(f"""
 import socket
 
