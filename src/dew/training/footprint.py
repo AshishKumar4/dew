@@ -208,13 +208,15 @@ def simplified(program: jcore.Jaxpr, platform: str, lowering: str | None = None)
 
 
 def folded(program: jcore.Jaxpr) -> jcore.Jaxpr:
-    """`program` with each sum of a value and a scatter-add read by that sum alone a scatter-add into the
-    sum of that value and the scatter's base, the base dropped where it is a zero, as XLA's simplifier
-    folds them (`A + scatter(B, I, U) => scatter(A + B, I, U)` and `A + 0 => A`,
-    `AlgebraicSimplifierVisitor::HandleAdd`, xla/hlo/transforms/simplifiers/algebraic_simplifier.cc):
+    """`program` with each sum of a value and a zero that value (`zeros_added`), and each sum of a value
+    and a scatter-add read by that sum alone a scatter-add into the sum of that value and the scatter's
+    base, the base dropped where it is a zero, as XLA's simplifier folds them (`A + scatter(B, I, U) =>
+    scatter(A + B, I, U)` and `A + 0 => A`, `AlgebraicSimplifierVisitor::HandleAdd`,
+    xla/hlo/transforms/simplifiers/algebraic_simplifier.cc):
     a tied embedding's gradient, its head's product and the scatter of its rows' cotangents, is one
     buffer, which the scatter writes in place (`in_place`). Qwen3.5-4B's step under 'full' was derived
     holding the product, the scatter and their sum at its end, 7.1 GiB against XLA's 4.4 (row 4089)."""
+    program = zeros_added(program)
     producers = {out: equation for equation in program.eqns for out in equation.outvars}
     readers = collections.Counter(value for equation in program.eqns for value in equation.invars
                                   if isinstance(value, jcore.Var))
@@ -231,9 +233,7 @@ def folded(program: jcore.Jaxpr) -> jcore.Jaxpr:
                     or scattered.aval != equation.outvars[0].aval or id(scatter) in dropped):
                 continue
             base, *rest = scatter.invars
-            zero = producers.get(base) if isinstance(base, jcore.Var) else None
-            fill = None if zero is None or zero.primitive.name != "broadcast_in_dim" else zero.invars[0]
-            if isinstance(fill, jcore.Literal) and not np.any(np.asarray(fill.val)):
+            if zero(base, producers):
                 summed, sums = other, []
             else:
                 summed = jcore.Var(equation.outvars[0].aval)
@@ -246,6 +246,40 @@ def folded(program: jcore.Jaxpr) -> jcore.Jaxpr:
         return program
     return program.replace(eqns=[each for equation in program.eqns if id(equation) not in dropped
                                  for each in replaced.get(id(equation), [equation])])
+
+
+def zero(value: jcore.Var | jcore.Literal, producers: Mapping) -> bool:
+    """Whether `value` is a zero: a literal zero, or one broadcast."""
+    producer = producers.get(value) if isinstance(value, jcore.Var) else None
+    if producer is not None and producer.primitive.name == "broadcast_in_dim":
+        value = producer.invars[0]
+    return isinstance(value, jcore.Literal) and not np.any(np.asarray(value.val))
+
+
+def zeros_added(program: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`program` with each sum of a value and a zero of its shape that value (`A + 0 => A`,
+    `AlgebraicSimplifierVisitor::HandleAdd`): a tiled head of one tile adds its weight gradient to its
+    loop's zero carry, which its body runs inline (`compiled_program.once`)."""
+    producers = {out: equation for equation in program.eqns for out in equation.outvars}
+    renamed: dict[jcore.Var, jcore.Var | jcore.Literal] = {}
+    kept = []
+    for equation in program.eqns:
+        operands = [renamed.get(value, value) if isinstance(value, jcore.Var) else value
+                    for value in equation.invars]
+        if equation.primitive.name in ("add", "add_any") and len(operands) == 2:
+            first, second = operands
+            out = equation.outvars[0]
+            for added, other in ((first, second), (second, first)):
+                if zero(added, producers) and other.aval == out.aval:
+                    renamed[out] = other
+                    break
+            if out in renamed:
+                continue
+        kept.append(equation.replace(invars=operands))
+    if not renamed:
+        return program
+    return program.replace(eqns=kept, outvars=[renamed.get(value, value) if isinstance(value, jcore.Var)
+                                               else value for value in program.outvars])
 
 
 def operand_key(value: jcore.Var | jcore.Literal) -> Hashable:
