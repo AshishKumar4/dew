@@ -137,7 +137,14 @@ Rows 4026 to 4030 declare each lane's sites.
     on a lane that flushes a subnormal product (the CPU's, `tests/certified.py`'s `Lane.flushes`: the product
     is zero where the magnitude keeps its bits), nor for a complex value; exp and log cancel only over a sign
     and a range the language holds no fact of. None of these is built;
-  - **reuse** (compile time and dev time): a value the forward already computed;
+  - **reuse** (compile time and dev time): a value the forward already computed. An equal term is one e-class
+    and extraction prices a shared one once, so a value written twice is read once without a rule. A rule
+    would relate a new value to another the program holds; over benchmark_step's and the parallelism matrix's
+    step programs (2026-11-05, every program the pass saw, bodies included) none takes the square root and its
+    reciprocal of one value or the exponentials of a value and its negation, a handful square a value by a
+    product, and the only pattern of note is a divisor shared by several quotients (42 to 452 of 423 to 794
+    divisions a suite). A shared reciprocal `a (1/y)` overflows where `a / y` is finite (a subnormal `y`) and
+    makes a NaN of a zero `a`, so the dominance rule (§6.3) refuses it. Not built;
   - **decoupled reductions** (dev time): dependent nonlinear reductions broken with correction terms (the running-max
     rescale of online softmax, log-sum-exp merges and folds, moment merges);
   - **stable forms** (dev time; §1.5): `log1p` and `expm1`, log-space divergences, compensated and widened sums,
