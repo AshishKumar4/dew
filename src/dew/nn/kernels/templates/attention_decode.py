@@ -27,7 +27,7 @@ import jax.numpy as jnp
 from jax.extend import core as jaxpr_core
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic, resources
+from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic
 from dew.nn.kernels.templates.attention import Hooks, Initial, Kept, KeySpans, prescale
 from dew.nn.kernels.templates.attention_mosaic_program import bundle_of
 
@@ -138,7 +138,7 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     if programs >= processors:
         return Plan(config, 1)
     family = bundle_of(config, query.dtype)
-    resident = resources.resident_programs(family, config.consumers, op.registers(ba, config), target)
+    resident = family.programs(config.consumers, op.registers(ba, config))
     if target.shared_limit:
         resident = min(resident, max(1, target.shared_limit // op.staged_bytes(ba, config, target)))
     longest = math.ceil(spans.keys / config.block_k) // (2 * config.stages)
