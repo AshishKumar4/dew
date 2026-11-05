@@ -539,6 +539,13 @@ def spill_record(miss: report.Miss) -> dict[str, JSON]:
             "frame": miss.frame, "shared": miss.shared, "stepped": miss.stepped}
 
 
+def agreed(headroom: int | None) -> int | None:
+    """`headroom` as every process reads it: the tightest any process states, None where one states none
+    (it judges nothing), so each process takes the same decision on it (`from_every_process`)."""
+    stated = from_every_process(headroom)
+    return None if any(value is None for value in stated) else min(stated)
+
+
 @dataclasses.dataclass
 class FitSearch[LossT, EffectsT]:
     """A step's search over the fit ladder (`planned`): the first of the run's split candidates (`splits`)
@@ -733,14 +740,15 @@ class FitSearch[LossT, EffectsT]:
     def judged(self, split: int, narrow: bool) -> int | None:
         """The derived headroom of the step at `split` and `narrow` at the objective's rung, traced once a
         candidate (`judged_at`), and recorded beside the rungs `walked` reads; None where the derivation
-        cannot judge it or no device states memory to judge it against."""
+        cannot judge it or no device states memory to judge it against. Every process reads it alike
+        (`agreed`), so each compiles the plan the others do."""
         key = self.candidate_key(split, narrow)
         if key not in self.judged_at:
             assert self.derive is not None
             candidate = self.derive(split, narrow)
             footprint = candidate.footprint
-            headroom = None if footprint is None else derived_headroom(
-                footprint, local_devices(self.mesh), self.capacity, candidate.built)
+            headroom = agreed(None if footprint is None else derived_headroom(
+                footprint, local_devices(self.mesh), self.capacity, candidate.built))
             label = "unknown" if headroom is None else "fits" if headroom >= 0 else "refuses"
             self.derived.append({**self.current(), "narrow": narrow, "split": split, "headroom": headroom,
                                  "label": label, "terms": None if footprint is None else footprint.record()})
@@ -777,7 +785,8 @@ class FitSearch[LossT, EffectsT]:
         low, high = -1, len(candidates) - 1
         while high - low > 1:
             middle = (low + high) // 2
-            fits = (self.judged(candidates[middle], self.narrow) or -1) >= 0
+            judged = self.judged(candidates[middle], self.narrow)
+            fits = judged is not None and judged >= 0
             low, high = (low, middle) if fits else (middle, high)
         return high
 
@@ -789,9 +798,11 @@ class FitSearch[LossT, EffectsT]:
         return headroom is not None and headroom - self.under.get(self.remat_rung(), 0) >= 0
 
     def judging(self) -> bool:
-        """Whether this process's devices judge a derived footprint (`memory.judged`) at the search's
-        capacity: where one does not, every rung is unknown and no footprint is traced."""
-        return all(judged(device, self.capacity) for device in local_devices(self.mesh))
+        """Whether every process's devices judge a derived footprint (`memory.judged`) at the search's
+        capacity, each process answering alike: where one does not, every rung is unknown and no footprint
+        is traced."""
+        local = all(judged(device, self.capacity) for device in local_devices(self.mesh))
+        return all(from_every_process(local))
 
     def current(self) -> dict[str, JSON]:
         return rung_record(self.objective, self.xla_defaults, narrow=self.narrow)
@@ -870,14 +881,15 @@ class FitSearch[LossT, EffectsT]:
             fit, headroom = step_fits(compiled, self.mesh, candidate.held, self.capacity, candidate.built)
         seconds = time.perf_counter() - began
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
-        foreseen = None if candidate.footprint is None else derived_headroom(
-            candidate.footprint, local_devices(self.mesh), self.capacity, candidate.built)
+        foreseen = agreed(None if candidate.footprint is None else derived_headroom(
+            candidate.footprint, local_devices(self.mesh), self.capacity, candidate.built))
         probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, derived_headroom=foreseen)
-        if foreseen is not None and headroom is not None and foreseen > headroom:
+        measured = agreed(headroom)
+        if foreseen is not None and measured is not None and foreseen > measured:
             # What this compile needed past its derivation corrects the derivation's next judgments at its
             # remat (`derived_likely`).
             rung = self.remat_rung()
-            self.under[rung] = max(self.under.get(rung, 0), foreseen - headroom)
+            self.under[rung] = max(self.under.get(rung, 0), foreseen - measured)
         if foreseen is not None and (foreseen >= 0) != fit:
             # A derived peak bounded from below (`Footprint.exact`) admits provisionally: its miss names
             # the need the compile found, which a sourced rule is to reach.

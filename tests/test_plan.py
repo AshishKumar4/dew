@@ -396,12 +396,36 @@ class Handed(Trials):
 
 
 def live_executables() -> int:
-    """The executables the backend holds once the garbage they are part of is collected, the objects a plan
-    search holds out of the collector among it (`dew.nn.kernels.options.held_objects`, which freezes them
-    while it runs)."""
-    gc.unfreeze()
+    """The executables the backend holds once the garbage they are part of is collected."""
     gc.collect()
     return len(get_backend().live_executables())
+
+
+def test_a_plan_search_keeps_the_freeze_a_process_made_before_it():
+    """A plan search holds the objects alive before it out of Python's collector while it runs
+    (`held_objects`) and returns them after; a process that froze objects of its own before the search, as
+    one that forks its workers does, finds them frozen after it as before, the search freezing nothing
+    more (row 3341's review)."""
+    from dew.nn.kernels.options import held_objects
+
+    class Held:
+        """An object of the process's own."""
+
+    gc.collect()
+    assert gc.get_freeze_count() == 0
+    alive = Held()
+    with held_objects():
+        assert gc.get_freeze_count() > 0
+    assert gc.get_freeze_count() == 0
+    gc.freeze()
+    try:
+        frozen = gc.get_freeze_count()
+        with held_objects():
+            made = [Held() for _ in range(1000)]
+            assert gc.get_freeze_count() == frozen
+        assert gc.get_freeze_count() == frozen and made and alive
+    finally:
+        gc.unfreeze()
 
 
 COST = b"\x0a\x0c\x0a\x01x\x11" + struct.pack("<d", 1.0)
@@ -415,6 +439,9 @@ def stepped(trainer, steps: int = 3, trials: Callable[[TrainState], Trials] | No
     trials."""
     state, _, _ = trainer.place()
     held = None if trials is None else trials(state)
+    # The garbage of the steps before collected, which the plan search would hold frozen while it runs
+    # (`dew.nn.kernels.options.held_objects`) where an executable counted inside it is part of it.
+    gc.collect()
     step = trainer.compile(state, BATCH, held)
     state = state if held is None else held.state
     for _ in range(steps):

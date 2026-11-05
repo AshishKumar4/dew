@@ -10,7 +10,7 @@ import numpy as np
 import optax
 import pytest
 from objective_cases import jepa
-from test_plan import LIMIT, free, needs, one_device
+from test_plan import LIMIT, asked, free, needs, one_device
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
@@ -132,6 +132,47 @@ def test_the_first_compile_is_at_the_fewest_microbatches_the_derivation_says_fit
         compiled(trainer)
     assert compiles.count == 1 and trainer.plan["split"] == 4 and trainer.plan["remat"] is None
     assert {entry["split"]: entry["label"] for entry in trainer.plan["derived"]}[2] == "refuses"
+
+
+def test_a_split_the_derivation_leaves_no_byte_to_spare_is_one_it_fits(monkeypatch, tmp_path):
+    """A split whose derived headroom is exactly nothing fits as the derivation judges a fit (a headroom of
+    at least nothing), so with room for four microbatches to the byte the search's first compile is at
+    four, the fewest the derivation says fit, not the eight past it (row 3341's review: a headroom of
+    nothing read as a refusal)."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
+    sizing = deep(split=4)
+    compiled(sizing)
+    (judged,) = [entry for entry in sizing.plan["derived"] if entry["split"] == 4]
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
+    free(monkeypatch, LIMIT - judged["headroom"])
+    trainer = deep(split=None)
+    compiled(trainer)
+    headroom = {entry["split"]: entry["headroom"] for entry in trainer.plan["derived"]}
+    assert headroom[4] == 0 and headroom[2] < 0 and asked(trainer)[0][0] == 4
+
+
+def test_every_process_reads_a_derived_judgment_as_the_tightest_any_states(monkeypatch, tmp_path):
+    """The derivation's judgments decide which plan compiles first, so every process reads each alike
+    (`planning.agreed`): where another process's devices leave less room, a process plans by that room,
+    and where another cannot judge the step, none does and the compiles decide, each process compiling
+    the plan the others do (row 3341's review)."""
+    from dew.training import planning
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
+    sizing = deep(split=4)
+    compiled(sizing)
+    (judged,) = [entry for entry in sizing.plan["derived"] if entry["split"] == 4]
+    room = LIMIT - judged["headroom"]
+    # A peer with a byte less room refuses four and fits eight; one that cannot judge leaves the compiles
+    # to decide, from the batch whole.
+    for peer, first in ((lambda value: value if value is None else value - 1, 8), (lambda value: None, 1)):
+        monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / f"run-{first}"))
+        free(monkeypatch, room)
+        monkeypatch.setattr(planning, "from_every_process", lambda value, peer=peer: [value, peer(value)]
+                            if not isinstance(value, bool) else [value, value])
+        trainer = deep(split=None)
+        compiled(trainer)
+        assert asked(trainer)[0][0] == first
 
 
 def test_a_run_that_sets_its_remat_derives_its_own_rung_alone_and_compiles_there_once(monkeypatch, tmp_path):
