@@ -1332,6 +1332,30 @@ def test_the_hooked_mosaic_launches_lower_for_an_h100(launch):
 
 
 
+@lowers("sm90")
+def test_a_mosaic_launchs_epilogue_holding_a_marked_span_lowers_for_an_h100():
+    """A forward whose epilogue holds a marked span (`dew.nn.derivatives.marked`, as an error-free transform
+    or a surrogate's body is) is the Mosaic launch's on an H100 and lowers there at the tile it derives:
+    Dew's JAX lowers a marked call inside a Pallas kernel as its body (row 4029)."""
+    from dew.nn.derivatives import Protected, marked
+
+    rows, depth, width, groups = 2044, 768, 1536, 8
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((groups,), jnp.int32)
+    launch = grouped_matmul.MosaicGmm()
+    args = (bf16((rows, depth)), bf16((groups, depth, width)), sizes, (),
+            (jax.ShapeDtypeStruct((width,), jnp.float32),))
+    hooks = grouped_matmul.Hooks(epilogue=marked(Protected(), biased), epilogue_axes=(("columns",),))
+    options = {"out_dtype": "bfloat16", "trans_rhs": False, "hooks": hooks, "interpret": False}
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        bound = launch.bind(*args, **options)
+        assert launch.eligible(bound, generation.gpu_target())
+        [config] = launch.fitting(bound, generation.gpu_target())
+        jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
+            lowering_platforms=("cuda",))
+
+
 def _on_a_v5e():
     """An assumed v5e and a mesh of one of its devices, abstract, which Pallas's TPU lowering reads its
     target from on any host."""
