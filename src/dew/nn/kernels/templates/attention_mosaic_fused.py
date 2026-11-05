@@ -75,6 +75,18 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     add_dq(q_first, family.product(cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1])))
     return carry, (dk_acc, dv_acc)
 
+def _fused_out(family: mosaic.Family, sums: tuple, views: tuple, index, rows: int, stage, *, grouped: bool,
+               interpret: bool) -> None:
+    """A fused consumer `index`'s dK and dV `sums` out to their `views` through its rows of the output
+    `stage`: added into the key heads' sums where query heads share them (`grouped`), else stored."""
+    smem = stage.at[index, pl.ds(0, rows)]
+    if grouped:
+        for value, view in zip(sums, views, strict=True):
+            family.added(value, view, interpret, smem=smem)
+    else:
+        family.stored(sums, views, smem=smem)
+
+
 @tuning.lowered_once(("walk",))
 def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans: _Spans | None, *,
                   walk: _Backward) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -149,14 +161,9 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                 streams, views, (lo, hi), streamed, index,
                 lambda streams, lo, hi, counted: family.walk(streams, segments(lo, hi), (), shapes,
                                                              walk.interpret, first=counted))
-            def finished(stage):
-                smem = stage.at[index, pl.ds(0, block_k)]
-                if grouped:
-                    for value, ref in ((dk, dk_ref), (dv, dv_ref)):
-                        family.added(value, ref.at[keys_view], walk.interpret, smem=smem)
-                else:
-                    family.stored((dk, dv), (dk_ref.at[keys_view], dv_ref.at[keys_view]), smem=smem)
-
+            outs = (dk_ref.at[keys_view], dv_ref.at[keys_view])
+            finished = functools.partial(_fused_out, family, (dk, dv), outs, index, block_k, grouped=grouped,
+                                         interpret=walk.interpret)
             if after is None:
                 finished(out_smem)
             else:

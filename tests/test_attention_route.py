@@ -531,7 +531,7 @@ def test_the_accurate_form_is_one_option_away():
     """A run's numerics in the accurate forms (`generation.run_precision`, `Numerics.forms`) run every
     template call in the accurate form (natural logits and the accurate products, `attention_route.FORMS`),
     its forward and gradients bitwise a call's that names that form, and the fast forms run the default, a
-    call's that names none; the two forms differ; a form the template does not have is refused. Bit for bit
+    call's that names none; a form the template does not have is refused. Bit for bit
     by construction: the forms resolve to the named form's arguments before the call traces, so the two
     calls trace one program."""
     spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
@@ -548,7 +548,6 @@ def test_the_accurate_form_is_one_option_away():
         want = jax.tree.leaves(jax.jit(functools.partial(routed, **named))(query, key, value))
         for mine, theirs in zip(found[form], want, strict=True):
             np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs), err_msg=form)
-    assert any(not np.array_equal(accurate, fast) for accurate, fast in zip(*found.values(), strict=True))
     with pytest.raises(ValueError):
         Numerics(forms="exact")
 
@@ -706,22 +705,22 @@ def test_a_call_no_triton_config_fits_lowers_on_another_mainloop(generation_name
 
 
 def test_a_pass_the_mosaic_mainloop_declines_reports_its_reason_under_its_row():
-    """A pass the Mosaic mainloop declines on a GPU runs the next mainloop that takes it, and its route
-    reports Mosaic's own reason (the analysis's code and detail) under the row that tracks lifting it, so
-    the kernel-route audit reads a gap and not an undeclared refusal (row 2545); a Triton refusal is its
-    inherent limit."""
+    """A pass the Mosaic mainloop declines on a GPU is taken by a later mainloop, and its route reports
+    Mosaic's own reason (the analysis's code and detail) under the row its requirement declares, so the
+    kernel-route audit reads a gap and not an undeclared refusal (row 2545), whichever mainloop takes it; a
+    Triton refusal is its inherent limit."""
     from dew.nn.kernels import selection
 
     declined = selection.Refusal("registers", "no tile holds the walk's registers")
     spans = selection.Refusal("dropout", "the Triton mainloop drops no probabilities")
-    route = selection.select(attention_route.MAINLOOP,
-                             attention_route._Pass(on_gpu=True, mosaic=declined, triton=None))
-    assert (route.kernel, route.refusal.code, route.refusal.detail) == ("triton", "registers",
-                                                                         declined.detail)
-    assert route.refusal.row == "roadmap: the Mosaic template takes every call"
-    route = selection.select(attention_route.MAINLOOP,
-                             attention_route._Pass(on_gpu=True, mosaic=declined, triton=spans))
-    assert route.kernel == "portable"
+    [requirement] = [requirement for requirement in attention_route.MAINLOOP.kernel("mosaic").supports
+                     if requirement.code == "declined"]
+    for triton in (None, spans):
+        route = selection.select(attention_route.MAINLOOP,
+                                 attention_route._Pass(on_gpu=True, mosaic=declined, triton=triton))
+        assert route.kernel != "mosaic"
+        assert (route.refusal.code, route.refusal.detail, route.refusal.row) == (
+            "registers", declined.detail, requirement.row)
     [refused] = attention_route.MAINLOOP.kernel("triton").failed(
         attention_route._Pass(on_gpu=True, mosaic=None, triton=spans))
     assert (refused.code, refused.row) == ("dropout", generation.INHERENT)

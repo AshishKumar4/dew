@@ -27,6 +27,7 @@ from typing import Any, NamedTuple, Self
 
 import jax
 from jax import lax, numpy as jnp
+from jax._src.pallas import core as pallas_core
 from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
@@ -806,6 +807,10 @@ class Ring:
         plgpu.barrier_wait(self.full.at[slot], parity=turn.parity)
         return self.smem.at[slot]
 
+    def slot(self, turn: Turn):
+        """`turn`'s slot, which the caller acquired already (`acquire`): a phase is waited for once."""
+        return self.smem.at[opaque(turn.slot)]
+
     def release(self, turn: Turn) -> None:
         """A consumer's release of `turn`'s slot, whose reads (and MMAs) are done."""
         plgpu.barrier_arrive(self.consumed.at[opaque(turn.slot)])
@@ -961,10 +966,11 @@ def tabled(wg, table: tuple, producer) -> None:
 class Slots:
     """A walk step's operand slots (`Family.walk`), by stream name: each acquired when the step first reads
     it (`slots[name]`) and released at the step's end, once its MMAs are done, unless the step `release`s it
-    sooner (a slot its last product has read)."""
+    sooner (a slot its last product has read), or but for the streams `held_past` it, whose slot the next
+    step gives back (`previous`: a product of this step's tile the next one issues)."""
 
-    def __init__(self, rings: dict[str, Ring], turn: Turn):
-        self._rings, self._turn = rings, turn
+    def __init__(self, rings: dict[str, Ring], turn: Turn, held_past: tuple[str, ...] = ()):
+        self._rings, self._turn, self._held_past = rings, turn, held_past
         self._held: dict[str, Ref] = {}
         self._released: set[str] = set()
 
@@ -979,11 +985,20 @@ class Slots:
         self._rings[name].release(self._turn)
         self._released.add(name)
 
+    def previous(self, name: str):
+        """Stream `name`'s slot of the step before, which it held past its end (`held_past`), acquired then
+        (`Ring.slot`)."""
+        ring = self._rings[name]
+        return ring.slot(self._turn.back(1, ring.stages))
+
     def done(self) -> None:
-        """Every slot the step has not given back given back: each consumer waits on every load (a wait
-        takes its barrier's next phase), so a slot it never read is still acquired before it is released."""
+        """Every slot the step has not given back given back, but those held past it (`held_past`), each
+        acquired: each consumer waits on every load (a wait takes its barrier's next phase), so a slot it
+        never read is still acquired before it is released."""
         for name in self._rings:
-            if name not in self._released:
+            if name in self._held_past:
+                self[name]
+            elif name not in self._released:
                 self.release(name)
 
     def held(self) -> None:
@@ -1226,11 +1241,12 @@ class Issuer[Accumulator](abc.ABC):
         return tuple(self.zeros(shape) if value is None else value
                      for shape, value in zip(shapes, initial, strict=True))
 
-    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool, initial: tuple | None = None
-                       ) -> tuple[C, tuple[jax.Array, ...]]:
+    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool, initial: tuple | None = None,
+                       finish: Callable | None = None) -> tuple[C, tuple[jax.Array, ...]]:
         """A walk of `segments` (`Loop`s) in turn, with the family's accumulators of `shapes` held across it
         from their `initial` values (`walk`): in registers, the walk's loop carrying them (mma.sync's), unless
-        the issuer's home is a ref it scopes (wgmma's)."""
+        the issuer's home is a ref it scopes (wgmma's); `finish(carry, accumulators) -> (carry,
+        accumulators)` after the last, inside their scope (a walk's products it issued a step late)."""
         del interpret
         both = (start, self.started(shapes, initial))
         for loop in segments:
@@ -1238,7 +1254,7 @@ class Issuer[Accumulator](abc.ABC):
                                  both)
             if loop.then is not None:
                 loop.then()
-        return both
+        return both if finish is None else finish(*both)
 
     @abc.abstractmethod
     def held(self, ref: Ref) -> Operand:
@@ -1255,8 +1271,22 @@ class Issuer[Accumulator](abc.ABC):
         """`lhs @ rhs` into a fresh fp32 accumulator, `lhs` in registers (16-bit), its value."""
 
     @abc.abstractmethod
-    def products(self, acc: Accumulator, lhs, rhs, interpret: bool) -> Accumulator:
-        """`acc` with `lhs @ rhs` issued into it in place, both operands in shared memory (a GEMM's step)."""
+    def products(self, acc: Accumulator, lhs, rhs, interpret: bool, *, accumulate: bool = True
+                 ) -> Accumulator:
+        """`acc` with `lhs @ rhs` issued into it in place, both operands in shared memory (a GEMM's step);
+        unless `accumulate`, the accumulator started from zero (a walk's own fresh product, `read` once
+        done)."""
+
+    def read(self, acc: Accumulator, *, first: int = 0, columns: int | None = None, pending: int = 0
+             ) -> jax.Array:
+        """The accumulator's columns `first` to `first + columns` (all of them where None), once at most
+        `pending` of the program's product groups are still in flight: a register home's value sliced, its
+        products done as they are issued."""
+        del pending
+        value = jnp.asarray(acc)
+        if first == 0 and columns is None:
+            return value
+        return value[:, first:first + (value.shape[1] - first if columns is None else columns)]
 
     def issued(self, acc: Accumulator, left: tuple, right: tuple, interpret: bool) -> Accumulator:
         """`acc` with the products of `left`'s and `right`'s parts (`product.formed`, each a part's
@@ -1624,15 +1654,20 @@ class Transport[Allocated, Opened](abc.ABC):
     @abc.abstractmethod
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, held_past: tuple[str, ...] = (), finish: Callable | None = None
+                ) -> tuple[C, tuple[jax.Array, ...]]:
         """A consumer's walk of `segments`, each `(step, lo, hi)`, `step(index, slots, carry, accumulators)
         -> (carry, accumulators)` given each stream's slots (`Slots`, the streams' steps counted from
         `first`), from `start`, with fp32 accumulators of `shapes` its products issue into in place, zero
         or their `initial` values (in the accumulator's layout; None, zero). `in_flight` steps' products stay
         running past their step (0 or 1): their slots go back once they are done, a step later, so the next
-        step's operands are waited for while they run. A ring's `unrolled` walk takes a rotation of its slots
-        a trip, each step at a slot it knows (`mosaic.stepping`): for a step small beside its waits (a
-        GEMM's), where a ring's slots are few. Returns the carry and the accumulators' values."""
+        step's operands are waited for while they run. The streams `held_past` keep a step's slot to the end
+        of the next (`Slots.previous`), which issues a product of its tile (FlashAttention 3's P·V a step
+        late, its softmax under it), and `finish(carry, accumulators, held) -> (carry, accumulators)` takes
+        the last step's (`held`, by name) inside the accumulators' scope, after which they go back. A ring's
+        `unrolled` walk takes a rotation of its slots a trip, each step at a slot it knows
+        (`mosaic.stepping`): for a step small beside its waits (a GEMM's), where a ring's slots are few.
+        Returns the carry and the accumulators' values."""
 
     @abc.abstractmethod
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
@@ -1648,9 +1683,10 @@ class Transport[Allocated, Opened](abc.ABC):
         accumulator's axes a vector follows, where a family stages its loads through registers in the
         accumulator's layouts (`mosaic_sm80.Mma`); a vector whose axes go unstated follows its columns."""
 
-    def load_barriers(self, count: int):
+    def load_barriers(self, count: int) -> pallas_core.ScratchShape:
         """The scoped allocation of `count` whole loads' completions (`loaded`'s barriers), which a program's
-        allocations hold beside its streams (`scoped`, `resources.Scope`)."""
+        allocations hold beside its streams (`scoped`, `resources.Scope`): a backend's own kind of scoped
+        allocation (a GPU's barriers, a TPU's DMA semaphores)."""
         return plgpu.Barrier(num_barriers=count)
 
     def staging(self, name: str, shaped) -> dict:
@@ -1957,19 +1993,31 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, held_past: tuple[str, ...] = (), finish: Callable | None = None
+                ) -> tuple[C, tuple[jax.Array, ...]]:
         return self._walked(streams, segments, start, shapes, interpret, first=first, in_flight=in_flight,
-                            initial=initial, unrolled=unrolled)
+                            initial=initial, unrolled=unrolled, held_past=held_past, finish=finish)
 
     def _walked[C](self, streams: dict[str, Ring], segments, start: C, shapes: tuple, interpret: bool, *,
                    first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                   freed: Callable | None = None, unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
+                   freed: Callable | None = None, unrolled: bool = False, held_past: tuple[str, ...] = (),
+                   finish: Callable | None = None) -> tuple[C, tuple[jax.Array, ...]]:
         """`walk`, `freed(counter)` run after each step's slots are given back (step `counter`'s). Each
-        segment walks its steps a step a trip or, `unrolled`, a rotation of the rings (`stepping`)."""
+        segment walks its steps a step a trip or, `unrolled`, a rotation of the rings (`stepping`). A walk
+        holding streams past its steps (`held_past`) walks at least one: its last step's slots are
+        `finish`'s."""
         stages = min(ring.stages for ring in streams.values())
         if not 0 <= in_flight < stages:
             raise ValueError(f"a walk keeps fewer steps' products in flight than its rings' {stages} slots, "
                              f"none or some, not {in_flight}")
+        if held_past and (in_flight or unrolled or freed is not None):
+            # A step's slot held past it goes back a step late, after the step's products: a loading
+            # consumer's refill of it (`freed`) would wait on its own later release.
+            raise NotImplementedError("a walk holds a stream past its steps with no products in flight, a "
+                                      "step a trip, over a producer's loads")
+        if held_past and finish is None:
+            raise ValueError("a walk holding streams past its steps hands its last step's to `finish`")
+        walk_lo = segments[0][1]
 
         def given(turn: Turn, *, release: bool = False) -> None:
             # `turn`'s slots given back (`release`: here, a step its products ran past), then `freed`.
@@ -1979,7 +2027,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                 freed(turn.counter)
 
         def turned(step, lo, index, turn: Turn, carry, accumulators, *, before: int = 0):
-            slots = Slots(streams, turn)
+            slots = Slots(streams, turn, held_past)
             groups = commits()
             carry, accumulators = step(index, slots, carry, accumulators)
             # The step's product groups (its completion tokens): a step `in_flight` back is done once no
@@ -1987,9 +2035,15 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             # issues (a walk's steps are one function each, their groups alike).
             groups = commits() - groups
             if not in_flight:
-                # The step's products done before its slots are given back.
+                # The step's products done before its slots are given back; the streams it held past the
+                # step before, whose products it issued, given back for that step.
                 self.settled()
                 slots.done()
+                if held_past:
+                    @pl.when(index > walk_lo)
+                    def _():
+                        for name in held_past:
+                            streams[name].release(turn.back(1, stages))
                 given(turn)
                 return carry, accumulators
             # The step's products run on while the next steps' operands are waited for: the step
@@ -2014,11 +2068,24 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
             return drain
 
+        def finished(carry, accumulators):
+            # The last step's slots of the streams held past it, `finish`'s, given back once its products
+            # are done.
+            last = Turn.of(segments[-1][2] - 1 - first, stages)
+            assert finish is not None  # `_walked` takes no held stream without it
+            carry, accumulators = finish(carry, accumulators,
+                                         {name: streams[name].slot(last) for name in held_past})
+            self.settled()
+            for name in held_past:
+                streams[name].release(last)
+            return carry, accumulators
+
         loops: list[Loop] = []
         for step, lo, hi in segments:
             run = stepping(functools.partial(turned, step, lo), lo, hi, first, stages, unrolled=unrolled)
             loops += [*run[:-1], run[-1]._replace(then=drained(lo, hi) if in_flight else None)]
-        return self.accumulated(tuple(loops), start, shapes, interpret, initial)
+        return self.accumulated(tuple(loops), start, shapes, interpret, initial,
+                                finish=None if finish is None else finished)
 
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         passed(tuple(streams.values()), lo, hi, first=first, between=between)
@@ -2176,7 +2243,8 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, held_past: tuple[str, ...] = (), finish: Callable | None = None
+                ) -> tuple[C, tuple[jax.Array, ...]]:
         if not isinstance(streams, Feed):
             raise NotImplementedError(f"{self.name}'s consumers feed their own rings (`fed`)")
         # The walk reads each step at the ring counter its feed loads it at, both from the feed's `lo`.
@@ -2187,7 +2255,8 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
             raise NotImplementedError(f"{self.name}'s fed walk keeps no products in flight across segments")
         walked = self._walked(streams.rings, segments, start, shapes, interpret, first=first,
                               in_flight=in_flight, initial=initial, unrolled=unrolled,
-                              freed=streams.refilled if streams.refills else None)
+                              freed=streams.refilled if streams.refills else None, held_past=held_past,
+                              finish=finish)
         if streams.drains:
             streams.drained()
         return walked

@@ -448,9 +448,6 @@ def _experts_lowered(generation: str, implementation: str):
         return jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=('cuda',))
 
 
-COLLECTIVES = re.compile(r"stablehlo\.(all_gather|all_reduce|all_to_all|reduce_scatter|collective_permute|"
-                         r"collective_broadcast)")
-"""The collectives a lowered program states itself (a `shard_map`'s; XLA's partitioner adds its own later)."""
 
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
 def test_a_kernel_launches_only_where_every_axis_of_its_mesh_is_manual(generation):
@@ -586,9 +583,9 @@ PER_SHARD_STEPS = {"expert layer": _expert_layer_step, "rms norm": _norm_step, "
 """Each op whose kernels run per shard (row 1923, bible §7), its step at a number of rows. Each lane adds its
 ops here."""
 
-def _kernel_launches(loss, args, generation: str, devices: int) -> tuple[list, str]:
+def _kernel_launches(loss, args, generation: str, devices: int) -> tuple[list, list]:
     """The Pallas launches (`custom_calls`) of `loss`'s value and gradient lowered for `generation`'s GPU on
-    an abstract mesh of `devices` that splits the rows, and the program's text."""
+    an abstract mesh of `devices` that splits the rows, and the program's operations (`_operations`)."""
     from jax.sharding import AbstractMesh, AxisType
 
     from dew.telemetry.instrumentation import custom_call_kind
@@ -599,7 +596,7 @@ def _kernel_launches(loss, args, generation: str, devices: int) -> tuple[list, s
             lowering_platforms=("cuda",))
     calls = [call for call in custom_calls(lowered)
              if custom_call_kind(call.target) in ("triton", "mosaic_gpu")]
-    return calls, lowered.as_text()
+    return calls, _operations(lowered)
 
 
 @pytest.mark.parametrize(("generation", "op"),
@@ -611,7 +608,7 @@ def test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh(gen
     only collective is the reduction of its replicated parameters' gradients over the data axis."""
     loss, args = PER_SHARD_STEPS[op](384)
     whole, _ = _kernel_launches(loss, args, generation, 1)
-    split, text = _kernel_launches(loss, args, generation, 2)
+    split, operations = _kernel_launches(loss, args, generation, 2)
 
     def elements(call) -> int:
         return sum(math.prod(shape) for shape in call.operands)
@@ -620,7 +617,7 @@ def test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh(gen
     assert whole and pairs, (op, [call.target for call in whole], [call.target for call in split])
     assert all(elements(on_two) < elements(on_one) for on_two, on_one in pairs), (
         op, [(elements(on_two), elements(on_one)) for on_two, on_one in pairs])
-    assert set(COLLECTIVES.findall(text)) <= {"all_reduce"}
+    assert {_collective(name) for name, *_ in operations if _collective(name)} <= {"all-reduce"}
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
@@ -656,9 +653,11 @@ def test_a_per_group_bias_reaches_its_launch_at_its_groups_extent(generation):
 def test_a_fused_epilogues_intermediates_never_reach_global_memory(generation):
     """Row 1705: a grouped product's consumers fused into its epilogue (`fuser.fuse` over
     `fused_gemm.fusible_gemm`: a SiLU of the scaled product plus a residual, cast to bf16), lowered for the
-    GPU, write only their bf16 result: no `[rows, N]` fp32 value, the product's accumulator or anything the
-    consumers compute from it, is a tensor of the program, so none is ever stored to global memory, and the
-    launch's results are the consumers' output alone."""
+    GPU, write only their bf16 result: the one launch's result is the consumers' bf16 `[rows, N]` output, no
+    operation of the program reads or writes an fp32 `[rows, N]` value (the product's accumulator or
+    anything the consumers compute from it), and compiled for the GPU its temporaries hold less than one
+    such value, so none is ever stored to global memory."""
+    import kernel_compile
     from jax.experimental.pallas import fuser
     from jax.sharding import AbstractMesh, AxisType
 
@@ -680,7 +679,13 @@ def test_a_fused_epilogues_intermediates_never_reach_global_memory(generation):
     calls = custom_calls(lowered)
     launches = [call for call in calls if custom_call_kind(call.target) in ("triton", "mosaic_gpu")]
     assert len(launches) == 1, [call.target for call in calls]
-    assert f"tensor<{rows}x{width}xf32>" not in lowered.as_text()
+    operations = _operations(lowered)
+    results = [results for _, target, _, results in operations if target == launches[0].target]
+    assert results == [(((rows, width), "bf16"),)], results
+    wide = ((rows, width), "f32")
+    assert not any(wide in operands + results for _, _, operands, results in operations)
+    memory = kernel_compile.lowered_for(fuser.fuse(fused), args, generation).compile().memory_analysis()
+    assert memory is not None and memory.temp_size_in_bytes < rows * width * 4, memory
 
 
 @pytest.mark.parametrize("generation", GPUS)

@@ -19,7 +19,7 @@ from reference_error import as_given, assert_as_exact, with_gradients
 from tuned import each_config
 
 from dew.nn.kernels import fused_gemm, gemm, generation, grouped_matmul, tuning
-from dew.nn.kernels.templates import mosaic_sm90, product, resources, tail
+from dew.nn.kernels.templates import bundles, mosaic_sm90, product, resources, tail
 from dew.nn.kernels.templates.gemm import mosaic_gpu, mosaic_tpu, triton_dense
 
 pytestmark = pytest.mark.kernel
@@ -2202,6 +2202,24 @@ def test_the_templates_paired_product_without_an_epilogue_holds_check_1(generati
         assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), draw,
                         f"paired product's two outputs ({generation_name})", seeds=SEEDS,
                         truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, cast=jnp.float64)))
+
+
+def test_a_tiles_consumers_are_the_count_whose_reads_are_least():
+    """The derivation's objective over consumer counts (`mosaic_gpu._reads`): on mma.sync, whose warps load
+    their operands' fragments from shared memory, one consumer's 128 x 128 tile reads less a FLOP than two
+    consumers' 64-row shares of a 128 x 256 tile (NS-P2-NCU2-a100: 1.5x the fragment loads, 2.78x the time),
+    and as little as two consumers' 128-row shares of a 256 x 128 tile, whose own reads are fewer; on
+    warpgroup MMA, which reads both operands from shared memory itself, the cooperative 128 x 256 tile
+    reads least."""
+    def tile(block_m, block_n, consumers, family):
+        return mosaic_gpu.Tiles(block_m, block_n, 32, 4, 1, warpgroups=consumers, family=family)
+
+    mma, wgmma = bundles.named("mma.sync", jnp.bfloat16), bundles.named("wgmma", jnp.bfloat16)
+    one, two = tile(128, 128, 1, "mma.sync"), tile(128, 256, 2, "mma.sync")
+    assert mosaic_gpu._reads(mma, one) < mosaic_gpu._reads(mma, two)
+    assert mosaic_gpu._reads(mma, tile(256, 128, 2, "mma.sync")) < mosaic_gpu._reads(mma, one)
+    assert (mosaic_gpu._reads(wgmma, tile(128, 256, 2, "wgmma"))
+            < mosaic_gpu._reads(wgmma, tile(128, 128, 1, "wgmma")))
 
 
 @pytest.mark.parametrize("generation_name", ["sm80", "sm86", "sm90"])
