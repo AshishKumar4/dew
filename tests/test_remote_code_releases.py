@@ -106,3 +106,16 @@ def test_an_export_opens_through_its_releases_own_code_as_the_release_does(name,
         checks = reference.opens(name, tmp_path / "export", tmp_path / "scratch")
     assert all(checks.values()), checks
 
+
+def test_a_release_test_outside_its_overlay_fails_naming_the_overlay():
+    """A release_env test run by an interpreter without the package its mark pins fails before it runs,
+    naming the overlay that holds it (`uv run --with <requirement>`), where the release's own loader failed
+    opaquely in its subprocess (row 3576); an interpreter that holds it runs the test."""
+    from importlib.metadata import version
+
+    from conftest import release_unheld
+
+    unheld = release_unheld("transformers==0.0.1")
+    assert unheld is not None and "uv run --with 'transformers==0.0.1'" in unheld
+    assert release_unheld("dew-absent-package==1.0") is not None
+    assert release_unheld(f"transformers=={version('transformers')}") is None
