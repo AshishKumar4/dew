@@ -878,7 +878,7 @@ class _Branch:
                              f"{rows.shape[0]} the call's adapters name, so its rows' adapters are unknown")
         scales = jnp.asarray(_stored_target(self.bound.scales, self.root, module.path), jnp.float32)
         # A row of the base model alone takes any adapter's factors and a zero scale.
-        own = jnp.maximum(rows, 0)
+        own = jnp.zeros_like(rows)
         x, a, b = promote_dtype(x, a[own], b[own], dtype=module.dtype)
         hidden = float32_dot_general(x, a, ((axes, tuple(range(1, len(axes) + 1))), ((0,), (0,))),
                                      precision=module.precision)
