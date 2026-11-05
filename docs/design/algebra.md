@@ -299,7 +299,7 @@ because its Python API is still marked as subject to change.
 |---|---|
 | `dew.algebra.terms` | The term language and its conversion to and from jaxprs |
 | `dew.algebra.facts` | Facts about each value (e-class analyses) |
-| `dew.algebra.rules` | `Rules`, `Monoid`, their registries and the sets registered: `identities`, `stable`, `linear`, `joined` (`reuse`, `decoupled` and `error_free`, §1, are not registered yet) |
+| `dew.algebra.rules` | `Rules` and `RuleFamily`, the registry and the sets registered: `identities`, `contracted`, `stable`, `linear`, `joined`, each declared as its rewrites with their instances (`reuse` and `error_free`, §1, are not built; `decoupled` and `carried` are the derivations' own sets, never registered) |
 | `dew.algebra.linear_scan` | A recurrence's token update read as an affine map by rules, and its chunk form derived by identities and extracted under the work-span model (§6.9) |
 | `dew.algebra.cost` | `Price`, `CostModel` and error-aware DAG extraction |
 | `dew.algebra.error` | Dev time: each candidate DAG's error, sampled on its declaration's cases against the float64 truth |
@@ -320,44 +320,43 @@ the primitive's parameters as primitive sorts:
 ```python
 class Term(Expr):
     @classmethod
-    def input(cls, index: i64Like) -> Term: ...                 # a region's argument
+    def leaf(cls, index: i64Like) -> Term: ...                 # an input, or an equation outside the language
     @classmethod
-    def literal(cls, value: f64Like, dtype: StringLike) -> Term: ...
+    def literal(cls, index: i64Like) -> Term: ...              # by its index in the region's literals
     @classmethod
-    def opaque(cls, equation: i64Like, output: i64Like) -> Term: ...  # never rewritten (§1.2)
+    def bundle(cls, roots: Vec[Term]) -> Term: ...             # a region's roots, extracted together
+    def binary(self, name: StringLike, other: Term, params: i64Like) -> Term: ...  # add, sub, mul, div, max, ...
+    def compare(self, name: StringLike, other: Term, params: i64Like) -> Term: ...  # lt, le, eq, ne, ge, gt
+    def unary(self, name: StringLike, params: i64Like) -> Term: ...  # neg, exp, exp2, log, log1p, sqrt, ...
+    def select(self, false: Term, true: Term) -> Term: ...
+    def convert(self, params: i64Like) -> Term: ...
+    def shaped(self, name: StringLike, params: i64Like) -> Term: ...  # broadcast_in_dim, reshape, transpose, ...
+    def reduce(self, monoid: StringLike, axes: Vec[i64], params: i64Like) -> Term: ...  # sum, max or min (§6.3)
+    def dot(self, other: Term, params: i64Like) -> Term: ...   # dot_general
+    # the derivation's readings (§6.9), rewritten into the language and never extracted themselves
     @classmethod
-    def semantic(cls, name: StringLike, operands: Vec[Term], output: i64Like) -> Term: ...
-    def __add__(self, other: Term) -> Term: ...                 # add, sub, mul, div, max, min, ...
-    def unary(self, name: StringLike) -> Term: ...             # neg, exp, exp2, log, sqrt, rsqrt, abs, sign
-    def compare(self, kind: StringLike, other: Term) -> Term: ...  # lt, le, eq, ne, ge, gt
-    @classmethod
-    def iota(cls, shape: Vec[i64], dimension: i64Like) -> Term: ...
-    def prefix(self, monoid: StringLike, axis: i64Like, reverse: BoolLike) -> Term: ...  # cumsum, cummax, ...
-    def convert(self, dtype: StringLike) -> Term: ...
-    def broadcast(self, shape: Vec[i64], dimensions: Vec[i64]) -> Term: ...
-    def reshape(self, shape: Vec[i64]) -> Term: ...
-    def transpose(self, permutation: Vec[i64]) -> Term: ...
-    def reduce(self, monoid: StringLike, axes: Vec[i64]) -> Term: ...   # a registered monoid (§6.3)
-    @classmethod
-    def dot(cls, lhs: Term, rhs: Term, contracting: Vec[i64], batch: Vec[i64], result: StringLike) -> Term: ...
-    @classmethod
-    def select(cls, predicate: Term, true: Term, false: Term) -> Term: ...
+    def state(cls, index: i64Like, side: i64Like) -> Term: ...
+    def held(self, side: i64Like) -> Term: ...
+    def stepped(self) -> Term: ...
+    def merged(self) -> Term: ...
+    def finished(self) -> Term: ...
 ```
 
-- `semantic` is a primitive whose meaning is declared, not computed by the e-graph. No rule rewrites inside it,
-  and no compile-time set equates it with anything. At dev time the `stable` and `error_free` sets may equate it
-  with another form, which extraction admits only where its error estimate meets the declared accuracy (§1.5).
-  These primitives are:
-  - the error-free transformations, `two_sum`, `two_product` and scaling by `2**k`, exact barring overflow;
-  - `bounded_split(x, dtype)`, hi = dtype(x) and lo = dtype(x − hi), whose declared error bound is the dtype's
-    rounding of lo;
-  - `triangular_inverse`.
-- `terms.region(jaxpr, equations) -> (Term roots, Leaves)` converts a region of equations:
-  - every equation outside the language becomes `opaque`;
-  - a `Protected` span (§6.10) becomes one `opaque` leaf for each of its outputs, its equations kept as they are;
-  - every value the region reads but does not compute becomes an `input`.
-- `terms.rebuilt(roots, leaves) -> jax.extend.core.Jaxpr` converts an extracted term back to equations, and drops the
-  markers, which lower to nothing.
+- A term's `params` index the region's table of its equation's parameters (`terms.parameter_key`'s structural
+  key, `Region.params`), so a rule reads a parameter as a fact of its own (a product's dimension numbers, a
+  literal's value) and an equation's every parameter rebuilds it as traced.
+- The error-free transformations (`two_sum`, `two_product`, the correctly rounded divide's significand) are
+  `Protected` spans (§6.10): one leaf of the region each, no rule touching them, rather than a `semantic`
+  constructor. An `iota`, a prefix sum (`cumsum`, `cummax`) and every other primitive outside the language are
+  leaves; a recurrence's prefix is the scan derivation's (`linear_scan`, §6.9), which reads the token update,
+  not a prefix term.
+- `terms.region(closed) -> Region` converts a window's equations (`program._windows`):
+  - every equation outside the language becomes a `leaf` for each of its outputs;
+  - a `Protected` span (§6.10) is one marked call, a `leaf` for each of its outputs, its equations kept as
+    they are;
+  - every value the window reads but does not compute becomes a `leaf`.
+- `terms.form_value(region, form, values)` evaluates an extracted form over its leaves' values, each equation
+  rebuilt from its interned parameters, which a splice traces into the window's place (`program._splices`).
 - A surviving custom-derivative call (`custom_jvp_call`, `custom_vjp_call`, in a program no transform has traced
   through) is a region of its own: its `call_jaxpr` is rewritten in place by its marked kind, and the call, its
   rules and their derivative programs are rebuilt as they were, so the custom derivative stays the site's. Its
@@ -435,22 +434,15 @@ Two notes on the table:
   (§1.5, §6.5).
 - The inputs' facts come from the traced avals, their shardings, and a declaration's roles (§6.9).
 
-Monoids are an open registry, so a reduction, a prefix and a derived form's merge all name one:
-
-```python
-@dataclass(frozen=True)
-class Monoid:
-    name: str                          # "sum", "max", "softmax" (m, total, acc), "affine" (A, b),
-                                       # "compensated" (sum, error), "argmax", "moments", ...
-    combine: jax.extend.core.ClosedJaxpr      # (state, state) -> state
-    identity: jax.extend.core.ClosedJaxpr     # () -> state
-    associative: bool                  # False: an ordered fold, never reassociated
-    rounding: str                      # its combine's rounding class
-    tie_break: str | None = None       # a total order where combine chooses (argmax: lowest position)
-
-MONOIDS: Mapping[str, Monoid]
-def register_monoid(monoid: Monoid) -> None: ...
-```
+A reduction names its monoid in the language (`Term.reduce`'s name), from the closed set the language holds
+(`terms.REDUCTIONS`: `sum`, `max`, `min`). There is no open registry: the derivation reads each monoid's
+algebra in its own rules (`derive.py`'s `summed` and `peaked` facts, the walked merge's `max` and `add`, the
+softmax's rescaling by `exp(k_carried - k_new)`) and its identity in `derive._identity` (a sum's zero, a
+maximum's least value), so a new reduction is a new name in `terms.REDUCTIONS` with the rules and the identity
+that read it, each held by the laws (`tests/test_algebra_laws.py`). An open `Monoid` registry, whose
+combine and identity were jaxprs a rule could read, was the earlier draft: no reduction the templates take
+needs one, and a monoid's rules cannot be written from its combine alone (the softmax's rescaling is a rule
+about `exp`, not about the monoid).
 
 ### 6.4 Rules
 

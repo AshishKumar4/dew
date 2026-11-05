@@ -322,18 +322,20 @@ def test_a_corpus_states_the_share_of_its_rows_cut_short_in_rows(bounded):
 
 
 def test_a_step_after_a_mix_that_makes_bytes_of_its_rows_is_refused_for_the_counts_it_drops():
-    """A step after a mix that makes raw bytes of its members' rows, under a bound in examples, is refused
-    for the counts its bytes cannot carry (`consumed_by`, ValueError), not as a member that gave bytes,
-    which none did (row 3746)."""
+    """An objective's step that makes raw bytes of the rows its expansion makes of a mixture's records,
+    after the examples bound (which an objective's expansion reads after), is refused for the counts its
+    bytes cannot carry (`consumed_by`, ValueError), not as a member that gave bytes: the rows it read are
+    its member's, tagged as such, and none gave bytes (rows 3746, 4018)."""
     from test_pipeline_core import Encoded
 
     from dew.data.pipeline import mix
 
-    members = [Pipeline(Memory({"id": np.arange(at * 16, at * 16 + 16, dtype=np.int32)}), name=f"member-{at}")
-               for at in range(2)]
+    members = [Pipeline(Memory({"id": np.arange(at * 16 + 1, at * 16 + 17, dtype=np.int32)}),
+                        name=f"member-{at}") for at in range(2)]
     with pytest.raises(ValueError):
-        loader = compile(mix(members).map(Encoded()).batch(BATCH), read="streamed", examples=12)
-        read_whole(loader, "id")
+        loader = compile(mix(members).batch(BATCH), read="streamed", examples=12,
+                         objective=ObjectiveData(train=(Fanned(), Encoded())), loading=Loading(workers=0))
+        read_whole(loader, "text")
 
 
 def test_a_streamed_mixture_of_byte_records_counted_by_member_is_refused_not_credited_to_none():

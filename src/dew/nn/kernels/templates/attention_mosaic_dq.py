@@ -18,6 +18,8 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _rows,
     _Spans,
     issued_into,
+    modelled,
+    part_count,
     reducing,
     stated,
     transposed_swizzles,
@@ -217,9 +219,14 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
         interpret=walk.interpret, approx_math=walk.approx_math,
         name=name,
         reducing_warpgroups=reducing(family, consumers, walk.spec.score_mod),
-        # Its share of dQ's product, the model's this launch owns (`stated`): its `S` and `dP` recomputed.
-        cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, share[1], query, key, value,
-                    dout))(
+        # The products this launch issues (`stated`): its `S` and `dP` recomputed, each part of its share of
+        # dQ's (`part_count`) and, in the accurate form, of the keyed sums'; its share of dQ's product the
+        # model's it owns (`modelled`).
+        cost=stated(walk.spec, batch, heads, walk.spec.queries or queries,
+                    width + value_width
+                    + (part_count(key.dtype, walk.accurate) + walk.accurate) * share[1],
+                    query, key, value, dout),
+        model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries, share[1]))(
             query, key, value, dout, peak, prior, anchor, delta, key_index, *leaves)
     dq, keyed, rows = out if walk.accurate else (out[0], None, out[1])
     return dq, keyed, rows

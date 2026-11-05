@@ -385,23 +385,26 @@ def owned_program[**P, R](function: Callable[P, R], *models: Held,
 
 class Fetched:
     """`program`, of no static argument, as a host loop that calls it every step runs it: the executable of
-    its first call (`OuterProgram.executable`), which each call after it runs, so none builds the dispatch
-    key a call reads from every argument (`OuterProgram._keyed`, which jit read in C++). A step of the loop
-    keeps the first's shapes, dtypes and placements, and the context it traces in: its executable refuses
-    other arguments, where the program would compile for them. A server's step, one executable for each
-    size of its admission, runs as this does (`dew.inference.serving_kernel.dispatched`)."""
+    its first call in each trace context it is called in (`OuterProgram.executable`; a reference arm's run
+    with the algebra pass off is another context), which each call after it in that context runs, so none
+    builds the dispatch key a call reads from every argument (`OuterProgram._keyed`, which jit read in C++).
+    A step of the loop keeps the first's shapes, dtypes and placements: its executable refuses other
+    arguments, where the program would compile for them. A server's step, one executable for each size of its
+    admission, runs as this does (`dew.inference.serving_kernel.dispatched`)."""
 
     def __init__(self, program: OuterProgram):
         if program.numbers or program.names:
             raise ValueError("an executable takes the arguments that are not static: a program with static "
                              "arguments is fetched as `OuterProgram.executable` is, by its caller")
         self.program = program
-        self._executable: jax.stages.Compiled | None = None
+        self._executables: dict[Hashable, jax.stages.Compiled] = {}
 
     def __call__(self, *args, **kwargs):
-        if self._executable is None:
-            self._executable = self.program.executable(*args, **kwargs)
-        return self._executable(*args, **kwargs)
+        context = jax_config.trace_context()
+        executable = self._executables.get(context)
+        if executable is None:
+            executable = self._executables[context] = self.program.executable(*args, **kwargs)
+        return executable(*args, **kwargs)
 
 
 _Structure = tuple[jax.tree_util.PyTreeDef]

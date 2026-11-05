@@ -350,7 +350,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
-               cluster: int = 1, cost: pl.CostEstimate | None = None,
+               cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1) -> Callable:
         # Its one warpgroup is its consumer, no producer beside it, and no cluster; its kernels' default
         # parameters reserve the scratch an implicit reduction takes (`reduction_scratch`).
@@ -362,7 +362,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                                                                   min_blocks_per_sm=resident),
                              interpret=mosaic.interpreted(interpret),
                              kernel_name=report.named(name), cost_estimate=cost)
-        return mosaic.checked(built, name or self.name, resident)
+        return mosaic.checked(built, name or self.name, resident, model_flops)
 
     def scoped(self, body, *allocations, streams):
         return pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)

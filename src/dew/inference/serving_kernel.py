@@ -17,6 +17,7 @@ from collections.abc import Callable, Hashable, Mapping
 import jax
 import jax.numpy as jnp
 from flax import linen as nn, struct
+from jax._src import config as jax_config
 from jax.experimental import checkify
 from jax.experimental.layout import Format, Layout
 from jax.sharding import Mesh, NamedSharding
@@ -685,17 +686,18 @@ Qwen3-0.6B at 64 slots, about 5 ms before 9 of a run's 16 admitting steps
 
 def dispatched(program: OuterProgram) -> Step:
     """`program`, a server's step, as a `Step` that runs its executables (`OuterProgram.executable`), one
-    for each size of admission its bucketing pads to, called with the dynamic arguments alone: a server's
-    weights, cache and policies keep their shapes and placements from call to call, so no step's Python
-    walks them to build jit's dispatch key."""
+    for each size of admission its bucketing pads to and each trace context it runs in (`Fetched`'s), called
+    with the dynamic arguments alone: a server's weights, cache and policies keep their shapes and placements
+    from call to call, so no step's Python walks them to build jit's dispatch key."""
     executables: dict[Hashable, jax.stages.Compiled] = {}
 
     def step(model, params, pad_id, placement, steps, resident, carried, admission, transforms, stopping,
              grammar, progress):
         size = None if admission is None else tuple(jnp.shape(leaf) for leaf in jax.tree.leaves(admission))
-        executable = executables.get(size)
+        key = (size, jax_config.trace_context())
+        executable = executables.get(key)
         if executable is None:
-            executable = executables[size] = program.executable(
+            executable = executables[key] = program.executable(
                 model, params, pad_id, placement, steps, resident, carried, admission, transforms, stopping,
                 grammar, progress)
         return executable(params, resident, carried, admission, transforms, stopping, grammar, progress)

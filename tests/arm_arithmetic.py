@@ -55,8 +55,11 @@ def unrewritten(fn):
     """`fn` run with the algebra pass off (`Unrewritten`), the one scope of every reference arm
     (`reference_error._compiled`) and float64 truth (`reference_error._truth_program`, `Truth`) the gate
     runs: the programs they trace or run are Dew's as written, never a rewrite the candidate's check judges
-    (docs/design/algebra.md §3). A recorded arm, which replays values and runs no program, is as it is."""
-    return fn if fn is None or getattr(fn, "recorded", False) else Unrewritten(fn)
+    (docs/design/algebra.md §3). A recorded arm, which replays values and runs no program, is as it is, and
+    so is one unrewritten already."""
+    if fn is None or getattr(fn, "recorded", False) or isinstance(fn, Unrewritten):
+        return fn
+    return Unrewritten(fn)
 
 
 class Unrewritten:

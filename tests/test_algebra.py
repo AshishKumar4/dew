@@ -84,8 +84,19 @@ def test_every_registered_rule_set_is_qualified_by_instances_of_its_own():
     named = {name.split(": ", 1)[0] for name in rules.instances()}
     assert named == set(rules.RULES)
     with pytest.raises(ValueError):
-        rules.register(rules.Rules("unqualified", "exact", rules.RULES["identities"].ruleset, receipt="",
-                                   instances={}))
+        rules.register(rules.Rules.declared("unqualified", "exact", (), ""))
+
+
+def test_each_rewrite_of_a_registered_set_is_declared_with_its_instance():
+    """A registered set is declared as its rewrites (`rules.RuleFamily`), each its rules (every direction and
+    layout of it) and its instance written as JAX, so no rule of the registry runs without a case of its own
+    qualifying it: the inventory (`rules.instances`), which the accuracy test holds each right side to its
+    left side over, is every family's."""
+    from dew.algebra import rules
+
+    declared = {f"{sets.name}: {family.name}" for sets in rules.RULES.values() for family in sets.families}
+    assert set(rules.instances()) == declared
+    assert all(family.rules for sets in rules.RULES.values() for family in sets.families)
 
 
 def test_a_compensated_sums_residual_survives_a_rewritten_program():

@@ -422,7 +422,7 @@ def _reached(queries: int, keys: int, attributes: str) -> int:
 
 
 def _fused_attention_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]], *,
-                           query: int, backward: bool) -> float:
+                           query: int, backward: bool) -> tuple[float, float]:
     """A fused-attention call (cuDNN's or dew_flash_attn's), from the query,
     key and value it is given, the operands at `query` and the two after it,
     and the pairs of them its mask computes (`_reached`).
@@ -439,17 +439,20 @@ def _fused_attention_flops(instruction: _Instruction, shapes: dict[str, tuple[in
     causal mask leaves the kernels about half the square, which is what they
     compute: on an H100, FlashAttention-3's causal call at 2 x 16 heads x 4096
     x 128 counted the whole square, twice its work, before this read the mask.
+    The model's work and the hardware's: the backward recomputes the scores
+    it kept off memory, one `Q K^T` more at the query's width, the hardware's
+    alone.
     """
     if len(instruction.operands) < query + 3:
-        return 0.0
+        return 0.0, 0.0
     queries, key, value = (shapes.get(instruction.operands[query + offset]) for offset in range(3))
     if any(operand is None or len(operand) != 4 for operand in (queries, key, value)):
-        return 0.0
+        return 0.0, 0.0
     assert queries is not None and key is not None and value is not None
     batch, length, heads, width = queries
-    passes = 2 if backward else 1
-    pairs = _reached(length, key[1], instruction.attributes)
-    return passes * _MAC * batch * heads * pairs * (width + value[3])
+    pairs = _MAC * batch * heads * _reached(length, key[1], instruction.attributes)
+    model = (2 if backward else 1) * pairs * (width + value[3])
+    return model, model + (pairs * width if backward else 0.0)
 
 
 def custom_call_kind(target: str) -> str | None:
@@ -528,7 +531,7 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
             return frozenset(), frozenset(), 0.0
         ops = {instruction.op for instruction in computation.instructions.values()}
         names = {each for instruction in computation.instructions.values() for each in instruction.traced}
-        flops = sum(_instruction_flops(instruction, computation.shapes)
+        flops = sum(_instruction_flops(instruction, computation.shapes)[1]
                     for instruction in computation.instructions.values())
         for instruction in computation.instructions.values():
             for called in _CALLS.findall(instruction.attributes):
@@ -558,7 +561,8 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
             ops = called[0][0] if len(called) == 1 else frozenset().union(*(each for each, _, _ in called))
             names = frozenset(instruction.traced).union(*(each for _, each, _ in called))
             reads = frozenset().union(*(parameters(computation, each) for each in instruction.operands))
-            flops = _instruction_flops(instruction, computation.shapes) + sum(each for _, _, each in called)
+            flops = (_instruction_flops(instruction, computation.shapes)[1]
+                     + sum(each for _, _, each in called))
             found[name] = HloInstruction(instruction.op, target.group(1) if target else '',
                                          tuple(instruction.operands), ops, instruction.recomputed, names,
                                          reads, flops, weights.get(called_as, 0.0), instruction.buffers,
@@ -568,9 +572,9 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
     return found
 
 
-def _instruction_flops(instruction: _Instruction,
-                       shapes: dict[str, tuple[int, ...]]) -> float:
-    """The multiply-add work of one instruction, and zero for anything else.
+def _instruction_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]]) -> tuple[float, float]:
+    """The multiply-add work of one instruction, the model's and the hardware's (a kernel's recomputed
+    products the hardware's alone), and zero for anything else.
 
     Only the matmuls and convolutions count. Everything the compiler leaves
     elementwise (the optimizer, the EMA, normalization, the softmax, the loss
@@ -578,6 +582,36 @@ def _instruction_flops(instruction: _Instruction,
     about, which is the convention this repo's benchmarks state
     (docs/research/benchmark-parity.md:44-48).
     """
+    target = target_of(instruction)
+    if custom_call_kind(target) == 'attention':
+        query, backward = _FLASH.get(target, (0, target.endswith('Backward')))
+        return _fused_attention_flops(instruction, shapes, query=query, backward=backward)
+    if custom_call_kind(target) in PALLAS:
+        # A Pallas kernel's work is the hardware's it states, the model's share where it declares one
+        # (`MODEL_FLOPS`); `_unsized` counts a kernel that states none.
+        hardware = _stated_flops(instruction.attributes) or 0.0
+        declared = _MODEL_FLOPS.search(instruction.attributes)
+        return (hardware if declared is None else float(declared.group(1))), hardware
+    flops = _matmul_flops(instruction, shapes)
+    return flops, flops
+
+
+def target_of(instruction: _Instruction) -> str:
+    """A custom call's target, empty for any other instruction."""
+    target = _TARGET.search(instruction.attributes) if instruction.op == 'custom-call' else None
+    return target.group(1) if target else ''
+
+
+MODEL_FLOPS = "dew_model_flops"
+"""The frontend attribute a kernel's launch declares the model's share of the work it states by (`declared`):
+the rest its own recomputation (attention's scores, `attention_mosaic_program.stated`)."""
+
+_MODEL_FLOPS = re.compile(MODEL_FLOPS + r'="(\d+)"')
+
+
+def _matmul_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]]) -> float:
+    """A matmul's or a convolution's multiply-add work, a GEMM library call's among them; zero for any other
+    instruction."""
     if instruction.op == 'dot':
         contracting = _CONTRACTING.search(instruction.attributes)
         axes = () if contracting is None else tuple(
@@ -585,10 +619,7 @@ def _instruction_flops(instruction: _Instruction,
         return _dot_flops(instruction, shapes, axes)
     if instruction.op == 'convolution':
         return _convolution_flops(instruction, shapes)
-    if instruction.op != 'custom-call':
-        return 0.0
-    target = _TARGET.search(instruction.attributes)
-    target = target.group(1) if target else ''
+    target = target_of(instruction)
     kind = custom_call_kind(target)
     if kind == 'gemm':
         contracting = _GEMM_CONTRACTING.search(instruction.attributes)
@@ -600,12 +631,6 @@ def _instruction_flops(instruction: _Instruction,
         return _cudnn_convolution_flops(target, instruction, shapes)
     if kind == 'grouped_gemm':
         return _grouped_gemm_flops(instruction, shapes)
-    if kind == 'attention':
-        query, backward = _FLASH.get(target, (0, target.endswith('Backward')))
-        return _fused_attention_flops(instruction, shapes, query=query, backward=backward)
-    if kind in PALLAS:
-        # A Pallas kernel's work is its own cost, where it states one (`_unsized` counts it otherwise).
-        return _stated_flops(instruction.attributes) or 0.0
     return 0.0
 
 
@@ -857,7 +882,8 @@ def hlo_flops(text: str) -> StepFlops | None:
     """Matmul and convolution FLOPs of one call of an optimized HLO module,
     parsed and weighted once: the forward a remat recomputes counted once in
     `model` and each time it runs in `hardware`, each Pallas kernel at the cost
-    it states, beside the custom calls it runs whose work neither counts
+    it states, the model's share of it where it declares one (`MODEL_FLOPS`),
+    beside the custom calls it runs whose work neither counts
     (`StepFlops.unsized`, `sizes`)."""
     computations, entry = _parse(text)
     if entry is None:
@@ -867,15 +893,15 @@ def hlo_flops(text: str) -> StepFlops | None:
     for name, computation in computations.items():
         if not weights[name]:
             continue
-        counted = [(_instruction_flops(instruction, computation.shapes), instruction.recomputed)
+        counted = [(*_instruction_flops(instruction, computation.shapes), instruction.recomputed)
                    for instruction in computation.instructions.values()]
         launches = sum(_unsized(instruction) for instruction in computation.instructions.values())
         unsized += weights[name] * launches if launches else 0.0
-        ran = sum(flops for flops, _ in counted)
+        ran = sum(flops for _, flops, _ in counted)
         if not ran:
             continue
         hardware += weights[name] * ran
-        model += weights[name] * sum(flops for flops, recomputed in counted if not recomputed)
+        model += weights[name] * sum(flops for flops, _, recomputed in counted if not recomputed)
     totals = (model, hardware, unsized)
     return StepFlops(*totals) if all(math.isfinite(total) for total in totals) else None
 

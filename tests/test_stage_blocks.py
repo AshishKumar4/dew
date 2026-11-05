@@ -156,8 +156,7 @@ def float64_pulled(model, variables, call):
     gate compiles for every draw. Returned to the host, the gate would run it as a NumPy truth, op by
     op, which took a UNet cell's draw 1.2 s against the arms' 0.16 s."""
     wide = model.clone(dtype=jnp.float64)
-    with jax.enable_x64(new_val=True):
-        held = float64_held(variables)
+    held = float64_held(variables)
     run = pulled(wide, call)
     return lambda inputs, cotangent: run(held, inputs, cotangent)
 

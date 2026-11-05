@@ -20,7 +20,7 @@ import jax.extend.core as jcore
 import numpy as np
 from jax.core import ShapedArray
 
-from dew.nn.programs import CALLS, bodies, computed, inlined, opaque, platform_branch
+from dew.nn.programs import bodies, called, computed, inlined, opaque, platform_branch
 
 VIEWS = frozenset({"reshape", "squeeze", "expand_dims"})
 """Primitives a row-major value's layout keeps as a bitcast of their operand (XLA's `ReshapeIsBitcast`
@@ -142,16 +142,6 @@ def interpreter(interpret) -> Callable:
     if isinstance(interpret, mosaic_gpu.InterpretGPUParams):
         return functools.partial(on_gpu, interpret_params=interpret)
     return hlo_interpreter.pallas_call_hlo_interpret
-
-
-def called(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
-    """The program a call (`CALLS`) runs on `equation`'s operands one for one, returning its results, else
-    None: every reader of a call through its program reads it here (`compiled`, `gradients_read`)."""
-    found = bodies(equation) if equation.primitive.name in CALLS else []
-    if len(found) == 1 and (len(found[0].invars), len(found[0].outvars)) == (
-            len(equation.invars), len(equation.outvars)):
-        return found[0]
-    return None
 
 
 def gradients_read(program: jcore.Jaxpr, read: Sequence[frozenset[int]]) -> list[frozenset[int]]:

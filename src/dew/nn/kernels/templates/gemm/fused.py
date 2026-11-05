@@ -44,6 +44,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
 from jax.extend import core as jax_core
 
+from dew import algebra
 from dew.nn import programs
 from dew.nn.kernels.selection import Kernel, Op, Refusal, analysed, select
 from dew.nn.kernels.templates.gemm import template
@@ -171,7 +172,9 @@ def _split(producer, values):
     def flat(*leaves):
         return producer(jax.tree.unflatten(treedef, list(leaves)))
 
-    closed = jax.make_jaxpr(functools.partial(_inlined, jax.make_jaxpr(flat)(*leaves)))(*leaves)
+    # The producer as the algebra pass rewrites it, before the fuser stages it (docs/design/algebra.md §2).
+    closed = jax.make_jaxpr(functools.partial(_inlined, jax.make_jaxpr(algebra.rewritten(flat))(*leaves)))(
+        *leaves)
     jaxpr = closed.jaxpr
     [out] = jaxpr.outvars
     shape = tuple(getattr(out.aval, 'shape', ()))
@@ -235,23 +238,27 @@ def _inlined(closed, *args):
     custom-derivative call, as Dew's own norms are) read through to its body, so the split sees a norm's
     statistics however its producer wraps them: their values are their bodies'; their derivatives stay the
     producer's (`_whole_jvp`)."""
-    env = dict(zip(closed.jaxpr.invars, args, strict=True)) | dict(zip(closed.jaxpr.constvars, closed.consts,
-                                                                       strict=True))
+    return _evaluated(closed.jaxpr, closed.consts, args)
+
+
+def _evaluated(program, consts, args):
+    """`program` evaluated over `args` and its constants `consts`, each call it makes read through its own
+    program (`dew.nn.programs.called`, its operands its program's one for one)."""
+    env = dict(zip(program.invars, args, strict=True)) | dict(zip(program.constvars, consts, strict=True))
 
     def read(var):
         return var.val if isinstance(var, jax_core.Literal) else env[var]
 
-    for eqn in closed.jaxpr.eqns:
-        body = (eqn.params.get('jaxpr') or eqn.params.get('call_jaxpr') or eqn.params.get('fun_jaxpr')
-                if eqn.primitive.name in programs.CALLS else None)
+    for eqn in program.eqns:
+        body = programs.called(eqn)
         invals = [read(var) for var in eqn.invars]
         if body is not None:
-            outvals = _inlined(body, *invals[len(invals) - len(body.jaxpr.invars):])
+            outvals = _evaluated(body, body.consts, invals)
         else:
             outvals = eqn.primitive.bind(*invals, **eqn.params)
             outvals = outvals if eqn.primitive.multiple_results else [outvals]
         env.update(zip(eqn.outvars, outvals, strict=True))
-    return [read(var) for var in closed.jaxpr.outvars]
+    return [read(var) for var in program.outvars]
 
 
 def _shape(var) -> tuple:
