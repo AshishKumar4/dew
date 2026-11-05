@@ -176,13 +176,15 @@ def test_the_derived_walk_computes_the_declared_function(name, walk):
 
 def test_a_walks_sums_added_by_its_mainloop_take_each_tiles_factor_and_sum():
     """A mainloop that makes a walked sum's additions itself (`Derived.step`'s `add`, a compensated walk's
-    running sums) takes each tile's rescale factor and its tile's sum: added twice over, the softmax's
+    running sums) takes each tile's rescale factor, its tile's sum and the terms it sums: the terms summed and
+    added twice over, the softmax's
     denominator doubles on every tile, and the walk's attention is the declared function's halved, on par
     against the float64 truth (check 1)."""
     forms = derive.derive(declared(attention), accurate=False, saturation=SATURATION)
 
-    def doubled(state, factor, summed):
-        return state * factor + 2 * summed
+    def doubled(state, factor, summed, terms):
+        del summed
+        return state * factor + 2 * jnp.sum(terms, axis=-1)
 
     def run(q, k, v):
         values = operands(q, k, v)
