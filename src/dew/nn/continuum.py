@@ -258,9 +258,13 @@ def feedforward_levels(view: StackView, variables, layers: tuple[int, ...]) -> d
 def with_feedforward_levels(view: StackView, variables, levels: Mapping) -> dict:
     """`variables` holding `levels` as their layers' feed-forward blocks (`feedforward_levels`), each
     written where `view` holds it (`StackView.with_stored_layer`), a bank's other rows as stored."""
+    from dew.nn.backbones.layer_names import layer_index
+
     params = variables["params"]
     for key, level in levels.items():
-        params = view.with_stored_layer(params, int(key.removeprefix("layers_")), "mlp", level)
+        if (layer := layer_index(key)) is None:
+            raise ValueError(f"feed-forward level {key!r} names no single layer (`layers_N`)")
+        params = view.with_stored_layer(params, layer, "mlp", level)
     return {**variables, "params": params}
 
 
