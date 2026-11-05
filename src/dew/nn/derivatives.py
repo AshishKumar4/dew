@@ -15,8 +15,9 @@ their call, and a derivative written to restructure algebra (`Algebra`) opens in
 
 A custom derivative is declared through its class's function, which makes it one marked call of its kind:
 `kernel_derivative` and `kernel_tangent` (a kernel's glue), `numerics_derivative` and `numerics_tangent` (a
-rule its numerics need as written), `surrogate` (a value and its declared derivative). No module of Dew
-applies `jax.custom_vjp` or `jax.custom_jvp` itself.
+rule its numerics need as written), `surrogate` (a value and its declared derivative). Each lane moves its
+sites onto them (rows 4026 to 4030); then the slop check refuses `jax.custom_vjp` and `jax.custom_jvp`
+outside this module.
 """
 
 from __future__ import annotations
@@ -70,7 +71,7 @@ def surrogate[Value](forward: Callable[..., Value], derivative: Callable[..., Va
         return value, derivative(*fixed, primals, tangents, value)
 
     rule.defjvp(tangent)
-    return bound_span(Surrogate(), rule)
+    return bound_span(Surrogate(), rule, static=declared)
 
 
 def _derivative[Value](kind: Kind, primal: Callable[..., Value], forward: Callable, backward: Callable, *,
@@ -80,7 +81,7 @@ def _derivative[Value](kind: Kind, primal: Callable[..., Value], forward: Callab
     mode refuses it as a bare `jax.custom_vjp` does."""
     rule = jax.custom_vjp(primal, nondiff_argnums=tuple(nondiff_argnums))
     rule.defvjp(forward, backward)
-    return bound_span(kind, rule)
+    return bound_span(kind, rule, static=nondiff_argnums)
 
 
 def _tangent[Value](kind: Kind, primal: Callable[..., Value], tangent: Callable, *,
@@ -90,28 +91,35 @@ def _tangent[Value](kind: Kind, primal: Callable[..., Value], tangent: Callable,
     `kind` (`bound_span`)."""
     rule = jax.custom_jvp(primal, nondiff_argnums=tuple(nondiff_argnums))
     rule.defjvp(tangent)
-    return bound_span(kind, rule)
+    return bound_span(kind, rule, static=nondiff_argnums)
 
 
-def bound_span[Result](kind: Kind, function: Callable[..., Result]) -> Callable[..., Result]:
+def bound_span[Result](kind: Kind, function: Callable[..., Result], *,
+                       static: Sequence[int] = ()) -> Callable[..., Result]:
     """`function` as one marked call of `kind` (`marked`) over its arrays, passed by position or by name: its
-    other arguments (a static factor, a dtype, a Python number, an option) bound in, so a constant still
-    splits where it is known; a call of no array, `function` itself."""
+    other arguments (a static factor, a dtype, a Python number, an option) and those at its `static` positions
+    (a custom derivative's `nondiff_argnums`, arrays among them, which its rule takes as constants) bound in,
+    so a constant still splits where it is known; a call of no array, `function` itself."""
     signature = inspect.signature(function)
+    fixed = frozenset(static)
 
     @functools.wraps(function)
     def call(*args, **kwargs):
         bound = signature.bind(*args, **kwargs)
-        leaves, structure = jax.tree.flatten((bound.args, bound.kwargs))
+        operands = [arg for position, arg in enumerate(bound.args) if position not in fixed]
+        leaves, structure = jax.tree.flatten((operands, bound.kwargs))
         traced = [index for index, leaf in enumerate(leaves) if isinstance(leaf, jax.Array)]
         if not traced:
             return function(*args, **kwargs)
 
-        def span(*operands):
+        def span(*arrays):
             filled = list(leaves)
-            for index, operand in zip(traced, operands, strict=True):
-                filled[index] = operand
-            positional, named = jax.tree.unflatten(structure, filled)
+            for index, array in zip(traced, arrays, strict=True):
+                filled[index] = array
+            given, named = jax.tree.unflatten(structure, filled)
+            positional, rest = [], iter(given)
+            for position, arg in enumerate(bound.args):
+                positional.append(arg if position in fixed else next(rest))
             return function(*positional, **named)
 
         return marked(kind, span)(*(leaves[index] for index in traced))
