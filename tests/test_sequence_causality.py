@@ -137,16 +137,26 @@ REFUSED = {
 
 
 def test_an_operation_is_known_by_its_object_whatever_the_processs_random_keys():
-    """JAX's own operations are read by their objects, its random ones off a trace of its public random
-    functions (`dew.nn.programs.jax_name`), in a process whose keys are another implementation's too
-    (`jax_default_prng_impl`), where the trace's key is its own."""
+    """JAX's own operations are read by their objects, those JAX exports by their modules and the random
+    ones it binds without exporting off a trace of its public random functions
+    (`dew.nn.programs.jax_name`): the linear algebra's and every random operation's, in a process whose
+    keys are another implementation's too (`jax_default_prng_impl`), where the trace's key is its own."""
     assert_exits_cleanly("""
 import jax
 jax.config.update("jax_default_prng_impl", "rbg")
+from jax.extend.core import primitives
 from dew.nn.programs import jax_name
 assert jax_name(jax.lax.exp_p) == "exp"
-folded = jax.make_jaxpr(lambda key: jax.random.fold_in(key, 1))(jax.random.key(0)).jaxpr.eqns
-assert "random_fold_in" in {jax_name(equation.primitive) for equation in folded}, folded
+assert jax_name(primitives.cholesky_p) == "cholesky"
+assert jax_name(primitives.random_gamma_p) == "random_gamma"
+def names(function, argument):
+    return {jax_name(equation.primitive) for equation in jax.make_jaxpr(function)(argument).jaxpr.eqns}
+key = jax.random.key(0)
+for function, argument, name in ((lambda key: jax.random.fold_in(key, 1), key, "random_fold_in"),
+                                 (jax.random.key, 0, "random_seed"), (jax.random.clone, key, "random_clone"),
+                                 (jax.random.key_data, key, "random_unwrap")):
+    found = names(function, argument)
+    assert name in found, (name, found)
 """)
 
 
