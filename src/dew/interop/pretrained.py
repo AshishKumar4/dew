@@ -2224,10 +2224,12 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: source
     route = source_route(config, remote=remote, pinned=pinned)
     language = route.wrapper if text_only and isinstance(route, WrapperRoute) else None
     if language is not None and decoders.bundles(config):
-        # A bundle its own family reads whole: its family's decoder over the source's own config and
-        # tensors, the towers' retained by name and written back with the config that names them (Kimi
-        # K2.5's under `language_model.`, MiMo-V2.6's at the root).
-        route, language = DecoderRoute(decoders.translate_config(config)), None
+        # A bundle its own family reads whole: its family's decoder, as its text checkpoint states it
+        # (`bundle_text_config`), over the source's own tensors, the towers' retained by name and written
+        # back with the config that names them (Kimi K2.5's under `language_model.`, MiMo-V2.6's at the
+        # root).
+        route = DecoderRoute(decoders.translate_config(decoders.bundle_text_config(config)))
+        language = None
     elif language is not None:
         # The language model's config as its decoder reads it (`decoders.decoder_config`), a quantized
         # wrapper's module selection renamed with its tensors.
