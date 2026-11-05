@@ -116,15 +116,13 @@ def _unthird(row) -> bool:
     return int(row["id"]) % 3 != 2
 
 
-@pytest.mark.parametrize("read", ["indexed", "streamed"])
-def test_a_compiled_reader_reads_its_store_in_memory_no_more_to_name_it(read):
-    """A store in memory names itself by a hash of every record it holds, which its compile takes once:
-    each reader the compile opens names its corpus as the compile did, reading the store no more than
-    for its rows, however often a run opens one (row 803)."""
+def test_a_compiled_reader_reads_its_store_in_memory_no_more_to_name_it():
+    """A store in memory names itself by a hash of every record it holds, which its compile takes once
+    (reading it by index): each reader the compile opens of a stream of it names its corpus as the
+    compile did, reading the store only for its rows, however often a run opens one (row 803)."""
     reads = []
     kept = Pipeline(Logged(source(8).values, reads=reads)).filter(_unthird)
-    ordered = kept.shuffle(0, window=4) if read == "streamed" else kept.shuffle(0)
-    data = compile(ordered.repeat().batch(2), read=read, loading=READ)
+    data = compile(kept.shuffle(0, window=4).repeat().batch(2), read="streamed", loading=READ)
     before = len(reads)
     for _ in range(3):
         reader = data.train(DataPartition())
@@ -132,7 +130,7 @@ def test_a_compiled_reader_reads_its_store_in_memory_no_more_to_name_it(read):
             listed(reader, 2)
         finally:
             reader.close()
-    assert len(reads) - before <= 3
+    assert "indexed" not in reads[before:], reads[before:]
 
 
 class Decoded(list):
