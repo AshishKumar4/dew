@@ -721,7 +721,7 @@ def test_a_hugging_face_stream_cache_publishes_only_its_store_shards(tmp_path, s
     source = from_hf(stream, identity="cached-counting@1")
     cache, key = Cache((tmp_path / "cache").as_uri()), Manifest(source.fingerprint())
     manifest = source.manifest()
-    cached = dataclasses.replace(manifest, reader=cache.streamed(manifest.reader, key))
+    cached = dataclasses.replace(manifest, reader=cache.streamed(manifest.reader, key, loading=Loading()))
     actual = []
     for index in range(shares):
         reader = iter(streamed(cached, partition=DataPartition(index, shares), loading=READ))

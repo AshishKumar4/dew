@@ -46,7 +46,7 @@ from dew.data.storage import (
     on_gcs,
 )
 
-from .base import Read, Shard, ShardManifest, preparing, url_label
+from .base import Read, Shard, ShardManifest, ShardRows, preparing, url_label
 from .index import ArrayIndex
 
 type Format = Literal["jsonl", "text", "csv", "parquet", "arrow", "array_record", "files", "webdataset"]
@@ -888,14 +888,14 @@ class Files(Dataset):
                              "read it with fewer")
         return tuple(shards)
 
-    def _read_shard(self, shard: Shard) -> grain.IterDataset:
+    def _read_shard(self, shard: Shard) -> ShardRows:
         if self.kind in ("parquet", "arrow"):
-            return grain.MapDataset.source(_ArrowFragment(self, shard.start)).to_iter_dataset()
+            return grain.MapDataset.source(_ArrowFragment(self, shard.start))
         rows = self._shard_rows(shard)
         return rows if self.columns is None else rows.map(_Columns(self.columns, self.describe())).map(
             Fields(self.columns))
 
-    def _shard_rows(self, shard: Shard) -> grain.IterDataset:
+    def _shard_rows(self, shard: Shard) -> ShardRows:
         if self.kind == "array_record":
             from .records import ArrayRecords
 
@@ -906,13 +906,13 @@ class Files(Dataset):
                     record_codec=self.committed is not None and self.committed.get("codec") == 1,
                     declared=(self._declared_objects.get(shard.uri),),
                 )
-            ).to_iter_dataset()
+            )
         if self.kind == "webdataset":
             from .webdataset import TarRows
 
             return TarRows(shard.uri, self.storage_options, self._declared_objects.get(shard.uri))
         if self.kind == "files":
-            return grain.MapDataset.source(_Paths((shard.uri,))).to_iter_dataset()
+            return grain.MapDataset.source(_Paths((shard.uri,)))
         return _Lines(self, shard)
 
     def locality(self) -> tuple[tuple[int, ...], bool]:

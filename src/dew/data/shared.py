@@ -73,6 +73,16 @@ class Shared[V](Mapping[str, V]):
     def __reduce__(self):
         return Shared, (self._keys, tuple(self[key] for key in self._keys))
 
+    def __copy__(self) -> Shared[V]:
+        return self
+
+    def __deepcopy__(self, memo: dict) -> Shared[V]:
+        """Itself: neither it nor the positions it holds are written once held, each a snapshot of its own,
+        so a copy of it holds them as it does. Grain's prefetch copies a read's position deep for each
+        element it reads ahead (`ThreadPrefetchDatasetIterator`), which, member by member, cost an element
+        a mixture's size (row 4079)."""
+        return self
+
 
 def _built(values: tuple, depth: int) -> tuple:
     """The trie of `depth` levels holding `values` in order, each node `WIDTH` slots or fewer."""

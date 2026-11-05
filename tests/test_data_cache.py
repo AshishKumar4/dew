@@ -349,10 +349,12 @@ def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
 
 
 def test_stream_completions_use_physical_shards_and_resume_without_rekeying():
+    from dew.data.dataset import Loading
+
     source = Memory([{"id": index} for index in range(8)], shard_rows=2)
     cache, key = _cache(), _key()
     manifest = source.manifest()
-    reader = cache.streamed(manifest.reader, key)
+    reader = cache.streamed(manifest.reader, key, loading=Loading())
     for shard in reversed(manifest.shards):
         iterator = iter(reader(shard))
         assert next(iterator)["id"] == shard.start
