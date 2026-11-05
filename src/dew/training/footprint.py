@@ -228,7 +228,9 @@ def folded(program: jcore.Jaxpr) -> jcore.Jaxpr:
             continue
         first, second = equation.invars
         for scattered, other in ((first, second), (second, first)):
-            scatter = producers.get(scattered) if isinstance(scattered, jcore.Var) else None
+            if not isinstance(scattered, jcore.Var):
+                continue
+            scatter = producers.get(scattered)
             if (scatter is None or scatter.primitive.name != "scatter-add" or readers[scattered] != 1
                     or scattered.aval != equation.outvars[0].aval or id(scatter) in dropped):
                 continue
@@ -499,7 +501,7 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
                 if out in last and frontier.buffered(out) and out not in carried]
         made_bytes = sum(map(device_share, made))
         # A scatter writes its result in the buffer of the base it reads last (`in_place`).
-        taken = in_place(equation, held, last, index)
+        taken = in_place(frontier, equation, held, last, index)
         if made or not frontier.fusing(equation):
             inner = max((peak_bytes(body, platform, workspace, Slicing.entering(equation, body),
                                     returned_carry(equation, body)) for body in bodies(equation)), default=0)
@@ -524,20 +526,26 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
     return most
 
 
-def in_place(equation: jcore.JaxprEqn, held: set, last: Mapping, index: int) -> int:
+def in_place(frontier: Frontier, equation: jcore.JaxprEqn, held: set, last: Mapping, index: int) -> int:
     """The bytes of the buffer the scatter `equation`, the program's `index`th, writes its result in: its
-    base's, where the program holds that buffer (`held`) and reads it last there, its result's size, as
-    XLA shares a scatter's first operand's buffer with its result
-    (`HloDataflowAnalysis::CanShareOperandBufferWithUser`, xla/hlo/analysis/hlo_dataflow_analysis.cc);
-    none for any other equation."""
+    base's, the one buffer the program holds (`held`) that the base is or views (`Frontier.reading`), where
+    it reads that buffer last and it is its result's size, as XLA shares a scatter's first operand's
+    buffer with its result (`HloDataflowAnalysis::CanShareOperandBufferWithUser`,
+    xla/hlo/analysis/hlo_dataflow_analysis.cc); none for any other equation."""
     if not equation.primitive.name.startswith("scatter") or not equation.invars:
         return 0
     base = equation.invars[0]
-    if not computed(base) or base not in held or last.get(base) != index:
+    if not computed(base) or equation.invars.count(base) != 1 or frontier.made_for(base):
         return 0
-    if device_share(base) != device_share(equation.outvars[0]) or equation.invars.count(base) != 1:
+    kept = frontier.reading([base])
+    if len(kept) != 1:
         return 0
-    return device_share(base)
+    (buffer,) = kept
+    if buffer not in held or last.get(buffer) != index:
+        return 0
+    if device_share(buffer) != device_share(equation.outvars[0]):
+        return 0
+    return device_share(buffer)
 
 
 def carry(equation: jcore.JaxprEqn) -> list[tuple]:
