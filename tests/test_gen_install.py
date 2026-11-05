@@ -24,7 +24,7 @@ def scratch(root: Path) -> Path:
         (root / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(REPO / name, root / name)
     shutil.copytree(REPO / "src", root / "src", ignore=lambda _, names: [
-        name for name in names if name.endswith(".py") and name not in ("builds.py", "tpu_setup.py")])
+        name for name in names if name.endswith(".py") and name not in ("_builds.py", "tpu_setup.py")])
     # The generator and what it reads beside it, and the tested Pythons, which tools/armada/ci.py reads from
     # pyproject.toml's classifiers.
     for directory in ("site/scripts", "tools/armada"):
