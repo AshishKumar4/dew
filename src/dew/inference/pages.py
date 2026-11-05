@@ -18,6 +18,14 @@ shared; the page a prompt ends inside, and every page its draws fill, stay
 private to the row, so a shared page is never written again. A cached page
 is reclaimed, least recently released first, when the free list runs dry.
 
+A host tier keeps prefix pages past the device's: a cached page the pool reclaims
+is copied to one of `host` page slots in host memory first, still named by its
+hash, and a later prompt that shares it takes a fresh device page that the host
+copy is read back into before its prefill, as vLLM's and SGLang's hierarchical
+prefix caches offload and reload blocks. The ledger names the copies each step
+owes (`Transfers`); the server makes them before the step's program writes any
+page.
+
 A decoder that keeps a row's own state beside its pages (a recurrent mixer's
 memory, latent attention's index keys) reads a prefix with the state its
 prompt left at the prefix's end as well, which `States` names as vLLM's
@@ -30,6 +38,7 @@ from __future__ import annotations
 import hashlib
 from collections import Counter, OrderedDict, deque
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -84,15 +93,35 @@ class States:
         self._by_hash.clear()
 
 
-class Pages:
-    """Free, held and cached pages of one pool of `count` pages of `size` slots, and with `states` the row
-    states a shared prefix is read with (`States`)."""
+@dataclass
+class Transfers:
+    """The page copies a step owes before its program runs: `spills`, (device page, host slot) pairs whose
+    device page is reclaimed and goes to the host first, then `uploads`, (host slot, device page) pairs a
+    seated prompt reads back from the host into a fresh device page."""
 
-    def __init__(self, count: int, size: int, *, prefix_cache: bool, states: States | None = None) -> None:
+    spills: list[tuple[int, int]] = field(default_factory=list)
+    uploads: list[tuple[int, int]] = field(default_factory=list)
+
+
+class Pages:
+    """Free, held and cached pages of one pool of `count` pages of `size` slots, with `host` page slots in
+    host memory that a reclaimed prefix page goes to (`Transfers`), and with `states` the row states a
+    shared prefix is read with (`States`), whose pages stay on the device."""
+
+    def __init__(self, count: int, size: int, *, prefix_cache: bool, states: States | None = None,
+                 host: int = 0) -> None:
         self.size = size
         self.count = count
         self.prefix_cache = prefix_cache
         self.states = states
+        self.host = host
+        self._host_free: deque[int] = deque(range(host))
+        self._on_host: OrderedDict[bytes, int] = OrderedDict()
+        """Prefix pages held in host slots, by their hash, least recently used first."""
+        self.transfers = Transfers()
+        """The copies owed before the next step's program (`drained`)."""
+        self._reading: list[int] = []
+        """Host slots an owed upload still reads, free again once the copies are made."""
         self._free: deque[int] = deque(range(count))
         self._holders = np.zeros(count, np.int32)
         self._cached: OrderedDict[int, None] = OrderedDict()
@@ -119,12 +148,15 @@ class Pages:
         return self._matched(prompt, salt)[0]
 
     def _matched(self, prompt: np.ndarray, salt: bytes) -> tuple[list[int], bytes | None]:
-        """`shared`'s pages and the digest of the last of them, None for none."""
+        """`shared`'s pages and the digest of the last of them, None for none: a page on the device as
+        its index, one in a host slot as the slot's index, negated past one (`-1 - slot`)."""
         pages: list[int] = []
         depth, last = 0, None
         if self.prefix_cache:
             for digest in prefix_hashes(prompt, self.size, (len(prompt) - 1) // self.size, salt):
                 page = self._by_hash.get(digest)
+                if page is None and digest in self._on_host:
+                    page = -1 - self._on_host[digest]
                 if page is None:
                     break
                 pages.append(page)
@@ -157,17 +189,39 @@ class Pages:
         """
         needed = -(-total // self.size)
         shared, last = self._matched(prompt, salt)
-        reclaimable = len(self._free) + sum(page not in shared for page in self._cached)
-        if needed - len(shared) > reclaimable:
+        resident = [page for page in shared if page >= 0]
+        reclaimable = len(self._free) + sum(page not in resident for page in self._cached)
+        if needed - len(resident) > reclaimable:
             return None
-        for page in shared:
+        for page in resident:
             self._hold(page)
         entry = None if self.states is None or last is None else self.states.entry(last)
         hashes = prefix_hashes(prompt, self.size, len(prompt) // self.size, salt) if self.prefix_cache else []
+        # A page on the host comes back into a fresh device page, named by its hash there again.
+        pages = [page if page >= 0 else self._uploaded(-1 - page, hashes[index])
+                 for index, page in enumerate(shared)]
         writing = tuple(digest for digest in hashes[len(shared):] if digest not in self._by_hash)
         self._writing.update(writing)
-        return (shared + [self._take() for _ in range(needed - len(shared))], len(shared) * self.size,
+        return (pages + [self._take() for _ in range(needed - len(shared))], len(shared) * self.size,
                 entry, writing)
+
+    def _uploaded(self, slot: int, digest: bytes) -> int:
+        """A fresh device page that host `slot`'s copy of `digest`'s page is read back into, held."""
+        page = self._take()
+        del self._on_host[digest]
+        self._reading.append(slot)
+        self.transfers.uploads.append((slot, page))
+        self._by_hash[digest] = page
+        self._hash_of[page] = digest
+        return page
+
+    def drained(self) -> Transfers:
+        """The copies owed before the next step's program, which its caller makes, spills first; the host
+        slots the uploads read are free again after them."""
+        owed, self.transfers = self.transfers, Transfers()
+        self._host_free.extend(self._reading)
+        self._reading = []
+        return owed
 
     def written(self, writing: Sequence[bytes]) -> None:
         """A row's pages of `writing` (`reserve`'s) are written no more: it published them (`publish`) or
@@ -211,6 +265,8 @@ class Pages:
         self._cached.clear()
         self._by_hash.clear()
         self._hash_of.clear()
+        self._host_free.extend(self._on_host.values())
+        self._on_host.clear()
         if self.states is not None:
             self.states.forget()
 
@@ -227,5 +283,20 @@ class Pages:
             del self._by_hash[digest]
             if self.states is not None:
                 self.states.drop(digest)
+            elif self.host:
+                self._spilled(page, digest)
         self._holders[page] += 1
         return page
+
+    def _spilled(self, page: int, digest: bytes) -> None:
+        """Keep reclaimed `page`'s keys in a host slot under `digest`: a free slot, or the least recently
+        used one's, whose page is forgotten."""
+        if self._host_free:
+            slot = self._host_free.popleft()
+        elif self._on_host:
+            slot = self._on_host.popitem(last=False)[1]
+        else:
+            # Every slot is read by an owed upload this step.
+            return
+        self._on_host[digest] = slot
+        self.transfers.spills.append((page, slot))
