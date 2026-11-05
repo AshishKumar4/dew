@@ -13,7 +13,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.inference.banks import CheckpointBanks, HeldBanks, LayerBanks, SafetensorsBanks
     from dew.inference.clients import Completion, OllamaCompletion, OpenAICompletion, Usage
     from dew.inference.engine import Engine, Kind, Timed
-    from dew.inference.images import DenoisingInputs, Images, TextToImage
+    from dew.inference.images import DenoisingInputs, ImageRequest, Images, TextToImage
     from dew.inference.loading import pipeline
     from dew.inference.nccl import NCCLPush
     from dew.inference.rollouts import (
@@ -36,7 +36,8 @@ _EXPORTS = {
     "Completion": "dew.inference.clients", "OllamaCompletion": "dew.inference.clients",
     "OpenAICompletion": "dew.inference.clients", "Usage": "dew.inference.clients",
     "Engine": "dew.inference.engine", "Kind": "dew.inference.engine", "Timed": "dew.inference.engine",
-    "DenoisingInputs": "dew.inference.images", "Images": "dew.inference.images",
+    "DenoisingInputs": "dew.inference.images", "ImageRequest": "dew.inference.images",
+    "Images": "dew.inference.images",
     "TextToImage": "dew.inference.images",
     "RunProcessor": "dew.inference.tasks", "pipeline": "dew.inference.loading",
     "NCCLPush": "dew.inference.nccl",
@@ -62,6 +63,7 @@ __all__ = [
     "Draw",
     "Engine",
     "HeldBanks",
+    "ImageRequest",
     "Images",
     "InfrastructureError",
     "Kind",

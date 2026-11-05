@@ -23,6 +23,7 @@ from dew._records import JSON
 from dew.artifacts import uint8_pixels
 from dew.batch import Variables, thaw
 from dew.diffusion.process import Conditioning, Process
+from dew.inference.scoring import ScoringRequest
 from dew.inference.tasks import InItsForm, SavedRun, SavedRunTask, traced_in_its_form
 from dew.inputs import InputSpec, encode_conditions, unit_range
 from dew.nn.autoencoders import AutoEncoder
@@ -419,6 +420,65 @@ class TextToImage(SavedRunTask, InItsForm):
                                grid_steps=settled.count if owns_grid else None,
                                process=settled.process if owns_grid else None, times=settled.times)
 
+    def _guidance(self, guidance: Guidance | float | None | Omitted) -> Guidance | None:
+        """The guidance a call runs: the task's where it is omitted, a scale as `CFG`'s."""
+        chosen = self.guidance if guidance is OMITTED else guidance
+        if isinstance(chosen, (int, float)) and not isinstance(chosen, bool):
+            chosen = CFG(float(chosen))
+        if chosen is not None and not isinstance(chosen, Guidance):
+            raise ValueError("guidance must be a scale, a guidance value or None")
+        return chosen
+
+    def scoring(self, *, steps: int | None = None, guidance: Guidance | float | None | Omitted = OMITTED,
+                solver: Solver | None = None, decode: bool = True, images: int = 8
+                ) -> tuple[ImageScoring, Variables]:
+        """This task as a scoring task of `ImageRequest`s (`dew.inference.scoring.Scoring`), which a
+        `ScoringServer` serves beside the other kinds of an `Engine`, and the weights it samples with. A
+        request is answered with the `Images` a lone call `task(request.prompts, key=request.key)` with
+        these settings draws: its noise and its walk's draws are its key's, whatever requests share its
+        pass. A pass holds requests of as many prompts as the first it takes, up to `images` images,
+        and walks them as one batch, each request's walk its own. The scoring task holds no weights: a
+        server holds them resident and swaps both whole on a reload (`ScoringServer.reload`)."""
+        count = self.steps if steps is None else steps
+        process, times = self.prepared_process(count)
+        if type(decode) is not bool:
+            raise ValueError("decode must be a boolean")
+        if type(images) is not int or images < 1:
+            raise ValueError(f"a pass holds an image or more, not {images}")
+        self._text_encoder("a served request's prompts are encoded with it")
+        held = ImageScoring(replace(self, variables={}), count, process, times, self._guidance(guidance),
+                            self.solver if solver is None else solver, decode, images)
+        return held, self.variables
+
+    @traced_in_its_form
+    def _served(self, requests: Sequence[_Drawn], scoring: ImageScoring) -> list[Images]:
+        """One served pass of `scoring` over `requests`, each of as many prompts: each request's conditions
+        and noise prepared as its lone call prepares them, and the walks run as one program mapped over
+        the requests, each with its own key (`ImageScoring`)."""
+        mesh = mesh_of(self.variables)
+        prepared = [self._inputs(self._resolved(
+            mesh, list(request.prompts), None, request=request.key, count=scoring.count,
+            process=scoring.process, selected=scoring.times, unconditional=None, image=None,
+            image_latents=None, mask=None, noise=None, initial=None, encode_key=None),
+            owns_grid=self.grid is not None)
+            for request in requests]
+        noise, conditions, unconditional = (jax.tree.map(lambda *leaves: jnp.stack(leaves), *branch)
+                                            for branch in zip(*((inputs.noise, dict(inputs.conditions),
+                                                                 dict(inputs.unconditional))
+                                                                for inputs in prepared), strict=True))
+        walks = jnp.stack([jax.random.fold_in(request.key, 1) for request in requests])
+        grid = _default_grid(scoring.process, scoring.count) if scoring.times is None else scoring.times
+        with region("inference.image"):
+            initial = program(_initials, static_argnums=(0, 1, 2))(
+                scoring.solver, scoring.process, grid, noise, walks)
+            models = sampling_modules(self.model, scoring.guidance, self.autoencoder)
+            generated = program(_walks, *models, static_argnums=(0, 1, 2, 3, 4, 5))(
+                self.model, scoring.process, self.autoencoder, self.finish, self.final_denoise,
+                scoring.decode, scoring.solver, scoring.guidance, np.asarray(grid, np.float32), initial,
+                self.variables, conditions, unconditional, noise, walks)
+        return [replace(jax.tree.map(lambda leaf, index=index: leaf[index], generated), rows=inputs.rows)
+                for index, inputs in enumerate(prepared)]
+
     def _settings(self, mesh, prompts, *, steps, guidance, solver, key, decode):
         """Everything one call settles on the host before it runs the model.
 
@@ -427,11 +487,7 @@ class TextToImage(SavedRunTask, InItsForm):
         the grid, the solver and the guidance a call runs with. The value
         ends with the signature a pool compares.
         """
-        chosen = self.guidance if guidance is OMITTED else guidance
-        if isinstance(chosen, (int, float)) and not isinstance(chosen, bool):
-            chosen = CFG(float(chosen))
-        if chosen is not None and not isinstance(chosen, Guidance):
-            raise ValueError("guidance must be a scale, a guidance value or None")
+        chosen = self._guidance(guidance)
         request = request_key(key)
         prepared = prompts if isinstance(prompts, DenoisingInputs) else None
         default_count = (prepared.grid_steps if prepared is not None and prepared.grid_steps is not None
@@ -715,6 +771,75 @@ class TextToImage(SavedRunTask, InItsForm):
         return replace(generated, rows=plan.rows)
 
 
+@dataclass(frozen=True)
+class ImageRequest:
+    """One request a served text-to-image task answers (`TextToImage.scoring`): its prompts, an image
+    each, and the key its draws come from, as a lone call `task(prompts, key=key)` draws them."""
+
+    prompts: str | Sequence[str]
+    key: int | jax.Array
+
+
+@dataclass(frozen=True, eq=False)
+class _Drawn:
+    """An admitted request: its prompts and its typed key."""
+
+    prompts: tuple[str, ...]
+    key: jax.Array
+
+
+@dataclass
+class _ImagePass:
+    """A served pass of requests of as many prompts as its first, up to `images` images (`PassPlan`)."""
+
+    images: int
+    prompts: int = 0
+    held: int = 0
+
+    def add(self, request: _Drawn) -> bool:
+        count = len(request.prompts)
+        if self.held and (count != self.prompts or self.held + count > self.images):
+            return False
+        self.prompts, self.held = count, self.held + count
+        return True
+
+
+@dataclass(frozen=True, eq=False)
+class ImageScoring:
+    """A text-to-image task served by a `ScoringServer` (`TextToImage.scoring`): each `ImageRequest` one
+    row, answered with its `Images`, every pass over the weights its server hands it."""
+
+    task: TextToImage
+    count: int
+    process: Process
+    times: tuple[float, ...] | None
+    guidance: Guidance | None
+    solver: Solver
+    decode: bool
+    images: int
+
+    def admit(self, request: ImageRequest) -> ScoringRequest[_Drawn, None]:
+        prompts = (request.prompts,) if isinstance(request.prompts, str) else tuple(request.prompts)
+        if not prompts or not all(isinstance(prompt, str) for prompt in prompts):
+            raise ValueError("an image request holds a prompt or more, each a string")
+        return ScoringRequest((_Drawn(prompts, request_key(request.key)),), None)
+
+    def planned(self) -> _ImagePass:
+        return _ImagePass(self.images)
+
+    def forward(self, variables: Variables, rows: Sequence[_Drawn]) -> list[Images]:
+        return self.task.bind(variables)._served(rows, self)
+
+    def compile(self, variables: Variables) -> Sequence[object]:
+        """Nothing up front: a pass's programs compile at its first count of requests and prompts, as a
+        lone call's do at its first count of prompts."""
+        return ()
+
+    def answer(self, payload: None, outputs: Sequence[Images]) -> Images:
+        (images,) = outputs
+        return images
+
+
 def restored_tree(run: SavedRun, *, ema: bool | None, mesh: MeshSpec | Mesh | None, layout: Layout | None,
                   param_dtype: DTypeLike | None) -> Variables:
     """The diffusion run `run`'s tree as its checkpoint holds it, an adapter's split of it kept
@@ -858,6 +983,22 @@ def _initial(solver, process, grid, x_T, key):
     with jax.ensure_compile_time_eval():
         times = jnp.asarray(grid, jnp.float32)
     return solver.init(x_T, times, process, key=key)
+
+
+def _initials(solver, process, grid, x_T, keys):
+    """`_initial` of each request's rows, mapped over the requests (`TextToImage._served`)."""
+    return jax.vmap(lambda x, key: _initial(solver, process, grid, x, key))(x_T, keys)
+
+
+def _walks(model, process, autoencoder, finish, final_denoise, decode,
+           solver, guidance, times, initial, params, given, null, x_T, keys):
+    """`_walk` of each request's rows, mapped over the requests, the weights and the grid shared, so a
+    served pass runs each request's walk as its lone call does under one program."""
+    def walked(initial, given, null, x_T, key):
+        return _walk(model, process, autoencoder, finish, final_denoise, decode, solver, guidance, times,
+                     initial, params, given, null, x_T, key)
+
+    return jax.vmap(walked)(initial, given, null, x_T, keys)
 
 
 def _walk(model, process, autoencoder, finish, final_denoise, decode,

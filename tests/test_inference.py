@@ -865,6 +865,55 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
 
 
 @pytest.mark.mesh
+def test_a_scoring_server_answers_image_requests_as_each_draws_alone(tmp_path):
+    """A text-to-image task served by a `ScoringServer` (`TextToImage.scoring`), as an `Engine` serves it
+    beside other kinds: requests of two prompts share a pass up to its four images, a request of one walks
+    in a pass of its own, and each request's images are those its lone call draws under its key, on par
+    with that call against the float64 pipeline over the same prepared noise and conditions (check 1)."""
+    from arm_arithmetic import widened
+    from reference_error import as_given, assert_as_exact, seeds_for
+
+    from dew.inference import ImageRequest, ScoringServer
+
+    make_run(tmp_path)
+    pipe = TextToImage.from_run(str(tmp_path))
+    prompts = (("a water lily", "a sunflower"), ("a rose", "a tulip"), ("a daisy",), ("an iris", "a lotus"))
+    settings = {"steps": 3, "guidance": 2.0}
+    server = ScoringServer.from_task(*pipe.scoring(**settings, images=4))
+    wide = dataclasses.replace(pipe, model=pipe.model.clone(dtype=jnp.float64),
+                               variables=widened(pipe.variables))
+
+    def draw(seed):
+        return (np.arange(len(prompts)) + len(prompts) * seed,)
+
+    @as_given
+    def served(keys):
+        futures = [server.submit(ImageRequest(rows, key=int(key)))
+                   for rows, key in zip(prompts, keys, strict=True)]
+        server.run()
+        admitted = [future.admitted for future in futures]
+        assert admitted[0] == admitted[1] != admitted[2] != admitted[3]
+        return tuple(future.result().host().images for future in futures)
+
+    @as_given
+    def alone(keys):
+        return tuple(pipe(rows, **settings, key=int(key)).host().images for rows, key in zip(prompts, keys,
+                                                                                           strict=True))
+
+    @as_given
+    def truth(keys):
+        images = []
+        for rows, key in zip(prompts, keys, strict=True):
+            prepared = jax.tree.map(np.asarray, pipe.prepare(list(rows), key=int(key), steps=3))
+            with jax.enable_x64(new_val=True):
+                images.append(wide(widened(prepared), **settings, key=int(key)).host().images)
+        return tuple(images)
+
+    label = "served images"
+    count = seeds_for(alone, draw, label, truth_fn=truth, dew_fn=served)
+    assert_as_exact(served, alone, draw, label, seeds=count, truth_fn=truth)
+
+
 def test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images(tmp_path):
     """Placed under the trainer's layout, the weights shard over the mesh,
     prompts split over its batch axes, the result keeps that sharding, and

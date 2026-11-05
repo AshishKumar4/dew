@@ -3,7 +3,8 @@
 A serving kind (`Kind`) admits the requests waiting for it within its own bounds, runs them with one
 device call a `step`, and settles their futures: `dew.inference.serving.Server` is autoregressive
 generation's kind, a slot scheduler over a resident cache, and `dew.inference.scoring.ScoringServer`
-scoring's, one forward a batch. A kind of block or masked generation joins as one more. Each holds its
+scoring's, one forward a batch, which a text-to-image task's walks are served by too
+(`TextToImage.scoring`). A kind of block or masked generation joins as one more. Each holds its
 weights resident on its mesh (`dew.inference.tasks.resident`), reloads new weights through
 `normalized` and `reloaded`, and answers each request through a `Timed` future that `settled`
 completes. `Engine` serves kinds from one thread, a bounded step of each busy kind a turn, so none

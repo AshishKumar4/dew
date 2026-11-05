@@ -1,7 +1,8 @@
 """Serving for scoring: requests answered by forward passes over their rows, batched as they arrive.
 
-A scoring request reads no cache and draws nothing: a classifier's answer, a decision's, a reward or an
-embedding is a forward over its rows. `ScoringServer` queues such requests and runs one pass of the
+A scoring request reads no cache: a classifier's answer, a decision's, a reward or an embedding is a
+forward over its rows, and a text-to-image request a walk over its prompts whose draws are its own key's
+(`dew.inference.images.TextToImage.scoring`). `ScoringServer` queues such requests and runs one pass of the
 task's (`Scoring`) a `step`: the waiting rows oldest first, as many as the task says one pass holds
 (`Scoring.planned`), its compiled shapes bucketed so a compile is reused across passes. A request whose
 rows outrun one pass carries its rows not yet scored to the next step, and is answered once its last
