@@ -172,8 +172,11 @@ floating-point expressions:
 Each form is priced in time from the device facts Dew already owns, never from facts of its own:
 
 - the program model reads `dew.nn.kernels.generation.gpu_target()` (memory bandwidth, dense peaks by precision,
-  the architecture's load latency) and, for collectives, the pool-agreed link figure
-  (`dew.training.distributed.link_figure`), so every process of a pool prices with the same numbers;
+  the architecture's load latency), so every process of a pool prices with the same numbers. No price reads
+  links: every registered rule either keeps a reduction's axes and count or joins two reductions into one
+  (`joined`; `linear`'s shared operand out of two products), which the device price already prefers, so a
+  collective's bytes over `dew.training.distributed.link_figure` would only agree with it. A rule that moves a
+  reduction onto or off a sharded axis brings that price with it;
 - the kernel model is the templates' own (`dew.nn.kernels.templates.cost.seconds`);
 - a fact a price needs and no owner holds, such as a reduction's latency, is added to `GpuTarget` or its
   `Architecture`.
@@ -479,40 +482,24 @@ def admitted(numerics, mode: Mode) -> tuple[Rules, ...]   # the sets a mode and 
 ### 6.5 Cost and extraction
 
 ```python
-@dataclass(frozen=True)
-class Terms:                          # a node's, or a chosen DAG's, composed
-    bytes: int                        # passes over large tensors
-    flops: Mapping[str, int]          # by dtype
-    collective_bytes: int             # over links
-    depth: int                        # the longest chain of dependent reductions
+def work(graph: EGraph, node, region: Region, held: dict | None = None) -> templates.cost.Work: ...
+    # a node's work alone: device and shared bytes at its dtypes' sizes, tensor-core and CUDA-core FLOPs by
+    # mode, operations, exponentials, conversions, and its span (the tile walk's longest dependent chain)
 
-@dataclass(frozen=True)
-class Price:
-    seconds: float                    # CostModel.seconds of its composed terms
-    terms: Terms
+class Schedule(Protocol):            # how a chosen DAG's composed work becomes seconds
+    def pieces(self, work: Work) -> ...: ...
+def fused(facts: GpuTarget) -> Fused: ...  # the compile-time pass: XLA's fusion
+def walk(facts: GpuTarget) -> Walk: ...    # a template's interface: the tile walk
 
-class CostModel(Protocol):
-    def terms(self, node: Node, facts: Facts) -> Terms: ...         # the node alone
-    def seconds(self, terms: Terms) -> float: ...                     # once per region, from its composed terms
-
-def candidates(graph: egglog.EGraph, roots: Sequence[Term], cost: CostModel) -> Iterator[Extraction]: ...
-    # concrete DAGs, every child chosen, in order of price
-
-def extracted(graph: egglog.EGraph, roots: Sequence[Term], cost: CostModel,
-              admits: Callable[[Extraction], bool]) -> Extraction: ...   # the cheapest candidate admitted
-
-@dataclass(frozen=True)
-class Extraction:
-    roots: tuple[Term, ...]
-    price: Price                      # the region's, each shared value priced once
-    fired: Mapping[str, int]          # rule set name: the extracted nodes it introduced
-    error: float | None = None        # dev time: the candidate's sampled check 1 statistic; None at compile time
+def model(region: Region, schedule: Schedule) -> DagCostModel[Seconds]: ...  # egglog's DAG cost model
+def cheapest(graph, root, model) -> ...: ...    # extract.py: greedy-dag, each shared node once
+def extracted(graph, root, model) -> ...: ...   # the exact extractor (a MILP), check 1's oracle under checked
 ```
 
-- A cost model gives a node's terms alone. Extraction composes them over the chosen DAG: `bytes`, `flops` and
-  `collective_bytes` add up with each shared e-class counted once, and `depth` is the longest path of
-  reductions. `seconds` is computed once from the composed terms, as `templates.cost` combines a launch's, so a
-  longest path stays a latency and never becomes a count.
+- A cost model gives a node's work alone. Extraction composes it over the chosen DAG: bytes and FLOPs add up
+  with each shared e-class counted once, and the span is the longest dependent path. Seconds are computed once
+  from the composed work, as `templates.cost` combines a launch's, so a longest path stays a latency and never
+  becomes a count.
 - `admits` decides a candidate: at compile time, whether every rule set it drew on is admitted (§6.4); at dev
   time, whether its sampled error meets the declared accuracy (§1.5), which `dew.algebra.error` measures on the
   candidate itself. The candidates come cheapest first, so the first admitted is the answer; the form as written
@@ -533,8 +520,8 @@ class Extraction:
   the next. Each level is solved in turn with the ones before it held at their optimum; a level whose
   additions are infinite on every DAG (a reading the derivation left) ties, as its prices compare.
 - `fired` comes from the nodes each set's run added, recorded between runs of the sets.
-- The facts are the owners' (§1.6): `gpu_target()` for bandwidth, peaks by precision and latencies, and the
-  pool-agreed `link_figure` for links, so every process prices with the same numbers. A fact no owner holds is
+- The facts are the owners' (§1.6): `gpu_target()` for bandwidth, peaks by precision and latencies, so every
+  process prices with the same numbers. A fact no owner holds is
   added to `GpuTarget` or its `Architecture`, never to the engine. Prices are checked against measured profiles,
   never fitted to them; a form whose price and profile disagree is a finding against the cost model.
 - One cost vocabulary, two schedules. Every price is told in one vocabulary, the toolkit's `templates.cost.Work`:
@@ -584,9 +571,9 @@ class Extraction:
   declaration (`terms.key`), not its text, which egglog formats through black at about a millisecond a term.
 - Extraction for a template's interface (`derive`) prices candidates through the tile walk; the compile-time
   pass and the derived scan's carry split price them through XLA's fusion. Each shared term is priced once either way.
-- The tile walk does not yet read registers (the liveness pass) or the walk's rings when pricing a candidate.
-  Both are properties of a whole chosen DAG, not of a node, and the template's compile gate checks them on the
-  form chosen.
+- The tile walk reads no registers or rings when pricing a candidate: both are properties of a whole chosen DAG
+  at a tile size the derivation does not yet know. The template's register model (`MosaicForward.registers`,
+  `_hook_live`) sizes its tiles to the form chosen, and its compile gate refuses a spill.
 
 ### 6.6 Saturation
 
