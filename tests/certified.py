@@ -783,8 +783,8 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
     results reach: sums of every alignment, a quarter of them nearly cancelling; products and quotients
     from about 2^-140 (subnormal on a lane that keeps subnormals) to 2^126; roots of every binade,
     subnormals included; logarithms of every binade and a quarter near one; exponentials across fp32's
-    range and a quarter near zero; log1p and expm1 at every binade near zero, subnormals included, and
-    across their domains; inverse error functions across (-1, 1) and a quarter near its poles;
+    range and a quarter near zero; log1p and expm1 at every normal binade near zero and across their
+    domains; inverse error functions across (-1, 1) and a quarter near its poles;
     reciprocal roots of every binade, a quarter at the powers of four where they are exact; logistics
     across fp32's range and a quarter near zero; and each transcendental at its exact value (exp(0),
     log(1), erf_inv(0), logistic(0)), which a lane must return exactly. One fixed draw per primitive and
@@ -818,10 +818,11 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
         value[0] = 0.0
         drawn = [value]
     elif name in ("log1p", "expm1"):
-        # Every binade near zero, subnormals included, where the functions are their argument to within a
-        # last bit; and their domains' reach: log1p's down to just above -1 and up to fp32's largest, expm1's
-        # across fp32's range.
-        value = scaled(-149, 0)
+        # Every normal binade near zero, where the functions are their argument to within a last bit (their
+        # enclosures' precision raised there, `_near_zero_interval`); and their domains' reach: log1p's down
+        # to just above -1 and up to fp32's largest, expm1's across fp32's range. A subnormal operand is read
+        # as the lane reads it (`flushes`), whose expm1 keeps one its multiply flushes.
+        value = scaled(-126, 0)
         value[quarter:2 * quarter] = (rng.uniform(-1, 0, quarter) if name == "log1p"
                                       else rng.uniform(-104, 89, quarter))
         value[2 * quarter:3 * quarter] = np.abs(scaled(0, 127))[:quarter]
