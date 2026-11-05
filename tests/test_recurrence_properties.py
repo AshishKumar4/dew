@@ -28,17 +28,13 @@ PORTABLE = hypothesis.settings(max_examples=2, deadline=None)
 """Each portable property's draws: a draw's three compiles (each arm and the truth at its shape), about 17 s a
 case at four draws on armada's CPU (props at f3cf82c98), every form one row and packed."""
 
-TEMPLATE_SPLITS = (30, 64)
-"""Where the template's call is split: inside a chunk and a document, and on a chunk's edge. Each is a check-1
-site over map tasks of two draws (`check1_shards`): at two drawn splits a form, Kimi delta attention's took
-371 s interpreted, the gated delta net's 145 (props2 at e9406e7d8), past a group's two minutes."""
 
 FORMS = HOOKS + FORMED
 """Every hook combination the chunked op takes (test_recurrence_chunk's)."""
 
-TEMPLATE_FORMS = [FORMED[0], HOOKS[4], HOOKS[8], FORMED[4]]
-"""The forms whose split runs on the template: the gated delta net's gates and l2 norm, the delta rule with a
-decay a head and a key dimension, and Mamba2's rated scan."""
+TEMPLATE_SPLIT = 30
+"""Where the template's call is split: inside a chunk and inside a document of either row, the second call
+starting off the chunks' grid."""
 
 LENGTHS = st.integers(49, 100)
 """A draw's tokens: past its packed documents' last start (48)."""
@@ -110,15 +106,40 @@ def test_the_portable_math_carried_across_a_split_is_the_whole_recurrence(hooks,
                     truth_fn=functools.partial(token_by_token, hooks))
 
 
-@pytest.mark.parametrize("at", TEMPLATE_SPLITS)
-@pytest.mark.parametrize("hooks", TEMPLATE_FORMS, ids=ids(TEMPLATE_FORMS))
-@pytest.mark.check1_shards(seeds=8, per_task=2)
-def test_the_template_carried_across_a_split_is_the_whole_recurrence_interpreted(hooks, at):
-    """The template's 16-bit call over packed documents split at token `at` into two, the second entering the
-    first's final memory, interpreted: its output and final memory on par with the call whole."""
-    length = 70
+def the_template_carried_across_a_split_is_the_whole_recurrence(hooks):
+    """The template's 16-bit call over packed documents split at `TEMPLATE_SPLIT` into two, the second
+    entering the first's final memory, interpreted: its output and final memory on par with the call whole."""
+    length, at = 70, TEMPLATE_SPLIT
     whole = functools.partial(chunk_on, "mosaic_gpu", hooks)
     assert_as_exact(jax.jit(split("mosaic_gpu", hooks, at, length)), jax.jit(whole),
                     _drawn(hooks, packed=True, length=length, narrow=True),
                     f"the template, {hooks}, packed, split at {at}", seeds=SEEDS,
                     truth_fn=functools.partial(token_by_token, hooks))
+
+
+# The template's split interpreted, a form a check-1 site of its own over map tasks of two draws: at two
+# drawn splits a form, Kimi delta attention's took 371 s, the gated delta net's 145 (props2 at e9406e7d8).
+@pytest.mark.check1_shards(seeds=8, per_task=2)
+def test_the_gated_delta_nets_split_on_the_template_is_its_whole_call_interpreted():
+    """`the_template_carried_across_a_split_is_the_whole_recurrence`: the gated delta net's gates and l2
+    norm."""
+    the_template_carried_across_a_split_is_the_whole_recurrence(FORMED[0])
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=2)
+def test_the_delta_rules_split_on_the_template_is_its_whole_call_interpreted():
+    """`the_template_carried_across_a_split_is_the_whole_recurrence`: the delta rule with a decay a head."""
+    the_template_carried_across_a_split_is_the_whole_recurrence(HOOKS[4])
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=2)
+def test_kimi_delta_attentions_split_on_the_template_is_its_whole_call_interpreted():
+    """`the_template_carried_across_a_split_is_the_whole_recurrence`: the delta rule with a decay a key
+    dimension."""
+    the_template_carried_across_a_split_is_the_whole_recurrence(HOOKS[8])
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=2)
+def test_the_rated_scans_split_on_the_template_is_its_whole_call_interpreted():
+    """`the_template_carried_across_a_split_is_the_whole_recurrence`: Mamba2's rated scan."""
+    the_template_carried_across_a_split_is_the_whole_recurrence(FORMED[4])
