@@ -236,36 +236,36 @@ def test_a_mamba_layer_from_a_held_state_out_of_the_template_is_as_exact_interpr
     the_layer_is_as_exact_under_the_template(packed=False, held="out of the template")
 
 
-def dispatched(target: str, forms: str, *, named: bool, c_dtype, starts=None):
-    """The selective scan's dispatch (`recurrence_chunk.selective_scan`) as a scan traced for `target` under
-    the run's `forms` traces it, the template named where `named`, `C` in `c_dtype` and every other operand
-    as drawn: the output alone."""
+def dispatched(forms: str, *, named: bool, c_dtype, target: str | None = None):
+    """The selective scan's dispatch (`recurrence_chunk.selective_scan`) under the run's `forms`, the template
+    named where `named` (interpreted off a GPU), `C` in `c_dtype` and every other operand as drawn, traced
+    for `target` where given (lowered for it, never run here): the output alone."""
     def run(x, dt, a, b, c, skip):
         named_template = generation.chosen(selective_scan="mosaic_gpu") if named else contextlib.nullcontext()
-        with (generation.assumed(target), named_template,
+        assumed = contextlib.nullcontext() if target is None else generation.assumed(target)
+        with (assumed, named_template,
               generation.run_precision(dataclasses.replace(generation.numerics(), forms=forms))):
-            return recurrence_chunk.selective_scan(x, dt, a, b, c.astype(c_dtype), skip, None, starts,
+            return recurrence_chunk.selective_scan(x, dt, a, b, c.astype(c_dtype), skip, None, None,
                                                    portable=portable)[0]
 
     return run
 
 
-ROUTE_CASES = [("sm90", "fast", False, jnp.float32), ("sm90", "accurate", True, jnp.float32),
-               ("sm80", "fast", True, jnp.float32), ("sm90", "fast", True, jnp.bfloat16)]
-"""The scans whose dispatch may take the template, as a run on an H100 or an A100 traces them, interpreted
-here: an H100's under the fast forms, its accurate ones with the template named, an A100's named, and a bf16
-`C` beside fp32 `x` and `B`, whose rows a bulk copy takes whole at Mamba's 16 states."""
+ROUTE_CASES = [("fast", jnp.float32), ("accurate", jnp.float32), ("fast", jnp.bfloat16)]
+"""The scans whose dispatch takes the template where a call names it, interpreted here as off any GPU: under
+the fast forms and the accurate ones, and a bf16 `C` beside fp32 `x` and `B`, whose rows a bulk copy takes
+whole at Mamba's 16 states. Which kernel an H100's or an A100's selector takes unnamed is the GPU flow's to
+run (tests/test_gpu_recurrence.py), each held there to recorded mamba_ssm."""
 
 
-@pytest.mark.parametrize(("target", "forms", "named", "c_dtype"), ROUTE_CASES,
-                         ids=[f"{target}-{forms}{'-named' if named else ''}-C {jnp.dtype(c).name}"
-                              for target, forms, named, c in ROUTE_CASES])
+@pytest.mark.parametrize(("forms", "c_dtype"), ROUTE_CASES,
+                         ids=[f"{forms}-C {jnp.dtype(c).name}" for forms, c in ROUTE_CASES])
 @pytest.mark.check1_shards(seeds=8, per_task=4)
-def test_the_selective_scan_is_as_exact_as_the_portable_scan_on_any_route(target, forms, named, c_dtype):
-    """The selective scan through its dispatch, whichever kernel its selector gives each product (the
-    template where it is qualified or named, the portable math else): its output and every input's gradient
-    on par from float64 with the portable scan's over drawn fp32 operands (check 1), one row of a ragged
-    chunk over two channel blocks; what each route is, the selector's business, is not held (KT5)."""
+def test_the_selective_scan_through_its_dispatch_is_as_exact_as_the_portable_scan(forms, c_dtype):
+    """The selective scan through its dispatch with the template named, its placement and operand dtypes as
+    a call hands them over: its output and every input's gradient on par from float64 with the portable
+    scan's over drawn fp32 operands (check 1), one row of a ragged chunk over two channel blocks (KT5: no
+    route held, the scan's behaviour)."""
     shape = SHAPES["interpreted"]
 
     def draws(seed):
@@ -275,10 +275,10 @@ def test_the_selective_scan_is_as_exact_as_the_portable_scan_on_any_route(target
     def reference(x, dt, a, b, c, skip):
         return portable(x, dt, a, b, c.astype(c_dtype).astype(jnp.float32), skip, None, None)[0]
 
-    assert_as_exact(jax.jit(with_gradients(dispatched(target, forms, named=named, c_dtype=c_dtype))),
+    assert_as_exact(jax.jit(with_gradients(dispatched(forms, named=True, c_dtype=c_dtype))),
                     jax.jit(with_gradients(reference)), draws,
-                    f"the selective scan's dispatch, {target} under the {forms} forms"
-                    f"{', the template named' if named else ''}, C in {jnp.dtype(c_dtype).name}",
+                    f"the selective scan's dispatch, the template named, under the {forms} forms, C in "
+                    f"{jnp.dtype(c_dtype).name}",
                     seeds=FEWEST_SEEDS, truth_fn=jax.jit(with_gradients(reference)))
 
 
@@ -293,7 +293,7 @@ def test_a_named_template_refuses_a_state_row_no_bulk_copy_takes(states):
     shape = (1, selective.CHUNK, selective.block_scan.THREADS, states)
     inputs, _, _ = draw(jnp.float32, 0, *shape, packed=False)
     with pytest.raises(KernelRefused) as refused:
-        jax.eval_shape(dispatched("sm90", "fast", named=True, c_dtype=jnp.bfloat16), *inputs)
+        jax.eval_shape(dispatched("fast", named=True, c_dtype=jnp.bfloat16, target="sm90"), *inputs)
     assert [refusal.code for refusal in refused.value.refusals] == ["state rows"]
 
 
