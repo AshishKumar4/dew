@@ -227,6 +227,11 @@ def test_transformers_reads_a_trained_image_reading_runs_export(tmp_path):
         return np.asarray(bundle.model.apply({**bundle.variables, "cache": cache}, reference["canvas"]))
 
     np.testing.assert_array_equal(logits(again), logits(exported))
+    # Loaded stating no dtype, it computes in the run's own, its decoder's (row 4314).
+    stated = exported.model.dtype
+    computed = np.dtype(stated) if stated is not None else np.result_type(*(
+        leaf.dtype for leaf in jax.tree.leaves(exported.variables["params"])))
+    assert np.dtype(Pretrained.load(str(tmp_path / "export")).model.dtype) == computed
 
     # The run's task (its process, canvas budget and pad id) is the export's,
     # in a generation config transformers' own class reads.

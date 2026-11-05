@@ -14,12 +14,14 @@ from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
+from flax import linen as nn
 from jax.typing import DTypeLike
 
 from dew import _records
 from dew.batch import Variables, unboxed
 from dew.interop.weights import AUTO
 from dew.nn.precision import Numerics
+from dew.nn.protocols import ComputesIn
 from dew.registry import DtypeName, dtype_name, from_record, to_record
 
 if TYPE_CHECKING:
@@ -29,17 +31,17 @@ RELEASE_FILE = "dew_release.json"
 """The file an export of a run writes its release metadata in, beside its config."""
 
 
-def release_record(settings: TaskSettings, numerics: Numerics | None, model_config: Mapping[str, object],
+def release_record(settings: TaskSettings, numerics: Numerics | None, model: nn.Module,
                    variables: Variables) -> Mapping[str, object]:
     """The release metadata of a run's export: its task settings' record, its numerics and the dtype its
-    model computes in, the `dtype` of its record (`model_config`), else its parameters' (`variables`),
-    which a module without one computes in; the parameters' own dtypes are the export's."""
+    model computes in, the one it states (`ComputesIn`), else its parameters' (`variables`), which a
+    module stating none computes in; the parameters' own dtypes are the export's."""
     from dew.inference.tasks import TaskSettings
 
-    stated = model_config.get("dtype")
+    stated = model.dtype if isinstance(model, ComputesIn) else None
     held = jnp.result_type(*(leaf.dtype for leaf in jax.tree.leaves(unboxed(variables))
                              if jnp.issubdtype(leaf.dtype, jnp.floating)))
-    compute = held if stated is None else _records.text(stated, "dtype")
+    compute = held if stated is None else stated
     return {"task": {"settings": to_record(settings, TaskSettings),
                      "numerics": None if numerics is None else to_record(numerics, Numerics),
                      "dtypes": {"compute": dtype_name(compute)}}}

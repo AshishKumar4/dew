@@ -753,7 +753,7 @@ class Pretrained:
                                     generation_config=dict(self.generation_config),
                                     named=self.names_tokenizer,
                                     release=None if self.settings is None else release_record(
-                                        self.settings, self.numerics, self.model_config, values))
+                                        self.settings, self.numerics, self.model, values))
         for name, module in sorted(modules.items()):
             written = destination / name
             written.parent.mkdir(parents=True, exist_ok=True)
