@@ -661,7 +661,8 @@ class FitSearch[LossT, EffectsT]:
     """Whether each candidate the derivation read keeps narrow copies (`Candidate.copies`)."""
     footprints: dict[tuple[str, int], Footprint | None] = dataclasses.field(default_factory=dict)
     """The footprint of each candidate the derivation read, which its lowering keeps (`lowering`): traced
-    again there, it was 22 of a Qwen3.5-4B step's 185 seconds of `compile_ahead` (row 4261)."""
+    again there, it was 22 of a Qwen3.5-4B step's 185 seconds of `compile_ahead` (row 4261). A spill's
+    refusal, which changes the configs its kernels take, clears it (`measured`)."""
     under: dict[str, int] = dataclasses.field(default_factory=dict)
     """By remat rung (`remat_rung`), the most bytes a compile there needed past its derived headroom: a
     candidate there is judged to fit only where its derived headroom holds that much more."""
@@ -969,6 +970,9 @@ class FitSearch[LossT, EffectsT]:
             executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered,
                                              first=firsts[0])
             candidate = relowered.candidate(candidate)
+            if relowered.last is not None:
+                # A spill's refusal changes the configs every derivation traced: each is traced again.
+                self.footprints.clear()
         fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
         self.sampled = None
         if fit and candidate.sampled is not None and ahead is not None and ahead.sampled is not None:
@@ -991,6 +995,8 @@ class FitSearch[LossT, EffectsT]:
                 return lowered[-1]
             compiled = compiled_if_it_fits(lowered[0], options, self.refusals, relower=resampled,
                                            first=None if beside is None else firsts[1])
+            if len(lowered) > 1:
+                self.footprints.clear()
             self.sampled = None if compiled is None else SampledStep(program_of(lowered[-1]), compiled)
             fit, headroom = step_fits(compiled, self.mesh, candidate.held, self.capacity, candidate.built)
         seconds = time.perf_counter() - began

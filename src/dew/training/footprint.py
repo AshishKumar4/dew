@@ -505,12 +505,7 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
         if made or not frontier.fusing(equation):
             inner = max((peak_bytes(body, platform, workspace, Slicing.entering(equation, body),
                                     returned_carry(equation, body)) for body in bodies(equation)), default=0)
-            # A barrier's results are its operands' own storage: the buffers made for its fused operands
-            # are the ones it holds, not a second set read beside them.
-            barrier = equation.primitive.name == "optimization_barrier"
-            operands = 0 if frontier.fusing(equation) or barrier else sum(
-                device_share(value) for value in {value for value in equation.invars if computed(value)}
-                if frontier.made_for(value))
+            operands = sum(map(device_share, unfused(frontier, equation)))
             products = 0 if not cublas_product(equation) else (
                 workspace.sliced if sliced.fused(equation) else workspace.each)
             # A loop's results (its stacked outputs, its carry) are held beside each turn's own; a call's
@@ -526,10 +521,31 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
     return most
 
 
+def unfused(frontier: Frontier, equation: jcore.JaxprEqn) -> set[jcore.Var]:
+    """The operands `equation` reads from buffers made for its read, beside the ones it holds: each fused one
+    of an equation that takes its operands from memory (`Frontier.fusing` says no), none of one that
+    recomputes them, nor of an optimization barrier, whose results are its operands' own storage (the
+    buffers made for its fused operands are the ones it holds, not a second set read beside them). A
+    scatter fuses its indices and updates but those reading its base, which XLA computes apart, as it
+    computes the base apart into the buffer the scatter writes (`CanEmitInputFusedScatter`,
+    xla/service/gpu/gpu_fusible.cc): its updates computed from its base hold a buffer of their own."""
+    name = equation.primitive.name
+    if name == "optimization_barrier" or not equation.invars:
+        return set()
+    if name.startswith("scatter"):
+        base = frontier.roots(equation.invars[:1])
+        return {value for value in equation.invars[1:] if computed(value) and value is not equation.invars[0]
+                and frontier.made_for(value) and frontier.roots([value]) & base}
+    if frontier.fusing(equation):
+        return set()
+    return {value for value in equation.invars if computed(value) and frontier.made_for(value)}
+
+
 def in_place(frontier: Frontier, equation: jcore.JaxprEqn, held: set, last: Mapping, index: int) -> int:
     """The bytes of the buffer the scatter `equation`, the program's `index`th, writes its result in: its
     base's, the one buffer the program holds (`held`) that the base is or views (`Frontier.reading`), where
-    it reads that buffer last and it is its result's size, as XLA shares a scatter's first operand's
+    it reads that buffer last, its indices and updates read none of it, and it is its result's size, as
+    XLA shares a scatter's first operand's
     buffer with its result (`HloDataflowAnalysis::CanShareOperandBufferWithUser`,
     xla/hlo/analysis/hlo_dataflow_analysis.cc); none for any other equation."""
     if not equation.primitive.name.startswith("scatter") or not equation.invars:
@@ -541,7 +557,8 @@ def in_place(frontier: Frontier, equation: jcore.JaxprEqn, held: set, last: Mapp
     if len(kept) != 1:
         return 0
     (buffer,) = kept
-    if buffer not in held or last.get(buffer) != index:
+    # Its indices and updates read none of that buffer, which a scatter in place would overwrite under them.
+    if buffer not in held or last.get(buffer) != index or buffer in frontier.reading(equation.invars[1:]):
         return 0
     if device_share(buffer) != device_share(equation.outvars[0]):
         return 0
@@ -692,12 +709,31 @@ class Frontier:
         `reduce` among them, which XLA fuses into its own kernel whatever its operands' number
         (`PriorityFusion::ChooseKind`, `CanFuseWithNativeEmitter`,
         xla/backends/gpu/transforms/priority_fusion.cc), or a scatter's, an input fusion as a reduction's
-        is (`IsInputFusibleScatter`, xla/service/gpu/gpu_fusible.cc), its base computed into its result:
+        is (`IsInputFusibleScatter`, xla/service/gpu/gpu_fusible.cc), its base computed apart into its
+        result and its updates read from its base apart (`unfused`):
         Qwen3.5-4B's tied embedding's gradient, a scatter-add into zeros, was derived holding the zeros
         beside it, 2.37 GiB over XLA's 4.76 at its step's peak under 'full' (row 4089)."""
         name = equation.primitive.name
         return (recomputed(equation, self.platform) or name == "reduce"
                 or name.startswith(("reduce_", "arg", "scatter")))
+
+    def roots(self, values: Iterable) -> set[jcore.Var]:
+        """The buffers reading `values` holds (`reading`) and the inputs they are computed from or view: what
+        they depend on, the program's inputs among it."""
+        found: set[jcore.Var] = set()
+        pending = [value for value in values if computed(value)]
+        seen: set[jcore.Var] = set()
+        while pending:
+            value = pending.pop()
+            if value in seen:
+                continue
+            seen.add(value)
+            if value in self.inputs or not self.fused(value):
+                found.add(value)
+                continue
+            read = [self.forwards[value]] if value in self.forwards else self.producers[value].invars
+            pending.extend(each for each in read if computed(each))
+        return found
 
     def reading(self, values: Iterable) -> set[jcore.Var]:
         """The buffers reading `values` holds: each value's own, or for one fused, those it is
