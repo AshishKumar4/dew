@@ -285,12 +285,25 @@ class Measured:
     the plateau a long transfer reaches, below what the memory clock and bus give; `launch`, the seconds a
     kernel launch adds to a program that runs kernels one after another; and `handoff`, a GPU-scope semaphore
     signal another program of the same launch waits on, where the part's ring families fix tiles up across
-    programs (the balanced tail's partials). None where not measured."""
+    programs (the balanced tail's partials). None where not measured.
+
+    The latencies a kernel's synchronization and loads meet on the part's die, in its clock's cycles: a
+    block's mbarrier arrival observed by another of its warps (`barrier_cycles`), a cluster's
+    (`cluster_barrier_cycles`), a shared-memory load's use (`shared_cycles`), a hit in the near half of the
+    L2 (`l2_cycles`) and a GPU-scope acquire-release fence (`fence_cycles`); and the device-memory bytes a
+    second that 16-byte asynchronous copies of scattered 128-byte rows reach (`gather_bytes_per_second`),
+    below the stream's plateau. The algebra's cost model prices by them (`dew.algebra.cost`)."""
 
     fixed: float
     bytes_per_second: float
     launch: float | None = None
     handoff: float | None = None
+    barrier_cycles: float | None = None
+    cluster_barrier_cycles: float | None = None
+    shared_cycles: float | None = None
+    l2_cycles: float | None = None
+    fence_cycles: float | None = None
+    gather_bytes_per_second: float | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -496,8 +509,10 @@ TARGETS = {target.generation: target for target in (
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), multiprocessors=108, clock_hz=1410e6,
               memory_bandwidth=2039e9, triton_gemm_fusions=False, step_seconds=5.96e-6,
               # tools/device_facts.py on an A100-SXM4-40GB: its stream FS-DEVICEFACTS2-a100's (1.555 TB/s by
-              # its clocks), its launch FS-DEVICEFACTS4-a100's.
-              measured={'NVIDIA A100-SXM4-40GB': Measured(6.04e-6, 1.486e12, launch=2.11e-6)}),
+              # its clocks), its launch FS-DEVICEFACTS4-a100's; its die's shared-memory and near-L2 latencies
+              # an A100 PCIe's (GA100), Luo et al. 2025, arXiv:2501.12084, Tables 3 and 4.
+              measured={'NVIDIA A100-SXM4-40GB': Measured(6.04e-6, 1.486e12, launch=2.11e-6, shared_cycles=29,
+                                                          l2_cycles=208)}),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024,
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}, multiprocessors=72,
               clock_hz=1695e6, memory_bandwidth=600e9),
@@ -520,10 +535,18 @@ TARGETS = {target.generation: target for target in (
               # through the kernel challenge's best read at each size, 16.8 MB to 805 MB, cold L2 under graph
               # replay (judge-facts.md:3-18).
               # The H100 PCIe's two rounds of tools/device_facts.py agreed to 1% (ET-DEVICEFACTS-h100pcie).
-              measured={'NVIDIA H100 80GB HBM3': Measured(1.87e-6, 3.190e12, launch=1.02e-6, handoff=0.78e-6),
-                        'NVIDIA H100 PCIe': Measured(2.11e-6, 1.980e12),
-                        'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6),
-                        'NVIDIA H200': Measured(2.81e-6, 4.617e12)}),
+              # The GH100 die's shared-memory and near-L2 latencies an H800 PCIe's (Luo et al. 2025,
+              # arXiv:2501.12084, Tables 3 and 4); the H200's the kernel challenge's calibration on the
+              # judge's H200 (h200-lean calibration/params.md: mbarrier 66, cluster arrive 67, LDS 39, L2
+              # 20 and 49, fence.acq_rel.gpu 71, the cp.async gather at two blocks a multiprocessor 59).
+              measured={'NVIDIA H100 80GB HBM3': Measured(1.87e-6, 3.190e12, launch=1.02e-6, handoff=0.78e-6,
+                                                          shared_cycles=29, l2_cycles=258),
+                        'NVIDIA H100 PCIe': Measured(2.11e-6, 1.980e12, shared_cycles=29, l2_cycles=258),
+                        'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6,
+                                                       shared_cycles=29, l2_cycles=258),
+                        'NVIDIA H200': Measured(2.81e-6, 4.617e12, barrier_cycles=65,
+                                                cluster_barrier_cycles=395, shared_cycles=28, l2_cycles=270,
+                                                fence_cycles=274, gather_bytes_per_second=3.80e12)}),
     # Datasheet facts alone, no routes: what a compile-only sm100 device needs (`tests/kernel_compile.py`),
     # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,
