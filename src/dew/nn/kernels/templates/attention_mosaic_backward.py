@@ -25,6 +25,7 @@ from dew.nn.kernels.templates.attention_mosaic_dq import _dq_launch
 from dew.nn.kernels.templates.attention_mosaic_fused import _fused_launch
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
+    TileWalk,
     _columns,
     _coords,
     _Program,
@@ -138,8 +139,10 @@ def _centre_launch(query, key, value, dout, peak, spans: _Spans | None, score_pa
         grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
         interpret=walk.interpret, approx_math=False, name="attention_centre",
         # Its `S` and `dP`, recomputed for dropout's first pass: the hardware's alone.
-        cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, width + value.shape[-1], query,
-                    key, value, dout),
+        cost=stated(walk.spec, batch, heads, width + value.shape[-1], query,
+                    key, value, dout,
+                    tile_walk=TileWalk((queries, key.shape[1]), (block_q, block_k), consumers,
+                                       common=family.feeds_itself)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries, 0)
     )(query, key, value, dout, peak, *leaves)
     return gradient.Centre(out[0], out[1] > 0, out[2:2 + parts], out[2 + parts:])

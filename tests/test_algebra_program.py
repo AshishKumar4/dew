@@ -237,14 +237,13 @@ def _shared_products(a, x, y):
 def test_a_run_under_the_accurate_forms_keeps_its_program_as_written():
     """Under the run's accurate numerics (`precision="accurate"`, `generation.run_precision`) the pass admits
     the `exact` sets alone (docs/design/algebra.md §1.4): two products of a shared operand, summed, which the
-    default numerics join into one, stay two (`dot_general` counted) and compute what they compute."""
+    default numerics join into one, stay two (`dot_general` counted), no window splicing a form."""
     from dew.nn.precision import ACCURATE
 
     operands_ = rows(1, (256, 64), (64, 64), (64, 64))
     with generation.run_precision(ACCURATE), report.refusals():
         accurate = jax.make_jaxpr(algebra.rewritten(_shared_products))(*operands_)
-        # Its numerics admit commutativity alone, which XLA's HloCSE takes already: no pass runs.
-        assert not report.rewrites()
+        assert not any(made.spliced for made in report.rewrites())
     default = jax.make_jaxpr(algebra.rewritten(_shared_products))(*operands_)
     assert (count(accurate, "dot_general"), count(default, "dot_general")) == (2, 1)
 
