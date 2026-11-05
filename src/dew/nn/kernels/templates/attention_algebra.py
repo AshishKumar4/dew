@@ -1154,9 +1154,13 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
         # the undropped weights'.
         parts = ((narrow(p, value.dtype),) if multiplier is None
                  else weights_parts(p * multiplier, value.dtype))
+        # The denominator before the product, so the tile's fp32 weights die at their narrowing and hold no
+        # registers through it (FS-4324-PEAK1: on an A100 they held 64 a thread past P·V, its peak 299 at
+        # 128 x 64, where FlashAttention 2's sums them before; its bits the same either way).
+        total = denominator_after(state.total, factor, p, axis=keys.coords.key_axis)
         # `carry_factor`'s plain factor, each query's broadcast over its sums as the mainloop holds them.
         acc = keys.accumulate(state.acc, lambda acc: keys.coords.queries(factor, acc) * acc, parts, value)
-        return Partial(acc, m, denominator_after(state.total, factor, p, axis=keys.coords.key_axis))
+        return Partial(acc, m, total)
     assert not keys.coords.keys_first, "a tile held keys first takes the plain walk's mainloop sums"
     times = functools.partial(_times, keys.dot, value, multiplier=multiplier, chunk=chunk_of(spec))
     return stepped(state, m, factor, p, times(p), held, times)
@@ -1899,13 +1903,17 @@ def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
         accumulated, added = taken["acc"], taken["total"]
         assert isinstance(accumulated, Accumulated)
         if plain:
-            # The weighted values' sums the mainloop's accumulators hold; every other state the forms'.
+            # The denominator from the forms' terms before the product, as `plain_step` takes it, so the
+            # tile's fp32 weights die at their narrowing (FS-4324-PEAK1); the weighted values' sums the
+            # mainloop's accumulators hold.
+            assert isinstance(added, Added) and held_by is not None
+            total = states[fields.index("total")] * added.factor + added.terms.sum(axis=keys.coords.key_axis)
+
             def scale(held):
                 return keys.coords.queries(accumulated.factor, held) * held
 
-            assert held_by is not None
             acc = held_by(states[fields.index("acc")], scale, (accumulated.weights,), accumulated.values)
-            return tuple(acc if field == "acc" else None for field in fields)
+            return tuple(acc if field == "acc" else total if field == "total" else None for field in fields)
         assert isinstance(added, Added)
         # The template's step over the forms' weights (the denominator's terms, before their narrowing for
         # the product) and rescale.
