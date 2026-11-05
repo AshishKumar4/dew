@@ -2128,15 +2128,33 @@ def test_every_fixture_archive_names_nothing_of_the_machine_that_wrote_it():
     assert (stamped, placed) == ({}, {})
 
 
-def test_an_image_pipeline_receipt_names_no_directory_of_the_host_that_ran_it(tmp_path):
+def test_an_image_pipeline_receipt_names_its_dataset_and_none_of_its_hosts_directories(tmp_path):
     """The image pipeline's receipt records its config as the data benchmark's does (tools/receipt_paths):
-    the flowers' directory, given shell-expanded outside the checkout, by its name (row 2872: a receipt
-    recorded /home/<user>/...)."""
+    the flowers' TFDS directory, given shell-expanded outside the checkout as its docstring lays it out
+    (`<data dir>/oxford_flowers102/<version>`), as its dataset and version, and a bucket's URI as given
+    (rows 2872, 4209: a receipt recorded /home/<user>/..., then the version directory alone, and a gs://
+    path as gs:/bucket)."""
     tool = load("benchmark_image_pipeline")
-    config = tool.Config(flowers=str(tmp_path / "data" / "oxford_flowers102"), out=tmp_path / "out")
+    config = tool.Config(flowers=str(tmp_path / "data" / "oxford_flowers102" / "2.1.1"), out=tmp_path / "out")
     recorded = tool.recorded_config(config)
-    assert recorded["flowers"] == "oxford_flowers102" and "out" not in recorded
+    assert recorded["flowers"] == "oxford_flowers102/2.1.1" and "out" not in recorded
     assert recorded["images"] == config.images
+    bucket = "gs://tfds-data/datasets/oxford_flowers102/2.1.1"
+    assert tool.recorded_config(tool.Config(flowers=bucket))["flowers"] == bucket
+
+
+def test_the_disk_bank_and_host_offload_receipts_name_none_of_their_hosts_directories(tmp_path):
+    """The disk-bank and host-offload benchmarks record their configs through tools/receipt_paths: a
+    checkpoint, a trace and an output outside the checkout by name, none whole (row 4210: their receipts
+    recorded resolved paths)."""
+    banks = load("benchmark_disk_banks")
+    config = banks.DiskConfig(checkpoint=tmp_path / "models" / "qwen3", trace=str(tmp_path / "trace"))
+    assert banks.recorded_config(config) == {**dataclasses.asdict(config), "checkpoint": "qwen3",
+                                            "trace": "trace"}
+    offload = load("benchmark_host_offload")
+    written = tmp_path / "offload.json"
+    offload.main(offload.OffloadConfig(depths=[], out=str(written)))
+    assert json.loads(written.read_text())["config"]["out"] == "offload.json"
 
 
 def test_a_saved_run_archive_takes_the_fixture_writer_with_its_own_cleaning_and_modes():
