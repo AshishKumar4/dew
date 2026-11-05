@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import math
 import re
+import threading
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from functools import cache, partial
@@ -329,43 +330,52 @@ class SourceQuantization:
         tensors is refused, since the encoding would overwrite it.
 
         The table is lazy (`LazyTensors`): a weight is encoded when the first of
-        its stored tensors is read, the group's others held until they are read,
-        so a writer that reads in the table's order holds one weight's group
-        beside its shard, not the encoded model. An encoding whose tensors are
-        not the ones the source stored, a weight whose geometry changed among
-        them, is refused as it is read."""
-        names = tuple(names)
+        its stored tensors is read and its group held until each of them has been
+        read, a later read encoding it again, so a writer that reads in the
+        table's order holds one weight's group beside its shard, not the encoded
+        model; any tensor reads as often as asked, from any thread. A weight none
+        of whose tensors its source stored is refused at once, and an encoding
+        whose tensors are not the ones the source stored, a weight whose geometry
+        changed among them, as it is read."""
         specs = dict(tensor_specs(tensors))
         groups: dict[str, str] = {}
+        parts: dict[str, tuple[str, ...]] = {}
         for name in names:
             taken = [partner for partner in self.partners(name) if partner in specs]
             if taken:
                 raise ValueError(f"{', '.join(taken)} is already among the tensors to write, so "
                                  f"quantizing {name} would overwrite it")
+            parts[name] = tuple(part for part in (name, *self.partners(name)) if part in stored)
+            if not parts[name]:
+                raise ValueError(f"{name} was stored quantized and its source's tensors for it are unknown, "
+                                 "so it cannot be written back in their format")
             specs.pop(name)
-            for part in (name, *self.partners(name)):
-                if part in stored:
-                    specs[part] = stored[part]
-                    groups[part] = name
-        held: dict[str, dict[str, np.ndarray]] = {}
+            for part in parts[name]:
+                specs[part], groups[part] = stored[part], name
+        held: dict[str, tuple[dict[str, np.ndarray], set[str]]] = {}
+        lock = threading.Lock()
+
+        def encoded(name: str) -> dict[str, np.ndarray]:
+            written = self.encode(name, np.asarray(tensors[name]))
+            if set(written) != set(parts[name]) or any(
+                    (np.shape(written[part]), np.dtype(written[part].dtype))
+                    != (tuple(specs[part].shape), np.dtype(specs[part].dtype)) for part in parts[name]):
+                raise ValueError(f"{name} encodes to tensors other than the ones its source stored "
+                                 f"({list(parts[name])}), so it is not written back in their format")
+            return written
 
         def build(part: str) -> np.ndarray:
             name = groups.get(part)
             if name is None:
                 return tensors[part]
-            if name not in held:
-                encoded = self.encode(name, np.asarray(tensors[name]))
-                expected = {other for other, owner in groups.items() if owner == name}
-                if set(encoded) != expected or any(
-                        (np.shape(encoded[other]), np.dtype(encoded[other].dtype))
-                        != (tuple(specs[other].shape), np.dtype(specs[other].dtype)) for other in expected):
-                    raise ValueError(f"{name} encodes to tensors other than the ones its source stored "
-                                     f"({sorted(expected)}), so it is not written back in their format")
-                held[name] = encoded
-            value = held[name].pop(part)
-            if not held[name]:
-                del held[name]
-            return value
+            with lock:
+                if name not in held:
+                    held[name] = (encoded(name), set(parts[name]))
+                group, unread = held[name]
+                unread.discard(part)
+                if not unread:
+                    del held[name]
+                return group[part]
 
         return LazyTensors(specs, build)
 

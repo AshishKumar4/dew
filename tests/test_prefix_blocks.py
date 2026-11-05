@@ -227,7 +227,8 @@ def test_a_saved_prefix_runs_bundle_serves_as_the_runs_own_task(tmp_path):
     numerics its step trained in, where the bundle had built a task from the generation config its
     export writes, which states neither. Their greedy rollouts agree bit for bit, and a bundle loaded from
     the export, which writes the run's declaration beside its config, builds the run's own task again
-    (row 4314), where it had built a causal one from the generation config alone."""
+    in the run's own dtypes, from the folder a load selects (row 4314), where it had built a causal one
+    in bfloat16 from the generation config alone."""
     import json
 
     from affine_run import Replaying
@@ -270,8 +271,18 @@ def test_a_saved_prefix_runs_bundle_serves_as_the_runs_own_task(tmp_path):
     assert given.temperature == 0.5
     assert (given.eos_token_ids, given.pad_token_id) == ((VOCAB - 1,), VOCAB - 2)
     bundle.save(tmp_path / "export")
-    exported = Pretrained.load(tmp_path / "export", dtype="float32").pipeline()
+    # Loaded stating no dtypes: the run's own, which the export carries beside its declaration, where a
+    # load of a source with none computes in bfloat16; and from a folder of a release, its own.
+    (tmp_path / "release").mkdir()
+    bundle.save(tmp_path / "release" / "model")
+    selected = Pretrained.load(tmp_path / "release", subfolder="model")
+    loaded = Pretrained.load(tmp_path / "export")
+    assert jnp.dtype(loaded.model.dtype) == jnp.dtype(selected.model.dtype) == jnp.float32
+    assert jax.tree.map(lambda leaf: leaf.dtype, loaded.variables) == jax.tree.map(
+        lambda leaf: leaf.dtype, jax.device_get(bundle.variables))
+    exported = loaded.pipeline()
     assert (exported.prefix, exported.precision) == (PREFIX, trained_in)
+    assert (selected.settings, selected.numerics) == (loaded.settings, loaded.numerics)
     # The run's own task over the same weights on the host, where the export's loads them: one program.
     home = dataclasses.replace(bundle, variables=jax.device_get(bundle.variables)).pipeline()
     again, run = exported(prompt, NEW, key=0), home(prompt, NEW, key=0)
