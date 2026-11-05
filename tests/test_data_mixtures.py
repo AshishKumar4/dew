@@ -2142,18 +2142,18 @@ def test_a_token_mixture_logs_the_tokens_each_member_delivered_through_a_resume(
     targets of the rows of it the run read, one a short row and nine a long one, across a saved position
     and its resume (row 4119)."""
     chain = mix([_token_rows("short", 1, 2).repeat(), _token_rows("long", 2, 10).repeat()],
-                by="tokens").batch(2)
+                by="tokens").batch(1)
     data = compile(chain, read=read, loading=READ)
     stopped = data.train(DataPartition())
     try:
-        read_ids = [int(identity) for batch in itertools.islice(stopped, 5) for identity in batch["id"]]
+        read_ids = [int(identity) for batch in itertools.islice(stopped, 10) for identity in batch["id"]]
         state = stopped.get_state()
     finally:
         stopped.close()
     resumed = data.train(DataPartition())
     try:
         resumed.set_state(state)
-        read_ids += [int(identity) for batch in itertools.islice(resumed, 5) for identity in batch["id"]]
+        read_ids += [int(identity) for batch in itertools.islice(resumed, 10) for identity in batch["id"]]
         statistics = data.statistics()
     finally:
         resumed.close()
