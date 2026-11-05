@@ -1143,7 +1143,8 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     forms' (`dew.algebra.forms.derived`, `_derived_step`), but for a dropping call's: the derivation narrows a
     dropped weight unnormalized, past fp16's largest at a rate near 1 (a multiplier of 2^16), where this
     step's scaled parts (`weights_parts`) keep it, a representation the declaration states none of."""
-    if states_derived(spec, state) and keys.coords.drop is None:
+    # A compensated walk's step takes its state's dropped roundings through the derived step's hooks.
+    if states_derived(spec, state._replace(low=None)) and keys.coords.drop is None:
         return _derived_step(spec, state, keys)
     m, factor, p, value, held = _softmax(spec, state, keys)
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
@@ -1846,13 +1847,13 @@ def states_derived(spec: Forward, *states: Partial) -> bool:
     """Whether the derived forms walk a state of `spec` (behind the switch, `dew.algebra.forms.derived`):
     where the declaration states its walk, the accurate form's among them (`Forward.natural`: its exponential
     and its compensated rescale declared, its largest weight held to 1 or its raw products scaled after their
-    difference, `declaration`). Its compensated running sums (`Forward.compensated`) and the headroom guard's
-    shifted sums (`Forward.headroom`, a state's `Guard`) are representation choices the derivation does not
-    make yet (error-aware extraction's compensation rules, docs/design/algebra.md §6.9): there the template's
-    own forms run, under the replacement rule (a derived form replaces a hand-written one only where it states
-    the walk)."""
-    return derived_on() and not (spec.compensated or spec.headroom) and all(
-        state.guard is None and state.low is None for state in states)
+    difference, `declaration`), a compensated walk's step too, whose additions' roundings the step's hooks
+    keep (`_derived_step`; the walk settles them before any merge or finish, `settled`). The headroom guard's
+    shifted sums (a state's `Guard`) are the template's own: its control flow is the walk's (`walked`,
+    `walked_launches`), and a guarded walk's every step and merge runs the hand-written forms, its plain walk
+    the derived ones, under the replacement rule (a derived form replaces a hand-written one only where it
+    states the walk)."""
+    return derived_on() and all(state.guard is None and state.low is None for state in states)
 
 
 def _slotted(key: tuple, shapes: Mapping) -> tuple[str, ...]:
@@ -1881,25 +1882,40 @@ def _stated(spec: Forward, state: Partial) -> tuple[tuple, dict]:
 def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     """`plain_step` by the derived forms: the tile's logits (-inf where a query does not see a key, as
     `modify` writes them) and values; the weighted values' sums the mainloop's own where it holds them
-    (`Keys.accumulate`), every product the mainloop's (`Keys.dot`)."""
+    (`Keys.accumulate`), every product the mainloop's (`Keys.dot`). A compensated walk's
+    (`Forward.compensated`, the state's `Low`) takes its sums' additions through the derived step's hooks as
+    `stepped` takes them: the tile's products a chunk of keys each (`products_of`), each sum's additions with
+    their roundings kept (`kept_in_turn`), what earlier ones dropped taken by the same factor."""
     # Over the raw products where the mainloop gives them (`logits_of`), their factor the declaration's own.
     raw = keys.products is not None
     key = (spec.base2, bool(keys.coords.keys_first), spec.factor if raw else None, *_form_key(spec))
     forms = derived_forms(*key)
     tiles = {"logits": keys.products if raw else keys.logits, "values": keys.values}
     fields = _slotted(key, {name: (value.shape, value.dtype) for name, value in tiles.items()})
-    held_by = keys.accumulate
+    held_by, low = keys.accumulate, state.low
+    dropped: dict[str, jax.Array] = {}
 
     def accumulate(acc, factor, weights, values):
         def scale(held):
             return keys.coords.queries(factor, held) * held
 
+        if low is not None:
+            sums = products_of((weights,), values, keys.dot, chunk_of(spec))
+            acc, dropped["acc"] = kept_in_turn(scale(acc), scale(low.acc), sums)
+            return acc
         assert held_by is not None
         return held_by(acc, scale, (weights,), values)
 
+    def add(total, factor, summed):
+        assert low is not None
+        total, dropped["total"] = kept_in_turn(total * factor, low.total * factor, (summed,))
+        return total
+
     stepped = forms.step(tuple(getattr(state, field) for field in fields), tiles, product=keys.dot,
-                         accumulate=None if held_by is None else accumulate)
-    return Partial(**dict(zip(fields, stepped, strict=True)))
+                         accumulate=None if held_by is None and low is None else accumulate,
+                         add=None if low is None else add)
+    kept = None if low is None else Low(dropped["acc"], dropped["total"])
+    return Partial(**dict(zip(fields, stepped, strict=True)), low=kept)
 
 
 def _rows(state: Partial) -> Partial:

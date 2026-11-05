@@ -337,16 +337,18 @@ forward's step, merge and finish whatever walk the training step takes), and a d
 
 
 @pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
 @pytest.mark.parametrize("numerics", ["fast", "accurate"])
 @pytest.mark.parametrize("call", list(CALLS))
 @pytest.mark.parametrize("form", ["full", "causal"])
-def test_the_portable_mainloop_computes_attention_by_either_forms(form, call, numerics, derived):
+def test_the_portable_mainloop_computes_attention_by_either_forms(form, call, numerics, dtype, derived):
     """The plain-JAX mainloop's forward (`attention_portable.attend`) over fp16 operands (a plain walk, of no
-    compensation or guard, which the derived forms serve) under the run's fast forms or its accurate ones
-    (natural logits, the largest weight held to 1 and the rescale compensated, which the declaration states),
-    its walk's step, merge and finish the hand-written forms or the derived ones behind the switch, the
-    product of its weights with the values its own (`Keys.dot`): on par with the reference (check 1) either
-    way, a plain call's, a training call's (with its residuals) and a dropping call's."""
+    compensation or guard) and fp32 ones (its running sums compensated, its plain walk under the headroom
+    guard's), each of which the derived forms serve, under the run's fast forms or its accurate ones (natural
+    logits, the largest weight held to 1 and the rescale compensated, which the declaration states), its
+    walk's step, merge and finish the hand-written forms or the derived ones behind the switch, the product
+    of its weights with the values its own (`Keys.dot`): on par with the reference (check 1) either way, a
+    plain call's, a training call's (with its residuals) and a dropping call's."""
     spans = template.spans(LENGTH, LENGTH, 1, **SPANS[form])
     rate = CALLS[call].get("drop")
     residuals = CALLS[call].get("residuals", False)
@@ -368,11 +370,11 @@ def test_the_portable_mainloop_computes_attention_by_either_forms(form, call, nu
 
     def operands(seed):
         rng = np.random.default_rng(seed)
-        return (*(jnp.asarray(rng.standard_normal((LENGTH, DEPTH)), jnp.float16) for _ in range(3)),
+        return (*(jnp.asarray(rng.standard_normal((LENGTH, DEPTH)), dtype) for _ in range(3)),
                 jax.random.bits(jax.random.key(seed), (2,), jnp.uint32))
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), operands,
-                    f"portable forward {form} {call} {numerics} derived {derived}", seeds=16)
+                    f"portable forward {form} {call} {numerics} {dtype} derived {derived}", seeds=16)
 
 
 @pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
