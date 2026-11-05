@@ -19,7 +19,7 @@ import pytest
 from flax import linen as nn
 from float64_terms import float64_forward
 from interop_support import NVFP4_QDQ_CASES, nvfp4_qdq_case, token_draw
-from reference_error import GateFailure, as_given, assert_as_exact
+from reference_error import GateFailure, Inconclusive, as_given, assert_as_exact
 
 import dew
 from dew.inference.projections import inference_projections, pending, projection_groups
@@ -58,9 +58,10 @@ def test_without_its_scales_the_model_fails_the_rule_every_view_is_held_to(case)
     model with them."""
     _, loaded, reference = case
     bare = {name: tree for name, tree in loaded.variables.items() if name != QUANTIZATION}
-    with pytest.raises(GateFailure):
+    with pytest.raises(GateFailure) as failed:
         assert_view(lambda ids: loaded.model.apply(bare, ids), loaded.model, loaded.variables, reference,
                     "without its scales")
+    assert not isinstance(failed.value, Inconclusive)
 
 
 def test_the_scanned_stack_quantizes_each_layer_with_its_own_scales(case):
