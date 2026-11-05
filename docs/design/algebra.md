@@ -110,9 +110,10 @@ JVP's forward and backward bodies, by the site's declared class:
 Each site declares its class where it defines its derivative (`dew.nn.derivatives`: `declared_derivative` or
 `declared_tangent` with its kind, or `surrogate`; §6.10), so the class is read from the site, never inferred. A
 bare custom derivative in `src/dew` is to fail a slop check, not take a default. Each declaring function wraps
-`jax.custom_vjp` or `jax.custom_jvp` and returns the derivative as one marked call of its kind, its primal,
-forward and backward one span (`dew.nn.derivatives.bound_span`: its arrays the operands, its other arguments
-and its `nondiff_argnums` bound in), so the check (SLOP026, row 4012) refuses `jax.custom_vjp` and
+`jax.custom_vjp` or `jax.custom_jvp` around its primal and its rules, each one marked call of its kind
+(`dew.nn.derivatives.bound_span`: its arrays the operands, its other arguments and its `nondiff_argnums` bound
+in), the custom rule outermost, so a differentiated call traces its rules alone, each where it runs, and the
+check (SLOP026, row 4012) refuses `jax.custom_vjp` and
 `jax.custom_jvp` anywhere in `src/dew` but `dew/nn/derivatives.py` (a reference to JAX's `custom_vjp_call_p` is
 no application). Rows 4026 to 4030 declare each lane's sites; the check lands after them. Until a site is
 declared, its custom call's bodies are rewritten as any glue is (§6.2), reorderings over its values held by
