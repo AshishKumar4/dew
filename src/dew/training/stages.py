@@ -415,6 +415,7 @@ def whole_reading(optimizer: optax.GradientTransformation | None, shapes, local:
     (`dew.interop.sequence_causality.positional_refusal`), as optax's constant rate, its moments and its
     decay read; a trust ratio or a clip over a leaf's norm reads every layer, and is named. None for Dew's
     own optimizers (None), which read a stacked leaf as its layers, and for a run with no stacked site."""
+    from dew.gauss_newton import solves_equations
     from dew.interop.sequence_causality import positional_refusal
     from dew.nn.sharding import layers_of
 
@@ -422,7 +423,12 @@ def whole_reading(optimizer: optax.GradientTransformation | None, shapes, local:
         return []
     with local.held():
         params = local.staged_shapes(shapes)["params"]
-        arguments = (params, jax.eval_shape(optimizer.init, params), params)
+        state = jax.eval_shape(optimizer.init, params)
+        if solves_equations(state):
+            # Its update is a solve of the step's system over every parameter at once (`dew.gauss_newton`),
+            # read from the statistics the step hands it, not its gradient a layer at a time.
+            return ["a Gauss-Newton solve, over every parameter at once"]
+        arguments = (params, state, params)
         given, structure = jax.tree_util.tree_flatten_with_path(arguments)
         stacked = [layers_of(path)[1] for path, _ in given]
         merged = [jax.ShapeDtypeStruct((math.prod(leaf.shape[:held]), *leaf.shape[held:]), leaf.dtype)
