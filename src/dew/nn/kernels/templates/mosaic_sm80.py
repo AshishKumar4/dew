@@ -546,10 +546,10 @@ class Mma(MmaIssuer, CpAsync):
 
     name = "mma.sync"
 
-    # One consumer warpgroup a program; a multiprocessor runs two programs (`programs`). Two consumers in
-    # one program took 1.04 to 1.50 of one's time on an A100 (CONSUMERS1), their shared copies leaner or
-    # not, where two programs took 0.73 to 0.89 (CONSUMERS3).
-    consumers = 1
+    # One consumer warpgroup a program or two, the two running one cp.async pipeline (`thread_axis`, the
+    # fork's pipeline-thread-axis); which a launch runs is its objective's (CONSUMERS1 measured the
+    # two-consumer branch bce608d2d3 removed, not this collective copy).
+    consumers = 2
 
     def column_unit(self, dtype) -> int:
         # Its stores move rows through registers, laid over the role's threads (`stores_columns`): half a
