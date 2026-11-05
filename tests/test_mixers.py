@@ -282,10 +282,28 @@ attention's 64 are sized paired (`seeds_for` with the packed row as its Dew arm,
 compared with themselves its documents alone take 512."""
 
 
-@pytest.mark.parametrize("kind", sorted(set(mixers.paths) - {"memory"}))
+SHARDED = {"kimi_delta_attention", "mamba2", "memory"}
+"""The kinds whose packed rows' draws run as armada's map tasks (`check1_shards`), each a test of its own."""
+
+
+@pytest.mark.parametrize("kind", sorted(set(mixers.paths) - SHARDED))
 def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
-    """`assert_packs_as_alone` over every mixer in the registry but the in-context memory."""
+    """`assert_packs_as_alone` over every mixer in the registry but the sharded ones (`SHARDED`)."""
     assert_packs_as_alone(kind)
+
+
+@pytest.mark.check1_shards(seeds=64, per_task=8)
+def test_a_packed_row_of_kimi_delta_attention_computes_what_its_documents_compute_alone():
+    """`assert_packs_as_alone` over Kimi delta attention, whose 64 seeds took 60 s of 120 cold on
+    armada's CI CPU: CI draws them in map tasks of 8 (ledger 3901)."""
+    assert_packs_as_alone("kimi_delta_attention")
+
+
+@pytest.mark.check1_shards(seeds=256, per_task=32)
+def test_a_packed_row_of_mamba2_computes_what_its_documents_compute_alone():
+    """`assert_packs_as_alone` over Mamba2, whose 256 seeds took most of 126 s cold on armada's CI CPU:
+    CI draws them in map tasks of 32 (ledger 3901)."""
+    assert_packs_as_alone("mamba2")
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=64)
@@ -520,10 +538,11 @@ def test_a_cross_attention_feed_forward_keeps_its_rungs_where_the_trunk_has_none
 @chosen(gated_delta_rule="fla")
 def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsys):
     """A decoder skips the remat rungs that keep none of its mixers' names (`MixerBase.marks`), so
-    a kind may name only what its layer marks: under `jax.checkpoint` with a policy saving each one
-    alone, a tiny decoder of that kind saves it for its backward. A recurrence's output is both its
-    'context' and its 'scan', either of which keeps it. A delta rule's decay and inverse are its
-    port's (`row_names_port`, interpreted off a GPU)."""
+    a kind may name only what its layer marks: under `jax.checkpoint` a policy saving each one alone
+    keeps more for a tiny decoder's backward than a policy saving nothing. A recurrence's output is
+    both its 'context' and its 'scan', either of which keeps it. A delta rule's decay and inverse are
+    its port's (`row_names_port`, interpreted off a GPU), named within its rule's declared span
+    (`derivatives.declared_derivative`), whose saved residuals JAX reports as the span's outputs."""
     from jax.ad_checkpoint import print_saved_residuals
 
     from dew.nn.backbones.decoder_block import RematPolicy
@@ -537,13 +556,14 @@ def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsy
     def loss(variables):
         return jnp.sum(model.apply(variables, tokens) ** 2)
 
-    def saves(name):
+    def saved(names):
         capsys.readouterr()
-        policy = RematPolicy(save=(name,)).checkpoint_policy()
+        policy = RematPolicy(save=names).checkpoint_policy()
         print_saved_residuals(jax.checkpoint(loss, policy=policy), variables)
-        return f"named '{name}'" in capsys.readouterr().out
+        return capsys.readouterr().out
 
-    assert [name for name in value.marks() or () if not saves(name)] == []
+    nothing = saved(())
+    assert [name for name in value.marks() or () if saved((name,)) == nothing] == []
 
 
 def one_tap(kind):

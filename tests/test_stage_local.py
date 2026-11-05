@@ -20,7 +20,6 @@ import pytest
 from affine_run import Replaying
 from flax import linen as nn
 from model_support import TINY_DECODER
-from optim_support import stage_local_adam
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, widened
 from token_support import token_rows
 
@@ -96,9 +95,9 @@ def test_each_device_holds_one_stage_of_the_pipelined_run(stages):
     its memory analysis reports, the batch's rows aside, is within a few bytes a leaf of that. Before,
     every device held the whole run, and the step restacked it."""
     model = decoder(num_layers=8)
-    one = trainer(model, stage_local_adam(1e-3), MeshSpec(), 1).initial_state()
+    one = trainer(model, optax.adam(1e-3), MeshSpec(), 1).initial_state()
     inside, outside = run_bytes({"variables": one.variables, "opt_state": one.opt_state, "ema": one.ema})
-    run = trainer(model, stage_local_adam(1e-3), MeshSpec(stage=stages), 8)
+    run = trainer(model, optax.adam(1e-3), MeshSpec(stage=stages), 8)
     state, _, _ = run.place()
     batch = shard_batch(run.device_mesh, token_rows(VOCAB, BATCH, SEQ + 1))
     run.compile(state, batch)
@@ -157,13 +156,17 @@ OPTIMIZERS = {
     "normuon": (OptimConfig(optimizer="muon", learning_rate=1e-2,
                             optimizer_opts={**SMOOTH, "neuron_beta2": 0.95}), {}),
     # M3 on every matrix, its matrices by its own default (rows the reduction), Adam on the vectors, each
-    # stepped at its rate by a schedule, whose state names the transform that steps a number at a time.
+    # stepped at its rate by a schedule, given built: M3's products batched on a stacked leaf's rows are
+    # each its layer's (`_row_form`, rows 4031, 4035).
     "m3": (optax.multi_transform(
         {"m3": optax.chain(scale_by_m3(beta1=0.9, beta2=0.95, beta3=0.99, alpha=5.0, eps=1e-8, frequency=2),
                            optax.scale_by_schedule(lambda count: -1e-2)),
-         "adam": stage_local_adam(1e-2)},
+         "adam": optax.adam(1e-2)},
         lambda params: jax.tree.map(lambda matrix: "m3" if matrix else "adam", weight_decay_mask(params))),
         {}),
+    # Adam after a clip by the global norm, given built: the norm over a stacked leaf is its layers' sum
+    # (`_Numbering.summed`, row 4036).
+    "global_clip": (optax.chain(optax.clip_by_global_norm(0.05), optax.adam(1e-2)), {}),
     # A layer's 8 x 256 up projection is below int8's threshold of 4096 values, two layers stacked are not.
     "int8": (OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1, state_dtype="int8",
                          optimizer_opts=SMOOTH),
@@ -172,8 +175,8 @@ OPTIMIZERS = {
 """Each optimizer whose rules read a leaf as one layer, with the decoder fields its rule needs to act:
 every named optimizer Dew stacks (`STACKED_OPTIMIZERS`), its weight-decay mask's rank, Muon's matrix axes,
 QK-Clip's per-layer maxima, LAMB's trust ratio and LaProp's clip; a param group's patterns, int8 moments'
-threshold and Muon's variants; and a transformation given as it is whose every state names its transform,
-M3's (one that may read a leaf whole keeps every layer whole: optax's LAMB, row 3934)."""
+threshold and Muon's variants. A transformation given built is stage-local where its update is its layers'
+expression row by row (`whole_reading`), as optax's Adam's is, which the read-whole test reads."""
 
 LORA_OPTIMIZER = OptimConfig(optimizer="adamw", learning_rate=1e-2, optimizer_opts=SMOOTH)
 """What the LoRA cell trains its factors with."""
@@ -335,7 +338,7 @@ def test_the_state_a_stage_local_fit_returns_is_the_one_it_holds_and_reads_off_t
     3457): its model reads it off the mesh as its stored layers, computing from it what it computes from
     the same state with every layer whole (`Trainer.stored`), which is what the run's last checkpoint
     holds; the objective's pipeline generates from it; and it trains on when handed back to `fit`."""
-    model, optimizer = decoder(), stage_local_adam(1e-2)
+    model, optimizer = decoder(), optax.adam(1e-2)
     run = trainer(model, optimizer, STAGED, 8, checkpoints=Checkpoints(str(tmp_path)))
     observe = Observe(STEPS, lambda state: (state.variables, state.opt_state, state.ema))
     trained = run.fit(stream(), steps=STEPS, log_every=1, observe=observe, checkpoint_every=STEPS)
@@ -451,21 +454,82 @@ def test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one(tmp_path):
     assert int(alone.fit(stream(), steps=3, log_every=1).step) == 3
 
 
+def scaled_by_progress() -> optax.GradientTransformationExtraArgs:
+    """Each update scaled by the run's progress where a commit hands it one (a run bounded in examples),
+    as it is otherwise: an entrywise transformation of an extra argument."""
+    def update(updates, state, params=None, *, progress=None, **extra):
+        return (updates if progress is None else jax.tree.map(lambda leaf: leaf * progress, updates)), state
+
+    return optax.GradientTransformationExtraArgs(lambda params: optax.EmptyState(), update)
+
+
+def doubled_gains() -> optax.GradientTransformation:
+    """Each leaf's update scaled by a sum of squares doubled 64 times: of the leaf's own entries where it
+    is of rank one, of each entry plus one at any other rank, so a stacked leaf's rows' gains are other
+    sums than its layers'. A sum named modulo 2**64 names both alike, doubling empties it."""
+    def update(updates, state, params=None):
+        def scaled(gradient):
+            read = gradient if gradient.ndim == 1 else gradient + 1
+            gain = jnp.sum(read * read, axis=-1)
+            for _ in range(64):
+                gain = gain + gain
+            return gradient * (0.0 * gain[..., None])
+        return jax.tree.map(scaled, updates), state
+    return optax.GradientTransformation(lambda params: optax.EmptyState(), update)
+
+
+def spread_sums() -> optax.GradientTransformation:
+    """Each leaf's update from a primitive of its own named `copy`, JAX's entrywise copy's name, that
+    broadcasts its operand's sum over it: no operation one entry at a time, whatever its name."""
+    from jax.extend.core import Primitive
+    from jax.interpreters import mlir
+
+    def spread(value):
+        return jnp.broadcast_to(jnp.sum(value), value.shape)
+
+    copy = Primitive("copy")
+    copy.def_impl(spread)
+    copy.def_abstract_eval(lambda value: value)
+    mlir.register_lowering(copy, mlir.lower_fun(spread, multiple_results=False))
+
+    def update(updates, state, params=None):
+        return jax.tree.map(lambda gradient: -1e-3 * jnp.tanh(copy.bind(gradient)), updates), state
+    return optax.GradientTransformation(lambda params: optax.EmptyState(), update)
+
+
 @pytest.mark.mesh(devices=8)
 def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trains():
-    """Over two stages, a transformation given built whose every state names a transform that acts a
-    number at a time (Adam's moments, a schedule's rate) keeps each run stage-local; optax's Adam, whose
-    constant rate is a stateless transform (`optax.EmptyState`, which names none: optax's LAMB trust ratio
-    holds one too, row 3934), and Adafactor, whose factored moments and block clip read a leaf whole, keep
-    every layer whole on every stage, given built or named by its import path in an `OptimConfig`, and the
-    run's plan names what kept them whole. No per-layer view of a transform whose reductions only its own
-    code knows is exact short of each layer a leaf of its own, which one program can hold on every stage
-    alone, so the run trains as `Layout(stage_local=False)` trains it, and steps: optax's LAMB, whose trust
-    ratio over a stacked leaf would take one ratio over both stages, among them."""
+    """Over two stages, a transformation given built whose update reads each stored layer of a stacked leaf
+    by the same expression of that layer's entries as over the stored layers keeps each run stage-local
+    (`whole_reading`): optax's Adam and SGD with momentum at a constant rate, AdamW's decay on a schedule,
+    a scale by the run's progress, their moments, decay and scales a number at a time, and AdamW after a
+    clip by the global norm, its layers' sum (rows 3995, 4015, 4036). One whose update reads a leaf whole,
+    optax's LAMB, whose trust ratio would take one ratio over both stages, and Adafactor, whose factored
+    moments and block clip read the leaf, given built or named by its import path in an `OptimConfig`, one
+    whose build reads its tree's shapes (a decay masked by rank), one whose sums of squares differ by row
+    and are doubled 64 times (`doubled_gains`), and one through a primitive that takes an entrywise
+    operation's name and reads its operand whole (`spread_sums`), keep every layer whole on every stage,
+    and the run's plan names what kept them whole. No per-layer view of a transform whose reductions only
+    its own code knows is exact short of each layer a leaf of its own, so the run trains as
+    `Layout(stage_local=False)` trains it, and steps."""
     model = decoder()
-    assert saving(functools.partial(trainer, model, stage_local_adam(1e-3), STAGED, 8, ema=None)) > 0
-    for given in (optax.adam(1e-3), optax.lamb(1e-3), optax.adafactor(1e-3),
-                  OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3)):
+    for local in (optax.adam(1e-3), optax.sgd(1e-3, momentum=0.9),
+                  optax.adamw(optax.cosine_decay_schedule(1e-3, 8), weight_decay=0.1),
+                  optax.chain(scaled_by_progress(), optax.sgd(1e-3)),
+                  optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(1e-3))):
+        assert saving(functools.partial(trainer, model, local, STAGED, 8, ema=None)) > 0
+        run = trainer(model, local, STAGED, 8, ema=None)
+        assert int(run.fit(stream(), steps=1, log_every=1).step) == 1
+        assert "layers_whole_for" not in run.plan
+    # Two runs of unequal depth, four layers and two that share their keys and values, each output read
+    # against its own run's rows.
+    uneven = decoder(num_layers=6, kv_shared_layers=(4, 5))
+    assert saving(functools.partial(trainer, uneven, optax.adam(1e-3), STAGED, 8, ema=None)) > 0
+    # A decay masked by rank decides otherwise over a stacked leaf, whose bias is rank three.
+    by_rank = optax.adamw(1e-3, mask=lambda params: jax.tree.map(lambda leaf: leaf.ndim > 1, params))
+    for given in (optax.lamb(1e-3), optax.adafactor(1e-3), by_rank,
+                  OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3), doubled_gains(),
+                  spread_sums()):
         # An OptimConfig's transformation is built over the run's length, which fit gives.
         assert saving(functools.partial(trainer, model, given, STAGED, 8, ema=None)) == 0
         run = trainer(model, given, STAGED, 8, ema=None)
@@ -627,7 +691,7 @@ def test_a_stage_local_state_handed_to_another_run_starts_it_on_its_stored_layer
     3487): a run over four stages given it by `fit(state=...)`, and a run with no stage axis given its
     variables by its objective (SFT into DPO), each start from every layer of it, where placement refused
     a store stacked over another count."""
-    model, optimizer = decoder(), stage_local_adam(1e-2)
+    model, optimizer = decoder(), optax.adam(1e-2)
     trained = trainer(model, optimizer, STAGED, 8).fit(stream(), steps=1, log_every=1)
     stored = on_host(trainer(model, optimizer, STAGED, 8).stored(trained).variables)
     four = trainer(model, optimizer, MeshSpec(fsdp=2, stage=4), 8)

@@ -273,9 +273,7 @@ def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged)
     placement = {"mesh": MeshSpec(fsdp=2, stage=2), "microbatches": 2} if staged else {}
 
     def clip(threshold):
-        # A rate of naught the schedule's, whose state names its transform, so a staged run keeps the
-        # layers stage-local (`dew.optim.STACKED_STATES`), as `optax.sgd(0.0)`'s would not.
-        return optax.chain(optax.scale_by_schedule(lambda count: -0.0), scale_by_qk_clip(threshold))
+        return optax.chain(optax.sgd(0.0), scale_by_qk_clip(threshold))
 
     def trained(threshold, first, second):
         train = Trainer(objective, clip(threshold), key=jax.random.PRNGKey(3), accumulation=2, **placement)
@@ -286,6 +284,9 @@ def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged)
         opt_state = jax.tree.map(np.asarray, initial.opt_state)
         held = train.staged(initial)
         run = train.compile(held, first)
+        # A QK-Clip given built reads the maxima its forward reports, so a pipelined run keeps every layer
+        # whole on every stage and says so (`whole_reading`, row 4035); a named Muon-Clip keeps them local.
+        assert ("layers_whole_for" in train.plan) == staged
         partial, *_ = run(held, first)
         pooled = jax.tree.map(np.asarray, train.stored(partial).accumulation.qk_stats)
         final, *_ = run(partial, second)

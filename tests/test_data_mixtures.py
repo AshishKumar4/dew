@@ -19,6 +19,7 @@ import collections
 import dataclasses
 import itertools
 import json
+import operator
 from pathlib import Path
 
 import grain.python as pygrain
@@ -134,6 +135,121 @@ def test_a_mixture_is_the_same_order_from_the_same_seed_and_another_from_another
 
     assert taken(mixed(two_corpora())(DataPartition()), 5) == first
     assert taken(mixed(two_corpora(seed=1), seed=1)(DataPartition()), 5) != first
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_mixtures_corpora_shuffled_by_one_seed_read_in_orders_of_their_own(read):
+    """Corpora of one length, each shuffled by one seed, read in orders of their own in a mix from data
+    plan version 9, each by its seed and its key in the mixture, so a corpus keeps its order whichever
+    others the mix holds; version 8, which a run saved under it reads by (`compile`'s `plan_version`),
+    read them in one permutation (row 3840)."""
+    def orders(names: tuple[str, ...], version: int | None = None) -> list[list[int]]:
+        corpora = [Pipeline(Memory(Indexed(tag, 16)), name=name).shuffle(5, **(
+            {"window": 16} if read == "streamed" else {})).repeat() for tag, name in enumerate(names, 1)]
+        stated = {} if version is None else {"plan_version": version}
+        stream = compile(mix(corpora).batch(4), read=read, loading=READ, **stated).train(DataPartition())
+        try:
+            seen = [value for step in taken(stream, 8) for value in step]
+        finally:
+            stream.close()
+        # Each corpus's records as it read them, by their place in it.
+        return [[value % 1000 for value in seen if value // 1000 == tag][:12]
+                for tag in range(1, len(names) + 1)]
+
+    wiki, code = orders(("wiki", "code"))
+    assert wiki != code
+    assert orders(("wiki", "news"))[0] == wiki
+    assert operator.eq(*orders(("wiki", "code"), 8))
+
+
+def test_a_position_saved_under_plan_version_8_resumes_by_8_or_by_9_where_9_reads_it_alike():
+    """A position a version 8 read saved of a mix whose corpora shuffle, which version 9 reads in other
+    orders, resumes where 8 compiles the chain (`plan_version=8`) and is refused where 9 does, naming the
+    version to compile it by; one of a read whose order 9 reads alike, a mix of corpora that keep their
+    order, resumes under 9 (`dew.data.plan.read_otherwise_at_9`, row 3840)."""
+    def chain(shuffled: bool) -> Pipeline:
+        corpora = [Pipeline(Memory(Indexed(tag, 16)), name=name) for tag, name in ((1, "wiki"), (2, "code"))]
+        return mix([corpus.shuffle(5).repeat() if shuffled else corpus.repeat()
+                    for corpus in corpora]).batch(4)
+
+    for shuffled in (True, False):
+        saving = compile(chain(shuffled), read="indexed", loading=READ,
+                         plan_version=8).train(DataPartition())
+        try:
+            taken(saving, 2)
+            saved = saving.get_state()
+            expected = taken(saving, 2)
+        finally:
+            saving.close()
+        for version in (8, 9):
+            resumed = compile(chain(shuffled), read="indexed", loading=READ,
+                              plan_version=version).train(DataPartition())
+            try:
+                if shuffled and version == 9:
+                    with pytest.raises(ValueError):
+                        resumed.set_state(saved)
+                    continue
+                resumed.set_state(saved)
+                assert taken(resumed, 2) == expected
+            finally:
+                resumed.close()
+
+
+def test_an_unnamed_chains_shuffled_position_of_plan_version_8_resumes_under_9():
+    """A chain given no name shuffles by its seed alone under data plan version 9, as 8 shuffled it, so a
+    position 8 saved of it resumes under 9; a named chain's, which 9 shuffles by its name too, is refused
+    there, naming the version to read it by (rows 3840, 4063)."""
+    def opened(version: int, name: str | None = None):
+        chain = Pipeline(Memory(Indexed(1, 16)), name=name).shuffle(5).repeat().batch(4)
+        return compile(chain, read="indexed", loading=READ, plan_version=version).train(DataPartition())
+
+    for name in (None, "wiki"):
+        saving = opened(8, name)
+        try:
+            taken(saving, 1)
+            saved = saving.get_state()
+            expected = taken(saving, 1)
+        finally:
+            saving.close()
+        resumed = opened(9, name)
+        try:
+            if name is not None:
+                with pytest.raises(ValueError):
+                    resumed.set_state(saved)
+                continue
+            resumed.set_state(saved)
+            assert taken(resumed, 1) == expected
+        finally:
+            resumed.close()
+
+
+def test_a_named_chains_order_is_its_names_and_a_position_of_another_name_is_refused():
+    """A named chain read alone shuffles by its name from data plan version 9, as a mixture reads it as its
+    member, so its plan records the name: a position it saved is refused by the chain under another name,
+    which reads another permutation of the same records, and resumes under its own (row 3840)."""
+    def opened(name: str):
+        chain = Pipeline(Memory(Indexed(1, 16)), name=name).shuffle(5).repeat().batch(4)
+        return compile(chain, read="indexed", loading=READ).train(DataPartition())
+
+    saving = opened("wiki")
+    try:
+        taken(saving, 1)
+        saved = saving.get_state()
+        expected = taken(saving, 1)
+    finally:
+        saving.close()
+    other = opened("code")
+    try:
+        with pytest.raises(ValueError):
+            other.set_state(saved)
+    finally:
+        other.close()
+    same = opened("wiki")
+    try:
+        same.set_state(saved)
+        assert taken(same, 1) == expected
+    finally:
+        same.close()
 
 
 def test_a_mixtures_position_resumes_on_another_process_count():

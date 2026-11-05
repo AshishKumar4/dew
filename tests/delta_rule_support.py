@@ -66,21 +66,28 @@ def recurrence(q, k, v, g, beta, h0, cuts=None, rule=rule_math):
     """`rule` (the token recurrence, `rule_math`, by default) with value heads reading their key head,
     each row through its documents (`cuts`, each row's first tokens, the first 0; None, one a row):
     each from a zero memory but a row's first, which takes the row's, the row's final memory its last
-    document's."""
+    document's. The documents run as one batch, each padded to the longest with tokens that leave the
+    memory as it is (every operand zero: no decay, no write, a zero output), so a program traces `rule`
+    once however many documents it holds: four documents traced apart took a cold check-1 task 115 to 120
+    s of compiles (site-tasks4 at 07287dadc)."""
     group = v.shape[2] // q.shape[2]
     q, k = jnp.repeat(q, group, axis=2), jnp.repeat(k, group, axis=2)
     if cuts is None:
         return rule(q, k, v, g, beta, h0)
-    outs, finals = [], []
-    for row, begins in enumerate(cuts):
-        state, pieces = h0[row:row + 1], []
-        for begin, end in itertools.pairwise((*begins, q.shape[1])):
-            state = state if begin == 0 else jnp.zeros_like(state)
-            out, state = rule(*(x[row:row + 1, begin:end] for x in (q, k, v, g, beta)), state)
-            pieces.append(out)
-        outs.append(jnp.concatenate(pieces, axis=1))
-        finals.append(state)
-    return jnp.concatenate(outs), jnp.concatenate(finals)
+    pieces = [(row, begin, end) for row, begins in enumerate(cuts)
+              for begin, end in itertools.pairwise((*begins, q.shape[1]))]
+    longest = max(end - begin for _, begin, end in pieces)
+
+    def documents(x):
+        return jnp.stack([jnp.pad(x[row, begin:end], [(0, longest - (end - begin))] + [(0, 0)] * (x.ndim - 2))
+                          for row, begin, end in pieces])
+
+    entering = jnp.stack([h0[row] if begin == 0 else jnp.zeros_like(h0[row]) for row, begin, _ in pieces])
+    out, final = rule(*map(documents, (q, k, v, g, beta)), entering)
+    outs = [jnp.concatenate([out[i, :end - begin] for i, (held, begin, end) in enumerate(pieces)
+                             if held == row]) for row in range(len(cuts))]
+    last = [max(i for i, (held, _, _) in enumerate(pieces) if held == row) for row in range(len(cuts))]
+    return jnp.stack(outs), final[jnp.asarray(last)]
 
 
 def through(rule, do, dht):

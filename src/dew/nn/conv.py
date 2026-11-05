@@ -50,7 +50,7 @@ from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, logical_spec, mesh_axes
 
 from .flops import conv_flops
 from .precision import biased
-from .sharding import auto_part, in_pipeline_stage
+from .sharding import auto_part, automatic_axes, in_pipeline_stage
 
 # A linear boundary must survive in tangents and cotangents too: dropping it
 # from either leaves the same convolution chain open to the faulty rewrite.
@@ -68,16 +68,15 @@ def _barrier(x: jax.Array) -> jax.Array:
 
 
 def _automatic_axes(mesh: jax.sharding.AbstractMesh) -> list[str]:
-    """The mesh axes above size one that GSPMD places: neither a
-    `shard_map`'s manual axes, an Explicit axis, which an array's type
-    places, nor, inside a pipeline's stage (`in_pipeline_stage`), the stage
-    axis, which the stage's vmap holds. Outside one, a convolution runs on
-    every stage, and the stage axis replicating its input and output doubled
-    its kernel gradient as the first bug does (a JEPA's patch embedding over
-    stage 2 and sequence 2, tests/test_stage_blocks.py), so it splits them
-    like any other axis."""
-    return [axis for axis in mesh.axis_names if mesh.shape[axis] > 1 and axis not in mesh.manual_axes
-            and axis not in mesh.explicit_axes and not (axis == STAGE_AXIS and in_pipeline_stage())]
+    """The automatic mesh axes (`sharding.automatic_axes`) a constraint here
+    places: not an Explicit axis, which an array's type places, nor, inside a
+    pipeline's stage (`in_pipeline_stage`), the stage axis, which the stage's
+    vmap holds. Outside one, a convolution runs on every stage, and the stage
+    axis replicating its input and output doubled its kernel gradient as the
+    first bug does (a JEPA's patch embedding over stage 2 and sequence 2,
+    tests/test_stage_blocks.py), so it splits them like any other axis."""
+    return [axis for axis in automatic_axes() if axis not in mesh.explicit_axes
+            and not (axis == STAGE_AXIS and in_pipeline_stage())]
 
 
 def _whole(kernel: jax.Array) -> jax.Array:

@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import tokamax
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, launches
 from dew.nn.kernels.selection import Refusal
 from dew.nn.kernels.templates import attention_algebra as algebra, attention_gradient as gradient, report
 from dew.nn.kernels.templates.attention import (
@@ -330,7 +330,7 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
             initial=initial, residuals=residuals, output_mod=self.output_mod, block_k=block_k,
             interpret=interpret)
         launch = functools.partial(
-            pl.pallas_call, grid=(queries // block_q, batch, heads), interpret=interpret,
+            launches.pallas_call, grid=(queries // block_q, batch, heads), interpret=interpret,
             compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=config.stages))
         if not spec.headroom:
             out = launch(functools.partial(kernel, guard="none"), in_specs=in_specs, out_specs=out_specs,
@@ -867,7 +867,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                                how=how,
                                block_k=block_k,
                                split=sums is not None, accurate=accurate, interpret=interpret)
-    out = pl.pallas_call(
+    out = launches.pallas_call(
         kernel, grid=(queries // block_q, batch, heads), in_specs=in_specs, out_specs=out_specs,
         out_shape=out_shape, interpret=interpret, name=report.named("attention_dq"),
         compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
@@ -926,7 +926,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                                score_mod=score_mod, scale=scale, prescale=prescale, grad_scale=grad_scale,
                                how=how,
                                block_q=block_q, accurate=accurate, interpret=interpret)
-    out = pl.pallas_call(
+    out = launches.pallas_call(
         kernel, grid=(keys // block_k, batch, heads), in_specs=in_specs, out_specs=out_specs,
         out_shape=out_shape, input_output_aliases=aliases, interpret=interpret,
         name=report.named("attention_dkv"),

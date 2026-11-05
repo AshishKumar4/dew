@@ -28,7 +28,7 @@ from selective_support import selective_draw, selective_xla
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kernels import generation, recurrence_chunk
-from dew.nn.kernels.templates import bundles, mosaic_sm90
+from dew.nn.kernels.templates import bundles, mosaic_sm90, report
 from dew.nn.kernels.templates.recurrence import selective
 from dew.nn.mixers.mamba import Mamba, selective_scan as portable
 
@@ -82,9 +82,19 @@ def the_template_is_as_exact_as_the_portable_scan(case: str, packed: bool, dtype
                     truth_fn=jax.jit(with_gradients(scanned(portable, starts))))
 
 
-@pytest.mark.parametrize("packed", [False, True], ids=["one row", "packed documents"])
-def test_the_template_is_as_exact_as_the_portable_scan_interpreted(packed):
-    the_template_is_as_exact_as_the_portable_scan("interpreted", packed)
+# The template's scan interpreted, each case a check-1 site of its own, its eight draws in armada map tasks of
+# four (`check1_shards`): whole, both took 200 s (site-tasks2 at d87423e30), a task of two seeds of both 91 s
+# (site-tasks at c17a54df2).
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+def test_the_template_is_as_exact_as_the_portable_scan_interpreted():
+    """`the_template_is_as_exact_as_the_portable_scan` over one row."""
+    the_template_is_as_exact_as_the_portable_scan("interpreted", packed=False)
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+def test_the_template_is_as_exact_as_the_portable_scan_over_packed_documents_interpreted():
+    """`the_template_is_as_exact_as_the_portable_scan` over packed documents."""
+    the_template_is_as_exact_as_the_portable_scan("interpreted", packed=True)
 
 
 SEEDED = Path(__file__).resolve().parent / "fixtures" / "mamba" / "selective_mamba_ssm_seeded.npz"
@@ -128,13 +138,13 @@ def test_the_training_forward_keeps_a_state_a_backward_block():
     kept = jax.eval_shape(lambda *operands: jax.vjp(template, *operands)[1], *operands)
     beyond = sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(kept)) - sum(
         operand.size * operand.dtype.itemsize for operand in operands)
-    chunks = length // recurrence_chunk.SELECTIVE_CHUNK
+    chunks = length // selective.CHUNK
     assert beyond < chunks * rows * states * channels * 4, beyond
 
 
 LAYER = {"emb_features": 64, "intermediate_size": 128, "state_size": 16, "time_step_rank": 8,
          "chunk_size": 32}
-"""A Mamba layer one channel block wide (`recurrence_chunk.SELECTIVE_BLOCK`), Mamba's 16 states."""
+"""A Mamba layer one channel block wide (`selective.block_scan.THREADS`), Mamba's 16 states."""
 
 
 HELD = {"into the template": (False, True), "out of the template": (True, False),
@@ -199,14 +209,31 @@ def the_layer_is_as_exact_under_the_template(packed: bool, held: str | None, *, 
                     seeds=FEWEST_SEEDS, truth_fn=jax.jit(with_gradients(run(truth, template=False))))
 
 
-@pytest.mark.parametrize("packed, held", [(False, None), (True, None), (False, "into the template"),
-                                          (False, "out of the template")],
-                         ids=["one row", "packed documents", "a held state into the template",
-                              "a held state out of the template"])
-def test_a_mamba_layer_is_as_exact_under_the_template_interpreted(packed, held):
-    """The layer's cases interpreted, a held state's into the template and out of it apart: through it on
-    both calls it took 189 s on armada (6f7a1978a), each call 11 s a draw, past a test's two minutes."""
-    the_layer_is_as_exact_under_the_template(packed, held)
+# The layer's cases interpreted, each a check-1 site of its own, its eight draws in armada map tasks of
+# two (`check1_shards`): whole, each took 125 to 157 s (test_durations at 8e7d4ce444, row 3758), a task of
+# two seeds of the four 170 s (site-tasks at c17a54df2), about 20 s a case's seed.
+@pytest.mark.check1_shards(seeds=8, per_task=2)
+def test_a_mamba_layer_is_as_exact_under_the_template_interpreted():
+    """`the_layer_is_as_exact_under_the_template` over one row."""
+    the_layer_is_as_exact_under_the_template(packed=False, held=None)
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=2)
+def test_a_packed_mamba_layer_is_as_exact_under_the_template_interpreted():
+    """`the_layer_is_as_exact_under_the_template` over packed documents."""
+    the_layer_is_as_exact_under_the_template(packed=True, held=None)
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=2)
+def test_a_mamba_layer_from_a_held_state_into_the_template_is_as_exact_interpreted():
+    """`the_layer_is_as_exact_under_the_template` from a held state, the template on the second call."""
+    the_layer_is_as_exact_under_the_template(packed=False, held="into the template")
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=2)
+def test_a_mamba_layer_from_a_held_state_out_of_the_template_is_as_exact_interpreted():
+    """`the_layer_is_as_exact_under_the_template` from a held state, the template on the first call."""
+    the_layer_is_as_exact_under_the_template(packed=False, held="out of the template")
 
 
 def routed(target: str, states: int, c_dtype=jnp.float32, *, forms: str = "fast", named: bool = False):
@@ -214,7 +241,7 @@ def routed(target: str, states: int, c_dtype=jnp.float32, *, forms: str = "fast"
     for a scan traced for `target` over fp32 `x` and `B` and a `c_dtype` `C` of `states` states, two rows of
     a chunk's tokens and a channel block, under the run's `forms`, the template named where `named`: each
     route's `(kernel, refusal code)`; or the refusal it raises."""
-    x = jnp.zeros((2, recurrence_chunk.SELECTIVE_CHUNK, recurrence_chunk.SELECTIVE_BLOCK), jnp.float32)
+    x = jnp.zeros((2, selective.CHUNK, selective.block_scan.THREADS), jnp.float32)
     a, b = jnp.zeros((x.shape[-1], states)), jnp.zeros((*x.shape[:2], states))
     named_template = generation.chosen(selective_scan="mosaic_gpu") if named else contextlib.nullcontext()
     with (generation.assumed(target), named_template, generation.routes() as found,
@@ -293,3 +320,108 @@ def test_the_backward_holds_its_registers_at_the_residency_it_launches(packed):
     held = selective.backward_programs(need, target)
     assert held == resident == selective.backward_programs(selective.backward_registers(positions), target), (
         need, held, resident, positions)
+
+
+@lowers('sm90')
+def test_a_launchs_backward_kernel_carries_its_launch():
+    """The selective scan's training step lowered for an H100 (`kernel_compile.lowered_for`): its backward
+    kernel, which JAX traces on the pullback after the launch's scope ended, carries the launch that traced
+    its forward (`report.relaunched`), so a compile that finds it spilling refuses that launch and steps the
+    backward's tokens down (row 3851)."""
+    from kernel_compile import lowered_for
+
+    from dew.training._lowering import kernel_calls
+
+    rows, length, channels, states = 1, 2048, 256, 16
+    operands = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((channels, states), jnp.float32),
+        *(jax.ShapeDtypeStruct((rows, length, states), jnp.bfloat16),) * 2,
+        jax.ShapeDtypeStruct((channels,), jnp.float32))
+
+    def trained(*given):
+        out, pull = jax.vjp(lambda *a: selective.SELECTIVE(*a)[0], *given)
+        return pull(out)
+
+    lowered = lowered_for(trained, operands, 'sm90')
+    launches = {call.name: call.launch for call in kernel_calls(lowered, unrun=True)
+                if call.kind == 'mosaic_gpu'}
+    assert set(launches) == {'selective_scan', 'selective_scan_backward'}, launches
+    assert launches['selective_scan'] is not None
+    assert launches['selective_scan_backward'] == launches['selective_scan'], launches
+
+
+def _bound(length: int):
+    """The selective scan's template launch bound to a bf16 call of `length` tokens (one row, 256 channels,
+    Mamba's 16 states), interpreted."""
+    operands = (jax.ShapeDtypeStruct((1, length, 256), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((256, 16), jnp.float32),
+        *(jax.ShapeDtypeStruct((1, length, 16), jnp.bfloat16),) * 2,
+        jax.ShapeDtypeStruct((256,), jnp.float32))
+    return selective.SELECTIVE.bind(*operands, interpret=True)
+
+
+def test_a_spill_steps_the_kernel_that_spilled():
+    """`Selective.derived` past a compile's spill (`report.refuse`, a refusals scope): a backward kernel that
+    spilled halves the backward's tokens, its residency the planner's at their registers, the forward's
+    chunk kept; a forward kernel's spill, whose registers no tile sets, leaves the call no config (rows 3851,
+    3861)."""
+    bound = _bound(2048)
+    target = generation.gpu_target('sm90')
+    with generation.assumed(target):
+        derived = selective.SELECTIVE.derived(bound, target)
+        identity = report._identity(selective.SELECTIVE, bound)
+        with report.refusals():
+            report.refuse([(identity, derived, {'selective_scan_backward'})])
+            stepped = selective.SELECTIVE.derived(bound, target)
+        with report.refusals():
+            report.refuse([(identity, derived, {'selective_scan'})])
+            assert selective.SELECTIVE.derived(bound, target) is None
+    facts = generation.gpu_target(generation.INTERPRETED_GENERATION)
+    fewer = derived.positions // 2
+    assert stepped == selective.Tiles(derived.chunk, fewer,
+                                      selective.backward_programs(selective.backward_registers(fewer), facts))
+
+
+@pytest.mark.parametrize(('length', 'chunk'), [(129, 32), (2048, 128)], ids=['129 tokens', '2048 tokens'])
+def test_a_chunk_walks_no_more_padding_than_the_shortest(length, chunk):
+    """The forward's derived chunk on an H100's facts: the longest whose ring a block holds, dividing the
+    call's tokens padded to the shortest chunk's, so 129 tokens walk 160 at 32 a chunk, not 256 at 128
+    (row 3853)."""
+    target = generation.gpu_target('sm90')
+    with generation.assumed(target):
+        assert selective.SELECTIVE.derived(_bound(length), target).chunk == chunk
+
+
+@lowers('sm90')
+@pytest.mark.parametrize('packed', [False, True], ids=['one sequence', 'packed'])
+def test_the_forwards_shared_memory_is_what_mosaic_allocates(packed):
+    """The forward's shared memory as the template counts it (`forward_scope`, `resources.scratch_bytes`) the
+    scratch Mosaic GPU's resource estimate gives its kernel lowered for an H100, at the derived chunk; and
+    counted for an A100's family, whose walks scope their streams (row 3854, 3859)."""
+    from kernel_compile import SHARED, _estimates, _printed, lowered_for
+
+    from dew.nn.kernels.templates import resources
+    from dew.training._lowering import kernel_calls
+
+    length, states = 2048, 16
+    operands = (jax.ShapeDtypeStruct((1, length, 256), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((256, states), jnp.float32),
+        *(jax.ShapeDtypeStruct((1, length, states), jnp.bfloat16),) * 2,
+        jax.ShapeDtypeStruct((256,), jnp.float32), None,
+        jax.ShapeDtypeStruct((1, length), bool) if packed else None)
+    target = generation.gpu_target('sm90')
+    with generation.assumed(target):
+        chunk = selective.SELECTIVE.derived(selective.SELECTIVE.bind(*operands), target).chunk
+    with _printed(MOSAIC_GPU_DUMP_RESOURCES='1') as printed:
+        lowered = lowered_for(lambda *given: selective.SELECTIVE(*given)[0], operands, 'sm90')
+    calls = [call for call in kernel_calls(lowered, unrun=True) if call.kind == 'mosaic_gpu']
+    estimates = _estimates(calls, ''.join(printed))
+    (estimate,) = [found for name, found in estimates.items() if name.startswith('selective_scan__')
+                   or name == 'selective_scan']
+    dtypes = (jnp.bfloat16,) * 4
+    scope = selective.forward_scope(mosaic_sm90.WGMMA, chunk, states, dtypes, packed)
+    counted = resources.scratch_bytes(mosaic_sm90.WGMMA, scope)
+    assert counted == int(SHARED.search(estimate).group(1)), (counted, estimate)
+    ampere = bundles.of('sm80', jnp.bfloat16)
+    assert resources.shared_bytes(ampere, selective.forward_scope(ampere, chunk, states, dtypes, packed)) > 0
+

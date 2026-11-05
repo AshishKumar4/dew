@@ -75,7 +75,8 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
     sibling reduction's too) and keeps its fused intermediates on chip; a product's tensor-core FLOPs (its
     result's elements by its contraction's length, twice) and the bytes its operands are staged in (the tile
     walk's, at their dtypes' sizes); a reduction's
-    CUDA-core operations, one an element of its operand; a conversion's conversions and a special
+    CUDA-core operations, one an element of its operand; a reduction and a product each a kernel of XLA's
+    fusion, its root (elementwise work fuses into it); a conversion's conversions and a special
     function's exponentials, one an element of their result; any other elementwise node's CUDA-core
     operations; a layout change none."""
     if (args := get_callable_args(node, Term.leaf)) is not None:
@@ -85,7 +86,7 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
         return Work() if extent is None else Work(
             device_bytes=math.prod(extent) * np.dtype(region.dtypes[leaf]).itemsize)
     if (args := get_callable_args(node, Term.reduce)) is not None:
-        return Work(operations=made(graph, args[:1], held))
+        return Work(operations=made(graph, args[:1], held), kernels=1.0)
     if (args := get_callable_args(node, Term.dot)) is not None:
         left, right = (shape_of(graph, operand, held) for operand in args[:2])
         if left is None or right is None:
@@ -103,7 +104,7 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
                    for extent, dtype in zip((left, right), operands, strict=True))
         flops = 2.0 * math.prod(left[axis] for axis in batch) * free * length
         mode, passes = _mode(params.get("precision"), set(operands))
-        return Work(shared_bytes=read, **{_MODES[mode]: flops * passes})
+        return Work(shared_bytes=read, kernels=1.0, **{_MODES[mode]: flops * passes})
     if (args := get_callable_args(node, Term.convert)) is not None:
         return Work(conversions=made(graph, args[:1], held))
     if (args := get_callable_args(node, Term.unary)) is not None:
@@ -241,14 +242,18 @@ def cheaper(form: Seconds, than: Seconds) -> bool:
 @dataclasses.dataclass(frozen=True)
 class Fused:
     """XLA's schedule (the compile-time pass's): a reduction or a product reads its operands in one pass over
-    device memory and elementwise work fuses into its consumer, costing its units' work alone, each at the
-    whole device's rate (`templates.cost.rates`), in series, or its span at a loop iteration's latency where
-    longer (the work-span model, `templates.cost.spanned`); no tie to break."""
+    device memory and elementwise work fuses into its consumer, costing its units' work, each at the whole
+    device's rate (`templates.cost.rates`), in series, and each kernel the part's fixed latency (its launch
+    and first byte, `Measured.fixed`; row 4081: a small fusion's time is that latency, 0.02 of it priced
+    without), or its span at a loop iteration's latency where longer (the work-span model,
+    `templates.cost.spanned`); no tie to break."""
 
     facts: generation.GpuTarget
 
     def pieces(self, done: Work) -> tuple[float, ...]:
-        return (sum(kernel_cost.units(done, kernel_cost.rates(self.facts, device=True))[0]),)
+        fixed = _fixed(self.facts)
+        return (sum(kernel_cost.units(done, kernel_cost.rates(self.facts, device=True))[0])
+                + (0.0 if fixed is None else done.kernels * fixed),)
 
     def spanned(self, done: Work) -> float:
         return kernel_cost.spanned(done, kernel_cost.step_latency(self.facts, device=True))[0]
@@ -263,7 +268,14 @@ class Fused:
     def unpriced(self, done: Work) -> tuple[float, ...]:
         latency = kernel_cost.step_latency(self.facts, device=True)
         return (*kernel_cost.units(done, kernel_cost.rates(self.facts, device=True))[1],
-                kernel_cost.spanned(done, latency)[1])
+                kernel_cost.spanned(done, latency)[1], done.kernels if _fixed(self.facts) is None else 0.0)
+
+
+def _fixed(facts: generation.GpuTarget) -> float | None:
+    """A kernel's fixed seconds on `facts`' part, measured (`Measured.fixed`); None for a part no one
+    measured, whose kernels no time prices."""
+    part = facts.part
+    return None if part is None else part.fixed
 
 
 def fused(facts: generation.GpuTarget) -> Fused:

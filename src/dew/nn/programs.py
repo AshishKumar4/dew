@@ -9,10 +9,14 @@ which branch a platform runs and which bodies XLA sees.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import functools
+from collections.abc import Mapping, Sequence
 from typing import TypeGuard
 
+import jax
 import jax.extend.core as jcore
+from jax.extend import random as jax_random
+from jax.interpreters import ad
 
 CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat2", "checkpoint", "custom_jvp_call",
                    "custom_vjp_call", "marked_call"})
@@ -53,6 +57,37 @@ def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
         found.extend(each for each in (value if isinstance(value, tuple | list) else (value,))
                      if isinstance(each, jcore.Jaxpr))
     return found
+
+
+@functools.cache
+def _jax_own() -> Mapping[jcore.Primitive, str]:
+    """JAX's own operations by their objects: `jax.lax`'s and `jax.extend.random`'s, the sum JAX's
+    derivatives add with (`add_any`), and those its public random functions bind, which no module of
+    JAX's exports (`random_wrap`, `random_split`, `random_fold_in`, `random_bits`, `random_unwrap`), read
+    off a trace of them once asked."""
+    def drawn(seed_words):
+        # A key of its own implementation, whichever the process's default is (`jax_default_prng_impl`).
+        first, _ = jax.random.split(jax.random.wrap_key_data(seed_words, impl="threefry2x32"))
+        return jax.random.bits(jax.random.fold_in(first, 1), ()), jax.random.key_data(first)
+
+    def each(jaxpr: jcore.Jaxpr):
+        for equation in jaxpr.eqns:
+            yield equation.primitive
+            for inner in jcore.jaxprs_in_params(equation.params):
+                yield from each(inner)
+
+    traced = jax.make_jaxpr(drawn)(jax.ShapeDtypeStruct((2,), jax.numpy.uint32)).jaxpr
+    exported = (primitive for module in (jax.lax, jax_random) for attribute, primitive in vars(module).items()
+                if attribute.endswith("_p") and isinstance(primitive, jcore.Primitive))
+    return {primitive: primitive.name for primitive in (*exported, *each(traced), ad.add_jaxvals_p)}
+
+
+def jax_name(primitive) -> str | None:
+    """`primitive`'s name where it is JAX's own operation (`_jax_own`), None for any other: a primitive
+    of another library or of a user's takes any name, whatever it computes, so a reader that knows an
+    operation by its name knows it by its object. A call (`CALLS`) runs the program it holds, read as
+    such by its name."""
+    return _jax_own().get(primitive)
 
 
 def computed(value) -> TypeGuard[jcore.Var]:

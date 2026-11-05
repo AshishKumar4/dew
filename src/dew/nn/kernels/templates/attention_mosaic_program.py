@@ -564,7 +564,7 @@ def _entrywise(jaxpr: jax_core.Jaxpr, inputs: set[int], tile: tuple[int, int]) -
             if name not in CALLS or not all(
                     _entrywise(inner, set(read), tile) for inner in nested):
                 return False
-        elif name not in layout.ENTRYWISE and not (name == "broadcast_in_dim" and shapes[0] == ()):
+        elif not layout.entrywise(eqn):
             return False
         tainted.update(eqn.outvars)
     return True

@@ -10,7 +10,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import mosaic
+from dew.nn.kernels.templates import mosaic, resources
 
 
 class WgmmaIssuer(mosaic.Issuer):
@@ -21,6 +21,7 @@ class WgmmaIssuer(mosaic.Issuer):
 
     name = "wgmma"
     takes_tf32 = True
+    takes_fp8 = True
     rows = 64
     role_rows = 64
     widest_product = 256
@@ -62,10 +63,10 @@ class WgmmaIssuer(mosaic.Issuer):
     `scalar_registers`'."""
 
     def scalar_registers(self, addressed=()) -> int:
-        # The core words and a thread's own shared-memory addresses (`mosaic.addresses`), which the
+        # The core words and a thread's own shared-memory addresses (`resources.addresses`), which the
         # recurrence's states launches and the exact normed kernel gradient spilled without (28 to 392 bytes
         # at the four core words alone).
-        return self.held_registers + mosaic.addresses(addressed)
+        return self.held_registers + resources.addresses(addressed)
 
     def column_registers(self, columns: int, dtype) -> int:
         # The column layout repeats a vector over the warpgroup's four warps and eight lanes of each, so a
