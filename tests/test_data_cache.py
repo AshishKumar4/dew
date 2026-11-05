@@ -1472,18 +1472,25 @@ def test_a_local_fill_leaves_its_disks_headroom_free_whatever_its_budget(tmp_pat
     assert not list(tmp_path.rglob("*.array_record"))
 
 
-@pytest.mark.parametrize("full", ["spool", "root"])
-def test_an_optional_streamed_fill_with_no_room_stops_once_for_its_key(tmp_path, caplog, full):
-    """A stream's optional fill that runs out of room, in its spool or in a root that evicts nothing, stops
-    once: its later shards' records are computed and their writers write nothing, so a store of four
-    shards reports the stop as a store of one does, not once a shard (row 4296)."""
+@pytest.mark.parametrize("full", ["spool", "disk"])
+def test_an_optional_streamed_fill_with_no_room_stops_once_for_its_key(tmp_path, caplog, monkeypatch, full):
+    """A stream's optional fill that runs out of room, in its spool or on a disk a root that evicts nothing
+    writes to, stops once: its later shards' records are computed and their writers write nothing, so a
+    store of four shards reports the stop as a store of one does, not once a shard (row 4296)."""
     import logging
+    import shutil
+    from collections import namedtuple
     from uuid import uuid4
+
+    from dew.data.retention import DISK_HEADROOM
+
+    if full == "disk":
+        usage = namedtuple("usage", "total used free")
+        monkeypatch.setattr(shutil, "disk_usage", lambda path: usage(2**40, 2**40, DISK_HEADROOM))
 
     def warned(records: int) -> int:
         source = Memory([{"id": index} for index in range(records)], shard_rows=1)
-        budgets = ({"spool_bytes": 1, "keep_local_bytes": 1} if full == "spool"
-                   else {"keep_local_bytes": 1, "evicts": False})
+        budgets = {"spool_bytes": 1, "keep_local_bytes": 1} if full == "spool" else {"evicts": False}
         cache = Cache(str(tmp_path / str(records)), shard_bytes=1, optional=True, **budgets)
         manifest = source.manifest()
         reader = cache.streamed(manifest.reader, _key(f"halted-{uuid4().hex}"), source=source)
