@@ -295,10 +295,11 @@ class GpuTarget:
     where a step measured cuBLAS's GEMMs faster with them off, an A100's (26a01bc18), an L4's
     (71966bcea) and an H100's (0fb7f065e), unless a module the step runs keeps them (`TritonGemm`)."""
     late_weight_gradients: bool = False
-    """Whether XLA's schedule of a training step for this GPU runs every layer's weight gradient after the
-    whole backward where the step's head takes its gradient a tile at a time, unfused, holding the
-    products' operands to then (`dew.training.footprint.sunk`): an H100's, compiled for one at 80 GiB
-    (row 3341's calibration, `TARGETS`' comments)."""
+    """Whether XLA's schedule of a training step for this GPU runs its weight gradients after the whole
+    backward where the step's head takes its gradient a tile at a time, unfused, holding the products'
+    operands to then, as the derivation runs them (`dew.training.footprint.sunk`): an H100's every one, a
+    B200's and a B300's some, which running every one there bounds from above (row 3341's calibration,
+    compile-only, `TARGETS`' comments)."""
     step_seconds: float | None = None
     """One dependent step's latency on XLA's path: an iteration of a loop XLA lowers, its launches and its
     predicate, each reading the last (the work-span model's step, `templates.cost.Work.span`), measured per
@@ -496,8 +497,10 @@ TARGETS = {target.generation: target for target in (
               dense_peaks={'NVIDIA B200': {'bf16': 2.25e15, 'fp8': 4.5e15}}, multiprocessors=148,
               clock_hz=1965e6, memory_bandwidth=8e12,
               # Qwen3.5-0.8B's step at 8 x 3072 tokens under 'full', its head tiled and unfused, compiled for
-              # a B200 holds 22.9 GiB of temporaries, its weight gradients run after the backward, against
-              # 5.6 with the head fused (row 3341's calibration, compile-only).
+              # a B200 holds 22.9 GiB of temporaries, against 5.6 with the head fused: some of its weight
+              # gradients run after the backward, which the derivation bounds from above by running all
+              # there (43.4 derived; 8.5 with each in its layer's backward), row 3341's calibration,
+              # compile-only.
               late_weight_gradients=True),
     # Blackwell Ultra, datasheet alone and unmeasured, a compile-only sm103 device's facts: 160 SMs and
     # 8 TB/s (NVIDIA, "Inside NVIDIA Blackwell Ultra"), HGX B300's 2.25/4.5 PF dense bf16/fp8 a GPU (the
@@ -505,7 +508,10 @@ TARGETS = {target.generation: target for target in (
     # only XLA's own fusions in a compile-only target; a B300 run reads its own (`runtime_facts`).
     GpuTarget('sm103', 'NVIDIA B300', 227 * 1024,
               dense_peaks={'NVIDIA B300': {'bf16': 2.25e15, 'fp8': 4.5e15}}, multiprocessors=160,
-              clock_hz=1965e6, memory_bandwidth=8e12),
+              clock_hz=1965e6, memory_bandwidth=8e12,
+              # The B200's step above compiled for a B300 holds 13.9 GiB, 5.6 with the head fused: some
+              # weight gradients late, bounded from above as on a B200 (row 3341's calibration).
+              late_weight_gradients=True),
     GpuTarget('sm120', 'NVIDIA RTX PRO 6000 Blackwell Server Edition', 99 * 1024,
               dense_peaks={'NVIDIA RTX PRO 6000 Blackwell': {'bf16': 500e12, 'fp8': 1000e12}},
               aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1792e9,
