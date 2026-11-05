@@ -2370,12 +2370,14 @@ def matrix_data(read: str, cached: str, rejecting: bool, packed: bool, cache_dir
 
 def mode_decision_publish(args) -> dict:
     """The slot release at `--release`, placed over the pool's devices with its readout partitioned
-    across the processes (`Layout(min_shard=1)`), published as both publishers gather it: written by
-    `SafetensorsReload` into `--run-dir`, and exported as `NCCLPush` sends it, into the `.npz` beside
-    the report. Every process takes part; process 0 writes both."""
+    across the processes (`Layout(min_shard=1)`), published as both publishers read it: written by
+    `SafetensorsReload` into `--run-dir`, and exported as `NCCLPush` sends it, a tensor at a time read
+    home by the pool together (`reading_home`), into the `.npz` beside the report. Every process takes
+    part; process 0 writes both, the others read along."""
     import jax
     import jax.numpy as jnp
 
+    from dew._coordination import reading_home
     from dew.inference import rollouts
     from dew.interop import Pretrained
     from dew.training import Layout, MeshSpec
@@ -2385,11 +2387,59 @@ def mode_decision_publish(args) -> dict:
                              layout=Layout(min_shard=1, tolerance=1.0))
     written = rollouts.SafetensorsReload(placed, Path(args.run_dir), (), "vllm", dtype="float32")
     written.write(placed.variables)
-    published = rollouts._published(placed, placed.variables, jnp.dtype("float32"), phase="push gather")
-    if published is not None:
-        np.savez(args.out.with_suffix(".npz"), **published.export())
+    with reading_home("push export", writes=jax.process_index() == 0):
+        exported = rollouts._published(placed, placed.variables, jnp.dtype("float32")).export()
+        tensors = {name: exported[name] for name in sorted(exported)}
+    if jax.process_index() == 0:
+        np.savez(args.out.with_suffix(".npz"), **tensors)
     leaves = jax.tree.leaves(placed.head_variables)
     return {"partitioned": any(not leaf.is_fully_addressable for leaf in leaves)}
+
+
+def mode_served_refusals(args) -> dict:
+    """What a pool refuses to serve from one process's engine, on every process and before any program
+    compiles: an engine over a scoring server whose weights span the pool (`ScoringServer.pooled`), and a
+    served GRPO rollout, whose engine steps one process's server (`RolloutScheduler.served`, row 4279).
+    Each outcome is the error's text, or None for one that served, and the programs compiled meanwhile."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.inference import Engine
+    from dew.inference.scoring import ScoringServer
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.rl import GRPOObjective, RolloutScheduler
+    from dew.training import MeshSpec
+
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
+                              head_dim=8, mlp_features=32, max_seq_len=12,
+                              dtype="float32", attention_impl="xla")
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+    mesh = MeshSpec(fsdp=jax.device_count()).build()
+    pooled = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    weights = jax.tree.map(lambda leaf: jax.make_array_from_callback(
+        leaf.shape, pooled, lambda index: np.asarray(leaf)[index]), params)
+    compiled = []
+
+    def counted(event: str, duration: float, **_) -> None:
+        if event.endswith("backend_compile_duration"):
+            compiled.append(duration)
+
+    jax.monitoring.register_event_duration_secs_listener(counted)
+
+    def refused(call) -> str | None:
+        try:
+            call()
+        except ValueError as error:
+            return str(error)
+        return None
+
+    class Unscored:
+        """A scoring task whose passes none reaches: the engine refuses its server first."""
+
+    scoring = refused(lambda: Engine(ScoringServer(Unscored(), weights)))
+    served = refused(lambda: RolloutScheduler.served(GRPOObjective(model, seq_len=7, variables=params),
+                                                     lambda text, record: 0.0, tasks=1, slots=2))
+    return {"scoring": scoring, "served": served, "compiled": len(compiled)}
 
 
 def mode_matrix(args) -> dict:
@@ -2419,7 +2469,7 @@ def mode_matrix(args) -> dict:
 
 
 MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget, "schedule_fit": mode_schedule_fit,
-         "decision_publish": mode_decision_publish,
+         "decision_publish": mode_decision_publish, "served_refusals": mode_served_refusals,
          "host_training": mode_host_training, "step_fits": mode_step_fits,
          "whole_validation": mode_whole_validation, "host_fields": mode_host_fields,
          "topology": mode_topology, "data": mode_data, "online_data": mode_online_data,
