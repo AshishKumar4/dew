@@ -152,10 +152,12 @@ def _extension(checkout: str):
 
 
 def serve(checkout: str) -> None:
-    """The torch side: each request a line naming a case's inputs (an npz) and where to write mamba_ssm's
-    outputs and the oracle's (`<path>.reference.npz`, `<path>.truth.npz`), answered with a line `done`."""
+    """The torch side (tools/reference_worker.py's protocol): each request a case's inputs and its `dtype`,
+    answered with mamba_ssm's outputs and the oracle's (`reference.<leaf>`, `truth.<leaf>`), after one `ready`
+    line of mamba_ssm's version, the checkout's revision and the device."""
     import re
 
+    import reference_worker
     import torch
     from reference_source import git_head, package
 
@@ -167,40 +169,30 @@ def serve(checkout: str) -> None:
 
     init = Path(checkout, "mamba_ssm", "__init__.py").read_text()
     version = re.search(r'__version__ = "([^"]+)"', init).group(1)
-    print(f"ready {version} {git_head(checkout)} {torch.cuda.get_device_name()}", flush=True)
-    for line in sys.stdin:
-        path, dtype = line.split()
-        with np.load(path) as stored:
-            arrays = dict(stored)
-        np.savez(f"{path}.reference.npz", **mamba_ssm_run(selective_scan_fn, arrays, getattr(torch, dtype)))
-        np.savez(f"{path}.truth.npz", **minimal_truth(arrays))
-        print("done", flush=True)
+
+    def run(arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        dtype = str(arrays.pop("dtype"))
+        return reference_worker.paired(mamba_ssm_run(selective_scan_fn, arrays, getattr(torch, dtype)),
+                                       minimal_truth(arrays))
+
+    reference_worker.serve(run, f"{version} {git_head(checkout)} {torch.cuda.get_device_name()}")
 
 
 def write_seeded(worker) -> None:
     """Each case's seeded draws with mamba_ssm's outputs and gradients and their float64 truth (`worker`,
-    `serve`'s process), recorded as a summary (`record_case`), Dew's portable scan the sizing proxy and
+    `serve`'s `Session`), recorded as a summary (`record_case`), Dew's portable scan the sizing proxy and
     its float64 path held to the oracle at every seed (`assert_computes_the_oracle`)."""
-    import tempfile
-
     import jax
     import jax.numpy as jnp
     from recorded_references import held_to_the_oracle, provenance, record_case, save
     from reference_error import chain_roundings, widened
+    from reference_worker import arms
     from selective_support import selective_draw, selective_xla
 
-    _, version, revision, device = worker.stdout.readline().split(maxsplit=3)
-    requests = tempfile.mkdtemp(prefix="selective-")
+    version, revision, device = worker.started.split(maxsplit=2)
 
     def mamba_ssm(arrays, dtype: str):
-        path = os.path.join(requests, "inputs.npz")
-        np.savez(path, **arrays)
-        worker.stdin.write(f"{path} {dtype}\n")
-        worker.stdin.flush()
-        if worker.stdout.readline().strip() != "done":
-            raise RuntimeError("the torch process answered no request")
-        with np.load(f"{path}.reference.npz") as reference, np.load(f"{path}.truth.npz") as truth:
-            return dict(reference), dict(truth)
+        return arms(worker.ask({**arrays, "dtype": np.asarray(dtype)}))
 
     stored = {}
     for case, (*shape, dtype, regime) in SEEDED_CASES.items():
@@ -226,7 +218,7 @@ def write_seeded(worker) -> None:
         stored[f"{case}.shape"] = np.asarray(shape, np.int32)
         stored[f"{case}.regime"] = np.asarray(regime)
     stored["provenance"] = provenance(
-        f"mamba_ssm {version}", revision, device.strip(),
+        f"mamba_ssm {version}", revision, device,
         "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/mamba_selective_reference.py <checkout> "
         "<torch python>",
         truth="the recurrence one token at a time in torch float64, per document",
@@ -236,16 +228,14 @@ def write_seeded(worker) -> None:
 
 
 def main() -> None:
-    import subprocess
+    from reference_worker import session
 
     checkout = sys.argv[1]
     if sys.argv[2] == "--serve":
         serve(checkout)
         return
-    with subprocess.Popen([sys.argv[2], __file__, checkout, "--serve"], stdin=subprocess.PIPE,
-                          stdout=subprocess.PIPE, text=True) as worker:
+    with session([sys.argv[2], __file__, checkout, "--serve"]) as worker:
         write_seeded(worker)
-        worker.stdin.close()
 
 
 if __name__ == "__main__":
