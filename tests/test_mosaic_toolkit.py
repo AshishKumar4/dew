@@ -540,3 +540,83 @@ def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
 
     for index, (shape, array) in enumerate(zip(shapes, jax.jit(stacked)(), strict=True)):
         np.testing.assert_array_equal(array, np.full(shape, index + 1.0))
+
+
+PERSISTED_TILES, PERSISTED_STEPS, PERSISTED_DEPTH = 3, 2, 64
+
+
+def _persisted_products(x, w, *, family, interpret):
+    """`x @ w` a 128-row tile at a time through `family`'s persistent walk (`Family.persist`): tile `t` the
+    rows `128 t` on, each step `PERSISTED_DEPTH` of the contraction, the middle tile multiplying nothing
+    (zeros); each tile issued (`issue`'s walk) and finished (`Issuer.chunks`, each chunk stored at its
+    columns), on the family's roles."""
+    rows, columns = family.rows, w.shape[1]
+    shape = (rows, columns)
+    swizzle = mosaic.swizzle_for(x.dtype, PERSISTED_DEPTH)
+    blocks = {'x': ((rows, PERSISTED_DEPTH), x.dtype), 'w': ((PERSISTED_DEPTH, columns), w.dtype)}
+
+    def body(x_gmem, w_gmem, o_gmem):
+        def scope(*, streams):
+            def schedule(index):
+                tile = index[0]
+                views = {'x': (x_gmem, lambda j: (tile, j)), 'w': (w_gmem, lambda j: (j, 0))}
+                return tile != 1, PERSISTED_STEPS, views, tile
+
+            def issue(wg, tile, walk, *, active):
+                del wg, tile, active
+
+                def step(index, slots, carry, accumulators):
+                    del index
+                    (acc,) = accumulators
+                    return carry, (family.products(acc, slots['x'], slots['w'], interpret),)
+
+                return walk(step, None, (shape,))[1]
+
+            def finish(wg, tile, accs, store, *, active):
+                del wg, active
+                for first, (value,) in family.chunks(accs):
+                    store(0, value, o_gmem, (tile * rows, 0, rows, first, rows, mosaic.TILE_ROWS))
+
+            family.persist(streams, (PERSISTED_TILES,), schedule, issue, finish, consumers=1, axis="programs",
+                           outputs=((shape, jnp.float32),), interpret=interpret, accumulators=(shape,))
+
+        family.scoped(scope, streams=family.streams(blocks, 2, 1, swizzles={'x': swizzle, 'w': swizzle}))
+
+    out = jax.ShapeDtypeStruct((PERSISTED_TILES * rows, columns), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="persisted")(x, w)
+
+
+def _persisted_operands(rows: int):
+    """Small integers, so every tile's product is exact in fp32 whatever its order."""
+    keys = jax.random.split(jax.random.key(2))
+    depth = PERSISTED_STEPS * PERSISTED_DEPTH
+    x = jax.random.randint(keys[0], (PERSISTED_TILES * rows, depth), -4, 4).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[1], (depth, 128), -4, 4).astype(jnp.bfloat16)
+    return x, w
+
+
+@INTERPRETS
+def test_tcgen05_tiles_walk_into_tensor_memory_and_their_epilogue_reads_it_out_in_chunks():
+    """Interpreted: a persistent walk on tcgen05's bundle (`mosaic_sm100.RINGS`), its product warp issuing
+    each tile's steps into one of two accumulator turns in tensor memory and the epilogue reading each
+    tile's out in chunks, over three tiles (the turns wrap) with the middle one multiplying nothing: each
+    tile's rows exactly its product, the middle's zeros."""
+    from dew.nn.kernels.templates import mosaic_sm100
+    family = mosaic_sm100.RINGS
+    x, w = _persisted_operands(family.rows)
+    got = np.asarray(_persisted_products(x, w, family=family, interpret=INTERPRETED))
+    expected = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
+    expected[family.rows:2 * family.rows] = 0
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_the_tcgen05_persistent_walk_lowers_for_a_b200():
+    """The persistent walk on tcgen05's bundle lowers for a B200 on any host, as the GPU gate runs it."""
+    from dew.nn.kernels.templates import mosaic_sm100
+    family = mosaic_sm100.RINGS
+    x, w = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _persisted_operands(family.rows))
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm100")
+    with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(functools.partial(_persisted_products, family=family, interpret=False)).trace(x, w).lower(
+            lowering_platforms=("cuda",))

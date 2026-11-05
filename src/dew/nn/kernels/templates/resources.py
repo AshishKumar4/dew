@@ -125,7 +125,9 @@ def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int]
     share = rows // consumers
     fragments = operand_fragments(family, share, depth, columns, dtype, dtype,
                                  rhs_transposed=rhs_transposed)
-    accumulator = (share, columns, jnp.float32)
+    # The accumulator's columns its consumer holds at once: all of them, or an epilogue's chunk of one held
+    # in tensor memory (`Issuer.chunk_columns`).
+    accumulator = (share, family.chunk_columns(columns), jnp.float32)
     walk = live_registers(family, [accumulator], fragments)
     if not (family.stores_through_registers and stored):
         return walk
