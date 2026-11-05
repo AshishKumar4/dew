@@ -372,7 +372,8 @@ def test_a_grpo_run_draws_its_rollouts_ahead_from_dews_own_server(tmp_path):
     weights a copy of the run's first snapshot's, which the trainer's update donates and the server
     serves until its next push two updates on: by its third step a batch submitted a step ahead trails
     the trainer's weights (`rollout/lag/mean` above 0, which each step's own generation never does), each
-    weighted by the objective's behavior importance, and the server ends with the run. The run records the
+    weighted by the objective's behavior importance, a group's samples of a prompt reading its paged prompt
+    once (`--rollout.served.page-size`), and the server ends with the run. The run records the
     served settings and loads with them, and a record written before they existed loads as drawing each
     step's own (ledger 2695)."""
     import json
@@ -398,10 +399,11 @@ def test_a_grpo_run_draws_its_rollouts_ahead_from_dews_own_server(tmp_path):
                               str(tmp_path), "--trainer.compilation-cache-dir", "None",
                               "--trainer.multi-host", "False", "--trainer.log-every", "1",
                               "--rollout.served.slots", "8", "--rollout.served.sync-every", "2",
-                              "--rollout.served.max-lag", "2", "--objective.behavior-importance", "2.0"],
+                              "--rollout.served.max-lag", "2", "--rollout.served.page-size", "4",
+                              "--objective.behavior-importance", "2.0"],
                              default=default)
     assert config.rollout is not None
-    assert config.rollout.served == ServedRollout(slots=8, max_lag=2, sync_every=2)
+    assert config.rollout.served == ServedRollout(slots=8, max_lag=2, sync_every=2, page_size=4)
     state = config.run()
     assert int(state.step) == 3
     # The server and its reward pool end with the run: no engine or scorer thread outlives it.
