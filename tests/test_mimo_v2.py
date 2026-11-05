@@ -18,6 +18,10 @@ from dew.interop import Pretrained, codecs
 from dew.interop.sources import load_shards
 
 TINY = Path(__file__).parent / 'fixtures' / 'hf' / 'mimo-v2-tiny'
+WHOLE = Path(__file__).parent / 'fixtures' / 'hf' / 'mimo-v2-vl-tiny'
+"""The release with its towers, its audio tokenizer's folder and its prediction layer
+(tools/remote_code_reference.py), whose check 1 against the release is
+tests/test_remote_code_releases.py's."""
 
 
 def fixture(name):
@@ -113,17 +117,16 @@ def test_a_window_named_by_sliding_window_size_alone_loads_the_same_model(tmp_pa
     assert json.loads((tmp_path / 'saved' / 'config.json').read_text()) == config
 
 
-def test_the_towers_and_prediction_layers_ride_along_unread(tmp_path):
-    """A release's tower and prediction-layer tensors, which the text decoder
-    never runs, leave its logits as they were and are written back as they
-    came."""
+def test_the_towers_of_a_config_that_names_none_ride_along_unread(tmp_path):
+    """A checkpoint's tower tensors beside a config that names no tower, which
+    its text decoder never runs, leave its logits as they were and are
+    written back as they came."""
     source = tmp_path / 'release'
     shutil.copytree(TINY, source)
     tensors = load_file(TINY / 'model.safetensors')
     extra = {'visual.blocks.0.attn.qkv.weight': np.full((6, 4), 0.25, np.float32),
              'audio_encoder.layers.0.mlp.fc1.weight': np.arange(8, dtype=np.float32).reshape(2, 4),
-             'speech_embeddings.0.weight': np.ones((3, 4), np.float32),
-             'model.mtp.layers.0.enorm.weight': np.full((4,), 2.0, np.float32)}
+             'speech_embeddings.0.weight': np.ones((3, 4), np.float32)}
     save_file({**tensors, **extra}, source / 'model.safetensors')
     loaded, actual = logits(source)
     np.testing.assert_array_equal(actual, logits(TINY)[1])
@@ -131,6 +134,164 @@ def test_the_towers_and_prediction_layers_ride_along_unread(tmp_path):
     written = load_file(tmp_path / 'saved' / 'model.safetensors')
     for name, tensor in extra.items():
         np.testing.assert_array_equal(written[name], tensor, err_msg=name)
+
+
+def test_a_release_with_its_towers_loads_whole_and_saves_back_as_it_came(tmp_path):
+    """MiMo-V2.6 with its towers is a bundle its family reads whole (row 357): the decoder at the config's
+    root, the ViT and its merger, the audio encoder over the codes of the tokenizer the release keeps in a
+    folder of its own, and the prediction layer vLLM drafts with. It saves back every tensor it read under
+    its own name, the folder's in the folder beside the folder's config, the config as it was published,
+    and loads again to the same variables; its language model alone (`text_only`) computes the bundle's
+    logits over text bit for bit."""
+    import jax
+
+    from dew.nn.multimodal import MultimodalTransformer
+
+    loaded = Pretrained.load(WHOLE, dtype='float32', attention_impl='reference')
+    model = loaded.model
+    assert isinstance(model, MultimodalTransformer)
+    assert None not in (model.vision, model.projection, model.audio)
+    assert model.num_nextn_predict_layers == 1
+    loaded.save(tmp_path / 'saved')
+    for folder in (Path(), Path('audio_tokenizer')):
+        saved, released = tmp_path / 'saved' / folder, WHOLE / folder
+        assert (json.loads((saved / 'config.json').read_text())
+                == json.loads((released / 'config.json').read_text()))
+        written, read = load_file(saved / 'model.safetensors'), load_file(released / 'model.safetensors')
+        assert sorted(written) == sorted(read)
+        for name, tensor in read.items():
+            np.testing.assert_array_equal(written[name], tensor, err_msg=name)
+    again = Pretrained.load(tmp_path / 'saved', dtype='float32', attention_impl='reference')
+    jax.tree.map(np.testing.assert_array_equal, again.variables, loaded.variables)
+    text = Pretrained.load(WHOLE, dtype='float32', attention_impl='reference', text_only=True)
+    ids = np.load(WHOLE / 'input_ids.npy')
+    np.testing.assert_array_equal(np.asarray(model.apply(loaded.variables, ids)),
+                                  np.asarray(text.model.apply(text.variables, ids)))
+
+
+def test_a_release_without_its_audio_tokenizer_is_refused_whole_and_loads_as_text(tmp_path):
+    """A release whose config names its audio tower and whose folder lacks the tokenizer the tower reads
+    is refused whole, before any weight is read; its language model alone still loads."""
+    source = tmp_path / 'release'
+    shutil.copytree(WHOLE, source)
+    shutil.rmtree(source / 'audio_tokenizer')
+    with pytest.raises(ValueError):
+        Pretrained.load(source, dtype='float32', attention_impl='reference')
+    text = Pretrained.load(source, dtype='float32', attention_impl='reference', text_only=True)
+    assert text.model.num_nextn_predict_layers == 1
+
+
+@pytest.mark.parametrize('emptied', [('audio_config',), ('vision_config',),
+                                     ('vision_config', 'audio_config')],
+                         ids=['vision alone', 'audio alone', 'text alone'])
+def test_a_tower_section_that_states_nothing_builds_no_tower(tmp_path, emptied):
+    """MiMoV2Config reads an absent tower section as `{}` and MiMoV2ForCausalLM builds a tower only for a
+    section that states something, so a release that saves one empty is the model without that tower: its
+    other tower loads, without the audio tokenizer's folder where audio is gone, an audio-only release
+    states no image placeholder, and with neither the release is its text decoder. The decoder computes
+    the whole release's logits over text, bit for bit, and the absent tower's tensors ride along."""
+    from dew.nn.multimodal import MultimodalTransformer
+
+    def edit(config):
+        config.update({section: {} for section in emptied})
+        if 'vision_config' in emptied:
+            config['image_token_id'] = None
+        return config
+
+    source = respelled(WHOLE, tmp_path / 'release', edit)
+    if 'audio_config' in emptied:
+        shutil.rmtree(source / 'audio_tokenizer')
+    loaded = Pretrained.load(source, dtype='float32', attention_impl='reference')
+    whole = Pretrained.load(WHOLE, dtype='float32', attention_impl='reference')
+    model = loaded.model
+    if len(emptied) == 2:
+        assert not isinstance(model, MultimodalTransformer)
+    else:
+        assert isinstance(model, MultimodalTransformer)
+        assert (model.vision is None, model.audio is None) == ('vision_config' in emptied,
+                                                              'audio_config' in emptied)
+    ids = np.load(WHOLE / 'input_ids.npy')
+    np.testing.assert_array_equal(np.asarray(model.apply(loaded.variables, ids)),
+                                  np.asarray(whole.model.apply(whole.variables, ids)))
+
+
+@pytest.mark.parametrize('stated', [None, 0, 1])
+def test_a_trunk_of_full_layers_alone_builds_the_prediction_layer_its_config_states(stated):
+    """A prediction layer attends with the sliding geometry its config states (vLLM's `MiMoV2MTPLayer`,
+    whatever the trunk's pattern): a trunk of full layers alone builds none where its config states none
+    or 0 (Dew's export of such a model), and one it states attends with the `swa_*` query and key heads and
+    width, the window, the sliding base and the sliding sinks, in a kind no trunk layer has. Its values are
+    the model's width, which no kind sets apart, so another value width is refused by name."""
+    from dew.interop.hf_decoders import translate_config
+
+    config = {**json.loads((TINY / 'config.json').read_text()), 'hybrid_layer_pattern': [0, 0, 0, 0],
+              **PREDICTOR}
+    if stated is not None:
+        config['num_nextn_predict_layers'] = stated
+    fields = translate_config(config)
+    assert fields['num_nextn_predict_layers'] == (stated or 0)
+    if stated:
+        attending = fields['kinds'][fields['mtp_layer_type']]
+        assert fields['mtp_layer_type'] not in fields['layer_types']
+        assert ((attending['num_heads'], attending['head_dim'], attending['num_kv_heads'],
+                 attending['window'], attending['rope_theta'], attending['sinks'])
+                == (2, 24, 1, config['sliding_window_size'], config['swa_rope_theta'], True))
+        with pytest.raises(ValueError):
+            translate_config({**config, 'swa_v_head_dim': 12})
+
+
+PREDICTOR = {'swa_num_attention_heads': 2, 'swa_num_key_value_heads': 1, 'swa_head_dim': 24,
+             'swa_v_head_dim': 8}
+"""A prediction layer's sliding geometry other than the tiny trunk's: half its query heads, one key head,
+twice its width."""
+
+
+def test_a_fused_prediction_layer_of_its_own_geometry_loads_and_saves_back_as_it_came(tmp_path):
+    """A trunk of full layers alone, stored fused as the Pro release stores itself, beside a prediction layer
+    whose fused q, k and v runs are its own geometry (`PREDICTOR`), as vLLM reads them: the layer's runs
+    split by its own kind (`Packed.owner`), its depth built of them, and every tensor written back as it
+    came, fused in its own runs."""
+    config = {**json.loads((TINY / 'config.json').read_text()), 'hybrid_layer_pattern': [0, 0, 0, 0],
+              'attention_projection_layout': 'fused_qkv', 'num_nextn_predict_layers': 1, **PREDICTOR}
+    rng = np.random.default_rng(357)
+    tensors = {name: tensor for name, tensor in load_file(TINY / 'model.safetensors').items()
+               if not name.endswith('attention_sink_bias')}
+    stem, width, inner = 'model.mtp.layers.0.', config['hidden_size'], config['intermediate_size']
+    run = PREDICTOR['swa_num_attention_heads'] * PREDICTOR['swa_head_dim'] + PREDICTOR['swa_head_dim'] + 8
+    drawn = {'enorm.weight': (width,), 'hnorm.weight': (width,), 'eh_proj.weight': (width, 2 * width),
+             'input_layernorm.weight': (width,), 'self_attn.qkv_proj.weight': (run, width),
+             'self_attn.o_proj.weight': (width, PREDICTOR['swa_num_attention_heads'] * 8),
+             'self_attn.attention_sink_bias': (PREDICTOR['swa_num_attention_heads'],),
+             'pre_mlp_layernorm.weight': (width,), 'mlp.gate_proj.weight': (inner, width),
+             'mlp.up_proj.weight': (inner, width), 'mlp.down_proj.weight': (width, inner),
+             'final_layernorm.weight': (width,)}
+    tensors = {**fused(tensors, config),
+               **{stem + name: rng.normal(size=shape).astype(np.float32) for name, shape in drawn.items()}}
+    source = tmp_path / 'fused'
+    source.mkdir()
+    (source / 'config.json').write_text(json.dumps(config))
+    save_file(tensors, source / 'model.safetensors')
+    loaded, _ = logits(source)
+    assert loaded.model.num_nextn_predict_layers == 1
+    loaded.save(tmp_path / 'saved')
+    written = load_file(tmp_path / 'saved' / 'model.safetensors')
+    assert sorted(written) == sorted(tensors)
+    for name, tensor in tensors.items():
+        np.testing.assert_array_equal(written[name], tensor, err_msg=name)
+
+
+def test_a_release_without_a_processor_of_its_own_refuses_raw_media_and_reads_its_fields():
+    """MiMo-V2.6 ships no processor, only its config's `processor_config`: raw images are refused, and the
+    processed fields it states lay out into the model's inputs (`Processor.from_hf`)."""
+    from remote_code_draws import draw
+
+    loaded = Pretrained.load(WHOLE, dtype='float32', attention_impl='reference')
+    with pytest.raises(ValueError):
+        loaded.processor('w1 w2', images=[np.zeros((8, 8, 3), np.uint8)])
+    drawn = draw('image', 0, dict(loaded.config))
+    fields = loaded.processor.from_hf({'input_ids': drawn['ids'], 'pixel_values': drawn['pixel_values'],
+                                       'image_grid_thw': drawn['image_grid_thw']})
+    assert int((np.asarray(fields.token_fields['image_indices']) >= 0).sum()) == 6
 
 
 STORED = {'quant_method': 'fp8', 'fmt': 'e4m3', 'weight_block_size': [128, 128],
