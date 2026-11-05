@@ -183,7 +183,7 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
             try:
                 profiler.stop(wait=False)
             except telemetry_profile.ExportFailed as failure:
-                _log.warning("the run's profile window traced, and its manifest was not written: %s (%s)",
+                _log.warning("the profile window traced, and its manifest was not written: %s (%s)",
                              failure, failure.exceptions)
             except BaseException as failure:
                 if primary is None:

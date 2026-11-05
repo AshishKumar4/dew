@@ -680,15 +680,18 @@ def test_a_runs_persistent_and_local_checkpoints_hold_one_envelope(tmp_path):
 
         submitted: ClassVar[dict[tuple[str, int], dict]] = {}
 
+        def kept(self, tier: str, step, args, fields):
+            """What `tier`'s save of `step` was handed, by its parameters' names, saved as it was asked."""
+            written = getattr(Checkpoints, tier)
+            self.submitted.setdefault((tier, step), inspect.signature(written).bind(
+                self, step, *args, **fields).arguments)
+            return written(self, step, *args, **fields)
+
         def save(self, step, *args, **fields):
-            bound = inspect.signature(Checkpoints.save).bind(self, step, *args, **fields).arguments
-            self.submitted.setdefault(("save", step), bound)
-            return super().save(step, *args, **fields)
+            return self.kept("save", step, args, fields)
 
         def save_local(self, step, *args, **fields):
-            bound = inspect.signature(Checkpoints.save_local).bind(self, step, *args, **fields).arguments
-            self.submitted.setdefault(("save_local", step), bound)
-            return super().save_local(step, *args, **fields)
+            return self.kept("save_local", step, args, fields)
 
     for name, tiers in (("persistent", {}), ("local", {"local_directory": str(tmp_path / "local"),
                                                      "local_every": 2})):
