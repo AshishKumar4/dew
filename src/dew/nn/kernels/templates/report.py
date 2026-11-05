@@ -501,13 +501,13 @@ class Binary:
     stack frame's bytes a thread, nonzero where its registers spill (`REGISTER_COUNT`, `FRAME_SIZE`), the
     dynamic shared memory its launch asks for (a Mosaic kernel proto's `smem_bytes`, a custom kernel's
     `shared_memory_bytes`), None where its proto states none, and, read `decoded`, what its machine code
-    breaks of the SASS rules (`sass_findings`)."""
+    breaks of the SASS rules (`sass_findings`), None where no disassembler read it."""
     kernel: str
     launch: str | None
     registers: int
     frame: int
     shared: int | None = None
-    sass: tuple[str, ...] = ()
+    sass: tuple[str, ...] | None = ()
 
 
 def binaries(executable: jax.stages.Compiled, *, decoded: bool = False) -> list[Binary]:
@@ -642,9 +642,8 @@ def _binary(function: str, elf: bytes, decoded: bool = False) -> Binary:
 
 def disassembler() -> Path | None:
     """NVIDIA's nvdisasm, which the SASS rules read a kernel's machine code through (`sass_findings`): the
-    nvdisasm wheel's (`nvidia/cu13/bin`, the kernel-compile extra's, beside the nvcc wheel's ptxas) or the
-    PATH's; None where neither is installed, a user's install among them, where the gate reads ptxas's
-    notes alone."""
+    nvdisasm wheel's (`nvidia/cu13/bin`, the kernel-compile and CUDA extras', beside the nvcc wheel's
+    ptxas) or the PATH's; None where neither is installed, a user's install among them."""
     spec = importlib.util.find_spec("nvidia")
     for root in (spec.submodule_search_locations or ()) if spec else ():
         if (found := Path(root) / "cu13" / "bin" / "nvdisasm").is_file():
@@ -653,12 +652,12 @@ def disassembler() -> Path | None:
     return None if found is None else Path(found)
 
 
-def sass_findings(elf: bytes) -> tuple[str, ...]:
+def sass_findings(elf: bytes) -> tuple[str, ...] | None:
     """What the machine code of the cubin `elf` breaks of the SASS rules (`sass_findings_of`, nvdisasm's
-    listing of it), none where no disassembler is installed (`disassembler`)."""
+    listing of it); None where no disassembler is installed (`disassembler`), the rules unread."""
     tool = disassembler()
     if tool is None:
-        return ()
+        return None
     with tempfile.NamedTemporaryFile(suffix=".cubin") as cubin:
         cubin.write(elf)
         cubin.flush()
