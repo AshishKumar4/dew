@@ -39,9 +39,9 @@ from reference_error import (
     rows_summary,
     seeds_for,
     seeds_resolving,
-    truth_sketch,
     widened,
 )
+from truth_sketch import truth_sketch
 
 __all__ = ["merge_shards", "provenance", "record_case", "record_distances", "record_logits",
            "record_reference", "record_shard", "save", "with_pilots"]

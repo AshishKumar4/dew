@@ -2016,7 +2016,8 @@ def test_a_truths_sketch_rounds_alike_in_any_order_and_refuses_an_overflowing_or
     block of SKETCH_BLOCK summed from its other end as another host may; a
     truth recomputed far past float64's range is refused, not passed on an infinite bound; and an empty
     leaf's evidence is exact, its reference's dtype kept."""
-    from reference_error import SKETCH, _sign_bits, leaf_summary, sketch_rounding, truth_sketch
+    from reference_error import leaf_summary
+    from truth_sketch import SKETCH, _sign_bits, sketch_rounding, truth_sketch
 
     rng = np.random.default_rng(7)
     truth = rng.normal(size=4096)
@@ -2144,7 +2145,7 @@ def test_a_truths_sketch_is_its_exact_signed_sums_within_its_rounding(size):
     bit for bit where they do not)."""
     import math
 
-    from reference_error import SKETCH, _sign_bits, sketch_rounding, truth_sketch
+    from truth_sketch import SKETCH, _sign_bits, sketch_rounding, truth_sketch
 
     rng = np.random.default_rng(size)
     values = rng.standard_normal(size) * 10.0 ** rng.uniform(-30, 30, size)
