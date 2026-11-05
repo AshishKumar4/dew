@@ -760,7 +760,12 @@ _SELECTED: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("de
 def selected(rows: jax.Array) -> Iterator[None]:
     """Run an adapter set's model (`AdapterSet`) with each row of the call's batch under its own adapter:
     `rows` `[B]` int32 holds each row's adapter's place in `AdapterSet.names`, -1 for the base model
-    alone. A served row's adapter is its request's (`dew.inference.Server.submit`)."""
+    alone. A served row's adapter is its request's (`dew.inference.Server.submit`).
+
+    Enter it inside the traced program, with `rows` one of the program's traced arguments, as the
+    server's step programs do (`dew.inference.serving_kernel`): a jit cache keys on a program's arguments
+    and never sees a context variable, so rows set around a jitted call would be baked into its first
+    trace and every later call with other rows would reuse it."""
     token = _SELECTED.set(rows)
     try:
         yield
