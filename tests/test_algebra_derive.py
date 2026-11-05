@@ -207,9 +207,11 @@ def held(q, k, v, rows, keys):
 
 
 def held_floored(q, k, v, rows, keys):
-    """The held form over each query's keys up to its own place, its maximum floored at fp32's least finite
-    value (`attention_algebra.softmax_of`'s), so a query that sees no key weighs every key 0."""
-    s = jnp.where(keys[None, :] <= rows[:, None], (q @ k.T) * WIDTH ** -0.5, -jnp.inf)
+    """The held form over each query's keys up to its own place, the first query seeing none, its maximum
+    floored at fp32's least finite value (`attention_algebra.softmax_of`'s), so that query weighs every key
+    0."""
+    seen = (keys[None, :] <= rows[:, None]) & (rows[:, None] > 0)
+    s = jnp.where(seen, (q @ k.T) * WIDTH ** -0.5, -jnp.inf)
     safe = jnp.maximum(jnp.max(s, axis=-1), jnp.finfo(s.dtype).min)[:, None]
     p = jnp.exp(jnp.where(s < safe, s - safe, 0.0))
     return (p @ v) / jnp.where(jnp.sum(p, axis=-1) == 0, 1.0, jnp.sum(p, axis=-1))[:, None]
