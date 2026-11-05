@@ -257,13 +257,13 @@ def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, pa
 
 
 def test_packing_a_calls_heads_into_its_rows_is_undone_by_unpacking():
-    """A key head's group of query heads as its rows (`packed`) and back (`unpacked`): the query as it was,
-    each packed row's keys its query's."""
+    """A key head's group of query heads as its rows (`packed`) and back (`template.ungrouped_rows`): the
+    query as it was, each packed row's keys its query's."""
     query = jax.random.normal(jax.random.key(0), (2, 3, 8, 16))
     spans = _spans(3)
     rows, row_spans, _ = attention_decode.packed(query, spans, 2)
     assert rows.shape == (2, 12, 2, 16)
-    np.testing.assert_array_equal(attention_decode.unpacked(rows, 8), query)
+    np.testing.assert_array_equal(template.ungrouped_rows(rows, 8), query)
     np.testing.assert_array_equal(row_spans.start, np.repeat(np.asarray(spans.start), 4, axis=1))
 
 
