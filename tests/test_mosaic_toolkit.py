@@ -436,6 +436,42 @@ def test_a_launch_with_a_producer_takes_the_plan_holding_the_most_bytes_in_fligh
     assert (single.programs, single.stages) == (3, 1)
 
 
+def _vector_scaled(scale, x, axis: str, *, interpret: bool):
+    """An sm80 program scaling a 64 x 128 accumulator by a side vector along `axis` ('rows' or 'columns'),
+    the vector loaded as an epilogue's side tile is (`Family.loaded`, its axes stated)."""
+    from dew.nn.kernels.templates import mosaic_sm80
+
+    family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16))
+
+    def body(scale_gmem, x_gmem, out_gmem):
+        def scoped(scale_smem, barrier):
+            family.loaded([(scale_gmem, scale_smem, barrier.at[0])], axes=((axis,),))
+            vector = scale_smem[...]
+            acc = plgpu.load(x_gmem, layout=family.layout, optimized=False)
+            out_gmem[...] = acc * (vector[:, None] if axis == "rows" else vector[None, :])
+
+        pl.run_scoped(scoped, plgpu.SMEM(scale.shape, scale.dtype), plgpu.Barrier(num_barriers=1))
+
+    out = jax.ShapeDtypeStruct(x.shape, jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="vector_scaled")(scale, x)
+
+
+@pytest.mark.parametrize("axis", ["rows", "columns"])
+def test_an_sm80_side_vector_loads_in_the_layout_of_the_axis_it_follows(axis):
+    """An mma.sync epilogue's side vector is loaded in the accumulator's layout of the axis it follows (a
+    row scale `[rows]` in its rows' vector layout, read as `s[:, None]`; a column scale in its columns'),
+    so a row-scaled epilogue lowers for an A100 (row 2100's K18: every vector was loaded in the columns'
+    layout, and a row scale found no layout)."""
+    rows, columns = 64, 128
+    scale = jax.ShapeDtypeStruct((rows if axis == "rows" else columns,), jnp.float32)
+    x = jax.ShapeDtypeStruct((rows, columns), jnp.float32)
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
+    with generation.assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(functools.partial(_vector_scaled, axis=axis, interpret=False)).trace(scale, x).lower(
+            lowering_platforms=("cuda",))
+
+
 def test_a_light_launch_is_held_within_the_threads_its_multiprocessor_runs():
     """A one-warpgroup mma.sync launch of a few registers a thread on an L4 (sm89), whose multiprocessor runs
     1536 threads in at most 24 blocks (CUDA C++ Programming Guide §5.1, Table 33): its registers would hold
