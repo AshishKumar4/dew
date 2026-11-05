@@ -11,9 +11,10 @@ import pytest
 from reference_error import as_given, assert_as_exact, widened
 
 from dew import algebra
-from dew.decision import Budget, Choice, Decide
+from dew.decision import Budget, Choice, Decide, DecisionInputs
 from dew.decision.model import DecisionModel
 from dew.interop import Pretrained
+from dew.registry import ModelConfig
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -38,9 +39,10 @@ def copies(request, tmp_path_factory):
                    budget=Budget(rows=1, tokens=2048))
     with jax.enable_x64(new_val=True):
         model = task.model
-        wide = replace(task, model=DecisionModel(model.backbone.clone(dtype=jnp.float64),
-                                                 model.head.clone(dtype=jnp.float64)),
-                       variables=widened(task.variables))
+        wide_model = DecisionModel(
+            ModelConfig.from_model(model.backbone).with_dtype("float64").build(),
+            model.head.clone(dtype=jnp.float64))
+        wide = replace(task, model=wide_model, variables=widened(task.variables))
 
     @functools.lru_cache(maxsize=128)
     def rows_of(seed):
@@ -68,9 +70,16 @@ def copies(request, tmp_path_factory):
     assert tuple(row.questions[0].order for row in rows[:2]) == ORDERS
     assert rows[0].tokens != rows[1].tokens
     print("ROTATED_SETUP", dtype, [len(row.tokens) for row in rows], plan.windows(), flush=True)
+    print("ROTATED_STORED_DTYPES", dtype,
+          sorted({str(leaf.dtype) for leaf in jax.tree.leaves(task.variables)}), flush=True)
     print("ROTATED_NATIVE_ALONE", dtype, probabilities(task, 0, False).tolist(), flush=True)
     print("ROTATED_NATIVE_PACKED", dtype, probabilities(task, 0, True).tolist(), flush=True)
     with jax.enable_x64(new_val=True), algebra.passes(False):
+        from float64_terms import float32_values
+
+        inputs = DecisionInputs.collate(rows[:1], task.specials.pad)
+        traced = jax.make_jaxpr(wide.model.logits)(wide.variables, inputs)
+        print("ROTATED_TRUTH_FLOAT32_VALUES", dtype, float32_values(traced.jaxpr), flush=True)
         reference = probabilities(wide, 0, False)
         packed = probabilities(wide, 0, True)
     print("ROTATED_FLOAT64_ALONE", dtype, reference.tolist(), flush=True)

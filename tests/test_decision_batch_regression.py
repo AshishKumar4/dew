@@ -109,6 +109,7 @@ def test_mixed_joint_probabilities_against_float64(tmp_path, dtype):
     from reference_error import as_given, assert_as_exact, widened
 
     from dew.decision.model import DecisionModel
+    from dew.registry import ModelConfig
 
     source = tmp_path / "release"
     source.mkdir()
@@ -123,8 +124,9 @@ def test_mixed_joint_probabilities_against_float64(tmp_path, dtype):
     long = ("invoice " * 20, {"q": Choice("which department", ["billing", "technical", "sales",
                                                              "support", "account", "other"])})
     rows = [own[0] for own in task.rows([short, long])]
-    wide_model = DecisionModel(task.model.backbone.clone(dtype=jnp.float64),
-                               task.model.head.clone(dtype=jnp.float64))
+    wide_model = DecisionModel(
+        ModelConfig.from_model(task.model.backbone).with_dtype("float64").build(),
+        task.model.head.clone(dtype=jnp.float64))
     wide = replace(task, model=wide_model)
 
     def probabilities(held, variables, together):
