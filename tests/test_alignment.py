@@ -10,15 +10,8 @@ import numpy as np
 import pytest
 from diffusion_support import TanhLayer
 from flax import linen as nn
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_over_orders,
-    distance,
-    indexed_recording,
-    recording,
-)
-from tool_support import run_from
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_over_orders, distance
 
 from dew.diffusion import presets
 from dew.inference import TextToImage
@@ -111,7 +104,7 @@ def test_the_objective_adds_the_weighted_alignment_to_the_denoising_mean(kind):
 
 
 COMPOSED = np.load(Path(__file__).resolve().parent / "fixtures" / "repa" / "composed.npz")
-PREPROCESSED = recording(Path(__file__).resolve().parent / "fixtures" / "repa" / "preprocessed.npz")
+PREPROCESSED = np.load(Path(__file__).resolve().parent / "fixtures" / "repa" / "preprocessed.npz")
 
 
 class Network(nn.Module):
@@ -229,23 +222,13 @@ def test_the_encoders_input_is_repas_and_irepas_dinov2_preprocessing(spatial_nor
     ("dinov2") and iREPA's `DINOv2Encoder.preprocess`, which agree (the
     reference checks), /255, ImageNet's normalization and torch's bicubic
     resize, and under iREPA its `spatial_zscore` (gamma 0.6) of the
-    features, on par with the published float32 run over drawn images (check 1, the recording's summary
-    of its evidence), the truth Dew's float64 run held to the sketch of the published one."""
+    features, held to the published float64 run by the float64 rule."""
     from dew.inputs import unit_range
 
     alignment = Alignment("block", encoder=Unchanged(), resolution=224, spatial_norm=spatial_norm)
+    targets = alignment.targets({}, unit_range(PREPROCESSED["pixels"]))
     name = "dinov2" if spatial_norm is None else "zscore"
-    import torch
-
-    with run_from("repa_reference", "tools") as generator:
-        redraw, preprocess = generator.preprocessed_draw, generator.preprocess
-    seeds = int(PREPROCESSED["preprocessed.seeds"])
-    # The truth the published preprocessing in float64 (Dew's targets resize in its compute dtype).
-    draw, reference, truth = indexed_recording(
-        PREPROCESSED, "preprocessed", seeds, inputs_of=redraw, leaves=(name,),
-        truth_fn=as_given(lambda inputs: {name: preprocess(inputs["pixels"], torch.float64)[name]}))
-    assert_as_exact(lambda index, inputs: {name: alignment.targets({}, unit_range(inputs["pixels"]))},
-                    reference, draw, name, seeds=seeds, truth_fn=truth)
+    assert_as_exact_as_the_reference(targets, PREPROCESSED[name], PREPROCESSED[f"{name}_f64"], name)
 
 
 def test_a_layer_the_model_lacks_is_refused():
