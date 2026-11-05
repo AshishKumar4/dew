@@ -22,6 +22,7 @@ from dew._records import boolean, integer, record, text
 from dew.batch import Batch
 from dew.data.dataset import LONG_RUN, logged_run
 from dew.data.pipeline import Owed, Record, Rejected, accounts, member_of, members_of
+from dew.data.shared import Shared
 
 _log = logging.getLogger(__name__)
 
@@ -223,16 +224,40 @@ class _KeepAccepted:
         self.owed = Owed()
         """The source examples the rows it rejected since the last it kept were the last of (`CONSUMED`),
         which that next row carries on (`_AcceptedIterator`)."""
+        self.rejections = 0
+        """How many records it rejected, its own and its members', counted as it rejects them."""
+        self._states: Shared[Mapping[str, object]] | None = None
+        self._touched: set[str] = set(self.members)
+        """The members whose counts moved since `_states` was made, which alone a capture makes again."""
 
     def _of(self, member: str | None) -> CorpusCounts:
         """The counts a row of `member` (`MEMBER`) is counted under: its member's, else the counter's own."""
         if member is None or not self.members:
             return self.counts
+        self._touched.add(member)
         return self.members[member]
+
+    def member_states(self) -> Shared[Mapping[str, object]]:
+        """Each member's counts as they stand, by member key (`MEMBERS`): the states captured before, the
+        members' that moved since made again, the rest shared with them (`Shared`), so a capture before
+        each record costs it the members it counted, not every member (row 4079)."""
+        touched = {key: {"corpus": self.members[key].name, "label": self.members[key].label,
+                         "counts": self.members[key].state()} for key in self._touched}
+        self._states = Shared.of(touched) if self._states is None else self._states.replaced(touched)
+        self._touched.clear()
+        return self._states
+
+    def restored(self) -> None:
+        """Every member's counts and the rejections as a restore left them: each member's state made again
+        at its next capture, the rejections counted afresh."""
+        self._touched = set(self.members)
+        self.rejections = sum(sum(counts.rejected.values())
+                              for counts in (self.counts, *self.members.values()))
 
     def __call__(self, element: Batch | Rejected) -> TypeGuard[Batch]:
         self.counts.attempted += 1
         if isinstance(element, Rejected):
+            self.rejections += 1
             reason = element.reason
             self.owed.owe(element.consumed)
             self._of(element.member).dropped(element)
@@ -245,10 +270,11 @@ class _KeepAccepted:
                 self.consecutive = 0
                 return True
             reason = "zero_targets"
+            self.rejections += 1
             self.owed.owe(accounts(element)[0])
             self._of(member_of(element)).rejected[reason] += 1
         self.consecutive += 1
-        if not self.warned and self._rejected_count() / self.counts.attempted > _WARN_OVER:
+        if not self.warned and self.rejections / self.counts.attempted > _WARN_OVER:
             _log.warning("corpus %s rejected more than %.1f%% of attempted records (%s)",
                          self.counts.label, _WARN_OVER * 100, reason)
             self.warned = True
@@ -276,11 +302,6 @@ class _KeepAccepted:
         only where a raise or a log names the reasons, never a row at a time (row 3531)."""
         return sum((counts.rejected for counts in self.members.values()), self.counts.rejected.copy())
 
-    def _rejected_count(self) -> int:
-        """How many records it rejected, its own and its members', summed without merging their reasons:
-        read at each rejection only until it warns."""
-        return sum(sum(counts.rejected.values()) for counts in (self.counts, *self.members.values()))
-
     def _delivered(self, element: Batch) -> None:
         """Count a row delivered: under its member where a mixture's last counter credits its members,
         each member the examples its rows complete (`MEMBERS`), the row's own counts its member's."""
@@ -292,6 +313,7 @@ class _KeepAccepted:
         owner = self._of(own)
         for member, examples in completed.items():
             if member != own:
+                self._touched.add(member)
                 self.members[member].accepted += examples
         owner.delivered(element, 0 if own is None else completed.get(own, 0))
 
@@ -362,11 +384,9 @@ class _AcceptedIterator(_CountedIterator[Batch]):
 
     def _counted(self) -> Mapping[str, object]:
         # A mixture's counter keeps its members' counts beside its own, by member key (`MEMBERS`).
-        members = {key: {"corpus": counts.name, "label": counts.label, "counts": counts.state()}
-                   for key, counts in self._predicate.members.items()}
         return {**super()._counted(), "consecutive": self._predicate.consecutive,
                 "warned": self._predicate.warned, "consumed": self._predicate.owed.examples,
-                "members": members}
+                "members": self._predicate.member_states()}
 
     def _restore(self, counted: Mapping[str, object]) -> None:
         super()._restore(counted)
@@ -378,6 +398,7 @@ class _AcceptedIterator(_CountedIterator[Batch]):
         for key, counts in self._predicate.members.items():
             if key in members:
                 counts.restore(record(record(members[key], "member counter")["counts"], "member counts"))
+        self._predicate.restored()
 
 
 class Carried(pygrain.IterDataset[Batch]):
@@ -486,6 +507,7 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         super().__init__(reads)
         self._reads, self._weights, self._tokens, self._keys = tuple(reads), weights, tokens, keys
         self._delivered = [0] * len(reads)
+        self._parents = _Captured(dict(zip(keys, self._reads, strict=True)))
 
     def __next__(self) -> Batch:
         total = sum(self._delivered)
@@ -494,6 +516,7 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
             range(len(self._reads)),
             key=lambda index: self._weights[index] * total - self._delivered[index] * scale,
         )
+        self._parents.moved(self._keys[chosen])
         value = next(self._reads[chosen])
         tokens = self._tokens(value)
         if tokens <= 0:
@@ -504,10 +527,8 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         return value
 
     def get_state(self) -> Mapping[str, object]:
-        return {
-            "parents": {key: read.get_state() for key, read in zip(self._keys, self._reads, strict=True)},
-            "delivered": dict(zip(self._keys, self._delivered, strict=True)),
-        }
+        return {"parents": self._parents.captured(),
+                "delivered": dict(zip(self._keys, self._delivered, strict=True))}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         """Restore each corpus the state keeps by its key, and start one it keeps none of where its
@@ -522,6 +543,7 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         if any(count < 0 for count in delivered.values()):
             raise ValueError("token deficit state has negative delivered targets")
         kept = [key in parents for key in self._keys]
+        self._parents.restored()
         for key, read in zip(self._keys, self._reads, strict=True):
             if key in parents:
                 read.set_state(record(parents[key], "corpus iterator"))
@@ -883,6 +905,31 @@ class KeyedMix(pygrain.IterDataset[Batch]):
         return iter(pygrain.IterDataset.mix(parents, weights))
 
 
+class _Captured:
+    """A mix's corpora's positions by key, captured before each record the mix gives: the corpus it read
+    since the last capture captured again, every other's shared with it (`Shared`), so a capture costs
+    a record the corpus it read, not every corpus (row 4079)."""
+
+    def __init__(self, reads: Mapping[str, pygrain.DatasetIterator[Batch]]):
+        self._reads = reads
+        self._held: Shared[Mapping[str, object]] | None = None
+        self._moved: set[str] = set(reads)
+
+    def moved(self, key: str) -> None:
+        """Corpus `key` read, its position captured again at the next capture."""
+        self._moved.add(key)
+
+    def restored(self) -> None:
+        """Every corpus restored, each captured again at the next capture."""
+        self._moved = set(self._reads)
+
+    def captured(self) -> Shared[Mapping[str, object]]:
+        changed = {key: self._reads[key].get_state() for key in self._moved}
+        self._held = Shared.of(changed) if self._held is None else self._held.replaced(changed)
+        self._moved.clear()
+        return self._held
+
+
 class _SeededMix(pygrain.DatasetIterator[Batch]):
     """A keyed mix's reads (`KeyedMix`) in the corpus order a seeded `Proportions` gives each position,
     its position saved as Grain saves its own mix's: each corpus's under its key, the positions read
@@ -892,24 +939,27 @@ class _SeededMix(pygrain.DatasetIterator[Batch]):
         super().__init__()
         self._reads, self._keys, self._proportions = dict(reads), tuple(reads), proportions
         self._index, self._stop = 0, False
+        self._parents = _Captured(self._reads)
 
     def __next__(self) -> Batch:
         if self._stop:
             raise StopIteration
         corpus, _ = self._proportions.at(self._index)
         self._index += 1
+        key = self._keys[corpus]
+        self._parents.moved(key)
         try:
-            return next(self._reads[self._keys[corpus]])
+            return next(self._reads[key])
         except StopIteration:
             self._stop = True
             raise
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parents": {key: read.get_state() for key, read in self._reads.items()},
-                "index": self._index, "stop": self._stop}
+        return {"parents": self._parents.captured(), "index": self._index, "stop": self._stop}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         parents = record(state["parents"], "seeded mix")
+        self._parents.restored()
         for key, read in self._reads.items():
             if (held := parents.get(key)) is not None:
                 read.set_state(record(held, "mixed corpus"))

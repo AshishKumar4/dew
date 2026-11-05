@@ -65,12 +65,19 @@ def _declaring(stage: Stage) -> Declares | None:
     return step if isinstance(step, Declares) else None
 
 
+class PerMember(dict):
+    """A fact each corpus states of its own member of a mixture, keyed by the member (a mixture's weight of
+    each corpus, `dew.decision.data.mixture`): the corpora a run reads together state it joined, each
+    member's value its own corpus's (`merge_facts`), where a whole copy in each corpus held a mixture's
+    size a corpus, its square a mixture (row 4079)."""
+
+
 def merge_facts(facts: Iterable[Mapping[str, object]], *,
                 measured: frozenset[str] = frozenset()) -> Mapping[str, object]:
     """Facts several stores or corpora state, as one run reads them together: a fact they state
     alike, slot maxima and `measured` facts as their largest, a field's shape where every one of
-    them states it alike; a fact two state differently is no fact of the run, whatever a third
-    states."""
+    them states it alike, and a fact of each member (`PerMember`) joined; a fact two state differently
+    is no fact of the run, whatever a third states."""
     combined: dict[str, object] = {}
     conflicted: set[str] = set()
     slots: dict[str, int] = {}
@@ -85,6 +92,12 @@ def merge_facts(facts: Iterable[Mapping[str, object]], *,
                 continue
             elif key in measured:
                 combined[key] = max(integer(value, key), integer(combined.get(key, 0), key))
+            elif isinstance(value, PerMember) and isinstance(combined.get(key), PerMember):
+                # Each member's value its own corpus's; a member two state otherwise is no fact of the run.
+                held = combined[key]
+                if any(held[member] != stated for member, stated in value.items() if member in held):
+                    conflicted.add(key)
+                combined[key] = PerMember({**held, **value})
             elif key not in combined:
                 combined[key] = value
             elif combined[key] != value:
