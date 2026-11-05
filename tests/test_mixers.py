@@ -478,7 +478,8 @@ def test_every_attention_mixer_computes_or_refuses_each_policy_it_is_asked(kind,
     bfloat16 where it changes a narrow input's arithmetic (`POLICY_DTYPES`), and its gradient is finite,
     reaching every weight the policy adds. A parallel layer computes it in its branch that attends."""
     dtype = POLICY_DTYPES.get(policy, jnp.float32)
-    context = MixerContext(emb_features=64, num_heads=4, num_kv_heads=2, head_dim=64, max_seq_len=32,
+    # The test decoder's geometry (`TINY`), which each kind's fields are sized for (`KIND_FIELDS`).
+    context = MixerContext(emb_features=32, num_heads=4, num_kv_heads=2, head_dim=8, max_seq_len=32,
                            dtype=dtype, **KIND_CONTEXT.get(kind, {}))
     asked = dataclasses.replace(context, **{policy: POLICY_VALUES[policy]})
     assert asked.policies()[policy] and not context.policies()[policy]
@@ -489,9 +490,9 @@ def test_every_attention_mixer_computes_or_refuses_each_policy_it_is_asked(kind,
     except MixerRefused as refused:
         assert policy in refused.names
         return
-    plain_block, asked_block = (DecoderBlock(mixer=factory, feedforward=None, emb_features=64,
+    plain_block, asked_block = (DecoderBlock(mixer=factory, feedforward=None, emb_features=32,
                                              wiring=BlockWiring(), dtype=dtype) for factory in (plain, taken))
-    x = jax.random.normal(jax.random.key(1), (2, 8, 64), dtype)
+    x = jax.random.normal(jax.random.key(1), (2, 8, 32), dtype)
     weights = plain_block.init(jax.random.key(0), x)
     drawn = asked_block.init(jax.random.key(0), x)
     shared = dict(jax.tree_util.tree_leaves_with_path(weights))
