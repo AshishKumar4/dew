@@ -65,21 +65,23 @@ def sweep(check, space) -> Cell:
                                    for case in CASES for config in space]))
 
 
-def a_shared_bias_step_repeats_bit_for_bit(bias_shape: tuple) -> None:
+def a_shared_bias_step_repeats_bit_for_bit(bias_shape: tuple, kv_heads: int = 8) -> None:
     """A bf16 causal training step through the template at a sequence of 2048, its bias of `bias_shape`
-    shared by every batch row (a tile of each head's logits, or a key bias), the same program on the same
-    inputs run six times under the lane's deterministic ops (tests/lane_environment.py), the second compiled
-    afresh: every
-    gradient, the bias's own included, the same bits as the first run's, as kernel-templates.md promises
-    a schedule's reproducibility (ledger 2620). Only a GPU's atomics reorder, so only a GPU can fail it."""
+    shared by every batch row (a tile of each head's logits, or a key bias), its 8 query heads over
+    `kv_heads` key heads, the same program on the same inputs run six times under the lane's deterministic
+    ops (tests/lane_environment.py), the second compiled afresh: every gradient, the bias's own included,
+    the same bits as the first run's, as kernel-templates.md promises a schedule's reproducibility (ledger
+    2620; a key head's dK/dV programs write each grouped query head's bias gradient, row 2645). Only a
+    GPU's atomics reorder, so only a GPU can fail it."""
     rng = np.random.default_rng(2620)
     batch, length, heads, width = 4, 2048, 8, 64
 
     def normal(*shape, scale=1.0):
         return jnp.asarray(scale * rng.standard_normal(shape, dtype=np.float32), jnp.bfloat16)
 
-    shape = (batch, length, heads, width)
-    query, key, value, cotangent = normal(*shape), normal(*shape, scale=0.3), normal(*shape), normal(*shape)
+    shape, kv_shape = (batch, length, heads, width), (batch, length, kv_heads, width)
+    query, key, value, cotangent = (normal(*shape), normal(*kv_shape, scale=0.3), normal(*kv_shape),
+                                    normal(*shape))
     bias = jnp.asarray(0.5 * rng.standard_normal((1, heads, *bias_shape), dtype=np.float32))
 
     @jax.jit
@@ -130,8 +132,10 @@ def test_the_attention_kernels_run_on_this_gpu():
                functools.partial(stability.default_is_finite, family, "mosaic two launches"), "sm90")
           for family in stability.HOOKLESS_FAMILIES),
         *(Cell(f"a step with a bias every row shares repeats bit for bit: {name}",
-               functools.partial(a_shared_bias_step_repeats_bit_for_bit, shape))
-          for name, shape in (("a tile of the logits", (2048, 2048)), ("a key bias", (1, 2048)))),
+               functools.partial(a_shared_bias_step_repeats_bit_for_bit, shape, kv_heads))
+          for name, shape, kv_heads in (("a tile of the logits", (2048, 2048), 8),
+                                        ("a key bias", (1, 2048), 8),
+                                        ("a tile of the logits over grouped heads", (2048, 2048), 2))),
         Cell("a dropping route call on a GPU runs finite",
              dropout.a_dropping_route_call_on_a_gpu_runs_finite),
         *(Cell(f"a decode step's sinks take their gradient and tangent through the dispatch: {name}",

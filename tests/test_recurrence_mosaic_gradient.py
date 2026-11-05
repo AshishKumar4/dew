@@ -218,13 +218,15 @@ WALKS = interpreted(WALK_GRID, INTERPRETED_WALKS)
 
 @runs('sm90')
 @pytest.mark.parametrize(('case', 'product'), WALKS)
+@pytest.mark.check1_shards(seeds=256, per_task=128)
 def test_a_walk_of_two_roles_is_as_exact_as_its_reference(case, product):
     """The states and reverse launches with two value blocks of a sequence and head a program, one a
     consumer role (`Tiles.walkers`, warpgroup MMA's bundle, which the derivation gives a call whose walks
     fill more than a wave), on par from float64 with recorded fla-core's forward, or forward and gradient
     (`fla_sites`), over the case's draws (check 1, truth the recurrence a token at a time's): each role's
     columns, staging and stores its own. Off a GPU interpreted; a GPU that runs no Hopper kernels (an A100)
-    skips it."""
+    skips it. Its interpreted forward's 256 recorded draws took 108 s whole with the shared cache warm
+    (jsf-slow-37e5) and 135 to 148 s in main's CI (ea1d57903, 614382ac3): a site, two map tasks."""
     hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5, write_bound=1.0)
     tiles = mainloop.Tiles(32, 1, walkers=2)
 

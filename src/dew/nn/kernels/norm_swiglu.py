@@ -79,6 +79,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 from dew.mesh import logical_spec
+from dew.nn.kernels import launches
 
 from ..precision import (
     activation_and_slope,
@@ -593,8 +594,11 @@ def _rms_backward(x_ref, scale_ref, gate_ref, mean_square_ref, dy_ref, stream_re
         if inverse_rounded:
             dx = _rounded_inverse_cotangent(m, x, multiplier, slope, dy_ref.dtype, width, interpret)
         else:
-            # The two x contributions are kept separate, as XLA's square VJP is.
-            correction = jnp.sum(m * x, axis=1) * slope * (1.0 / width)
+            # The two x contributions are kept separate, as XLA's square VJP is. The reduction reads x
+            # normalized and the mean square's own slope (`slope / inverse`), the same product, so near
+            # float32's largest (inputs near 2**63) its sum (2**130 as m * x) does not overflow while the
+            # slope (2**-189) underflows, whose product was NaN where the formula is finite (ledger 2692).
+            correction = jnp.sum(m * (x * inverse[:, None]), axis=1) * (-0.5 / mean_square) * (1.0 / width)
             dx = m * multiplier[:, None] + (2.0 * x) * correction[:, None]
         if ds is not None:
             # The stream's own cotangent joins in fp32, one rounding for the sum.
@@ -650,7 +654,7 @@ def _launched(*operands, kernel, name: str, outputs, grid: tuple[int, ...], warp
     """`kernel` launched over `operands` (None where a call has none) with its `arithmetic`'s keyword
     arguments, lowered once a configuration (`tuning.lowered_once`): its outputs' shapes and dtypes, its grid,
     warps and arithmetic static."""
-    return pl.pallas_call(
+    return launches.pallas_call(
         functools.partial(kernel, interpret=interpret, **dict(arithmetic)), grid=grid, out_shape=outputs,
         compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=1),
         interpret=interpret, name=name,

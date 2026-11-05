@@ -545,10 +545,11 @@ def test_a_cross_attention_feed_forward_keeps_its_rungs_where_the_trunk_has_none
 @chosen(gated_delta_rule="fla")
 def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsys):
     """A decoder skips the remat rungs that keep none of its mixers' names (`MixerBase.marks`), so
-    a kind may name only what its layer marks: under `jax.checkpoint` with a policy saving each one
-    alone, a tiny decoder of that kind saves it for its backward. A recurrence's output is both its
-    'context' and its 'scan', either of which keeps it. A delta rule's decay and inverse are its
-    port's (`row_names_port`, interpreted off a GPU)."""
+    a kind may name only what its layer marks: under `jax.checkpoint` a policy saving each one alone
+    keeps more for a tiny decoder's backward than a policy saving nothing. A recurrence's output is
+    both its 'context' and its 'scan', either of which keeps it. A delta rule's decay and inverse are
+    its port's (`row_names_port`, interpreted off a GPU), named within its rule's declared span
+    (`derivatives.declared_derivative`), whose saved residuals JAX reports as the span's outputs."""
     from jax.ad_checkpoint import print_saved_residuals
 
     from dew.nn.backbones.decoder_block import RematPolicy
@@ -562,13 +563,14 @@ def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsy
     def loss(variables):
         return jnp.sum(model.apply(variables, tokens) ** 2)
 
-    def saves(name):
+    def saved(names):
         capsys.readouterr()
-        policy = RematPolicy(save=(name,)).checkpoint_policy()
+        policy = RematPolicy(save=names).checkpoint_policy()
         print_saved_residuals(jax.checkpoint(loss, policy=policy), variables)
-        return f"named '{name}'" in capsys.readouterr().out
+        return capsys.readouterr().out
 
-    assert [name for name in value.marks() or () if not saves(name)] == []
+    nothing = saved(())
+    assert [name for name in value.marks() or () if saved((name,)) == nothing] == []
 
 
 def one_tap(kind):

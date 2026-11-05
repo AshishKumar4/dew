@@ -148,6 +148,36 @@ def test_a_portable_grouped_projection_holds_every_order(edge):
                     truth_fn=masked_grouped_product, plain_fn=masked_grouped_product)
 
 
+@jax.custom_vjp
+def straight_through(scores):
+    """A score hook through a custom VJP entry by entry: a rounding to bfloat16 whose cotangent passes
+    unchanged."""
+    return scores.astype(jnp.bfloat16).astype(scores.dtype)
+
+
+straight_through.defvjp(lambda scores: (straight_through(scores), None), lambda _, cotangent: (cotangent,))
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_transposed_hooks_custom_vjp_holds_every_reverse_order(edge):
+    """A custom VJP within a hook a mainloop runs on transposed tiles (`layout.transposed`, its pullback held
+    entry by entry, `_custom.held`): every reverse order, under a nested jit and a scan, finite wherever
+    float64 is a normal float32 and the hook on the tile as its caller holds it is; it takes no forward
+    order, as the call itself does not (ledger 2658)."""
+    from dew.nn.kernels.templates import layout
+
+    (tile,) = normal_draw(108, (6, 4), scale=EDGES[edge])
+    (direction,) = normal_draw(109, (6, 4), scale=EDGES[edge])
+    (cotangent,) = normal_draw(110, (6, 4))
+
+    def plain(tile):
+        return straight_through(tile.T).T
+
+    assert_contract(layout.transposed(straight_through), (tile,), (direction,), cotangent,
+                    f"a transposed hook's custom VJP {edge}", truth_fn=plain, plain_fn=plain,
+                    without=FORWARD_ORDERS)
+
+
 def rms_producer(lhs, scale):
     """An RMS norm as a GEMM's producer writes it: the operand over its root mean square, times its scale."""
     return lhs * jax.lax.rsqrt(jnp.mean(jnp.square(lhs), axis=-1, keepdims=True) + 1e-6) * scale
@@ -175,11 +205,11 @@ def softly_rectified(scores):
 
 
 @pytest.mark.parametrize("edge", EDGES)
-def test_a_transposed_hooks_custom_derivative_holds_every_order_it_takes(edge):
-    """A custom derivative within a hook a mainloop runs on transposed tiles (`layout.transposed`, its rule
-    held entry by entry, `_custom.held`): every order it takes finite wherever float64 is a normal float32
-    and the hook on the tile as its caller holds it is; it takes no forward-derivative order, under a nested
-    jit and a scan too (ledger 2658)."""
+def test_a_transposed_hooks_custom_derivative_holds_every_order(edge):
+    """A custom JVP within a hook a mainloop runs on transposed tiles (`layout.transposed`, its rule held
+    entry by entry, `_custom`): every order, forward ones too, under a nested jit and a scan, finite wherever
+    float64 is a normal float32 and the hook on the tile as its caller holds it is (ledger 2658: the held
+    rule was a custom VJP whatever the call's own, so it took no forward order)."""
     from dew.nn.kernels.templates import layout
 
     (tile,) = normal_draw(105, (6, 4), scale=EDGES[edge])
@@ -190,8 +220,7 @@ def test_a_transposed_hooks_custom_derivative_holds_every_order_it_takes(edge):
         return softly_rectified(tile.T).T
 
     assert_contract(layout.transposed(softly_rectified), (tile,), (direction,), cotangent,
-                    f"a transposed hook's custom derivative {edge}", truth_fn=plain, plain_fn=plain,
-                    without=FORWARD_ORDERS)
+                    f"a transposed hook's custom derivative {edge}", truth_fn=plain, plain_fn=plain)
 
 
 @pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
@@ -226,14 +255,13 @@ sums of sixteen products near the largest and the least normal, where `EDGES`' s
 root of each."""
 
 
-@pytest.mark.parametrize("edge", [edge for edge in LINEAR_EDGES if edge != "near the largest"])
+@pytest.mark.parametrize("edge", LINEAR_EDGES)
 def test_a_frozen_fp8_product_holds_every_order(edge):
     """A frozen FP8 kernel's product (`quantization.frozen_fp8_product`, its tangent the decoded kernel's):
     every order in the input finite wherever float64 is a normal float32 and the product with the kernel its
     codes decode to (each row's codes times its scale) is, the kernel a unit draw and the input at
-    `LINEAR_EDGES`, so the product itself nears
-    float32's ends. Near the largest its input's scale overflows before the kernel's applies (ledger 2715),
-    that row's head adds the edge."""
+    `LINEAR_EDGES`, so the product itself nears float32's ends: near the largest, the input's block scale
+    applied before the kernel's had overflowed a product that did not (ledger 2715)."""
     from dew.quantization import FROZEN_FP8, frozen_fp8_leaves
 
     (kernel,) = normal_draw(475, (16, 8))

@@ -199,6 +199,13 @@ chunked rule against the float64 recurrence, for each decay width and strength."
 @pytest.mark.parametrize("strong", [False, True], ids=["drawn decay", "strong decay"])
 @pytest.mark.parametrize("decay_width", [1, 8], ids=["per head", "per key dimension"])
 def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, strong):
+    """`the_chunked_rule_runs_packed_documents_as_each_runs_alone` at each decay width and strength: 18 to 20
+    s a case cold, its reference's documents traced once (`delta_rule_support.recurrence`), where four
+    documents traced apart took 115 to 153 s (cuts-whole at aad1c89d7, row 3772)."""
+    the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, strong)
+
+
+def the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, strong):
     """Packed documents in the chunked rule, one starting on a chunk's first token, one four tokens before a
     chunk's end and one spanning chunks: each document's output, the final memory and every gradient
     on par with the chunked rule on each document alone, both measured from the float64 recurrence.

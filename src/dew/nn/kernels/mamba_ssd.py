@@ -43,7 +43,8 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import recurrence_algebra as algebra, tuning
+from dew.nn import derivatives
+from dew.nn.kernels import launches, recurrence_algebra as algebra, tuning
 from dew.nn.kernels.chunked_launch import read_rows, write_rows
 from dew.nn.kernels.fla_gdn import _dot
 from dew.nn.precision import compensated_add, compensated_difference, compensated_sum, two_sum
@@ -281,7 +282,7 @@ class ChunkCumsum(_Cumsum):
         padded = -(-length // chunk) * chunk
         bh = config.bm
         out = pl.BlockSpec((None, bh, padded), lambda b, c, h: (b, h, 0))
-        step, da = pl.pallas_call(
+        step, da = launches.pallas_call(
             functools.partial(_chunk_cumsum_kernel, length=length, chunk=chunk, bh=bh, interpret=interpret),
             grid=(batch, padded // chunk, heads // bh),
             in_specs=[pl.BlockSpec((None, length, heads), lambda b, c, h: (b, 0, 0)),
@@ -328,7 +329,7 @@ class ChunkCumsumBwd(_Cumsum):
         bh = config.bm
         first = pl.BlockSpec((None, bh, padded), lambda b, c, h: (b, h, 0))
         rows = pl.BlockSpec((None, length, heads), lambda b, c, h: (b, 0, 0))
-        out, da = pl.pallas_call(
+        out, da = launches.pallas_call(
             functools.partial(_chunk_cumsum_bwd_kernel, length=length, chunk=chunk, bh=bh,
                               interpret=interpret),
             grid=(batch, padded // chunk, heads // bh),
@@ -389,7 +390,7 @@ class ChunkState(_Launch):
              chunk: int, groups: int, interpret: bool, config: Tiles, return_residuals: bool = False):
         batch, length, heads, width, state, padded, ratio, bm, bn, columns = _state_blocks(
             x, b, dt, groups, config)
-        states = pl.pallas_call(
+        states = launches.pallas_call(
             functools.partial(_chunk_state_kernel, batch=batch, length=length, chunk=chunk, bk=config.bk,
                               exact=interpret),
             grid=(width // bm * columns, batch * (padded // chunk), heads),
@@ -445,7 +446,7 @@ class StatePassing(_Passing):
         size = config.bm
         rows = pl.BlockSpec((None, chunks, None, size), lambda i, b, h: (b, 0, h, i))
         final = pl.BlockSpec((None, None, size), lambda i, b, h: (b, h, i))
-        out, last = pl.pallas_call(
+        out, last = launches.pallas_call(
             functools.partial(_state_passing_kernel, chunk=chunk),
             grid=(flat // size, batch, heads),
             in_specs=[rows, (pl.BlockSpec((None, None, padded), lambda i, b, h: (b, h, 0)),) * 2, final,
@@ -498,7 +499,7 @@ class BmmChunk(_Launch):
         bm, bn = config.bm, config.bn
         columns = chunk // bn
         grouped = pl.BlockSpec((None, length, None, state), lambda mn, row, cg: (row, 0, cg % groups, 0))
-        cb = pl.pallas_call(
+        cb = launches.pallas_call(
             functools.partial(_bmm_kernel, length=length, chunk=chunk, groups=groups, bm=bm, bn=bn,
                               bk=config.bk, exact=interpret),
             grid=(chunk // bm * columns, batch, chunks * groups),
@@ -570,7 +571,7 @@ class ChunkScan(_Launch):
         bm, bn = config.bm, config.bn
         columns = width // bn
         headed = pl.BlockSpec((None, length, None, bn), lambda mn, bc, h: (bc % batch, 0, h, mn % columns))
-        out = pl.pallas_call(
+        out = launches.pallas_call(
             functools.partial(_chunk_scan_kernel, batch=batch, length=length, chunk=chunk, width=width,
                               bm=bm, bn=bn, bk=config.bk, exact=interpret),
             grid=(chunk // bm * columns, batch * (padded // chunk), heads),
@@ -636,7 +637,7 @@ class ChunkScanBwdDstates(_Launch):
         ratio = heads // groups
         bm, bn = config.bm, config.bn
         columns = state // bn
-        dstates = pl.pallas_call(
+        dstates = launches.pallas_call(
             functools.partial(_dstates_kernel, batch=batch, length=length, chunk=chunk, bk=config.bk,
                               exact=interpret),
             grid=(width // bm * columns, batch * (padded // chunk), heads),
@@ -698,7 +699,7 @@ class StatePassingBwd(_Passing):
         size = config.bm
         rows = pl.BlockSpec((None, chunks, None, size), lambda i, b, h: (b, 0, h, i))
         whole = pl.BlockSpec((None, None, size), lambda i, b, h: (b, h, i))
-        dstates, dtotal, dinit, converted = pl.pallas_call(
+        dstates, dtotal, dinit, converted = launches.pallas_call(
             functools.partial(_state_passing_bwd_kernel, chunk=chunk),
             grid=(flat // size, batch, heads),
             in_specs=[rows, rows, (pl.BlockSpec((None, None, padded), lambda i, b, h: (b, h, 0)),) * 2, whole,
@@ -775,7 +776,7 @@ class ChunkScanChunkStateBwdDx(_Launch):
         bm, bn = config.bm, config.bn
         columns = width // bn
         headed = pl.BlockSpec((None, length, None, bn), lambda mn, bc, h: (bc % batch, 0, h, mn % columns))
-        dx, ddt, dd = pl.pallas_call(
+        dx, ddt, dd = launches.pallas_call(
             functools.partial(_dx_kernel, batch=batch, length=length, chunk=chunk, width=width, bm=bm, bn=bn,
                               bk=config.bk, exact=interpret),
             grid=(chunk // bm * columns, batch * chunks, heads),
@@ -874,7 +875,7 @@ def _state_gradient(left, states, mat, dt, da, seq, *, chunk: int, groups: int, 
         left, mat, da[0], groups, config)
     splits = -(-ratio // config.heads)
     steps = [] if dt is None else [dt]
-    grad, dacs = pl.pallas_call(
+    grad, dacs = launches.pallas_call(
         functools.partial(_state_gradient_kernel, leaving=dt is not None, batch=batch, length=length,
                           chunk=chunk, groups=groups, ratio=ratio, heads=config.heads, state=state, bm=bm,
                           bn=bn, exact=interpret),
@@ -985,7 +986,7 @@ class ChunkScanBwdDcb(_Launch):
         columns = chunk // bn
         splits = -(-ratio // config.heads)
         rows = pl.BlockSpec((None, length, heads, width), lambda mn, bc, sg: (bc % batch, 0, 0, 0))
-        dcb = pl.pallas_call(
+        dcb = launches.pallas_call(
             functools.partial(_dcb_kernel, batch=batch, length=length, chunk=chunk, groups=groups,
                               ratio=ratio, heads=config.heads, bm=bm, bn=bn, exact=interpret),
             grid=(chunk // bm * columns, batch * chunks, splits * groups),
@@ -1045,7 +1046,7 @@ class BmmChunkBwd(_Launch):
         columns = state // bn
         grouped = pl.BlockSpec((None, length, None, bn),
                                lambda mn, row, cg: (row, 0, cg % groups, mn % columns))
-        out = pl.pallas_call(
+        out = launches.pallas_call(
             functools.partial(_bmm_bwd_kernel, length=length, chunk=chunk, groups=groups, state=state,
                               transposed=transposed, bm=bm, bn=bn, bk=config.bk, exact=interpret),
             grid=(chunk // bm * columns, batch, chunks * groups),
@@ -1115,7 +1116,7 @@ class ChunkScanBwdDdacsStable(_Launch):
         ratio = heads // groups
         bm = config.bm
         headed = pl.BlockSpec((None, length, None, width), lambda m, bc, h: (bc % batch, 0, h, 0))
-        dacs = pl.pallas_call(
+        dacs = launches.pallas_call(
             functools.partial(_ddacs_kernel, batch=batch, length=length, chunk=chunk, bm=bm, bn=config.bn,
                               exact=interpret),
             grid=(chunk // bm, batch * chunks, heads),
@@ -1233,7 +1234,8 @@ def _scan_bwd(chunk: int, interpret: bool, residual, cotangent):
             dh0.reshape(shape).astype(h0.dtype), None)
 
 
-ssd_scan = jax.custom_vjp(_scan, nondiff_argnums=(8, 9))
+ssd_scan = derivatives.declared_derivative(derivatives.KernelGlue(), _scan, _scan_fwd, _scan_bwd,
+                                           nondiff_argnums=(8, 9))
 """mamba_ssm's chunked SSD scan on the ported kernels: `(y, final)` for `x` `[B, T, H, P]`, the step
 `dt` `[B, T, H]` through its bias, softplus and limit, `A` `[H]`, `B` and `C` `[B, T, G, N]` in `x`'s
 dtype, `D` `[H]`, each row's initial state `h0` `[B, H, P, N]` and each token's document `seq` `[B, T]`
@@ -1242,4 +1244,3 @@ tokens. `y` and the final state are fp32. P, N and the chunk are powers of two o
 numbers are mamba_ssm's: operands in their own dtype into fp32 accumulation, the states the chunks enter
 in the operands' dtype, the decay and the states across chunks in fp32; the output's cotangent is
 rounded to the operands' dtype for its products, as mamba_ssm's arrives."""
-ssd_scan.defvjp(_scan_fwd, _scan_bwd)

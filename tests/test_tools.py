@@ -1889,6 +1889,27 @@ def test_a_bare_jit_anywhere_in_the_package_is_reported(tmp_path):
     assert _linted(tmp_path / "suite", {"tests/test_rollout.py": rollout, "tools/rollout.py": rollout}) == []
 
 
+def test_a_pallas_call_outside_the_launch_point_is_reported(tmp_path):
+    """SLOP027: in `src/<package>`, `jax.experimental.pallas.pallas_call` by any name it is imported as,
+    called or passed on, is reported outside the launch point (`nn/kernels/launches.py`), whose
+    `pallas_call` holds each launch to the per-shard boundary (rows 1897, 1923); a call of the launch
+    point's is not, nor a Pallas call in the tests or the tools."""
+    kernel = ("import functools\n"
+              "from jax.experimental import pallas as pl\n"
+              "from jax.experimental.pallas import pallas_call\n"
+              "from sparx.nn.kernels import launches\n"
+              "out = pl.pallas_call(lambda r: None, out_shape=None)\n"
+              "named = pallas_call(lambda r: None, out_shape=None)\n"
+              "partial = functools.partial(pl.pallas_call, grid=(1,))\n"
+              "launched = launches.pallas_call(lambda r: None, out_shape=None)\n")
+    for package in ("nn/kernels", "nn"):
+        assert_reported(tmp_path / package.replace("/", "_"), f"src/sparx/{package}/kernel.py", kernel,
+                        "SLOP027", (5, 6, 7))
+    point = "from jax.experimental import pallas as pl\ncall = pl.pallas_call\n"
+    assert _linted(tmp_path / "point", {"src/sparx/nn/kernels/launches.py": point}) == []
+    assert _linted(tmp_path / "suite", {"tests/test_kernel.py": kernel, "tools/kernel.py": kernel}) == []
+
+
 def test_an_outer_program_built_outside_the_compile_point_is_reported(tmp_path):
     """SLOP025: a program built as an `OuterProgram` of its own, by a call, a `functools.partial` over it, a
     decorator or an alias of its name, takes no compiler option, so it is reported in any package of

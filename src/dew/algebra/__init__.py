@@ -24,9 +24,9 @@ of a UNet's fsdp2 x tensor2 matrix cell and benchmark_step's cpu-smoke steps rea
 using under a quarter of each, and none gained at four times both (row 4010)."""
 rewritten = functools.partial(program.rewritten, saturation=SATURATION)
 """`program.rewritten` at `SATURATION`: a function with its program rewritten."""
-program_of = functools.partial(program.program_of, saturation=SATURATION)
-"""`program.program_of` at `SATURATION`: a jit's own trace of a program, rewritten."""
+rewritten_program = functools.partial(program.rewritten_program, saturation=SATURATION)
+"""`program.rewritten_program` at `SATURATION`: a jit's own trace of a program, rewritten."""
 
 __all__ = ["SATURATION", "AlgebraReport", "Derived", "Reduction", "Refused", "Rewrite", "Saturation", "Scan",
-           "cost", "derive", "error", "forms", "passes", "program", "program_of", "rewritten", "rules",
+           "cost", "derive", "error", "forms", "passes", "program", "rewritten", "rewritten_program", "rules",
            "scan", "terms"]
