@@ -507,7 +507,7 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         super().__init__(reads)
         self._reads, self._weights, self._tokens, self._keys = tuple(reads), weights, tokens, keys
         self._delivered = [0] * len(reads)
-        self._parents = _Captured(dict(zip(keys, self._reads, strict=True)))
+        self._positions = _Captured(dict(zip(keys, self._reads, strict=True)))
 
     def __next__(self) -> Batch:
         total = sum(self._delivered)
@@ -516,7 +516,7 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
             range(len(self._reads)),
             key=lambda index: self._weights[index] * total - self._delivered[index] * scale,
         )
-        self._parents.moved(self._keys[chosen])
+        self._positions.moved(self._keys[chosen])
         value = next(self._reads[chosen])
         tokens = self._tokens(value)
         if tokens <= 0:
@@ -527,7 +527,7 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         return value
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parents": self._parents.captured(),
+        return {"parents": self._positions.captured(),
                 "delivered": dict(zip(self._keys, self._delivered, strict=True))}
 
     def set_state(self, state: Mapping[str, object]) -> None:
@@ -543,7 +543,7 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         if any(count < 0 for count in delivered.values()):
             raise ValueError("token deficit state has negative delivered targets")
         kept = [key in parents for key in self._keys]
-        self._parents.restored()
+        self._positions.restored()
         for key, read in zip(self._keys, self._reads, strict=True):
             if key in parents:
                 read.set_state(record(parents[key], "corpus iterator"))
@@ -939,7 +939,7 @@ class _SeededMix(pygrain.DatasetIterator[Batch]):
         super().__init__()
         self._reads, self._keys, self._proportions = dict(reads), tuple(reads), proportions
         self._index, self._stop = 0, False
-        self._parents = _Captured(self._reads)
+        self._positions = _Captured(self._reads)
 
     def __next__(self) -> Batch:
         if self._stop:
@@ -947,7 +947,7 @@ class _SeededMix(pygrain.DatasetIterator[Batch]):
         corpus, _ = self._proportions.at(self._index)
         self._index += 1
         key = self._keys[corpus]
-        self._parents.moved(key)
+        self._positions.moved(key)
         try:
             return next(self._reads[key])
         except StopIteration:
@@ -955,11 +955,11 @@ class _SeededMix(pygrain.DatasetIterator[Batch]):
             raise
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parents": self._parents.captured(), "index": self._index, "stop": self._stop}
+        return {"parents": self._positions.captured(), "index": self._index, "stop": self._stop}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         parents = record(state["parents"], "seeded mix")
-        self._parents.restored()
+        self._positions.restored()
         for key, read in self._reads.items():
             if (held := parents.get(key)) is not None:
                 read.set_state(record(held, "mixed corpus"))
