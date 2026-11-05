@@ -59,6 +59,23 @@ def draw(dtype, seed: int, rows: int, length: int, channels: int, states: int, p
     return (x, dt, a, b, c, skip), starts, dy
 
 
+REGIMES = ("decays near zero", "a document at every chunk")
+"""The regimes the template's backward fixes were measured in (`selective.PARTIALS`, its pairwise sums):
+steps of softplus(N(3, 1)), so each channel's state decays to near zero within a few tokens; and a document
+starting at every chunk's first token, so every chunk's carried gradient is cut."""
+
+
+def regime_draw(regime: str, dtype, seed: int, rows: int, length: int, channels: int, states: int):
+    """`draw`'s inputs in `regime` (`REGIMES`), with their documents' starts."""
+    (x, dt, a, b, c, skip), _, dy = draw(dtype, seed, rows, length, channels, states, packed=False)
+    starts = None
+    if regime == "decays near zero":
+        dt = jax.nn.softplus(jax.random.normal(jax.random.key(seed + 1), dt.shape) + 3.0).astype(dtype)
+    else:
+        starts = jnp.zeros((rows, length), bool).at[:, ::selective.CHUNK].set(True)
+    return (x, dt, a, b, c, skip), starts, dy
+
+
 def scanned(fn, starts):
     """`fn`'s output alone, its documents' starts `starts`."""
     return lambda *inputs: fn(*inputs, starts=starts)[0]
@@ -95,6 +112,29 @@ def test_the_template_is_as_exact_as_the_portable_scan_interpreted():
 def test_the_template_is_as_exact_as_the_portable_scan_over_packed_documents_interpreted():
     """`the_template_is_as_exact_as_the_portable_scan` over packed documents."""
     the_template_is_as_exact_as_the_portable_scan("interpreted", packed=True)
+
+
+@pytest.mark.parametrize("regime", REGIMES)
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+def test_the_template_holds_its_hardest_regimes_interpreted(regime):
+    """The template's output and every input's gradient on par from float64 with the portable scan's in each
+    regime its backward's fixes were measured in (`REGIMES`), over check 1's fewest draws, one row of a ragged
+    chunk over two channel blocks: a backward adding B's and C's gradients through one buffer put B's 1.95
+    times the portable scan's distance with a document at every chunk (`selective.PARTIALS`), which no CPU
+    test held once the regime cases went to the GPU flow alone (row 3133)."""
+    shape = SHAPES["interpreted"]
+    family = mosaic_sm90.WGMMA if INTERPRETED else bundles.of(generation.device_generation(), jnp.bfloat16)
+    template = functools.partial(selective.selective_scan, family=family, interpret=INTERPRETED)
+
+    def draws(seed):
+        inputs, _, dy = regime_draw(regime, jnp.bfloat16, seed, *shape)
+        return (*inputs, dy)
+
+    starts = regime_draw(regime, jnp.bfloat16, 0, *shape)[1]
+    assert_as_exact(jax.jit(with_gradients(scanned(template, starts))),
+                    jax.jit(with_gradients(scanned(portable, starts))), draws,
+                    f"the selective template under {regime}", seeds=FEWEST_SEEDS,
+                    truth_fn=jax.jit(with_gradients(scanned(portable, starts))))
 
 
 SEEDED = Path(__file__).resolve().parent / "fixtures" / "mamba" / "selective_mamba_ssm_seeded.npz"
