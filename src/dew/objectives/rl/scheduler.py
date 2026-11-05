@@ -672,6 +672,7 @@ class RolloutScheduler:
         from dew.inference.rollouts import NativeRolloutServer
         from dew.inference.serving import Server
         from dew.nn.kv_cache import KVCache
+        from dew.nn.protocols import Layered
 
         from .sources import PromptSource
 
@@ -682,8 +683,10 @@ class RolloutScheduler:
             policy = objective.policy(variables, drawing, Progress(jnp.asarray(version, jnp.int32)))
             if page_size is None:
                 return Server.from_task(policy, slots=slots, capacity=width)
-            return Server.from_task(policy, slots=slots, capacity=width,
-                                    kv_cache=KVCache(page_size=page_size), prefix_cache=True)
+            # The policy's own cache layout, its format kept, in pages.
+            declared = policy.model.kv_cache if isinstance(policy.model, Layered) else KVCache()
+            return Server.from_task(policy, slots=slots, capacity=width, prefix_cache=True,
+                                    kv_cache=dataclasses.replace(declared, page_size=page_size))
 
         server = NativeRolloutServer.deferred(built, drawing)
         source = PromptSource(server, reward, decode=decode, max_new_tokens=max_new_tokens)

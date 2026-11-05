@@ -911,18 +911,21 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
 
 
 def test_samples_of_one_prompt_prefill_it_once_and_each_draws_what_it_draws_alone():
-    """Four samples of one prompt submitted together to a paged server with a prefix cache: the first writes
-    the prompt's full pages and the other three wait one step and read them once written, as vLLM shares a
-    running prompt's blocks, so 3 x 16 of the 19 prompt tokens come from shared pages; each sample draws
-    under its own key what its lone call draws (ledger 1423)."""
+    """Four samples of one prompt and another prompt behind them, submitted together to a paged server with
+    a prefix cache: the first sample writes the prompt's full pages, the other three wait and read them
+    once written, as vLLM shares a running prompt's blocks, while the other prompt seats past them at
+    once, so 3 x 16 of the 19-token prompt's tokens come from shared pages; each request draws under its
+    own key what its lone call draws (ledger 1423)."""
     bound = task(Sampling(temperature=1.0))
-    prompt, budget = "1234567812345678912", 6
-    alone = [bound(prompt, budget, key=index) for index in range(4)]
+    prompt, other, budget = "1234567812345678912", "9876543", 6
+    requests = [prompt] * 4 + [other]
+    alone = [bound(held, budget, key=index) for index, held in enumerate(requests)]
     server = Server.from_task(bound, slots=4, capacity=128, admission=4,
                               kv_cache=KVCache(page_size=4, pages=64), prefix_cache=True)
-    tickets = [server.submit(prompt, budget, key=index) for index in range(4)]
+    tickets = [server.submit(held, budget, key=index) for index, held in enumerate(requests)]
     server.run()
     assert server.prefix_hits == 3 * 16
+    assert tickets[4].admitted <= tickets[1].admitted
     for ticket, lone in zip(tickets, alone, strict=True):
         assert_same_generation(ticket.result(), lone)
 

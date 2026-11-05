@@ -267,7 +267,7 @@ def _row_keys(keys: tuple[jax.Array | np.ndarray, ...], seeds: jax.Array, seeded
     return jax.vmap(folded)(jnp.where(seeded[:, None], made, jnp.stack(keys)), folds)
 
 
-@dataclass
+@dataclass(eq=False)
 class _Row:
     """One request on the host: its prompt, budget and key, and what it drew."""
 
@@ -455,6 +455,7 @@ class PagedRows:
                     break
             else:
                 break
+            # By identity: a row is one request, and its arrays compare by value.
             queue.remove(row)
             seated.append(_seated_in(group, free, taken, row))
         return seated

@@ -237,39 +237,29 @@ def serving(service, native, path):
         shared.server_close()
 
 
-def test_a_guest_whose_request_outlasts_its_connection_stays_admitted_until_the_engine_settles_it(
-        service, tmp_path, monkeypatch):
-    """A guest's image request the engine still runs when its connection's wait runs out keeps the guest's
-    one admission: its connection hears the timeout and nothing after it, a second request is refused
-    while the first runs, and the guest is admitted again once the engine has settled it, so a slow pass
-    never lets one guest queue a second job past the service's bounds. The service's real models run
-    the request (`live_kernel`), its 40-step walk compiling past the shortened wait."""
-    _, _, native = live_kernel(service, tmp_path)
-    monkeypatch.setattr(service, "REQUEST_SECONDS", 0.05)
-    path = tmp_path / "model.sock"
-    with serving(service, native, path):
-        first, lines = connected(path, SLOW)
-        with first:
-            assert reply(lines)["error"]["name"] == "TimeoutError"
-            # The reply ends the connection's output: no progress of the running walk follows it.
-            assert lines.read() == ""
-        second, lines = connected(path, SLOW)
-        with second:
-            assert reply(lines)["error"]["name"] == "ValueError"
-        # The engine answers requests in order: once this one is answered, the first has been settled.
-        native.sample(service.validate({**SLOW, "key": 6}), lambda _: None)
-        third, lines = connected(path, DESCRIBE)
-        with third:
-            assert "result" in reply(lines)
+@contextlib.contextmanager
+def held_in_its_walk(native, monkeypatch):
+    """The engine held inside the next image request's first step until the context ends: its preview
+    signals `running` and waits for the release, so a test knows the request runs, not by a clock."""
+    import threading
+
+    running, release = threading.Event(), threading.Event()
+    preview = native.progress.preview_png
+
+    def holding(latent):
+        running.set()
+        release.wait()
+        return preview(latent)
+
+    monkeypatch.setattr(native.progress, "preview_png", holding)
+    try:
+        yield running
+    finally:
+        release.set()
 
 
-def test_a_guest_whose_queued_request_times_out_frees_its_admission_and_its_request_never_runs(
-        service, tmp_path, monkeypatch):
-    """A guest's request still queued behind another when its connection's wait runs out is cancelled: the
-    engine drops it where it would take it, never running it, and the guest is admitted again at once,
-    while the request ahead still runs."""
-    _, _, native = live_kernel(service, tmp_path)
-    monkeypatch.setattr(service, "REQUEST_SECONDS", 0.05)
+def spied_submissions(native, monkeypatch):
+    """The futures the service hands the engine, in order."""
     submitted, held = [], native.submitted
 
     def spied(request, emit):
@@ -278,15 +268,57 @@ def test_a_guest_whose_queued_request_times_out_frees_its_admission_and_its_requ
         return future, answered
 
     monkeypatch.setattr(native, "submitted", spied)
+    return submitted
+
+
+def test_a_guest_whose_request_outlasts_its_connection_stays_admitted_until_the_engine_settles_it(
+        service, tmp_path, monkeypatch):
+    """A guest's image request the engine runs when its connection's wait runs out keeps the guest's one
+    admission: its connection hears the timeout and nothing after it, a second request is refused while
+    the first runs, and the guest is admitted again once the engine has settled it, so a slow pass never
+    lets one guest queue a second job past the service's bounds. The service's real models run it
+    (`live_kernel`), held inside its walk while the test looks (`held_in_its_walk`)."""
+    _, _, native = live_kernel(service, tmp_path)
+    monkeypatch.setattr(service, "REQUEST_SECONDS", 0.05)
+    submitted = spied_submissions(native, monkeypatch)
     path = tmp_path / "model.sock"
     with serving(service, native, path):
-        native.submitted(service.validate({**SLOW, "key": 6}), lambda _: None)
-        queued, lines = connected(path, SLOW)
-        with queued:
-            assert reply(lines)["error"]["name"] == "TimeoutError"
-        described, lines = connected(path, DESCRIBE)
-        with described:
+        with held_in_its_walk(native, monkeypatch) as running:
+            first, lines = connected(path, SLOW)
+            with first:
+                assert reply(lines)["error"]["name"] == "TimeoutError"
+                assert running.is_set()
+                second, refused = connected(path, SLOW)
+                with second:
+                    assert reply(refused)["error"]["name"] == "ValueError"
+                assert len(submitted) == 1
+        # Released: the walk finishes, and its progress reaches no one after the reply.
+        submitted[0].result()
+        assert lines.read() == ""
+        third, lines = connected(path, DESCRIBE)
+        with third:
             assert "result" in reply(lines)
+
+
+def test_a_guest_whose_queued_request_times_out_frees_its_admission_and_its_request_never_runs(
+        service, tmp_path, monkeypatch):
+    """A guest's request still queued behind a running one when its connection's wait runs out is
+    cancelled: the guest is admitted again at once, and the engine drops the request where it would take
+    it, never running it, while the request ahead runs on."""
+    _, _, native = live_kernel(service, tmp_path)
+    monkeypatch.setattr(service, "REQUEST_SECONDS", 0.05)
+    submitted = spied_submissions(native, monkeypatch)
+    path = tmp_path / "model.sock"
+    with serving(service, native, path):
+        with held_in_its_walk(native, monkeypatch) as running:
+            native.submitted(service.validate({**SLOW, "key": 6}), lambda _: None)
+            assert running.wait(timeout=600)
+            queued, lines = connected(path, SLOW)
+            with queued:
+                assert reply(lines)["error"]["name"] == "TimeoutError"
+            described, lines = connected(path, DESCRIBE)
+            with described:
+                assert "result" in reply(lines)
         ahead, behind = submitted
         ahead.result()
     assert behind.cancelled() and not ahead.cancelled()

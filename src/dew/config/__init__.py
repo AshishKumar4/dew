@@ -50,6 +50,7 @@ from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._records import JSON, duration, earlier_fields, is_share, recorded_duration
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
+from dew.cleanup import attempted
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.data import records
 from dew.data.compile import fitted
@@ -851,20 +852,14 @@ def _closed(tracker, checkpoints: Checkpoints | None, primary: BaseException | N
     own failure is the one a caller wants; without one, the first failure is
     raised with the others noted on it.
     """
+    closes = [*([] if rollout is None else [("closing the rollout", rollout.close)]),
+              *([] if tracker is None else
+                [("closing the tracker", functools.partial(tracker.__exit__, type(primary), primary, None))])]
     error = None
     try:
-        if rollout is not None:
-            rollout.close()
+        attempted(closes)
     except BaseException as failure:
         error = failure
-    try:
-        if tracker is not None:
-            tracker.__exit__(type(primary), primary, None)
-    except BaseException as failure:
-        if error is None:
-            error = failure
-        else:
-            error.add_note(f"Tracker close failed: {failure!r}")
     failed = None
     try:
         agree_process_phase(error, phase="tracker close")
