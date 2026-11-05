@@ -1082,6 +1082,61 @@ def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(t
                     truth_fn=by_itself("float64"))
 
 
+def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own():
+    """An adapter set of two adapters over different layers of one decoder, one over layer 0's q and one
+    over layer 1's: the layers, whose like stacks scan as one, scan apart where the adapters' scales
+    differ, and each row's logits are those of its adapter alone, on par with that adapter against its
+    float64 twin (check 1)."""
+    from pathlib import Path
+
+    from arm_arithmetic import widened
+    from reference_error import as_given, assert_as_exact, seeds_for
+
+    from dew.interop.pretrained import Pretrained
+    from dew.lora import AdapterSet, LoRA, selected
+
+    decoder = Pretrained.load(Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny",
+                              dtype="float32", attention_impl="reference")
+
+    def drawn(layer: int, key: int):
+        adapter = LoRA(rank=2, modules=(f"layers.{layer}.self_attn.q_proj",)).apply(
+            decoder.model, decoder.variables, key=key, layouts=decoder.layouts)
+        factors = jax.tree_util.tree_map_with_path(
+            lambda path, leaf: (jax.random.normal(jax.random.key(key), leaf.shape, leaf.dtype)
+                                if jax.tree_util.keystr(path).endswith("'lora_B']") else leaf),
+            adapter.variables["params"])
+        return dataclasses.replace(adapter, variables={**adapter.variables, "params": factors})
+
+    first, second = drawn(0, 1), drawn(1, 2)
+    adapters = AdapterSet.of({"first": first, "second": second})
+
+    def draw(seed):
+        return (jax.random.randint(jax.random.key(seed), (2, 5), 1, 30),)
+
+    @as_given
+    def served(tokens):
+        with selected(jnp.asarray([0, 1], jnp.int32)):
+            return np.asarray(adapters.model.apply(adapters.variables, jnp.asarray(tokens)))
+
+    def alone(dtype):
+        @as_given
+        def logits(tokens):
+            rows = []
+            for row, adapter in enumerate((first, second)):
+                model, variables = adapter.model, adapter.variables
+                if dtype == "float64":
+                    model, variables = model.clone(dtype=jnp.float64), widened(variables)
+                with jax.enable_x64(new_val=dtype == "float64"):
+                    rows.append(np.asarray(model.apply(variables, jnp.asarray(tokens)))[row])
+            return np.stack(rows)
+
+        return logits
+
+    label = "adapter set over different layers"
+    count = seeds_for(alone("float32"), draw, label, truth_fn=alone("float64"), dew_fn=served)
+    assert_as_exact(served, alone("float32"), draw, label, seeds=count, truth_fn=alone("float64"))
+
+
 def test_a_row_of_an_adapter_sets_base_computes_the_base_bit_for_bit():
     """A row naming no adapter of a set (`dew.lora.selected`'s -1) takes no branch: beside a row whose
     adapter's factors overflow its update to inf, its logits are the base model's, bit for bit."""
