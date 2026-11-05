@@ -102,6 +102,11 @@ def test_the_gemm_kernels_run_on_this_gpu():
                functools.partial(grouped_gemm.cutlass_runs_the_projection_as_exactly_as_xla_where_chosen,
                                  sizes))
           for sizes in grouped_gemm.SIZES if any(grouped_gemm.SIZES[sizes])),
+        *(Cell(f"CUTLASS runs a mapped projection as exactly as XLA where chosen: "
+               f"{'shared' if shared else 'mapped'} matrices",
+               functools.partial(grouped_gemm.cutlass_runs_a_mapped_projection_as_exactly_as_xla_where_chosen,
+                                 shared))
+          for shared in (False, True)),
         *(Cell(f"a ring streams tiles of their own trip counts: {consumers} consumers",
                functools.partial(mosaic_toolkit.a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100,
                                  consumers), "sm90")

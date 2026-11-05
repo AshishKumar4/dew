@@ -24,8 +24,10 @@ from tools import grouped_oracle as oracle
 pytestmark = pytest.mark.kernel
 
 SIZES = {"ragged": [0, 70, 1, 100, 0], "one-group": [200], "all-empty": [0, 0, 0], "aligned": [64, 64, 64, 8],
-         "unrouted-tail": [3, 0, 120]}
+         "unrouted-tail": [3, 0, 120], "tile-boundaries": [100, 0, 128, 129, 3, 40]}
 ROWS, DEPTH, WIDTH = 200, 128, 256
+"""The rows a draw holds at least (`operands`): its groups' rows where they are more (`tile-boundaries`: 400,
+groups that start inside a 128-row tile, end past one, and an empty one between)."""
 SEEDS = 8
 """Each site's declared draws (`reference_error.seeds_for` of the plain program on them)."""
 
@@ -35,13 +37,14 @@ def rounded(values, dtype) -> np.ndarray:
 
 
 def operands(sizes, dtype, seed=0):
-    """Rows, per-group matrices and a cotangent, rounded to `dtype`, and the group of each row (-1 past the
-    routed ones)."""
+    """Rows (`ROWS`, or the groups' where they are more), per-group matrices and a cotangent, rounded to
+    `dtype`, and the group of each row (-1 past the routed ones)."""
     rng = np.random.default_rng(seed)
-    x = rounded(rng.normal(size=(ROWS, DEPTH)), dtype)
+    rows = max(ROWS, sum(sizes))
+    x = rounded(rng.normal(size=(rows, DEPTH)), dtype)
     w = rounded(rng.normal(size=(len(sizes), DEPTH, WIDTH)) / np.sqrt(DEPTH), dtype)
-    dy = rounded(rng.normal(size=(ROWS, WIDTH)), dtype)
-    group = np.full(ROWS, -1)
+    dy = rounded(rng.normal(size=(rows, WIDTH)), dtype)
+    group = np.full(rows, -1)
     group[:sum(sizes)] = np.repeat(np.arange(len(sizes)), sizes)
     return x, w, dy, group
 
@@ -228,6 +231,58 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
 
     assert_as_exact(jax.jit(through_cutlass), jax.jit(with_gradients(projection("xla"))), draw,
                     f"cutlass {sizes}", seeds=SEEDS, truth_fn=with_gradients(projection("xla", jnp.float64)))
+
+
+def test_a_mapped_cutlass_call_runs_each_map_in_turn():
+    """CUTLASS's FFI calls (`grouped_matmul._cutlass_call`, the forward's and the kernel gradient's) mapped
+    (`jax.vmap`, the matrices mapped or shared) trace a sequential batching rule, each map one call in turn;
+    none was declared, and JAX's raised (row 4389). Traced, never run: the targets register on a GPU whose
+    dew-cutlass holds them."""
+    sizes = jnp.asarray([3, 5], jnp.int32)
+    xs, dys = jnp.zeros((2, 8, 16), jnp.bfloat16), jnp.zeros((2, 8, 32), jnp.bfloat16)
+    ws = jnp.zeros((2, 2, 16, 32), jnp.bfloat16)
+    forward = grouped_matmul._cutlass_call('dew_cutlass_grouped_gemm',
+                                           jax.ShapeDtypeStruct((8, 32), jnp.bfloat16))
+    gradient = grouped_matmul._cutlass_call('dew_cutlass_grouped_gemm_k',
+                                            jax.ShapeDtypeStruct((2, 16, 32), jnp.bfloat16))
+
+    def product(x, w):
+        return forward(x, w, sizes, transpose_w=False)
+
+    for mapped, args in ((jax.vmap(product), (xs, ws)), (jax.vmap(product, in_axes=(0, None)), (xs, ws[0])),
+                         (jax.vmap(lambda x, dy: gradient(x, dy, sizes)), (xs, dys))):
+        traced = str(jax.make_jaxpr(mapped)(*args))
+        assert "dew_cutlass_grouped_gemm" in traced and ("scan" in traced or "while" in traced), traced[-300:]
+
+
+def cutlass_runs_a_mapped_projection_as_exactly_as_xla_where_chosen(shared):
+    """Where the installed dew-cutlass holds this GPU's kernels, a projection mapped over a batch of two
+    (`jax.vmap`: each its rows and cotangent, and its matrices unless `shared`), its forward and both
+    gradients through CUTLASS's launches chosen by name, each map one launch in turn (their FFI calls'
+    sequential batching, row 4389), are as exact as XLA's ragged dot mapped, from float64."""
+    here = generation.gpu_target().generation
+    if here not in grouped_matmul.cutlass_architectures():
+        pytest.skip(f"no installed dew-cutlass holds kernels for {here}")
+    group_sizes = jnp.asarray(SIZES["ragged"], jnp.int32)
+
+    def draw(seed):
+        first, second = (operands(SIZES["ragged"], jnp.bfloat16, seed + offset)[:3]
+                         for offset in (0, 1 << 16))
+        x, w, dy = (jnp.stack([jnp.asarray(a, jnp.bfloat16), jnp.asarray(b, jnp.bfloat16)])
+                    for a, b in zip(first, second, strict=True))
+        return x, w[0] if shared else w, dy
+
+    def mapped(implementation, dtype=jnp.bfloat16):
+        one = with_gradients(lambda x, w: expert_projection(x, w, group_sizes, dtype, implementation, None))
+        return jax.vmap(one, in_axes=(0, None if shared else 0, 0))
+
+    def through_cutlass(x, w, dy):
+        with generation.chosen(grouped_matmul="cutlass"):
+            return mapped("pallas")(x, w, dy)
+
+    assert_as_exact(jax.jit(through_cutlass), jax.jit(mapped("xla")), draw,
+                    f"cutlass mapped{' shared' if shared else ''}", seeds=SEEDS,
+                    truth_fn=mapped("xla", jnp.float64))
 
 
 def ragged_draw(seed):
@@ -519,19 +574,6 @@ def test_a_cooperative_tile_stores_each_of_several_outputs():
 
     assert_as_exact(run, jax.jit(plain), draw, "a cooperative tile's two outputs", seeds=SEEDS,
                     truth_fn=truth)
-
-
-def test_each_groups_row_tiles_start_at_its_first_row():
-    """A group's row tiles start at its first row, rounded down to the 8 a TMA descriptor tiles rows by,
-    whole tiles after it, as CUTLASS's grouped GEMM tiles each group: a group within a tile's rows from
-    there takes one tile, reading its matrix once, an empty group none, and the tiles fit the launch's
-    bound (`mosaic_gpu.tile_groups`)."""
-    lengths = jnp.asarray([100, 0, 128, 129, 3, 40], jnp.int32)
-    bound = -(-int(lengths.sum()) // 128) + len(lengths) - 1
-    table = np.asarray(mosaic_gpu.tile_groups(lengths, 128, bound))
-    assert table.tolist() == [[0, 0, 0, 100], [2, 96, 100, 228], [2, 224, 100, 228], [3, 224, 228, 357],
-                              [3, 352, 228, 357], [4, 352, 357, 360], [5, 360, 360, 400], [0, 0, 0, 0],
-                              [0, 0, 0, 0]]
 
 
 @pytest.mark.parametrize("sizes, row_tile", [([120, 8], 64), ([3, 200, 1, 0, 57], 128), ([0, 0, 13], 256),
