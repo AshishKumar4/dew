@@ -41,7 +41,9 @@ class Derived(NamedTuple):
     stepped as `state * factor + weights @ values` (`accumulate(state, factor, weights, values)`, the factor a
     row's, the parts the rule states, `derive.rescaled_by`) and its own addition for a reduction a rule
     stepped as `state * factor + sum` (`add(state, factor, sum)`, `derive.summand`: a compensated walk's
-    running sums), and with `outputs` (places) returns
+    running sums), each called once a step in the carried states' order (`slots`'), so a mainloop's policy
+    over several of them (a guard's shift) is found in the first and read by the rest, and with `outputs`
+    (places) returns
     those of the tile's outputs along the walked axis beside the state, by the same evaluation; its `merge(a,
     b, operands=None, shapes=)` and `finish(state, operands=None, shapes=)` read the state (and the unwalked
     operands given) by the forms of the walk whose tiles were of `shapes` (`init`'s), named, as a state's
