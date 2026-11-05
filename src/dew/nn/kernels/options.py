@@ -13,6 +13,7 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
+import gc
 import threading
 import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
@@ -139,6 +140,45 @@ def compiler_options(*models: Held) -> dict[str, Option]:
     for opened in _COMPILED_WITH.get():
         options.update({name: value for name, value in opened.items() if xla_flag(name) is None})
     return options
+
+
+TRACING_COLLECTIONS = 50_000
+"""The allocations between collections of Python's youngest generation while a program traces and compiles
+(`held_objects`), past CPython's 700: a trace allocates millions of short-lived objects."""
+
+_HELD = 0
+"""The blocks of `held_objects` open, across nesting and threads."""
+
+_HELD_GUARD = threading.Lock()
+
+_THRESHOLDS: list[int] = []
+"""Python's collection thresholds as the first open block of `held_objects` found them."""
+
+
+@contextlib.contextmanager
+def held_objects() -> Iterator[None]:
+    """Within the block, the objects alive when the first open block began are frozen out of Python's
+    collector (`gc.freeze`), as a program's model, its state's specs and JAX's own tables are, and the
+    youngest generation collects every `TRACING_COLLECTIONS` allocations: a trace and its compile make
+    millions of short-lived objects, and each full collection walked the long-lived ones beside them (row
+    2440: 59 full collections paused a Qwen3.5-4B step's compile_ahead 73 s of 342, FS2440-GC-PLAIN; frozen,
+    its pauses took 18 s and it 305, FS2440-GC-FROZEN). Nested and concurrent blocks share one freeze; the
+    last to leave restores the thresholds and returns the frozen objects to the collector (`gc.unfreeze`)."""
+    global _HELD
+    with _HELD_GUARD:
+        if not _HELD:
+            _THRESHOLDS[:] = gc.get_threshold()
+            gc.freeze()
+            gc.set_threshold(TRACING_COLLECTIONS, *_THRESHOLDS[1:])
+        _HELD += 1
+    try:
+        yield
+    finally:
+        with _HELD_GUARD:
+            _HELD -= 1
+            if not _HELD:
+                gc.set_threshold(*_THRESHOLDS)
+                gc.unfreeze()
 
 
 type Placements = (Sharding | Format | None | tuple[Placements, ...] | Mapping[str, Placements]
@@ -304,17 +344,20 @@ class OuterProgram:
             lowered = self._traced(fresh, args, kwargs).lower()
             relowered.append(fresh)
             return lowered
-        executable = report.compiled(self.lower(*args, **kwargs), relower=relower)
+        with held_objects():
+            executable = report.compiled(self.lower(*args, **kwargs), relower=relower)
         # Later calls trace as the relowering did, past the trace its refused config is in.
         if relowered:
             self.jitted = relowered[-1]
         return executable
 
     def lower(self, *args, **kwargs) -> jax.stages.Lowered:
-        return self.trace(*args, **kwargs).lower()
+        with held_objects():
+            return self.trace(*args, **kwargs).lower()
 
     def trace(self, *args, **kwargs) -> jax.stages.Traced:
-        return self._traced(self.jitted, args, kwargs)
+        with held_objects():
+            return self._traced(self.jitted, args, kwargs)
 
     def _keyed(self, args: tuple, kwargs: dict) -> tuple[Hashable, tuple, dict]:
         """The key of the executable a call runs, and the arguments the executable takes, the static
