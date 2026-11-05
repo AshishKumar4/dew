@@ -689,31 +689,70 @@ def _pooled(cache: Variables) -> Variables:
                                             cache)
 
 
-def _read_pages(resident: Slots, carried: Slots, pages: jax.Array) -> Variables:
-    """The pool's `pages`, each leaf's `[heads, len(pages), page_size, ...]`, None off the pool."""
-    return jax.tree.map(lambda leaf: None if leaf is None else jnp.take(leaf, pages, axis=1),
-                        _pooled(joined(resident, carried).decoder.cache), is_leaf=lambda x: x is None)
+def host_pages(resident: Slots, carried: Slots, slots: int) -> Variables:
+    """A host tier of `slots` pages beside the pool the resident state keeps (`Transfers`,
+    `dew.inference.pages`): each pool leaf's `[heads, slots, page_size, ...]`, placed as its pool leaf with
+    its pages in pinned host memory, None off the pool."""
+    def held(leaf):
+        if leaf is None:
+            return None
+        sharding = leaf.sharding.with_memory_kind("pinned_host")
+        return jax.device_put(jnp.zeros((leaf.shape[0], slots, *leaf.shape[2:]), leaf.dtype), sharding)
+
+    pool = _pooled(joined(resident, carried).decoder.cache)
+    return jax.tree.map(held, pool, is_leaf=lambda x: x is None)
 
 
-def _written_pages(resident: Slots, carried: Slots, pages: jax.Array, held: Variables) -> tuple[Slots, Slots]:
-    """The state with the pool's `pages` set to `held` (`_read_pages`' layout); a page past the pool is
-    dropped."""
+def _spilled_pages(resident: Slots, carried: Slots, host: Variables, pages: jax.Array, slots: jax.Array,
+                   count: jax.Array) -> Variables:
+    """`host` with its `slots` holding the pool's `pages`, the first `count` pairs, a page at a time: the
+    page sliced on the device and written into its host slot, as XLA moves a host buffer's slice."""
+    pool = _pooled(joined(resident, carried).decoder.cache)
+
+    def moved(index, host):
+        def one(held, leaf):
+            if held is None:
+                return None
+            page = jax.lax.dynamic_index_in_dim(leaf, pages[index], 1)
+            return jax.lax.dynamic_update_index_in_dim(held, jax.device_put(page, jax.memory.Space.Host),
+                                                       slots[index], 1)
+
+        return jax.tree.map(one, host, pool, is_leaf=lambda x: x is None)
+
+    return jax.lax.fori_loop(0, count, moved, host)
+
+
+def _uploaded_pages(resident: Slots, carried: Slots, host: Variables, slots: jax.Array, pages: jax.Array,
+                    count: jax.Array) -> tuple[Slots, Slots]:
+    """The state with the pool's `pages` holding `host`'s `slots`, the first `count` pairs, a page at a
+    time: the slot read onto the device and written into its page."""
     state = joined(resident, carried)
 
-    def written(leaf, values):
-        return leaf if values is None else leaf.at[:, pages].set(values.astype(leaf.dtype), mode="drop")
+    def moved(index, cache):
+        def one(leaf, held):
+            if held is None:
+                return leaf
+            page = jax.device_put(jax.lax.dynamic_index_in_dim(held, slots[index], 1),
+                                  jax.memory.Space.Device)
+            return jax.lax.dynamic_update_index_in_dim(leaf, page.astype(leaf.dtype), pages[index], 1)
 
-    cache = jax.tree.map(written, state.decoder.cache, held, is_leaf=lambda x: x is None)
+        return jax.tree.map(one, cache, host, is_leaf=lambda x: x is None)
+
+    cache = jax.lax.fori_loop(0, count, moved, state.decoder.cache)
     return split_donated(dataclasses.replace(state, decoder=dataclasses.replace(state.decoder, cache=cache)))
 
 
-def page_programs(formats: Formats) -> tuple[OuterProgram, OuterProgram]:
-    """The programs that move a paged pool's pages between the resident state, kept in `formats`, and the
-    host (`dew.inference.pages.Transfers`): reading pages out, and writing pages in, the resident matrices
-    donated."""
+def page_programs(formats: Formats, host: Variables) -> tuple[OuterProgram, OuterProgram]:
+    """The programs that move a paged pool's pages between the resident state, kept in `formats`, and its
+    host tier placed as `host` is (`host_pages`): spilling pages into host slots, the tier donated, and
+    uploading slots into pages, the resident matrices donated."""
     resident, carried = split_donated(formats)
-    return (outer_program(_read_pages, in_shardings=(resident, carried, None)),
-            outer_program(_written_pages, donate_argnums=(0,), in_shardings=(resident, carried, None, None),
+    placed = jax.tree.map(lambda leaf: None if leaf is None else leaf.sharding, host,
+                          is_leaf=lambda x: x is None)
+    return (outer_program(_spilled_pages, donate_argnums=(2,),
+                          in_shardings=(resident, carried, placed, None, None, None), out_shardings=placed),
+            outer_program(_uploaded_pages, donate_argnums=(0,),
+                          in_shardings=(resident, carried, placed, None, None, None),
                           out_shardings=(resident, carried)))
 
 
