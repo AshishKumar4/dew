@@ -272,9 +272,9 @@ def test_a_saved_prefix_runs_bundle_serves_as_the_runs_own_task(tmp_path):
     bundle.save(tmp_path / "export")
     exported = Pretrained.load(tmp_path / "export", dtype="float32").pipeline()
     assert (exported.prefix, exported.precision) == (PREFIX, trained_in)
-    # Each generation's real rows on the host (`Generation.host`): the run's task holds its weights over the
-    # run's devices, its batch padded to the data axis there.
-    again, run = exported(prompt, NEW, key=0).host(), theirs.host()
+    # The run's own task over the same weights on the host, where the export's loads them: one program.
+    home = dataclasses.replace(bundle, variables=jax.device_get(bundle.variables)).pipeline()
+    again, run = exported(prompt, NEW, key=0), home(prompt, NEW, key=0)
     np.testing.assert_array_equal(again.tokens, run.tokens)
     np.testing.assert_array_equal(again.raw_log_probs, run.raw_log_probs)
 
