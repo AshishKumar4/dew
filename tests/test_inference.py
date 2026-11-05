@@ -664,6 +664,12 @@ def test_a_run_on_a_mesh_packs_the_projections_its_layout_keeps_whole(tmp_path):
         np.testing.assert_array_equal(there.tokens, here.tokens, err_msg=str(spec))
 
 
+LAYOUT_SEEDS = 128
+"""The layout sites' declared seeds, sized by `seeds_for` paired with each layout's draw on armada's CPUs:
+128 for every layout (fsdp-stage's on two machines, the others' on one), a sizing that took 17 to 55 s of
+each case's run when the case sized itself (row 4341)."""
+
+
 @pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("spec", [{"sequence": 2}, {"fsdp": 2, "stage": 2}, {"tensor": 2, "sequence": 2}],
                          ids=["sequence", "fsdp-stage", "tensor-sequence"])
@@ -672,7 +678,7 @@ def test_a_run_samples_on_every_trainer_layout_what_one_device_samples(tmp_path,
     and their products, draws what it draws on one device, on par with that draw against its float64
     twin (check 1); a server on the layout serves what a call draws (ledger 1817)."""
     from arm_arithmetic import widened
-    from reference_error import as_given, assert_as_exact, seeds_for
+    from reference_error import as_given, assert_as_exact
 
     from dew.inference import Server
     from dew.sampling import Sampling
@@ -708,10 +714,10 @@ def test_a_run_samples_on_every_trainer_layout_what_one_device_samples(tmp_path,
         return tuple(ticket.result().host().raw_log_probs for ticket in tickets)
 
     label = f"sampled on {spec}"
-    count = seeds_for(drawn(alone), draw, label, truth_fn=drawn(wide, "float64"), dew_fn=drawn(placed))
-    assert_as_exact(drawn(placed), drawn(alone), draw, label, seeds=count, truth_fn=drawn(wide, "float64"))
+    assert_as_exact(drawn(placed), drawn(alone), draw, label, seeds=LAYOUT_SEEDS,
+                    truth_fn=drawn(wide, "float64"))
     server = Server.from_task(dataclasses.replace(placed, sampling=sampling), slots=2, capacity=16)
-    assert_as_exact(served, drawn(alone), draw, label, seeds=count, truth_fn=drawn(wide, "float64"))
+    assert_as_exact(served, drawn(alone), draw, label, seeds=LAYOUT_SEEDS, truth_fn=drawn(wide, "float64"))
 
 
 def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):

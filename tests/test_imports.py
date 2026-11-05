@@ -218,6 +218,9 @@ LAYERS: dict[str, tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = {
     "inference imports no trainer or front end": (
         ("dew.inference",), (), ("dew.training", "dew._cli", "dew.decision", "dew.io")),
     "reinforcement learning imports no trainer": (("dew.rl",), (), ("dew.training",)),
+    # An environment run's record is the configuration's (`dew.config.env`), not the objectives' (row 4267).
+    "objectives import no trainer, configuration or front end": (
+        ("dew.objectives",), (), ("dew.training", "dew.config", "dew.checkpoints", "dew._cli")),
     "only the reinforcement-learning packages import dew.rl": (
         ("dew",), ("dew.rl", "dew.objectives.rl"), ("dew.rl",)),
 }

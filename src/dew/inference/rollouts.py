@@ -36,7 +36,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax.core import FrozenDict
 
-from dew._coordination import agreed, collective_host
+from dew._coordination import agreed, reading_home
 from dew._records import JSON, finite, record as section
 from dew.batch import Variables, thaw, token_id
 from dew.nn.inputs import key_seed, request_key
@@ -517,18 +517,13 @@ def _served(variables: Variables, dtype: jnp.dtype) -> Variables:
                         thaw(variables))
 
 
-def _published(source: Pretrained, variables: Variables, dtype: jnp.dtype, *,
-               phase: str) -> Pretrained | None:
+def _published(source: Pretrained, variables: Variables, dtype: jnp.dtype) -> Pretrained:
     """`source` holding `variables` in place of its own tree, each of its trees (a composite release's
-    readout beside its backbone, `Pretrained.map_variables`) cast to the serving `dtype` and gathered
-    home on process 0, which alone returns it: what a publisher exports or saves there. Every process
-    of a pool calls it, as every tree of a pool's placement may hold another process's shards."""
-    def gathered(tree: Variables) -> Variables:
-        held = collective_host(_served(tree, dtype), phase=phase, held_by="first")
-        return {} if held is None else held
-
-    published = replace(source, variables=variables).map_variables(gathered)
-    return published if jax.process_index() == 0 else None
+    readout beside its backbone, `Pretrained.map_variables`) cast to the serving `dtype` where it is
+    placed, on its devices: what a publisher exports or saves, a tensor at a time, each read home by the
+    pool together inside `reading_home` as the writer reads it, so no host holds the whole tree (ledger
+    4370). Every process of a pool exports it alike."""
+    return replace(source, variables=variables).map_variables(lambda tree: _served(tree, dtype))
 
 
 @dataclass(frozen=True)
@@ -560,12 +555,12 @@ class SafetensorsReload:
     directory.
 
     A failed push raises an error that names every replica that did not take
-    the version. Every process of a pool calls the push.
-    `collective_host(held_by="first")` gathers the served tree to process 0,
-    which writes and publishes it, with every other tree the source writes
-    beside it (a decision release's readout, `_published`), and an agreement
-    point raises a failure on every process, so the others do not hang at the
-    next collective.
+    the version. Every process of a pool calls the push: each runs the same
+    writer over the served tree and every other tree the source writes beside
+    it (a decision release's readout, `_published`), reading each tensor home
+    together as it is written (`reading_home`), and process 0 alone writes the
+    weights and publishes them; an agreement point raises a failure on every
+    process, so the others do not hang at the next collective.
     """
 
     source: Pretrained
@@ -584,8 +579,9 @@ class SafetensorsReload:
 
         Every process of a pool calls it.
         """
-        published = _published(self.source, variables, jnp.dtype(self.dtype), phase="weight export gather")
-        agreed("weight export", lambda: None if published is None else published.save(self.directory))
+        published = _published(self.source, variables, jnp.dtype(self.dtype))
+        with reading_home("weight export", writes=jax.process_index() == 0):
+            agreed("weight export", lambda: published.save(self.directory))
 
     def __call__(self, variables: Variables, version: int) -> None:
         self.write(variables)

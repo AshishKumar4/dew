@@ -19,6 +19,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   other than `params` go to the content-addressed store, and their EMA is stored as its difference from their
   weights, as the outer model's are.
 - `Decide.save` writes the average's model alone.
+- An environment run's record moves from `dew.objectives.rl.config` to `dew.config.env`, beside the other
+  run kinds' records: `EnvRunConfig`, `EnvConfig`, `RolloutConfig`, `TeacherConfig`, `EpisodesConfig` and
+  `idle`, with no alias left, so the objectives import no configuration. A record names its kind as before.
 - Dew's support modules are private: `dew.accuracy`, `dew.builds`, `dew.cache`, `dew.cleanup`, `dew.devices`,
   `dew.files`, `dew.logging`, `dew.pool`, `dew.position` and `dew.cli` are now `dew._accuracy` and so on, with
   no alias left, and the API reference no longer lists `dew.cache`. `CPUOnlyJax`, which a run raises where JAX
@@ -101,7 +104,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   the run's directory and a step the run pins as it starts). The run derives the tokenizer's frame from its
   clips and the dynamics' widths from the tokenizer and the clips' actions, and the objectives read uint8
   clips as the frames in [-1, 1] they encode (`dew.objectives.world_model.unit_frames`). The idle loader of
-  an environment run is public (`dew.objectives.rl.config.idle`), an episodic split flies the policy's draws
+  an environment run is public (`dew.config.env.idle`), an episodic split flies the policy's draws
   in place of its mean with `drawn` (`EpisodesConfig`), the acceptance runs of PPO and DreamerV3
   (`tools/rl_acceptance.py`) train as environment runs, DreamerV3's `return` scored by its draws and its
   `greedy_return` beside it, and `LocalTracker.timed` reads a journal's reports with the second each was
