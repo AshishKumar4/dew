@@ -16,7 +16,6 @@ from collections.abc import Callable, Hashable, Mapping
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import linen as nn, struct
 from jax._src import config as jax_config
 from jax.experimental import checkify
@@ -690,73 +689,43 @@ def _pooled(cache: Variables) -> Variables:
                                             cache)
 
 
-def host_pages(resident: Slots, carried: Slots, slots: int) -> Variables:
-    """A host tier of `slots` pages beside the pool the resident state keeps (`Transfers`,
-    `dew.inference.pages`): each pool leaf's `[heads, slots, page_size, ...]`, placed as its pool leaf with
-    its pages in pinned host memory, None off the pool."""
-    def held(leaf):
-        if leaf is None:
-            return None
-        # Each shard made on the host and put where it lives: the tier never passes through device memory.
-        shape = (leaf.shape[0], slots, *leaf.shape[2:])
-        sharding = leaf.sharding.with_memory_kind("pinned_host")
-        return jax.make_array_from_callback(
-            shape, sharding, lambda index: np.zeros(sharding.shard_shape(shape), leaf.dtype))
-
-    pool = _pooled(joined(resident, carried).decoder.cache)
-    return jax.tree.map(held, pool, is_leaf=lambda x: x is None)
+def _read_pages(resident: Slots, carried: Slots, pages: jax.Array) -> Variables:
+    """The pool's `pages`, each leaf's `[heads, len(pages), page_size, ...]`, None off the pool."""
+    return jax.tree.map(lambda leaf: None if leaf is None else jnp.take(leaf, pages, axis=1),
+                        _pooled(joined(resident, carried).decoder.cache), is_leaf=lambda x: x is None)
 
 
-def _spilled_pages(resident: Slots, carried: Slots, host: Variables, pages: jax.Array, slots: jax.Array,
-                   count: jax.Array) -> Variables:
-    """`host` with its `slots` holding the pool's `pages`, the first `count` pairs, a page at a time: the
-    page sliced on the device and written into its host slot, as XLA moves a host buffer's slice."""
-    pool = _pooled(joined(resident, carried).decoder.cache)
-
-    def moved(index, host):
-        def one(held, leaf):
-            if held is None:
-                return None
-            page = jax.lax.dynamic_index_in_dim(leaf, pages[index], 1)
-            return jax.lax.dynamic_update_index_in_dim(held, jax.device_put(page, jax.memory.Space.Host),
-                                                       slots[index], 1)
-
-        return jax.tree.map(one, host, pool, is_leaf=lambda x: x is None)
-
-    return jax.lax.fori_loop(0, count, moved, host)
+def page_shapes(resident: Slots, carried: Slots, count: int) -> Variables:
+    """The shapes `count` of the pool's pages take as `_read_pages` reads them."""
+    return jax.eval_shape(_read_pages, resident, carried, jax.ShapeDtypeStruct((count,), jnp.int32))
 
 
-def _uploaded_pages(resident: Slots, carried: Slots, host: Variables, slots: jax.Array, pages: jax.Array,
-                    count: jax.Array) -> tuple[Slots, Slots]:
-    """The state with the pool's `pages` holding `host`'s `slots`, the first `count` pairs, a page at a
-    time: the slot read onto the device and written into its page."""
+def _written_pages(resident: Slots, carried: Slots, pages: jax.Array, groups: jax.Array,
+                   held: Variables) -> tuple[Slots, Slots]:
+    """The state with the pool's `pages` set to `held`'s, each leaf `[groups, heads, len(pages), ...]` with
+    page `i` in the row of its group (`groups[i]`), the group whose rows hold its slot; a page past the
+    pool is dropped."""
     state = joined(resident, carried)
 
-    def moved(index, cache):
-        def one(leaf, held):
-            if held is None:
-                return leaf
-            page = jax.device_put(jax.lax.dynamic_index_in_dim(held, slots[index], 1),
-                                  jax.memory.Space.Device)
-            return jax.lax.dynamic_update_index_in_dim(leaf, page.astype(leaf.dtype), pages[index], 1)
+    def written(leaf, values):
+        if values is None:
+            return leaf
+        own = jnp.take_along_axis(values, groups.reshape(1, 1, -1, *(1,) * (values.ndim - 3)), axis=0)[0]
+        return leaf.at[:, pages].set(own.astype(leaf.dtype), mode="drop")
 
-        return jax.tree.map(one, cache, host, is_leaf=lambda x: x is None)
-
-    cache = jax.lax.fori_loop(0, count, moved, state.decoder.cache)
+    cache = jax.tree.map(written, state.decoder.cache, held, is_leaf=lambda x: x is None)
     return split_donated(dataclasses.replace(state, decoder=dataclasses.replace(state.decoder, cache=cache)))
 
 
-def page_programs(formats: Formats, host: Variables) -> tuple[OuterProgram, OuterProgram]:
-    """The programs that move a paged pool's pages between the resident state, kept in `formats`, and its
-    host tier placed as `host` is (`host_pages`): spilling pages into host slots, the tier donated, and
-    uploading slots into pages, the resident matrices donated."""
+def page_programs(formats: Formats, rows: NamedSharding | None) -> tuple[OuterProgram, OuterProgram]:
+    """The programs that move a paged pool's pages between the resident state, kept in `formats`, and the
+    host (`dew.inference.pages.Transfers`): reading pages out, and writing pages in, the pages handed in a
+    row per group placed as the server's admitted rows are (`rows`), the resident matrices donated. JAX
+    writes no slice into an array in host memory, so the host keeps the pages it reads."""
     resident, carried = split_donated(formats)
-    placed = jax.tree.map(lambda leaf: None if leaf is None else leaf.sharding, host,
-                          is_leaf=lambda x: x is None)
-    return (outer_program(_spilled_pages, donate_argnums=(2,),
-                          in_shardings=(resident, carried, placed, None, None, None), out_shardings=placed),
-            outer_program(_uploaded_pages, donate_argnums=(0,),
-                          in_shardings=(resident, carried, placed, None, None, None),
+    return (outer_program(_read_pages, in_shardings=(resident, carried, None)),
+            outer_program(_written_pages, donate_argnums=(0,),
+                          in_shardings=(resident, carried, None, None, rows),
                           out_shardings=(resident, carried)))
 
 

@@ -85,7 +85,7 @@ from jax.experimental import checkify
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
-from dew._coordination import agreed_reads
+from dew._coordination import agreed_reads, collective_host
 from dew._hashing import array_fingerprint
 from dew._records import JSON
 from dew.batch import (
@@ -108,12 +108,12 @@ from dew.inference.serving_kernel import (
     Placement,
     decode_programs,
     dispatched,
-    host_pages,
     joined,
     mixed_refusal,
     opened,
     opened_in,
     page_programs,
+    page_shapes,
     resident_formats,
     row_state,
     split_donated,
@@ -686,12 +686,12 @@ class Server:
                 self.cache)
             self._states = states
             self._restored, self._captured = map(Fetched, state_programs(formats, states))
-        self._host: Variables | None = None
-        """The prefix cache's host tier, each pool leaf's pages in pinned host memory, its slots the groups'
-        in order (`dew.inference.pages.Transfers`); None without one."""
+        self._host: dict[int, list[np.ndarray]] | None = None
+        """The prefix cache's host tier: each of this process's host slots, by the slot's global index, its
+        page of each pool leaf (`dew.inference.pages.Transfers`); None without one."""
         if isinstance(rows, PagedRows) and rows.pages[0].host:
-            self._host = host_pages(self._resident, self._carried, rows.pages[0].host * self.groups)
-            self._spill, self._upload = map(Fetched, page_programs(formats, self._host))
+            self._host = {}
+            self._read_pages, self._written_pages = map(Fetched, page_programs(formats, self._admitted))
 
     @contextlib.contextmanager
     def _context(self) -> Iterator[None]:
@@ -1112,18 +1112,33 @@ class Server:
     def _transferred(self, spills: Sequence[tuple[int, int]], uploads: Sequence[tuple[int, int]]) -> None:
         """Make the page copies every process's seating owes before the step's program writes any page: each
         reclaimed prefix page out to its host slot, then each shared one back from its slot into its fresh
-        page, a fixed number a call so one program of each serves every step."""
+        page, a fixed number a call so one program of each serves every step. A process keeps the slots of
+        its own groups, and hands the pages written in a row per group, its groups' rows its own
+        (`_placed`)."""
         if self._host is None:
             return
-        width = self.admission * self.rows.width
+        assert isinstance(self.rows, PagedRows)
+        width, host = self.admission * self.rows.width, self.rows.pages[0].host
         for start in range(0, len(spills), width):
-            pages, slots = _padded(spills[start:start + width], width, 1)
-            self._host = self._spill(self._resident, self._carried, self._host, pages, slots,
-                                     np.int32(min(width, len(spills) - start)))
+            batch = spills[start:start + width]
+            pages, _ = _padded(batch, width, 1)
+            leaves = jax.tree.leaves(collective_host(self._read_pages(self._resident, self._carried, pages),
+                                                     phase="the prefix cache's spilled pages"))
+            for index, (_, slot) in enumerate(batch):
+                if slot // host in self._local:
+                    self._host[slot] = [np.asarray(leaf)[:, index].copy() for leaf in leaves]
         for start in range(0, len(uploads), width):
-            slots, pages = _padded(uploads[start:start + width], width, 1)
-            self._resident, self._carried = self._upload(self._resident, self._carried, self._host, slots,
-                                                         pages, np.int32(min(width, len(uploads) - start)))
+            batch = uploads[start:start + width]
+            slots, pages = _padded(batch, width, 1)
+            shapes = page_shapes(self._resident, self._carried, width)
+            held = [np.zeros((len(self._local), *leaf.shape), leaf.dtype) for leaf in jax.tree.leaves(shapes)]
+            for index, (slot, _) in enumerate(batch):
+                if slot // host in self._local:
+                    for rows, page in zip(held, self._host[slot], strict=True):
+                        rows[self._local.index(slot // host), :, index] = page
+            self._resident, self._carried = self._written_pages(
+                self._resident, self._carried, pages, slots // host,
+                jax.tree.unflatten(jax.tree.structure(shapes), self._placed(held)))
 
     def run(self) -> None:
         """Step until every queued and running request has resolved. A step that fails stops the server:
