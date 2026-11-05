@@ -50,9 +50,20 @@ class Lane:
     over its probes (`_probes`): 0 where every one was its exact value rounded to nearest, 1 where each
     was one of the two neighbours of its exact value on the lane's grid (faithful), n where each was
     within n - 1 steps of the grid past them; a division by a size-1 broadcast divisor its own form's
-    (`BROADCAST`)."""
+    (`BROADCAST`).
+
+    `kept`: the rounding primitives and formats that read a subnormal operand as it is on a lane that
+    `flushes` (`SUBNORMAL_OPERANDS`): XLA on the CPU flushes per primitive, its expm1 and log1p returning
+    a subnormal argument where its multiply reads one as zero (ledger 4023). Each is held as a lane that
+    keeps subnormals (`flushes_in`)."""
     flushes: bool
     reach: dict[tuple[str, str], int]
+    kept: frozenset[tuple[str, str]] = frozenset()
+
+    def flushes_in(self, name: str, fmt: Format) -> bool:
+        """Whether the rounding primitive `name` flushes in `fmt` on this lane: the lane's, but where it
+        reads a subnormal operand as it is (`kept`)."""
+        return self.flushes and (name, fmt.name) not in self.kept
 
 
 def _grid_index(value, fmt: Format, flushes: bool) -> np.ndarray:
@@ -417,7 +428,7 @@ def _rounding(name: str, integral):
         divisor = np.shape(operands[-1])
         broadcast = name == "div" and len(divisor) == np.ndim(result) and divisor != np.shape(result)
         reach = measured.reach[name + BROADCAST if broadcast else name, fmt.name]
-        return LEVELS[name](operands, result, fmt, measured.flushes) <= reach
+        return LEVELS[name](operands, result, fmt, measured.flushes_in(name, fmt)) <= reach
     return contract
 
 
@@ -835,9 +846,10 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
         # Every normal binade near zero, where the functions are their argument to within a last bit (their
         # enclosures' precision raised there, `_near_zero_interval`); a quarter densest across (-0.5, 1),
         # where XLA's log1p rounds farthest, and out to 8; and their domains' reach: log1p's down to just
-        # above -1 and up to fp32's largest, expm1's across fp32's range. A subnormal operand is read as the
-        # lane reads it (`flushes`), whose expm1 keeps one its multiply flushes.
-        value = scaled(-126, 0)
+        # above -1 and up to fp32's largest, expm1's across fp32's range. Their subnormal binades too, which a
+        # lane reads as its own primitive does (`Lane.flushes_in`: XLA:CPU's expm1 keeps one its multiply
+        # flushes, ledger 4023).
+        value = scaled(fmt.emin - fmt.precision + 1, 0)
         value[quarter:2 * quarter] = (rng.uniform(-1, 0, quarter) if name == "log1p"
                                       else rng.uniform(-104, 89, quarter))
         value[2 * quarter:3 * quarter] = rng.uniform(-0.5, 1, quarter) * 2.0 ** rng.integers(0, 4, quarter)
@@ -857,22 +869,52 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
     return [value.astype(DTYPES[fmt.name]) for value in drawn]
 
 
+SUBNORMAL_OPERANDS = {
+    "add": lambda tiny: (tiny, tiny), "sub": lambda tiny: (tiny, -tiny),
+    "mul": lambda tiny: (tiny, 2.0 ** 100), "div": lambda tiny: (tiny, 2.0 ** -100),
+    "sqrt": lambda tiny: (tiny,), "rsqrt": lambda tiny: (tiny,),
+    "log": lambda tiny: (tiny,), "log1p": lambda tiny: (tiny,), "expm1": lambda tiny: (-tiny,),
+    "erf_inv": lambda tiny: (tiny,),
+}
+"""Each rounding primitive's operands at a subnormal `tiny` whose result tells a subnormal read as it is from
+one read as zero (`lane`'s `kept`); exp, logistic and square return the same result either way, so a lane's
+flushing holds them as it holds every other operation."""
+
+
+def _keeps_subnormals(name: str, fmt: Format) -> bool:
+    """Whether the lane's `name` in `fmt` reads a subnormal operand as it is: its result at
+    `SUBNORMAL_OPERANDS`' subnormal differs from its result with that operand zero."""
+    import jax
+
+    tiny = 2.0 ** (fmt.emin - 4)
+    subnormal = [np.asarray(value, DTYPES[fmt.name]) for value in SUBNORMAL_OPERANDS[name](tiny)]
+    zeroed = [np.asarray(0.0 if abs(float(value)) == tiny else value, DTYPES[fmt.name])
+              for value in SUBNORMAL_OPERANDS[name](tiny)]
+    run = getattr(jax.lax, name)
+    return bool(np.any(_bits(np.asarray(run(*subnormal))) != _bits(np.asarray(run(*zeroed)))))
+
+
 @functools.cache
 def lane() -> Lane:
     """The lane check 2 runs on (the process's default backend), measured once: whether it reads a
-    subnormal operand as zero (2^-140 times 2^100), and each rounding primitive's reach in each format,
-    the largest level (`LEVELS`) of the lane's own results on its probes (`_probes`), each operation
-    run as `certified` runs it, eagerly and alone. A lane result that breaks an exact case (UNREACHED)
-    is a finding no reach admits, raised here."""
+    subnormal operand as zero (2^-140 times 2^100), the rounding primitives that read one as it is where
+    it does (`_keeps_subnormals`), and each rounding primitive's reach in each format, the largest level
+    (`LEVELS`) of the lane's own results on its probes (`_probes`), each operation run as `certified`
+    runs it, eagerly and alone, at the primitive's own flushing. A lane result that breaks an exact case
+    (UNREACHED) is a finding no reach admits, raised here."""
     import jax
 
     flushes = float(jax.lax.mul(np.float32(2.0 ** -140), np.float32(2.0 ** 100))) == 0.0
-    reach = {}
+    kept = frozenset((name, fmt.name) for name in SUBNORMAL_OPERANDS for fmt in FORMATS.values()
+                     if flushes and _keeps_subnormals(name, fmt))
+    measured = Lane(flushes, {}, kept)
+    reach = measured.reach
     for name, levels in LEVELS.items():
         for fmt in FORMATS.values():
             operands = _probes(name, fmt)
             # Each primitive is `jax.lax`'s function of its own name.
-            found = levels(operands, np.asarray(getattr(jax.lax, name)(*operands)), fmt, flushes)
+            found = levels(operands, np.asarray(getattr(jax.lax, name)(*operands)), fmt,
+                           measured.flushes_in(name, fmt))
             if np.any(found == UNREACHED):
                 at = int(np.argmax(found == UNREACHED))
                 raise ArithmeticError(f"the lane's {name} in {fmt.name} breaks an exact case at "
@@ -884,11 +926,12 @@ def lane() -> Lane:
         dividend, divisor = _probes("div", fmt)
         rows = PROBES // 32
         operands = [dividend[:rows * 32].reshape(rows, 32), divisor[:rows].reshape(rows, 1)]
-        found = LEVELS["div"](operands, np.asarray(jax.lax.div(*operands)), fmt, flushes)
+        found = LEVELS["div"](operands, np.asarray(jax.lax.div(*operands)), fmt,
+                              measured.flushes_in("div", fmt))
         if np.any(found == UNREACHED):
             raise ArithmeticError(f"the lane's broadcast div in {fmt.name} breaks an exact case")
         reach["div" + BROADCAST, fmt.name] = int(np.max(found))
-    return Lane(flushes, reach)
+    return measured
 
 
 CONTRACTS = {

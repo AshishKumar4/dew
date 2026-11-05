@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from one_draw import assert_as_exact_as_the_reference, assert_leaves_as_exact
+from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
     MOST_SEEDS,
@@ -1095,8 +1095,6 @@ def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
     assert distance(dew, truth) <= FACTOR * distance(reference, truth)
     with pytest.raises(AssertionError):
         assert_as_exact_as_the_reference(dew, reference, truth, "small row")
-    with pytest.raises(AssertionError):
-        assert_leaves_as_exact({"rows": dew}, {"rows": reference}, {"rows": truth})
 
 
 def test_a_row_that_cancels_is_held_to_what_it_sums():
@@ -1118,10 +1116,10 @@ def test_a_row_that_cancels_is_held_to_what_it_sums():
         return truth + noise
 
     reference, further = rounded(), rounded(10.0)
-    assert_leaves_as_exact({"dq": rounded()}, {"dq": reference}, {"dq": truth}, terms={"dq": terms})
+    assert_as_exact_as_the_reference(rounded(), reference, truth, "dq", terms=terms)
     assert distance(further, truth) <= FACTOR * distance(reference, truth)
     with pytest.raises(AssertionError):
-        assert_leaves_as_exact({"dq": further}, {"dq": reference}, {"dq": truth}, terms={"dq": terms})
+        assert_as_exact_as_the_reference(further, reference, truth, "dq", terms=terms)
 
 
 def test_a_row_of_float64_zero_is_held_to_the_references_own_row():
