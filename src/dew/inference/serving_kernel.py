@@ -95,7 +95,11 @@ class Admission:
     marks the rows whose piece ends their prompt: those start drawing this
     step, and `history` with `history_valid` is their whole prompt
     right-aligned in `capacity` slots, for the transforms to read. `adapters`
-    is each row's adapter (`Slots.adapter`)."""
+    is each row's adapter (`Slots.adapter`). `prefilled`, where the server
+    prefills on a mesh of its own (`Server.from_task`'s `prefill_mesh`), is
+    the rows' prefilled decoder state and their real slots that program
+    left (`Dense.rows_prefilled`), moved to the decoding mesh; None, the
+    step prefills them itself."""
 
     prompts: ModelInputs
     slots: jax.Array
@@ -107,6 +111,7 @@ class Admission:
     history: jax.Array
     history_valid: jax.Array
     adapters: jax.Array
+    prefilled: tuple[DecoderState, jax.Array] | None = None
 
 
 @struct.dataclass
@@ -237,18 +242,36 @@ class Dense:
         capacity's f32 scores. A row's slots past the prompt keep a former
         occupant's keys, past the cursor the prefill sets.
         """
-        narrow = cache_sized(model, admission.prompts.tokens.shape[1])
-        with selected(admission.adapters):
-            fresh, real = prefill_state(narrow, params, admission.prompts,
-                                        decode_ops(narrow, params, pad_id, drafting_depths(model, self.plan),
-                                                   progress),
-                                        rounding=rounding_keys(jax.random.wrap_key_data(admission.keys,
-                                                                                        impl=self.prng)),
-                                        progress=progress)
+        fresh, real = (self.rows_prefilled(model, params, pad_id, admission, progress)
+                       if admission.prefilled is None else admission.prefilled)
+
         def place(resident: jax.Array, incoming: jax.Array) -> jax.Array:
             return _placed(resident, incoming, admission.slots, self.groups)
 
         return jax.tree.map(place, state.decoder, fresh), real
+
+
+    def rows_prefilled(self, model: nn.Module, params: Variables, pad_id: int, admission: Admission,
+                       progress: Progress = END) -> tuple[DecoderState, jax.Array]:
+        """The admitted prompts' own decoder state, their rows prefilled over a fresh cache at their bucket
+        width, and their real slots: what `prefilled` seats, which a server that prefills on a mesh of its
+        own runs there and moves (`Admission.prefilled`)."""
+        narrow = cache_sized(model, admission.prompts.tokens.shape[1])
+        ops = decode_ops(narrow, params, pad_id, drafting_depths(model, self.plan), progress)
+        rounding = rounding_keys(jax.random.wrap_key_data(admission.keys, impl=self.prng))
+        with selected(admission.adapters):
+            return prefill_state(narrow, params, admission.prompts, ops, rounding=rounding, progress=progress)
+
+
+def _prefilled_rows(model: nn.Module, params: Variables, pad_id: int, placement: Dense, admission: Admission,
+                    progress: Progress) -> tuple[DecoderState, jax.Array]:
+    return placement.rows_prefilled(model, params, pad_id, admission, progress)
+
+
+def prefill_program() -> OuterProgram:
+    """The program a server that prefills on a mesh of its own runs there (`Dense.rows_prefilled`), over
+    the admission where its caller places it on that mesh (`Server._prefilled_elsewhere`)."""
+    return outer_program(_prefilled_rows, static_argnums=(0, 2, 3))
 
 
 @dataclasses.dataclass(frozen=True)

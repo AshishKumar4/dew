@@ -114,6 +114,7 @@ from dew.inference.serving_kernel import (
     opened_in,
     page_programs,
     page_shapes,
+    prefill_program,
     resident_formats,
     row_state,
     split_donated,
@@ -138,6 +139,7 @@ from dew.nn.inputs import (
     CONTEXT_LENGTHS,
     CrossContext,
     ModelInputs,
+    default_placement,
     host_token_rows,
     mesh_of,
     request_key,
@@ -553,7 +555,7 @@ class Server:
                  grammar: Grammar | None, rows: Rows, slots: int, capacity: int, admission: int,
                  default_budget: int | None, max_length: int | None, decode_steps: int,
                  prefix: int | Literal["prompt"] | None = None, precision: Numerics | None = None,
-                 progress: Progress = END) -> None:
+                 progress: Progress = END, prefill_mesh: Mesh | None = None) -> None:
         if type(slots) is not int or slots < 1:
             raise ValueError("slots must be a positive number of resident rows")
         _refuse_unserved_modes(
@@ -586,9 +588,7 @@ class Server:
         self.sampling = dataclasses.replace(sampling, pad_token_id=self.pad_id)
         self.transforms = transforms
         self.stopping = stopping
-        self.slots = slots
-        self.capacity = capacity
-        self.admission = admission
+        self.slots, self.capacity, self.admission = slots, capacity, admission
         self.default_budget = default_budget
         self.max_length = max_length
         self.prefix: int | Literal["prompt"] | None = prefix
@@ -638,7 +638,8 @@ class Server:
             """Whether a layer's decode cache holds its rows' rounding keys (`dew.nn.kv_cache.ROUNDING_KEYS`),
             so a prompt's state follows its request's key, which then names its prefix too (`_prepared`)."""
             # None selects the one mixed forward of `_mixed_step`.
-            self.mixed_refusal = mixed_refusal(model, shapes, rows.placement)
+            self.mixed_refusal = ("its prompts prefill on a mesh of their own" if prefill_mesh is not None
+                                  else mixed_refusal(model, shapes, rows.placement))
             """Why the admitting step prefills in a separate forward, or None when it runs one mixed forward.
 
             The mixed forward covers each row's last draw and the admitted
@@ -664,6 +665,27 @@ class Server:
                 opened_in(formats)(model, self.variables, self.pad_id, slots, capacity, rows.placement.plan,
                                    self.prng))
             self._keep_states(formats)
+        self._prefill_apart(prefill_mesh)
+
+    def _prefill_apart(self, mesh: Mesh | None) -> None:
+        """Prefill the admitted prompts on `mesh`, apart from the decoding mesh (`from_task`'s
+        `prefill_mesh`): the program that runs there and a copy of the weights placed on it."""
+        self.prefill_mesh = mesh
+        if mesh is None:
+            return
+        spans = {device.process_index for device in mesh.devices.flat}
+        if spans != ({jax.process_index()} if self.mesh is None else
+                     {device.process_index for device in self.mesh.devices.flat}):
+            # Each process's requests reach the prefill mesh through the server's own steps, which the
+            # processes take together only where the server's mesh spans them all.
+            raise ValueError("a server prefills on a mesh over the processes its own mesh spans; place its "
+                             "weights over the same processes as prefill_mesh")
+        rows = self.rows
+        if not isinstance(rows, DenseRows) or rows.chunk is not None or rows.placement.plan is not None:
+            raise ValueError("a server that prefills on a mesh of its own prefills each prompt whole over a "
+                             "dense cache; serve it without page_size, chunk or a speculative plan")
+        self._prefill = prefill_program()
+        self._prefill_variables = _on_mesh(self.variables, mesh)
 
     def _keep_states(self, formats) -> None:
         """Open the store of row states a shared prefix is read with, where the rows keep state beside
@@ -712,7 +734,7 @@ class Server:
                   admission: int | None = None, kv_cache: KVCache | None = None,
                   chunk: int | None = None, prefix_cache: bool = False, prefix_states: int | None = None,
                   prefix_state_every: int | None = None, host_pages: int = 0,
-                  decode_steps: int = 1) -> Server:
+                  decode_steps: int = 1, prefill_mesh: Mesh | None = None) -> Server:
         """Build a server over the task's model, weights, processor and policy.
 
         `capacity` is rounded up to whole 64-slot tiles and whole pages, and
@@ -741,6 +763,13 @@ class Server:
         pool reclaims goes to the host first, and a prompt that shares it reads
         it back into a fresh page before its prefill (`dew.inference.pages`), so
         a prefix cache holds more than the device's pages.
+
+        `prefill_mesh` prefills the admitted prompts on a mesh of their own,
+        as MaxEngine's and vLLM's disaggregated serving does: the server keeps
+        a copy of its weights there, placed as on its own mesh, prefills each
+        admission's rows over it and moves their decoder state to the decoding
+        mesh, where the rows are seated and decode; a request draws what it
+        draws on one mesh. The rows prefill whole over a dense cache.
 
         Weights on a mesh are served on that mesh. The slots, the admission
         and the pages are split over its row axes, so the number of row
@@ -809,6 +838,7 @@ class Server:
             default_budget=task.max_new_tokens,
             max_length=task.max_length,
             decode_steps=decode_steps, prefix=task.prefix, precision=task.precision, progress=task.progress,
+            prefill_mesh=prefill_mesh,
         )
 
     @property
@@ -861,6 +891,8 @@ class Server:
         packed = pack_projections(normalized(stored_layers(self.model, variables), self._source_shapes),
                                   self._weight_groups)
         self.variables = reloaded(packed, self.variables)
+        if self.prefill_mesh is not None:
+            self._prefill_variables = _on_mesh(self.variables, self.prefill_mesh)
         if progress is not None:
             self.progress = progress
         self.rows.reloaded()
@@ -1063,6 +1095,8 @@ class Server:
                 self._resident, self._carried = self._restored(
                     self._resident, self._carried, self._states, *_padded(restores, self.slots, 0))
                 self._restores = []
+            if admission is not None and self.prefill_mesh is not None:
+                admission = self._prefilled_elsewhere(admission)
             program = self._step if admission is None else self._admitting
             error, (self._resident, self._carried, draws) = program(
                 self.model, self.variables, self.pad_id, self.rows.placement, self.decode_steps,
@@ -1075,6 +1109,23 @@ class Server:
         self.steps += self.decode_steps
         self._settle()
         self._pending = (error, draws)
+
+    def _prefilled_elsewhere(self, admission: Admission) -> Admission:
+        """`admission` with its rows prefilled on the prefill mesh (`Dense.rows_prefilled`) and their decoder
+        state moved onto the decoding mesh's rows, which the admitting step seats."""
+        assert isinstance(self.rows.placement, Dense) and self.prefill_mesh is not None
+        mesh = self.prefill_mesh
+        # The rows split over the prefill mesh's row groups where they divide, else each device prefills all.
+        split = admission.slots.shape[0] % _row_groups(mesh) == 0
+        rows = _moved(admission, NamedSharding(mesh, P(batch_axes(mesh) or None) if split else P()),
+                      phase="an admission to the prefill mesh")
+        with jax.set_mesh(mesh), whole():
+            prefilled = self._prefill(self.model, self._prefill_variables, self.pad_id, self.rows.placement,
+                                      rows, self.progress)
+        # Onto the decoding rows: the server's mesh's, or the default device's, where an unmeshed state is.
+        return dataclasses.replace(admission, prefilled=_moved(
+            prefilled, default_placement() if self._admitted is None else self._admitted,
+            phase="prefilled rows to the decoding mesh"))
 
     def _owed(self) -> dict[str, list[list[int]]]:
         """The page copies this process's seating owes (`dew.inference.pages.Transfers`), by the pool's and
@@ -1420,6 +1471,35 @@ def _served_plan(strategy: Strategy, mesh: Mesh | None, chunk: int | None,
         raise ValueError("speculative rows prefill each prompt whole, its drafting state seeded by its "
                          "own prefill; serve without chunk and prefix_cache")
     return strategy
+
+
+def _on_mesh(variables: Variables, mesh: Mesh) -> Variables:
+    """`variables` placed on `mesh` as they lie on their own, each leaf's partition spec kept: a copy of a
+    server's weights on its prefill mesh. A leaf on one device is replicated."""
+    return _moved(variables, jax.tree.map(lambda leaf: NamedSharding(
+        mesh, leaf.sharding.spec if isinstance(leaf.sharding, NamedSharding) else P()), variables),
+        phase="weights to the prefill mesh")
+
+
+def _moved[T](tree: T, shardings: object, *, phase: str) -> T:
+    """`tree` placed by `shardings` (one, or a tree of them): where JAX moves it between the device sets
+    (`jax.device_put`, every array within this process's devices), as it does; between meshes over several
+    processes, each leaf gathered to every process's host (`collective_host`, every process calling it) and
+    each process's shards made of it, as JAX's transfers cannot move a sharded array to another processes'
+    device set."""
+    leaves, structure = jax.tree.flatten(tree)
+    targets = (jax.tree.leaves(shardings, is_leaf=lambda x: isinstance(x, jax.sharding.Sharding))
+               if not isinstance(shardings, jax.sharding.Sharding) else [shardings] * len(leaves))
+    if all(leaf.is_fully_addressable and target.is_fully_addressable
+           for leaf, target in zip(leaves, targets, strict=True)):
+        return jax.device_put(tree, shardings)
+    # Gathered under the mesh the leaves lie on, whatever mesh the caller traces under.
+    source = next(leaf.sharding.mesh for leaf in leaves if isinstance(leaf.sharding, NamedSharding))
+    with jax.set_mesh(source):
+        home = collective_host(leaves, phase=phase)
+    return jax.tree.unflatten(structure, [
+        jax.make_array_from_callback(held.shape, target, lambda index, held=held: held[index])
+        for held, target in zip(home, targets, strict=True)])
 
 
 def _served_layout(model: nn.Module, kv_cache: KVCache | None,

@@ -114,7 +114,41 @@ def mode_pooled_host_tier(args) -> dict:
                       for name, generation in drawn}}
 
 
-MODES = {"pooled_server": mode_pooled_server, "pooled_host_tier": mode_pooled_host_tier}
+def mode_pooled_prefill_apart(args) -> dict:
+    """`PROMPTS` served through one server that decodes on a mesh of each process's first device and
+    prefills on a mesh of each process's second, both over the pool, each process submitting its share,
+    the pool stepping it together; one process serves every prompt, decoding on its first device and
+    prefilling on its second."""
+    import jax
+    import jax.numpy as jnp
+    from flax import linen as nn
+    from model_support import serving_task
+
+    from dew.inference.loading import place
+    from dew.inference.serving import Server
+    from dew.interop.decoder_parts import decoder_axes
+    from dew.nn.sharding import boxed
+    from dew.training import Layout, MeshSpec
+
+    rank, processes = jax.process_index(), jax.process_count()
+    devices = jax.devices()
+    first = [device for device in devices if device.id % 2 == 0]
+    second = [device for device in devices if device.id % 2 == 1]
+    bound = serving_task()
+    bound = bound.bind(nn.unbox(bound.model.init(jax.random.key(3), jnp.ones((1, 2), jnp.int32))))
+    with boxed(decoder_axes(bound.model)):
+        bound = bound.bind(place(bound.variables, MeshSpec(fsdp=len(first)).build(first),
+                                 Layout(min_shard=1, tolerance=1.0)))
+    server = Server.from_task(bound, slots=2 * len(first), capacity=128, admission=len(first),
+                              prefill_mesh=MeshSpec(fsdp=len(second)).build(second))
+    mine = range(rank, len(PROMPTS), processes)
+    tickets = [(index, server.submit(PROMPTS[index], BUDGETS[index], key=index)) for index in mine]
+    server.run()
+    return {"drawn": {str(index): ticket.result().host().tokens[0].tolist() for index, ticket in tickets}}
+
+
+MODES = {"pooled_server": mode_pooled_server, "pooled_host_tier": mode_pooled_host_tier,
+         "pooled_prefill_apart": mode_pooled_prefill_apart}
 
 
 if __name__ == "__main__":
