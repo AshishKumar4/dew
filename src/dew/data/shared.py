@@ -4,7 +4,7 @@ A read's position is captured before each record it gives (a packer captures it 
 to resume at the one that did not fit), and a position must be the read's at that moment however the
 read moves on. A mixture's position holds each member's, and between two captures one member moved:
 copying every member's position at each capture costs a record what the mixture's size is (row 4079: a
-thousand members' counts copied before each packed document). `Shared` holds its values in a trie of
+thousand members' counts copied before each packed document). `SharedMapping` holds its values in a trie of
 `WIDTH` slots a node, so a mapping that differs from another in one value copies the nodes on that
 value's path and shares the rest: a capture costs a record the trie's depth, two nodes at a thousand
 members.
@@ -18,7 +18,7 @@ WIDTH = 32
 """The slots of a trie node: a thousand values two nodes deep."""
 
 
-class Shared[V](Mapping[str, V]):
+class SharedMapping[V](Mapping[str, V]):
     """An immutable mapping of `keys`, in their order, to values held in a trie shared with the mappings
     it was `replaced` from. It reads as any mapping (`dict(shared)` is its copy, as a position's JSON is
     written, `dew._records.json_value`)."""
@@ -39,10 +39,10 @@ class Shared[V](Mapping[str, V]):
         self._root = _built(tuple(values), depth)
 
     @classmethod
-    def of(cls, given: Mapping[str, V]) -> Shared[V]:
+    def of(cls, given: Mapping[str, V]) -> SharedMapping[V]:
         return cls(tuple(given), tuple(given.values()))
 
-    def replaced(self, changes: Mapping[str, V]) -> Shared[V]:
+    def replaced(self, changes: Mapping[str, V]) -> SharedMapping[V]:
         """This mapping with each of `changes`' keys, every one among its own, holding its new value: the
         nodes on their paths copied, the rest shared."""
         if not changes:
@@ -50,7 +50,7 @@ class Shared[V](Mapping[str, V]):
         root = self._root
         for key, value in changes.items():
             root = _set(root, self._index[key], value, self._depth)
-        made = object.__new__(Shared)
+        made = object.__new__(SharedMapping)
         made._keys, made._index, made._depth, made._root = self._keys, self._index, self._depth, root
         return made
 
@@ -68,10 +68,21 @@ class Shared[V](Mapping[str, V]):
         return len(self._keys)
 
     def __repr__(self) -> str:
-        return f"Shared({dict(self)!r})"
+        return f"SharedMapping({dict(self)!r})"
 
     def __reduce__(self):
-        return Shared, (self._keys, tuple(self[key] for key in self._keys))
+        return SharedMapping, (self._keys, tuple(self[key] for key in self._keys))
+
+    def __copy__(self) -> SharedMapping[V]:
+        return self
+
+    def __deepcopy__(self, memo: dict) -> SharedMapping[V]:
+        """Itself: neither it nor the positions it holds are written once held, each a snapshot of its own
+        (a mix's captured positions copied as they are captured, `dew.data.mixing._Captured`, its counts
+        made afresh), so a copy of it holds them as it does. Grain's prefetch copies a read's position
+        deep for each element it reads ahead (`ThreadPrefetchDatasetIterator`), which, member by member,
+        cost an element a mixture's size (row 4079)."""
+        return self
 
 
 def _built(values: tuple, depth: int) -> tuple:

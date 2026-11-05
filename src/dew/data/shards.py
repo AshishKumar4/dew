@@ -10,10 +10,10 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 import grain.experimental as experimental
 import grain.python as grain
 
-from dew._records import boolean, record
+from dew._records import boolean, integer, integers, listed, record
 
 from .dataset import LONG_RUN, DataPartition, Loading, logged_run, restore_parent
-from .sources.base import Shard, ShardManifest
+from .sources.base import Shard, ShardManifest, ShardOpener
 
 _log = logging.getLogger(__name__)
 
@@ -148,7 +148,7 @@ class _ShardPass[Place](grain.IterDataset):
     is held in examples over shards that state no rows. A loading worker reads its slice of the places
     (`set_slice`) and its part of the quota, every worker's count-th."""
 
-    def __init__(self, root: grain.MapDataset, reader: Callable[[Place], grain.IterDataset], cycle: int,
+    def __init__(self, root: grain.MapDataset, reader: Callable[..., grain.IterDataset], cycle: int,
                  loading: Loading, name: str, quota: int | None = None):
         super().__init__(root)
         self.root, self.reader = root, reader
@@ -164,15 +164,96 @@ class _ShardPass[Place](grain.IterDataset):
             # A worker dealt no place or no row of the bound reads nothing (Grain's interleave of no dataset
             # raises).
             return _Passing(None)
-        empty = _EmptyRun(self.name)
-        rows = experimental.InterleaveIterDataset(
-            self.root.map(_Reader(self.reader, empty)),
-            cycle_length=self.cycle,
-            num_make_iter_threads=max(self.loading.threads, 1),
-            make_iter_buffer_size=self.loading.read_buffer,
-        )
+        reader = _Reader(self.reader, _EmptyRun(self.name), self.loading)
+        rows = (_Sequential(self.root, reader, self.loading) if self.cycle == 1
+                else interleaved(self.root, reader, self.cycle, self.loading))
         limited = rows if self.quota is None else experimental.LimitIterDataset(rows, self.quota)
         return _Passing(limited.__iter__())
+
+
+def interleaved(places: grain.MapDataset, reader: Callable[..., grain.IterDataset], cycle: int,
+                loading: Loading) -> grain.IterDataset:
+    """`places` read by `reader`, `cycle` of them open at once, by Grain's interleave: each open place read a
+    row ahead on a thread of the interleave's own, the next ones opened ahead on the loading's threads."""
+    return experimental.InterleaveIterDataset(places.map(reader), cycle_length=cycle,
+                                              num_make_iter_threads=max(loading.threads, 1),
+                                              make_iter_buffer_size=loading.read_buffer)
+
+
+class _Sequential(grain.IterDataset):
+    """A share's places read one after another, each by `reader` as the one before it ends, on the thread
+    that reads them: the rows, in their order, of Grain's interleave of one place at a time (`interleaved`),
+    which read each open place a row ahead on a thread of its own, so a thousand members of a mix, each its
+    place open, held a thousand threads (row 4079); a place's own reads run under the reading's loading."""
+
+    def __init__(self, places: grain.MapDataset, reader: Callable[..., grain.IterDataset], loading: Loading):
+        super().__init__()
+        self.places, self.reader, self.loading = places, reader, loading
+
+    def __iter__(self) -> grain.DatasetIterator:
+        return _SequentialIterator(self.places, self.reader, self.loading)
+
+
+_ENDED = object()
+"""A place's rows read to their end (`_SequentialIterator`)."""
+
+
+class _SequentialIterator(grain.DatasetIterator):
+    """`_Sequential`'s reads: the place it reads (`place`) and its rows' position there, None before it
+    opens; a position an earlier Dew saved, its interleave's of one place at a time, read as the place it
+    read and its rows' position there (`_sequential_position`)."""
+
+    def __init__(self, places: grain.MapDataset, reader: Callable[..., grain.IterDataset], loading: Loading):
+        super().__init__()
+        self.places, self.reader, self.loading = places, reader, loading
+        self.place, self.rows = 0, None
+
+    def __next__(self):
+        # Each place read to its end, then the next opened, until the last ends.
+        while self.place < len(self.places):
+            if self.rows is None:
+                self.rows = iter(self.reader(self.places[self.place]))
+            row = next(self.rows, _ENDED)
+            if row is not _ENDED:
+                return row
+            self.rows.close()
+            self.rows, self.place = None, self.place + 1
+        raise StopIteration
+
+    def get_state(self) -> Mapping[str, object]:
+        return {"place": self.place, "rows": None if self.rows is None else self.rows.get_state()}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self.close()
+        position = _sequential_position(state)
+        self.place = integer(position["place"], "sequential shard pass's place")
+        rows = position["rows"]
+        if rows is not None:
+            self.rows = iter(self.reader(self.places[self.place]))
+            self.rows.set_state(record(rows, "sequential shard pass's rows"))
+
+    def close(self) -> None:
+        if self.rows is not None:
+            self.rows.close()
+        self.rows = None
+
+
+def _sequential_position(state: Mapping[str, object]) -> Mapping[str, object]:
+    """`state`, a sequential pass's position (`_SequentialIterator`), or one an earlier Dew saved of the
+    same rows in the same order, Grain's interleave of one place at a time, read as the sequential one: the
+    place its iterator in use read and that iterator's position there (each place read by the same reader,
+    so its rows' position is the one the sequential reader keeps), or, its iterator exhausted or none open,
+    the next place it opens from its start. The one translation of it, at the restore, the run reading on
+    by the sequential reader (row 4079); deleted at 1.0."""
+    if "place" in state:
+        return state
+    (index,) = integers(state["iterators_in_use_indices"], "interleave's places in use")
+    (exhausted,) = integers(state["exhausted"], "interleave's exhausted places")
+    (rows,) = listed(state["iterators_in_use_states"], "interleave's places' positions",
+                     read=lambda value, key: value, what="a list of positions")
+    if rows is None or exhausted:
+        return {"place": state["next_index_in_datasets"], "rows": None}
+    return {"place": index, "rows": rows}
 
 
 NOTHING: Mapping[str, object] = {"rows": None}
@@ -226,23 +307,30 @@ class _EmptyRun:
 class _Taken:
     """A shard reader of `(shard, rows)` places (`bounded_places`): the shard's first `rows` rows."""
 
-    reader: Callable[[Shard], grain.IterDataset]
+    reader: ShardOpener
 
-    def __call__(self, place: tuple[Shard, int]) -> grain.IterDataset:
+    def __call__(self, place: tuple[Shard, int],
+                 options: grain.ReadOptions | None = None) -> grain.IterDataset:
         shard, rows = place
-        read = self.reader(shard)
+        read = self.reader(shard, options)
         return read if rows == shard.rows else experimental.LimitIterDataset(read, rows)
 
 
 @dataclasses.dataclass(frozen=True)
 class _Reader[Place]:
-    """A place's reader (a shard's), its rows watched for a run of empty shards (`_EmptyRun`)."""
+    """A place's reader (a shard's), its rows read under the reading's loading, its threads and its
+    read-ahead, and watched for a run of empty shards (`_EmptyRun`). A mix member reads under its share of
+    the run's (none of a thousand members' share of one thread, which read on the thread that draws
+    from them), where Grain's own read each shard on sixteen threads of its own and five hundred rows
+    ahead (row 4079: a thousand-member packed mix held 9,249 threads after 190 steps)."""
 
-    reader: Callable[[Place], grain.IterDataset]
+    reader: Callable[..., grain.IterDataset]
     empty: _EmptyRun
+    loading: Loading
 
     def __call__(self, place: Place) -> grain.IterDataset:
-        return _Watched(self.reader(place), self.empty)
+        options = grain.ReadOptions(self.loading.threads, self.loading.read_buffer)
+        return _Watched(self.reader(place, options), self.empty)
 
 
 class _Watched(grain.IterDataset):

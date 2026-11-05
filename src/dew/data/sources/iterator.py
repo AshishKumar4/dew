@@ -63,7 +63,7 @@ class Iterated(Dataset):
     def manifest(self) -> ShardManifest:
         return ShardManifest((Shard(self.describe(), self.describe()),), self._read_shard)
 
-    def _read_shard(self, shard: Shard) -> grain.IterDataset:
+    def _read_shard(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
         return _Stream(self)
 
     def metadata(self) -> Mapping[str, object]:
