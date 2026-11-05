@@ -219,13 +219,13 @@ class TracedWindow:
 
     The steps from `warmup` up to the last `profiled` ones are timed,
     synchronized at both ends and nowhere inside; the last `profiled` are
-    traced by jax.profiler into `trace_dir`, with its Python tracer off as
-    in a Dew capture (`dew.telemetry.profile.CaptureOptions`, which this
-    module can't import): the tracer records every Python and C call and
-    slows a host-bound run's steps. Call `before(step, pending)` ahead of
-    each step with the newest output still in flight, add any in-window
-    seconds that are not training to `excluded`, and end with
-    `close(pending)`, which returns the window's training seconds."""
+    traced into `trace_dir` by `dew.Profiler`, Dew's one capture path: the
+    trace alone, which `attach_xplane_profile` reads, with the Python tracer
+    off (it records every Python and C call and slows a host-bound run's
+    steps). Call `before(step, pending)` ahead of each step with the newest
+    output still in flight, add any in-window seconds that are not training
+    to `excluded`, and end with `close(pending)`, which returns the window's
+    training seconds."""
 
     def __init__(self, total: int, warmup: int, profiled: int, trace_dir: str | Path):
         self.warmup, self.profiled, self.trace_dir = warmup, profiled, Path(trace_dir)
@@ -233,6 +233,7 @@ class TracedWindow:
         self.timed_steps = self.profile_from - warmup
         self.start: float | None = None
         self.end: float | None = None
+        self.capture = None
         self.excluded = 0.0
 
     def times(self, step: int) -> bool:
@@ -240,6 +241,8 @@ class TracedWindow:
 
     def before(self, step: int, pending) -> None:
         import jax
+
+        from dew.telemetry.profile import Profiler
 
         if step not in (self.warmup, self.profile_from):
             return
@@ -249,19 +252,17 @@ class TracedWindow:
             self.start = now
         if step == self.profile_from and self.profiled:
             self.end = now
-            options = jax.profiler.ProfileOptions()
-            options.python_tracer_level = 0
-            jax.profiler.start_trace(str(self.trace_dir), profiler_options=options)
+            self.capture = Profiler(self.trace_dir, reports=False).start()
 
     def close(self, pending) -> float:
         import jax
 
         jax.block_until_ready(pending)
         end = time.perf_counter()
-        if self.end is None:
+        if self.capture is None:
             self.end = end
         else:
-            jax.profiler.stop_trace()
+            self.capture.stop()
         if self.start is None:
             raise ValueError(f"the timed window never opened: warm-up {self.warmup} is past the run")
         return self.end - self.start - self.excluded

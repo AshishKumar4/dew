@@ -391,6 +391,7 @@ def test_a_head_trains_as_transformers_does_by_what_it_is(head, tokens, tmp_path
                                                                    attn_implementation="eager").eval()
         wide_model.load_state_dict(model.state_dict())
 
+    @as_given
     def truth_fn(ids, cotangent):
         with float64():
             return torch_step(wide_model, ids, cotangent, torch.float64)
@@ -437,6 +438,7 @@ def test_an_unregistered_causal_lm_loads_as_transformers_own_forward(tokens, tmp
                                                              attn_implementation="eager").eval()
         wide.load_state_dict(model.state_dict())
 
+    @as_given
     def truth_fn(ids, cotangent):
         with float64():
             return torch_step(wide, ids, cotangent, torch.float64)
@@ -565,6 +567,7 @@ def test_a_packed_row_trains_each_document_as_transformers_runs_it_alone(family,
                                                              attn_implementation="eager")
         wide.load_state_dict(model.state_dict())
 
+    @as_given
     def truth(ids, segments, valid, cotangent):
         with float64():
             return documents_alone(wide, ids, segments, valid, cotangent, torch.float64)
@@ -636,6 +639,7 @@ def test_a_training_call_that_drops_attention_reads_each_documents_real_tokens(t
                                                              attn_implementation="eager").eval()
         wide.load_state_dict(model.state_dict())
 
+    @as_given
     def truth(ids, segments, valid, _):
         with float64():
             return alone(wide, ids, segments, valid)
@@ -777,6 +781,7 @@ def test_bf16_compute_gradients_are_as_exact_as_torchs_bf16(family, tokens, tmp_
                                                              attn_implementation="eager").eval()
         wide.load_state_dict(model.state_dict())
 
+    @as_given
     def truth_fn(ids, cotangent):
         with float64():
             return torch_step(wide, ids, cotangent, torch.float64)
@@ -1040,6 +1045,7 @@ def test_a_tier_3_models_final_states_and_head_are_transformers(case, tmp_path):
     reference = copy.deepcopy(model)
     reference.set_attn_implementation("eager")
 
+    @as_given
     def truth(*inputs):
         with float64():
             return theirs(wide, torch.float64)(*inputs)

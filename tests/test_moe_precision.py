@@ -238,6 +238,7 @@ def _tile_gate(kernel, width, features):
                             jnp.float32),
                 jnp.asarray(rng.normal(size=(rows, features)), jnp.bfloat16))
 
+    @as_given
     def truth(x, kernel_matrix, dy):
         # The products of the operands as the projection rounds them, in float64.
         return oracle.products(x, rounded(kernel_matrix), dy, TILE_SIZES)

@@ -5,11 +5,13 @@ mainloop, in XLA ops, so it runs on any backend and is the boundary test's secon
 same tiles). It takes a call at its launches' padded shapes, as `TritonForward` does."""
 
 import functools
+from collections.abc import Callable
 from typing import Literal, overload
 
 import jax
 import jax.numpy as jnp
 
+from dew.algebra.forms import Accumulated
 from dew.nn.kernels.templates import attention_algebra as algebra, attention_gradient as gradient, axes
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
@@ -380,10 +382,10 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             return jax.lax.fori_loop(lo, hi, step, gradient.no_dq_sums(block_q, width, len(score_kinds)))
 
 
-        if backward_derived(how, accurate=accurate):
-            found = _derived_dq(formed, q, do, q_pos, m, anchor, delta, prior, lo, hi, draw,
+        if backward_derived():
+            found = _derived_dq(formed, q, do, q_pos, m, anchor, delta, prior, lo, hi, draw, chosen,
                                 hooked=score_mod is not None, score_kinds=score_kinds, summed=summed,
-                                prescale=prescale, grad_scale=grad_scale)
+                                prescale=prescale, grad_scale=grad_scale, how=how, accurate=accurate)
         else:
             found = sweep(anchor, delta, chosen, prior)
         dq, delta, denominator, mass, grads = gradient.dq_finish(found, prior, state_total, peak0,
@@ -418,16 +420,18 @@ def _dq_outputs(dq, rows_out, chosen, written, kinds: tuple[Kind, ...], blocks: 
     return jnp.swapaxes(queried(dq), 1, 2), tuple(queried(x) for x in rows_out), queried(chosen), grads
 
 
-def _derived_dq(formed, q, do, q_pos, m, anchor, delta, total, lo, hi, draw, *, hooked: bool,
-                score_kinds: tuple[Kind, ...], summed: tuple[bool, ...], prescale: float, grad_scale: float
-                ) -> gradient.DqSums:
-    """A dQ pass's sums by the derived forms behind the switch (`derived_backward`): dQ the walk's over the
-    keys `lo` to `hi` (`formed(j)` each key tile's coordinates, mask, keys, values, logits and hook slopes,
-    the dQ launch's), at the pass's D (`anchor`, `delta`) and denominator `total`, dQ at the call's
-    whole scale, its query the call's own (the launch's `q` is taken by the power of two `prescale`,
-    `attention.prescale`: exactly undone); the row sums D's refinement and the hook's parameters read
-    (`gradient.dq_rows`) from each tile's weights and cotangents the walk gives."""
-    forms = derived_backward(grad_scale, "keys", hooked, draw is not None)
+def _derived_dq(formed, q, do, q_pos, m, anchor, delta, total, lo, hi, draw, chosen, *, hooked: bool,
+                score_kinds: tuple[Kind, ...], summed: tuple[bool, ...], prescale: float, grad_scale: float,
+                how: algebra.Recompute, accurate: bool) -> gradient.DqSums:
+    """A dQ pass's sums by the derived forms behind the switch (`derived_backward`, in the forward's units
+    `how` and the form `accurate` names): dQ the walk's over the keys `lo` to `hi` (`formed(j)` each key
+    tile's coordinates, mask, keys, values, logits and hook slopes, the dQ launch's), at the pass's D
+    (`anchor`, `delta`, its anchor keys `chosen`) and denominator `total`, dQ at the call's whole scale, its
+    query the call's own (the launch's `q` is taken by the power of two `prescale`, `attention.prescale`:
+    exactly undone); the row sums D's refinement and the hook's parameters read (`gradient.dq_rows`) from
+    each tile's weights and cotangents the walk gives. The accurate form's dQ products are this mainloop's
+    own (`_accurate_sums`), its cotangents' parts', and its keyed sums its own (`gradient.dq_issued`)."""
+    forms = derived_backward(grad_scale, "keys", hooked, draw is not None, how, accurate)
     call_q = by_power(q, 1.0 / prescale)
 
     def tiles_at(j):
@@ -438,19 +442,45 @@ def _derived_dq(formed, q, do, q_pos, m, anchor, delta, total, lo, hi, draw, *, 
             tiles["slope"] = slopes[0]
         if draw is not None:
             tiles["keep"] = draw(q_pos, columns[None, :])
+        if accurate:
+            tiles["at_anchor"] = columns[None, :] == chosen[:, None]
         return tiles, slopes, seen
 
     def step(j, carry):
         state, sums = carry
         tiles, slopes, seen = tiles_at(j)
-        state, (weights, cotangents) = forms.step(state, tiles, product=interpreted_dot, outputs=(3, 4))
-        sums, _ = gradient.dq_rows(sums, weights, cotangents, slopes, seen, kinds=score_kinds, summed=summed)
-        return state, sums
+        stepped = _accurate_sums(interpreted_dot) if accurate else None
+        state, (weights, cotangents) = forms.step(state, tiles, product=interpreted_dot, outputs=(3, 4),
+                                                  stepped=stepped)
+        if not accurate:
+            sums, _ = gradient.dq_rows(sums, weights, cotangents, slopes, seen, kinds=score_kinds,
+                                       summed=summed)
+            return state, sums
+        k_tile = tiles["k"]
+        sums, _, (factor, keyed) = gradient.dq_issued(sums, weights, cotangents, slopes, seen, k_tile.dtype,
+                                                      total, scale=grad_scale, kinds=score_kinds,
+                                                      summed=summed, accurate=True)
+        held = sums.keyed if factor is None else algebra.expand(factor, sums.keyed) * sums.keyed
+        return state, sums._replace(keyed=held + algebra.summed_products(keyed, k_tile, interpreted_dot))
 
     shapes = {name: (value.shape, value.dtype) for name, value in tiles_at(lo)[0].items()}
     empty = gradient.no_dq_sums(q.shape[0], q.shape[1], len(score_kinds))
     state, sums = jax.lax.fori_loop(lo, hi, step, (forms.init(shapes), empty))
     return sums._replace(dq=forms.finish(state, shapes=shapes)[0])
+
+
+def _accurate_sums(dot: Callable) -> Callable:
+    """The accurate form's walked sums of products (`Derived.step`'s `stepped`): each the score cotangents'
+    product with the keys (dQ's, `Accumulated`) by their parts (`algebra.cotangent_product`, the accurate
+    form's three), added into the sum the step carries, as the hand form's `gradient.dq_step` adds them;
+    every other sum the derived forms' own."""
+    def stepped(states, parts):
+        return tuple(None if not isinstance(part, Accumulated) else
+                     (state if part.factor is None else algebra.expand(part.factor, state) * state)
+                     + algebra.cotangent_product(part.weights, part.values, dot, accurate=True)
+                     for state, part in zip(states, parts, strict=True))
+
+    return stepped
 
 
 def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans, score_params, *,
@@ -472,7 +502,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     start, end, query_ids, key_ids = spans
     ranges = block_map(KeySpans(start, end, query_ids, key_ids, keys), block_q, block_k)
 
-    derived = backward_derived(how, accurate=accurate)
+    derived = backward_derived()
 
     def program(index):
         j, rest = index // (batch * heads), index % (batch * heads)
@@ -485,7 +515,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
         # Behind the switch, dK and dV the derived walk's over the query tiles (`derived_backward`),
         # at the dQ launch's D and denominator; else this module's contributions. Either way each tile's
         # cotangents give the key and tile parameters' gradients (`hooked`).
-        forms = (derived_backward(grad_scale, "rows", score_mod is not None, draw is not None)
+        forms = (derived_backward(grad_scale, "rows", score_mod is not None, draw is not None, how, accurate)
                  if derived else None)
 
         def tile_at(i):
@@ -513,6 +543,8 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                 tiles["slope"] = slopes[0]
             if zt is not None:
                 tiles["keep"] = zt
+            if accurate:
+                tiles["at_anchor"] = columns[None, :] == key_index[row, head, rows][:, None]
             return tiles, slopes, seen
 
         def hooked(i, hooks, pieces):

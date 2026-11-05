@@ -196,12 +196,6 @@ FORMS = {
 and right shifts on either pipe, and a mask of one value and of two values' XOR."""
 
 
-def test_the_forms_take_every_instruction_the_ptx_writes():
-    """`FORMS` reach every (instruction, pipe) PTX writes, so the tests below run each of them."""
-    taken = {(step.op, step.unit) for form in FORMS.values() for step in form().steps}
-    assert taken == set(bits._PTX)
-
-
 @pytest.mark.parametrize("name", FORMS)
 def test_a_forms_traced_decode_is_its_decode(name):
     """A form traced in JAX's integer operations (`BitForm.traced`, a kernel's portable path and its

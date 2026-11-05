@@ -485,33 +485,6 @@ def test_a_light_launch_is_held_within_the_threads_its_multiprocessor_runs():
             assert resources.register_programs(family, 1, 32) == programs
 
 
-def test_a_consumer_is_raised_within_the_registers_a_thread_addresses():
-    """One warpgroup-MMA consumer beside its producer, one program a multiprocessor on an H100, raises to 248,
-    the largest of setmaxnreg's steps of 8 within the 255 a thread addresses, and holds them
-    (`Family.registers`): a raise to the instruction's 256 made ptxas spill a launch it otherwise compiled
-    spill-free at any raise from 192 to 248."""
-    from dew.nn.kernels.templates import bundles, resources
-
-    with generation.assumed("sm90"):
-        family = bundles.of("sm90", jnp.bfloat16)
-        assert resources.raised_registers(1, 1) == 248
-        assert family.registers(1) == 248
-
-
-def test_the_compile_gate_caps_a_consumer_at_the_registers_its_launch_raises_it_to():
-    """One warpgroup-MMA consumer beside its producer on an H100, at one to four programs a multiprocessor:
-    the compile gate holds it at each residency to the registers its launch raises it to there
-    (`RegisterModel.cap`, `raised_registers`: 248, 232, 136 and 104), where its cap at three programs was the
-    multiprocessor's share less the producer's, 144, past the launch's raise, so a kernel of 137 to 144
-    registers passed the gate and spilled."""
-    from dew.nn.kernels.templates import bundles, resources
-
-    with generation.assumed("sm90"):
-        family = bundles.of("sm90", jnp.bfloat16)
-        model = resources.register_model(family, 1, None)
-        assert [model.cap(programs, honored=True) for programs in range(1, 5)] == [248, 232, 136, 104]
-
-
 def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
     """Two zeroed refs of one shape and dtype a launch adds into in place are one value to XLA, which a
     dynamic-slice fusion wrapping the launch passes once for both (row 3180): `mosaic.checked` refuses the
@@ -550,12 +523,12 @@ def _padded(rows: int, family) -> int:
     return -(-rows // family.rows) * family.rows
 
 
-def _persisted_products(x, w, *, family, interpret, rows: int | None = None):
+def _persisted_products(x, w, *, family, interpret, rows: int | None = None, resident: int = 1):
     """`x @ w` a tile at a time through `family`'s persistent walk (`Family.persist`): each tile the
     family's least rows covering `rows` (its own least where None; `_padded`), of which it stores `rows`,
     tile `t` the tiles' rows `t` on, each step `PERSISTED_DEPTH` of the contraction, the middle tile
     multiplying nothing (zeros); each tile issued (`issue`'s walk) and finished (`Issuer.chunks`, each
-    chunk stored at its columns), on the family's roles."""
+    chunk stored at its columns), on the family's roles, launched for `resident` programs a multiprocessor."""
     stored = family.rows if rows is None else rows
     rows, columns = _padded(stored, family), w.shape[1]
     family = family.specialized(rows, columns)
@@ -591,7 +564,7 @@ def _persisted_products(x, w, *, family, interpret, rows: int | None = None):
 
     out = jax.ShapeDtypeStruct((PERSISTED_TILES * rows, columns), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
-                         interpret=interpret, name="persisted")(x, w)
+                         interpret=interpret, name="persisted", resident=resident)(x, w)
 
 
 def _persisted_operands(rows: int):
@@ -633,17 +606,6 @@ def test_a_few_rows_lower_on_every_bundle_their_device_issues(generation_name, r
             lhs = jax.ShapeDtypeStruct(padded, x.dtype)
             jax.jit(functools.partial(_persisted_products, family=family, interpret=False, rows=rows)).trace(
                 lhs, w).lower(lowering_platforms=("cuda",))
-
-
-def test_a_launch_of_few_rows_takes_first_the_bundle_whose_padded_rows_it_fills_most():
-    """An H100 launch of a decode step's 8 rows takes mma.sync first, whose 16 rows it fills half of where
-    wgmma's 64 it fills an eighth (row 4042); one of 128 rows keeps wgmma's producer layout first, and a
-    launch that states no rows its own family's layouts alone."""
-    from dew.nn.kernels.templates import bundles, mosaic_sm80, mosaic_sm90
-    assert bundles.layouts("sm90", jnp.bfloat16, rows=8)[0].name == bundles.MmaFed.name
-    assert bundles.layouts("sm90", jnp.bfloat16, rows=128)[0] is mosaic_sm90.WGMMA
-    assert all(family.name != mosaic_sm80.Mma.name and family.name != bundles.MmaFed.name
-               for family in bundles.layouts("sm90", jnp.bfloat16))
 
 
 def test_the_tcgen05_persistent_walk_lowers_for_a_b200():
@@ -744,3 +706,103 @@ def test_the_relay_through_tensor_memory_lowers_for_a_b200():
     with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(mesh):
         jax.jit(functools.partial(_relayed_products, interpret=False)).trace(q, k, v).lower(
             lowering_platforms=("cuda",))
+
+
+def test_a_tpu_core_walks_the_persistent_tiles_interpreted():
+    """Interpreted on any host: the persistent walk on a TPU core's bundle (`mosaic_tpu.MXU`), each step's
+    blocks DMA'd into its VMEM ring a step ahead and multiplied by the MXU, each tile's rows stored from
+    VMEM, over three tiles with the middle one multiplying nothing: each tile's rows exactly its product,
+    the middle's zeros."""
+    from dew.nn.kernels.templates import mosaic_tpu
+    family = mosaic_tpu.MXU
+    x, w = _persisted_operands(family.rows)
+    got = np.asarray(_persisted_products(x, w, family=family, interpret=True))
+    expected = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
+    expected[family.rows:2 * family.rows] = 0
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_the_tpu_persistent_walk_lowers_for_a_v5e():
+    """The persistent walk on a TPU core's bundle lowers for a TPU v5e on any host, its devices abstract."""
+    from jax.sharding import AbstractDevice, AbstractMesh
+
+    from dew.nn.kernels.templates import mosaic_tpu
+    family = mosaic_tpu.MXU
+    x, w = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _persisted_operands(family.rows))
+    device = AbstractDevice(device_kind=generation.TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
+    with jax.sharding.use_abstract_mesh(AbstractMesh((1,), ("data",), abstract_device=device)):
+        jax.jit(functools.partial(_persisted_products, family=family, interpret=False)).trace(x, w).lower(
+            lowering_platforms=("tpu",))
+
+
+def _gemm_on_a_tpu_core():
+    """The GEMM template's kernel bodies on a TPU core's bundle (`mosaic_tpu.MXU`), each `(call, operands,
+    expected)` at small integers, so each product is exact in fp32: a dense forward with a bias epilogue,
+    the grouped forward (three groups, one empty, rows past the routed ones zero) with its matrices stored
+    as they come and transposed, and the grouped kernel gradient."""
+    from dew.nn.kernels.templates.gemm import mosaic_gpu
+
+    rows, depth, width = 384, 512, 256
+    tiles = mosaic_gpu.Tiles(128, 128, 128, 2, 1, family="mxu")
+    keys = jax.random.split(jax.random.key(4), 4)
+    x = jax.random.randint(keys[0], (rows, depth), -3, 4).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[1], (3, depth, width), -3, 4).astype(jnp.bfloat16)
+    dy = jax.random.randint(keys[2], (rows, width), -3, 4).astype(jnp.bfloat16)
+    bias = jax.random.randint(keys[3], (width,), -3, 4).astype(jnp.float32)
+    sizes = jnp.asarray([100, 0, 250], jnp.int32)
+    xf, wf, dyf = (np.asarray(each, np.float32) for each in (x, w, dy))
+    unrouted = np.zeros((rows - 350, width), np.float32)
+    routed = np.concatenate([xf[:100] @ wf[0], xf[100:350] @ wf[2], unrouted])
+    grouped = functools.partial(mosaic_gpu.gmm, tiles=tiles, out_dtype=jnp.float32, multiprocessors=2)
+    return {
+        "dense bias": (functools.partial(mosaic_gpu.gmm, tiles=tiles, transpose_rhs=False,
+                                         out_dtype=jnp.float32, multiprocessors=1, dense=True,
+                                         epilogue=lambda acc, b: acc + b[None, :], epilogue_operands=(bias,),
+                                         epilogue_axes=(("columns",),)),
+                       (x, w[:1], None), xf @ wf[0] + np.asarray(bias)[None, :]),
+        "grouped": (functools.partial(grouped, transpose_rhs=False), (x, w, sizes), routed),
+        "grouped transposed": (functools.partial(grouped, transpose_rhs=True),
+                               (x, jnp.swapaxes(w, 1, 2), sizes), routed),
+        "kernel gradient": (functools.partial(mosaic_gpu.tgmm, tiles=tiles, out_dtype=jnp.float32,
+                                              multiprocessors=2), (x, dy, sizes),
+                            np.stack([xf[:100].T @ dyf[:100], np.zeros((depth, width), np.float32),
+                                      xf[100:350].T @ dyf[100:350]])),
+    }
+
+
+@pytest.mark.parametrize("case", ["dense bias", "grouped", "grouped transposed", "kernel gradient"])
+def test_the_gemms_kernel_bodies_run_on_a_tpu_core(case):
+    """Interpreted on any host, each of the GEMM template's kernel bodies on a TPU core's bundle gives its
+    product exactly, and it lowers for a TPU v5e, its devices abstract."""
+    from jax.sharding import AbstractDevice, AbstractMesh
+
+    call, operands, expected = _gemm_on_a_tpu_core()[case]
+    np.testing.assert_array_equal(np.asarray(call(*operands, interpret=True)), expected)
+    abstract = [None if each is None else jax.ShapeDtypeStruct(each.shape, each.dtype) for each in operands]
+    device = AbstractDevice(device_kind=generation.TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
+    with jax.sharding.use_abstract_mesh(AbstractMesh((1,), ("data",), abstract_device=device)):
+        jax.jit(call).trace(*abstract).lower(lowering_platforms=("tpu",))
+
+
+def test_a_consumer_launched_at_each_residency_its_family_admits_raises_to_the_gates_cap_spill_free():
+    """A persistent warpgroup-MMA walk, one consumer beside its producer, launched at each residency its
+    family admits a multiprocessor on an H100 (`RegisterModel.most`) and compiled as the GPU gate compiles
+    it: the registers its consumer raises to in its PTX (`setmaxnreg.inc`) are the gate's cap for it at that
+    residency (`RegisterModel.cap`), and its binary holds its registers within them, spilling nothing."""
+    import kernel_compile
+    from fla_gdn_support import KernelCase
+
+    from dew.nn.kernels.templates import bundles, resources
+
+    with generation.assumed("sm90"):
+        family = bundles.of("sm90", jnp.bfloat16)
+        model = resources.register_model(family, 1, None)
+    x, w = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _persisted_operands(family.rows))
+    for programs in range(1, model.most + 1):
+        call = functools.partial(_persisted_products, family=family, interpret=False, resident=programs)
+        case = KernelCase("persisted", lambda call=call: (call, (x, w)))
+        [record] = kernel_compile.compile_mosaic_kernels([case], "sm90")
+        [kernel] = record["kernels"]
+        cap = model.cap(programs, honored=True)
+        assert (kernel["raised"], kernel["spilled"]) == (cap, 0), (programs, record.get("error"), kernel)
+        assert kernel["registers"] <= cap

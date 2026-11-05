@@ -187,6 +187,7 @@ def test_sqrt_schedule_is_diffusion_lms_table(steps):
         cumulative = alpha_bar(time(step)) / alpha_bar(np.float32(0))
         return {"alpha": np.sqrt(cumulative), "sigma": np.sqrt(1 - cumulative)}
 
+    @as_given
     def tabled(step):
         return {"alpha": np.sqrt(table[step]), "sigma": np.sqrt(1 - table[step])}
 

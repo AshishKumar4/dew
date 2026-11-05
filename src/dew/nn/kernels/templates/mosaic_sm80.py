@@ -262,7 +262,10 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
             then()
         return out
 
-    def products(self, acc, lhs, rhs, interpret: bool):
+    def products(self, acc, lhs, rhs, interpret: bool, *, accumulate: bool = True):
+        if not accumulate:
+            # A fresh product: onto zeros, its accumulator a value (`read` is that value).
+            acc = self.zeros(acc.shape)
         if jnp.dtype(lhs.dtype) != self.dtype:
             # Another dtype's operands (fp32's, as TF32) by that dtype's issuer: its fragments' layouts and
             # depths are its own, its accumulator's the same.
@@ -359,6 +362,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     stores_through_registers = True
 
+    copies_in_pieces = False  # emit_pipeline copies a step's block whole, from one view
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
 
     adds_vectors = False  # its atomic adds take no layout replicating a vector's entries (a [bk] key sum's)
@@ -386,11 +390,11 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
-               reducing_warpgroups: int = 0, resident: int = 1) -> Callable:
+               reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0) -> Callable:
         # Its warpgroups are its consumers, no producer beside them (two a thread axis 'wg'), and no
         # cluster; its kernels' default parameters reserve the scratch an implicit reduction takes
         # (`reduction_scratch`).
-        del reducing_warpgroups
+        del reducing_warpgroups, scalars  # its programs read a table from global memory as any operand
         _most(consumers, clustered=cluster > 1)
         threads = {} if consumers == 1 else {"num_threads": consumers, "thread_name": "wg"}
         built = launches.kernel(mosaic.dependent(entry, interpret), name=name or self.name,
@@ -482,10 +486,13 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, held_past: tuple[str, ...] = (), finish: Callable | None = None
+                ) -> tuple[C, tuple[jax.Array, ...]]:
         # Its products are synchronous: none stays in flight past its step, and `emit_pipeline` gives
-        # each stage back as its step ends.
+        # each stage back as its step ends, so no step holds one past it.
         del first, in_flight, unrolled
+        if held_past or finish is not None:
+            raise NotImplementedError(f"{self.name}'s pipeline gives each stage back as its step ends")
         blocks = streams.pipeline.blocks
         names = tuple(blocks)
         carry = (start, self.started(shapes, initial))

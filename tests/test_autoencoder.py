@@ -8,7 +8,10 @@ contract to Diffusers' own VAE, posterior and SD3 pipeline normalization
 """
 
 import json
+import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import jax
@@ -351,6 +354,45 @@ def test_a_flax_layout_vae_binds_as_its_torch_layout_does(tmp_path):
     standalone = StableDiffusionVAE(str(tmp_path), dtype=jnp.float32)
     np.testing.assert_array_equal(np.asarray(standalone.decode(standalone.params, latent)),
                                   np.asarray(vae.decode(flax_params, latent)))
+
+
+_PINNED_LOCATION = """
+import json, sys
+from dew.nn.autoencoders.vae import located_vae
+directory, config, weights = located_vae(sys.argv[1], sys.argv[2])
+print(json.dumps({"directory": str(directory), "weights": weights}))
+"""
+
+
+def test_a_pinned_vae_loads_its_own_revisions_weights_not_the_flax_branchs(tmp_path):
+    """A standalone VAE loaded at a pinned commit whose weights are torch's alone takes them, from that
+    commit, though the repo's `flax` branch holds a flax VAE beside it; the `flax` layout name still finds
+    the flax branch's."""
+    from interop_support import hub_cache
+
+    from dew.nn.autoencoders.vae import FLAX_WEIGHTS, TORCH_WEIGHTS
+
+    config = json.dumps({"_class_name": "AutoencoderKL", "latent_channels": 4})
+    pinned, flax = tmp_path / "pinned", tmp_path / "flax" / "vae"
+    pinned.mkdir()
+    flax.mkdir(parents=True)
+    for directory, weights in ((pinned, TORCH_WEIGHTS), (flax, FLAX_WEIGHTS)):
+        (directory / "config.json").write_text(config)
+        (directory / weights).write_bytes(b"weights")
+    commit = hub_cache(tmp_path / "hub", "dew/tiny-vae", pinned, "1" * 40)
+    hub_cache(tmp_path / "hub", "dew/tiny-vae", flax.parent, "2" * 40, branch="flax")
+    env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / "hub"), "HF_HUB_OFFLINE": "1",
+           "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+
+    def located(revision: str) -> dict:
+        done = subprocess.run([sys.executable, "-c", _PINNED_LOCATION, "dew/tiny-vae", revision], env=env,
+                              check=False, capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr[-3000:]
+        return json.loads(done.stdout.strip().splitlines()[-1])
+
+    snapshots = tmp_path / "hub" / "models--dew--tiny-vae" / "snapshots"
+    assert located(commit) == {"directory": str(snapshots / commit), "weights": TORCH_WEIGHTS}
+    assert located("flax") == {"directory": str(snapshots / ("2" * 40) / "vae"), "weights": FLAX_WEIGHTS}
 
 
 def test_a_kl_config_naming_no_class_is_an_autoencoder_kls():
