@@ -46,6 +46,7 @@ from dew.nn.kernels.templates.attention import (
     gradients,
     kept_dtype,
     kernel_dot,
+    key_tiles,
     launch_arguments,
     output_split,
     padded_call,
@@ -174,13 +175,7 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     block_q = query_ref.shape[0]
     head = pl.program_id(2)
     first_query = pl.program_id(0) * block_q
-    tiles = -(-spec.keys // block_k)
-    if bounds is not None:
-        lo, hi = bounds
-    elif spec.form == "causal":
-        lo, hi = 0, jnp.minimum(-(-(first_query + block_q) // block_k), tiles)
-    else:
-        lo, hi = 0, tiles
+    lo, hi = bounds if bounds is not None else key_tiles(spec.form, first_query, block_q, block_k, spec.keys)
     query = query_ref[...]
     q_pos = first_query + jnp.arange(block_q)[:, None]
 
@@ -540,18 +535,15 @@ def _key_param(ref, kind: Kind, head, rows):
 
 def _tile_scores(score_mod, query, key, value, dout, peak, total, anchor, delta, seen, q_pos, k_pos, params,
                  *, key_index, scale: float, how: algebra.Recompute, interpret: bool):
-    """A tile's backward through its scores: its unnormalized weights `exp(s - m)` and its weights `p` over
-    `total` (zero where masked), the masked score cotangents `p * ((dP - c) - (D - c))`
-    (`gradient.grad_scores`), `dP = dO V^T`, `c` each query's `anchor` and `delta` its `D - c`, and the
+    """A tile's backward through its scores from its refs' tiles: its softmax and score cotangents
+    (`gradient.tile_scores`), `dP = dO V^T`, `c` each query's `anchor` and `delta` its `D - c`, and the
     entries' derivatives through `score_mod` (`gradient.scored`), its weights recomputed as its forward
     computed them (`how`)."""
     logits, slopes = gradient.tile_logits(score_mod, kernel_dot(query, key.T, interpret), seen, q_pos, k_pos,
                                          params, scale=scale if how.factor is None else 1.0, slopes=True)
-    inverse_total = algebra.inverse(total)
-    exponentials, weights = gradient.normalized(logits, peak, inverse_total, how)
-    cotangents = gradient.grad_scores(exponentials, kernel_dot(dout, value.T, interpret), anchor, delta, seen,
-                                     k_pos == key_index[:, None], inverse_total)
-    return exponentials, weights, cotangents, slopes
+    products = kernel_dot(dout, value.T, interpret)
+    at_anchor = k_pos == key_index[:, None]
+    return gradient.tile_scores(logits, products, peak, total, anchor, delta, seen, at_anchor, how), slopes
 
 
 def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tuple[Kind, ...], score_mod,
@@ -627,12 +619,13 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         # own at the end (`gradient.dq_finish`); the weights' sums unnormalized.
         keys, k_pos, seen, params = tile(index)
         key, value = key_ref[keys, :], value_ref[keys, :]
-        weights, _, cotangents, slopes = _tile_scores(score_mod, query, key, value, dout, peak, prior, anchor,
-                                                   delta, seen, q_pos, k_pos, params, key_index=key_index,
-                                                   scale=scale, how=how, interpret=interpret)
+        scores, slopes = _tile_scores(score_mod, query, key, value, dout, peak, prior, anchor, delta, seen,
+                                      q_pos, k_pos, params, key_index=key_index, scale=scale, how=how,
+                                      interpret=interpret)
         # The cotangents at the call's whole scale, its logits at the scale its query's power left
         # (`prescale`).
-        return gradient.dq_step(carry, weights, cotangents, slopes, seen, key, prior, scale=grad_scale,
+        return gradient.dq_step(carry, scores.exponentials, scores.cotangents, slopes, seen, key, prior,
+                               scale=grad_scale,
                                kinds=score_kinds, summed=summed, dot=product, accurate=accurate)
 
     sums = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], step,
@@ -684,15 +677,14 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
                       (id_refs[0][rows][:, None], key_ids[0][None, :]) if ids else None)
         params = [_key_param(ref, kind, head, rows)
                   for ref, kind in zip(score_refs, score_kinds, strict=True)]
-        exponentials, weights, cotangents, slopes = _tile_scores(
+        scores, slopes = _tile_scores(
             score_mod, by_power(query, prescale), key, value, dout, peak_ref[rows], total_ref[rows],
             anchor_ref[rows], delta_ref[rows], seen, q_pos, k_pos, params, key_index=index_ref[rows],
             scale=scale, how=how, interpret=interpret)
-        logits, pieces = gradient.pulled(cotangents, slopes, seen, score_kinds)
-        dv = dv + transposed(*algebra.value_operands(exponentials, weights, dout, total_ref[rows]))
-        # Scaled before it meets the queries, in the backward's form (`algebra.cotangent_product`), at the
-        # call's whole scale against the call's own queries, the logits' alone taken by the power.
-        dk = dk + algebra.cotangent_product(logits * grad_scale, query, transposed, accurate=accurate)
+        # At the call's whole scale against the call's own queries, the logits' alone taken by the power.
+        dk, dv, pieces = gradient.dkv_step(dk, dv, scores, slopes, seen, score_kinds, query, dout,
+                                           total_ref[rows], scale=grad_scale, transposed=transposed,
+                                           accurate=accurate)
         for place, (kind, piece) in enumerate(zip(score_kinds, pieces, strict=True)):
             if kind == Kind.TILE:
                 # A tile parameter's entries, under the refined D (`gradient.refinement`).
