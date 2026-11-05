@@ -5,7 +5,7 @@ back by its matrix instructions), evaluates special-function exponentials and do
 CUDA cores (the algebra between its products); its units overlap, so its time is the longest unit's at its
 rate (`walked`, ties broken by the units in series, `dew.algebra.cost.Walk`). The tensor cores' rate is the
 generation's (`GpuTarget.tensor_rate`), the shared-memory and special-function rates its architecture's
-(`generation.Architecture.shared_bytes_per_clock`, `exponentials_per_clock`), the CUDA cores' the
+(`generation.Multiprocessor.shared_bytes_per_clock`, `exponentials_per_clock`), the CUDA cores' the
 generation's fp32 rate. Nothing ranks a launch's configs by it (bible §6: configs are derived); the
 derivation prices a form a template's algebra takes by it (`dew.algebra.derive`, `dew.algebra.carry`)."""
 
@@ -68,13 +68,15 @@ def rates(target: generation.GpuTarget, *, device: bool) -> tuple[float | None, 
     def rate(per_clock: float | None) -> float | None:
         return None if per_clock is None or each is None else per_clock * each
 
+    # A TPU has no CUDA multiprocessor, nor its special-function units' or shared memory's rates.
+    held = target.architecture.multiprocessor
     tensor = rate(target.tensor_rate("16bit"))
     if tensor is None and device:
         tensor = target.bf16_peak
     eight = rate(target.tensor_rate("8bit")) or tensor
     return (tensor, rate(target.tensor_rate("tf32")), eight, rate(target.tensor_rate("fp32")),
-            rate(target.architecture.exponentials_per_clock),
-            math.inf if device else rate(target.architecture.shared_bytes_per_clock),
+            rate(None if held is None else held.exponentials_per_clock),
+            math.inf if device else rate(None if held is None else held.shared_bytes_per_clock),
             target.memory_rate if device else math.inf)
 
 

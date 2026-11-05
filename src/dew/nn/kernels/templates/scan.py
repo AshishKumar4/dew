@@ -63,7 +63,7 @@ def linear_scan(decays: jax.Array, writes: jax.Array, carried: jax.Array, exchan
 
 
 BANKS = 32
-"""Shared memory's banks, a 4-byte word each (`generation.Architecture.shared_bytes_per_clock`'s 128 bytes a
+"""Shared memory's banks, a 4-byte word each (`generation.Multiprocessor.shared_bytes_per_clock`'s 128 bytes a
 clock)."""
 
 

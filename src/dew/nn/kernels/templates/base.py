@@ -60,7 +60,7 @@ class Template[Config: Hashable](tuning.KernelOp):
 
     def register_budget(self, config: Config) -> int:
         """The registers a thread of the launch's program may hold at `config`: a thread's own
-        (`Architecture.thread_registers`) unless the launch's roles share the file otherwise (a
+        (`Multiprocessor.thread_registers`) unless the launch's roles share the file otherwise (a
         warp-specialized program's consumers, `resources.consumer_registers`)."""
         del config
         return resources.facts().thread_registers

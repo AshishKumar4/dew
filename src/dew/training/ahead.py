@@ -105,7 +105,7 @@ def target_config(target: GpuTarget, capacity: int | None = None) -> str:
   threads_per_warp: 32
   shared_memory_per_block: 49152
   shared_memory_per_core: {shared + 1024}
-  threads_per_core_limit: {target.architecture.resident_threads}
+  threads_per_core_limit: {target.multiprocessor.resident_threads}
   core_count: {multiprocessors}
   fpus_per_core: {64 if (major, minor) == (8, 0) else 128}
   block_dim_limit_x: 2147483647

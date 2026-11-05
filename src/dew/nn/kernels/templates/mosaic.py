@@ -1629,7 +1629,7 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
 
     @property
     def register_step(self) -> int:
-        """The allocator's registers per thread in one step (`generation.Architecture.register_step`,
+        """The allocator's registers per thread in one step (`generation.Multiprocessor.register_step`,
         setmaxnreg's eight-register granularity). A compile gate tests admits at their actual cap, refusals
         one such step below it."""
         return resources.facts().register_step

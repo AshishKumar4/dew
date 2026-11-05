@@ -246,7 +246,7 @@ def backward_programs(registers: int, target: generation.GpuTarget) -> int:
     """The programs of the backward, one warpgroup and no producer, a multiprocessor of `target` holds at once
     at `registers` a thread: the shared planner's residency (`resources.RegisterModel.resident`) within its
     resident threads."""
-    held = target.architecture
+    held = target.multiprocessor
     threads = held.resident_threads // block_scan.THREADS
     model = resources.RegisterModel(registers, held.thread_registers, 1, min(held.resident_blocks, threads),
                                     held.register_step, 0)
@@ -266,7 +266,7 @@ def backward_plan(target: generation.GpuTarget) -> tuple[int, int]:
     slowed (sel-sweep-sxm at f3040b154)."""
     plans = []
     positions = 1
-    while backward_registers(positions) <= target.architecture.thread_registers:
+    while backward_registers(positions) <= target.multiprocessor.thread_registers:
         programs = backward_programs(backward_registers(positions), target)
         if programs:
             plans.append(((2 * positions + 2 * SCAN_STEPS) / (positions * programs), -programs, positions))
