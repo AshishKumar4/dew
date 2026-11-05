@@ -507,7 +507,10 @@ def test_kimi_k25_reads_raw_media_through_its_processor_as_its_fields(kind):
     source = Pretrained.load(KIMI_K25, dtype="float32", attention_impl="reference")
     rng = np.random.default_rng(855)
     picture = (rng.random((12, 8, 3)) * 255).astype(np.uint8)
-    media = {"images": [picture]} if kind == "image" else {"videos": [np.stack([picture, picture[::-1]])]}
+    # A clip of two frames at two a second, which its processor samples by its own fps.
+    media = {"images": [picture]} if kind == "image" else {
+        "videos": [np.stack([picture, picture[::-1]])],
+        "video_metadata": [{"total_num_frames": 2, "fps": 2.0, "duration": 1.0}]}
     text = "w5 " + ("<|media_pad|>" if kind == "image" else "<|kimi_k25_video_placeholder|>") + " w7"
     called = source.processor(text, **media)
     fields = AutoProcessor.from_pretrained(str(KIMI_K25), local_files_only=True)(
