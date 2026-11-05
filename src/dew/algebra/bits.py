@@ -535,18 +535,29 @@ the stored layout's version: weights stored in it decode by this form alone."""
 
 NVFP4_OWED = 2.0 ** 8
 """The factor an NVFP4 tile's decode (`nvfp4_decoded`) owes its values, which the epilogue's fp32 scale takes:
-the decode's 2^-126 (`NVFP4_BFLOAT16`) against its block scale's 2^118, each value and its scale then in
-bfloat16's normal range, the product exact."""
+a GPU's prologue multiplies the form's decode (`code 2^-126`, `NVFP4_BFLOAT16`) by its block scale times
+2^118, each then in bfloat16's range, the product exact, so the tile is the values over 2^8."""
 
 
 def nvfp4_decoded(words: jax.Array, scales: jax.Array) -> jax.Array:
     """An NVFP4 tile in bfloat16, each value its E2M1 code times its block's E4M3 scale over `NVFP4_OWED`,
     exactly: `words` `[depth / 8, columns]` uint32, each the stored (`BitForm.prepared`) word of a column's
     eight consecutive codes along the depth, and `scales` `[depth / 16, columns]` float8_e4m3fn, one for
-    each sixteen; `[depth, columns]`. A code's decode (`NVFP4_BFLOAT16_FORM.values`) is `code 2^-126`, a
-    scale's widening `scale 2^118`: their product in float32 is exact (at most six significant bits) and
-    within bfloat16's normal range, a GEMM operand prologue's per stage (the template's matrix-operand hook,
-    algebra.md 7.4)."""
-    codes = NVFP4_BFLOAT16_FORM.values(words.T, jnp.bfloat16).T.astype(jnp.float32)
-    widened = scales.astype(jnp.float32) * np.float32(2.0 ** 118)
-    return (codes * jnp.repeat(widened, 16, axis=0)).astype(jnp.bfloat16)
+    each sixteen; `[depth, columns]`: the code restored from its decode (`_restored`) times its scale over
+    2^8 in float32, exact (at most six significant bits) and within bfloat16's normal range, as a GPU's
+    prologue forms it in one multiply per value (`NVFP4_OWED`), a GEMM operand prologue's per stage (the
+    template's matrix-operand hook, algebra.md 7.4)."""
+    codes = _restored(NVFP4_BFLOAT16_FORM.values(words.T, jnp.bfloat16).T)
+    owed = scales.astype(jnp.float32) * np.float32(1 / NVFP4_OWED)
+    return (codes * jnp.repeat(owed, 16, axis=0)).astype(jnp.bfloat16)
+
+
+def _restored(decoded: jax.Array) -> jax.Array:
+    """A decode's bfloat16 values (`NVFP4_BFLOAT16_FORM.values`, each `code 2^-126`) times 2^126, in float32,
+    by integer arithmetic: a subnormal (a code of 0 or 0.5) as its mantissa's integer times 2^-7, every other
+    value's exponent raised by 126, so no lane that flushes subnormals (XLA:CPU's) zeroes a code of 0.5."""
+    bits = jax.lax.bitcast_convert_type(decoded, jnp.uint16).astype(jnp.uint32)
+    raised = jax.lax.bitcast_convert_type(((bits + (126 << 7)) & 0xFFFF).astype(jnp.uint16), jnp.bfloat16)
+    mantissa = (bits & 0x7F).astype(jnp.float32) * np.float32(2.0 ** -7)
+    subnormal = jnp.where(bits & 0x8000 != 0, -mantissa, mantissa)
+    return jnp.where(bits & 0x7F80 == 0, subnormal, raised.astype(jnp.float32))
