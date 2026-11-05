@@ -2259,9 +2259,10 @@ class CausalTransformer(LinearProducts):
         return self.clone(dex=extension)
 
     @nn.nowrap
-    def with_scanned_layers(self) -> Self:
-        """This decoder running its like and periodic runs under the scan (`scan_layers`)."""
-        return self.clone(scan_layers=True)
+    def with_scanned_layers(self, *, scanned: bool = True) -> Self:
+        """This decoder running its like and periodic runs under the scan (`scan_layers`), or with
+        `scanned` False the plain loop."""
+        return self.clone(scan_layers=scanned)
 
     @nn.nowrap
     def reads_progress(self) -> bool:
