@@ -412,9 +412,11 @@ def _rounding(name: str, integral):
         if fmt is None:
             return _bits(result) == _bits(integral(result, *operands))
         measured = lane()
-        # A division by a divisor broadcast along a size-1 axis is held at that form's own reach
-        # (`BROADCAST`), which XLA may compute as a multiply by the divisor's reciprocal.
-        form = BROADCAST if np.shape(operands[-1]) != np.shape(result) else ""
+        # A division by a divisor broadcast along a size-1 axis of its own rank is held at that form's own
+        # reach (`BROADCAST`), which XLA may compute as a multiply by the divisor's reciprocal; a scalar
+        # divisor's (a literal's, ledger 1402) is the division's.
+        divisor = np.shape(operands[-1])
+        form = BROADCAST if len(divisor) == np.ndim(result) and divisor != np.shape(result) else ""
         reach = measured.reach.get((name + form, fmt.name), measured.reach[name, fmt.name])
         return LEVELS[name](operands, result, fmt, measured.flushes) <= reach
     return contract
@@ -828,13 +830,15 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
         drawn = [value]
     elif name in ("log1p", "expm1"):
         # Every normal binade near zero, where the functions are their argument to within a last bit (their
-        # enclosures' precision raised there, `_near_zero_interval`); and their domains' reach: log1p's down
-        # to just above -1 and up to fp32's largest, expm1's across fp32's range. A subnormal operand is read
-        # as the lane reads it (`flushes`), whose expm1 keeps one its multiply flushes.
+        # enclosures' precision raised there, `_near_zero_interval`); a quarter across the scales a model's
+        # values take; and their domains' reach: log1p's down to just above -1 and up to fp32's largest,
+        # expm1's across fp32's range. A subnormal operand is read as the lane reads it (`flushes`), whose
+        # expm1 keeps one its multiply flushes.
         value = scaled(-126, 0)
         value[quarter:2 * quarter] = (rng.uniform(-1, 0, quarter) if name == "log1p"
                                       else rng.uniform(-104, 89, quarter))
-        value[2 * quarter:3 * quarter] = np.abs(scaled(0, 127))[:quarter]
+        value[2 * quarter:3 * quarter] = rng.uniform(0, 16, quarter)
+        value[3 * quarter:] = np.abs(scaled(0, 127))[:PROBES - 3 * quarter]
         value[0] = 0.0
         drawn = [value]
     elif name == "rsqrt":
