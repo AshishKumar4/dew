@@ -1,0 +1,9 @@
+{
+ "bytes": 67341495,
+ "license": "Apache-2.0",
+ "path": "recordings/a035af789bb049d9a559a60f1cfa44dec8f347eefc9d256fcb3c7cab77fe1d4d.npz",
+ "reference": "huggingface/diffusers 6256aa7666cedd47443adc8f82da9a10e110b09c",
+ "repo": "dewml/fixtures",
+ "revision": null,
+ "sha256": "a035af789bb049d9a559a60f1cfa44dec8f347eefc9d256fcb3c7cab77fe1d4d"
+}
