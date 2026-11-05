@@ -1047,13 +1047,17 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def earlier_data_plan(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A saved run's record that states no data plan version (`RunConfig.data_plan_version`): it was written
-    before the field, under version 8, which read a mixture's corpora shuffled by one seed in one
-    permutation, so it reads by 8 (row 3840). Carried to 1.0 (ledger 1552)."""
+    """A saved run's record that states no data plan version (`RunConfig.data_plan_version`): one a Dew
+    wrote while the field was `data_plan` states it there, None where the run was trained in Python,
+    which that Dew compiled at version 9; one written before either, under version 8, which read a
+    mixture's corpora shuffled by one seed in one permutation, reads by 8 (row 3840). Carried to 1.0
+    (ledger 1552)."""
     named = registry.class_record(record)
     if named is None or named[0] not in registry.runs or "data_plan_version" in named[1]:
         return record
-    return {**record, "fields": {**named[1], "data_plan_version": 8}}
+    fields = {name: value for name, value in named[1].items() if name != "data_plan"}
+    landed = named[1].get("data_plan", 8)
+    return {**record, "fields": {**fields, "data_plan_version": 9 if landed is None else landed}}
 
 
 def earlier_option_text(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -2012,8 +2016,12 @@ class RunConfig:
         optimizer's groups (`grouped`)."""
         self.check_process()
         # Its data plan version resolved before its data compiles and its record is written, a run trained
-        # in Python reaching `readied` alone (train 589's review).
-        planned = self.resumed(("data_plan_version",))
+        # in Python reaching `readied` alone, as the run it trains under `name` reads it (train 589's
+        # review): a loader compiled already reads by its own plan's version, which it records.
+        named = dataclasses.replace(self, trainer=dataclasses.replace(self.trainer, name=name))
+        plan = dataset.plan if isinstance(dataset, Loader) else None
+        planned = (named.resumed(("data_plan_version",)) if plan is None
+                   else dataclasses.replace(named, data_plan_version=plan.version))
         dataset, held = planned.compiled(objective.data(), dataset, validation)
         # Each split scores the metrics `val_metrics` names for it, or else `metrics`, the kind's.
         suites = planned.suites(dataset, held, metrics)
