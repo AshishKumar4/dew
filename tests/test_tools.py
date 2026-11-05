@@ -2107,17 +2107,36 @@ def test_a_fixture_archive_names_nothing_of_the_machine_that_wrote_it_and_packs_
 
 def test_every_fixture_archive_names_nothing_of_the_machine_that_wrote_it():
     """Every xz archive the suite holds (tests/fixtures), each written through tools/fixture_archive: no
-    member names its writer's user, group or time (rows 2866, 2873)."""
+    member names its writer's user, group or time (rows 2866, 2873), and no saved config names a directory
+    of the writer's (`fixture_archive.cleaned`; row 2865: a reference's /tmp/dew-diffusers-reference-xl in
+    six text encoders' configs)."""
+    import re
     import tarfile
 
-    stamped = {}
+    stamped, placed = {}, {}
     for path in sorted((REPO_ROOT / "tests" / "fixtures").rglob("*.tar.xz")):
         with tarfile.open(path) as archive:
+            members = archive.getmembers()
             owners = {(member.uid, member.gid, member.uname, member.gname, member.mtime)
-                      for member in archive.getmembers()}
+                      for member in members}
+            texts = {member.name: archive.extractfile(member).read() for member in members
+                     if member.isfile() and member.name.endswith(".json")}
         if owners != {(0, 0, "", "", 0)}:
             stamped[path.name] = sorted(owners)[:2]
-    assert stamped == {}
+        placed |= {f"{path.name}:{name}": found.group(0)[:80] for name, text in texts.items()
+                   if (found := re.search(rb'"(/tmp|/home|/Users|/mnt|/armada)/[^"]*"', text))}
+    assert (stamped, placed) == ({}, {})
+
+
+def test_an_image_pipeline_receipt_names_no_directory_of_the_host_that_ran_it(tmp_path):
+    """The image pipeline's receipt records its config as the data benchmark's does (tools/receipt_paths):
+    the flowers' directory, given shell-expanded outside the checkout, by its name (row 2872: a receipt
+    recorded /home/<user>/...)."""
+    tool = load("benchmark_image_pipeline")
+    config = tool.Config(flowers=str(tmp_path / "data" / "oxford_flowers102"), out=tmp_path / "out")
+    recorded = tool.recorded_config(config)
+    assert recorded["flowers"] == "oxford_flowers102" and "out" not in recorded
+    assert recorded["images"] == config.images
 
 
 def test_a_saved_run_archive_takes_the_fixture_writer_with_its_own_cleaning_and_modes():
