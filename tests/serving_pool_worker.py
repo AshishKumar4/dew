@@ -2,6 +2,7 @@
 process's engine: the modes tests/test_multiprocess.py runs over two processes (`run_pool`'s `script`)."""
 
 import itertools
+import threading
 from collections.abc import Callable
 
 import numpy as np

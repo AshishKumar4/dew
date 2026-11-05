@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-import itertools
 import shutil
 import threading
 import time
