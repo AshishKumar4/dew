@@ -12,7 +12,10 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TypeGuard
 
+import jax
 import jax.extend.core as jcore
+from jax.extend import random as jax_random
+from jax.interpreters import ad
 
 CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat2", "checkpoint", "custom_jvp_call",
                    "custom_vjp_call", "marked_call"})
@@ -53,6 +56,22 @@ def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
         found.extend(each for each in (value if isinstance(value, tuple | list) else (value,))
                      if isinstance(each, jcore.Jaxpr))
     return found
+
+
+_JAX_OWN = {primitive: primitive.name for module in (jax.lax, jax_random)
+            for attribute, primitive in vars(module).items()
+            if attribute.endswith("_p") and isinstance(primitive, jcore.Primitive)} | {
+    ad.add_jaxvals_p: ad.add_jaxvals_p.name}
+"""JAX's own operations by their objects: `jax.lax`'s, its random bits' (`jax.extend.random`), and the sum
+JAX's derivatives add with (`add_any`)."""
+
+
+def jax_name(primitive) -> str | None:
+    """`primitive`'s name where it is JAX's own operation (`_JAX_OWN`), None for any other: a primitive
+    of another library or of a user's takes any name, whatever it computes, so a reader that knows an
+    operation by its name knows it by its object. A call (`CALLS`) runs the program it holds, read as
+    such by its name."""
+    return _JAX_OWN.get(primitive)
 
 
 def computed(value) -> TypeGuard[jcore.Var]:

@@ -36,7 +36,7 @@ from jax.core import ShapedArray
 from jax.extend import core
 
 from dew.nn.nested import nested
-from dew.nn.programs import CALLS, bodies
+from dew.nn.programs import CALLS, bodies, jax_name
 
 CAUSAL_ATTENTION = "causal attention"
 """The rule of a program tier 3's attention runs (`torchax_fallback._dew_attention`, `attested`), causal
@@ -200,11 +200,12 @@ class _Walk:
             return _call(self, eqn, given, operands)
         if not any(isinstance(value, Reads) for value in given):
             return [None] * len(eqn.outvars), self.evaluated(eqn, operands)
-        rule = _RULES.get(name)
+        # Any operation but a call by its object: another's of a lax name reads its operands whole.
+        rule = _RULES.get(jax_name(eqn.primitive))
         if rule is not None:
             return rule(self, eqn, given, operands), [None] * len(eqn.outvars)
         shape = _shape(eqn.outvars[0])
-        if name in _ENTRYWISE and all(_shape(var) == shape for var in eqn.outvars) and all(
+        if jax_name(eqn.primitive) in _ENTRYWISE and all(_shape(var) == shape for var in eqn.outvars) and all(
                 _fits(_shape(var), shape) for var, value in zip(eqn.invars, given, strict=True)
                 if isinstance(value, Reads)):
             return [_combined(given, shape)] * len(eqn.outvars), [None] * len(eqn.outvars)

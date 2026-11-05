@@ -463,7 +463,6 @@ def scaled_by_progress() -> optax.GradientTransformationExtraArgs:
     return optax.GradientTransformationExtraArgs(lambda params: optax.EmptyState(), update)
 
 
-@pytest.mark.mesh(devices=8)
 def doubled_gains() -> optax.GradientTransformation:
     """Each leaf's update scaled by a sum of squares doubled 64 times: of the leaf's own entries where it
     is of rank one, of each entry plus one at any other rank, so a stacked leaf's rows' gains are other
@@ -498,6 +497,7 @@ def spread_sums() -> optax.GradientTransformation:
     return optax.GradientTransformation(lambda params: optax.EmptyState(), update)
 
 
+@pytest.mark.mesh(devices=8)
 def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trains():
     """Over two stages, a transformation given built whose update reads each stored layer of a stacked leaf
     by the same expression of that layer's entries as over the stored layers keeps each run stage-local
