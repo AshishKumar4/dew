@@ -338,7 +338,7 @@ def released(kind: str, directory: Path) -> Path:
     return directory
 
 
-@pytest.mark.parametrize("kind", ["joint", "slot", "laya"])
+@pytest.mark.parametrize("kind", ["joint", "slot", "slot_lm", "laya"])
 def test_a_decision_release_exports_every_tensor_it_saves(tmp_path, kind):
     """A release's `export` is every tensor its `save` writes, the readout's beside the backbone's, by
     its name in the release's files, so a weight push (`NCCLPush`) sends the whole task, where an
