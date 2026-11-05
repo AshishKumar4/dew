@@ -74,8 +74,7 @@ from dew.nn.kernels.generation import (
 from dew.nn.kernels.options import owned_program
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
-from dew.telemetry.instrumentation import StepFlops, step_flops
-from dew.training.memory import compiled_memory
+from dew.telemetry.instrumentation import StepFlops, compiled_memory, step_flops
 from dew.training.profiling import pgle_runs
 
 if TYPE_CHECKING:

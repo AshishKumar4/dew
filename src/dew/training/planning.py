@@ -38,6 +38,7 @@ from dew.nn.kernels.templates import report
 from dew.nn.protocols import RematChoosing
 from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
+from dew.telemetry.instrumentation import compiled_memory
 from dew.telemetry.profile import Profiler, active_profile
 from dew.training.ahead import handed, program_of
 from dew.training.distributed import batch_divisor
@@ -45,7 +46,6 @@ from dew.training.footprint import Footprint
 from dew.training.memory import (
     climbed,
     compiled_if_it_fits,
-    compiled_memory,
     derived_headroom,
     deviceless_options,
     head_fused_of,
