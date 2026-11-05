@@ -83,9 +83,14 @@ reference's error, past the gate's 1.5).
 
 Dew holds 58 custom-derivative sites (the inventory of 2026-11-01, by class: 24 kernel, 26 numerics, 8 surrogate),
 and two more since: nGPT's join and normed hidden (`ngpt.stepped`, `ngpt.normed_hidden`, row 1308), which reverse in
-two passes only to restructure the norm's algebra (§0's example) and are the algebra-only sites the engine retires
-first. The engine sees through every one: it rewrites inside each custom VJP's and JVP's forward and backward
-bodies, by the site's declared class:
+two passes only to restructure the norm's algebra (§0's example). They stay hand-written: the one-pass form's
+new intermediates are sums of the raw rows and of the joined rows `start + |alpha scale| (end - start)` against
+the cotangent, and neither the cotangent nor the learned rate has a range the program proves or declares, so no
+reordering to that form meets the dominance rule (§6.3). Autodiff's own backward is no safer: it forms the same
+unscaled products (the pullback of `x r` to `r` is `sum(g x)`), and over residual, branch and cotangent scales
+of 1 to 1e38 in fp32 the hand backward was never non-finite where autodiff's was finite, and finite in 137 cases
+where autodiff's was not (row 4124). The engine sees through every site: it rewrites inside each custom VJP's and
+JVP's forward and backward bodies, by the site's declared class:
 
 - **Kernel** (the norm and SwiGLU kernels, the GEMM and attention templates, the recurrence kernels, the paged and
   Splash attention kernels): the launches are opaque leaves and their XLA glue is `KernelGlue`, rewritten freely.
@@ -184,14 +189,15 @@ Each form is priced in time from the device facts Dew already owns, never from f
   (`joined`; `linear`'s shared operand out of two products), which the device price already prefers, so a
   collective's bytes over `dew.training.distributed.link_figure` would only agree with it. A rule that moves a
   reduction onto or off a sharded axis brings that price with it;
-- the kernel model is the templates' own (`dew.nn.kernels.templates.cost.seconds`);
+- the kernel model is the templates' own (`dew.nn.kernels.templates.cost.walked`);
 - a fact a price needs and no owner holds, such as a reduction's latency, is added to `GpuTarget` or its
   `Architecture`.
 
 A region's seconds are computed once, from its composed terms over the chosen DAG (§6.5): bytes over bandwidth,
-FLOPs over the dtype's rate, collective bytes over the link, each kernel XLA's fusion makes of it (a reduction's
-and a product's, each a fusion's root) at the part's measured fixed latency (its launch and first byte), and
-the longest chain of dependent reductions as latency, combined as `templates.cost` combines a launch's. Row
+FLOPs over the dtype's rate, each kernel XLA's fusion makes of it (a reduction's
+and a product's, each a fusion's root) at the part's measured fixed latency (its launch and first byte), so a
+chain of dependent reductions pays a kernel's latency a link, and the span of a loop XLA lowers at its
+iteration's latency (§6.5), combined as `templates.cost` combines a launch's. Row
 4072's validation priced 1,580 profiled kernels: without a kernel's fixed latency an H100's XLA fusions came
 to 0.02 of their measured time, with it 0.51 (p10 0.40). Prices are checked against measured profiles, not
 fitted to them, and a rule set ships only with measured receipts.
@@ -278,9 +284,8 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
 
 ## 4. What it replaces, and what it leaves
 
-- **It replaces** custom derivatives that exist only to restructure algebra (nGPT's join and normed hidden, §1.3),
-  and
-  hand-derived template algebra and numeric forms wherever a generated form meets both bars:
+- **It replaces** custom derivatives that exist only to restructure algebra where its rules reach their form
+  under the dominance rule (nGPT's join and normed hidden do not, §1.3), and hand-derived template algebra and numeric forms wherever a generated form meets both bars:
   - bible §4: at least as efficient on every scoreboard row and GPU type the route serves, at the derived default,
     in operator rows and the `benchmark_step` step;
   - bible §6: the template's stability suite on both forms, and check 1 and check 2 against the float64 truth.
@@ -563,8 +568,11 @@ def extracted(graph, root, model) -> ...: ...   # the exact extractor (a MILP), 
   an iteration of a loop XLA lowers, its launches and its predicate (`GpuTarget.step_seconds`, each GPU's
   measured as the slope of a loop's time over its iterations: an A100's 5.96 µs, an H100's 4.93 µs, an RTX
   PRO 6000's 3.68 µs); a token loop's tokens and a substitution's rows are a step each. On the template's
-  path a step's latency is its instructions', which the resource model does not state yet, so a span there
-  is priced by no time.
+  path a step is a dependent reduction inside a program, measured as one (`GpuTarget.kernel_step_seconds`:
+  a Pallas program's 128-lane reduction read by the next, an A100's 225.3 ns, an H100's 142.7 ns, an RTX PRO
+  6000's 137.7 ns). The algebra's terms state no span of their own, extraction composing a span as its largest
+  node's (`extract.Level`), so a derived tile form's span is the derivation's to state. A whole launch's step,
+  its tile's load and products where its ring does not hide them, is the launch model's (row 4123).
 - Every rule is the pass's own, applied wherever its cost model prices the rewrite cheaper, with no
   condition on XLA: where XLA would make the same rewrite the result is the same, and where XLA's factoring
   and reassociation are held to integers, powers of two or fast math, the pass's fire on floats wherever the
@@ -886,7 +894,7 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
 - Every custom-derivative site declares itself through one of the three declarations, in place of a bare
   `jax.custom_vjp` or `jax.custom_jvp`. `linear_tangent` takes its caller's declared kind: `KernelGlue` at a kernel
   site, `Protected` at a numerics one (`sampling.flow`'s KL, the chunked heads, `nn.precision`'s products), and
-  `Algebra` at nGPT's join and normed hidden, which the compile-time sets rewrite until the engine retires them. A bare custom derivative in `src/dew` fails a slop check, so the inventory of §1.3 stays complete.
+  `Algebra` at nGPT's join and normed hidden, which the compile-time sets rewrite and which stay (§1.3). A bare custom derivative in `src/dew` fails a slop check, so the inventory of §1.3 stays complete.
 - `surrogate(forward, derivative)`: the forward runs as written and its tangent is `derivative`'s, both bodies
   `Surrogate`. No rule set holds a rule relating a `Surrogate` span to autodiff's derivative of its forward, so the
   engine optimizes inside each body and never replaces the rule.
