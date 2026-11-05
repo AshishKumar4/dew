@@ -1434,6 +1434,27 @@ def test_local_retention_keeps_pinned_generations_and_evicts_closed_ones(tmp_pat
     assert cache.generation(first_key) is None
 
 
+def test_a_fill_that_evicts_nothing_stops_at_its_roots_free_room_and_keeps_its_generations(tmp_path):
+    """A cache that evicts nothing (a stream's automatic cache, `Cache.evicts`) fills only the room its
+    root has free: past it, an optional one stops admitting and reads on, and the generation another
+    fill published stays read (row 4217)."""
+    source = Memory([{"id": 0}])
+    published = Cache(str(tmp_path), keep_local_bytes=250_000, shard_bytes=1)
+    first_key, second_key = _key("one"), _key("two")
+    first = published.mapped(grain.MapDataset.source(source.records("indexed")), first_key)
+    first[0]
+    first.finish()
+    first.close()
+    published.publish(first_key, source).close()
+    holding = Cache(str(tmp_path), keep_local_bytes=250_000, shard_bytes=1, optional=True, evicts=False)
+    second = holding.mapped(grain.MapDataset.source(source.records("indexed")), second_key)
+    assert second[0] == {"id": 0}
+    second.finish()
+    second.close()
+    assert holding.generation(second_key) is None
+    assert published.generation(first_key)[0] == {"id": 0}
+
+
 def test_local_retention_counts_what_its_root_holds_once_its_record_passes_the_limit(tmp_path):
     """A local root records the bytes its writes reserve, so a write under the limit counts nothing
     again. Bytes removed outside a reservation leave the record above what the root holds: the next
