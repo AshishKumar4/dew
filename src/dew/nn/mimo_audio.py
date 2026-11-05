@@ -230,7 +230,7 @@ class MiMoAudioCodeEncoder(nn.Module):
     def __call__(self, codes, counts):
         cfg = self.config
         batch, frames, _ = codes.shape
-        groups = -(-frames // cfg.group_size)
+        groups = grouped(frames, cfg.group_size)
         codes = jnp.pad(codes, ((0, 0), (0, groups * cfg.group_size - frames), (0, 0)))
         last = jnp.take_along_axis(codes, jnp.maximum(counts - 1, 0)[:, None, None], axis=1)
         place = jnp.arange(codes.shape[1])[None, :, None]
@@ -306,8 +306,11 @@ def tower_counts(frames, tokenizer: MiMoAudioTokenizer):
     """The tokens a segment of `frames` mel frames (an integer or an integer array, on the host or traced)
     holds at each stage of the audio tokenizer's encoder: its two convolutions' (`AudioTokenizerEncoder`'s
     conv1 and its strided conv2), then its pooling's by `avg_pooler` rounding up, its codes. The one count
-    the tower's masks and the host's placement read (`MiMoAudio.encoded`)."""
-    convolved = (frames + 3 - tokenizer.kernel_size + 2 - tokenizer.kernel_size) // tokenizer.stride_size + 1
+    the tower's masks and the host's placement read (`MiMoAudio.encoded`). An empty segment, a clip's
+    padding, holds none at any stage, as the release tokenizes none (`batch_longest`), whatever count the
+    convolutions' arithmetic gives zero frames."""
+    kernel, stride = tokenizer.kernel_size, tokenizer.stride_size
+    convolved = (frames > 0) * ((frames + 3 - kernel + 2 - kernel) // stride + 1)
     return convolved, -(-convolved // tokenizer.avg_pooler)
 
 
