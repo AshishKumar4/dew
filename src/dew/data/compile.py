@@ -244,6 +244,10 @@ class _Facts(View[Source]):
     read: Read
     stated_snapshot: Mapping[str, object]
     stated_metadata: Mapping[str, object]
+    stated_description: str
+    """The source's description as the compile took it, which every reader the compile makes names its
+    corpus by: a store in memory describes itself by a hash of every record it holds, which a reader
+    opened outside the compile would take again (row 803)."""
     held: _PinnedRead | None = None
     """The memory read pinning took, which the compile's memory reads of the source reuse, so its
     facts and the rows a run materializes are one read's."""
@@ -253,6 +257,9 @@ class _Facts(View[Source]):
 
     def label(self) -> str:
         return self.stated_label
+
+    def describe(self) -> str:
+        return self.stated_description
 
     def fingerprint(self) -> Mapping[str, object]:
         return self.stated_snapshot
@@ -318,7 +325,7 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
         source = _consumed(source, read)
         records, metadata = _stated(source, read, measuring, whole)
         held = None if records is None else _PinnedRead(records)
-        return _Facts(source, read, source.fingerprint(), metadata, held, label)
+        return _Facts(source, read, source.fingerprint(), metadata, source.describe(), held, label)
 
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as readers:
         # Each read in this compilation, which fingerprints each source once (`compiling`).

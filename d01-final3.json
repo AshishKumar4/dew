@@ -1,0 +1,145 @@
+{
+ "sha": "8e9c26cbce9e4ba4c41596dcb56d6dfc5af8bf1b",
+ "items": [
+  {
+   "item": "tests/test_decision_task.py",
+   "green": true,
+   "why": "7 groups green",
+   "finished": true,
+   "cases": {
+    "tests/test_decision_task.py": "passed"
+   },
+   "tail": "               [100%]\n=============================== warnings summary ===============================\ntests/test_decision_task.py: 178 warnings\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/core.py:222: DeprecationWarning: core.Jaxpr is missing a DebugInfo object. This behavior is deprecated, use api_util.debug_info() to construct a proper DebugInfo object and propagate it to this function. See https://github.com/jax-ml/jax/issues/26480 for more details.\n    debug_info = debug_info or lu._missing_debug_info(\"core.Jaxpr\")\n\ntests/test_decision_task.py::test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/numpy/array_methods.py:125: UserWarning: Explicitly requested dtype float64 requested in astype is not available, and will be truncated to dtype float32. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/jax-ml/jax#current-gotchas for more.\n    return lax_numpy.astype(self, dtype, copy=copy, device=device)\n\ntests/test_decision_task.py::test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/flax/linen/normalization.py:226: UserWarning: Explicitly requested dtype float64 requested in asarray is not available, and will be truncated to dtype float32. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/jax-ml/jax#current-gotchas for more.\n    return jnp.asarray(y, dtype)\n\ntests/test_decision_task.py::test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/flax/linen/dtypes.py:79: UserWarning: Explicitly requested dtype float64 requested in asarray is not available, and will be truncated to dtype float32. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/jax-ml/jax#current-gotchas for more.\n    return [jnp.asarray(x, dtype) if x is not None else None for x in args]\n\ntests/test_decision_task.py::test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/core.py:1980: UserWarning: Explicitly requested dtype float64 requested in ShapeDtypeStruct is not available, and will be truncated to dtype float32. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/jax-ml/jax#current-gotchas for more.\n    return aval_fn(x)\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\nshared XLA cache: 5218 programs fetched (66.4 MB read), 0 bundles uploaded (0.0 MB)\n7 passed, 38 deselected, 182 warnings in 58.22s\nrun_tests: {\"tests\": 7, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 7, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_example_counts.py",
+   "green": true,
+   "why": "20 passed, 0 skipped",
+   "finished": true,
+   "cases": {
+    "tests/test_example_counts.py": "passed"
+   },
+   "tail": "....................                                                     [100%]\nshared XLA cache: 40 programs fetched (0.1 MB read), 0 bundles uploaded (0.0 MB)\n20 passed in 30.90s\nrun_tests: {\"tests\": 20, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 20, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_prompts.py",
+   "green": true,
+   "why": "14 passed, 0 skipped",
+   "finished": true,
+   "cases": {
+    "tests/test_prompts.py": "passed"
+   },
+   "tail": "..............                                                           [100%]\nshared XLA cache: 0 programs fetched (0.0 MB read), 0 bundles uploaded (0.0 MB)\n14 passed in 16.58s\nrun_tests: {\"tests\": 14, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 14, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_decision_workflow.py",
+   "green": true,
+   "why": "7 groups green",
+   "finished": true,
+   "cases": {
+    "tests/test_decision_workflow.py": "passed"
+   },
+   "tail": ".                                                                        [100%]\n=============================== warnings summary ===============================\ntests/test_decision_workflow.py: 303 warnings\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/core.py:222: DeprecationWarning: core.Jaxpr is missing a DebugInfo object. This behavior is deprecated, use api_util.debug_info() to construct a proper DebugInfo object and propagate it to this function. See https://github.com/jax-ml/jax/issues/26480 for more details.\n    debug_info = debug_info or lu._missing_debug_info(\"core.Jaxpr\")\n\ntests/test_decision_workflow.py::test_a_cell_of_the_workflow_holds_the_conservation_contract[joint-context-0.5-share]\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/optax/_src/linear_algebra.py:44: DeprecationWarning: optax.global_norm is deprecated in favor of optax.tree.norm\n    warnings.warn(\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\nshared XLA cache: 2552 programs fetched (41.5 MB read), 0 bundles uploaded (0.0 MB)\n1 passed, 6 deselected, 304 warnings in 76.30s (0:01:16)\nrun_tests: {\"tests\": 1, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 1, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_data_host.py",
+   "green": true,
+   "why": "6 passed, 0 skipped",
+   "finished": true,
+   "cases": {
+    "tests/test_data_host.py": "passed"
+   },
+   "tail": "......                                                                   [100%]\nshared XLA cache: 0 programs fetched (0.0 MB read), 0 bundles uploaded (0.0 MB)\n6 passed in 6.36s\nrun_tests: {\"tests\": 6, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 6, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_pipeline_core.py",
+   "green": true,
+   "why": "2 groups green",
+   "finished": true,
+   "cases": {
+    "tests/test_pipeline_core.py": "passed"
+   },
+   "tail": "...................................................                      [100%]\nshared XLA cache: 0 programs fetched (0.0 MB read), 0 bundles uploaded (0.0 MB)\n51 passed, 156 deselected in 70.20s (0:01:10)\nrun_tests: {\"tests\": 51, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 51, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_data_sources.py",
+   "green": true,
+   "why": "177 passed, 0 skipped",
+   "finished": true,
+   "cases": {
+    "tests/test_data_sources.py": "passed"
+   },
+   "tail": "........................................................................ [ 40%]\n........................................................................ [ 81%]\n.................................                                        [100%]\n=============================== warnings summary ===============================\ntests/test_data_sources.py::test_tfds_source_metadata_and_decoder_identity_need_no_data_scan\ntests/test_data_sources.py::test_tfds_source_metadata_and_decoder_identity_need_no_data_scan\ntests/test_data_sources.py::test_tfds_source_metadata_and_decoder_identity_need_no_data_scan\ntests/test_data_sources.py::test_remote_tfds_requires_explicit_provisioning_before_native_reads\ntests/test_data_sources.py::test_remote_tfds_requires_explicit_provisioning_before_native_reads\ntests/test_data_sources.py::test_tfds_label_definitions_participate_in_source_identity\ntests/test_data_sources.py::test_tfds_label_definitions_participate_in_source_identity\ntests/test_data_sources.py::test_an_indexed_source_streams_as_bounded_shards_of_its_records[tfds]\ntests/test_data_sources.py::test_an_indexed_source_streams_as_bounded_shards_of_its_records[tfds]\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/tensorflow_datasets/core/logging/__init__.py:296: DeprecationWarning: label() is deprecated. Use is_required() or is_repeated() instead.\n    return function(*args, **kwargs)\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\nshared XLA cache: 0 programs fetched (0.0 MB read), 0 bundles uploaded (0.0 MB)\n177 passed, 9 warnings in 63.05s (0:01:03)\nrun_tests: {\"tests\": 177, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 177, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_hub_sources.py",
+   "green": true,
+   "why": "74 passed, 0 skipped",
+   "finished": true,
+   "cases": {
+    "tests/test_hub_sources.py": "passed"
+   },
+   "tail": "........................................................................ [ 97%]\n..                                                                       [100%]\nshared XLA cache: 0 programs fetched (0.0 MB read), 0 bundles uploaded (0.0 MB)\n74 passed in 10.58s\nrun_tests: {\"tests\": 74, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 74, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_data_mixtures.py",
+   "green": true,
+   "why": "123 passed, 0 skipped",
+   "finished": true,
+   "cases": {
+    "tests/test_data_mixtures.py": "passed"
+   },
+   "tail": "........................................................................ [ 58%]\n...................................................                      [100%]\n=============================== warnings summary ===============================\ntests/test_data_mixtures.py: 170 warnings\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/core.py:222: DeprecationWarning: core.Jaxpr is missing a DebugInfo object. This behavior is deprecated, use api_util.debug_info() to construct a proper DebugInfo object and propagate it to this function. See https://github.com/jax-ml/jax/issues/26480 for more details.\n    debug_info = debug_info or lu._missing_debug_info(\"core.Jaxpr\")\n\ntests/test_data_mixtures.py: 99 warnings\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/optax/_src/linear_algebra.py:44: DeprecationWarning: optax.global_norm is deprecated in favor of optax.tree.norm\n    warnings.warn(\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\nshared XLA cache: 3062 programs fetched (31.6 MB read), 0 bundles uploaded (0.0 MB)\n123 passed, 269 warnings in 60.76s (0:01:00)\nrun_tests: {\"tests\": 123, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 123, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_dataset_chain.py",
+   "green": true,
+   "why": "2 groups green",
+   "finished": true,
+   "cases": {
+    "tests/test_dataset_chain.py": "passed"
+   },
+   "tail": "........................................................................ [ 60%]\n...............................................                          [100%]\nshared XLA cache: 1446 programs fetched (7.5 MB read), 0 bundles uploaded (0.0 MB)\n119 passed, 34 deselected in 90.02s (0:01:30)\nrun_tests: {\"tests\": 119, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 119, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_saved_runs.py",
+   "green": true,
+   "why": "29 groups green",
+   "finished": true,
+   "cases": {
+    "tests/test_saved_runs.py": "passed"
+   },
+   "tail": "...                                                                      [100%]\n=============================== warnings summary ===============================\ntests/test_saved_runs.py::test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint[7fb2637f6b36-lm]\ntests/test_saved_runs.py::test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint[cfe46a741b15-block-diffusion]\ntests/test_saved_runs.py::test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint[cfe46a741b15-decision-lettered]\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/optax/_src/linear_algebra.py:44: DeprecationWarning: optax.global_norm is deprecated in favor of optax.tree.norm\n    warnings.warn(\n\ntests/test_saved_runs.py: 384 warnings\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/core.py:222: DeprecationWarning: core.Jaxpr is missing a DebugInfo object. This behavior is deprecated, use api_util.debug_info() to construct a proper DebugInfo object and propagate it to this function. See https://github.com/jax-ml/jax/issues/26480 for more details.\n    debug_info = debug_info or lu._missing_debug_info(\"core.Jaxpr\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\nshared XLA cache: 4349 programs fetched (66.9 MB read), 0 bundles uploaded (0.0 MB)\n3 passed, 151 deselected, 387 warnings in 73.99s (0:01:13)\nrun_tests: {\"tests\": 3, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 3, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_declared_reads.py",
+   "green": true,
+   "why": "28 passed, 0 skipped",
+   "finished": true,
+   "cases": {
+    "tests/test_declared_reads.py": "passed"
+   },
+   "tail": "............................                                             [100%]\nshared XLA cache: 0 programs fetched (0.0 MB read), 0 bundles uploaded (0.0 MB)\n28 passed in 18.24s\nrun_tests: {\"tests\": 28, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 28, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_data.py",
+   "green": true,
+   "why": "72 passed, 0 skipped",
+   "finished": true,
+   "cases": {
+    "tests/test_data.py": "passed"
+   },
+   "tail": "........................................................................ [100%]\n=============================== warnings summary ===============================\ntests/test_data.py: 150 warnings\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/moviepy/video/io/ffmpeg_reader.py:226: DeprecationWarning: Setting the shape on a NumPy array has been deprecated in NumPy 2.5.\n  As an alternative, you can create a new view using np.reshape (with copy=False if needed).\n    result.shape = (h, w, len(s) // (w * h))  # reshape((h, w, len(s)//(w*h)))\n\ntests/test_data.py: 10 warnings\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/core.py:222: DeprecationWarning: core.Jaxpr is missing a DebugInfo object. This behavior is deprecated, use api_util.debug_info() to construct a proper DebugInfo object and propagate it to this function. See https://github.com/jax-ml/jax/issues/26480 for more details.\n    debug_info = debug_info or lu._missing_debug_info(\"core.Jaxpr\")\n\ntests/test_data.py::test_a_run_over_a_grain_dataset_trains_and_resumes_where_it_stopped\ntests/test_data.py::test_a_run_over_a_grain_dataset_trains_and_resumes_where_it_stopped\ntests/test_data.py::test_a_run_over_a_grain_dataset_trains_and_resumes_where_it_stopped\ntests/test_data.py::test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped\ntests/test_data.py::test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped\ntests/test_data.py::test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/optax/_src/linear_algebra.py:44: DeprecationWarning: optax.global_norm is deprecated in favor of optax.tree.norm\n    warnings.warn(\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\nshared XLA cache: 188 programs fetched (2.3 MB read), 0 bundles uploaded (0.0 MB)\n72 passed, 166 warnings in 129.77s (0:02:09)\nrun_tests: {\"tests\": 72, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 72, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_data_cache.py",
+   "green": true,
+   "why": "108 passed, 0 skipped",
+   "finished": true,
+   "cases": {
+    "tests/test_data_cache.py": "passed"
+   },
+   "tail": "........................................................................ [ 66%]\n....................................                                     [100%]\nshared XLA cache: 0 programs fetched (0.0 MB read), 0 bundles uploaded (0.0 MB)\n108 passed, 1 deselected in 62.86s (0:01:02)\nrun_tests: {\"tests\": 108, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 108, \"cases\": {}}\n"
+  }
+ ]
+}
