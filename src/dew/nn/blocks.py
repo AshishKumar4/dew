@@ -3,6 +3,7 @@
 import functools
 from collections.abc import Callable
 from functools import partial
+from typing import overload
 
 import jax
 import jax.numpy as jnp
@@ -266,7 +267,15 @@ def torch_nearest_resize(x, height: int, width: int):
     return jnp.take(jnp.take(x, rows, axis=1), columns, axis=2)
 
 
-def torch_cubic_weights[T: (np.ndarray, jax.Array)](t: T) -> T:
+@overload
+def torch_cubic_weights(t: np.ndarray) -> np.ndarray: ...
+
+
+@overload
+def torch_cubic_weights(t: jax.Array) -> jax.Array: ...
+
+
+def torch_cubic_weights(t: np.ndarray | jax.Array) -> np.ndarray | jax.Array:
     """The weights of torch's bicubic interpolation (a = -0.75, `upsample_bicubic2d`) on the four taps
     around a source coordinate whose distance past its floor is `t` (NumPy or JAX, its dtype kept): the
     taps at floor - 1, floor, floor + 1 and floor + 2, in that order, on a new last axis."""
