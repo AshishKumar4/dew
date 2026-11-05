@@ -674,6 +674,20 @@ def pool_checkpoint(tmp_path_factory):
 
 
 @pytest.mark.distributed
+def test_every_process_plans_from_the_tightest_room_any_of_their_devices_leaves(tmp_path):
+    """The derivation's judgments decide which plan compiles first, so every process reads each alike, the
+    tightest any process's devices leave (`planning.agreed`, row 3341's review): over two processes whose
+    devices leave four microbatches room to the byte on one and a byte less on the other, each judges four
+    to refuse and compiles eight first, the plan the other compiles, where judged apart one would have
+    compiled four and the other eight."""
+    reports = run_pool("plan_agreement", tmp_path, 2, fsdp_size=2)
+    first, second = reports
+    assert first["need"] == second["need"]
+    assert first["derived"] == second["derived"] and first["derived"]["4"] == -1
+    assert first["asked"] == second["asked"] and first["asked"][0] == 8 and first["split"] == second["split"]
+
+
+@pytest.mark.distributed
 def test_no_process_of_a_cpu_pool_traces_residuals_its_devices_never_judge(pool_checkpoint):
     """A step's derived footprint judges each process's own device, so no process of a CPU pool, whose
     devices state no memory, traces the residuals its loss's pullback keeps (row 3093): process 1 judged

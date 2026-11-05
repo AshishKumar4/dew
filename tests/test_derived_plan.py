@@ -141,7 +141,7 @@ def test_a_split_the_derivation_leaves_no_byte_to_spare_is_one_it_fits(monkeypat
     nothing read as a refusal)."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
     sizing = deep(split=4)
-    compiled(sizing)
+    needs(monkeypatch, sizing, lambda: compiled(sizing))
     (judged,) = [entry for entry in sizing.plan["derived"] if entry["split"] == 4]
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
     free(monkeypatch, LIMIT - judged["headroom"])
@@ -149,30 +149,6 @@ def test_a_split_the_derivation_leaves_no_byte_to_spare_is_one_it_fits(monkeypat
     compiled(trainer)
     headroom = {entry["split"]: entry["headroom"] for entry in trainer.plan["derived"]}
     assert headroom[4] == 0 and headroom[2] < 0 and asked(trainer)[0][0] == 4
-
-
-def test_every_process_reads_a_derived_judgment_as_the_tightest_any_states(monkeypatch, tmp_path):
-    """The derivation's judgments decide which plan compiles first, so every process reads each alike
-    (`planning.agreed`): where another process's devices leave less room, a process plans by that room,
-    and where another cannot judge the step, none does and the compiles decide, each process compiling
-    the plan the others do (row 3341's review)."""
-    from dew.training import planning
-
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
-    sizing = deep(split=4)
-    compiled(sizing)
-    (judged,) = [entry for entry in sizing.plan["derived"] if entry["split"] == 4]
-    room = LIMIT - judged["headroom"]
-    # A peer with a byte less room refuses four and fits eight; one that cannot judge leaves the compiles
-    # to decide, from the batch whole.
-    for peer, first in ((lambda value: value if value is None else value - 1, 8), (lambda value: None, 1)):
-        monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / f"run-{first}"))
-        free(monkeypatch, room)
-        monkeypatch.setattr(planning, "from_every_process", lambda value, peer=peer: [value, peer(value)]
-                            if not isinstance(value, bool) else [value, value])
-        trainer = deep(split=None)
-        compiled(trainer)
-        assert asked(trainer)[0][0] == first
 
 
 def test_a_run_that_sets_its_remat_derives_its_own_rung_alone_and_compiles_there_once(monkeypatch, tmp_path):

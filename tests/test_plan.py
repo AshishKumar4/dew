@@ -22,6 +22,7 @@ import pytest
 from affine_run import FEATURES, Regression
 from export_support import Stalled
 from jax.extend.backend import get_backend
+from process_support import assert_exits_cleanly
 from reference_error import as_given, assert_as_exact, seeds_for
 from sharded import collectives
 from token_support import write_token_corpus
@@ -405,27 +406,23 @@ def test_a_plan_search_keeps_the_freeze_a_process_made_before_it():
     """A plan search holds the objects alive before it out of Python's collector while it runs
     (`held_objects`) and returns them after; a process that froze objects of its own before the search, as
     one that forks its workers does, finds them frozen after it as before, the search freezing nothing
-    more (row 3341's review)."""
-    from dew.nn.kernels.options import held_objects
+    more, in a fresh interpreter whose freeze is its own (row 3341's review)."""
+    assert_exits_cleanly("""
+import gc
+from dew.nn.kernels.options import held_objects
 
-    class Held:
-        """An object of the process's own."""
-
-    gc.collect()
-    assert gc.get_freeze_count() == 0
-    alive = Held()
-    with held_objects():
-        assert gc.get_freeze_count() > 0
-    assert gc.get_freeze_count() == 0
-    gc.freeze()
-    try:
-        frozen = gc.get_freeze_count()
-        with held_objects():
-            made = [Held() for _ in range(1000)]
-            assert gc.get_freeze_count() == frozen
-        assert gc.get_freeze_count() == frozen and made and alive
-    finally:
-        gc.unfreeze()
+gc.collect()
+assert gc.get_freeze_count() == 0, gc.get_freeze_count()
+with held_objects():
+    assert gc.get_freeze_count() > 0
+assert gc.get_freeze_count() == 0
+gc.freeze()
+frozen = gc.get_freeze_count()
+with held_objects():
+    made = [object() for _ in range(1000)]
+    assert gc.get_freeze_count() == frozen
+assert gc.get_freeze_count() == frozen and made
+""")
 
 
 COST = b"\x0a\x0c\x0a\x01x\x11" + struct.pack("<d", 1.0)
