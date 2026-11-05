@@ -212,7 +212,7 @@ def test_an_fp32_rated_scan_through_the_template_stays_finite_interpreted(forms)
 @pytest.mark.parametrize(('name', 'regime', 'forms'),
                          [(name, regime, forms) for name, regime, product, forms in CASES
                           if product == 'forward' and regime in INTERPRETED])
-@pytest.mark.check1_shards(seeds=256, per_task=64)
+@pytest.mark.check1_shards(seeds=256, per_task=16)
 def test_each_form_the_template_takes_stays_finite_and_on_par_interpreted(name, regime, forms):
     """Each form's 16-bit forward through the template, interpreted off a GPU under the regimes that grow its
     tiles most, held as its GPU flow cell is: finite, and its output and final memory on par from float64
@@ -220,7 +220,9 @@ def test_each_form_the_template_takes_stays_finite_and_on_par_interpreted(name, 
     (`recurrence_chunk.chunk_rounding`) put its final memory 2.1e4 times the portable math's distance from
     float64 unseen off a GPU (row 3962). Whole, the cells took 27 to 151 s (Kimi delta attention's aligned
     keys 128, the rated scan's decays near zero under the accurate forms 151, stab-case at d51a2d2cf): a site
-    each, sharded over the most seeds a cell declares."""
+    each, sharded over the most seeds a cell declares, sixteen draws a task, where every cell's 64 a task
+    took 966.6 s, Kimi delta attention's decays near zero 329 of it (train 625's CI, armada job
+    20261105212801-7b615468)."""
     the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime, 'forward', forms)
 
 
