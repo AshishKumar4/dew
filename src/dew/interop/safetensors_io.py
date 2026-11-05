@@ -22,9 +22,9 @@ import ml_dtypes
 import numpy as np
 
 from dew._coordination import read_home, writes_weights
+from dew._files import replacing, write_atomically
 from dew._records import JSON
 from dew.batch import unboxed
-from dew._files import replacing, write_atomically
 from dew.interop.unread import Stored, Unread
 from dew.interop.weights import ParamTree, insert
 

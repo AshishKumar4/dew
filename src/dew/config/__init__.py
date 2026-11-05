@@ -46,11 +46,12 @@ from etils import epath
 
 import dew.io
 from dew import _records, registry, training
-from dew._coordination import agree_process_phase, agreed, agreed_same
-from dew._records import JSON, duration, earlier_fields, is_share, recorded_duration
 from dew._cache import dew_cache_dir
-from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
 from dew._cleanup import attempted
+from dew._coordination import agree_process_phase, agreed, agreed_same
+from dew._files import write_atomically
+from dew._records import JSON, duration, earlier_fields, is_share, recorded_duration
+from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.data import records
 from dew.data.compile import fitted
@@ -58,7 +59,6 @@ from dew.data.dataset import Closeable, Loader, Ramp, Reader, ramped
 from dew.data.pipeline import Dataset, ObjectiveData
 from dew.data.plan import PLAN_VERSIONS, SCHEDULE, PlanOrderChanged
 from dew.distributed.placement import Layout, MeshSpec
-from dew._files import write_atomically
 from dew.interop.weights import AUTO
 from dew.lora import LoRA
 from dew.nn.dex import DifferentialExtension

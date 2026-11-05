@@ -21,6 +21,7 @@ from jax.typing import DTypeLike
 from PIL import Image
 
 from dew import _records
+from dew._files import write_atomically
 from dew._records import JSON, json_value, record
 from dew.batch import Variables
 from dew.checkpoints import Checkpoints
@@ -68,7 +69,6 @@ from dew.decision.questions import (
     Question,
     ScoreAnswer,
 )
-from dew._files import write_atomically
 from dew.inference import scoring
 from dew.inference.tasks import (
     InItsForm,

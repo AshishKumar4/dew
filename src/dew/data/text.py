@@ -27,9 +27,9 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, runtime_chec
 import grain.python as grain
 import numpy as np
 
+from dew._files import published
 from dew.data.pipeline import TOKEN_FIELDS, Rejected
 from dew.data.tokens import chunk_table
-from dew._files import published
 
 if TYPE_CHECKING:
     from datatrove.pipeline.filters.base_filter import BaseFilter

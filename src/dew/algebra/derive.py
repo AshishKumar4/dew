@@ -57,11 +57,11 @@ from egglog import (
 )
 from egglog.bindings import EggSmolError
 
+from dew._cache import ALGEBRA
 from dew.algebra import cost, extract, program, rules, terms
 from dew.algebra.cost import Work
 from dew.algebra.forms import Accumulated, Added, Derived, Merged, Refused, evaluated, evaluator, inlined
 from dew.algebra.terms import Term
-from dew._cache import ALGEBRA
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
 

@@ -40,12 +40,12 @@ from egglog import (
     vars_,
 )
 
+from dew._cache import ALGEBRA
 from dew.algebra import cost, forms, program, rules, terms
 from dew.algebra.cost import Work
 from dew.algebra.extract import Level
 from dew.algebra.forms import Refused
 from dew.algebra.terms import Term
-from dew._cache import ALGEBRA
 
 
 @function(merge=lambda old, new: old)

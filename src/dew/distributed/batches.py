@@ -25,9 +25,9 @@ from flax import linen as nn
 from jax.experimental import multihost_utils
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
+from dew._cleanup import attempted
 from dew._coordination import agreed, broadcast_from_process_zero, from_every_process, stop_at_exit
 from dew.batch import Batch
-from dew._cleanup import attempted
 from dew.data.dataset import Budgeted, Checkpointable, Closeable, DataPartition, Stoppable
 from dew.distributed.placement import Placement, placeable, placed_bytes, placed_shapes
 from dew.mesh import SEQUENCE_AXIS, batch_axes

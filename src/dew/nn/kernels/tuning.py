@@ -72,10 +72,10 @@ from jax._src import config as jax_config
 from jax.extend import core as jax_core
 from jax.extend.backend import get_default_device
 
-from dew import _coordination, _records, _cache
+from dew import _cache, _coordination, _records
+from dew._files import write_atomically
 from dew._records import JSON
 from dew.algebra.terms import opaque, parameter_key
-from dew._files import write_atomically
 from dew.nn.kernels.options import owned_program
 
 from . import generation

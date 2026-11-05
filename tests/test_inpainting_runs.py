@@ -15,8 +15,8 @@ import numpy as np
 import pytest
 from objective_data import IMAGES
 
-from dew.checkpoints import Checkpoints
 from dew._cli.main import main
+from dew.checkpoints import Checkpoints
 from dew.config import ObjectiveConfig
 from dew.config.diffusion import DiffusionRunConfig, FlowRolloutConfig
 from dew.data import TFDS, images as image_steps, presets

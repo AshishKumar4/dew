@@ -57,9 +57,9 @@ import numpy as np
 from jax.experimental import serialize_executable
 
 from dew import communicators
+from dew._cache import uncached
 from dew._records import JSON, record
 from dew.batch import Batch
-from dew._cache import uncached
 from dew.nn.kernels.generation import (
     GpuTarget,
     assumed,

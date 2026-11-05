@@ -22,8 +22,8 @@ import jax
 from jax.experimental import multihost_utils
 
 from dew import communicators
-from dew._coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
 from dew._cache import enable_compilation_cache, persist_compilations
+from dew._coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
 from dew._devices import (
     apply_xla_flags,
     backend_open,

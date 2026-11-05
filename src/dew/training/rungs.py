@@ -29,8 +29,8 @@ from jax.sharding import Mesh
 from jaxlib.xla_client import LoadedExecutable
 
 from dew import _cache
-from dew._records import JSON, json_value, record
 from dew._files import write_atomically
+from dew._records import JSON, json_value, record
 from dew.nn.kernels.generation import assumption, gpu_target
 from dew.nn.sharding import trace_context
 from dew.telemetry.instrumentation import StepFlops, step_flops

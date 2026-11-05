@@ -27,8 +27,8 @@ from map_judge import sharded
 from option_witness import SETTINGS, TASK_RUNS, same, saved_with, witnessed_on
 from run_kinds import ADAPTED, DEFAULT_METRICS, KINDS, RATE, TINY_LAYA, decision, dreamed, scalars, trained
 
-from dew.batch import FROZEN
 from dew._cli.main import main
+from dew.batch import FROZEN
 from dew.config import SourceOptions, TrainerConfig
 from dew.lora import LoRA
 from dew.registry import ModelConfig, objectives

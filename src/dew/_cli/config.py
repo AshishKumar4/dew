@@ -14,9 +14,9 @@ from pathlib import Path
 
 from filelock import FileLock
 
-from dew._records import JSON
 from dew._cache import dew_config_dir
 from dew._files import write_atomically
+from dew._records import JSON
 
 DEFAULT_ZONES = ("us-central2-b", "europe-west4-a", "us-east1-d")
 

@@ -146,9 +146,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew._cleanup import attempted
 from dew._coordination import agreed, agreed_count, from_every_process
 from dew.batch import Batch, Variables
-from dew._cleanup import attempted
 from dew.data.dataset import DataPartition, Loader, tapped
 from dew.distributed.batches import first_reader_batch, shard_batch
 from dew.nn.inputs import local_rows, mesh_of

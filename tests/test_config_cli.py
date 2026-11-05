@@ -170,8 +170,8 @@ def test_dew_profile_trains_a_run_afresh_and_reports_where_its_window_spent_the_
     pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
     import autoencoder_experiment
 
-    from dew.checkpoints import Checkpoints
     from dew._cli.main import main
+    from dew.checkpoints import Checkpoints
 
     out = tmp_path / "profile"
     command = ["profile", autoencoder_experiment.__file__, "--warmup", "2", "--steps", "2", "--out", str(out)]

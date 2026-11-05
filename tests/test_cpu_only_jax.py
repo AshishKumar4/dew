@@ -66,7 +66,7 @@ def run():
     fit_one_step()
 
 
-from dew._devices import CPUOnlyJax
+from dew.training import CPUOnlyJax
 
 try:
     run()

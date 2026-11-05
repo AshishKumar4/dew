@@ -46,8 +46,8 @@ from process_support import (
 from test_whole_validation import POOLED
 from token_support import Corpus, write_token_corpus
 
-from dew.checkpoints import FROZEN_STORE
 from dew._position import ENVELOPE
+from dew.checkpoints import FROZEN_STORE
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh

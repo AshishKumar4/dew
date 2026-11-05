@@ -71,8 +71,8 @@ from flax import core, linen as nn
 from flax.core import meta
 from flax.traverse_util import flatten_dict, unflatten_dict
 
-from dew.batch import Coordinates, unboxed
 from dew._cache import INTERCEPTED, QUANTIZED_TRACE
+from dew.batch import Coordinates, unboxed
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.derivatives import surrogate
 from dew.nn.kernels.generation import backend, linear_map
@@ -1014,7 +1014,7 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
     so a rank whose tree lacks one is refused with its peers rather than
     leaving them at the measurement's agreement.
     """
-    from dew import _coordination, _cache
+    from dew import _cache, _coordination
     from dew.nn.kernels.generation import device_generation, fp8_tensor_cores
 
     variables = unboxed(variables)

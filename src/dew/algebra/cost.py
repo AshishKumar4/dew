@@ -18,10 +18,10 @@ import jax.numpy as jnp
 import numpy as np
 from egglog import DagCostModel, EGraph, get_callable_args
 
+from dew._cache import ALGEBRA
 from dew.algebra.extract import Level
 from dew.algebra.rules import CONTRACTED, shape
 from dew.algebra.terms import RESCALE, Region, Term, integer, key, text
-from dew._cache import ALGEBRA
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import cost as kernel_cost
 from dew.nn.kernels.templates.cost import Work

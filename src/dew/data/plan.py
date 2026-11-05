@@ -20,10 +20,10 @@ import numpy as np
 
 from dew import _checkout
 from dew._hashing import array_header
+from dew._position import PER_SHARE
 from dew._records import ADDED, JSON, integer, json_value, listed, record, set_added, without_removed
 from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
-from dew._position import PER_SHARE
 
 _log = logging.getLogger(__name__)
 

@@ -43,13 +43,13 @@ from typing import TYPE_CHECKING
 import egglog as _egglog
 from absl import flags as _flags
 
-from dew._exports import lookup as _lookup
 from dew._devices import (
     connect_at_creation as _connect_at_creation,
     divide_exactly as _divide_exactly,
     keep_roundings as _keep_roundings,
     unpartition_gpu_pool as _unpartition_gpu_pool,
 )
+from dew._exports import lookup as _lookup
 
 # egglog's builtin declarations keep the frame of the module that first imports egglog, and through it every
 # caller's, until each is first used: imported here, it holds `import dew`'s importer alone, never the locals

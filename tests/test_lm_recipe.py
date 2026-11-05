@@ -304,8 +304,8 @@ def test_a_pretrained_runs_record_trains_again(tmp_path, lora):
     through the command's `--set trainer.steps=2`. The restored parameters
     move again, so the replay reaches training rather than only parsing.
     """
-    from dew.checkpoints import Checkpoints
     from dew._cli.main import main
+    from dew.checkpoints import Checkpoints
 
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")

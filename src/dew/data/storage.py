@@ -31,10 +31,10 @@ from huggingface_hub.file_download import REGEX_COMMIT_HASH
 from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 from s3fs import S3FileSystem
 
-from dew._records import JSON, json_value, record, text
 from dew._cache import dew_cache_dir
-from dew.data.retention import LocalRetention, evictable, read_pin
 from dew._files import write_atomically
+from dew._records import JSON, json_value, record, text
+from dew.data.retention import LocalRetention, evictable, read_pin
 
 
 class PreconditionFailed(FileExistsError):

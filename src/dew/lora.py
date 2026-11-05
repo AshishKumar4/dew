@@ -56,6 +56,7 @@ from flax.linen.dtypes import promote_dtype
 from flax.linen.module import Interceptor
 from flax.nnx import bridge
 
+from dew._cache import INTERCEPTED
 from dew._records import finite
 from dew.batch import (
     FROZEN,
@@ -69,7 +70,6 @@ from dew.batch import (
     thaw,
     unboxed,
 )
-from dew._cache import INTERCEPTED
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_names import group_layers, stored_layers

@@ -16,8 +16,8 @@ from egglog import get_callable_args
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
-from dew.algebra import program, terms
 from dew._cache import DERIVED
+from dew.algebra import program, terms
 from dew.nn.precision import float32_dot_general
 
 

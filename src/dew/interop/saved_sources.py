@@ -26,11 +26,11 @@ import jax
 from etils import epath
 from jax.sharding import Mesh
 
-from dew._coordination import agreed_same, from_every_process, reading_home, seen_by_every_process
-from dew._records import JSON, json_value
 from dew._cache import dew_cache_dir, package_digest
-from dew.checkpoints import RUN_FILE
+from dew._coordination import agreed_same, from_every_process, reading_home, seen_by_every_process
 from dew._files import staged
+from dew._records import JSON, json_value
+from dew.checkpoints import RUN_FILE
 
 if TYPE_CHECKING:
     from flax import linen as nn

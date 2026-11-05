@@ -19,10 +19,10 @@ from typing import TYPE_CHECKING
 from etils import epath
 from filelock import FileLock
 
-from dew.batch import Batch
 from dew._cache import dew_cache_dir
-from dew.data.pipeline import Dataset
 from dew._files import published
+from dew.batch import Batch
+from dew.data.pipeline import Dataset
 
 from ..dataset import Records
 from .base import Read, ShardManifest, _indexed_manifest, preparing

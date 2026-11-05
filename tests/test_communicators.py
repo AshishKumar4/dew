@@ -19,8 +19,8 @@ import pytest
 
 from dew import communicators
 from dew._cache import package_digest
-from dew.communicators import Collectives, CommunicatorRoom, Needs
 from dew._devices import POOL_NAMES, pool_bound
+from dew.communicators import Collectives, CommunicatorRoom, Needs
 
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 GIB = 2**30

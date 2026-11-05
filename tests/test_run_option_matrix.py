@@ -16,8 +16,8 @@ from pathlib import Path
 import pytest
 from run_kinds import KINDS, scalars
 
-from dew.checkpoints import Checkpoints
 from dew._cli.main import main
+from dew.checkpoints import Checkpoints
 from dew.config import RunConfig, TrainerConfig
 from dew.quantization import Quantization
 from dew.registry import to_record
