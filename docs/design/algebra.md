@@ -885,9 +885,10 @@ def derive_scan(declaration: Scan, *, saturation: Saturation, splits_held: int =
   - `linear_scan`: a token's algebra over its state and its affine forms; the chunk's identities, compact
     WY, the state-space dual, a solve's inverse by doubling or its substitution, and a solve's linearity.
     A scan's adjoint is its forms' derivative;
-  - `error_free`: the compensated sum, the natural exponent through `two_product` and `2**k`, and an argmax
-    anchor's split identity. Under accurate numerics, extraction keeps these wherever the hand-written form's
-    error bound requires them.
+  - no `error_free` set: the accurate numerics admit only exact rewrites, so a compensated form is the
+    declaration's own numerics (`Reduction.exponential`, `rescale`: the natural exponent through
+    `two_product` and `2**k`) or the mainloop's own step over the derived parts (`Derived.step`'s `stepped`:
+    the compensated and the guarded sums, an argmax anchor's split), never a rewrite extraction chooses.
 
 ### 6.10 Marked regions and custom derivatives
 
