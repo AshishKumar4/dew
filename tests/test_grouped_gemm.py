@@ -70,17 +70,18 @@ def test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla(sizes
     group_sizes = jnp.asarray(sizes, jnp.int32)
     # One warpgroup a tile at two row blocks, and two (CUTLASS's cooperative schedule; a pair of
     # multiprocessors the interpreter does not model, the GPU's tile gate runs).
-    tiled = [mosaic_gpu.Tiles(64, 64, 64, 2, 1), mosaic_gpu.Tiles(128, 64, 64, 2, 1),
-             mosaic_gpu.Tiles(128, 64, 64, 2, 1, warpgroups=2),
-             mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2)]
+    tiled = [mosaic_gpu.Tiles(64, 64, 64, 2, 1, family='wgmma'), mosaic_gpu.Tiles(128, 64, 64, 2, 1, family='wgmma'),
+             mosaic_gpu.Tiles(128, 64, 64, 2, 1, warpgroups=2, family='wgmma'),
+             mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2, family='wgmma')]
     for tiles, transpose in itertools.product(tiled, (False, True)):
         matrix = jnp.swapaxes(arrays[1], 1, 2) if transpose else arrays[1]
         got = mosaic_gpu.gmm(arrays[0], matrix, group_sizes, tiles=tiles, transpose_rhs=transpose,
                              out_dtype=dtype, multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
         check(got, reference[0], truth[0], group, f"forward {tiles} transpose={transpose}")
-    for tiles in (mosaic_gpu.Tiles(64, 64, 64, 2, 1), mosaic_gpu.Tiles(64, 64, 128, 2, 1),
-                  mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2),
-                  mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2)):
+    for tiles in (mosaic_gpu.Tiles(64, 64, 64, 2, 1, family='wgmma'),
+                  mosaic_gpu.Tiles(64, 64, 128, 2, 1, family='wgmma'),
+                  mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma'),
+                  mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2, family='wgmma')):
         got = mosaic_gpu.tgmm(arrays[0], arrays[2], group_sizes, tiles=tiles, out_dtype=jnp.float32,
                               multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
         check(got, reference[2], truth[2], None, f"kernel gradient {tiles}")
@@ -97,8 +98,8 @@ def check(got, reference, truth, group, label):
 
 
 @INTERPRETS
-@pytest.mark.parametrize("tiles", [mosaic_gpu.Tiles(64, 64, 64, 2, 1),
-                                   mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2)],
+@pytest.mark.parametrize("tiles", [mosaic_gpu.Tiles(64, 64, 64, 2, 1, family='wgmma'),
+                                   mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')],
                          ids=["one warpgroup", "cooperative"])
 def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out(tiles):
     """For each group, every other row (its neighbours' and the unrouted tail) holds inf in the rows and
@@ -148,7 +149,7 @@ def test_the_hopper_grouped_matmuls_lower_for_an_h100_at_their_tile_and_a_narrow
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         ba, target = launch.bind(*args, **options), generation.gpu_target()
-        derived, narrow = launch.derived(ba, target), mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2)
+        derived, narrow = launch.derived(ba, target), mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
         assert launch.legal(ba, narrow, target) and derived != narrow
         # The forward's rows, 256 a group, span two of its row tiles: a pair (`mosaic_gpu.derived`).
         pairs = 1 if isinstance(launch, grouped_matmul.MosaicTgmm) else 2
@@ -404,7 +405,7 @@ def test_a_cooperative_tile_refuses_what_its_consumers_cannot_compute(block_m, b
     """A cooperative tile's two consumers each take half its rows in warpgroup MMAs (a multiple of 64
     rows by at most 256 columns): a tile whose halves are not that refuses."""
     with pytest.raises(ValueError):
-        mosaic_gpu.Tiles(block_m, block_n, 64, 2, 1, warpgroups=2)
+        mosaic_gpu.Tiles(block_m, block_n, 64, 2, 1, warpgroups=2, family='wgmma')
 
 
 @INTERPRETS
@@ -417,7 +418,7 @@ def test_a_tile_of_192_columns_stages_every_column_it_writes():
     truth = oracle.products(x, wide, np.tile(dy, (1, 2))[:, :192], sizes)
     reference = xla_products(x, wide, np.tile(dy, (1, 2))[:, :192], sizes, jnp.bfloat16, jnp.float32)
     for warpgroups in (1, 2):
-        tiles = mosaic_gpu.Tiles(128, 192, 64, 2, 1, warpgroups=warpgroups)
+        tiles = mosaic_gpu.Tiles(128, 192, 64, 2, 1, warpgroups=warpgroups, family='wgmma')
         got = mosaic_gpu.gmm(jnp.asarray(x, jnp.bfloat16), jnp.asarray(wide, jnp.bfloat16),
                              jnp.asarray(sizes, jnp.int32), tiles=tiles, transpose_rhs=False,
                              out_dtype=jnp.bfloat16, multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
@@ -494,7 +495,7 @@ def test_a_cooperative_tile_stores_each_of_several_outputs():
     and its epilogue in float64 (eagerly: the interpreter's ordered callbacks)."""
     bias = jnp.asarray(np.linspace(-1, 1, WIDTH), jnp.float32)
     sizes = jnp.asarray(SIZES["ragged"], jnp.int32)
-    tiles = mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2)
+    tiles = mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2, family='wgmma')
 
     def draw(seed):
         x, w, _, _ = operands(SIZES["ragged"], jnp.bfloat16, seed)
