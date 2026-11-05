@@ -10,7 +10,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 import grain.experimental as experimental
 import grain.python as grain
 
-from dew._records import boolean, integer, record
+from dew._records import boolean, integer, integers, listed, record
 
 from .dataset import LONG_RUN, DataPartition, Loading, logged_run, restore_parent
 from .sources.base import Shard, ShardManifest, ShardReader
@@ -247,9 +247,10 @@ def _sequential_position(state: Mapping[str, object]) -> Mapping[str, object]:
     by the sequential reader (row 4079); deleted at 1.0."""
     if "place" in state:
         return state
-    (index,) = state["iterators_in_use_indices"]
-    (rows,) = state["iterators_in_use_states"]
-    (exhausted,) = state["exhausted"]
+    (index,) = integers(state["iterators_in_use_indices"], "interleave's places in use")
+    (exhausted,) = integers(state["exhausted"], "interleave's exhausted places")
+    (rows,) = listed(state["iterators_in_use_states"], "interleave's places' positions",
+                     read=lambda value, key: value, what="a list of positions")
     if rows is None or exhausted:
         return {"place": state["next_index_in_datasets"], "rows": None}
     return {"place": index, "rows": rows}
