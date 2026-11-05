@@ -276,7 +276,7 @@ images = refiner(refiner.prepare(prompts, key=key, steps=steps, initial=latents,
 
 ## Serving
 
-`Server.from_task(task, slots=, capacity=)` keeps `slots` cache rows of `capacity` positions resident, and it admits queued requests into free rows while the other rows keep decoding. Each step is one compiled program that prefills the prompts admitted in that step and draws one token for every occupied row. A request leaves its row at EOS or when its budget runs out, and the next request takes the slot. A served request draws with the key it was submitted with, folded the way a one-row `TextGeneration` call folds it, so it draws the tokens it would draw alone, except where the model's products round at boundaries that two programs' roundings cross (below, with the cache layouts).
+`Server.from_task(task, slots=, capacity=)` keeps `slots` cache rows of `capacity` positions resident, and it admits queued requests into free rows while the other rows keep decoding. Each step is one compiled program that prefills the prompts admitted in that step and draws one token for every occupied row, or a verified block of them where the task drafts speculatively (below). A request leaves its row at EOS or when its budget runs out, and the next request takes the slot. A served request draws with the key it was submitted with, folded the way a one-row `TextGeneration` call folds it, so it draws the tokens it would draw alone, except where the model's products round at boundaries that two programs' roundings cross (below, with the cache layouts).
 
 ```python
 from dew.inference.serving import Server
@@ -301,7 +301,7 @@ prompt tokens read from shared pages: 16
 
 The second call's prompt begins with the first call's, so its first full 16-token page comes from the prefix cache instead of a prefill.
 
-Calling the server with a batch submits every prompt, steps until they all finish and returns one `Generation` per prompt. `server.submit(prompt, max_new_tokens, key=...)` queues one request and returns a ticket that resolves to its `Generation`. `step()` runs one device call, and `run()` steps until the queue and the rows are empty. The task's `n` must be one, and its strategy must be the row-wise sampler, with or without a grammar. `capacity` is rounded up to whole 64-slot tiles (and to whole pages, for a paged cache), and it may not exceed the model's context.
+Calling the server with a batch submits every prompt, steps until they all finish and returns one `Generation` per prompt. `server.submit(prompt, max_new_tokens, key=...)` queues one request and returns a ticket that resolves to its `Generation`. `step()` runs one device call, and `run()` steps until the queue and the rows are empty. The task's `n` must be one, and its strategy the row-wise sampler, with or without a grammar, or speculative blocks (`Speculative`): each iteration then drafts, verifies and emits a block in every row, drawing as the row-wise sampler draws. Speculative rows prefill each prompt whole over a dense cache, so the server refuses them with `chunk`, `prefix_cache` or a mesh (`Server.from_task`). `capacity` is rounded up to whole 64-slot tiles (and to whole pages, for a paged cache), and it may not exceed the model's context.
 
 | Option | Meaning |
 |---|---|
