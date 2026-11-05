@@ -18,11 +18,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from architecture_cases import CASES as ARCHITECTURES, LM, SEQ_LEN, TEXT_FEATURES, TEXT_TOKENS, VOCAB, Case
+from arm_arithmetic import float64_held
 from checkpoint_cases import LENGTH, PATHS, ROWS, loaded, tokens
 from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 from model_support import float64_twin, stepped_outputs
-from reference_error import assert_as_exact, widened
+from reference_error import assert_as_exact
 from tool_support import load
 
 from dew.nn.attention_residuals import AttentionResiduals
@@ -185,8 +186,13 @@ def _climbs_and_restores(model, variables, inputs, **apply) -> None:
     saved = [_saved(rung, variables, inputs, **apply) for rung in rungs]
     assert all(above < below for below, above in itertools.pairwise(saved)), list(zip(records, saved,
                                                                                          strict=True))
-    written = model.apply(variables, *inputs, mutable=True, **apply)[1].keys()
-    assert rungs[-1].apply(variables, *inputs, mutable=True, **apply)[1].keys() == written
+    # The collections each call writes, traced abstractly: op by op the two calls took most of the
+    # test (ledger 3905).
+    def written(rung):
+        return jax.eval_shape(lambda variables: rung.apply(variables, *inputs, mutable=True, **apply)[1],
+                              variables).keys()
+
+    assert written(rungs[-1]) == written(model)
 
 
 def _zeros_drawn(variables):
@@ -197,20 +203,22 @@ def _zeros_drawn(variables):
 
 
 def _against_its_twin(model, variables):
-    """The model's top rung, its record, and its float64 twin over `variables` widened, every all-zero
-    leaf drawn (`_zeros_drawn`): the arms and the truth check 1 holds the top rung's step to. Device
-    arrays, made under x64 so they stay float64: a layer that indexes a weight by its ids (DeepSeek V4's
-    hash routing, Gemma 4's per-expert scales) indexes a device array in a program."""
+    """`variables` with every all-zero leaf drawn (`_zeros_drawn`), the model's top rung, its record, and
+    its float64 twin over those variables widened: the arms and the truth check 1 holds the top rung's step
+    to, over the drawn variables both arms read. Device arrays, made under x64 so they stay float64: a layer
+    that indexes a weight by its ids (DeepSeek V4's hash routing, Gemma 4's per-expert scales) indexes a
+    device array in a program (row 3655)."""
+    variables = _zeros_drawn(variables)
     top = _rungs(model)[-1]
     with jax.enable_x64(new_val=True):
-        return top, top.recompute_record(), float64_twin(model), jax.tree.map(jnp.asarray, widened(variables))
+        wide = float64_held(variables)
+        return variables, top, top.recompute_record(), float64_twin(model), wide
 
 
 def _steps_its_forward(model, variables, inputs, **apply) -> None:
     """The top rung's checkpoint makes its forward another program, which check 1 holds against the model's
     from the model's float64 twin over drawn inputs (`_against_its_twin`)."""
-    variables = _zeros_drawn(variables)
-    top, record, twin, wide = _against_its_twin(model, variables)
+    variables, top, record, twin, wide = _against_its_twin(model, variables)
     assert_as_exact(lambda *drawn: _call(top, variables, drawn, **apply),
                     lambda *drawn: _call(model, variables, drawn, **apply),
                     lambda seed: _redrawn(inputs, seed), f"forward at {record}", seeds=RUNG_SEEDS,
@@ -222,8 +230,7 @@ def _steps_its_gradient(name: str, model, variables, inputs, **apply) -> None:
     kimi-k3-tiny's 8.3e-3 of 10.8; test_decoder_remat.py found the same), so a covering class's member
     (`GRADIENT_COVERING`) holds its gradients to check 1 against the model's from its float64 twin, each
     parameter its own leaf (`_against_its_twin`), at the setting its truth resolves (`judged`)."""
-    variables = _zeros_drawn(variables)
-    top, record, twin, wide = _against_its_twin(model, variables)
+    variables, top, record, twin, wide = _against_its_twin(model, variables)
     if judged(model) is not model:
         # The release's setting, whose gradient no float64 truth judges, steps finitely: one compiled step,
         # where run op by op it took 16 s of DeepSeek V4's 87 on armada.
