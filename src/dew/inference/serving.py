@@ -1354,10 +1354,10 @@ class Server:
         conditioning = {} if cross is None else {CONTEXT: placed[11], CONTEXT_LENGTHS: placed[12]}
         fields = {VALIDITY_FIELD: placed[1], **dict(zip(pieces, placed[len(placed) - len(pieces):],
                                                           strict=True))}
-        slots, budgets, keys, tables, cursors, final, history, history_valid, adapters = placed[2:11]
-        return Admission(ModelInputs(placed[0], fields, conditioning), slots=slots, budgets=budgets,
-                         keys=keys, tables=tables, cursors=cursors, final=final, history=history,
-                         history_valid=history_valid, adapters=adapters)
+        names = ("slots", "budgets", "keys", "tables", "cursors", "final", "history", "history_valid",
+                 "adapters")
+        return Admission(ModelInputs(placed[0], fields, conditioning), **dict(zip(names, placed[2:11],
+                                                                                   strict=True)))
 
     def _placed(self, local: list) -> list[jax.Array]:
         """This process's rows of an admission's arrays placed as the admission is (`_admitted`): every row
