@@ -733,8 +733,10 @@ class Server:
         and the pages are split over its row axes, so the number of row
         groups must divide the slots and the admission. The admission
         defaults to the largest multiple of the group count up to eight rows
-        an iteration. A stage or sequence axis larger than one, or a mesh
-        over several processes, is refused.
+        an iteration. The model decodes its stack and sequences whole on a
+        mesh with a stage or sequence axis (`dew.nn.sharding.whole`). On a
+        mesh over several processes each process seats and reads its own
+        groups' rows and the pool steps the server together (`run`).
 
         `decode_steps` runs that many iterations per device call, so the host
         launches the step's kernels once per call; on a tensor axis those
