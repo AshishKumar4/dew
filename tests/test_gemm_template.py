@@ -1820,7 +1820,8 @@ def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
         [tile] = launch.fitting(exact, target)
         budget = mosaic_gpu.family_of(tile, jnp.bfloat16).registers(tile.warpgroups)
         assert 2 * tile.block_m * tile.block_n // (128 * tile.warpgroups) < budget
-        narrow, wide = (mosaic_gpu.Tiles(128, width, 64, 2, 1, warpgroups=2, family='wgmma') for width in (128, 256))
+        narrow, wide = (mosaic_gpu.Tiles(128, width, 64, 2, 1, warpgroups=2, family='wgmma')
+                        for width in (128, 256))
         assert launch.legal(exact, narrow, target) and launch.legal(plain, narrow, target)  # 128 a thread
         assert not launch.legal(exact, wide, target) and launch.legal(plain, wide, target)  # 256
         # Triton's kernel gradient with exact sums takes at most EXACT_STEP rows a step.

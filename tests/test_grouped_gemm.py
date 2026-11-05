@@ -70,7 +70,8 @@ def test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla(sizes
     group_sizes = jnp.asarray(sizes, jnp.int32)
     # One warpgroup a tile at two row blocks, and two (CUTLASS's cooperative schedule; a pair of
     # multiprocessors the interpreter does not model, the GPU's tile gate runs).
-    tiled = [mosaic_gpu.Tiles(64, 64, 64, 2, 1, family='wgmma'), mosaic_gpu.Tiles(128, 64, 64, 2, 1, family='wgmma'),
+    tiled = [mosaic_gpu.Tiles(64, 64, 64, 2, 1, family='wgmma'),
+             mosaic_gpu.Tiles(128, 64, 64, 2, 1, family='wgmma'),
              mosaic_gpu.Tiles(128, 64, 64, 2, 1, warpgroups=2, family='wgmma'),
              mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2, family='wgmma')]
     for tiles, transpose in itertools.product(tiled, (False, True)):
@@ -149,7 +150,8 @@ def test_the_hopper_grouped_matmuls_lower_for_an_h100_at_their_tile_and_a_narrow
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         ba, target = launch.bind(*args, **options), generation.gpu_target()
-        derived, narrow = launch.derived(ba, target), mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
+        derived = launch.derived(ba, target)
+        narrow = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
         assert launch.legal(ba, narrow, target) and derived != narrow
         # The forward's rows, 256 a group, span two of its row tiles: a pair (`mosaic_gpu.derived`).
         pairs = 1 if isinstance(launch, grouped_matmul.MosaicTgmm) else 2

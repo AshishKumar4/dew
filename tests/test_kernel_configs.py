@@ -204,7 +204,8 @@ def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources
         return support.KernelCase(f"gmm {tiles}", lambda: launch.lowering(ba, tiles), {"dew_gmm": model})
 
     found = compile_mosaic_kernels([case(mosaic_gpu.Tiles(128, 128, 64, 3, 1, family='wgmma')),
-                                    case(mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2, family='wgmma'))], "sm90")
+                                    case(mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2,
+                                                          family='wgmma'))], "sm90")
     assert len(found) == 2 and all(record.get("kernels") for record in found), found
     failed = mosaic_failures(found) + model_failures(found)
     assert not failed, "\n".join(failed)
