@@ -26,7 +26,7 @@ from attention_oracle import (
     qkv,
     value_and_grads,
 )
-from contract_support import normal_draw
+from contract_support import normal_drawn
 from flax import linen as nn
 from reference_error import as_given, assert_as_exact, widened, with_gradients
 
@@ -749,8 +749,7 @@ def test_queries_reading_another_sequences_documents_on_the_tpu_kernels_are_as_e
     the TPU's, fp32 (`FP32_SUMS`), and a CPU runs them on its reference path."""
     queries = jnp.asarray([[1] * 40 + [2] * 30 + [3] * 30 + [0] * 28])
     keys = jnp.asarray([[1] * 50 + [3] * 50 + [0] * 28])
-    def draw(seed):
-        return normal_draw([0x7B0, seed], *[(1, 128, 2, 128)] * 4)
+    draw = normal_drawn(0x7B0, *[(1, 128, 2, 128)] * 4)
 
     def attend(implementation):
         def run(q, k, v):
@@ -865,8 +864,7 @@ def test_cpu_fp32_attention_summed_in_float64_takes_forward_mode():
     jax.nn.dot_product_attention's over drawn inputs (check 1, the truth its own float64 run)."""
     from dew.nn.attention import forward_mode_attention
 
-    def draw(seed):
-        return normal_draw([0xF0D, seed], *[(1, 300, 2, 16)] * 7)
+    draw = normal_drawn(0xF0D, *[(1, 300, 2, 16)] * 7)
 
     def reference(q, k, v):
         return scaled_dot_product_attention(q, k, v, implementation="reference", causal=True)

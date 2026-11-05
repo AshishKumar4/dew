@@ -165,3 +165,9 @@ def normal_draw(seed, *shapes, scale: float = 1.0, dtype=jnp.float32) -> tuple:
     a seed: NumPy's `SeedSequence` entropy)."""
     rng = np.random.default_rng(seed)
     return tuple(jnp.asarray(rng.standard_normal(shape) * scale, dtype) for shape in shapes)
+
+
+def normal_drawn(salt: int, *shapes, dtype=jnp.float32):
+    """A check-1 draw (`draw(seed)`) of standard normal arrays of `shapes` in `dtype`, a site's `salt`
+    keeping its stream apart (`normal_draw`)."""
+    return lambda seed: normal_draw([salt, seed], *shapes, dtype=dtype)

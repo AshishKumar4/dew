@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 from arm_arithmetic import float64_held
 from attention_oracle import attention_on_par, exact_attention, float64_weights
-from contract_support import normal_draw
+from contract_support import normal_drawn
 from model_support import as_stepped
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, assert_fp32_reduction_bound
 
@@ -427,8 +427,7 @@ def test_a_grouped_query_attends_as_its_heads_do_alone(implementation):
 
     lengths = jnp.asarray([1, 9, 32], jnp.int32)
 
-    def draw(seed):
-        return normal_draw([3, seed], (3, 1, 8, 32), (3, 32, 2, 32), (3, 32, 2, 32))
+    draw = normal_drawn(3, (3, 1, 8, 32), (3, 32, 2, 32), (3, 32, 2, 32))
 
     def alone(query, key, value):
         mask = (jnp.arange(key.shape[1]) < lengths[:, None])[:, None, None, :]
@@ -558,8 +557,7 @@ def test_key_starts_keep_the_arithmetic_auto_is_asked_for_where_the_decode_kerne
     keys = jnp.arange(64)
     kept = ((keys >= starts[:, None]) & (keys < lengths[:, None]))[:, None, None, :]
 
-    def draw(seed):
-        return normal_draw([6, seed], (3, 1, 4, 16), (3, 64, 2, 16), (3, 64, 2, 16))
+    draw = normal_drawn(6, (3, 1, 4, 16), (3, 64, 2, 16), (3, 64, 2, 16))
 
     def by_starts(query, key, value):
         with assumed("sm80"):
