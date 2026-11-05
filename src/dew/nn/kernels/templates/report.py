@@ -418,7 +418,8 @@ class Attempt:
 
     executable: jax.stages.Compiled | None
     spilling: list["Binary"]
-    error: jax.errors.JaxRuntimeError | None = None
+    error: Exception | None = None
+    """A `jax.errors.JaxRuntimeError`, which JAX names as a value, no type."""
 
 
 def attempted(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
