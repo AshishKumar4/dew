@@ -211,21 +211,16 @@ def test_a_diloco_groups_step_is_planned_by_its_own_optimizer_state():
     Adam over its moments; the run's optimizer traced over the outer state failed, and the group's view
     made an array on a GPU that is only compiled for."""
     from dew.training import DiLoCo
-    from dew.training.diloco import group_of
 
     trainer = Trainer(Features(), optax.adam(0.1), key=jax.random.key(0), diloco=DiLoCo(every=2),
                       layout=Layout(min_shard=1, tolerance=1.0),
                       mesh=MeshSpec(diloco=1).build(compile_only_gpus("sm90", 1)))
     rows = {"x": np.ones((8, 3), np.float32), "y": np.zeros((8, 2), np.float32)}
     ahead = compile_ahead(trainer, rows, capacity=1 << 30)
-    assert [probe["derived"]["peak"] is not None for probe in ahead.plan["probes"]] == [True]
-    # The answer the peak read, over the group's view of a run of one group placed on this host: Adam over
-    # the group's in-device moments consumes each gradient where it is made (row 3806).
-    placed = Trainer(Features(), optax.adam(0.1), key=jax.random.key(0), diloco=DiLoCo(every=2),
-                     layout=Layout(min_shard=1, tolerance=1.0), mesh=MeshSpec(diloco=1))
-    state, _, _ = placed.place()
-    with group_of(state, rows) as (view, _):
-        assert consumed_where_made(placed.objective, placed.optimizer, view, 1, shared=True, progressed=False)
+    # The peak the plan derived read each gradient consumed where it is made: Adam over the group's own
+    # in-device moments (rows 3806, 4019).
+    assert [(probe["derived"]["peak"] is not None, probe["derived"]["consumed"])
+            for probe in ahead.plan["probes"]] == [(True, True)]
 
 
 def test_a_step_whose_head_takes_its_gradient_in_the_backward_holds_every_gradient():

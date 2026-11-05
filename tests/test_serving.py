@@ -16,6 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_arithmetic import float64_held
 from flax import linen as nn
 from jax.experimental import checkify
 from model_support import Digits, decoder, serving_task as task
@@ -1033,7 +1034,7 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
         bound, alone, _ = drawn(int(seed))
         with jax.enable_x64(new_val=True):
             model = bound.model.clone(dtype=jnp.float64)
-            params = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), bound.variables)
+            params = float64_held(bound.variables)
             picked = []
             for (prompt, _), lone in zip(rows, alone, strict=True):
                 ids = Digits().encode(prompt)

@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_arithmetic import float64_held
 from jax.experimental import checkify
 from model_support import greedy_walk as walk, initialized_decoder
 
@@ -261,7 +262,7 @@ def test_a_float64_decoders_beam_searches_in_float64(model, chain):
     prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
     with jax.enable_x64(new_val=True):
         wide = module.clone(dtype=jnp.float64)
-        values = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params)
+        values = float64_held(params)
         searched = generate(wide, values, prompt, 2, key=jax.random.key(0),
                             sampling=Sampling(temperature=0, pad_token_id=11),
                             **({"logits": ()} if chain == "none" else {}), strategy=Beam(width=2))

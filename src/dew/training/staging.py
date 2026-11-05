@@ -24,8 +24,7 @@ import jax.extend.core as jcore
 from jax.core import ShapedArray
 
 from dew.distributed.placement import placed_bytes
-from dew.nn.programs import CALLS, computed, inlined
-from dew.training.compiled_program import called
+from dew.nn.programs import CALLS, called, computed, inlined
 
 PURE_CALLS = CALLS - {"remat2", "checkpoint", "custom_jvp_call", "custom_vjp_call", "marked_call"}
 """The calls (`dew.nn.programs.CALLS`) that run a program on their operands and do nothing else, which

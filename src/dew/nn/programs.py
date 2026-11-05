@@ -80,3 +80,15 @@ def inlined(body: jcore.Jaxpr, operands: Sequence[jcore.Var | jcore.Literal],
         equations.append(equation.replace(invars=[read(value) for value in equation.invars], outvars=fresh))
         local.update(zip(equation.outvars, fresh, strict=True))
     return equations, [read(value) for value in body.outvars]
+
+
+def called(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
+    """The program a call (`CALLS`) runs on `equation`'s operands one for one, returning its results, else
+    None: every reader of a call through its program reads it here (`dew.training.compiled_program`'s
+    `compiled` and `gradients_read`, staging's flattening, the kernel split's `_inlined`, the float64
+    terms)."""
+    found = bodies(equation) if equation.primitive.name in CALLS else []
+    if len(found) == 1 and (len(found[0].invars), len(found[0].outvars)) == (
+            len(equation.invars), len(equation.outvars)):
+        return found[0]
+    return None
