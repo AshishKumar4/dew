@@ -626,15 +626,18 @@ def _scan_reads(params, operands: int, used) -> tuple:
     """Which of a scan body's outputs its `used` outputs read (`_evaluated`'s `used`, every one where None):
     a used carry or output, and every carry a read output reads back in through the next step, until none
     is added."""
+    from jax.extend.core import Var
+
     body = params["jaxpr"].jaxpr
     constants, carries = scan_groups(params, operands)
     reading = tuple([True] * len(body.outvars) if used is None else used)
     spans = tuple((index, index + 1) for index in range(len(body.eqns)))
     while True:
-        read = {body.outvars[index] for index, kept in enumerate(reading) if kept}
+        read = {body.outvars[index] for index, kept in enumerate(reading)
+                if kept and isinstance(body.outvars[index], Var)}
         for (start, _), found in zip(spans, _reading(body, spans, reading), strict=True):
             if found is not None:
-                read.update(body.eqns[start].invars)
+                read.update(var for var in body.eqns[start].invars if isinstance(var, Var))
         added = [index for index in range(carries)
                  if not reading[index] and body.invars[constants + index] in read]
         if not added:
