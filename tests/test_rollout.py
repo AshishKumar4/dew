@@ -239,20 +239,20 @@ def test_a_schedulers_branch_calls_reach_no_log_and_leave_the_runs_metrics():
 
 
 class Cancelling(RolloutScheduler):
-    """A scheduler that counts its cancellations (`close`), each failing where `fails`."""
+    """A scheduler that counts its cancellations (`cancel`), each failing where `fails`."""
 
     def __init__(self, *args, **options):
         super().__init__(*args, **options)
         self.closed, self.fails = 0, False
 
-    def close(self):
+    def cancel(self):
         self.closed += 1
         if self.fails:
             raise OSError("the acquisition refused to cancel")
 
 
 def test_a_branch_cancels_what_it_left_in_flight_and_restores_the_scheduler_however_it_ends():
-    """A branch's end cancels what it left in flight (`close`); where that cancellation fails it
+    """A branch's end cancels what it left in flight (`cancel`); where that cancellation fails it
     raises, and where the branch itself fails its failure is the one raised; either way the scheduler
     stands as the run left it: its log takes the next call's records."""
     objective, records = tiny_objective(), []

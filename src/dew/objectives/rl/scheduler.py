@@ -717,10 +717,14 @@ class RolloutScheduler:
         batch ahead of the step; synchronously, `dataset` itself."""
         return self.acquisition.tasks(dataset, self.tasks_of)
 
+    def cancel(self) -> None:
+        """Cancel every rollout in flight, as a branch's end does; what it serves from stays up."""
+        self.acquisition.close()
+
     def close(self) -> None:
         """Cancel every rollout in flight, and end what it built itself (`served`'s source and server);
         a source its caller built, its caller closes."""
-        self.acquisition.close()
+        self.cancel()
         for close in self._owned:
             close()
 
@@ -741,10 +745,10 @@ class RolloutScheduler:
             yield
         except BaseException as failure:
             # The branch's failure stays the one raised; a cancellation's is noted on it.
-            attempted([("cancelling the branch's rollouts", self.acquisition.close)], primary=failure)
+            attempted([("cancelling the branch's rollouts", self.cancel)], primary=failure)
             raise
         else:
-            self.acquisition.close()
+            self.cancel()
         finally:
             self.metrics, self.log, self._branch = metrics, log, branch
 
