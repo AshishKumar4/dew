@@ -292,12 +292,17 @@ def test_a_guest_whose_request_outlasts_its_connection_stays_admitted_until_the_
                 """The engine's future, whose wait runs out once its walk runs."""
                 future, answered = engine(request, emit)
 
+                # A walk that fails before its first step ends the wait with its failure.
+                future.add_done_callback(lambda _: running.set())
+
                 class Waited:
                     def __getattr__(self, name):
                         return getattr(future, name)
 
                     def result(self, timeout=None):
-                        running.wait()
+                        assert running.wait(timeout=600)
+                        if future.done():
+                            return future.result()
                         raise FuturesTimeout
 
                 return Waited(), answered

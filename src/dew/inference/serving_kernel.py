@@ -280,9 +280,11 @@ class Paged:
         scattered back to the rows' slots.
         """
         rows = admission.cursors.shape[0]
-        allocated = with_rounding_keys(
-            model.apply(params, rows, method="init_cache", mutable=["cache"])[1]["cache"],
-            rounding_keys(jax.random.wrap_key_data(admission.keys, impl=self.prng)))
+        # The cache's allocation runs the model too (a forward over a dummy token): under the rows' adapters.
+        with selected(admission.adapters):
+            allocated = with_rounding_keys(
+                model.apply(params, rows, method="init_cache", mutable=["cache"])[1]["cache"],
+                rounding_keys(jax.random.wrap_key_data(admission.keys, impl=self.prng)))
         continues = admission.cursors > 0
 
         def view(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.Array, fresh: jax.Array) -> jax.Array:

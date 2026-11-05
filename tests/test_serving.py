@@ -1001,12 +1001,14 @@ def test_a_server_drafts_speculative_blocks_as_a_lone_call_does(temperature, dec
         server.reload(params)
 
 
-def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(tmp_path):
+@pytest.mark.parametrize("cache", [None, KVCache(page_size=2, pages=64)], ids=["dense", "paged"])
+def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(tmp_path, cache):
     """One server over an adapter set (`dew.lora.AdapterSet`) of a published decoder: the fixture's PEFT
     adapter (rank 8 over q and v, with an alpha pattern) and one of rank 2 over q alone, saved side by side
     and loaded by directory. Requests naming either adapter, or none, share the server's steps and its
     one copy of the base, and each draws what a task over its adapter alone (or the base) draws, on par
-    with that task against its float64 twin (check 1) (ledger 870)."""
+    with that task against its float64 twin (check 1), over a dense cache and over a paged one sharing
+    prompt pages, where one prompt under two adapters shares none (ledger 870)."""
     from pathlib import Path
 
     from arm_arithmetic import widened
@@ -1038,9 +1040,10 @@ def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(t
                                        ).text_generation(sampling=sampling)
              for name, adapter in (("fixture", fixture), ("second", second))} | {
                  None: decoder.text_generation(sampling=sampling)}
-    prompts = ([1, 5, 9, 13], [2, 4], [7, 7, 7, 3, 1], [11, 6, 2])
-    names = ("fixture", "second", None, "fixture")
-    server = Server.from_task(served, slots=4, capacity=64, admission=2)
+    prompts = ([1, 5, 9, 13, 2], [2, 4], [7, 7, 7, 3, 1], [1, 5, 9, 13, 2], [1, 5, 9, 13, 2])
+    names = ("fixture", "second", None, "second", "fixture")
+    server = Server.from_task(served, slots=4, capacity=64, admission=2, kv_cache=cache,
+                              prefix_cache=cache is not None)
 
     def draw(seed):
         return (np.arange(len(prompts)) + len(prompts) * seed,)

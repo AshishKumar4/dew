@@ -616,7 +616,7 @@ class AdapterSet:
         base = unadapted(first.model)
         if any(unadapted(adapter.model) != base for adapter in adapters.values()):
             raise ValueError("an adapter set's adapters are bound over one base model")
-        weights = traverse_util.flatten_dict(unboxed(thaw(first.variables))["params"])
+        weights = unboxed(thaw(first.variables))
         factors = {name: traverse_util.flatten_dict(unboxed(adapter.variables)["params"])
                    for name, adapter in adapters.items()}
         paths = sorted({path for adapter in adapters.values() for path in adapter.targets})
@@ -625,14 +625,10 @@ class AdapterSet:
             held = {name: adapter.targets[path] for name, adapter in adapters.items()
                     if path in adapter.targets}
             rank = max(target.rank for target in held.values())
-            kernel = weights.get((*path[1:], "kernel"))
-            if kernel is None:
-                raise ValueError(f"{'/'.join(path)} holds no kernel beside its factors (a frozen FP8 "
-                                 "site); an adapter set stacks factors over a kernel of the base's own dtype")
             some = factors[next(iter(held))]
             a, b = some[(*path[1:], "lora_A")], some[(*path[1:], "lora_B")]
             # The axes before a factor's own: a scanned run's layers.
-            lead = a.ndim + b.ndim - 2 - kernel.ndim
+            lead = a.ndim + b.ndim - 2 - len(_kernel_shape(weights, path))
             for factor, axis, shape in (("lora_A", a.ndim - 1, a.shape), ("lora_B", lead, b.shape)):
                 leaves = [_rank_padded(factors[name].get((*path[1:], factor)) if name in held else None,
                                        axis, shape, rank) for name in names]
@@ -642,7 +638,8 @@ class AdapterSet:
             targets[path] = Target(rank, float(rank))
         # What the first adapter's tree trains besides its factors (a cross-attention block) stays.
         trained = {**traverse_util.flatten_dict(first.variables["params"]), **stacked}
-        model = _adapted(base, _Bound(targets, names=names, scales=scales))
+        layouts = {name: layout for adapter in adapters.values() for name, layout in adapter.layouts.items()}
+        model = _adapted(base, _Bound(targets, layouts=layouts, names=names, scales=scales))
         return cls(model, {**first.variables, "params": traverse_util.unflatten_dict(trained)})
 
 
@@ -801,8 +798,9 @@ class _Branch:
             # (`CausalTransformer.drawn_like`): a scanned run stacks one factor pair over its layers.
             index = args[0] if args else kwargs["index"]
             layer = (*root, *module.path, f"layers_{index}")
-            own = tuple(sorted((path[len(layer):], target) for path, target in self.targets.items()
-                               if path[:len(layer)] == layer))
+            # A set's layers draw apart where their adapters' scales differ (`_Bound.scales`).
+            own = tuple(sorted((path[len(layer):], target, self.bound.scales.get(path))
+                               for path, target in self.targets.items() if path[:len(layer)] == layer))
             return next_fun(*args, **kwargs), own
         if context.method_name == "nonlinear_input":
             # A layer asks whether its submodule is linear in its input on
@@ -857,41 +855,44 @@ class _Branch:
         # dropout stream, which is how a training forward is marked; an
         # evaluation forward carries none.
         if self.bound.names:
-            return self._selected(module, x, a, b, axes, output)
+            rows, scale = self._selected(module, x)
+            # A row of the base model alone computes with any adapter's factors and keeps the base's output.
+            own = jnp.maximum(rows, 0)
+            per_row = (-1, *(1,) * (output.ndim - 1))
+            adapted = output + _low_rank(module, x, a[own], b[own], scale[own].reshape(per_row), axes,
+                                         rowwise=True)
+            return jnp.where((rows >= 0).reshape(per_row), adapted, output)
         if self.dropout and module.has_rng("dropout"):
             x = Dropout(self.dropout, deterministic=False)(x)
-        x, a, b = promote_dtype(x, a, b, dtype=module.dtype)
-        hidden = float32_dot_general(x, a, ((axes, tuple(range(len(axes)))), ((), ())),
-                                     precision=module.precision)
-        delta = float32_dot_general(hidden, b, (((hidden.ndim - 1,), (0,)), ((), ())),
-                                    precision=module.precision)
-        return output + jnp.asarray(_scale(target, self.rslora), delta.dtype) * delta
+        return output + _low_rank(module, x, a, b, _scale(target, self.rslora), axes, rowwise=False)
 
 
-    def _selected(self, module: nn.Module, x: jax.Array, a: jax.Array, b: jax.Array,
-                  axes: tuple[int, ...], output: jax.Array) -> jax.Array:
-        """An adapter set's `output` at `module` (`AdapterSet`): each row of `x` through its own adapter's
-        factors (`a` `[N, *in, r]`, `b` `[N, r, *out]`) and scale, as `selected` names them, added to the
-        base's; a row of the base model alone takes no branch, its output the base's own bits."""
+    def _selected(self, module: nn.Module, x: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """An adapter set's rows at `module` (`AdapterSet`), as `selected` names them, and the target's
+        scale, adapter by adapter: each row of `x` runs its own adapter's factors."""
         where = "/".join((*self.root, *module.path))
         rows = _SELECTED.get()
         if rows is None:
             raise ValueError(f"{where} adds each row's adapter of a set, and this call names none: run it "
                              "under dew.lora.selected(rows)")
-        if x.ndim <= len(axes) or x.shape[0] != rows.shape[0]:
-            raise ValueError(f"{where} receives {x.shape[0] if x.ndim > len(axes) else 0} rows, not the "
-                             f"{rows.shape[0]} the call's adapters name, so its rows' adapters are unknown")
-        scales = jnp.asarray(_stored_target(self.bound.scales, self.root, module.path), jnp.float32)
-        # A row of the base model alone computes with any adapter's factors and keeps the base's output.
-        own = jnp.maximum(rows, 0)
-        x, a, b = promote_dtype(x, a[own], b[own], dtype=module.dtype)
-        hidden = float32_dot_general(x, a, ((axes, tuple(range(1, len(axes) + 1))), ((0,), (0,))),
-                                     precision=module.precision)
-        delta = float32_dot_general(hidden, b, (((hidden.ndim - 1,), (1,)), ((0,), (0,))),
-                                    precision=module.precision)
-        per_row = (-1, *(1,) * (delta.ndim - 1))
-        adapted = output + scales[own].astype(delta.dtype).reshape(per_row) * delta
-        return jnp.where((rows >= 0).reshape(per_row), adapted, output)
+        if x.shape[0] != rows.shape[0]:
+            raise ValueError(f"{where} receives {x.shape[0]} rows, not the {rows.shape[0]} the call's "
+                             "adapters name, so its rows' adapters are unknown")
+        return rows, jnp.asarray(_stored_target(self.bound.scales, self.root, module.path), jnp.float32)
+
+
+def _low_rank(module: nn.Module, x: jax.Array, a: jax.Array, b: jax.Array, scale: float | jax.Array,
+              axes: tuple[int, ...], *, rowwise: bool) -> jax.Array:
+    """The adapter's update at `module`: `x` through the factors `a` and `b`, contracted over `axes`, in
+    at least float32 at the module's precision, times `scale`. `rowwise` factors carry each row of `x`'s
+    own on a leading axis (an adapter set's, `[B, *in, r]` and `[B, r, *out]`), and `scale` each row's."""
+    batch = ((0,), (0,)) if rowwise else ((), ())
+    x, a, b = promote_dtype(x, a, b, dtype=module.dtype)
+    hidden = float32_dot_general(x, a, ((axes, tuple(range(int(rowwise), len(axes) + int(rowwise)))), batch),
+                                 precision=module.precision)
+    delta = float32_dot_general(hidden, b, (((hidden.ndim - 1,), (int(rowwise),)), batch),
+                                precision=module.precision)
+    return jnp.asarray(scale, delta.dtype) * delta
 
 
 def _refusing_counts(model: nn.Module, base: type[nn.Module], *protocols) -> type[nn.Module]:
