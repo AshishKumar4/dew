@@ -84,15 +84,22 @@ class CorpusCounts:
     """The tokens the cuts of the members delivered rows left out removed, by what each cut
     (`_dew_left_out_cut`), counted with them."""
     declined: Counter[str] = dataclasses.field(default_factory=Counter)
+    tokens: int = 0
+    """The valid target tokens of the rows its reader weighed as it accepted them, under its member where a
+    mixture's rows are (row 4119): what a mixture measured in tokens (`mix(..., by="tokens")`) drew of each
+    member, the shares it balances, or a layout's windows that hold a target. A step after the weighing
+    that refuses a weighed row counts it under `data/rejected`, its tokens staying weighed."""
 
-    def delivered(self, element: Batch | bytes, examples: int | None = None) -> None:
+    def delivered(self, element: Batch | bytes, examples: int | None = None,
+                  tokens: int | None = None) -> None:
         """Count one row the corpus delivered: accepted, cut short where it says it was
         (`_dew_truncated`), each cut it reports (`_dew_cut`: by what it cut, the rows it shortened and
         the tokens it removed), the members it left out by reason (`_dew_rejected`) and the tokens their
         cuts removed (`_dew_left_out_cut`), and the augmentation a read declines for it, by reason
         (`_dew_declined`). A mixture's counter counts the `examples` of this corpus the row completes
-        (`MEMBERS`)."""
+        (`MEMBERS`), and a counter that weighs rows its valid target `tokens`."""
         self.delivered_rows += 1
+        self.tokens += tokens or 0
         if examples is not None:
             self.accepted += examples
         elif not isinstance(element, Mapping):
@@ -105,10 +112,10 @@ class CorpusCounts:
         if not isinstance(element, Mapping):
             return
         self.truncated += int(bool(element.get("_dew_truncated", False)))
-        for kind, (rows, tokens) in element.get("_dew_cut", {}).items():
+        for kind, (rows, removed) in element.get("_dew_cut", {}).items():
             self.cut_examples[kind] += 1
             self.cut_rows[kind] += int(rows)
-            self.cut_removed[kind] += int(tokens)
+            self.cut_removed[kind] += int(removed)
         for reason, count in element.get("_dew_rejected", {}).items():
             self.left_out[reason] += int(count)
         self.left_out_cut.update(element.get("_dew_left_out_cut", {}))
@@ -124,7 +131,7 @@ class CorpusCounts:
     def counted_anew(self) -> None:
         """Start over the counts of delivered rows, for a read that counts them again whole (a memory
         read's rows, read once more as it holds them)."""
-        self.accepted, self.truncated, self.delivered_rows = 0, 0, 0
+        self.accepted, self.truncated, self.delivered_rows, self.tokens = 0, 0, 0, 0
         for counted in (self.cut_examples, self.cut_rows, self.cut_removed, self.left_out, self.left_out_cut,
                         self.declined):
             counted.clear()
@@ -146,8 +153,10 @@ class CorpusCounts:
         delivered, its rejections and the augmentation it declined by reason as integers, the share
         of those rows cut short and the chunks per chunked record."""
         examples = {f"data/rows/{label}": self.accepted} if self.rows else {}
+        tokens = {f"data/weighed_tokens/{label}": self.tokens} if self.tokens else {}
         return {
             **examples,
+            **tokens,
             f"data/truncated/{label}": self.truncated / max(1, self.delivered_rows),
             f"data/chunks_per_record/{label}": self.chunks / max(1, self.chunk_records),
             **{f"data/rejected/{label}/{reason}": count for reason, count in self.refused.items()},
@@ -174,6 +183,7 @@ class CorpusCounts:
             "rejected_cut": dict(self.rejected_cut),
             "left_out_cut": dict(self.left_out_cut),
             "declined": dict(self.declined),
+            "tokens": self.tokens,
         }
 
     def restore(self, state: Mapping[str, object]) -> None:
@@ -183,6 +193,7 @@ class CorpusCounts:
         self.delivered_rows = integer(state["delivered_rows"], "delivered_rows")
         self.chunks = integer(state["chunks"], "chunks")
         self.chunk_records = integer(state["chunk_records"], "chunk_records")
+        self.tokens = integer(state["tokens"], "tokens")
         self.rejected = Counter(
             {name: integer(value, name) for name, value in record(state["rejected"], "rejected").items()}
         )
@@ -193,13 +204,15 @@ class CorpusCounts:
     def followed(self, reader: CorpusCounts) -> CorpusCounts:
         """These counts of the prefix a memory read ran, followed by `reader`'s of the stages it
         read after them: the reader delivered the rows and counted those cut short, and its examples
-        where it counts them (`rows`), else the prefix did, and the two dropped and chunked apart."""
+        where it counts them (`rows`), else the prefix did, and the two dropped and chunked apart; the
+        tokens are the first weighing's, whichever weighed."""
         examples = {} if reader.rows else {
             "rows": self.rows, "examples": self.examples, "accepted": self.accepted}
         return dataclasses.replace(
             reader, **examples, attempted=max(self.attempted, reader.attempted),
             chunks=self.chunks + reader.chunks, chunk_records=self.chunk_records + reader.chunk_records,
-            rejected=self.rejected + reader.rejected, rejected_cut=self.rejected_cut + reader.rejected_cut)
+            rejected=self.rejected + reader.rejected, rejected_cut=self.rejected_cut + reader.rejected_cut,
+            tokens=max(self.tokens, reader.tokens))
 
     def expanded(self, outputs: Sequence[Record]) -> None:
         """Count one chunked document and its fan-out before later stages can reject chunks."""
@@ -267,7 +280,7 @@ class _KeepAccepted:
             if count is not None and count < 0:
                 raise ValueError(f"corpus {self.counts.name} has a negative valid-target count: {count}")
             if count != 0:
-                self._delivered(element)
+                self._delivered(element, count)
                 self.consecutive = 0
                 return True
             reason = "zero_targets"
@@ -303,11 +316,12 @@ class _KeepAccepted:
         only where a raise or a log names the reasons, never a row at a time (row 3531)."""
         return sum((counts.rejected for counts in self.members.values()), self.counts.rejected.copy())
 
-    def _delivered(self, element: Batch) -> None:
-        """Count a row delivered: under its member where a mixture's last counter credits its members,
-        each member the examples its rows complete (`MEMBERS`), the row's own counts its member's."""
+    def _delivered(self, element: Batch, tokens: int | None) -> None:
+        """Count a row delivered, of `tokens` valid targets where the counter weighs them: under its member
+        where a mixture's last counter credits its members, each member the examples its rows complete
+        (`MEMBERS`), the row's own counts its member's."""
         if not self.credits:
-            self.counts.delivered(element)
+            self.counts.delivered(element, tokens=tokens)
             return
         own = member_of(element)
         completed = members_of(element)
@@ -316,7 +330,7 @@ class _KeepAccepted:
             if member != own:
                 self._touched.add(member)
                 self.members[member].accepted += examples
-        owner.delivered(element, 0 if own is None else completed.get(own, 0))
+        owner.delivered(element, 0 if own is None else completed.get(own, 0), tokens)
 
 
 COUNTER = "dew.corpus_counts"
@@ -1102,6 +1116,9 @@ def _nested(counted: dict[str, CorpusCounts], inner: Mapping[str, CorpusCounts])
         combined.attempted = max(combined.attempted, counts.attempted)
         combined.chunks = max(combined.chunks, counts.chunks)
         combined.chunk_records = max(combined.chunk_records, counts.chunk_records)
+        # Counters inside one iterator weigh the same rows, a later one those an earlier left: the first
+        # weighing is the corpus's.
+        combined.tokens = max(combined.tokens, counts.tokens)
         # Members a row left out travel with the row, as its cuts do: the outermost counts them.
         combined.rejected.update(counts.rejected)
         combined.rejected_cut.update(counts.rejected_cut)
@@ -1116,7 +1133,7 @@ def _past(counted: dict[str, CorpusCounts], outer: CorpusCounts) -> None:
         outer, rows=inner.rows, examples=inner.examples, accepted=inner.accepted,
         attempted=max(inner.attempted, outer.attempted), chunks=max(inner.chunks, outer.chunks),
         chunk_records=max(inner.chunk_records, outer.chunk_records), rejected=inner.rejected + outer.rejected,
-        rejected_cut=inner.rejected_cut + outer.rejected_cut)
+        rejected_cut=inner.rejected_cut + outer.rejected_cut, tokens=max(inner.tokens, outer.tokens))
 
 
 def _added(counted: dict[str, CorpusCounts], counts: CorpusCounts) -> None:
@@ -1127,6 +1144,7 @@ def _added(counted: dict[str, CorpusCounts], counts: CorpusCounts) -> None:
     combined.attempted += counts.attempted
     combined.accepted += counts.accepted
     combined.delivered_rows += counts.delivered_rows
+    combined.tokens += counts.tokens
     combined.truncated += counts.truncated
     combined.chunks += counts.chunks
     combined.chunk_records += counts.chunk_records

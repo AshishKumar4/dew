@@ -16,7 +16,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from data_support import WideDraw, listed
+from data_support import Logged, WideDraw, listed
 from reader_support import assert_resumes_where_it_stopped
 from token_support import write_token_corpus
 
@@ -24,7 +24,7 @@ from dew import position
 from dew.batch import VALID_ROWS
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate, validation
-from dew.data.dataset import GRAIN_KILL_SECONDS, DataPartition, Loading
+from dew.data.dataset import DataPartition, Loading
 from dew.data.mixing import TokenDeficit, token_weights
 from dew.data.pipeline import Configured, Pipeline, Rejected, mix
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
@@ -85,17 +85,6 @@ def source(count=24):
     return Memory(tuple({"id": np.int32(index)} for index in range(count)))
 
 
-@dataclasses.dataclass(frozen=True)
-class Logged(Memory):
-    """Records in memory that log each read a run takes of them."""
-
-    reads: list = dataclasses.field(default_factory=list, compare=False)
-
-    def records(self, read):
-        self.reads.append(read)
-        return super().records(read)
-
-
 def test_a_memory_compile_reads_each_source_once():
     """Compiling a memory read pins each source's facts and materializes its steps from one read of
     its records, whatever else states its facts by index."""
@@ -109,6 +98,40 @@ def test_a_memory_compile_reads_each_source_once():
     finally:
         reader.close()
     assert reads.count("memory") == 1
+
+
+def _unthird(row) -> bool:
+    """Whether a row is not every third, which a filter keeps."""
+    return int(row["id"]) % 3 != 2
+
+
+@dataclasses.dataclass(frozen=True)
+class Hashed(Memory):
+    """Records in memory that note each time something hashes them to name them."""
+
+    hashed: list = dataclasses.field(default_factory=list, compare=False)
+
+    def fingerprint(self):
+        self.hashed.append(1)
+        return super().fingerprint()
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_compiled_reader_hashes_its_store_in_memory_no_more_to_name_it(read):
+    """A store in memory names itself by a hash of every record it holds, which its compile takes: each
+    reader the compile opens names its corpus as the compile did, hashing none of it again, however
+    often a run opens one (row 803)."""
+    store = Hashed(source(8).values)
+    kept = Pipeline(store).filter(_unthird).shuffle(0, window=4)
+    data = compile(kept.repeat().batch(2), read=read, loading=READ)
+    before = len(store.hashed)
+    for _ in range(3):
+        reader = data.train(DataPartition())
+        try:
+            listed(reader, 2)
+        finally:
+            reader.close()
+    assert len(store.hashed) == before
 
 
 class Decoded(list):
@@ -785,73 +808,6 @@ def test_worker_processes_read_a_global_order_in_the_batches_one_process_reads()
     assert batches(2) == batches(0)
 
 
-@pytest.mark.parametrize("bound", ["cpus", "memory"])
-def test_automatic_loading_starts_no_more_workers_than_the_hosts_cpus_and_memory_hold(monkeypatch, bound):
-    """Automatic loading sizes its workers from the CPUs this process may run on and the memory it
-    may take, together. On two CPUs of a 64-core machine it reads in at most two workers; in 512
-    MiB, at most two, each a process of its own that imports the program again. Grain's pick read
-    every core the machine has and counted a worker's memory as one batch, so it started 64 workers
-    in both."""
-    monkeypatch.setattr(os, "cpu_count", lambda: 64)
-    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(2 if bound == "cpus" else 16)))
-    budget = {"cpus": 4096, "memory": 512}[bound]
-    loading = Loading(workers="auto", ram_budget_mb=budget)
-    data = compile(Pipeline(source(64)).repeat().batch(8), loading=loading)
-    reader = data.train(DataPartition())
-    try:
-        workers = reader.stop_seconds / GRAIN_KILL_SECONDS - 1
-    finally:
-        reader.close()
-    assert workers <= 2
-
-
-@pytest.mark.parametrize("limited", ["own", "parent"])
-def test_a_cgroups_reclaimable_page_cache_is_room_for_automatic_loading(tmp_path, limited):
-    """Under a cgroup's memory limit, the page cache its kernel reclaims first is room: a run that read
-    1.5 GiB of its corpus into cache, charged to its cgroup of 2 GiB with 1.9 GiB in use, still has
-    1.6 GiB, where counting the cache as taken left 0.1 GiB, room for no loading worker. The cgroup's
-    CPU quota of two bounds the CPUs as its affinity does, and a limit on the container's cgroup
-    binds the process's own cgroup beneath it, unlimited, as much as one on its own."""
-    from dew.data.dataset import Host
-
-    own = tmp_path / "session"
-    own.mkdir()
-    limits = tmp_path if limited == "parent" else own
-    for level in (tmp_path, own):
-        (level / "cpu.max").write_text("max 100000\n")
-        (level / "memory.max").write_text("max\n")
-    (limits / "cpu.max").write_text("200000 100000\n")
-    (limits / "memory.max").write_text(f"{2 * 2**30}\n")
-    (limits / "memory.current").write_text(f"{int(1.9 * 2**30)}\n")
-    (limits / "memory.stat").write_text(f"anon {int(0.4 * 2**30)}\ninactive_file {int(1.5 * 2**30)}\n")
-    host = Host.current(own, root=tmp_path)
-    assert host.cpus == min(2, len(os.sched_getaffinity(0)))
-    assert host.memory == 2 * 2**30 - int(1.9 * 2**30) + int(1.5 * 2**30)
-
-
-def test_automatic_loading_holds_its_reads_and_each_workers_batches_within_half_the_memory():
-    """Each worker holds its `worker_buffer` batches and its `read_buffer` reads in a process of its
-    own, within half the memory the process may take; a read is a batch where the order is read by
-    batch, a record where it streams. Eight 64 KiB rows make a 512 KiB batch: 2 MiB holds four reads
-    of a batch and no worker, and half a host's memory that holds two and a half workers holds two,
-    reading by the batch or by the record. Workers take each CPU where there is more than one, at
-    most `max_workers`."""
-    from dew.data.dataset import WORKER_PROCESS_BYTES, Host
-
-    rows = grain.MapDataset.source([{"x": np.zeros((8, 16384), np.float32)}] * 6).to_iter_dataset()
-    auto = Loading(workers="auto", worker_buffer=2)
-    small = dataclasses.replace(auto, ram_budget_mb=2).resolved(rows, reads=1, host=Host(8, 2**40))
-    assert (small.workers, small.read_buffer) == (0, 4)
-    held = WORKER_PROCESS_BYTES + 2 * 2**19 + 16 * 2**19
-    roomy = auto.resolved(rows, reads=1, host=Host(8, 2 * (2 * held + held // 2)))
-    assert (roomy.workers, roomy.read_buffer) == (2, 16)
-    streamed = auto.resolved(rows, reads=8, host=Host(8, 2 * (2 * held + held // 2)))
-    assert streamed.workers == 2 and streamed.read_buffer == 16
-    assert auto.resolved(rows, reads=1, host=Host(3, 2**40)).workers == 3
-    assert auto.resolved(rows, reads=1, host=Host(1, 2**40)).workers == 0
-    assert dataclasses.replace(auto, max_workers=1).resolved(rows, reads=1, host=Host(8, 2**40)).workers == 1
-
-
 def test_a_validation_pass_starts_at_most_one_worker_per_batch(monkeypatch):
     """A held pass of two batches starts two worker processes though training
     reads with four: a third and a fourth would read nothing, yet each would
@@ -1028,7 +984,7 @@ class Blocked:
     prefix: int
 
     def __call__(self, row):
-        from dew.nn.visibility import prefix_blocks
+        from dew.batch import prefix_blocks
 
         places = np.arange(len(row["text"]), dtype=np.int32)
         blocks = prefix_blocks(np.ones(len(places), np.int32), places, self.prefix, xp=np)
@@ -2486,3 +2442,18 @@ def test_a_version_7_position_of_a_two_share_streamed_read_resumes_where_8_reads
         assert [np.asarray(next(stream)["id"]).tolist() for _ in range(2)] == saved["after"]
     finally:
         stream.close()
+
+
+def unsized(record):
+    """A step that reads a field the seventh record lacks."""
+    return {**record, "size": record["sizes"][0]}
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_raising_step_raises_its_own_error_naming_the_step_and_its_record(read):
+    """A record step that raises raises its own error, noting which step raised, in every read (row
+    4117)."""
+    rows = tuple({"id": index, "sizes": [index]} if index != 7 else {"id": index} for index in range(12))
+    with pytest.raises(KeyError) as raised:
+        list(iterate(Pipeline(Memory(rows)).map(unsized), read=read))
+    assert any(unsized.__qualname__ in note for note in raised.value.__notes__)

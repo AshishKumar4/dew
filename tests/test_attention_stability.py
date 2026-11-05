@@ -1161,6 +1161,37 @@ def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, f
                     f"decode {form} {family.dtype}", seeds=seeds,
                     truth_fn=_reference(family, anchored=True))
 
+def test_a_decode_steps_logits_past_the_folds_reach_weigh_as_the_references():
+    """bf16, the default form: one query over two keys whose products are 2^30 and 2^30 + 128, an fp32 ulp
+    apart (logits 2^28 and 2^28 + 32), their values the first two unit vectors: the reference weighs the
+    first exp(-32). A fold that scales each logit before the difference (`algebra.Forward.base2`) rounds it
+    at log2(e) times its size, 32 here, and weighed the first exp2(-32), 2.3e-10 against 1.27e-14; the decode
+    kernel's raw fold (`algebra.Forward.subtracted`) scales the raw products' difference after it is taken,
+    so its output is the float64 truth's in bf16, one slice or two, with no natural rewalk (row 1955)."""
+    width = 16
+
+    def first(rows, *fills):
+        array = np.zeros((1, rows, 1, width), np.float32)
+        for at, fill in fills:
+            array[(0, *at)] = fill
+        return jnp.asarray(array, jnp.bfloat16)
+
+    query = first(1, ((0, 0, 0), 2.0 ** 15), ((0, 0, 1), 1.0))
+    key = first(2, ((0, 0, 0), 2.0 ** 15), ((1, 0, 0), 2.0 ** 15), ((1, 0, 1), 128.0))
+    value = first(2, ((0, 0, 0), 1.0), ((1, 0, 1), 1.0))
+    logits = np.asarray([2.0 ** 28, 2.0 ** 28 + 32])
+    weights = np.exp(logits - logits.max()) / np.exp(logits - logits.max()).sum()
+    truth = np.zeros(width, np.float64)
+    truth[:2] = weights
+    for splits in (1, 2):
+        target = generation.assumed("sm80") if INTERPRETED else contextlib.nullcontext()
+        with target, tuning.pinned({decode_attention.DecodeAttention: decode_attention.Split(splits)}):
+            out = decode_attention.attend(query, _cache(key), _cache(value), jnp.asarray([2], jnp.int32),
+                                          interpret=INTERPRETED)
+        np.testing.assert_array_equal(np.asarray(out[0, 0, 0]), np.asarray(truth.astype(jnp.bfloat16)),
+                                      err_msg=f"{splits} slices")
+
+
 DECODED_OVERFLOWS = list(dict.fromkeys(family for family, _ in DECODED if FAMILIES[family].overflows))
 """The decode steps (`DECODED`) whose one divergence in the default form is their sums passing fp32's
 largest."""

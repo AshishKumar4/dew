@@ -122,7 +122,8 @@ def _publish(
     source: Source,
     plan: Callable[[Generation], Mapping[str, np.ndarray]] | None,
     pins: ExitStack,
-) -> Generation:
+    of_several: bool = False,
+) -> Generation | None:
     root = cache._root(key)
     try:
         current = root.child("CURRENT").get_versioned()
@@ -131,10 +132,19 @@ def _publish(
     completions, shards = _sealed(root, pins)
     if current is not None:
         _retain_committed(root, current, completions, shards, pins)
-    expected = tuple(_source_ids(source, streamed=any(row.startswith("[") for row in completions),
-                                 completed=completions))
+    streamed = any(row.startswith("[") for row in completions)
+    if of_several and streamed:
+        stored = {shard.id for shard in source.manifest().shards}
+        if any(json.loads(row)[0] not in stored for row in completions):
+            # A stream cut into more shards than its store's keys its rows by its own cuts, which no
+            # generation of the store holds: it publishes nothing.
+            return None
+    expected = tuple(_source_ids(source, streamed=streamed, completed=completions))
     expected_keys = {_row_key(row) for row in expected}
     missing, extra = expected_keys - completions.keys(), completions.keys() - expected_keys
+    if of_several and missing and not extra:
+        # One of a stream's shard fills, whose others have not sealed yet: the last to seal publishes.
+        return None
     if missing or extra:
         sample = next(iter(missing or extra))
         raise ValueError(
