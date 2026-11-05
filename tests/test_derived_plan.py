@@ -169,6 +169,61 @@ def test_past_a_miss_the_derivation_orders_the_next_compile_where_it_judges():
     assert not judged_likely(None, 0, forecast=False)
 
 
+def bare_search(objective):
+    """A plan search over `objective` on one device that compiles nothing: its derivation's judgments are
+    the test's to set (`judged_at`), and a compile it asks raises `Asked` naming the rung it asked at."""
+    from dew.training.planning import FitSearch
+
+    def asked(split, narrow):
+        raise Asked(search.remat_rung())
+
+    search = FitSearch(lower=asked, options=lambda candidate: None, objective=objective,
+                       mesh=MeshSpec().build(jax.devices()[:1]), xla_defaults=False, narrow=False, base=None,
+                       resumed=None, capacity=LIMIT)
+    return search
+
+
+class Asked(Exception):
+    """A compile `bare_search` was asked for, at the remat rung its argument names."""
+
+
+def test_a_compile_that_fits_past_the_derivations_corrected_refusal_lets_its_refusals_rule_nothing_out():
+    """A compile that fits where the derivation, as the search corrects it (`under`), judged it short means
+    its refusals at that remat rule no compile out: a miss at one microbatch past a judged fit raises the
+    correction above the judged headroom of two and four, a compile at eight fits short of the corrected
+    judgment, and two and four are compiled again, the compiles deciding (review of row 3341's search)."""
+    search = bare_search(deep(split=None).objective)
+    mib = 2**20
+    for split, headroom in ((1, 0), (2, 50 * mib), (4, 100 * mib), (8, 150 * mib)):
+        search.judged_at[search.candidate_key(split, narrow=False)] = headroom
+    search.learned(0, -200 * mib, fit=False)
+    assert search.refused(2) and search.refused(4)
+    search.learned(150 * mib, 100 * mib, fit=True)
+    assert not search.refused(2) and not search.refused(4)
+
+
+def test_a_split_the_derivation_refuses_is_still_asked_at_its_half_rung():
+    """The halving past a miss asks no compile of a split the derivation judges short at the objective's
+    rung, and still asks one at its half rung (`remat_half`), judged on its own (review of row 3341's
+    search): a refusal of the base rung says nothing of the half."""
+    from dew.training.memory import remat_half
+
+    for policy in REMAT_POLICIES.values():
+        objective = deep(policy, split=None).objective
+        held = remat_half(objective)
+        if held is not None:
+            objective.substitute(held)
+            break
+    else:
+        raise AssertionError("no remat rung of the decoder has a half rung")
+    search = bare_search(objective)
+    base = search.remat_rung()
+    search.judged_at[search.candidate_key(2, narrow=False)] = -1
+    with pytest.raises(Asked) as asked:
+        search.fits(2, pruned=True)
+    assert str(asked.value) != base
+
+
 def test_a_run_that_sets_its_remat_derives_its_own_rung_alone_and_compiles_there_once(monkeypatch, tmp_path):
     """A run that sets its remat compiles at it alone (row 2111), once, its split derived there; no rung
     below its own is traced for it, which cost a run every lighter rung's trace before its first step to
