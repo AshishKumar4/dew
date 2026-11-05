@@ -776,11 +776,15 @@ def _report(kernel: dict) -> Report:
 
 
 def _register_evidence(record: dict) -> list[dict]:
+    """Each modelled kernel's evidence: its decision under the model that decided its launch, the one its
+    launch lowered (`lowered_models`, whose residency its need was searched at, `_needs`), else the case's
+    declared one for its name; and its spills and unmodelled launches."""
     rows = []
     for kernel in record.get("kernels", ()):
         found = _report(kernel)
+        lowered = found.traced in record.get("lowered_models", {})
         for source, key in (("models", found.kernel), ("lowered_models", found.traced)):
-            if (stated := record.get(source, {}).get(key)) is None:
+            if (stated := record.get(source, {}).get(key)) is None or (source == "models" and lowered):
                 continue
             model = resources.RegisterModel(**stated)
             need = kernel.get("need")

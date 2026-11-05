@@ -832,6 +832,27 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     assert mosaic_failures([{**record, "kernels": [unbound]}])
 
 
+def test_a_kernel_is_judged_by_the_model_its_launch_lowered_not_the_cases_declared_one():
+    """A kernel whose launch lowered its own register model (`lowered_models`: its plan's two programs)
+    is judged by that model, whose residency ptxas's need was searched at: the case's declared model for
+    its name (a family's four programs by registers alone) states no decision this launch made, so it
+    adds no disagreement (row 1971: 381 of the gate's 511 recorded misses were the declared model's
+    residency against the lowered launch's need)."""
+    from kernel_compile import _register_evidence
+
+    declared = resources.RegisterModel(112, 255, 1, 4, 8, 0, shared=49232)
+    lowered = resources.RegisterModel(112, 255, 1, 2, 8, 0, shared=49232)
+    need = {"admitted": True, "programs": 2, "budget": 255, "refusal_holds": True, "refusal_programs": 2,
+            "caps": [{"cap": 255, "registers": 96, "spilled": 0, "compiled": True, "holds": True}]}
+    kernel = {"kernel": "dew_tgmm", "launch": None, "unread": [], "shared": 49232, "tmem": 0,
+              "registers": 96, "spilled": 0, "need": need}
+    record = {"name": "kernel gradient", "generation": "sm120", "limit": 101376, "tmem_limit": 0,
+              "models": {"dew_tgmm": declared.record()}, "lowered_models": {"dew_tgmm": lowered.record()},
+              "kernels": [kernel]}
+    rows = _register_evidence(record)
+    assert rows and all(row["agrees"] for row in rows), rows
+
+
 def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():
     """Evidence of one kernel's name and launch from two kernels is one kernel's at most: two modules
     (`kernel_modules`), two binaries (`reports`) or two PTX modules (`write_modules`) of one raise."""
