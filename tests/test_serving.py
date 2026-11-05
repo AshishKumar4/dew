@@ -947,6 +947,25 @@ def test_a_host_tier_reads_back_a_prefix_whose_upload_reclaims_the_last_device_p
     assert (owed.spills, owed.uploads, pages.shared(first)) == ([], [], [-1])
 
 
+@pytest.mark.distributed
+def test_a_pooled_servers_host_tier_reads_each_processs_prefix_back_from_its_own_slots(tmp_path):
+    """One server over a mesh that spans two processes, a group of rows a process, with a host tier: each
+    process's prompt is cached, its group's pages taken by two other prompts, which spill the prompt's pages
+    to the process's host slots, and served again, reading them back into fresh pages; every request draws
+    what one process serving them all draws, and each process reads its prompt's 8 tokens from its slots
+    (ledger 874)."""
+    from pathlib import Path
+
+    from process_support import run_pool, run_worker
+
+    worker = Path(__file__).with_name("serving_worker.py")
+    reports = run_pool("pooled_host_tier", tmp_path / "pool", 2, script=worker, devices=1, fsdp_size=2,
+                       timeout=300)
+    single = run_worker("pooled_host_tier", tmp_path / "single.json", script=worker, fsdp_size=1, devices=1)
+    assert {**reports[0]["drawn"], **reports[1]["drawn"]} == single["drawn"]
+    assert [report["shared"] for report in reports] == [8, 8]
+
+
 @pytest.mark.parametrize("stateful, host_pages, hits", [
     (False, 0, 0), (False, 1, 4), (False, 8, 8), (True, 1, 0), (True, 8, 8),
 ], ids=["device", "one-slot", "host", "hybrid-one-slot", "hybrid-host"])
