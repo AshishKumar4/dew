@@ -207,3 +207,28 @@ def test_the_code_encoder_in_bf16_rounds_as_its_qwen2_reference_does():
                                      reference(torch.bfloat16).reshape(-1, ours.shape[-1]),
                                      reference(torch.float64).reshape(-1, ours.shape[-1]),
                                      "code encoder transformer in bfloat16")
+
+
+@pytest.mark.parametrize("kernel,stride,pooler", [(3, 2, 2), (1, 2, 2), (2, 2, 3), (5, 1, 2)])
+def test_the_host_counts_a_clips_tokens_by_the_towers_own_count(kernel, stride, pooler):
+    """The host's count of a clip's encoded tokens, which places its placeholders (`MiMoAudio.encoded`),
+    is the tower's own, which its masks read (`tower_counts` a segment, `grouped` a clip): over clips of
+    no frames, of whole segments, of a short last segment and of fewer frames than one, for any
+    convolution the tokenizer's config states, an empty segment holding none (row 4301)."""
+    from dew.nn.mimo_audio import MiMoAudio, grouped, tower_counts
+
+    config = json.loads((FIXTURE / "config.json").read_text())
+    tower = towers.from_record(translate_mimo_audio_config(config["audio_config"], config["tokenizer"]))
+    assert isinstance(tower, MiMoAudio)
+    tokenizer = dataclasses.replace(tower.tokenizer, kernel_size=kernel, stride_size=stride,
+                                    avg_pooler=pooler)
+    tower = dataclasses.replace(tower, tokenizer=tokenizer)
+    size = tower.audio_segment_size
+    frames = np.asarray([0, size, 2 * size, 2 * size + 3, 3])
+    mask = np.arange(2 * size + 3)[None, :] < frames[:, None]
+    assert tower_counts(0, tokenizer) == (0, 0)
+    whole = int(tower_counts(size, tokenizer)[1])
+    codes = [whole * (count // size) + int(tower_counts(count % size, tokenizer)[1]) for count in frames]
+    np.testing.assert_array_equal(tower.encoded(mask).sum(axis=1), [grouped(code, tower.group_size)
+                                                                     for code in codes])
+    assert not tower.encoded(mask)[0].any()

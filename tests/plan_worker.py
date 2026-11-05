@@ -1,5 +1,5 @@
 """A small decoder's step planned on each process of a pool whose devices leave each its own room: what
-the plan search compiles and plans on each (`dew.training.planning.agreed`)."""
+the plan search compiles and plans on each (`dew.training.memory.pooled_headroom`)."""
 
 import numpy as np
 from process_support import serve_mode, worker_parser

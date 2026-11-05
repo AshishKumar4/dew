@@ -28,7 +28,7 @@ held, and starts from that state.
 from __future__ import annotations
 
 import hashlib
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from collections.abc import Sequence
 
 import numpy as np
@@ -100,6 +100,9 @@ class Pages:
         one's digest is `_hash_of`'s."""
         self._by_hash: dict[bytes, int] = {}
         self._hash_of: dict[int, bytes] = {}
+        self._writing: Counter[bytes] = Counter()
+        """The prefix hashes of full prompt pages rows hold and have not yet published: a prompt that
+        shares one waits for it (`waits`), so it reads those keys where it would write them again."""
 
     @property
     def available(self) -> int:
@@ -129,14 +132,28 @@ class Pages:
                     depth, last = len(pages), digest
         return pages[:depth], last
 
+    def waits(self, prompt: np.ndarray, salt: bytes = b"") -> bool:
+        """Whether `prompt`, under `salt`, shares its next full page past those cached with a row that is
+        writing it now, so it reads that page once the row publishes it (`publish`) instead of writing
+        its keys a second time: as vLLM's prefix caching shares a running prompt's blocks, the samples of
+        one prompt prefill once."""
+        if not self.prefix_cache:
+            return False
+        pages = (len(prompt) - 1) // self.size
+        shared = len(self._matched(prompt, salt)[0])
+        return shared < pages and prefix_hashes(prompt, self.size, shared + 1, salt)[-1] in self._writing
+
     def reserve(self, prompt: np.ndarray, total: int,
-                salt: bytes = b"") -> tuple[list[int], int, int | None] | None:
+                salt: bytes = b"") -> tuple[list[int], int, int | None, tuple[bytes, ...]] | None:
         """Pages for a row that will hold `total` tokens of which `prompt`, under `salt`, comes first.
 
         Returns the row's pages, how many leading prompt tokens they
-        already hold, and the `States` entry holding the state the row starts
-        from after them (None where it starts afresh), or None when the pool
-        cannot cover the row; then nothing changes.
+        already hold, the `States` entry holding the state the row starts
+        from after them (None where it starts afresh), and the hashes of the
+        full prompt pages it writes that no page names yet, which other
+        prompts wait for (`waits`) until it publishes them or gives its pages
+        back (`written`); or None when the pool cannot cover the row; then
+        nothing changes.
         """
         needed = -(-total // self.size)
         shared, last = self._matched(prompt, salt)
@@ -146,8 +163,17 @@ class Pages:
         for page in shared:
             self._hold(page)
         entry = None if self.states is None or last is None else self.states.entry(last)
+        hashes = prefix_hashes(prompt, self.size, len(prompt) // self.size, salt) if self.prefix_cache else []
+        writing = tuple(digest for digest in hashes[len(shared):] if digest not in self._by_hash)
+        self._writing.update(writing)
         return (shared + [self._take() for _ in range(needed - len(shared))], len(shared) * self.size,
-                entry)
+                entry, writing)
+
+    def written(self, writing: Sequence[bytes]) -> None:
+        """A row's pages of `writing` (`reserve`'s) are written no more: it published them (`publish`) or
+        gave its pages back first."""
+        self._writing.subtract(writing)
+        self._writing = +self._writing
 
     def publish(self, prompt: np.ndarray, pages: Sequence[int], salt: bytes = b"") -> None:
         """Name the row's full prompt pages by their prefix hash under `salt`, once their keys are written."""

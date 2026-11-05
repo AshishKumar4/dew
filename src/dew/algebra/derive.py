@@ -37,6 +37,7 @@ import numpy as np
 from egglog import (
     DagCostModel,
     EGraph,
+    Ruleset,
     Schedule,
     String,
     Unit,
@@ -58,7 +59,7 @@ from egglog.bindings import EggSmolError
 
 from dew.algebra import cost, extract, program, rules, terms
 from dew.algebra.cost import Work
-from dew.algebra.forms import Derived, Refused, evaluated, evaluator, inlined
+from dew.algebra.forms import Accumulated, Added, Derived, Merged, Refused, evaluated, evaluator, inlined
 from dew.algebra.terms import Term
 from dew.cache import ALGEBRA
 from dew.nn.kernels import generation
@@ -84,6 +85,19 @@ class Reduction:
     exact: bool = False
     """Whether its forms are extracted exactly (`extract.cheapest`): a declaration whose greedy extraction the
     test suite's oracle finds dearer than the optimum (`dew.cache.Passes.checked`)."""
+    exponential: Callable[..., jax.Array] | None = None
+    """The implementation of its exponential (`exponent`'s base), `exponential(x, scale=1.0)`, `exp(x scale)`
+    in the reals, which its walk's every exponential of that base evaluates by, an exponential of a
+    difference times a literal taking the literal as its `scale` (raw logits', `forms._scaled`): a numerics
+    choice of the declaration's (attention's accurate form's `natural_exp`, as exact as the reference's on
+    every backend), equal to the plain one in the reals; None for JAX's."""
+    rescale: Callable[[jax.Array, jax.Array], jax.Array] | None = None
+    """The factor a carried state takes from its anchor `carried` to the walk's new one `now`, the walk's
+    weights' exponential of their difference: `exp(carried - now)` in the reals, or `exp((carried - now) c)`
+    where the weights are `exp((x - b) c)` (raw logits, `c` the declaration's literal, which the rescale
+    carries itself: only a declaration that states its rescale walks scaled weights, `WALKING_SCALED`),
+    which the walk's rescale evaluates by where given (attention's accurate form's `carried`, its exponent's
+    rounding compensated); None for the plain exponential of the difference."""
 
 
 # The facts the derivation reads (§6.3), each registered from a parameter's own values or saturated by
@@ -211,13 +225,77 @@ def weighted(step: Term) -> Term: ...
 
 
 @function(merge=lambda old, new: old)
+def summand(step: Term) -> Term: ...
+"""The tile's sum a reduction's step adds to its rescaled state (`state * lift(factor) + sum`, `rescaled_by`'s
+factor): a mainloop's own addition takes it, as its accumulator takes a product's parts."""
+
+
+@function(merge=lambda old, new: old)
+def merge_factors(merge: Term) -> Term: ...
+"""The factor a merge of two rescaled sums takes its first state by (its maximum to the joined one), as the
+rule writes the merge: a mainloop's own merge takes it (`Merged`)."""
+
+
+@function(merge=lambda old, new: old)
+def merge_second(merge: Term) -> Term: ...
+"""The factor the same merge takes its second state by."""
+
+
+@function(merge=lambda old, new: old)
+def summed_terms(step: Term) -> Term: ...
+"""The tile's terms `summand` sums, before their reduction: a mainloop's addition that takes them apart (a
+guard's shift on each) reads them."""
+
+
+@function(merge=lambda old, new: old)
 def slot(term: Term) -> i64: ...
 """A walked reduction's index among the walk's, its carried state's (`Term.state`)."""
 
 
-def _walking():
-    """The facts' rules (the module's account)."""
-    x, y, z, k, t, base = vars_("x y z k t base", Term)
+def _exponentials(scaled: bool = False) -> list:
+    """The rules that find what scales as `exp(-k)` of an anchor `k` (`scales`), from its exponential; and
+    `scaled`, as `exp(-c k)`, an exponential of a difference times a positive literal `c` (raw logits, the
+    scale after the subtraction), which a declaration's own rescale alone carries (`Reduction.rescale`)."""
+    x, y, z, k, t, base, c_ = vars_("x y z k t base c_", Term)
+    name = var("name", String)
+    p, q, c, d, e, s, f = vars_("p q c d e s f", i64)
+    axes = var("axes", Vec[i64])
+    found = []
+    # An exponential of a local value less an anchor's broadcast, with the axis along which the anchor's own
+    # lies (`at`, -1 for a scalar anchor's), as its broadcast placed it. The same where the largest value's
+    # exponent is held to 0 by a select, `exp(where(x < b, x - b, 0))`, `b` the broadcast of a bound of every
+    # `x` (so the two are equal in the reals): attention's accurate form's weights over scaled logits, its
+    # largest weighing exactly 1 against a compiler's contraction.
+    for power in ("exp", "exp2"):
+        difference = x.binary(String("sub"), base, s)
+        held = x.compare(String("lt"), base, d).select(y, difference)
+        broadcast = (local(x), eq(base).to(k.shaped(String("broadcast_in_dim"), q)), anchor(k),
+                     eq(name).to(String(power)))
+        # `b` at least every `x` (its own maximum, or that maximum floored, `max(max(x), z)`), so that where
+        # `x < b` fails the difference is 0 too.
+        bounds = (eq(k).to(x.reduce(String("max"), axes, p)),
+                  eq(k).to(x.reduce(String("max"), axes, p).binary(String("max"), z, f)),
+                  eq(k).to(z.binary(String("max"), x.reduce(String("max"), axes, p), f)))
+        forms = ((difference.unary(name, e), ()),
+                 *((held.unary(name, e), (zero(y), bound)) for bound in bounds))
+        if scaled:
+            forms = tuple((product.unary(name, e), (rules.positive_scale(c_), eq(c_).to(Term.literal(f))))
+                          for product in (difference.binary(String("mul"), c_, d),
+                                          c_.binary(String("mul"), difference, d)))
+        for exponential, conditions in forms:
+            found += [
+                rule(eq(t).to(exponential), *broadcast, *conditions, lays(q, i64(0), c)).then(
+                    scales(t, k, name, e, s, c)),
+                rule(eq(t).to(exponential), *broadcast, *conditions, eq(rules.shape(k)).to(Vec[i64]())).then(
+                    scales(t, k, name, e, s, i64(-1))),
+            ]
+    return found
+
+
+def _walking(scaled: bool = False):
+    """The facts' rules (the module's account); `scaled`, with an exponential of a difference times a positive
+    literal among what scales (`_exponentials`)."""
+    x, y, z, k, t = vars_("x y z k t", Term)
     name, layout = vars_("name layout", String)
     p, q, a, b, c, d, e, s = vars_("p q a b c d e s", i64)
     axes = var("axes", Vec[i64])
@@ -285,20 +363,9 @@ def _walking():
         rule(eq(t).to(x.shaped(name, p)), zero(x)).then(zero(t)),
         rule(eq(t).to(x.convert(p)), zero(x)).then(zero(t)),
     ]
-    # What scales as exp(-k): an exponential of a local value less an anchor's broadcast, and what multiplies,
-    # divides, selects against zeros, sums, casts or lays it out with local values; with the axis along which
-    # the anchor's own lies (`at`, -1 for a scalar anchor's), as its broadcast placed it and each equation
-    # moved it.
-    for power in ("exp", "exp2"):
-        exponential = x.binary(String("sub"), base, s).unary(name, e)
-        broadcast = (local(x), eq(base).to(k.shaped(String("broadcast_in_dim"), q)), anchor(k),
-                     eq(name).to(String(power)))
-        walking += [
-            rule(eq(t).to(exponential), *broadcast, lays(q, i64(0), c)).then(
-                scales(t, k, name, e, s, c)),
-            rule(eq(t).to(exponential), *broadcast, eq(rules.shape(k)).to(Vec[i64]())).then(
-                scales(t, k, name, e, s, i64(-1))),
-        ]
+    # What scales as exp(-k) (`_exponentials`), and what multiplies, divides, selects against zeros, sums,
+    # casts or lays it out with local values, each equation moving the anchor's axis.
+    walking += _exponentials() + (_exponentials(scaled=True) if scaled else [])
     for side in (0, 1):
         def product(scaled, other, params, side=side):
             return scaled.binary(String("mul"), other, params) if side == 0 else other.binary(
@@ -329,7 +396,7 @@ def _walking():
         rule(eq(t).to(x.dot(y, p)), eq(walked(y)).to(a), contracts_right(p, a), scales(y, k, name, e, s, c),
              local(x), right_of(p, c, d)).then(summed(t), set_(anchored(t)).to(d)),
     ]
-    return ruleset(*walking, name="walking")
+    return ruleset(*walking, name="walking scaled" if scaled else "walking")
 
 
 def _shapes():
@@ -353,12 +420,17 @@ def _shapes():
 
 
 WALKING = _walking()
+WALKING_SCALED = _walking(scaled=True)
+"""`WALKING` for a declaration that states its own rescale (`Reduction.rescale`), which carries a scaled
+exponential's factor."""
 SHAPES = _shapes()
 
 
-def _decoupled():
+def _decoupled(rescaling: bool = False):
     """The derivation's rules (the module's account): each reading distributes over the language, and a walked
-    reduction's step, merge and finish are its monoid's, a sum that scales with an anchor rescaled first."""
+    reduction's step, merge and finish are its monoid's, a sum that scales with an anchor rescaled first, by
+    the plain exponential of the anchors' difference, or `rescaling` by the declaration's own rescale
+    (`Reduction.rescale`, the language's binary `rescale` of the two anchors, which no rule rewrites)."""
     x, y, z, k, t = vars_("x y z k t", Term)
     name = var("name", String)
     p, e, s, side, a, b, at, along, lift, added, multiplied, largest, i, floor, typed = vars_(
@@ -410,6 +482,8 @@ def _decoupled():
     # at least the least finite value, so a state that has seen nothing (both -inf) rescales by 0.
     def correction(carried_side, now):
         shifted = now.binary(String("max"), Term.literal(floor), largest)
+        if rescaling:
+            return k.held(carried_side).binary(String(terms.RESCALE), shifted, e).convert(typed)
         return k.held(carried_side).binary(String("sub"), shifted, s).unary(name, e).convert(typed)
 
     def rescaled(carried_side, now):
@@ -420,25 +494,30 @@ def _decoupled():
               eq(lift).to(lifts(given, to, along)),
               eq(added).to(stock("add")), eq(multiplied).to(stock("mul")), eq(largest).to(stock("max")),
               eq(floor).to(least(k)), eq(typed).to(retype(i)), slotted)
-    stepped = var("stepped", Term)
+    stepped, merged = vars_("stepped merged", Term)
     for summed_term, tile in ((x.reduce(String("sum"), axes, p), x.stepped().reduce(String("sum"), axes, p)),
                               (x.dot(y, p), x.stepped().dot(y.stepped(), p)),
                               (y.dot(x, p), y.stepped().dot(x.stepped(), p))):
         conditions = (eq(t).to(summed_term), summed(t), scales(x, k, name, e, s, at), *lifted)
-        # A product's step states its parts as it writes them: the factor, the tile's weights and values a
-        # mainloop's own accumulator takes (`rescaled_by`), whatever form extraction then picks of the step.
+        # A step states its parts as it writes them, whatever form extraction then picks of the step: the
+        # factor (`rescaled_by`) and a product's weights and values a mainloop's own accumulator takes, or a
+        # reduction's tile sum its own addition takes (`summand`).
         product = get_callable_args(tile, Term.dot)
-        parts = () if product is None else (set_(rescaled_by(stepped)).to(correction(0, k.stepped())),
-                                            set_(weighed(stepped)).to(product[0]),
-                                            set_(weighted(stepped)).to(product[1]))
+        parts = (set_(rescaled_by(stepped)).to(correction(0, k.stepped())),
+                 *((set_(summand(stepped)).to(tile), set_(summed_terms(stepped)).to(x.stepped()))
+                   if product is None else
+                   (set_(weighed(stepped)).to(product[0]), set_(weighted(stepped)).to(product[1]))))
         derived += [
             rule(eq(stepped).to(t.stepped()), *conditions).then(
                 union(stepped).with_(rescaled(0, k.stepped()).binary(String("add"), tile, added)), *parts),
-            rewrite(t.merged()).to(rescaled(0, k.merged()).binary(String("add"), rescaled(1, k.merged()),
-                                                                  added), *conditions),
+            rule(eq(merged).to(t.merged()), *conditions).then(
+                union(merged).with_(rescaled(0, k.merged()).binary(String("add"), rescaled(1, k.merged()),
+                                                                   added)),
+                set_(merge_factors(merged)).to(correction(0, k.merged())),
+                set_(merge_second(merged)).to(correction(1, k.merged()))),
             rewrite(t.finished()).to(Term.state(i, 0), *conditions),
         ]
-    return ruleset(*derived, name="decoupled")
+    return ruleset(*derived, name="decoupled rescaled" if rescaling else "decoupled")
 
 
 @function
@@ -458,9 +537,16 @@ def _plain():
         name="plain walked")
 
 
+EXPONENTIALS = {2: "exp2", "e": "exp"}
+"""The language's exponential of each base a declaration states (`Reduction.exponent`)."""
+
+
 DECOUPLED = rules.Rules("decoupled", "reorders", _decoupled(),
                         receipt="docs/design/algebra.md §6.9; tests/test_algebra_derive.py")
 """The derivation's rules, run beside the engine's sets (`rules.admitted`) and never among them."""
+DECOUPLED_RESCALED = rules.Rules("decoupled rescaled", "reorders", _decoupled(rescaling=True),
+                                 receipt="docs/design/algebra.md §6.9; tests/test_algebra_derive.py")
+"""`DECOUPLED` for a declaration that states its own rescale (`Reduction.rescale`)."""
 PLAIN = _plain()
 
 
@@ -502,6 +588,12 @@ class _Forms:
     accumulated: tuple[tuple[Term, Term, Term] | None, ...] = ()
     """Each reduction's step as a mainloop's accumulator takes it (`rescaled_by`): its row factor, the tile
     product's weights and values, extracted with the forms; None for a step of no such rule."""
+    added: tuple[tuple[Term, Term, Term] | None, ...] = ()
+    """Each reduction's step as a mainloop's own addition takes it (`summand`): its row factor, the tile's sum
+    and the terms it sums (`summed_terms`), extracted with the forms; None for a step of no such rule."""
+    merged: tuple[tuple[Term, Term] | None, ...] = ()
+    """Each reduction's merge as a mainloop's own merge takes it (`merge_factors`): the factors its first and
+    second states take, extracted with the forms; None for a merge of no such rule."""
 
 
 def context() -> tuple:
@@ -528,6 +620,10 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
     names = tuple(declaration.operands)
     walked_axes = {name: axes.index(declaration.walked) for name, axes in declaration.operands.items()
                    if declaration.walked in axes}
+    # The declaration's own numerics its forms evaluate by (`Reduction.exponential`, `rescale`).
+    declared = {"exponential": None if declaration.exponential is None else
+                (EXPONENTIALS[declaration.exponent], declaration.exponential),
+                "rescale": declaration.rescale}
     @functools.lru_cache(maxsize=FORMS_HELD)
     def derived_at(contexts: tuple, keyed: tuple) -> _Forms:
         del contexts  # The key alone: the derivation reads them where it runs.
@@ -557,17 +653,19 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
                 for side, state in enumerate(states)
                 for index in range(len(made.reductions))}
 
-    def step(state, tiles, *, product=None, accumulate=None, outputs: Sequence[int] = ()):
+    def step(state, tiles, *, product=None, stepped=None, outputs: Sequence[int] = ()):
         made = forms(shaped(tiles))
         value = evaluator(made.region, [*made.consts, *(tiles[name] for name in names)],
-                          carried(made, state), product=product)
-        stepped = []
-        for index, form in enumerate(made.steps):
-            if accumulate is not None and (parts := made.accumulated[index]) is not None:
-                factor, weights, values = parts
-                stepped.append(accumulate(state[index], value(factor), value(weights), value(values)))
-            else:
-                stepped.append(value(form))
+                          carried(made, state), product=product, **declared)
+        # The mainloop's own step where it gives one, once, over each reduction's parts as the rules state
+        # them (each value evaluated once), every reduction it leaves (None) by its form.
+        taken = (None,) * len(made.steps)
+        if stepped is not None:
+            parts = tuple(Accumulated(*map(value, accumulated)) if accumulated is not None
+                          else Added(*map(value, added)) if added is not None else None
+                          for accumulated, added in zip(made.accumulated, made.added, strict=True))
+            taken = tuple(stepped(tuple(state), parts))
+        stepped = [value(form) if own is None else own for own, form in zip(taken, made.steps, strict=True)]
         if not outputs:
             return tuple(stepped)
         # The tile's outputs along the walked axis `outputs` names (by place), by the same evaluation: a
@@ -579,18 +677,25 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
             along.append(value(output))
         return tuple(stepped), tuple(along)
 
-    def merge(a, b, operands=None, *, shapes: Mapping):
+    def merge(a, b, operands=None, *, shapes: Mapping, merged=None):
         made = forms(shapes)
         # A merge reads no walked operand (`_derived`), its unwalked ones whole.
         leaves = [*made.consts, *(None if operands is None or name in walked_axes else operands[name]
                                   for name in names)]
-        value = evaluator(made.region, leaves, carried(made, a, b))
-        return tuple(value(form) for form in made.merges)
+        value = evaluator(made.region, leaves, carried(made, a, b), **declared)
+        # The mainloop's own merge where it gives one, once, over each rescaled sum's two factors (`step`'s).
+        taken = (None,) * len(made.merges)
+        if merged is not None:
+            parts = tuple(None if factors is None else Merged(*map(value, factors))
+                          for factors in made.merged)
+            taken = tuple(merged(tuple(a), tuple(b), parts))
+        return tuple(value(form) if own is None else own
+                     for own, form in zip(taken, made.merges, strict=True))
 
     def finish(state, operands=None, *, shapes: Mapping):
         made = forms(shapes)
         leaves = [*made.consts, *(None if operands is None else operands[name] for name in names)]
-        value = evaluator(made.region, leaves, carried(made, state))
+        value = evaluator(made.region, leaves, carried(made, state), **declared)
         # A literal output is its literal; one along the walked axis, `mapped`'s.
         outputs = [jnp.asarray(literal) if term is None else None if form is None else value(form)
                    for term, literal, form in zip(made.region.outputs, made.region.literal_outputs,
@@ -599,7 +704,7 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
 
     def mapped(tiles):
         made = forms(shaped(tiles))
-        value = evaluator(made.region, [*made.consts, *(tiles[name] for name in names)], {})
+        value = evaluator(made.region, [*made.consts, *(tiles[name] for name in names)], {}, **declared)
         outputs = [value(form) if along and form is not None else None
                    for form, along in zip(made.outputs, made.mapped, strict=True)]
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
@@ -640,10 +745,11 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
                                    if name in declaration.ranges})
     graph = EGraph()
     _register(graph, region, closed, names, walked_axes)
-    graph.run(WALKING.saturate())
-    for term in _opaque_locals(graph, region):
+    walking = WALKING if declaration.rescale is None else WALKING_SCALED
+    graph.run(walking.saturate())
+    for term in _opaque_locals(graph, region, walking):
         graph.register(local(term))
-    graph.run(WALKING.saturate())
+    graph.run(walking.saturate())
     graph.run(PLAIN.saturate())
     found = [term for term, _ in region.shapes if _holds(graph, summed(term)) or _holds(graph, peaked(term))]
     reductions = tuple({terms.key(term): term for term in found}.values())
@@ -670,23 +776,35 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     graph.register(declared, bundle)
     schedule = cost.walk(cost.target())
     _, before = extract.cheapest(graph, declared, cost.model(region, schedule))
-    facts = seq(rules.FACTS.saturate(), SHAPES.saturate(), WALKING.saturate())
-    _decoupled_through(graph, region, facts)
-    saturated = program.saturate(graph, region, (*rules.admitted(accurate), DECOUPLED),
+    facts = seq(rules.FACTS.saturate(), SHAPES.saturate(), walking.saturate())
+    decoupled = DECOUPLED if declaration.rescale is None else DECOUPLED_RESCALED
+    _decoupled_through(graph, region, facts, decoupled)
+    saturated = program.saturate(graph, region, (*rules.admitted(accurate), decoupled),
                                  saturation, facts)
-    # Each step a rule wrote as a mainloop's accumulator takes it, its parts extracted with the forms.
-    accumulating = [index for index, reduction in enumerate(reductions)
-                    if graph.lookup_function_value(rescaled_by(reduction.stepped())) is not None]
-    parts = [part(reductions[index].stepped()) for index in accumulating
-             for part in (rescaled_by, weighed, weighted)]
+    # Each step a rule wrote as a mainloop's accumulator or its own addition takes it, its parts extracted
+    # with the forms.
+    def stated(part, reduction: Term) -> bool:
+        return graph.lookup_function_value(part(reduction.stepped())) is not None
+
+    accumulating = [index for index, reduction in enumerate(reductions) if stated(weighed, reduction)]
+    adding = [index for index, reduction in enumerate(reductions) if stated(summand, reduction)]
+    parts = [part(reductions[index].stepped()) for index in range(len(reductions))
+             for part in ((rescaled_by, weighed, weighted) if index in accumulating
+                          else (rescaled_by, summand, summed_terms) if index in adding else ())]
+    merging = [index for index, reduction in enumerate(reductions)
+               if graph.lookup_function_value(merge_factors(reduction.merged())) is not None]
+    parts += [part(reductions[index].merged()) for index in merging for part in (merge_factors, merge_second)]
     if parts:
         bundle = Term.bundle(Vec[Term](*roots, *parts))
         graph.register(bundle)
     chosen, after = program.extracted(graph, bundle, _priced(region, schedule), exact=declaration.exact,
                                       checked=ALGEBRA.value.checked)
     held = iter(chosen[len(roots):])
-    accumulated = tuple((next(held), next(held), next(held)) if index in accumulating else None
-                        for index in range(len(reductions)))
+    accumulated, added = [], []
+    for index in range(len(reductions)):
+        accumulated.append((next(held), next(held), next(held)) if index in accumulating else None)
+        added.append((next(held), next(held), next(held)) if index in adding else None)
+    merged = [(next(held), next(held)) if index in merging else None for index in range(len(reductions))]
     chosen = chosen[:len(roots)]
     if not math.isfinite(after.value):
         unwritten = next(root for root, form in zip(roots, chosen, strict=True) if not _written(form))
@@ -708,16 +826,17 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
         if _reads_leaves(form) & walked_leaves:
             raise Refused("a merge reads a walked operand: no tile is there to read")
     return _Forms(region, reductions, tuple(steps), tuple(merges), finishes, tuple(along), tuple(outputs),
-                  walked_leaves, tuple(closed.consts), report, accumulated)
+                  walked_leaves, tuple(closed.consts), report, tuple(accumulated), tuple(added),
+                  tuple(merged))
 
 
-def _decoupled_through(graph: EGraph, region: terms.Region, facts: Schedule) -> None:
+def _decoupled_through(graph: EGraph, region: terms.Region, facts: Schedule, decoupled: rules.Rules) -> None:
     """The derivation's readings run through `region`'s terms alone first (`DECOUPLED`, its facts saturated
     after each pass): each reading meets the language at the region's depth, before the engine's sets grow
     the graph toward their limits, so a limit the engine reaches never stops a form."""
     for _ in range(4 * max(region.depth, 1) + 8):
         graph.run(facts)
-        if not graph.run(DECOUPLED.ruleset).updated:
+        if not graph.run(decoupled.ruleset).updated:
             break
     graph.run(facts)
 
@@ -841,7 +960,7 @@ def _dot_ranks(region: terms.Region, index: int) -> tuple[int, int]:
     return 0, 0
 
 
-def _opaque_locals(graph: EGraph, region: terms.Region) -> list[Term]:
+def _opaque_locals(graph: EGraph, region: terms.Region, walking: Ruleset) -> list[Term]:
     """The outputs of equations outside the language (`terms.Opaque`), each over local, unwalked inputs alone:
     local themselves, in program order, so an equation over an earlier one's outputs reads them as local. An
     equation outside the language over a value the walk reads is refused: over a walked value its axis is
@@ -858,7 +977,7 @@ def _opaque_locals(graph: EGraph, region: terms.Region) -> list[Term]:
         for leaf in opaque.outputs:
             found.append(Term.leaf(i64(leaf)))
             graph.register(local(Term.leaf(i64(leaf))), unwalked(Term.leaf(i64(leaf))))
-        graph.run(WALKING.saturate())
+        graph.run(walking.saturate())
     return found
 
 

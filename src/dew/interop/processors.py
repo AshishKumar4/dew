@@ -19,12 +19,13 @@ from dew.batch import POSITIONS_FIELD, VALIDITY_FIELD
 from dew.interop.sources import SourceReference
 from dew.nn import audio as audio_nn
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
+from dew.nn.mimo_audio import MiMoAudio
 from dew.registry import towers
 
-PACKED_MEDIA = (*QWEN35_TYPES, 'muse_glimmer', 'lfm3_vl')
+PACKED_MEDIA = (*QWEN35_TYPES, 'muse_glimmer', 'lfm3_vl', 'mimo_v2')
 """The wrappers whose processors pack images and videos alike, as runs of patch vectors beside their
 `(t, h, w)` grids, a video's frames each a run of its own (`Processor._qwen_frames`): Qwen 3.5's, Muse
-Glimmer's and LFM3-VL's, whose towers attend and convolve within a frame."""
+Glimmer's, LFM3-VL's and MiMo-V2.6's, whose towers attend and convolve within a frame."""
 
 VIDEO_MEDIA = (*PACKED_MEDIA, *GEMMA4_TYPES)
 """The wrappers whose processors carry videos (`pixel_values_videos`): the packed ones and Gemma 4's,
@@ -110,6 +111,32 @@ def _in_text_order[T](streams: Mapping[int, Sequence[T]], tokens: np.ndarray,
     if any(offsets[token] != len(stream) for token, stream in streams.items()):
         raise ValueError("media payloads and placeholder counts disagree")
     return ordered
+
+
+def _payload_spans(runs: list[list[np.ndarray]], tokens: np.ndarray,
+                   sizes: Mapping[int, Sequence[int]]) -> list[list[np.ndarray]]:
+    """Each run of placeholders cut into the spans its payloads fill, in row and placeholder order, each
+    payload taking the next of its kind's `sizes` placeholders: a run holds one payload's, or several
+    payloads' side by side, as a release that fills its placeholders by count reads a video's frames with
+    nothing between them (MiMo-V2.6's `_replace_modal_embeddings_inplace`). No payload's placeholders cross
+    two runs."""
+    offsets = dict.fromkeys(sizes, 0)
+    spans = []
+    for row, held in enumerate(runs):
+        cut = []
+        for run in held:
+            token = int(tokens[row, run[0]])
+            while len(run):
+                if token not in sizes or offsets[token] == len(sizes[token]):
+                    raise ValueError("media placeholders exceed their payloads")
+                size = sizes[token][offsets[token]]
+                if size > len(run):
+                    raise ValueError("a media payload's placeholders cross two runs")
+                offsets[token] += 1
+                cut.append(run[:size])
+                run = run[size:]
+        spans.append(cut)
+    return spans
 
 
 def _placed(runs: list[list[np.ndarray]], selected: Sequence[np.ndarray], capacity: int,
@@ -237,6 +264,12 @@ class Processor:
     def _media_reference(self) -> HostProcessor:
         if self.directory is None:
             raise ValueError("this source ships no media processor")
+        if not any((self.directory / name).exists() for name in ("processor_config.json",
+                                                                 "preprocessor_config.json")):
+            # MiMo-V2.6 states its processing in its config.json (`processor_config`) and ships no code
+            # that runs it.
+            raise ValueError(f"{self.config.get('model_type')} ships no processor of its own, only its "
+                             "config's processor_config: hand the model its processed fields (`from_hf`)")
         from transformers import AutoProcessor
 
         options = {"backend": "pil"} if self.config.get("model_type") == "gemma3" else {}
@@ -461,7 +494,8 @@ class Processor:
                 supplied_types = np.asarray(values.get("mm_token_type_ids"))
                 if not np.array_equal(supplied_types, expected_types):
                     raise ValueError("mm_token_type_ids must identify each image and video placeholder")
-            chunks, grid, merge = self._qwen_frames(values, tokens, runs)
+            chunks, grid, merge, runs = self._qwen_frames(values, tokens, runs)
+            image_counts = np.array([len(row) for row in runs], np.int32)
             shape = (max(chunk.shape[0] for chunk in chunks), chunks[0].shape[-1])
             selected = [np.arange(length) for length in np.prod(grid, axis=1) // merge ** 2]
             capacity = shape[0] // merge ** 2
@@ -547,26 +581,30 @@ class Processor:
 
         Each contiguous run of the audio placeholder is one clip, in the
         processor's clip order. Gemma 4 inserts one placeholder per encoded
-        valid frame; Gemma 3n inserts its fixed slot count. Both are checked
-        against the encoder's frame stride here, before any device work.
+        valid frame; Gemma 3n inserts its fixed slot count; MiMo-V2.6 one per
+        group of its codes (`MiMoAudio.encoded`). Each is checked against the
+        encoder's frames here, before any device work.
         """
         audio_id = self.record.get("audio_token_id")
         audio = self.record.get("audio")
-        if type(audio_id) is not int or self.record.get("audio_projector") is None:
-            raise ValueError("this source has no audio projector")
-        stride = 1
-        if audio is not None:
-            encoder = towers.from_record(_records.record(audio, "audio"))
-            if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
-                raise ValueError("audio conditioning requires a Gemma audio encoder")
-            stride = audio_nn.encoded_frame_stride(encoder)
+        if type(audio_id) is not int or (audio is None and self.record.get("audio_projector") is None):
+            raise ValueError("this source reads no audio")
         features = np.asarray(values["input_features"])
         mask = np.asarray(values["input_features_mask"])
         if features.ndim != 3 or not np.issubdtype(features.dtype, np.floating):
             raise ValueError("input_features must be floating [clips, frames, mel]")
         if mask.shape != features.shape[:2] or mask.dtype != np.bool_:
             raise ValueError("input_features_mask must be bool [clips, frames], True for valid frames")
-        encoded = mask[:, ::stride]
+        # Without a tower, each raw frame is one token.
+        encoded = mask
+        if audio is not None:
+            encoder = towers.from_record(_records.record(audio, "audio"))
+            if isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
+                encoded = mask[:, ::audio_nn.encoded_frame_stride(encoder)]
+            elif isinstance(encoder, MiMoAudio):
+                encoded = encoder.encoded(mask)
+            else:
+                raise ValueError("audio conditioning requires a Gemma or a MiMo-V2.6 audio encoder")
         slots = self.record.get("audio_soft_tokens")
         if slots is None:
             selected = [np.flatnonzero(row) for row in encoded]
@@ -604,8 +642,9 @@ class Processor:
         return _records.integer(projector[name], name)
 
     def _qwen_frames(self, values: Mapping[str, object], tokens: np.ndarray, runs):
-        """Return views of packed image/video patches in text order, one item per frame: Qwen 3.5's
-        and Muse Glimmer's, whose processors pack alike.
+        """Return views of packed image/video patches in text order, one item per frame, and the
+        placeholder runs cut into each frame's span (`_payload_spans`): Qwen 3.5's, Muse Glimmer's and
+        MiMo-V2.6's, whose processors pack alike.
 
         Qwen3.5 get_rope_index repeats video grids by their temporal count and
         resets each frame's temporal coordinate to zero. The processor places
@@ -642,14 +681,17 @@ class Processor:
             if type(token_id) is not int:
                 raise ValueError(f"{token_name} must be an integer")
             streams[token_id] = pieces
-        ordered = _in_text_order(streams, tokens, runs)
+        sizes = {token: [int(np.prod(grid)) // merge ** 2 for _, grid in pieces]
+                 for token, pieces in streams.items()}
+        spans = _payload_spans(runs, tokens, sizes)
+        ordered = _in_text_order(streams, tokens, spans)
         if not ordered:
             raise ValueError("visual payloads and placeholder frame counts disagree")
         chunks, grids = zip(*ordered, strict=True)
         widths = {chunk.shape[-1] for chunk in chunks}
         if len(widths) != 1:
             raise ValueError("image and video patch widths must agree")
-        return list(chunks), np.asarray(grids, np.int32), merge
+        return list(chunks), np.asarray(grids, np.int32), merge, spans
 
     def _image_rotary_positions(self, tokens: np.ndarray, valid: np.ndarray,
                                 groups: jax.Array, grids: jax.Array) -> jax.Array:

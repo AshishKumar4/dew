@@ -24,6 +24,7 @@ from jax.sharding import Mesh, NamedSharding
 
 from dew.batch import VALIDITY_FIELD, Variables, coordinates, real_slots
 from dew.inference.tasks import cache_sized
+from dew.lora import adapter_names, selected
 from dew.mesh import logical_spec
 from dew.nn.attention_blocks import CROSS_KEY, CROSS_VALUE
 from dew.nn.cross_attention import CROSS_CACHE
@@ -70,6 +71,9 @@ class Slots:
     caps them, `active` marks the rows still drawing, and `keys` holds each
     row's PRNG key data. `automaton` is each row's grammar state under a
     guided policy, zero (the start) on admission, and unread otherwise.
+    `adapter` is each row's adapter of an adapter set's model, its place in
+    the set's names, -1 for the base alone (`dew.lora.selected`), and unread
+    by any other model.
     """
 
     decoder: DecoderState
@@ -80,6 +84,7 @@ class Slots:
     active: jax.Array
     keys: jax.Array
     automaton: jax.Array
+    adapter: jax.Array
 
 @struct.dataclass
 class Admission:
@@ -89,7 +94,8 @@ class Admission:
     and how many of its prompt tokens the cache already holds. `final`
     marks the rows whose piece ends their prompt: those start drawing this
     step, and `history` with `history_valid` is their whole prompt
-    right-aligned in `capacity` slots, for the transforms to read."""
+    right-aligned in `capacity` slots, for the transforms to read. `adapters`
+    is each row's adapter (`Slots.adapter`)."""
 
     prompts: ModelInputs
     slots: jax.Array
@@ -100,6 +106,7 @@ class Admission:
     final: jax.Array
     history: jax.Array
     history_valid: jax.Array
+    adapters: jax.Array
 
 
 @struct.dataclass
@@ -133,8 +140,11 @@ def opened(model: nn.Module, params: Variables, pad_id: int, slots: int, capacit
     ops = decode_ops(model, params, pad_id, drafting_depths(model, plan))
     blank = ModelInputs(jnp.zeros((slots, 1), jnp.int32),
                         {VALIDITY_FIELD: jnp.zeros((slots, 1), bool)})
-    _, decoder = jax.eval_shape(checkify.checkify(lambda: prefill_state(model, params, blank, ops)[0],
-                                                  errors=checkify.user_checks))
+    def blank_prefill():
+        with selected(jnp.full((slots,), -1, jnp.int32)):
+            return prefill_state(model, params, blank, ops)[0]
+
+    _, decoder = jax.eval_shape(checkify.checkify(blank_prefill, errors=checkify.user_checks))
     keys = jax.random.key_data(jax.random.key(0, impl=impl))
     return Slots(jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype), decoder),
                  jnp.zeros((slots, 2 * capacity), jnp.int32),
@@ -142,7 +152,7 @@ def opened(model: nn.Module, params: Variables, pad_id: int, slots: int, capacit
                  jnp.zeros((slots,), jnp.int32), jnp.zeros((slots,), jnp.int32),
                  jnp.zeros((slots,), bool),
                  jnp.zeros((slots, *keys.shape), keys.dtype),
-                 jnp.zeros((slots,), jnp.int32))
+                 jnp.zeros((slots,), jnp.int32), jnp.full((slots,), -1, jnp.int32))
 
 
 def _placed(resident: jax.Array, incoming: jax.Array, rows: jax.Array, groups: int) -> jax.Array:
@@ -192,7 +202,7 @@ def _seated(state: Slots, decoder: DecoderState, real: jax.Array, admission: Adm
                  place(state.valid, jnp.pad(admission.history_valid, padding)),
                  place(state.step, fresh), place(state.budget, admission.budgets),
                  place(state.active, real & admission.final), place(state.keys, admission.keys),
-                 place(state.automaton, fresh))
+                 place(state.automaton, fresh), place(state.adapter, admission.adapters))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -228,12 +238,13 @@ class Dense:
         occupant's keys, past the cursor the prefill sets.
         """
         narrow = cache_sized(model, admission.prompts.tokens.shape[1])
-        fresh, real = prefill_state(narrow, params, admission.prompts,
-                                    decode_ops(narrow, params, pad_id, drafting_depths(model, self.plan),
-                                               progress),
-                                    rounding=rounding_keys(jax.random.wrap_key_data(admission.keys,
-                                                                                    impl=self.prng)),
-                                    progress=progress)
+        with selected(admission.adapters):
+            fresh, real = prefill_state(narrow, params, admission.prompts,
+                                        decode_ops(narrow, params, pad_id, drafting_depths(model, self.plan),
+                                                   progress),
+                                        rounding=rounding_keys(jax.random.wrap_key_data(admission.keys,
+                                                                                        impl=self.prng)),
+                                        progress=progress)
         def place(resident: jax.Array, incoming: jax.Array) -> jax.Array:
             return _placed(resident, incoming, admission.slots, self.groups)
 
@@ -269,9 +280,11 @@ class Paged:
         scattered back to the rows' slots.
         """
         rows = admission.cursors.shape[0]
-        allocated = with_rounding_keys(
-            model.apply(params, rows, method="init_cache", mutable=["cache"])[1]["cache"],
-            rounding_keys(jax.random.wrap_key_data(admission.keys, impl=self.prng)))
+        # The cache's allocation runs the model too (a forward over a dummy token): under the rows' adapters.
+        with selected(admission.adapters):
+            allocated = with_rounding_keys(
+                model.apply(params, rows, method="init_cache", mutable=["cache"])[1]["cache"],
+                rounding_keys(jax.random.wrap_key_data(admission.keys, impl=self.prng)))
         continues = admission.cursors > 0
 
         def view(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.Array, fresh: jax.Array) -> jax.Array:
@@ -287,9 +300,10 @@ class Paged:
             return jnp.where(continues.reshape(rows, *(1,) * (held.ndim - 1)), held, fresh)
 
         cache = jax.tree_util.tree_map_with_path(view, state.decoder.cache, allocated)
-        fresh, real = prefill_state(model, params, admission.prompts,
-                                    decode_ops(model, params, pad_id, drafting_depths(model, self.plan),
-                                               progress), cache=cache, progress=progress)
+        with selected(admission.adapters):
+            fresh, real = prefill_state(model, params, admission.prompts,
+                                        decode_ops(model, params, pad_id, drafting_depths(model, self.plan),
+                                                   progress), cache=cache, progress=progress)
 
         def merged(path: tuple[jax.tree_util.KeyEntry, ...], resident: jax.Array,
                    updated: jax.Array) -> jax.Array:
@@ -340,7 +354,8 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
         decoder = _mixed_step(model, params, pad_id, placement, state.decoder, last, fed, admission, progress)
     else:
         ops = decode_ops(model, params, pad_id, None, progress)
-        decoder = ops.advance(state.decoder, last, fed)
+        with selected(state.adapter):
+            decoder = ops.advance(state.decoder, last, fed)
     if admission is not None and not mixed:
         # Only a row seated this step draws without feeding; with no admission
         # every drawing row fed, and the step's logits replace the held ones
@@ -358,7 +373,7 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
     # A row stops at its own budget here, where `Sample` scans one budget for every row.
     return (Slots(decoder, committed.tokens, committed.valid, committed.step, state.budget,
                   drawn & ~stopped & (committed.step < state.budget), state.keys,
-                  state.automaton if drew.automaton is None else drew.automaton),
+                  state.automaton if drew.automaton is None else drew.automaton, state.adapter),
             Draws(drew.token[:, None], drawn[:, None], stopped, drawn & drew.finished.ended,
                   drew.behavior[:, None], drew.raw[:, None]))
 
@@ -381,12 +396,13 @@ def _speculated(model: nn.Module, params: Variables, pad_id: int, placement: Pla
     view = StepState(state.tokens, state.valid, state.step, state.active,
                      jax.random.wrap_key_data(state.keys, impl=placement.prng), prompt_width=capacity,
                      budget=state.budget)
-    block = block_step(state.decoder, view, jnp.zeros_like(view.active), plan, ops,
-                       decoding.chain(transforms), decoding.finish(stopping), state.budget)
+    with selected(state.adapter):
+        block = block_step(state.decoder, view, jnp.zeros_like(view.active), plan, ops,
+                           decoding.chain(transforms), decoding.finish(stopping), state.budget)
     drawn, kept = state.active, block.kept
     committed = block.step
     return (Slots(block.state, committed.tokens, committed.valid, committed.step, state.budget,
-                  committed.active, state.keys, state.automaton),
+                  committed.active, state.keys, state.automaton, state.adapter),
             Draws(block.tokens, kept & drawn[:, None], drawn & block.stopped, drawn & block.terminated,
                   jnp.where(kept, block.behavior, 0.0), jnp.where(kept, block.raw, 0.0)))
 
@@ -429,6 +445,8 @@ def mixed_refusal(model: nn.Module, shapes: Slots, placement: Placement) -> str 
     that does not keeps the two forwards; the placement answers for the rest."""
     if placement.plan is not None:
         return "its rows draw speculative blocks, whose drafting state a prompt's own prefill seeds"
+    if adapter_names(model):
+        return "its rows run their own adapters (an adapter set), and the mixed forward packs them in one row"
     if not isinstance(model, Serving):
         return f"{type(model).__name__} does not say its layers run a mixed step (Serving)"
     refusal = model.mixed_admission_refusal()

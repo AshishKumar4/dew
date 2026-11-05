@@ -118,10 +118,17 @@ def worker_env(devices: int) -> dict[str, str]:
             "XLA_FLAGS": f"--xla_force_host_platform_device_count={devices}"}
 
 
+def owned(command: Sequence[str], environment: Mapping[str, str]) -> subprocess.Popen[str]:
+    """`command` from the checkout under `environment`, its output piped, as a group its owner holds
+    (tools/armada/child_groups.py's `start`): its lifeline kills it as its owner dies, however it dies."""
+    return groups.start(command, cwd=REPO_ROOT, env=dict(environment), stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True)
+
+
 def start_process(command: Sequence[str], devices: int, *,
                   environment: Mapping[str, str] | None = None) -> subprocess.Popen[str]:
-    return groups.start(command, cwd=REPO_ROOT, env={**worker_env(devices), **(environment or {})},
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    """`command` as an owned group (`owned`) on `devices` CPU devices (`worker_env`)."""
+    return owned(command, {**worker_env(devices), **(environment or {})})
 
 
 def spawn(mode: str, out: Path, processes: int = 1, process_id: int = 0,

@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 from reference_error import assert_computes_the_oracle, chain_roundings
 
-from dew.objectives.world_model import Dynamics, sampled_steps, shortcut_forcing_loss
+from dew.objectives.world_model import Dynamics, shortcut_forcing_loss
 
 
 def test_shortcut_forcing_is_the_papers_bootstrap():
@@ -54,9 +54,22 @@ def test_shortcut_forcing_is_the_papers_bootstrap():
 
 
 def test_step_sizes_are_powers_of_two_and_levels_lie_on_their_grid():
-    """Eq. 4: every step size is the reciprocal of a power of two up to K_max, every one is drawn, and
-    each signal level is a multiple of its frame's step size below 1."""
-    tau, d = (np.asarray(x) for x in sampled_steps(jax.random.key(1), (4096,), 64))
+    """Eq. 4, as the world model's loss draws them for each clip's frames (its recorded boundaries): every
+    step size is the reciprocal of a power of two up to K_max, every one is drawn, and each signal level is
+    a multiple of its frame's step size below 1 (row 4225: the test held a function no loss called)."""
+    from dew.objectives.base import Recorder, Step
+    from dew.objectives.world_model import CausalTokenizer, WorldModelObjective
+
+    tokenizer = CausalTokenizer((8, 8, 1), patch=4, width=16, depth=1, heads=2, latents=4, bottleneck=4)
+    dynamics = Dynamics(latents=4, bottleneck=4, spatial=2, width=16, depth=1, heads=2, levels=7, frames=32)
+    objective = WorldModelObjective(dynamics, tokenizer,
+                                    tokenizer.init(jax.random.key(1), jnp.zeros((1, 8, 8, 1))))
+    recorder = Recorder()
+    step = Step(jnp.asarray(0), jax.random.key(2), None, recorder=recorder)
+    video = jnp.zeros((128, 32, 8, 8, 1), jnp.float32)
+    objective.loss(objective.init(jax.random.key(3)), {"video": video}, step)
+    tape = recorder.tape(128)
+    tau, d = tape["signal level"].ravel(), tape["step size"].ravel()
     exponents = -np.log2(d)
     np.testing.assert_array_equal(exponents, np.round(exponents))
     assert set(exponents.astype(int)) == set(range(7))
@@ -123,3 +136,122 @@ def test_a_clip_of_uint8_pixels_trains_as_the_frames_in_minus_one_to_one_it_enco
     step = Step(jnp.asarray(0), jax.random.key(10), None)
     stats = [objective.loss(variables, {"video": video}, step)[0] for video in (pixels, frames)]
     np.testing.assert_array_equal(np.asarray(stats[0].total), np.asarray(stats[1].total))
+
+
+def _tiny_models():
+    """A tokenizer and a dynamics model at the tests' scale, the tokenizer's tree drawn."""
+    from dew.objectives.world_model import CausalTokenizer
+
+    tokenizer = CausalTokenizer((8, 8, 1), patch=4, width=16, depth=1, heads=2, latents=4, bottleneck=4)
+    dynamics = Dynamics(latents=4, bottleneck=4, spatial=2, width=16, depth=1, heads=2, levels=3, frames=4)
+    return tokenizer, tokenizer.init(jax.random.key(4), jnp.zeros((1, 8, 8, 1))), dynamics
+
+
+def _objectives():
+    """The tokenizer's objective and the world model's over it, each with its variables drawn."""
+    from dew.objectives.world_model import TokenizerObjective, WorldModelObjective
+
+    tokenizer, tokens, dynamics = _tiny_models()
+    objectives = (TokenizerObjective(tokenizer), WorldModelObjective(dynamics, tokenizer, tokens))
+    return [(objective, objective.fresh_variables(jax.random.key(5), None)) for objective in objectives]
+
+
+def test_a_padded_batch_scores_its_real_clips_alone():
+    """An evaluation's last batch, three clips padded to four (`VALID_ROWS`, as `FilledBatch` pads it),
+    counts its three real clips alone in each objective's loss (`Objective.row_mean`): the padding's
+    content changes nothing, its mass is the real clips', and a batch of padding alone holds no mass and
+    moves no weight (row 4146: both losses counted the padding, and a batch of it kept a positive mass and a
+    gradient)."""
+    from dew.batch import VALID_ROWS
+    from dew.objectives.base import Step
+
+    video = jnp.asarray(np.random.default_rng(11).uniform(-1, 1, (4, 4, 8, 8, 1)), jnp.float32)
+    real = jnp.asarray([True, True, True, False])
+    padded = [{"video": clips, VALID_ROWS: real} for clips in (video, video.at[3].set(video[0]))]
+    repeats = {"video": video, VALID_ROWS: jnp.zeros((4,), bool)}
+    step = Step(jnp.asarray(0), jax.random.key(12), None, training=False)
+    for objective, variables in _objectives():
+        (other, _), (repeat, _) = (objective.loss(variables, batch, step) for batch in padded)
+        three, _ = objective.loss(variables, {"video": video[:3]}, step)
+        assert (float(other.total), float(other.mass)) == (float(repeat.total), float(repeat.mass))
+        assert float(repeat.mass) == float(three.mass)
+
+        def total(params, objective=objective, variables=variables):
+            return objective.loss({**variables, "params": params}, repeats, step)[0].total
+
+        empty, _ = objective.loss(variables, repeats, step)
+        assert (float(empty.total), float(empty.mass)) == (0.0, 0.0)
+        gradient = jax.grad(total)(variables["params"])
+        assert not any(np.any(np.asarray(leaf)) for leaf in jax.tree.leaves(gradient))
+
+
+def test_an_updates_corruption_is_each_clips_own_however_the_update_is_split():
+    """Each clip's corruption (the tokenizer's mask rate and patch mask, the world model's step size,
+    signal level and noise) is drawn from the update's example key at the clip's place (`Step.sample`),
+    what it derives kept at its boundaries, so an update of four clips read whole or as two microbatches of
+    two, each attempt's key its own, records the same draws and boundaries for every clip (row 4147: they
+    were drawn batch-wide from each attempt's key)."""
+    from dew.objectives.base import Recorder, Step
+
+    video = jnp.asarray(np.random.default_rng(13).uniform(-1, 1, (4, 4, 8, 8, 1)), jnp.float32)
+    update = jax.random.key(14)
+
+    def recorded(objective, variables, parts):
+        recorder = Recorder()
+        for rows, attempt in parts:
+            step = Step(jnp.asarray(0), jax.random.key(attempt), None, example_key=update,
+                        example_index=jnp.asarray(rows, jnp.int32), example_count=4, recorder=recorder)
+            objective.loss(variables, {"video": video[np.asarray(rows)]}, step)
+        return recorder.tape(4)
+
+    for objective, variables in _objectives():
+        whole = recorded(objective, variables, [([0, 1, 2, 3], 15)])
+        split = recorded(objective, variables, [([0, 1], 16), ([2, 3], 17)])
+        assert whole and set(whole) == set(split)
+        for name, tape in whole.items():
+            np.testing.assert_array_equal(tape, split[name], err_msg=name)
+
+
+def test_a_tokenizers_patches_are_each_frames_row_major_pixels_whatever_its_leading_axes():
+    """The tokenizer patches each frame of a clip batch `[B, T, H, W, C]` as `nn.scan_orders.patchify` does
+    one image (row 4150: it kept its own reshape): pixel (r, c, k) at patch (r // p) * (W / p) + c // p,
+    place ((r % p) * p + c % p) * C + k, and unpatching returns the frames."""
+    from dew.objectives.world_model import CausalTokenizer
+
+    tokenizer = CausalTokenizer((8, 12, 2), patch=4)
+    frames = jnp.arange(2 * 3 * 8 * 12 * 2, dtype=jnp.float32).reshape(2, 3, 8, 12, 2)
+    patches = np.asarray(tokenizer._patchify(frames))
+    assert patches.shape == (2, 3, 6, 32)
+    r, c, k = np.meshgrid(np.arange(8), np.arange(12), np.arange(2), indexing="ij")
+    placed = np.zeros_like(patches)
+    placed[:, :, (r // 4) * 3 + c // 4, ((r % 4) * 4 + c % 4) * 2 + k] = np.asarray(frames)
+    np.testing.assert_array_equal(patches, placed)
+    np.testing.assert_array_equal(np.asarray(tokenizer._unpatchify(jnp.asarray(patches))), np.asarray(frames))
+
+
+def test_a_world_models_tokenizer_rides_in_its_state_and_its_loss_reads_it_there():
+    """The world model's frozen tokenizer is state (row 4148: it lived on the objective, a compiled constant
+    outside the tree placement and checkpoints share): the drawn tree holds the given weights beside the
+    dynamics' under its own collection, which the optimizer never sees, and the loss encodes with the
+    weights the tree holds, other weights giving another loss."""
+    from dew.batch import unboxed
+    from dew.objectives.base import Step
+    from dew.objectives.world_model import TOKENIZER, WorldModelObjective
+
+    tokenizer, tokens, dynamics = _tiny_models()
+    objective = WorldModelObjective(dynamics, tokenizer, tokens)
+    variables = objective.init(jax.random.key(5))
+    tokens = unboxed(tokens)
+    assert jax.tree.structure(variables[TOKENIZER]) == jax.tree.structure(tokens)
+    for held, given in zip(jax.tree.leaves(variables[TOKENIZER]), jax.tree.leaves(tokens), strict=True):
+        np.testing.assert_array_equal(np.asarray(held), np.asarray(given))
+    assert TOKENIZER not in variables["params"]
+    # The dynamics model's own tree, what another objective over it starts from, holds no tokenizer (row
+    # 4224: `model_variables` returned it too).
+    assert set(objective.model_variables(variables)) == set(variables) - {TOKENIZER}
+    video = jnp.asarray(np.random.default_rng(18).uniform(-1, 1, (2, 4, 8, 8, 1)), jnp.float32)
+    step = Step(jnp.asarray(0), jax.random.key(19), None)
+    other = tokenizer.init(jax.random.key(20), jnp.zeros((1, 8, 8, 1)))
+    held, _ = objective.loss(variables, {"video": video}, step)
+    swapped, _ = objective.loss({**variables, TOKENIZER: other}, {"video": video}, step)
+    assert float(held.total) != float(swapped.total)

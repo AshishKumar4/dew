@@ -17,8 +17,11 @@ from `hybrid_layer_pattern` and `moe_layer_freq`, each kind's geometry from
 the `swa_*` fields, and a sink per head on the kinds whose flag asks for
 one. Its Pro release stores each layer's q, k and v projections fused,
 pre-sharded over the key heads (`attention_projection_layout` 'fused_qkv',
-vLLM's `_shard_fp8_qkv_proj` at 78b32b3), and its towers and prediction
-layers ride along unread and are written back.
+vLLM's `_shard_fp8_qkv_proj` at 78b32b3). A release with its towers is a bundle
+its family reads whole (`DecoderFamily.wrapper`): the ViT and its merger, and the
+audio encoder over the codes of the audio tokenizer the release keeps in a folder
+of its own; the decoder read alone leaves them, and its prediction layers, unread
+and writes them back.
 """
 
 from __future__ import annotations
@@ -30,7 +33,10 @@ from dew import _records
 from dew.interop import release_pins
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
+    NO_AUDIO,
     PLAIN_SPELLING,
+    PREDICTION_INPUTS,
+    PREDICTION_STEP_END,
     DecoderFamily,
     DecoderFields,
     KindFields,
@@ -38,19 +44,28 @@ from dew.interop.decoder_parts import (
     Renames,
     Ropes,
     SourceCode,
+    WrapperFields,
     base_config,
     decoder_kinds,
+    folder_config,
+    folder_name,
     grouped_qkv,
     nested_ramp,
     partial_rope_entry,
     plain_partial_rope,
+    prediction_path,
+    record_int,
     refuse,
     renamed_name,
     renamed_path,
+    translated,
 )
 from dew.interop.families.deepseek import deepseek_layout, deepseek_mixture
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
+from dew.nn.mimo_audio import AUDIO_TOKENIZER, translate_mimo_audio_config
+from dew.nn.mixers.mlp import MLPMixer
+from dew.nn.vision.mimo import translate_mimo_projector_config, translate_mimo_vision_config
 
 _KINDS = ('full_attention', 'sliding_attention')
 
@@ -261,12 +276,15 @@ _V2_FIELDS = ('swa_num_attention_heads', 'swa_num_key_value_heads', 'swa_head_di
               'add_swa_attention_sink_bias', 'attention_projection_layout', 'attention_value_scale',
               'v_head_dim', 'partial_rotary_factor', 'rope_parameters', 'rope_theta', 'norm_topk_prob',
               'scoring_func', 'topk_method', 'attention_dropout')
+_AUDIO_TOKENIZER = AUDIO_TOKENIZER
+
 _V2_UNREAD = ('attention_chunk_size', 'moe_router_dtype', 'audio_config', 'vision_config', 'processor_config',
               'vision_model_type', 'audio_token_id', 'audio_start_token_id', 'audio_end_token_id',
-              'image_token_id', 'video_token_id', 'vision_start_token_id', 'vision_end_token_id')
+              'image_token_id', 'video_token_id', 'vision_start_token_id', 'vision_end_token_id',
+              folder_config(_AUDIO_TOKENIZER))
 """Fields MiMoV2ForCausalLM's text decoder never reads: the chunk the window
 is restated as, the router dtype its fp32 gate ignores (modeling_mimo_v2.py:153),
-and the towers' sections and tokens, whose tensors ride unread."""
+and the towers' sections, tokens and folder, whose tensors ride unread."""
 
 
 def _layer_flags(hf: Mapping[str, object], used: set[str],
@@ -317,16 +335,27 @@ def _mimo_v2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
            'swa_head_dim': (swa_head_dim, head_dim),
            'swa_v_head_dim': (_records.integer(hf.get('swa_v_head_dim') or swa_head_dim, 'swa_v_head_dim'),
                               value_dim)}
-    for key, (stated, full) in swa.items():
-        if stated != full and 'sliding_attention' in layers:
-            refuse(f'{key} {stated}', f"Dew's sliding layers hold the full layers' {full}; "
-                                      'its kinds differ in key heads alone')
+    # The prediction depths: the count a config states (Dew's export of one, 0 where it holds none), else
+    # the one depth the release's code skips on load and vLLM drafts with (mimo_v2_mtp.py at 19aba3e,
+    # `MiMoV2MTPLayer`, one layer for the Pro and the Flash alike) where its trunk has sliding layers, as
+    # every release's does. Each attends with the sliding geometry the config states, whatever the trunk's
+    # pattern, which the sliding layers read too.
+    slides = 'sliding_attention' in layers
+    depths = _records.integer(hf.get('num_nextn_predict_layers', int(slides)), 'num_nextn_predict_layers')
+    used.add('num_nextn_predict_layers')
     swa_kv_heads = _records.integer(hf.get('swa_num_key_value_heads') or kv_heads,
                                    'swa_num_key_value_heads')
     layout = hf.get('attention_projection_layout') or 'split'
     if layout not in ('split', 'fused_qkv'):
         refuse(f'attention_projection_layout {layout!r}', "MiMoV2Attention stores 'split' or 'fused_qkv'")
-    if layout == 'fused_qkv' and swa_kv_heads != kv_heads and 'sliding_attention' in layers:
+    for key, (stated, full) in swa.items():
+        if stated != full and slides:
+            refuse(f'{key} {stated}', f"Dew's sliding layers hold the full layers' {full}; "
+                                      'its kinds differ in key heads alone')
+        # A prediction layer's own kind takes its query heads and width; its values are the model's.
+        if stated != full and depths and key == 'swa_v_head_dim':
+            refuse(f'{key} {stated}', f"a prediction layer's values are the model's {full} wide")
+    if layout == 'fused_qkv' and swa_kv_heads != kv_heads and slides:
         refuse('attention_projection_layout fused_qkv', 'its runs are one geometry for every layer here, '
                f'not {kv_heads} key heads on the full layers and {swa_kv_heads} on the sliding ones')
     window = hf.get('sliding_window') or hf.get('sliding_window_size')
@@ -353,20 +382,148 @@ def _mimo_v2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         # A windowed kind rotates whole heads unless it states its own
         # factor (`LayerKind`); MiMoV2Attention turns the same third of both.
         kinds['sliding_attention'].update(num_kv_heads=swa_kv_heads, partial_rotary_factor=factor)
+    # A prediction depth attends with the sliding layers' kind, or where no trunk layer slides with a kind
+    # of its own of the sliding geometry (its query and key heads, width, window, base, sinks and rotary),
+    # over a dense feed-forward at `intermediate_size`. A checkpoint without its tensors holds none
+    # (`hf_decoders.held_depths`).
+    attending = 'sliding_attention' if slides else _PREDICTION_ATTENTION
+    if depths and not slides:
+        predictor = native_fields(LayerKind)(
+            window=None if window is None else _records.integer(window, 'sliding_window'),
+            rope_theta=local_theta, num_heads=swa['swa_num_attention_heads'][0], head_dim=swa_head_dim,
+            num_kv_heads=swa_kv_heads, partial_rotary_factor=factor)
+        if _records.boolean(hf.get('add_swa_attention_sink_bias', False), 'add_swa_attention_sink_bias'):
+            predictor['sinks'] = True
+        kinds[_PREDICTION_ATTENTION] = predictor
+    if depths:
+        kinds[_PREDICTION_FEEDFORWARD] = native_fields(LayerKind)(mixer=MLPMixer(
+            intermediate_size=_records.integer(config['mlp_features'], 'intermediate_size'),
+            activation=_records.text(config['mlp'], 'hidden_act')))
+    # Each depth's residual plain, as a record a load keeps the trunk alone of states it too.
+    config.update(num_nextn_predict_layers=depths, mtp_layer_type=attending if depths else None,
+                  mtp_feedforward_type=_PREDICTION_FEEDFORWARD if depths else None,
+                  mtp_hyper_connections=None)
     return _attention_and_experts(config, hf, used, kinds, value_dim=value_dim,
                                   scale=None, factor=factor, count=count,
                                   sparse=sparse)
 
 
-_FUSED_QKV = grouped_qkv('.self_attn.qkv_proj')
+def _prediction_geometry(name: str, config: Mapping[str, object]) -> Mapping[str, object]:
+    """The geometry a fused projection's runs take for tensor `name`: a prediction layer's own kind's
+    query and key heads and width where it states them (`_PREDICTION_ATTENTION`), else the model's."""
+    if _prediction_depth(name, config) is None or config.get('mtp_layer_type') != _PREDICTION_ATTENTION:
+        return config
+    kind = _records.record(_records.record(config['kinds'], 'kinds')[_PREDICTION_ATTENTION], 'kind')
+    return {**config, **{field: kind[field] for field in ('num_heads', 'head_dim', 'num_kv_heads')
+                         if kind.get(field) is not None}}
+
+
+_FUSED_QKV = grouped_qkv('.self_attn.qkv_proj', owner=_prediction_geometry)
+
+_PREDICTION_FEEDFORWARD = 'prediction_feedforward'
+"""The kind whose MLP mixer is the prediction depth's dense feed-forward, in no layer of the trunk."""
+
+_PREDICTION_ATTENTION = 'prediction_attention'
+"""The kind of a prediction depth's attention where no trunk layer slides: the sliding geometry the config
+states, in no layer of the trunk."""
+
+_PREDICTION_LEAVES = {**PREDICTION_INPUTS, **PREDICTION_STEP_END}
+"""A prediction depth's own leaves by their names past `model.mtp.layers.{d}.` (vLLM's
+`MiMoV2MTPLayer`): its normed inputs, their projection and its output norm, `final_layernorm`."""
+
+_PREDICTION_NAMES = (('pre_mlp_layernorm', 'post_attention_layernorm'),)
+"""A prediction depth's block norm under vLLM's name for it, and the trunk layer's."""
+
+
+def _prediction_depth(name: str, config: Mapping[str, object]) -> int | None:
+    """The prediction depth of a `model.mtp.layers.{d}.*` tensor, or None for any other."""
+    parts = name.split('.')
+    if len(parts) > 4 and parts[:3] == ['model', 'mtp', 'layers'] and parts[3].isdigit():
+        return int(parts[3])
+    return None
 
 
 def _mimo_v2_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """The shared map under the family's names; the prediction layers, which the reference skips
-    on load, and the towers, which the text decoder never runs, have no place."""
-    if name.startswith(('model.mtp.', 'visual.', 'audio_encoder.', 'speech_embeddings.')):
+    """The shared map under the family's names; a prediction depth's tensors under its own leaves, its
+    block's as the trunk's layer 0's (`prediction_path`), or no place for a model that builds none; and
+    no place for the towers and the audio tokenizer's folder, which the text decoder never runs."""
+    depth = _prediction_depth(name, config)
+    if depth is not None:
+        declared = _records.integer(config.get('num_nextn_predict_layers', 0), 'num_nextn_predict_layers')
+        if not declared:
+            return None
+        tail = '.'.join(name.split('.')[4:])
+
+        def block(tail: str) -> tuple[str, ...] | None:
+            for vllm, trunk in _PREDICTION_NAMES:
+                tail = tail.replace(vllm, trunk)
+            return _mimo_v2_path(f'model.layers.0.{tail}', config)
+        return prediction_path(name, 'mtp', depth, declared, tail, _PREDICTION_LEAVES, block)
+    if name.startswith(('visual.', 'audio_encoder.', 'speech_embeddings.',
+                        folder_name(_AUDIO_TOKENIZER, ''))):
         return None
     return renamed_path(_NAMES, name, config)
+
+
+def _mimo_v2_name(dew_name: str, config: Mapping[str, object]) -> str | None:
+    """`_mimo_v2_path` backwards: a prediction depth's leaf under its `model.mtp.layers.{d}.` name, any
+    other under the shared map's."""
+    parts = dew_name.split('.')
+    if not parts[0].startswith('mtp_'):
+        return renamed_name(_NAMES, dew_name, config)
+    stem = f"model.mtp.layers.{parts[0].removeprefix('mtp_')}."
+    own = {path: name for name, path in _PREDICTION_LEAVES.items()}.get(tuple(parts[1:]))
+    if own is not None:
+        return stem + own
+    trunk = renamed_name(_NAMES, '.'.join(('layers_0', *parts[2:])), config)
+    if trunk is None:
+        return None
+    tail = trunk.removeprefix('model.layers.0.')
+    for vllm, layer in _PREDICTION_NAMES:
+        tail = tail.replace(layer, vllm)
+    return stem + tail
+
+
+def _mimo_v2_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
+    """Read a MiMo-V2.6 bundle (MiMoV2ForCausalLM at 6a7f202): its decoder at the config's root, the ViT
+    and its merger (`visual.`) and the audio encoder (`audio_encoder.`, `speech_embeddings.`) over the
+    codes of the tokenizer in its folder, whose config the source carries beside its own
+    (`DecoderFamily.wrapper_folders`). Images, a video's frames and audio clips fill their placeholders
+    (`_get_multimodal_embeds`), each token one position on (`MiMoV2Model.forward`); the encoder projects
+    to the decoder's width itself, through no projector of the wrapper's."""
+    text = translated(hf_config, MIMO_V2)
+    # The decoder's translation read every field at the root or refused it.
+    used.update(hf_config)
+    width = record_int(text, 'emb_features')
+    # A section that states nothing builds no tower (MiMoV2ForCausalLM tests each for truth).
+    vision = bool(hf_config.get('vision_config'))
+    fields: WrapperFields = {
+        'model_type': 'mimo_v2', 'text_model_type': 'mimo_v2', 'text': text,
+        'tower': translate_mimo_vision_config(hf_config) if vision else None,
+        'projector': translate_mimo_projector_config(hf_config, width) if vision else None,
+        'image_token_id': (record_int(hf_config, 'image_token_id')
+                           if vision or hf_config.get('image_token_id') is not None else None),
+        'tokens_per_image': None,
+        'video_token_id': (None if hf_config.get('video_token_id') is None
+                           else record_int(hf_config, 'video_token_id')),
+        'extra_placeholder_ids': (), 'text_unprefixed': ('embed_tokens.', 'layers.', 'norm.', 'mtp.'),
+        **NO_AUDIO}
+    stated = hf_config.get('audio_config') or None
+    tokenizer = hf_config.get(folder_config(_AUDIO_TOKENIZER))
+    if stated is not None and tokenizer is None:
+        # The language model alone loads (`text_only`); a whole load is refused by the encoder's name.
+        fields['unported'] = dict.fromkeys(('audio_encoder.', 'speech_embeddings.'),
+                                           f"the audio encoder reads the codes of the tokenizer in the "
+                                           f"release's {_AUDIO_TOKENIZER} folder, which this source lacks")
+    elif stated is not None:
+        record = translate_mimo_audio_config(_records.record(stated, 'audio_config'),
+                                             _records.record(tokenizer, folder_config(_AUDIO_TOKENIZER)))
+        projected = record_int(_records.record(record['fields'], 'audio fields'), 'out_hidden_size')
+        if projected != width:
+            refuse(f'audio_config.out_hidden_size {projected}', f'the decoder embeds {width} wide')
+        fields['audio'] = record
+        fields['audio_token_id'] = record_int(hf_config, 'audio_token_id')
+    return fields
 
 
 def _mimo_v2_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -376,7 +533,10 @@ def _mimo_v2_export(model: CausalTransformer) -> Mapping[str, object]:
     stored apart ('split'); the shared fields it does not read (`layer_types`, `rms_norm_eps`,
     `rope_local_base_freq`) written as nothing."""
     types = model.per_layer_types
-    sliding = model.kind_of('sliding_attention') if 'sliding_attention' in types else None
+    # The sliding geometry: the sliding layers', or where none slides, a prediction depth's own.
+    stating = ('sliding_attention' if 'sliding_attention' in types
+               else model.mtp_layer_type if model.num_nextn_predict_layers else None)
+    sliding = None if stating is None else model.kind_of(stating)
     full = model.kind_of('full_attention') if 'full_attention' in types else None
     mixture = model.mixture
     return {
@@ -387,7 +547,8 @@ def _mimo_v2_export(model: CausalTransformer) -> Mapping[str, object]:
                            for index in range(model.num_layers)],
         # A sliding kind's geometry, every field stated: its value width defaults to its key width.
         **({} if sliding is None else {
-            'swa_num_attention_heads': model.num_heads, 'swa_head_dim': model.features_per_head,
+            'swa_num_attention_heads': sliding.num_heads or model.num_heads,
+            'swa_head_dim': sliding.head_dim or model.features_per_head,
             'swa_v_head_dim': model.value_head_dim, 'swa_num_key_value_heads': sliding.num_kv_heads}),
         'swa_rope_theta': None if sliding is None else sliding.rope_theta,
         'sliding_window_size': None if sliding is None else sliding.window,
@@ -396,12 +557,16 @@ def _mimo_v2_export(model: CausalTransformer) -> Mapping[str, object]:
         'v_head_dim': model.value_head_dim, 'attention_value_scale': model.value_scale,
         'partial_rotary_factor': model.partial_rotary_factor or 1.0,
         'attention_projection_layout': 'split', 'scoring_func': 'sigmoid', 'topk_method': 'noaux_tc',
-        'attention_dropout': model.attention_dropout_rate, **_experts(model)}
+        'attention_dropout': model.attention_dropout_rate,
+        # The depths it holds, which the release's config does not state: a reader takes one where none is.
+        'num_nextn_predict_layers': model.num_nextn_predict_layers, **_experts(model)}
 
 
 MIMO_V2 = DecoderFamily(
     ('mimo_v2',), _mimo_v2_config, _matches, 'mimo_v2', 'MiMoV2ForCausalLM',
-    _mimo_v2_export, weight_path=_mimo_v2_path, export_path=partial(renamed_name, _NAMES),
+    _mimo_v2_export, weight_path=_mimo_v2_path, export_path=_mimo_v2_name,
+    prediction_depth=_prediction_depth,
     packed=_FUSED_QKV, packs=lambda config: config.get('attention_projection_layout') == 'fused_qkv',
     preserve_source_layout=True, release_code=SourceCode(*release_pins.MIMO_V2),
+    wrapper=_mimo_v2_wrapper, wrapper_folders=(_AUDIO_TOKENIZER,),
 )

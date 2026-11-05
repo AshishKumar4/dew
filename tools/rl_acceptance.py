@@ -453,7 +453,7 @@ def dreamer4(
         trained = prepared.train(f"dreamer4-{name}")
         objective = prepared.objective
         assert isinstance(objective, WorldModelObjective)
-        latents = objective.latents(jnp.asarray(held))
+        latents = objective.latents(trained.variables, jnp.asarray(held))
         for steps in (4, 64):
             predicted = objective.generate(
                 trained.variables, latents[:, :context], horizon, jax.random.key(2), steps=steps
