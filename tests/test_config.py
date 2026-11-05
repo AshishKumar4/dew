@@ -465,6 +465,29 @@ def test_every_run_profiles_a_short_window_of_its_own_steps_kept_with_its_record
     assert not (inside / "profile").exists()
 
 
+def test_a_runs_own_window_whose_manifest_is_not_written_leaves_the_run_training(tmp_path, monkeypatch,
+                                                                                 caplog):
+    """A run's own profile window is a diagnostic of the run's: where its capture's manifest cannot be
+    written as it stops (`dew.telemetry.profile.ExportFailed`), the run logs it and trains to its end, where
+    a window the run names fails it as before (train 607's review)."""
+    import logging
+
+    from dew.telemetry import profile as telemetry_profile
+
+    def unwritable(capture, metadata, reports):
+        raise OSError("the profile's directory is read-only")
+
+    monkeypatch.setattr(telemetry_profile, "_manifest", unwritable)
+    config = TrainerConfig(name="diagnosed", checkpoint_dir=str(tmp_path / "runs"), steps=14, eval_every=None,
+                           checkpoint_every=None)
+    loader = Loader(lambda partition: batches(), None, None, 8)
+    with caplog.at_level(logging.WARNING, logger="dew"):
+        state = RunConfig(trainer=config).train(Regression(), loader, name="diagnosed")
+    assert int(state.step) == 14
+    assert any(record.name == "dew.training.profiling" and record.levelno == logging.WARNING
+               for record in caplog.records)
+
+
 def test_a_trainer_given_a_window_naming_no_directory_traces_into_one_of_its_own(tmp_path):
     """A trainer given a profile window that names no directory traces it into a directory of the
     profiler's own (`dew.Profiler`'s), which its `ProfileTraced` record names, where it refused to run

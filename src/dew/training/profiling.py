@@ -10,6 +10,7 @@ import dataclasses
 import functools
 import gzip
 import json
+import logging
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -24,6 +25,9 @@ if TYPE_CHECKING:
     import jax
 
     from dew.telemetry.profile import Profiler
+
+
+_log = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -149,14 +153,17 @@ def start_capture(profiler: "Profiler") -> None:
         raise
 
 
-def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
-    """Stop the window's owned capture on every rank.
+def stop_capture(profiler: "Profiler", loss: "jax.Array | None", window: ProfileWindow) -> None:
+    """Stop `window`'s owned capture on every rank.
 
     The core Profiler drains the backend and stops the trace here, and
     exports its native reports in a process of its own while the run
     trains on (`Profiler.stop`, row 2017), which the run's cleanup waits
     for (`dew.telemetry.profile.exported`). The run's last `loss` is blocked
-    on only to order the primary's failure ahead of the profiler's own drain."""
+    on only to order the primary's failure ahead of the profiler's own drain.
+    A window that reports nothing writes its manifest as it stops, a
+    diagnostic of the run's: its write failing is logged, and the run trains
+    on (`dew.telemetry.profile.ExportFailed`)."""
     def stop() -> None:
         try:
             if loss is not None:
@@ -165,6 +172,11 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
             primary = sys.exception()
             try:
                 profiler.stop(wait=False)
+            except telemetry_profile.ExportFailed as failure:
+                if window.reports:
+                    raise
+                _log.warning("the run's profile window traced, and its manifest was not written: %s (%s)",
+                             failure, failure.__cause__)
             except BaseException as failure:
                 if primary is None:
                     raise
@@ -173,13 +185,21 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
     agreed("profile stop", stop)
 
 
-def waited_export(window: ProfileWindow | None) -> Callable[[], None] | None:
-    """What a fit's cleanup waits for of its `window`'s capture: this rank's export of the reports it
-    converts (`dew.telemetry.profile.exported`), a failed one failing every rank at the run's outcome's
-    agreement; none for a window that reports nothing, whose manifest its stop wrote."""
-    if window is None or not window.reports:
+def waited_export(window: ProfileWindow | None, profiler: "Profiler | None") -> Callable[[], None] | None:
+    """What a fit's cleanup waits for of its `window`'s capture by `profiler`: this rank's export of the
+    reports it converts, of the captures under the profiler's own directory alone
+    (`dew.telemetry.profile.exported`), a failed one failing every rank at the run's outcome's agreement;
+    none for a window that reports nothing, whose manifest its stop wrote, or that never started."""
+    if window is None or not window.reports or profiler is None:
         return None
-    return functools.partial(telemetry_profile.exported, window.directory)
+    return functools.partial(_exported_under, profiler)
+
+
+def _exported_under(profiler: "Profiler") -> None:
+    """`profiler`'s exports waited for, under the directory it captured into once it started; none where it
+    never did."""
+    if profiler.directory is not None:
+        telemetry_profile.exported(profiler.directory)
 
 
 def reported_window(report: Callable[[Record, int], None], note: Callable[[str], None],
