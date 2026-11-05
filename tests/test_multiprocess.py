@@ -680,7 +680,7 @@ def test_every_process_plans_from_the_tightest_room_any_of_their_devices_leaves(
     devices leave four microbatches room to the byte on one and a byte less on the other, each judges four
     to refuse and compiles eight first, the plan the other compiles, where judged apart one would have
     compiled four and the other eight."""
-    reports = run_pool("plan_agreement", tmp_path, 2, fsdp_size=2)
+    reports = run_pool("agreement", tmp_path, 2, script=Path(__file__).with_name("plan_worker.py"), devices=1)
     first, second = reports
     assert first["need"] == second["need"]
     assert first["derived"] == second["derived"] and first["derived"]["4"] == -1

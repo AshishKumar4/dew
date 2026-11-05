@@ -406,11 +406,13 @@ def test_a_plan_search_keeps_the_freeze_a_process_made_before_it():
     """A plan search holds the objects alive before it out of Python's collector while it runs
     (`held_objects`) and returns them after; a process that froze objects of its own before the search, as
     one that forks its workers does, finds them frozen after it as before, the search freezing nothing
-    more, in a fresh interpreter whose freeze is its own (row 3341's review)."""
+    more, in a fresh interpreter whose freeze is its own: one that a forking server started from holds its
+    server's frozen objects, given back first (row 3341's review)."""
     assert_exits_cleanly("""
 import gc
 from dew.nn.kernels.options import held_objects
 
+gc.unfreeze()
 gc.collect()
 assert gc.get_freeze_count() == 0, gc.get_freeze_count()
 with held_objects():
