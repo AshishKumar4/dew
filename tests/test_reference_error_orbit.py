@@ -203,6 +203,15 @@ def test_a_worst_row_one_element_rules_takes_one_values_factor():
                            np.ones((8, 1), bool), (width,), shares=shares)
             over, _ = _judgement(draws, "leaf")
             assert bool(over) == fails, (width, shares)
+        # Joined from a chunk whose shares are all unknown (a map task's draws, a stage's), the factor is the
+        # whole run's: the known chunk holds both maxima.
+        ruled_chunk = _Draws(["leaf"], np.ones((4, 1)), np.ones((4, 1)),
+                             np.tile([[[np.log(worst), 0.0]]], (4, 1, 1)), [[NO_ZERO_ROWS]] * 4,
+                             np.ones((4, 1), bool), (width,), shares=np.tile([[[ruled, ruled]]], (4, 1, 1)))
+        unknown = _Draws(["leaf"], np.ones((4, 1)), np.ones((4, 1)), np.zeros((4, 1, 2)),
+                         [[NO_ZERO_ROWS]] * 4, np.ones((4, 1), bool), (width,))
+        for joined in (unknown.joined(ruled_chunk), ruled_chunk.joined(unknown)):
+            assert joined.factor(0) == ruled_chunk.factor(0) == NARROW_FACTORS[1]
         # A site of stacked examples judges their paired worst rows at its width's factor whatever the shares:
         # Dew's rows ten times the reference's on every example fail, however one value rules each.
         tenfold = [[np.full(32, np.log(10.0))] for _ in range(8)]

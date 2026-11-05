@@ -1095,12 +1095,11 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     return [first, *drawn[len(arms) - len(also):]] if also else first
 
 
-def _shares(found: list[list], count: int) -> np.ndarray | None:
+def _shares(found: list[list], count: int) -> np.ndarray:
     """The worst rows' shares over a run's seeds (`_Draws.shares`, seed by leaf by arm), NaN where one is
-    unknown (a recording's summary keeps no row's elements), None where every one is."""
-    held = np.asarray([[[np.nan if share is None else share for share in pair] for pair in seed]
+    unknown (a recording's summary keeps no row's elements)."""
+    return np.asarray([[[np.nan if share is None else share for share in pair] for pair in seed]
                        for seed in found], np.float64).reshape(count, -1, 2)
-    return None if np.isnan(held).all() else held
 
 
 def _example_ratios(leaves, references, truths) -> list[np.ndarray | None]:

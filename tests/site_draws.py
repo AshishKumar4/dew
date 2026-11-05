@@ -33,7 +33,7 @@ class _Draws:
     """The share of each seed's worst row's squared error its largest element carries, Dew's and the
     reference's (seed by leaf by arm, as `worst`), zero where no row is sized and NaN where it is unknown (a
     recording's summary keeps no row's elements, a row of float64 zero a live reference measured); None
-    where every one is unknown."""
+    where none was kept (`held_shares`)."""
 
     def factor(self, index: int) -> float:
         """The worst-row rule's factor for leaf `index` (its maximum's, `_judgement`): its rows' width's
@@ -41,18 +41,22 @@ class _Draws:
         past RULED_SHARE of both Dew's worst row and the reference's over these draws, the two rows one
         value rules alike. A share unknown keeps the width's."""
         width = self.widths[index]
-        if width > 2 and self.shares is not None:
+        if width > 2:
+            shares = self.held_shares()
             mine, theirs = (int(np.argmax(self.worst[:, index, arm])) for arm in (0, 1))
-            if self.shares[mine, index, 0] > RULED_SHARE and self.shares[theirs, index, 1] > RULED_SHARE:
+            if shares[mine, index, 0] > RULED_SHARE and shares[theirs, index, 1] > RULED_SHARE:
                 return row_factor(1)
         return row_factor(width)
+
+    def held_shares(self) -> np.ndarray:
+        """`shares`, every cell unknown (NaN) where none was kept, so draws join and pick per cell."""
+        return np.full(self.worst.shape, np.nan) if self.shares is None else self.shares
 
     def joined(self, other: "_Draws") -> "_Draws":
         examples, example_rows = ((getattr(self, field) + getattr(other, field)
                                    if getattr(self, field) is not None and getattr(other, field) is not None
                                    else None) for field in ("examples", "example_rows"))
-        shares = (np.concatenate([self.shares, other.shares])
-                  if self.shares is not None and other.shares is not None else None)
+        shares = np.concatenate([self.held_shares(), other.held_shares()])
         return _Draws(self.names, *(np.concatenate([getattr(self, field), getattr(other, field)])
                                     for field in ("mine", "theirs", "worst")),
                       self.zero_rows + other.zero_rows, np.concatenate([self.finite, other.finite]),
@@ -107,11 +111,8 @@ class _Draws:
                      for seed, other, picked in zip(self.zero_rows, library.zero_rows, pick, strict=True)]
         # A library arm's leaves are judged by their pooled ratio alone: their examples are not Dew's against
         # one reference.
-        # A picked cell's worst row is the library arm's, and so is its share (unknown where it keeps none).
-        shares = None
-        if self.shares is not None:
-            theirs = np.full(pick.shape, np.nan) if library.shares is None else library.shares[..., 1]
-            shares = self.shares.copy()
-            shares[..., 1] = np.where(pick, theirs, self.shares[..., 1])
+        # A picked cell's worst row is the library arm's, and so is its share.
+        shares = self.held_shares().copy()
+        shares[..., 1] = np.where(pick, library.held_shares()[..., 1], shares[..., 1])
         return _Draws(self.names, self.mine, np.where(pick, library.theirs, self.theirs), worst, zero_rows,
                       self.finite & (library.finite | ~covered), self.widths, shares=shares)
