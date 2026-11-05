@@ -44,7 +44,7 @@ import dataclasses
 import functools
 import logging
 import math
-from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence, Sized
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, overload
 
 import jax
@@ -665,7 +665,7 @@ class _Numbering:
 
         params = equation.params
         if equation.primitive.name == "scan":
-            counts = _scan_counts(params)
+            counts = _scan_counts(equation)
             if counts is None:
                 return None
             consts, carries = counts
@@ -707,17 +707,35 @@ class _Numbering:
         return chosen
 
 
-def _scan_counts(params: Mapping) -> tuple[int, int] | None:
-    """A loop's (`scan`) count of constants and of carried values among its operands, as its parameters
-    state them: by count, or as the flat trees of its constants, carries and scanned values a JAX that
-    names them so holds (`ft_in`); None where they state neither."""
+def _scan_counts(equation) -> tuple[int, int] | None:
+    """A loop's (`scan`) count of constants and of carried values among its operands: as its parameters
+    state them where they do (`num_consts`, `num_carry`), else the one split its program's values allow,
+    each constant and carry its program's own, each scanned value and each stacked result its program's
+    a step, `length` steps of it; None where none or several do."""
+    params = equation.params
     if "num_consts" in params:
         return params["num_consts"], params["num_carry"]
-    trees = params.get("ft_in")
-    if isinstance(trees, Sized) and len(trees) == 3 and all(isinstance(tree, Sized) for tree in trees):
-        consts, carries, _ = trees
-        return len(consts), len(carries)
-    return None
+    body, length = params["jaxpr"].jaxpr, params["length"]
+    given, made = [var.aval for var in equation.invars], [var.aval for var in equation.outvars]
+    reads, writes = [var.aval for var in body.invars], [var.aval for var in body.outvars]
+
+    def alike(one, other) -> bool:
+        return tuple(one.shape) == tuple(other.shape) and one.dtype == other.dtype
+
+    def stepped(whole, step) -> bool:
+        return tuple(whole.shape) == (length, *step.shape) and whole.dtype == step.dtype
+
+    def fits(consts: int, carries: int) -> bool:
+        held = consts + carries
+        return (held <= len(given)
+                and all(map(alike, given[:held], reads[:held]))
+                and all(map(alike, writes[:carries], reads[consts:held]))
+                and all(map(stepped, given[held:], reads[held:]))
+                and all(map(stepped, made[carries:], writes[carries:])))
+
+    splits = [(consts, carries) for consts in range(len(given) + 1) for carries in range(len(made) + 1)
+              if fits(consts, carries)]
+    return splits[0] if len(splits) == 1 else None
 
 
 UNROLLED = 256
