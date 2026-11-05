@@ -528,7 +528,8 @@ def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trai
     # A decay masked by rank decides otherwise over a stacked leaf, whose bias is rank three.
     by_rank = optax.adamw(1e-3, mask=lambda params: jax.tree.map(lambda leaf: leaf.ndim > 1, params))
     for given in (optax.lamb(1e-3), optax.adafactor(1e-3), by_rank,
-                  OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3), doubled_gains(), spread_sums()):
+                  OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3), doubled_gains(),
+                  spread_sums()):
         # An OptimConfig's transformation is built over the run's length, which fit gives.
         assert saving(functools.partial(trainer, model, given, STAGED, 8, ema=None)) == 0
         run = trainer(model, given, STAGED, 8, ema=None)
