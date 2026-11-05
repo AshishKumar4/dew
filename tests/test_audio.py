@@ -75,8 +75,13 @@ def assert_bf16_tower_on_par(path, model, variables, features, real):
     wide = float64_twin(tower, lambda: Gemma4AudioModel(config).eval())
     narrow = tower.to(torch.bfloat16)
     mask = torch.from_numpy(np.asarray(features["input_features_mask"]))
-    lowered = jax.jit(lambda drawn: model.clone(dtype=jnp.bfloat16).apply(
-        variables, drawn, features["input_features_mask"]).features)
+    narrow_model, held = model.clone(dtype=jnp.bfloat16), jnp.asarray(real)[..., None]
+
+    def lowered(drawn):
+        # A padded frame is zero in every arm: its output is no frame's.
+        found = narrow_model.apply(variables, drawn, features["input_features_mask"]).features
+        return jnp.where(held, found.astype(jnp.float32), 0)
+
     shape = np.asarray(features["input_features"]).shape
 
     def draw(seed):
@@ -87,11 +92,10 @@ def assert_bf16_tower_on_par(path, model, variables, features, real):
         def run(drawn):
             with context(), torch.no_grad():
                 found = tower(torch.from_numpy(drawn).to(dtype), mask).last_hidden_state
-            return np.asarray(found.double().numpy())[real]
+            return np.where(real[..., None], found.double().numpy(), 0.0)
         return run
 
-    assert_as_exact(as_given(lambda drawn: np.asarray(lowered(jnp.asarray(drawn)), np.float64)[real]),
-                    reference(narrow, torch.bfloat16, contextlib.nullcontext), draw, "bf16 encoded",
+    assert_as_exact(lowered, reference(narrow, torch.bfloat16, contextlib.nullcontext), draw, "bf16 encoded",
                     seeds=BF16_TOWER_SEEDS, truth_fn=reference(wide, torch.float64, widened))
 
 

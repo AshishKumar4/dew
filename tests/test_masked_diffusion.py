@@ -268,6 +268,8 @@ def test_a_masked_family_unmasks_each_position_from_the_logits_its_reference_rea
     def draw(seed):
         return (np.random.default_rng([0x0D, seed]).integers(0, 120, shape).astype(np.int32),)
 
+    # The mask itself is never drawn: its log probability is exactly -inf at every position.
+    assert np.all(np.asarray(denoise(draw(0)[0], jnp.ones((1,)))[1])[..., 120] == -np.inf)
     assert_as_exact(lambda ids: denoise(ids, jnp.ones((1,)))[1][..., :120], unmasking(model, variables), draw,
                     f"{name} unmasking", seeds=UNMASKING_SEEDS,
                     truth_fn=unmasking(model.clone(dtype=jnp.float64), widened(variables)))

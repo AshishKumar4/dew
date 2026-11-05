@@ -23,9 +23,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact, chain_roundings
+from reference_error import assert_as_exact, assert_same_artifact, chain_roundings
 from test_chunked_cross_entropy import EXERCISED, eighths
 from test_moe import OUTPUT_TOLERANCE, ROUTER_TOLERANCE
+from test_text_encoders import transformers_clip
 from test_vae_16ch import TOLERANCE as VAE_TOLERANCE
 from tool_support import FIXTURES, REPO_ROOT, load
 
@@ -130,10 +131,11 @@ def test_moe_fixtures_are_what_the_generator_writes(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_clip_tiny_fixture_is_what_the_generator_writes(tmp_path):
-    """Exact checkpoint, tokenizer and pixels, and the recorded outputs' names, shapes and dtypes. The
-    outputs are transformers' float32 run of that checkpoint on those inputs, both exact here; their
-    accuracy is the consumers' to hold (check 1 against the towers' float64 run), not a second float32
-    run's to repeat (ledger 1305: no one-draw comparison)."""
+    """Exact checkpoint, tokenizer and pixels, and the recorded outputs' names, shapes and dtypes; each
+    output an evaluation of transformers' float32 towers on those inputs (`assert_same_artifact`, an
+    artifact check against the float64 run, not a parity)."""
+    import torch
+
     load("clip_reference").write_tiny(tmp_path)
 
     committed = FIXTURES / "clip" / "tiny"
@@ -145,6 +147,12 @@ def test_clip_tiny_fixture_is_what_the_generator_writes(tmp_path):
             assert (ours[name].shape, ours[name].dtype) == (theirs[name].shape, theirs[name].dtype), name
             if name not in CLIP_OUTPUTS:
                 np.testing.assert_array_equal(ours[name], theirs[name], err_msg=name)
+        inputs = dict(theirs)
+        recomputed, wide = (transformers_clip(tmp_path, inputs, dtype, CLIP_OUTPUTS)
+                            for dtype in (torch.float32, torch.float64))
+        for name in CLIP_OUTPUTS:
+            assert_same_artifact(np.asarray(recomputed[name], np.float64),
+                                 np.asarray(theirs[name], np.float64), wide[name], name)
 
 
 # ---------------------------------------------------------------------------

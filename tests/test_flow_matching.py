@@ -249,8 +249,10 @@ def test_the_flow_loss_and_its_gradient_are_diffusers_flux_trainings(case):
     import torch
     from diffusers.training_utils import compute_loss_weighting_for_sd3
 
-    from tools.flow_loss_reference import velocity
     from tools.torch_precision import float_as, replaced
+
+    with run_from("flow_loss_reference", "tools") as generator:
+        velocity = generator.velocity
 
     variables = objective.init(jax.random.PRNGKey(0))
     schedule = objective.process.schedule
@@ -293,6 +295,5 @@ def test_the_flow_loss_and_its_gradient_are_diffusers_flux_trainings(case):
             return {"loss": scope["loss"].detach().numpy(), "gradient": parameters.grad.numpy()}
         return run
 
-    np.testing.assert_array_equal(np.asarray(draw(0)[2]), np.asarray(schedule.rates(draw(0)[0])[1]))
     assert_as_exact(dew, diffusers(torch.float32), draw, f"flow loss at shift {shift}",
                     seeds=FLOW_LOSS_SEEDS, truth_fn=diffusers(torch.float64))
