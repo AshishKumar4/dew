@@ -154,36 +154,20 @@ _HELD_GUARD = threading.Lock()
 _THRESHOLDS: list[int] = []
 """Python's collection thresholds as the first open block of `held_objects` found them."""
 
-_FROZE = False
-"""Whether the first open block of `held_objects` froze the objects alive, the process having frozen none
-of its own."""
-
-_RUNTIME_FROZEN = gc.get_freeze_count()
-"""The objects Python's runtime holds frozen as this module is imported: CPython 3.12's immortal ones,
-which each collection returns to the permanent generation (375 in a fresh 3.12 interpreter, before and
-after an unfreeze and a collection). A freeze past them is the process's own."""
-
-
 @contextlib.contextmanager
 def held_objects() -> Iterator[None]:
-    """Within the block, the objects alive when the first open block began are frozen out of Python's
-    collector (`gc.freeze`), as a run's model, its state's specs and JAX's own tables are, and the youngest
-    generation collects every `TRACING_COLLECTIONS` allocations: a plan search's traces, compiles and
-    bookkeeping make millions of short-lived objects, and each full collection walked the long-lived ones
+    """Within the block, the youngest generation of Python's collector collects every
+    `TRACING_COLLECTIONS` allocations: a plan search's traces, compiles and bookkeeping make millions of
+    short-lived objects, and each full collection their collections led to walked the long-lived ones
     beside them (row 2440: 59 full collections paused a Qwen3.5-4B step's compile_ahead 73 s of 342,
-    FS2440-GC-PLAIN; held over the search, 7 paused it 7 s and it took 279, FS2440-GC-LIBRARY2; held over
-    each trace alone, it took 334, FS2440-GC-LIBRARY). Nested and concurrent blocks share one freeze; the
-    last to leave restores the thresholds and returns the frozen objects to the collector (`gc.unfreeze`).
-    A process that froze objects of its own before, more than its runtime holds frozen as this module is
-    imported (`_RUNTIME_FROZEN`), keeps its freeze as it made it: the block freezes nothing more, which no
-    unfreeze could part from the process's, and unfreezes nothing."""
-    global _HELD, _FROZE
+    FS2440-GC-PLAIN). The process's permanent generation is no part of it: a freeze is the process's own
+    to make and undo (one made before Dew was imported reads as CPython 3.12's own immortal objects do, which
+    each collection returns to it), so the block never freezes nor unfreezes. Nested and concurrent blocks
+    share one threshold; the last to leave restores the process's."""
+    global _HELD
     with _HELD_GUARD:
         if not _HELD:
             _THRESHOLDS[:] = gc.get_threshold()
-            _FROZE = gc.get_freeze_count() <= _RUNTIME_FROZEN
-            if _FROZE:
-                gc.freeze()
             gc.set_threshold(TRACING_COLLECTIONS, *_THRESHOLDS[1:])
         _HELD += 1
     try:
@@ -193,8 +177,6 @@ def held_objects() -> Iterator[None]:
             _HELD -= 1
             if not _HELD:
                 gc.set_threshold(*_THRESHOLDS)
-                if _FROZE:
-                    gc.unfreeze()
 
 
 type Placements = (Sharding | Format | None | tuple[Placements, ...] | Mapping[str, Placements]
