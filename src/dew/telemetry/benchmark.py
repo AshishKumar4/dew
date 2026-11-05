@@ -132,11 +132,14 @@ class DeviceTime:
 
     def __init__(self, cupti):
         self._cupti = cupti
-        self._last: tuple[Callable, tuple] | None = None
+        self._subscribed = False
 
     def kernels(self, fn: Callable, *args) -> tuple[KernelTime, ...]:
         """Each kernel one call of `fn(*args)` launched, in launch order, with its device milliseconds,
         once its output is ready. A call that launched none is refused: its time would read as zero."""
+        # Each read subscribes CUPTI, which only a finalizing read detaches from the process (`_detach`),
+        # whether this one reads, launches nothing or fails.
+        self._subscribed = True
         try:
             _, read = self._cupti.measure(fn, aggregate=False)(*args)
         except RuntimeError as error:
@@ -145,7 +148,6 @@ class DeviceTime:
             raise
         if not read:
             raise ValueError(f"{fn} launched no kernel CUPTI timed, so it has no device time")
-        self._last = fn, args
         return tuple(KernelTime(name, milliseconds) for name, milliseconds in read)
 
     def seconds(self, fn: Callable, *args) -> float:
@@ -153,19 +155,22 @@ class DeviceTime:
         return sum(kernel.milliseconds for kernel in self.kernels(fn, *args)) / 1e3
 
     def _detach(self) -> None:
-        """Detach CUPTI from the process with a finalizing read of the last call, so a profiler can
-        subscribe after; a session that read none, or whose subscription another holds (`CuptiHeld`),
-        has nothing to detach."""
+        """Detach CUPTI from the process with a finalizing read of a call that runs nothing, so a profiler
+        can subscribe after and no call of the caller's runs again; a session that read nothing, or whose
+        subscription another holds (`CuptiHeld`), has nothing to detach."""
         from jax.experimental.mosaic.gpu import profiler
 
-        if self._last is None:
+        if not self._subscribed:
             return
-        fn, args = self._last
         try:
-            profiler.Cupti().measure(fn, aggregate=False)(*args)
+            profiler.Cupti().measure(_nothing, aggregate=False)()
         except RuntimeError as error:
             if "another subscriber" not in str(error):
                 raise
+
+
+def _nothing() -> None:
+    """A call that launches no kernel, which a session's finalizing read runs (`DeviceTime._detach`)."""
 
 
 @contextlib.contextmanager

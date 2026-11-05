@@ -229,16 +229,28 @@ def test_resident_memory_reads_the_kernel_fields_in_bytes_and_sees_an_allocation
 @pytest.mark.gpu(reason="CUPTI times a GPU's kernels")
 def test_device_time_reads_a_calls_kernels_and_hands_cupti_to_a_profiler_however_it_ends(tmp_path):
     """A session reads each kernel a call launched with its device time and refuses a call that launched
-    none, whose time would read as zero; it detaches CUPTI however it ends, so a profile capture after it
-    takes CUPTI's one subscription, and a read inside that capture is refused as held."""
+    none, whose time would read as zero; it detaches CUPTI however it ends, after a read or only a refused
+    one, so a profile capture after it records the call's kernels, and a read inside that capture is
+    refused as held. Leaving a session runs none of its calls again: an input deleted inside it stays
+    deleted."""
+    from dew.telemetry.profile import Profiler, program_kernels
+
+    def squared(a):
+        return a @ a
     x = jnp.ones((1024, 1024))
-    matmul = jax.jit(lambda a: a @ a)
+    matmul = jax.jit(squared)
+    used = jnp.ones((1024, 1024))
     with pytest.raises(ZeroDivisionError), device_time() as device:
-        kernels = device.kernels(matmul, x)
+        kernels = device.kernels(matmul, used)
         assert kernels and all(kernel.milliseconds > 0 for kernel in kernels)
-        assert device.seconds(matmul, x) > 0
-        with pytest.raises(ValueError, match="launched no kernel"):
-            device.kernels(lambda: None)
+        assert device.seconds(matmul, used) > 0
+        used.delete()
         raise ZeroDivisionError
-    with jax.profiler.trace(str(tmp_path)), device_time() as device, pytest.raises(CuptiHeld):
-        device.kernels(matmul, x)
+    with device_time() as device, pytest.raises(ValueError):
+        device.kernels(lambda: None)
+    profiler = Profiler(tmp_path)
+    with profiler, device_time() as device:
+        jax.block_until_ready(matmul(x))
+        with pytest.raises(CuptiHeld):
+            device.kernels(matmul, x)
+    assert program_kernels(profiler.captures[-1], ["squared"])["squared"]
