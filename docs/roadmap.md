@@ -44,11 +44,10 @@ A second full audit of `main` (e4f857000c) on 2026-11-04, grouped by shared caus
 ## Models and interop
 
 - One cross-attention block for every consumer: the language model's gated adapter, the decision model and diffusion conditioning compose the same block and its cache instead of parallel copies. [1629]
-- Pass dense MLA visibility descriptors to the shared attention core. [41]
 - Bind native Flax forward methods explicitly, including the objective's choice of forward method. [171]
 - Carry FlaxDiff's remaining capabilities, or record dropping them: the continuous and tangent cosine schedules and the exponential schedule's test, SimpleAutoEncoder, the learned-variance head and the old UViT and wrapper, the W&B sweep promotion and run loading, the older checkpoints. [864–867]
 - Carry MaxText's workflows Dew lacks: the pretrain-to-RL chain, named LoRA directories, MaxText checkpoints, replica and live-slice recovery, a host prefix tier and disaggregated serving, DiLoCo, sparse indexed attention, audio language models, and remote-topology compilation. [869–877, 879, 881]
-- Load the requested families Dew does not load yet: MiniMax M3, the LLaDA MoE variants and LLaDA 2.x, DiffuCoder, Kimi K2.5's and K3's vision, and MiniMax M2.5, M2.7 and H3. [851–856]
+- Load the requested families Dew does not load yet: MiniMax M3, Kimi K2.5's and K3's vision, and MiniMax H3, whose architecture needs its root config. [851, 855, 856]
 - Load any Hugging Face model natively where its parts allow: an unregistered model built from a registered family's parts is assembled from Dew's own modules, matched by code identity, and qualified for training as well as inference. Otherwise transformers' own modeling code runs automatically, with Dew's attention through transformers' `AttentionInterface`, placement from the config's `base_model_tp_plan` and Dew's fsdp rules, and weights streamed by name onto the mesh. Native families stay the fast path. [1493, 1607]
 - Load Gemma 4's unified wrapper and Muse Glimmer's wrapper, and qualify Nemotron-Nano-9B-v2, Nemotron 3.5 Lightning and Qwen3.8's native release at their sizes. [1501, 357]
 - Read a release's per-layer-kind attention overrides from its config. [1497]
@@ -127,8 +126,6 @@ Dew derives the cheapest form of its own math ([design](design/algebra.md)): one
 
 ## Data
 
-- Integrate DataTrove once for decontamination and distributed MinHash dedup through publication and snapshots. [201, 203]
-- Add language and scored quality filters with recorded models and thresholds. Existing length, image-size and aspect filters remain the simple predicates. [202]
 - Translate per-share streamed, filtered and packed positions across host counts without changing their order. Global record-count positions already support host-count changes. [722]
 - Spread a filtered read across worker processes so none starves, and have a read that can never yield a row raise rather than spin. [883]
 - Select holdouts over a generation by input position, or refuse them above the published store. [884]
@@ -171,7 +168,7 @@ Dew derives the cheapest form of its own math ([design](design/algebra.md)): one
 - Add explicit continue/restart control beside automatic latest-checkpoint restore. In-memory state continuation was rejected. [208]
 - Match PNDM's multistep grouping and startup steps against Diffusers before remeasuring its parity margin. [647]
 - Find the tiled chunked head's residual at small token tiles, where a few head-gradient elements sit further from float64 than the whole-logits reference. [737]
-- Compile a step lowered by `Trainer(lower_for=)` before allocating training time, carry its executable and tuning picks to the run, and measure the saved startup time. Lowering alone already works. [720]
+- Carry a step compiled under `Trainer(lower_for=)` to its run, with its executable and tuning picks, and measure the startup time it saves. Deviceless compilation already works. [720]
 - Build the training design's remaining contracts: refusing a split leaf that declares no axes, a token budget ending at the commit that reaches it, and kernel choices in a run's report. [design/training.md]
 - Record every component through the registry's records, earlier saved runs loading through one translation per component until 1.0. [1412]
 - Find what changed Qwen3.5-4B's peak memory between pins. [1555]
@@ -213,7 +210,6 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 
 ## Tutorials and docs
 
-- Publish a pinned multi-source text, code and chat pretraining example. [236]
 - Show a notebook run with prepared data, checkpoints and cache on persistent mounted storage. [233]
 - Re-record the landing example on a matched host within the existing visible training budget. [590]
 - Publish dewml and CUDA kernel wheels through the configured release workflow after qualification, then update installation examples and the site. [335]
@@ -238,7 +234,6 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Land the layering gate: import contracts between Dew's layers, with `dew.batch` and `dew.mesh` as its first step. Have the queue refuse a head that edits another lane's files without its sign-off. [1557, 1558]
 - Train on GH200 with aarch64 wheels and its device facts. [1554]
 - Derive executable training and generation qualification from the registries. Cover codec combinations with fusion, scan and pipeline stages. [176, 178]
-- Compare cached and full forwards on logits and likelihoods. [179]
 - Build registry-backed uninterrupted/resumed flows and extend them to compiled-program reuse. [182, 183]
 - Inventory every kernel's float64 gate and derive GPU obligations from `TARGETS`. Runtime qualification remains open until the named device runs it. [184, 185]
 - Replace implementation pins with compile, fit and numerical behavior. Restore DeepSeek lifecycle gates against an independent, unmodified oracle. [192, 354]
