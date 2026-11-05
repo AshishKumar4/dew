@@ -173,6 +173,12 @@ def released_classes(name: str, workspace: Path):
     return configured, model
 
 
+OMITTED = {"mimo-v2-vl-tiny": ("visual.merger.ln_q.bias", "visual.merger.mlp.0.bias",
+                                "visual.merger.mlp.2.bias", "audio_encoder.input_local_transformer.embed_tokens.weight")}
+"""Each fixture's tensors its release's checkpoint does not store, which its loader initializes as a missing
+key: MiMo-V2.6's merger's biases, zeros (transformers' `_init_weights`), and its audio encoder's unused
+token table (`_keys_to_ignore_on_load_missing`)."""
+
 AUDIO_TOKENIZER = "audio_tokenizer"
 """The folder a release keeps its audio tokenizer in, its own config and weights, which its model loads
 (MiMo-V2.6's `load_audio_tokenizer`)."""
@@ -185,12 +191,14 @@ def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Mod
     configured, built = released_classes(name, scratch)
     model = built(configured(json.loads((FIXTURES / name / "config.json").read_text())))
     tokenizer = FIXTURES / name / AUDIO_TOKENIZER
+    omitted = OMITTED.get(name, ())
     if draw:
         torch.manual_seed(0)
         with torch.no_grad():
             for parameter in model.parameters():
                 parameter.copy_(torch.randn_like(parameter) * 0.1)
-        save_file(_stored_once(model.state_dict()), str(FIXTURES / name / "model.safetensors"))
+        stored = {key: value for key, value in _stored_once(model.state_dict()).items() if key not in omitted}
+        save_file(stored, str(FIXTURES / name / "model.safetensors"))
         config = json.loads((FIXTURES / name / "config.json").read_text())
         ids = torch.randint(0, vocabulary(config), (2, 16)).numpy().astype(np.int32)
         np.save(FIXTURES / name / "input_ids.npy", ids)
@@ -201,9 +209,14 @@ def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Mod
     state = model.state_dict()
     missing, unexpected = model.load_state_dict(load_file(str(FIXTURES / name / "model.safetensors")),
                                                 strict=False)
+    with torch.no_grad():
+        for key in omitted:
+            # As the release's loader initializes a missing bias; an unused table stays as it is.
+            if key.endswith(".bias"):
+                state[key].zero_()
     # A tied head is its embedding's tensor, which the file stores once (`_stored_once`).
     shared = set(state) - set(_stored_once(state))
-    if unexpected or set(missing) != shared:
+    if unexpected or set(missing) != shared | set(omitted):
         raise ValueError(f"{name}: the file's tensors differ from the model's: missing {missing}, "
                          f"unexpected {unexpected}")
     if (tokenizer / "model.safetensors").is_file():
