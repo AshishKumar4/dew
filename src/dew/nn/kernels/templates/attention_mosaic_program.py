@@ -690,18 +690,35 @@ def reached(spec: algebra.Forward, queries: int) -> int | None:
 
 def stated(spec: algebra.Forward, batch: int, heads: int, queries: int, widths: int, *arrays
            ) -> pl.CostEstimate | None:
-    """A launch's cost as it states it to XLA and to Dew's FLOP count (`dew.telemetry.instrumentation`):
-    a multiply-add a reached pair (`reached`), head and row for each of `widths` product columns, the
-    model's products the launch owns (the forward's `Q K^T` and `P V`, the backward's two transposes of
-    each, as the library's fused attention counts them: a recomputed product is the hardware's alone), a
-    transcendental a reached pair, and the bytes of each of `arrays` once; None for a spans call, whose
-    pairs no launch knows (`reached`): its FLOPs count as unsized, never as 0."""
+    """A launch's cost as it states it to XLA and to Dew's FLOP count (`dew.telemetry.instrumentation`), the
+    hardware's work: a multiply-add a reached pair (`reached`), head and row for each of `widths` product
+    columns the launch issues, its recomputed ones (a backward's `S`) and each part a cotangent's product
+    takes (`part_count`) among them, a transcendental a reached pair, and the bytes of each of `arrays` once;
+    None for a spans call, whose pairs no launch knows (`reached`): its FLOPs count as unsized, never as
+    0. The model's share of it the launch declares apart (`modelled`)."""
     pairs = reached(spec, queries)
     if pairs is None:
         return None
     return pl.CostEstimate(flops=2 * batch * heads * pairs * widths, transcendentals=batch * heads * pairs,
                            bytes_accessed=sum(math.prod(array.shape) * jnp.dtype(array.dtype).itemsize
                                               for array in arrays))
+
+
+def modelled(spec: algebra.Forward, batch: int, heads: int, queries: int, widths: int) -> int | None:
+    """The model's share of a launch's work (`stated`'s), which its launch declares to Dew's FLOP count
+    (`Family.kernel`'s `model_flops`): `widths` product columns of the model's products it owns (the forward's
+    `Q K^T` and `P V`, the backward's two transposes of each, as the library's fused attention counts them),
+    a recomputed product or a cotangent's later parts the hardware's alone; None for a spans call."""
+    pairs = reached(spec, queries)
+    return None if pairs is None else 2 * batch * heads * pairs * widths
+
+
+def part_count(dtype, accurate: bool) -> int:
+    """The products a cotangent's product with an operand of `dtype` takes (`algebra.cotangent_parts`): one in
+    the fast form's bf16 and in fp32, three in the accurate form's bf16, two in fp16's either form."""
+    held = jax.eval_shape(lambda cotangents: algebra.cotangent_parts(cotangents, dtype, accurate=accurate),
+                          jax.ShapeDtypeStruct((8, 8), jnp.float32))
+    return len(held)
 
 
 def _spans_of(spec: algebra.Forward, call: PaddedCall, block_q: int, block_k: int, *, readers: bool = False

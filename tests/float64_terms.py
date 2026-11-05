@@ -13,6 +13,7 @@ from typing import Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
+from arm_arithmetic import unrewritten
 
 from dew.nn import programs
 
@@ -192,7 +193,8 @@ def _traced(fn, args):
                              getattr(jax.typeof(leaf), "weak_type", False)) for leaf in leaves))
     traces = TRACES.setdefault(fn, {})
     if key not in traces:
-        closed, shapes = jax.make_jaxpr(fn, return_shape=True)(*args)
+        # A truth's program as written: traced with the algebra pass off (`arm_arithmetic.unrewritten`).
+        closed, shapes = jax.make_jaxpr(unrewritten(fn), return_shape=True)(*args)
         traces[key] = (closed, jax.tree.structure(shapes))
     return traces[key]
 

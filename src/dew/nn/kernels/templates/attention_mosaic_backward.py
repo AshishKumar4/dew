@@ -32,6 +32,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _spans_of,
     approximate,
+    modelled,
     score_places,
     stated,
     transposed_swizzles,
@@ -136,7 +137,10 @@ def _centre_launch(query, key, value, dout, peak, spans: _Spans | None, score_pa
         entry, out_type=jax.ShapeDtypeStruct((fields, batch, heads, queries), jnp.float32),
         grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
         interpret=walk.interpret, approx_math=False, name="attention_centre",
-        cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, 0, query, key, value, dout)
+        # Its `S` and `dP`, recomputed for dropout's first pass: the hardware's alone.
+        cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, width + value.shape[-1], query,
+                    key, value, dout),
+        model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries, 0)
     )(query, key, value, dout, peak, *leaves)
     return gradient.Centre(out[0], out[1] > 0, out[2:2 + parts], out[2 + parts:])
 
