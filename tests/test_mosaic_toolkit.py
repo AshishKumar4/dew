@@ -545,14 +545,21 @@ def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
 PERSISTED_TILES, PERSISTED_STEPS, PERSISTED_DEPTH = 3, 2, 64
 
 
-def _persisted_products(x, w, *, family, interpret):
-    """`x @ w` a 128-row tile at a time through `family`'s persistent walk (`Family.persist`): tile `t` the
-    rows `128 t` on, each step `PERSISTED_DEPTH` of the contraction, the middle tile multiplying nothing
-    (zeros); each tile issued (`issue`'s walk) and finished (`Issuer.chunks`, each chunk stored at its
-    columns), on the family's roles."""
-    rows, columns = family.rows, w.shape[1]
+def _padded(rows: int, family) -> int:
+    """A tile's rows for a launch of `rows`: padded to the least its family's products issue."""
+    return -(-rows // family.rows) * family.rows
+
+
+def _persisted_products(x, w, *, family, interpret, rows: int | None = None):
+    """`x @ w` a tile at a time through `family`'s persistent walk (`Family.persist`): each tile the
+    family's least rows covering `rows` (its own least where None; `_padded`), of which it stores `rows`,
+    tile `t` the tiles' rows `t` on, each step `PERSISTED_DEPTH` of the contraction, the middle tile
+    multiplying nothing (zeros); each tile issued (`issue`'s walk) and finished (`Issuer.chunks`, each
+    chunk stored at its columns), on the family's roles."""
+    stored = family.rows if rows is None else rows
+    rows, columns = _padded(stored, family), w.shape[1]
+    family = family.specialized(rows, columns)
     shape = (rows, columns)
-    swizzle = mosaic.swizzle_for(x.dtype, PERSISTED_DEPTH)
     blocks = {'x': ((rows, PERSISTED_DEPTH), x.dtype), 'w': ((PERSISTED_DEPTH, columns), w.dtype)}
 
     def body(x_gmem, w_gmem, o_gmem):
@@ -575,12 +582,12 @@ def _persisted_products(x, w, *, family, interpret):
             def finish(wg, tile, accs, store, *, active):
                 del wg, active
                 for first, (value,) in family.chunks(accs):
-                    store(0, value, o_gmem, (tile * rows, 0, rows, first, rows, mosaic.TILE_ROWS))
+                    store(0, value, o_gmem, (tile * rows, 0, stored, first, rows))
 
             family.persist(streams, (PERSISTED_TILES,), schedule, issue, finish, consumers=1, axis="programs",
                            outputs=((shape, jnp.float32),), interpret=interpret, accumulators=(shape,))
 
-        family.scoped(scope, streams=family.streams(blocks, 2, 1, swizzles={'x': swizzle, 'w': swizzle}))
+        family.scoped(scope, streams=family.streams(blocks, 2, 1))
 
     out = jax.ShapeDtypeStruct((PERSISTED_TILES * rows, columns), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
@@ -609,6 +616,34 @@ def test_tcgen05_tiles_walk_into_tensor_memory_and_their_epilogue_reads_it_out_i
     expected = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
     expected[family.rows:2 * family.rows] = 0
     np.testing.assert_array_equal(got, expected)
+
+
+@pytest.mark.parametrize("rows", [4, 8, 16, 24, 32])
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+def test_a_few_rows_lower_on_every_bundle_their_device_issues(generation_name, rows):
+    """A launch of a decode step's few rows lowers on each bundle its device issues for them
+    (`bundles.layouts`' `rows`: mma.sync's on cp.async on an A100; on an H100 wgmma's two layouts and
+    mma.sync's on TMA rings), its tile padded to the bundle's least rows and storing only its own."""
+    from dew.nn.kernels.templates import bundles
+    x, w = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _persisted_operands(64))
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
+    with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
+        for family in bundles.layouts(generation_name, jnp.bfloat16, rows=rows):
+            padded = (PERSISTED_TILES * _padded(rows, family), x.shape[1])
+            lhs = jax.ShapeDtypeStruct(padded, x.dtype)
+            jax.jit(functools.partial(_persisted_products, family=family, interpret=False, rows=rows)).trace(
+                lhs, w).lower(lowering_platforms=("cuda",))
+
+
+def test_a_launch_of_few_rows_takes_first_the_bundle_whose_padded_rows_it_fills_most():
+    """An H100 launch of a decode step's 8 rows takes mma.sync first, whose 16 rows it fills half of where
+    wgmma's 64 it fills an eighth (row 4042); one of 128 rows keeps wgmma's producer layout first, and a
+    launch that states no rows its own family's layouts alone."""
+    from dew.nn.kernels.templates import bundles, mosaic_sm80, mosaic_sm90
+    assert bundles.layouts("sm90", jnp.bfloat16, rows=8)[0].name == bundles.MmaFed.name
+    assert bundles.layouts("sm90", jnp.bfloat16, rows=128)[0] is mosaic_sm90.WGMMA
+    assert all(family.name != mosaic_sm80.Mma.name and family.name != bundles.MmaFed.name
+               for family in bundles.layouts("sm90", jnp.bfloat16))
 
 
 def test_the_tcgen05_persistent_walk_lowers_for_a_b200():
