@@ -4,7 +4,7 @@ sketch."""
 
 import jax
 import jax.numpy as jnp
-from reference_error import assert_as_exact, indexed_recording, recording
+from reference_error import as_given, assert_as_exact, indexed_recording, recording
 
 
 def assert_as_exact_as_recorded(fixture, site: str, seeds: int, draw, dew, label: str) -> None:
@@ -14,5 +14,7 @@ def assert_as_exact_as_recorded(fixture, site: str, seeds: int, draw, dew, label
     drawn, reference, truth = indexed_recording(recording(fixture), site, seeds, inputs_of=draw,
                                                 truth_fn=lambda inputs: dew(jnp.float64, inputs))
     compiled = jax.jit(lambda inputs: dew(jnp.float32, inputs))
-    assert_as_exact(lambda index, inputs: compiled(inputs), reference, drawn, label, seeds=seeds,
+    # Compiled here, so the gate runs it as given: compiling it again would compile the program twice
+    # (ledger 3900).
+    assert_as_exact(as_given(lambda index, inputs: compiled(inputs)), reference, drawn, label, seeds=seeds,
                     truth_fn=truth)
