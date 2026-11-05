@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from sampling_gate import FALSE_RED
 
-from dew.telemetry.benchmark import benchmark
+from dew.telemetry.benchmark import CuptiHeld, benchmark, device_time
 
 
 class Slow:
@@ -224,3 +224,21 @@ def test_resident_memory_reads_the_kernel_fields_in_bytes_and_sees_an_allocation
     assert {"VmRSS", "RssAnon", "RssFile", "VmHWM"} <= set(before)
     assert after["RssAnon"] > before["RssAnon"] + measured["size"] // 2
     assert after["VmHWM"] >= after["VmRSS"] >= after["RssAnon"]
+
+
+@pytest.mark.gpu(reason="CUPTI times a GPU's kernels")
+def test_device_time_reads_a_calls_kernels_and_hands_cupti_to_a_profiler_however_it_ends(tmp_path):
+    """A session reads each kernel a call launched with its device time and refuses a call that launched
+    none, whose time would read as zero; it detaches CUPTI however it ends, so a profile capture after it
+    takes CUPTI's one subscription, and a read inside that capture is refused as held."""
+    x = jnp.ones((1024, 1024))
+    matmul = jax.jit(lambda a: a @ a)
+    with pytest.raises(ZeroDivisionError), device_time() as device:
+        kernels = device.kernels(matmul, x)
+        assert kernels and all(kernel.milliseconds > 0 for kernel in kernels)
+        assert device.seconds(matmul, x) > 0
+        with pytest.raises(ValueError, match="launched no kernel"):
+            device.kernels(lambda: None)
+        raise ZeroDivisionError
+    with jax.profiler.trace(str(tmp_path)), device_time() as device, pytest.raises(CuptiHeld):
+        device.kernels(matmul, x)
