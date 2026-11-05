@@ -82,6 +82,12 @@ class Forward:
     prescale: float = 1.0
     walked_keys: int | None = None
     approximate: bool = True
+    subtracted: bool = False
+    """Whether the fold (`base2`) takes its exponent as the accurate form's raw one does (`raw`), a difference
+    of the raw products scaled after it is taken, `exp2((s - m) * scale * log2(e))`: no logit the reference
+    keeps apart ties at the fold's size (`reaches`), so no walk walks again natural, for one more operation
+    an element than the fold's contracted multiply-add, which a memory-bound walk (the decode kernel's,
+    row 1955) does not feel."""
 
     @property
     def raw(self) -> bool:
@@ -93,8 +99,20 @@ class Forward:
         maximum is not the scaled one's), the logits are scaled, the largest's weight held to 1 by a select
         (`weights`). The backward recomputes in the same units (`below`)."""
         low, high = RAW_SCALES
-        return (self.natural and not self.scaled and self.score_mod is None and not self.initial
-                and low <= self.scale <= high)
+        # A raw fold resumes from an initial state's maximum taken to raw units (`raw_maximum`), which the
+        # accurate form's exactness forgoes.
+        kept = (self.subtracted and self.base2) or (self.natural and not self.initial)
+        return kept and not self.scaled and self.score_mod is None and low <= self.scale <= high
+
+    @property
+    def reaches(self) -> bool:
+        """Whether a walk's logits can pass the fold's reach (`FOLD_REACH`), past which the fold's rounding
+        of each logit at log2(e) times its size ties logits the reference keeps apart, so a walk whose rows'
+        maxima pass it walks again natural (`walked`, `walked_launches`): folded logits scaled before their
+        difference (`base2`, not `raw`), but for a cap's (`Capped`, whose logits stay within it)."""
+        cap = getattr(self.score_mod, "softcap", None)
+        bounded = cap is not None and abs(float(cap)) * LOG2E < FOLD_REACH
+        return self.base2 and not self.raw and not bounded
 
     @property
     def base2(self) -> bool:
@@ -137,7 +155,7 @@ class Forward:
         range reduction would repeat the lowering's own (the softcap's forward, 68 of its conversions to
         integers and back a tile)."""
         if self.base2:
-            return jnp.exp2(x)
+            return jnp.exp2(x * np.float32(self.scale * LOG2E)) if self.raw else jnp.exp2(x)
         if not self.natural and not self.approximate:
             return jnp.exp(x)
         return natural_exp(x, self.scale) if self.raw else natural_exp(x)
@@ -145,9 +163,9 @@ class Forward:
     def naturalized(self, m: jax.Array) -> jax.Array:
         """A maximum in the logits' units taken to natural ones: from base 2 folded, from raw products
         raw."""
-        if self.base2:
-            return m / LOG2E
-        return m * self.scale if self.raw else m
+        if self.raw:
+            return m * self.scale
+        return m / LOG2E if self.base2 else m
 
 
 class Recompute(NamedTuple):
@@ -416,7 +434,7 @@ def walked[C: (Partial, tuple), O](spec: Forward, walk: Callable[[Forward, jax.A
     def walked_plain(form: Forward) -> C:
         return walk(form, None)
 
-    if not spec.base2:
+    if not spec.reaches:
         return finished(spec, guarded_walk(spec, functools.partial(walked_plain, spec)))
     carry = walk(spec, None)
     state = carry if isinstance(carry, Partial) else carry[0]
@@ -480,7 +498,7 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
     2.11 natural, the H100's bandwidth floor 1.28)."""
     if masked:
         outputs, maxima, over = launch(spec, None)
-        if spec.base2:
+        if spec.reaches:
             # A padded query's maximum is -inf, a row that reads nothing, as is a slice's row of no keys.
             live = (reached(maxima, unseen=spec.form == "spans") >= FOLD_REACH) | over
             return kept(live, launch(unfolded(spec), live)[0], outputs)
@@ -498,7 +516,7 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
                             lambda: outputs)
 
     outputs, maxima, over = launch(spec, None)
-    if not spec.base2:
+    if not spec.reaches:
         return guarded_launch(spec, outputs, over)
     # The call's own rows alone: a padded query's maximum is -inf, a row that reads nothing (`seen`).
     reach = reach_of(maxima if spec.queries is None else maxima[..., :spec.queries],
@@ -817,6 +835,16 @@ def base2_maximum(m: jax.Array) -> jax.Array:
     return jnp.where(infinite(folded) & finite(m), jnp.sign(m) * largest, folded)
 
 
+def raw_maximum(m: jax.Array, scale: float) -> jax.Array:
+    """A natural initial maximum (a sink's logit) in a raw fold's units (`Forward.subtracted`), `m / scale`,
+    saturated at fp32's largest where that quotient passes it, as `base2_maximum` saturates: a raw product is
+    finite, so a maximum past fp32's largest exceeds every key's and weighs them all zero, as its saturation
+    does."""
+    raw = m / np.float32(scale)
+    largest = float(jnp.finfo(jnp.float32).max)
+    return jnp.where(infinite(raw) & finite(m), jnp.sign(m) * largest, raw)
+
+
 def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array, *,
             live: jax.Array | None = None) -> Partial:
     """The softmax resumed from a state `(m, total, acc)` (`Hooks.initial`: sinks, a resumed partial),
@@ -824,7 +852,8 @@ def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array, *,
     may shift, `guarded`) those rows' sums shifted as their size needs (`needed`: `acc`'s largest
     magnitude is its denominator times a bound on the values it weighed)."""
     m, total, acc = (array.astype(jnp.float32) for array in (m, total, acc))
-    m = base2_maximum(m) if spec.base2 else m
+    if spec.base2:
+        m = raw_maximum(m, spec.scale) if spec.raw else base2_maximum(m)
     if live is None:
         return Partial(acc, m, total)
     held = headroom_of(Partial(acc, m, total), live)
@@ -1849,9 +1878,12 @@ def derived_forms(base2: bool, keys_first: bool = False, factor: float | None = 
 
 
 def _form_key(spec: Forward) -> tuple:
-    """The accurate form's part of the derived forms' key (`derived_forms`): natural, and a raw product's
-    scale (`Forward.raw`); the fast form's none."""
-    return (True, spec.scale if spec.raw else None) if spec.natural else ()
+    """The derived forms' key's part past the fold and the products' factor (`derived_forms`): the accurate
+    form's natural and a raw product's scale (`Forward.raw`), a raw fold's the factor its difference takes
+    (`Forward.subtracted`), the fast form's none."""
+    if spec.natural:
+        return (True, spec.scale if spec.raw else None)
+    return (False, float(np.float32(spec.scale * LOG2E))) if spec.raw else ()
 
 
 def _slotted(key: tuple, shapes: Mapping) -> tuple[str, ...]:
