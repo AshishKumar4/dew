@@ -583,8 +583,8 @@ def tiny_qwen3_next() -> Qwen3NextForCausalLM:
 def write_qwen3_next_mtp(name: str, model: Qwen3NextForCausalLM, repo: str,
                          seed: int = 2027) -> None:
     """The prediction layer's tensors under vLLM's mtp.* names beside the
-    fixture's, its logits over the trunk's hidden states, and the release
-    the fixture was scaled from.
+    fixture's, and the release the fixture was scaled from; the layer's
+    logits are check 1's, live (tests/test_hf_decoder_hybrids.py).
 
     The trunk's experts are one tensor per expert, the release's layout,
     which `save_pretrained` writes by reversing its load-time packing; the
@@ -597,13 +597,6 @@ def write_qwen3_next_mtp(name: str, model: Qwen3NextForCausalLM, repo: str,
     directory = FIXTURES / name
     depth = QwenMTP(model.config).eval()
     scatter_weights(depth, seed)
-    ids = torch.from_numpy(np.load(directory / "input_ids.npy").astype(np.int64))
-    with torch.no_grad():
-        hidden = model.model(input_ids=ids, use_cache=False).last_hidden_state
-        embeddings = model.model.embed_tokens(ids)
-        positions = torch.arange(ids.shape[1])[None].expand(ids.shape[0], -1)
-        valid = torch.ones(ids.shape[0], ids.shape[1] - 1, dtype=torch.bool)
-        logits = model.lm_head(depth(hidden[:, :-1], embeddings[:, 1:], positions[:, 1:], valid))
     tensors = load_file(str(directory / "model.safetensors"))
     for tensor_name, tensor in depth.state_dict().items():
         if not tensor_name.startswith("layers.0.mlp.experts."):
@@ -611,15 +604,13 @@ def write_qwen3_next_mtp(name: str, model: Qwen3NextForCausalLM, repo: str,
     for tensor_name, tensor in expert_tensors(depth.layers[0].get_submodule("mlp.experts")).items():
         tensors["mtp.layers.0." + tensor_name] = tensor
     write_file(tensors, directory / "model.safetensors", {"format": "pt"})
-    np.savez(directory / "mtp_reference.npz", logits=logits.numpy(), hidden=hidden.numpy(),
-             embeddings=embeddings.numpy(), positions=positions.numpy(), valid=valid.numpy())
     config = json.loads((directory / "config.json").read_text())
     config.update(num_nextn_predict_layers=QWEN3_NEXT_TINY["num_nextn_predict_layers"],
                   full_attention_interval=QWEN3_NEXT_TINY["full_attention_interval"])
     write_config(directory, config)
     write_provenance(directory, repo, vllm={"revision": "51da0ca66c8065619c79e35dff97aa99aeaf5644",
                                            "mtp_file": "vllm/model_executor/models/qwen3_next_mtp.py"})
-    print(f"{directory}: mtp.* depth with {len(tensors)} tensors, mtp logits {tuple(logits.shape)}")
+    print(f"{directory}: mtp.* depth with {len(tensors)} tensors")
 # zai-org/GLM-5.3 at toy width. The release's proportions on a hidden width
 # of 32: intermediate_size twice the width (64), moe_intermediate_size and
 # the query LoRA a third of it (12 each), qk_nope three times qk_rope with

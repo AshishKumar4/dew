@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import pytest
@@ -154,6 +156,25 @@ def test_a_class_record_in_a_json_field_stays_the_record_it_is():
     head's, an autoencoder's) is read back as written, for its owner to bind."""
     record = {"class": f"{Loaded.__module__}:Loaded", "fields": {"name": "tiny"}}
     assert from_record(Settings, {"component": record}) == Settings(record)
+
+
+@dataclasses.dataclass(frozen=True)
+class Called:
+    """Settings holding JSON data and, beside it, a function."""
+
+    data: JSON
+    entries: dict[str, JSON]
+    call: Callable[[], str] | None = None
+
+
+def test_a_function_record_in_json_data_stays_the_data_it_is():
+    """JSON data spelled like a function record, `{"function": name}`, is read back as written, whole or
+    as a mapping's entry, where the walk from a record imported the function it names whatever its field
+    declared (row 3957); a field that may hold a function still reads the record as the function."""
+    spelled = {"function": "os:getcwd"}
+    built = from_record(Called, {"data": spelled, "entries": {"f": spelled}, "call": spelled})
+    assert built.data == spelled and built.entries == {"f": spelled}
+    assert built.call is os.getcwd
 
 
 class Pair(nn.Module):

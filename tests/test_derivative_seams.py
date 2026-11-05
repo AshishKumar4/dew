@@ -68,6 +68,8 @@ CONTRACTED = {
         ("test_the_precision_seams_hold_every_order", NUMERICS),
     "src/dew/nn/precision.py::_compensated_sum":
         ("test_the_precision_seams_hold_every_order", NUMERICS),
+    "src/dew/nn/linear.py::_shards_summed":
+        ("test_a_split_convs_bias_holds_its_orders", NUMERICS),
     "src/dew/nn/precision.py::rounded_operand":
         ("test_the_precision_seams_hold_every_order", SURROGATE),
     "src/dew/nn/attention.py::forward_differentiable.attend":

@@ -13,7 +13,6 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
-import gc
 import threading
 import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
@@ -140,43 +139,6 @@ def compiler_options(*models: Held) -> dict[str, Option]:
     for opened in _COMPILED_WITH.get():
         options.update({name: value for name, value in opened.items() if xla_flag(name) is None})
     return options
-
-
-TRACING_COLLECTIONS = 50_000
-"""The allocations between collections of Python's youngest generation while a plan search runs
-(`held_objects`), past CPython's 700: its traces allocate millions of short-lived objects."""
-
-_HELD = 0
-"""The blocks of `held_objects` open, across nesting and threads."""
-
-_HELD_GUARD = threading.Lock()
-
-_THRESHOLDS: list[int] = []
-"""Python's collection thresholds as the first open block of `held_objects` found them."""
-
-@contextlib.contextmanager
-def held_objects() -> Iterator[None]:
-    """Within the block, the youngest generation of Python's collector collects every
-    `TRACING_COLLECTIONS` allocations: a plan search's traces, compiles and bookkeeping make millions of
-    short-lived objects, and each full collection their collections led to walked the long-lived ones
-    beside them (row 2440: 59 full collections paused a Qwen3.5-4B step's compile_ahead 73 s of 342,
-    FS2440-GC-PLAIN). The process's permanent generation is no part of it: a freeze is the process's own
-    to make and undo (one made before Dew was imported reads as CPython 3.12's own immortal objects do, which
-    each collection returns to it), so the block never freezes nor unfreezes. Nested and concurrent blocks
-    share one threshold; the last to leave restores the process's."""
-    global _HELD
-    with _HELD_GUARD:
-        if not _HELD:
-            _THRESHOLDS[:] = gc.get_threshold()
-            gc.set_threshold(TRACING_COLLECTIONS, *_THRESHOLDS[1:])
-        _HELD += 1
-    try:
-        yield
-    finally:
-        with _HELD_GUARD:
-            _HELD -= 1
-            if not _HELD:
-                gc.set_threshold(*_THRESHOLDS)
 
 
 type Placements = (Sharding | Format | None | tuple[Placements, ...] | Mapping[str, Placements]

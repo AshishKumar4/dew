@@ -332,7 +332,8 @@ def test_the_loss_is_the_mean_of_the_terms_evaluation_reports_under_the_weights_
 
 class Reversed(nn.Module):
     """A user's own token model, no Dew class: each slot scores how many
-    slots follow it in the row, which it knows only by reading to the end."""
+    slots follow it in the row, which it knows only by reading to the end.
+    Its call gives its logits, as a Linen model's does; it names no `logits`."""
 
     vocab_size: int = VOCAB
     max_seq_len: int = 8
@@ -340,10 +341,7 @@ class Reversed(nn.Module):
     def setup(self):
         self.scale = self.param("scale", nn.initializers.constant(30.0), ())
 
-    def __call__(self, tokens, **fields):
-        return self.logits(tokens, **fields)
-
-    def logits(self, tokens, *, train=False, **fields):
+    def __call__(self, tokens, *, train=False, **fields):
         following = tokens.shape[1] - 1 - jnp.arange(tokens.shape[1])
         return self.scale * jnp.broadcast_to(jax.nn.one_hot(following % MASK, VOCAB), (*tokens.shape, VOCAB))
 
@@ -355,32 +353,56 @@ class Mirrored(Reversed):
     mask_token_id: int | None = None
 
 
-def test_a_user_bidirectional_model_fills_a_masked_response():
+class AliasedMirrored(Mirrored):
+    """`Mirrored` with a `logits` that only forwards to its call."""
+
+    def logits(self, tokens, **fields):
+        return self(tokens, **fields)
+
+
+class Unscored(nn.Module):
+    """A bidirectional encoder of final states alone: no `logits` and no forward of its own."""
+
+    causal: bool = False
+    mask_token_id: int | None = None
+
+    @nn.compact
+    def hidden_states(self, tokens, **_):
+        return nn.Embed(VOCAB, 4)(tokens)
+
+
+@pytest.mark.parametrize("model", [Mirrored(), AliasedMirrored()], ids=["native", "aliased"])
+def test_a_user_bidirectional_model_fills_a_masked_response(model):
     """Masked generation needs full-sequence logits that read the whole row,
     not a CausalTransformer: a user module that says so fills each response
-    slot with what it scores there, the slots after it."""
+    slot with what it scores there, the slots after it, read by its own
+    forward with no `logits` that only forwards to it (`forward_method`, row
+    171), as one with that method is, as a task and in a call."""
     from dew.inference import MaskedGeneration
 
-    model = Mirrored()
-    task = MaskedGeneration(model, model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)),
-                            DiscreteProcess(LogLinear(), mask_id=MASK), steps=8)
+    variables = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+    task = MaskedGeneration(model, variables, DiscreteProcess(LogLinear(), mask_id=MASK), steps=8)
     generated = task([[1, 2, 3], [4, 5, 0]], 4, key=0)
     np.testing.assert_array_equal(generated.tokens, [[1, 2, 3, 3, 2, 1, 0], [4, 5, 0, 3, 2, 1, 0]])
     np.testing.assert_array_equal(generated.lengths, [4, 4])
+    called = DiscreteProcess(LogLinear(), mask_id=MASK).generate(model, variables, [[1, 2, 3], [4, 5, 0]], 4,
+                                                                 key=0, steps=8)
+    np.testing.assert_array_equal(called.tokens, generated.tokens)
 
 
-@pytest.mark.parametrize("model,lacks", [
-    (transformer(causal=True), "this CausalTransformer is causal"),
-    (Reversed(), r"this Reversed does not say whether a position reads the ones after it \(TokenModel\)"),
-    (Peaked(), r"this Peaked gives no full-sequence logits \(Logits\)")])
-def test_masked_generation_names_what_a_model_lacks(rng, model, lacks):
+@pytest.mark.parametrize("model,reads,lacks", [
+    (transformer(causal=True), None, "this CausalTransformer is causal"),
+    (Reversed(), None, "this Reversed does not say whether a position reads the ones after it (TokenModel)"),
+    (Unscored(), "hidden_states", "this Unscored gives no full-sequence logits: no logits and no forward")])
+def test_masked_generation_names_what_a_model_lacks(rng, model, reads, lacks):
     """A causal decoder has every capability masked generation reads but one
     of its positions never sees the masked ones after it; a model that does
-    not say how it reads, or gives no full-sequence logits, is refused for
-    that, by name."""
+    not say how it reads, or gives no full-sequence logits (no `logits` and no
+    forward), is refused for that, by name."""
     process = DiscreteProcess(LogLinear(), mask_id=MASK)
+    variables = model.init(rng, jnp.zeros((1, 4), jnp.int32), method=reads)
     with pytest.raises(ValueError):
-        process.generate(model, model.init(rng, jnp.zeros((1, 4), jnp.int32)), [[1, 2]], 3, key=0)
+        process.generate(model, variables, [[1, 2]], 3, key=0)
 
 
 def test_a_masked_walk_whose_model_scores_nothing_refuses_rather_than_reveal_a_token(rng):

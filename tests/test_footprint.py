@@ -200,6 +200,34 @@ def test_a_loops_stacked_results_are_held_beside_each_turns_own():
     assert peak_bytes(program, "gpu", Workspace(0, 0)) == (10 + 2) * 8 * 8 * 4
 
 
+def test_a_loops_carry_read_and_written_through_an_axis_of_one_holds_one_buffer():
+    """A loop that reads its carry by unstacking an axis of one and writes it back by stacking holds the
+    carry's buffer alone, each a view of it, as one that reshapes it does: a scanned head's weight
+    gradient read and written so cost the derivation two copies more (Qwen3.5-4B's fused tiled head,
+    2 x 2.37 GiB, row 4089)."""
+    from dew.training.footprint import peak_bytes
+
+    carry = jax.ShapeDtypeStruct((1, 64, 64), jnp.float32)
+    rows = jax.ShapeDtypeStruct((10, 64, 64), jnp.float32)
+
+    def unstacked(carry, rows):
+        def turn(held, row):
+            (current,) = jnp.unstack(held, axis=0)
+            return jnp.stack([current + row]), None
+        return jax.lax.scan(turn, carry, rows)[0]
+
+    def reshaped(carry, rows):
+        def turn(held, row):
+            return (held.reshape(64, 64) + row).reshape(1, 64, 64), None
+        return jax.lax.scan(turn, carry, rows)[0]
+
+    programs = [jax.make_jaxpr(function)(carry, rows).jaxpr for function in (unstacked, reshaped)]
+    body = programs[0].eqns[-1].params["jaxpr"].jaxpr
+    assert {"stack", "unstack"} <= {equation.primitive.name for equation in body.eqns}
+    each = [peak_bytes(program, "gpu", Workspace(0, 0)) for program in programs]
+    assert each[0] == each[1], each
+
+
 def test_a_transposed_input_returned_flat_is_a_copy():
     """A transpose of an input whose layout is fixed reorders its elements into a buffer of their own,
     which a flattening of it returned holds, where a transpose of a value the program computes is laid

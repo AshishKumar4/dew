@@ -70,15 +70,13 @@ Dew sorts tokens into expert order and runs the experts as one grouped matrix mu
 
 | Value | Kernel |
 |---|---|
-| `'auto'` | The one measured fastest on the hardware generation (`dew.nn.kernels.device_generation`, read from `dew.nn.kernels.gpu_target().kernels['grouped_matmul']`): `'pallas'` on sm80 (A100), sm86 (RTX 3090), sm89 (L4, RTX 4080) and sm90 (H100), `'xla'` on TPU v5e and v6e. Every other generation runs `'xla'`: GPUs older than sm80 cannot compile the kernels, and sm100 and sm120 are unmeasured. |
-| `'xla'` | `jax.lax.ragged_dot`. On a GPU, XLA runs it as a product over every expert. |
-| `'pallas'` | JAX's own Pallas/Triton grouped-matmul kernels, `gmm` and `tgmm`, vendored in `dew.nn.kernels.ragged_dot` from the jax 0.11.2 source tree because no wheel ships them. |
+| `'auto'` | The GEMM template's kernels wherever one of its launches takes the call, else XLA's program. |
+| `'pallas'` | The same choice as `'auto'`: both leave it to the GEMM template (`dew.nn.moe.expert_projection`). |
+| `'xla'` | `jax.lax.ragged_dot` for every launch, which XLA runs as a product over every expert. |
 
-On an L4 the Pallas kernels cut the lm-moe training step from 601.6 ms to 213.1 ms ([Performance measurements](../performance.md)). jax 0.11.2 deprecates the Pallas Triton backend they run on. Dew still uses them on compute capability 8.0 to 9.0: JAX's Mosaic GPU grouped matmul does not compile below sm90 (on sm89 it fails for lack of wgmma), and on an H100 tokamax's Mosaic GPU forward only matched them, its backward running on XLA, and it leaves the deprecation warning to your warning filters.
+The GEMM template chooses each launch where it runs, and reports each route with its reason (`dew.nn.kernels.generation.route`). Its order and the cells an older route keeps are the selector's ([Kernel templates: choice](../design/kernel-templates.md#7-choice-the-one-kernel-each-template-derives)). `generation.chosen(grouped_matmul=...)` names one kernel, and a named kernel that cannot run the call raises `KernelRefused`. A CPU process runs XLA's program. XLA's ragged dot computes a product over every expert, so where the template's kernels run they are much faster ([Performance measurements](../performance.md#the-moe-grouped-matmul)). The template differentiates its launches at every order, so a `Trainer` step's reverse mode, forward mode and higher-order derivatives (as in meta-learning) all run the same arithmetic.
 
-The Pallas kernels run through Dew's GEMM template, which differentiates them at every order: an ordinary `Trainer` step's reverse mode runs the kernels, and forward mode and higher-order derivatives, as in meta-learning, run XLA's tangent of the same arithmetic. Dew also falls back to `'xla'` in the cases where the Pallas kernels would compute a different product than you asked for: float64, fp32 operands at a precision above the default, and any x64 run.
-
-The choice is the same on a mesh. The experts run inside the dispatch's `shard_map` on each device's rows, and the weights they need are gathered onto that device. On 2x RTX 3090, one fsdp-sharded expert layer took 26.2 ms with the Pallas kernels and 271.9 ms with `'xla'`. Every routed expert module the decoder builds follows `implementation`, including GPT OSS's.
+The choice is the same on a mesh. The experts run inside the dispatch's `shard_map` on each device's rows, and the weights they need are gathered onto that device. Every routed expert module the decoder builds follows `implementation`, including GPT OSS's.
 
 ## Dispatch and expert parallelism
 
