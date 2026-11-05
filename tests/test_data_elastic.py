@@ -719,12 +719,52 @@ class Fetched:
         return row
 
 
-def test_an_elastic_read_of_a_volatile_source_over_several_shares_is_refused():
+@dataclasses.dataclass(frozen=True)
+class FetchedKept:
+    """Whether a live check keeps a record, which may differ between reads (`Volatile`)."""
+
+    volatile: bool = True
+
+    def __call__(self, row) -> bool:
+        return True
+
+
+@dataclasses.dataclass(frozen=True)
+class FetchedPieces:
+    """A record's pieces as a live fetch lists them, which may differ between reads (`Volatile`)."""
+
+    volatile: bool = True
+
+    def __call__(self, row):
+        return [row]
+
+
+@dataclasses.dataclass(frozen=True)
+class FetchedDrawn:
+    """A record a live fetch returns at a drawn offset, which may differ between reads (`Volatile`)."""
+
+    volatile: bool = True
+
+    def __call__(self, row, rng):
+        return row
+
+
+VOLATILE_STEPS = {
+    "map": lambda chain: chain.map(Fetched()),
+    "filter": lambda chain: chain.filter(FetchedKept(), reason="unfetched"),
+    "flat_map": lambda chain: chain.flat_map(FetchedPieces()),
+    "random_map": lambda chain: chain.random_map(FetchedDrawn()),
+}
+
+
+@pytest.mark.parametrize("kind", VOLATILE_STEPS)
+def test_an_elastic_read_of_a_volatile_source_over_several_shares_is_refused(kind):
     """Every elastic share reads its order's whole prefix on its own, so a source a fetch reads
     differently each time (`Volatile`) would order the shares apart: over two shares it is refused
-    before any reads, and over one it reads (row 1914)."""
-    chain = (Pipeline(Memory(tuple({"id": np.int64(index)} for index in range(32))))
-             .shuffle(5).repeat(None).map(Fetched()).filter(odd).batch(BATCH).elastic())
+    before any reads, and over one it reads (row 1914), whichever kind of step the fetch is written
+    as (row 4120)."""
+    source = Pipeline(Memory(tuple({"id": np.int64(index)} for index in range(32)))).shuffle(5).repeat(None)
+    chain = VOLATILE_STEPS[kind](source).filter(odd).batch(BATCH).elastic()
     with pytest.raises(ValueError):
         reader(chain, 0, 2)
     assert len(listed(reader(chain, 0, 1), 2)) == 2

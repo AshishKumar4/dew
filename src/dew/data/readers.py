@@ -30,6 +30,7 @@ from dew.data.dataset import (
 from dew.data.mixing import CorpusCounts, data_metrics, state_counts
 from dew.data.pipeline import HostStep, Map
 from dew.data.plan import COUNTERS, Plan, earlier_position
+from dew.data.storage import mirror_metrics
 
 READER_FIELDS = (EXAMPLES_CONSUMED, VALID_ROWS)
 """A batch's fields its reader owns, which a host step after the batch neither reads nor writes
@@ -260,8 +261,9 @@ class _PerShare(Forwarding):
         return self._plan.identity()
 
     def statistics(self) -> Mapping[str, float]:
-        """The metrics of the counters last published by the reading thread."""
-        return data_metrics(self._statistics.counts.values())
+        """The metrics of the counters last published by the reading thread, and what this process's
+        mirrors did (`mirror_metrics`)."""
+        return {**data_metrics(self._statistics.counts.values()), **mirror_metrics()}
 
     def close(self) -> None:
         if self._read is not None:
