@@ -545,14 +545,21 @@ def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
 PERSISTED_TILES, PERSISTED_STEPS, PERSISTED_DEPTH = 3, 2, 64
 
 
-def _persisted_products(x, w, *, family, interpret):
-    """`x @ w` a 128-row tile at a time through `family`'s persistent walk (`Family.persist`): tile `t` the
-    rows `128 t` on, each step `PERSISTED_DEPTH` of the contraction, the middle tile multiplying nothing
-    (zeros); each tile issued (`issue`'s walk) and finished (`Issuer.chunks`, each chunk stored at its
-    columns), on the family's roles."""
-    rows, columns = family.rows, w.shape[1]
+def _padded(rows: int, family) -> int:
+    """A tile's rows for a launch of `rows`: padded to the least its family's products issue."""
+    return -(-rows // family.rows) * family.rows
+
+
+def _persisted_products(x, w, *, family, interpret, rows: int | None = None):
+    """`x @ w` a tile at a time through `family`'s persistent walk (`Family.persist`): each tile the
+    family's least rows covering `rows` (its own least where None; `_padded`), of which it stores `rows`,
+    tile `t` the tiles' rows `t` on, each step `PERSISTED_DEPTH` of the contraction, the middle tile
+    multiplying nothing (zeros); each tile issued (`issue`'s walk) and finished (`Issuer.chunks`, each
+    chunk stored at its columns), on the family's roles."""
+    stored = family.rows if rows is None else rows
+    rows, columns = _padded(stored, family), w.shape[1]
+    family = family.specialized(rows, columns)
     shape = (rows, columns)
-    swizzle = mosaic.swizzle_for(x.dtype, PERSISTED_DEPTH)
     blocks = {'x': ((rows, PERSISTED_DEPTH), x.dtype), 'w': ((PERSISTED_DEPTH, columns), w.dtype)}
 
     def body(x_gmem, w_gmem, o_gmem):
@@ -575,12 +582,12 @@ def _persisted_products(x, w, *, family, interpret):
             def finish(wg, tile, accs, store, *, active):
                 del wg, active
                 for first, (value,) in family.chunks(accs):
-                    store(0, value, o_gmem, (tile * rows, 0, rows, first, rows, mosaic.TILE_ROWS))
+                    store(0, value, o_gmem, (tile * rows, 0, stored, first, rows))
 
             family.persist(streams, (PERSISTED_TILES,), schedule, issue, finish, consumers=1, axis="programs",
                            outputs=((shape, jnp.float32),), interpret=interpret, accumulators=(shape,))
 
-        family.scoped(scope, streams=family.streams(blocks, 2, 1, swizzles={'x': swizzle, 'w': swizzle}))
+        family.scoped(scope, streams=family.streams(blocks, 2, 1))
 
     out = jax.ShapeDtypeStruct((PERSISTED_TILES * rows, columns), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
@@ -611,6 +618,34 @@ def test_tcgen05_tiles_walk_into_tensor_memory_and_their_epilogue_reads_it_out_i
     np.testing.assert_array_equal(got, expected)
 
 
+@pytest.mark.parametrize("rows", [4, 8, 16, 24, 32])
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+def test_a_few_rows_lower_on_every_bundle_their_device_issues(generation_name, rows):
+    """A launch of a decode step's few rows lowers on each bundle its device issues for them
+    (`bundles.layouts`' `rows`: mma.sync's on cp.async on an A100; on an H100 wgmma's two layouts and
+    mma.sync's on TMA rings), its tile padded to the bundle's least rows and storing only its own."""
+    from dew.nn.kernels.templates import bundles
+    x, w = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _persisted_operands(64))
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
+    with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
+        for family in bundles.layouts(generation_name, jnp.bfloat16, rows=rows):
+            padded = (PERSISTED_TILES * _padded(rows, family), x.shape[1])
+            lhs = jax.ShapeDtypeStruct(padded, x.dtype)
+            jax.jit(functools.partial(_persisted_products, family=family, interpret=False, rows=rows)).trace(
+                lhs, w).lower(lowering_platforms=("cuda",))
+
+
+def test_a_launch_of_few_rows_takes_first_the_bundle_whose_padded_rows_it_fills_most():
+    """An H100 launch of a decode step's 8 rows takes mma.sync first, whose 16 rows it fills half of where
+    wgmma's 64 it fills an eighth (row 4042); one of 128 rows keeps wgmma's producer layout first, and a
+    launch that states no rows its own family's layouts alone."""
+    from dew.nn.kernels.templates import bundles, mosaic_sm80, mosaic_sm90
+    assert bundles.layouts("sm90", jnp.bfloat16, rows=8)[0].name == bundles.MmaFed.name
+    assert bundles.layouts("sm90", jnp.bfloat16, rows=128)[0] is mosaic_sm90.WGMMA
+    assert all(family.name != mosaic_sm80.Mma.name and family.name != bundles.MmaFed.name
+               for family in bundles.layouts("sm90", jnp.bfloat16))
+
+
 def test_the_tcgen05_persistent_walk_lowers_for_a_b200():
     """The persistent walk on tcgen05's bundle lowers for a B200 on any host, as the GPU gate runs it."""
     from dew.nn.kernels.templates import mosaic_sm100
@@ -619,4 +654,93 @@ def test_the_tcgen05_persistent_walk_lowers_for_a_b200():
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm100")
     with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(mesh):
         jax.jit(functools.partial(_persisted_products, family=family, interpret=False)).trace(x, w).lower(
+            lowering_platforms=("cuda",))
+
+
+def _relayed_products(q, k, v, *, interpret):
+    """FlashAttention 4's relay on tcgen05's bundle: `S = q k` into tensor memory by the product warp, read
+    out by a role of the table (`Tcgen05Issuer.read`), doubled, narrowed and written back as `P`
+    (`write`), and `O = P v` with `P` the left operand from tensor memory (the TS product); `O` read out
+    and stored by the same role. Its roles wait on signals the products' commit and the role's publication
+    arrive at (`signals`)."""
+    from dew.nn.kernels.templates import mosaic_sm100
+    family = mosaic_sm100.RINGS
+    rows = q.shape[0]
+    columns = v.shape[1]
+
+    def body(q_gmem, k_gmem, v_gmem, o_gmem):
+        def scoped(q_smem, k_smem, v_smem, o_smem, loaded, s_tmem, p_tmem, o_tmem, scored, weighed, summed):
+            s = mosaic_sm100.Accumulator(s_tmem, (rows, k.shape[1]))
+            p = mosaic_sm100.Accumulator(p_tmem, (rows, k.shape[1]), dtype=jnp.bfloat16)
+            o = mosaic_sm100.Accumulator(o_tmem, (rows, columns))
+            scored, weighed, summed = (family.signals().opened(each) for each in (scored, weighed, summed))
+            first = mosaic.Turn.of(0, 1)
+
+            def relay(index):
+                del index
+                plgpu.barrier_wait(scored.barriers.at[0], parity=0)
+                family.write(p, family.read(s) * 2)
+                weighed.published(first)
+                plgpu.barrier_wait(summed.barriers.at[0], parity=0)
+                o_smem[...] = family.read(o)
+                plgpu.wait_load_tmem()
+                plgpu.commit_smem()
+                plgpu.copy_smem_to_gmem(o_smem, o_gmem)
+                plgpu.wait_smem_to_gmem(0)
+
+            def load():
+                for gmem, smem, at in ((q_gmem, q_smem, 0), (k_gmem, k_smem, 1), (v_gmem, v_smem, 2)):
+                    plgpu.copy_gmem_to_smem(gmem, smem, loaded.at[at])
+
+            def products():
+                for at in range(3):
+                    plgpu.barrier_wait(loaded.at[at], parity=0)
+                family.products(s, q_smem, k_smem, interpret)
+                scored.committed(first)
+                plgpu.barrier_wait(weighed.barriers.at[0], parity=0)
+                family.products(o, p, v_smem, interpret)
+                summed.committed(first)
+
+            family.roles_of(((1, relay),), load=load, products=products)
+
+        smem = [plgpu.SMEM(each.shape, each.dtype, transforms=mosaic.swizzle_transforms(each.dtype, 128))
+                for each in (q, k, v)]
+        signals = [family.signals().scratch(), family.signals(by_products=False).scratch(),
+                   family.signals().scratch()]
+        pl.run_scoped(scoped, *smem, plgpu.SMEM((rows, columns), jnp.float32), plgpu.Barrier(num_barriers=3),
+                      family.tensor_memory((rows, k.shape[1])),
+                      family.tensor_memory((rows, k.shape[1]), jnp.bfloat16),
+                      family.tensor_memory((rows, columns)), *signals, collective_axes="wg")
+
+    out = jax.ShapeDtypeStruct((rows, columns), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="relayed")(q, k, v)
+
+
+def _relayed_operands():
+    """Small integers, so `2 (q k) v` is exact in fp32 and its weights exact in bf16."""
+    keys = jax.random.split(jax.random.key(3), 3)
+    q = jax.random.randint(keys[0], (128, 64), -2, 3).astype(jnp.bfloat16)
+    k = jax.random.randint(keys[1], (64, 128), -2, 3).astype(jnp.bfloat16)
+    v = jax.random.randint(keys[2], (128, 64), -2, 3).astype(jnp.bfloat16)
+    return q, k, v
+
+
+@INTERPRETS
+def test_a_role_relays_scores_through_tensor_memory_into_a_product_that_reads_them_there():
+    """Interpreted: scores issued into tensor memory, read out by a role, doubled and written back narrowed,
+    and the next product reading them from tensor memory as its left operand (tcgen05's TS form, P·V):
+    exactly `2 (q k) v`."""
+    q, k, v = _relayed_operands()
+    got = np.asarray(_relayed_products(q, k, v, interpret=INTERPRETED))
+    weights = 2 * (np.asarray(q, np.float32) @ np.asarray(k, np.float32))
+    np.testing.assert_array_equal(got, weights @ np.asarray(v, np.float32))
+
+
+def test_the_relay_through_tensor_memory_lowers_for_a_b200():
+    """The relay lowers for a B200 on any host, as the GPU gate runs it."""
+    q, k, v = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _relayed_operands())
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm100")
+    with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(functools.partial(_relayed_products, interpret=False)).trace(q, k, v).lower(
             lowering_platforms=("cuda",))

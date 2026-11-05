@@ -189,6 +189,12 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # `n_warps * 8` (`MMALayouts`' accumulator tiling).
         return 6 | 8 * (4 // self.m_warps - 1)
 
+    def written(self, smem, value: jax.Array) -> None:
+        # Its accumulator's layout at one or two row warps takes no optimized register-to-shared transfer
+        # (FS-T1-ROWS2: a 32-row tile on TMA rings found no layout, "Failed to infer a possible set of
+        # layouts"; written unoptimized it lowers at 8 to 64 rows, FS-T1-ROWS3), as its own stores take it.
+        plgpu.store(smem, value.astype(smem.dtype), optimized=False)
+
     def column_registers(self, columns: int, dtype) -> int:
         # The accumulator's tiles are `m_warps * 16` rows by `n_warps * 8` columns, each warp's 16 x 8 a
         # thread's two columns a row (jax/experimental/mosaic/gpu/mma.py:63, `MMALayouts`' accumulator
