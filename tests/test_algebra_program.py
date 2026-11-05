@@ -500,8 +500,9 @@ def test_xlas_schedule_prices_each_kernel_its_parts_fixed_latency():
     assert traced.kernels == 2
     one, two = cost.product_work(64, 64, 64), cost.product_work(64, 64, 64, count=2)
     throughput = sum(kernel_cost.units(one, kernel_cost.rates(hopper, device=True))[0])
-    assert schedule(one) == pytest.approx(throughput + hopper.fixed_seconds)
-    assert schedule(two) == pytest.approx(2 * (throughput + hopper.fixed_seconds))
+    # Exact: two products' work and kernels are one's doubled, each unit's seconds a power of two apart.
+    assert schedule(one) == throughput + hopper.fixed_seconds
+    assert schedule(two) == 2 * (throughput + hopper.fixed_seconds)
     assert cost.fused(generation.gpu_target("sm86")).unpriced(two)[-1] == 2
 
 
