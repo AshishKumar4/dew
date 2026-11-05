@@ -15,7 +15,7 @@ from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
 
 from .base import Read, ShardManifest, Source, preparing
-from .files import Files, Format
+from .files import Files, Format, inferred_format
 from .hf import arrow_rows, class_names
 
 
@@ -202,7 +202,7 @@ class Hub(Dataset):
             if self.revision is not None:
                 raise FileNotFoundError(
                     f"HF {self.repo!r}@{self.commit} split {self.split!r} "
-                    "has no native Parquet or JSONL files; "
+                    "has no native Parquet or JSON files; "
                     "pin the converted branch's own commit explicitly, "
                     "or provision=True for Arrow at this revision"
                 )
@@ -317,10 +317,11 @@ class Hub(Dataset):
             paths = split_files(listed, self.split) if self.name in (None, "default") else []
         # Not Arrow: the `.arrow` files a dataset repo holds are what `save_to_disk` and
         # `push_to_hub` write, Arrow's stream format, which no reader can cut into shards or count
-        # without reading it whole; such a split streams its Parquet conversion, or is prepared.
-        formats: tuple[Format, ...] = ("parquet", "jsonl")
+        # without reading it whole; such a split streams its Parquet conversion, or is prepared. JSON
+        # files are read as `datasets` reads them, compressed or not (row 2402).
+        formats: tuple[Format, ...] = ("parquet", "jsonl", "json")
         for format in formats:
-            matches = [path for path in paths if path.endswith("." + format)]
+            matches = [path for path in paths if inferred_format(path) == format]
             if matches:
                 return matches, format
         return [], "parquet"
@@ -358,8 +359,12 @@ class Hub(Dataset):
     def can_provision(self, read: Read) -> bool:
         return read != "streamed"
 
+    def preparation_bytes(self) -> int | None:
+        """What `datasets` downloads to prepare the split, as its builder's info states it."""
+        return self.builder.info.download_size
+
     def provision(self) -> Hub:
-        preparing(self, self.builder.info.download_size, self.builder.cache_dir)
+        preparing(self, self.preparation_bytes(), self.builder.cache_dir)
         self.builder.download_and_prepare()
         return self
 

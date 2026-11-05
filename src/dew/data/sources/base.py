@@ -77,7 +77,8 @@ class Shard:
 
 
 def preparing(source: Source, size: int | None, into: str) -> None:
-    """Log the one line a source logs as it prepares a read: what, how large, and where."""
+    """Log the one line a source logs as it prepares a read: what, how large (its `preparation_bytes`),
+    and where."""
     stated = "size not stated" if size is None else f"{size / 2**20:.1f} MiB"
     logging.getLogger("dew.data").warning("preparing %s (%s) into %s", source.describe(), stated, into)
 

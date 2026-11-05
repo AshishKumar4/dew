@@ -271,6 +271,12 @@ class SelectedGeneration(View[Source]):
 
         return _provisioner(self.source, self.placing) is not None
 
+    def preparation_bytes(self) -> int | None:
+        from dew.data.analysis import _provisioner
+
+        preparer = _provisioner(self.source, self.placing)
+        return None if preparer is None else preparer.preparation_bytes()
+
     def provision(self) -> SelectedGeneration:
         from dew.data.analysis import _provisioner
 

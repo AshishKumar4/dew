@@ -92,6 +92,10 @@ _STAGES = get_args(Stage.__value__)
 class _Provisionable(Protocol):
     def can_provision(self, read: Read) -> bool: ...
     def provision(self) -> Source: ...
+    def preparation_bytes(self) -> int | None:
+        """The bytes preparing reads, as the store states them before any read, None where it states none
+        (row 4118)."""
+        ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -109,6 +113,10 @@ class _ConcatenationPreparers:
         for preparer in self.preparers:
             preparer.provision()
         return self.concatenation
+
+    def preparation_bytes(self) -> int | None:
+        sizes = [preparer.preparation_bytes() for preparer in self.preparers]
+        return None if None in sizes else sum(size for size in sizes if size is not None)
 
 
 def _provisioner(source: Source, read: Read) -> _Provisionable | None:
@@ -1149,4 +1157,10 @@ def _refusal(source: Source, read: Read, *, provision: bool) -> str:
             return view.refusal
     if provision:
         return "its store takes no such read, and provisioning prepared none"
-    return "provision the named artifact with dew data provision or provision=True"
+    preparer = _provisioner(source, read)
+    if preparer is None:
+        # Nothing prepares this read of it (a Hub split with no Parquet or JSON files streams none).
+        return f"its store holds nothing a {read} read takes, and no preparation makes it: read it otherwise"
+    size = preparer.preparation_bytes()
+    stated = "its size not stated" if size is None else f"{size / 2**20:.1f} MiB to read"
+    return f"provision the named artifact ({stated}) with dew data provision or provision=True"
