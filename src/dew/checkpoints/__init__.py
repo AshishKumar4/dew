@@ -1214,6 +1214,15 @@ _PAYLOADS = {MODEL: "its model (counters, variables and EMA)", PROFILES: "its po
 """How a refusal names each item a step holds or lacks (`ROLES`)."""
 
 
+def _refuse_profiles_alone(step: int, facts: _StepFacts) -> None:
+    """Refuse a read of a step's named state where it holds its profiles' averages without the optimizer
+    state they are part of (its retention keeps it for its profiles alone), which only
+    `Checkpoints.restore_profiles` reads."""
+    if PROFILES in facts.items and RESUME not in facts.items:
+        raise ValueError(f"step {step} holds {_payload(facts.items)} alone, which its retention keeps it "
+                         "for; its profiles' averages are read by Checkpoints.restore_profiles")
+
+
 def _payload(items) -> str:
     return " and ".join(_PAYLOADS[item] for item in (*ROLES, ONE_ITEM) if item in items)
 
@@ -1825,13 +1834,13 @@ class Checkpoints:
             if weights_only and rollout is not None:
                 raise ValueError("a weights-only snapshot resumes nothing, so it holds no rollout's state")
             state_tree = self._item(state, saved, share, rollout)
+            if weights_only:
+                from dew.state import MODEL_STATE
+                state_tree = {name: state_tree[name] for name in MODEL_STATE}
             profiles = None if weights_only else _profiles_at(state_tree)
             state_tree, frozen = self._frozen(state_tree)
             state_tree, deltas = _with_ema_deltas(state_tree)
             items = _in_items(state_tree, None if profiles is None else profiles[0])
-            if weights_only:
-                items = {MODEL: items[MODEL]}
-                frozen = _frozen_held(frozen, (MODEL,))
         profile_metadata = None if profiles is None else {**_profile_record(profiles[1]),
                                                           'at': _named(profiles[0])}
         self._metadata = None
@@ -1880,7 +1889,7 @@ class Checkpoints:
             with region("checkpoint.write_in_place"):
                 persistent.wait_until_finished()
 
-    def _project(self, manager: ocp.CheckpointManager | None = None) -> None:
+    def _project(self) -> None:
         """Cut each committed step to the items its readers read, as the retention that ran with the newest
         save decided (`_RankedSteps.roles`, row 4311), once that save has landed: as Orbax deletes a step
         no reader keeps only once the save that dropped it commits (its `_finalize`), so a save that fails
@@ -1889,7 +1898,7 @@ class Checkpoints:
         short reads as cut, and its leftovers go at the first projection of a later process. It runs where
         every process of the pool does, in `save`, `wait` and `close`, before the store's collection
         reads the steps' references (`_frozen`)."""
-        manager = self._manager if manager is None else manager
+        manager = self._manager
         plan, self._plan = self._plan, None
         if manager is None or plan is None:
             return
@@ -1919,6 +1928,8 @@ class Checkpoints:
             if int(step) in self._committed:
                 metrics, custom, _ = self._committed[int(step)]
                 self._committed[int(step)] = metrics, custom, tuple(kept)
+            if int(step) in self._staged:
+                self._staged[int(step)] = self._staged[int(step)][0], tuple(kept)
         if cuts:
             self._metadata = None
 
@@ -2299,6 +2310,7 @@ class Checkpoints:
         """
         step = self.pinned(step)
         snapshot = self._step_metadata(step, local=step == self._local_latest())
+        _refuse_profiles_alone(step, snapshot)
         metadata = _item_metadata(snapshot)
         stored = {name: None if value is None else
                   jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), value)
@@ -2418,6 +2430,7 @@ class Checkpoints:
             raise ValueError(f"step {step} of {self.directory} holds {_payload(self._items(step))} alone: a "
                              "weights-only snapshot, or a step kept for its weights or profiles, resumes "
                              "nothing; resume a whole checkpoint")
+        _refuse_profiles_alone(step, snapshot)
         metadata = _item_metadata(snapshot)
         stored = metadata.keys()
         _check_template(template, metadata, stored, mapping=mapping)
@@ -2661,12 +2674,13 @@ class Checkpoints:
         """The steps that close the open managers, which this forgets: each one's wait, then each
         one's close."""
         opened = [writer for writer in (self._manager, self._local_manager) if writer is not None]
-        persistent = self._manager
-        self._manager, self._local_manager, self._pending = None, None, None
-        cut = ([] if persistent is None
-               else [("Checkpoint projection", functools.partial(self._project, persistent))])
+
+        def detached():
+            self._manager, self._local_manager, self._pending = None, None, None
+        # The projection reads the run's steps through its own manager (`_complete`), so it runs attached.
+        cut = [] if self._manager is None else [("Checkpoint projection", self._project)]
         return [*(("Checkpoint wait", writer.wait_until_finished) for writer in opened), *cut,
-                *(("Checkpoint close", writer.close) for writer in opened)]
+                ("Checkpoint detach", detached), *(("Checkpoint close", writer.close) for writer in opened)]
 
     def wait(self) -> None:
         """Block until pending async writes have landed on disk.

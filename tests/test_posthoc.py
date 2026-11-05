@@ -110,6 +110,9 @@ def test_an_older_snapshot_keeps_its_profiles_alone_and_rebuilds_the_same_averag
     assert {entry.kind for entry in whole.kept()} == {"state"}
     with pytest.raises(ValueError, match="model"):
         alone.variables(step=4)
+    for read in (alone.stored, lambda step: alone.restore(None, step)):
+        with pytest.raises(ValueError, match="restore_profiles"):
+            read(4)
     for got, want in zip(jax.tree.leaves(alone.posthoc_ema(0.07)), jax.tree.leaves(whole.posthoc_ema(0.07)),
                          strict=True):
         np.testing.assert_array_equal(got, want)
