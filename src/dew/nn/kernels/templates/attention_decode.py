@@ -118,7 +118,7 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     """The work list of a packed call (`packed`) on `target`: the forward's derived config at the key tile
     its memory-bound walk streams at least (`MosaicForward.streaming`) and its slices.
     One where the programs already fill the multiprocessors (a slice's merge would cost and its keys gain
-    nothing). Else as many as its programs' residency holds at once (`resources.resident_programs`, its
+    nothing). Else as many as its programs' residency holds at once (`Family.programs`, its
     registers; its shared memory's), but each slice at least twice its ring's stages of key tiles: a shorter
     slice's walk spends its prologue's loads, `stages` tiles, without as many steps of products to hide them
     (ET-DECODE2-h100: 32 slices of one key tile each, at batch 1 over 4096 keys, took 22 us where cuDNN's
