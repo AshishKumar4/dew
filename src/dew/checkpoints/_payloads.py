@@ -78,7 +78,7 @@ def _in_payloads(tree: Mapping, profiles: TreePath | None) -> dict[str, dict]:
     payloads: dict[str, dict] = {MODEL: {}, PROFILES: {}, RESUME: {}}
     held = None if profiles is None else _at(rest, profiles)
     found = None if held is None else _power_profiles(held)
-    if found is not None:
+    if profiles is not None and found is not None:
         # Their place in the optimizer state holds no leaf, which every reader of a step's trees keeps.
         payloads[PROFILES] = {'averages': _averages_of(found)}
         rest = _with(rest, profiles, _with_averages(held, None))
@@ -94,7 +94,7 @@ def _from_payloads(payloads: Mapping[str, Mapping], profiles: TreePath | None) -
             for name, value in (payloads.get(payload) or {}).items()}
     averages = payloads.get(PROFILES)
     held = None if profiles is None else _at(tree, profiles)
-    if averages is not None and held is not None:
+    if profiles is not None and averages is not None and held is not None:
         tree = _with(tree, profiles, _with_averages(held, averages['averages']))
     return tree
 

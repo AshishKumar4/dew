@@ -24,13 +24,13 @@ class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str 
   .local_path: property -> str
   .materialized(self, template: Mapping[str, Variables], placement: Mapping[str, Variables], *, step: int, param_dtype: jax.typing.DTypeLike | None = None, parameter_roots: tuple[tuple[str, ...], ...] = (('params',), ('frozen',))) -> Variables
   .path(self, step: int) -> str
-  .pinned(self, step: int | str | None = None) -> int
+  .pinned(self, step: int | str | None = None, *, reads: str = 'model') -> int
   .position(self, step: int, share: DataPartition) -> bytes | None
   .posthoc_ema(self, std: float, step: int | None = None) -> Variables
   .profile_metadata(self, step: int) -> tuple[int, tuple[float, ...]]
   .profile_steps(self) -> list[int]
   .python_run(self, reasons: Sequence[str]) -> None
-  .resolve(self, step: int | str | None) -> int | None
+  .resolve(self, step: int | str | None, *, reads: str = 'model') -> int | None
   .restore(self, template=None, step: int | str | None = None, *, share: DataPartition | None = None, served: Sequence[ProjectionGroup] = ())
   .restore_profiles(self, step: int) -> tuple[Variables, ...]
   .resumed(self, resume: Resume = 'auto') -> int | None
@@ -99,7 +99,7 @@ class InputSpec(sample: Field, conditions: Mapping[str, Condition] = <factory>, 
   .encode_fields(self, batch: Batch) -> dict[str, Mapping[str, np.ndarray]]
   .encoders: property -> tuple[tuple[str, ConditionEncoder], ...]
   .tokenize(self, captions: Sequence[str]) -> dict[str, Mapping[str, np.ndarray]]
-class Keep(latest: int = 2, every: int | None = None, interval: datetime.timedelta | str | None = None, where: Callable[[Kept], bool] | None = None) -> None  [dew.checkpoints]
+class Keep(latest: int = 2, every: int | None = None, interval: datetime.timedelta | str | None = None, where: Callable[[Kept], bool] | None = None, weights_only: bool = False) -> None  [dew.checkpoints]
 class Layout(rules: LogicalAxisRules | Mapping[str, MeshAxes] = (('vocab', ('fsdp', 'tensor')), ('mlp', 'tensor'), ('mlp', 'fsdp'), ('modulation', 'fsdp'), ('attention', 'tensor'), ('attention', 'fsdp'), ('linear', 'fsdp'), ('embed', 'fsdp'), ('head_dim', 'fsdp'), ('heads', ('fsdp', 'tensor')), ('kv', ('fsdp', 'tensor')), ('index', 'fsdp'), ('kvlora', 'fsdp'), ('qlora', 'fsdp'), ('output', 'fsdp'), ('exp', 'expert'), ('heads', 'tensor'), ('kv', 'tensor'), ('activation_batch', ('data', 'expert', 'fsdp')), ('activation_length', 'sequence'), ('activation_spread', ('sequence', 'tensor')), ('activation_spread', 'sequence'), ('activation_heads', 'tensor'), ('activation_kv', 'tensor'), ('activation_mlp', 'tensor'), ('activation_vocab', 'tensor'), ('pages', ('data', 'expert', 'fsdp')), ('activation_batch', ('data', 'expert')), ('activation_batch', 'data')), min_shard: int = 65536, tolerance: float = 0.02, host: tuple[str, ...] = (), host_parameters: tuple[str, ...] = (), frozen_whole: bool = False, stage_local: bool = True, data_axes: tuple[str, ...] = ()) -> None  [dew.distributed.placement]
   .axis_rules: property -> LogicalAxisRules
   .check(self, params: Variables, shardings: Placement[Variables], mesh: Mesh) -> None
