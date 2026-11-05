@@ -92,10 +92,33 @@ def test_a_kernel_ptxas_serializes_fails_the_gate_as_a_spill_does():
     and spills clean: its MMAs run one at a time (row 3615; the kernel challenge's C7511 at 112 registers,
     C7512 at 96), which the registers and spills the gate read did not state."""
     read = kc.ptxas_read(SERIALIZING)
-    assert (read.registers, read.spilled, read.serialized) == (152, 0, ("C7512",))
-    record = {"name": "recurrence output", "generation": "sm90", "limit": 232448, "tmem_limit": 0,
-              "kernels": [{"kernel": "recurrence_output_mosaic_gpu_kernel", "shared": 1024, "tmem": 0,
-                           "registers": read.registers, "spilled": read.spilled,
-                           "serialized": read.serialized, "unread": []}]}
-    (failure,) = kc.mosaic_failures([record])
+    assert (read.registers, read.spilled, read.losses) == (152, 0, ("C7512",))
+    (failure,) = kc.mosaic_failures([_assembled_record("recurrence_output_mosaic_gpu_kernel", read)])
     assert "serialize" in failure
+
+
+IGNORING = ("ptxas info    : (C7507) Potential Performance Loss: 'setmaxnreg' ignored to maintain minimum "
+            "register requirements\n"
+            "ptxas info    : Compiling entry function 'gemm_mosaic_gpu_kernel' for 'sm_90a'\n"
+            "ptxas info    : Used 168 registers, used 1 barriers, 0 bytes smem\n"
+            "    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads")
+"""ptxas's report of a warp-specialized kernel whose roles' paths rejoin after their setmaxnreg: the kernel
+challenge's C7507 (notes/ptxas-re.md §4, 'setmaxnreg' ignored), its threads left at the entry's registers."""
+
+
+def test_a_kernel_whose_register_raises_ptxas_ignores_fails_the_gate():
+    """A Mosaic GPU kernel whose setmaxnreg ptxas ignores (C7507: code after the warp roles' split reachable
+    from both budgets, so every raise and decrease is dropped and the threads keep the entry's registers)
+    fails the compile gate (`mosaic_failures`), its registers and spills clean: its consumers never hold the
+    registers its tile was sized for (row 4071)."""
+    read = kc.ptxas_read(IGNORING)
+    assert (read.registers, read.spilled, read.losses) == (168, 0, ("C7507",))
+    (failure,) = kc.mosaic_failures([_assembled_record("gemm_mosaic_gpu_kernel", read)])
+    assert "setmaxnreg" in failure
+
+
+def _assembled_record(kernel: str, read) -> dict:
+    """A compile record of one spill-free H100 kernel as ptxas `read` it."""
+    return {"name": kernel, "generation": "sm90", "limit": 232448, "tmem_limit": 0,
+            "kernels": [{"kernel": kernel, "shared": 1024, "tmem": 0, "registers": read.registers,
+                         "spilled": read.spilled, "losses": read.losses, "unread": []}]}
