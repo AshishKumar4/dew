@@ -11,7 +11,7 @@ WHOLE = slice(None)
 """An axis taken whole (a view's slice along an axis it does not cut)."""
 
 GROUPS = 'groups'
-"""A side operand's axis of one value a group (`gemm.template`'s, row 3963): a launch reads the operand at its
+"""A side operand's axis of one value a group (`dew.nn.kernels.gemm`'s, row 3963): a launch reads the operand at its
 tile's group (`at_group`), the axis indexed away (`held`), and hands its hook the value at each of the tile's
 rows (`by_rows`), as the portable program reads it repeated at each row."""
 
@@ -39,7 +39,7 @@ def held(axes: Sequence[str]) -> tuple[str, ...]:
 def at_group(axes: Sequence[str], shape: Sequence[int], group) -> dict:
     """The origin along `GROUPS` a launch reads a side operand of `shape` at, none where `axes` name no
     groups: its tile's `group` modulo the operand's groups, as a stacked layer's call numbers its groups
-    past the layers before it (`gemm.template._grouped`)."""
+    past the layers before it (`dew.nn.kernels.gemm._grouped`)."""
     return {GROUPS: group % shape[axes.index(GROUPS)]} if GROUPS in axes else {}
 
 
