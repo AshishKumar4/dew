@@ -628,6 +628,32 @@ def test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh(gen
     assert set(COLLECTIVES.findall(text)) <= {"all_reduce"}
 
 
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_per_group_bias_reaches_its_launch_at_its_groups_extent(generation):
+    """Row 3963 (kernel-templates.md §3, Appendix C row 10): a grouped product's bias of each group's own,
+    `[G, N]` on the axes `('groups', 'columns')`, lowered for the GPU, reaches the product's launch as
+    `[G, N]`: the launch reads no `[rows, N]` operand, the buffer of each row's bias the epilogue's fusion
+    exists to remove."""
+    from dew.nn.kernels.templates.gemm import template
+    from dew.telemetry.instrumentation import custom_call_kind
+
+    rows, depth, width, groups = 384, 128, 256, 4
+
+    def biased(x, w, sizes, b):
+        return template.gemm(x, w, sizes, epilogue=lambda acc, bias: acc + bias,
+                             epilogue_operands=((b, ("groups", "columns")),), out_dtype=jnp.bfloat16)
+
+    args = (jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16),
+            jax.ShapeDtypeStruct((groups, depth, width), jnp.bfloat16),
+            jax.ShapeDtypeStruct((groups,), jnp.int32), jax.ShapeDtypeStruct((groups, width), jnp.float32))
+    with assumed(generation):
+        lowered = jax.jit(biased).trace(*args).lower(lowering_platforms=("cuda",))
+    launches = [call.operands for call in custom_calls(lowered)
+                if custom_call_kind(call.target) in ("triton", "mosaic_gpu")]
+    assert launches
+    assert all((rows, width) not in operands for operands in launches), launches
+
+
 @pytest.mark.parametrize("generation", GPUS)
 def test_an_expert_layer_lowers_for_every_gpu(generation):
     """An expert layer's bf16 forward and backward under 'auto', its grouped matmul and SiLU product as
