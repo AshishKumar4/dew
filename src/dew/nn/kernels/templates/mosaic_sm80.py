@@ -419,6 +419,11 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             raise ValueError("an mma.sync family's pipeline loads a step's block in one copy, not in pieces")
         return Pipeline(blocks, stages, dict(swizzles or {}), consumers)
 
+    def shares_rows(self, rows: int, consumers: int) -> bool:
+        # Two consumers copy a block by cp.async, each an equal share of its rows, a warpgroup's copy
+        # spreading whole 8-row tiles over its four warps (the fork's pipeline-thread-axis refuses others).
+        return consumers == 1 or rows % (consumers * 4 * mosaic.TILE_ROWS) == 0
+
     def output_staging(self, outputs: tuple, consumers: int) -> list:
         # Each output's tile staged whole: two consumers' rows of it side by side (`persist`).
         return [plgpu.SMEM(shape if consumers == 1 else (consumers, *shape), dtype)
