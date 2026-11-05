@@ -1048,12 +1048,11 @@ def test_a_run_draws_images_on_every_trainer_layout_as_one_device_does(tmp_path,
     make_run(tmp_path)
     devices = jax.devices()[:4]
     layout = Layout(min_shard=1, tolerance=1.0)
-    alone = TextToImage.from_run(str(tmp_path))
+    alone = dew.pipeline(str(tmp_path), mesh=MeshSpec().build(devices[:1]), layout=layout)
     placed = dew.pipeline(str(tmp_path), mesh=MeshSpec(**spec).build(devices), layout=layout)
     server = ScoringServer.from_task(*placed.scoring(steps=3, images=2))
-    # The twin on the host, as its prepared inputs are.
     wide = dataclasses.replace(alone, model=alone.model.clone(dtype=jnp.float64),
-                               variables=widened(jax.device_get(alone.variables)))
+                               variables=widened(alone.variables))
     prompts = ["a", "b"]
 
     def draw(seed):
@@ -1074,8 +1073,7 @@ def test_a_run_draws_images_on_every_trainer_layout_as_one_device_does(tmp_path,
 
     @as_given
     def truth(keys):
-        prepared = alone.prepare(prompts, key=int(keys[0]), steps=3)
-        held = widened(jax.tree.map(np.asarray, prepared))
+        held = widened(alone.prepare(prompts, key=int(keys[0]), steps=3))
         with jax.enable_x64(new_val=True):
             return wide(held, steps=3, key=int(keys[0])).host().images
 
