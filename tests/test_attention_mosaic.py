@@ -1580,11 +1580,13 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
     share of it; together the model's are the library's fused attention's own count, a multiply-add a
     reached pair, head and product column (a causal call's `pairs` each query's keys up to its own place,
     written out: the first key aligned to the first query, as the mainloop masks them): the forward's two
-    products, the training forward's two and the backward's four, the hardware's one recomputed `Q K^T`
-    more in the training forward and in the backward
-    (`instrumentation._fused_attention_flops`), a rerun (the guarded launch, the fold's natural walk) adding
-    none. The launches' own statements are read: the training forward's overflowed rows rerun the plain-JAX
-    walk in a conditional, whose products the count bounds apart."""
+    products, the training forward's two and the backward's four (`instrumentation._fused_attention_flops`).
+    The hardware's work is every tile its walk issues, whole: each 64 by 64 tile holding a reached pair
+    (padded rows and a causal diagonal tile's masked half computed with the rest, as an H100's tensor-pipe
+    counts read them, row 3948's receipt), and one recomputed `Q K^T` more in the training forward and in the
+    backward; a rerun (the guarded launch, the fold's natural walk) adds none. The launches' own statements
+    are read: the training forward's overflowed rows rerun the plain-JAX walk in a conditional, whose
+    products the count bounds apart."""
     import re
 
     from dew.telemetry.instrumentation import _MODEL_FLOPS, _stated_flops, hlo_flops
@@ -1594,6 +1596,12 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
     key = jax.ShapeDtypeStruct((rows, keys, kv_heads, width), jnp.bfloat16)
     spans = template.spans(queries, keys, rows, causal=causal)
     forward = 2 * rows * heads * pairs * (width + width)
+    # The 64 by 64 tiles the pinned launches walk that hold a reached pair (a key at or before its query
+    # where causal), each computed whole.
+    block = 64
+    walked = sum(block * block for first_q in range(0, queries, block) for first_k in range(0, keys, block)
+                 if not causal or first_k <= min(first_q + block, queries) - 1)
+    issued = 2 * rows * heads * walked * (width + width)
 
     # Lowered deviceless for an H100 whatever the host, so a GPU host of another generation lowers no TMA
     # of its own.
@@ -1621,9 +1629,12 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
         return attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals)
 
     # The training forward recomputes its walk's `Q K^T`; the fast backward its `S` beside its four.
-    product = forward // 2
-    plain = counted(lambda q, k, v: attention_mosaic.forward(q, k, v, spans), query, key, key)
-    assert plain == (forward, forward)
+    product = issued // 2
+    pins = (attention_mosaic.Tiles(block, block, 2, 1), attention_mosaic.BackwardTiles(block, block, 2, 1,
+                                                                                         fused=True))
+    with _pinned(*pins):
+        plain = counted(lambda q, k, v: attention_mosaic.forward(q, k, v, spans), query, key, key)
+    assert plain == (forward, issued)
     # A forward whose launches walk its value columns a block apiece: each recomputes `Q K^T`, which the
     # model owns once. The blocks' launches are one kernel called once a block, as the step's FLOP count
     # weighs it (`hlo_flops`, against the whole walk's count).
@@ -1634,12 +1645,14 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
         assert found is not None
         return found.model, found.hardware
 
-    whole = weighed(lambda q, k, v: attention_mosaic.forward(q, k, v, spans))
-    with _pinned(attention_mosaic.Tiles(64, 64, 2, 1, columns=width // 2)):
+    with _pinned(*pins):
+        whole = weighed(lambda q, k, v: attention_mosaic.forward(q, k, v, spans))
+    with _pinned(attention_mosaic.Tiles(block, block, 2, 1, columns=width // 2)):
         blocked = weighed(lambda q, k, v: attention_mosaic.forward(q, k, v, spans))
     assert blocked == (whole[0], whole[1] + product)
-    assert counted(trained, query, key, key) == (forward, forward + product)
-    assert counted(backward, query, key, key, query, residuals) == (2 * forward, 2 * forward + product)
+    with _pinned(*pins):
+        assert counted(trained, query, key, key) == (forward, issued + product)
+        assert counted(backward, query, key, key, query, residuals) == (2 * forward, 2 * issued + product)
 
 
 @pytest.mark.parametrize("axis", [0, 1])
