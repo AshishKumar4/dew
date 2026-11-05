@@ -1860,13 +1860,13 @@ def prepared(models: Sequence[str], *, dtype: str, seeds: int | Mapping[str, int
     seeds the reference's first draw alone (`ran`), with the reference's FLOPs, computed into
     `references` where missing; whether every model's is there."""
     sys.path.insert(0, str(REPO / "tests"))
-    from reference_error import REDRAW
+    from check1_wire import staged_units
 
     whole = True
     for model in models:
         started = time.perf_counter()
         count = seeds if isinstance(seeds, int) else seeds[model]
-        draws = (1 + REDRAW) * count * (windows if isinstance(windows, int) else windows.get(model, 1))
+        draws = staged_units(count) * (windows if isinstance(windows, int) else windows.get(model, 1))
         try:
             _, reference = model_case(model, dtype, mixture, objective)
             judge = Judge(reference, references, model)

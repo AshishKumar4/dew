@@ -230,6 +230,26 @@ def test_reference_reads_work_without_importing_dew_or_jax(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_a_reference_runs_traced_tail_is_a_dew_capture(tmp_path):
+    """`TracedWindow` traces a run's last steps through `dew.Profiler`, Dew's one capture path: a Dew
+    capture is running for exactly those steps, so a `dew.region` marks them, and it has stopped, its
+    trace under the window's directory where `attach_xplane_profile` reads it, when the window closes."""
+    from dew.telemetry.profile import active_profile
+
+    common = load("reference_runs/common")
+    window = common.TracedWindow(total=5, warmup=1, profiled=2, trace_dir=tmp_path / "trace")
+    step = jax.jit(lambda value: value + 1)
+    value, capturing = jax.numpy.zeros(()), []
+    for index in range(5):
+        window.before(index, value)
+        capturing.append(active_profile() is not None)
+        value = step(value)
+    assert window.close(value) > 0
+    assert capturing == [False, False, False, True, True]
+    assert active_profile() is None
+    assert list((tmp_path / "trace").rglob("*.xplane.pb"))
+
+
 def test_the_dew_qwen35_runner_trains_its_compiled_step(tmp_path):
     """The Dew side of the matched pair runs the trainer's compiled step as it returns: a tiny
     Qwen3.5 backbone on one device, as the runner requires, warms up, times and samples a step

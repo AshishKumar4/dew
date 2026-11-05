@@ -168,7 +168,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
 
     splits: collections.OrderedDict = collections.OrderedDict()  # the least recently prepared first
 
-    def prepare(chunk, issue=None, transition: bool = False):
+    def prepare(chunk, issue=None, transition: bool = False, inverse=None):
         affine, (exponent, *values) = parts(chunk)
         decays = _decays(exponent, affine.base2)
         natural = _walked(exponent, affine.base2)
@@ -178,7 +178,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         form = _form(extents, corrected)
         # The form's largest values that read no state, prepared with the chunk's decays and tokens: the
         # operands of its function, whose state the carry reads (`carry.split`).
-        held = _prepared(form, tokens, decays, issue or _issued)
+        held, solved = _prepared(form, tokens, decays, issue or _issued, inverse)
         given = (*decays, *(tokens[name] for name in TOKENS), *held.values())
         # A split is priced and traced where it is derived (`derive.context`): one derived under another
         # target, precision, numerics or mesh is none of this one's.
@@ -191,7 +191,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
             if len(splits) > splits_held:
                 splits.popitem(last=False)
         splits.move_to_end(key)
-        prepared = Prepared((natural, split.prepare(*given)), split, corrected)
+        prepared = Prepared((natural, split.prepare(*given)), split, corrected, inverse=solved)
         if not (corrected and transition):
             return prepared
         return dataclasses.replace(prepared, transition=_transition(prepared, jnp.zeros(shape, carried)))
@@ -224,7 +224,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         del operands
         return state[1].astype(dtype)
 
-    def backward(chunk, state, d_state, d_outputs, issue=None):
+    def backward(chunk, state, d_state, d_outputs, issue=None, inverse=None):
         # The chunk's forms' adjoint: the reverse scan's step, each chunk's transition transposed, as the
         # forward forms' derivative (their prefix, substitution and Dew products differentiated), each
         # product's adjoint the issuer's where one is given (`_adjoined`).
@@ -232,7 +232,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         issued = None if issue is None else _adjoined(issue)
 
         def forward(h, operands):
-            entering, prepared = (state[0], h), prepare({**chunk, **operands}, issued)
+            entering, prepared = (state[0], h), prepare({**chunk, **operands}, issued, inverse=inverse)
             return mapped(prepared, entering, issued), step(entering, prepared, issued)[1]
 
         _, pullback = jax.vjp(forward, state[1], {name: chunk[name] for name in names})
@@ -243,7 +243,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
                    {"rounding": "compensated prefix", "walked": declaration.walked}, backward, prepare)
 
 
-@functools.partial(jax.tree_util.register_dataclass, data_fields=["values", "transition"],
+@functools.partial(jax.tree_util.register_dataclass, data_fields=["values", "transition", "inverse"],
                    meta_fields=["split", "corrected"])
 @dataclasses.dataclass(frozen=True)
 class Prepared:
@@ -256,6 +256,10 @@ class Prepared:
     split: carry.Split
     corrected: bool
     transition: jax.Array | None = None
+    inverse: jax.Array | None = None
+    """The chunk's solve's inverse less its unit diagonal (`[C, C]`, None where the form solves nothing),
+    which a training forward keeps and its backward reads (`Derived.backward`'s `inverse`) in place of
+    solving again."""
 
 
 class Walk(NamedTuple):
@@ -403,12 +407,21 @@ def _chunk(form: linear_scan.Form, held: tuple, h, entering, to_last, whole, bet
             _evaluated(form.state, tokens, decays, h, known))
 
 
-def _prepared(form: linear_scan.Form, tokens: Mapping, decays: _Decays, issue: Callable) -> dict:
+def _prepared(form: linear_scan.Form, tokens: Mapping, decays: _Decays, issue: Callable,
+              inverse: jax.Array | None = None) -> tuple[dict, jax.Array | None]:
     """The form's largest values that read no state but its tokens and decays (a solve's inverse, a gram,
-    a token decayed), by node, evaluated, each product `issue`'s (`_evaluated`)."""
-    known: dict = {}
+    a token decayed), by node, evaluated, each product `issue`'s (`_evaluated`), and the solve's inverse
+    they read (None where the form solves nothing): a training forward's kept `inverse`, where given, in
+    place of the solve (`_kept`)."""
+    known: dict = {} if inverse is None else {INVERSE: inverse}
     nodes = linear_scan.prepared((form.outputs, form.state))
-    return {node: _evaluated(node, tokens, decays, None, known, issue) for node in nodes}
+    values = {node: _evaluated(node, tokens, decays, None, known, issue) for node in nodes}
+    return values, known.get(INVERSE)
+
+
+INVERSE = object()
+"""`_evaluated`'s key of a chunk's solve's inverse (less its unit diagonal) among the values it knows: a
+training forward's kept one, which takes the solve's place, or the one it solved."""
 
 
 def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Callable | None = None):
@@ -466,7 +479,11 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
         value = issue("carry", (of(args[0]) * decays.to_last).T, of(args[1]))
     elif (args := get_callable_args(node, Chunk.doubled)) is not None:
         # Differentiated by its own rule where Dew's products make it (`_lowered`); a mainloop's are forward.
-        value = _lowered(of(args[0])) if issue is _issued else _doubled(of(args[0]), issue)
+        if INVERSE in known:
+            value = _kept(of(args[0]), known[INVERSE])
+        else:
+            value = _lowered(of(args[0])) if issue is _issued else _doubled(of(args[0]), issue)
+        known[INVERSE] = value
     elif (args := get_callable_args(node, Chunk.substituted)) is not None:
         value = _substituted(of(args[0]), of(args[1]))
     else:
@@ -636,6 +653,32 @@ def _issued(name: str, left, right):
     return float32_matmul(left, right)
 
 
+def _inverse_cotangent(lower, d_lower):
+    """The overlaps' cotangent of `(I + overlaps)^-1 - I` (`lower`) from its own: with `X = I + lower`,
+    `-X^T d_lower X^T` below the diagonal."""
+    back = _applied(lower.T, d_lower)
+    return _below(-_applied(lower, back.T).T)
+
+
+def _kept(overlaps, lower):
+    """A chunk's solve's inverse as a training forward kept it (`lower`, `_lowered`'s), in place of solving
+    `overlaps` again: its value `lower`, its overlaps' cotangent the solve's (`_inverse_cotangent`), so a
+    backward that reads the kept inverse redoes no doubling."""
+    return _kept_rule()(overlaps, lower)
+
+
+@functools.cache
+def _kept_rule() -> Callable:
+    def forward(overlaps, lower):
+        del overlaps
+        return lower, lower
+
+    def backward(lower, d_lower):
+        return _inverse_cotangent(lower, d_lower), jnp.zeros_like(lower)
+
+    return declared_derivative(Protected(), lambda overlaps, lower: lower, forward, backward)
+
+
 def _applied(lower, given):
     """`(I + lower) @ given`, the identity outside the product."""
     return given + float32_matmul(lower, given)
@@ -659,8 +702,7 @@ def _lowered_rule() -> Callable:
 
     def backward(lower, operands, d_lower):
         del operands
-        back = _applied(lower.T, d_lower)
-        return (_below(-_applied(lower, back.T).T),)
+        return (_inverse_cotangent(lower, d_lower),)
 
     return generation.linear_tangent(forward, backward, _doubled, kind=Protected())
 

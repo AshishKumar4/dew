@@ -5,7 +5,7 @@ import dataclasses
 from collections.abc import Sequence
 
 import numpy as np
-from check1_statistics import ZeroRows, row_factor
+from check1_statistics import RULED_SHARE, ZeroRows, row_factor
 
 
 @dataclasses.dataclass
@@ -29,19 +29,38 @@ class _Draws:
     example_rows: list[list[np.ndarray | None]] | None = None
     """At such a site, each seed's per-example log ratio of Dew's worst row over the reference's worst row
     on the same example, each over its size (`_example_worst_rows`), else None."""
+    shares: np.ndarray | None = None
+    """The share of each seed's worst row's squared error its largest element carries, Dew's and the
+    reference's (seed by leaf by arm, as `worst`), zero where no row is sized and NaN where it is unknown (a
+    recording's summary keeps no row's elements, a row of float64 zero a live reference measured); None
+    where none was kept (`held_shares`)."""
 
     def factor(self, index: int) -> float:
-        """The worst-row rule's factor for leaf `index`, by its rows' width (`row_factor`)."""
-        return row_factor(self.widths[index])
+        """The worst-row rule's factor for leaf `index` (its maximum's, `_judgement`): its rows' width's
+        (`row_factor`), but a row of one value's at rows of more than two values where one element carries
+        past RULED_SHARE of both Dew's worst row and the reference's over these draws, the two rows one
+        value rules alike. A share unknown keeps the width's."""
+        width = self.widths[index]
+        if width > 2:
+            shares = self.held_shares()
+            mine, theirs = (int(np.argmax(self.worst[:, index, arm])) for arm in (0, 1))
+            if shares[mine, index, 0] > RULED_SHARE and shares[theirs, index, 1] > RULED_SHARE:
+                return row_factor(1)
+        return row_factor(width)
+
+    def held_shares(self) -> np.ndarray:
+        """`shares`, every cell unknown (NaN) where none was kept, so draws join and pick per cell."""
+        return np.full(self.worst.shape, np.nan) if self.shares is None else self.shares
 
     def joined(self, other: "_Draws") -> "_Draws":
         examples, example_rows = ((getattr(self, field) + getattr(other, field)
                                    if getattr(self, field) is not None and getattr(other, field) is not None
                                    else None) for field in ("examples", "example_rows"))
+        shares = np.concatenate([self.held_shares(), other.held_shares()])
         return _Draws(self.names, *(np.concatenate([getattr(self, field), getattr(other, field)])
                                     for field in ("mine", "theirs", "worst")),
                       self.zero_rows + other.zero_rows, np.concatenate([self.finite, other.finite]),
-                      self.widths, examples, example_rows)
+                      self.widths, examples, example_rows, shares)
 
     def between(self, start: int, stop: int) -> "_Draws":
         """These draws' seeds `start` to `stop`, counted from their first."""
@@ -49,7 +68,8 @@ class _Draws:
         examples, example_rows = (None if getattr(self, field) is None else getattr(self, field)[cut]
                                   for field in ("examples", "example_rows"))
         return _Draws(self.names, self.mine[cut], self.theirs[cut], self.worst[cut], self.zero_rows[cut],
-                      self.finite[cut], self.widths, examples, example_rows)
+                      self.finite[cut], self.widths, examples, example_rows,
+                      None if self.shares is None else self.shares[cut])
 
     def of_examples(self, index: int) -> list[np.ndarray] | None:
         """Leaf `index`'s per-example log ratios a seed, or None where the site stacks none or a seed's
@@ -91,5 +111,8 @@ class _Draws:
                      for seed, other, picked in zip(self.zero_rows, library.zero_rows, pick, strict=True)]
         # A library arm's leaves are judged by their pooled ratio alone: their examples are not Dew's against
         # one reference.
+        # A picked cell's worst row is the library arm's, and so is its share.
+        shares = self.held_shares().copy()
+        shares[..., 1] = np.where(pick, library.held_shares()[..., 1], shares[..., 1])
         return _Draws(self.names, self.mine, np.where(pick, library.theirs, self.theirs), worst, zero_rows,
-                      self.finite & (library.finite | ~covered), self.widths)
+                      self.finite & (library.finite | ~covered), self.widths, shares=shares)
