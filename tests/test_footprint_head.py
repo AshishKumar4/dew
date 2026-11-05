@@ -240,11 +240,19 @@ def test_a_head_that_takes_its_gradient_in_the_backward_has_its_weight_gradients
             rows = rows @ weights
         return jnp.sum(rows), ()
 
+    def weights_last(program) -> bool:
+        """Whether every weight's product runs after every product another of the backward's reads."""
+        products = [equation for equation in program.eqns if equation.primitive.name == "dot_general"]
+        weights = [index for index, equation in enumerate(products)
+                   if equation.outvars[0].aval.shape == square]
+        read = {value for equation in products if equation.outvars[0].aval.shape != square
+                for value in equation.invars}
+        chained = [index for index, equation in enumerate(products) if equation.outvars[0] in read]
+        return len(weights) == 4 and max(chained) < min(weights)
+
     program, count, _ = traced_gradient(chained, layers, (rows,))
     program = compiled(program.replace(outvars=program.outvars[:count]), "cuda")
-    reordered = sunk(program)
-    products = [equation for equation in reordered.eqns if equation.primitive.name == "dot_general"]
-    assert [tuple(equation.outvars[0].aval.shape) for equation in products[-4:]] == [square] * 4
+    assert not weights_last(program) and weights_last(sunk(program))
     early, late = (gradient_peak(chained, layers, (rows,), platform="gpu", workspace=Workspace(0, 0),
                                  consumed=True, deferred=deferred).bytes for deferred in (False, True))
     activation = TOKENS * 16 * WIDTH * 4
