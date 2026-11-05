@@ -872,7 +872,11 @@ def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
 def served_alongside(bound, slots=4, admission=2, **options):
     """Every prompt submitted at once, plus the longest again once it is done,
     through a server with `options`; returns the server and the tickets."""
-    server = Server.from_task(bound, slots=slots, capacity=128, admission=admission, **options)
+    return served_by(Server.from_task(bound, slots=slots, capacity=128, admission=admission, **options))
+
+
+def served_by(server):
+    """`served_alongside`'s requests through `server`; returns the server and the tickets."""
     tickets = [server.submit(prompt, budget, key=index)
                for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     server.run()
@@ -954,7 +958,8 @@ def test_a_server_drafts_speculative_blocks_as_a_lone_call_does(temperature, dec
     budgets beside one another, seated mid-flight, ending inside a call, and every request draws what its
     lone task call draws, greedy or sampled, the sampled ones under counter-based row keys too, as the
     RBG implementation keys them (3617: every row's own stream, whatever slot it sits in, where vmap would
-    draw them all from the first). Speculation over paged or chunked rows is refused by name, and so is a
+    draw them all from the first), served outside the context that made RBG the default, as an engine's
+    thread serves it (3943). Speculation over paged or chunked rows is refused by name, and so is a
     reload with a row running, whose next block would open on the old weights' logits."""
     model = decoder().clone(max_seq_len=128, num_nextn_predict_layers=1)
     params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
@@ -963,7 +968,8 @@ def test_a_server_drafts_speculative_blocks_as_a_lone_call_does(temperature, dec
     with contextlib.nullcontext() if keys is None else jax.default_prng_impl(keys):
         alone = [bound(prompt, budget, key=index)
                  for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-        server, tickets = served_alongside(bound, decode_steps=decode_steps)
+        server = Server.from_task(bound, slots=4, capacity=128, admission=2, decode_steps=decode_steps)
+    server, tickets = served_by(server)
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), lone)
     for options in ({"kv_cache": KVCache(page_size=16, pages=12)}, {"chunk": 3}):
