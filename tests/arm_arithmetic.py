@@ -104,4 +104,9 @@ class Truth:
         self.fn, self.run = fn, unrewritten(jax.jit(fn))
 
     def __call__(self, *inputs):
-        return self.run(*inputs)
+        try:
+            return self.run(*inputs)
+        except Exception as error:
+            code = getattr(self.fn, "__code__", None)
+            where = f"{code.co_filename.rsplit('/tests/', 1)[-1]}:{code.co_firstlineno}" if code else repr(self.fn)
+            raise AssertionError(f"PROBE-3198-WHERE {where} {type(error).__name__}") from error
