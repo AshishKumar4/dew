@@ -22,10 +22,11 @@ from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.nn.mimo_audio import MiMoAudio
 from dew.registry import towers
 
-PACKED_MEDIA = (*QWEN35_TYPES, 'muse_glimmer', 'lfm3_vl', 'mimo_v2')
+PACKED_MEDIA = (*QWEN35_TYPES, 'muse_glimmer', 'lfm3_vl', 'mimo_v2', 'kimi_k25')
 """The wrappers whose processors pack images and videos alike, as runs of patch vectors beside their
 `(t, h, w)` grids, a video's frames each a run of its own (`Processor._qwen_frames`): Qwen 3.5's, Muse
-Glimmer's, LFM3-VL's and MiMo-V2.6's, whose towers attend and convolve within a frame."""
+Glimmer's, LFM3-VL's and MiMo-V2.6's, whose towers attend and convolve within a frame; and Kimi K2.5's,
+each item whole, whose tower attends over an item's frames and pools them (`TowerGeometry.pools_frames`)."""
 
 VIDEO_MEDIA = (*PACKED_MEDIA, *GEMMA4_TYPES)
 """The wrappers whose processors carry videos (`pixel_values_videos`): the packed ones and Gemma 4's,
@@ -497,7 +498,9 @@ class Processor:
             chunks, grid, merge, runs = self._qwen_frames(values, tokens, runs)
             image_counts = np.array([len(row) for row in runs], np.int32)
             shape = (max(chunk.shape[0] for chunk in chunks), chunks[0].shape[-1])
-            selected = [np.arange(length) for length in np.prod(grid, axis=1) // merge ** 2]
+            # A pooling tower's item gives its first frame's merge blocks (`TowerGeometry.pools_frames`).
+            tokens_of = np.prod(grid[:, 1:] if self.pools_frames else grid, axis=1)
+            selected = [np.arange(length) for length in tokens_of // merge ** 2]
             capacity = shape[0] // merge ** 2
         elif "image_position_ids" in values or "video_position_ids" in values:
             chunks, patch_positions, selected, kernel = self._positioned_chunks(values, tokens, runs,
@@ -632,6 +635,14 @@ class Processor:
         }
         return {"audio_indices": jnp.asarray(indices)}, conditioning
 
+    @property
+    def pools_frames(self) -> bool:
+        """Whether the source's tower pools an item's frames into one frame's tokens
+        (`TowerGeometry.pools_frames`)."""
+        tower = self.record.get("tower")
+        return (tower is not None
+                and towers.from_record(_records.record(tower, "tower")).geometry().pools_frames)
+
     def _merge_size(self) -> int:
         """The merger's spatial merge, as the projector's translation reads it, the reference's
         default of 2 included: Qwen 3.5's merger names it `spatial_merge_size`, Muse Glimmer's
@@ -652,10 +663,11 @@ class Processor:
         views share the existing visual tower and merger without new weights.
         """
         merge = self._merge_size()
+        pooled = self.pools_frames
         streams = {}
         for pixel_name, grid_name, token_name, split in (
                 ("pixel_values", "image_grid_thw", "image_token_id", False),
-                ("pixel_values_videos", "video_grid_thw", "video_token_id", True)):
+                ("pixel_values_videos", "video_grid_thw", "video_token_id", not pooled)):
             if (pixel_name in values) != (grid_name in values):
                 raise ValueError(f"{pixel_name} and {grid_name} arrive together")
             if pixel_name not in values:
@@ -664,6 +676,9 @@ class Processor:
             if (grid.ndim != 2 or grid.shape[1] != 3 or not np.issubdtype(grid.dtype, np.integer)
                     or np.any(grid <= 0) or np.any(grid[:, 1:] % merge)):
                 raise ValueError(f"{grid_name} requires positive integer grids tiled by spatial_merge_size")
+            if pixels.ndim == 4:
+                # A patch as a convolution reads it, `[channels, height, width]`: its vector channels first.
+                pixels = pixels.reshape(pixels.shape[0], -1)
             if pixels.ndim != 2 or not np.issubdtype(pixels.dtype, np.floating):
                 raise ValueError(f"{pixel_name} must be floating packed patch vectors")
             if int(np.prod(grid, axis=1).sum()) != pixels.shape[0]:
@@ -681,7 +696,7 @@ class Processor:
             if type(token_id) is not int:
                 raise ValueError(f"{token_name} must be an integer")
             streams[token_id] = pieces
-        sizes = {token: [int(np.prod(grid)) // merge ** 2 for _, grid in pieces]
+        sizes = {token: [int(np.prod(grid[1:] if pooled else grid)) // merge ** 2 for _, grid in pieces]
                  for token, pieces in streams.items()}
         spans = _payload_spans(runs, tokens, sizes)
         ordered = _in_text_order(streams, tokens, spans)

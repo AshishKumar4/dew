@@ -219,10 +219,13 @@ def _interp_taps(index, size, side: int, align_corners: bool, dtype, *, clamped:
     index = index.astype(at_least_fp32(dtype))
     if align_corners:
         source = index * (side - 1) / jnp.maximum(size - 1, 1)
+    elif clamped or cubic:
+        # `F.interpolate`'s source coordinate: the scale first, then the half-pixel centre
+        # (`area_pixel_compute_source_index`), held at 0 for bilinear.
+        source = (side / size).astype(index.dtype) * (index + 0.5) - 0.5
+        source = source if cubic else jnp.maximum(source, 0)
     else:
         source = (index + 0.5) * side / size - 0.5
-    if clamped and not cubic:
-        source = jnp.maximum(source, 0)
     floor = jnp.floor(source)
     distance = source - floor
     if cubic:
