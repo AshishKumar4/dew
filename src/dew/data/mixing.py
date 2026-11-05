@@ -779,14 +779,19 @@ _UNOPENED = "unopened"
 
 
 class _MixReads:
-    """Every corpus of a mix, each opened and read only as the mix draws from it: a corpus the mix has
-    not drawn holds no iterator, so no reader's threads, buffers or files, and no position but its
-    start and the counts it carries there (`state`). A mix captures every corpus's position for each
-    record it gives (a packer captures it before each record), and only the corpus it read moved, so
-    a corpus's position is captured again only after the mix reads it or it is restored."""
+    """Every corpus of a mix, opened as the mix first draws, every one at once: an unopened corpus holds no
+    iterator, so no reader's buffers or files, and no position but its start and the counts it carries
+    there (`state`), and a mix that opened each as it first drew from it made a reader's objects at each
+    first draw, step after step until it had drawn from every one (row 4079: a thousand-member packed mix
+    retained 3.4k blocks a step over its first hundreds of steps, and its collector met them), where at
+    once its steps hold what its first does; a corpus a repeat or a restore puts back at its start opens
+    again as it is drawn. A mix captures every corpus's position for each record it gives (a packer
+    captures it before each record), and only the corpus it read moved, so a corpus's position is
+    captured again only after the mix reads it or it is restored."""
 
     def __init__(self, corpora: Sequence[pygrain.IterDataset[Batch]]):
         self.corpora = tuple(corpora)
+        self.drawn = False
         self.opened: dict[int, pygrain.DatasetIterator[Batch]] = {}
         # Each opened corpus's captured position, until a read or a restore moves it.
         self.states: dict[int, Mapping[str, object]] = {}
@@ -806,6 +811,10 @@ class _MixReads:
         return self.opened[index]
 
     def read(self, index: int) -> Batch:
+        if not self.drawn:
+            self.drawn = True
+            for each in range(len(self.corpora)):
+                self.parent(each)
         self.states.pop(index, None)
         return next(self.parent(index))
 

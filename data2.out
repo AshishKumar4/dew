@@ -1,0 +1,9 @@
+run_tests: tests/test_barren_reads.py runs as CI's 3 groups
+run_tests: tests/test_data_elastic.py runs as CI's 2 groups
+run_tests: tests/test_data_matrix.py runs as CI's 28 groups
+run_tests: tests/test_dataset_chain.py runs as CI's 2 groups
+run_tests: tests/test_decision_packing.py runs as CI's 22 groups
+run_tests: tests/test_decision_recipe.py runs as CI's 5 groups
+run_tests: tests/test_multiprocess.py runs as CI's 50 groups
+run_tests: tests/test_pipeline_golden.py runs as CI's 5 groups
+run_tests: tests/test_pipeline_streaming.py runs as CI's 2 groups
