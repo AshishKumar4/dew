@@ -71,7 +71,7 @@ def test_a_called_program_holds_what_it_would_inline(case):
     """XLA sees no call: a `jit` is a call its `CallInliner` inlines (`_pjit_lowering`, jax/_src/pjit.py;
     `GpuCompiler::RunPreSPMDPartitionerPasses`, xla/service/gpu/gpu_compiler.cc), and a custom derivative's
     primal lowers to its program in the caller (`_custom_jvp_vjp_call_lowering`,
-    jax/_src/custom_derivatives.py), so `compiled` inlines each (`compiled_program.called`) and a program
+    jax/_src/custom_derivatives.py), so `compiled` inlines each (`dew.nn.programs.called`) and a program
     holds at its peak what it would hold inlined (`CALLED`)."""
     called, inline, specs, held = CALLED[case]
 

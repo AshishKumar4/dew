@@ -418,13 +418,8 @@ def _body(equation):
     marked span, each evaluated op by op as the computation's own), or None. A shard_map's per-device program
     is evaluated too, on each device's blocks (`_mapped`); a body that runs elsewhere, a Pallas kernel, is
     one operation, its outputs their own size."""
-    if equation.primitive.name not in programs.CALLS:
-        return None
-    for name in ("jaxpr", "call_jaxpr", "fun_jaxpr"):
-        body = equation.params.get(name)
-        if body is not None:
-            return (body.jaxpr, body.consts) if hasattr(body, "consts") else (body, [])
-    return None
+    body = programs.called(equation)
+    return None if body is None else (body, body.consts)
 
 
 def _squared(value):

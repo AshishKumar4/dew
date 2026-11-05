@@ -138,8 +138,7 @@ def agrees_with_xla(kernel: str) -> None:
 
     fused, xla, wide = over(kernel, "bfloat16"), over("xla", "bfloat16"), over("xla", "float64")
     template = xla.init(jax.random.PRNGKey(0))
-    with jax.enable_x64(new_val=True):
-        held = float64_held(template)
+    held = float64_held(template)
     tokens = xla.inputs.tokenize(["a", "b", "c", "d"] * 4)
 
     def draw(seed):

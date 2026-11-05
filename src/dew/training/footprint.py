@@ -71,6 +71,10 @@ class Footprint:
     """The bytes of the state's host-resident fields its commit holds on the device at once, beside the
     whole gradient it reads: the step's own staged cut as it is traced (`dew.training.staging.measured`),
     none for a state the device holds."""
+    consumed: bool | None = None
+    """Whether `peak` holds each gradient only while it is made, the step reading it there into the
+    buffers its state donates (`transaction.consumed_where_made`, asked where the peak is derived), else
+    every gradient to the end; None where no peak is derived."""
 
     @property
     def temporaries(self) -> int | None:
@@ -85,7 +89,7 @@ class Footprint:
         """The terms traced, not an admission decision: XLA's fit check remains authoritative."""
         return {"residuals": self.residuals, "gradients": self.gradients, "held": self.held,
                 "resident": dict(self.resident), "peak": self.peak, "peak_exact": self.exact,
-                "staged": self.staged}
+                "staged": self.staged, "consumed": self.consumed}
 
 
 class Peak(NamedTuple):
@@ -620,7 +624,7 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     # Data and fully sharded data parallelism split the rows alone; an expert axis splits the experts too.
     rows = set(row_axes(rows_of(micro), mesh=mesh)) & {DATA_AXIS, FSDP_AXIS} if spread else set()
     if not spread <= rows or not judged(target, capacity):
-        residuals = peak = None
+        residuals = peak = reads = None
     else:
         loss, (variables, *rest) = traced_loss(objective, prepared, window, split)
         variables = forward_variables(variables, prepared.compute)
@@ -641,11 +645,12 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                 np.asarray([device]).reshape((1,) * len(mesh.axis_names)), mesh.axis_names,
                 axis_types=mesh.axis_types)):
             lowering = lowering_platform(target)
+            reads = consumed()
             residuals, peak = derived_terms(trained, arguments[0]["params"], arguments,
                                             platform=target.platform, workspace=gemm_workspace(target),
-                                            lowering=lowering, consumed=consumed())
+                                            lowering=lowering, consumed=reads)
     resident = {name: device_bytes(value) for name, value in {
         "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
         "accumulation": prepared.accumulation, "compute": prepared.compute, "groups": prepared.inner}.items()}
     return Footprint(residuals, device_bytes(prepared.variables["params"]), held, resident,
-                     None if peak is None else peak.bytes, peak is None or peak.exact, staged)
+                     None if peak is None else peak.bytes, peak is None or peak.exact, staged, reads)
