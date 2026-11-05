@@ -56,7 +56,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import axes, bundles, cost as unit_cost, mosaic, resources, tail as tail_of
-from dew.nn.kernels.templates.gemm import cost, rows_padded
+from dew.nn.kernels.templates.gemm import rows_padded
 
 
 def family_of(tiles: "Tiles", dtype) -> mosaic.Family:
@@ -621,8 +621,8 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                            grid=(multiprocessors // pair,), grid_names=("programs",), consumers=consumers,
                            interpret=interpret, approx_math=False, name="dew_gmm", cluster=pair,
                            resident=tiles.programs,
-                           cost=cost(2 * m * n * k * len(matrices), *operands, *prologue_operands,
-                                      *epilogue_operands, *out_type))
+                           cost=unit_cost.estimate(2 * m * n * k * len(matrices), *operands,
+                                                   *prologue_operands, *epilogue_operands, *out_type))
     outs = kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands)
     return outs[:len(out_type)] if tail is not None else outs
 
@@ -918,7 +918,8 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                            consumers=consumers,
                            interpret=interpret, approx_math=False, name="dew_tgmm",
                            resident=tiles.programs,
-                           cost=cost(2 * lhs.shape[0] * m * n, lhs, rhs, *prologue_operands, out_type))
+                           cost=unit_cost.estimate(2 * lhs.shape[0] * m * n, lhs, rhs, *prologue_operands,
+                                                   out_type))
     return kernel(*groups, lhs, rhs, *prologue_operands)[0]
 
 

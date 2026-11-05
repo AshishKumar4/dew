@@ -274,7 +274,7 @@ def test_a_cutlass_grouped_gemm_is_sized_by_its_shapes_and_an_unknown_call_is_un
 
 def test_a_tpu_grouped_gemm_states_its_cost_to_the_flop_count():
     """The TPU grouped GEMM's two launches, lowered for a TPU on this CPU, state their products'
-    FLOPs (`templates.gemm.cost`), which the kernel report and the FLOP count both read."""
+    FLOPs (`templates.cost.estimate`), which the kernel report and the FLOP count both read."""
     from dew.nn.kernels.templates.gemm import mosaic_tpu
     from dew.telemetry.instrumentation import hlo_flops
 

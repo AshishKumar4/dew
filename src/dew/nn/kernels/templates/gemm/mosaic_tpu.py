@@ -30,7 +30,8 @@ from jax.experimental.pallas.ops.tpu.megablox.gmm import make_group_metadata
 
 from dew.nn.kernels import launches
 from dew.nn.kernels.templates.axes import named
-from dew.nn.kernels.templates.gemm import cost, rows_padded
+from dew.nn.kernels.templates.cost import estimate
+from dew.nn.kernels.templates.gemm import rows_padded
 
 LANES = 128
 """A vreg's lanes: Mosaic TPU tiles a block's minor dimensions by them (a block of two dimensions or more
@@ -152,7 +153,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
             scratch_shapes=[pltpu.VMEM((block_m, block_n), jnp.float32)]),
         compiler_params=_compiler_params(),
         interpret=interpret,
-        cost_estimate=cost(2 * rows * depth * width, lhs, rhs, *prologue_operands, *epilogue_operands,
+        cost_estimate=estimate(2 * rows * depth * width, lhs, rhs, *prologue_operands, *epilogue_operands,
                            *out_shape),
         name="dew_gmm",
     )(*metadata, lhs, rhs, *prologue_operands, *epilogue_operands)
@@ -243,7 +244,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Bloc
             scratch_shapes=[pltpu.VMEM((block_m, block_n), jnp.float32)]),
         compiler_params=_compiler_params(),
         interpret=interpret,
-        cost_estimate=cost(2 * rows * depth * width, lhs, rhs, *prologue_operands, out_shape),
+        cost_estimate=estimate(2 * rows * depth * width, lhs, rhs, *prologue_operands, out_shape),
         name="dew_tgmm",
     )(*metadata, lhs, rhs, *prologue_operands)
 
