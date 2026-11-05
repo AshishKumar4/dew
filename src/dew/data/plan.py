@@ -657,23 +657,29 @@ def read_otherwise_at_8(saved: Mapping[str, object]) -> str | None:
             "takes it across them, so this position goes on only as 7 read it, the take once a worker")
 
 
-def read_otherwise_at_9(saved: Mapping[str, object]) -> str | None:
+def read_otherwise_at_9(saved: Mapping[str, object], plan: Plan) -> str | None:
     """Why version 9 reads a version 8 data plan's order otherwise, None where it reads it alike: where a
-    chain its order holds shuffles its records, a mixture's corpus at any depth or a chain read alone,
-    which version 9 draws by the corpus's key too, a chain read alone by its name where it has one, which
-    the saved order does not say (`dew.data.lowering._Build.ordered`, row 3840)."""
-    def shuffles(node: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> bool:
+    mixture's corpus its order holds shuffles its records, at any depth, which version 9 draws by the
+    corpus's key in the mixture too, or where its chain read alone shuffles and `plan`, the chain as this
+    run reads it, keys that shuffle by the chain's name (`named` in its order), or a phase's chain shuffles,
+    which its own name may key; an unnamed chain's shuffle alone draws by its seed alone, as 8 drew it
+    (`dew.data.lowering._Build.ordered`, rows 3840, 4063)."""
+    def shuffles(node: dict[str, JSON] | list[JSON] | str | int | float | bool | None, *,
+                 mixed: bool) -> bool:
         if isinstance(node, list):
-            return any(map(shuffles, node))
+            return any(shuffles(child, mixed=mixed) for child in node)
         if not isinstance(node, dict):
             return False
         stages = node.get("stages")
-        if isinstance(stages, list) and any(isinstance(stage, str) and stage.startswith("Shuffle(")
-                                            for stage in stages):
+        if mixed and isinstance(stages, list) and any(
+                isinstance(stage, str) and stage.startswith("Shuffle(") for stage in stages):
             return True
-        return any(map(shuffles, node.values()))
+        # A mixture's corpora, and a phase's chain, which a phased run may name, are keyed.
+        return any(shuffles(child, mixed=mixed or key in ("corpora", "phases"))
+                   for key, child in node.items())
 
-    if not shuffles(json_value(saved.get("order", {}), "saved order")):
+    order = json_value(saved.get("order", {}), "saved order")
+    if not shuffles(order, mixed="named" in plan.order):
         return None
     return ("version 8 shuffled each corpus by its seed alone, and version 9 by its key too, so this "
             "position goes on only as 8 read it")
@@ -691,7 +697,7 @@ def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object
     1.0 (ledger 1552)."""
     if saved.get("version") == 7 and plan.version >= 8 and read_otherwise_at_8(saved) is None:
         saved = {**saved, "version": 8}
-    if saved.get("version") == 8 and plan.version == 9 and read_otherwise_at_9(saved) is None:
+    if saved.get("version") == 8 and plan.version == 9 and read_otherwise_at_9(saved, plan) is None:
         saved = {**saved, "version": 9}
     # A plan of another version is refused as it is (`Plan.check`), so nothing of it is read here.
     if saved.get("version") != plan.version:
@@ -952,7 +958,7 @@ class Plan:
         current = self.record()
         if current["version"] != saved.get("version"):
             otherwise = (read_otherwise_at_8(saved) if saved.get("version") == 7 else
-                         read_otherwise_at_9(saved) if saved.get("version") == 8 else None)
+                         read_otherwise_at_9(saved, self) if saved.get("version") == 8 else None)
             raise ValueError(
                 f"the saved data position was written under data plan version {saved.get('version')!r}, "
                 f"and this read is of version {current['version']!r}, which makes other rows or "
