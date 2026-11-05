@@ -139,6 +139,9 @@ def _loaded(path: Path):
 
 HERE = Path(__file__).resolve().parent
 check1_wire = _loaded(HERE.parents[1] / "tests" / "check1_wire.py")
+"""Check 1's map and judge contract, its one owner: what runs a site's test as a map task (DRAWS, RECORDS), as
+their judge (POOL), a judge's ask for its later map tasks (LATER), its stages log (STAGES) and the units its
+stages draw (`staged_units`)."""
 child_groups = _loaded(HERE / "child_groups.py")
 session = _loaded(HERE / "session.py")
 coverage_report = _loaded(HERE / "coverage_report.py")
@@ -1022,11 +1025,6 @@ either as armada's map and judge (`site_entries`): map tasks of P units each ove
 its work take, and one judge."""
 SITE_MARK = re.compile(r"\bmark\.(?:" + "|".join(SHARDS) + r")\b")
 """A site's mark as a test file's source spells it (`sites`), which a file that holds none never parses."""
-DRAWS, RECORDS, POOL, LATER, STAGES = (check1_wire.DRAWS, check1_wire.RECORDS, check1_wire.POOL,
-                                       check1_wire.LATER, check1_wire.STAGES)
-"""Check 1's map and judge contract (tests/check1_wire.py, its one owner, `staged_units` the units a site's
-stages draw): what runs a site's test as a map task (DRAWS, RECORDS), as their judge (POOL), a judge's ask
-for its later map tasks (LATER), and its stages log (STAGES)."""
 LATER_JUDGED = "check1_later"
 """A check-1 site judge's row's word that its judgement needed its later map tasks (`later_judged`), which the
 next plan reads to draw them in the first wave (`eager_sites`)."""
@@ -1525,9 +1523,10 @@ def site_environment(site: re.Match | None) -> dict[str, str]:
         stages_file().unlink(missing_ok=True)
         # Check 1 appends to its log where the directory is (`_logged`).
         stages_file().parent.mkdir(parents=True, exist_ok=True)
-        return {POOL: str(armada_dir("ARMADA_INPUTS", INPUTS)), LATER: str(later_file()),
-                STAGES: str(stages_file())}
-    return {DRAWS: f"{site['start']}:{site['stop']}", RECORDS: str(armada_dir("ARMADA_ARTIFACTS", ARTIFACTS))}
+        return {check1_wire.POOL: str(armada_dir("ARMADA_INPUTS", INPUTS)),
+                check1_wire.LATER: str(later_file()), check1_wire.STAGES: str(stages_file())}
+    return {check1_wire.DRAWS: f"{site['start']}:{site['stop']}",
+            check1_wire.RECORDS: str(armada_dir("ARMADA_ARTIFACTS", ARTIFACTS))}
 
 
 def asked(site: re.Match | None) -> dict[str, bool]:
