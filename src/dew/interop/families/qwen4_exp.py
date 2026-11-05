@@ -291,6 +291,7 @@ QWEN4_EXP_TEXT = DecoderFamily(
     prepare=_qwen4_exp_prepare,
     constants=_qwen4_exp_constants,
     packed=FUSED_EXPERTS,
+    prediction_counts=('mtp_num_hidden_layers',),
     preserve_source_layout=True,
     padding_idx=True,
     # Qwen4ExpTextConfig's defaults for the fields its decoder reads.

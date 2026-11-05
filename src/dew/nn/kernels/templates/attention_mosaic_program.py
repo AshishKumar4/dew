@@ -493,14 +493,43 @@ def _varying_slopes(score_mod, params: tuple, graded: tuple[Kind, ...]) -> int:
         return jax.jvp(along, (inputs[place],), (jnp.ones_like(inputs[place]),))[1]
 
     count = int(_varies(score_mod, logits, positions, positions, *values))
+    traced = jax.make_jaxpr(score_mod)(logits, positions, positions, *values).jaxpr
     formed = [index for index in floating_params(values) if params[index][0] in graded]
     for place in (0, *(1 + index for index in formed)):
-        try:
-            count += _varies(functools.partial(slope, place), logits, positions, positions, *values)
-        except TypeError:
-            # A `jax.custom_vjp` hook takes no forward derivative: its slope counted.
-            count += 1
+        # A `jax.custom_vjp` the input reaches takes no forward derivative: that slope is counted untraced.
+        reached = _reaches_custom_vjp(traced, {traced.invars[0 if place == 0 else place + 2]})
+        count += reached or _varies(functools.partial(slope, place), logits, positions, positions, *values)
     return count
+
+
+def _holds_custom_vjp(jaxpr: jax_core.Jaxpr) -> bool:
+    """Whether `jaxpr` calls a `jax.custom_vjp`, itself or within a call it makes."""
+    return any(equation.primitive is jax_core.primitives.custom_vjp_call_p
+               or any(_holds_custom_vjp(inner) for inner in jax_core.jaxprs_in_params(equation.params))
+               for equation in jaxpr.eqns)
+
+
+def _reaches_custom_vjp(jaxpr: jax_core.Jaxpr, starts: set) -> bool:
+    """Whether any of `starts`, `jaxpr`'s inputs, reaches a `jax.custom_vjp` call: through a call whose
+    one sub-program takes the call's operands in order (a jit's, a custom JVP's), into that program by the
+    operands reached; through any other holding a sub-program, wherever that program calls one
+    (`_holds_custom_vjp`), a branch or a loop body not followed operand by operand."""
+    reached = set(starts)
+    for equation in jaxpr.eqns:
+        hit = [index for index, var in enumerate(equation.invars)
+               if not isinstance(var, jax_core.Literal) and var in reached]
+        if not hit:
+            continue
+        if equation.primitive is jax_core.primitives.custom_vjp_call_p:
+            return True
+        inner = list(jax_core.jaxprs_in_params(equation.params))
+        if len(inner) == 1 and len(inner[0].invars) == len(equation.invars):
+            if _reaches_custom_vjp(inner[0], {inner[0].invars[index] for index in hit}):
+                return True
+        elif any(_holds_custom_vjp(program) for program in inner):
+            return True
+        reached.update(equation.outvars)
+    return False
 
 
 def _varies(function: Callable, *arguments: jax.ShapeDtypeStruct) -> bool:
