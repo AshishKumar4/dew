@@ -14,10 +14,9 @@ from contract_support import LessFinite, assert_contract
 
 SOURCE = Path(__file__).resolve().parents[1] / "src" / "dew"
 
-CUSTOM = frozenset({"custom_jvp", "custom_vjp", "surrogate", "kernel_derivative", "kernel_tangent",
-                    "numerics_derivative", "numerics_tangent"})
-"""JAX's custom derivatives and Dew's declaring functions (`dew.nn.derivatives`: a surrogate, a kernel's and
-a rule's derivative and tangent), as a decorator, a call, or within functools.partial."""
+CUSTOM = frozenset({"custom_jvp", "custom_vjp", "surrogate", "declared_derivative", "declared_tangent"})
+"""JAX's custom derivatives and Dew's declaring functions (`dew.nn.derivatives`: a surrogate, a derivative and
+a tangent of a declared kind), as a decorator, a call, or within functools.partial."""
 
 KERNEL, NUMERICS, SURROGATE = "kernel", "numerics", "surrogate"
 """Each seam's kind (`CONTRACTED`)."""
@@ -145,9 +144,9 @@ CONTRACTED = {
         ("test_a_guided_prediction_holds_every_order", NUMERICS),
     "src/dew/nn/derivatives.py::surrogate.rule":
         ("test_a_surrogate_holds_every_order", SURROGATE),
-    "src/dew/nn/derivatives.py::_derivative.rule":
+    "src/dew/nn/derivatives.py::declared_derivative.rule":
         ("test_a_declared_derivative_holds_every_order", KERNEL),
-    "src/dew/nn/derivatives.py::_tangent.rule":
+    "src/dew/nn/derivatives.py::declared_tangent.rule":
         ("test_a_declared_derivative_holds_every_order", NUMERICS),
 }
 """Each contracted seam, `path::qualified name`, the test of tests/test_contracts_*.py that holds it, and its
