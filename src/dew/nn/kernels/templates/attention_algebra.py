@@ -1144,8 +1144,8 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     dropped weight unnormalized, past fp16's largest at a rate near 1 (a multiplier of 2^16), where this
     step's scaled parts (`weights_parts`) keep it, a representation the declaration states none of."""
     # A compensated or guarded walk's step takes its dropped roundings and its shifts through the derived
-    # step's own hook (`_derived_step`); only its merges and its finish are the template's.
-    if states_derived(spec, state._replace(low=None, guard=None)) and keys.coords.drop is None:
+    # step's own hook (`_derived_step`).
+    if derived_on() and keys.coords.drop is None:
         return _derived_step(spec, state, keys)
     m, factor, p, value, held = _softmax(spec, state, keys)
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
@@ -1487,7 +1487,7 @@ def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     keys), so `empty` is its identity under every spec. Behind the switch, the derived forms'
     (`dew.algebra.forms.derived`, `_derived_merge`), a guarded state's join of its sums the template's
     (`_guarded_merge`) over the factors they evaluate."""
-    if states_derived(spec, first._replace(guard=None), second._replace(guard=None)):
+    if derived_on():
         return _derived_merge(spec, first, second)
     m = jnp.maximum(first.m, second.m)
     safe = jnp.where(m == -jnp.inf, 0.0, m)
@@ -1540,7 +1540,7 @@ def merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     another order, no less accurately. A slice of no key (a maximum of -inf) adds nothing. On the guarded
     path the sums join at the largest shift, and a row whose join overflows shifts as its natural sums
     need, as `merge` shifts them. Behind the switch, the derived forms' (`_derived_merged`)."""
-    if states_derived(spec, stacked):
+    if derived_on():
         return _derived_merged(spec, stacked, axis)
     m = jnp.max(stacked.m, axis=axis)
     factors = carried(spec, stacked.m, jnp.expand_dims(jnp.where(m == -jnp.inf, 0.0, m), axis))
@@ -1595,13 +1595,14 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
            output_params: tuple[jax.Array, ...] = ()) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The block's output `[bq, Dv]` fp32 (its weighted values over its denominator, zero for a query
     that saw nothing and started from no state, then the output hook) and its residual rows
-    (`finished_rows`); the output is the shifted sums' ratio, which the shift leaves. Behind the switch, the
-    output the derived forms' (`dew.algebra.forms.derived`, `_derived_output`)."""
+    (`finished_rows`); the output is the shifted sums' ratio, which the shift leaves. Behind the switch, that
+    ratio the derived forms' (`dew.algebra.forms.derived`, `_derived_output`), a guarded state's live rows
+    taken from its unshifted sums as ever."""
     m, denominator = finished_rows(spec, state, initial=initial)
-    if states_derived(spec, state):
+    if derived_on():
         out = _derived_output(spec, state)
-        return (out if output_mod is None else output_mod(out, *output_params)), m, denominator
-    out = output_of(state.acc, state.total, guarded=spec.guarded or initial)
+    else:
+        out = output_of(state.acc, state.total, guarded=spec.guarded or initial)
     fields = state.guard
     if fields is not None:
         bounded = finite(fields.plain_total)
@@ -1851,19 +1852,6 @@ def _form_key(spec: Forward) -> tuple:
     """The accurate form's part of the derived forms' key (`derived_forms`): natural, and a raw product's
     scale (`Forward.raw`); the fast form's none."""
     return (True, spec.scale if spec.raw else None) if spec.natural else ()
-
-
-def states_derived(spec: Forward, *states: Partial) -> bool:
-    """Whether the derived forms walk a state of `spec` (behind the switch, `dew.algebra.forms.derived`):
-    where the declaration states its walk, the accurate form's among them (`Forward.natural`: its exponential
-    and its compensated rescale declared, its largest weight held to 1 or its raw products scaled after their
-    difference, `declaration`), a compensated walk's step too, whose additions' roundings the step's hooks
-    keep (`_derived_step`; the walk settles them before any merge or finish, `settled`). The headroom guard's
-    shifted sums (a state's `Guard`) are the template's own: its control flow is the walk's (`walked`,
-    `walked_launches`), and a guarded walk's every step and merge runs the hand-written forms, its plain walk
-    the derived ones, under the replacement rule (a derived form replaces a hand-written one only where it
-    states the walk)."""
-    return derived_on() and all(state.guard is None and state.low is None for state in states)
 
 
 def _slotted(key: tuple, shapes: Mapping) -> tuple[str, ...]:
