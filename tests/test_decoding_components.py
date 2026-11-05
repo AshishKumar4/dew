@@ -350,7 +350,7 @@ def test_frequency_and_presence_penalties_are_vllms(case):
     generated, the prompt counting for neither, both signs. Dew's two
     transforms, chained in vLLM's order, on par with vLLM's float32 run over
     drawn logits (check 1, the recording's summary of vLLM's evidence), the
-    truth Dew's float64 run held to the sketch of vLLM's."""
+    truth vLLM's formula in float64, held to the sketch of vLLM's own run."""
     frequency, presence = (float(value) for value in PENALTIES["penalties"][case])
     prompts, drawn = ([[int(token) for token in row if token != VOCAB] for row in PENALTIES[name]]
                       for name in ("prompt", "output"))
@@ -359,9 +359,15 @@ def test_frequency_and_presence_penalties_are_vllms(case):
     with run_from("vllm_penalty_reference", "tools") as generator:
         redraw = generator.draw
 
+    # vLLM's formula in float64, each token's count among the generated tokens and whether it was generated
+    # (Dew's own counts are float32, whose product with a penalty a float64 run would round).
+    counts = np.zeros((len(drawn), VOCAB))
+    for row, tokens in enumerate(drawn):
+        np.add.at(counts[row], tokens, 1.0)
     draw, reference, truth = indexed_recording(
         PENALTIES, site, int(PENALTIES[f"{site}.seeds"]), inputs_of=redraw,
-        truth_fn=lambda inputs: {"logits": native(state, jnp.asarray(inputs["logits"], jnp.float64))})
+        truth_fn=lambda inputs: {"logits": jnp.asarray(inputs["logits"], jnp.float64) - frequency * counts
+                                 - presence * (counts > 0)})
     assert_as_exact(as_given(lambda index, inputs: {"logits": np.asarray(native(state, inputs["logits"]))}),
                     reference, draw, f"penalties {frequency}, {presence}",
                     seeds=int(PENALTIES[f"{site}.seeds"]), truth_fn=truth)
