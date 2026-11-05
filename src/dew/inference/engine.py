@@ -131,6 +131,10 @@ class Kind(Protocol):
     arrived: Callable[[], None]
     """Called after each submission, so an engine waiting for work wakes to it."""
 
+    pooled: bool
+    """Whether its steps span several processes, which step it together (`dew.inference.Server.run`); an
+    engine steps a kind of one process, as only that process's submissions wake it."""
+
     @property
     def busy(self) -> bool:
         """Whether a request waits for, or runs in, a step."""
@@ -158,6 +162,9 @@ class Engine:
     def __init__(self, *kinds: Kind, name: str = "serving-engine") -> None:
         if not kinds:
             raise ValueError("an engine serves one kind or more")
+        if any(kind.pooled for kind in kinds):
+            raise ValueError("an engine steps kinds of one process; a server whose mesh spans several is "
+                             "stepped on each of them together, by its own run")
         self.kinds = kinds
         self.name = name
         self._arrived = threading.Event()

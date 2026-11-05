@@ -1001,6 +1001,30 @@ def test_a_server_drafts_speculative_blocks_as_a_lone_call_does(temperature, dec
         server.reload(params)
 
 
+@pytest.mark.distributed
+@pytest.mark.parametrize("paged", [False, True], ids=["dense", "paged"])
+def test_a_server_over_a_pool_draws_what_each_request_draws_alone(tmp_path, paged):
+    """One server over a mesh that spans two processes, each seating and reading its own groups of rows and
+    the pool stepping it together, each step's admission, captures and restores agreed: a round of
+    requests on the second process alone, then one on both with the widest on the second, serves every
+    request what one process serving them all draws, over a dense cache and a hybrid stack's paged one
+    sharing prompt pages and the recurrent states kept at them; and an engine, which steps one process's
+    kinds, refuses the pooled server (ledger 1423)."""
+    from pathlib import Path
+
+    from process_support import run_pool, run_worker
+
+    worker = Path(__file__).with_name("serving_worker.py")
+    reports = run_pool("pooled_server", tmp_path / "pool", 2, script=worker, devices=2, fsdp_size=4,
+                       paged=paged or None, timeout=300)
+    single = run_worker("pooled_server", tmp_path / "single.json", script=worker, fsdp_size=1, devices=1,
+                        paged=paged or None)
+    assert {**reports[0]["drawn"], **reports[1]["drawn"]} == single["drawn"]
+    assert [report["engine"] for report in (*reports, single)] == ["refuses it", "refuses it", "takes it"]
+    # The last process's second round read its first round's prefix pages and the states kept at them.
+    assert (reports[1]["shared"] > 0) == paged
+
+
 @pytest.mark.parametrize("cache", [None, KVCache(page_size=2, pages=64)], ids=["dense", "paged"])
 def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(tmp_path, cache):
     """One server over an adapter set (`dew.lora.AdapterSet`) of a published decoder: the fixture's PEFT
@@ -1270,6 +1294,35 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), row)
 
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_server_on_an_expert_and_stage_mesh_exchanges_its_experts_and_runs_its_stack_whole():
+    """A mixture whose dispatch exchanges tokens over the expert axis, placed on a mesh with a pipeline's
+    stage axis beside it, and built and stepped inside that training mesh's scope: the server decodes its
+    stack whole while the expert axis stays in context for the exchange (`dew.nn.sharding.whole`), and
+    serves what the global dispatch draws alone on one device (ledger 1817)."""
+    def generation(dispatch, params):
+        model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8,
+                                  mlp_features=32, max_seq_len=128, dtype="float32",
+                                  mixture=Mixture(experts=4, top_k=2, dispatch=dispatch))
+        if params is None:
+            params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+        return TextGeneration(
+            model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0, eos_token_ids=EOS)
+        )
+
+    lone = generation("global", None)
+    alone = [lone(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    spec = MeshSpec(expert=2, stage=2)
+    with boxed(decoder_axes(lone.model)):
+        placed = place(lone.variables, spec, Layout(min_shard=1, tolerance=1.0))
+    served = generation("exchange", placed)
+    with jax.set_mesh(spec.build()):
+        _, tickets = served_alongside(served, slots=8, admission=8)
+    for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), row)
 
 
 class UserDecoder(nn.Module):
