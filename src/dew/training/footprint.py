@@ -256,7 +256,8 @@ def biased(program: jcore.Jaxpr) -> jcore.Jaxpr:
             product = producers.get(made)
             if (product is None or not cublas_product(product) or len(product.invars) != 2
                     or readers[made] != 1 or made.aval != out.aval or addend.aval != out.aval
-                    or np.issubdtype(out.aval.dtype, np.integer) or id(product) in dropped):
+                    or not isinstance(out.aval, ShapedArray) or np.issubdtype(out.aval.dtype, np.integer)
+                    or id(product) in dropped):
                 continue
             dropped.add(id(product))
             replaced[id(equation)] = product.replace(invars=[*product.invars, addend], outvars=[out])
@@ -620,7 +621,8 @@ def dying(frontier: Frontier, equation: jcore.JaxprEqn, made_for: set[jcore.Var]
     step at four microbatches was derived holding both, 0.95 GiB over XLA's 7.42 (row 4089)."""
     if not made_for:
         return set()
-    direct = frontier.reading([value for value in equation.invars if value not in made_for])
+    direct = frontier.reading([value for value in equation.invars
+                               if computed(value) and value not in made_for])
     return {buffer for buffer in frontier.reading(made_for)
             if buffer in held and last.get(buffer) == index and buffer not in direct}
 
