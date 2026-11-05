@@ -119,9 +119,9 @@ def spanned(work: Work, latency: float | None) -> tuple[float, float]:
 
 def step_latency(target: generation.GpuTarget, *, device: bool) -> float | None:
     """A dependent step's latency on a schedule's path: XLA's loop iteration (`GpuTarget.step_seconds`) for
-    the whole device's; a template's in-kernel step from its instructions' latencies, which no fact states
-    yet, so none."""
-    return target.step_seconds if device else None
+    the whole device's; a template's in-kernel step, a tile's dependent reduction within a program
+    (`GpuTarget.kernel_step_seconds`), for a tile walk's. None where the GPU's was not measured."""
+    return target.step_seconds if device else target.kernel_step_seconds
 
 
 def walked(work: Work, target: generation.GpuTarget) -> float:

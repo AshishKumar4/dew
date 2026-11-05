@@ -361,6 +361,11 @@ class GpuTarget:
     """One dependent step's latency on XLA's path: an iteration of a loop XLA lowers, its launches and its
     predicate, each reading the last (the work-span model's step, `templates.cost.Work.span`), measured per
     GPU (FS-STEP-SECONDS1's receipts); None where none was, so a form's span there is priced by no time."""
+    kernel_step_seconds: float | None = None
+    """One dependent step's latency within a kernel: a tile's 128-lane reduction broadcast into the next
+    step's operand, in one program, each reading the last (a template walk's span, `templates.cost.walked`),
+    measured per GPU as the slope over 1,024 to 16,384 steps (FS-STEP-SECONDS1's kernel path); None where
+    none was."""
 
     @property
     def architecture(self) -> Architecture:
@@ -519,6 +524,9 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), multiprocessors=108, clock_hz=1410e6,
               memory_bandwidth=2039e9, triton_gemm_fusions=False, step_seconds=5.96e-6,
+              # In-kernel: a dependent lane reduction's 225.3 ns (FS-STEP-SECONDS1-a100, its two rounds 225.32
+              # and 225.25).
+              kernel_step_seconds=225.3e-9,
               # tools/device_facts.py on an A100-SXM4-40GB: its stream FS-DEVICEFACTS2-a100's (1.555 TB/s by
               # its clocks), its launch FS-DEVICEFACTS4-a100's.
               measured={'NVIDIA A100-SXM4-40GB': Measured(6.04e-6, 1.486e12, launch=2.11e-6)}),
@@ -542,6 +550,9 @@ TARGETS = {target.generation: target for target in (
               # A loop iteration on XLA's path, 4.93 us (FS-STEP-SECONDS1-h100's second round, 0.3% from the
               # line; its first's 4.80 us lay 17% from it).
               clock_hz=1830e6, memory_bandwidth=3350e9, triton_gemm_fusions=False, step_seconds=4.93e-6,
+              # In-kernel: a dependent lane reduction's 142.7 ns on an H100 80GB HBM3 (FS-STEP-SECONDS1-h100,
+              # its two rounds 142.72 and 142.61).
+              kernel_step_seconds=142.7e-9,
               # tools/device_facts.py on an H100 SXM and a GH200: their streams FS-DEVICEFACTS2-h100's and
               # -gh200's, their launches and hand-offs FS-DEVICEFACTS4's; the H200's stream the same line
               # through the kernel challenge's best read at each size, 16.8 MB to 805 MB, cold L2 under graph
@@ -570,7 +581,9 @@ TARGETS = {target.generation: target for target in (
               # datasheet); 1.792 TB/s is the Workstation part's (the RTX PRO Blackwell architecture
               # whitepaper, p.12).
               aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1597e9,
-              step_seconds=3.68e-6),
+              # In-kernel: a dependent lane reduction's 137.7 ns (FS-STEP-SECONDS1-g4, its two rounds 137.68
+              # and 137.66).
+              step_seconds=3.68e-6, kernel_step_seconds=137.7e-9),
     GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}),
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
     GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}),
