@@ -220,6 +220,24 @@ def test_a_zero_gradient_is_held_from_the_programs_start_where_its_gradients_are
     assert held == read + 128 * 128 * 4, (held, read)
 
 
+def test_a_loops_zero_carry_is_made_where_the_loop_needs_it():
+    """A constant the program's work reads, a loop's zero carry, is made where the loop needs it, as XLA
+    makes it, not ahead of the work as a constant the program returns alone (`hoisted`): a 64 MiB carry
+    the derivation held from the start counted beside the activations before the loop (row 4089)."""
+    from dew.training.footprint import hoisted
+
+    rows = jax.ShapeDtypeStruct((4096, 4096), jnp.float32)
+
+    def looped(rows):
+        warm = jnp.tanh(rows) @ rows
+        total, _ = jax.lax.scan(lambda held, row: (held + row, None), jnp.zeros((4096,), jnp.float32), warm)
+        return total
+
+    program = jax.make_jaxpr(looped)(rows).jaxpr
+    assert [equation.primitive for equation in hoisted(program).eqns] == [
+        equation.primitive for equation in program.eqns]
+
+
 def test_a_transposed_input_returned_flat_is_a_copy():
     """A transpose of an input whose layout is fixed reorders its elements into a buffer of their own,
     which a flattening of it returned holds, where a transpose of a value the program computes is laid
