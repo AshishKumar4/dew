@@ -19,12 +19,13 @@ from dew.batch import POSITIONS_FIELD, VALIDITY_FIELD
 from dew.interop.sources import SourceReference
 from dew.nn import audio as audio_nn
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
+from dew.nn.mimo_audio import MiMoAudio
 from dew.registry import towers
 
-PACKED_MEDIA = (*QWEN35_TYPES, 'muse_glimmer', 'lfm3_vl')
+PACKED_MEDIA = (*QWEN35_TYPES, 'muse_glimmer', 'lfm3_vl', 'mimo_v2')
 """The wrappers whose processors pack images and videos alike, as runs of patch vectors beside their
 `(t, h, w)` grids, a video's frames each a run of its own (`Processor._qwen_frames`): Qwen 3.5's, Muse
-Glimmer's and LFM3-VL's, whose towers attend and convolve within a frame."""
+Glimmer's, LFM3-VL's and MiMo-V2.6's, whose towers attend and convolve within a frame."""
 
 VIDEO_MEDIA = (*PACKED_MEDIA, *GEMMA4_TYPES)
 """The wrappers whose processors carry videos (`pixel_values_videos`): the packed ones and Gemma 4's,
@@ -237,6 +238,12 @@ class Processor:
     def _media_reference(self) -> HostProcessor:
         if self.directory is None:
             raise ValueError("this source ships no media processor")
+        if not any((self.directory / name).exists() for name in ("processor_config.json",
+                                                                 "preprocessor_config.json")):
+            # MiMo-V2.6 states its processing in its config.json (`processor_config`) and ships no code
+            # that runs it.
+            raise ValueError(f"{self.config.get('model_type')} ships no processor of its own, only its "
+                             "config's processor_config: hand the model its processed fields (`from_hf`)")
         from transformers import AutoProcessor
 
         options = {"backend": "pil"} if self.config.get("model_type") == "gemma3" else {}
@@ -547,26 +554,30 @@ class Processor:
 
         Each contiguous run of the audio placeholder is one clip, in the
         processor's clip order. Gemma 4 inserts one placeholder per encoded
-        valid frame; Gemma 3n inserts its fixed slot count. Both are checked
-        against the encoder's frame stride here, before any device work.
+        valid frame; Gemma 3n inserts its fixed slot count; MiMo-V2.6 one per
+        group of its codes (`MiMoAudio.encoded`). Each is checked against the
+        encoder's frames here, before any device work.
         """
         audio_id = self.record.get("audio_token_id")
         audio = self.record.get("audio")
-        if type(audio_id) is not int or self.record.get("audio_projector") is None:
-            raise ValueError("this source has no audio projector")
-        stride = 1
-        if audio is not None:
-            encoder = towers.from_record(_records.record(audio, "audio"))
-            if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
-                raise ValueError("audio conditioning requires a Gemma audio encoder")
-            stride = audio_nn.encoded_frame_stride(encoder)
+        if type(audio_id) is not int or (audio is None and self.record.get("audio_projector") is None):
+            raise ValueError("this source reads no audio")
         features = np.asarray(values["input_features"])
         mask = np.asarray(values["input_features_mask"])
         if features.ndim != 3 or not np.issubdtype(features.dtype, np.floating):
             raise ValueError("input_features must be floating [clips, frames, mel]")
         if mask.shape != features.shape[:2] or mask.dtype != np.bool_:
             raise ValueError("input_features_mask must be bool [clips, frames], True for valid frames")
-        encoded = mask[:, ::stride]
+        # Without a tower, each raw frame is one token.
+        encoded = mask
+        if audio is not None:
+            encoder = towers.from_record(_records.record(audio, "audio"))
+            if isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
+                encoded = mask[:, ::audio_nn.encoded_frame_stride(encoder)]
+            elif isinstance(encoder, MiMoAudio):
+                encoded = encoder.encoded(mask)
+            else:
+                raise ValueError("audio conditioning requires a Gemma or a MiMo-V2.6 audio encoder")
         slots = self.record.get("audio_soft_tokens")
         if slots is None:
             selected = [np.flatnonzero(row) for row in encoded]

@@ -97,6 +97,10 @@ RELEASES = {
     # The family's own pin (dew.interop.release_pins), as LFM3's.
     "mimo-v2-tiny": (*_PINNED["MIMO_V2"][:2], ("configuration_mimo_v2.py", "modeling_mimo_v2.py"),
                      "AutoModelForCausalLM"),
+    # The same release whole: its ViT and its audio encoder beside the decoder, the audio tokenizer in its
+    # folder (`audio_tokenizer`, `load_audio_tokenizer`).
+    "mimo-v2-vl-tiny": (*_PINNED["MIMO_V2"][:2], ("configuration_mimo_v2.py", "modeling_mimo_v2.py"),
+                        "AutoModelForCausalLM"),
     # The family's own pin (dew.interop.release_pins). modeling_lfm3.py imports its
     # Triton conv from lfm3_conv.py, which its CPU run passes by.
     "lfm3-tiny": (*_PINNED["LFM3"][:2],
@@ -112,7 +116,7 @@ RELEASES = {
                      "AutoModelForImageTextToText"),
 }
 LICENSES = {"lfm3-tiny": "lfm1.0", "lfm3-biased-tiny": "lfm1.0", "lfm3-vl-tiny": "lfm1.0",
-            "mimo-v2-tiny": "mit",
+            "mimo-v2-tiny": "mit", "mimo-v2-vl-tiny": "mit",
             "dream-tiny": "apache-2.0", "llada-tiny": "mit"}
 """The license of each release a recording (`--record`) runs, as its Hub card states it."""
 """Each fixture's release: the Hub repo, the commit its code is read at, the
@@ -169,11 +173,18 @@ def released_classes(name: str, workspace: Path):
     return configured, model
 
 
+AUDIO_TOKENIZER = "audio_tokenizer"
+"""The folder a release keeps its audio tokenizer in, its own config and weights, which its model loads
+(MiMo-V2.6's `load_audio_tokenizer`)."""
+
+
 def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Module:
     """The release's own model class over the fixture's config and weights,
-    or, with `draw`, weights it draws and writes as the fixture's."""
+    or, with `draw`, weights it draws and writes as the fixture's; with the audio tokenizer in its folder
+    (`AUDIO_TOKENIZER`) loaded as the release loads it, in the model's dtype."""
     configured, built = released_classes(name, scratch)
     model = built(configured(json.loads((FIXTURES / name / "config.json").read_text())))
+    tokenizer = FIXTURES / name / AUDIO_TOKENIZER
     if draw:
         torch.manual_seed(0)
         with torch.no_grad():
@@ -185,6 +196,8 @@ def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Mod
         np.save(FIXTURES / name / "input_ids.npy", ids)
         if "vision_config" in config:
             media_tokenizer(config, FIXTURES / name)
+        if (tokenizer / "config.json").is_file():
+            draw_audio_tokenizer(model, tokenizer)
     state = model.state_dict()
     missing, unexpected = model.load_state_dict(load_file(str(FIXTURES / name / "model.safetensors")),
                                                 strict=False)
@@ -193,13 +206,29 @@ def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Mod
     if unexpected or set(missing) != shared:
         raise ValueError(f"{name}: the file's tensors differ from the model's: missing {missing}, "
                          f"unexpected {unexpected}")
+    if (tokenizer / "model.safetensors").is_file():
+        model.load_audio_tokenizer(str(tokenizer), device="cpu", dtype=next(model.parameters()).dtype)
     return model.eval()
 
 
+def draw_audio_tokenizer(model: torch.nn.Module, folder: Path) -> None:
+    """The audio tokenizer of the release's own class (MiMoAudioTokenizer) over the folder's config, its
+    parameters and codebooks drawn as the model's are, written as the folder's weights."""
+    modeling = sys.modules[type(model).__module__]
+    config = json.loads((folder / "config.json").read_text())
+    tokenizer = modeling.MiMoAudioTokenizer(modeling.MiMoAudioTokenizerConfig(**config))
+    with torch.no_grad():
+        for tensor in [*tokenizer.parameters(),
+                       *(buffer for name, buffer in tokenizer.named_buffers() if name.endswith(".embed"))]:
+            tensor.copy_(torch.randn_like(tensor) * 0.1)
+    save_file(_stored_once(tokenizer.state_dict()), str(folder / "model.safetensors"))
+
+
 MEDIA_TOKENS = {"image_token_id": "<|image|>", "video_token_id": "<|video|>",
-                "vision_start_token_id": "<|vision_start|>", "vision_end_token_id": "<|vision_end|>"}
+                "vision_start_token_id": "<|vision_start|>", "vision_end_token_id": "<|vision_end|>",
+                "audio_token_id": "<|audio|>"}
 """A wrapper fixture's media tokens by the config field placing each, as its release's processor spells them
-(Lfm3VlProcessor's defaults, processing_lfm3_vl.py)."""
+(Lfm3VlProcessor's defaults, processing_lfm3_vl.py), each where its config places one."""
 
 
 def media_tokenizer(config: dict, directory: Path) -> None:
@@ -210,7 +239,7 @@ def media_tokenizer(config: dict, directory: Path) -> None:
     from tokenizers import Tokenizer, models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast
 
-    named = {config[field]: token for field, token in MEDIA_TOKENS.items()}
+    named = {config[field]: token for field, token in MEDIA_TOKENS.items() if config.get(field) is not None}
     ends = {"pad_token": config["pad_token_id"], "bos_token": config["bos_token_id"],
             "eos_token": config["eos_token_id"]}
     words = {named.get(index, f"w{index}"): index for index in range(vocabulary(config))}
@@ -303,10 +332,16 @@ def received(stream) -> dict:
         return dict(arrays)
 
 
-def released_outputs(model, site: str, inputs: dict) -> dict[str, np.ndarray]:
+SPELLED = {"mimo-v2-vl-tiny": {"pixel_values_videos": "video_pixel_values"}}
+"""Each release's names for the media fields its forward spells otherwise than its processor's: MiMo-V2.6's
+video patches (`MiMoV2ForCausalLM.forward`)."""
+
+
+def released_outputs(model, site: str, inputs: dict, name: str = "") -> dict[str, np.ndarray]:
     """The release's outputs at a recorded `site` (tests/remote_code_draws.py), as Dew's forward
     gives them (tests/model_support.py's `remote_code_site`), the gradients by the release's own tensor
-    names. An update steps `model` and restores its weights after."""
+    names, the media under `name`'s own spellings (`SPELLED`). An update steps `model` and restores its
+    weights after."""
     ids = torch.from_numpy(inputs["ids"].astype(np.int64))
     if site == "update":
         weights = {name: tensor.clone() for name, tensor in model.state_dict().items()}
@@ -343,9 +378,20 @@ def released_outputs(model, site: str, inputs: dict) -> dict[str, np.ndarray]:
         if site in ("image", "video"):
             # The patch vectors in the model's dtype, as its processor's float32 ones are cast to it.
             dtype = next(model.parameters()).dtype
-            media = {name: torch.from_numpy(value).to(dtype if name.startswith("pixel") else torch.int64)
-                     for name, value in inputs.items() if name != "ids"}
+            spelled = SPELLED.get(name, {})
+            media = {spelled.get(field, field): torch.from_numpy(value).to(
+                dtype if field.startswith("pixel") else torch.int64)
+                for field, value in inputs.items() if field != "ids"}
             return {"logits": model(input_ids=ids, **media).logits.numpy()}
+        if site == "audio":
+            # Each clip's valid mel frames through the release's own pipeline (`get_audio_feature`: its
+            # tokenizer's codes, then its encoder), in the model's dtype, filling the placeholders.
+            dtype = next(model.parameters()).dtype
+            clips = zip(inputs["input_features"], inputs["input_features_mask"], strict=True)
+            mels = [torch.from_numpy(clip[valid]).to(dtype) for clip, valid in clips]
+            embeds = model.audio_encoder.get_audio_feature(mels, model.speech_embeddings,
+                                                           model.audio_tokenizer.encoder)
+            return {"logits": model(input_ids=ids, audio_embeds=embeds).logits.numpy()}
         return {"logits": model(input_ids=ids).logits.numpy()}
 
 
@@ -359,9 +405,9 @@ def serve(name: str) -> None:
         while True:
             request = received(sys.stdin.buffer)
             site = str(request.pop("site"))
-            reference = released_outputs(native, site, request)
+            reference = released_outputs(native, site, request, name)
             with float64():
-                truth = released_outputs(wide, site, request)
+                truth = released_outputs(wide, site, request, name)
             send(sys.stdout.buffer, {**{f"reference.{leaf}": value for leaf, value in reference.items()},
                                      **{f"truth.{leaf}": value for leaf, value in truth.items()}})
 

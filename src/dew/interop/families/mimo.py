@@ -17,8 +17,11 @@ from `hybrid_layer_pattern` and `moe_layer_freq`, each kind's geometry from
 the `swa_*` fields, and a sink per head on the kinds whose flag asks for
 one. Its Pro release stores each layer's q, k and v projections fused,
 pre-sharded over the key heads (`attention_projection_layout` 'fused_qkv',
-vLLM's `_shard_fp8_qkv_proj` at 78b32b3), and its towers and prediction
-layers ride along unread and are written back.
+vLLM's `_shard_fp8_qkv_proj` at 78b32b3). A release with its towers is a bundle
+its family reads whole (`DecoderFamily.wrapper`): the ViT and its merger, and the
+audio encoder over the codes of the audio tokenizer the release keeps in a folder
+of its own; the decoder read alone leaves them, and its prediction layers, unread
+and writes them back.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ from dew import _records
 from dew.interop import release_pins
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
+    NO_AUDIO,
     PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
@@ -38,19 +42,26 @@ from dew.interop.decoder_parts import (
     Renames,
     Ropes,
     SourceCode,
+    WrapperFields,
     base_config,
     decoder_kinds,
+    folder_config,
+    folder_name,
     grouped_qkv,
     nested_ramp,
     partial_rope_entry,
     plain_partial_rope,
+    record_int,
     refuse,
     renamed_name,
     renamed_path,
+    translated,
 )
 from dew.interop.families.deepseek import deepseek_layout, deepseek_mixture
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
+from dew.nn.mimo_audio import translate_mimo_audio_config
+from dew.nn.vision.mimo import translate_mimo_projector_config, translate_mimo_vision_config
 
 _KINDS = ('full_attention', 'sliding_attention')
 
@@ -261,12 +272,17 @@ _V2_FIELDS = ('swa_num_attention_heads', 'swa_num_key_value_heads', 'swa_head_di
               'add_swa_attention_sink_bias', 'attention_projection_layout', 'attention_value_scale',
               'v_head_dim', 'partial_rotary_factor', 'rope_parameters', 'rope_theta', 'norm_topk_prob',
               'scoring_func', 'topk_method', 'attention_dropout')
+_AUDIO_TOKENIZER = 'audio_tokenizer'
+"""The folder a MiMo-V2.6 release keeps its audio tokenizer in, its own config and weights, which the
+release's code loads beside the model (`MiMoV2ForCausalLM.load_audio_tokenizer`)."""
+
 _V2_UNREAD = ('attention_chunk_size', 'moe_router_dtype', 'audio_config', 'vision_config', 'processor_config',
               'vision_model_type', 'audio_token_id', 'audio_start_token_id', 'audio_end_token_id',
-              'image_token_id', 'video_token_id', 'vision_start_token_id', 'vision_end_token_id')
+              'image_token_id', 'video_token_id', 'vision_start_token_id', 'vision_end_token_id',
+              folder_config(_AUDIO_TOKENIZER))
 """Fields MiMoV2ForCausalLM's text decoder never reads: the chunk the window
 is restated as, the router dtype its fp32 gate ignores (modeling_mimo_v2.py:153),
-and the towers' sections and tokens, whose tensors ride unread."""
+and the towers' sections, tokens and folder, whose tensors ride unread."""
 
 
 def _layer_flags(hf: Mapping[str, object], used: set[str],
@@ -363,10 +379,47 @@ _FUSED_QKV = grouped_qkv('.self_attn.qkv_proj')
 
 def _mimo_v2_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     """The shared map under the family's names; the prediction layers, which the reference skips
-    on load, and the towers, which the text decoder never runs, have no place."""
-    if name.startswith(('model.mtp.', 'visual.', 'audio_encoder.', 'speech_embeddings.')):
+    on load, and the towers and the audio tokenizer's folder, which the text decoder never runs, have
+    no place."""
+    if name.startswith(('model.mtp.', 'visual.', 'audio_encoder.', 'speech_embeddings.',
+                        folder_name(_AUDIO_TOKENIZER, ''))):
         return None
     return renamed_path(_NAMES, name, config)
+
+
+def _mimo_v2_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
+    """Read a MiMo-V2.6 bundle (MiMoV2ForCausalLM at 6a7f202): its decoder at the config's root, the ViT
+    and its merger (`visual.`) and the audio encoder (`audio_encoder.`, `speech_embeddings.`) over the
+    codes of the tokenizer in its folder, whose config the source carries beside its own
+    (`DecoderFamily.wrapper_folders`). Images, a video's frames and audio clips fill their placeholders
+    (`_get_multimodal_embeds`), each token one position on (`MiMoV2Model.forward`); the encoder projects
+    to the decoder's width itself, through no projector of the wrapper's."""
+    text = translated(hf_config, MIMO_V2)
+    # The decoder's translation read every field at the root or refused it.
+    used.update(hf_config)
+    width = record_int(text, 'emb_features')
+    vision = hf_config.get('vision_config') is not None
+    audio = dict(NO_AUDIO)
+    stated = hf_config.get('audio_config')
+    if stated is not None:
+        tokenizer = hf_config.get(folder_config(_AUDIO_TOKENIZER))
+        if tokenizer is None:
+            refuse('audio_config', f"its encoder reads the codes of the tokenizer in the release's "
+                                   f"{_AUDIO_TOKENIZER} folder, which this source lacks")
+        record = translate_mimo_audio_config(_records.record(stated, 'audio_config'),
+                                             _records.record(tokenizer, folder_config(_AUDIO_TOKENIZER)))
+        projected = record_int(_records.record(record['fields'], 'audio fields'), 'out_hidden_size')
+        if projected != width:
+            refuse(f'audio_config.out_hidden_size {projected}', f'the decoder embeds {width} wide')
+        audio.update(audio=record, audio_token_id=record_int(hf_config, 'audio_token_id'))
+    return {
+        'model_type': 'mimo_v2', 'text_model_type': 'mimo_v2', 'text': text,
+        'tower': translate_mimo_vision_config(hf_config) if vision else None,
+        'projector': translate_mimo_projector_config(hf_config, width) if vision else None,
+        'image_token_id': record_int(hf_config, 'image_token_id'), 'tokens_per_image': None,
+        'video_token_id': (None if hf_config.get('video_token_id') is None
+                           else record_int(hf_config, 'video_token_id')),
+        'extra_placeholder_ids': (), 'text_unprefixed': ('embed_tokens.', 'layers.', 'norm.'), **audio}
 
 
 def _mimo_v2_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -404,4 +457,5 @@ MIMO_V2 = DecoderFamily(
     _mimo_v2_export, weight_path=_mimo_v2_path, export_path=partial(renamed_name, _NAMES),
     packed=_FUSED_QKV, packs=lambda config: config.get('attention_projection_layout') == 'fused_qkv',
     preserve_source_layout=True, release_code=SourceCode(*release_pins.MIMO_V2),
+    wrapper=_mimo_v2_wrapper, wrapper_folders=(_AUDIO_TOKENIZER,),
 )

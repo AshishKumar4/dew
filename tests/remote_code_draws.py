@@ -34,14 +34,23 @@ IMAGE_AT, VIDEO_AT = (3,), (2, 9)
 """Where each drawn image's placeholder run starts, and each drawn video frame's: a frame's run apart from
 the next, as the release's processor sets a frame's timestamp and its bounds between them."""
 
+AUDIO_FRAMES = (45, 13)
+"""A drawn audio row's clips, by their mel frames (`audio`): over MiMo-V2.6's tiny segments of 20 frames,
+one cut into 20, 20 and 5, its last segment short, and one of 13, shorter than a segment."""
+
+AUDIO_AT = (2, 9)
+"""Where each drawn clip's placeholder run starts."""
+
 SITES = {"lfm3-tiny": ("logits", "packed", "decode", "gradients", "update"), "lfm3-biased-tiny": ("biased",),
          "lfm3-vl-tiny": ("logits", "image", "video"),
-         "mimo-v2-tiny": ("logits",), "dream-tiny": ("logits",), "llada-tiny": ("logits",)}
+         "mimo-v2-tiny": ("logits",), "mimo-v2-vl-tiny": ("logits", "image", "video", "audio"),
+         "dream-tiny": ("logits",), "llada-tiny": ("logits",)}
 """Each release fixture's sites: its logits over plain rows; LFM3's over a packed row, through the decode
 cache in chunks, its parameter gradients under a drawn cotangent, and its logits after one SGD step at
 `RATE` on the rows' next-token cross-entropy (`update`), the tied embedding and head stepped once; with
-its convolution's bias (`conv_bias`), over left-padded rows; and LFM3-VL's over a row whose placeholders a
-drawn image fills (`image`), or a drawn video's frames (`video`), each packed as its processor packs it."""
+its convolution's bias (`conv_bias`), over left-padded rows; LFM3-VL's and MiMo-V2.6's over a row whose
+placeholders a drawn image fills (`image`), or a drawn video's frames (`video`), each packed as its
+processor packs it; and MiMo-V2.6's over one whose placeholders drawn audio clips fill (`audio`)."""
 
 
 def vocabulary(config: dict) -> int:
@@ -60,6 +69,8 @@ def draw(site: str, seed: int, config: dict) -> dict[str, np.ndarray]:
     rng = np.random.default_rng([sum(map(ord, site)), seed])
     if site in ("image", "video"):
         return _media(rng, site, config)
+    if site == "audio":
+        return _audio(rng, config)
     rows, tokens = 1 if site == "packed" else ROWS, vocabulary(config)
     inputs = {"ids": rng.integers(0, tokens, (rows, LENGTH)).astype(np.int32)}
     if site == "gradients":
@@ -82,11 +93,44 @@ def _media(rng: np.random.Generator, site: str, config: dict) -> dict[str, np.nd
     runs = 1 if site == "image" else frames
     for start in starts[:runs]:
         ids[0, start:start + height * width * frames // runs // merge ** 2] = token
-    patch = vision["in_channels"] * vision["temporal_patch_size"] * vision["patch_size"] ** 2
+    # MiMo-V2.6's vision config names its channels as its ViT does (`in_chans`).
+    channels = vision["in_channels"] if "in_channels" in vision else vision["in_chans"]
+    patch = channels * vision["temporal_patch_size"] * vision["patch_size"] ** 2
     pixels = rng.normal(size=(frames * height * width, patch)).astype(np.float32)
     name = "" if site == "image" else "_videos"
     return {"ids": ids.astype(np.int32), f"pixel_values{name}": pixels,
             f"{site}_grid_thw": np.asarray([grid], np.int64)}
+
+
+def audio_tokens(frames: int, processing: dict) -> int:
+    """The placeholders a clip of `frames` mel frames fills, as MiMo-V2.6's processing states it (its
+    config's `processor_config`): each segment of `audio_segment_size` frames convolved, halved and pooled
+    to its codes, a clip's codes in groups of `audio_group_size`."""
+    size, kernel = processing["audio_segment_size"], processing["audio_kernel_size"]
+
+    def codes(length: int) -> int:
+        if length == 0:
+            return 0
+        convolved = (length + 3 - kernel + 2 - kernel) // processing["audio_stride_size"] + 1
+        return -(-convolved // processing["audio_avg_pooler"])
+
+    held = frames // size * codes(size) + codes(frames % size)
+    return -(-held // processing["audio_group_size"])
+
+
+def _audio(rng: np.random.Generator, config: dict) -> dict[str, np.ndarray]:
+    """An `audio` site's row (`draw`), drawn below every placeholder id: its clips' mel frames, normals,
+    padded to the longest with their valid-frame mask (`input_features`, `input_features_mask`), each
+    clip's placeholders at `AUDIO_AT`."""
+    processing = config["processor_config"]
+    ids = rng.integers(0, min(config["image_token_id"], config["video_token_id"], config["audio_token_id"]),
+                       (1, LENGTH))
+    for start, frames in zip(AUDIO_AT, AUDIO_FRAMES, strict=True):
+        ids[0, start:start + audio_tokens(frames, processing)] = config["audio_token_id"]
+    features = rng.normal(size=(len(AUDIO_FRAMES), max(AUDIO_FRAMES), processing["audio_n_mels"]))
+    mask = np.arange(max(AUDIO_FRAMES))[None, :] < np.asarray(AUDIO_FRAMES)[:, None]
+    return {"ids": ids.astype(np.int32), "input_features": np.where(mask[..., None], features, 0).astype(
+        np.float32), "input_features_mask": mask}
 
 
 def positions(documents: tuple[int, ...] = DOCUMENTS) -> np.ndarray:
