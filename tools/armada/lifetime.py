@@ -32,6 +32,9 @@ TOOL = 3
 followed.py's children hold 4."""
 CHILD_START = BaseProcess.start.__code__
 """Where every multiprocessing context starts a child: Python 3.12 audits no spawn or forkserver start."""
+FOLLOWER = str(Path(followed.__file__).resolve())
+"""Where followed.py lives, which a child's `.pth` runs: resolved as this module is imported, before `boot`
+makes every probe of the checkout (followed.py's `PROBES`) an input of every file."""
 
 root = os.getcwd() + os.sep
 owners: list[str] = [SHARED]
@@ -117,6 +120,10 @@ def started(code, offset):
     name = code.co_filename
     if not followed.checkout(name, root):
         return sys.monitoring.DISABLE
+    if followed.harness(name, root):
+        # Its code is every key's (ci.py's `SHARED`): it stays among the modules the closing guard lets in.
+        seen.add(name[len(root):])
+        return sys.monitoring.DISABLE
     write(owner(), followed.code_unit(code, root))
     if Path(name).name == "conftest.py":
         return sys.monitoring.DISABLE
@@ -196,7 +203,10 @@ def boot() -> None:
     for name, module in list(sys.modules.items()):
         write(SHARED, f"{followed.IMPORTED}{name.partition('.')[0]}")
         if followed.checkout(file := getattr(module, "__file__", None) or "", root):
-            write(SHARED, file[len(root):])
+            if followed.harness(file, root):
+                seen.add(file[len(root):])
+            else:
+                write(SHARED, file[len(root):])
     importer = followed.imports(lambda item: write(owner(), item))
     sys.meta_path.insert(0, importer)
     followed.opening(kept, root)
@@ -210,7 +220,7 @@ def boot() -> None:
 def followed_children() -> None:
     """The children this process starts record themselves (followed.py), given the GPU share it was given."""
     os.environ |= {followed.CHILDREN: children, "DEW_EXECUTED_ROOT": root,
-                   "DEW_EXECUTED_FOLLOWER": str(Path(followed.__file__).resolve()),
+                   "DEW_EXECUTED_FOLLOWER": FOLLOWER,
                    "DEW_EXECUTED_SHARE": os.environ.get(followed.FRACTION, ""), "DEW_EXECUTED_FILE": SHARED}
     followed.installed()
 

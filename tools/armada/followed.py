@@ -39,6 +39,13 @@ HIDDEN_INPUTS = (".github", ".armada.json", ".python-version", ".gitattributes",
 """The checkout's hidden entries a test may read as any of its files (a workflow, the run's settings,
 thresh's annotations), each the input of the files that read it alone; any other hidden entry (.git, an
 environment, a cache) is none."""
+HARNESS_MODULES = ("tools/armada/session.py", "tools/armada/child_groups.py", "tools/armada/split.py",
+                   "tools/armada/executed.py", "tools/armada/followed.py", "tools/armada/lifetime.py",
+                   "tools/armada/watched.py")
+"""The harness's Python files, which every test process or its supervisor runs: ci.py's `SHARED` covers each
+by its code, so the recorder logs none of their automatic execution (`harness`), which a comment or a
+docstring edit would otherwise key into every file's row. What a test observes of one stays logged: the text
+it reads, the `__code__` it takes."""
 READS = {"open", "os.listdir", "os.scandir"}
 LIMITS = {"cpu.max": "limit:cpu", "memory.max": "limit:memory"}
 """The cgroup files that set a process's execution limits, by the input a run that read one keys: host.py's
@@ -93,6 +100,12 @@ def checkout(name: str, root: str) -> bool:
     return name.startswith(root) and name.endswith(".py") and "site-packages" not in name
 
 
+def harness(name: str, root: str) -> bool:
+    """Whether `name` is a file of `HARNESS_MODULES` of the checkout at `root`: absolute, as a code object's
+    file is."""
+    return name.startswith(root) and name[len(root):] in HARNESS_MODULES
+
+
 def code_unit(code: types.CodeType, root: str) -> str:
     """How a record names code object `code` of a checkout file run under `root`: a test file or conftest
     whole, as its text is the run's; else the file, CODE, and the unit holding the code (ci.py's `units`): the
@@ -109,7 +122,9 @@ def code_unit(code: types.CodeType, root: str) -> str:
 
 def coded(event: str, args: tuple, root: str) -> str | None:
     """The unit (`code_unit`) of the checkout function whose code a run took (`object.__getattr__`'s audit of
-    `__code__`): its body is then the run's input though it never ran (its constants, its bytecode)."""
+    `__code__`): its body is then the run's input though it never ran (its constants, its bytecode); but not
+    pluggy's reading of the arguments a harness plugin's hook takes (`HARNESS_MODULES`), which no test
+    observed."""
     if event != "object.__getattr__" or args[1] != "__code__" or getattr(taking, "code", False):
         return None
     taking.code = True
@@ -118,6 +133,8 @@ def coded(event: str, args: tuple, root: str) -> str | None:
     finally:
         taking.code = False
     if isinstance(code, types.CodeType) and checkout(code.co_filename, root):
+        if harness(code.co_filename, root) and called_by(PLUGGY, (f"{os.sep}inspect.py",)):
+            return None
         return code_unit(code, root)
     return None
 
@@ -172,7 +189,31 @@ def read(event: str, args: tuple, root: str) -> str | None:
     cgroup = os.environ.get("DEW_CGROUP_ROOT", "/sys/fs/cgroup")
     if os.path.basename(name) in LIMITS and name.startswith(cgroup.rstrip(os.sep) + os.sep):
         return LIMITS[os.path.basename(name)]
-    return placed(name, root)
+    found = placed(name, root)
+    # A harness plugin's text (executed.py, split.py) that pytest's assertion rewriter reads to execute it, as
+    # the loader reads any module's: the harness's code is every key's (`HARNESS_MODULES`).
+    if event == "open" and found in HARNESS_MODULES and called_by(REWRITER, READING):
+        return None
+    return found
+
+
+REWRITER = os.path.join("_pytest", "assertion", "rewrite.py")
+"""The file of pytest's assertion rewriter, which executes the modules it rewrites itself."""
+PLUGGY = os.sep + "pluggy" + os.sep
+"""Where pluggy, which pytest registers its plugins' hooks with, is installed: a path part."""
+READING = (f"{os.sep}pathlib", f"{os.sep}io.py")
+"""The files that read a path on their caller's behalf (`called_by`)."""
+
+
+def called_by(part: str, through: tuple[str, ...]) -> bool:
+    """Whether the code that made the access the audit hook, which called this function's caller, reports is
+    on behalf of a file whose path holds `part`: the first frame above that access in a file none of `through`
+    holds (the library code that reads or inspects for its caller), as pluggy's reading of a hook's arguments
+    through `inspect`. Code run beneath it (a test module's body, which pytest imports) is no one's."""
+    frame = sys._getframe(3)
+    while frame is not None and any(each in frame.f_code.co_filename for each in through):
+        frame = frame.f_back
+    return frame is not None and part in frame.f_code.co_filename
 
 
 def placed(name: str, root: str) -> str | None:
@@ -418,7 +459,11 @@ def follow() -> None:
                 atexit.register(held)
             return None
         name = code.co_filename
-        if checkout(name, root):
+        if harness(name, root):
+            # Its code is every key's (ci.py's `SHARED`): it stays among the modules the closing guard
+            # lets in.
+            seen.add(name[len(root):])
+        elif checkout(name, root):
             recorded(code_unit(code, root))
             if reads_backend(code):
                 write("read", f"{name[len(root):]}:{code.co_qualname}")
