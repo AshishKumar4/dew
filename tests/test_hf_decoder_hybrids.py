@@ -240,14 +240,32 @@ def qwen3_next_mtp_case():
     from tools.torch_precision import float64
 
     config = AutoConfig.from_pretrained(QWEN3_NEXT)
-    config._attn_implementation = "eager"
     stored = load_file(str(QWEN3_NEXT / "model.safetensors"))
 
+    def experts(prefix):
+        # The checkpoint's experts one by one, as transformers fuses them on load: each expert's gate
+        # rows over its up rows, then its down map.
+        each = range(config.num_experts)
+        return {f"{prefix}.gate_up_proj": torch.stack([torch.cat([stored[f"{prefix}.{e}.gate_proj.weight"],
+                                                                  stored[f"{prefix}.{e}.up_proj.weight"]])
+                                                       for e in each]),
+                f"{prefix}.down_proj": torch.stack([stored[f"{prefix}.{e}.down_proj.weight"] for e in each])}
+
     def built(dtype):
-        # The eager experts: transformers' grouped product takes no float64 operands.
-        network = AutoModelForCausalLM.from_config(config, dtype=dtype, experts_implementation="eager")
+        # The eager experts: transformers' grouped product takes no float64 operands. Its own load fuses
+        # the trunk's experts; the depth, which it does not know, takes the same fusion, held to the
+        # trunk's as transformers loaded it.
+        network = AutoModelForCausalLM.from_pretrained(QWEN3_NEXT, dtype=dtype, attn_implementation="eager",
+                                                       experts_implementation="eager")
+        loaded = network.state_dict()
+        for name, fused in experts("model.layers.0.mlp.experts").items():
+            assert torch.equal(loaded[name], fused.to(dtype)), name
+        held = {name.removeprefix("mtp."): tensor for name, tensor in stored.items()
+                if name.startswith("mtp.") and ".mlp.experts." not in name}
+        held.update({name.removeprefix("mtp."): tensor
+                     for name, tensor in experts("mtp.layers.0.mlp.experts").items()})
         network.mtp = QwenMTP(config)
-        network.load_state_dict(stored, strict=True)
+        network.mtp.load_state_dict(held, strict=True)
         return network.to(dtype).eval()
 
     def predicted(network, ids):
