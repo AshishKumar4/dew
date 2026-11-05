@@ -657,19 +657,23 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             return max(2 * accumulator + resources.CONTROL_REGISTERS, plain + max(phases))
         return plain + max(phases)
 
-    @staticmethod
-    def _prologue_registers(ba, config: mosaic_gpu.Tiles) -> int:
-        """A prologue's rewrite of a consumer's share of the rows' stage: that share and each side tile of
-        its shape widened to fp32 as the hook computes them, and its result in the stage's dtype until it is
-        written back (HOOKS1, sm90: a norm's +46..53 and a cast's +47 at a 32-word share, SwiGLU's gate tile
-        +87..91). Vector sides are a share's broadcasts, held within it."""
+    def _prologue_registers(self, ba, config: mosaic_gpu.Tiles) -> int:
+        """A prologue's transform of a consumer's share of the rows' stage: that share and each side tile of
+        its shape widened to fp32 as the hook computes them, and its result in the stage's dtype (HOOKS1,
+        sm90: a norm's +46..53 and a cast's +47 at a 32-word share, SwiGLU's gate tile +87..91). Vector
+        sides are a share's broadcasts, held within it. The forward's products take the result from
+        registers (`mosaic_gpu._gmm_step`), each step's held until its products are done, so beside it each
+        step its family keeps in flight (`Family.in_flight`) still holds its own; the kernel gradient
+        rewrites its stage (`STAGED_ROWS`) and holds none."""
         hooks = ba.arguments['hooks']
         if hooks.prologue is None:
             return 0
         tiles = sum(len(held_axes(axes)) > 1 for axes in hooks.prologue_axes)
         share = config.block_m * config.block_k // config.warpgroups
         stored = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
-        return -(-share * ((1 + tiles) * 4 + stored) // (4 * resources.THREADS))
+        family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
+        in_flight = 0 if self.STAGED_ROWS else family.in_flight
+        return -(-share * ((1 + tiles) * 4 + (1 + in_flight) * stored) // (4 * resources.THREADS))
 
     @staticmethod
     def _epilogue_registers(ba, config: mosaic_gpu.Tiles, stored: tuple) -> int:

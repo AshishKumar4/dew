@@ -720,32 +720,44 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
               fixed_tiles: dict, read_tiles: dict, mine_rows, transpose_rhs: bool, matrices: tuple,
               interpret: bool, first=0, apart: tuple | None = None):
     """Dew: a consumer's step of the cooperative `gmm` (`mosaic.Family.walk`): its half of the rows' slot,
-    rewritten by the prologue on its side tiles (the streamed ones' slots, the fixed ones' `fixed_tiles`,
+    transformed by the prologue on its side tiles (the streamed ones' slots, the fixed ones' `fixed_tiles`,
     a depth vector the family does not copy read at step `index` from global memory: `read_tiles`),
     times each of `matrices`' slot into its accumulator (a paired product's two); with `apart`, each
-    product taken apart as an fp32 tile of that shape (`_walked_products`' exact sums)."""
+    product taken apart as an fp32 tile of that shape (`_walked_products`' exact sums). The prologue's
+    value stays in registers, where the products take it as their left operand (warpgroup MMA's register
+    operand A, mma.sync's fragments): rewritten into the stage and read back, the gated prologue of a
+    Llama-3-8B gate_up ran at 8.3x its plain product on an H100 (row 1336)."""
     stage = slots['rows']
+    oriented = {name: slots[name].transpose((1, 0)) if transpose_rhs else slots[name] for name in matrices}
     if prologue is not None:
         # This warpgroup's half of the rows, the only half its MMA reads.
         depth = stage.shape[1]
         tiles_of = {i: fixed_tiles[i] if i in fixed_tiles
                     else read_tiles[i].at[pl.ds((first + index) * depth, depth)] if i in read_tiles
                     else slots[f'side_{i}'] for i in range(len(prologue_axes))}
-        _rewritten(prologue, prologue_axes, stage.at[mine_rows], tiles_of, 'rows', mine_rows)
-        family.published()
-    oriented = {name: slots[name].transpose((1, 0)) if transpose_rhs else slots[name] for name in matrices}
+        left = _transformed(prologue, prologue_axes, stage.at[mine_rows], tiles_of, 'rows', mine_rows)
+        if apart is not None:
+            return nothing, tuple(family.registers_product(left, oriented[name], interpret)
+                                  for name in matrices)
+        return nothing, tuple(family.register_products(acc, (left,), oriented[name], interpret)
+                              for acc, name in zip(accumulators, matrices, strict=True))
     if apart is not None:
         return nothing, tuple(family.product(stage.at[mine_rows], oriented[name], apart) for name in matrices)
     return nothing, tuple(family.products(acc, stage.at[mine_rows], oriented[name], interpret)
                           for acc, name in zip(accumulators, matrices, strict=True))
 
 
-def _rewritten(prologue, axes_of: tuple, mine, tiles_of: dict, halved: str, half) -> None:
-    """Dew: `mine`, this warpgroup's half of a stage, rewritten by the prologue on its side tiles
-    (`tiles_of`, by operand) cut to the same half along the `halved` launch axis; its reader publishes
-    the writes (`mosaic.Family.published`)."""
+def _transformed(prologue, axes_of: tuple, mine, tiles_of: dict, halved: str, half) -> jax.Array:
+    """Dew: `mine`, this warpgroup's half of a stage, transformed by the prologue on its side tiles
+    (`tiles_of`, by operand) cut to the same half along the `halved` launch axis, in the stage's dtype."""
     cut = [tiles_of[i].at[axes.placed(side_axes, {halved: half})][...] for i, side_axes in enumerate(axes_of)]
-    mine[...] = prologue(mine[...], *cut).astype(mine.dtype)
+    return prologue(mine[...], *cut).astype(mine.dtype)
+
+
+def _rewritten(prologue, axes_of: tuple, mine, tiles_of: dict, halved: str, half) -> None:
+    """Dew: `mine` rewritten in place by the prologue (`_transformed`); its reader publishes the writes
+    (`mosaic.Family.published`)."""
+    mine[...] = _transformed(prologue, axes_of, mine, tiles_of, halved, half)
 
 
 def _split(refs: tuple, prologue: int, epilogue: int) -> tuple:
