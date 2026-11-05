@@ -85,6 +85,7 @@ from jax.experimental import checkify
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
+from dew._coordination import from_every_process
 from dew._hashing import array_fingerprint
 from dew.batch import (
     COORDINATES_FIELD,
@@ -517,7 +518,7 @@ def _refuse_unserved_modes(model: nn.Module, *, paged: bool = False, chunked: bo
 
 def _served_mesh(task: TextGeneration) -> Mesh | None:
     """The mesh `task`'s weights lie on, which a server serves on, refused where a server cannot: a
-    stage or sequence axis, or one over several processes."""
+    stage or sequence axis."""
     mesh = mesh_of(task.variables)
     if mesh is None:
         return None
@@ -532,9 +533,6 @@ def _served_mesh(task: TextGeneration) -> Mesh | None:
         raise ValueError("a server keeps each row's cached keys whole on the devices of its group, "
                          "and a decoder refuses to decode under a sequence axis, which splits a "
                          "sequence's positions. Serve on a mesh with sequence=1")
-    if not NamedSharding(mesh, P()).is_fully_addressable:
-        raise ValueError("a server schedules its rows from one process; a mesh over several "
-                         "processes would need them to agree on every step's admission")
     return mesh
 
 class Server:
@@ -627,6 +625,12 @@ class Server:
         self._admitted = (
             None if self.mesh is None else NamedSharding(self.mesh, P(batch_axes(self.mesh) or None))
         )
+        self._local = _local_groups(self._admitted, slots, self.groups)
+        """The groups of slots on this process's devices, which it seats and reads: every group on one
+        process; on a mesh over several, each process its own, and every step agreed among them
+        (`_agreed`)."""
+        self._pooled = self._admitted is not None and not self._admitted.is_fully_addressable
+        """Whether the server's mesh spans several processes, which step it together."""
 
         with self._context():
             groups, source_shapes = packed_layout(model, variables)
@@ -1050,13 +1054,13 @@ class Server:
         iterations. Its own draws are read by the next `step`, or by `run`.
         """
         self._waiting.check()
-        if not (self._waiting.queue or self._rows):
-            # Nothing to run: the host reads the last call's draws.
+        if not self._agreed(self._busy())[0]:
+            # Nothing to run anywhere: the host reads the last call's draws.
             self._settle()
             return
         admission = self._admit()
         with self._context():
-            if self._restores:
+            if self._agreed(bool(self._restores))[0]:
                 self._resident, self._carried = self._restored(
                     self._resident, self._carried, self._states, *_padded(self._restores, self.slots, 0))
                 self._restores = []
@@ -1065,7 +1069,7 @@ class Server:
                 self.model, self.variables, self.pad_id, self.rows.placement, self.decode_steps,
                 self._resident, self._carried, admission, self.transforms, self.stopping, self.grammar,
                 self.progress)
-            if self._captures:
+            if self._agreed(bool(self._captures))[0]:
                 self._states = self._captured(self._states, self._resident, self._carried,
                                               *_padded(self._captures, self.admission, 1))
                 self._captures = []
@@ -1075,9 +1079,21 @@ class Server:
 
     def run(self) -> None:
         """Step until every queued and running request has resolved."""
-        while self._waiting.queue or self._rows:
+        while self._agreed(self._busy())[0]:
             self.step()
         self._settle()
+
+    def _busy(self) -> bool:
+        """Whether a request of this process's waits for a slot or holds one."""
+        return bool(self._waiting.queue or self._rows)
+
+    def _agreed[T](self, value: T) -> list[T]:
+        """`value` as every process of the server's mesh holds it, in rank order, for the choices each
+        step makes alike on every process (whether it runs, admits, restores or captures, and its
+        admission's width): this process's alone on a mesh within one process. A step is one program
+        every process enters, so a server over several processes is stepped on each of them together,
+        through `run` or `step`, not by an `Engine` of each's own."""
+        return from_every_process(value) if self._pooled else [value]
 
     def __call__(
         self,
@@ -1111,8 +1127,9 @@ class Server:
         names its slot within its group.
         """
         size, share = self.slots // self.groups, self.admission // self.groups
+        # Another process's groups hold no slot this one seats.
         free = [[slot for slot in range(group * size, (group + 1) * size) if slot not in self._rows]
-                for group in range(self.groups)]
+                if group in self._local else [] for group in range(self.groups)]
         seated = self.rows.seat(self._waiting.queue, free, share)
         # After seating: a request another thread submitted while the queue
         # was read is seated too, and is admitted after it was submitted.
@@ -1132,20 +1149,24 @@ class Server:
             waiting = pending[slot // size]
             if row.prefilled < len(row.prompt) and len(waiting) < share:
                 waiting.append((slot, row))
-        if not any(pending):
+        ends = {slot: self._piece_end(row) for waiting in pending for slot, row in waiting}
+        # Every process admits alike: as many rows a group and as wide a piece as the widest of them.
+        widest = max((ends[slot] - row.prefilled for waiting in pending for slot, row in waiting), default=0)
+        agreed = self._agreed((max(map(len, pending)), widest))
+        waiting_most, longest = max(held[0] for held in agreed), max(held[1] for held in agreed)
+        if not waiting_most:
             return None
         # Padded to the fewest rows that hold every group's pieces, not to the
         # whole admission: a request arriving alone prefills one row.
-        share = admission_share(max(map(len, pending)), share)
-        chosen = [(group * share + index, slot, row) for group, waiting in enumerate(pending)
-                  for index, (slot, row) in enumerate(waiting)]
+        share = admission_share(waiting_most, share)
+        # This process's rows of the admission, its groups' in order (`_local_groups`).
+        chosen = [(position * share + index, slot, row) for position, group in enumerate(self._local)
+                  for index, (slot, row) in enumerate(pending[group])]
         # The capacity is whole tiles, not a bucket, so a piece's width bucket can pass it.
-        ends = {slot: self._piece_end(row) for _, slot, row in chosen}
-        longest = max(ends[slot] - row.prefilled for _, slot, row in chosen)
         width = min(shape_bucket(longest, 64), self.capacity)
         if self.rows.chunk is not None and longest <= self.rows.chunk:
             width = min(width, self.rows.chunk)
-        count, capacity = share * self.groups, self.capacity
+        count, capacity = share * len(self._local), self.capacity
         tokens = np.zeros((count, width), np.int32)
         valid = np.zeros((count, width), bool)
         slots = np.full((count,), size, np.int32)
@@ -1196,28 +1217,34 @@ class Server:
                 context_lengths[index] = len(row.context)
             if final[index]:
                 self.rows.prefilled(row)
-        placed = jax.device_put(
-            [
-                tokens,
-                valid,
-                slots,
-                budgets,
-                _row_keys(tuple(keys), seeds, seeded, folds, self.prng),
-                tables,
-                cursors,
-                final,
-                history,
-                history_valid,
-                adapters,
-                *([] if cross is None else [contexts, context_lengths]),
-                *pieces.values(),
-            ],
-            self._admitted,
-        )
+        placed = self._placed([
+            tokens,
+            valid,
+            slots,
+            budgets,
+            _row_keys(tuple(keys), seeds, seeded, folds, self.prng),
+            tables,
+            cursors,
+            final,
+            history,
+            history_valid,
+            adapters,
+            *([] if cross is None else [contexts, context_lengths]),
+            *pieces.values(),
+        ])
         conditioning = {} if cross is None else {CONTEXT: placed[11], CONTEXT_LENGTHS: placed[12]}
         fields = {VALIDITY_FIELD: placed[1], **dict(zip(pieces, placed[len(placed) - len(pieces):],
                                                           strict=True))}
         return Admission(ModelInputs(placed[0], fields, conditioning), *placed[2:11])
+
+    def _placed(self, local: list) -> list[jax.Array]:
+        """This process's rows of an admission's arrays placed as the admission is (`_admitted`): every row
+        where one process holds the mesh, and on a mesh over several, the admission's global arrays made
+        of each process's rows."""
+        if not self._pooled:
+            return jax.device_put(local, self._admitted)
+        assert self._admitted is not None, "a server over several processes is on a mesh"
+        return [jax.make_array_from_process_local_data(self._admitted, np.asarray(leaf)) for leaf in local]
 
     def _settle(self) -> None:
         """Read the previous call's draws into their rows, iteration by
@@ -1226,7 +1253,7 @@ class Server:
         iteration's last."""
         if self._pending is None:
             return
-        error, draws = jax.device_get(self._pending)
+        error, draws = jax.tree.map(_held_here, self._pending)
         self._pending = None
         try:
             error.throw()
@@ -1277,6 +1304,35 @@ class Server:
         settled(row.ticket, Generation(
             np.concatenate([row.prompt[None], drawn], axis=1), np.array([count], np.int32),
             np.array([terminated]), behavior, raw, rows=1, decoder=decoder))
+
+
+def _local_groups(rows: NamedSharding | None, slots: int, groups: int) -> tuple[int, ...]:
+    """The groups of a server's slots on this process's devices, in order: every group without a mesh or
+    on one within one process; on a mesh over several, those its devices hold, each group's devices all
+    one process's, which alone seats and reads its rows. A mesh splitting a group's devices over
+    processes (a tensor axis across them) is refused: two processes would write the group's slots
+    apart."""
+    if rows is None or rows.is_fully_addressable:
+        return tuple(range(groups))
+    size = slots // groups
+    owners: dict[int, set[int]] = {}
+    for device, index in rows.devices_indices_map((slots,)).items():
+        owners.setdefault((index[0].start or 0) // size, set()).add(device.process_index)
+    if any(len(held) > 1 for held in owners.values()):
+        raise ValueError("a server's group of rows is seated and read by one process, and this mesh "
+                         "splits a group's devices over several: lay the processes along the batch axes")
+    return tuple(sorted(group for group, held in owners.items() if held == {jax.process_index()}))
+
+
+def _held_here(leaf: jax.Array) -> np.ndarray:
+    """`leaf` on the host, the parts this process's devices hold filled in where its mesh spans several
+    processes: a step's draws are read by the process whose rows drew them."""
+    if leaf.is_fully_addressable:
+        return np.asarray(jax.device_get(leaf))
+    held = np.zeros(leaf.shape, leaf.dtype)
+    for shard in leaf.addressable_shards:
+        held[shard.index] = np.asarray(shard.data)
+    return held
 
 
 def _served_plan(strategy: Strategy, mesh: Mesh | None, chunk: int | None,
