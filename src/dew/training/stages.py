@@ -24,11 +24,11 @@ Invariants:
   reads it as the stored layers it stacks (`dew.nn.sharding.stacked_layers`): Dew's
   weight-decay mask, Muon's matrix axes, a param group's patterns, int8 moments' size threshold,
   LAMB's trust ratio, LaProp's adaptive clip and QK-Clip's per-layer maxima each give what they give
-  unstacked. An optax transformation given as it is runs over the stacked leaf, so unless every state it
-  holds names a transform Dew knows to act a number at a time, the run keeps every layer whole on every
-  stage, the replicated layout's memory, which trains it exactly (`StageLocal.of`): a stateless
-  transform (`optax.EmptyState`) says nothing of what it reads, and optax's LAMB trust ratio, its
-  adaptive clip and a constant rate's scale all hold one (row 3934).
+  unstacked. An optax transformation given as it is runs over the stacked leaf, so the run keeps its runs
+  stage-local where its update over the stacked leaves computes each layer as its update over the stored
+  layers does, entry by entry the same expression of that layer's entries (`whole_reading`), and keeps
+  every layer whole on every stage otherwise, the replicated layout's memory, which trains it exactly: a
+  trust ratio or a clip over a norm, or a build that decides by its leaves' shapes (rows 3934, 3995).
 
 Rejected: the stage axis as one more axis the state splits over, as fsdp splits it, which keeps each
 leaf one layer but moves the run's parameters to their stage and its gradients back every step, the
@@ -43,10 +43,12 @@ import dataclasses
 import functools
 import logging
 import math
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, overload
 
 import jax
+import jax.extend.core as jcore
+import jax.numpy as jnp
 import numpy as np
 import optax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -54,8 +56,9 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from dew.batch import unboxed
 from dew.mesh import STAGE_AXIS, LayoutRefused
 from dew.nn.kernels.options import owned_program, program
+from dew.nn.kernels.templates.layout import ENTRYWISE
+from dew.nn.programs import computed
 from dew.nn.sharding import abstract, held_by_stage
-from dew.optim import STACKED_STATES
 
 if TYPE_CHECKING:
     from dew.checkpoints import Checkpoints
@@ -150,13 +153,6 @@ class StageLocal:
             return cls((), mesh)
         # The draw's shapes, its tree plain as a run holds it (`dew.batch.unboxed`).
         shapes = unboxed(abstract(objective.initializer, jax.random.key(0)))
-        whole = whole_reading(optimizer, shapes.get("params", {}))
-        if whole:
-            _log.warning("the optimizer given built holds %s, transforms that may read a parameter whole, so "
-                         "each pipelined run keeps every layer whole on every stage, without stage-local "
-                         "storage's 1/%d of the run a device; a named optimizer (OptimConfig(optimizer=...)) "
-                         "reads each stored layer and keeps them stage-local", whole, stages)
-            return cls((), mesh, tuple(whole))
         declared = objective.stage_sites(shapes, stages)
         if not declared:
             _log.info("%s declares no run a pipeline over %d stages stacks (Objective.stage_sites), so its "
@@ -165,8 +161,17 @@ class StageLocal:
         # every collection, which the pipeline restacks as it would any stored layers.
         from dew.inference.banks import in_namespace
 
-        return cls(tuple(site for site in declared if not any(
+        staged = cls(tuple(site for site in declared if not any(
             site.view.splits(tree) for tree in in_namespace(shapes, site.namespace).values())), mesh)
+        whole = whole_reading(optimizer, shapes, staged)
+        if whole:
+            _log.warning("the optimizer given built may read a stacked leaf otherwise than layer by layer "
+                         "(%s), so each pipelined run keeps every layer whole on every stage, without "
+                         "stage-local storage's 1/%d of the run a device; a named optimizer "
+                         "(OptimConfig(optimizer=...)) reads each stored layer and keeps them stage-local",
+                         "; ".join(whole), stages)
+            return cls((), mesh, tuple(whole))
+        return staged
 
     @property
     def stages(self) -> int:
@@ -405,23 +410,213 @@ def _layered_arrays(local: StageLocal, tree):
     return local.layered(tree)
 
 
-def whole_reading(optimizer: optax.GradientTransformation | None, params) -> list[str]:
-    """The kinds of transform `optimizer`'s state over `params` (their shapes) holds outside
-    `dew.optim.STACKED_STATES`, each of which may read a parameter whole; none for Dew's own (None)."""
-    if optimizer is None or not params:
+def whole_reading(optimizer: optax.GradientTransformation | None, shapes, local: StageLocal) -> list[str]:
+    """Why `optimizer`'s update over a run's leaves stacked as `local` stacks them
+    (`StageLocal.staged_shapes`) may compute otherwise than its update over the stored layers: none where,
+    called as a commit calls it (`dew.training.transaction.optimizer_update`, a run's progress handed it
+    or not), every leaf it returns, its update's and its state's, is of the stacked layers' shapes and, row
+    by row, the same expression of its row's leaves over the stack as over each layer (`_expressions`), as
+    optax's moments, decay, rates and schedules are (row 3995). A reduction, a contraction or a reshape of
+    a stacked leaf, a call it cannot see into, a QK-Clip's read of the forward's maxima, or a choice its
+    build makes otherwise over a stacked tree (a mask by rank, a tree of the layers' paths) is named, and
+    keeps every layer whole: LAMB's trust ratio, a clip by a norm. None for Dew's own optimizers (None),
+    which read a stacked leaf as its layers, and for a run with no stacked site."""
+    from dew.gauss_newton import solves_equations
+    from dew.optim import clips_qk
+    from dew.training.transaction import optimizer_update
+
+    if optimizer is None or not local.sites:
         return []
-    kinds = {type(node) for node in _states(jax.eval_shape(optimizer.init, params))}
-    return sorted(kind.__name__ for kind in kinds - STACKED_STATES)
+    with local.held():
+        layer_params = shapes["params"]
+        layer_state = jax.eval_shape(optimizer.init, layer_params)
+        # The state as a run holds it: built over the layer tree, then stacked (`StageLocal.state`).
+        state = local.staged_shapes(layer_state)
+        if solves_equations(state):
+            # Its update is a solve of the step's system over every parameter at once (`dew.gauss_newton`),
+            # read from the statistics the step hands it, not its gradient a layer at a time.
+            return ["a Gauss-Newton solve, over every parameter at once"]
+        if clips_qk(state):
+            return ["a QK-Clip, which reads the attention maxima its forward reports for each layer"]
+        params = local.staged_shapes(shapes)["params"]
+        try:
+            built = jax.eval_shape(optimizer.init, params)
+        except ValueError:
+            # optax refuses a tree its build was given for another (a mask of the layers' paths).
+            return ["a transformation built against the layer tree, which builds over no stacked one"]
+        if _schema(built) != _schema(state):
+            return ["a transformation whose build reads its tree's shapes, deciding otherwise when stacked"]
+        held_leaves = len(jax.tree.leaves((layer_params, layer_state, layer_params)))
+        places = jax.tree.unflatten(jax.tree.structure((layer_params, layer_state, layer_params)),
+                                    range(held_leaves))
+        inputs = jax.tree.leaves((local.staged({"params": places[0]}, _row_places)["params"],
+                                  local.staged(places[1], _row_places),
+                                  local.staged({"params": places[2]}, _row_places)["params"]))
+        refusals: list[str] = []
+        # A run's progress, where it has one, an input of both programs, handed as a commit hands it.
+        clocks: list[tuple] = [()]
+        if isinstance(optimizer, optax.GradientTransformationExtraArgs):
+            clocks.append((jax.ShapeDtypeStruct((), jnp.float32),))
+        for clock in clocks:
+            def update(gradient, opt_state, held, *progress):
+                # As a commit calls it, handed no attention maxima (no QK-Clip, above).
+                return optimizer_update(optimizer, gradient, opt_state, held,
+                                        progress=progress[0] if progress else None)
+
+            returned = jax.eval_shape(update, layer_params, layer_state, layer_params, *clock)
+            made = jax.tree.unflatten(jax.tree.structure(returned), range(len(jax.tree.leaves(returned))))
+            outputs = jax.tree.leaves((local.staged({"params": made[0]}, _row_places)["params"],
+                                       local.staged(made[1], _row_places)))
+            staged = (local.staged_shapes({"params": returned[0]})["params"],
+                      local.staged_shapes(returned[1]))
+            if _schema(jax.eval_shape(update, params, state, params, *clock)) != _schema(staged):
+                refusals.append("an update whose results over the stack are not the stacked layers' shapes")
+                continue
+            # The progress, the layer program's last input, is the same input of the stacked one.
+            given = [*inputs, *range(held_leaves, held_leaves + len(clock))]
+            refusals += _expressions(jax.make_jaxpr(update)(layer_params, layer_state, layer_params, *clock),
+                                     jax.make_jaxpr(update)(params, state, params, *clock), given, outputs)
+    return refusals
 
 
-def _states(node) -> list:
-    """Every optimizer-state node `node` nests, its own included: each container of a type of its own
-    (a transform's state, a NamedTuple), past the tuples, lists and dicts that hold them."""
-    if node is None:
-        return []
-    children, structure = jax.tree_util.tree_flatten(node, is_leaf=lambda child: child is not node)
-    # A leaf is one value; an empty node (a transform's state of no fields, Gauss-Newton's) is a state.
-    if jax.tree_util.treedef_is_leaf(structure) and structure.num_leaves == 1:
-        return []
-    own = [] if type(node) in (tuple, list, dict) else [node]
-    return own + [state for child in children for state in _states(child)]
+def _schema(tree) -> tuple:
+    """`tree`'s structure and each leaf's shape and dtype."""
+    return jax.tree.structure(tree), tuple((leaf.shape, leaf.dtype) for leaf in jax.tree.leaves(tree))
+
+
+@dataclasses.dataclass(frozen=True)
+class _Rows:
+    """A stacked leaf's rows, by their places among the layer tree's leaves, stage-major (`staged`)."""
+
+    places: tuple[int, ...]
+
+
+def _row_places(rows, shape) -> _Rows:
+    return _Rows(tuple(rows))
+
+
+def _expressions(layered, stacked, inputs: Sequence, outputs: Sequence) -> list[str]:
+    """Where the program `stacked`, over the leaves `inputs` (each a layer program input's place, or the
+    `_Rows` it stacks), computes any of its `outputs` (each likewise) otherwise than `layered` computes
+    each row: an output is the same expression of the inputs, row by row, where both programs, their
+    calls inlined (`dew.training.staging.flattened`), compute it by the same equations of the same
+    primitives, parameters and constants over the same inputs' rows, each equation that reads a stacked
+    leaf elementwise (`_elementwise`), so each entry of a stacked leaf is its row's entry's expression,
+    and any equation of leaves no stack holds as the layer program has it. Row r of a stack of n rows is
+    read against row r of every stacked input of n rows; a stacked input of another count is no row's.
+    Equal expressions share one number (`_Numbering`)."""
+    from dew.training.staging import flattened
+
+    numbering = _Numbering()
+    lay_equations, lay_results = flattened(layered.jaxpr, layered.jaxpr.invars, layered.consts)
+    stack_equations, stack_results = flattened(stacked.jaxpr, stacked.jaxpr.invars, stacked.consts)
+    lay = numbering.program(lay_equations, {var: ("input", place)
+                                            for place, var in enumerate(layered.jaxpr.invars)})
+    rows_held = frozenset(var for var, given in zip(stacked.jaxpr.invars, inputs, strict=True)
+                          if isinstance(given, _Rows))
+    readers: dict[tuple[int, int] | None, dict] = {}
+
+    def stack_numbers(row: tuple[int, int] | None) -> dict:
+        # Each value's number with row r of every stacked input of n rows named as its layer's, every other
+        # stacked input as itself, so an output that reads one matches no layer's.
+        if row not in readers:
+            named = {var: ("input", given.places[row[1]])
+                     if isinstance(given, _Rows) and row is not None and len(given.places) == row[0]
+                     else ("stacked", given.places) if isinstance(given, _Rows) else ("input", given)
+                     for var, given in zip(stacked.jaxpr.invars, inputs, strict=True)}
+            readers[row] = numbering.program(stack_equations, named, rows_held)
+        return readers[row]
+
+    refusals = []
+    for output, returned in zip(outputs, stack_results, strict=True):
+        rows = ([((len(output.places), index), place) for index, place in enumerate(output.places)]
+                if isinstance(output, _Rows) else [(None, output)])
+        for row, place in rows:
+            number = numbering.read(stack_numbers(row), returned)
+            if number is None or number != numbering.read(lay, lay_results[place]):
+                refusals.append(f"its output {place} computes its layer otherwise over the stack, or by no "
+                                "elementwise expression of its layer")
+                break
+    return refusals
+
+
+class _Numbering:
+    """Numbers for expressions, one an expression however often it is formed: an input, a constant, or an
+    equation's result over numbered operands (`_expressions`), keyed by the primitive itself and its
+    parameters as JAX compares them."""
+
+    def __init__(self):
+        self.numbers: dict[tuple, int] = {}
+
+    def number(self, key: tuple) -> int:
+        return self.numbers.setdefault(key, len(self.numbers))
+
+    def read(self, numbers: dict, value) -> int | None:
+        """`value`'s number among a program's `numbers` (`program`): a literal's of its own."""
+        if isinstance(value, jcore.Literal):
+            literal = np.asarray(value.val)
+            return self.number(("literal", str(value.aval), literal.tobytes()))
+        return numbers.get(value)
+
+    def program(self, equations, named: dict, stacked: frozenset = frozenset()) -> dict:
+        """Each value of `equations` over the inputs `named` to its expression's number, in program order;
+        a value that reads a `stacked` input otherwise than elementwise (`_elementwise`), as no layer's
+        expression reads its own, has none."""
+        numbers = {var: self.number(key) for var, key in named.items()}
+        reaching = set(stacked)
+        for equation in equations:
+            operands = [self.read(numbers, operand) for operand in equation.invars]
+            stacks = any(computed(operand) and operand in reaching for operand in equation.invars)
+            if None in operands or (stacks and not _elementwise(equation)):
+                continue
+            if stacks:
+                reaching.update(equation.outvars)
+            # An entry of a scalar's broadcast is the scalar, whatever shape it fills; an entrywise result's
+            # entry is its operands' entries'; any other's reads its operands' shapes too.
+            spread = equation.primitive is jax.lax.broadcast_in_dim_p and equation.invars[0].aval.shape == ()
+            params = tuple(sorted((key, _hashable(setting)) for key, setting in equation.params.items()
+                                  if not (spread and key in _SHAPED)))
+            if any(setting is _UNKEYED for _, setting in params):
+                continue
+            shapes = () if spread or _elementwise(equation) else tuple(
+                getattr(operand.aval, "shape", None) for operand in equation.invars)
+            for index, out in enumerate(equation.outvars):
+                numbers[out] = self.number((equation.primitive, params, tuple(operands), shapes, index))
+        return numbers
+
+
+_UNKEYED = object()
+"""A parameter no key compares: its equation's results take no number, as no layer's expression."""
+
+
+def _hashable(setting):
+    """An equation's parameter as a key: itself where it hashes, as JAX's own caches compare parameters;
+    an array by its dtype, shape and bytes, a sequence by its items; `_UNKEYED` for any other."""
+    if isinstance(setting, np.ndarray):
+        return ("array", str(setting.dtype), setting.shape, setting.tobytes())
+    if isinstance(setting, tuple | list):
+        entries = tuple(_hashable(entry) for entry in setting)
+        return _UNKEYED if any(entry is _UNKEYED for entry in entries) else (type(setting).__name__, entries)
+    return setting if isinstance(setting, Hashable) else _UNKEYED
+
+
+_SHAPED = frozenset({"shape", "broadcast_dimensions", "sharding"})
+"""A scalar's broadcast's parameters that name the shape it fills, which a stacked leaf's holds more of."""
+
+
+def _elementwise(equation) -> bool:
+    """Whether `equation` computes each entry of its results from the same entry of each operand, or a
+    scalar: one of JAX's entrywise primitives (`ENTRYWISE`, each `jax.lax`'s own) whose every operand is of
+    its result's shape or a scalar, or a scalar's broadcast."""
+    shapes = {out.aval.shape for out in equation.outvars}
+    operands = [operand.aval.shape for operand in equation.invars]
+    if equation.primitive is jax.lax.broadcast_in_dim_p:
+        return operands == [()]
+    return (equation.primitive in _ENTRYWISE_PRIMITIVES and len(shapes) == 1
+            and all(shape in shapes or shape == () for shape in operands))
+
+
+_ENTRYWISE_PRIMITIVES = frozenset(
+    primitive for name in ENTRYWISE if (primitive := getattr(jax.lax, f"{name}_p", None)) is not None)
+"""JAX's entrywise primitives themselves (`dew.nn.kernels.templates.layout.ENTRYWISE`, each by its
+`jax.lax` object), so a primitive of another library that shares a name is none of them."""

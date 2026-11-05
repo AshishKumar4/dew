@@ -1270,17 +1270,6 @@ def _within(node: dict[str, JSON], key: str) -> dict[str, JSON]:
     return held
 
 
-def _holds(config: "RunConfig", path: str) -> bool:
-    """Whether `config` holds every record along the dotted `path` up to its field: false past an optional
-    record it holds none of (a teacher of None)."""
-    held: object = config
-    for group in path.split(".")[:-1]:
-        held = getattr(held, group, None)
-        if held is None:
-            return False
-    return True
-
-
 def _recorded_at(config: "RunConfig", path: str) -> JSON:
     """The value `config`'s record holds at the dotted `path` (`_placed`), as `override` writes it."""
     *groups, field = _placed(config, path)[0]
@@ -1290,14 +1279,26 @@ def _recorded_at(config: "RunConfig", path: str) -> JSON:
     return node.get(field)
 
 
-def _placed(config: "RunConfig", path: str) -> tuple[list[str], Annotation]:
-    """The keys of `path`'s value in `config`'s record, and the annotation it is read by."""
-    *groups, field = path.split(".")
-    held: object = config
-    for group in groups:
+def _group_of(config: "RunConfig", path: str) -> "DataclassInstance | None":
+    """The record the dotted `path`'s field is read in, its groups walked from `config`: None past an
+    optional record `config` holds none of (a teacher of None); a name no group of the run record has is
+    refused."""
+    held: DataclassInstance | None = config
+    for group in path.split(".")[:-1]:
+        if held is None:
+            return None
         if not (dataclasses.is_dataclass(held) and group in _names(held)):
             raise KeyError(f"{path} names no group of the run record")
         held = getattr(held, group)
+    return held
+
+
+def _placed(config: "RunConfig", path: str) -> tuple[list[str], Annotation]:
+    """The keys of `path`'s value in `config`'s record (`_group_of`), and the annotation it is read by."""
+    *groups, field = path.split(".")
+    held = _group_of(config, path)
+    if held is None:
+        raise KeyError(f"{path} is read in an optional record the run holds none of")
     if isinstance(held, Registered) and field not in _names(held):
         member = held.member
         # A flag's annotation types the value, as `--model.<field>` reads it;
@@ -1743,7 +1744,8 @@ class RunConfig:
         (`earlier_run`); itself where it resumes none (`TrainerConfig.resumes`) or leaves none to its
         build."""
         trainer = self.trainer
-        unset = [path for path in self.BUILT if _holds(self, path) and _recorded_at(self, path) is None]
+        unset = [path for path in self.BUILT
+                 if _group_of(self, path) is not None and _recorded_at(self, path) is None]
         if not unset or trainer.name is None or trainer.resume == "never" or not trainer.resumes():
             return self
         saved = self._saved_record(trainer.directory(trainer.name))
@@ -1751,7 +1753,8 @@ class RunConfig:
         if recorded is None:
             return self
         # A field of a record the saved run held none of (a teacher it had not) takes nothing.
-        return self.override({path: _recorded_at(recorded, path) for path in unset if _holds(recorded, path)})
+        return self.override({path: _recorded_at(recorded, path) for path in unset
+                              if _group_of(recorded, path) is not None})
 
     def build_run(self) -> Prepared:
         """Build what this run trains, the run as it stands, its sources already pinned (`prepare`
