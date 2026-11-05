@@ -585,7 +585,12 @@ class _Numbering:
     def read(self, numbers: dict, value) -> int | tuple[int, ...] | None:
         """`value`'s number among a program's `numbers` (`program`): a literal's of its own."""
         if isinstance(value, jcore.Literal):
-            return self.number(("literal", str(value.aval), parameter_key(value.val)))
+            number = self.number(("literal", str(value.aval), parameter_key(value.val)))
+            held = np.asarray(value.val)
+            if held.dtype.kind in "biuf" and bool(np.all(held >= 0)):
+                # A literal with no negative entry, a sum's starting zero among them (`summed`).
+                self.nonnegative.add(number)
+            return number
         return numbers.get(value)
 
     def equation(self, equation, params: Mapping, operands: Sequence, shapes: Sequence) -> list[int]:
