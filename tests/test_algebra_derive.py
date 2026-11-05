@@ -15,7 +15,7 @@ from check1_statistics import GateFailure
 from reference_error import assert_as_exact
 
 from dew import algebra
-from dew.algebra import SATURATION, derive
+from dew.algebra import SATURATION, derive, forms as algebra_forms
 from dew.nn import precision
 
 QUERIES, KEYS, WIDTH, TILE = 16, 96, 32, 32
@@ -175,23 +175,24 @@ def test_the_derived_walk_computes_the_declared_function(name, walk):
 
 
 def test_a_walks_sums_added_by_its_mainloop_take_each_tiles_factor_and_sum():
-    """A mainloop that makes a walked sum's additions itself (`Derived.step`'s `add`, a compensated walk's
-    running sums) takes each tile's rescale factor, its tile's sum and the terms it sums: the terms summed and
-    added twice over, the softmax's
+    """A mainloop that makes a walked sum's additions itself (`Derived.step`'s `stepped`, a compensated walk's
+    running sums) takes each tile's rescale factor, its tile's sum and the terms it sums (`Added`), the other
+    reductions left to the forms: the terms summed and added twice over, the softmax's
     denominator doubles on every tile, and the walk's attention is the declared function's halved, on par
     against the float64 truth (check 1)."""
     forms = derive.derive(declared(attention), accurate=False, saturation=SATURATION)
 
-    def doubled(state, factor, summed, terms):
-        del summed
-        return state * factor + 2 * jnp.sum(terms, axis=-1)
+    def doubled(states, parts):
+        return tuple(state * part.factor + 2 * jnp.sum(part.terms, axis=-1)
+                     if isinstance(part, algebra_forms.Added) else None
+                     for state, part in zip(states, parts, strict=True))
 
     def run(q, k, v):
         values = operands(q, k, v)
         tiles = [tile_of(values, tile) for tile in range(KEYS // TILE)]
         state = forms.init(shaped(tiles[0]))
         for tile in tiles:
-            state = forms.step(state, tile, add=doubled)
+            state = forms.step(state, tile, stepped=doubled)
         return forms.finish(state, values, shapes=shaped(tiles[0]))
 
     assert_as_exact(jax.jit(run), jax.jit(lambda q, k, v: whole(attention)(q, k, v) / 2), draw,
