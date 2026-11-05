@@ -225,7 +225,8 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
         cost=stated(walk.spec, batch, heads, walk.spec.queries or queries,
                     width + value_width
                     + (part_count(key.dtype, walk.accurate) + walk.accurate) * share[1],
-                    query, key, value, dout),
+                    query, key, value, dout,
+                    blocks=(program.tiles.block_q, program.tiles.block_k)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries, share[1]))(
             query, key, value, dout, peak, prior, anchor, delta, key_index, *leaves)
     dq, keyed, rows = out if walk.accurate else (out[0], None, out[1])

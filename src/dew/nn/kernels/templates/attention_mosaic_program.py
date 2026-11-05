@@ -688,15 +688,31 @@ def reached(spec: algebra.Forward, queries: int) -> int | None:
     return None
 
 
-def stated(spec: algebra.Forward, batch: int, heads: int, queries: int, widths: int, *arrays
-           ) -> pl.CostEstimate | None:
+def issued(spec: algebra.Forward, queries: int, blocks: tuple[int, int]) -> int | None:
+    """The query and key pairs a launch walking tiles of `blocks` (a consumer's query block and the key
+    block) computes: each tile holding a pair its call reaches (`reached`), whole, its padded rows and a
+    causal diagonal tile's masked part computed with the rest (on an H100, the tensor pipes' counts of a
+    causal call at 2048 queries and 128-row tiles: 6.25% past its reached pairs, row 3948); None for a spans
+    call."""
+    block_q, block_k = blocks
+    query_tiles, key_tiles = -(-queries // block_q), -(-spec.keys // block_k)
+    if spec.form == "full":
+        return query_tiles * block_q * key_tiles * block_k
+    if spec.form == "causal":
+        return sum(block_q * block_k * -(-min(spec.keys, min((tile + 1) * block_q, queries)) // block_k)
+                   for tile in range(query_tiles))
+    return None
+
+
+def stated(spec: algebra.Forward, batch: int, heads: int, queries: int, widths: int, *arrays,
+           blocks: tuple[int, int]) -> pl.CostEstimate | None:
     """A launch's cost as it states it to XLA and to Dew's FLOP count (`dew.telemetry.instrumentation`), the
-    hardware's work: a multiply-add a reached pair (`reached`), head and row for each of `widths` product
-    columns the launch issues, its recomputed ones (a backward's `S`) and each part a cotangent's product
-    takes (`part_count`) among them, a transcendental a reached pair, and the bytes of each of `arrays` once;
-    None for a spans call, whose pairs no launch knows (`reached`): its FLOPs count as unsized, never as
-    0. The model's share of it the launch declares apart (`modelled`)."""
-    pairs = reached(spec, queries)
+    hardware's work: a multiply-add a pair its walk of `blocks` tiles issues (`issued`), head and row for each
+    of `widths` product columns the launch issues, its recomputed ones (a backward's `S`) and each part a
+    cotangent's product takes (`part_count`) among them, a transcendental an issued pair, and the bytes of
+    each of `arrays` once; None for a spans call, whose pairs no launch knows (`reached`): its FLOPs count as
+    unsized, never as 0. The model's share of it the launch declares apart (`modelled`)."""
+    pairs = issued(spec, queries, blocks)
     if pairs is None:
         return None
     return pl.CostEstimate(flops=2 * batch * heads * pairs * widths, transcendentals=batch * heads * pairs,

@@ -497,7 +497,8 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
                     width + value_width + shares[1][1]
                     + part_count(query.dtype, walk.accurate)
                     * (shares[0][1] + (width if walk.fused else 0)),
-                    query, key, value, dout),
+                    query, key, value, dout,
+                    blocks=(walk.program.tiles.block_q, walk.program.tiles.block_k)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              (width if walk.fused else 0) + shares[0][1] + shares[1][1]
                              + (value_width if shares[0][0] == 0 else 0)))

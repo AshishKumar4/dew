@@ -174,7 +174,8 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         # and of dQ's (`part_count`); the model's of them it owns (`modelled`): dQ's, dK's, dV's and dP's.
         cost=stated(walk.spec, batch, heads, walk.spec.queries or queries,
                     width + 2 * value.shape[-1] + 2 * part_count(query.dtype, walk.accurate) * width,
-                    query, key, value, dout),
+                    query, key, value, dout,
+                    blocks=(program.tiles.block_q, program.tiles.block_k)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              2 * width + 2 * value.shape[-1]))
     dq = jax.new_ref(jnp.zeros((batch, queries, heads, width), jnp.float32))
