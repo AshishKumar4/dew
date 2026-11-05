@@ -1044,7 +1044,7 @@ def certified(fn, *arguments) -> tuple:
 @dataclasses.dataclass(frozen=True)
 class Certifying:
     """The walk's rule of check 2 (`float64_terms.Rule`, `certified`): each primitive bound natively on its
-    operands, a literal at its traced type, and held to its contract (`_held`), its findings appended to
+    operands and held to its contract (`_held`), its findings appended to
     `findings` by its path: each call's equation `name#index`, a scan's step its index, joined by `/`."""
 
     findings: list
@@ -1056,12 +1056,7 @@ class Certifying:
     def held(self, dtype):
         return dtype
 
-    def primitive(self, eqn, values: list) -> list:
-        from jax.extend import core
-
-        # A literal at its traced type: its Python value may be wider (a float64 scalar for a float32).
-        operands = [np.asarray(value, var.aval.dtype) if isinstance(var, core.Literal) else value
-                    for value, var in zip(values, eqn.invars, strict=True)]
+    def primitive(self, eqn, operands: list) -> list:
         results = eqn.primitive.bind(*operands, **eqn.params)
         results = list(results) if eqn.primitive.multiple_results else [results]
         _held(eqn, operands, results, self.findings, "/".join(self.path))

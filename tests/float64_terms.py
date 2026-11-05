@@ -268,7 +268,9 @@ def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False, rule=No
         values[var], energies[var] = value, energy
 
     def read(var):
-        return var.val if isinstance(var, Literal) else values.get(var)
+        # A literal at its traced type, as the program reads it: its Python value may be wider (a float64
+        # scalar for a float32), which a call's body would take in as it is.
+        return np.asarray(var.val, var.aval.dtype) if isinstance(var, Literal) else values.get(var)
 
     def energy(var):
         return None if isinstance(var, Literal) else energies.get(var)
