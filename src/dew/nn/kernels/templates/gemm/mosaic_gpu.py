@@ -508,13 +508,30 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
             and not exact_sums):
         tail = tail_of.balanced(-(-m // tiles.block_m) * (n // block_n), k // block_k, multiprocessors,
                                 handoff_steps=handoff_steps(tiles, generation.gpu_target()))
+    walked = (-(-m // row_tile) + (0 if dense else g)) * (n // block_n) * tiles.cluster
+    programs = launched(family_of(tiles, lhs.dtype), multiprocessors, walked, tail)
     outs = _gmm_mainloop(lhs, rhs, table, (m, n, k, g), tiles=tiles, transpose_rhs=transpose_rhs,
-                         dtypes=dtypes, multiprocessors=multiprocessors, interpret=interpret,
+                         dtypes=dtypes, multiprocessors=programs, interpret=interpret,
                          hooks=(prologue, prologue_axes, epilogue, epilogue_axes),
                          sides=(prologue_operands, epilogue_operands), dense=dense, paired=paired, tail=tail,
                          exact_sums=exact_sums, transpose_lhs=transpose_lhs)
     outs = tuple(out[:rows] for out in outs)
     return outs if out_dtypes else outs[0]
+
+
+def launched(family: mosaic.Family, multiprocessors: int, walked: int, tail: tail_of.Tail | None) -> int:
+    """Dew: the programs a launch walking `walked` tiles runs: the `multiprocessors` its residency holds at
+    once, persistent, where its family streams across a program's tiles (a producer's ring loading the next
+    tile's steps under the last one's stores) or a balanced tail splits its last wave (`tail`); a program a
+    tile where each walk scopes its streams apart (`mosaic.Family.walks_scoped`: cp.async's pipeline,
+    filled and drained a tile), which the block scheduler starts in the walk's order as multiprocessors free
+    up. A static persistent walk's programs drift apart over many rounds, where the scheduler keeps the
+    running tiles a window of the walk's order: on an A100, a program a tile ran 0.37x and 0.43x the
+    persistent walk's time on Mixtral-8x7B's down and DeepSeek-V3's gate input gradients, 0.80x and 0.90x
+    on Mixtral's and Qwen3-30B-A3B's gate forwards, 0.88-0.95x on four grouped kernel gradients and 0.63x on
+    Qwen3-32B's gate_up input gradient (a 51200-deep walk), and 0.99-1.03x on three shorter dense rows, the
+    outputs bitwise equal (NS-P8-WALK-a100, NS-P8-WALK2-a100)."""
+    return multiprocessors if tail is not None or not family.walks_scoped else max(walked, 1)
 
 
 @tuning.lowered_once(('shape', 'tiles', 'transpose_rhs', 'dtypes', 'multiprocessors', 'interpret', 'hooks',
@@ -867,9 +884,11 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     if dense and family_of(tiles, lhs.dtype).fixes_up and not exact_sums:
         tail = tail_of.balanced(m // block_m * (n // block_n), -(-k // block_k), multiprocessors,
                                 handoff_steps=handoff_steps(tiles, generation.gpu_target()))
+    walked = g * (m // block_m) * (n // block_n)
+    programs = launched(family_of(tiles, lhs.dtype), multiprocessors, walked, tail)
     return _tgmm_streamed(
         (lhs, rhs), (group_sizes, group_starts, group_ends, group_num_blocks, group_block_starts, order),
-        (k, m, n, g), tiles=tiles, out_dtype=out_dtype, multiprocessors=multiprocessors,
+        (k, m, n, g), tiles=tiles, out_dtype=out_dtype, multiprocessors=programs,
         interpret=interpret, prologue=prologue, prologue_operands=prologue_operands,
         prologue_axes=prologue_axes, exact_sums=exact_sums, tail=tail)
 

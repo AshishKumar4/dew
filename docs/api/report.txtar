@@ -347,7 +347,7 @@ dew.config.DecoderRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
-  data_plan: int | None = None
+  data_plan_version: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
@@ -383,7 +383,7 @@ dew.config.RunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
-  data_plan: int | None = None
+  data_plan_version: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
@@ -451,7 +451,7 @@ dew.config.diffusion.DiffusionRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
-  data_plan: int | None = None
+  data_plan_version: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
@@ -484,7 +484,7 @@ dew.config.env.EnvRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
-  data_plan: int | None = None
+  data_plan_version: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: TrainerConfig = (lambda: TrainerConfig(eval_every=None, checkpoint_every=None))()
@@ -516,7 +516,7 @@ dew.config.jepa.JepaRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
-  data_plan: int | None = None
+  data_plan_version: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: OptimConfig = (lambda: OptimConfig(learning_rate=0.001))()
   trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
@@ -536,7 +536,7 @@ dew.config.lm.LMRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
-  data_plan: int | None = None
+  data_plan_version: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: OptimConfig = (lambda: OptimConfig(learning_rate=0.0006, weight_decay=0.1, clip_grads=1.0))()
   trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
@@ -586,7 +586,7 @@ dew.config.world_model.WorldModelRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
-  data_plan: int | None = None
+  data_plan_version: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
@@ -605,7 +605,7 @@ dew.decision.config.DecisionRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
-  data_plan: int | None = None
+  data_plan_version: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: OptimConfig = (lambda: OptimConfig(learning_rate=2.5e-05))()
   trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()

@@ -457,12 +457,9 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
     elif (args := get_callable_args(node, Chunk.state)) is not None:
         value = of(args[0])[1]
     elif (args := get_callable_args(node, Chunk.gram)) is not None:
-        strict = terms.integer(args[2])
-        between = decays.between
-        if strict:
-            below = jnp.tril(jnp.ones(between.shape[:2], bool), -1)[:, :, None]
-            between = jnp.where(below, between, 0.0)
-        value = _paired(of(args[0]), of(args[1]), between, issue, "gram" if strict else "scores")
+        strict = bool(terms.integer(args[2]))
+        value = _paired(of(args[0]), of(args[1]), decays.between, issue, "gram" if strict else "scores",
+                        strict=strict)
     elif (args := get_callable_args(node, Chunk.rows)) is not None:
         value = of(args[1])[:, None] * of(args[0])
     elif (args := get_callable_args(node, Chunk.times)) is not None:
@@ -549,7 +546,8 @@ def _token(parts: linear_scan.Parts, token: tuple) -> tuple:
     return exponent, B, U, s, C, along(parts.reader, keys), along(parts.free, values)
 
 
-def _paired(left, right, between, issue: Callable | None = None, role: str = "scores"):
+def _paired(left, right, between, issue: Callable | None = None, role: str = "scores", *,
+            strict: bool = False):
     """Each pair's decayed contraction over keys, `sum_k left_ik right_jk between_ijk` `[C, C]`: a decay a
     key dimension's over the pairs' every key; a scalar decay's (`between` `[C, C, 1]`) the keys'
     product decayed after it, `(left right^T) between`, which spans no `[C, C, K]` tensor (Qwen3.5-27B's
@@ -558,23 +556,29 @@ def _paired(left, right, between, issue: Callable | None = None, role: str = "sc
     keys decayed from it, the diagonal sub-chunks' alone elementwise. A pair no decay joins (`between` zero,
     a token's future) is zero, selected, not multiplied: its product, or its cotangent, may be infinite near
     float32's largest (a future corrected write's), whose product by a zero decay is NaN in every query's
-    gradient the pair reads (the chunked op's reverse mode, near the largest) and in the decays'."""
-    active = jnp.any(between != 0, axis=-1)
+    gradient the pair reads (the chunked op's reverse mode, near the largest) and in the decays'. A `strict`
+    pairing's diagonal (a gram's own token) is no pair."""
+    joined = between
+    if strict:
+        joined = jnp.where(jnp.tril(jnp.ones(between.shape[:2], bool), -1)[:, :, None], between, 0.0)
+    active = jnp.any(joined != 0, axis=-1)
     issue = issue or _issued
     if between.shape[-1] == 1:
         # The product selected before its decay multiplies it: an inactive pair's may overflow, whose zero
         # decay's derivative would read it.
-        return jnp.where(active, issue(role, left, right.T), 0.0) * between[..., 0]
-    return jnp.where(active, _factored(left, right, between, issue, role), 0.0)
+        return jnp.where(active, issue(role, left, right.T), 0.0) * joined[..., 0]
+    # The factors read the reference's own decay (1, on the diagonal a strict pairing excludes).
+    return jnp.where(active, _factored(left, right, between, joined, issue, role), 0.0)
 
 
-def _factored(left, right, between, issue: Callable, role: str):
+def _factored(left, right, between, joined, issue: Callable, role: str):
     """A per-key decay's pairs `sum_k left_ik right_jk between_ijk` over sub-chunks of `SUB` rows
     (`recurrence_algebra.SUB`, fla's BC): a pair of an earlier sub-chunk's key `j` and a later one's row `i`
     is the product of the row decayed to the reference `p` before its sub-chunk and the key decayed from it,
     `(left_i between_ip) (right_j between_pj)`, each factor at most 1 (every exponent at most zero, each span
     across a vanished token zero, `_decays_value`), a matrix product `issue` makes; a sub-chunk's own pairs
-    elementwise over its keys (at most SUB^2 K a sub-chunk, not C^2 K)."""
+    elementwise over its keys (at most SUB^2 K a sub-chunk, not C^2 K), by the pairing's own decays
+    (`joined`: `between` less a strict pairing's diagonal)."""
     from dew.nn.kernels import recurrence_algebra
 
     count = left.shape[0]
@@ -589,7 +593,7 @@ def _factored(left, right, between, issue: Callable, role: str):
             if start > first:
                 blocks.append(jnp.zeros((own.stop - own.start, keys.stop - keys.start), jnp.float32))
             elif start == first:
-                blocks.append(float32_einsum("ik,ijk->ij", left[own], right[None, keys] * between[own, keys]))
+                blocks.append(float32_einsum("ik,ijk->ij", left[own], right[None, keys] * joined[own, keys]))
             else:
                 reference = first - 1
                 blocks.append(issue(role, left[own] * between[own, reference],
