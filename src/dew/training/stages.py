@@ -594,7 +594,11 @@ class _Numbering:
         read = () if free else tuple(map(tuple, shapes))
         made = [self.number((equation.primitive, keyed, tuple(operands), read, index))
                 for index in range(len(equation.outvars))]
-        if spread:
+        # A scalar's broadcast, and an entrywise result of such broadcasts and scalars, is one value at every
+        # entry.
+        uniform = all(operand in self.uniform or tuple(shape) == ()
+                      for operand, shape in zip(operands, shapes, strict=True))
+        if spread or (free and name in ENTRYWISE and uniform):
             self.uniform.update(made)
         return made
 
