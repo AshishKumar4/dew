@@ -367,10 +367,10 @@ def loads_launches(text: str) -> list[tokamax.BoundArguments]:
 
 def dumps_picks(device_kind: str, picks) -> str:
     """`picks`, `(launch, Timings)` pairs measured on GPUs of `device_kind`, as the JSON Dew stores
-    them (`_read`): each launch with the jax it was measured under, its derived config (`gaps`) and
-    the configs that ran."""
+    them (`_read`): each launch with its derived config (`gaps`) and the configs that ran, in its jax's
+    own file (`cache.kernel_picks_path`)."""
     return json.dumps({"device_kind": device_kind, "data": [
-        {**_launch_json(ba), "jax": jax.__version__, "derived": encoded(ba.heuristics_config),
+        {**_launch_json(ba), "derived": encoded(ba.heuristics_config),
          "timings": _timings_json(timings)} for ba, timings in picks]})
 
 
@@ -1012,8 +1012,7 @@ def _read(path: str) -> tuple[Keyed, list]:
     (`_keyed`), and the stored entries they do not, as JSON: another
     checkout's launches (a kernel another branch adds, another branch's
     config fields, or another signature of a kernel, with an operand more or
-    one fewer, or a launch measured under another jax), which a write keeps
-    as they are. An entry is read only where its argument names are exactly
+    one fewer), which a write keeps as they are. An entry is read only where its argument names are exactly
     its kernel's parameters. Each launch is read alone, so one launch this
     checkout cannot read leaves the others readable. A missing file, or one
     that is not JSON, holds nothing."""
@@ -1023,11 +1022,10 @@ def _read(path: str) -> tuple[Keyed, list]:
 
 def _partitioned(path: str) -> tuple[list[tuple[dict, tuple[tokamax.BoundArguments, Timings]]], list]:
     """The entries of the store at `path` this checkout reads, each with its launch and timings, and the
-    entries it does not (`_read`): another checkout's, or one measured under another jax or written
-    before the store kept its jax."""
+    entries it does not (`_read`), another checkout's."""
     ours, foreign = [], []
     for entry in _stored(path):
-        if not isinstance(entry, dict) or entry.get("jax") != jax.__version__:
+        if not isinstance(entry, dict):
             foreign.append(entry)
             continue
         try:
