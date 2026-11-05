@@ -194,9 +194,10 @@ class Publisher(Protocol):
     """Serves the trainer's weights to the rollout engines.
 
     `load(variables, version)` makes the engines serve `variables` under
-    `version`, and the `version` property is the version they serve now. A
-    `RolloutServer` is a publisher, and so is an engine fleet's publish
-    sequence.
+    `version`, and the `version` property is the version they serve now,
+    below zero while they serve none (`NativeRolloutServer.deferred`), which
+    the first call loads whatever `sync_every` says. A `RolloutServer` is a
+    publisher, and so is an engine fleet's publish sequence.
     """
 
     @property
@@ -452,8 +453,8 @@ class Asynchronous:
                  for word in np.asarray(jax.device_get(jax.random.key_data(snapshot.key))).reshape(-1)]
         self._key = functools.reduce(jax.random.fold_in, (*words, partition.index), jax.random.key(0))
         self._submissions = 0
-        updates = snapshot.updates
-        if 0 <= updates - self.weights.version < self.sync_every:
+        updates, served = snapshot.updates, self.weights.version
+        if served >= 0 and 0 <= updates - served < self.sync_every:
             return
         self.weights.load(snapshot.variables, updates)
         if self.weights.version != updates:
