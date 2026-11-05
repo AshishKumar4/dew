@@ -21,7 +21,7 @@ import pytest
 from attention_oracle import attention_and_grads, attention_terms, exact_attention, kept, qkv, value_and_grads
 from flax import linen as nn
 from one_draw import assert_as_exact_as_the_reference
-from reference_error import as_given, assert_as_exact, distance, with_gradients
+from reference_error import as_given, assert_as_exact, with_gradients
 
 from dew.nn import kernels
 from dew.nn.attention import scaled_dot_product_attention, weighted_values
@@ -68,16 +68,15 @@ def flash_through_dews_attention_refuses_rows_it_would_misread(without_determini
     row of 64 beside queries of two rows of 32, or another sequence's keys of one row of 32 beside
     their ids of two rows of 16, flatten to as many tokens and would be read as the next row's: the
     call names the ids. Each well-formed twin, dense with grouped heads and packed, gives its output
-    and gradients within tests/reference_error.py's rule of the xla kernel's, both measured from
-    float64 per row or document."""
+    and gradients on par with the xla kernel's over drawn inputs (check 1), the truth the xla kernel's
+    float64 run of the same call."""
     flash_here()
     rng = np.random.default_rng(31)
 
     def normal(*shape):
         return jnp.asarray(rng.normal(size=shape), jnp.bfloat16)
 
-    query, cotangent = normal(2, 32, 4, 64), normal(2, 32, 4, 64)
-    key, value = normal(2, 32, 2, 64), normal(2, 32, 2, 64)
+    query, key = normal(2, 32, 4, 64), normal(2, 32, 2, 64)
     own = {"segment_ids": jnp.asarray(documents([[20, 12, 0], [9, 23, 0]])), "max_segments": 2}
     cross = {"segment_ids": own["segment_ids"], "max_segments": 2,
              "key_segment_ids": jnp.asarray(documents([[10, 6, 0], [4, 12, 0]]))}
@@ -100,31 +99,14 @@ def flash_through_dews_attention_refuses_rows_it_would_misread(without_determini
                            normal(1, keys, 2, 64))
         assert not isinstance(refused.value, KernelRefused)
 
-    def exact(pieces):
-        """`[o, dq, dk, dv]` from float64 and their `window_terms`, each `(row, slice)` causal alone."""
-        truth = [np.zeros(x.shape, np.float64) for x in (query, query, key, value)]
-        terms = [np.zeros(x.shape, np.float64) for x in (query, query, key, value)]
-        with jax.enable_x64(new_val=True):
-            for row, piece in pieces:
-                parts = [x[row, piece] for x in (query, key, value, cotangent)]
-                wide = [jnp.asarray(np.asarray(x, np.float64)) for x in parts]
-                for whole, part in zip(truth, output_and_gradients(
-                        lambda q, k, v: float64_attention(q, k, v, causal=True), wide[3], *wide[:3]),
-                        strict=True):
-                    whole[row, piece] = part
-                for whole, part in zip(terms, window_terms(*parts, causal=True), strict=True):
-                    whole[row, piece] = part
-        return truth, terms
+    def draw(seed):
+        streams = np.random.default_rng([31, seed])
+        return tuple(jnp.asarray(streams.normal(size=shape), jnp.bfloat16)
+                     for shape in ((2, 32, 4, 64), (2, 32, 2, 64), (2, 32, 2, 64), (2, 32, 4, 64)))
 
-    rows = [(0, slice(0, 32)), (1, slice(0, 32))]
-    documents_ = [(0, slice(0, 20)), (0, slice(20, 32)), (1, slice(0, 9)), (1, slice(9, 32))]
-    for packed, pieces in (({}, rows), (own, documents_)):
-        fused = output_and_gradients(jax.jit(attend('flash', **packed)), cotangent, query, key, value)
-        reference = output_and_gradients(jax.jit(attend('xla', **packed)), cotangent, query, key, value)
-        truth, terms = exact(pieces)
-        for name, index in (("o", 0), ("dq", 1), ("dk", 2), ("dv", 3)):
-            assert_as_exact_as_the_reference(fused[index], reference[index], truth[index],
-                                             f"{name} {'packed' if packed else 'dense'}", terms=terms[index])
+    for packed in ({}, own):
+        _attention_on_par(attend('flash', **packed), attend('xla', **packed), draw,
+                          f"flash {'packed' if packed else 'dense'}")
 
 
 SHARDED_SEEDS = 8
@@ -325,6 +307,19 @@ def window_terms(query, key, value, cotangent, causal, window=(-1, -1), sinks=No
     return [x[0] for x in terms]
 
 
+ATTENTION_SEEDS = 8
+"""A fused kernel's declared check-1 seeds against the xla kernel (`_attention_on_par`), sized by
+`seeds_for` paired on the GPU it runs on."""
+
+
+def _attention_on_par(fused, reference, draw, label: str, *, truth=None, seeds: int = ATTENTION_SEEDS):
+    """`fused`'s output and its inputs' gradients (`with_gradients`) on par with `reference`'s over `draw`'s
+    inputs and output cotangent (check 1), the truth `truth`'s float64 run (`reference`'s where None), rows
+    sized by their float64 terms, which a causal or packed call's rows of float64 zero need."""
+    assert_as_exact(jax.jit(with_gradients(fused)), jax.jit(with_gradients(reference)), draw, label,
+                    seeds=seeds, truth_fn=None if truth is None else with_gradients(truth), terms=True)
+
+
 def output_and_gradients(attend, cotangent, *arrays):
     """`attend`'s output and the gradients of its inputs under `cotangent`, as float64 host arrays."""
     out, pull = jax.vjp(attend, *arrays)
@@ -336,10 +331,10 @@ def output_and_gradients(attend, cotangent, *arrays):
 @pytest.mark.parametrize("sunk", [False, True])
 def packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_time(
         head_dim, causal, sunk, without_deterministic_ops):
-    """Documents packed back to back, one a single token, with an empty sequence between two: each
-    document's output and its three input gradients lie within tests/reference_error.py's rule of
-    FlashAttention's own on that document alone, both measured from float64, and with a 64-key
-    window and sinks so does the sinks' gradient summed over the documents. Not bitwise: on one
+    """Documents packed back to back, one a single token, with an empty sequence between two: the packed
+    call's output and its input gradients on par with FlashAttention's own on each document alone over
+    drawn inputs (check 1, the truth each document's float64 attention), with a 64-key window and sinks
+    the sinks' gradient too, summed over the documents. Not bitwise: on one
     short document the dense forward splits its keys across blocks (`_splits`) and the packed one
     does not, so the two round differently (on an RTX 4080, 1.0003 to 1.012 times apart in RMS)."""
     flash = flash_here()
@@ -347,45 +342,32 @@ def packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_ti
         pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80, sm90 and sm1xx")
     lengths = [700, 1, 0, 333, 64]
     starts = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int32)
-    query, _, _ = qkv((int(starts[-1]), 8, head_dim))
-    _, key, value = qkv((int(starts[-1]), 2, head_dim), seed=1)
-    cotangent = qkv((int(starts[-1]), 8, head_dim), seed=2)[0]
-    logits = jnp.asarray(np.random.default_rng(3).normal(size=(8,)) * 2, jnp.float32)
+    documents = [slice(begin, end) for begin, end in itertools.pairwise(starts.tolist()) if end > begin]
     window = (63, 0 if causal else 63) if sunk else (-1, -1)
+
+    def draw(seed):
+        rows = int(starts[-1])
+        streams = np.random.default_rng([0x9AC, seed])
+        q, k, v, dy = (jnp.asarray(streams.normal(size=(rows, heads, head_dim)), jnp.bfloat16)
+                       for heads in (8, 2, 2, 8))
+        return q, k, v, jnp.asarray(streams.normal(size=(8,)) * 2, jnp.float32), dy
 
     def options(sinks):
         return {"is_causal": causal, "window_size": window, "sinks": sinks if sunk else None}
 
-    packed = output_and_gradients(
-        lambda q, k, v, s: flash.flash_mha_varlen(q, k, v, starts, max(lengths), **options(s)),
-        cotangent, query, key, value, logits)
-    dense_sinks, true_sinks = [], []
-    for begin, end in itertools.pairwise(starts):
-        if begin == end:
-            continue
-        pieces = (query[begin:end], key[begin:end], value[begin:end])
-        dense = output_and_gradients(
-            lambda q, k, v, s: flash.flash_mha(q[None], k[None], v[None], **options(s))[0],
-            cotangent[begin:end], *pieces, logits)
-        with jax.enable_x64(new_val=True):
-            wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (*pieces, cotangent[begin:end], logits)]
-            truth = output_and_gradients(
-                lambda q, k, v, s: float64_attention(q, k, v, causal, window, s if sunk else None),
-                wide[3], *wide[:3], wide[4])
-        dense_sinks.append(dense[4])
-        true_sinks.append(truth[4])
-        terms = window_terms(*pieces, cotangent[begin:end], causal, window, logits if sunk else None)
-        documents = (x[begin:end] for x in packed[:4])
-        for name, got, theirs, want, summed in zip(("o", "dq", "dk", "dv"), documents, dense[:4], truth[:4],
-                                                   terms, strict=True):
-            if distance(theirs, want) == 0:  # a one-token document's attention is exact either way
-                np.testing.assert_array_equal(got, theirs)
-            else:
-                assert_as_exact_as_the_reference(got, theirs, want, f"{name} of the document at {begin}",
-                                                 terms=summed)
-    if sunk:
-        assert_as_exact_as_the_reference(packed[4], np.sum(dense_sinks, axis=0), np.sum(true_sinks, axis=0),
-                                         "dsinks")
+    def packed(q, k, v, s):
+        return flash.flash_mha_varlen(q, k, v, starts, max(lengths), **options(s))
+
+    def by_document(attend):
+        # Each document alone, its rows put back where the packed call holds them.
+        return lambda q, k, v, s: jnp.concatenate([attend(q[at], k[at], v[at], s) for at in documents])
+
+    def dense(q, k, v, s):
+        return flash.flash_mha(q[None], k[None], v[None], **options(s))[0]
+
+    _attention_on_par(packed, by_document(dense), draw, "packed documents",
+                      truth=by_document(lambda q, k, v, s: float64_attention(q, k, v, causal, window,
+                                                                             s if sunk else None)))
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
@@ -393,38 +375,44 @@ def queries_packed_against_keys_of_their_own_lengths_attend_their_own_documents(
                                                                                      without_deterministic_ops):
     """Cross-attention between packed documents: sequence i's queries, packed by their own offsets,
     attend sequence i's keys, packed by theirs, as a decision head's option slots read their own
-    row's tokens. Each document's output and its query, key and value gradients lie within
-    tests/reference_error.py's rule of FlashAttention's own on that document alone, both measured
-    from float64, a one-query document and an empty one among them; a document's keys no query
+    row's tokens. The packed call's output and its query, key and value gradients are on par with
+    FlashAttention's own on each document alone over drawn inputs (check 1, the truth each document's
+    float64 attention), a one-query document and an empty one among them; a document's keys no query
     reads take no gradient."""
     flash = flash_here()
     queries, keys = [30, 1, 0, 45, 7], [700, 333, 50, 120, 64]
     starts, key_starts = (np.concatenate([[0], np.cumsum(lengths)]).astype(np.int32)
                           for lengths in (queries, keys))
-    query = qkv((int(starts[-1]), 8, head_dim))[0]
-    _, key, value = qkv((int(key_starts[-1]), 2, head_dim), seed=1)
-    cotangent = qkv((int(starts[-1]), 8, head_dim), seed=2)[0]
-    packed = output_and_gradients(
-        lambda q, k, v: flash.flash_mha_varlen(q, k, v, starts, max(queries), key_cu_seqlens=key_starts,
-                                               key_max_seqlen=max(keys)),
-        cotangent, query, key, value)
-    for (begin, end), (key_begin, key_end) in zip(itertools.pairwise(starts), itertools.pairwise(key_starts),
-                                                  strict=True):
+    pairs = list(zip(itertools.pairwise(starts.tolist()), itertools.pairwise(key_starts.tolist()),
+                     strict=True))
+
+    def draw(seed):
+        streams = np.random.default_rng([0xC055, seed])
+        rows = (int(starts[-1]), int(key_starts[-1]), int(key_starts[-1]), int(starts[-1]))
+        return tuple(jnp.asarray(streams.normal(size=(count, heads, head_dim)), jnp.bfloat16)
+                     for count, heads in zip(rows, (8, 2, 2, 8), strict=True))
+
+    def packed(q, k, v):
+        return flash.flash_mha_varlen(q, k, v, starts, max(queries), key_cu_seqlens=key_starts,
+                                      key_max_seqlen=max(keys))
+
+    def by_document(attend):
+        # Each document's queries against its own keys, the rows put back where the packed call holds
+        # them; an empty document's keys read by no query.
+        return lambda q, k, v: jnp.concatenate([
+            attend(q[begin:end], k[key_begin:key_end], v[key_begin:key_end])
+            for (begin, end), (key_begin, key_end) in pairs if end > begin])
+
+    dense = by_document(lambda q, k, v: flash.flash_mha(q[None], k[None], v[None])[0])
+    _attention_on_par(packed, dense, draw, "documents against their own keys",
+                      truth=by_document(lambda q, k, v: float64_attention(q, k, v, causal=False)))
+    # A document no query reads leaves its keys and values no gradient.
+    q, k, v, dy = draw(0)
+    _, dk, dv = jax.vjp(packed, q, k, v)[1](dy)
+    for (begin, end), (key_begin, key_end) in pairs:
         if begin == end:
-            np.testing.assert_array_equal(packed[2][key_begin:key_end], 0)
-            np.testing.assert_array_equal(packed[3][key_begin:key_end], 0)
-            continue
-        pieces = (query[begin:end], key[key_begin:key_end], value[key_begin:key_end])
-        dense = output_and_gradients(lambda q, k, v: flash.flash_mha(q[None], k[None], v[None])[0],
-                                     cotangent[begin:end], *pieces)
-        with jax.enable_x64(new_val=True):
-            wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (*pieces, cotangent[begin:end])]
-            truth = output_and_gradients(lambda q, k, v: float64_attention(q, k, v, causal=False), wide[3],
-                                         *wide[:3])
-        rows = (slice(begin, end), slice(begin, end), slice(key_begin, key_end), slice(key_begin, key_end))
-        for name, got, at, theirs, want in zip(("o", "dq", "dk", "dv"), packed, rows, dense, truth,
-                                               strict=True):
-            assert_as_exact_as_the_reference(got[at], theirs, want, f"{name} of the document at {begin}")
+            np.testing.assert_array_equal(np.asarray(dk[key_begin:key_end]), 0)
+            np.testing.assert_array_equal(np.asarray(dv[key_begin:key_end]), 0)
 
 
 @pytest.mark.mesh(devices=2)
