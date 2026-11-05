@@ -1000,3 +1000,29 @@ def test_a_tiles_transient_hook_is_released_once_its_trace_is_done():
     held = traced(made())
     gc.collect()
     assert held() is None
+
+
+@pytest.mark.parametrize("name, inverse, kind", [
+    ("a negation negated", lambda x: -(-x), jax.lax.neg_p),
+    ("a negation's magnitude", lambda x: jnp.abs(-x), jax.lax.neg_p),
+    ("a magnitude's magnitude", lambda x: jnp.abs(jnp.abs(x)), jax.lax.abs_p),
+    ("a value times its sign", lambda x: jnp.sign(x) * x, jax.lax.sign_p)])
+def test_an_operation_its_inverse_cancels_is_rewritten_away_under_either_numerics(name, inverse, kind):
+    """An exact identity (`inverses`: a negation negated, the magnitude of a negation or of a magnitude, a
+    value times its sign) rounds as its left side does, so the pass rewrites it away under the default and
+    the accurate numerics alike: the summed program holds one equation of the cancelled kind fewer, and
+    computes bit for bit what it computes as written."""
+    def summed(x):
+        return jnp.sum(inverse(x), axis=-1)
+
+    from dew.nn.precision import ACCURATE, Numerics
+
+    x = rows(18, (4, 64))[0]
+    for policy in (Numerics(), ACCURATE):
+        with generation.run_precision(policy):
+            rewritten = jax.make_jaxpr(algebra.rewritten(summed))(x)
+            np.testing.assert_array_equal(np.asarray(jax.jit(algebra.rewritten(summed))(x)),
+                                          np.asarray(jax.jit(summed)(x)))
+        written = jax.make_jaxpr(summed)(x)
+        count = [sum(eq.primitive is kind for eq in equations(closed)) for closed in (rewritten, written)]
+        assert count[0] < count[1], (name, policy)
