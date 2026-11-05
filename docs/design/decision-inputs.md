@@ -14,7 +14,7 @@ A question longer than the context its backbone reads is counted unfit, and a "n
 read draws that would pass it is declined, as one past `max_len` is. Several such rows pack a window,
 each reading its own context. And a row's own streams in one pass (§2a): a segment names a stream of
 the row (`Schema.stream`, `Instructions.stream`), and the layout's `Reads` says which stream's tokens
-each stream attends to. Owner: Training (`dew.decision`); cross-attention and `dew.inputs`' encoders: Models.
+each stream attends to. Ownership is PLAN.md's.
 
 ## Today
 
@@ -40,7 +40,7 @@ The three layouts become three configurations of these segments. The proof: each
 
 ## 2. A segment goes to a stream
 
-Each segment names its stream: `main`, the row the backbone reads, or a named conditioning stream. A conditioning stream is an ordinary `dew.inputs.Condition`: an encoder over a batch field. The decision's data writes that field from the segments routed to the stream. The backbone itself is one such encoder: it embeds the stream's tokens with its own table, as the context does today, or runs its own forward over them (a second pass). The model's cross-attention layers read the stream's encoded sequence as their context (`CONTEXT`, `CONTEXT_LENGTHS`).
+Each segment names its stream (`Schema.stream`, `Instructions.stream`): `"row"`, the row the backbone reads; `"context"`, the row's context, which the backbone reads in a pass of its own and its cross-attention layers read beside the row; or a stream of the row of its own name, in the row's own pass under the layout's `Reads` (§2a). A conditioning stream is an ordinary `dew.inputs.Condition`: an encoder over a batch field. The decision's data writes that field from the segments routed to the stream. The backbone itself is one such encoder: it embeds the stream's tokens with its own table, as the context does today, or runs its own forward over them (a second pass). The model's cross-attention layers read the stream's encoded sequence as their context (`CONTEXT`, `CONTEXT_LENGTHS`).
 
 So today's `Example.context` is one segment, `State`-like over the example's context, routed to a stream the token table encodes. "The schema on a separate path" is a `Schema` segment routed to a stream the backbone encodes. Neither needs code of its own. Packing places every stream of a row together: a window holds rows while both its tokens (`max_len`) and its contexts (the objective's `context_window`, `max_len` or one row's `context_length` where that is longer) hold them, each row's context end to end after the rows before it (`context_segments`), each question carrying the row the packer placed it in (`question_rows`), and each span moved by its row's start along the stream it indexes: its tokens, or its context where the schema is the context. A row's tokens attend to its own context alone, and the backbone's pass over the contexts reads each as a document of its own.
 
@@ -85,15 +85,23 @@ With the schema in the main row nothing changes. With the schema on a stream, th
 ## 4. What a user writes
 
 ```python
-layout = Layout(max_len=4096, joint=True, segments=(
-    Text(SYSTEM), Schema(stream="main"), State(cut="end"), Text(ASSISTANT)))  # schema before state
+from dew.decision import JointLayout, Schema, State, Text
+from dew.decision.layout import Reads
 
-layout = Layout(max_len=4096, joint=True, segments=(
-    Text(SYSTEM), State(cut="end"), Text(ASSISTANT),
-    Schema(stream="schema")))  # the schema read through cross-attention, its own pass
+layout = JointLayout(max_len=4096, segments=(
+    Text(SYSTEM), Schema(), State(keep="end"), Text(ASSISTANT)))  # schema before state
+
+layout = JointLayout(max_len=4096, segments=(
+    Text(SYSTEM), State(keep="end"), Text(ASSISTANT),
+    Schema(stream="context")))  # the schema read through cross-attention, its own pass
+
+layout = JointLayout(max_len=4096, segments=(
+    Text(SYSTEM), State(keep="end"), Schema(stream="schema"), Text(ASSISTANT)),
+    reads=Reads((("row", "self", "causal"), ("row", "schema", "whole"), ("schema", "self", "causal"))))
+# the schema a stream of the row's own, read whole by the state in one pass (§2a)
 ```
 
-On the command line it is the same record (`--layout.segments ...`). The decision guide shows both variants on one table, trained and served with no Dew change.
+On the command line it is the same record: a decision run's `--segments ...` and `--reads ...` (`DecisionRunConfig`). The decision guide shows both variants on one table, trained and served with no Dew change.
 
 ## Seams, invariants, rejected alternatives
 
