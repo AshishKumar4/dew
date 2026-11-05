@@ -380,8 +380,9 @@ def test_the_ssd_port_holds_its_orders(edge):
                     plain_fn=plain_ssd, without=REVERSE_ONLY)
 
 
-# A TPU's scan near float32's largest: its output is infinite at an entry the recurrence keeps finite
-# (ledger 2656).
+# A TPU's scan near float32's largest is out of its contract: at the 2^63 draw 23 of the 731 outputs float64
+# puts past 2^127 are infinite, the least 2^126.9 (a chunk's two terms summed past float32's largest), where
+# mamba_ssm's own chunked scan leaves 55 of the same draw's outputs non-finite (row 2656).
 @pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
 def test_the_tpu_ssd_scan_holds_its_orders(edge):
     """Mamba2's chunked scan on a TPU's Pallas kernel (`ssd.ssd_chunk_scan`, a custom VJP, interpreted off a
