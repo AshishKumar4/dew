@@ -67,6 +67,10 @@ Scope is per rule, because the rules are not all about the same thing:
   takes the options its models and the run's seam hold, admits its
   communicators and takes the algebra pass, and a trace that compiles nothing
   traces (`jax.make_jaxpr`, `jax.eval_shape`).
+- SLOP026 is about `src/<package>`: no module applies `jax.custom_vjp` or
+  `jax.custom_jvp`, by any name it is imported as, but `nn/derivatives.py`,
+  whose functions declare a custom derivative as one marked call of its kind
+  that the algebra pass reads (docs/design/algebra.md §6.10).
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -1968,6 +1972,31 @@ def compile_points(module: Module) -> Iterator[Finding]:
                               "it runs, or an objective's `Objective.program`")
 
 
+DERIVATIVE_OWNER = "nn/derivatives.py"
+"""The module of `src/<package>` that applies JAX's custom derivatives (SLOP026); every other declares one
+through its functions (`kernel_derivative`, `kernel_tangent`, `numerics_derivative`, `numerics_tangent`,
+`surrogate`), each one marked call of its kind."""
+
+CUSTOM_DERIVATIVES = frozenset({"jax.custom_vjp", "jax.custom_jvp", "jax.custom_derivatives.custom_vjp",
+                                "jax.custom_derivatives.custom_jvp"})
+"""JAX's custom derivatives, by their public paths, which SLOP026 reports outside `DERIVATIVE_OWNER`."""
+
+
+def custom_derivatives(module: Module) -> Iterator[Finding]:
+    """SLOP026: a custom derivative of JAX's (`CUSTOM_DERIVATIVES`), its name read through the imports of its
+    scope, anywhere in `src/<package>` but `DERIVATIVE_OWNER`: applied by a site, its derivative is a call
+    the algebra pass cannot tell a kernel's glue from a rule its numerics need as written."""
+    prefix = f"src/{module.package}/"
+    if not module.relative.startswith(prefix) or module.relative.removeprefix(prefix) == DERIVATIVE_OWNER:
+        return
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
+        named = isinstance(node, (ast.Name, ast.Attribute)) and scopes.resolved(node, table)
+        if named in CUSTOM_DERIVATIVES:
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP026",
+                          f"applies {named} itself; declare the derivative through `dew.nn.derivatives` "
+                          "(`kernel_derivative`, `numerics_derivative`, their tangents or `surrogate`)")
+
+
 GATE = frozenset({"tests/reference_error.py", "tests/check1_statistics.py", "tests/op_certificates.py",
                   "tests/certified.py",
                   "tests/reference_graph.py", "tests/reference_trees.py", "tests/residual_orders.py",
@@ -2252,7 +2281,8 @@ def tolerances(module: Module) -> Iterator[Finding]:
                       f"{what} compares floats within a tolerance ({why}); {gate}")
 
 
-CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections, compile_points)
+CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections, compile_points,
+                  custom_derivatives)
 UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private)
 
 
