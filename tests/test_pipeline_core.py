@@ -116,21 +116,33 @@ def _unthird(row) -> bool:
     return int(row["id"]) % 3 != 2
 
 
-def test_a_compiled_reader_reads_its_store_in_memory_no_more_to_name_it():
-    """A store in memory names itself by a hash of every record it holds, which its compile takes once
-    (reading it by index): each reader the compile opens of a stream of it names its corpus as the
-    compile did, reading the store only for its rows, however often a run opens one (row 803)."""
-    reads = []
-    kept = Pipeline(Logged(source(8).values, reads=reads)).filter(_unthird)
-    data = compile(kept.shuffle(0, window=4).repeat().batch(2), read="streamed", loading=READ)
-    before = len(reads)
+@dataclasses.dataclass(frozen=True)
+class Hashed(Memory):
+    """Records in memory that note each time something hashes them to name them."""
+
+    hashed: list = dataclasses.field(default_factory=list, compare=False)
+
+    def fingerprint(self):
+        self.hashed.append(1)
+        return super().fingerprint()
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_compiled_reader_hashes_its_store_in_memory_no_more_to_name_it(read):
+    """A store in memory names itself by a hash of every record it holds, which its compile takes: each
+    reader the compile opens names its corpus as the compile did, hashing none of it again, however
+    often a run opens one (row 803)."""
+    store = Hashed(source(8).values)
+    kept = Pipeline(store).filter(_unthird).shuffle(0, window=4)
+    data = compile(kept.repeat().batch(2), read=read, loading=READ)
+    before = len(store.hashed)
     for _ in range(3):
         reader = data.train(DataPartition())
         try:
             listed(reader, 2)
         finally:
             reader.close()
-    assert "indexed" not in reads[before:], reads[before:]
+    assert len(store.hashed) == before
 
 
 class Decoded(list):
