@@ -126,15 +126,22 @@ from transformers import (
 )
 from transformers.models.deepseek_v32.configuration_deepseek_v32 import DeepseekV32Config
 from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32ForCausalLM
-from transformers.models.gemma3.modeling_gemma3 import Gemma3MultiModalProjector
+from transformers.models.gemma3.modeling_gemma3 import (
+    Gemma3ForConditionalGeneration,
+    Gemma3MultiModalProjector,
+)
 from transformers.models.gemma4.configuration_gemma4 import Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig
 from transformers.models.gemma4.modeling_gemma4 import (
     Gemma4ForConditionalGeneration,
     Gemma4MultimodalEmbedder,
     Gemma4VisionModel,
 )
-from transformers.models.llama4.configuration_llama4 import Llama4VisionConfig
-from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector, Llama4VisionModel
+from transformers.models.llama4.configuration_llama4 import Llama4Config, Llama4VisionConfig
+from transformers.models.llama4.modeling_llama4 import (
+    Llama4ForConditionalGeneration,
+    Llama4MultiModalProjector,
+    Llama4VisionModel,
+)
 from transformers.models.nemotron_h.configuration_nemotron_h import NemotronHConfig
 from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHForCausalLM
 from transformers.models.qwen3_5.configuration_qwen3_5 import (
@@ -915,99 +922,52 @@ def write_llama4_vision_tiny() -> None:
     write_vision_tiny("llama4-vision-tiny", system, {"text_width": system["text_width"]})
 
 
-def write_gemma3_mm_tiny() -> None:
-    """A Gemma 3 wrapper fixture: the SigLIP and projector halves under the
-    released model.* prefixes beside a tiny decoder half, with the wrapper
-    config and both vision reference outputs.
+def wrapper_tensors(vision: dict[str, torch.nn.Module], text: dict[str, torch.Tensor],
+                    text_prefix: str = "model.language_model",
+                    tied_head: bool = True) -> dict[str, torch.Tensor]:
+    """A wrapper's tensors as its release names them: each vision part's under the prefix its key
+    names and the decoder half's under `text_prefix`. A tied head is not the decoder's own: it rides
+    top-level, the embedding's clone, as the released layout carries it."""
+    merged = {f"{prefix}.{name}": tensor
+              for prefix, part in vision.items() for name, tensor in part.state_dict().items()}
+    merged.update({f"{text_prefix}.{name}": tensor
+                   for name, tensor in text.items() if not (tied_head and name == "lm_head.weight")})
+    if tied_head:
+        merged["lm_head.weight"] = text["embed_tokens.weight"].clone()
+    return merged
 
-    The decoder half reuses gemma3-tiny's weights under model.language_model.*,
-    and the tied head rides top-level as the released layout carries it. The
-    tower and projector come from the shared SigLIP system at a fresh seed.
-    """
+
+def write_wrapper_tiny(name: str, decoder: str, system: dict, vision: dict[str, torch.nn.Module], *,
+                       text_root: str, text_prefix: str, config_class, wrapper_class,
+                       fields: dict[str, int]) -> None:
+    """A wrapper fixture under FIXTURES / `name`: the `vision` parts and the tiny decoder fixture
+    `decoder` merged as the release names them (`wrapper_tensors`: the decoder's tensors from
+    `text_root` on under `text_prefix`, its head tied as its config says), the wrapper config (the
+    decoder's and the tower's beside `fields`, which hold the special token ids), the vision
+    references, two token rows with an image mark each and the logits of `wrapper_class` on them."""
     from safetensors.torch import load_file, save_file
 
-    system = siglip_tiny_system(seed=4321, text_width=64)
-    text = load_file(str(FIXTURES / "gemma3-tiny" / "model.safetensors"))
-    text_config = json.loads((FIXTURES / "gemma3-tiny" / "config.json").read_text())
-    merged = {}
-    for name, tensor in system["tower"].state_dict().items():
-        merged[f"model.vision_tower.{name}"] = tensor
-    for name, tensor in system["projector"].state_dict().items():
-        merged[f"model.multi_modal_projector.{name}"] = tensor
-    for name, tensor in text.items():
-        tail = name[6:] if name.startswith("model.") else name
-        merged[f"model.language_model.{tail}"] = tensor
-    merged["lm_head.weight"] = text["model.embed_tokens.weight"].clone()
-    directory = FIXTURES / "gemma3-tiny-mm"
+    text = load_file(str(FIXTURES / decoder / "model.safetensors"))
+    text_config = json.loads((FIXTURES / decoder / "config.json").read_text())
+    merged = wrapper_tensors(vision, {key.removeprefix(text_root): tensor for key, tensor in text.items()},
+                             text_prefix, tied_head=text_config["tie_word_embeddings"])
+    directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
     save_file(merged, directory / "model.safetensors")
     (directory / "config.json").write_text(json.dumps({
-        "model_type": "gemma3",
+        "model_type": config_class.model_type,
         "text_config": text_config,
         "vision_config": system["vconf"].to_dict(),
-        "mm_tokens_per_image": system["mm_tokens"],
-        "boi_token_index": 200, "eoi_token_index": 201,
-        "image_token_index": 202}, indent=1) + "\n")
+        **fields}, indent=1) + "\n")
     np.save(directory / "pixels.npy", system["pixels"])
     np.save(directory / "tower_ref.npy", system["last"])
     np.save(directory / "projector_ref.npy", system["soft"])
-    ids = np.array([[2, 5, 202, 7, 9], [202, 3, 4, 5, 6]], np.int32)
+    image = fields["image_token_index"]
+    ids = np.array([[2, 5, image, 7, 9], [image, 3, 4, 5, 6]], np.int32)
     with torch.no_grad():
-        from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
-        wrapper = Gemma3ForConditionalGeneration(Gemma3Config(
-            text_config={k: v for k, v in text_config.items()
-                         if k not in ("architectures", "model_type")},
-            vision_config=system["vconf"], mm_tokens_per_image=system["mm_tokens"],
-            boi_token_index=200, eoi_token_index=201, image_token_index=202))
-        wrapper.load_state_dict(
-            {k: v for k, v in merged.items()}, strict=True)
-        wrapper = wrapper.float().eval()
-        logits = wrapper(
-            input_ids=torch.from_numpy(ids), pixel_values=torch.from_numpy(
-                system["pixels"]), use_cache=False).logits.to(torch.float32).numpy()
-    np.save(directory / "input_ids.npy", ids)
-    np.save(directory / "wrapper_ref.npy", logits)
-    size = sum(path.stat().st_size for path in directory.iterdir())
-    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
-
-
-def write_llama4_mm_tiny() -> None:
-    """A Llama 4 wrapper fixture: vision halves and decoder half under the
-    released nesting with no model prefix, with the wrapper config, both
-    vision references and the wrapper logits."""
-    from safetensors.torch import load_file, save_file
-
-    system = llama4_vision_tiny_system(seed=4321)
-    text = load_file(str(FIXTURES / "llama4-tiny" / "model.safetensors"))
-    text_config = json.loads((FIXTURES / "llama4-tiny" / "config.json").read_text())
-    merged = {}
-    for name, tensor in system["tower"].state_dict().items():
-        merged[f"vision_model.{name}"] = tensor
-    for name, tensor in system["projector"].state_dict().items():
-        merged[f"multi_modal_projector.{name}"] = tensor
-    for name, tensor in text.items():
-        merged[f"language_model.{name}"] = tensor
-    directory = FIXTURES / "llama4-tiny-mm"
-    directory.mkdir(parents=True, exist_ok=True)
-    save_file(merged, directory / "model.safetensors")
-    (directory / "config.json").write_text(json.dumps({
-        "model_type": "llama4",
-        "text_config": text_config,
-        "vision_config": system["vconf"].to_dict(),
-        "boi_token_index": 90, "eoi_token_index": 91,
-        "image_token_index": 92}, indent=1) + "\n")
-    np.save(directory / "pixels.npy", system["pixels"])
-    np.save(directory / "tower_ref.npy", system["last"])
-    np.save(directory / "projector_ref.npy", system["soft"])
-    ids = np.array([[2, 5, 92, 7, 9], [92, 3, 4, 5, 6]], np.int32)
-    with torch.no_grad():
-        from transformers.models.llama4.configuration_llama4 import Llama4Config
-        from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
-        wrapper = Llama4ForConditionalGeneration(Llama4Config(
-            text_config={k: v for k, v in text_config.items()
-                         if k not in ("architectures", "model_type")},
-            vision_config=system["vconf"],
-            boi_token_index=90, eoi_token_index=91, image_token_index=92))
+        wrapper = wrapper_class(config_class(
+            text_config={k: v for k, v in text_config.items() if k not in ("architectures", "model_type")},
+            vision_config=system["vconf"], **fields))
         wrapper.load_state_dict(merged, strict=True)
         wrapper = wrapper.float().eval()
         logits = wrapper(
@@ -1017,6 +977,38 @@ def write_llama4_mm_tiny() -> None:
     np.save(directory / "wrapper_ref.npy", logits)
     size = sum(path.stat().st_size for path in directory.iterdir())
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
+def write_gemma3_mm_tiny() -> None:
+    """A Gemma 3 wrapper fixture: the SigLIP and projector halves under the
+    released model.* prefixes beside a tiny decoder half, with the wrapper
+    config and both vision reference outputs.
+
+    The decoder half reuses gemma3-tiny's weights under model.language_model.*,
+    and the tied head rides top-level as the released layout carries it. The
+    tower and projector come from the shared SigLIP system at a fresh seed.
+    """
+    system = siglip_tiny_system(seed=4321, text_width=64)
+    write_wrapper_tiny(
+        "gemma3-tiny-mm", "gemma3-tiny", system,
+        {"model.vision_tower": system["tower"], "model.multi_modal_projector": system["projector"]},
+        text_root="model.", text_prefix="model.language_model", config_class=Gemma3Config,
+        wrapper_class=Gemma3ForConditionalGeneration,
+        fields={"mm_tokens_per_image": system["mm_tokens"], "boi_token_index": 200,
+                "eoi_token_index": 201, "image_token_index": 202})
+
+
+def write_llama4_mm_tiny() -> None:
+    """A Llama 4 wrapper fixture: vision halves and decoder half under the
+    released nesting with no model prefix, with the wrapper config, both
+    vision references and the wrapper logits."""
+    system = llama4_vision_tiny_system(seed=4321)
+    write_wrapper_tiny(
+        "llama4-tiny-mm", "llama4-tiny", system,
+        {"vision_model": system["tower"], "multi_modal_projector": system["projector"]},
+        text_root="", text_prefix="language_model", config_class=Llama4Config,
+        wrapper_class=Llama4ForConditionalGeneration,
+        fields={"boi_token_index": 90, "eoi_token_index": 91, "image_token_index": 92})
 
 
 G4V_TEXT_WIDTH = 32
@@ -1194,17 +1186,6 @@ GEMMA4_MM_TEXT: Dict[str, Any] = dict(
                            "partial_rotary_factor": 0.25},
         "sliding_attention": {"rope_type": "default", "rope_theta": 1e4}})
 
-def wrapper_tensors(vision: dict[str, torch.nn.Module], text: torch.nn.Module) -> dict[str, torch.Tensor]:
-    """A wrapper's tensors as its release names them: each vision part's under the prefix its key
-    names, the decoder half's under model.language_model.* and the tied head top-level, as the
-    released layout carries it."""
-    merged = {f"{prefix}.{name}": tensor
-              for prefix, part in vision.items() for name, tensor in part.state_dict().items()}
-    merged.update({f"model.language_model.{name}": tensor
-                   for name, tensor in text.state_dict().items() if name != "lm_head.weight"})
-    merged["lm_head.weight"] = text.state_dict()["embed_tokens.weight"].clone()
-    return merged
-
 
 def write_gemma4_mm_tiny() -> None:
     """A Gemma 4 wrapper fixture: the vision and embedder halves under the
@@ -1224,7 +1205,7 @@ def write_gemma4_mm_tiny() -> None:
         vision_config=system["vconf"], audio_config=None)).model.language_model
     scatter_weights(text, seed=4321)
     merged = wrapper_tensors({"model.vision_tower": system["tower"],
-                               "model.embed_vision": system["projector"]}, text)
+                               "model.embed_vision": system["projector"]}, text.state_dict())
     directory = FIXTURES / "gemma4-tiny-mm"
     directory.mkdir(parents=True, exist_ok=True)
     save_file(merged, directory / "model.safetensors")
@@ -1276,7 +1257,7 @@ def write_qwen35_mm_tiny() -> None:
     torch.manual_seed(4321)
     text = Qwen3_5ForCausalLM(Qwen3_5TextConfig(**QWEN35_MM_TEXT)).model
     scatter_weights(text, seed=4321)
-    merged = wrapper_tensors({"model.visual": system["tower"]}, text)
+    merged = wrapper_tensors({"model.visual": system["tower"]}, text.state_dict())
     directory = FIXTURES / "qwen35-tiny-mm"
     directory.mkdir(parents=True, exist_ok=True)
     save_file(merged, directory / "model.safetensors")
