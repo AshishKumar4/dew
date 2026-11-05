@@ -354,6 +354,22 @@ class Logits(Protocol):
     def logits(self, tokens: jax.Array, *, train: bool = False, **fields: ModelKwarg) -> jax.Array: ...
 
 
+_FORWARDLESS = frozenset(nn.Module.__mro__)
+"""Flax's module base and its own bases, whose methods are no model's forward (`forward_method`)."""
+
+
+def forward_method(model: nn.Module, output: str) -> str | None:
+    """The method a caller reads `model`'s `output` by (`logits`, `hidden_states`): the model's own method
+    of that name where the model has one, its class's or one it exposes (a bridge's `__getattr__` over
+    the module it wraps), else its own forward (`__call__`), so a native Flax module whose call returns
+    that output is read as it is, with no method that only forwards to it (row 171); None where it has
+    neither. Flax's own module classes declare no forward of a model's."""
+    if callable(getattr(model, output, None)):
+        return output
+    declared = [vars(klass) for klass in type(model).__mro__ if klass not in _FORWARDLESS]
+    return "__call__" if any(callable(names.get("__call__")) for names in declared) else None
+
+
 @runtime_checkable
 class Counted(Protocol):
     """Analytical forward FLOPs summed over real row lengths, on the host.
@@ -721,10 +737,10 @@ class CrossAttending(Protocol):
 
 @runtime_checkable
 class Scanning(Protocol):
-    """A decoder whose like layers, and those repeating one period, run under flax's scan or the plain
-    loop (`CausalTransformer.scan_layers`): CausalTransformer, and a wrapper over one."""
+    """A decoder whose like layers, and those repeating one period, can run under flax's scan
+    (`CausalTransformer.scan_layers`): CausalTransformer, and a wrapper over one."""
 
-    def with_scanned_layers(self, *, scanned: bool = True) -> Self: ...
+    def with_scanned_layers(self) -> Self: ...
 
 
 @runtime_checkable
@@ -890,8 +906,7 @@ def partitioned_routes(routed: Mapping[str, tuple[str, ...]], records, covered: 
     one routed site, or records keyed by site path (`dew.nn.inputs.LayerInputs.experts`); a record for
     several sites, or one that names not every routed site, raises `ValueError`. The one partition a
     decoder's layer (its mixer and its feed-forward) and a parallel mixer (its branches) make."""
-    if records is None or not routed:
-        # A layer whose sites route over no experts reads none of the record (a dense layer's slice).
+    if records is None:
         return {}
     sites = [site for paths in routed.values() for site in paths]
     if not isinstance(records, Mapping):

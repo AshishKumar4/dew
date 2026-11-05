@@ -1279,6 +1279,9 @@ class DecoderBlock(nn.Module):
             return {}, {}
         routed = {**routed_children({MIXER_ROUTES: self.self_attn}),
                   **({FEEDFORWARD_ROUTES: (FEEDFORWARD_ROUTES,)} if self.routed else {})}
+        if not routed:
+            # A dense layer of a routed stack reads none of the stack's record.
+            return {}, {}
         parts = partitioned_routes(routed, per_layer_input.experts, per_layer_input.routed)
         mixer, feedforward = ({"routes": parts[site]} if site in parts else {}
                               for site in (MIXER_ROUTES, FEEDFORWARD_ROUTES))

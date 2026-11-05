@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
     from flax import linen as nn
 
+    from dew.config import RunConfig
     from dew.diffusion.presets import Preset
     from dew.inputs.condition import ConditionEncoder
     from dew.interop.composite import SourceKind
@@ -81,6 +82,8 @@ if TYPE_CHECKING:
     from dew.objectives.rl.control import ControlRollout
     from dew.objectives.rl.dreamer import DreamerRollout
     from dew.optim import ScheduleBase
+    from dew.rl.env import Env
+    from dew.rl.simulator import Simulator
     from dew.sampling.solvers import Solver
 
 # A type annotation as a value: a class, a union of them, a subscripted
@@ -150,8 +153,8 @@ def imported(path: str) -> Callable[..., Configured]:
         raise ValueError(f"{path!r} names {module}, which is outside Dew and not imported; import it "
                          f"first, or trust its package where the run loads (trust=({package!r},), "
                          f"--trust {package})")
-    # Whatever the path names, untyped until `callable` says what it is.
-    held: Any = importlib.import_module(module)
+    # Whatever the path names, an object until the check below says what it is.
+    held: object = importlib.import_module(module)
     for part in name.split("."):
         try:
             held = getattr(held, part)
@@ -269,7 +272,8 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         protocol they share, whose members are then classes of Dew's or of a
         trusted package, or functions declared to return one (`_derives`); None
         where the members share only an unnamed protocol."""
-        # What a lookup imported, untyped as an import is; typed on the way out.
+        # What a lookup imported, held to the kind's contract (`_holds`), its type `T`'s on the way out: a
+        # bound cannot name the kind's `Built`, so a member's call is typed by the table it is read through.
         self._imported: dict[str, Any] = {}
 
     def __getitem__(self, name: str) -> T:
@@ -613,6 +617,22 @@ def _key_type(annotation: Annotation) -> Annotation:
 _MAPPINGS = (dict, Mapping, MutableMapping)
 
 
+def _admits_function(annotation: Annotation) -> bool:
+    """Whether a value `annotation` declares may be a function, so that a function record
+    (`{"function": name}`) is the function it names: not a mapping's entry type itself nor a union of
+    data alone (`dew._records.JSON`: scalars, sequences and mappings), where `{"function": ...}` is data
+    a JSON round trip keeps as it is."""
+    origin = typing.get_origin(annotation)
+    if origin in _MAPPINGS:
+        return False
+    if origin in (Union, types.UnionType):
+        scalars = (bool, int, float, str, type(None))
+        containers = (*_MAPPINGS, list, tuple, Sequence)
+        return any(member not in scalars and typing.get_origin(member) not in containers
+                   and _admits_function(member) for member in _union_members(annotation))
+    return True
+
+
 def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str = "") -> Configured:
     """Return `value` as its annotation asks for it: a record becomes the value it
     describes, and anything already built is left alone.
@@ -631,7 +651,8 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     if dtypes and name == "dtype":
         return resolve_dtype(value)
     annotation = resolve_alias(annotation)
-    if isinstance(value, Mapping) and set(value) == {"function"} and isinstance(value["function"], str):
+    if (isinstance(value, Mapping) and set(value) == {"function"} and isinstance(value["function"], str)
+            and _admits_function(annotation)):
         return imported(value["function"])
     if (isinstance(value, Mapping) and annotation not in (None, object)
             and typing.get_origin(annotation) not in _MAPPINGS and _sharing(value) is not None):
@@ -1403,7 +1424,7 @@ presets: Aliases[type[Preset], Preset] = Aliases("preset", {
     "shortcut": "dew.diffusion.presets:Shortcut",
     "sqrt": "dew.diffusion.presets:Sqrt",
 })
-solvers: Aliases[type[Solver[Any]], Solver[Any]] = Aliases("solver", {
+solvers: Aliases[type[Solver], Solver] = Aliases("solver", {
     "consistency": "dew.sampling.solvers.gaussian:Consistency",
     "ddim": "dew.sampling.solvers.gaussian:DDIM",
     "ddpm": "dew.sampling.solvers.gaussian:DDPM",
@@ -1425,6 +1446,8 @@ solvers: Aliases[type[Solver[Any]], Solver[Any]] = Aliases("solver", {
     "unmask": "dew.diffusion.discrete:Unmask",
     "confident": "dew.diffusion.discrete:Confident",
 })
+# An encoder's raw input is its own (`ConditionEncoder[Raw, Encoded]`, Raw invariant as an input is): the
+# table admits an encoder of any, which only the encoder's run reads.
 encoders: Aliases[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Aliases("encoder", {
     "char_table": "dew.inputs.encoders:CharTable",
     "clip_text": "dew.inputs.encoders:CLIPText",
@@ -1524,9 +1547,9 @@ schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {
 }, base="dew.optim:ScheduleBase")
 
 
-# A run config's own class sits above the registry, so the table's type names none. A run record
-# names its class by this table's alias (`RunConfig.record`), apart from every other kind.
-runs: Aliases[Callable[..., Any], Any] = Aliases("run", {
+# A run config's own class sits above the registry, which names it for the type checker alone. A run
+# record names its class by this table's alias (`RunConfig.record`), apart from every other kind.
+runs: Aliases[type[RunConfig], RunConfig] = Aliases("run", {
     "decision": "dew.decision.config:DecisionRunConfig",
     "diffusion": "dew.config.diffusion:DiffusionRunConfig",
     "env": "dew.objectives.rl.config:EnvRunConfig",
@@ -1537,8 +1560,9 @@ runs: Aliases[Callable[..., Any], Any] = Aliases("run", {
 
 
 # An environment's types live in `dew.rl`, which only `dew.rl` and `dew.objectives.rl` import
-# (docs/design/architecture.md), so the table's type names none; its base is read by path.
-envs: Aliases[type | Callable[..., Configured], Any] = Aliases("env", {
+# (docs/design/architecture.md), so the table names them for the type checker alone; its base is read by
+# path.
+envs: Aliases[type | Callable[..., Configured], Env | Simulator] = Aliases("env", {
     "flight": "dew.rl.flight:FlightEnv",
     "gate_race": "dew.rl.flight:GateRace",
     "playground": "dew.rl.playground:Playground.load",

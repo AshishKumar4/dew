@@ -195,6 +195,19 @@ def load_balance_update(counts: jax.Array, rate: jax.typing.ArrayLike) -> jax.Ar
     return jnp.asarray(rate) * direction
 
 
+def sqrt_softplus(logits: jax.Array) -> jax.Array:
+    """DeepSeek V4's score, `sqrt(softplus(logits))`, the plain formula wherever `exp(logits)` is above its
+    dtype's epsilon, and below it its tail `exp(logits / 2)`, which the formula equals there to within
+    the epsilon: where softplus underflows, the plain formula's derivative, `sqrt`'s at zero, is infinite
+    and an unselected expert's zero cotangent made the router's gradient NaN; a selected expert far down
+    the tail keeps its score where the plain formula rounded it to zero. Each branch reads only the
+    logits its side takes, so neither's derivative is evaluated past its range."""
+    tail = jnp.log(jnp.finfo(logits.dtype).eps)
+    below = logits < tail
+    plain = jnp.sqrt(jax.nn.softplus(jnp.where(below, tail, logits)))
+    return jnp.where(below, jnp.exp(jnp.minimum(logits, tail) / 2), plain)
+
+
 class Router(nn.Module):
     """Choose which experts a token goes to, and with what weight: `[..., k]`.
 
@@ -416,7 +429,7 @@ class Router(nn.Module):
         if self.score_function == 'softmax':
             return jax.nn.softmax(logits, axis=-1)
         if self.score_function == 'sqrtsoftplus':
-            return jnp.sqrt(jax.nn.softplus(logits))
+            return sqrt_softplus(logits)
         return jax.nn.sigmoid(logits)
 
     def group_mask(self, selection):

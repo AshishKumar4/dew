@@ -73,11 +73,12 @@ from dew.nn.precision import (
 )
 from dew.nn.protocols import (
     AffineHead,
+    Bounded,
     HiddenStates,
     Lacks,
-    Logits,
     LogitsFromHidden,
     OutputTable,
+    forward_method,
     head_table,
 )
 
@@ -127,19 +128,39 @@ def reads_states(model) -> bool:
 
 def refuse_without_logits(model, objective: str) -> None:
     """Refuse a model `objective` reads no logits from: no head over its final
-    states (`reads_states`) and no logits from its tokens (`Logits`)."""
-    if not reads_states(model) and not isinstance(model, Logits):
+    states (`reads_states`), no logits from its tokens (`Logits`) and no
+    forward that gives them (`forward_method`)."""
+    if not reads_states(model) and forward_method(model, "logits") is None:
         raise Lacks("logits",
                     f"{objective} scores a model's logits, and a {type(model).__name__} gives none: no head "
-                    f"over its final states (HiddenStates with AffineHead or LogitsFromHidden) and no Logits")
+                    f"over its final states (HiddenStates with AffineHead or LogitsFromHidden), no Logits "
+                    f"and no forward")
 
 
 def final_read(model, variables, *args, **kwargs):
     """`model.apply(variables, *args, **kwargs)` reading what a loss scores:
     the final states of a model that scores them through a head
-    (`reads_states`), else the logits it gives from its tokens (`Logits`)."""
-    return model.apply(variables, *args, method="hidden_states" if reads_states(model) else "logits",
-                       **kwargs)
+    (`reads_states`), else the logits it gives from its tokens: its `logits`
+    (`Logits`), or a native module's own forward (`forward_method`), which must
+    give `[B, S, vocab]`, its `vocab_size` where it declares one (`Bounded`): a
+    forward that gives anything else (its hidden states) is refused by name
+    here, not read as logits by the loss."""
+    method = "hidden_states" if reads_states(model) else forward_method(model, "logits")
+    read = model.apply(variables, *args, method=method, **kwargs)
+    if method == "__call__":
+        _refuse_unlike_logits(model, read)
+    return read
+
+
+def _refuse_unlike_logits(model, read) -> None:
+    """Refuse what a model's forward gave (`final_read`'s read, beside its sown collections where any were
+    opened) unless it is `[B, S, vocab]`, `vocab` its `vocab_size` where it declares one (`Bounded`)."""
+    logits = read[0] if isinstance(read, tuple) else read
+    vocabulary = model.vocab_size if isinstance(model, Bounded) else None
+    if jnp.ndim(logits) != 3 or (isinstance(vocabulary, int) and jnp.shape(logits)[-1] != vocabulary):
+        raise ValueError(f"a {type(model).__name__} has no `logits`, so its `__call__` is read as its "
+                         f"logits, [B, S, vocab{'' if vocabulary is None else f' = {vocabulary}'}], and "
+                         f"it gives {jnp.shape(logits)}; define `logits` to say what the loss scores")
 
 
 def model_logits(model, variables, read) -> jax.Array:

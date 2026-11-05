@@ -497,7 +497,7 @@ def _varying_slopes(score_mod, params: tuple, graded: tuple[Kind, ...]) -> int:
     formed = [index for index in floating_params(values) if params[index][0] in graded]
     for place in (0, *(1 + index for index in formed)):
         # A `jax.custom_vjp` the input reaches takes no forward derivative: that slope is counted untraced.
-        reached = _reaches_custom_vjp(traced, traced.invars[0 if place == 0 else place + 2])
+        reached = _reaches_custom_vjp(traced, {traced.invars[0 if place == 0 else place + 2]})
         count += reached or _varies(functools.partial(slope, place), logits, positions, positions, *values)
     return count
 
@@ -509,16 +509,40 @@ def _holds_custom_vjp(jaxpr: jax_core.Jaxpr) -> bool:
                for equation in jaxpr.eqns)
 
 
-def _reaches_custom_vjp(jaxpr: jax_core.Jaxpr, start: jax_core.Var) -> bool:
-    """Whether `start`, one of `jaxpr`'s inputs, reaches a `jax.custom_vjp` call (`_holds_custom_vjp`)."""
-    reached = {start}
+def _reaches_custom_vjp(jaxpr: jax_core.Jaxpr, starts: set) -> bool:
+    """Whether any of `starts`, `jaxpr`'s inputs, reaches a `jax.custom_vjp` call along its tangent
+    (`_tangent_reach`)."""
+    return _tangent_reach(jaxpr, starts)[0]
+
+
+def _tangent_reach(jaxpr: jax_core.Jaxpr, starts: set) -> tuple[bool, set]:
+    """Whether `starts`, `jaxpr`'s inputs, reach a `jax.custom_vjp` call along their tangent, and the
+    outputs they reach: no further than a `stop_gradient`, which passes no tangent; through a call whose one
+    sub-program takes the call's operands and gives its outputs in order (a jit's, a custom JVP's), by the
+    operands reached into that program and the outputs it reaches back out; through any other holding a
+    sub-program, a branch or a loop body not followed operand by operand, wherever that program calls one
+    (`_holds_custom_vjp`), else to every output."""
+    reached = set(starts)
     for equation in jaxpr.eqns:
-        if any(not isinstance(var, jax_core.Literal) and var in reached for var in equation.invars):
-            if equation.primitive is jax_core.primitives.custom_vjp_call_p or any(
-                    _holds_custom_vjp(inner) for inner in jax_core.jaxprs_in_params(equation.params)):
-                return True
-            reached.update(equation.outvars)
-    return False
+        hit = [index for index, var in enumerate(equation.invars)
+               if not isinstance(var, jax_core.Literal) and var in reached]
+        if not hit or equation.primitive.name == "stop_gradient":
+            continue
+        if equation.primitive is jax_core.primitives.custom_vjp_call_p:
+            return True, set()
+        inner = list(jax_core.jaxprs_in_params(equation.params))
+        if (len(inner) == 1 and len(inner[0].invars) == len(equation.invars)
+                and len(inner[0].outvars) == len(equation.outvars)):
+            found, outputs = _tangent_reach(inner[0], {inner[0].invars[index] for index in hit})
+            if found:
+                return True, set()
+            reached.update(out for out, inner_out in zip(equation.outvars, inner[0].outvars, strict=True)
+                           if inner_out in outputs)
+            continue
+        if any(_holds_custom_vjp(program) for program in inner):
+            return True, set()
+        reached.update(equation.outvars)
+    return False, {var for var in jaxpr.outvars if not isinstance(var, jax_core.Literal) and var in reached}
 
 
 def _varies(function: Callable, *arguments: jax.ShapeDtypeStruct) -> bool:
