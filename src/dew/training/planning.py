@@ -188,6 +188,18 @@ def whole_step(outputs):
             jax.tree.map(lambda *values: sum(values), *committed))
 
 
+def judged_likely(headroom: int | None, under: int, *, forecast: bool) -> bool:
+    """Whether a step is likely to fit: by the `headroom` the derivation judged, past `under`, the most a
+    compile at its remat needed beyond its derivation, where it judged one; by the compiles' `forecast`
+    where it judged none. The derivation counts what a split changes beside the activations (the
+    accumulated gradient a split of two or more holds), which a forecast from a compile's temporaries
+    does not, so where it judges it orders the search alone (row 3341: Qwen3.5-4B at 4 x 2048 on an H100
+    compiled two microbatches the derivation judged 3.83 GiB short, on the forecast's word)."""
+    if headroom is None:
+        return forecast
+    return headroom - under >= 0
+
+
 def planned(candidates: Sequence[int], first: int, fits: Callable[[int], bool],
             climb: Callable[[], bool], likely: Callable[[int], bool] = lambda split: False) -> int | None:
     """The split a step reads its batch in, at the rung `climb` leaves the
@@ -604,7 +616,7 @@ class FitSearch[LossT, EffectsT]:
     """Each rung the derivation read before the first compile: its rung, terms, headroom and label."""
     judged_at: dict[tuple[str, int], int | None] = dataclasses.field(default_factory=dict)
     """The derived headroom of each candidate the derivation read, by its rung (`rung`) and split: what
-    orders the compiles (`derived_likely`), a compile's measure correcting it (`under`)."""
+    orders the compiles (`likely`), a compile's measure correcting it (`under`)."""
     copies_at: dict[tuple[str, int], bool] = dataclasses.field(default_factory=dict)
     """Whether each candidate the derivation read keeps narrow copies (`Candidate.copies`)."""
     under: dict[str, int] = dataclasses.field(default_factory=dict)
@@ -635,8 +647,7 @@ class FitSearch[LossT, EffectsT]:
         self.derived_start(candidates[-1])
         first = self.derived_split(candidates, first)
         seen, held, traced = len(report.misses()), set(report.refused_launches()), len(report.rewrites())
-        split = planned(candidates, first, self.fits, self.climb,
-                        lambda split: self.forecast.likely(self.rung(), split) or self.derived_likely(split))
+        split = planned(candidates, first, self.fits, self.climb, self.likely)
         spills: list[JSON] = [spill_record(miss) for miss in report.misses()[seen:]]
         refused: list[JSON] = [refusal_record(*refusal) for refusal in report.refused_launches()
                                if refusal not in held]
@@ -790,12 +801,13 @@ class FitSearch[LossT, EffectsT]:
             low, high = (low, middle) if fits else (middle, high)
         return high
 
-    def derived_likely(self, split: int) -> bool:
-        """Whether the derivation judged the step at `split` at the objective's rung to fit, past the most
-        a compile at this remat needed beyond its derivation (`under`): the next compile asked after a
-        miss, so the derivation, corrected by what the compiles measured, orders them."""
-        headroom = self.judged_at.get(self.candidate_key(split, self.narrow))
-        return headroom is not None and headroom - self.under.get(self.remat_rung(), 0) >= 0
+    def likely(self, split: int) -> bool:
+        """Whether the step at `split` at the objective's rung is likely to fit, which orders the compiles
+        past a miss (`planned`): as the derivation judged it, corrected by what the compiles measured,
+        where it judged it, else as the compiles' forecast guesses (`judged_likely`)."""
+        return judged_likely(self.judged_at.get(self.candidate_key(split, self.narrow)),
+                             self.under.get(self.remat_rung(), 0),
+                             forecast=self.forecast.likely(self.rung(), split))
 
     def judging(self) -> bool:
         """Whether every process's devices judge a derived footprint (`memory.judged`) at the search's
@@ -887,7 +899,7 @@ class FitSearch[LossT, EffectsT]:
         measured = agreed(headroom)
         if foreseen is not None and measured is not None and foreseen > measured:
             # What this compile needed past its derivation corrects the derivation's next judgments at its
-            # remat (`derived_likely`).
+            # remat (`likely`).
             rung = self.remat_rung()
             self.under[rung] = max(self.under.get(rung, 0), foreseen - measured)
         if foreseen is not None and (foreseen >= 0) != fit:
