@@ -2,10 +2,10 @@
 
 Lanes add entries at the head of `## Unreleased` side by side, so two merged branches often insert lines at
 the same place: a 3-way merge calls that a conflict though neither side removed anything. The driver joins
-such a hunk, ours then theirs, as git's union merge would. A hunk where either side deleted or rewrote a line
-the base had stays a conflict: union kept the other side's copy there, so a corrected entry came back beside
-its correction and a head's deletion vanished in its train's merge (rows 3284, 3297). Everything else is
-git's own 3-way merge (`git merge-file --diff3`).
+such a hunk, ours then theirs, as git's union merge would, an entry both sides carry once (row 3431). A hunk
+where either side deleted or rewrote a line the base had stays a conflict: union kept the other side's copy
+there, so a corrected entry came back beside its correction and a head's deletion vanished in its train's
+merge (rows 3284, 3297). Everything else is git's own 3-way merge (`git merge-file --diff3`).
 
 Git runs it once a clone names it (the land queue does the same on its merges):
 
@@ -20,10 +20,21 @@ import sys
 from pathlib import Path
 
 
+def apart(ours: list[bytes], theirs: list[bytes]) -> list[bytes]:
+    """`theirs`, a side's new lines, without the lines it begins and ends with that `ours` begins and ends
+    with too: entries both sides carry (main took a train's, and a head carries them as a commit of its own)
+    are joined once (row 3431)."""
+    shared = min(len(ours), len(theirs))
+    start = next((index for index in range(shared) if ours[index] != theirs[index]), shared)
+    end = next((index for index in range(shared - start) if ours[-1 - index] != theirs[-1 - index]),
+               shared - start)
+    return theirs[start:len(theirs) - end]
+
+
 def joined(base: Path, ours: Path, theirs: Path, size: int) -> tuple[bytes, int]:
     """The merge of `ours` and `theirs` from `base`, each conflict hunk whose base side is empty joined (ours,
-    then theirs), and the number of hunks left in conflict, marked as git marks them (`size` its markers'
-    width)."""
+    then theirs' lines apart from ours', `apart`), and the number of hunks left in conflict, marked as git
+    marks them (`size` its markers' width)."""
     merged = subprocess.run(["git", "merge-file", "--stdout", "--diff3", f"--marker-size={size}",
                              "-L", "ours", "-L", "base", "-L", "theirs", str(ours), str(base), str(theirs)],
                             capture_output=True)
@@ -49,7 +60,7 @@ def joined(base: Path, ours: Path, theirs: Path, size: int) -> tuple[bytes, int]
                          *hunk["theirs"], line]
                 left += 1
             else:
-                text += hunk["ours"] + hunk["theirs"]
+                text += hunk["ours"] + apart(hunk["ours"], hunk["theirs"])
             side = None
         elif side is None:
             text.append(line)
