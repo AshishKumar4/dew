@@ -18,25 +18,15 @@ each stream attends to. Ownership is PLAN.md's.
 
 ## Today
 
-A layout is one of three classes (`MarkerLayout`, `StateFirstLayout`, `JointLayout` in `src/dew/decision/layout.py`, each recorded, as a decision head is, as a registry class record by import path, `{"class", "fields"}`, an earlier run's `{"name"}` read once at the pinned run boundary). Each assembles a row's tokens in a fixed order with fixed text, and each new arrangement needs a new class and a registry entry. A context beside the state (`Example.context`) has one path of its own: the backbone's token table embeds it, and the backbone's cross-attention reads it.
+A layout is one of three classes (`MarkerLayout`, `StateFirstLayout`, `JointLayout` in `src/dew/decision/layout.py`, each recorded, as a decision head is, as a registry class record by import path, `{"class", "fields"}`, an earlier run's `{"name"}` read once at the pinned run boundary). Each takes its row's parts as data, its `segments`, which a run names (`DecisionRunConfig.segments`), so an arrangement is a tuple of segments, not a class. A context beside the state (`Example.context`) has one path of its own: the backbone's token table embeds it, and the backbone's cross-attention reads it.
 
 ## 1. A layout is data: segments
 
-A layout is an ordered tuple of segments and a row budget (`max_len`). A segment renders one part of a request into tokens:
-
-| Segment | Renders | Marks |
-|---|---|---|
-| `Text(text)` | fixed text, a system prompt or the assistant's opening | nothing |
-| `Images(text)` | a request's images, as the processor expands `text` per image | the media span |
-| `State(render, cut)` | the state, rendered (`render`: text, compact JSON) | nothing |
-| `Schema(field, option, order)` | every question: its framing (`field` template), its instructions, each option (`option` template) in `order` (keyed, as given, noul true first) | each question's span and each option's span |
-| `Markers(...)` | one question's options each with a marker token, sequential or parallel | the question's span and one marker per option |
-
-Each segment has a budget (a token cap, or none) and a cut rule (`start`, `end`, `never`). Budgets settle in one pass: segments that never cut take their tokens first, and the rest share what remains of `max_len` in their declared priority. That is the rule each class encodes today: a schema is never cut, and the state takes what the schema leaves. A row may hold the state more than once: each copy is a `State` of its own budget (`max_tokens`, or a joint layout's `max_state_tokens`) and cut rule (`keep`), a copy kept whole takes its tokens first, and the copies that cut share what remains max-min within one token, as any row's segments share its room (`dew.data.tokens.share_tokens`: each at most what it holds and its cap, a floor's remainder to the later in ascending order of want, none left over while a copy wants more), each cut from the whole state by its own rule. A question row's copies each render as their own `render` says; a joint row's render compact.
+A row is an ordered tuple of segments and a row budget (`max_len`), each segment a frozen dataclass that renders one part of a request: fixed text (`Text`), a special token (`Special`), the request's images (`Media`), the state (`State`: its rendering, which end a cut keeps, `keep`, and its own cap, `max_tokens`), every question (`Schema`, a joint row's), and one question's instructions, option lines and answer cue (`Instructions`, `OptionLines`, `AnswerCue`, a question row's). The segments and their fields are `dew.decision.layout`'s (`RowSegment`); each layout refuses the parts it has none of. A schema is never cut, and the state takes what the row's other parts leave of `max_len`. A row may hold the state more than once: each copy is a `State` of its own budget (`max_tokens`, or a joint layout's `max_state_tokens`) and cut rule (`keep`), a copy kept whole takes its tokens first, and the copies that cut share what remains max-min within one token, as any row's segments share its room (`dew.data.tokens.share_tokens`: each at most what it holds and its cap, a floor's remainder to the later in ascending order of want, none left over while a copy wants more), each cut from the whole state by its own rule. A question row's copies each render as their own `render` says; a joint row's render compact.
 
 A layout is either joint (every question in one row) or per question (one row a question, the schema segment rendering that question alone). Its record is its segment tuple, each segment a frozen dataclass, recorded and rebuilt by its import path through `dew.registry`'s typed records (`to_record`, `from_record`), with no closed registry. A composition a user writes reloads as written.
 
-The three layouts become three configurations of these segments. The proof: each configuration lays out the existing fixtures' rows byte for byte as its class does today: tokens, spans, positions and option slots, including the parallel layout and the cut cases. That test lands before the classes go.
+Not built: the three classes as three configurations of one segment layout. Its proof would be each configuration laying out the existing fixtures' rows byte for byte as its class does: tokens, spans, positions and option slots, the parallel layout and the cut cases among them, a test that lands before the classes go.
 
 ## 2. A segment goes to a stream
 
