@@ -335,8 +335,8 @@ def test_a_rewrite_is_recorded_in_the_kernel_report():
 def test_a_program_the_rules_cannot_rewrite_is_kept_as_traced():
     """A program whose math no rule's left side reads (no sum of two reductions, products or contractions,
     no reduction of a product), in its own body or in a scan's, is left as traced: none of its regions is
-    saturated or recorded, and its scan's body is the one it traced, so a program of many such bodies pays
-    the pass nothing (row 3279's rollout pool paid 20 to 40 ms a region)."""
+    saturated or recorded, and it computes what it traced, so a program of many such bodies pays the pass
+    nothing (row 3279's rollout pool paid 20 to 40 ms a region)."""
     def stepped(x):
         return jax.lax.scan(lambda carry, row: (jnp.tanh(carry + row), carry * 2.0), x[0], x)[1]
 
@@ -345,9 +345,8 @@ def test_a_program_the_rules_cannot_rewrite_is_kept_as_traced():
         before = jax.make_jaxpr(stepped)(x)
         after = jax.make_jaxpr(algebra.rewritten(stepped))(x)
         assert report.rewrites() == ()
-    [scan] = [equation for equation in after.jaxpr.eqns if equation.primitive.name == "scan"]
-    [traced] = [equation for equation in before.jaxpr.eqns if equation.primitive.name == "scan"]
-    assert str(scan.params["jaxpr"]) == str(traced.params["jaxpr"])
+    np.testing.assert_array_equal(np.asarray(jax.core.eval_jaxpr(after.jaxpr, after.consts, x)[0]),
+                                  np.asarray(jax.core.eval_jaxpr(before.jaxpr, before.consts, x)[0]))
 
 PINNED = """
 import gc, weakref
@@ -588,10 +587,10 @@ def _layer(x, w):
 
 def test_a_body_shared_by_its_call_sites_stays_shared():
     """A model calling one jitted layer eight times, nothing to rewrite: with the pass on, every call site
-    holds one body, as with it off, and the lowered module has one function for the layer, so a model's
-    layers lower and compile once, their kernels too, not once a call site (each rebuilt body made a
-    Qwen3.5-4B training step's compile 52 to 487 seconds on an H100). A retrace takes the same rewritten
-    body."""
+    holds one body, as with it off, and the model compiles as many programs as it does with the pass off,
+    so a model's layers lower and compile once, their kernels too, not once a call site (each rebuilt body
+    made a Qwen3.5-4B training step's compile 52 to 487 seconds on an H100). A retrace takes the same
+    rewritten body."""
     def model(x, ws):
         for w in ws:
             x = _layer(x, w)
@@ -599,16 +598,20 @@ def test_a_body_shared_by_its_call_sites_stays_shared():
 
     x, *ws = rows(0, *[(64, 64)] * 9)
 
+    from dew.telemetry.compiles import Compiles
+
     def shared(*, on: bool):
         with algebra.passes(on):
             closed = jax.make_jaxpr(algebra.rewritten(model))(x, ws)
-            text = jax.jit(algebra.rewritten(model)).lower(x, ws).as_text()
+            jax.clear_caches()
+            with Compiles(None) as heard:
+                jax.jit(algebra.rewritten(model))(x, ws).block_until_ready()
         bodies = [equation.params["jaxpr"] for equation in closed.jaxpr.eqns
                   if equation.primitive.name in ("pjit", "jit")]
-        return {id(body) for body in bodies}, text.count("func.func")
+        return {id(body) for body in bodies}, len(heard.programs)
 
     off, on, again = shared(on=False), shared(on=True), shared(on=True)
-    assert (len(on[0]), on[1]) == (len(off[0]), off[1]) == (1, 2)
+    assert len(on[0]) == len(off[0]) == 1 and on[1] == off[1]
     assert again[0] == on[0]
 
 
