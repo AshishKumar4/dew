@@ -124,7 +124,7 @@ def split_executable(run, args, specs, mesh: jax.sharding.Mesh):
     gate runs each arm in (`summed_as_run`): a compiled executable never retraces, so the arithmetic its
     trace chose is the one every draw runs, and the one-device arm's, traced in that scope, is the same
     (ledger 4393: compiled outside it, a CPU suite's wide sums were frozen into it)."""
-    with jax.set_mesh(mesh), summed_as_run():
+    with jax.set_mesh(mesh):
         return run.lower(*placed_on(args, specs, mesh)).compile()
 
 
