@@ -1029,6 +1029,6 @@ def test_a_complex_value_times_its_sign_is_never_its_magnitude():
 
     real, imaginary = rows(19, (4, 64), (4, 64))
     x = jax.lax.complex(real, imaginary)
-    assert not any("signs" in made.fired for made in _rewrites(summed, (x,)))
+    assert all(made.fired["signs"] == 0 for made in _rewrites(summed, (x,)))
     np.testing.assert_array_equal(np.asarray(jax.jit(algebra.rewritten(summed))(x)),
                                   np.asarray(jax.jit(summed)(x)))
