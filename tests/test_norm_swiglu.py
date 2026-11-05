@@ -317,7 +317,9 @@ def every_config_of_the_norm_kernels_holds_the_float64_gate(kernel, dtype, opera
     """Each config the tuner may pick, at a step's rows, at rows wider than
     a tile holds two of, and at rows narrow enough for its tallest tiles:
     its variants are only configs proven here (`KernelOp.variants`)."""
-    draw, shape = {"full step": (functools.partial(full_step, dtype), (24576, 1000)),
+    # A step's launch over distinct rows: repeated rows give the output and input gradient one row's evidence.
+    draw, shape = {"full step": (functools.partial(norm_operands, (24576, 1000), dtype, jnp.float32),
+                                 "step of distinct rows"),
                    "wide rows": (functools.partial(norm_operands, (3, 4096), dtype, jnp.float32), (3, 4096)),
                    "narrow rows": (functools.partial(norm_operands, (4099, 256), dtype, jnp.float32),
                                    (4099, 256))}[operands]
