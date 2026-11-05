@@ -1541,7 +1541,7 @@ class Checkpoints:
             self._metadata = None
 
     def _frozen(self, state_tree: dict[str, StateLeaf]
-                ) -> tuple[dict[str, StateLeaf], dict[str, dict[str, str]]]:
+                ) -> tuple[dict[str, object], dict[str, dict[str, str]]]:
         """Return `state_tree` with the collections but `params` of each of its variables trees
         (`_variable_trees`: the variables and the EMA, the run's and each DiLoCo group's, stacked) held
         in the store (`FROZEN_STORE`), and each one's digest under its tree's name, which the step records.

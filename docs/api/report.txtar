@@ -335,6 +335,7 @@ dew.checkpoints.Keep
   every: int | None = None
   interval: datetime.timedelta | str | None = None
   where: Callable[[Kept], bool] | None = None
+  weights_only: bool = False
 dew.checkpoints.Kept
   step: int
   metrics: Metrics
