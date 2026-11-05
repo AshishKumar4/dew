@@ -22,6 +22,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn import derivatives
 from dew.nn.kernels import generation, recurrence_algebra as algebra, tuning
 from dew.nn.kernels.templates import base, cost, mosaic, report, resources, scan as block_scan
 from dew.nn.kernels.templates.recurrence import mainloop
@@ -438,8 +439,7 @@ def _parameters(A, D, channels: int):
     return jnp.concatenate([(A * algebra.LOG2_E).T, D[None], padding])
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(8,))
-def _scan(x, dt, A, B, C, D, entering, resets, scan: Scan):
+def _scan_primal(x, dt, A, B, C, D, entering, resets, scan: Scan):
     """`forward` over padded operands, its gradient `backward`'s: `(y, final [R, N, D] fp32)`."""
     y, final, _ = forward(x, dt, B, C, _parameters(A, D, scan.channels), entering, resets, scan)
     return y, final
@@ -478,7 +478,8 @@ def _scan_backward(scan: Scan, residuals, grads):
             None)
 
 
-_scan.defvjp(_scan_forward, _scan_backward)
+_scan = derivatives.declared_derivative(derivatives.KernelGlue(), _scan_primal, _scan_forward, _scan_backward,
+                                        nondiff_argnums=(8,))
 
 
 @dataclasses.dataclass(frozen=True)
