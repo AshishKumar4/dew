@@ -608,12 +608,12 @@ def test_a_hybrid_stack_decodes_as_it_scores_in_parallel(rng):
     """The test that catches a wrong recurrent state: a prefill of four
     tokens and eight single-token steps, every layer's state riding the
     flax cache collection (the delta net's recurrent memory and conv tail,
-    the attention's KV cache), on par with the same twelve tokens scored at
-    once over drawn weights and tokens (check 1), every argmax equal. A delta
-    net that stops writing its memory back (`recurrent.value = final`
-    dropped) moves the logits by 3.8e+00. Each call is one compiled program,
-    the decode's prefill and step the ones its check reads (`decode_steps`),
-    where run op by op they took a minute of the test (ledger 3774)."""
+    the attention's KV cache), every argmax equal to the same twelve tokens
+    scored at once, and on par with them over drawn weights and tokens
+    (check 1, `test_a_hybrid_stack_decodes_on_par_with_its_parallel_scores`).
+    Each call is one compiled program, the decode's prefill and step the ones
+    its check reads (`decode_steps`), where run op by op they took a minute
+    of the test (ledger 3774)."""
     model = hybrid()
     ids = tokens(rng)
     params = nn.unbox(model.init(rng, ids))
@@ -625,7 +625,6 @@ def test_a_hybrid_stack_decodes_as_it_scores_in_parallel(rng):
 
     incremental = decode_logits(model, params, ids[:, :4], ids[:, 4:], (made, step))
     assert jnp.array_equal(full[:, 3:].argmax(-1), incremental.argmax(-1))
-    decoded_against_full(model, 4, "hybrid decode", SEEDS['hybrid decode'], batch=16)
 
     _, mutated = step(params, cache, ids[:, :4])
     kept, _ = step(params, mutated, ids[:, 4:5])
@@ -634,6 +633,14 @@ def test_a_hybrid_stack_decodes_as_it_scores_in_parallel(rng):
         mutated)
     reset, _ = step(params, zeroed, ids[:, 4:5])
     assert not jnp.array_equal(kept, reset)
+
+
+@pytest.mark.check1_shards(seeds=512, per_task=128)
+def test_a_hybrid_stack_decodes_on_par_with_its_parallel_scores():
+    """`test_a_hybrid_stack_decodes_as_it_scores_in_parallel`'s check 1 over drawn weights and tokens:
+    its 512 seeds drawn in map tasks of 128 (ledger 3898: 96 s of draws in one task). A delta net that
+    stops writing its memory back (`recurrent.value = final` dropped) moves the logits by 3.8e+00."""
+    decoded_against_full(hybrid(), 4, "hybrid decode", SEEDS['hybrid decode'], batch=16)
 
 
 def test_gemma_zero_qk_norm_weights_are_identity(rng):

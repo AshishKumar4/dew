@@ -282,10 +282,28 @@ attention's 64 are sized paired (`seeds_for` with the packed row as its Dew arm,
 compared with themselves its documents alone take 512."""
 
 
-@pytest.mark.parametrize("kind", sorted(set(mixers.paths) - {"memory"}))
+SHARDED = {"kimi_delta_attention", "mamba2", "memory"}
+"""The kinds whose packed rows' draws run as armada's map tasks (`check1_shards`), each a test of its own."""
+
+
+@pytest.mark.parametrize("kind", sorted(set(mixers.paths) - SHARDED))
 def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
-    """`assert_packs_as_alone` over every mixer in the registry but the in-context memory."""
+    """`assert_packs_as_alone` over every mixer in the registry but the sharded ones (`SHARDED`)."""
     assert_packs_as_alone(kind)
+
+
+@pytest.mark.check1_shards(seeds=64, per_task=8)
+def test_a_packed_row_of_kimi_delta_attention_computes_what_its_documents_compute_alone():
+    """`assert_packs_as_alone` over Kimi delta attention, whose 64 seeds took 60 s of 120 cold on
+    armada's CI CPU: CI draws them in map tasks of 8 (ledger 3901)."""
+    assert_packs_as_alone("kimi_delta_attention")
+
+
+@pytest.mark.check1_shards(seeds=256, per_task=32)
+def test_a_packed_row_of_mamba2_computes_what_its_documents_compute_alone():
+    """`assert_packs_as_alone` over Mamba2, whose 256 seeds took most of 126 s cold on armada's CI CPU:
+    CI draws them in map tasks of 32 (ledger 3901)."""
+    assert_packs_as_alone("mamba2")
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=64)

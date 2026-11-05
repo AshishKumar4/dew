@@ -86,16 +86,26 @@ class Family:
     query_first: bool = False
 
 
-def _normal(seed: int, *shapes) -> list[np.ndarray]:
-    """Standard-normal fp32 arrays of `shapes`, one stream each."""
+@functools.partial(jax.jit, static_argnums=1)
+def _normal_drawn(seed, shapes: tuple) -> list:
     streams = jax.random.split(jax.random.key(seed), len(shapes))
-    return [np.array(jax.random.normal(stream, shape), np.float32)
-            for stream, shape in zip(streams, shapes, strict=True)]
+    return [jax.random.normal(stream, shape) for stream, shape in zip(streams, shapes, strict=True)]
+
+
+def _normal(seed: int, *shapes) -> list[np.ndarray]:
+    """Standard-normal fp32 arrays of `shapes`, one stream each: one compiled program a set of shapes,
+    where op by op the draws took a third of a family's test (ledger 3902)."""
+    return [np.array(drawn, np.float32) for drawn in _normal_drawn(seed, tuple(map(tuple, shapes)))]
+
+
+@functools.partial(jax.jit, static_argnums=3)
+def _uniform_drawn(seed, low, high, shape: tuple):
+    return jax.random.uniform(jax.random.key(seed), shape, jnp.float32, low, high)
 
 
 def _uniform(seed: int, low: float, high: float, shape=()) -> np.ndarray:
-    """fp32 draws uniform in `[low, high)`."""
-    return np.asarray(jax.random.uniform(jax.random.key(seed), shape, jnp.float32, low, high))
+    """fp32 draws uniform in `[low, high)`, compiled as `_normal`'s."""
+    return np.asarray(_uniform_drawn(seed, low, high, (shape,) if isinstance(shape, int) else tuple(shape)))
 
 
 ROWS = 32
