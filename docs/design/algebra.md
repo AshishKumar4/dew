@@ -839,8 +839,8 @@ from there. What exists: the four kinds, `marked_call_p` with its transform rule
 `surrogate`, the precision transforms marked `Protected`, and the pass reading a marked call's kind
 (`program._within`, `program._opened`: a protected call an opaque leaf, a surrogate's and a kernel glue's body
 rewritten within its call, an Algebra span opened into the region around it, its call kept where no form
-lands), and the declaring functions (`kernel_derivative`, `numerics_derivative`, `numerics_tangent`,
-`surrogate`). Not yet: each lane's sites declared through them (rows 4026 to 4030), and the slop check.
+lands), and the declaring functions (`kernel_derivative`, `kernel_tangent`, `numerics_derivative`,
+`numerics_tangent`, `surrogate`). Not yet: each lane's sites declared through them (rows 4026 to 4030), and the slop check.
 
 ```python
 class Protected: ...                  # error-free transforms and numerics bodies (§1.2, §1.3)

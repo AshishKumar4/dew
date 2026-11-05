@@ -14,9 +14,9 @@ it is, a surrogate's bodies (`Surrogate`) and a kernel derivative's glue (`Kerne
 their call, and a derivative written to restructure algebra (`Algebra`) opens into the region around it.
 
 A custom derivative is declared through its class's function, which makes it one marked call of its kind:
-`kernel_derivative` (a kernel's reverse-mode glue), `numerics_derivative` and `numerics_tangent` (a rule its
-numerics need as written), `surrogate` (a value and its declared derivative). No module of Dew applies
-`jax.custom_vjp` or `jax.custom_jvp` itself.
+`kernel_derivative` and `kernel_tangent` (a kernel's glue), `numerics_derivative` and `numerics_tangent` (a
+rule its numerics need as written), `surrogate` (a value and its declared derivative). No module of Dew
+applies `jax.custom_vjp` or `jax.custom_jvp` itself.
 """
 
 from __future__ import annotations
@@ -29,8 +29,8 @@ from collections.abc import Callable, Sequence
 import jax
 from jax.extend.core import create_call_primitive
 
-__all__ = ["Algebra", "KernelGlue", "Kind", "Protected", "Surrogate", "kernel_derivative", "marked",
-           "marked_call_p", "numerics_derivative", "numerics_tangent", "spanned", "surrogate"]
+__all__ = ["Algebra", "KernelGlue", "Kind", "Protected", "Surrogate", "kernel_derivative", "kernel_tangent",
+           "marked", "marked_call_p", "numerics_derivative", "numerics_tangent", "spanned", "surrogate"]
 
 
 def surrogate[Value](forward: Callable[..., Value], derivative: Callable[..., Value], *,
@@ -68,6 +68,16 @@ def kernel_derivative[Value](primal: Callable[..., Value], forward: Callable, ba
     call of its kind. Forward mode refuses it as a bare `jax.custom_vjp` does."""
     rule = jax.custom_vjp(primal, nondiff_argnums=tuple(nondiff_argnums))
     rule.defvjp(forward, backward)
+    return spanned(KernelGlue(), rule)
+
+
+def kernel_tangent[Value](primal: Callable[..., Value], tangent: Callable, *,
+                          nondiff_argnums: Sequence[int] = ()) -> Callable[..., Value]:
+    """`primal` with the tangent rule a kernel's derivative states (`tangent(primals, tangents)` returning
+    the primal's value and its tangent, as `jax.custom_jvp.defjvp` takes it, which reverse mode transposes),
+    one marked call of `KernelGlue`: a GEMM prologue's, whose glue the pass rewrites within the call."""
+    rule = jax.custom_jvp(primal, nondiff_argnums=tuple(nondiff_argnums))
+    rule.defjvp(tangent)
     return spanned(KernelGlue(), rule)
 
 
