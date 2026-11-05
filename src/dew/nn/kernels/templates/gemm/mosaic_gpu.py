@@ -56,7 +56,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import axes, bundles, cost as unit_cost, mosaic, resources, tail as tail_of
-from dew.nn.kernels.templates.gemm import rows_padded
+from dew.nn.kernels.templates.gemm import rows_extended, rows_padded, sides_padded
 
 
 def family_of(tiles: "Tiles", dtype) -> mosaic.Family:
@@ -496,11 +496,9 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         table = tile_groups(lengths, row_tile, pl.cdiv(m, row_tile) + g)
     extent = (m if family_of(tiles, lhs.dtype).bounded_loads and not interpret
               else -(-m // row_tile) * row_tile if dense else row_extent(m, row_tile))
-    lhs = _rows_extended(lhs, row_axis, extent)
-    prologue_operands = tuple(_side_extended(side, axes, extent)
-                              for side, axes in zip(prologue_operands, prologue_axes, strict=True))
-    epilogue_operands = tuple(_side_extended(side, axes, extent)
-                              for side, axes in zip(epilogue_operands, epilogue_axes, strict=True))
+    lhs = rows_extended(lhs, row_axis, extent)
+    prologue_operands = sides_padded(prologue_operands, prologue_axes, extent=extent)
+    epilogue_operands = sides_padded(epilogue_operands, epilogue_axes, extent=extent)
     # A dense product's last wave balanced over the programs (`tail.balanced`), as the kernel gradient's: one
     # matrix, one accumulator, a tile a program.
     # An exact sum's order is its contract, which a tile summed across programs reassociates.
@@ -837,8 +835,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     multiple = 8 if family_of(tiles, lhs.dtype).bounded_loads else math.lcm(8, block_k)
     lhs, rhs = rows_padded(lhs, 0, multiple), rows_padded(rhs, 0, multiple)
     k = lhs.shape[0]
-    prologue_operands = tuple(_side_padded(side, axes, multiple)
-                              for side, axes in zip(prologue_operands, prologue_axes, strict=True))
+    prologue_operands = sides_padded(prologue_operands, prologue_axes, multiple)
 
     group_sizes = group_sizes.astype(jnp.int32)
     out_dtype = jnp.dtype(out_dtype)
@@ -1196,20 +1193,3 @@ def row_extent(rows: int, row_tile: int) -> int:
     `row_tile` rows on."""
     return rows + row_tile - TMA_ROWS
 
-
-def _rows_extended(array: jax.Array, axis: int, extent: int) -> jax.Array:
-    """Dew: `array` with zeros after its own along `axis` up to `extent`."""
-    pad = extent - array.shape[axis]
-    widths = tuple((0, pad if dim == axis else 0) for dim in range(array.ndim))
-    return jnp.pad(array, widths) if pad > 0 else array
-
-
-def _side_extended(side: jax.Array, axes: tuple, extent: int) -> jax.Array:
-    """Dew: a side operand allocated as the rows are along the dimension that follows them (`row_extent`)."""
-    return _rows_extended(side, axes.index('rows'), extent) if 'rows' in axes else side
-
-
-def _side_padded(side: jax.Array, axes: tuple, multiple: int = 8) -> jax.Array:
-    """A side operand padded as the rows are along the dimension that follows them, wherever it is: to a
-    multiple of 8 (a TMA descriptor's tiling), or of `multiple` (a family's unpredicated loads)."""
-    return rows_padded(side, axes.index('rows'), multiple) if 'rows' in axes else side

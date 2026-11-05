@@ -22,7 +22,7 @@ from jax.experimental.pallas import triton as plgpu
 
 from dew.nn.kernels import launches
 from dew.nn.kernels.templates.axes import GROUPS, by_rows, held, named, placed
-from dew.nn.kernels.templates.gemm import rows_padded
+from dew.nn.kernels.templates.gemm import rows_padded, sides_padded
 
 
 def gmm(lhs: jax.Array, rhs: jax.Array, *, tile, transpose_rhs: bool, out_dtypes: tuple, interpret: bool,
@@ -47,10 +47,10 @@ def gmm(lhs: jax.Array, rhs: jax.Array, *, tile, transpose_rhs: bool, out_dtypes
     matrices = (rhs,) if paired is None else (
         rhs, rows_padded(rows_padded(paired, depth_axis, block_k), width_axis, block_n))
     (padded, padded_depth), padded_width = lhs.shape, rhs.shape[width_axis]
-    prologue_operands = _padded_on(_padded_on(prologue_operands, prologue_axes, 'depth', block_k),
-                                   prologue_axes, 'rows', block_m)
-    epilogue_operands = _padded_on(_padded_on(epilogue_operands, epilogue_axes, 'columns', block_n),
-                                   epilogue_axes, 'rows', block_m)
+    prologue_operands = sides_padded(sides_padded(prologue_operands, prologue_axes, block_k, along='depth'),
+                                     prologue_axes, block_m)
+    epilogue_operands = sides_padded(sides_padded(epilogue_operands, epilogue_axes, block_n, along='columns'),
+                                     epilogue_axes, block_m)
     blocks = {'rows': (block_m, 0), 'depth': (padded_depth, None), 'columns': (block_n, 1)}
 
     def spec(side_axes):
@@ -120,8 +120,8 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, *, tile, out_dtype, interpret: bool, pr
     lhs = rows_padded(rows_padded(lhs, 1, block_k), 0, block_m)
     rhs = rows_padded(rows_padded(rhs, 1, block_n), 0, block_m)
     (padded, padded_depth), padded_width = lhs.shape, rhs.shape[1]
-    prologue_operands = _padded_on(_padded_on(prologue_operands, prologue_axes, 'depth', block_k),
-                                   prologue_axes, 'rows', block_m)
+    prologue_operands = sides_padded(sides_padded(prologue_operands, prologue_axes, block_k, along='depth'),
+                                     prologue_axes, block_m)
     blocks = {'rows': (padded, None), 'depth': (block_k, 0)}
 
     def spec(side_axes):
@@ -197,12 +197,6 @@ def _kept(x: jax.Array, start, extent: int, *, axis: int) -> jax.Array:
     """`x`, a tile at `start` along `axis`, with its entries at `extent` or past it zero."""
     kept = start + lax.broadcasted_iota(jnp.int32, x.shape, axis) < extent
     return jnp.where(kept, x, jnp.zeros_like(x))
-
-
-def _padded_on(sides: tuple, axes_of: tuple, axis_name: str, block: int) -> tuple:
-    """Each side operand padded along the dimension that follows `axis_name`, where one does."""
-    return tuple(rows_padded(side, axes.index(axis_name), block) if axis_name in axes else side
-                 for side, axes in zip(sides, axes_of, strict=True))
 
 
 def _cut(refs, axes_of: tuple, stepped: str, span, rows: int) -> list:
