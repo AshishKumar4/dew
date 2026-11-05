@@ -460,12 +460,13 @@ def pretrained_on(objective, replay):
     from dew.training import Trainer
 
     keys = iter(jax.random.split(jax.random.key(11), 1000))
-    data = Loader(train=lambda partition: (jax.device_get(replay.sample(next(keys), 8, 16))
+    sample = jax.jit(lambda replay, key: replay.sample(key, 8, 16))
+    data = Loader(train=lambda partition: (jax.device_get(sample(replay, next(keys)))
                                            for _ in itertools.count()), val=None, records=8, batch=8)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7))
     initial = jax.device_get(trainer.place()[0])
     final = trainer.fit(data, steps=150, log_every=150)
-    return initial, final, jax.device_get(replay.sample(jax.random.key(8), 8, 16))
+    return initial, final, jax.device_get(sample(replay, jax.random.key(8)))
 
 
 def test_pretraining_from_demonstrations_learns_the_world_and_clones_the_pilot():
