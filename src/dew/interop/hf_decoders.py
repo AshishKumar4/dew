@@ -1538,6 +1538,18 @@ def decoder_config(config: Mapping[str, object],
     return text if quantization is None else {**text, "quantization_config": quantization}
 
 
+def bundle_media(config: Mapping[str, object], names: Collection[str]) -> frozenset[str]:
+    """The tensors `names` of a media bundle (`bundles`) its language model does not read: its towers' and
+    projectors' (`wrapper_route`) and its decoder's that serve its media alone
+    (`DecoderFamily.wrapper_media_suffixes`), which a load of its language model alone retains by name
+    and writes back byte for byte."""
+    record = translate_wrapper_config(config)
+    family = _bundled(_records.text(config["model_type"], "model_type"))
+    media = () if family is None else family.wrapper_media_suffixes
+    return frozenset(name for name in names
+                     if wrapper_route(name, record)[0] != "language_model" or name.endswith(media))
+
+
 def bundle_text_config(config: Mapping[str, object]) -> Mapping[str, object]:
     """A media bundle's config as its family's text checkpoint states it: the same record without its
     towers' sections (`_BUNDLE_MEDIA`) and its folders' configs (`DecoderFamily.wrapper_folders`),

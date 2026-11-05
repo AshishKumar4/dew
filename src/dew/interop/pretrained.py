@@ -1955,6 +1955,13 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.S
             record = verified.translate(config, tensors, family)
     if max_seq_len is not None:
         record["max_seq_len"] = max_seq_len
+    # A bundle's language model alone (`text_only`) reads its decoder's tensors under the bundle's names, and
+    # retains its media's by name, unread (`decoders.bundle_media`).
+    media = decoders.bundle_media(config, tensors.keys()) if decoders.bundles(config) else frozenset()
+    if media:
+        specs = tensor_specs(tensors)
+        held, tensors = tensors, LazyTensors(
+            {name: spec for name, spec in specs.items() if name not in media}, tensors.__getitem__)
     placed, readings = decoders.read_decoder(tensors, record, family, param_dtype=param_dtype, lazy=lazy,
                                              checked=checked)
     variables = decoders.with_constants(placed, record, directory)
@@ -1972,6 +1979,8 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.S
     layouts, retained = ((), {})
     if entry.preserve_source_layout or entry.prepare is decoder_parts.DecoderFamily.prepare:
         layouts, retained = decoder_layouts(readings, record, family, variables)
+    if media:
+        retained = {**retained, **{name: held[name] for name in sorted(media)}}
     export_adapter = None
     if verified is None and not entry.preserve_source_layout:
         # The family's own encoder, the inverse `PretrainedDecoder.from_model` writes
