@@ -126,6 +126,7 @@ from dew.inference.tasks import (
     resident,
     shape_bucket,
 )
+from dew.lora import adapter_names
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
 from dew.nn.cross_attention import CrossBlocks
 from dew.nn.inputs import (
@@ -266,7 +267,7 @@ def _row_keys(keys: tuple[jax.Array | np.ndarray, ...], seeds: jax.Array, seeded
     return jax.vmap(folded)(jnp.where(seeded[:, None], made, jnp.stack(keys)), folds)
 
 
-@dataclass
+@dataclass(eq=False)
 class _Row:
     """One request on the host: its prompt, budget and key, and what it drew."""
 
@@ -294,6 +295,12 @@ class _Row:
     """What the prompt's keys depend on beside its tokens, its context's digest and its groups with the
     tokens up to its last grouped one, under which its prefix pages are named (`dew.inference.pages`);
     empty for none."""
+    writing: tuple[bytes, ...] = ()
+    """The hashes of the full prompt pages the row writes that no page names yet (`Pages.reserve`),
+    which a prompt sharing them waits for until the row publishes them or ends."""
+    adapter: int = -1
+    """The row's adapter of an adapter set's model, its place in the set's names (`dew.lora.AdapterSet`),
+    -1 for the base model alone."""
     restore: int | None = None
     """The `States` entry the row's slot starts from after its shared prefix pages, before its first piece;
     None where it starts afresh."""
@@ -429,8 +436,10 @@ class PagedRows:
         """Seat queued requests in order while some group's part of the pool covers the next one."""
         seated: list[tuple[int, _Row]] = []
         taken = [0] * len(free)
-        while queue:
-            row = queue[0]
+        for row in list(queue):
+            if any(part.waits(row.prompt, row.salt) for part in self.pages):
+                # Another row writes this prompt's next page now: it reads that page once written.
+                continue
             open_groups = sorted((group for group, slots in enumerate(free) if taken[group] < len(slots)),
                                  key=lambda group: (len(self.pages[group].shared(row.prompt, row.salt)),
                                                     self.pages[group].available), reverse=True)
@@ -438,7 +447,7 @@ class PagedRows:
                 part = self.pages[group]
                 reserved = part.reserve(row.prompt, len(row.prompt) + row.budget, row.salt)
                 if reserved is not None:
-                    row.pages, row.prefilled, entry = reserved
+                    row.pages, row.prefilled, entry, row.writing = reserved
                     row.restore = None if entry is None else group * self.states + entry
                     row.weights = self.weights
                     if part.states is not None:
@@ -446,7 +455,8 @@ class PagedRows:
                     break
             else:
                 break
-            queue.popleft()
+            # By identity: a row is one request, and its arrays compare by value.
+            queue.remove(row)
             seated.append(_seated_in(group, free, taken, row))
         return seated
 
@@ -459,9 +469,14 @@ class PagedRows:
         reload and its earlier pieces kept the old weights' keys."""
         if row.weights == self.weights:
             self.pages[row.group].publish(row.prompt, row.pages, row.salt)
+        self.pages[row.group].written(row.writing)
+        row.writing = ()
 
     def release(self, row: _Row) -> None:
-        self.pages[row.group].release(row.pages)
+        part = self.pages[row.group]
+        part.written(row.writing)
+        row.writing = ()
+        part.release(row.pages)
 
     def kept(self, row: _Row) -> int | None:
         """The `States` entry, global over the groups, that keeps the row's state after its prompt's first
@@ -862,7 +877,7 @@ class Server:
         self.rows.reloaded()
 
     def submit(self, prompt: Prompt, max_new_tokens: int | None = None, *,
-               key: int | jax.Array) -> Ticket:
+               key: int | jax.Array, adapter: str | None = None) -> Ticket:
         """Queue one request and return a ticket that resolves to its `Generation`.
 
         `prompt` is one text prompt, `ModelInputs` row or token row, without
@@ -877,13 +892,17 @@ class Server:
         request with a zero budget resolves at once, with the prompt alone.
         Another thread may submit while one steps. The request is validated
         here and queued at once; a step seats it when a slot is free.
+        `adapter` names the request's adapter where the task's model is an
+        adapter set's (`dew.lora.AdapterSet`), each row drawing under its own:
+        a request draws what a task over that adapter alone draws, and the
+        base model's where it names none.
         """
         # One row's key, folded the way `RowPlan.keys` folds row zero.
-        return self._enqueued(prompt, max_new_tokens, _seed(key, self.prng), 0)
+        return self._enqueued(prompt, max_new_tokens, _seed(key, self.prng), 0, adapter)
 
     def _enqueued(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array,
-                  fold: int) -> Ticket:
-        row = self._prepared(prompt, max_new_tokens, seed, fold)
+                  fold: int, adapter: str | None = None) -> Ticket:
+        row = self._prepared(prompt, max_new_tokens, seed, fold, adapter)
         if row.budget:
             self._waiting.append(row)
         else:
@@ -893,7 +912,13 @@ class Server:
             self._finish(row, terminated=False)
         return row.ticket
 
-    def _prepared(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array, fold: int) -> _Row:
+    def _prepared(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array, fold: int,
+                  adapter: str | None = None) -> _Row:
+        names = adapter_names(self.model)
+        if adapter is not None and adapter not in names:
+            raise ValueError(f"this server's model holds no adapter named {adapter!r}"
+                             + (f": it holds {', '.join(names)}" if names else ""))
+        chosen = -1 if adapter is None else names.index(adapter)
         positions = None
         context = None
         if isinstance(prompt, (str, ModelInputs)):
@@ -939,8 +964,11 @@ class Server:
         groups = {name: np.asarray(fields[name])[0][valid[0]].astype(np.int32)
                   for name in GROUPS if name in fields and name in self.group_fields}
         salt = b""
-        if context is not None or groups or self.keyed:
+        if context is not None or groups or self.keyed or chosen >= 0:
             hasher = hashlib.blake2b(digest_size=16)
+            if chosen >= 0:
+                # A prompt's keys are its adapter's: its prefix pages are shared under that adapter alone.
+                hasher.update(b"adapter" + np.int32(chosen).tobytes())
             if self.keyed:
                 # A cached memory rounds by the request's own key (`dew.nn.kv_cache.ROUNDING_KEYS`), so the
                 # state after a prefix is that key's: the prefix is shared only under one key.
@@ -960,7 +988,8 @@ class Server:
                     hasher.update(held[:reach].tobytes())
                 hasher.update(tokens[:reach].tobytes())
             salt = hasher.digest()
-        return _Row(tokens, budget, seed, fold, Ticket(), context=context, salt=salt, groups=groups)
+        return _Row(tokens, budget, seed, fold, Ticket(), context=context, salt=salt, groups=groups,
+                    adapter=chosen)
 
     def _book_capture(self, slot: int, row: _Row) -> None:
         """Keep the state the call leaves in `slot` where the row's piece ends at a boundary it keeps
@@ -1131,6 +1160,7 @@ class Server:
         final = np.zeros((count,), bool)
         history = np.zeros((count, capacity), np.int32)
         history_valid = np.zeros((count, capacity), bool)
+        adapters = np.full((count,), -1, np.int32)
         cross = self.cross
         # Every piece carries its row's context, so a row continuing over a former occupant's slot,
         # or after shared prefix pages, reads its own; a row without one reads none.
@@ -1160,6 +1190,7 @@ class Server:
             final[index] = row.prefilled == len(row.prompt)
             history[index, capacity - len(row.prompt):] = row.prompt
             history_valid[index, capacity - len(row.prompt):] = True
+            adapters[index] = row.adapter
             if cross is not None and row.context is not None:
                 contexts[index, :len(row.context)] = row.context
                 context_lengths[index] = len(row.context)
@@ -1177,15 +1208,16 @@ class Server:
                 final,
                 history,
                 history_valid,
+                adapters,
                 *([] if cross is None else [contexts, context_lengths]),
                 *pieces.values(),
             ],
             self._admitted,
         )
-        conditioning = {} if cross is None else {CONTEXT: placed[10], CONTEXT_LENGTHS: placed[11]}
+        conditioning = {} if cross is None else {CONTEXT: placed[11], CONTEXT_LENGTHS: placed[12]}
         fields = {VALIDITY_FIELD: placed[1], **dict(zip(pieces, placed[len(placed) - len(pieces):],
                                                           strict=True))}
-        return Admission(ModelInputs(placed[0], fields, conditioning), *placed[2:10])
+        return Admission(ModelInputs(placed[0], fields, conditioning), *placed[2:11])
 
     def _settle(self) -> None:
         """Read the previous call's draws into their rows, iteration by

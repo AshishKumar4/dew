@@ -655,6 +655,7 @@ class RolloutScheduler:
                decode: Callable[[Sequence[int]], str] = lambda ids: " ".join(str(token) for token in ids),
                groups: int = 4, max_new_tokens: int = 32, estimator: str = "group", truncation: str = "score",
                sampling: Sampling | None = None, ahead: int = 1, max_lag: int = 1, sync_every: int = 1,
+               page_size: int | None = None,
                log: Callable[[SchedulerRecord], None] | None = None, varied: bool = False,
                overlong: tuple[int, int] | None = None, admit: int | None = None,
                generation_batches: int = 1) -> RolloutScheduler:
@@ -665,9 +666,13 @@ class RolloutScheduler:
         `max_lag` updates behind it, the weights pushed every `sync_every` updates, each version drawn
         at the run's progress at its updates (`LMObjective.policy`). The proximal policy is rescored
         under the trainer's weights, so a `max_lag` above 0 needs `objective.behavior_importance`. A
-        reward-side reference penalty (`GRPOObjective.reward_kl`) is `objective`'s own, as `sampled`'s."""
+        reward-side reference penalty (`GRPOObjective.reward_kl`) is `objective`'s own, as `sampled`'s.
+        With `page_size` the server pages its cache in pages of that many slots and shares prompt pages,
+        so a group's samples of one prompt prefill it once (`dew.inference.pages.Pages.waits`)."""
         from dew.inference.rollouts import NativeRolloutServer
         from dew.inference.serving import Server
+        from dew.nn.kv_cache import KVCache
+        from dew.nn.protocols import Layered
 
         from .sources import PromptSource
 
@@ -676,7 +681,12 @@ class RolloutScheduler:
 
         def built(variables: Variables, version: int) -> Server:
             policy = objective.policy(variables, drawing, Progress(jnp.asarray(version, jnp.int32)))
-            return Server.from_task(policy, slots=slots, capacity=width)
+            if page_size is None:
+                return Server.from_task(policy, slots=slots, capacity=width)
+            # The policy's own cache layout, its format kept, in pages.
+            declared = policy.model.kv_cache if isinstance(policy.model, Layered) else KVCache()
+            return Server.from_task(policy, slots=slots, capacity=width, prefix_cache=True,
+                                    kv_cache=dataclasses.replace(declared, page_size=page_size))
 
         server = NativeRolloutServer.deferred(built, drawing)
         source = PromptSource(server, reward, decode=decode, max_new_tokens=max_new_tokens)
@@ -707,10 +717,14 @@ class RolloutScheduler:
         batch ahead of the step; synchronously, `dataset` itself."""
         return self.acquisition.tasks(dataset, self.tasks_of)
 
+    def cancel(self) -> None:
+        """Cancel every rollout in flight, as a branch's end does; what it serves from stays up."""
+        self.acquisition.close()
+
     def close(self) -> None:
         """Cancel every rollout in flight, and end what it built itself (`served`'s source and server);
         a source its caller built, its caller closes."""
-        self.acquisition.close()
+        self.cancel()
         for close in self._owned:
             close()
 
@@ -731,10 +745,10 @@ class RolloutScheduler:
             yield
         except BaseException as failure:
             # The branch's failure stays the one raised; a cancellation's is noted on it.
-            attempted([("cancelling the branch's rollouts", self.acquisition.close)], primary=failure)
+            attempted([("cancelling the branch's rollouts", self.cancel)], primary=failure)
             raise
         else:
-            self.acquisition.close()
+            self.cancel()
         finally:
             self.metrics, self.log, self._branch = metrics, log, branch
 

@@ -910,6 +910,26 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
     assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
 
 
+def test_samples_of_one_prompt_prefill_it_once_and_each_draws_what_it_draws_alone():
+    """Four samples of one prompt and another prompt behind them, submitted together to a paged server with
+    a prefix cache: the first sample writes the prompt's full pages, the other three wait and read them
+    once written, as vLLM shares a running prompt's blocks, while the other prompt seats past them at
+    once, so 3 x 16 of the 19-token prompt's tokens come from shared pages; each request draws under its
+    own key what its lone call draws (ledger 1423)."""
+    bound = task(Sampling(temperature=1.0))
+    prompt, other, budget = "1234567812345678912", "9876543", 6
+    requests = [prompt] * 4 + [other]
+    alone = [bound(held, budget, key=index) for index, held in enumerate(requests)]
+    server = Server.from_task(bound, slots=4, capacity=128, admission=4,
+                              kv_cache=KVCache(page_size=4, pages=64), prefix_cache=True)
+    tickets = [server.submit(held, budget, key=index) for index, held in enumerate(requests)]
+    server.run()
+    assert server.prefix_hits == 3 * 16
+    assert tickets[4].admitted <= tickets[1].admitted
+    for ticket, lone in zip(tickets, alone, strict=True):
+        assert_same_generation(ticket.result(), lone)
+
+
 @pytest.mark.parametrize("prefix_cache", [False, True], ids=["unshared", "prefix"])
 @pytest.mark.parametrize("fields", [{"position_embedding": "alibi"},
                                     {"layer_types": ("chunked_attention",),
@@ -979,6 +999,166 @@ def test_a_server_drafts_speculative_blocks_as_a_lone_call_does(temperature, dec
     server.step()
     with pytest.raises(ValueError):
         server.reload(params)
+
+
+@pytest.mark.parametrize("cache", [None, KVCache(page_size=2, pages=64)], ids=["dense", "paged"])
+def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(tmp_path, cache):
+    """One server over an adapter set (`dew.lora.AdapterSet`) of a published decoder: the fixture's PEFT
+    adapter (rank 8 over q and v, with an alpha pattern) and one of rank 2 over q alone, saved side by side
+    and loaded by directory. Requests naming either adapter, or none, share the server's steps and its
+    one copy of the base, and each draws what a task over its adapter alone (or the base) draws, on par
+    with that task against its float64 twin (check 1), over a dense cache and over a paged one sharing
+    prompt pages, where one prompt under two adapters shares none (ledger 870)."""
+    from pathlib import Path
+
+    from arm_arithmetic import widened
+    from reference_error import as_given, assert_as_exact, seeds_for
+
+    from dew.interop.pretrained import Pretrained
+    from dew.lora import AdapterSet, LoRA
+
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    decoder = Pretrained.load(fixtures / "hf" / "llama-tiny", dtype="float32", attention_impl="reference")
+    fixture = LoRA.load(decoder.model, decoder.variables, fixtures / "lora" / "llama-tiny" / "adapter",
+                        layouts=decoder.layouts)
+    drawn = LoRA(rank=2, modules=("q_proj",)).apply(decoder.model, decoder.variables, key=0,
+                                                       layouts=decoder.layouts)
+    # Its B starts at zero; a draw of its own moves the model.
+    factors = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: (jax.random.normal(jax.random.key(len(path)), leaf.shape, leaf.dtype) * 0.5
+                            if jax.tree_util.keystr(path).endswith("'lora_B']") else leaf),
+        drawn.variables["params"])
+    second = dataclasses.replace(drawn, variables={**drawn.variables, "params": factors})
+    fixture.save(fixture.variables, tmp_path / "set" / "fixture")
+    second.save(second.variables, tmp_path / "set" / "second")
+    adapters = AdapterSet.load(decoder.model, decoder.variables, tmp_path / "set", layouts=decoder.layouts)
+    assert adapters.names == ("fixture", "second")
+    sampling = Sampling(temperature=1.0)
+    served = dataclasses.replace(decoder, model=adapters.model, variables=adapters.variables
+                                 ).text_generation(sampling=sampling)
+    alone = {name: dataclasses.replace(decoder, model=adapter.model, variables=adapter.variables
+                                       ).text_generation(sampling=sampling)
+             for name, adapter in (("fixture", fixture), ("second", second))} | {
+                 None: decoder.text_generation(sampling=sampling)}
+    prompts = ([1, 5, 9, 13, 2], [2, 4], [7, 7, 7, 3, 1], [1, 5, 9, 13, 2], [1, 5, 9, 13, 2])
+    names = ("fixture", "second", None, "second", "fixture")
+    server = Server.from_task(served, slots=4, capacity=64, admission=2, kv_cache=cache,
+                              prefix_cache=cache is not None)
+
+    def draw(seed):
+        return (np.arange(len(prompts)) + len(prompts) * seed,)
+
+    @as_given
+    def through_the_server(keys):
+        tickets = [server.submit(np.asarray([prompt]), 6, key=int(key), adapter=name)
+                   for prompt, name, key in zip(prompts, names, keys, strict=True)]
+        server.run()
+        return tuple(drawn_of(ticket.result()) for ticket in tickets)
+
+    def drawn_of(generation):
+        """A draw's tokens and the likelihoods its adapter gave them, which a wrong adapter moves."""
+        held = generation.host()
+        return held.tokens, held.raw_log_probs
+
+    def by_itself(dtype):
+        @as_given
+        def drawn_alone(keys):
+            out = []
+            for prompt, name, key in zip(prompts, names, keys, strict=True):
+                task = alone[name]
+                if dtype == "float64":
+                    task = dataclasses.replace(task, model=task.model.clone(dtype=jnp.float64),
+                                               variables=widened(task.variables))
+                with jax.enable_x64(new_val=dtype == "float64"):
+                    out.append(drawn_of(task(np.asarray([prompt]), 6, key=int(key))))
+            return tuple(out)
+
+        return drawn_alone
+
+    label = "served adapter set"
+    count = seeds_for(by_itself("float32"), draw, label, truth_fn=by_itself("float64"),
+                      dew_fn=through_the_server)
+    assert_as_exact(through_the_server, by_itself("float32"), draw, label, seeds=count,
+                    truth_fn=by_itself("float64"))
+
+
+def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own():
+    """An adapter set of two adapters over different layers of one decoder, one over layer 0's q and one
+    over layer 1's: each layer's update is its own adapter's or none, and each row's logits are those of
+    its adapter alone, on par with that adapter against its float64 twin (check 1). A scanned stack, which
+    runs its like layers under one factor pair, refuses layers whose adapters differ, as it refuses one
+    adapter's uneven targets (test_lora's test_the_branch_reaches_every_layer_of_a_scanned_run)."""
+    from pathlib import Path
+
+    from arm_arithmetic import widened
+    from reference_error import as_given, assert_as_exact, seeds_for
+
+    from dew.interop.pretrained import Pretrained
+    from dew.lora import AdapterSet, LoRA, selected
+
+    decoder = Pretrained.load(Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny",
+                              dtype="float32", attention_impl="reference")
+
+    def drawn(layer: int, key: int):
+        adapter = LoRA(rank=2, modules=(f"layers.{layer}.self_attn.q_proj",)).apply(
+            decoder.model, decoder.variables, key=key, layouts=decoder.layouts)
+        factors = jax.tree_util.tree_map_with_path(
+            lambda path, leaf: (jax.random.normal(jax.random.key(key), leaf.shape, leaf.dtype)
+                                if jax.tree_util.keystr(path).endswith("'lora_B']") else leaf),
+            adapter.variables["params"])
+        return dataclasses.replace(adapter, variables={**adapter.variables, "params": factors})
+
+    first, second = drawn(0, 1), drawn(1, 2)
+    adapters = AdapterSet.of({"first": first, "second": second})
+
+    def draw(seed):
+        return (jax.random.randint(jax.random.key(seed), (2, 5), 1, 30),)
+
+    @as_given
+    def served(tokens):
+        with selected(jnp.asarray([0, 1], jnp.int32)):
+            return np.asarray(adapters.model.apply(adapters.variables, jnp.asarray(tokens)))
+
+    def alone(dtype):
+        @as_given
+        def logits(tokens):
+            rows = []
+            for row, adapter in enumerate((first, second)):
+                model, variables = adapter.model, adapter.variables
+                if dtype == "float64":
+                    model, variables = model.clone(dtype=jnp.float64), widened(variables)
+                with jax.enable_x64(new_val=dtype == "float64"):
+                    rows.append(np.asarray(model.apply(variables, jnp.asarray(tokens)))[row])
+            return np.stack(rows)
+
+        return logits
+
+    label = "adapter set over different layers"
+    count = seeds_for(alone("float32"), draw, label, truth_fn=alone("float64"), dew_fn=served)
+    assert_as_exact(served, alone("float32"), draw, label, seeds=count, truth_fn=alone("float64"))
+
+
+def test_a_row_of_an_adapter_sets_base_computes_the_base_bit_for_bit():
+    """A row naming no adapter of a set (`dew.lora.selected`'s -1) takes no branch: beside a row whose
+    adapter's factors overflow its update to inf, its logits are the base model's, bit for bit."""
+    from pathlib import Path
+
+    from dew.interop.pretrained import Pretrained
+    from dew.lora import AdapterSet, LoRA, selected
+
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    decoder = Pretrained.load(fixtures / "hf" / "llama-tiny", dtype="float32", attention_impl="reference")
+    fixture = LoRA.load(decoder.model, decoder.variables, fixtures / "lora" / "llama-tiny" / "adapter",
+                        layouts=decoder.layouts)
+    huge = dataclasses.replace(fixture, variables={**fixture.variables, "params": jax.tree.map(
+        lambda leaf: leaf * 1e30, fixture.variables["params"])})
+    adapters = AdapterSet.of({"huge": huge})
+    tokens = jnp.asarray([[1, 5, 9, 13], [2, 4, 6, 8]], jnp.int32)
+    with selected(jnp.asarray([0, -1], jnp.int32)):
+        served = adapters.model.apply(adapters.variables, tokens)
+    base = decoder.model.apply(decoder.variables, tokens)
+    assert not np.isfinite(np.asarray(served[0])).all()
+    np.testing.assert_array_equal(np.asarray(served[1]), np.asarray(base[1]))
 
 
 @pytest.mark.mesh(devices=4)

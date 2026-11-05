@@ -323,25 +323,29 @@ class ModelService(socketserver.ThreadingUnixStreamServer):
 class ModelRequest(socketserver.StreamRequestHandler):
     def handle(self):
         uid = struct.unpack("3i", self.request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
-        connected = threading.Event()
-        connected.set()
+        # One frame at a time, and none after the reply: the engine's progress callbacks and the handler's
+        # reply write under one lock, and the reply ends the connection's output.
+        writing = threading.Lock()
+        ended = False
 
-        def emit(value):
-            # The engine's progress for a request whose connection has ended reaches no one.
-            if not connected.is_set():
-                return
-            try:
+        def emit(value, *, final=False):
+            nonlocal ended
+            with writing:
+                if ended:
+                    return
+                ended = final
                 try:
-                    line = json.dumps(value, allow_nan=False)
-                except ValueError as error:
-                    # A non-finite number has no JSON form: the client hears so in place of the reply.
-                    why = f"the model's reply holds a non-finite number: {error}"
-                    line = json.dumps({"error": {"name": "ValueError", "message": why}})
-                self.wfile.write(line.encode() + b"\n")
-                self.wfile.flush()
-            except OSError as gone:
-                print(f"a model request's client left before its reply: {gone!r}", file=sys.stderr,
-                      flush=True)
+                    try:
+                        line = json.dumps(value, allow_nan=False)
+                    except ValueError as error:
+                        # A non-finite number has no JSON form: the client hears so in place of the reply.
+                        why = f"the model's reply holds a non-finite number: {error}"
+                        line = json.dumps({"error": {"name": "ValueError", "message": why}})
+                    self.wfile.write(line.encode() + b"\n")
+                    self.wfile.flush()
+                except OSError as gone:
+                    print(f"a model request's client left before its reply: {gone!r}", file=sys.stderr,
+                          flush=True)
 
         try:
             self.request.settimeout(10)
@@ -350,19 +354,23 @@ class ModelRequest(socketserver.StreamRequestHandler):
                 raise ValueError("the model request is too large")
             request = validate(json.loads(raw))
             if request["op"] == "describe":
-                emit({"result": self.server.models.describe(request)})
+                emit({"result": self.server.models.describe(request)}, final=True)
                 return
             future, answered = self.server.models.submitted(request, emit)
             self.server.submitted(uid, future)
             try:
                 result = future.result(REQUEST_SECONDS)
             except FuturesTimeout:
+                # A request still queued is dropped where the engine would take it; a running one finishes,
+                # and holds the guest's admission until it has.
+                future.cancel()
                 raise TimeoutError("the shared model did not finish within 90 seconds") from None
-            emit({"result": answered(result)})
+            emit({"result": answered(result)}, final=True)
         except Exception as error:
-            emit({"error": {"name": type(error).__name__, "message": str(error)}})
+            emit({"error": {"name": type(error).__name__, "message": str(error)}}, final=True)
         finally:
-            connected.clear()
+            with writing:
+                ended = True
 
 
 if __name__ == "__main__":

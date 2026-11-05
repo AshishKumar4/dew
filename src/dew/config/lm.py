@@ -34,7 +34,7 @@ from dew.registry import ModelConfig, objectives
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
-    from dew.objectives.rl.methods import RolloutSettings
+    from dew.objectives.rl.methods import PromptSettings, RolloutSettings
 
 
 class Tokens(NamedTuple):
@@ -51,12 +51,14 @@ class ServedRollout:
     `slots` rows the server decodes at once, `ahead` batches submitted before the trainer reads them, a
     rollout at most `max_lag` updates behind the trainer, and the weights pushed every `sync_every`
     updates. A `max_lag` above 0 trains on stale rollouts, which the objective's behavior importance
-    weights (`--objective.behavior-importance`)."""
+    weights (`--objective.behavior-importance`). With `page_size` the server pages its cache and shares
+    prompt pages, so a group's samples of one prompt prefill it once; None keeps each row's cache whole."""
 
     slots: int = 8
     ahead: int = 1
     max_lag: int = 1
     sync_every: int = 1
+    page_size: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -157,19 +159,17 @@ class PromptRollout:
             if not isinstance(score, Real):
                 raise ValueError(f"the reward {self.reward} scored {type(score).__name__}, not a number")
             return float(score)
+        settings: PromptSettings = {"decode": decode, "groups": self.groups,
+                                    "max_new_tokens": self.max_new_tokens, "truncation": self.truncation,
+                                    "sampling": self.sampling, "admit": self.admit,
+                                    "generation_batches": self.generation_batches,
+                                    **self.scheduler_settings()}
         served = self.served
         if served is None:
-            return RolloutScheduler.sampled(objective, reward, decode=decode, groups=self.groups,
-                                            max_new_tokens=self.max_new_tokens, truncation=self.truncation,
-                                            sampling=self.sampling, admit=self.admit,
-                                            generation_batches=self.generation_batches,
-                                            **self.scheduler_settings())
+            return RolloutScheduler.sampled(objective, reward, **settings)
         return RolloutScheduler.served(objective, reward, tasks=tasks, slots=served.slots, ahead=served.ahead,
-                                       max_lag=served.max_lag, sync_every=served.sync_every, decode=decode,
-                                       groups=self.groups, max_new_tokens=self.max_new_tokens,
-                                       truncation=self.truncation, sampling=self.sampling, admit=self.admit,
-                                       generation_batches=self.generation_batches,
-                                       **self.scheduler_settings())
+                                       max_lag=served.max_lag, sync_every=served.sync_every,
+                                       page_size=served.page_size, **settings)
 
 
 @dataclasses.dataclass(frozen=True)
