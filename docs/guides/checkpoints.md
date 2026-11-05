@@ -380,8 +380,8 @@ custom = manager.metadata(step).custom_metadata
 
 `tree` holds, by name, the train-state fields a checkpoint persists (`dew.state.CHECKPOINTED`) and, when the data iterator reported one, `position`; Orbax returns `key` as a typed PRNG key. Two things in it are Dew's encodings, each named in `custom`:
 
-- An EMA leaf whose path `custom["ema_deltas"]` lists holds byte planes (above): the average's bits are its weight's bits XOR the planes' bytes, plane `k` shifted left by `8 * k`, read as unsigned integers of the weight's width.
-- A collection of the variables or the EMA other than `params` lives in the run's `frozen/` store, one Orbax PyTree checkpoint per content digest; `custom["frozen"]` maps each tree's collection names to their digests, and `ocp.PyTreeCheckpointer().restore(directory / "frozen" / digest)` reads one.
+- An EMA leaf whose path `custom["deltas"]["ema"]` lists holds byte planes (above): the average's bits are its weight's bits XOR the planes' bytes, plane `k` shifted left by `8 * k`, read as unsigned integers of the weight's width. A DiLoCo run's groups keep their own EMA beside their own weights, under `inner`, listed as `custom["deltas"]["inner/ema"]`. A step an earlier Dew wrote lists the EMA's alone, as `custom["ema_deltas"]`.
+- A collection of the variables or the EMA other than `params` lives in the run's `frozen/` store, one Orbax PyTree checkpoint per content digest; `custom["frozen"]` maps each tree's collection names to their digests, a DiLoCo group's trees named `inner/variables` and `inner/ema`, and `ocp.PyTreeCheckpointer().restore(directory / "frozen" / digest)` reads one.
 
 `Checkpoints.restore` reads all of this into a template's dtypes and placements, so a Dew run resumes through it; Orbax alone suits inspecting a run or carrying its weights elsewhere.
 

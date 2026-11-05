@@ -12,7 +12,8 @@ run's, such as a simulation's, is saved as a mapping of arrays and restored
 through a mapping template, with the same asynchronous writes, retention and
 step index.
 
-The EMA copy is stored as its difference from the weights. Each EMA leaf with
+The EMA copy is stored as its difference from the weights, the run's and each
+DiLoCo group's (`_averages_held`). Each EMA leaf with
 its weight's floating dtype and shape is stored as the XOR of the two, split
 into byte planes (a leading uint8 axis, least significant byte first). An
 average agrees with the weights it follows in its leading bits, and the zstd
@@ -116,7 +117,8 @@ Resume = Literal["auto", "require", "never"]
 
 FROZEN_STORE = "frozen"
 """The directory beside the steps that holds every variables collection but
-`params` once, under the digest of its content (`_digest`). A step records
+`params` once, the run's and each DiLoCo group's (`_variable_trees`), under the
+digest of its content (`_digest`). A step records
 each collection's digest and holds `params` and the optimizer state itself,
 so weights no step moves (a LoRA run's frozen base, a pipeline's towers) are
 written once a run, and a collection a step does move (batch statistics) is
@@ -160,6 +162,50 @@ def _power_profiles(opt_state):
     if len(held) > 1:
         raise ValueError(f"the optimizer state holds {len(held)} power_profiles; wrap the solver once")
     return held[0] if held else None
+
+
+def _profiles_at(tree) -> tuple[TreePath, object] | None:
+    """Where a step's state tree (or Orbax's metadata of one) keeps its post-hoc EMA profiles
+    (`dew.optim.power_profiles`), and the profiles: in the run's optimizer state, or under DiLoCo in the
+    groups', whose configured optimizer it is (`DiLoCo.started`), each field stacked over the groups;
+    None where it keeps none."""
+    held = [((*holder, 'opt_state'), profiles) for holder, fields in _holders(tree) if 'opt_state' in fields
+            for profiles in [_power_profiles(_at(tree, (*holder, 'opt_state')))] if profiles is not None]
+    if len(held) > 1:
+        raise ValueError("the state keeps power_profiles in both the run's optimizer and its groups'")
+    return held[0] if held else None
+
+
+def _profile_record(profiles) -> dict[str, JSON]:
+    """What a step records of the profiles it keeps (`Checkpoints.profile_metadata`): the updates each
+    holder's averages have taken, one count, or under DiLoCo each group's, whose rejected updates are its
+    own; and their relative standard deviations, every group's alike."""
+    from jax.experimental import multihost_utils
+
+    # A group's clocks are on its own devices, which a pool's processes split.
+    updates = np.asarray(multihost_utils.process_allgather(profiles.updates, tiled=True))
+    stds = np.asarray(multihost_utils.process_allgather(profiles.stds, tiled=True))
+    return {'updates': int(updates) if updates.ndim == 0 else [int(count) for count in updates],
+            'stds': [float(std) for std in (stds if stds.ndim == 1 else stds[0])]}
+
+
+def _snapshot_weights(held: Sequence[tuple[int, int, tuple[float, ...]]], step: int,
+                      std: float) -> dict[tuple[int, int], float]:
+    """The weight `coefficients` solves for each snapshot's profile, by the snapshot's step and the
+    profile's place, in the post-hoc EMA of relative std `std` at `step`, from one holder's snapshots
+    `held` (step, updates, stds). A snapshot before the first update holds the initial weights, with no
+    profile to fit; a step that made no update (accumulating a window, or rejected by a loss scaler)
+    holds the averages of the step before it, whose identical rows would leave the solve singular: one
+    snapshot an update count, the latest."""
+    from dew.averaging import coefficients
+
+    counted = [(each, updates, stds) for each, updates, stds in held if updates > 0]
+    counted = list({updates: (each, updates, stds) for each, updates, stds in counted}.values())
+    if not counted or counted[-1][0] != step:
+        raise ValueError(f"the snapshot at step {step} was taken before the first update")
+    solved = iter(coefficients([(updates, deviation) for _, updates, stds in counted for deviation in stds],
+                               counted[-1][1], std))
+    return {(each, index): next(solved) for each, _, stds in counted for index in range(len(stds))}
 
 
 def _averages_of(profiles):
@@ -565,52 +611,116 @@ def _by_path(tree):
     return dict(jax.tree_util.tree_flatten_with_path(tree)[0])
 
 
-def _with_ema_deltas(state_tree: dict[str, StateLeaf]) -> tuple[dict[str, StateLeaf], list[str]]:
-    """Return `state_tree` with its EMA leaves, where `_stored_as_delta` allows,
-    as byte planes of their difference from the weights, and the paths of
-    those leaves in the EMA tree, which the checkpoint's metadata records.
+type TreePath = tuple[str, ...]
+"""Where a tree sits in a step's state tree, field by field: ('variables',), or under DiLoCo a group's,
+('inner', 'variables'); a step's metadata names it by its fields joined with '/' (`_named`)."""
 
-    The planes are computed on the devices the EMA sits on, sharded as it
-    is, so a save holds one more EMA-sized buffer there until orbax has
+
+def _at(tree, path: TreePath):
+    """The subtree of a step's state tree at `path`, whether its nested state is a dataclass (`Replicas`,
+    a template's) or the mapping a host restore and Orbax's metadata give; None where a field on the way
+    holds none."""
+    for name in path:
+        if tree is None:
+            return None
+        tree = tree.get(name) if isinstance(tree, Mapping) else getattr(tree, name)
+    return tree
+
+
+def _with(tree, path: TreePath, value):
+    """`tree` with its subtree at `path` (`_at`) replaced by `value`, every container on the way copied."""
+    if not path:
+        return value
+    name, rest = path[0], path[1:]
+    if tree is None or isinstance(tree, Mapping):
+        return {**(tree or {}), name: _with(None if tree is None else tree.get(name), rest, value)}
+    return dataclasses.replace(tree, **{name: _with(getattr(tree, name), rest, value)})
+
+
+def _named(path: TreePath) -> str:
+    return "/".join(path)
+
+
+def _holders(tree) -> list[tuple[TreePath, tuple[str, ...]]]:
+    """Where a step's state tree holds a run's own state, and the fields there: the tree itself, and under
+    DiLoCo the groups' (`TrainState.inner`, `dew.state.Replicas`), each field stacked over the groups."""
+    from dew.state import CHECKPOINTED, REPLICA_FIELDS
+    nested = () if _at(tree, ("inner",)) is None else ((("inner",), REPLICA_FIELDS),)
+    return [((), CHECKPOINTED), *nested]
+
+
+def _variable_trees(tree) -> list[TreePath]:
+    """The variables trees a step's state tree holds, each keyed by collection: the variables and the EMA
+    (`dew.state.VARIABLE_FIELDS`), the run's and each DiLoCo group's."""
+    from dew.state import VARIABLE_FIELDS
+    return [(*holder, name) for holder, fields in _holders(tree) for name in VARIABLE_FIELDS
+            if name in fields and isinstance(_at(tree, (*holder, name)), Mapping)]
+
+
+def _averaged(path: TreePath) -> TreePath:
+    """The tree whose leaves the average at `path` follows (`dew.state.AVERAGES`): an EMA's weights."""
+    from dew.state import AVERAGES
+    return (*path[:-1], AVERAGES[path[-1]])
+
+
+def _averages_held(tree) -> list[TreePath]:
+    """The averages a step's state tree holds (`dew.state.AVERAGES`): the run's EMA and each group's."""
+    from dew.state import AVERAGES
+    return [(*holder, name) for holder, fields in _holders(tree) for name in AVERAGES
+            if name in fields and _at(tree, (*holder, name)) is not None]
+
+
+def _with_ema_deltas(state_tree: dict[str, StateLeaf]) -> tuple[dict[str, StateLeaf], dict[str, list[str]]]:
+    """Return `state_tree` with each average's leaves (`_averages_held`), where `_stored_as_delta`
+    allows, as byte planes of their difference from the weights they follow, and the paths of those leaves
+    in each average's tree, by its name, which the checkpoint's metadata records (`deltas`).
+
+    The planes are computed on the devices the average sits on, sharded as
+    it is, so a save holds one more EMA-sized buffer there until orbax has
     copied it to the host. A save runs between steps, when the buffers a
     step holds beside the state, among them a gradient as large as the
     weights, are free.
     """
-    ema = state_tree['ema']
-    if ema is None:
-        return state_tree, []
-    paths_leaves, structure = jax.tree_util.tree_flatten_with_path(ema)
-    leaves = [leaf for _, leaf in paths_leaves]
-    held = _by_path(state_tree['variables'])
-    lives = [held[path] for path, _ in paths_leaves]
-    chosen = [index for index, (average, live) in enumerate(zip(leaves, lives, strict=True))
-              if _stored_as_delta(average, live)]
-    if not chosen:
-        return state_tree, []
-    for index in chosen:
-        encode = program(_delta_planes, out_shardings=_planes_sharding(leaves[index].sharding))
-        leaves[index] = encode(leaves[index], lives[index])
-    return ({**state_tree, 'ema': jax.tree.unflatten(structure, leaves)},
-            [jax.tree_util.keystr(paths_leaves[index][0]) for index in chosen])
+    recorded = {}
+    for path in _averages_held(state_tree):
+        paths_leaves, structure = jax.tree_util.tree_flatten_with_path(_at(state_tree, path))
+        leaves = [leaf for _, leaf in paths_leaves]
+        held = _by_path(_at(state_tree, _averaged(path)))
+        lives = [held[keys] for keys, _ in paths_leaves]
+        chosen = [index for index, (average, live) in enumerate(zip(leaves, lives, strict=True))
+                  if _stored_as_delta(average, live)]
+        if not chosen:
+            continue
+        for index in chosen:
+            encode = program(_delta_planes, out_shardings=_planes_sharding(leaves[index].sharding))
+            leaves[index] = encode(leaves[index], lives[index])
+        state_tree = _with(state_tree, path, jax.tree.unflatten(structure, leaves))
+        recorded[_named(path)] = [jax.tree_util.keystr(paths_leaves[index][0]) for index in chosen]
+    return state_tree, recorded
 
 
-def _ema_deltas(metadata: _StepFacts) -> dict[jax.tree_util.KeyPath, jax.ShapeDtypeStruct]:
-    """The EMA leaves the checkpoint at `step` stores as byte planes, by path,
-    each with the shape and dtype of the weight it is the difference from,
-    which are its own. The step's custom metadata records those paths; a
-    checkpoint written before the EMA was stored so records none."""
+def _ema_deltas(metadata: _StepFacts) -> dict[TreePath, dict[jax.tree_util.KeyPath, jax.ShapeDtypeStruct]]:
+    """The leaves of each average the checkpoint at `step` stores as byte planes, by the average's path
+    and their own, each with the shape and dtype of the weight it is the difference from, which are its
+    own. The step's custom metadata records those paths by average (`deltas`); a step written before
+    the groups' averages were coded so records its EMA's alone (`ema_deltas`, carried to 1.0), and one
+    written before the EMA was, none."""
     stored = dict(_item_metadata(metadata))
-    if stored.get('ema') is None:
-        return {}
     custom = metadata.custom_metadata or {}
-    recorded = set(custom.get('ema_deltas', ()))
-    if not recorded:
-        return {}
-    deltas, lives = {}, _by_path(stored['variables'])
-    for path, _ in jax.tree_util.tree_flatten_with_path(dict(stored['ema']))[0]:
-        if jax.tree_util.keystr(path) in recorded:
-            live = lives[path]
-            deltas[path] = jax.ShapeDtypeStruct(tuple(live.shape), live.dtype)
+    recorded = custom.get('deltas')
+    if recorded is None:
+        recorded = {'ema': custom.get('ema_deltas') or []}
+    deltas = {}
+    for name, paths in record(recorded, 'deltas').items():
+        path = tuple(name.split('/'))
+        average = _at(stored, path)
+        wanted = set(_records.strings(paths, 'delta paths'))
+        if average is None or not wanted:
+            continue
+        lives = _by_path(_at(stored, _averaged(path)))
+        deltas[path] = {keys: jax.ShapeDtypeStruct(tuple(lives[keys].shape), lives[keys].dtype)
+                        for keys, _ in jax.tree_util.tree_flatten_with_path(dict(average))[0]
+                        if jax.tree_util.keystr(keys) in wanted}
     return deltas
 
 
@@ -764,13 +874,14 @@ def _held_apart(state_tree: dict, frozen: Mapping[str, Mapping[str, str]]) -> di
     the restore reads them from the store onto these templates."""
     held = {}
     for tree, names in frozen.items():
-        collections = state_tree.get(tree)
+        path = tuple(tree.split('/'))
+        collections = _at(state_tree, path)
         if isinstance(collections, Mapping):
             collections = dict(collections)
             held[tree] = {name: collections.pop(name) for name in names if name in collections}
-            # A template asking for stored collections alone leaves no tree for the step to read.
-            if collections:
-                state_tree[tree] = collections
+            # A template asking for a run's stored collections alone leaves no tree for the step to read.
+            if collections or len(path) > 1:
+                state_tree[path[0]] = _at(_with(state_tree, path, collections), path[:1])
             else:
                 del state_tree[tree]
     return held
@@ -1534,18 +1645,18 @@ class Checkpoints:
                 raise ValueError("a mapping is saved as it is: it takes no data position, share, "
                                  "weights-only split, rung, artifact or rollout, which a train state's save "
                                  "records")
-            profiles, state_tree, frozen, deltas = None, dict(state), {}, []
+            profiles, state_tree, frozen, deltas = None, dict(state), {}, {}
         else:
-            profiles = None if weights_only else _power_profiles(state.opt_state)
             if weights_only and rollout is not None:
                 raise ValueError("a weights-only snapshot resumes nothing, so it holds no rollout's state")
-            state_tree, frozen = self._frozen(self._item(state, saved, share, rollout))
+            state_tree = self._item(state, saved, share, rollout)
+            profiles = None if weights_only else _profiles_at(state_tree)
+            state_tree, frozen = self._frozen(state_tree)
             state_tree, deltas = _with_ema_deltas(state_tree)
             if weights_only:
                 from dew.state import MODEL_STATE
                 state_tree = {name: state_tree[name] for name in MODEL_STATE}
-        profile_metadata = None if profiles is None else {
-            'updates': int(profiles.updates), 'stds': [float(std) for std in np.asarray(profiles.stds)]}
+        profile_metadata = None if profiles is None else _profile_record(profiles[1])
         self._metadata = None
         if profiles is not None:
             self._profile_snapshots.add(step)
@@ -1592,9 +1703,9 @@ class Checkpoints:
 
     def _frozen(self, state_tree: dict[str, StateLeaf]
                 ) -> tuple[dict[str, StateLeaf], dict[str, dict[str, str]]]:
-        """Return `state_tree` with its variables' and its EMA's collections
-        but `params` held in the store (`FROZEN_STORE`), and each one's digest
-        under its tree, which the step records.
+        """Return `state_tree` with the collections but `params` of each of its variables trees
+        (`_variable_trees`: the variables and the EMA, the run's and each DiLoCo group's, stacked) held
+        in the store (`FROZEN_STORE`), and each one's digest under its tree's name, which the step records.
 
         An EMA collection no average moves has its weights' content, so it is
         the same entry. A collection the store lacks is written now, before
@@ -1603,11 +1714,10 @@ class Checkpoints:
         records is deleted first, by process 0.
         """
         held: dict[str, dict[str, object]] = {}
-        for tree in ('variables', 'ema'):
-            collections = state_tree.get(tree)
-            if isinstance(collections, Mapping):
-                held[tree] = {str(name): value for name, value in collections.items()
-                              if name != 'params' and jax.tree.leaves(value)}
+        for path in _variable_trees(state_tree):
+            collections = _at(state_tree, path)
+            held[_named(path)] = {str(name): value for name, value in collections.items()
+                                  if name != 'params' and jax.tree.leaves(value)}
         digests = {tree: {name: _digest(value) for name, value in values.items()}
                    for tree, values in held.items()}
         root = epath.Path(self.directory) / FROZEN_STORE
@@ -1632,9 +1742,9 @@ class Checkpoints:
                     written.add(digest)
         kept_tree = dict(state_tree)
         for tree, values in held.items():
-            collections = state_tree[tree]
-            assert isinstance(collections, Mapping)
-            kept_tree[tree] = {name: value for name, value in collections.items() if name not in values}
+            path = tuple(tree.split('/'))
+            kept_tree = _with(kept_tree, path, {name: value for name, value in _at(state_tree, path).items()
+                                                if name not in values})
         return kept_tree, digests
 
     def _with_frozen(self, restored: dict, frozen: Mapping[str, Mapping[str, str]],
@@ -1643,11 +1753,14 @@ class Checkpoints:
         back into its tree, onto `held`'s templates (`_held_apart`) or, with
         none, as host arrays."""
         for tree, names in frozen.items():
+            path = tuple(tree.split('/'))
             templates = None if held is None else held.get(tree, {})
-            collections = restored.get(tree, {} if templates else None)
+            collections = _at(restored, path)
+            if collections is None and templates:
+                collections = {}
             if isinstance(collections, Mapping):
                 wanted = names if templates is None else {name: names[name] for name in templates}
-                restored[tree] = {**collections, **self._frozen_values(wanted, templates)}
+                restored = _with(restored, path, {**collections, **self._frozen_values(wanted, templates)})
         return restored
 
     def _frozen_values(self, digests: Mapping[str, str], templates: Mapping | None) -> dict[str, Variables]:
@@ -1699,27 +1812,39 @@ class Checkpoints:
                       and ocp.utils.is_checkpoint_finalized(self.path(step)))
 
     def profile_metadata(self, step: int) -> tuple[int, tuple[float, ...]]:
-        """Return a snapshot's recorded updates and relative standard deviations, without its averages."""
+        """Return a snapshot's recorded updates and relative standard deviations, without its averages: the
+        run's updates, under DiLoCo the first group's, whose clocks are the run's (`_profile_updates`)."""
+        return self._profile_updates(step)[0][0], self._profile_updates(step)[1]
+
+    def _profile_updates(self, step: int) -> tuple[tuple[int, ...], tuple[float, ...], bool]:
+        """A snapshot's recorded updates of each holder of its profiles, one, or under DiLoCo each group's
+        (`_profile_record`), their stds, and whether they are the groups', stacked over them."""
         self.kept()
-        custom = self._custom(step)
-        profiles = custom.get('profiles')
+        profiles = self._custom(step).get('profiles')
         if profiles is None:
             raise ValueError(f"the checkpoint at step {step} holds no post-hoc EMA snapshot")
-        return int(profiles['updates']), tuple(profiles['stds'])
+        updates = profiles['updates']
+        grouped = isinstance(updates, list)
+        return (tuple(int(count) for count in updates) if grouped else (int(updates),),
+                tuple(profiles['stds']), grouped)
 
     def restore_profiles(self, step: int) -> tuple[Variables, ...]:
-        """Read only a snapshot's averages, as host arrays, from its retained checkpoint."""
+        """Read only a snapshot's averages, as host arrays, from its retained checkpoint: under DiLoCo each
+        group's, stacked over the groups on a first axis (`_profiles_at`)."""
         persistent = self._open()
         self.profile_metadata(step)
-        opt_state = dict(persistent.item_metadata(step))['opt_state']
-        profiles = _power_profiles(opt_state)
+        metadata = dict(persistent.item_metadata(step))
+        found = _profiles_at(metadata)
+        if found is None:
+            raise ValueError(f"the checkpoint at step {step} holds no post-hoc EMA profiles")
+        path, profiles = found
         averages = tuple(_averages_of(profiles))
-        wanted = _with_averages(jax.tree.map(lambda _: ocp.PLACEHOLDER, opt_state), averages)
-        wanted = {'opt_state': wanted}
+        wanted = _with({}, path, _with_averages(jax.tree.map(lambda _: ocp.PLACEHOLDER, _at(metadata, path)),
+                                                averages))
         host = _host_read(from_local=False)
         restored = persistent.restore(step, args=ocp.args.PyTreeRestore(
             item=wanted, partial_restore=True, restore_args=jax.tree.map(lambda _: host, wanted)))
-        return tuple(_averages_of(_power_profiles(restored['opt_state'])))
+        return tuple(_averages_of(_power_profiles(_at(restored, path))))
 
     def posthoc_ema(self, std: float, step: int | None = None) -> Variables:
         """Return the post-hoc EMA with relative standard deviation `std` at checkpoint `step`.
@@ -1730,9 +1855,15 @@ class Checkpoints:
         reading one snapshot at a time and accumulating in fp32 or wider. Use
         the result where the run's params go:
         `merge(variables, {"params": checkpoints.posthoc_ema(...)})`.
-        """
-        from dew.averaging import coefficients
 
+        Under DiLoCo the profiles are each group's, of the parameters its inner
+        solver makes (`DiLoCo.started` moves the configured optimizer into the
+        groups), and a group's rejected updates are its own, so each group's
+        weights are solved from its own update counts: the result is the groups'
+        mean of their own reconstructions, as the groups' EMAs average each its
+        own group's parameters, not an average of the outer model's trajectory,
+        which no profile follows.
+        """
         steps = self.profile_steps()
         if not steps:
             raise FileNotFoundError(f"{self.directory} holds no EMA profile snapshots; train with "
@@ -1740,32 +1871,29 @@ class Checkpoints:
         step = steps[-1] if step is None else step
         if step not in steps:
             raise ValueError(f"{self.directory} holds EMA profile snapshots at steps {steps}, not {step}")
-        held = [(each, *self.profile_metadata(each)) for each in steps if each <= step]
-        # A snapshot before the first update holds the initial weights, with no
-        # profile to fit.
-        held = [(each, updates, stds) for each, updates, stds in held if updates > 0]
-        # A step that made no update (accumulating a window, or rejected by a loss scaler) holds the
-        # averages of the step before it, whose identical rows would leave the solve singular: one
-        # snapshot an update count, the latest.
-        held = list({updates: (each, updates, stds) for each, updates, stds in held}.values())
-        if not held or held[-1][0] != step:
-            raise ValueError(f"the snapshot at step {step} was taken before the first update")
-        weights = iter(coefficients([(updates, deviation) for _, updates, stds in held for deviation in stds],
-                                    held[-1][1], std))
+        held = [(each, *self._profile_updates(each)) for each in steps if each <= step]
+        grouped = held[-1][3]
+        weights = [_snapshot_weights([(each, updates[group], stds) for each, updates, stds, _ in held],
+                                     step, std) for group in range(len(held[-1][1]))]
         total, dtypes = None, None
-        for each, _, _ in held:
-            for average in self.restore_profiles(each):
-                weight = next(weights)
+        for each, *_ in held:
+            if not any((each, 0) in solved for solved in weights):
+                continue
+            for index, average in enumerate(self.restore_profiles(each)):
+                factors = [solved.get((each, index), 0.0) for solved in weights]
+
+                def weighted(leaf, factors=factors):
+                    # Each group's weight on its own row of the stacked average.
+                    return (np.reshape(np.asarray(factors), (-1,) + (1,) * (leaf.ndim - 1)) if grouped
+                            else factors[0])
                 if total is None:
                     dtypes = jax.tree.map(lambda leaf: leaf.dtype, average)
-                    total = jax.tree.map(
-                        lambda leaf, weight=weight: weight
-                        * leaf.astype(at_least_fp32(leaf.dtype)),
-                        average,
-                    )
+                    total = jax.tree.map(lambda leaf: weighted(leaf) * leaf.astype(at_least_fp32(leaf.dtype)),
+                                         average)
                 else:
-                    total = jax.tree.map(lambda sum_, leaf, weight=weight: sum_ + weight * leaf,
-                                         total, average)
+                    total = jax.tree.map(lambda sum_, leaf: sum_ + weighted(leaf) * leaf, total, average)
+        if grouped:
+            total = jax.tree.map(lambda leaf: np.mean(leaf, axis=0), total)
         return jax.tree.map(lambda leaf, dtype: leaf.astype(dtype), total, dtypes)
 
     def save_local(
@@ -1945,19 +2073,19 @@ class Checkpoints:
         stored = {name: None if value is None else
                   jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), value)
                   for name, value in dict(metadata).items()}
-        deltas = _ema_deltas(snapshot)
-        if deltas:
-            stored['ema'] = jax.tree_util.tree_map_with_path(
-                lambda path, leaf: deltas.get(path, leaf), stored['ema'])
+        for path, deltas in _ema_deltas(snapshot).items():
+            stored = _with(stored, path, jax.tree_util.tree_map_with_path(
+                lambda keys, leaf, deltas=deltas: deltas.get(keys, leaf), _at(stored, path)))
         frozen = epath.Path(self.directory) / FROZEN_STORE
         with ocp.PyTreeCheckpointer() as checkpointer:
             for tree, names in ((snapshot.custom_metadata or {}).get('frozen') or {}).items():
-                collections = stored.get(tree)
+                path = tuple(tree.split('/'))
+                collections = _at(stored, path)
                 if isinstance(collections, Mapping):
-                    stored[tree] = {**collections, **{
+                    stored = _with(stored, path, {**collections, **{
                         name: jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), dict(
                             _item_metadata(checkpointer.metadata(frozen / digest))))
-                        for name, digest in names.items()}}
+                        for name, digest in names.items()}})
         return stored
 
     def accumulation_template(self, step: int):
@@ -2074,13 +2202,12 @@ class Checkpoints:
                 restore_args=jax.tree.map(lambda _: untyped, dict(metadata))))
             if from_local:
                 restored = jax.tree.map(np.asarray, restored)
-            deltas = _ema_deltas(snapshot)
-            if deltas:
-                restored = dict(restored)
-                weights = _by_path(restored['variables'])
-                restored['ema'] = jax.tree_util.tree_map_with_path(
-                    lambda path, leaf: _from_delta_planes(leaf, weights[path])
-                    if path in deltas else leaf, restored['ema'])
+            restored = dict(restored)
+            for path, deltas in _ema_deltas(snapshot).items():
+                weights = _by_path(_at(restored, _averaged(path)))
+                restored = _with(restored, path, jax.tree_util.tree_map_with_path(
+                    lambda keys, leaf, deltas=deltas, weights=weights: _from_delta_planes(leaf, weights[keys])
+                    if keys in deltas else leaf, _at(restored, path)))
         elif from_local and self._lost(step):
             restored, held = self._lost_shards(step, template, frozen, snapshot, metadata, where)
         else:
@@ -2091,10 +2218,11 @@ class Checkpoints:
             held = _held_apart(state_tree, frozen)
             if from_local:
                 self._check_placement(step, state_tree)
-            targets, deltas = {}, {}
-            if state_tree.get('ema') is not None:
-                deltas = _ema_deltas(snapshot)
-                state_tree['ema'], targets = _plane_template(state_tree['ema'], deltas)
+            targets, deltas = {}, _ema_deltas(snapshot)
+            for path, planes in deltas.items():
+                if _at(state_tree, path) is not None:
+                    templated, targets[path] = _plane_template(_at(state_tree, path), planes)
+                    state_tree = _with(state_tree, path, templated)
             _refuse_reshaped(state_tree, metadata, where)
             restore_args = jax.tree.map(lambda want: _read(want, want.dtype), state_tree)
             if 'position' in stored and not mapping and share is not None:
@@ -2126,9 +2254,9 @@ class Checkpoints:
                              if isinstance(leaf, jax.ShapeDtypeStruct)}, where)
             restored = {name: value if name == 'position' else _placed(value, state_tree[name])
                         for name, value in restored.items()}
-            if targets:
-                restored = {**restored, 'ema': self._averages(checkpointer, step, metadata, restored,
-                                                              targets, deltas)}
+            for path, wanted in targets.items():
+                restored = _with(restored, path, self._averages(checkpointer, step, metadata, restored, path,
+                                                                wanted, deltas[path]))
         if from_local and template is not None:
             restored = self._recovered(step, dict(restored),
                                        positioned='position' in stored and not mapping and share is not None)
@@ -2139,9 +2267,9 @@ class Checkpoints:
         return restored, saved
 
     @staticmethod
-    def _averages(checkpointer: ocp.CheckpointManager, step: int, metadata, restored,
+    def _averages(checkpointer: ocp.CheckpointManager, step: int, metadata, restored, path: TreePath,
                   targets: dict, deltas: dict) -> Variables:
-        """Return the restored EMA tree with each plane stack of `targets` turned
+        """Return the restored average at `path` with each plane stack of `targets` turned
         back into the leaf it holds, typed and placed as the template has it.
 
         Undoing a difference takes the weight it was taken from, in its
@@ -2150,36 +2278,38 @@ class Checkpoints:
         rest are read here, placed as the leaves they undo.
         """
         lives, unread = {}, {}
-        held = _by_path(restored.get('variables'))
-        for path, target in targets.items():
-            weight = held.get(path)
-            if (isinstance(weight, jax.Array) and weight.dtype == deltas[path].dtype
+        weights_path = _averaged(path)
+        held = _by_path(_at(restored, weights_path))
+        for keys, target in targets.items():
+            weight = held.get(keys)
+            if (isinstance(weight, jax.Array) and weight.dtype == deltas[keys].dtype
                     and weight.sharding.memory_kind != "pinned_host"):
-                lives[path] = weight
+                lives[keys] = weight
             else:
                 sharding = getattr(target, "sharding", None)
-                unread[path] = jax.ShapeDtypeStruct(
-                    deltas[path].shape, deltas[path].dtype,
+                unread[keys] = jax.ShapeDtypeStruct(
+                    deltas[keys].shape, deltas[keys].dtype,
                     sharding=None if sharding is None else sharding.with_memory_kind("device"))
         if unread:
             # The stored params tree, its containers kept, with every leaf
             # but the ones to read held back by orbax's placeholder.
-            weights = {'variables': jax.tree_util.tree_map_with_path(
-                lambda path, _: unread.get(path, ocp.PLACEHOLDER), dict(metadata)['variables'])}
+            weights = _with({}, weights_path, jax.tree_util.tree_map_with_path(
+                lambda keys, _: unread.get(keys, ocp.PLACEHOLDER), _at(dict(metadata), weights_path)))
             read = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
                 item=weights, partial_restore=True, restore_args=jax.tree.map(
                     lambda leaf: ocp.ArrayRestoreArgs(sharding=getattr(leaf, "sharding", None)),
                     weights)))
-            lives.update({path: leaf for path, leaf in _by_path(read['variables']).items() if path in unread})
+            lives.update({keys: leaf for keys, leaf in _by_path(_at(read, weights_path)).items()
+                          if keys in unread})
 
-        def average(path, planes):
-            if path not in targets:
+        def average(keys, planes):
+            if keys not in targets:
                 return planes
-            target = targets[path]
-            value = _decode_delta(planes, lives[path], np.dtype(target.dtype))
+            target = targets[keys]
+            value = _decode_delta(planes, lives[keys], np.dtype(target.dtype))
             sharding = getattr(target, "sharding", None)
             return value if sharding is None else jax.device_put(value, sharding)
-        return jax.tree_util.tree_map_with_path(average, restored['ema'])
+        return jax.tree_util.tree_map_with_path(average, _at(restored, path))
 
     def _check_placement(self, step: int, state_tree: Mapping[str, StateLeaf]) -> None:
         """Refuse a local step written for another placement of the state."""
@@ -2215,10 +2345,11 @@ class Checkpoints:
             if not isinstance(template, Mapping) else dict(template)
         held = _held_apart(state_tree, frozen)
         self._check_recovered(step, state_tree)
-        # The EMA is stored as byte planes of its difference from the weights, checked as such.
+        # Each average is stored as byte planes of its difference from its weights, checked as such.
         checked = dict(state_tree)
-        if checked.get('ema') is not None:
-            checked['ema'], _ = _plane_template(checked['ema'], _ema_deltas(snapshot))
+        for path, planes in _ema_deltas(snapshot).items():
+            if _at(checked, path) is not None:
+                checked = _with(checked, path, _plane_template(_at(checked, path), planes)[0])
         _refuse_reshaped(checked, metadata, where)
         return jax.tree.map(_zeros, state_tree), held
 

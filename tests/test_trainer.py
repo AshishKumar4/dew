@@ -808,7 +808,7 @@ def test_a_runs_checkpoint_opens_with_orbax_alone(tmp_path):
 
     manager = ocp.CheckpointManager(str(tmp_path), item_handlers=ocp.PyTreeCheckpointHandler())
     tree = manager.restore(manager.latest_step(), args=ocp.args.PyTreeRestore())
-    deltas = manager.metadata(manager.latest_step()).custom_metadata["ema_deltas"]
+    deltas = manager.metadata(manager.latest_step()).custom_metadata["deltas"]["ema"]
     assert int(tree["step"]) == int(state.step) == 2
     assert jnp.issubdtype(tree["key"].dtype, jax.dtypes.prng_key)
     np.testing.assert_array_equal(jax.random.key_data(tree["key"]), jax.random.key_data(state.key))

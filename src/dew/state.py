@@ -121,7 +121,7 @@ class TrainState:
     updates: jax.Array = struct.field(metadata=REPLICA)
     variables: Variables = struct.field(metadata={'variables': True, **REPLICA})
     opt_state: optax.OptState = struct.field(metadata=REPLICA)
-    ema: Variables | None = struct.field(metadata={'variables': True, **REPLICA})
+    ema: Variables | None = struct.field(metadata={'variables': True, 'averages': 'variables', **REPLICA})
     key: jax.Array
     scale: DynamicScale | None = struct.field(metadata=REPLICA)
     window_size: jax.Array
@@ -240,6 +240,13 @@ VARIABLE_FIELDS = tuple(field.name for field in dataclasses.fields(TrainState)
 """The train-state fields that each hold a variables tree, keyed by collection (`params`,
 `FROZEN`, ...), as their declarations mark them; the optimizer's state mirrors the trained
 parameters' paths instead."""
+
+AVERAGES: Mapping[str, str] = MappingProxyType({
+    field.name: field.metadata['averages'] for field in dataclasses.fields(TrainState)
+    if 'averages' in field.metadata})
+"""Each train-state field that averages another's leaves, by name, to the field it averages: the EMA of
+the variables, which a checkpoint stores as its difference from them (`dew.checkpoints`), the run's and
+each DiLoCo group's."""
 
 
 def drawn_in[LossT, EffectsT](variables: Variables, dtype: DTypeLike | None,
