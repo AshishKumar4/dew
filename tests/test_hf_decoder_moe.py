@@ -494,6 +494,33 @@ def test_kimi_k25_reads_its_media_whole_on_par_with_transformers(site):
     assert_as_exact(dew, reference, draw, f"kimi-k25 {site}", seeds=KIMI_K25_MEDIA_SEEDS, truth_fn=truth)
 
 
+@pytest.mark.parametrize("kind", ["image", "video"])
+def test_kimi_k25_reads_raw_media_through_its_processor_as_its_fields(kind):
+    """Kimi K2.5's raw media reach the model through the checkpoint's own processor (transformers'
+    Kimi_K25Processor, its tiny patches and merge): Dew's call (`Processor.__call__`) gives the inputs its
+    processed fields give (`Processor.from_hf`), whose logits the media sites hold by check 1, and the
+    model's logits over them are those inputs' bit for bit (row 855's review)."""
+    from transformers import AutoProcessor
+
+    from dew.nn.inputs import ModelInputs
+
+    source = Pretrained.load(KIMI_K25, dtype="float32", attention_impl="reference")
+    rng = np.random.default_rng(855)
+    picture = (rng.random((12, 8, 3)) * 255).astype(np.uint8)
+    media = {"images": [picture]} if kind == "image" else {"videos": [np.stack([picture, picture[::-1]])]}
+    text = "w5 " + ("<|media_pad|>" if kind == "image" else "<|kimi_k25_video_placeholder|>") + " w7"
+    called = source.processor(text, **media)
+    fields = AutoProcessor.from_pretrained(str(KIMI_K25), local_files_only=True)(
+        text=text, return_tensors="np", **media)
+    given = source.processor.from_hf(dict(fields))
+
+    def logits(inputs: ModelInputs):
+        return np.asarray(source.model.apply(source.variables, inputs.tokens, **inputs.kwargs()))
+
+    np.testing.assert_array_equal(np.asarray(called.tokens), np.asarray(given.tokens))
+    np.testing.assert_array_equal(logits(called), logits(given))
+
+
 def test_kimi_k25_text_only_placeholders_match_reference():
     import torch
 

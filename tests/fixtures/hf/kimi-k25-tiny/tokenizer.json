@@ -23,7 +23,16 @@
     },
     {
       "id": 252,
-      "content": "<|vision_start|>",
+      "content": "<|media_begin|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 253,
+      "content": "<|media_content|>",
       "single_word": false,
       "lstrip": false,
       "rstrip": false,
@@ -32,7 +41,7 @@
     },
     {
       "id": 254,
-      "content": "<|vision_end|>",
+      "content": "<|media_end|>",
       "single_word": false,
       "lstrip": false,
       "rstrip": false,
@@ -41,7 +50,7 @@
     },
     {
       "id": 255,
-      "content": "<|image|>",
+      "content": "<|media_pad|>",
       "single_word": false,
       "lstrip": false,
       "rstrip": false,
@@ -50,7 +59,7 @@
     },
     {
       "id": 256,
-      "content": "<|video|>",
+      "content": "<|kimi_k25_video_placeholder|>",
       "single_word": false,
       "lstrip": false,
       "rstrip": false,
@@ -344,10 +353,11 @@
       "w249": 249,
       "w250": 250,
       "w251": 251,
-      "<|vision_start|>": 252,
-      "w253": 253,
-      "<|vision_end|>": 254,
-      "<|image|>": 255
+      "<|media_begin|>": 252,
+      "<|media_content|>": 253,
+      "<|media_end|>": 254,
+      "<|media_pad|>": 255,
+      "<|kimi_k25_video_placeholder|>": 256
     },
     "unk_token": "w0"
   }
