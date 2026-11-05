@@ -82,8 +82,6 @@ if TYPE_CHECKING:
     from dew.objectives.rl.control import ControlRollout
     from dew.objectives.rl.dreamer import DreamerRollout
     from dew.optim import ScheduleBase
-    from dew.rl.env import Env
-    from dew.rl.simulator import Simulator
     from dew.sampling.solvers import Solver
 
 # A type annotation as a value: a class, a union of them, a subscripted
@@ -1560,9 +1558,8 @@ runs: Aliases[type[RunConfig], RunConfig] = Aliases("run", {
 
 
 # An environment's types live in `dew.rl`, which only `dew.rl` and `dew.objectives.rl` import
-# (docs/design/architecture.md), so the table names them for the type checker alone; its base is read by
-# path.
-envs: Aliases[type | Callable[..., Configured], Env | Simulator] = Aliases("env", {
+# (docs/design/architecture.md), so the table's type names none; its base is read by path.
+envs: Aliases[type | Callable[..., Configured], Any] = Aliases("env", {
     "flight": "dew.rl.flight:FlightEnv",
     "gate_race": "dew.rl.flight:GateRace",
     "playground": "dew.rl.playground:Playground.load",
