@@ -76,7 +76,8 @@ def compiled(program: jcore.Jaxpr, lowering: str,
     (`_shard_map_lowering_shardy`, jax/_src/shard_map.py, makes no manual computation of it), each
     `platform_dependent` conditional the branch `lowering` keeps, inline, no conditional around it
     (`_cond_lowering`, jax/_src/lax/control_flow/conditionals.py, keeps the branches whose platforms
-    hold the lowering's, and lowers a sole branch as the computation itself), and each call (`CALLS`)
+    hold the lowering's, and lowers a sole branch as the computation itself), each scan of one turn
+    inline (`once`), and each call (`CALLS`)
     as its program in its caller, a differentiated checkpoint's operands behind its barrier
     (`prevented`), a nested `jit` among them (a wide sum's, `precision.accumulated`, traced once for its
     types: called, its GEMMs were no fusion's of the slices that read them, row 3193); through every program
@@ -107,6 +108,11 @@ def compiled(program: jcore.Jaxpr, lowering: str,
         elif name == "cond" and params.get("branches_platforms") is not None:
             branch = params["branches"][platform_branch(params["branches_platforms"], lowering)]
             body, consts, reading = branch.jaxpr, branch.consts, operands[1:]
+        elif name == "scan" and params["length"] == 1 and not params["jaxpr"].jaxpr.effects:
+            inner, returned = once(equation, operands, lowering, made)
+            equations.extend(inner)
+            renamed.update(zip(equation.outvars, returned, strict=True))
+            continue
         elif (program_called := called(equation)) is not None:
             body, consts = program_called, tuple(program_called.consts)
             if params.get("differentiated"):
@@ -123,6 +129,40 @@ def compiled(program: jcore.Jaxpr, lowering: str,
     lowered = program.replace(eqns=equations, outvars=[read(value) for value in program.outvars])
     made[id(program)] = (program, lowered)
     return lowered
+
+
+def once(equation: jcore.JaxprEqn, operands: Sequence[jcore.Var | jcore.Literal], lowering: str,
+         made: dict[int, tuple[jcore.Jaxpr, jcore.Jaxpr]]
+         ) -> tuple[list[jcore.JaxprEqn], list[jcore.Var | jcore.Literal]]:
+    """The equations of `equation`, a scan of one turn whose body has no effect, run inline over
+    `operands`, and its results: XLA removes a loop of one trip, its body a call it inlines where none of
+    its computations has a side effect (`TryRemoveWhileLoop`, xla/service/while_loop_simplifier.cc), so
+    what the loop read from memory its body's own equations fuse. Each stacked operand is read as its one
+    slice and each stacked result is that slice's stack, each a bitcast (`VIEWS`). Qwen3.5-4B's fused
+    tiled head at four microbatches, its rows one tile, was derived holding its zero carry and its cast
+    weights beside the loop: 14.4 GiB of temporaries against XLA's 8.1 (row 4089)."""
+    params = equation.params
+    _, _, stacked = params["ft_in"].update(range(len(operands))).unpack()
+    unstacked, sliced = reshaped([operands[at] for at in stacked], lambda value: jax.lax.squeeze(value, (0,)))
+    reading = list(operands)
+    for at, value in zip(stacked, sliced, strict=True):
+        reading[at] = value
+    body = params["jaxpr"]
+    inner, returned = inlined(compiled(body.jaxpr, lowering, made), reading, body.consts)
+    _, turned = params["ft_out"].update(range(len(returned))).unpack()
+    restacked, stacks = reshaped([returned[at] for at in turned],
+                                 lambda value: jax.lax.reshape(value, (1, *value.shape)))
+    for at, value in zip(turned, stacks, strict=True):
+        returned[at] = value
+    return [*unstacked, *inner, *restacked], returned
+
+
+def reshaped(values: Sequence[jcore.Var | jcore.Literal], reshape: Callable
+             ) -> tuple[list[jcore.JaxprEqn], list[jcore.Var | jcore.Literal]]:
+    """The equations that `reshape` each of `values`, and their results."""
+    traced = jax.make_jaxpr(lambda *each: [reshape(value) for value in each])(
+        *(value.aval for value in values))
+    return inlined(traced.jaxpr, values, traced.consts)
 
 
 def prevented(operands: Sequence[jcore.Var | jcore.Literal], prevent_cse: bool | Sequence[bool]

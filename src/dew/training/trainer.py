@@ -153,7 +153,7 @@ from dew.training.distributed import (
     traced_start,
 )
 from dew.training.evaluation import COOLDOWN, EvalSuite, Evaluation, Split, Summary, admit_split, episodic
-from dew.training.footprint import candidate_footprint, traced_loss
+from dew.training.footprint import Footprint, candidate_footprint, traced_loss
 from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, held, logged_scalars
 from dew.training.memory import (
@@ -1071,10 +1071,11 @@ class Trainer(Generic[Loss, Effects]):
         placement = batch_shardings(mesh, batch)
         candidates = splits(self._rows, batch, mesh, self.microbatches, self._split)
 
-        def lower(split: int, narrow: bool, lowering: bool = True) -> Candidate:
+        def lower(split: int, narrow: bool, footprint: Footprint | None = None, lowering=True) -> Candidate:
             rung = {**self._rung(), 'narrow': narrow, 'split': split}
             return self._candidate(state, batch, schedule, placement, replicated, split, narrow,
-                                   recorded_launches(recorded, rung), lowering=lowering, capacity=capacity)
+                                   recorded_launches(recorded, rung), lowering=lowering, capacity=capacity,
+                                   footprint=footprint)
 
         # Read before anything traces, so a recorded rung is the first one lowered.
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
@@ -1126,13 +1127,14 @@ class Trainer(Generic[Loss, Effects]):
     def _candidate(self, state: TrainState, batch: Batch, schedule: Schedule, placement, replicated,
                    split: int, narrow: bool | None, launches: str | None, lowering: bool = True, *,
                    mesh: Mesh | AbstractMesh | None = None, platforms: tuple[str, ...] | None = None,
-                   capacity: int | None = None) -> Candidate:
+                   capacity: int | None = None, footprint: Footprint | None = None) -> Candidate:
         """The step reading `batch` in `split` microbatches, lowered at the objective's current rung (traced
         alone where not `lowering`, for its derived footprint), with what the fit check holds beside it.
         `launches` are its kernel launches where a record holds them, which settle their configs before it
         lowers; otherwise, or where the run measures configs (`tune_kernels`), its lowering records them
         (`tune`). `mesh` and `platforms` lower it for other devices, untuned (`_lowered_for`). `capacity` is
-        the bytes a device that states none holds (`FitSearch.capacity`), at which its footprint is judged."""
+        the bytes a device that states none holds (`FitSearch.capacity`), at which its footprint is judged;
+        `footprint`, the one its derivation traced, which it keeps (`FitSearch.footprints`)."""
         micro = microbatch_shapes(batch, split)
         shapes, copies, prepared = self._prepared(state, micro, schedule, split, narrow)
         shardings = self.shardings(prepared)
@@ -1173,11 +1175,12 @@ class Trainer(Generic[Loss, Effects]):
             if staging_measured and not lowering:
                 jitted.trace(*apart(prepared), given, part)
         window = split * self.accumulation
-        footprint = None if shapes is None or mesh is not None else candidate_footprint(
-            self.objective, self._model_shapes(micro), window, prepared, held,
-            (local_devices(self.device_mesh) or [*self.device_mesh.devices.flat])[0], split,
-            functools.partial(self._consumes_where_made, prepared, micro, window, shapes),
-            max(cuts, default=0), capacity)
+        if footprint is None and shapes is not None and mesh is None:
+            footprint = candidate_footprint(
+                self.objective, self._model_shapes(micro), window, prepared, held,
+                (local_devices(self.device_mesh) or [*self.device_mesh.devices.flat])[0], split,
+                functools.partial(self._consumes_where_made, prepared, micro, window, shapes),
+                max(cuts, default=0), capacity)
         # The sampled step lowers as the step does, over the same arguments, for the same platforms.
         watched = None if self.inspection is None else self._jitted(shapes, copies, shardings, placement,
                                                                     replicated, split, sampled=True)

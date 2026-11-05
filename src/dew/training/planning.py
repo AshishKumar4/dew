@@ -620,7 +620,7 @@ class FitSearch[LossT, EffectsT]:
     that keeps its residuals in pinned host memory ('minimal_offloaded') keeps as many on the device as
     'full' does (`tests/test_remat_rungs.py`' `_saved`: a decoder's 107,720 bytes both, 'save_dot_except_mlp'
     132,296), so it fits nowhere 'full' does not, and a run takes it by its own remat."""
-    lower: Callable[[int, bool], Candidate]
+    lower: Callable[[int, bool, Footprint | None], Candidate]
     options: Callable[[Candidate], jax.stages.CompilerOptions | None]
     objective: Objective[LossT, EffectsT]
     mesh: Mesh
@@ -659,6 +659,9 @@ class FitSearch[LossT, EffectsT]:
     orders the compiles (`likely`), a compile's measure correcting it (`under`)."""
     copies_at: dict[tuple[str, int], bool] = dataclasses.field(default_factory=dict)
     """Whether each candidate the derivation read keeps narrow copies (`Candidate.copies`)."""
+    footprints: dict[tuple[str, int], Footprint | None] = dataclasses.field(default_factory=dict)
+    """The footprint of each candidate the derivation read, which its lowering keeps (`lowering`): traced
+    again there, it was 22 of a Qwen3.5-4B step's 185 seconds of `compile_ahead` (row 4261)."""
     under: dict[str, int] = dataclasses.field(default_factory=dict)
     """By remat rung (`remat_rung`), the most bytes a compile there needed past its derived headroom: a
     candidate there is judged to fit only where its derived headroom holds that much more."""
@@ -808,7 +811,13 @@ class FitSearch[LossT, EffectsT]:
             self.derived.append({**self.current(), "narrow": narrow, "split": split, "headroom": headroom,
                                  "label": label, "terms": None if footprint is None else footprint.record()})
             self.judged_at[key], self.copies_at[key] = headroom, bool(candidate.copies)
+            self.footprints[key] = footprint
         return self.judged_at[key]
+
+    def lowering(self, split: int) -> Candidate:
+        """The step at `split` at the objective's rung and the search's `narrow`, lowered, with the
+        footprint the derivation traced of it where it read it (`footprints`)."""
+        return self.lower(split, self.narrow, self.footprints.get(self.candidate_key(split, self.narrow)))
 
     def candidate_key(self, split: int, narrow: bool) -> tuple[str, int]:
         """The step at `split` and `narrow` at the objective's rung, as the derivation's judgments keep it."""
@@ -943,7 +952,7 @@ class FitSearch[LossT, EffectsT]:
         if ahead is not None:
             executable, self.ahead = ahead.taken(candidate.lowered), None
         else:
-            relowered = Relowered(lambda: self.lower(split, self.narrow))
+            relowered = Relowered(lambda: self.lowering(split))
             executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered)
             candidate = relowered.candidate(candidate)
         fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
@@ -959,7 +968,7 @@ class FitSearch[LossT, EffectsT]:
 
             def resampled() -> jax.stages.Lowered:
                 """The sampled step lowered afresh, its launches derived past a spilled one's config."""
-                again = self.lower(split, self.narrow).sampled
+                again = self.lowering(split).sampled
                 assert again is not None
                 lowered.append(again())
                 return lowered[-1]
@@ -999,7 +1008,7 @@ class FitSearch[LossT, EffectsT]:
             # A step compiled ahead, its first compile, is lowered as its own compile lowered it (`handed`):
             # within its refusals, for its GPU; every other compile within this process's, for this GPU.
             with handed(self.ahead):
-                self.lowered[key] = self.lower(split, self.narrow)
+                self.lowered[key] = self.lowering(split)
         self.chosen, candidate, executable, probe = self.measured(split, self.lowered[key])
         self.lowered[key] = candidate
         fit, headroom = probe.fits, probe.headroom
