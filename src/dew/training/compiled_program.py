@@ -120,9 +120,9 @@ def compiled(program: jcore.Jaxpr, lowering: str,
         if not opaque(equation):
             params = {key: within(value, lowering, made) for key, value in params.items()}
         equations.append(equation.replace(invars=operands, params=params))
-    result = program.replace(eqns=equations, outvars=[read(value) for value in program.outvars])
-    made[id(program)] = (program, result)
-    return result
+    lowered = program.replace(eqns=equations, outvars=[read(value) for value in program.outvars])
+    made[id(program)] = (program, lowered)
+    return lowered
 
 
 def prevented(operands: Sequence[jcore.Var | jcore.Literal], prevent_cse: bool | Sequence[bool]
