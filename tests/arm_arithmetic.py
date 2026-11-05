@@ -112,6 +112,7 @@ class Truth:
             # a process draws first (a map task's, DRAWS), and a large truth pays no eager run.
             values = compiled(*inputs)
         except Exception as untraced:
+            raise AssertionError(f"PROBE-3198 truth fallback: {type(untraced).__name__}: {untraced}"[:600])
             first = unrewritten(self.fn)(*inputs)
             if all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(first)):
                 raise untraced

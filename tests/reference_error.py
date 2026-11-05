@@ -1512,6 +1512,7 @@ def _cancelling_terms(draw, truth, program=None):
                 return None
             truths, terms = float64_terms(truth, *widened(draw(0)))
     except Exception as untraced:
+        raise AssertionError(f"PROBE-3198 terms fallback: {type(untraced).__name__}: {untraced}"[:600])
         found = f"untraced: {type(untraced).__name__}"
     else:
         plain, termed = _LaidTruths.of(jax.tree.leaves(truths)), _LaidTruths.of(
