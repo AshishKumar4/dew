@@ -172,7 +172,7 @@ class TokenizerObjective(Objective[Ratio]):
             # Each clip's own draws (`Step.sample`): a frame's mask rate, and each patch's uniform.
             rate = step.sample("mask rate", functools.partial(jax.random.uniform, maxval=self.max_mask),
                                (frames,), rows=rows)
-            uniform = step.sample("patch mask", jax.random.uniform, (frames, self.model.patches), rows=rows)
+            uniform = step.sample("patch draw", jax.random.uniform, (frames, self.model.patches), rows=rows)
             masked = step.boundary("patch mask", uniform < rate[..., None])
 
         tokenizer = self.model.bind(variables)
@@ -341,11 +341,11 @@ class WorldModelObjective(Objective[Ratio]):
         rows, frames = clean.shape[:2]
         d_min = 1.0 / self.model.k_max
         # Each clip's own draws (`Step.sample`): Eq. 4's step size and signal level a frame, and its noise.
-        exponent = step.sample("step size", functools.partial(jax.random.randint, minval=0,
-                                                              maxval=self.model.levels), (frames,), rows=rows)
-        tau, d = _gridded(exponent, step.sample("signal level", jax.random.uniform, (frames,), rows=rows))
+        exponents = functools.partial(jax.random.randint, minval=0, maxval=self.model.levels)
+        exponent = step.sample("step exponent", exponents, (frames,), rows=rows)
+        tau, d = _gridded(exponent, step.sample("level draw", jax.random.uniform, (frames,), rows=rows))
         tau, d = step.boundary("signal level", tau), step.boundary("step size", d)
-        noise = step.boundary("noise", step.sample("noise", jax.random.normal, clean.shape[1:], rows=rows))
+        noise = step.sample("noise", jax.random.normal, clean.shape[1:], rows=rows)
 
         dynamics = self.model.bind(_dynamics(variables))
 
