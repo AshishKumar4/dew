@@ -598,9 +598,11 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     def eligible(self, ba, target) -> bool:
         first, second = (value.dtype for name, value in ba.arguments.items()
                          if name in ('tokens', 'kernel', 'cotangent'))
-        # A hooked or exactly summed call runs where its bundle's register model counts what they hold.
-        special = ba.arguments['hooks'] != NO_HOOKS or ba.arguments.get('exact_sums')
+        # A hooked or exactly summed call runs where its bundle's register model counts what they hold; a
+        # paired product's epilogue over its two accumulators alone every family's counts (`registers`).
         family = self._family(ba, target)
+        special = ((ba.arguments['hooks'] != NO_HOOKS or ba.arguments.get('exact_sums'))
+                   and not (family is not None and _pair_alone(ba, family)))
         # A prologue's side operand by group streams with no group's origin here; Triton's and the TPU's
         # launches read it at their tile's group (`axes.at_group`).
         grouped = any(GROUPS in axes for axes in ba.arguments['hooks'].prologue_axes)
@@ -1521,11 +1523,11 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
     eligibility for the call (`Template.eligible`), then what the targets measured of it (`measured`, which
     a call naming it overrides)."""
     return selection.Kernel(name, (*SUPPORTS, _Need(
-        'pair', lambda case: not case.paired or _takes_pair(name, case.call.target),
+        'pair', lambda case: not case.paired or _takes_pair(name, case),
         lambda case: f"the {name} launches take no paired product on {case.call.target.generation}, whose "
                      "two products then run apart", row='ledger 2100', kind='handoff'), _Need(
         # A paired call's capability is the pairing launch's alone: every other hands it on (`pair`).
-        'launch', lambda case: ((case.paired and not _takes_pair(name, case.call.target))
+        'launch', lambda case: ((case.paired and not _takes_pair(name, case))
                                 or case.call.eligible(name)),
         lambda case: f"the {name} launches take no call of these dtypes, widths, side operands or hooks on "
                      f"{case.call.target.generation}", row='ledger 1295'), *measured))
@@ -1592,12 +1594,27 @@ _NEEDS = {'cutlass': (DECLARED_ONLY,), 'triton': (DENSE_MEASURED,)}
 """Each old route's requirements beyond its launch's own: CUTLASS on its declared cells alone, Triton off the
 dense products the template's launches cannot run."""
 
-def _takes_pair(name: str, target) -> bool:
-    """Whether the launches `name` take a paired product whole on `target`: Mosaic GPU's on a family whose
-    register model counts the second accumulator (`mosaic.Family.counts_hooks`: warpgroup MMA); every other
+def _takes_pair(name: str, case: GroupedCase) -> bool:
+    """Whether the launches `name` take the paired product `case` whole: Mosaic GPU's on a family whose
+    register model counts its hooks (`mosaic.Family.counts_hooks`: warpgroup MMA), or on any family where
+    its only hook is the epilogue over its two accumulators (`_pair_alone`: mma.sync's SwiGLU, 254 to 255
+    registers and no spill at Qwen3-30B-A3B's and Qwen3.5-4B's gate|up on sm80, row 2100); every other
     hands it on (`APART`)."""
-    family = bundles.of(target.generation, jnp.bfloat16)
-    return name == MosaicGmm.name and family is not None and family.counts_hooks
+    family = bundles.of(case.call.target.generation, jnp.bfloat16)
+    if name != MosaicGmm.name or family is None:
+        return False
+    bound = case.call.bound.get(name)
+    return bound is not None and (family.counts_hooks or _pair_alone(bound[1], family))
+
+
+def _pair_alone(ba, family: mosaic.Family) -> bool:
+    """Whether `ba` is a paired product whose only hook is the epilogue over its two accumulators (no
+    prologue, no side operand, no exact sums) on a family whose model counts it: one whose consumers issue
+    no ring's loads (`Family.feeds_itself`: sm120's fed mma.sync spilled 208 and 280 bytes at the paired
+    128 x 64 x 64 tile its model admitted, NS2100-1)."""
+    hooks = ba.arguments['hooks']
+    return (ba.arguments.get('paired') is not None and hooks.prologue is None and not family.feeds_itself
+            and not ba.arguments.get('epilogue_operands') and not ba.arguments.get('exact_sums'))
 
 class Apart:
     """`launched`'s answer for a paired product no launch takes whole: its two products run apart

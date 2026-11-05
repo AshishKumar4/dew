@@ -2001,9 +2001,8 @@ def test_the_templates_paired_product_holds_check_1(generation_name, grouped):
     gradient (the rows', both matrices') through the paired product's own reverse mode on the routes the
     selector takes (its two accumulators recomputed, the input gradient's two products summed wide: the
     SwiGLU's fp32 cotangents multiply wide, which warpgroup MMA's 16-bit products do not take), each as
-    exact as the unfused program's from float64 truth. On mma.sync, which takes no paired call, its two
-    products run apart (`grouped_matmul.APART`, a structural handoff a named kernel keeps), each through
-    its own launch, the named one, the SwiGLU in XLA on their fp32 accumulators (`gemm._apart`). The
+    exact as the unfused program's from float64 truth. On mma.sync too the paired product is one launch,
+    its only hook the epilogue over its two accumulators (`grouped_matmul._pair_alone`, row 2100). The
     gradients run eagerly, as the Mosaic interpreters' ordered callbacks need."""
     rows, depth, width = 136, 128, 256
     sizes = jnp.asarray([70, 66], jnp.int32) if grouped else None
@@ -2038,10 +2037,11 @@ def test_the_templates_paired_product_holds_check_1(generation_name, grouped):
     label = f"paired {'grouped' if grouped else 'dense'} product on {generation_name}"
     truth = functools.partial(plain, wide=jnp.float64, out=jnp.float64)
     with generation.assumed(generation_name):
-        # Named: on mma.sync, which takes no pair, the call hands its two products on apart, each Mosaic's.
-        with generation.chosen(grouped_matmul="mosaic_gpu"):
+        # Named, the value is the one paired launch's on either family.
+        with generation.chosen(grouped_matmul="mosaic_gpu"), generation.routes() as routes:
             assert_as_exact(jax.jit(valued(dew)), jax.jit(valued(plain)), draw, label, seeds=SEEDS,
                             truth_fn=valued(truth))
+        assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic_gpu"}
         assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), draw, f"{label}, gradients",
                         seeds=SEEDS, truth_fn=with_gradients(truth))
 
