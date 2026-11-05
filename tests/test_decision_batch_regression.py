@@ -143,3 +143,61 @@ def test_mixed_joint_probabilities_against_float64(tmp_path, dtype):
     assert_as_exact(as_given(lambda variables: probabilities(task, variables, True)),
                     as_given(lambda variables: probabilities(task, variables, False)), draw,
                     "mixed joint probabilities", seeds=16, truth_fn=truth)
+
+
+def test_isolate_the_recurrence_roundings(tmp_path, monkeypatch):
+    import dew.nn.linear as linear
+    from dew.nn.kernels import recurrence_algebra
+    from dew.nn.precision import float64_sum
+
+    source = tmp_path / "release"
+    source.mkdir()
+    backbone = FIXTURES / "hf" / "qwen38-dense-tiny"
+    joint = FIXTURES / "joint_checkpoint" / "tiny"
+    for item in [*backbone.iterdir(), joint / "joint_head_config.json",
+                 joint / "joint_head.safetensors"]:
+        (source / item.name).symlink_to(item.resolve())
+    task = Decide.from_pretrained(source, attention_impl="xla", dtype="bfloat16")
+    task = replace(task, layout=replace(task.layout, max_len=512))
+    short = ("refund", {"q": Choice("team", ["pay", "tech", "sales"])})
+    long = ("invoice " * 20, {"q": Choice("which department", ["billing", "technical", "sales",
+                                                             "support", "account", "other"])})
+    rows = [own[0] for own in task.rows([short, long])]
+    single = DecisionInputs.collate(rows[:1], task.specials.pad)
+    padded = jax.tree.map(lambda leaf: leaf[:1], DecisionInputs.collate(rows, task.specials.pad))
+    original = linear.chunk_gated_delta_rule
+
+    def captured(inputs):
+        records = []
+
+        def record(*args, **kwargs):
+            result = original(*args, **kwargs)
+            records.append((*args[:5], result[0]))
+            return result
+
+        with monkeypatch.context() as patch:
+            patch.setattr(linear, "chunk_gated_delta_rule", record)
+            states = task.model.states(task.variables, inputs)
+        return states, records[0]
+
+    def show(mode):
+        compiled = jax.jit(lambda inputs: captured(inputs))
+        alone, extra = compiled(single), compiled(padded)
+        for index, (left, right) in enumerate(zip(jax.tree.leaves(alone), jax.tree.leaves(extra),
+                                                strict=True)):
+            left, right = np.asarray(left), np.asarray(right)
+            right = right[tuple(slice(0, width) for width in left.shape)]
+            hits = np.argwhere(left != right)
+            print("RECURRENCE", mode, index, left.shape, len(hits),
+                  hits[:3].tolist(), float(np.max(np.abs(left.astype(float) - right.astype(float)))),
+                  flush=True)
+
+    with algebra.passes(False):
+        show("fp32")
+        jax.clear_caches()
+        with monkeypatch.context() as patch:
+            def rounded_once(left, right, precision=None):
+                return float64_sum(jnp.matmul, left, right, dtype=jnp.result_type(left, right))
+
+            patch.setattr(recurrence_algebra, "float32_matmul", rounded_once)
+            show("wide_products")
