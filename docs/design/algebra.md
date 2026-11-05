@@ -812,9 +812,16 @@ Those are rounding and representation choices the fast class does not make. The 
 a derived form replaces a hand-written one only where it states the walk, passes check 1 and is no slower.
 
 **Drift to fix.**
-- Error-aware extraction with the compensation rules (`error_free`'s TwoSum and product splitting,
-  rewriting into compensated forms where check 1 needs them) is the next derivation build. It covers the
-  accurate forms and the guard.
+- The accurate forms (row 4228, theme AL03) are the declaration's numerics, not rewrites: the accurate
+  numerics admit only the `exact` sets, so no rule could reach them. A declaration states its exponential's
+  implementation (`Reduction.exponential`) and the rescale a carried state takes from one anchor to the next
+  (`Reduction.rescale`, the language's binary `rescale`, `terms.RESCALE`, which no rule rewrites), and may
+  hold its largest weight to 1 by a select (`exp(where(x < b, x - b, 0))`, `b` the broadcast of `x`'s own
+  maximum). A compensated walk's running sums are the mainloop's own additions over the derived forms
+  (`Derived.step`'s `add`, beside the accumulator's `accumulate`). The template's hand forms run until it
+  takes these (row 4228); the guard's shifted sums follow, its control flow the template's. Error-aware
+  extraction (§1.5) waits for a cell whose cheapest form fails check 1 where an equal one passes: row 3310's
+  was the test's schedule, not a form.
 - The chunk's decays (`scan._decays`: the compensated prefix and its exponentials) and a gram's evaluation
   by decay kind (`scan._paired`) are written, not extracted. The compensated prefix is the declaration's
   numerics, not a candidate: a plain prefix loses about 1e-6 of a deep decay, which no price weighs.
@@ -836,6 +843,8 @@ class Reduction:                     # attention, and any walk whose state is a 
     exponent: Literal[2, "e"]        # stated by each template per call (a scale folded with log2(e)), never found
     ranges: Mapping[str, float] = {} # operands' magnitude bounds by name (§6.3)
     exact: bool = False              # extracted exactly where greedy prices dearer (§6.5)
+    exponential: Callable | None = None   # its exponential's implementation, which its forms evaluate by
+    rescale: Callable | None = None  # (carried, now) -> the factor a carried state takes; None: exp(carried - now)
 
 @dataclass(frozen=True)
 class Scan:                          # a recurrence
