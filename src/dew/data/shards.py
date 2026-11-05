@@ -251,8 +251,7 @@ class _Reader[Place]:
     loading: Loading
 
     def __call__(self, place: Place) -> grain.IterDataset:
-        options = grain.ReadOptions(self.loading.threads, self.loading.read_buffer)
-        return _Watched(self.reader(place, options), self.empty)
+        return _Watched(self.reader(place, None), self.empty)
 
 
 class _Watched(grain.IterDataset):
