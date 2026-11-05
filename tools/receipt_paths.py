@@ -8,10 +8,14 @@ ROOT = Path(__file__).resolve().parents[1]
 """The checkout a tool runs from."""
 
 
-def named(path: str | Path) -> str:
-    """`path` as a receipt records it: relative to the checkout inside it, by its name outside it."""
+def named(path: str | Path, parts: int = 1) -> str:
+    """`path` as a receipt records it: a URI (`scheme://...`, a bucket's) as given; a local path relative
+    to the checkout inside it, outside it by its last `parts` parts (a TFDS directory's dataset and
+    version, 2)."""
+    if "://" in str(path):
+        return str(path)
     whole = Path(path).resolve()
-    return str(whole.relative_to(ROOT)) if whole.is_relative_to(ROOT) else Path(path).name
+    return str(whole.relative_to(ROOT)) if whole.is_relative_to(ROOT) else "/".join(Path(path).parts[-parts:])
 
 
 def recorded(config: object, paths: tuple[str, ...] = ()) -> dict:
