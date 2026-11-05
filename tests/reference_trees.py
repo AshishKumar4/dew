@@ -140,6 +140,7 @@ class Summed:
     the tree does not set refused (`ORDERED`), every other one as it is."""
 
     tree: str = dataclasses.field(metadata={"static": True})
+    pruned = True
 
     def at(self, index: int, name: str | None = None) -> "Summed":
         return self

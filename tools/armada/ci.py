@@ -126,34 +126,25 @@ from collections.abc import Container, Mapping, Sequence
 from pathlib import Path
 
 
-def _beside(name: str):
-    """tools/armada/`name`.py, the module beside this file, loaded by its path: this file runs as a
-    script and is loaded by the tests, and puts nothing on sys.path."""
-    spec = importlib.util.spec_from_file_location(f"armada_{name}", Path(__file__).with_name(f"{name}.py"))
+def _loaded(path: Path):
+    """The module at `path`, loaded by its path: this file runs as a script and is loaded by the tests, and
+    puts nothing on sys.path. Its neighbours here, and the gate's standard-library contract the plan shares
+    (tests/check1_wire.py)."""
+    spec = importlib.util.spec_from_file_location(f"armada_{path.stem}", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-def _gate(name: str):
-    """tests/`name`.py, a standard-library module of the gate's the plan shares (`check1_wire`), loaded by its
-    path as `_beside` loads this file's neighbours."""
-    path = Path(__file__).resolve().parents[2] / "tests" / f"{name}.py"
-    spec = importlib.util.spec_from_file_location(f"armada_{name}", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-check1_wire = _gate("check1_wire")
-child_groups = _beside("child_groups")
-session = _beside("session")
-coverage_report = _beside("coverage_report")
-r2 = _beside("r2")
-watched = _beside("watched")
-followed = _beside("followed")
+HERE = Path(__file__).resolve().parent
+check1_wire = _loaded(HERE.parents[1] / "tests" / "check1_wire.py")
+child_groups = _loaded(HERE / "child_groups.py")
+session = _loaded(HERE / "session.py")
+coverage_report = _loaded(HERE / "coverage_report.py")
+r2 = _loaded(HERE / "r2.py")
+watched = _loaded(HERE / "watched.py")
+followed = _loaded(HERE / "followed.py")
 SETTLE = 30.0
 """Seconds a task's process group has, after SIGKILL, to be reaped and gone: inside armada's own timeout
 with the default deadline and grace (session.DEADLINE + session.GRACE + 30 + the reader's 10 < .armada.json's

@@ -166,6 +166,16 @@ def test_a_computation_is_certified_through_its_calls_and_a_primitive_without_a_
         ct.assert_certified(lambda x: jnp.sin(x), lambda seed: (x,), "sine", seeds=1)
 
 
+def test_an_equation_whose_result_nothing_reads_is_held_too():
+    """Check 2 holds every equation the program executes: a primitive without a contract whose result the
+    output never reads (a sine dropped before the return, inside a call too) is still a finding."""
+    x = np.float32(np.linspace(0.1, 3, 32))
+    for discarded in (lambda x: (jnp.sin(x), x + 1)[1],
+                      lambda x: jax.jit(lambda x: (jnp.sin(x), x * 2))(x)[1]):
+        _, findings = ct.certified(discarded, x)
+        assert len(findings) == 1 and "no contract for sin" in findings[0], findings
+
+
 def test_an_equation_past_the_lanes_reach_is_a_finding_by_its_path():
     """A division by a literal, which XLA may compute as a product with the literal's rounded reciprocal
     (ledger 1402), is held to the lane's own division's reach: it is a finding, named by its equation,

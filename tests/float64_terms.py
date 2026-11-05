@@ -231,6 +231,11 @@ class Rule(Protocol):
         floats float64): a traced loop's carries and a branch's outputs are cast to it, exactly."""
         ...
 
+    pruned: bool
+    """Whether the walk runs only what the outputs read (`_reading`), as an evaluation does; false where
+    every equation is the rule's to hold, check 2's (tests/certified.py), whose contract is every equation
+    executed."""
+
 
 def walked(jaxpr, consts, args, rule: Rule, *, compiling: bool = False) -> list:
     """`jaxpr`'s outputs on `consts` and `args`, each primitive evaluated by `rule` (`Rule`) and the walk's
@@ -276,9 +281,11 @@ def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False, rule=No
         return None if isinstance(var, Literal) else energies.get(var)
 
     spans = runs if compiling else tuple((index, index + 1) for index in range(len(jaxpr.eqns)))
-    used = tuple([True] * len(jaxpr.outvars) if used is None else used)
-    for (start, stop), reading in zip(spans, _reading(jaxpr, spans, used), strict=True):
-        if reading is None:
+    pruned = rule is None or rule.pruned
+    used = tuple([True] * len(jaxpr.outvars) if used is None or not pruned else used)
+    readings = _reading(jaxpr, spans, used) if pruned else [None] * len(spans)
+    for (start, stop), reading in zip(spans, readings, strict=True):
+        if pruned and reading is None:
             continue
         run = jaxpr.eqns[start:stop]
         if stop - start > 1:

@@ -112,9 +112,9 @@ def test_blocks_and_context_follow_the_documented_distribution(mask):
     """The static-shape multi-block draw: each block's shape uniform over
     `block_shapes`, its corner uniform over the corners where that shape
     fits, and the context a uniform subset of the targets' complement: among
-    rows leaving the same number of tokens free, every free position kept at
-    the rate num_context / free, wherever the blocks fell. Each held by the
-    sampling gate over 4096 rows, 1024 a seed."""
+    rows leaving the same number of tokens free, a free position drawn apart
+    from the mask is kept at the rate num_context / free, wherever the blocks
+    fell. Each held by the sampling gate over 4096 rows, 1024 a seed."""
     rows = 1024
 
     @functools.cache
@@ -144,15 +144,21 @@ def test_blocks_and_context_follow_the_documented_distribution(mask):
 
         assert_draws_as_declared(corners, np.full(places, 1 / places), f"the {h}x{w} block's corner",
                                  seeds=MASK_SEEDS)
-    # The rows of the free count seed 0 draws most often, each free position kept or dropped at the rate.
+    # Of each mask leaving the free count seed 0 draws most often, one free position drawn apart from the
+    # mask (its own stream): kept at the rate num_context / free wherever the blocks fell, each mask one
+    # independent trial, counted by the position drawn (the context's positions in a mask are a subset of
+    # fixed size, not independent of each other).
     size = int(np.bincount((~drawn(0)[3]).sum(axis=1)).argmax())
     chance = mask.num_context / size
 
     def kept_or_dropped(seed):
         *_, covered, kept = drawn(seed)
-        same = (~covered).sum(axis=1) == size
-        offered, taken = (~covered[same]).sum(axis=0), kept[same].sum(axis=0)
-        return np.stack([taken, offered - taken], axis=-1)
+        probes = np.random.default_rng([0x7E9A, seed])
+        counts = np.zeros((mask.num_patches, 2), np.int64)
+        for row in np.flatnonzero((~covered).sum(axis=1) == size):
+            position = probes.choice(np.flatnonzero(~covered[row]))
+            counts[position, 0 if kept[row, position] else 1] += 1
+        return counts
 
     assert_draws_as_declared(kept_or_dropped, np.tile([chance, 1 - chance], (mask.num_patches, 1)),
                              "the context's free positions", seeds=MASK_SEEDS)

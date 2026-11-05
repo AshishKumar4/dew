@@ -888,7 +888,8 @@ def _keeps_subnormals(name: str, fmt: Format) -> bool:
 
     tiny = 2.0 ** (fmt.emin - 4)
     subnormal = [np.asarray(value, DTYPES[fmt.name]) for value in SUBNORMAL_OPERANDS[name](tiny)]
-    zeroed = [np.asarray(0.0 if abs(float(value)) == tiny else value, DTYPES[fmt.name])
+    # Each subnormal zeroed with its sign, as a lane that flushes it reads it.
+    zeroed = [np.asarray(np.copysign(0.0, value) if abs(float(value)) == tiny else value, DTYPES[fmt.name])
               for value in SUBNORMAL_OPERANDS[name](tiny)]
     run = getattr(jax.lax, name)
     return bool(np.any(_bits(np.asarray(run(*subnormal))) != _bits(np.asarray(run(*zeroed)))))
@@ -1043,12 +1044,14 @@ def certified(fn, *arguments) -> tuple:
 
 @dataclasses.dataclass(frozen=True)
 class Certifying:
-    """The walk's rule of check 2 (`float64_terms.Rule`, `certified`): each primitive bound natively on its
-    operands and held to its contract (`_held`), its findings appended to
-    `findings` by its path: each call's equation `name#index`, a scan's step its index, joined by `/`."""
+    """The walk's rule of check 2 (`float64_terms.Rule`, `certified`), unpruned: every equation executed is
+    held, its outputs read or not; each primitive bound natively on its operands and held to its contract
+    (`_held`), its findings appended to `findings` by its path: each call's equation `name#index`, a scan's
+    step its index, joined by `/`."""
 
     findings: list
     path: tuple[str, ...] = ()
+    pruned = False
 
     def at(self, index: int, name: str | None = None) -> "Certifying":
         return Certifying(self.findings, (*self.path, str(index) if name is None else f"{name}#{index}"))
