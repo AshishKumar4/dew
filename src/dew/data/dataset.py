@@ -35,6 +35,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from dew import position
 from dew._records import record
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS, Batch, padded_rows
+from dew.data import cgroups
 from dew.mesh import LayoutRefused, batch_axes
 
 _log = logging.getLogger(__name__)
@@ -330,7 +331,7 @@ class Host:
     memory: int
 
     @classmethod
-    def current(cls, cgroup: Path | None = None, root: Path = Path("/sys/fs/cgroup")) -> Host:
+    def current(cls, cgroup: Path | None = None, root: Path = cgroups.ROOT) -> Host:
         """This process's host, read through `cgroup`, its own cgroup (v2) directory, which
         /proc/self/cgroup names under `root` by default, and every ancestor of it up to `root`:
         a container's limit on a parent binds an unlimited child, so each level's CPU quota and
@@ -340,32 +341,15 @@ class Host:
         cgroup, and counting that as taken left room for no worker beside it."""
         import psutil
 
-        group = _own_cgroup() if cgroup is None else cgroup
+        group = cgroups.own(root) if cgroup is None else cgroup
         cpus, memory = len(os.sched_getaffinity(0)), psutil.virtual_memory().available
-        for level in (group, *group.parents):
-            quota = level / "cpu.max"
-            if quota.is_file():
-                limit, period = quota.read_text().split()
-                if limit != "max":
-                    cpus = min(cpus, math.ceil(int(limit) / int(period)))
-            maximum, current, stat = level / "memory.max", level / "memory.current", level / "memory.stat"
-            if maximum.is_file() and current.is_file() and (limit := maximum.read_text().strip()) != "max":
-                stated = [line.split() for line in stat.read_text().splitlines()] if stat.is_file() else []
-                reclaimed = next((int(value) for name, value in stated if name == "inactive_file"), 0)
-                memory = min(memory, max(0, int(limit) - (int(current.read_text()) - reclaimed)))
-            if level == root:
-                break
+        for level in cgroups.levels(group, root):
+            if (quota := cgroups.cpus(level)) is not None:
+                cpus = min(cpus, quota)
+            limit, held = cgroups.memory(level), cgroups.memory_held(level)
+            if limit is not None and held is not None:
+                memory = min(memory, max(0, limit - held))
         return cls(cpus, memory)
-
-
-def _own_cgroup() -> Path:
-    """This process's cgroup (v2) directory: the path /proc/self/cgroup names (`0::/path`) under
-    /sys/fs/cgroup, which is the root itself inside a container's own cgroup namespace."""
-    root, membership = Path("/sys/fs/cgroup"), Path("/proc/self/cgroup")
-    lines = membership.read_text().splitlines() if membership.is_file() else []
-    named = next((line[3:] for line in lines if line.startswith("0::")), None)
-    own = root / named.strip().lstrip("/") if named else root
-    return own if own.is_dir() else root
 
 
 def batch_bytes(batch: Batch) -> int:

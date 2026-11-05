@@ -829,6 +829,38 @@ def test_a_cgroups_reclaimable_page_cache_is_room_for_automatic_loading(tmp_path
     assert host.memory == 2 * 2**30 - int(1.9 * 2**30) + int(1.5 * 2**30)
 
 
+def test_a_process_reads_its_cgroups_limits_through_the_reader_a_tool_loads_before_dew(tmp_path):
+    """The cgroup reader Dew's loading sizes by is the one a tool loads by its path before Dew is
+    importable, as CI's host keys do (row 4161): in a fresh interpreter that imports none of Dew, it
+    finds the process's cgroup by the membership's v2 line and reads the binding limits up the tree."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root, own = tmp_path / "hierarchy", tmp_path / "hierarchy" / "session"
+    own.mkdir(parents=True)
+    (root / "cpu.max").write_text("300000 100000\n")
+    (own / "memory.max").write_text(f"{3 * 2**30}\n")
+    membership = tmp_path / "cgroup"
+    membership.write_text("1:name=systemd:/elsewhere\n0::/session\n")
+    reader = Path(__file__).resolve().parents[1] / "src" / "dew" / "data" / "cgroups.py"
+    program = (
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('cgroups', {str(reader)!r})\n"
+        "cgroups = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(cgroups)\n"
+        "from pathlib import Path\n"
+        f"root = Path({str(root)!r})\n"
+        f"group = cgroups.own(root, Path({str(membership)!r}))\n"
+        "levels = list(cgroups.levels(group, root))\n"
+        "import json\n"
+        "print(json.dumps([group.name, [cgroups.cpus(level) for level in levels],\n"
+        "                  [cgroups.memory(level) for level in levels],\n"
+        "                  any(name.split('.')[0] == 'dew' for name in sys.modules)]))\n")
+    done = subprocess.run([sys.executable, "-I", "-c", program], capture_output=True, text=True, check=True)
+    assert json.loads(done.stdout) == ["session", [None, 3], [3 * 2**30, None], False]
+
+
 def test_automatic_loading_holds_its_reads_and_each_workers_batches_within_half_the_memory():
     """Each worker holds its `worker_buffer` batches and its `read_buffer` reads in a process of its
     own, within half the memory the process may take; a read is a batch where the order is read by
