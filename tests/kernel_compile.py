@@ -508,6 +508,8 @@ PTXAS = Path(next(iter(_NVCC.submodule_search_locations or ()))) / "bin" / "ptxa
 ENTRY = re.compile(r"(\.maxntid[^\n]*\n)")
 OCCUPANCY = re.compile(r"\.minnctapersm[^\n]*\n")
 RAISE = re.compile(r"setmaxnreg\.inc\.sync\.aligned\.u32 \d+;")
+RAISED = re.compile(r"setmaxnreg\.inc\.sync\.aligned\.u32 (\d+);")
+"""A raise's registers (`RAISE`'s), as a kernel record states them (`raised`)."""
 
 
 RELOCATABLE = not resources.RAISES_HONORED
@@ -689,6 +691,10 @@ def _compiled_here(cases, generation: str, *, least: bool = False) -> list[dict]
                 name = report.launch_name(kernel["kernel"], kernel["launch"])
                 if kernel["module"] is not None and name in printed:
                     PTX[kernel["module"]] = printed[name]
+                # The registers its consumers raise to, as its PTX states (`setmaxnreg.inc`); None where they
+                # raise none or no PTX was printed for it.
+                ptx = printed.get(name, PTX.get(kernel["module"], ""))
+                kernel["raised"] = int(found.group(1)) if (found := RAISED.search(ptx)) else None
                 if least:
                     kernel["least"] = _least(kernel["module"], generation)
         record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
