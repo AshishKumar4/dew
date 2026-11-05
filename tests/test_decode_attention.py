@@ -724,8 +724,8 @@ def test_a_decode_step_launches_the_decode_kernel_on_each_shard_of_its_mesh(axes
             lowering_platforms=("cuda",))
     # Each decode launch's operands, read from the lowered program's custom calls: the rows' key spans and
     # the padded queries a shard's own (`custom_calls`, `triton_calls`, in program order).
+    from dew.nn.kernels.lowered import custom_calls, triton_calls
     from dew.telemetry.instrumentation import custom_call_kind
-    from dew.training._lowering import custom_calls, triton_calls
 
     calls = [call for call in custom_calls(lowered) if custom_call_kind(call.target) == "triton"]
     launches = [call for call, kernel in zip(calls, triton_calls(lowered), strict=True)

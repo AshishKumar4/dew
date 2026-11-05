@@ -436,7 +436,7 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
     compile the whole program a launch at a time (row 3584). Each launch's miss is recorded and logged at
     the bytes asked; where the relowered program is refused again, or a derivation finds no config left
     (`Exhausted`), the refusal stands, each a miss not stepped."""
-    from dew.training._lowering import kernel_calls
+    from dew.nn.kernels.lowered import kernel_calls
 
     tried: dict[tuple[str, Hashable], tuple[str, Launch]] = {}
     # Every Triton kernel XLA compiles, a branch no run reaches too (a guarded forward's rewalk).
@@ -495,7 +495,7 @@ def _recorded(found: list, *, stepped: bool) -> None:
 
 def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
                        ) -> tuple[jax.stages.Compiled, list["Binary"]]:
-    from dew.training._lowering import kernel_calls
+    from dew.nn.kernels.lowered import kernel_calls
 
     executable = lowered.compile(options)
     # A program of Pallas-Triton launches alone spills as a Mosaic one does: both kinds' binaries are read

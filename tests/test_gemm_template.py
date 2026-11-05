@@ -674,7 +674,7 @@ def test_two_launches_whose_padded_shapes_meet_name_their_own_kernels():
     program: each launch's kernel carries its own launch's digest (`report.named`), as a spill refuses the
     launch that compiled it. Their shared static configuration traced once under the first launch, and the
     second's kernel was named for the first (row 2941)."""
-    from dew.training._lowering import kernel_calls
+    from dew.nn.kernels.lowered import kernel_calls
 
     weight = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
     shorter, longer = (jax.ShapeDtypeStruct((rows, 256), jnp.bfloat16) for rows in (4089, 4096))

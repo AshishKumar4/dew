@@ -35,9 +35,10 @@ from dew.nn.kernels.generation import (
     runtime_facts,
     triton_runs,
 )
+from dew.nn.kernels.lowered import custom_calls, triton_kernels
 from dew.nn.kernels.selection import Refusal
 from dew.telemetry import instrumentation
-from dew.training._lowering import KernelReport, custom_calls, kernel_report, triton_kernels
+from dew.training._lowering import KernelReport, kernel_report
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -174,8 +175,8 @@ def test_a_kernel_behind_a_loop_of_no_trips_is_compiled_and_launches_none(genera
     launch none, so the kernel report and the FLOP count leave them out alike, the step's Triton kernel its
     one launch (2958's review: a kernel of no runs once turned a live kernel's stated FLOPs unknown)."""
     from dew.nn.kernels import gemm
+    from dew.nn.kernels.lowered import kernel_calls
     from dew.telemetry.instrumentation import hlo_flops
-    from dew.training._lowering import kernel_calls
 
     def step(x, w, sizes):
         def body(carry):
@@ -228,20 +229,20 @@ def test_a_call_that_runs_none_adds_none_however_often_its_caller_runs():
 
 
 def test_a_kernel_is_named_from_its_location_wherever_the_location_nests_the_name():
-    """A Mosaic GPU call's kernel name and launch (`_lowering._kernel_name`) from its location's name stack
+    """A Mosaic GPU call's kernel name and launch (`lowered._kernel_name`) from its location's name stack
     wherever the location nests it: its own, a call site's callee's, a fused location's part (a rewrite
     that merged operations); a location that carries no name gives none, and the report names the call by
     its hash."""
     from jax.extend.mlir import ir
 
-    from dew.training import _lowering
+    from dew.nn.kernels import lowered
 
     with ir.Context():
         named = ir.Location.name("jit(step)/attention_forward__l0123456789/mpmd_map")
         source = ir.Location.file("model.py", 1, 1)
         for location in (named, ir.Location.callsite(named, [source]), ir.Location.fused([source, named])):
-            assert _lowering._kernel_name(location) == ("attention_forward", "0123456789")
-        assert _lowering._kernel_name(ir.Location.fused([source])) is None
+            assert lowered._kernel_name(location) == ("attention_forward", "0123456789")
+        assert lowered._kernel_name(ir.Location.fused([source])) is None
 
 
 def test_a_cutlass_grouped_gemm_is_sized_by_its_shapes_and_an_unknown_call_is_unsized():
@@ -744,7 +745,7 @@ def test_a_mamba_layer_lowers_its_template_scan_for_each_gpu_it_takes(generation
     """A Mamba layer, its selective scan the template's and its launches settled as the trainer settles
     them, lowers on this CPU for each GPU the template takes it on (an A100's and an H100's), forward and
     backward each a Mosaic GPU launch."""
-    from dew.training._lowering import kernel_calls
+    from dew.nn.kernels.lowered import kernel_calls
 
     names = {call.name for call in kernel_calls(_mamba1_lowered(generation_name))
              if call.kind == "mosaic_gpu"}
@@ -835,7 +836,7 @@ Operation = tuple[str, str, tuple, tuple]
 
 def _operations(lowered: jax.stages.Lowered) -> list[Operation]:
     """Every operation of a lowered program in program order (its StableHLO module's walk, as
-    `dew.training._lowering.triton_calls` reads it)."""
+    `dew.nn.kernels.lowered.triton_calls` reads it)."""
     from jax.extend.mlir import ir
 
     found: list[Operation] = []
@@ -1441,8 +1442,8 @@ def test_a_kernel_report_states_the_share_of_its_launches_tile_grids_their_tails
     import tokamax
 
     from dew.nn.kernels import grouped_matmul
+    from dew.nn.kernels.lowered import KernelCall
     from dew.nn.kernels.templates import attention_mosaic, attention_mosaic_program, report
-    from dew.training._lowering import KernelCall
 
     def spec(*shape):
         return jax.ShapeDtypeStruct(shape, jnp.bfloat16)

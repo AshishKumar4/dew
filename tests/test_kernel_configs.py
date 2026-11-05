@@ -858,7 +858,7 @@ def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():
     (`kernel_modules`), two binaries (`reports`) or two PTX modules (`write_modules`) of one raise."""
     from kernel_compile import PTX_MODULE, kernel_modules, reports, write_modules
 
-    from dew.training._lowering import KernelCall
+    from dew.nn.kernels.lowered import KernelCall
 
     calls = [KernelCall("mosaic_gpu", "k", b"", module, None, "0123456789") for module in ("aa", "bb")]
     assert kernel_modules(calls[:1]) == {"k__l0123456789": "aa"}

@@ -347,7 +347,7 @@ def test_a_launchs_backward_kernel_carries_its_launch():
     backward's tokens down (row 3851)."""
     from kernel_compile import lowered_for
 
-    from dew.training._lowering import kernel_calls
+    from dew.nn.kernels.lowered import kernel_calls
 
     rows, length, channels, states = 1, 2048, 256, 16
     operands = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (
@@ -421,8 +421,8 @@ def test_the_forwards_shared_memory_is_what_mosaic_allocates(packed):
     counted for an A100's family, whose walks scope their streams (row 3854, 3859)."""
     from kernel_compile import SHARED, _estimates, _printed, lowered_for
 
+    from dew.nn.kernels.lowered import kernel_calls
     from dew.nn.kernels.templates import resources
-    from dew.training._lowering import kernel_calls
 
     length, states = 2048, 16
     operands = (jax.ShapeDtypeStruct((1, length, 256), jnp.bfloat16),) * 2 + (

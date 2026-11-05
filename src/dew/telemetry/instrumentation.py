@@ -710,7 +710,7 @@ def _counted_trips(loop: _Instruction, caller: _Computation,
 def counted_trips(start: int, bound: int, step: int, bits: int, *, signed: bool) -> float:
     """The trips of a loop that counts an integer of `bits` bits (`signed` or not) from `start` by `step`
     while it is below `bound`: the one rule an executable's loop (`_counted_trips`) and a lowered program's
-    (`dew.training._lowering._trips`) are both read by. Infinite for a step that is not positive, and for a
+    (`dew.nn.kernels.lowered._trips`) are both read by. Infinite for a step that is not positive, and for a
     last step that overflows the counter's type, since a wrapped counter need never reach the bound."""
     if step <= 0:
         return math.inf

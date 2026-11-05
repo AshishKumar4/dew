@@ -1,5 +1,5 @@
 """A register liveness pass over a Mosaic GPU kernel's lowered module (the module bytes its custom call
-carries, `dew.training._lowering.KernelCall.ir`): the most 32-bit registers a thread holds live at once, over
+carries, `dew.nn.kernels.lowered.KernelCall.ir`): the most 32-bit registers a thread holds live at once, over
 structured control flow. Values are tracked as the 32-bit registers they occupy (atoms): an op that computes
 makes new ones; one that only regroups (a cast between a warpgroup array and its threads' registers, a
 bitcast, an element taken from or put into a vector or struct, an MMA accumulating in place) names its
