@@ -456,9 +456,11 @@ class CausalTransformer(LinearProducts):
     (Dream-v0); False reads each position's own (LLaDA). The forward ignores it: it says how
     the checkpoint's logits line up, which `dew.diffusion.discrete.aligned` applies for the
     masked loss and the sampler alike."""
-    scan_layers: bool = False
-    """Runs of like layers under flax's scan; a decode step over resident weights scans a period's repeats as
-    one body too (`scan_groups(periodic=True)`), so its program grows with the period, not the depth."""
+    scan_layers: bool = True
+    """Runs of like layers under flax's scan, and a step over resident weights, training's or a decode
+    step's, a period's repeats as one body too (`scan_groups(periodic=True)`), so its program grows with
+    the period, not the depth (a hybrid's GDN x 3 + attention period scanned eight times where Qwen3.5-4B
+    unrolled its 32 layers); False runs the plain loop, a layer at a time."""
     bank_layers: int | None = None
     """The most layers one scanned run holds, which is also how many layers its
     parameter bank stacks. A longer run of like layers is split into
@@ -1811,11 +1813,12 @@ class CausalTransformer(LinearProducts):
                 raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
                                     f"by run holds whole runs; {list(banked)} arrived banked")
             groups = self.groups if span is None else spanned
-            # A decode step over resident weights scans by period; weights a step reads a layer at
-            # a time (banked, streamed from disk or in host memory) keep the runs their banks hold,
-            # and a layer that leaves what a later one reads (`_provides`) runs alone.
-            if decode and not (banked or self._provides or 'streaming' in self.variables
-                               or on_host(self.variables.get('params', {}))):
+            # A step over resident weights, training's or a decode step's, scans by period, its program
+            # one period's body however deep the stack; weights a step reads a layer at a time (banked,
+            # streamed from disk or in host memory) keep the runs their banks hold, and a layer that
+            # leaves what a later one reads (`_provides`) runs alone.
+            if not (banked or self._provides or 'streaming' in self.variables
+                    or on_host(self.variables.get('params', {}))):
                 keys = self.scan_keys[first:end]
                 groups = tuple((first + start, count) for start, count in scan_groups(keys, periodic=True))
             periods = tuple(run_period(self.scan_keys, start, count) for start, count in groups)
@@ -1915,18 +1918,23 @@ class CausalTransformer(LinearProducts):
         A scan carries one dtype through, and each pipeline stage takes the
         dtype the stage before returns. Under a bf16 policy the dense
         feed-forward returns fp32, so the loops use fp32 from the start. The
-        first layer runs abstractly in its own scope (no cache, nothing sown,
-        a placeholder 'params' key, which flax draws any other stream from),
-        and a banked store answers from its first bank's first row without
-        fetching it.
+        first layer runs abstractly in its own scope (a placeholder 'params'
+        key, which flax draws any other stream from), with the collections the
+        call opened open and no other, so it takes the call's own path: opened
+        beyond them, an attention sowing its QK-Clip maxima decided a kernel
+        for a mask the call never builds (a cache made under a chosen template
+        refused, row 4101). A banked store answers from its first bank's first
+        row without fetching it.
         """
         layer = self.layers[0]
         streams = x.streams if isinstance(x, Carried) else x
+        opened = self.scope.mutable
         output = jax.eval_shape(lambda held: layer.apply(
-            held, x, mutable=True, rngs={'params': jax.random.key(0)},
+            held, x, mutable=opened, rngs={'params': jax.random.key(0)},
             train=train, decode=decode, kv_store={} if self._provides else None,
             per_layer_input=None if per_layer_input is None else per_layer_input.layer(0),
-            attention_metadata=attention_metadata)[0], self.first_layer_shapes())
+            attention_metadata=attention_metadata), self.first_layer_shapes())
+        output = output if opened is False else output[0]
         output = output.streams if isinstance(output, Carried) else output
         return jnp.result_type(streams.dtype, output.dtype)
 
@@ -2236,9 +2244,10 @@ class CausalTransformer(LinearProducts):
         return self.clone(dex=extension)
 
     @nn.nowrap
-    def with_scanned_layers(self) -> Self:
-        """This decoder running its like and periodic runs under the scan (`scan_layers`)."""
-        return self.clone(scan_layers=True)
+    def with_scanned_layers(self, scanned: bool = True) -> Self:
+        """This decoder running its like and periodic runs under the scan (`scan_layers`), or with
+        `scanned` False the plain loop."""
+        return self.clone(scan_layers=scanned)
 
     @nn.nowrap
     def reads_progress(self) -> bool:
