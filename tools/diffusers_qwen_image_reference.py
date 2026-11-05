@@ -1,11 +1,13 @@
-"""Actual Qwen-Image 2.1 objects from Diffusers 6256aa76, saved and walked, for tests/fixtures.
+"""Actual Qwen-Image 2.1 objects from Diffusers 6256aa76, saved, and walked over check 1's seeds, for
+tests/fixtures.
 
 Two halves. The transformer half constructs tiny `QwenImage21Transformer2DModel`
 instances, saves each with `save_pretrained`, and runs each the way
 `QwenImage21Pipeline` runs it for text-to-image: packed latents, one token per
 latent position; the prompt states; the timestep divided by a thousand; the
-`img_mask` with one image slot per 2x2 group of target tokens appended. It
-records the prediction at the image's tokens and, against a fixed cotangent,
+`img_mask` with one image slot per 2x2 group of target tokens appended
+(`walked`). Over drawn latents, prompt states and cotangents
+(tests/qwen_image_draws.py) it records the prediction at the image's tokens and
 the gradients of the latent, the prompt states and every parameter,
 unmodified, in float32, the reference, and in float64, the truth: on the
 model's float64 twin (`torch_precision.float64_twin`, its rotary and
@@ -20,13 +22,19 @@ of a separate call and the parameter gradients are summed over the calls.
 The pipeline half saves one tiny `QwenImage21Pipeline` - a Qwen3-VL text
 encoder, the 2.1 VAE, the transformer, the published scheduler config and a
 processor over a byte-level vocabulary carrying the published special tokens
-and chat template - and walks the unmodified pipeline once per prompt from
-fixed latents, recording the prompt states, the walked latents and the
-decoded images, in float32 and, each component its float64 twin and the
+and chat template - and, over drawn prompts and latents, records each
+prompt's states alone (`encoded`) and the unmodified pipeline's walk of each
+from its latents, the walked latents and the decoded images
+(`pipeline_walked`), in float32 and, each component its float64 twin and the
 scheduler's own tables widened, in float64.
 
-Run in the isolated reference environment on CPU (torch 2.14.0, transformers
-5.17.0, diffusers at 6256aa7666cedd47443adc8f82da9a10e110b09c):
+Each site is recorded over check 1's seeds by `recorded_references.record_case`
+in summary mode (`SEEDED`): the count its evidence resolves and each seed's
+evidence and truth sketch, which the test's own float64 path is held to.
+
+Run on CPU in Dew's environment (torch 2.14.0, transformers 5.17.0) with
+diffusers at 6256aa7666cedd47443adc8f82da9a10e110b09c ahead on the path, and
+tools/ and tests/ on it (the recording sizes its seeds with check 1's own):
 
     python tools/diffusers_qwen_image_reference.py OUTPUT_DIR
     python tools/diffusers_qwen_image_reference.py bundle OUTPUT_DIR tests/fixtures/qwen_image_source.tar.xz
@@ -94,9 +102,41 @@ def transformer_call(model, packed, context, times, grid, mask=None):
     return output[:, -rows * columns:]
 
 
-def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
-    """The case's saved transformer and its walk in float32 and, on its float64 twin, in float64
-    (`fp64.`)."""
+SEEDED = ROOT / "tests" / "fixtures" / "qwen_image_seeds.npz"
+"""Check 1's recordings over seeds (`record_seeds`): each case's walk and the pipeline's, a summary each,
+over tests/qwen_image_draws.py's draws."""
+
+
+def walked(model, case: Case, inputs: dict[str, np.ndarray], dtype) -> dict[str, np.ndarray]:
+    """The source's walk of a case at `dtype`: each row its own call for its prompt alone, its output, and
+    against the cotangent `probe` the gradients of its latent, its prompt states (zero past its length)
+    and every parameter, summed over the rows."""
+    packed, context, probe = (torch.from_numpy(np.asarray(inputs[key]))
+                              for key in ("packed", "context", "probe"))
+    times = torch.tensor(case.times, dtype=torch.float32)
+    tokens = context.shape[1]
+    named = list(model.named_parameters())
+    outputs, grad_packed, grad_context = [], [], []
+    grad_params = [torch.zeros_like(value) for _, value in named]
+    for row, length in enumerate(case.lengths):
+        latent = packed[row:row + 1].to(dtype).requires_grad_(True)
+        text = context[row:row + 1, :length].to(dtype).requires_grad_(True)
+        output = transformer_call(model, latent, text, times[row:row + 1].to(dtype), case.grid)
+        gradients = torch.autograd.grad((output * probe[row:row + 1].to(dtype)).sum(),
+                                        [latent, text] + [value for _, value in named])
+        outputs.append(output.detach())
+        grad_packed.append(gradients[0])
+        grad_context.append(torch.nn.functional.pad(gradients[1], (0, 0, 0, tokens - length)))
+        for index, gradient in enumerate(gradients[2:]):
+            grad_params[index] += gradient
+    return {"output": torch.cat(outputs).numpy(), "grad_packed": torch.cat(grad_packed).numpy(),
+            "grad_context": torch.cat(grad_context).numpy(),
+            **{f"grad_param.{key}": gradient.numpy()
+               for (key, _), gradient in zip(named, grad_params, strict=True)}}
+
+
+def build(name: str, case: Case, root: Path):
+    """The case's saved transformer, its float32 model as saved."""
     from diffusers import QwenImage21Transformer2DModel
 
     config = {**BASE, **case.config}
@@ -108,45 +148,8 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.add_(torch.randn(parameter.shape, generator=generator) * 0.05)
-    directory = root / name / "transformer"
-    model.save_pretrained(directory, safe_serialization=True)
-    rows, columns = case.grid
-    batch, tokens = len(case.lengths), max(case.lengths)
-    packed = torch.randn((batch, rows * columns, config["in_channels"]), generator=generator)
-    context = torch.randn((batch, tokens, config["context_in_dim"]), generator=generator)
-    mask = torch.arange(tokens)[None] < torch.tensor(case.lengths)[:, None]
-    context = context * mask[..., None]
-    times = torch.tensor(case.times, dtype=torch.float32)
-    probe = torch.randn((batch, rows * columns, config["out_channels"]), generator=generator)
-
-    def walk(model, dtype) -> dict[str, np.ndarray]:
-        named = list(model.named_parameters())
-        outputs, grad_packed, grad_context = [], [], []
-        grad_params = [torch.zeros_like(value) for _, value in named]
-        for row, length in enumerate(case.lengths):
-            latent = packed[row:row + 1].to(dtype).requires_grad_(True)
-            text = context[row:row + 1, :length].to(dtype).requires_grad_(True)
-            output = transformer_call(model, latent, text, times[row:row + 1].to(dtype), case.grid)
-            gradients = torch.autograd.grad((output * probe[row:row + 1].to(dtype)).sum(),
-                                            [latent, text] + [value for _, value in named])
-            outputs.append(output.detach())
-            grad_packed.append(gradients[0])
-            grad_context.append(torch.nn.functional.pad(gradients[1], (0, 0, 0, tokens - length)))
-            for index, gradient in enumerate(gradients[2:]):
-                grad_params[index] += gradient
-        return {"output": torch.cat(outputs).numpy(), "grad_packed": torch.cat(grad_packed).numpy(),
-                "grad_context": torch.cat(grad_context).numpy(),
-                **{f"grad_param.{key}": gradient.numpy()
-                   for (key, _), gradient in zip(named, grad_params, strict=True)}}
-
-    narrow = walk(model, torch.float32)
-    with float64():
-        wide = walk(float64_twin(model), torch.float64)
-    print(f"{name}: grid {case.grid} lengths {case.lengths} "
-          f"|output| <= {float(np.abs(narrow['output']).max()):.4g}")
-    return {"packed": packed.numpy(), "context": context.numpy(), "mask": mask.numpy(),
-            "times": times.numpy(), "probe": probe.numpy(), **narrow,
-            **{f"fp64.{key}": value for key, value in wide.items()}}
+    model.save_pretrained(root / name / "transformer", safe_serialization=True)
+    return model
 
 
 # The pipeline half.
@@ -226,47 +229,76 @@ def build_pipeline(root: Path):
     return saved_pipeline(pipe, directory, HEIGHT, WIDTH)
 
 
-def pipeline_record(root: Path) -> dict[str, np.ndarray]:
-    """The prompt states each prompt encodes to, and the unmodified call's walk from fixed latents:
-    the latents it ends on and the images it decodes; in float32 and, each component its float64 twin
-    (`float64_twin`) and the flow-matching scheduler's tables widened (`float64_scheduler`), in
-    float64."""
+def encoded(pipe, inputs: dict[str, np.ndarray], dtype) -> dict[str, np.ndarray]:
+    """The prompt states each drawn prompt encodes to alone (`encode_prompt`); `dtype` the pipeline's."""
+    from qwen_image_draws import prompts_of
+
+    del dtype
+    arrays = {}
+    for row, prompt in enumerate(prompts_of(inputs)):
+        with torch.no_grad():
+            embeds, mask, slots = pipe.encode_prompt(prompt=prompt, device=torch.device("cpu"))
+        assert mask is None and not bool(slots.any())
+        arrays[f"context.{row}"] = embeds.numpy()[0]
+    return arrays
+
+
+def pipeline_walked(pipe, inputs: dict[str, np.ndarray], dtype) -> dict[str, np.ndarray]:
+    """The source's call for each drawn prompt alone at `dtype`, from the drawn latents: the latents it
+    ends on and the images it decodes."""
+    from qwen_image_draws import prompts_of
+
+    latents = torch.from_numpy(np.asarray(inputs["x_T"]))
+    arrays = {}
+    for row, prompt in enumerate(prompts_of(inputs)):
+        start = latents[row:row + 1].to(dtype)
+        with torch.no_grad():
+            walked = pipe(prompt=prompt, height=HEIGHT, width=WIDTH, latents=start.clone(),
+                          output_type="latent").images
+            images = pipe(prompt=prompt, height=HEIGHT, width=WIDTH, latents=start.clone(),
+                          output_type="np").images
+        arrays[f"latents.{row}"] = walked.numpy()[0]
+        arrays[f"images.{row}"] = images[0]
+    return arrays
+
+
+def record_seeds(record: dict, models: dict[str, object], pipe) -> dict[str, np.ndarray]:
+    """Check 1's recordings over seeds, summarized (`record_case`), over tests/qwen_image_draws.py's draws
+    of the fixture's `record`: each case's walk (`walked`), the prompts' encoding (`encoded`) and the
+    pipeline's walk (`pipeline_walked`), in
+    float32, the reference, and on the float64 twin (`float64_twin`, the pipeline's scheduler tables
+    widened by `float64_scheduler`), the truth whose sketch the test's own float64 path is held to."""
     from diffusers.schedulers import scheduling_flow_match_euler_discrete
     from diffusers_wan_reference import float64_scheduler
+    from qwen_image_draws import case_draw, pipeline_draw
+    from recorded_references import record_case
 
-    pipe = build_pipeline(root)
-    rows, columns = HEIGHT // 16, WIDTH // 16
-    generator = torch.Generator().manual_seed(SEED + 9)
-    latents = torch.randn((len(PROMPTS), rows * columns, PIPELINE["in_channels"]),
-                          generator=generator)
+    arrays: dict[str, np.ndarray] = {}
+    for name, case in CASES.items():
+        model = models[name]
+        twin = float64_twin(model)
 
-    def walk(pipe, dtype) -> dict[str, np.ndarray]:
-        arrays = {}
-        for row, prompt in enumerate(PROMPTS):
-            start = latents[row:row + 1].to(dtype)
-            with torch.no_grad():
-                embeds, mask, slots = pipe.encode_prompt(prompt=prompt, device=torch.device("cpu"))
-                walked = pipe(prompt=prompt, height=HEIGHT, width=WIDTH, latents=start.clone(),
-                              output_type="latent").images
-                images = pipe(prompt=prompt, height=HEIGHT, width=WIDTH, latents=start.clone(),
-                              output_type="np").images
-            assert mask is None and not bool(slots.any())
-            arrays[f"context.{row}"] = embeds.numpy()
-            arrays[f"latents.{row}"] = walked.numpy()
-            arrays[f"images.{row}"] = images
-        return arrays
+        def evaluate(inputs, model=model, twin=twin, case=case):
+            narrow = walked(model, case, inputs, torch.float32)
+            with float64():
+                return narrow, walked(twin, case, inputs, torch.float64)
 
-    narrow = walk(pipe, torch.float32)
+        arrays.update(record_case(f"{name} walk", case_draw(record, name), evaluate, store_inputs=False,
+                                  summary=True))
     twin = copy.deepcopy(pipe)
-    for name, component in pipe.components.items():
+    for component_name, component in pipe.components.items():
         if isinstance(component, torch.nn.Module):
-            setattr(twin, name, float64_twin(component))
-    with float64(), float64_scheduler(scheduling_flow_match_euler_discrete):
-        wide = walk(twin, torch.float64)
-    print(f"pipeline: context {narrow['context.0'].shape} latents {narrow['latents.0'].shape} "
-          f"images {narrow['images.0'].shape}")
-    return {"pipeline.x_T": latents.numpy(), **{f"pipeline.{key}": value for key, value in narrow.items()},
-            **{f"pipeline.fp64.{key}": value for key, value in wide.items()}}
+            setattr(twin, component_name, float64_twin(component))
+
+    for site, run in (("prompt encoding", encoded), ("pipeline walk", pipeline_walked)):
+        def evaluate_pipeline(inputs, run=run):
+            narrow = run(pipe, inputs, torch.float32)
+            with float64(), float64_scheduler(scheduling_flow_match_euler_discrete):
+                return narrow, run(twin, inputs, torch.float64)
+
+        arrays.update(record_case(site, pipeline_draw(record), evaluate_pipeline, store_inputs=False,
+                                  summary=True))
+    return arrays
 
 
 def main(destination: str) -> None:
@@ -275,25 +307,28 @@ def main(destination: str) -> None:
     import diffusers
     import transformers
     from diffusers import QwenImage21Pipeline
+    from recorded_references import provenance, save
 
     root = recording(destination, "qwen-image")
-    arrays: dict[str, np.ndarray] = {}
-    cases: dict[str, dict[str, object]] = {}
-    for name, case in CASES.items():
-        arrays.update({f"{name}.{key}": value for key, value in build(name, case, root).items()})
-        cases[name] = {"config": {**BASE, **case.config}, "grid": list(case.grid),
-                       "lengths": list(case.lengths), "times": list(case.times)}
-    arrays.update(pipeline_record(root))
+    models = {name: build(name, case, root) for name, case in CASES.items()}
+    pipe = build_pipeline(root)
     defaults = inspect.signature(QwenImage21Pipeline.__call__).parameters
     record = {"diffusers": diffusers.__version__, "diffusers_commit": DIFFUSERS_COMMIT,
               "transformers": transformers.__version__, "torch": torch.__version__,
-              "base": BASE, "cases": cases,
+              "base": BASE,
+              "cases": {name: {"config": {**BASE, **case.config}, "grid": list(case.grid),
+                               "lengths": list(case.lengths), "times": list(case.times)}
+                        for name, case in CASES.items()},
               "pipeline": {"config": PIPELINE, "vae": VAE, "prompts": PROMPTS,
                            "height": HEIGHT, "width": WIDTH,
                            "default_steps": defaults["num_inference_steps"].default,
                            "true_cfg": defaults["true_cfg_scale"].default}}
-    np.savez_compressed(root / "qwen_image.npz", **arrays)
     (root / "qwen_image.json").write_text(json.dumps(record, indent=1) + "\n")
+    command = f"python tools/diffusers_qwen_image_reference.py {destination}"
+    save(SEEDED, {**record_seeds(record, models, pipe),
+                  "provenance": provenance("diffusers", diffusers.__version__, "cpu", command,
+                                           torch=torch.__version__, commit=DIFFUSERS_COMMIT)},
+         reference=f"huggingface/diffusers {DIFFUSERS_COMMIT}", license="Apache-2.0")
     size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
     print(f"{root}: {size / 1e6:.2f} MB, {len(CASES)} cases")
 
