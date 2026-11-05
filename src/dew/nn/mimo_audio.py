@@ -21,6 +21,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
 from dew.batch import Variables, coordinates
+from dew.interop.decoder_parts import folder_name
 from dew.interop.unread import Stored, held
 from dew.interop.weights import Tree, checkpoint_dtype, insert, placed
 from dew.nn.conv import Conv
@@ -118,16 +119,12 @@ class MiMoAudio(TowerBase):
         its valid frames `mask` `[clips, frames]`: the frames cut into segments of `audio_segment_size`,
         each convolved and pooled to its codes (`AudioTokenizerEncoder`), a clip's codes in groups of
         `group_size`, as many places as a clip of every frame valid fills."""
-        cfg, size = self.tokenizer, self.audio_segment_size
-
-        def codes(frames):
-            convolved = (frames + 3 - cfg.kernel_size + 2 - cfg.kernel_size) // cfg.stride_size + 1
-            return np.where(frames > 0, -(-convolved // cfg.avg_pooler), 0)
-
+        size = self.audio_segment_size
+        whole = tower_counts(np.asarray(size), self.tokenizer)[1]
         valid = np.sum(mask, axis=1)
-        counts = valid // size * codes(np.asarray(size)) + codes(valid % size)
-        groups = -(-counts // self.group_size)
-        capacity = -(-(-(-mask.shape[1] // size) * codes(np.asarray(size))) // self.group_size)
+        codes = valid // size * whole + tower_counts(valid % size, self.tokenizer)[1]
+        groups = grouped(codes, self.group_size)
+        capacity = grouped(-(-mask.shape[1] // size) * whole, self.group_size)
         return np.arange(capacity)[None, :] < groups[:, None]
 
 
@@ -160,10 +157,8 @@ class AudioTokenizerEncoder(nn.Module):
         x = gelu_exact(conv((cfg.kernel_size,), strides=(cfg.stride_size,), padding=((1, 1),),
                             name="conv2")(x))
 
-        def convolved(frames):
-            return (frames + 3 - cfg.kernel_size + 2 - cfg.kernel_size) // cfg.stride_size + 1
-
-        counts, widest = convolved(lengths), convolved(jnp.broadcast_to(batch_lengths, lengths.shape))
+        (counts, codes), widest = (tower_counts(lengths, cfg),
+                                   tower_counts(jnp.broadcast_to(batch_lengths, lengths.shape), cfg)[0])
         valid = jnp.arange(x.shape[1])[None, :] < counts[:, None]
         heads = cfg.encoder_attention_heads
         skip = None
@@ -203,8 +198,7 @@ class AudioTokenizerEncoder(nn.Module):
             x = gelu_exact(conv((pool,), strides=(pool,), padding="VALID", use_bias=False,
                                 name="down_sample_layer")(x))
             x = LayerNorm(epsilon=1e-5, dtype=self.dtype, name="down_sample_norm")(x)
-            counts = -(-counts // pool)
-        return x, jnp.arange(x.shape[1])[None, :] < counts[:, None]
+        return x, jnp.arange(x.shape[1])[None, :] < codes[:, None]
 
 
 class ResidualQuantizer(nn.Module):
@@ -236,7 +230,7 @@ class MiMoAudioCodeEncoder(nn.Module):
     def __call__(self, codes, counts):
         cfg = self.config
         batch, frames, _ = codes.shape
-        groups = -(-frames // cfg.group_size)
+        groups = grouped(frames, cfg.group_size)
         codes = jnp.pad(codes, ((0, 0), (0, groups * cfg.group_size - frames), (0, 0)))
         last = jnp.take_along_axis(codes, jnp.maximum(counts - 1, 0)[:, None, None], axis=1)
         place = jnp.arange(codes.shape[1])[None, :, None]
@@ -304,8 +298,26 @@ class MiMoAudioTower(nn.Module):
         counts = jnp.sum(valid.reshape(clips, -1), axis=1)
         features = MiMoAudioCodeEncoder(cfg, dtype=self.dtype, precision=self.precision, name="encoder")(
             codes, counts)
-        groups = -(-counts // cfg.group_size)
+        groups = grouped(counts, cfg.group_size)
         return AudioEncoding(features, jnp.arange(features.shape[1])[None, :] < groups[:, None])
+
+
+def tower_counts(frames, tokenizer: MiMoAudioTokenizer):
+    """The tokens a segment of `frames` mel frames (an integer or an integer array, on the host or traced)
+    holds at each stage of the audio tokenizer's encoder: its two convolutions' (`AudioTokenizerEncoder`'s
+    conv1 and its strided conv2), then its pooling's by `avg_pooler` rounding up, its codes. The one count
+    the tower's masks and the host's placement read (`MiMoAudio.encoded`). An empty segment, a clip's
+    padding, holds none at any stage, as the release tokenizes none (`batch_longest`), whatever count the
+    convolutions' arithmetic gives zero frames."""
+    kernel, stride = tokenizer.kernel_size, tokenizer.stride_size
+    convolved = (frames > 0) * ((frames + 3 - kernel + 2 - kernel) // stride + 1)
+    return convolved, -(-convolved // tokenizer.avg_pooler)
+
+
+def grouped(codes, group_size: int):
+    """A clip's encoded tokens of its `codes`: one a group of `group_size`, the last group short
+    (`MiMoAudioCodeEncoder`)."""
+    return -(-codes // group_size)
 
 
 def batch_longest(spans, config: MiMoAudio) -> jax.Array:
@@ -455,7 +467,7 @@ AUDIO_TOKENIZER = "audio_tokenizer"
 release's code loads beside the model (`MiMoV2ForCausalLM.load_audio_tokenizer`); a bundle's names hold
 its tensors under it (`dew.interop.decoder_parts.folder_name`)."""
 
-_TOKENIZER_ENCODER = f"{AUDIO_TOKENIZER}/encoder."
+_TOKENIZER_ENCODER = folder_name(AUDIO_TOKENIZER, "encoder.")
 """The tokenizer's encoder in a bundle's names: the half its MiMoAudioTokenizer holds."""
 
 _STATISTICS = ("inited", "cluster_size", "embed_avg")

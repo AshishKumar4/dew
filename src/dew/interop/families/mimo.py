@@ -63,7 +63,7 @@ from dew.interop.decoder_parts import (
 from dew.interop.families.deepseek import deepseek_layout, deepseek_mixture
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
-from dew.nn.mimo_audio import translate_mimo_audio_config
+from dew.nn.mimo_audio import AUDIO_TOKENIZER, translate_mimo_audio_config
 from dew.nn.mixers.mlp import MLPMixer
 from dew.nn.vision.mimo import translate_mimo_projector_config, translate_mimo_vision_config
 
@@ -276,9 +276,7 @@ _V2_FIELDS = ('swa_num_attention_heads', 'swa_num_key_value_heads', 'swa_head_di
               'add_swa_attention_sink_bias', 'attention_projection_layout', 'attention_value_scale',
               'v_head_dim', 'partial_rotary_factor', 'rope_parameters', 'rope_theta', 'norm_topk_prob',
               'scoring_func', 'topk_method', 'attention_dropout')
-_AUDIO_TOKENIZER = 'audio_tokenizer'
-"""The folder a MiMo-V2.6 release keeps its audio tokenizer in, its own config and weights, which the
-release's code loads beside the model (`MiMoV2ForCausalLM.load_audio_tokenizer`)."""
+_AUDIO_TOKENIZER = AUDIO_TOKENIZER
 
 _V2_UNREAD = ('attention_chunk_size', 'moe_router_dtype', 'audio_config', 'vision_config', 'processor_config',
               'vision_model_type', 'audio_token_id', 'audio_start_token_id', 'audio_end_token_id',
