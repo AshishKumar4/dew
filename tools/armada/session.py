@@ -1,6 +1,6 @@
 """A CI task's pytest session, as the plan (ci.py) and the plugins a task loads into it (split.py,
 executed.py) share it: the one contract of how pytest is run and what it sees (`pytest_run`, `selected`,
-`pytest_command`, `pytest_environment`), the part of the environment a test's results
+`pytest_command`, `pytest_environment`, `lane_environment`), the part of the environment a test's results
 depend on (`keyed_environment`), how long it runs (`DEADLINE`, `GRACE`), which tests take another path on a
 GPU (`MARKS`), and how a split file's tests are cut (`cut`, `groups`), those of one shared setup together
 (`SHARED_SETUP`). What it decides changes a task's outcome, so the test cache keys every file's record on it
@@ -99,6 +99,18 @@ def pytest_environment(environ: Mapping[str, str], hub_open: bool = False) -> di
     held = {**os.environ, **environ, **({} if hub_open else CLOSED_HUB), "PYTHONPATH": path}
     return {name: value for name, value in held.items()
             if name not in STEERING and not (hub_open and name in CLOSED_HUB)}
+
+
+def lane_environment(share: float, total: float, budget: float, threads: int) -> dict[str, str]:
+    """What a GPU lane's file runs under beside the session's: its `share` of the GPU's `total` bytes as XLA's
+    pool, taken at its first op where it is a part of the lane's `budget`, grown as it is used where it holds
+    the whole of it (a file given the whole share has children the lane did not follow, which have what it
+    has not yet taken), and `threads` for torch's and OpenMP's small ops, which on all of a node's CPUs ran
+    13 times slower than on 4 (test_gemma3n's gradient reference on an A100 node, 1175 s against armada's
+    326 s)."""
+    return {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(share / total),
+            "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if share >= budget else "true",
+            "OMP_NUM_THREADS": str(threads)}
 
 
 SHARDS = {"check1_shards": "seeds", "shards": "units"}
