@@ -14,8 +14,9 @@ attention eager (`eager_attention`, the vision config's `_attn_implementation`).
 precision policy: the position table's interpolation (`get_rope_shape`) runs eagerly, not through
 `torch.compile`; and the float64 twin, built and run inside `torch_precision.float64`, reads its rotary
 table as the complex128 its widened arange makes, where the release asserts complex64
-(`_apply_rope_input_validation`), and its attention's `torch.softmax(..., dtype=torch.float32)` in
-float64.
+(`_apply_rope_input_validation`), its attention's `torch.softmax(..., dtype=torch.float32)` in float64,
+and its RMS norms at the epsilon the float32 run's take (`RMSNorm(eps=None)`, float32's, which a float64
+input would take as float64's), so the twin computes the float32 run's function.
 """
 
 from __future__ import annotations
@@ -121,6 +122,10 @@ def main() -> None:
     narrow = models(release, torch.float32)
     with float64(), twin_policy(release):
         wide = models(release, torch.float64)
+    # The float32 run's RMS norms' epsilon, which `eps=None` resolves by its input's dtype.
+    for module in wide[0].modules():
+        if isinstance(module, torch.nn.RMSNorm) and module.eps is None:
+            module.eps = torch.finfo(torch.float32).eps
 
     def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         out = {}

@@ -785,11 +785,18 @@ def language_model_names(names: Collection[str], read: Callable[[str], Stored], 
     name of it (`wrapper_route`). The media towers' names are not among them, nor read, nor a bundle's
     decoder tensors that serve its media alone (`DecoderFamily.wrapper_media_suffixes`): only the
     language model's spellings of one tensor are compared."""
+    own = [name for name in names if language_reads(name, record)]
+    return _wrapper_sources(own, read, record, checked)[0]["language_model"]
+
+
+def language_reads(name: str, record: WrapperFields) -> bool:
+    """Whether a wrapper's language model reads its tensor `name`: one it routes to the language model
+    (`wrapper_route`) that serves no media alone (a bundle's `DecoderFamily.wrapper_media_suffixes`). The
+    one owner of that line, which a wrapper's language model reads by (`language_model_names`) and a
+    bundle's language model alone keeps the rest by (`bundle_media`)."""
     bundled = _bundled(record["model_type"])
     media = () if bundled is None else bundled.wrapper_media_suffixes
-    own = [name for name in names if wrapper_route(name, record)[0] == "language_model"
-           and not name.endswith(media)]
-    return _wrapper_sources(own, read, record, checked)[0]["language_model"]
+    return wrapper_route(name, record)[0] == "language_model" and not name.endswith(media)
 
 
 def _text_aliases(names: Collection[str], read: Callable[[str], Stored], config,
@@ -1542,12 +1549,9 @@ def bundle_media(config: Mapping[str, object], names: Collection[str]) -> frozen
     """The tensors `names` of a media bundle (`bundles`) its language model does not read: its towers' and
     projectors' (`wrapper_route`) and its decoder's that serve its media alone
     (`DecoderFamily.wrapper_media_suffixes`), which a load of its language model alone retains by name
-    and writes back byte for byte."""
+    and writes back byte for byte: those its language model does not read (`language_reads`)."""
     record = translate_wrapper_config(config)
-    family = _bundled(_records.text(config["model_type"], "model_type"))
-    media = () if family is None else family.wrapper_media_suffixes
-    return frozenset(name for name in names
-                     if wrapper_route(name, record)[0] != "language_model" or name.endswith(media))
+    return frozenset(name for name in names if not language_reads(name, record))
 
 
 def bundle_text_config(config: Mapping[str, object]) -> Mapping[str, object]:

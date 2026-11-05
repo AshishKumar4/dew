@@ -5,11 +5,13 @@ the dtype the tower computes in, unbiased maps, an attention wider than the towe
 `kimi-k3-vision` site (tools/kimi_k3_vision_worker.py) over kimi-k3-tiny's tower and projector. No model
 weights are downloaded at test time."""
 
+import dataclasses
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from reference_runs import assert_as_exact_as_recorded
 
 from dew.interop import Pretrained
@@ -39,7 +41,9 @@ _LOADED: dict[str, tuple[MultimodalTransformer, dict]] = {}
 def dew(dtype, inputs) -> dict[str, jax.Array]:
     """Dew's bundle at `dtype` (`Pretrained.load`, loaded once in float32 and widened), each item's
     projected merge blocks: its patches through the bundle's tower and projector, as a row's media
-    conditioning carries them (`VisionConditioner`)."""
+    conditioning carries them (`VisionConditioner`). Widened, its RMS norms keep the float32 run's
+    epsilon (`MoonViT.rms_eps`), as the release's twin does (tools/kimi_k3_vision_worker.py): the truth is
+    the function the float32 run computes."""
     name = jnp.dtype(dtype).name
     if name not in _LOADED:
         # Loaded where its weights stay concrete, though its first call traces (`recorded_dew`'s pattern).
@@ -50,7 +54,8 @@ def dew(dtype, inputs) -> dict[str, jax.Array]:
                 assert isinstance(source.model, MultimodalTransformer)
                 _LOADED["float32"] = source.model, source.variables
             model, variables = _LOADED["float32"]
-            _LOADED[name] = model.clone(dtype=jnp.dtype(name)), jax.tree.map(
+            vision = dataclasses.replace(model.vision, rms_eps=float(jnp.finfo(jnp.float32).eps))
+            _LOADED[name] = model.clone(dtype=jnp.dtype(name), vision=vision), jax.tree.map(
                 lambda leaf: jnp.asarray(leaf, name) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf,
                 variables)
     model, variables = _LOADED[name]
@@ -88,3 +93,23 @@ def test_a_kimi_k3_bundle_loads_whole_and_its_language_model_alone_on_request():
                                     jax.tree.leaves(alone.variables["params"]), strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs),
                                       err_msg=jax.tree_util.keystr(path))
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16", "float32", "float64"])
+def test_an_rms_norms_default_epsilon_is_the_one_torch_takes_in_each_dtype(dtype):
+    """An RMS norm stating no epsilon (K3's `RMSNorm(eps=None)`) takes the one torch's rms_norm takes for an
+    input of `dtype` (`compute_epsilon`): over inputs small enough that the epsilon dominates, torch's
+    norm at Dew's resolved epsilon is its norm at None, bit for bit, where its input dtype's own epsilon
+    differs for a half or bfloat16 input."""
+    import torch
+
+    from dew.nn.vision.vit import compute_epsilon
+
+    narrow = getattr(torch, dtype)
+    x = torch.full((2, 16), 2.0 ** -12, dtype=narrow)
+    x[1] = torch.linspace(-1, 1, 16, dtype=narrow) * 2.0 ** -10
+    taken = torch.nn.functional.rms_norm(x, (16,), eps=None)
+    resolved = torch.nn.functional.rms_norm(x, (16,), eps=compute_epsilon(None, jnp.dtype(dtype)))
+    assert torch.equal(taken, resolved)
+    own = torch.nn.functional.rms_norm(x, (16,), eps=torch.finfo(narrow).eps)
+    assert torch.equal(taken, own) == (dtype in ("float32", "float64"))

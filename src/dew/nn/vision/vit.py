@@ -138,8 +138,8 @@ class ViTLayout:
     the attention's maps, and `qk_norm` norms each head's queries and keys (an RMS norm at the layers'
     epsilon) before the rotary; under `scale_after_cast` every RMS norm weighs its normalized input after
     its cast back, as Llama's does. An RMS norm's epsilon None (`norm_eps`, `outer_norm_eps`) is the
-    machine epsilon of the dtype the tower computes in (`compute_epsilon`), as torch's RMSNorm(eps=None)
-    takes its input's (Kimi K3's MoonViT).
+    machine epsilon of the dtype it accumulates in (`compute_epsilon`), as torch's RMSNorm(eps=None)
+    takes it (Kimi K3's MoonViT).
     """
 
     depth: int
@@ -257,9 +257,13 @@ def resampled_positions(table, rows, columns, heights, widths, *, align_corners:
 
 
 def compute_epsilon(epsilon: float | None, dtype: Dtype | None) -> float:
-    """A norm's `epsilon`, or for None the machine epsilon of `dtype`, the dtype a tower computes in
-    (float32 without one), as torch's RMSNorm(eps=None) takes its input's (`ViTLayout`)."""
-    return float(jnp.finfo(jnp.float32 if dtype is None else dtype).eps) if epsilon is None else epsilon
+    """A norm's `epsilon`, or for None the machine epsilon of the dtype it accumulates in, `dtype` (the
+    tower's, float32 without one) at least float32: torch's rms_norm (2.8, layer_norm.cpp
+    `rms_norm_symint`) reads a half or bfloat16 input in float32 and takes float32's epsilon, a float64
+    input float64's (`ViTLayout`)."""
+    if epsilon is not None:
+        return epsilon
+    return float(jnp.finfo(jnp.promote_types(jnp.float32 if dtype is None else dtype, jnp.float32)).eps)
 
 
 def vit_block(layout: ViTLayout, index: int, *, dtype: Dtype | None,

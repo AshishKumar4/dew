@@ -41,9 +41,9 @@ class MoonViT(TowerBase):
     rotated in adjacent pairs by the patch grid, a column's pair then a row's (`Rope2DPosEmbRepeated`),
     and an ungated tanh-GELU feed-forward (`MLP2`); a norm after the blocks; then each merge block's
     patches averaged over the item's frames (`tpool_patch_merger`, `sd2_tpool`). K2.5's norms are layer
-    norms and its maps biased; K3 states RMS norms (`norm_type`), each at the epsilon of the dtype the
-    tower computes in, as torch's RMSNorm(eps=None) takes its input's, unbiased maps and a wider attention
-    (`qkv_hidden_size`).
+    norms and its maps biased; K3 states RMS norms (`norm_type`), each at `rms_eps`, by default (None) the
+    epsilon of the dtype it accumulates in as torch's RMSNorm(eps=None) takes it (float32's, float64's in
+    float64), unbiased maps and a wider attention (`qkv_hidden_size`).
     """
 
     vt_hidden_size: int = 1152
@@ -60,6 +60,7 @@ class MoonViT(TowerBase):
     linear_bias: bool = True
     patch_embed_proj_bias: bool = True
     norm_type: Literal["layernorm", "rmsnorm"] = "layernorm"
+    rms_eps: float | None = None
 
     def __post_init__(self):
         if self.pos_emb_interpolation_mode not in ("bicubic", "bilinear"):
@@ -72,8 +73,8 @@ class MoonViT(TowerBase):
         depth, heads = self.vt_num_hidden_layers, self.vt_num_attention_heads
         width = self.vt_hidden_size if self.qkv_hidden_size is None else self.qkv_hidden_size
         rms = self.norm_type == "rmsnorm"
-        # torch's LayerNorm at its default epsilon (K2.5), or its RMSNorm at the computing dtype's (K3).
-        eps = None if rms else 1e-5
+        # torch's LayerNorm at its default epsilon (K2.5), or its RMSNorm at its accumulating dtype's (K3).
+        eps = self.rms_eps if rms else 1e-5
         return ViTLayout(
             depth=depth, hidden_size=self.vt_hidden_size, num_heads=heads, num_kv_heads=heads,
             head_dim=head_width(width, heads), intermediate_size=self.vt_intermediate_size,
