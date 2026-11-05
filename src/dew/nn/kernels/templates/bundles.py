@@ -5,9 +5,10 @@ an execution policy: Hopper's warpgroup MMA's (`mosaic_sm90.WGMMA`, and its layo
 TMA rings (`MmaFed`); a launch names its bundle by the bundle's `name` (`named`). Blackwell's tcgen05, whose
 products accumulate in tensor memory, composes its issuer with the TMA rings (`mosaic_sm100.RINGS`), which a
 launch names; `of` gives it to sm100 and sm103 once the templates' persistent launches state their
-accumulators (`Transport.persist`'s `accumulators`). A device of a family with no bundle here (a TPU's) runs
-no Mosaic GPU mainloop: every template's Mosaic launch is ineligible there, and its call takes the next route
-by legality."""
+accumulators (`Transport.persist`'s `accumulators`). A TPU core's bundle composes the MXU's issuer with VMEM
+rings (`mosaic_tpu.MXU`), which runs the toolkit's persistent walk; `of` gives it to a TPU once the templates'
+launches run on it. Until then a TPU runs no shared mainloop: every template's Mosaic launch is ineligible
+there, and its call takes the next route by legality."""
 
 import dataclasses
 
