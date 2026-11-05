@@ -815,6 +815,11 @@ class CausalSelfAttention(nn.Module):
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL, train: bool = False):
         decode, kv_store, attention_metadata = call.decode, call.kv_store, call.metadata
+        # Wide logits are the reference attention's (`MixerContext.wide_logits`), which a cached call's and a
+        # local layer's kernels are not.
+        self.ctx.refuse("attention", {"wide_logits": self.ctx.wide_logits and (
+            decode or self._runs_local(attention_metadata, decode))},
+            "a cached call's and a local layer's kernels form their logits in the inputs' dtype")
         # The run's progress, the call's declared input (`dew.nn.progress`), None at its end.
         progress = None if attention_metadata is None else attention_metadata.progress
         B, S, _ = x.shape
@@ -988,6 +993,7 @@ class CausalSelfAttention(nn.Module):
         attention = checkpoint_name(scaled_dot_product_attention(
             query, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
             force_fp32_for_softmax=self.ctx.force_fp32_for_softmax, implementation=self.ctx.attention_impl,
+            wide_logits=self.ctx.wide_logits,
             key_value_seq_lengths=jnp.maximum(lengths, 1), segment_ids=queries, key_segment_ids=segments,
             max_segments=max_segments, sinks=self.sinks, softcap=self.ctx.attn_logit_softcap), 'context')
         B, S = query.shape[:2]
@@ -1286,8 +1292,9 @@ class CausalSelfAttention(nn.Module):
             return checkpoint_name(scaled_dot_product_attention(
                 query, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
                 force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
-                implementation=self.ctx.attention_impl, causal=causal, sliding_window=window,
-                mask=mask, bias=bias, sinks=sinks, softcap=self.ctx.attn_logit_softcap, segment_ids=documents,
+                implementation=self.ctx.attention_impl, wide_logits=self.ctx.wide_logits, causal=causal,
+                sliding_window=window, mask=mask, bias=bias, sinks=sinks, softcap=self.ctx.attn_logit_softcap,
+                segment_ids=documents,
                 block_groups=blocks, image_groups=images, key_valid=valid, key_runs=runs, places=held,
                 dropout_rate=self.ctx.attention_dropout_rate, dropout_rng=self.make_rng("dropout"),
                 deterministic=False), 'context')
@@ -1304,7 +1311,7 @@ class CausalSelfAttention(nn.Module):
             attention = checkpoint_name(scaled_dot_product_attention(
                 query, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
                 force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
-                implementation=implementation, causal=causal,
+                implementation=implementation, wide_logits=self.ctx.wide_logits, causal=causal,
                 sliding_window=window, mask=mask, bias=bias, sinks=sinks,
                 softcap=self.ctx.attn_logit_softcap, segment_ids=documents, max_segments=max_segments,
                 block_groups=blocks, image_groups=images, key_valid=valid, key_runs=runs, places=held),

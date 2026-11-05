@@ -439,6 +439,7 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
 
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  force_fp32_for_softmax=True, implementation: AttentionImpl = 'auto',
+                                 wide_logits: bool = False,
                                  causal=False, sliding_window=None, mask=None, bias=None,
                                  sinks=None, softcap=None, segment_ids=None, max_segments=None,
                                  key_value_seq_lengths=None, dropout_rate=0.0,
@@ -459,7 +460,10 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     the row index, so a decode step against a cache passes `mask` instead.
     `bias` is additive and broadcasts to [B, H, Q, K] (T5's position table).
     `sinks` is one learned value-free logit per query head in the denominator.
-    `softcap` is Gemma 2's tanh on the scaled logits. `segment_ids` `[B, S]`
+    `softcap` is Gemma 2's tanh on the scaled logits. `wide_logits` forms the
+    logits from queries and keys widened to at least fp32, scaled after the
+    product (`reference_attention`'s): the reference takes it and every other
+    kernel refuses it. `segment_ids` `[B, S]`
     keeps each packed document to itself, 0 as padding (`document_mask`), and
     `max_segments`, static, bounds the documents a row holds
     (`Coordinates.max_segments`), which flash's packed sequences need.
@@ -540,7 +544,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
-        softcap=softcap)
+        softcap=softcap, wide_logits=wide_logits)
     if shards > 1:
         out = sequence_parallel_attention(
             kernel, query, key, value, shards, causal=causal,
@@ -678,7 +682,8 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
                      softcap=None, segment_ids=None, max_segments=None, key_value_seq_lengths=None,
                      key_value_seq_starts=None, block_groups=None, image_groups=None, key_valid=None,
                      key_runs=None,
-                     places=None, dropout_rate=0.0, dropout_seed=None, dropout_places=None):
+                     places=None, dropout_rate=0.0, dropout_seed=None, dropout_places=None,
+                     wide_logits: bool = False):
     """Dispatch one whole-sequence attention call to the kernel it names,
     differentiable in forward mode under `forward_mode_attention`.
 
@@ -703,7 +708,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         return decode_attention.grouped_query(functools.partial(
             attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
             implementation=implementation, softcap=softcap, key_value_seq_lengths=key_value_seq_lengths,
-            key_value_seq_starts=key_value_seq_starts), query, key, value)
+            key_value_seq_starts=key_value_seq_starts, wide_logits=wide_logits), query, key, value)
     lengths = (None if key_value_seq_lengths is None
                else jnp.asarray(key_value_seq_lengths, jnp.int32))
     starts = None if key_value_seq_starts is None else jnp.asarray(key_value_seq_starts, jnp.int32)
@@ -721,7 +726,8 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
         segment_ids=segment_ids, max_segments=max_segments, lengths=lengths, starts=starts,
         block_groups=block_groups, image_groups=image_groups, key_valid=key_valid, key_runs=key_runs,
-        places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed, dropout_places=dropout_places)
+        places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed, dropout_places=dropout_places,
+        wide_logits=wide_logits)
     live = visible_rows(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids, lengths,
                         starts, block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
                         key_runs=key_runs,
@@ -779,7 +785,7 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
                       force_fp32_for_softmax, causal, sliding_window, mask, masked, softcap,
                       segment_ids, max_segments, lengths, starts, block_groups=None, image_groups=None,
                       key_valid=None, key_runs=None, places=None, dropout_rate=0.0, dropout_seed=None,
-                      dropout_places=None):
+                      dropout_places=None, wide_logits: bool = False):
     """Run one whole-sequence attention call on the kernel `attention_kernel` resolved.
 
     `masked` is `mask` with the key `lengths` and `starts` in it. Splash takes sinks, a
@@ -825,9 +831,12 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
             precision = jax.lax.Precision.HIGHEST
         return reference_attention(query, key, value, mask=mask, bias=bias, sinks=sinks, softcap=softcap,
                                    dtype=dtype, precision=precision,
-                                   force_fp32_for_softmax=force_fp32_for_softmax,
+                                   force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits,
                                    dropout_rate=dropout_rate, dropout_seed=dropout_seed,
                                    dropout_places=dropout_places)
+    if wide_logits:
+        raise ValueError(f"attention kernel {implementation!r} forms its logits in its inputs' dtype; wide "
+                         "logits (`wide_logits`) are the reference attention's")
 
     # The decode kernel and the template read key starts as their own spans; elsewhere they are the mask.
     if implementation not in ('decode', 'template'):

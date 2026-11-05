@@ -42,11 +42,13 @@ were drawn with)."""
 def _block(width: int, heads: int, tokens: int, name: str) -> DecoderBlock:
     """A pre-RMSNorm `DecoderBlock` of `width` features over `tokens` tokens: unrotated attention of `heads`
     biased heads (`nope`), each head's queries and keys RMS-normed, under the call's pairwise mask
-    (`AttentionMetadata.pairwise_mask`) in the reference implementation, whose logits are at least float32;
-    then a biased SwiGLU of four times the width (`GatedMLP`)."""
+    (`AttentionMetadata.pairwise_mask`) in the reference implementation, its logits formed in at least
+    float32 (`MixerContext.wide_logits`), as TSSM's blocks attend; then a biased SwiGLU of four times the
+    width (`GatedMLP`)."""
     attention = functools.partial(CausalSelfAttention, nope=True, ctx=MixerContext(
         emb_features=width, num_heads=heads, num_kv_heads=heads, head_dim=width // heads, max_seq_len=tokens,
-        causal=False, qk_norm=True, norm_eps=RMS_EPSILON, attention_bias=True, attention_impl="reference"))
+        causal=False, qk_norm=True, norm_eps=RMS_EPSILON, attention_bias=True, attention_impl="reference",
+        wide_logits=True))
     mlp = functools.partial(GatedMLP, hidden_features=4 * width, out_features=width, use_bias=True)
     return DecoderBlock(attention, mlp, width, BlockWiring(), norm_eps=RMS_EPSILON, name=name)
 
