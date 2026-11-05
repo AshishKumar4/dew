@@ -230,6 +230,58 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
                     f"cutlass {sizes}", seeds=SEEDS, truth_fn=with_gradients(projection("xla", jnp.float64)))
 
 
+def test_a_mapped_cutlass_call_runs_each_map_in_turn():
+    """CUTLASS's FFI calls (`grouped_matmul._cutlass_call`, the forward's and the kernel gradient's) mapped
+    (`jax.vmap`, the matrices mapped or shared) trace a sequential batching rule, each map one call in turn;
+    none was declared, and JAX's raised (row 4389). Traced, never run: the targets register on a GPU whose
+    dew-cutlass holds them."""
+    sizes = jnp.asarray([3, 5], jnp.int32)
+    xs, dys = jnp.zeros((2, 8, 16), jnp.bfloat16), jnp.zeros((2, 8, 32), jnp.bfloat16)
+    ws = jnp.zeros((2, 2, 16, 32), jnp.bfloat16)
+    forward = grouped_matmul._cutlass_call('dew_cutlass_grouped_gemm',
+                                           jax.ShapeDtypeStruct((8, 32), jnp.bfloat16))
+    gradient = grouped_matmul._cutlass_call('dew_cutlass_grouped_gemm_k',
+                                            jax.ShapeDtypeStruct((2, 16, 32), jnp.bfloat16))
+
+    def product(x, w):
+        return forward(x, w, sizes, transpose_w=False)
+
+    for mapped, args in ((jax.vmap(product), (xs, ws)), (jax.vmap(product, in_axes=(0, None)), (xs, ws[0])),
+                         (jax.vmap(lambda x, dy: gradient(x, dy, sizes)), (xs, dys))):
+        traced = str(jax.make_jaxpr(mapped)(*args))
+        assert "dew_cutlass_grouped_gemm" in traced and ("scan" in traced or "while" in traced), traced[-300:]
+
+
+def cutlass_runs_a_mapped_projection_as_exactly_as_xla_where_chosen(shared):
+    """Where the installed dew-cutlass holds this GPU's kernels, a projection mapped over a batch of two
+    (`jax.vmap`: each its rows and cotangent, and its matrices unless `shared`), its forward and both
+    gradients through CUTLASS's launches chosen by name, each map one launch in turn (their FFI calls'
+    sequential batching, row 4389), are as exact as XLA's ragged dot mapped, from float64."""
+    here = generation.gpu_target().generation
+    if here not in grouped_matmul.cutlass_architectures():
+        pytest.skip(f"no installed dew-cutlass holds kernels for {here}")
+    group_sizes = jnp.asarray(SIZES["ragged"], jnp.int32)
+
+    def draw(seed):
+        first, second = (operands(SIZES["ragged"], jnp.bfloat16, seed + offset)[:3]
+                         for offset in (0, 1 << 16))
+        x, w, dy = (jnp.stack([jnp.asarray(a, jnp.bfloat16), jnp.asarray(b, jnp.bfloat16)])
+                    for a, b in zip(first, second, strict=True))
+        return x, w[0] if shared else w, dy
+
+    def mapped(implementation, dtype=jnp.bfloat16):
+        one = with_gradients(lambda x, w: expert_projection(x, w, group_sizes, dtype, implementation, None))
+        return jax.vmap(one, in_axes=(0, None if shared else 0, 0))
+
+    def through_cutlass(x, w, dy):
+        with generation.chosen(grouped_matmul="cutlass"):
+            return mapped("pallas")(x, w, dy)
+
+    assert_as_exact(jax.jit(through_cutlass), jax.jit(mapped("xla")), draw,
+                    f"cutlass mapped{' shared' if shared else ''}", seeds=SEEDS,
+                    truth_fn=mapped("xla", jnp.float64))
+
+
 def ragged_draw(seed):
     """The ragged sizes' rows, matrices and cotangent in bf16, at a seed (`operands`)."""
     x, w, dy, _ = operands(SIZES["ragged"], jnp.bfloat16, seed)
