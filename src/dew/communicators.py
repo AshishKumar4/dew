@@ -62,7 +62,7 @@ from dew.devices import (
     pool_bound,
 )
 from dew.files import write_atomically
-from dew.telemetry.instrumentation import hlo_instructions
+from dew.telemetry.instrumentation import compiled_memory, hlo_instructions
 from dew.telemetry.trace import collective
 
 _log = logging.getLogger(__name__)
@@ -502,9 +502,9 @@ def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = g
         loaded = None
     else:
         made = collectives_kept(fingerprint, gpus, lambda: executable.as_text() or "")
-        memory = executable.memory_analysis()
+        memory = compiled_memory(executable)
         # A backend that states no memory analysis states no code of the program's either.
-        loaded = None if memory is None else Loaded(fingerprint, gpus, memory.generated_code_size_in_bytes)
+        loaded = None if memory is None else Loaded(fingerprint, gpus, memory.generated_code)
     _RESIDENT.admit(made, _HELD.needs, _HELD.room, free, loaded)
 
 
