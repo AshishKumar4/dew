@@ -34,7 +34,7 @@ import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import fla_gdn, recurrence, recurrence_algebra as algebra
+from dew.nn.kernels import fla_gdn, launches, recurrence, recurrence_algebra as algebra
 from dew.nn.kernels.chunked_launch import (
     _CHUNK,
     Sequences,
@@ -128,7 +128,7 @@ class IntraRows(_Launch):
         group, bh, tokens = value_heads // key_heads, config.bh, batch * length
         keys = pl.BlockSpec((tokens, bh, width), lambda p, b: (0, b // group, 0))
         out = pl.BlockSpec((tokens, bh, chunk), lambda p, b: (0, b, 0))
-        found = pl.pallas_call(
+        found = launches.pallas_call(
             functools.partial(_intra_rows_kernel, chunk=chunk,
                               aligned=_aligned(spans, batch, length, chunk), scale=scale),
             grid=(spans.chunks.shape[0] * chunk, value_heads // bh),
@@ -209,7 +209,7 @@ class IntraSolve(_Launch):
         tokens = batch * length
         headed = functools.partial(_headed, tokens)
         shape = jax.ShapeDtypeStruct((tokens, value_heads, chunk), aqk.dtype)
-        found = pl.pallas_call(
+        found = launches.pallas_call(
             functools.partial(_intra_solve_kernel, chunk=chunk, aligned=_aligned(spans, batch, length, chunk),
                               exact=interpret, solve=aqk.dtype),
             grid=(spans.chunks.shape[0], value_heads),
@@ -306,7 +306,7 @@ class RecomputeWU(_Launch):
 
         keyed = jax.ShapeDtypeStruct((tokens, value_heads, width), k.dtype)
         queries = q is not None
-        found = pl.pallas_call(
+        found = launches.pallas_call(
             functools.partial(_w_u_kernel, chunk=chunk, aligned=aligned,
                               bk=min(config.bk, width), bv=min(config.bv, columns), queries=queries,
                               exact=interpret),
@@ -390,7 +390,7 @@ class ChunkFwdO(_Launch):
         bv = min(config.bv, columns)
         dtype = jnp.float32 if wide else v.dtype
         values = pl.BlockSpec((tokens, None, bv), lambda i_v, i_t, i_h: (0, i_h, i_v))
-        out = pl.pallas_call(
+        out = launches.pallas_call(
             functools.partial(_o_kernel, chunk=chunk, aligned=aligned, scale=scale, bk=min(config.bk, width),
                               exact=interpret),
             grid=(columns // bv, spans.chunks.shape[0], value_heads),
@@ -464,7 +464,7 @@ class BwdDav(_Launch):
 
         headed = functools.partial(_headed, tokens)
 
-        da, dv = pl.pallas_call(
+        da, dv = launches.pallas_call(
             functools.partial(_dav_kernel, chunk=chunk, aligned=_aligned(spans, batch, length, chunk),
                               scale=scale, bv=min(config.bv, columns), exact=interpret),
             grid=(spans.chunks.shape[0], value_heads),
@@ -607,7 +607,7 @@ class BwdWyDqkg(_Launch):
         gate = pl.BlockSpec((tokens, None), lambda i_t, h: (0, h))
         states = pl.BlockSpec((h.shape[0], None, width, columns), lambda i_t, head: (0, head, 0, 0))
         wide = jax.ShapeDtypeStruct((tokens, value_heads, width), jnp.float32)
-        dq, dk, dv2, dg, last, db, da = pl.pallas_call(
+        dq, dk, dv2, dg, last, db, da = launches.pallas_call(
             functools.partial(_wy_dqkg_kernel, chunk=chunk, aligned=aligned,
                               scale=scale, bk=min(config.bk, width), bv=min(config.bv, columns),
                               exact=interpret),
@@ -873,7 +873,7 @@ class BwdIntra(_Launch):
         gate = pl.BlockSpec((tokens, None), lambda i_k, i_s, h: (0, h))
         scores = pl.BlockSpec((tokens, None, chunk), lambda i_k, i_s, h: (0, h, 0))
         wide = jax.ShapeDtypeStruct((tokens, value_heads, width), jnp.float32)
-        dq, dk, partial, ranged = pl.pallas_call(
+        dq, dk, partial, ranged = launches.pallas_call(
             functools.partial(_bwd_intra_kernel, chunk=chunk, aligned=_aligned(spans, batch, length, chunk),
                               exact=interpret),
             grid=(blocks, spans.chunks.shape[0] * count, value_heads),

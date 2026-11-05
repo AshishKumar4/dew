@@ -44,11 +44,11 @@ from jax.custom_derivatives import SymbolicZero
 from jax.experimental.pallas import mosaic_gpu as plgpu, tpu as pltpu
 from jax.extend import core as jax_core
 
-from ..derivatives import Protected, declared_tangent
+from ..derivatives import Protected, declared_tangent, marked_call_p
 from ..precision import at_least_fp32, rounded_operand
 from . import generation, selection, tuning
 from .generation import INHERENT
-from .templates import base, bundles, cost, mosaic, mosaic_sm90, report, resources, tail as tail_of
+from .templates import base, bundles, cost, mosaic, report, resources, tail as tail_of
 from .templates.gemm import mosaic_gpu, mosaic_tpu
 from .templates.product import EIGHT, Product
 
@@ -158,10 +158,10 @@ def _equations(jaxpr):
 def _lowers(hook, tiles: tuple, sides, rules) -> bool:
     """Whether a Pallas lowering's `rules` hold a rule for every primitive of `hook` on its `tiles` and its
     side tiles: Mosaic GPU's, at warpgroup semantics, have none for a transpose, which Triton's lowering
-    takes."""
+    takes. A marked span (`derivatives.marked_call_p`) lowers as its body, whose primitives are read."""
     if hook is None:
         return True
-    return all(equation.primitive in rules
+    return all(equation.primitive in rules or equation.primitive is marked_call_p
                for equation in _equations(jax.make_jaxpr(hook)(*tiles, *sides).jaxpr))
 
 
@@ -714,7 +714,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         """Whether an FP8 call (`product.EIGHT`) runs here: a forward product on warpgroup MMA, its matrix
         K-major (`trans_rhs`, as Hopper's FP8 tensor cores read both operands; an N-major FP8 matrix is
         refused, row 3620), with no hook, its running sum promoted every step (`exact_sums`)."""
-        return (jnp.dtype(dtype) in EIGHT and self.FP8 and family is mosaic_sm90.WGMMA
+        return (jnp.dtype(dtype) in EIGHT and self.FP8 and family is not None and family.takes_fp8
                 and ba.arguments['trans_rhs']
                 and ba.arguments['hooks'] == NO_HOOKS and ba.arguments.get('paired') is None
                 and bool(ba.arguments.get('exact_sums')))
@@ -1393,7 +1393,7 @@ class GroupedCase:
     `dew.nn.sharding.seen_whole`), the `product` it declares, its `rows`, its launches bound to it
     (`call`) and the `kind` of call it is ('grouped forward', 'dense input_gradient', 'grouped
     kernel_gradient exact', as `gmm_call` and `tgmm_call` state it), which with the device's instruction
-    family is its cell (`DECLARED`)."""
+    family is its cell (`DECLARED`), an FP8 call's kind its own (' fp8')."""
 
     placed: bool
     whole: bool
@@ -1540,7 +1540,10 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
         made = 'kernel_gradient exact' if options['exact_sums'] else 'kernel_gradient'
     else:
         made = 'input_gradient' if options['trans_rhs'] else 'forward'
-    kind = f"{'dense' if options['dense'] else 'grouped'} {made}"
+    # An FP8 call's cells are its own: `DECLARED`'s receipts timed 16-bit products, and XLA's dot of FP8
+    # operands sums narrower than the FP8 contract holds (row 1625), so the template takes them by default.
+    eight = ' fp8' if any(jnp.dtype(argument.dtype) in EIGHT for argument in arguments[:2]) else ''
+    kind = f"{'dense' if options['dense'] else 'grouped'} {made}{eight}"
     call = base.call(launches, *arguments, **options)
     cuda = generation.capability(call.target.generation)
     floor = cuda is not None and cuda[0] * 10 + cuda[1] >= generation.BF16_GPU
@@ -1624,7 +1627,9 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     """
     if any(operand.dtype in EIGHT for operand in (tokens, kernel)):
         # FP8 codes are each exact in bfloat16: the product is theirs there, summed in the preferred type
-        # (the FP8 contract's reference arm, testing.md, FP8 products), where XLA's FP8 GEMM sums narrower.
+        # (the FP8 contract's reference arm, testing.md, FP8 products). XLA's GPU compiler rewrites no
+        # ragged dot of widened FP8 codes into its narrower-summing FP8 GEMM (sm90's lowering of this
+        # product holds no F8 GEMM, FS-1625-HLO, row 1625).
         tokens, kernel = tokens.astype(jnp.bfloat16), kernel.astype(jnp.bfloat16)
         precision = jax.lax.Precision.DEFAULT
     elif all(jnp.finfo(operand.dtype).bits == 16 for operand in (tokens, kernel)):

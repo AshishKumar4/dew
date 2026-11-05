@@ -636,10 +636,11 @@ def copy_tiles(shape: tuple[int, ...], dtype, swizzle: int) -> bool:
 
 def copied_swizzle(shape: tuple[int, ...], dtype) -> int:
     """The swizzle, in bytes, a `[rows, columns]` block of `dtype` a program copies in with cp.async stages
-    at: its rows' widest (`widest_swizzle`), or the widest narrower one the copy layout tiles the block at
-    (`copy_tiles`) where it tiles none at that, as an A100's key memory backward's 8 rows of 64 bf16 columns,
-    one tile at 128 bytes, four at 32 (a decay a key dimension 16 wide, the recurrence stability sites)."""
-    widest = widest_swizzle(dtype, shape[-1])
+    at: its rows' widest (`resources.widest_swizzle`), or the widest narrower one the copy layout tiles the
+    block at (`copy_tiles`) where it tiles none at that, as an A100's key memory backward's 8 rows of 64 bf16
+    columns, one tile at 128 bytes, four at 32 (a decay a key dimension 16 wide, the recurrence stability
+    sites)."""
+    widest = resources.widest_swizzle(dtype, shape[-1])
     narrower = (swizzle for swizzle in (widest, widest // 2, widest // 4)
                 if swizzle >= NARROWEST_SWIZZLE_BYTES)
     return next((swizzle for swizzle in narrower if copy_tiles(shape, dtype, swizzle)), widest)
@@ -815,33 +816,6 @@ NARROWEST_SWIZZLE_BYTES = 32
 UNSWIZZLED = 0
 """A stream's swizzle (`Family.streams`' `swizzles`) where a step reads its tile a row at a time, at a traced
 row (a scan's tokens): staged plain, no tiling or swizzle, which Mosaic GPU indexes at any row."""
-
-
-def widest_swizzle(dtype, columns: int) -> int:
-    """The widest swizzle, in bytes, a row of `columns` elements of `dtype` fills (`plgpu.find_swizzle`): the
-    one a block staged at its rows' width takes, as layout inference and jax's Ampere examples stage it."""
-    return plgpu.find_swizzle(columns * jnp.dtype(dtype).itemsize * 8)
-
-
-def addresses(tiles) -> int:
-    """The registers a thread holds for its own addresses into the shared-memory tiles `tiles` (each
-    `(shape, dtype)`) it reads or writes through registers: one for each swizzle pattern its accesses to a
-    tile take, the swizzle its rows' width fills (`widest_swizzle`) over the bytes one pattern covers, and
-    one for a vector. A 16-bit tile moves in ldmatrix or stmatrix rows, two patterns at a 128-byte swizzle
-    and one at 64; a 32-bit one in each lane's own columns (an accumulator's), four at 128 bytes. A ring
-    slot's offset is an immediate, so a tile costs this once whatever its stages. A tile read by descriptor
-    or TMA costs none: its base is a uniform register (3117's census on the sm90 recurrence and GEMM kernel
-    gradient: the SSD, GDN and KDA states launches' staging and landing tiles 5 to 10, the exact normed
-    kernel gradient's rewrite 8, its statistics vector 1 and its output staging 4, each a SASS address
-    register of one pattern)."""
-    def patterns(shape: tuple, dtype) -> int:
-        itemsize = jnp.dtype(dtype).itemsize
-        # A vector, or rows of no whole 16-byte chunk, stage unswizzled: one pattern.
-        if len(shape) < 2 or shape[-1] * itemsize % 16:
-            return 1
-        return max(1, widest_swizzle(dtype, shape[-1]) // (64 if itemsize == 2 else 32))
-
-    return sum(patterns(tuple(shape), dtype) for shape, dtype in tiles)
 
 
 def swizzle_columns(dtype, swizzle: int) -> int:
@@ -1109,6 +1083,11 @@ class Issuer[Accumulator](abc.ABC):
     """Whether its products take fp32 operands, as TF32 (warpgroup MMA's kind::tf32: Mosaic's wgmma issues
     fp32 shared-memory operands so; mma.sync's m16n8k8.tf32, the fork's from 0.12.0.1.post42); where not, a
     template splits fp32 operands into bf16 parts instead."""
+
+    takes_fp8: bool = False
+    """Whether its products take FP8 operands (`product.EIGHT`: E4M3, E5M2), both read K-major as Hopper's
+    warpgroup MMA reads them ('Only f16 WGMMA supports transposes'); mma.sync's FP8 forms are Ada's and
+    consumer Blackwell's, which no bundle of Dew's runs yet (row 3620)."""
 
     transposes_tf32: bool = False
     """Whether its TF32 products take an operand read transposed (`takes_tf32`): mma.sync's, whose threads

@@ -133,7 +133,7 @@ def rewritten(fn: Callable, *, saturation: Saturation, static_argnums: int | tup
     return run
 
 
-def program_of(closed: jcore.Jaxpr, *, saturation: Saturation) -> jcore.Jaxpr:
+def rewritten_program(closed: jcore.Jaxpr, *, saturation: Saturation) -> jcore.Jaxpr:
     """`closed`, a jit's own trace of a program, its bodies and its own math rewritten where the switch is on
     (`passes`, `rewrite`'s walks): `closed` itself where no rule changes it, so the trace jit made lowers as
     it is, never staged again (a Dory-4B training step's replay of its unchanged program, 1.8 seconds of
@@ -149,9 +149,9 @@ def program_of(closed: jcore.Jaxpr, *, saturation: Saturation) -> jcore.Jaxpr:
 
 def replaying(closed: jcore.Jaxpr, structure, numbers: Iterable[int],
               names: Iterable[str]) -> Callable:
-    """A function of a program's arguments computing `closed` (its rewritten program, `program_of`) over its
-    dynamic ones (`_dynamic`, as jit reads them), its outputs in `structure`: what a jit of it traces is
-    `closed`'s program."""
+    """A function of a program's arguments computing `closed` (its rewritten program, `rewritten_program`)
+    over its dynamic ones (`_dynamic`, as jit reads them), its outputs in `structure`: what a jit of it
+    traces is `closed`'s program."""
     numbers, names = tuple(numbers), frozenset(names)
 
     def run(*args, **kwargs):

@@ -47,6 +47,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 from jax.typing import DTypeLike
 
+from dew.nn.kernels import launches
 from dew.nn.kernels.options import program
 
 DEFAULT_BLOCK_M = 64
@@ -361,7 +362,7 @@ def gmm(
     "exact_sums": exact_sums,
   }
   with jax.named_scope("pallas_triton_ragged_dot"):
-    outs = pl.pallas_call(
+    outs = launches.pallas_call(
       partial(
         _gpu_ragged_dot_kernel, size=size, block=block_sizes,
         **other_kws  # pyrefly: ignore[bad-argument-type]
@@ -513,7 +514,7 @@ def tgmm(
   dtype_spec = {"compute_dtype": compute_dtype, "acc_dtype": acc_dtype, "prologue": prologue,
                 "prologue_axes": prologue_axes, "exact_sums": exact_sums}
   with jax.named_scope("tgmm_ragged_dot"):
-    return pl.pallas_call(
+    return launches.pallas_call(
       partial(_tgmm_ragged_dot_kernel, size=size, block=block_sizes,
               **dtype_spec),  # pyrefly: ignore[bad-argument-type]
       out_shape=out_shape,

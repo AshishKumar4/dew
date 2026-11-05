@@ -53,6 +53,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     whole_blocks,
     zero_padded,
 )
+from dew.nn.precision import compensated_sum
 
 
 def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = False) -> bool:
@@ -285,7 +286,7 @@ def _gate_back(run, call: Call, dv2, gated: list, laid_do, skip) -> tuple:
     output's gradient `laid_do`. `dskip` None without a `skip`."""
     if gated:
         dbeta, *skipped = gated
-        return dv2, dbeta.sum(0).T, skipped[0].sum((0, 2)) if skipped else None
+        return dv2, dbeta.sum(0).T, compensated_sum(skipped[0], (0, 2)) if skipped else None
     rows, heads, columns = call.rows, call.heads, call.value_width
     du = dv2.astype(jnp.float32).reshape(rows, heads, columns)
     values = call.given.joined(run.v).reshape(rows, heads, columns)
@@ -293,7 +294,7 @@ def _gate_back(run, call: Call, dv2, gated: list, laid_do, skip) -> tuple:
     if skip is not None:
         read = call.given.joined(laid_do).reshape(rows, heads, columns)
         skipped, dskip = algebra.skipped_back(read, values, skip.astype(jnp.float32)[:, None])
-        dv, dskip = dv + skipped, dskip.sum(0)
+        dv, dskip = dv + skipped, compensated_sum(dskip, (0,))
     return dv.reshape(rows, heads * columns), dbeta, dskip
 
 

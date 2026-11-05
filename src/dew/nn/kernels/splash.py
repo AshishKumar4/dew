@@ -54,7 +54,7 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 )
 
 from dew.nn.attention_kernels import SPLASH_BLOCK, SPLASH_LANES
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, launches
 from dew.nn.kernels.options import program
 
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
@@ -636,7 +636,7 @@ def _forward(
         mask_function=call.mask_function,
     )
     with jax.named_scope(name):
-        out, logsumexp = pl.pallas_call(
+        out, logsumexp = launches.pallas_call(
             kernel,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=3,
@@ -813,7 +813,7 @@ def _dq(
     )
     name = _kernel_name(segment_ids is not None, "delta" if delta else "dq")
     with jax.named_scope(name):
-        (dq,) = pl.pallas_call(
+        (dq,) = launches.pallas_call(
             kernel,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=3,
@@ -1064,7 +1064,7 @@ def _dkv(
     name = _kernel_name(segment_ids is not None, "dkv")
     sizes = {"block_q_dkv": bq, "block_kv_dkv": bkv, "block_kv_dkv_compute": bkv_compute}
     with jax.named_scope(name):
-        dk, dv = pl.pallas_call(
+        dk, dv = launches.pallas_call(
             kernel,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=3,

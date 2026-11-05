@@ -251,7 +251,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
           states launch's: on an A100 the output launch holds 264 registers 32 wide, where the states
           launch's 384 programs 16 wide took two waves of 593 us (SE-family-a100-0c8018352);
         - stages: the ring of the states launch's steps whose plan hides the most latency, its programs a
-          multiprocessor and its depth one choice (`_staged`, `resources.hidden`).
+          multiprocessor running at once (`_running`) and its depth one choice (`_staged`,
+          `resources.hidden`).
         - a forward without a gradient: the same rules without the fast backward's (`Tiles.forward`), where
           they run the states launch in one wave and the training call's do not: on an H100 the 27B gated
           delta net's forward took 0.513 ms at the training call's 32-wide block, its states launch's 192
@@ -426,8 +427,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         """`block`'s tiles at `walkers` walk roles (`Tiles.walkers`) with the widest output block legal beside
         it (`Tiles.block_o`; `wide` where given), at the ring of the states launch's steps, within
         `Family.most_shared` over a step's bytes, whose plan hides the most latency, its programs a
-        multiprocessor (`states_held`) and its depth one choice (`resources.hidden`); None where no output
-        block is legal beside it."""
+        multiprocessor running at once (`_running`) and its depth one choice (`resources.hidden`); None
+        where no output block is legal beside it."""
         family = bundle(target, _dtype(ba))
         assert family is not None
         widths = self._blocks(ba, family) if wide is None else [wide]
@@ -443,7 +444,22 @@ class Mosaic(base.Template[mainloop.Tiles]):
                   for stages in range(2, min(resources.MOST_STAGES,
                                              family.most_shared // max(states.step_bytes, 1)) + 1))
         rings = [shallowest, *(tiles for tiles in deeper if self.legal(ba, tiles, target))]
-        return max(rings, key=lambda tiles: order(self.states_held(ba, tiles, target), tiles.stages))
+        return max(rings, key=lambda tiles: order(self._running(ba, tiles, target), tiles.stages))
+
+    def _running(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
+                 ) -> int:
+        """The programs of the states launch at `tiles` a multiprocessor of `target` runs at once: those it
+        holds (`states_held`), but no more than its programs spread over the device's multiprocessors where
+        it knows them, as a launch's blocks go to its multiprocessors in turn. A residency past them hides
+        nothing: on an A100 Qwen3-Next's 128 programs 32 wide held three a multiprocessor one deep and two
+        two deep, and ran two a multiprocessor either way, the forward 0.749 ms one deep against 0.727 two
+        deep (the 27B's 0.943 against 0.916), where the one deep ring narrowed the block to 16 at 0.752
+        (1.193, gdn-pins-a100-3b0d2267d)."""
+        held = self.states_held(ba, tiles, target)
+        if target.multiprocessors is None:
+            return held
+        programs = self._programs(ba, tiles, target) // tiles.walkers
+        return min(held, -(-programs // target.multiprocessors))
 
     def neighbours(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> list[mainloop.Tiles]:
         """The tiles the opt-in tuner times beside the derived `config` (`variants`; the gate holds at each):

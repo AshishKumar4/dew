@@ -29,7 +29,7 @@ import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import recurrence, recurrence_algebra as algebra
+from dew.nn.kernels import launches, recurrence, recurrence_algebra as algebra
 from dew.nn.kernels.chunked_launch import (
     _CHUNK,
     Sequences,
@@ -202,7 +202,7 @@ class KktSolve(_Launch):
         tokens = batch * length
         aligned = _aligned(spans, batch, length, chunk)
         gated = pl.BlockSpec((tokens, None), lambda i_t, h: (0, h))
-        solved = pl.pallas_call(
+        solved = launches.pallas_call(
             functools.partial(_kkt_solve_kernel, chunk=chunk, aligned=aligned, sub=sub, bk=min(bk, width),
                               exact=interpret),
             grid=(spans.chunks.shape[0], value_heads),
@@ -275,7 +275,7 @@ class RecomputeWU(_Launch):
         headed = functools.partial(_headed, tokens)
 
         gate = pl.BlockSpec((tokens, None), lambda i_t, h: (0, h))
-        w, u = pl.pallas_call(
+        w, u = launches.pallas_call(
             functools.partial(_w_u_kernel, chunk=chunk, aligned=aligned, bk=min(bk, width),
                               bv=min(bv, columns), exact=interpret),
             grid=(spans.chunks.shape[0], value_heads),
@@ -396,7 +396,7 @@ class ChunkFwdH(_Launch):
         gated = (pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)) if per_key
                  else pl.BlockSpec((tokens, None), lambda i_v, sh: (0, head(i_v, sh))))
         held = slots(spans, batch, length, chunk)
-        h, corrected, final = pl.pallas_call(
+        h, corrected, final = launches.pallas_call(
             functools.partial(_h_kernel, chunk=chunk, aligned=aligned, length=length, exact=interpret,
                               **({"per_key": True} if per_key else {})),
             grid=(columns // bv, spans.spans.shape[0] * value_heads),
@@ -561,7 +561,7 @@ class ChunkBwdDhu(_Launch):
         per_key = g.ndim == 4
         gated = (pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)) if per_key
                  else pl.BlockSpec((tokens, None), lambda i_v, sh: (0, head(i_v, sh))))
-        dh, dh0, dv2 = pl.pallas_call(
+        dh, dh0, dv2 = launches.pallas_call(
             functools.partial(_dhu_kernel, chunk=chunk, aligned=aligned, length=length, scale=scale,
                               exact=interpret,
                               **({"per_key": True} if per_key else {})),
@@ -645,7 +645,7 @@ class ChunkBwdDvLocal(_Launch):
             q, do, chunk_spans, sequence_spans, chunk)
         keys = pl.BlockSpec((tokens, None, width), lambda i_t, h: (0, h // group, 0))
         values = pl.BlockSpec((tokens, None, columns), lambda i_t, h: (0, h, 0))
-        dv = pl.pallas_call(
+        dv = launches.pallas_call(
             functools.partial(_dv_local_kernel, chunk=chunk, aligned=aligned, scale=scale, bk=min(bk, width),
                               bv=min(bv, columns),
                               exact=interpret),
@@ -795,7 +795,7 @@ class ChunkBwdDqkwg(_Launch):
         keys = pl.BlockSpec((tokens, None, bk), lambda i_k, i_h, i_t: (0, i_h, i_k))
         values = pl.BlockSpec((tokens, group, columns), lambda i_k, i_h, i_t: (0, i_h, 0))
         memory = pl.BlockSpec((h.shape[0], group, bk, columns), lambda i_k, i_h, i_t: (0, i_h, i_k, 0))
-        dq, dk, dw, dp, dg = pl.pallas_call(
+        dq, dk, dw, dp, dg = launches.pallas_call(
             functools.partial(_dqkwg_kernel, chunk=chunk, aligned=aligned, scale=scale, bv=bv,
                               exact=interpret),
             grid=(width // bk, key_heads, spans.chunks.shape[0]),
@@ -984,7 +984,7 @@ class PrepareWyReprBwd(_Launch):
         gate = pl.BlockSpec((tokens, None), lambda i_t, h: (0, h))
         keys = pl.BlockSpec((tokens, None, width), lambda i_t, h: (0, h // group, 0))
         earlier = () if dk is None else (dk,)
-        parts, dv, db, dg = pl.pallas_call(
+        parts, dv, db, dg = launches.pallas_call(
             functools.partial(_wy_bwd_kernel, chunk=chunk, aligned=aligned, bk=min(bk, width),
                               bv=min(bv, columns), group=group if earlier else None, exact=interpret),
             grid=(spans.chunks.shape[0], value_heads),
@@ -1083,7 +1083,7 @@ class ChunkFwdO(_Launch):
         keyed = pl.BlockSpec((tokens, None, width), lambda i_v, i_t, i_h: (0, i_h // group, 0))
         valued = pl.BlockSpec((tokens, None, bv), lambda i_v, i_t, i_h: (0, i_h, i_v))
         gated = pl.BlockSpec((tokens, None), lambda i_v, i_t, i_h: (0, i_h))
-        out = pl.pallas_call(
+        out = launches.pallas_call(
             functools.partial(_o_kernel, chunk=chunk, aligned=aligned, scale=scale, bk=min(bk, width),
                               exact=interpret),
             grid=(columns // bv, spans.chunks.shape[0], value_heads),
