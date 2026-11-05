@@ -762,13 +762,14 @@ class FitSearch[LossT, EffectsT]:
             return first
         if not self.judging():
             if not self.derived:
-                # A run that sets its remat reads no rung's walk (`derived_start`), so its record and its
-                # log say here what a walk would: nothing is judged, and the compiles decide.
+                # A run that sets its remat reads no rung's walk (`derived_start`), so its record says here
+                # what a walk would, and its log what it asked for and is not told: nothing is judged, and
+                # the compiles decide. A run that leaves its remat to the walk asked nothing of it.
                 self.derived.append({**self.current(), "narrow": self.narrow, "split": candidates[-1],
                                      "headroom": None, "label": "unstated", "terms": None})
-            _log.warning("the devices state no memory to judge the step's footprint against (a CPU, or a "
-                         "compile-only GPU given no capacity), so the derivation picks no plan and the "
-                         "compiles decide it")
+                _log.warning("the run sets remat %s, and its devices state no memory to judge its footprint "
+                             "against (a CPU, or a compile-only GPU given no capacity), so the derivation "
+                             "picks no plan and the compiles decide it", self.remat_rung())
             return first
         headroom = self.judged(candidates[-1], self.narrow)
         if headroom is None or headroom < 0:
