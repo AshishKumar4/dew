@@ -52,6 +52,53 @@ for named in ("AuthenticAMD-25-17", "AuthenticAMD-25-1"):
         assert zen4.endswith("/AuthenticAMD-25-17") and zen3.endswith("/AuthenticAMD-25-1"), (platforms, zen4)
 
 
+CPUINFO = """processor\t: 0
+vendor_id\t: AuthenticAMD
+cpu family\t: {family}
+model\t\t: 17
+model name\t: {name}
+"""
+"""What /proc/cpuinfo says of one armada host (.armada.json's task.cpu): the two EPYC families CI runs on."""
+
+
+def test_each_cpu_family_reads_and_writes_the_bundles_of_its_own(cache_worker, tmp_path, monkeypatch):
+    """XLA:CPU compiles for the features of the host, so JAX keys one program differently on the AMD EPYC
+    family 25 (model 17) hosts and the family 26 (model 17) ones (row 4132: 23 and 17 of 40 fresh containers,
+    two keys for one program), and a program of one does not link on the other. A bundle is its host's
+    class's (`prefix`, `HOST.cpu_class`), so through a real round against the Worker's protocol a family 26
+    container that opens a file's bundle restores none of what a family 25 one wrote, writes a bundle of its
+    own, and a second family 25 container restores its family's programs alone."""
+    url, stored, _ = cache_worker
+    file = "tests/test_step.py"
+
+    def container(name: str, family: int, program: str | None = None) -> Path:
+        """A container of the EPYC `family` that opens `file`'s bundle, compiles `program` where it is given
+        and sends what it compiled: its cache directory."""
+        cpuinfo = tmp_path / f"cpuinfo-{name}"
+        cpuinfo.write_text(CPUINFO.format(family=family, name=f"AMD EPYC family {family}"))
+        monkeypatch.setattr(remote_cache.HOST, "CPUINFO", cpuinfo)
+        directory = tmp_path / name
+        directory.mkdir()
+        cache = remote_cache.RemoteCache(directory, url, "token", remote_cache.prefix())
+        cache.opened(file)
+        if program is not None:
+            compiled(directory, program, f"{program} for family {family}".encode())
+        cache.closed(file)
+        cache.drain()
+        return directory
+
+    assert programs(container("first-25", 25, "jit_step-for-25")) == {
+        "jit_step-for-25": b"jit_step-for-25 for family 25"}
+    assert programs(container("only-26", 26)) == {}, "nothing of family 25's restored"
+    # Its own bundle, beside the other family's, which its compile adds nothing to.
+    assert programs(container("second-26", 26, "jit_step-for-26")) == {
+        "jit_step-for-26": b"jit_step-for-26 for family 26"}
+    assert programs(container("again-25", 25)) == {"jit_step-for-25": b"jit_step-for-25 for family 25"}
+    assert programs(container("again-26", 26)) == {"jit_step-for-26": b"jit_step-for-26 for family 26"}
+    bundles = sorted(key for key in stored if key.endswith(f"/bundles/{file}"))
+    assert [key.split("/")[-4] for key in bundles] == ["AuthenticAMD-25-17", "AuthenticAMD-26-17"]
+
+
 def test_a_worker_keeps_the_cache_it_shares_unless_the_shared_cache_is_on(tmp_path):
     """Each xdist worker writes a cache directory of its own only where the shared cache keeps bundles of its
     writes (DEW_XLA_CACHE_URL and DEW_XLA_CACHE_TOKEN both set); a URL alone, which installs no shared cache,

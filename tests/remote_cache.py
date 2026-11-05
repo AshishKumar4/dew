@@ -8,8 +8,9 @@ programs in that file's bundle on the dew-xla-cache Worker (deployed from the pr
 repository), through JAX's own cache directory: one GET as the file is collected writes its last
 run's programs into the directory, and one PUT after it ran, where it compiled any program the
 bundle lacked, sends the programs compiled under it and those fetched for it. Bundles are kept
-under jaxlib's version, the backend, the Python minor and the device's kind, beside
-JAX's own key of each program and its flags.
+under jaxlib's version, the backend, the Python minor, the device's kind and the host's CPU class
+(`prefix`: its vendor, family and model, which XLA:CPU compiles for), beside JAX's own key of each program
+and its flags: a container of one EPYC family reads the bundles its family wrote, never another's.
 
 JAX keeps a program as one file, `<key>-cache`, in `jax_compilation_cache_dir`, and with no
 `jax_compilation_cache_max_size` (Dew sets none) it neither evicts nor stamps them
