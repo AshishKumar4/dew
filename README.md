@@ -1022,9 +1022,10 @@ trajectories; they are not quality benchmarks of the released models.
 
 A task in `dew.inference` pairs a model with its weights for generation.
 `TextGeneration` decodes tokens, `BlockGeneration` decodes Diffusion Gemma
-canvases, `MaskedGeneration` samples a whole response from a masked-diffusion
-decoder with Dew's MDLM sampler, and `TextToImage` denoises images.
-`MaskedGeneration` does not implement LLaDA's or Dream's own remasking recipes.
+canvases, `MaskedGeneration` samples a response from a masked-diffusion
+decoder, walking as the release does where its family declares the walk
+(Dream's and DiffuCoder's sampling, LLaDA2's blocks) and by Dew's MDLM sampler
+otherwise, and `TextToImage` denoises images.
 A task is immutable and keeps the weights it was built with; `bind` returns a
 new task with other weights.
 
