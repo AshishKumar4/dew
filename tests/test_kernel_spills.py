@@ -630,3 +630,41 @@ def test_a_program_under_an_eager_transformation_compiles_under_its_own_options(
             called()
     enclosing = owned_program(lambda x: unknown(x) + 1.0)
     np.testing.assert_array_equal(np.asarray(enclosing(rows)), np.full((2, 3), 3.0))
+
+
+CONVERTING_LISTING = """
+//--------------------- .text.dew_gmm_mosaic_gpu_kernel --------------------------
+.text.dew_gmm_mosaic_gpu_kernel:
+        /*0000*/                   S2R R10, SR_TID.X ;
+        /*0010*/                   MOV R9, 0x400 ;
+.L_x_1:
+        /*0020*/                   R2UR UR4, R9 ;
+        /*0030*/                   IADD3 R2, R2, 0x1, RZ ;
+        /*0040*/                   HGMMA.64x128x16.F32.BF16 R24, gdesc[UR4], RZ ;
+        /*0050*/                   ISETP.NE.AND P0, PT, R2, 0x8, PT ;
+        /*0060*/               @P0 BRA `(.L_x_1) ;
+        /*0070*/                   EXIT ;
+"""
+"""An MMA loop converting a register to a uniform one each iteration, no waterfall around the conversion."""
+
+WATERFALL_LISTING = """
+.text.dew_gmm_mosaic_gpu_kernel:
+        /*0000*/                   S2R R10, SR_TID.X ;
+.L_x_2:
+        /*0010*/                   ELECT P1, UR6, PT ;
+        /*0020*/                   R2UR UR8, R10 ;
+        /*0030*/                   UBLKCP.S.G [UR8], [UR4], UR5 ;
+        /*0040*/                   PLOP3.LUT P1, PT, P1, PT, PT, 0x80, 0x8 ;
+        /*0050*/               @P1 BRA.U.ANY `(.L_x_2) ;
+        /*0060*/                   EXIT ;
+"""
+"""A copy whose operand ptxas could not prove uniform, issued lane by lane in an elect waterfall (BRA.U.ANY)
+around its R2UR (notes/ptxas-re.md §2: a divergent copy operand)."""
+
+def test_the_sass_rules_find_an_elect_waterfall_around_a_conversion():
+    """The compile gate's SASS rules (row 4071, the kernel challenge's harness/ptxas checks) read nvdisasm's
+    listing of a kernel: an elect waterfall (a backward BRA.U.ANY) holding an R2UR serializes a copy whose
+    operand ptxas could not prove uniform; a loop's conversion without a waterfall is none."""
+    (waterfall,) = report.sass_findings_of(WATERFALL_LISTING)
+    assert "waterfall" in waterfall
+    assert report.sass_findings_of(CONVERTING_LISTING) == ()
