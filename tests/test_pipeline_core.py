@@ -2464,9 +2464,8 @@ def test_a_version_7_position_of_a_two_share_streamed_read_resumes_where_8_reads
     batches by a version 7 main (tests/fixtures/version7_positions.json, written at its commit): read
     plainly, or taking 18 rows, version 8 reads the order as 7 did, so the position resumes onto the
     rows 7 read next; bounded to 10 examples, which version 8 deals to the shares otherwise, it is refused
-    before a row is read (row 3364). Its order shuffles, which version 9 keys by a chain's name where it has
-    one and a saved order does not say, so it is read by version 8 (`plan_version`, row 3840), as a run
-    config's resume reads a run saved under it."""
+    before a row is read (row 3364). Its chain, named none, shuffles by its seed alone under version 9 too,
+    so the position reads on under 9 (rows 3840, 4063)."""
     import json
     from pathlib import Path
 
@@ -2476,7 +2475,7 @@ def test_a_version_7_position_of_a_two_share_streamed_read_resumes_where_8_reads
     if kind == "take":
         chain = chain.repeat().take(18)
     loader = compile(chain.batch(2), read="streamed", loading=Loading(workers=0),
-                     examples=10 if kind == "bound" else None, plan_version=8)
+                     examples=10 if kind == "bound" else None)
     stream = loader.train(DataPartition(index=0, count=2))
     try:
         if kind == "bound":

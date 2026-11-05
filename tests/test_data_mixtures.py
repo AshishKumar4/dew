@@ -195,6 +195,34 @@ def test_a_position_saved_under_plan_version_8_resumes_by_8_or_by_9_where_9_read
                 resumed.close()
 
 
+def test_an_unnamed_chains_shuffled_position_of_plan_version_8_resumes_under_9():
+    """A chain given no name shuffles by its seed alone under data plan version 9, as 8 shuffled it, so a
+    position 8 saved of it resumes under 9; a named chain's, which 9 shuffles by its name too, is refused
+    there, naming the version to read it by (rows 3840, 4063)."""
+    def opened(version: int, name: str | None = None):
+        chain = Pipeline(Memory(Indexed(1, 16)), name=name).shuffle(5).repeat().batch(4)
+        return compile(chain, read="indexed", loading=READ, plan_version=version).train(DataPartition())
+
+    for name in (None, "wiki"):
+        saving = opened(8, name)
+        try:
+            taken(saving, 1)
+            saved = saving.get_state()
+            expected = taken(saving, 1)
+        finally:
+            saving.close()
+        resumed = opened(9, name)
+        try:
+            if name is not None:
+                with pytest.raises(ValueError):
+                    resumed.set_state(saved)
+                continue
+            resumed.set_state(saved)
+            assert taken(resumed, 1) == expected
+        finally:
+            resumed.close()
+
+
 def test_a_named_chains_order_is_its_names_and_a_position_of_another_name_is_refused():
     """A named chain read alone shuffles by its name from data plan version 9, as a mixture reads it as its
     member, so its plan records the name: a position it saved is refused by the chain under another name,
