@@ -630,6 +630,9 @@ class FitSearch[LossT, EffectsT]:
     under: dict[str, int] = dataclasses.field(default_factory=dict)
     """By remat rung (`remat_rung`), the most bytes a compile there needed past its derived headroom: a
     candidate there is judged to fit only where its derived headroom holds that much more."""
+    overstated: set[str] = dataclasses.field(default_factory=set)
+    """The remat rungs (`remat_rung`) a compile fit at that the derivation judged short: its refusals
+    there rule no compile out (`refused`)."""
     kernels: dict[str, JSON] = dataclasses.field(default_factory=dict)
     """What the templates' reports found where the search compiled (`admitted`): each kernel its compiles
     found spilling (`report.misses`, `spill_record`) and each launch config they refused
@@ -827,9 +830,13 @@ class FitSearch[LossT, EffectsT]:
     def refused(self, split: int) -> bool:
         """Whether the derivation judges the step at `split` short past a miss, corrected by what a compile
         at the rung needed beyond it (`under`), which the halving below a split that fits does not compile
-        (`planned`); no split it cannot judge."""
+        (`planned`): no split it cannot judge, and none at a remat where a compile it judged short fit
+        (`overstated`: a tiny model's derived peak, its fixed buffers, over-states the step many times)."""
+        rung = self.remat_rung()
+        if rung in self.overstated:
+            return False
         derived = self.judgment(split)
-        return derived is not None and derived - self.under.get(self.remat_rung(), 0) < 0
+        return derived is not None and derived - self.under.get(rung, 0) < 0
 
     def judging(self) -> bool:
         """Whether every process's devices judge a derived footprint (`memory.judged`) at the search's
@@ -924,6 +931,10 @@ class FitSearch[LossT, EffectsT]:
             # remat (`likely`).
             rung = self.remat_rung()
             self.under[rung] = max(self.under.get(rung, 0), foreseen - measured)
+        if foreseen is not None and foreseen < 0 and fit:
+            # A compile the derivation judged short that fits: its refusals at this remat order no compile
+            # out (`refused`), the compiles deciding.
+            self.overstated.add(self.remat_rung())
         if foreseen is not None and (foreseen >= 0) != fit:
             # A derived peak bounded from below (`Footprint.exact`) admits provisionally: its miss names
             # the need the compile found, which a sourced rule is to reach.
