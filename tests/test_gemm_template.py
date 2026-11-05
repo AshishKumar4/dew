@@ -738,6 +738,21 @@ def test_the_planar_snake_walks_every_tile_once_in_its_bands(major, minor, width
     np.testing.assert_array_equal(np.stack(walk, axis=1), np.asarray(expected))
 
 
+def test_a_kernel_gradients_tail_is_priced_in_its_parts_steps_whatever_multiprocessors_a_target_states():
+    """A balanced tail's hand-off is priced in MMA steps at one multiprocessor's tensor rate, so a part's
+    8 multiprocessors or 64 move neither the step nor the hand-off's steps (row 3790; 3781's pricing,
+    where a step at the device's peak over its multiprocessors read 16 times too short). At an H100's
+    measured 0.78 us hand-off, a tail of 2 to 5 steps a tile takes no balancing, as the walk whole is
+    cheaper, and one of 16 does."""
+    h100 = generation.gpu_target("sm90")
+    few, more = (dataclasses.replace(h100, multiprocessors=count) for count in (8, 64))
+    assert mosaic_gpu.step_seconds(COOPERATIVE, few) == mosaic_gpu.step_seconds(COOPERATIVE, more)
+    handoff = mosaic_gpu.handoff_steps(COOPERATIVE, few)
+    assert handoff == mosaic_gpu.handoff_steps(COOPERATIVE, more) and handoff > 1
+    assert all(tail.balanced(11, steps, 8, handoff_steps=handoff) is None for steps in range(2, 6))
+    assert tail.balanced(11, 16, 8, handoff_steps=handoff) is not None
+
+
 @runs("sm90")
 @pytest.mark.parametrize(("rows", "depth", "width"), [(320, 128, 2816), (200, 128, 2816), (320, 256, 1408)])
 def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width):
@@ -1317,6 +1332,30 @@ def test_the_hooked_mosaic_launches_lower_for_an_h100(launch):
 
 
 
+@lowers("sm90")
+def test_a_mosaic_launchs_epilogue_holding_a_marked_span_lowers_for_an_h100():
+    """A forward whose epilogue holds a marked span (`dew.nn.derivatives.marked`, as an error-free transform
+    or a surrogate's body is) is the Mosaic launch's on an H100 and lowers there at the tile it derives:
+    Dew's JAX lowers a marked call inside a Pallas kernel as its body (row 4029)."""
+    from dew.nn.derivatives import Protected, marked
+
+    rows, depth, width, groups = 2044, 768, 1536, 8
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((groups,), jnp.int32)
+    launch = grouped_matmul.MosaicGmm()
+    args = (bf16((rows, depth)), bf16((groups, depth, width)), sizes, (),
+            (jax.ShapeDtypeStruct((width,), jnp.float32),))
+    hooks = grouped_matmul.Hooks(epilogue=marked(Protected(), biased), epilogue_axes=(("columns",),))
+    options = {"out_dtype": "bfloat16", "trans_rhs": False, "hooks": hooks, "interpret": False}
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        bound = launch.bind(*args, **options)
+        assert launch.eligible(bound, generation.gpu_target())
+        [config] = launch.fitting(bound, generation.gpu_target())
+        jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
+            lowering_platforms=("cuda",))
+
+
 def _on_a_v5e():
     """An assumed v5e and a mesh of one of its devices, abstract, which Pallas's TPU lowering reads its
     target from on any host."""
@@ -1660,26 +1699,24 @@ def test_a_pin_names_only_a_config_the_launchs_kernel_takes():
 
 
 @pytest.mark.parametrize("trans_rhs", [False, True], ids=["forward", "input gradient"])
-def test_the_forward_pairs_a_groups_row_tiles_where_its_rows_span_two(trans_rhs):
-    """On an H100 the forward and the input gradient derive a pair of multiprocessors a cluster
-    (`mosaic.Family.cluster`) where a group averages a row tile's rows, each multiprocessor's tile and
-    stages as alone, and one multiprocessor where it averages fewer; an A100's mma.sync bundle takes no
-    cluster at any rows. Each derived tile is legal, a decode step's few rows a group too."""
+def test_the_forward_derives_a_legal_tile_at_every_rows_a_group_and_takes_a_pinned_cluster(trans_rhs):
+    """The forward and the input gradient derive a legal tile on an H100 and an A100 where a group averages
+    a row tile's rows, fewer, and a decode step's few, which tile the derivation picks being its own choice
+    (rows 3767, 3796); and a pair of multiprocessors a cluster (`mosaic.Family.cluster`), pinned on the
+    H100's tile, is legal there."""
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     groups, depth, width = 8, 2048, 1536
     launch = grouped_matmul.MosaicGmm()
-    derived = {}
     for name, rows in (("sm90", 8 * 512), ("sm90", 8 * 100), ("sm90", 8 * 32), ("sm80", 8 * 512)):
         with generation.assumed(name):
             target = generation.gpu_target()
             ba = launch.bind(bf16((rows, width if trans_rhs else depth)), bf16((groups, depth, width)),
                              jax.ShapeDtypeStruct((groups,), jnp.int32), out_dtype="bfloat16",
                              trans_rhs=trans_rhs, interpret=False)
-            derived[name, rows] = launch.derived(ba, target)
-            assert launch.legal(ba, derived[name, rows], target)
-    paired, alone = derived["sm90", 8 * 512], derived["sm90", 8 * 100]
-    assert (paired.cluster, alone.cluster, derived["sm80", 8 * 512].cluster) == (2, 1, 1)
-    assert (paired.block_m, paired.block_n, paired.stages) == (alone.block_m, alone.block_n, alone.stages)
+            derived = launch.derived(ba, target)
+            assert launch.legal(ba, derived, target)
+            if (name, rows) == ("sm90", 8 * 512):
+                assert launch.legal(ba, dataclasses.replace(derived, cluster=2), target)
 
 
 def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():

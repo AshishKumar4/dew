@@ -4,11 +4,10 @@ walk does tensor-core FLOPs, stages bytes through shared memory (its operand til
 back by its matrix instructions), evaluates special-function exponentials and does fp32 operations on the
 CUDA cores (the algebra between its products); its units overlap, so its time is the longest unit's at its
 rate (`walked`, ties broken by the units in series, `dew.algebra.cost.Walk`). The tensor cores' rate is the
-generation's (`GpuTarget.tensor_rate`), the shared-memory and special-function rates the CUDA
-architecture's own (`SHARED_BYTES_PER_CLOCK`, `EXPONENTIALS_PER_CLOCK`), the CUDA cores' the generation's
-fp32 rate. Nothing ranks a launch's configs by it (bible §6: configs are derived); the derivation prices a
-form a template's algebra takes by it (`dew.algebra.derive`, `dew.algebra.carry`). The register and
-shared-memory constants the resource model reads live here beside it (`resources`)."""
+generation's (`GpuTarget.tensor_rate`), the shared-memory and special-function rates its architecture's
+(`generation.Multiprocessor.shared_bytes_per_clock`, `exponentials_per_clock`), the CUDA cores' the
+generation's fp32 rate. Nothing ranks a launch's configs by it (bible §6: configs are derived); the
+derivation prices a form a template's algebra takes by it (`dew.algebra.derive`, `dew.algebra.carry`)."""
 
 
 import dataclasses
@@ -16,30 +15,6 @@ import functools
 import math
 
 from dew.nn.kernels import generation
-
-SHARED_BYTES_PER_CLOCK = 128
-"""Shared memory a multiprocessor serves per clock: 32 banks of 4 bytes, on every CUDA generation Dew's
-kernels run on (CUDA C++ Programming Guide, "Shared Memory", compute capabilities 5.x to 12.x)."""
-
-EXPONENTIALS_PER_CLOCK = 16
-"""Base-2 exponentials a multiprocessor's special-function units return per clock (CUDA C++ Programming
-Guide, "Arithmetic Instructions" throughput table, compute capabilities 5.x to 12.x)."""
-
-REGISTER_STEP = 8
-"""Registers a thread in one allocation unit (256 registers a warp)."""
-
-
-THREAD_REGISTERS = 255
-"""32-bit registers one thread may hold, compute capabilities 5.0 to 12.x (CUDA C++ Programming Guide,
-"Technical Specifications per Compute Capability"); what a kernel needs past them it spills to memory."""
-
-REGISTERS = 64 * 1024
-"""32-bit registers per multiprocessor, compute capabilities 5.0 to 12.x (the same table)."""
-
-RESERVED_SHARED = 1024
-"""Shared memory the driver reserves for each resident block, compute capabilities 8.0 to 12.x (CUDA C++
-Programming Guide, "Shared Memory" of compute capability 8.x): a multiprocessor holds the opted-in block
-size plus one reservation."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -49,11 +24,12 @@ class Work:
     at the default precision, and FP8's, `GpuTarget.tensor_rate`; CUDA-core fp32 operations, a product at
     `Precision.HIGHEST`'s FLOPs among them; special-function exponentials; conversions, which run on the
     CUDA cores at their rate until a target states one of their own) and its bytes by level (device memory,
-    shared memory), and its span, the dependent steps on its critical path (a loop's iterations, each reading
-    the last). The algebra's terms and a template's instructions both price through it; a schedule turns it
-    into seconds by the work-span model (Brent's): the larger of its work at its units' rates and its span
-    at a dependent step's latency, XLA's fusion's (`dew.algebra.cost.fused`) or a template's tile walk
-    (`walked`)."""
+    shared memory), its span, the dependent steps on its critical path (a loop's iterations, each reading
+    the last), and the kernels XLA's fusion makes of it (`kernels`: a reduction's and a product's, each a
+    fusion's root), each paying the part's fixed latency in XLA's schedule (`dew.algebra.cost.Fused`). The
+    algebra's terms and a template's instructions both price through it; a schedule turns it into seconds by
+    the work-span model (Brent's): the larger of its work at its units' rates and its span at a dependent
+    step's latency, XLA's fusion's (`dew.algebra.cost.fused`) or a template's tile walk (`walked`)."""
 
     flops: float = 0.0
     operations: float = 0.0
@@ -64,6 +40,7 @@ class Work:
     tf32_flops: float = 0.0
     span: float = 0.0
     fp8_flops: float = 0.0
+    kernels: float = 0.0
 
     def __add__(self, other: "Work") -> "Work":
         # Works summed side by side: their span the longer one's; a chain of works' span is its path's sum,
@@ -72,7 +49,7 @@ class Work:
                     self.exponentials + other.exponentials, self.conversions + other.conversions,
                     self.device_bytes + other.device_bytes, self.shared_bytes + other.shared_bytes,
                     self.tf32_flops + other.tf32_flops, max(self.span, other.span),
-                    self.fp8_flops + other.fp8_flops)
+                    self.fp8_flops + other.fp8_flops, self.kernels + other.kernels)
 
 
 @functools.cache
@@ -89,19 +66,19 @@ def rates(target: generation.GpuTarget, *, device: bool) -> tuple[float | None, 
         each = clock
     else:
         each = clock * target.multiprocessors if clock and target.multiprocessors else None
-    # The special-function and shared-memory rates are a CUDA multiprocessor's (a TPU has neither).
-    cuda = generation.capability(target.generation) is not None
 
     def rate(per_clock: float | None) -> float | None:
         return None if per_clock is None or each is None else per_clock * each
 
+    # A TPU has no CUDA multiprocessor, nor its special-function units' or shared memory's rates.
+    held = target.architecture.multiprocessor
     tensor = rate(target.tensor_rate("16bit"))
     if tensor is None and device:
         tensor = target.bf16_peak
     eight = rate(target.tensor_rate("8bit")) or tensor
     return (tensor, rate(target.tensor_rate("tf32")), eight, rate(target.tensor_rate("fp32")),
-            rate(EXPONENTIALS_PER_CLOCK if cuda else None),
-            math.inf if device else rate(SHARED_BYTES_PER_CLOCK if cuda else None),
+            rate(None if held is None else held.exponentials_per_clock),
+            math.inf if device else rate(None if held is None else held.shared_bytes_per_clock),
             target.memory_rate if device else math.inf)
 
 

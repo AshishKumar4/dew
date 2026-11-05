@@ -15,7 +15,7 @@ from typing import ClassVar, TypeGuard
 import tokamax
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import cost, report
+from dew.nn.kernels.templates import report, resources
 
 
 class Template[Config: Hashable](tuning.KernelOp):
@@ -60,10 +60,10 @@ class Template[Config: Hashable](tuning.KernelOp):
 
     def register_budget(self, config: Config) -> int:
         """The registers a thread of the launch's program may hold at `config`: a thread's own
-        (`cost.THREAD_REGISTERS`) unless the launch's roles share the file otherwise (a warp-specialized
-        program's consumers, `resources.consumer_registers`)."""
+        (`Multiprocessor.thread_registers`) unless the launch's roles share the file otherwise (a
+        warp-specialized program's consumers, `resources.consumer_registers`)."""
         del config
-        return cost.THREAD_REGISTERS
+        return resources.facts().thread_registers
 
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:

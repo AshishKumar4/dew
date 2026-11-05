@@ -1690,9 +1690,11 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                   truth_fn=truth_fn, orders=orders, library_fn=library_fn, library_row=library_row,
                   library_leaves=library_leaves, also=also, terms=terms, examples=examples)
         return
+    # A map task draws no seed past the site's stages (`REDRAW`): a sharded test's cases each declare their
+    # own, the shards cut at the most of them, and a recording holds no more.
     _site_judged(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
                  library_fn=library_fn, library_row=library_row, library_leaves=library_leaves, also=also,
-                 terms=terms, examples=examples, weighing=None)
+                 terms=terms, examples=examples, weighing=None, upto=(1 + REDRAW) * seeds)
 
 
 def _deferred(dew_fn, reference_fn, draw, label: str, *, seeds: int, conditioning: int, truth_fn, orders,
@@ -2114,6 +2116,16 @@ def declared_seeds(path) -> dict[str, int]:
             if name.endswith(".seeds")}
 
 
+def drawn_on_the_host(inputs_of: Callable, seed: int):
+    """`inputs_of(seed)` drawn on the host's CPU, as a recording's inputs were, whatever device the test runs
+    on: jax.random's draws are the same bits on every device but its normal's float transform is not (a
+    recorded site's seed drawn on an H100 had another digest than on the CPU, the recording's, in 157 of the
+    recurrence GPU flow's cells, draw-digest at 996fa29f1), so a draw on the test's device would not be the
+    recorded inputs. The arrays then go to the device where the run reads them."""
+    with jax.default_device(jax.devices("cpu")[0]):
+        return inputs_of(seed)
+
+
 def input_digest(inputs) -> np.uint64:
     """A seed's inputs (a dict of NumPy arrays, a torch draw's converted) as 64 bits of the SHA-256 of
     each array's name, dtype by name, shape and bytes in C order: what a recording of outputs alone
@@ -2218,7 +2230,7 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
     def draw(seed):
         if inputs_of is None:
             return np.int32(seed), {name: value[seed] for name, value in inputs.items()}
-        drawn = inputs_of(seed)
+        drawn = drawn_on_the_host(inputs_of, seed)
         if input_digest(drawn) != digests[seed]:
             raise AssertionError(f"{site}: seed {seed}'s inputs drawn again are not the recorded ones (their "
                                  f"digest differs); the generator's draw changed since the recording")
@@ -2272,7 +2284,7 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
         return pilot, stored[f"{site}.pilot.input_digest"], seed - SIZING_FROM
 
     def draw(seed):
-        drawn = inputs_of(seed)
+        drawn = drawn_on_the_host(inputs_of, seed)
         _, recorded, row = held(seed)
         if input_digest(drawn) != recorded[row]:
             raise AssertionError(f"{site}: seed {seed}'s inputs drawn again are not the recorded ones (their "

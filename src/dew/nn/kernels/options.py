@@ -257,13 +257,13 @@ class OuterProgram:
         return jax.jit(traced, **self.arguments)
 
     def _traced(self, jitted: jax.stages.Wrapped, args: tuple, kwargs: dict) -> jax.stages.Traced:
-        """`jitted`'s trace of a call, its program the algebra pass's (`algebra.program_of`), so its lowering,
-        its trace, its executable and every relowering read one program (docs/design/algebra.md §6.7): the
-        pass reads the trace jit made, which lowers as it is where no rule changes it; a program a rule
-        changes is traced afresh from its rewritten program (`program.replaying`). Its switch is in JAX's
-        trace context, so a held program traces afresh as it changes."""
+        """`jitted`'s trace of a call, its program the algebra pass's (`algebra.rewritten_program`), so its
+        lowering, its trace, its executable and every relowering read one program (docs/design/algebra.md
+        §6.7): the pass reads the trace jit made, which lowers as it is where no rule changes it; a program
+        a rule changes is traced afresh from its rewritten program (`program.replaying`). Its switch is in
+        JAX's trace context, so a held program traces afresh as it changes."""
         traced = jitted.trace(*args, **kwargs)
-        rewritten = algebra.program_of(traced.jaxpr)
+        rewritten = algebra.rewritten_program(traced.jaxpr)
         if rewritten is traced.jaxpr:
             return traced
         replay = algebra.program.replaying(rewritten, jax.tree.structure(traced.out_info), self.numbers,

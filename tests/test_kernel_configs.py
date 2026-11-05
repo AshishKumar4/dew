@@ -390,6 +390,9 @@ PLAIN_FORMS = ("forward", "forward bf16", "forward fp16", "input gradient", "inp
                "kernel gradient", "kernel gradient fp32", "kernel gradient fp16")
 """The forms every family's GEMM launches emit: each product and output dtype they take."""
 
+FP8_FORMS = ("forward fp8",)
+"""The FP8 forms a family whose products take FP8 operands emits (`Family.takes_fp8`)."""
+
 HOOKED_FORMS = ("kernel gradient exact fp32", "normed biased forward", "normed biased input gradient",
                 "normed kernel gradient", "exact normed kernel gradient", "fp16 normed biased forward",
                 "cast forward", "gated forward", "gated kernel gradient", "residual forward",
@@ -421,6 +424,9 @@ def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
     sizes = jax.ShapeDtypeStruct((groups,), jnp.int32)
     x, w, dy = shaped((rows, depth)), shaped((groups, depth, width)), shaped((rows, width))
     x16, w16, dy16 = (jax.ShapeDtypeStruct(array.shape, jnp.float16) for array in (x, w, dy))
+    # An FP8 product's operands (E4M3), its matrix K-major as Hopper's FP8 tensor cores read it (row 3620).
+    x8, w8 = (jax.ShapeDtypeStruct(shape, jnp.float8_e4m3fn)
+              for shape in ((rows, depth), (groups, width, depth)))
     gmm, tgmm, hooks = grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm(), grouped_matmul.Hooks
     norm = hooks(normed, (("rows",), ("depth",)))
     forward = {"interpret": False, "out_dtype": "bfloat16", "trans_rhs": False}
@@ -429,6 +435,8 @@ def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
         ("forward", gmm, (x, w, sizes), {**forward, "out_dtype": "float32"}),
         ("forward bf16", gmm, (x, w, sizes), forward),
         ("forward fp16", gmm, (x16, w16, sizes), {**forward, "out_dtype": "float16"}),
+        ("forward fp8", gmm, (x8, w8, sizes),
+         {**forward, "out_dtype": "float32", "trans_rhs": True, "exact_sums": True}),
         ("input gradient", gmm, (dy, w, sizes), {**backward, "trans_rhs": True}),
         ("input gradient fp16", gmm, (dy16, w16, sizes),
          {**forward, "out_dtype": "float16", "trans_rhs": True}),
@@ -549,20 +557,25 @@ def _derived_and_refused(launch, ba, target) -> tuple:
 
 
 def _emitted_forms(family, shape: str | None = None) -> set[str]:
-    """The forms a family's GEMM launches emit (`PLAIN_FORMS`, `HOOKED_FORMS`): none without a bundle, the
-    hooked and exactly summed ones where its register model counts what they hold (`Family.counts_hooks`);
+    """The forms a family's GEMM launches emit (`PLAIN_FORMS`, `HOOKED_FORMS`, `FP8_FORMS`): none without a
+    bundle, the hooked and exactly summed ones where its register model counts what they hold
+    (`Family.counts_hooks`), the FP8 ones where its products take FP8 (`Family.takes_fp8`);
     at a projection `shape`, each whose output's width steps by the family's column unit, whose stores take
     it (`Family.stores_columns`: a grouped product's rows ragged to one, a kernel gradient's whole role's)
     and whose contraction steps by its narrowest depth (`Family.column_unit`, `Family.depths`)."""
     if family is None:
         return set()
-    forms = {*PLAIN_FORMS, *(HOOKED_FORMS if family.counts_hooks else ())}
+    forms = {*PLAIN_FORMS, *(HOOKED_FORMS if family.counts_hooks else ()),
+             *(FP8_FORMS if family.takes_fp8 else ())}
     if shape is None:
         return forms
     _, depth, width, _ = GEMM_SHAPES[shape]
-    unit, step = family.column_unit(jnp.bfloat16), min(family.depths(jnp.bfloat16))
 
     def takes(form: str) -> bool:
+        # Each form at its operands' units: an FP8 product's column unit and narrowest step are FP8's (128
+        # elements a 128-byte swizzle), the others' bf16's.
+        dtype = jnp.float8_e4m3fn if form in FP8_FORMS else jnp.bfloat16
+        unit, step = family.column_unit(dtype), min(family.depths(dtype))
         # An input gradient's output is the depth wide, contracting the width; every other form's output
         # is the width wide, a kernel gradient's contracting the rows (padded to its steps).
         columns, contracted = (depth, width) if "input gradient" in form else (width, depth)

@@ -27,6 +27,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from dew._hashing import fmix32
+from dew.nn.kernels import launches
 from dew.nn.precision import (
     L2NORM_EPS,
     at_least_fp32,
@@ -666,7 +667,7 @@ class StepLaunch(tuning.KernelOp):
         out_shape.append(jax.ShapeDtypeStruct((rows, value_heads, value_width), jnp.dtype(dtype)))
         kernel = functools.partial(_kernel, hooks=hooks, group=value_heads // key_heads, key_heads=key_heads,
                                    interpret=interpret)
-        return tuple(pl.pallas_call(
+        return tuple(launches.pallas_call(
             kernel, grid=(rows, value_heads, value_width // block), in_specs=in_specs, out_specs=out_specs,
             out_shape=out_shape, input_output_aliases={len(given): 0},
             compiler_params=plgpu.CompilerParams(num_warps=config.warps),
@@ -831,7 +832,7 @@ class ChunkLocalCumsum(chunked_launch._Launch):
         tiles = [width // block for width, block in zip(columns, blocks, strict=True)]
         spec = pl.BlockSpec((batch * length, None, *blocks), lambda i_t, h, *i_k: (0, h, *i_k))
         outputs = 1 + compensated
-        out = pl.pallas_call(
+        out = launches.pallas_call(
             functools.partial(_cumsum_kernel, chunk=chunk, aligned=aligned, scale=scale, reverse=reverse),
             grid=(spans.chunks.shape[0], heads, *tiles),
             in_specs=[chunked_launch._CHUNK, spec], out_specs=[spec] * outputs,

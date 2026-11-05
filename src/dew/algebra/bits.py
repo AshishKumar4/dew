@@ -15,6 +15,8 @@ import itertools
 from collections.abc import Iterator, Mapping, Sequence
 from typing import NamedTuple
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
 WORD = 32
@@ -199,11 +201,75 @@ class BitForm:
             depths.append(1 + max(depths[arg] for arg in step.args))
         return max(depths[index] for index in self.outputs)
 
+    def traced(self, words: jax.Array) -> tuple[jax.Array, ...]:
+        """Each output register of each stored word of `words` (uint32), as JAX computes it: the form's
+        steps in `jax.numpy`'s integer operations, for a kernel's portable path and its interpreter, where no
+        inline assembly runs."""
+        values = [words.astype(jnp.uint32)]
+        for step in self.steps:
+            first = values[step.args[0]]
+            if step.op is BitOp.SHR:
+                value = first >> step.immediate
+            elif step.op is BitOp.ROTR:
+                value = (first >> step.immediate) | (first << (WORD - step.immediate))
+            elif step.op is BitOp.SHL:
+                value = first << step.immediate
+            else:
+                xor = first if len(step.args) == 1 else first ^ values[step.args[1]]
+                value = xor & jnp.uint32(step.immediate)
+            values.append(value)
+        return tuple(values[index] for index in self.outputs)
+
+    def ptx(self, output: int) -> str:
+        """Output register `output` of the form as one PTX block over its stored word `$1` into `$0`, the
+        steps it reads each on the pipe its step names (`_PTX`), for a kernel's inline assembly (Pallas's
+        `elementwise_inline_asm`, constraints `=r,r`, which takes one result a block): a register's block
+        apiece, each holding the steps it reads, so a step two registers share is written twice and ptxas,
+        which optimizes the kernel's PTX whole, may compute it once (the consumer's compile report shows
+        whether it does)."""
+        needed: set[int] = set()
+        pending = [self.outputs[output]]
+        while pending:
+            value = pending.pop()
+            if value and value not in needed:
+                needed.add(value)
+                pending.extend(self.steps[value - 1].args)
+        names = {0: "$1", **{value: f"v{value}" for value in needed}}
+        lines = [f".reg .b32 {', '.join(names[value] for value in sorted(needed))};"] if needed else []
+        for value in sorted(needed):
+            step = self.steps[value - 1]
+            lines.append(_PTX[step.op, step.unit](names[value], [names[arg] for arg in step.args],
+                                                  step.immediate))
+        lines.append(f"mov.b32 $0, {names[self.outputs[output]]};")
+        return "{\n" + "\n".join(lines) + "\n}"
+
     @property
     def price(self) -> tuple[int, int]:
         """Its busiest unit's issues, then its instructions (`Unit`: one rate): a decoder's words are many
         and independent, so its pipes' throughput prices it, not its chain's latency."""
         return max(self.issues.values()), len(self.steps)
+
+
+# LOP3's truth table of `c & (a ^ b)` and of `c & a`, over its operands' tables 0xF0, 0xCC and 0xAA (PTX ISA,
+# "Logic and Shift Instructions: lop3").
+_MASKED_XOR, _MASKED = (0xF0 ^ 0xCC) & 0xAA, 0xF0 & 0xAA
+
+_PTX = {
+    (BitOp.SHR, Unit.ALU): lambda out, ins, amount: f"shr.b32 {out}, {ins[0]}, {amount};",
+    # IMAD.HI.U32: the high word of a multiply by 2^(32-c) is the logical shift right by c.
+    (BitOp.SHR, Unit.FMA): lambda out, ins, amount: f"mul.hi.u32 {out}, {ins[0]}, {1 << (WORD - amount):#x};",
+    (BitOp.ROTR, Unit.ALU): lambda out, ins, amount: f"shf.r.wrap.b32 {out}, {ins[0]}, {ins[0]}, {amount};",
+    (BitOp.SHL, Unit.ALU): lambda out, ins, amount: f"shl.b32 {out}, {ins[0]}, {amount};",
+    # IMAD.SHL: a multiply by 2^k, the FMA pipe's left shift.
+    (BitOp.SHL, Unit.FMA): lambda out, ins, amount: f"mul.lo.u32 {out}, {ins[0]}, {1 << amount:#x};",
+    (BitOp.LOP3, Unit.ALU): lambda out, ins, mask: (
+        f"lop3.b32 {out}, {ins[0]}, {ins[1]}, {mask:#010x}, {_MASKED_XOR:#04x};" if len(ins) == 2
+        else f"lop3.b32 {out}, {ins[0]}, {ins[0]}, {mask:#010x}, {_MASKED:#04x};"),
+}
+"""Each instruction as the PTX written for its pipe: a shift or rotation as `shr`/`shl`/`shf`, which ptxas
+issues as SHF on the ALU, and a multiply by a power of two as `mul`, which it issues as IMAD on the FMA pipe
+(PTX ISA, "Integer Arithmetic Instructions"; Nsight Compute's pipelines). PTX fixes the arithmetic, not the
+SASS: ptxas chooses the final instructions, which the consumer's compile report shows."""
 
 
 class Unproven(ValueError):

@@ -12,7 +12,7 @@ barrier's completions no later turn waited for are observed before the program e
 Unlike Hopper's and Ampere's bundles (`mosaic.Family`), a thread holds no accumulator between products: the
 registers a program takes are its warpgroups' entry share alone (`registers`), the issuing warpgroup's few
 (addresses and counters) left to a per-launch rule once a liveness model prices its branch
-(`resources.PRODUCER_REGISTERS`)."""
+(`resources.producer_floor`)."""
 
 import dataclasses
 import functools
@@ -175,7 +175,7 @@ TCGEN05 = Tcgen05()
 def swizzled(dtype, contraction: int) -> tuple:
     """A stage's transforms for an operand block of `dtype` contracting `contraction` elements a step: 8-row
     tiles of the widest swizzle its rows take, swizzled (tcgen05 reads its shared operands so)."""
-    return mosaic.swizzle_transforms(dtype, mosaic.widest_swizzle(dtype, contraction))
+    return mosaic.swizzle_transforms(dtype, resources.widest_swizzle(dtype, contraction))
 
 
 def operand(shape: tuple[int, int], dtype, contraction: int):

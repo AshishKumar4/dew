@@ -50,6 +50,8 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
+from dew.nn.kernels import launches
+
 from . import tuning
 from .generation import INHERENT, gpu_target, triton_runs
 from .selection import Requirement
@@ -349,7 +351,7 @@ class DecodeAttention(tuning.KernelOp):
         def launch(spec: algebra.Forward) -> jax.Array:
             out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 1, queried, summed, reduced,
                                             headroom=spec.headroom)
-            out = pl.pallas_call(
+            out = launches.pallas_call(
                 lambda *refs: _kernel(*refs, spec=spec, splits=splits, interpret=interpret,
                                       sinks=sinks is not None),
                 grid=(batch, heads, splits),
@@ -418,7 +420,7 @@ class PagedDecodeAttention(tuning.KernelOp):
         def launch(spec: algebra.Forward) -> jax.Array:
             out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 2, queried, summed, reduced,
                                             headroom=spec.headroom)
-            out = pl.pallas_call(
+            out = launches.pallas_call(
                 lambda *refs: _paged_kernel(*refs, pages=pages, spec=spec, splits=splits,
                                             interpret=interpret, sinks=sinks is not None),
                 grid=(rows, kv_heads, splits),

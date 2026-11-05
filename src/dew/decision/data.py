@@ -544,7 +544,10 @@ def mixture(root_url: str, *, weights: Mapping[str, float] | None = None, descri
 
 def _drawn(seed: int, name: str) -> int:
     """Corpus `name`'s own seed of a mixture drawn from `seed` (`mixture`): two corpora of one length read
-    in orders of their own, and a corpus keeps its order whichever others the mixture weighs."""
+    in orders of their own, and a corpus keeps its order whichever others the mixture weighs. From data
+    plan version 9 the mix keys each corpus's shuffle by its name on its own (row 3840); these seeds stay
+    what every saved decision run's chain records, so a run saved under version 8 resumes by the script
+    that built its mixture, its corpora in the orders they read."""
     return int.from_bytes(hashlib.sha256(f"{seed}:{name}".encode()).digest()[:4], "big")
 
 

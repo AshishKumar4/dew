@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -68,18 +69,25 @@ def _timed(ms):
 
 def test_a_pick_measured_under_another_jax_is_not_read(tmp_path, monkeypatch):
     """Picks persist per device, shape and JAX version (bible §6): Pallas lowers a kernel in jax itself,
-    which a release moves without jaxlib, so a launch measured under another jax is read by none, kept
-    in the store for its own checkout, and measured anew here."""
-    monkeypatch.setattr(tuning.cache, "kernel_picks_path", lambda kind: str(tmp_path / f"{kind}.json"))
+    which a release moves without jaxlib, so a launch measured under another jax is read by none here,
+    kept in its own jax's store for its own checkout, and measured anew here into this jax's, which holds
+    no copy of the other's (row 3837: one store for every jax kept each fork's copy, parsed by every read)."""
+    # The store's own path (its jax's file), moved under `tmp_path`, not the suite's cache.
+    cache, picks_path = tuning.cache, tuning.cache.kernel_picks_path
+    monkeypatch.setattr(cache, "kernel_picks_path", lambda kind: str(
+        tmp_path / Path(picks_path(kind)).relative_to(cache.default_compilation_cache_dir())))
     ba, derived, other = _norm_launch_and_two_configs()
     with monkeypatch.context() as patched:
         patched.setattr(jax, "__version__", "0.0.0.other")
         tuning._store("gpu", [(ba, tuning.Timings({derived: _timed(2.0), other: _timed(1.0)}))])
-    read, foreign = tuning._read(str(tmp_path / "gpu.json"))
-    assert (read, len(foreign)) == ({}, 1)
+        theirs = tuning.cache.kernel_picks_path("gpu")
+    assert tuning._read(tuning.cache.kernel_picks_path("gpu")) == ({}, [])
     tuning._store("gpu", [(ba, tuning.Timings({derived: _timed(2.0), other: _timed(1.0)}))])
-    read, foreign = tuning._read(str(tmp_path / "gpu.json"))
-    assert len(read) == 1 and len(foreign) == 1
+    read, foreign = tuning._read(tuning.cache.kernel_picks_path("gpu"))
+    assert len(read) == 1 and foreign == []
+    with monkeypatch.context() as patched:
+        patched.setattr(jax, "__version__", "0.0.0.other")
+        assert len(tuning._read(theirs)[0]) == 1
 
 
 def test_a_launch_whose_derived_config_lost_names_its_gap(tmp_path, monkeypatch):

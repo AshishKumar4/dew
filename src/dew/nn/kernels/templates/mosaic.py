@@ -34,9 +34,8 @@ from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.experimental.xla_metadata import set_xla_metadata
 
-from dew.nn.kernels import generation
-from dew.nn.kernels.templates import cost, product, report, resources
-from dew.nn.sharding import per_shard
+from dew.nn.kernels import generation, launches
+from dew.nn.kernels.templates import product, report, resources
 from dew.telemetry.instrumentation import MODEL_FLOPS
 
 Ref = state_types.AbstractRef | state_types.TransformedRef
@@ -130,16 +129,17 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
            approx_math: bool = False, cluster: int = 1, cost: pl.CostEstimate | None = None,
            model_flops: int | None = None, reduction_scratch: int = 0, resident: int = 1) -> Callable:
     """Build a per-shard launch with the same reporting and interpreter semantics for every family, each call
-    checked against the mesh it runs in (`per_shard`), named as the launch tracing it reports `name`
+    checked against the mesh it runs in (`launches.kernel`), named as the launch tracing it reports `name`
     (`report.named`), a launch lowered once for every call of its facts (`tuning.lowered_once`), its `cost`
     the hardware's work and `model_flops` the model's share of it (`checked`)."""
     clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
-    built = plgpu.kernel(dependent(entry, interpret), out_type=out_type, grid=grid, grid_names=grid_names,
-                         num_threads=warpgroups, thread_name="wg", scratch_types=scratch,
-                         compiler_params=compiler_params(approx_math=approx_math, resident=resident,
-                                                         reduction_scratch=reduction_scratch),
-                         interpret=interpreted(interpret),
-                         kernel_name=report.named(name), cost_estimate=cost, **clustered)
+    built = launches.kernel(dependent(entry, interpret), name=name or family, out_type=out_type, grid=grid,
+                            grid_names=grid_names, num_threads=warpgroups, thread_name="wg",
+                            scratch_types=scratch,
+                            compiler_params=compiler_params(approx_math=approx_math, resident=resident,
+                                                            reduction_scratch=reduction_scratch),
+                            interpret=interpreted(interpret),
+                            kernel_name=report.named(name), cost_estimate=cost, **clustered)
 
     return checked(built, name or family, resident, model_flops)
 
@@ -174,8 +174,9 @@ raise their registers to that residency's share (`roles`)."""
 
 
 def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | None = None) -> Callable:
-    """The launch `built`, each call checked against the mesh it runs in (`per_shard`) and traced at its
-    residency (`_RESIDENT`): a launch built once for every call of its facts checks each call's own; and
+    """The launch `built` (`launches.kernel`, which holds each call per shard), each call traced at its
+    residency (`_RESIDENT`) under the name `kernel`: a launch built once for every call of its facts checks
+    each call's own; and
     refused at its trace where two of the refs it adds into in place share a shape and a dtype, which
     `stacked_zeros` makes one ref (row 3180). Its call declares `model_flops`, the model's share of the work
     its cost states (the rest its own recomputation), where given, as its custom call's frontend attribute
@@ -187,7 +188,6 @@ def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | 
         return checked_launch(*operands)
 
     def checked_launch(*operands):
-        per_shard(kernel)
         refs = [jax.typeof(operand) for operand in operands if _is_ref(operand)]
         kinds = [(ref.shape, ref.dtype) for ref in refs]
         if len(set(kinds)) < len(kinds):
@@ -636,10 +636,11 @@ def copy_tiles(shape: tuple[int, ...], dtype, swizzle: int) -> bool:
 
 def copied_swizzle(shape: tuple[int, ...], dtype) -> int:
     """The swizzle, in bytes, a `[rows, columns]` block of `dtype` a program copies in with cp.async stages
-    at: its rows' widest (`widest_swizzle`), or the widest narrower one the copy layout tiles the block at
-    (`copy_tiles`) where it tiles none at that, as an A100's key memory backward's 8 rows of 64 bf16 columns,
-    one tile at 128 bytes, four at 32 (a decay a key dimension 16 wide, the recurrence stability sites)."""
-    widest = widest_swizzle(dtype, shape[-1])
+    at: its rows' widest (`resources.widest_swizzle`), or the widest narrower one the copy layout tiles the
+    block at (`copy_tiles`) where it tiles none at that, as an A100's key memory backward's 8 rows of 64 bf16
+    columns, one tile at 128 bytes, four at 32 (a decay a key dimension 16 wide, the recurrence stability
+    sites)."""
+    widest = resources.widest_swizzle(dtype, shape[-1])
     narrower = (swizzle for swizzle in (widest, widest // 2, widest // 4)
                 if swizzle >= NARROWEST_SWIZZLE_BYTES)
     return next((swizzle for swizzle in narrower if copy_tiles(shape, dtype, swizzle)), widest)
@@ -817,33 +818,6 @@ UNSWIZZLED = 0
 row (a scan's tokens): staged plain, no tiling or swizzle, which Mosaic GPU indexes at any row."""
 
 
-def widest_swizzle(dtype, columns: int) -> int:
-    """The widest swizzle, in bytes, a row of `columns` elements of `dtype` fills (`plgpu.find_swizzle`): the
-    one a block staged at its rows' width takes, as layout inference and jax's Ampere examples stage it."""
-    return plgpu.find_swizzle(columns * jnp.dtype(dtype).itemsize * 8)
-
-
-def addresses(tiles) -> int:
-    """The registers a thread holds for its own addresses into the shared-memory tiles `tiles` (each
-    `(shape, dtype)`) it reads or writes through registers: one for each swizzle pattern its accesses to a
-    tile take, the swizzle its rows' width fills (`widest_swizzle`) over the bytes one pattern covers, and
-    one for a vector. A 16-bit tile moves in ldmatrix or stmatrix rows, two patterns at a 128-byte swizzle
-    and one at 64; a 32-bit one in each lane's own columns (an accumulator's), four at 128 bytes. A ring
-    slot's offset is an immediate, so a tile costs this once whatever its stages. A tile read by descriptor
-    or TMA costs none: its base is a uniform register (3117's census on the sm90 recurrence and GEMM kernel
-    gradient: the SSD, GDN and KDA states launches' staging and landing tiles 5 to 10, the exact normed
-    kernel gradient's rewrite 8, its statistics vector 1 and its output staging 4, each a SASS address
-    register of one pattern)."""
-    def patterns(shape: tuple, dtype) -> int:
-        itemsize = jnp.dtype(dtype).itemsize
-        # A vector, or rows of no whole 16-byte chunk, stage unswizzled: one pattern.
-        if len(shape) < 2 or shape[-1] * itemsize % 16:
-            return 1
-        return max(1, widest_swizzle(dtype, shape[-1]) // (64 if itemsize == 2 else 32))
-
-    return sum(patterns(tuple(shape), dtype) for shape, dtype in tiles)
-
-
 def swizzle_columns(dtype, swizzle: int) -> int:
     """The elements of `dtype` a row of a `swizzle`-byte swizzle spans: a swizzled tile's width, so the least
     slice a load of a block swizzled along that axis takes."""
@@ -915,7 +889,7 @@ def staged(shape: tuple, dtype, swizzle: int | None = None):
 def roles(wg, consumers: int, consumer, producer) -> None:
     """Each warpgroup's role in a cooperative block: the `consumers` first run `consumer(wg)` with their
     register budget raised to their share at the launch's residency (`resources.raised_registers`,
-    `_RESIDENT`), the last runs `producer()` with its lowered to `resources.PRODUCER_REGISTERS`, where the
+    `_RESIDENT`), the last runs `producer()` with its lowered to `resources.producer_floor`, where the
     GPU's compile honors them (`resources.RAISES_HONORED`)."""
     @pl.when(wg < consumers)
     def _():
@@ -924,7 +898,7 @@ def roles(wg, consumers: int, consumer, producer) -> None:
 
     @pl.when(wg == consumers)
     def _():
-        plgpu.set_max_registers(resources.PRODUCER_REGISTERS, action="decrease")
+        plgpu.set_max_registers(resources.producer_floor(), action="decrease")
         producer()
 
 
@@ -1109,6 +1083,11 @@ class Issuer[Accumulator](abc.ABC):
     """Whether its products take fp32 operands, as TF32 (warpgroup MMA's kind::tf32: Mosaic's wgmma issues
     fp32 shared-memory operands so; mma.sync's m16n8k8.tf32, the fork's from 0.12.0.1.post42); where not, a
     template splits fp32 operands into bf16 parts instead."""
+
+    takes_fp8: bool = False
+    """Whether its products take FP8 operands (`product.EIGHT`: E4M3, E5M2), both read K-major as Hopper's
+    warpgroup MMA reads them ('Only f16 WGMMA supports transposes'); mma.sync's FP8 forms are Ada's and
+    consumer Blackwell's, which no bundle of Dew's runs yet (row 3620)."""
 
     transposes_tf32: bool = False
     """Whether its TF32 products take an operand read transposed (`takes_tf32`): mma.sync's, whose threads
@@ -1648,9 +1627,12 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
     consumers: int
     """The compute roles a program may take (sm90 two warpgroups, sm80 one)."""
 
-    register_step: int = cost.REGISTER_STEP
-    """The allocator's registers per thread in one step (setmaxnreg's eight-register granularity).
-    A compile gate tests admits at their actual cap, refusals one such step below it."""
+    @property
+    def register_step(self) -> int:
+        """The allocator's registers per thread in one step (`generation.Multiprocessor.register_step`,
+        setmaxnreg's eight-register granularity). A compile gate tests admits at their actual cap, refusals
+        one such step below it."""
+        return resources.facts().register_step
 
     most_shared: int
     """The most shared memory a block of any GPU of the family holds (CUDA's opt-in limit), which bounds

@@ -127,7 +127,9 @@ CONTRACTED = {
     "src/dew/nn/kernels/templates/gemm/template.py::_prologued.prologued":
         ("test_a_gemm_prologue_holds_every_order", KERNEL),
     "src/dew/nn/kernels/templates/layout.py::_custom.held":
-        ("test_a_transposed_hooks_custom_derivative_holds_every_order_it_takes", KERNEL),
+        ("test_a_transposed_hooks_custom_vjp_holds_every_reverse_order", KERNEL),
+    "src/dew/nn/kernels/templates/layout.py::_held_jvp.held":
+        ("test_a_transposed_hooks_custom_derivative_holds_every_order", KERNEL),
     "src/dew/nn/moe.py::_stored_primal":
         ("test_a_stored_expert_primal_holds_every_order", NUMERICS),
     "src/dew/nn/precision.py::at_default_precision.run":

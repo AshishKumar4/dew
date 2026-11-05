@@ -212,7 +212,7 @@ registers, the route's next mainloop taking it (`_takes_backward`): a query's te
 every tile (ET-PINBWD: 232 bytes at 64 x 64, width 64, its keyed sums beside the hook's three slopes and its
 mask); a softcap with sinks and ALiBi, whose dQ at 64 x 64, width 128, in two column halves, spilled 204 bytes
 at ptxas's 255 where its model held 254 (et-ceil), refused once a consumer's raise is at most
-`resources.RAISE_CEILING`'s 248."""
+`resources.raise_ceiling`'s 248."""
 
 
 def _takes_backward(spans: template.KeySpans, query, key, hooks: template.Hooks | None, *, accurate: bool,
@@ -258,9 +258,10 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
     accurate, config = _backward_form(form)
     if backward:
         query, key = (jax.ShapeDtypeStruct((rows, queries, count, width), dtype) for count in shape[2:])
+        declined = accurate and any(score == SCORE_HOOKS[name] for name in ACCURATE_DECLINED)
         with _device(interpret):
             if not _takes_backward(spans, query, key, hooked(*draw_hooks(0)), accurate=accurate,
-                                   declined=accurate and "temperature" in score):
+                                   declined=declined):
                 return
 
     def ours(query, key, value, dout, params, initial):
@@ -408,21 +409,26 @@ def _gradient_terms(spans: template.KeySpans, hooked: Callable | None = None, sc
     product's rounding), so a row that cancels to zero in float64 is held to it, not to its own zero. Under
     score hooks (`hooked(params, initial)`, a draw's `(query, key, value, dout, params, initial)`), the
     logits are the hook's (`template.score_modded`), and its parameters' gradients take the terms check 1
-    traces from `reference` (`float64_terms`, its static runs compiled once for every draw). A call
-    resuming from an initial state (`score` naming sinks or a resumed partial) takes check 1's own terms
-    (None): its weights start from the state, which `attention_terms` does not carry."""
-    if {"sinks", "resumed"} & set(score):
+    traces from `reference` (`float64_terms`, its static runs compiled once for every draw), as do the
+    initial state's. Sinks are a head's value-free logit (`template.sinks`), which `attention_terms` joins to
+    each denominator: a query of one key whose sink weighs 3e-8 beside it (ALiBi's slope lifting its logit
+    to 17.7) cancels to its sink's share, and the fast form's anchor rounding, its terms' size, is 51 times
+    that (row 3843). A resumed partial takes check 1's own terms (None): its weights start from a state of
+    values, which `attention_terms` does not carry."""
+    if "resumed" in score:
         return None
     keep = template.dense(spans)[:, None]
     # The parameters' terms over every draw, traced once and its static runs compiled (`float64_terms`).
     traced_terms = None if reference is None else functools.partial(float64_terms, reference)
 
     def terms(query, key, value, dout, *hooks):
-        params = hooks[0] if hooks else ()
+        params, initial = hooks if hooks else ((), None)
         wide = tuple(jnp.asarray(np.asarray(param), np.float64) for param in params)
-        found = attention_terms(query, key, value, dout, keep, score=None if hooked is None else (
-            lambda raw: template.score_modded(raw, hooked(wide, None))))
-        if not params:
+        # Each head's sink, the state's maximum at any row and query (`template.sinks`).
+        sinks = None if initial is None else np.asarray(initial.m)[0, :, 0]
+        modded = None if hooked is None else (lambda raw: template.score_modded(raw, hooked(wide, None)))
+        found = attention_terms(query, key, value, dout, keep, sinks=sinks, score=modded)
+        if not params and initial is None:
             # No hook parameter takes a gradient (a softcap's hook has none): the operands' terms alone, the
             # draw's hooks `((), None)` as they are.
             return (*found[1:], *hooks)

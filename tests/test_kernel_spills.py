@@ -479,12 +479,49 @@ def test_a_program_called_under_another_mesh_of_its_shape_runs_on_that_meshs_dev
         np.testing.assert_array_equal(np.asarray(ran), given * scale + 1)
 
 
+def test_a_programs_spilling_triton_launch_is_recorded_with_no_mosaic_kernel_beside_it():
+    """A program of one Pallas-Triton launch, no Mosaic GPU kernel in it, compiled for a compile-only H100:
+    its launch's spill (a row softmax of a 64 x 512 block at one warp, 1024 values a thread) is read from its
+    binary and recorded as any template launch's is (`report.misses`), whatever kernels share its program
+    (row 3960: the compile read binaries only beside a Mosaic kernel)."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as pltriton
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.training.ahead import compile_only_gpus
+
+    def softmax(x_ref, o_ref):
+        x = x_ref[...]
+        exponentials = jnp.exp(x - jnp.max(x, axis=1, keepdims=True))
+        o_ref[...] = exponentials / jnp.sum(exponentials, axis=1, keepdims=True)
+
+    shape = jax.ShapeDtypeStruct((64, 512), jnp.float32)
+
+    def program(x):
+        return pl.pallas_call(softmax, out_shape=shape, grid=(1,), name="dew_softmax__l0123456789",
+                              compiler_params=pltriton.CompilerParams(num_warps=1, num_stages=1))(x)
+
+    devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
+    spec = jax.ShapeDtypeStruct((64, 512), jnp.float32, sharding=NamedSharding(devices, PartitionSpec()))
+    def lowered():
+        return jax.jit(program).trace(spec).lower()
+
+    with (report.refusals(), generation.assumed("sm90"),
+          jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
+        report.compiled(lowered(), relower=lowered)
+        missed = [(miss.kernel, miss.frame > 0) for miss in report.misses()]
+    assert missed == [("dew_softmax", True)]
+
+
 @lowers("sm90")
-def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once():
+@pytest.mark.parametrize("constant", [False, True], ids=["no-constant", "a-constant"])
+def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once(constant):
     """A program of a Pallas-Triton launch feeding a Mosaic GPU kernel and an XLA fusion, compiled for an
-    H100: `report.binaries` reads the launch once, its cubin from its thunk's own binary, and the Mosaic
-    kernel once, from its kernel proto (a Mosaic thunk's binary is empty), each stating its registers; the
-    fusion, whose thunk carries its cubin too, names no launch and is no template's."""
+    H100, with or without a constant: `report.binaries` reads the launch once, its cubin from its custom
+    kernel's proto (a program holding a constant gives every thunk that constant's module alone as its
+    binary, which states no registers: row 3858), and the Mosaic kernel once, from its kernel proto, each
+    stating its registers; the fusion, whose thunk carries its cubin too, names no launch and is no
+    template's."""
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import triton as pltriton
     from jax.sharding import NamedSharding, PartitionSpec
@@ -498,11 +535,12 @@ def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once():
 
     copy = staged_copy((128, 128), jnp.float32)
     shape = jax.ShapeDtypeStruct((128, 128), jnp.float32)
+    table = np.arange(128 * 128, dtype=np.float32).reshape(128, 128) if constant else 0
 
     def program(x, y):
         launched = pl.pallas_call(added, out_shape=shape, grid=(1,), name="dew_added__l0123456789",
                                   compiler_params=pltriton.CompilerParams(num_warps=4, num_stages=1))(x, y)
-        return jnp.concatenate([copy(launched), jnp.sin(x)]).sum(axis=1)
+        return jnp.concatenate([copy(launched), jnp.sin(x) + table]).sum(axis=1)
 
     devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
     spec = jax.ShapeDtypeStruct((128, 128), jnp.float32, sharding=NamedSharding(devices, PartitionSpec()))
@@ -592,3 +630,41 @@ def test_a_program_under_an_eager_transformation_compiles_under_its_own_options(
             called()
     enclosing = owned_program(lambda x: unknown(x) + 1.0)
     np.testing.assert_array_equal(np.asarray(enclosing(rows)), np.full((2, 3), 3.0))
+
+
+CONVERTING_LISTING = """
+//--------------------- .text.dew_gmm_mosaic_gpu_kernel --------------------------
+.text.dew_gmm_mosaic_gpu_kernel:
+        /*0000*/                   S2R R10, SR_TID.X ;
+        /*0010*/                   MOV R9, 0x400 ;
+.L_x_1:
+        /*0020*/                   R2UR UR4, R9 ;
+        /*0030*/                   IADD3 R2, R2, 0x1, RZ ;
+        /*0040*/                   HGMMA.64x128x16.F32.BF16 R24, gdesc[UR4], RZ ;
+        /*0050*/                   ISETP.NE.AND P0, PT, R2, 0x8, PT ;
+        /*0060*/               @P0 BRA `(.L_x_1) ;
+        /*0070*/                   EXIT ;
+"""
+"""An MMA loop converting a register to a uniform one each iteration, no waterfall around the conversion."""
+
+WATERFALL_LISTING = """
+.text.dew_gmm_mosaic_gpu_kernel:
+        /*0000*/                   S2R R10, SR_TID.X ;
+.L_x_2:
+        /*0010*/                   ELECT P1, UR6, PT ;
+        /*0020*/                   R2UR UR8, R10 ;
+        /*0030*/                   UBLKCP.S.G [UR8], [UR4], UR5 ;
+        /*0040*/                   PLOP3.LUT P1, PT, P1, PT, PT, 0x80, 0x8 ;
+        /*0050*/               @P1 BRA.U.ANY `(.L_x_2) ;
+        /*0060*/                   EXIT ;
+"""
+"""A copy whose operand ptxas could not prove uniform, issued lane by lane in an elect waterfall (BRA.U.ANY)
+around its R2UR (notes/ptxas-re.md §2: a divergent copy operand)."""
+
+def test_the_sass_rules_find_an_elect_waterfall_around_a_conversion():
+    """The compile gate's SASS rules (row 4071, the kernel challenge's harness/ptxas checks) read nvdisasm's
+    listing of a kernel: an elect waterfall (a backward BRA.U.ANY) holding an R2UR serializes a copy whose
+    operand ptxas could not prove uniform; a loop's conversion without a waterfall is none."""
+    (waterfall,) = report.sass_findings_of(WATERFALL_LISTING)
+    assert "waterfall" in waterfall
+    assert report.sass_findings_of(CONVERTING_LISTING) == ()

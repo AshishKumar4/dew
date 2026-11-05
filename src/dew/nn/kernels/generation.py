@@ -140,6 +140,58 @@ lab verifies on the GPU. 'flash' and 'cudnn' name CUDA libraries."""
 
 
 @dataclasses.dataclass(frozen=True)
+class RegisterRaises:
+    """The register counts a warpgroup's `setmaxnreg` moves a thread's allocation to: from `lowest` to
+    `highest` in steps of `step` (PTX ISA, "setmaxnreg": a count in 24 to 256, a multiple of 8, on sm_90a,
+    sm_100f and sm_120f)."""
+
+    lowest: int
+    highest: int
+    step: int
+
+
+SETMAXNREG = RegisterRaises(24, 256, 8)
+"""`setmaxnreg`'s range on every architecture that takes it (PTX ISA, "setmaxnreg")."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Multiprocessor:
+    """A CUDA multiprocessor's resources, which the templates' register and resource models read
+    (`templates.resources`, `templates.cost`): the most threads and blocks resident at once
+    (`resident_threads`, `resident_blocks`), its 32-bit `registers`, the most a thread holds
+    (`thread_registers`), the allocator's `register_step` a thread (256 a warp), the shared memory the driver
+    reserves for each resident block (`reserved_shared`), the bytes its shared memory serves a clock
+    (`shared_bytes_per_clock`), the base-2 exponentials its special-function units return a clock
+    (`exponentials_per_clock`), and the range its warpgroups' `setmaxnreg` moves a thread's registers in
+    (`register_raises`, None before Hopper). The defaults are the facts every CUDA compute capability from 7.5
+    to 12.x shares (CUDA C++ Programming Guide §5.1, Tables 33 and 34; the exponentials the CUDA C++ Best
+    Practices Guide 13's §12.1.1 Table 5, `lg2.approx.f32`'s row, where CUDA 13 moved the throughput table,
+    15.97 measured on an H200, the kernel challenge's MUFU.EX2; 128 bytes a clock measured 126 to 128 on an
+    A100 and an H800, Luo et al. 2025, "Dissecting the NVIDIA Hopper Architecture through Microbenchmarking",
+    Table 3) and setmaxnreg's range,
+    which a target of no architecture (the CPU interpreting a launch) reads too, under which every family's
+    launch interprets."""
+
+    resident_threads: int = 1536
+    resident_blocks: int = 16
+    registers: int = 64 * 1024
+    thread_registers: int = 255
+    register_step: int = 8
+    reserved_shared: int = 1024
+    shared_bytes_per_clock: int = 128
+    exponentials_per_clock: int = 16
+    register_raises: RegisterRaises | None = SETMAXNREG
+
+    def raises(self) -> RegisterRaises:
+        """The range setmaxnreg moves a thread's registers in (`register_raises`); a multiprocessor before
+        Hopper's takes none, which no family raising its consumers runs on."""
+        if self.register_raises is None:
+            raise ValueError("this multiprocessor takes no setmaxnreg: a family raising its consumers' "
+                             "registers runs on Hopper's and Blackwell's")
+        return self.register_raises
+
+
+@dataclasses.dataclass(frozen=True)
 class Architecture:
     """The facts every device of one instruction family shares, from its compute capability (a TPU's
     generation): the family a template's mainloop claims (`family`), its dense tensor-core FLOPs per clock per
@@ -151,11 +203,12 @@ class Architecture:
     into shared memory by TMA, which it picks from compute capability 9.0 on (its `emit_pipeline` and
     `copy_gmem_to_smem`), where below it they copy by cp.async. `dependent_launch`: PTX's grid dependency
     control (`griddepcontrol`, programmatic dependent launch), sm_90 on. A family of None is no template's:
-    its devices' facts serve the rest of Dew (MFU's peaks)."""
+    its devices' facts serve the rest of Dew (MFU's peaks). Its CUDA multiprocessor's resources
+    (`multiprocessor`), None on a TPU."""
 
     family: str | None
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
-    resident_threads: int = 1536
+    multiprocessor: Multiprocessor | None = Multiprocessor()
     wgmma: bool = False
     tma: bool = False
     dependent_launch: bool = False
@@ -177,28 +230,37 @@ class Architecture:
 # 16384). Hopper's mma.sync takes none (an m16n8k32 e4m3 assembles to F2FP unpacks and HMMA.16816 on
 # sm_90a; the kernel challenge's judge-facts.md:127), nor does Ampere's: there an FP8 product runs as a
 # 16-bit one.
-_AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128}, resident_threads=2048)
-_AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256})
-_ADA = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256})
+# Resident blocks and threads a multiprocessor holds are the CUDA C++ Programming Guide's (§5.1, Table 33):
+# 7.5 16 and 1024, 8.0 32 and 2048, 8.6 16 and 1536, 8.9 24 and 1536, 9.0 and 10.0 32 and 2048, 12.x 24 and
+# 1536; setmaxnreg is sm_90a's, sm_100f's and sm_120f's (PTX ISA, `SETMAXNREG`).
+_AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128},
+                       Multiprocessor(resident_threads=2048, resident_blocks=32, register_raises=None))
+_AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256},
+                                Multiprocessor(register_raises=None))
+_ADA = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
+                    Multiprocessor(resident_blocks=24, register_raises=None))
 # Turing's MMA takes no bf16 operands, which every template computes in: it is outside every family.
-_TURING = Architecture(None, {'16bit': 1024, 'fp32': 128}, resident_threads=1024)
+_TURING = Architecture(None, {'16bit': 1024, 'fp32': 128},
+                       Multiprocessor(resident_threads=1024, register_raises=None))
 _HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, '8bit': 8192, 'fp32': 256},
-                       resident_threads=2048, wgmma=True, tma=True, dependent_launch=True)
+                       Multiprocessor(resident_threads=2048, resident_blocks=32), wgmma=True, tma=True,
+                       dependent_launch=True)
 # Blackwell's tcgen05 family.
 _BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, '8bit': 16384, 'fp32': 256},
-                          resident_threads=2048,
-                          tmem_columns=512, tma=True, dependent_launch=True)
+                          Multiprocessor(resident_threads=2048, resident_blocks=32), tmem_columns=512,
+                          tma=True, dependent_launch=True)
 # Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms, its blocks moved by TMA: Ada's rates.
 _BLACKWELL_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
-                                   tma=True, dependent_launch=True)
+                                   Multiprocessor(resident_blocks=24), tma=True, dependent_launch=True)
 # A TPU's: its MXU's FLOPs a clock (v5e 197 TF over 1.5 GHz -> 131072) and the scoped VMEM limit at XLA's
 # default (v5e 16 MiB, read from a Mosaic kernel's refusal: "limit 16.00M"; v6e's pending GEMMTPU-VMEM's).
 # v6e: two 256x256 MXUs, 918 TF over its clock -> 524288. T4: 65 TF fp16 summed in fp32 and 8.1 TF fp32
 # over 40 SMs at 1590 MHz -> 1024 and 128.
 # VMEM capacity: v6e 128 MiB from an allocation refusal ("would exceed memory (size=134217728)",
 # GEMMTPU-GRIDSTEP@v6e1); v5e 128 MiB by Google's specification, pending GEMMTPU-VMEM@v5e1's refusal.
-_TPUS = {'v5e': Architecture('tpu', {'16bit': 131072}, scoped_vmem=16 * 2 ** 20, vmem_bytes=128 * 2 ** 20),
-         'v6e': Architecture('tpu', {'16bit': 524288}, vmem_bytes=128 * 2 ** 20)}
+_TPUS = {'v5e': Architecture('tpu', {'16bit': 131072}, None, scoped_vmem=16 * 2 ** 20,
+                             vmem_bytes=128 * 2 ** 20),
+         'v6e': Architecture('tpu', {'16bit': 524288}, None, vmem_bytes=128 * 2 ** 20)}
 
 
 def architecture(generation: str) -> Architecture | None:
@@ -238,12 +300,25 @@ class Measured:
     the plateau a long transfer reaches, below what the memory clock and bus give; `launch`, the seconds a
     kernel launch adds to a program that runs kernels one after another; and `handoff`, a GPU-scope semaphore
     signal another program of the same launch waits on, where the part's ring families fix tiles up across
-    programs (the balanced tail's partials). None where not measured."""
+    programs (the balanced tail's partials). None where not measured.
+
+    The latencies a kernel's synchronization and loads meet on the part's die, in its clock's cycles: a
+    block's mbarrier arrival observed by another of its warps (`barrier_cycles`), a cluster's
+    (`cluster_barrier_cycles`), a shared-memory load's use (`shared_cycles`), a hit in the near half of the
+    L2 (`l2_cycles`) and a GPU-scope acquire-release fence (`fence_cycles`); and the device-memory bytes a
+    second that 16-byte asynchronous copies of scattered 128-byte rows reach (`gather_bytes_per_second`),
+    below the stream's plateau. The algebra's cost model prices by them (`dew.algebra.cost`)."""
 
     fixed: float
     bytes_per_second: float
     launch: float | None = None
     handoff: float | None = None
+    barrier_cycles: float | None = None
+    cluster_barrier_cycles: float | None = None
+    shared_cycles: float | None = None
+    l2_cycles: float | None = None
+    fence_cycles: float | None = None
+    gather_bytes_per_second: float | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -337,6 +412,14 @@ class GpuTarget:
         """A TPU's VMEM capacity in bytes, the most a Mosaic kernel may raise its scoped limit to
         (`vmem_limit_bytes`); None on GPUs and where no rule states it."""
         return self.architecture.vmem_bytes
+
+    @property
+    def multiprocessor(self) -> Multiprocessor:
+        """The resources of this target's CUDA multiprocessor (`Architecture.multiprocessor`); a TPU has
+        none, which no CUDA launch's derivation reads."""
+        if self.architecture.multiprocessor is None:
+            raise ValueError(f"a {self.generation} target has no CUDA multiprocessor")
+        return self.architecture.multiprocessor
 
     @property
     def device_kind_prefixes(self) -> tuple[str, ...]:
@@ -455,10 +538,15 @@ TARGETS = {target.generation: target for target in (
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), multiprocessors=108, clock_hz=1410e6,
               memory_bandwidth=2039e9, triton_gemm_fusions=False, step_seconds=5.96e-6,
               # tools/device_facts.py on an A100-SXM4-40GB: its stream FS-DEVICEFACTS2-a100's (1.555 TB/s by
-              # its clocks), its launch FS-DEVICEFACTS4-a100's.
-              measured={'NVIDIA A100-SXM4-40GB': Measured(6.04e-6, 1.486e12, launch=2.11e-6)}),
+              # its clocks), its launch FS-DEVICEFACTS4-a100's; its die's shared-memory and near-L2 latencies
+              # an A100 PCIe's (GA100), Luo et al. 2025, arXiv:2501.12084, Tables 3 and 4.
+              measured={'NVIDIA A100-SXM4-40GB': Measured(6.04e-6, 1.486e12, launch=2.11e-6, shared_cycles=29,
+                                                          l2_cycles=208)}),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024,
-              {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}, multiprocessors=72,
+              # The RTX A6000's 154.8 TF dense (its datasheet's 309.7 with sparsity; the RTX PRO Blackwell
+              # architecture whitepaper's Table 4), a real one's other facts its driver's (`runtime_facts`).
+              {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12},
+               'NVIDIA RTX A6000': {'bf16': 154.8e12}}, multiprocessors=72,
               clock_hz=1695e6, memory_bandwidth=600e9),
     GpuTarget('sm89', 'NVIDIA L4', 99 * 1024,
               {'NVIDIA L4': {'bf16': 121e12, 'fp8': 242.5e12},
@@ -486,11 +574,22 @@ TARGETS = {target.generation: target for target in (
               # -gh200's, their launches and hand-offs FS-DEVICEFACTS4's; the H200's stream the same line
               # through the kernel challenge's best read at each size, 16.8 MB to 805 MB, cold L2 under graph
               # replay (judge-facts.md:3-18).
-              # The H100 PCIe's two rounds of tools/device_facts.py agreed to 1% (ET-DEVICEFACTS-h100pcie).
-              measured={'NVIDIA H100 80GB HBM3': Measured(1.87e-6, 3.190e12, launch=1.02e-6, handoff=0.78e-6),
-                        'NVIDIA H100 PCIe': Measured(2.11e-6, 1.980e12),
-                        'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6),
-                        'NVIDIA H200': Measured(2.81e-6, 4.617e12)}),
+              # The H100 PCIe's two rounds of tools/device_facts.py agreed to 1% (ET-DEVICEFACTS-h100pcie),
+              # its hand-off 0.695 us in both; its launch fit no line (negative slopes).
+              # The GH100 die's shared-memory and near-L2 latencies an H800 PCIe's (Luo et al. 2025,
+              # arXiv:2501.12084, Tables 3 and 4); the H200's the kernel challenge's calibration on the
+              # judge's H200 (h200-lean calibration/params.md, lines 39, 49, 59, 66, 67 and 71: the shared
+              # load, the near L2 hit at 260 to 280, the cp.async gather at two blocks a multiprocessor, the
+              # mbarrier arrival in a block and across a cluster, the GPU-scope acquire-release fence).
+              measured={'NVIDIA H100 80GB HBM3': Measured(1.87e-6, 3.190e12, launch=1.02e-6, handoff=0.78e-6,
+                                                          shared_cycles=29, l2_cycles=258),
+                        'NVIDIA H100 PCIe': Measured(2.11e-6, 1.980e12, handoff=0.695e-6, shared_cycles=29,
+                                                     l2_cycles=258),
+                        'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6,
+                                                       shared_cycles=29, l2_cycles=258),
+                        'NVIDIA H200': Measured(2.81e-6, 4.617e12, barrier_cycles=65,
+                                                cluster_barrier_cycles=395, shared_cycles=28, l2_cycles=270,
+                                                fence_cycles=274, gather_bytes_per_second=3.80e12)}),
     # Datasheet facts alone, no routes: what a compile-only sm100 device needs (`tests/kernel_compile.py`),
     # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,
@@ -514,7 +613,10 @@ TARGETS = {target.generation: target for target in (
               late_weight_gradients=True),
     GpuTarget('sm120', 'NVIDIA RTX PRO 6000 Blackwell Server Edition', 99 * 1024,
               dense_peaks={'NVIDIA RTX PRO 6000 Blackwell': {'bf16': 500e12, 'fp8': 1000e12}},
-              aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1792e9,
+              # The Server Edition's 1.597 TB/s (NVIDIA's RTX PRO 6000 Blackwell Server Edition page and
+              # datasheet); 1.792 TB/s is the Workstation part's (the RTX PRO Blackwell architecture
+              # whitepaper, p.12).
+              aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1597e9,
               step_seconds=3.68e-6),
     GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}),
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
@@ -1069,6 +1171,19 @@ def gpu_placed() -> bool:
     GPU host, so it makes none."""
     import jax
     return assumption() is None and jax.default_backend() == 'gpu' and placed_platform() == 'gpu'
+
+
+def cuda_lowered() -> bool:
+    """Whether a library's CUDA call lowers here for the call's target: on this process's own GPU
+    (`gpu_placed`), or within `assumed` on a GPU host whose own GPU is the assumed generation's, where a
+    compile ahead's program for that GPU's compile-only devices lowers it as for its own (an FFI target
+    the library registered, and the facts it reads of the GPU: FlashAttention's, dew_flash_attn)."""
+    import jax
+    if gpu_placed():
+        return True
+    found = assumption()
+    return (found is not None and jax.default_backend() == 'gpu'
+            and _generation(jax.local_devices()[0]) == found.generation)
 
 
 def backend() -> str:

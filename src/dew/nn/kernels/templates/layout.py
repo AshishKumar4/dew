@@ -9,7 +9,7 @@ from typing import Any
 import jax
 import jax.extend.core as jax_core
 
-from dew.nn.programs import CALLS
+from dew.nn.programs import CALLS, jax_name
 
 
 class Untransposable(NotImplementedError):
@@ -106,8 +106,9 @@ def _call(eqn, *operands, **params):
 
 def _custom(eqn, *operands, **params):
     # A custom derivative whose program and rule act one entry at a time (`_axis_free`): its program and its
-    # rule's pullback, both traced at its own shapes, run entry for entry on the held tiles (`_run`), the
-    # rule kept as the held call's own (`jax.custom_vjp`), so no tile is reshaped (Mosaic GPU lowers none).
+    # rule, both traced at its own shapes, run entry for entry on the held tiles (`_run`), the rule kept the
+    # call's own kind, so no tile is reshaped (Mosaic GPU lowers none): a custom JVP's tangent program, which
+    # reverse mode transposes and a higher order differentiates (`_held_jvp`), a custom VJP's pullback.
     traced = [var.aval for var in eqn.invars]
     cotangents = [var.aval for var in eqn.outvars]
 
@@ -116,6 +117,8 @@ def _custom(eqn, *operands, **params):
 
     floating = [index for index, aval in enumerate(traced)
                 if jax.numpy.issubdtype(aval.dtype, jax.numpy.inexact)]
+    if eqn.primitive.name == "custom_jvp_call":
+        return _held_jvp(params["call_jaxpr"], call, traced, floating)(*operands)
 
     def pulled(*values_and_cotangents):
         values, given = values_and_cotangents[:len(traced)], values_and_cotangents[len(traced):]
@@ -143,6 +146,39 @@ def _custom(eqn, *operands, **params):
     return held(*operands)
 
 
+def _held_jvp(primal, call, traced: list, floating: list[int]) -> Callable:
+    """A custom JVP call (`call`, at `traced` avals, its inexact operands at `floating`) held entry for entry:
+    its program and its JVP's, both traced at its own shapes, run on the held tiles (`_run`); the JVP is the
+    call's own rule, so forward mode, its transpose and every higher order meet that rule as on the call."""
+    def tangent(*values_and_tangents):
+        values, tangents = values_and_tangents[:len(traced)], values_and_tangents[len(traced):]
+
+        def chosen(*picked):
+            return call(*[picked[floating.index(index)] if index in floating else value
+                          for index, value in enumerate(values)])
+
+        picked = tuple(values[index] for index in floating)
+        outputs, output_tangents = jax.jvp(chosen, picked, tuple(tangents))
+        return [*outputs, *output_tangents]
+
+    tangents = jax.make_jaxpr(tangent)(*traced, *(traced[index] for index in floating))
+    shapes = {aval.shape for aval in traced} - {()}
+    if len(shapes) > 1 or not all(_axis_free(program.jaxpr, *shapes) and not _tiles_in(program)
+                                  for program in (primal, tangents)):
+        raise Untransposable("a custom_jvp_call whose program or derivative reads an axis or a constant tile")
+
+    @jax.custom_jvp
+    def held(*values):
+        return _run(primal.jaxpr, primal.consts, values)
+
+    @held.defjvp
+    def held_tangent(values, directions):
+        both = _run(tangents.jaxpr, tangents.consts, [*values, *(directions[index] for index in floating)])
+        return both[:len(both) // 2], both[len(both) // 2:]
+
+    return held
+
+
 def _tiles_in(closed) -> bool:
     """Whether a closed program holds a constant tile, among its constants or its operations' literals, its
     nested programs' too."""
@@ -153,6 +189,14 @@ def _tiles_in(closed) -> bool:
 
     return (any(len(getattr(value, "shape", ())) == 2 for value in closed.consts)
             or literal_tiles(closed.jaxpr))
+
+
+def entrywise(eqn) -> bool:
+    """Whether `eqn` acts one entry at a time: one of `ENTRYWISE`, or a scalar's broadcast. The one test of
+    an equation's kind its readers share, each with its own of the shapes it reads (`_axis_free`, the
+    Mosaic program's `_entrywise`, `dew.training.stages`)."""
+    name = jax_name(eqn.primitive)
+    return name in ENTRYWISE or (name == "broadcast_in_dim" and _rank(eqn.invars[0]) == 0)
 
 
 def _axis_free(jaxpr: jax_core.Jaxpr, shape: tuple[int, ...] = ()) -> bool:
@@ -168,7 +212,7 @@ def _axis_free(jaxpr: jax_core.Jaxpr, shape: tuple[int, ...] = ()) -> bool:
             if name not in CALLS or not all(
                     _axis_free(inner, shape) for inner in nested):
                 return False
-        elif name not in ENTRYWISE and not (name == "broadcast_in_dim" and _rank(eqn.invars[0]) == 0):
+        elif not entrywise(eqn):
             return False
     return True
 
@@ -218,13 +262,14 @@ def _run(jaxpr: jax_core.Jaxpr, consts, operands) -> list:
         if any(_rank(var) > 2 for var in (*eqn.invars, *eqn.outvars)):
             raise Untransposable(f"{eqn.primitive.name} of a value past a tile's two axes")
         operands_of = [read(var) for var in eqn.invars]
-        name = eqn.primitive.name
+        # A call by its name, which runs the program it holds; any other by its object (`jax_name`).
+        name = eqn.primitive.name if eqn.primitive.name in CALLS else jax_name(eqn.primitive)
         if name in RULES:
             out = RULES[name](eqn, *operands_of, **eqn.params)
-        elif name in ENTRYWISE:
+        elif entrywise(eqn):
             out = eqn.primitive.bind(*operands_of, **eqn.primitive.get_bind_params(eqn.params))
         else:
-            raise Untransposable(f"{name}, which no layout rule takes")
+            raise Untransposable(f"{eqn.primitive.name}, which no layout rule takes")
         values.update(zip(eqn.outvars, out if eqn.primitive.multiple_results else [out], strict=True))
     return [read(var) for var in jaxpr.outvars]
 
