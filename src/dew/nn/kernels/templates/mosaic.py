@@ -1673,11 +1673,6 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         one such step below it."""
         return resources.facts().register_step
 
-    most_shared: int
-    """The most shared memory a block of any GPU of the family holds (CUDA's opt-in limit), which bounds
-    the stages a generated tile takes; a GPU's own (`generation.shared_budget`) bounds the tiles its
-    launches keep."""
-
     @abc.abstractmethod
     def column_unit(self, dtype) -> int:
         """The columns a tile's width steps by for operands of `dtype`: the swizzle a block's rows are

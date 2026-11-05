@@ -176,7 +176,6 @@ class Wgmma(WgmmaIssuer, mosaic.RingFamily):
     blocks."""
 
     consumers = 2
-    most_shared = 227 * 1024  # sm90's (and sm100's) opt-in block
     cluster = 2  # TMA multicast to a pair, CUTLASS's grouped GEMM's and cuBLASLt's on an H100
 
 

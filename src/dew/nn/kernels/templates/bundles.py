@@ -31,7 +31,6 @@ class MmaFed(mosaic_sm80.MmaIssuer, mosaic.ConsumerFed):
 
     name = "mma.sync.fed"
     consumers = 1
-    most_shared = 99 * 1024  # sm120's opt-in block
 
 
 def of(generation_name: str, dtype) -> mosaic.Family | None:

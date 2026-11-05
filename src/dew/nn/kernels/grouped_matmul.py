@@ -796,9 +796,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     def launch_of(self, ba, config: mosaic_gpu.Tiles) -> resources.Launch:
         """The launch the planner sizes at `config`'s shape (`resources.plan`): its allocations at a ring
         depth (`_allocations`), its consumers, its registers a consumer thread (`registers`), and at most
-        the stages its program's share of the family's shared memory holds of a step's two operand blocks
-        at an element a byte and its contraction has steps, at least two: the call's a launch at `config`
-        runs (`_ran`), the launch naming `config`."""
+        the stages its program's share of the GPU's block (`generation.shared_budget`) holds of a step's
+        two operand blocks at an element a byte and its contraction has steps, at least two: the call's a
+        launch at `config` runs (`_ran`), the launch naming `config`."""
         launched = config
         ba, config = self._ran(ba, config)
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
@@ -809,7 +809,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             staged = dataclasses.replace(config, stages=stages)
             return self._allocations(ba, staged, family).scope(family, staged, steps)
 
-        shared = resources.program_shared(family.most_shared, config.programs)
+        shared = resources.program_shared(generation.shared_budget(generation.gpu_target()), config.programs)
         most = shared // ((config.block_m + config.block_n) * config.block_k)
         if steps is not None:
             # A ring deeper than its contraction's steps holds no more of them.
