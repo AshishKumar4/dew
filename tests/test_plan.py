@@ -405,13 +405,19 @@ def live_executables() -> int:
 def test_a_plan_search_keeps_the_freeze_a_process_made_before_it():
     """A plan search raises Python's youngest collection threshold while it runs (`held_objects`) and
     leaves the permanent generation to the process: one that froze its objects before importing Dew, as one
-    that forks its workers does, finds its freeze as it made it after a step planned and compiled, and its
-    thresholds as they were, in a fresh interpreter (row 3341's review)."""
+    that forks its workers does, has its freeze as it made it after a step planned and compiled, Dew
+    freezing and unfreezing nothing, and its thresholds as they were, in a fresh interpreter (row 3341's
+    review)."""
     assert_exits_cleanly("""
 import gc
+
+touched = []
+freeze, unfreeze = gc.freeze, gc.unfreeze
+gc.freeze = lambda: touched.append("freeze")
+gc.unfreeze = lambda: touched.append("unfreeze")
 gc.collect()
-gc.freeze()
-frozen, thresholds = gc.get_freeze_count(), gc.get_threshold()
+freeze()
+thresholds = gc.get_threshold()
 
 import sys
 sys.path.insert(0, "tests")
@@ -420,13 +426,12 @@ from test_plan import BATCH, lm
 trainer = lm()
 state, _, _ = trainer.place()
 trainer.compile(state, BATCH)
-assert gc.get_freeze_count() >= frozen, (gc.get_freeze_count(), frozen)
-assert gc.get_threshold() == thresholds, gc.get_threshold()
+assert not touched and gc.get_threshold() == thresholds, (touched, gc.get_threshold())
 from dew.nn.kernels.options import held_objects
 with held_objects():
     assert gc.get_threshold()[0] > thresholds[0]
-    inside = gc.get_freeze_count()
-assert gc.get_freeze_count() == inside and gc.get_threshold() == thresholds
+assert not touched and gc.get_threshold() == thresholds
+unfreeze()
 """)
 
 
