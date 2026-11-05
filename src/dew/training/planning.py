@@ -201,7 +201,8 @@ def judged_likely(headroom: int | None, under: int, *, forecast: bool) -> bool:
 
 
 def planned(candidates: Sequence[int], first: int, fits: Callable[[int], bool],
-            climb: Callable[[], bool], likely: Callable[[int], bool] = lambda split: False) -> int | None:
+            climb: Callable[[], bool], likely: Callable[[int], bool] = lambda split: False,
+            refused: Callable[[int], bool] = lambda split: False) -> int | None:
     """The split a step reads its batch in, at the rung `climb` leaves the
     objective on, or None where no candidate fits.
 
@@ -228,9 +229,13 @@ def planned(candidates: Sequence[int], first: int, fits: Callable[[int], bool],
     takes its first point.
 
     Past a miss, the first split `likely` to fit by what the compiles
-    measured (`Forecast`) is asked in place of the largest, and where it
-    misses, the next above it: a guess orders the compiles and never moves
-    the plan. Replayed through it, the six compiles an A100-40 asked for
+    measured (`Forecast`) or the derivation judged is asked in place of the
+    largest, and where it misses, the next above it; the halving below a
+    split that fits compiles no split `refused`, one the derivation judges
+    short, corrected by what a compile at the rung needed beyond it
+    (Qwen3.5-4B at 4 x 2048 on an H100: two microbatches, judged 3.83 GiB
+    short for their accumulated gradient, compiled a third time on main,
+    row 3341). Replayed through it, the six compiles an A100-40 asked for
     Qwen3.5-0.8B's packed 8 x 3072 step are five (no largest split), the
     plan the same.
     """
@@ -244,7 +249,9 @@ def planned(candidates: Sequence[int], first: int, fits: Callable[[int], bool],
                 high = index
                 while high - low > 1:
                     middle = (low + high) // 2
-                    low, high = (low, middle) if fits(candidates[middle]) else (middle, high)
+                    # A split the derivation refuses past a miss is not compiled (`refused`).
+                    fitted = not refused(candidates[middle]) and fits(candidates[middle])
+                    low, high = (low, middle) if fitted else (middle, high)
                 return candidates[high]
             low = index
         if not climb():
@@ -647,7 +654,7 @@ class FitSearch[LossT, EffectsT]:
         self.derived_start(candidates[-1])
         first = self.derived_split(candidates, first)
         seen, held, traced = len(report.misses()), set(report.refused_launches()), len(report.rewrites())
-        split = planned(candidates, first, self.fits, self.climb, self.likely)
+        split = planned(candidates, first, self.fits, self.climb, self.likely, self.refused)
         spills: list[JSON] = [spill_record(miss) for miss in report.misses()[seen:]]
         refused: list[JSON] = [refusal_record(*refusal) for refusal in report.refused_launches()
                                if refusal not in held]
@@ -801,15 +808,27 @@ class FitSearch[LossT, EffectsT]:
             low, high = (low, middle) if fits else (middle, high)
         return high
 
+    def judgment(self, split: int) -> int | None:
+        """The derivation's headroom of the step at `split` at the objective's rung, traced where the search
+        has not judged it yet (a trace, where a compile it saves is a minute and more), None where it
+        cannot judge."""
+        if self.derive is not None and self.judging():
+            return self.judged(split, self.narrow)
+        return self.judged_at.get(self.candidate_key(split, self.narrow))
+
     def likely(self, split: int) -> bool:
         """Whether the step at `split` at the objective's rung is likely to fit, which orders the compiles
-        past a miss (`planned`): as the derivation judges it, traced where the search has not judged it
-        yet (a trace, where a compile it saves is a minute and more), corrected by what the compiles
-        measured; as the compiles' forecast guesses where the derivation cannot judge (`judged_likely`)."""
-        derived = (self.judged(split, self.narrow) if self.derive is not None and self.judging()
-                   else self.judged_at.get(self.candidate_key(split, self.narrow)))
-        return judged_likely(derived, self.under.get(self.remat_rung(), 0),
+        past a miss (`planned`): as the derivation judges it, corrected by what the compiles measured;
+        as the compiles' forecast guesses where the derivation cannot judge (`judged_likely`)."""
+        return judged_likely(self.judgment(split), self.under.get(self.remat_rung(), 0),
                              forecast=self.forecast.likely(self.rung(), split))
+
+    def refused(self, split: int) -> bool:
+        """Whether the derivation judges the step at `split` short past a miss, corrected by what a compile
+        at the rung needed beyond it (`under`), which the halving below a split that fits does not compile
+        (`planned`); no split it cannot judge."""
+        derived = self.judgment(split)
+        return derived is not None and derived - self.under.get(self.remat_rung(), 0) < 0
 
     def judging(self) -> bool:
         """Whether every process's devices judge a derived footprint (`memory.judged`) at the search's
