@@ -162,26 +162,39 @@ class Measuring:
 
 
 def _stated(source: Source, read: Read, measuring: Sequence[Measuring] = (),
-            whole: Callable[[Source], Records] | None = None) -> tuple[Records | None, Mapping[str, object]]:
+            whole: Callable[[Source], Source] | None = None) -> tuple[Records | None, Mapping[str, object]]:
     """The records a memory read of `source` holds, then its metadata, with each fact `measuring`
     measures in place of any the store states, in a memory read: over the whole store's records,
     below any holdout (a generation's part's over the generation's rows for every input,
     `SelectedGeneration.whole`), so each part of it binds alike, as the stages before the measuring
     step make them (`dew.data.lowering.prepared_rows`). `whole` reads the store once for every part
-    of it."""
+    of it, a source holding that read, which each part's own rows are then read over."""
     from dew.data.holdout import SelectedGeneration
     from dew.data.lowering import prepared_rows
 
-    held = source.records(read) if read == "memory" else None
     metadata = source.metadata()
-    if held is None or not measuring:
-        return held, metadata
     store = _store(source)
-    if isinstance(store, SelectedGeneration):
-        store = store.whole
-    rows = held if store is source else whole(store) if whole is not None else store.records(read)
+    if read != "memory" or not measuring or store is source or isinstance(store, SelectedGeneration) or (
+            whole is None):
+        held = source.records(read) if read == "memory" else None
+        if held is None or not measuring:
+            return held, metadata
+        measured = store.whole if isinstance(store, SelectedGeneration) else store
+        rows = held if measured is source else measured.records(read)
+    else:
+        pinned = whole(store)
+        rows, held = pinned.records(read), _over(source, store, pinned).records(read)
     return held, {**metadata, **{each.measure.fact: each.measure(prepared_rows(rows, each.before))
                                  for each in measuring}}
+
+
+def _over(source: Source, store: Source, pinned: Source) -> Source:
+    """`source`, the views over `store` whose rows are its own (`SAME_ROWS`), read over `pinned` in its
+    place."""
+    if source is store:
+        return pinned
+    assert isinstance(source, View)
+    return dataclasses.replace(source, source=_over(source.source, store, pinned))
 
 
 def _measures(stages: Sequence[Stage]) -> tuple[Measuring, ...]:
