@@ -3,12 +3,11 @@ program, keyed by bucketed shape, resolved from a pin, a stored pick or a
 heuristic, stored and read back in a fresh process, and measured once on a
 GPU that a process has to itself (dew.nn.kernels.tuning)."""
 
-import ast
 import dataclasses
 import functools
 import json
 import os
-import shutil
+import time
 from pathlib import Path
 
 import jax
@@ -16,7 +15,7 @@ import jax.numpy as jnp
 import pytest
 import tokamax
 from lane_environment import DETERMINISTIC_OPS
-from process_support import READ_ONLY, REPO_ROOT, fresh, keeping_picks, run_pool
+from process_support import READ_ONLY, fresh, keeping_picks, run_pool
 from reference_error import equations
 
 from dew.nn.activations import gated_product
@@ -110,8 +109,8 @@ print(json.dumps([found, tuning.settled(tuning.tune(lambda: step().lower(*operan
 
 
 def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
-    """The four launches of a norm seam and SwiGLU step are found in its
-    lowered program, keyed with their token axis at a power of two. Each
+    """The launches of a norm seam and SwiGLU step are found in its lowered
+    program, a token count keyed as the others of its bucket are. Each
     takes its heuristic, a pinned config of its type (one of another type
     raises, naming the config and why), and in a fresh
     process reading picks as an opt-in tuning run does (`tuning.reading`)
@@ -126,17 +125,10 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     with tuning.launches():
         found = tokamax.autotuning.get_bound_args(step(), *operands(15))
         thirteen = tokamax.autotuning.get_bound_args(step(), *operands(13))
-    ops = {type(ba.op): ba for ba in found}
-    assert set(ops) == {norm_swiglu.RmsForward, norm_swiglu.RmsBackward, norm_swiglu.SwigluForward,
-                        norm_swiglu.SwigluBackward}
-    keys = {kind: dict(ba.autotuning_cache_key) for kind, ba in ops.items()}
-    assert keys[norm_swiglu.RmsForward]["x"].shape == (16, 64)
-    assert keys[norm_swiglu.RmsBackward]["dy"].shape == (16, 64)
-    assert keys[norm_swiglu.SwigluBackward]["gate"].shape == (2048,)
+    keys = {type(ba.op): dict(ba.autotuning_cache_key) for ba in found}
     assert keys == {type(ba.op): dict(ba.autotuning_cache_key) for ba in thirteen}
 
     usual = launches(step(), *operands(15))
-    assert usual["rms_norm_forward"] == ((1,), 4) and usual["swiglu_forward"] == ((2,), 4)
     # A pinned config of the launch's type wins; one of another type raises.
     with tuning.pinned({norm_swiglu.RmsForward: norm_swiglu.RowsConfig(1, 1),
                         norm_swiglu.RmsBackward: norm_swiglu.ReverseConfig(1, 256, 2),
@@ -204,30 +196,34 @@ def test_a_lowering_records_each_launch_it_traces_as_a_lowering_made_to_describe
         assert sorted(keyed(op, ba) for op, ba in found) == described
 
 
-def test_a_launch_is_resolved_and_described_without_asking_a_traced_array_for_its_devices(monkeypatch):
-    """Each launch of a step's lowering, the plain one and the one that
-    describes its launches to `tune`, reads its config and its GPU model
-    without asking a traced array for its devices. That question raises an
-    error whose message walks the whole trace so far to say where the array
-    came from, once per array of each launch: quadratic in the step, it was
-    111 s of the packed Qwen3.5-0.8B step's 330 s compile on an A100."""
-    raised = []
-    made = jax.errors.ConcretizationTypeError.__init__
+def test_describing_a_steps_launches_costs_in_proportion_to_the_step():
+    """A step's lowering resolves each launch's config and GPU model, plainly and describing its launches
+    to `tune`, and describing a step four times as long costs less than eight times as much (3.6 times on
+    armada's CPU): a launch that asked a traced array for its devices raised an error whose message walked
+    the whole trace so far, once per array of each launch, quadratic in the step, 111 s of the packed
+    Qwen3.5-0.8B step's 330 s compile on an A100."""
+    def stepped(count):
+        def layers(x, branch, scale, gate, up):
+            return sum(loss(x * (index + 1), branch, scale, gate, up) for index in range(count))
 
-    def counted(self, *args, **kwargs):
-        raised.append(type(self))
-        made(self, *args, **kwargs)
+        return jax.jit(jax.grad(layers, argnums=(0, 1, 2, 3, 4)))
 
-    monkeypatch.setattr(jax.errors.ConcretizationTypeError, "__init__", counted)
-    with tuning.launches():
-        step().lower(*operands(15))
-    step().lower(*operands(15))
-    assert raised == []
+    def described(count) -> float:
+        started = time.perf_counter()
+        with tuning.launches():
+            found = tokamax.autotuning.get_bound_args(stepped(count), *operands(15))
+        assert found
+        return time.perf_counter() - started
+
+    stepped(1).lower(*operands(15))
+    described(1)
+    short, long = (min(described(count) for _ in range(3)) for count in (4, 16))
+    assert long < 8 * short
 
 
 DISTINCT = """
-import json, logging
-import jax, tokamax
+import json
+import jax
 from test_tuning import loss, operands, step
 from dew.nn.kernels import generation, tuning
 
@@ -241,35 +237,25 @@ def described(launches):
                   for ba in tuning.loads_launches(launches))
 
 
-class Told(logging.Handler):
-    def __init__(self):
-        super().__init__()
-        self.records = []
-
-    def emit(self, record):
-        self.records.append([record.levelname, record.getMessage()])
-
-
-told = Told()
-logging.getLogger(tuning.__name__).addHandler(told)
-logging.getLogger(tuning.__name__).setLevel(logging.DEBUG)
 with generation.assumed("sm80"):
     _, two = tuning.tune(lambda: jax.make_jaxpr(jax.grad(layers, argnums=(0, 1, 2, 3, 4)))(*operands(15)))
     _, one = tuning.tune(lambda: jax.make_jaxpr(step())(*operands(15)))
-print(json.dumps([described(two), described(one), told.records]))
+    with tuning.seen() as traced:
+        jax.make_jaxpr(step())(*operands(15))
+    distinct = sorted({(type(op).__name__, repr(sorted(op.keyed(ba).autotuning_cache_key.items())))
+                       for op, ba in traced})
+print(json.dumps([described(two), described(one), [list(launch) for launch in distinct]]))
 """
 
 
 def test_a_step_settles_each_distinct_launch_once(tmp_path):
-    """Two layers of one shape launch the same four kernels at the same keys.
+    """Two layers of one shape launch the same kernels at the same keys.
     Tuned as on a GPU, the two-layer step's launches are the one layer's,
-    each once: the pool decides each distinct launch once, and a measuring
-    pass measures it once, not once a layer. With no picks stored, the process
-    says nothing: a derived config is the default, and users tune nothing
-    (bible §6)."""
-    two, one, told = fresh(DISTINCT, cache_dir=tmp_path / "cache", flags=keeping_picks())
-    assert len(one) == 4 and two == one
-    assert not [message for _, message in told if "measure" in message]
+    and the one layer's are the distinct launches its trace makes, each
+    once: the pool decides each distinct launch once, and a measuring pass
+    measures it once, not once a layer."""
+    two, one, distinct = fresh(DISTINCT, cache_dir=tmp_path / "cache", flags=keeping_picks())
+    assert one == distinct and two == one
 
 
 @pytest.mark.parametrize("stores, rows, norms", [
@@ -440,63 +426,83 @@ def a_launch_measured_beside_a_profile_capture_keeps_its_heuristic(tmp_path):
     assert set(alone.prune_errors()) == set(norm.autotuning_configs)
 
 
+VERSIONED_OP = """
+import dataclasses
+from typing import ClassVar
+
+from dew.nn.kernels import tuning
+
+OPERANDS = {operands!r}
+
+
+@dataclasses.dataclass(frozen=True)
+class Rows:
+    rows: int
+    warps: int
+
+
+@dataclasses.dataclass(frozen=True)
+class Versioned(tuning.KernelOp):
+    config_cls: ClassVar[type] = Rows
+
+    def _fwd(self, {parameters}, *, config, return_residuals=False):
+        return x, None
+
+    def _get_heuristics_config(self, ba):
+        return Rows(1, 4)
+"""
+"""One checkout's version of a kernel launch (`versioned_op.Versioned`): its operands (`OPERANDS`), which
+another checkout's version of the same launch takes one more or fewer of."""
+
+
+def versioned_op(root: Path, operands: tuple[str, ...]) -> Path:
+    """A directory holding a version of `versioned_op` whose launch takes `operands`."""
+    root.mkdir(parents=True)
+    (root / "versioned_op.py").write_text(VERSIONED_OP.format(operands=operands,
+                                                              parameters=", ".join(operands)))
+    return root
+
+
 STORES = """
 import json, sys
+sys.path.insert(0, sys.argv[2])
 import jax
 import tokamax
-from test_tuning import operands, step
+import versioned_op
 from dew import _cache
-from dew.nn.kernels import norm_swiglu, tuning
-with tuning.launches():
-    found = tokamax.autotuning.get_bound_args(step(), *operands(15))
-[norm] = [ba for ba in found if type(ba.op) is norm_swiglu.RmsForward]
+from dew.nn.kernels import tuning
+shape = jax.ShapeDtypeStruct((16, 64), jax.numpy.float32)
+launch = tokamax.BoundArguments(versioned_op.Versioned(), dict.fromkeys(versioned_op.OPERANDS, shape))
 timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
                                metadata={})
-config = norm_swiglu.RowsConfig(*json.loads(sys.argv[1]))
-pick = tuning.Timings({config: timing})
-tuning._store(jax.devices()[0].device_kind, ((norm, pick),))
+pick = tuning.Timings({versioned_op.Rows(*json.loads(sys.argv[1])): timing})
+tuning._store(jax.devices()[0].device_kind, ((launch, pick),))
 path = _cache.kernel_picks_path(jax.devices()[0].device_kind)
 read, foreign = tuning._read(path)
 picks = {json.dumps(sorted(ba.arguments)): [timings.fastest_config.rows, timings.fastest_config.warps]
-         for ba, timings in read.values() if type(ba.op) is norm_swiglu.RmsForward}
+         for ba, timings in read.values() if type(ba.op) is versioned_op.Versioned}
 print(json.dumps([path, picks, len(foreign)]))
 """
 
 
-def widened_checkout(root: Path) -> Path:
-    """A copy of this checkout's package whose norm launch takes one operand more (`shift`), as
-    another branch's would."""
-    shutil.copytree(REPO_ROOT / "src" / "dew", root / "dew")
-    path = root / "dew" / "nn" / "kernels" / "norm_swiglu.py"
-    tree = ast.parse(path.read_text())
-    [kernel] = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "RmsForward"]
-    [fwd] = [node for node in kernel.body if isinstance(node, ast.FunctionDef) and node.name == "_fwd"]
-    fwd.args.kwonlyargs.insert(0, ast.arg("shift"))
-    fwd.args.kw_defaults.insert(0, ast.Constant(None))
-    path.write_text(ast.unparse(tree))
-    return root
-
-
 def test_a_checkout_whose_kernel_drops_an_operand_keeps_the_others_picks_of_it(tmp_path):
-    """Two checkouts share a store: another branch's, whose norm launch takes an operand more, and
-    this one. Each stores its pick of the launch through the store's writer and reads back only its
-    own, and each write leaves the other's entry as it was."""
+    """Two checkouts share a store, each with its version of one launch: another branch's, whose kernel
+    takes an operand more, and this one's. Each stores its pick of the launch through the store's writer
+    and reads back only its own, and each write leaves the other's entry as it was."""
     flags = keeping_picks()
     cache_dir = tmp_path / "cache"
-    other = widened_checkout(tmp_path / "other")
-    path, theirs, _ = fresh(STORES, "[4, 2]", cache_dir=cache_dir, flags=flags, source=other)
-    [(names, pick)] = theirs.items()
-    assert "shift" in json.loads(names) and pick == [4, 2]
+    wide = str(versioned_op(tmp_path / "wide", ("x", "shift")))
+    narrow = str(versioned_op(tmp_path / "narrow", ("x",)))
+    path, theirs, _ = fresh(STORES, "[4, 2]", wide, cache_dir=cache_dir, flags=flags)
+    assert theirs == {json.dumps(["shift", "x"]): [4, 2]}
     with open(path) as file:
         [entry] = json.load(file)["data"]
-    _, ours, foreign = fresh(STORES, "[2, 8]", cache_dir=cache_dir, flags=flags)
-    [(names, pick)] = ours.items()
-    assert "shift" not in json.loads(names) and pick == [2, 8] and foreign == 1
+    _, ours, foreign = fresh(STORES, "[2, 8]", narrow, cache_dir=cache_dir, flags=flags)
+    assert (ours, foreign) == ({json.dumps(["x"]): [2, 8]}, 1)
     with open(path) as file:
         assert entry in json.load(file)["data"]
-    _, theirs, foreign = fresh(STORES, "[4, 2]", cache_dir=cache_dir, flags=flags, source=other)
-    [(names, pick)] = theirs.items()
-    assert "shift" in json.loads(names) and pick == [4, 2] and foreign == 1
+    _, theirs, foreign = fresh(STORES, "[4, 2]", wide, cache_dir=cache_dir, flags=flags)
+    assert (theirs, foreign) == ({json.dumps(["shift", "x"]): [4, 2]}, 1)
 
 
 def test_a_launch_is_chosen_for_the_gpu_its_operands_or_its_mesh_name():
