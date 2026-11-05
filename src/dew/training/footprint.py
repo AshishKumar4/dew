@@ -190,11 +190,13 @@ def derived_terms(loss: Callable, params, arguments: Sequence, *, platform: str,
                   lowering: str | None = None, consumed: bool = False,
                   deferred: bool = False) -> tuple[int, Peak]:
     """`residual_bytes` and `gradient_peak` of `loss(params, *arguments)` from one trace of its forward and
-    backward (`traced_gradient`), as each derives it from its own."""
-    traced = traced_gradient(loss, params, arguments)
-    lowering = lowering or LOWERED.get(platform, platform)
-    return (_kept(*traced, platform, lowering),
-            _peak(*traced, platform, workspace, lowering, consumed, deferred))
+    backward (`traced_gradient`), lowered once (`compiled`, its outputs the gradient and the residuals
+    alike: an equation's lowering reads no output), as each derives it from its own (row 4261: lowered
+    for each, the two lowerings were 16 of a Qwen3.5-4B candidate's 28 seconds)."""
+    program, count, shapes = traced_gradient(loss, params, arguments)
+    lowered = compiled(program, lowering or LOWERED.get(platform, platform))
+    return (_kept(lowered, count, shapes, platform),
+            _peak(lowered, count, platform, workspace, consumed, deferred))
 
 
 def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str,
@@ -208,8 +210,8 @@ def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str
     none. A value the pullback closes over keeps its own traced sharding; one whose trace states none, and
     every other value, count whole. Matching an axis's size to the batch size cannot identify its
     sharding: a weight or a scan's layer axis can have that size too."""
-    lowering = lowering or LOWERED.get(platform, platform)
-    return _kept(*traced_gradient(loss, params, arguments), platform, lowering)
+    program, count, shapes = traced_gradient(loss, params, arguments)
+    return _kept(compiled(program, lowering or LOWERED.get(platform, platform)), count, shapes, platform)
 
 
 def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
@@ -229,22 +231,24 @@ def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
     xla/hlo/transforms/simplifiers/hlo_memory_scheduler.cc; `ScheduleGpuModule`,
     xla/service/gpu/gpu_hlo_schedule.cc). With `deferred`, the gradient's own equations run after the rest
     of the backward (`sunk`)."""
-    return _peak(*traced_gradient(loss, params, arguments), platform, workspace,
-                 lowering or LOWERED.get(platform, platform), consumed, deferred)
+    program, count, _ = traced_gradient(loss, params, arguments)
+    return _peak(compiled(program, lowering or LOWERED.get(platform, platform)), count, platform, workspace,
+                 consumed, deferred)
 
 
-def _kept(program: jcore.Jaxpr, count: int, shapes: Sequence, platform: str, lowering: str) -> int:
-    """`residual_bytes` of `traced_gradient`'s program, its outputs past the first `count` the residuals."""
-    return _residuals(compiled(program.replace(outvars=program.outvars[count:]), lowering), shapes, platform)
+def _kept(lowered: jcore.Jaxpr, count: int, shapes: Sequence, platform: str) -> int:
+    """`residual_bytes` of `traced_gradient`'s program as it is `lowered` (`compiled`), its outputs past
+    the first `count` the residuals."""
+    return _residuals(lowered.replace(outvars=lowered.outvars[count:]), shapes, platform)
 
 
-def _peak(program: jcore.Jaxpr, count: int, shapes: Sequence, platform: str, workspace: Workspace,
-          lowering: str, consumed: bool = False, deferred: bool = False) -> Peak:
-    """`gradient_peak` of `traced_gradient`'s program, its first `count` outputs the gradient."""
-    del shapes
-    lowered = compiled(program.replace(outvars=program.outvars[:count]), lowering)
-    return Peak(peak_bytes(sunk(lowered) if deferred else lowered, platform, workspace, consumed=consumed),
-                not bounded_below(lowered, platform))
+def _peak(lowered: jcore.Jaxpr, count: int, platform: str, workspace: Workspace, consumed: bool = False,
+          deferred: bool = False) -> Peak:
+    """`gradient_peak` of `traced_gradient`'s program as it is `lowered` (`compiled`), its first `count`
+    outputs the gradient."""
+    gradient = lowered.replace(outvars=lowered.outvars[:count])
+    return Peak(peak_bytes(sunk(gradient) if deferred else gradient, platform, workspace, consumed=consumed),
+                not bounded_below(gradient, platform))
 
 
 def sunk(program: jcore.Jaxpr) -> jcore.Jaxpr:
