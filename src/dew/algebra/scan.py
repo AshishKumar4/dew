@@ -120,9 +120,11 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
     alone. `prepare`, `step`, `mapped` and `merge` each take a mainloop's issuer, `issue(role, lhs, rhs)`
     (`lhs @ rhs`), which makes every matrix product of the forms, each by its role: `scores`, `gram`,
     `inverse_merge`, `apply` and `carry` prepared; `correct` and `carry` stepped (`carry.CARRY_ROLES`);
-    `readout_memory` and `readout_local` mapped (`carry.EMIT_ROLES`); `transfer_carry`, `transfer_apply`
-    and `transfer_compose` forming and joining a walk's transfer. The same forms without one take Dew's
-    products, the portable route's."""
+    `readout_memory` and `readout_local` mapped (`carry.EMIT_ROLES`); `transfer_compose` (a chunk's prepared
+    transition on the transfer, and two transfers joined), `transfer_apply` and `transfer_decay` (`rhs *
+    lhs`, a decay's column scale, the one role no product) forming and joining a walk's transfer. The same
+    forms without one take Dew's products, the portable route's; a chunk's prepared transition is always
+    Dew's, formed chunk-parallel."""
     names = tuple(name for name in declaration.operands if name != declaration.reset)
     shape, dtype = declaration.state
     if len(shape) != 2:
@@ -188,7 +190,10 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
             if len(splits) > splits_held:
                 splits.popitem(last=False)
         splits.move_to_end(key)
-        return Prepared((natural, split.prepare(*given)), split, corrected)
+        prepared = Prepared((natural, split.prepare(*given)), split, corrected)
+        if not corrected:
+            return prepared
+        return dataclasses.replace(prepared, transition=_transition(prepared, jnp.zeros(shape, carried)))
 
     def step(state, prepared, issue=None):
         decay, h = state[:2]
@@ -199,7 +204,8 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
             return decay, leaving
         if prepared.corrected and state.transfer is None:
             raise Refused("a walk started for tokens that do not correct the state steps a chunk whose do")
-        transfer = None if state.transfer is None else _transferred(prepared, state.transfer, h, issue)
+        transfer = (None if state.transfer is None
+                    else (issue or _issued)("transfer_compose", prepared.transition, state.transfer))
         return Walk(decay, leaving, transfer)
 
     def mapped(prepared, state, issue=None):
@@ -208,7 +214,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
 
     def merge(a, b, operands, issue=None):
         del operands
-        return _merged(a, b, carried, issue or _issued)
+        return _merged(a, b, None if issue else carried, issue or _issued)
 
     def finish(state, operands):
         del operands
@@ -230,16 +236,19 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
                    {"rounding": "compensated prefix", "walked": declaration.walked}, backward, prepare)
 
 
-@functools.partial(jax.tree_util.register_dataclass, data_fields=["values"],
+@functools.partial(jax.tree_util.register_dataclass, data_fields=["values", "transition"],
                    meta_fields=["split", "corrected"])
 @dataclasses.dataclass(frozen=True)
 class Prepared:
     """A chunk's values that read no state (`carry.Split.prepare`), batched as a walk computes them for every
-    chunk at once, the split that reads them and whether its tokens correct the state (static)."""
+    chunk at once, the split that reads them and whether its tokens correct the state (static); where they
+    do, the chunk's transition (`transition`, keys by keys: its carry's linear part, `_transition`), which a
+    walk that merges composes into its transfer."""
 
     values: tuple
     split: carry.Split
     corrected: bool
+    transition: jax.Array | None = None
 
 
 class Walk(NamedTuple):
@@ -256,7 +265,9 @@ class Walk(NamedTuple):
 def _merged(a, b, carried, issue: Callable) -> Walk:
     """Two consecutive walks' states joined (`derive_scan`'s `merge`), the later's from zero applying its
     transfer to the state before it: its decay per key (its exponent sum in natural units) where no token
-    corrects the state, else the transfer it carried; each in `carried`, the walks' accumulation dtype."""
+    corrects the state, else the transfer it carried; each in `carried`, the walks' accumulation dtype (as
+    `issue` makes them where `carried` is None: a mainloop's issuer, its products float32 and its operands
+    its own, each touched by it alone)."""
     if not (isinstance(a, Walk) and isinstance(b, Walk)):
         raise Refused("a merge of walks init did not start from their operands' shapes")
     if b.transfer is None:
@@ -264,24 +275,22 @@ def _merged(a, b, carried, issue: Callable) -> Walk:
         transfer = None if a.transfer is None else jnp.exp(b.decay)[:, None] * a.transfer
     else:
         h = issue("transfer_apply", b.transfer, a.h) + b.h
-        transfer = (b.transfer * jnp.exp(a.decay)[None, :] if a.transfer is None
+        transfer = (issue("transfer_decay", jnp.exp(a.decay), b.transfer) if a.transfer is None
                     else issue("transfer_compose", b.transfer, a.transfer))
+    if carried is None:
+        return Walk(_held(a.decay + b.decay), h, transfer)
     return Walk(_held(a.decay + b.decay), h.astype(carried),
                 None if transfer is None else transfer.astype(carried))
 
 
-def _transferred(prepared: Prepared, transfer: jax.Array, h: jax.Array, issue: Callable | None) -> jax.Array:
-    """The chunk's transfer applied to a walk's (`transfer`, keys by keys): its carry's linear part in the
-    state (`jax.linearize` at the state `h` entering it, the carry affine in it), over the transfer's
-    columns a state's width at a time."""
+def _transition(prepared: Prepared, h: jax.Array) -> jax.Array:
+    """The chunk's transition (keys by keys): its carry's linear part in the state (`jax.linearize` at a
+    state `h`, the carry affine in it) over the identity's columns a state's width at a time, Dew's products,
+    prepared for every chunk at once."""
     keys, width = h.shape
-    def transferring(role, left, right):
-        return issue("transfer_carry", left, right)
-
-    _, linear = jax.linearize(lambda state: prepared.split.carry(
-        prepared.values[1], state, None if issue is None else transferring)[0], h)
+    _, linear = jax.linearize(lambda state: prepared.split.carry(prepared.values[1], state)[0], h)
     blocks = -(-keys // width)
-    padded = jnp.pad(transfer.astype(h.dtype), ((0, 0), (0, blocks * width - keys)))
+    padded = jnp.pad(jnp.eye(keys, dtype=h.dtype), ((0, 0), (0, blocks * width - keys)))
     columns = jax.vmap(linear, in_axes=1, out_axes=1)(padded.reshape(keys, blocks, width))
     return columns.reshape(keys, blocks * width)[:, :keys]
 
@@ -557,8 +566,10 @@ def _doubled(overlaps, issue: Callable | None = None):
 
 
 def _issued(name: str, left, right):
-    """The doubling's products (`recurrence_algebra.doubled`'s issuer) as Dew's (`float32_matmul`)."""
-    del name
+    """A derived scan's products as Dew's (`float32_matmul`), the doubling's among them
+    (`recurrence_algebra.doubled`'s issuer); `transfer_decay` a transfer's columns scaled, `right * left`."""
+    if name == "transfer_decay":
+        return right * left[None, :]
     return float32_matmul(left, right)
 
 
