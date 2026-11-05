@@ -665,7 +665,10 @@ class _Numbering:
 
         params = equation.params
         if equation.primitive.name == "scan":
-            consts, carries = params["num_consts"], params["num_carry"]
+            counts = _scan_counts(params)
+            if counts is None:
+                return None
+            consts, carries = counts
             scanned = operands[consts + carries:]
             if params["length"] > UNROLLED or any(isinstance(value, tuple) for value in scanned):
                 return None
@@ -702,6 +705,18 @@ class _Numbering:
             else:
                 return None
         return chosen
+
+
+def _scan_counts(params: Mapping) -> tuple[int, int] | None:
+    """A loop's (`scan`) count of constants and of carried values among its operands, as its parameters
+    state them: by count, or as the flat trees of its constants, carries and scanned values a JAX that
+    names them so holds (`ft_in`); None where they state neither."""
+    if "num_consts" in params:
+        return params["num_consts"], params["num_carry"]
+    trees = params.get("ft_in")
+    if isinstance(trees, tuple) and len(trees) == 3 and all(isinstance(tree, tuple) for tree in trees):
+        return len(trees[0]), len(trees[1])
+    return None
 
 
 UNROLLED = 256
