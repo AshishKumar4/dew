@@ -211,12 +211,12 @@ def _holders(tree) -> list[tuple[TreePath, tuple[str, ...]]]:
     return [((), CHECKPOINTED), *nested]
 
 
-def _variable_trees(tree) -> list[TreePath]:
-    """The variables trees a step's state tree holds, each keyed by collection: the variables and the EMA
-    (`dew.state.VARIABLE_FIELDS`), the run's and each DiLoCo group's."""
+def _variable_trees(tree) -> dict[TreePath, Mapping[str, object]]:
+    """The variables trees a step's state tree holds, by where they sit, each keyed by collection: the
+    variables and the EMA (`dew.state.VARIABLE_FIELDS`), the run's and each DiLoCo group's."""
     from dew.state import VARIABLE_FIELDS
-    return [(*holder, name) for holder, fields in _holders(tree) for name in VARIABLE_FIELDS
-            if name in fields and isinstance(_at(tree, (*holder, name)), Mapping)]
+    return {(*holder, name): collections for holder, fields in _holders(tree) for name in VARIABLE_FIELDS
+            if name in fields and isinstance(collections := _at(tree, (*holder, name)), Mapping)}
 
 
 def _averaged(path: TreePath) -> TreePath:

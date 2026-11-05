@@ -1552,11 +1552,10 @@ class Checkpoints:
         collection that no kept step, this step nor the one still in flight
         records is deleted first, by process 0.
         """
-        held: dict[str, dict[str, object]] = {}
-        for path in _variable_trees(state_tree):
-            collections = _at(state_tree, path)
-            held[_named(path)] = {str(name): value for name, value in collections.items()
-                                  if name != 'params' and jax.tree.leaves(value)}
+        trees = _variable_trees(state_tree)
+        held = {_named(path): {str(name): value for name, value in collections.items()
+                               if name != 'params' and jax.tree.leaves(value)}
+                for path, collections in trees.items()}
         digests = {tree: {name: _digest(value) for name, value in values.items()}
                    for tree, values in held.items()}
         root = epath.Path(self.directory) / FROZEN_STORE
@@ -1581,9 +1580,9 @@ class Checkpoints:
                         checkpointer.save(root / digest, args=ocp.args.PyTreeSave(value))
                     written.add(digest)
         kept_tree = dict(state_tree)
-        for tree, values in held.items():
-            path = tuple(tree.split('/'))
-            kept_tree = _with(kept_tree, path, {name: value for name, value in _at(state_tree, path).items()
+        for path, collections in trees.items():
+            values = held[_named(path)]
+            kept_tree = _with(kept_tree, path, {name: value for name, value in collections.items()
                                                 if name not in values})
         return kept_tree, digests
 

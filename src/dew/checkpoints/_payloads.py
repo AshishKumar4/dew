@@ -61,8 +61,7 @@ def _payload_of(tree: str) -> str:
     return MODEL if tree.split('/')[0] in MODEL_STATE else RESUME
 
 
-def _frozen_held(frozen: Mapping[str, Mapping[str, str]],
-                 payloads: Sequence[str]) -> dict[str, Mapping[str, str]]:
+def _frozen_held[T](frozen: Mapping[str, T], payloads: Sequence[str]) -> dict[str, T]:
     """The store entries of a step's `frozen` record (`FROZEN_STORE`) whose trees the items it holds keep:
     a step cut to its model references its groups' collections no longer."""
     return {tree: names for tree, names in frozen.items()
