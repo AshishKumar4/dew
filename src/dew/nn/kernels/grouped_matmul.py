@@ -1,4 +1,4 @@
-"""The grouped matmul's kernel launches, which the GEMM template (`templates.gemm.template`) runs and
+"""The grouped matmul's kernel launches, which the GEMM template (`kernels.gemm`) runs and
 differentiates (`dew.nn.moe.expert_projection` through it), and XLA's portable projection.
 
 Three products, in MaxText's megablox shape: the forward `gmm`, the input gradient `gmm` against the
@@ -48,7 +48,7 @@ from ..derivatives import marked_call_p
 from ..precision import at_least_fp32, rounded_operand
 from . import generation, selection, tuning
 from .generation import INHERENT
-from .templates import base, bundles, cost, mosaic, report, resources, tail as tail_of
+from .templates import base, bundles, mosaic, report, resources, tail as tail_of
 from .templates.axes import GROUPS, held as held_axes
 from .templates.gemm import mosaic_gpu, mosaic_tpu
 from .templates.product import EIGHT, Product
@@ -94,7 +94,7 @@ class Hooks:
     then each side tile's: `prologue_dtypes`, `epilogue_dtypes`). The side operands themselves are the
     launch's `prologue_operands` and `epilogue_operands`. A launch's picks key each hook by what it
     computes (`_GroupedLaunch.traced`), never by the function object. A `paired` product's epilogue takes its
-    two accumulators before its side tiles (`templates.gemm.template.gemm`'s `paired`)."""
+    two accumulators before its side tiles (`gemm.gemm`'s `paired`)."""
     prologue: object = None
     prologue_axes: tuple = ()
     epilogue: object = None
@@ -312,7 +312,7 @@ class _Triton(_GroupedLaunch[Tile]):
     GENERATES: ClassVar[bool] = True
 
     def eligible(self, ba, target) -> bool:
-        # Every CUDA GPU the template sends the kernels to (`templates.gemm.template`), and
+        # Every CUDA GPU the template sends the kernels to (`kernels.gemm`), and
         # a CPU, which interprets them, or traces the CUDA branch a GPU's lowering takes; never a TPU (a
         # paired product the selector hands on apart: `_takes_pair`).
         return generation.capability(target.generation) is not None and self.derived(ba, target) is not None
@@ -357,7 +357,7 @@ class _Triton(_GroupedLaunch[Tile]):
         8.5 times slower on an H100, GMM-h100-2)."""
         rows, columns = self.output(config)
         accumulators = 2 if ba.arguments.get('exact_sums') else 1
-        held = accumulators * rows * columns // (32 * config.warps) < cost.THREAD_REGISTERS
+        held = accumulators * rows * columns // (32 * config.warps) < resources.facts().thread_registers
         short = not ba.arguments.get('exact_sums') or self.contraction(config) <= EXACT_STEP
         shared = not (target.wgmma and rows // max(config.warps // 4, 1) % 64)
         return held and short and shared and super().legal(ba, config, target)
@@ -1502,8 +1502,13 @@ DENSE_MEASURED = _Need('dense', lambda case: not case.kind.startswith('dense'),
 as it measured faster than Triton's on every generation timed; a call naming Triton still runs them."""
 
 
-_GMMS = (MosaicGmm(), MosaicTpuGmm(), Gmm(), CutlassGmm())
-_TGMMS = (MosaicTgmm(), MosaicTpuTgmm(), Tgmm(), CutlassTgmm())
+IMPLEMENTATIONS = ((MosaicGmm(), MosaicTgmm()), (MosaicTpuGmm(), MosaicTpuTgmm()), (Gmm(), Tgmm()),
+                   (CutlassGmm(), CutlassTgmm()))
+"""Each implementation of the grouped product, in `GROUPED`'s order: its launch of a product and its launch
+of a kernel gradient, one name for both."""
+
+_GMMS = tuple(product for product, _ in IMPLEMENTATIONS)
+_TGMMS = tuple(gradient for _, gradient in IMPLEMENTATIONS)
 
 _NEEDS = {'cutlass': (DECLARED_ONLY,), 'triton': (DENSE_MEASURED,)}
 """Each old route's requirements beyond its launch's own: CUTLASS on its declared cells alone, Triton off the
@@ -1518,7 +1523,7 @@ def _takes_pair(name: str, target) -> bool:
 
 class Apart:
     """`launched`'s answer for a paired product no launch takes whole: its two products run apart
-    (`templates.gemm.template._apart`), each through the launches that take it, as the unfused program runs
+    (`gemm._apart`), each through the launches that take it, as the unfused program runs
     them."""
 
     name = 'apart'
@@ -1578,7 +1583,7 @@ def gmm_call(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_oper
              paired: jax.Array | None = None, *, out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS,
              interpret: bool, promoted: bool = False, dense: bool = False) -> tuple:
     """The launches, arguments and options of each group's rows of `tokens` times its matrix of `kernel`,
-    both of one dtype, with the template's hooks (`templates.gemm.template.gemm`). `promoted`,
+    both of one dtype, with the template's hooks (`gemm.gemm`). `promoted`,
     the declared product's (`templates.product.Product`), adds each depth step's partial apart
     (`exact_sums`); `dense`, one group of every row (a dense product), the plain tiled kernel where Triton
     runs it; `paired`, a second matrix of `kernel`'s shape multiplied by the same rows (Mosaic GPU's
@@ -1594,7 +1599,7 @@ def tgmm_call(tokens, cotangent, sizes, prologue_operands: tuple = (), *, out_dt
               hooks: Hooks = NO_HOOKS, interpret: bool, promoted: bool = False, dense: bool = False) -> tuple:
     """The launches, arguments and options of each group's rows of `tokens` transposed times its rows of
     `cotangent`, both of one dtype, with the template's prologue
-    (`templates.gemm.template.gemm_t`); `promoted` and `dense` as `gmm_call`'s."""
+    (`gemm.gemm_t`); `promoted` and `dense` as `gmm_call`'s."""
     arguments = (tokens, cotangent, sizes, tuple(prologue_operands))
     options = {'out_dtype': jnp.dtype(out_dtype).name, 'hooks': hooks, 'interpret': interpret,
                'exact_sums': promoted, 'dense': dense}

@@ -50,19 +50,22 @@ PTX_ENTRY = re.compile(r"\.entry\s+([A-Za-z_$][\w$]*)")
 """A PTX module's kernel function, `<kernel>_mosaic_gpu_kernel` (`report.KERNEL_FUNCTION`)."""
 REGISTERS = re.compile(r"Used (\d+) registers")
 SPILLS = re.compile(r"(\d+) bytes spill stores, (\d+) bytes spill loads")
-SERIALIZED = re.compile(r"\((C751\d)\) Potential Performance Loss: wgmma\.mma_async instructions are "
-                        r"serialized")
-"""ptxas's report of a kernel's registers a thread, its spills and its warpgroup MMAs serialized (C7510 to
-C7515: each HGMMA waited for before the next issues), `ptxas_read`."""
+LOSSES = {"C7507": "ignores its setmaxnreg, its warp roles' paths rejoining after the split",
+          **{f"C751{digit}": "serializes its warpgroup MMAs" for digit in range(6)}}
+"""ptxas's notes of a performance loss the gate fails a kernel for, by code: its register raises and decreases
+dropped, the threads left at the entry's registers (C7507, the kernel challenge's notes/ptxas-re.md §4), or
+its warpgroup MMAs serialized, each HGMMA waited for before the next issues (C7510 to C7515)."""
+LOSS = re.compile(r"\((C75\d\d)\) Potential Performance Loss: ")
+"""A note of ptxas's of a performance loss, `ptxas_read`."""
 
 
 @dataclasses.dataclass(frozen=True)
 class Assembled:
     """What ptxas reports of a kernel (`ptxas_read`): its registers a thread, its spilled bytes, and the codes
-    of each note that it serialized its warpgroup MMAs."""
+    of each note of a performance loss the gate fails it for (`LOSSES`)."""
     registers: int
     spilled: int
-    serialized: tuple[str, ...]
+    losses: tuple[str, ...]
 
 
 def ptxas_read(text: str) -> Assembled:
@@ -70,7 +73,8 @@ def ptxas_read(text: str) -> Assembled:
     serialization notes' codes in order."""
     used = [int(count) for count in REGISTERS.findall(text)]
     spilled = [int(stores) + int(loads) for stores, loads in SPILLS.findall(text)]
-    return Assembled(max(used, default=0), max(spilled, default=0), tuple(SERIALIZED.findall(text)))
+    return Assembled(max(used, default=0), max(spilled, default=0),
+                     tuple(code for code in LOSS.findall(text) if code in LOSSES))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -82,8 +86,9 @@ class Report:
     binary carries, or a field no report states, is no evidence the kernel is within its resources; and its
     `module`, its kernel hash, which two compiles of one module share: Mosaic compiles a module once a
     process, so a later compile of it prints no PTX of its own; the digest of the launch that traced it
-    (`launching`), which its name carried, or None; and ptxas's notes that it serialized the kernel's
-    warpgroup MMAs (`ptxas_read`)."""
+    (`launching`), which its name carried, or None; ptxas's notes of a performance loss it fails for
+    (`ptxas_read`, `LOSSES`); and what its machine code breaks of the SASS rules (`report.sass_findings`,
+    read where nvdisasm is installed)."""
     kernel: str
     shared: int | None
     tmem: int | None
@@ -92,7 +97,8 @@ class Report:
     unread: tuple[str, ...] = ()
     module: str | None = None
     launch: str | None = None
-    serialized: tuple[str, ...] = ()
+    losses: tuple[str, ...] = ()
+    sass: tuple[str, ...] = ()
 
     @property
     def traced(self) -> str:
@@ -101,13 +107,16 @@ class Report:
 
     def failure(self, shared_limit: int, tmem_limit: int) -> str | None:
         """Why the kernel is not within a multiprocessor's `shared_limit` bytes and `tmem_limit` tensor memory
-        columns without spilling registers and with its warpgroup MMAs in flight together, or None where it
-        is: a kernel ptxas serializes runs its MMAs one at a time, its registers and spills clean (row 3615;
-        the kernel challenge's C7511 at 112 registers, C7512 at 96)."""
+        columns without spilling registers, with its warpgroup MMAs in flight together and its register raises
+        taken, or None where it is: a kernel ptxas serializes runs its MMAs one at a time, its registers and
+        spills clean (row 3615; the kernel challenge's C7511 at 112 registers, C7512 at 96), and one whose
+        raises it ignores keeps its consumers at the entry's registers (C7507, row 4071)."""
         if self.unread:
             return f"its reports state no {', '.join(self.unread)}"
-        if self.serialized:
-            return f"ptxas serializes its warpgroup MMAs ({', '.join(self.serialized)})"
+        if self.losses:
+            return "ptxas " + "; ".join(f"{LOSSES[code]} ({code})" for code in self.losses)
+        if self.sass:
+            return "its machine code holds " + "; ".join(self.sass)
         if (self.shared is not None and self.tmem is not None and self.shared <= shared_limit
                 and self.tmem <= tmem_limit and self.spilled == 0):
             return None
@@ -143,7 +152,8 @@ def reports(estimates: dict[str, str], binaries: list[report.Binary],
         found_reports.append(Report(
             kernel, binary.shared if binary is not None else None,
             sum(map(int, tmem.groups())) if tmem else None,
-            None, None, unread, (modules or {}).get(name), launch))
+            None, None, unread, (modules or {}).get(name), launch,
+            sass=tuple(binary.sass) if binary is not None else ()))
     return found_reports
 
 
@@ -295,7 +305,8 @@ def _compiled(case, generation: str, record: dict,
                 record["shared"] = asked
             return None
         if directory is not None:
-            record["binaries"] = [dataclasses.asdict(found) for found in report.binaries(executable)]
+            record["binaries"] = [dataclasses.asdict(found)
+                                  for found in report.binaries(executable, decoded=True)]
             write_modules("".join(printed), directory)
         return [path.read_text() for path in Path(dump).glob("*thunk_sequence.txt")], triton_kernels(lowered)
 
@@ -634,7 +645,7 @@ def _compiled_reports(directory: str, generation: str) -> dict[str, dict]:
             raise RuntimeError(f"ptxas does not compile {path.name} for {generation}")
         read = ptxas_read(text)
         found[path.stem] = {"registers": read.registers, "spilled": read.spilled,
-                            "serialized": read.serialized, "ptxas": "the GPU's compile of its PTX"}
+                            "losses": read.losses, "ptxas": "the GPU's compile of its PTX"}
     return found
 
 

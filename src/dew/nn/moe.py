@@ -39,8 +39,7 @@ from dew.nn.dense import Dense
 from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
-from .kernels import generation
-from .kernels.templates.gemm import template
+from .kernels import gemm, generation
 from .precision import (
     at_least_fp32,
     capped_logits,
@@ -472,7 +471,7 @@ read where it lies (`Layered`)."""
 
 class Layered(struct.PyTreeNode):
     """An expert kernel read in place from a bank: the run's stack `[layers, experts, in, out]` and the
-    layer read, which the GEMM template reads where it lies (`template.gemm`'s `layer`) rather than as a
+    layer read, which the GEMM template reads where it lies (`gemm.gemm`'s `layer`) rather than as a
     slice copied out a layer at a time (1.2 GB a layer at Qwen3-30B-A3B's experts, half a decode step on
     an H100)."""
 
@@ -544,13 +543,13 @@ def expert_projection(x: jax.Array, kernel: jax.Array | Layered, group_sizes: ja
     the bias's own dtype.
 
     Every implementation runs the GEMM template
-    (`dew.nn.kernels.templates.gemm.template.gemm`), which selects each of its
+    (`dew.nn.kernels.gemm.gemm`), which selects each of its
     launches where it runs (`grouped_matmul.GROUPED`: the template's kernels on
     a GPU, an old route on a declared cell, XLA's program off a GPU and on a
     call no launch takes, each route reported with its reason) and holds the
     law in every differentiation mode; 'xla' names XLA's ragged dot for every
     launch (`generation.chosen`), and 'auto' and 'pallas' alike leave the
-    choice to the template. `generation.chosen(grouped_matmul=...)` names a
+    choice to the gemm. `generation.chosen(grouped_matmul=...)` names a
     kernel, a launch's name raising where it cannot run the call
     (`selection.KernelRefused`). A CPU process runs XLA's program: a test
     interprets the kernels by calling the template's interpreter itself. XLA's
@@ -565,8 +564,8 @@ def expert_projection(x: jax.Array, kernel: jax.Array | Layered, group_sizes: ja
     stack, layer = (kernel.stack, kernel.layer) if isinstance(kernel, Layered) else (kernel, None)
     compute = canonicalize_dtype(x, stack, *(() if bias is None else (bias,)), dtype=dtype)
     with _named(implementation):
-        return template.gemm(x, stack, group_sizes, compute=compute, out_dtype=compute, precision=precision,
-                             layer=layer, **_biased(bias, compute))
+        return gemm.gemm(x, stack, group_sizes, compute=compute, out_dtype=compute, precision=precision,
+                         layer=layer, **_biased(bias, compute))
 
 
 def _biased(bias: jax.Array | None, compute) -> dict:
@@ -589,7 +588,7 @@ def paired_projections(x: jax.Array, first: jax.Array | Layered, second: jax.Arr
                        group_sizes: jax.Array, dtype: Dtype | None, implementation: str,
                        precision: PrecisionLike) -> tuple[jax.Array, jax.Array]:
     """`expert_projection` of the same rows through two expert matrices of one shape (a gate's and an up
-    projection's), as one paired product (`template.gemm`'s `paired`): a launch that takes the pair reads
+    projection's), as one paired product (`gemm.gemm`'s `paired`): a launch that takes the pair reads
     the rows once for both, and the call hands the two products on apart where its launch takes none
     (`grouped_matmul._takes_pair`), each under `expert_projection`'s law. On an H100 the pair took 0.79
     to 1.0 of the two products' time at the routings of DeepSeek-V3, Qwen3-30B-A3B and GPT-OSS-20B, its
@@ -604,7 +603,7 @@ def paired_projections(x: jax.Array, first: jax.Array | Layered, second: jax.Arr
     if implementation not in GROUPED_MATMULS:
         raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     with _named(implementation):
-        return template.gemm(x, first, group_sizes, compute=compute, out_dtype=compute,
+        return gemm.gemm(x, first, group_sizes, compute=compute, out_dtype=compute,
                              out_dtypes=(compute, compute), precision=precision, paired=second)
 
 

@@ -1,5 +1,5 @@
 #!/bin/sh
-# The test suite's environment, locked: pyproject.toml's ci, tutorials and mutation extras under constraints.txt,
+# The test suite's environment, locked: pyproject.toml's ci and tutorials extras under constraints.txt,
 # resolved as PyPI stood at RESOLVED, so the same inputs always give the same locks. Torch is the CPU
 # build in every lock: Dew runs torch only on the host (interop, vision), and a CUDA torch built for
 # another CUDA loads its own cuDNN over JAX's. Dew's CUDA extra is the locks' one difference, by driver: locks/cpu.txt for CI and every host
@@ -58,7 +58,7 @@ resolve() {
 lock() {
   name=$1
   shift
-  resolve "$(tr -d '\n' < .python-version)" "locks/$name.txt" --extra ci --extra tutorials --extra mutation "$@"
+  resolve "$(tr -d '\n' < .python-version)" "locks/$name.txt" --extra ci --extra tutorials "$@"
 }
 # A host with no GPU compiles kernels for one with the CUDA plugin of the kernel-compile extra; a GPU host's
 # own CUDA extra holds its plugin, and two CUDA plugins in one environment would both claim 'cuda'.

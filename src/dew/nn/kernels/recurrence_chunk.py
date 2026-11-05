@@ -14,7 +14,7 @@ linear attentions) the inverse is the identity and nothing is corrected.
 
 The portable math in XLA (`chunk_delta_rule`) computes every hook: Dew's float32 reference and the
 CPU path. Kernels take the rest, by what each takes and in order, no GPU named: the delta rule with one
-decay a head or one per key dimension runs on the recurrence template (`mosaic_rule`) where its
+decay a head or one per key dimension runs on the recurrence template (`template.mosaic_rule`) where its
 launches take the call and the cell is not a declared port cell (`PORT_CELLS`), else on the port of fla
 0.5.2's kernels (`fla_rule`, `fla_gdn` and `fla_kda`) on any GPU Dew's Triton kernels run on
 (`GATED_DELTA`); without the delta rule, a rated decay (Mamba2's SSD) runs on the port of mamba_ssm's
@@ -33,7 +33,6 @@ from typing import NamedTuple, Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
 from dew.algebra.forms import derived_on
@@ -1024,12 +1023,13 @@ def _shard_specs(shape: tuple[int, ...], key_heads: int, decay_ndim: int) -> tup
 
 
 def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=None, skip=None, **options):
-    """The recurrence template's op (`templates.recurrence.template.MOSAIC`, `mosaic_rule`) on each shard
-    (`manual_map`), placed as `fla_rule`: its tiles derived from each shard's shapes, its forward and its
-    gradient on each device's own rows. Called on the whole batch, every device of a 2xH100 FSDP run ran
+    """The recurrence template's op (`templates.recurrence.template.MOSAIC`, its `mosaic_rule`) on each
+    shard (`manual_map`), placed as `fla_rule`: its tiles derived from each shard's shapes, its forward and
+    its gradient on each device's own rows. Called on the whole batch, every device of a 2xH100 FSDP run ran
     its launches on the global batch, layer 0's solve over 4 rows for its 2, beside 40 GB of gathers a
     microbatch (row 1897). `options` are the op's (`max_segments`, `scale`, `delta`, `wide`, `floor`,
-    `bound`, `rounded`)."""
+    `bound`, `rounded`); whether the block's remat rung recomputes the delta rule's memory (`RECOMPUTED`)
+    is resolved here, as its route traces."""
     from .templates.recurrence import template
 
     four, three, memory, decays, resets = _shard_specs(value.shape, key.shape[2], g.ndim)
@@ -1041,106 +1041,10 @@ def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=No
     def local(query, key, value, g, beta, *given):
         given = iter(given)
         state, starts, firsts, skip = (None if x is None else next(given) for x, _ in optional)
-        return template.MOSAIC(query, key, value, g, beta, state, starts, firsts=firsts, skip=skip, **options)
+        return template.MOSAIC(query, key, value, g, beta, state, starts, firsts=firsts, skip=skip,
+                               recomputed="delta_memory" in RECOMPUTED.get(), **options)
 
     return manual_map(local, specs, (four, memory))(*operands)
-
-
-def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
-                max_segments: int | None = None, scale: float | None = None, delta: bool = True,
-                wide: bool = False, family=None, floor: float | None = None, bound: float | None = None,
-                firsts=None, rounded: bool = False, skip=None):
-    """The chunked rule, a decay a head (`g` `[B, S, Hv]`) or a key dimension (`[B, S, Hv, Dk]`), with or
-    without the `delta` rule, on the recurrence template's Mosaic GPU mainloop
-    (`templates.recurrence.mainloop.forward`): `fla_rule`'s operands and results, the operands in their common
-    dtype and beta with them, the decay and the memory fp32, on one device, by the bundle of its instruction
-    family (`mainloop.family_of`, `bundles.of`), interpreted off a GPU (Mosaic GPU's interpreter,
-    `bundles.INTERPRETED`'s). Its gradient: the gated delta rule's in a 16-bit call on the mainloop
-    (`mainloop_backward.gradients`, fla's DAG, fla's rounding) where its launches hold on the device
-    (`template.backward_holds`); it takes no other call's, which raises NotImplementedError as the
-    gradient is traced: the delta rule's selector gives a training call it refuses another kernel
-    (`MOSAIC_SUPPORTS`' 'backward', `Mosaic.trains`), and a call that names the mainloop insists on it (ledger
-    1926: no kernel falls back inside itself). Its states and output launches take `tiles` (`mainloop.Tiles`,
-    the template's config, `templates.recurrence.template`); a `family` given is the bundle it issues by,
-    interpreted off a GPU of that family (a CPU's). A decay a key dimension takes the layer's declared
-    `floor`, which the mainloop's intra launch reads (`mainloop.per_key_refusal`), and a 16-bit delta rule the
-    chunk inverse's `bound` its form proves, its solve at fp32's range where it proves none
-    (`template.ranged`); a `rounded` call takes the run's fast forms' numbers (`fast_rounding`,
-    `mainloop.forward`)."""
-    from .templates import bundles, report as template_report
-    from .templates.recurrence import mainloop, mainloop_backward, template
-
-    dtype = jnp.result_type(query, key, value)
-    device, interpret = mainloop.family_of(dtype), generation.backend() != 'gpu'
-    issuing = family or device or bundles.INTERPRETED
-    query, key, value = (x.astype(dtype) for x in (query, key, value))
-    # The delta rule's write gate in the operands' dtype, as fla's layer holds it; without the delta rule the
-    # call's own, as the portable math takes it (Mamba-2's fp32 `dt`).
-    beta = beta.astype(dtype) if delta else beta
-    g = g.astype(jnp.float32)
-    # Interpreted off a GPU (an assumed one's calls lower for it); a GPU no bundle claims runs no launch.
-    if family is None and device is None and not interpret:
-        raise NotImplementedError(f"the recurrence template has no bundle for the "
-                                  f"{generation.family(generation.device_generation())!r} family")
-    run = {"family": issuing, "interpret": interpret, "tiles": tiles, "floor": floor,
-           "ranged": template.ranged(dtype, delta, bound)}
-    # The fast backward where its launches hold on the device (a derived launch spills nothing), else none.
-    fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4)
-            and template.backward_holds(
-                query, key, value, g, beta, state, tiles=tiles, family=issuing,
-                target=template.Mosaic.launched(), starts=starts,
-                max_segments=max_segments, delta=delta, floor=floor, rounded=rounded, ranged=run["ranged"],
-                skip=skip))
-
-    # The launch tracing the forward (`report.launch_digest`), whose name the fast backward's kernels carry
-    # too (`report.relaunched`): JAX traces the backward after that launch's scope ended.
-    launch = template_report.launch_digest()
-
-    # The documents' starts and firsts operands, not closed over (a custom VJP's function closes over no
-    # tracer).
-    @jax.custom_vjp
-    def rule(query, key, value, g, beta, state, starts, firsts, skip):
-        # A forward without a gradient at its own tiles, no fast backward narrowing them (`Tiles.forward`).
-        alone = {**run, "tiles": tiles.forward or tiles}
-        return mainloop.forward(query, key, value, g, beta, state, starts=starts, firsts=firsts,
-                                max_segments=max_segments, scale=scale, delta=delta, wide=wide,
-                                rounded=rounded, skip=skip, **alone)
-
-    def forward(*operands):
-        if not fast:
-            return rule(*operands), (operands, (None, None))
-        # The chunks' inverses kept for the fast backward, as fla's keeps its `A`, and the launches' memories,
-        # weighted keys and corrected values, as the port keeps its memory, but where the block's remat rung
-        # recomputes them (`RECOMPUTED`). Each is named as the port names its own, so a rung that saves names
-        # keeps them rather than replaying the forward's launches for them (`mixer_base.DELTA_RESIDUALS`).
-        out, final, (inverse, kept) = mainloop.kept_forward(*operands[:6], starts=operands[6],
-                                                            firsts=operands[7], max_segments=max_segments,
-                                                            scale=scale, delta=delta, wide=wide,
-                                                            rounded=rounded, skip=operands[8], **run)
-        kept = None if "delta_memory" in RECOMPUTED.get() else checkpoint_name(kept, 'delta_memory')
-        return (out, final), (operands, (checkpoint_name(inverse, 'delta_inverse'), kept))
-
-    def backward(saved, grads):
-        operands, (inverse, kept) = saved
-        out_grad, final_grad = grads
-        query, key, value, g, beta, state, starts, firsts, skip = operands
-        if not fast:
-            form = (f"{dtype.name}, {'the delta rule' if delta else 'no delta rule'}, a decay a "
-                    f"{'head' if g.ndim == 3 else 'key dimension'}")
-            raise NotImplementedError(
-                f"the recurrence template's fast backward takes no gradient of this call ({form}, or its "
-                "launches past the device's at these tiles): the delta rule's selector gives a training call "
-                "it refuses the port or the portable math (`MOSAIC_SUPPORTS`' 'backward')")
-        with template_report.relaunched(launch):
-            *grads, dh0, dskip = mainloop_backward.gradients(
-                query, key, value, g, beta, state, out_grad, final_grad, starts=starts, firsts=firsts,
-                max_segments=max_segments, scale=scale, inverse=inverse, kept=kept, delta=delta,
-                rounded=rounded, skip=skip, **run)
-        return (*grads, None if state is None else dh0, None, None,
-                None if dskip is None else dskip.astype(skip.dtype))
-
-    rule.defvjp(forward, backward)
-    return rule(query, key, value, g, beta, state, starts, firsts, skip)
 
 
 RECOMPUTED: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("recomputed", default=())
@@ -1564,11 +1468,6 @@ SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
     Requirement('tokens', lambda case: case.length >= _selective().CHUNK,
                 lambda case: f"{case.length} tokens, fewer than a chunk of {_selective().CHUNK}: a decode "
                              "step's scan, the portable math's own steps", row=INHERENT, kind='handoff'),
-    Requirement('strided copies', lambda case: case.family != 'mma.sync',
-                "mma.sync's streams copy a channel block untiled by cp.async, which jax 0.12.0.1.post41 "
-                "addresses at the block's width, not its row's stride, reading the wrong rows "
-                "(cp-async-alone4-h100-3674febe1's unfixed run; the jax fork's fix ships in post42)",
-                row='ledger 1300'),
     Requirement('forms', lambda case: case.fast,
                 "the run's accurate forms, whose sums the portable math compensates (row 1698); the template "
                 "sums at mamba_ssm's rounding, the fast forms' bar", row='ledger 2968', kind='measured'),
@@ -1580,7 +1479,7 @@ SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
 """What the template's selective scan (`templates.recurrence.selective`) needs of a call: no caller's
 `shard_map` that checks varying axes, a GPU of a family its bundles cover, 16-bit or fp32 operands, whole
 blocks of channels, at most `SELECTIVE_STATES` states, a chunk's tokens at least (a decode step hands off
-to the portable math), no untiled strided copies (an A100's, until post42), the run's fast forms, and its
+to the portable math), the run's fast forms, and its
 qualification against recorded mamba_ssm on the GPU's family: on an H100 the template is as exact as
 mamba_ssm in every recorded case (tests/test_gpu_recurrence.py)."""
 

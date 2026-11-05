@@ -9,7 +9,7 @@ from typing import Any
 import jax
 import jax.extend.core as jax_core
 
-from dew.nn.programs import CALLS
+from dew.nn.programs import CALLS, CUMULATIVE, ENTRYWISE, REDUCTIONS, jax_name
 
 
 class Untransposable(NotImplementedError):
@@ -191,6 +191,14 @@ def _tiles_in(closed) -> bool:
             or literal_tiles(closed.jaxpr))
 
 
+def entrywise(eqn) -> bool:
+    """Whether `eqn` acts one entry at a time: one of `ENTRYWISE`, or a scalar's broadcast. The one test of
+    an equation's kind its readers share, each with its own of the shapes it reads (`_axis_free`, the
+    Mosaic program's `_entrywise`, `dew.training.stages`)."""
+    name = jax_name(eqn.primitive)
+    return name in ENTRYWISE or (name == "broadcast_in_dim" and _rank(eqn.invars[0]) == 0)
+
+
 def _axis_free(jaxpr: jax_core.Jaxpr, shape: tuple[int, ...] = ()) -> bool:
     """Whether `jaxpr` acts one entry at a time: every value a scalar or of `shape`, every operation one of
     `ENTRYWISE`, a scalar's broadcast or a call of a program so."""
@@ -204,37 +212,21 @@ def _axis_free(jaxpr: jax_core.Jaxpr, shape: tuple[int, ...] = ()) -> bool:
             if name not in CALLS or not all(
                     _axis_free(inner, shape) for inner in nested):
                 return False
-        elif name not in ENTRYWISE and not (name == "broadcast_in_dim" and _rank(eqn.invars[0]) == 0):
+        elif not entrywise(eqn):
             return False
     return True
 
 
 RULES: dict[str, Callable] = {
     "broadcast_in_dim": _broadcast, "reshape": _reshape, "squeeze": _squeeze, "iota": _iota,
-    "reduce_sum": _reduced("reduce_sum"), "reduce_max": _reduced("reduce_max"),
-    "reduce_min": _reduced("reduce_min"), "reduce_prod": _reduced("reduce_prod"),
-    "reduce_and": _reduced("reduce_and"), "reduce_or": _reduced("reduce_or"),
-    "argmax": _reduced("argmax"), "argmin": _reduced("argmin"),
-    "cumsum": _along("axis"), "cumprod": _along("axis"), "cummax": _along("axis"), "cummin": _along("axis"),
-    "cumlogsumexp": _along("axis"), "concatenate": _along("dimension"),
-    "slice": _reversed("start_indices", "limit_indices", "strides"), "pad": _reversed("padding_config"),
-    "dynamic_slice": _dynamic_slice, "transpose": _transpose,
+    **{name: _reduced(name) for name in REDUCTIONS}, **dict.fromkeys(CUMULATIVE, _along("axis")),
+    "concatenate": _along("dimension"), "slice": _reversed("start_indices", "limit_indices", "strides"),
+    "pad": _reversed("padding_config"), "dynamic_slice": _dynamic_slice, "transpose": _transpose,
     "jit": _call, "pjit": _call, "closed_call": _call, "custom_jvp_call": _custom, "custom_vjp_call": _custom,
 }
 """Each operation `transposed` takes that names an axis, by its primitive's name: its rule binds it on the
-held operands with each axis it names swapped."""
-
-ENTRYWISE = frozenset({
-    "abs", "acos", "acosh", "add", "add_any", "and", "asin", "asinh", "atan", "atan2", "atanh", "cbrt",
-    "ceil", "clamp", "convert_element_type", "copy", "copy_p", "cos", "cosh", "digamma", "div", "eq", "erf",
-    "erf_inv", "erfc", "exp", "exp2", "expm1", "floor", "ge", "gt", "integer_pow", "is_finite", "le",
-    "lgamma", "log", "log1p", "logistic", "lt", "max", "min", "mul", "ne", "neg", "nextafter", "not", "or",
-    "population_count", "pow", "rem", "round", "rsqrt", "select_n", "shift_left", "shift_right_arithmetic",
-    "shift_right_logical", "sign", "sin", "sinh", "sqrt", "square", "stop_gradient", "sub", "tan", "tanh",
-    "xor",
-})
-"""The operations of one entry at a time, whose operands are each a scalar or a value of their output's
-shape: bound on held tiles unchanged. An operation neither these nor `RULES` take is refused."""
+held operands with each axis it names swapped. An operation of `dew.nn.programs.ENTRYWISE` is bound on
+held tiles unchanged; one neither those nor these take is refused."""
 
 
 def _run(jaxpr: jax_core.Jaxpr, consts, operands) -> list:
@@ -254,13 +246,14 @@ def _run(jaxpr: jax_core.Jaxpr, consts, operands) -> list:
         if any(_rank(var) > 2 for var in (*eqn.invars, *eqn.outvars)):
             raise Untransposable(f"{eqn.primitive.name} of a value past a tile's two axes")
         operands_of = [read(var) for var in eqn.invars]
-        name = eqn.primitive.name
+        # A call by its name, which runs the program it holds; any other by its object (`jax_name`).
+        name = eqn.primitive.name if eqn.primitive.name in CALLS else jax_name(eqn.primitive)
         if name in RULES:
             out = RULES[name](eqn, *operands_of, **eqn.params)
-        elif name in ENTRYWISE:
+        elif entrywise(eqn):
             out = eqn.primitive.bind(*operands_of, **eqn.primitive.get_bind_params(eqn.params))
         else:
-            raise Untransposable(f"{name}, which no layout rule takes")
+            raise Untransposable(f"{eqn.primitive.name}, which no layout rule takes")
         values.update(zip(eqn.outvars, out if eqn.primitive.multiple_results else [out], strict=True))
     return [read(var) for var in jaxpr.outvars]
 

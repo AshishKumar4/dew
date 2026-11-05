@@ -37,7 +37,6 @@ aiohttp==3.14.5
     #   dewml (pyproject.toml)
     #   aiobotocore
     #   aiohttp-retry
-    #   cosmic-ray
     #   daytona
     #   daytona-analytics-api-client-async
     #   daytona-api-client-async
@@ -73,8 +72,6 @@ annotated-types==0.8.0
     # via pydantic
 antlr4-python3-runtime==4.13.2
     # via moto
-anybadge==1.16.0
-    # via cosmic-ray
 anyio==4.15.1
     # via
     #   gradio
@@ -111,7 +108,6 @@ asttokens==3.0.2
 attrs==26.1.0
     # via
     #   aiohttp
-    #   cosmic-ray
     #   cyclopts
     #   dm-tree
     #   e2b
@@ -191,7 +187,6 @@ cheroot==11.1.2
 click==8.5.0
     # via
     #   black
-    #   cosmic-ray
     #   flask
     #   huggingface-hub
     #   mlflow-skinny
@@ -227,8 +222,6 @@ connectrpc==0.11.1
     # via e2b
 contourpy==1.4.0
     # via matplotlib
-cosmic-ray==8.7.0
-    # via dewml (pyproject.toml)
 courlan==1.4.0
     # via trafilatura
 coverage==7.16.2
@@ -286,7 +279,6 @@ debugpy==1.8.22
     # via ipykernel
 decorator==5.3.1
     # via
-    #   cosmic-ray
     #   gcsfs
     #   moviepy
 defusedxml==0.7.1
@@ -299,6 +291,8 @@ deprecated==1.3.1
     # via
     #   daytona
     #   deltalake
+dew-cutlass-cu13==0.1.0
+    # via dewml (pyproject.toml)
 dew-flash-attn-cu13==0.3.7
     # via dewml (pyproject.toml)
 diffusers==0.39.0
@@ -353,8 +347,6 @@ execnet==2.1.2
     # via pytest-xdist
 executing==2.3.0
     # via stack-data
-exit-codes==1.3.0
-    # via cosmic-ray
 fastapi==0.143.0
     # via
     #   gradio
@@ -431,9 +423,7 @@ gguf==0.19.0
 gitdb==4.0.12
     # via gitpython
 gitpython==3.2.0
-    # via
-    #   cosmic-ray
-    #   mlflow-skinny
+    # via mlflow-skinny
 google-api-core==2.42.0
     # via
     #   google-cloud-core
@@ -639,6 +629,7 @@ jax==0.12.0.1.post51
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
+    #   dew-cutlass-cu13
     #   dew-flash-attn-cu13
     #   flax
     #   optax
@@ -1071,7 +1062,6 @@ outlines-core==0.2.14
 packaging==26.3
     # via
     #   accelerate
-    #   anybadge
     #   black
     #   datasets
     #   e2b
@@ -1110,9 +1100,7 @@ pandas==3.0.6
 pandocfilters==1.5.1
     # via nbconvert
 parso==0.8.7
-    # via
-    #   cosmic-ray
-    #   jedi
+    # via jedi
 pathable==0.6.0
     # via jsonschema-path
 pathspec==1.1.1
@@ -1445,7 +1433,6 @@ rfc3987-syntax==1.1.0
 rich==15.0.0
     # via
     #   dewml (pyproject.toml)
-    #   cosmic-ray
     #   cyclopts
     #   e2b
     #   fastmcp-slim
@@ -1547,7 +1534,6 @@ spacy-loggers==1.0.5
 sqlalchemy==2.1.4
     # via
     #   alembic
-    #   cosmic-ray
     #   mlflow
     #   optuna
 sqlitedict==2.1.0
@@ -1572,8 +1558,6 @@ starlette==1.7.0
     #   mcp
     #   mlflow-skinny
     #   sse-starlette
-stevedore==5.9.1
-    # via cosmic-ray
 stringzilla==5.2.0
     # via albucore
 sympy==1.14.0
@@ -1629,7 +1613,6 @@ tokenizers==0.23.3
     #   transformers
 toml==0.10.2
     # via
-    #   cosmic-ray
     #   daytona
     #   modal
     #   tensorflow-datasets
@@ -1898,8 +1881,6 @@ xxhash==3.8.1
     #   wandb
 yarl==1.25.1
     # via aiohttp
-yattag==1.16.1
-    # via cosmic-ray
 zipp==4.1.1
     # via
     #   etils

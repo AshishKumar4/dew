@@ -22,8 +22,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn import derivatives
 from dew.nn.kernels import generation, recurrence_algebra as algebra, tuning
-from dew.nn.kernels.templates import base, cost, mosaic, report, resources, scan as block_scan
+from dew.nn.kernels.templates import base, mosaic, report, resources, scan as block_scan
 from dew.nn.kernels.templates.recurrence import mainloop
 
 RESET_WIDTH = 32
@@ -246,9 +247,10 @@ def backward_programs(registers: int, target: generation.GpuTarget) -> int:
     """The programs of the backward, one warpgroup and no producer, a multiprocessor of `target` holds at once
     at `registers` a thread: the shared planner's residency (`resources.RegisterModel.resident`) within its
     resident threads."""
-    threads = target.architecture.resident_threads // block_scan.THREADS
-    model = resources.RegisterModel(registers, cost.THREAD_REGISTERS, 1,
-                                    min(resources.RESIDENT_PROGRAMS, threads), cost.REGISTER_STEP, 0)
+    held = target.multiprocessor
+    threads = held.resident_threads // block_scan.THREADS
+    model = resources.RegisterModel(registers, held.thread_registers, 1, min(held.resident_blocks, threads),
+                                    held.register_step, 0)
     return model.resident(registers)
 
 
@@ -265,7 +267,7 @@ def backward_plan(target: generation.GpuTarget) -> tuple[int, int]:
     slowed (sel-sweep-sxm at f3040b154)."""
     plans = []
     positions = 1
-    while backward_registers(positions) <= cost.THREAD_REGISTERS:
+    while backward_registers(positions) <= target.multiprocessor.thread_registers:
         programs = backward_programs(backward_registers(positions), target)
         if programs:
             plans.append(((2 * positions + 2 * SCAN_STEPS) / (positions * programs), -programs, positions))
@@ -438,8 +440,7 @@ def _parameters(A, D, channels: int):
     return jnp.concatenate([(A * algebra.LOG2_E).T, D[None], padding])
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(8,))
-def _scan(x, dt, A, B, C, D, entering, resets, scan: Scan):
+def _scan_primal(x, dt, A, B, C, D, entering, resets, scan: Scan):
     """`forward` over padded operands, its gradient `backward`'s: `(y, final [R, N, D] fp32)`."""
     y, final, _ = forward(x, dt, B, C, _parameters(A, D, scan.channels), entering, resets, scan)
     return y, final
@@ -478,7 +479,8 @@ def _scan_backward(scan: Scan, residuals, grads):
             None)
 
 
-_scan.defvjp(_scan_forward, _scan_backward)
+_scan = derivatives.declared_derivative(derivatives.KernelGlue(), _scan_primal, _scan_forward, _scan_backward,
+                                        nondiff_argnums=(8,))
 
 
 @dataclasses.dataclass(frozen=True)

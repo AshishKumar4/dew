@@ -212,7 +212,7 @@ registers, the route's next mainloop taking it (`_takes_backward`): a query's te
 every tile (ET-PINBWD: 232 bytes at 64 x 64, width 64, its keyed sums beside the hook's three slopes and its
 mask); a softcap with sinks and ALiBi, whose dQ at 64 x 64, width 128, in two column halves, spilled 204 bytes
 at ptxas's 255 where its model held 254 (et-ceil), refused once a consumer's raise is at most
-`resources.RAISE_CEILING`'s 248."""
+`resources.raise_ceiling`'s 248."""
 
 
 def _takes_backward(spans: template.KeySpans, query, key, hooks: template.Hooks | None, *, accurate: bool,

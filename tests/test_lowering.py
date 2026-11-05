@@ -108,11 +108,11 @@ def _reported(generation: str, layers: int = 1, *, scanned: bool = False):
     each call it, its kernels lowered once, `tuning.lowered_once`), unrolled or under a scan (`scanned`, as
     `scan_layers=True` runs a stack of like layers), beside a Triton kernel, lowered on this CPU for
     `generation`'s GPU, with the routes its dispatches reported (`routes`)."""
-    from dew.nn.kernels.templates.gemm import template
+    from dew.nn.kernels import gemm
 
     def step(x, w, sizes):
         def layer(x, w, scale):
-            return template.gemm(x * scale, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
+            return gemm.gemm(x * scale, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
 
         def loss(x, w):
             if scanned:
@@ -173,14 +173,14 @@ def test_a_kernel_behind_a_loop_of_no_trips_is_compiled_and_launches_none(genera
     and compiles, so the compile gate's inventory holds them (`kernel_calls(..., unrun=True)`), and which
     launch none, so the kernel report and the FLOP count leave them out alike, the step's Triton kernel its
     one launch (2958's review: a kernel of no runs once turned a live kernel's stated FLOPs unknown)."""
-    from dew.nn.kernels.templates.gemm import template
+    from dew.nn.kernels import gemm
     from dew.telemetry.instrumentation import hlo_flops
     from dew.training._lowering import kernel_calls
 
     def step(x, w, sizes):
         def body(carry):
             trip, total = carry
-            product = template.gemm(x, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
+            product = gemm.gemm(x, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
             return trip + 1, total + product
 
         _, total = jax.lax.while_loop(lambda carry: carry[0] < 0, body, (jnp.int32(0), jnp.float32(0)))
@@ -274,7 +274,7 @@ def test_a_cutlass_grouped_gemm_is_sized_by_its_shapes_and_an_unknown_call_is_un
 
 def test_a_tpu_grouped_gemm_states_its_cost_to_the_flop_count():
     """The TPU grouped GEMM's two launches, lowered for a TPU on this CPU, state their products'
-    FLOPs (`templates.gemm.cost`), which the kernel report and the FLOP count both read."""
+    FLOPs (`templates.cost.estimate`), which the kernel report and the FLOP count both read."""
     from dew.nn.kernels.templates.gemm import mosaic_tpu
     from dew.telemetry.instrumentation import hlo_flops
 
@@ -585,11 +585,6 @@ PER_SHARD_STEPS = {"expert layer": _expert_layer_step, "rms norm": _norm_step, "
 """Each op whose kernels run per shard (row 1923, bible §7), its step at a number of rows. Each lane adds its
 ops here."""
 
-UNTAKEN = {("sm80", "selective scan")}
-"""The steps whose template a GPU's kernel refuses whatever a call names: an A100's selective scan, its
-strided channel blocks' untiled copies wrong until the jax fork's post42 (`recurrence_chunk.SELECTIVE`)."""
-
-
 def _kernel_launches(loss, args, generation: str, devices: int) -> tuple[list, str]:
     """The Pallas launches (`custom_calls`) of `loss`'s value and gradient lowered for `generation`'s GPU on
     an abstract mesh of `devices` that splits the rows, and the program's text."""
@@ -607,8 +602,7 @@ def _kernel_launches(loss, args, generation: str, devices: int) -> tuple[list, s
 
 
 @pytest.mark.parametrize(("generation", "op"),
-                         [(generation, op) for generation in ("sm80", "sm90") for op in PER_SHARD_STEPS
-                          if (generation, op) not in UNTAKEN])
+                         [(generation, op) for generation in ("sm80", "sm90") for op in PER_SHARD_STEPS])
 def test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh(generation, op):
     """Bible §7, row 1923: an op's forward and backward, lowered for the GPU on an abstract two-device mesh
     that splits its rows, launches the kernels it launches on one device, each reading fewer elements than
@@ -634,14 +628,14 @@ def test_a_per_group_bias_reaches_its_launch_at_its_groups_extent(generation):
     `[G, N]` on the axes `('groups', 'columns')`, lowered for the GPU, reaches the product's launch as
     `[G, N]`: the launch reads no `[rows, N]` operand, the buffer of each row's bias the epilogue's fusion
     exists to remove."""
-    from dew.nn.kernels.templates.gemm import template
+    from dew.nn.kernels import gemm
     from dew.telemetry.instrumentation import custom_call_kind
 
     rows, depth, width, groups = 384, 128, 256, 4
 
     def biased(x, w, sizes, b):
-        return template.gemm(x, w, sizes, epilogue=lambda acc, bias: acc + bias,
-                             epilogue_operands=((b, ("groups", "columns")),), out_dtype=jnp.bfloat16)
+        return gemm.gemm(x, w, sizes, epilogue=lambda acc, bias: acc + bias,
+                         epilogue_operands=((b, ("groups", "columns")),), out_dtype=jnp.bfloat16)
 
     args = (jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16),
             jax.ShapeDtypeStruct((groups, depth, width), jnp.bfloat16),
@@ -714,11 +708,11 @@ def _mamba1_lowered(generation_name: str, layers: int = 1):
         return tuning.tune(lower)[0]
 
 
-@pytest.mark.parametrize("generation_name", ["sm90"])
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
 def test_a_mamba_layer_lowers_its_template_scan_for_each_gpu_it_takes(generation_name):
     """A Mamba layer, its selective scan the template's and its launches settled as the trainer settles
-    them, lowers on this CPU for each GPU the template takes it on (an H100; an A100's strided copies wait
-    for post42, `UNTAKEN`), forward and backward each a Mosaic GPU launch."""
+    them, lowers on this CPU for each GPU the template takes it on (an A100's and an H100's), forward and
+    backward each a Mosaic GPU launch."""
     from dew.training._lowering import kernel_calls
 
     names = {call.name for call in kernel_calls(_mamba1_lowered(generation_name))

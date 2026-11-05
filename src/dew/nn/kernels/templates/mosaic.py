@@ -34,9 +34,8 @@ from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.experimental.xla_metadata import set_xla_metadata
 
-from dew.nn.kernels import generation
-from dew.nn.kernels.templates import cost, product, report, resources
-from dew.nn.sharding import per_shard
+from dew.nn.kernels import generation, launches
+from dew.nn.kernels.templates import product, report, resources
 from dew.telemetry.instrumentation import MODEL_FLOPS
 
 Ref = state_types.AbstractRef | state_types.TransformedRef
@@ -130,16 +129,17 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
            approx_math: bool = False, cluster: int = 1, cost: pl.CostEstimate | None = None,
            model_flops: int | None = None, reduction_scratch: int = 0, resident: int = 1) -> Callable:
     """Build a per-shard launch with the same reporting and interpreter semantics for every family, each call
-    checked against the mesh it runs in (`per_shard`), named as the launch tracing it reports `name`
+    checked against the mesh it runs in (`launches.kernel`), named as the launch tracing it reports `name`
     (`report.named`), a launch lowered once for every call of its facts (`tuning.lowered_once`), its `cost`
     the hardware's work and `model_flops` the model's share of it (`checked`)."""
     clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
-    built = plgpu.kernel(dependent(entry, interpret), out_type=out_type, grid=grid, grid_names=grid_names,
-                         num_threads=warpgroups, thread_name="wg", scratch_types=scratch,
-                         compiler_params=compiler_params(approx_math=approx_math, resident=resident,
-                                                         reduction_scratch=reduction_scratch),
-                         interpret=interpreted(interpret),
-                         kernel_name=report.named(name), cost_estimate=cost, **clustered)
+    built = launches.kernel(dependent(entry, interpret), name=name or family, out_type=out_type, grid=grid,
+                            grid_names=grid_names, num_threads=warpgroups, thread_name="wg",
+                            scratch_types=scratch,
+                            compiler_params=compiler_params(approx_math=approx_math, resident=resident,
+                                                            reduction_scratch=reduction_scratch),
+                            interpret=interpreted(interpret),
+                            kernel_name=report.named(name), cost_estimate=cost, **clustered)
 
     return checked(built, name or family, resident, model_flops)
 
@@ -174,8 +174,9 @@ raise their registers to that residency's share (`roles`)."""
 
 
 def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | None = None) -> Callable:
-    """The launch `built`, each call checked against the mesh it runs in (`per_shard`) and traced at its
-    residency (`_RESIDENT`): a launch built once for every call of its facts checks each call's own; and
+    """The launch `built` (`launches.kernel`, which holds each call per shard), each call traced at its
+    residency (`_RESIDENT`) under the name `kernel`: a launch built once for every call of its facts checks
+    each call's own; and
     refused at its trace where two of the refs it adds into in place share a shape and a dtype, which
     `stacked_zeros` makes one ref (row 3180). Its call declares `model_flops`, the model's share of the work
     its cost states (the rest its own recomputation), where given, as its custom call's frontend attribute
@@ -187,7 +188,6 @@ def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | 
         return checked_launch(*operands)
 
     def checked_launch(*operands):
-        per_shard(kernel)
         refs = [jax.typeof(operand) for operand in operands if _is_ref(operand)]
         kinds = [(ref.shape, ref.dtype) for ref in refs]
         if len(set(kinds)) < len(kinds):
@@ -889,7 +889,7 @@ def staged(shape: tuple, dtype, swizzle: int | None = None):
 def roles(wg, consumers: int, consumer, producer) -> None:
     """Each warpgroup's role in a cooperative block: the `consumers` first run `consumer(wg)` with their
     register budget raised to their share at the launch's residency (`resources.raised_registers`,
-    `_RESIDENT`), the last runs `producer()` with its lowered to `resources.PRODUCER_REGISTERS`, where the
+    `_RESIDENT`), the last runs `producer()` with its lowered to `resources.producer_floor`, where the
     GPU's compile honors them (`resources.RAISES_HONORED`)."""
     @pl.when(wg < consumers)
     def _():
@@ -898,7 +898,7 @@ def roles(wg, consumers: int, consumer, producer) -> None:
 
     @pl.when(wg == consumers)
     def _():
-        plgpu.set_max_registers(resources.PRODUCER_REGISTERS, action="decrease")
+        plgpu.set_max_registers(resources.producer_floor(), action="decrease")
         producer()
 
 
@@ -1627,9 +1627,12 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
     consumers: int
     """The compute roles a program may take (sm90 two warpgroups, sm80 one)."""
 
-    register_step: int = cost.REGISTER_STEP
-    """The allocator's registers per thread in one step (setmaxnreg's eight-register granularity).
-    A compile gate tests admits at their actual cap, refusals one such step below it."""
+    @property
+    def register_step(self) -> int:
+        """The allocator's registers per thread in one step (`generation.Multiprocessor.register_step`,
+        setmaxnreg's eight-register granularity). A compile gate tests admits at their actual cap, refusals
+        one such step below it."""
+        return resources.facts().register_step
 
     most_shared: int
     """The most shared memory a block of any GPU of the family holds (CUDA's opt-in limit), which bounds

@@ -9,10 +9,14 @@ which branch a platform runs and which bodies XLA sees.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import functools
+from collections.abc import Mapping, Sequence
 from typing import TypeGuard
 
+import jax
 import jax.extend.core as jcore
+from jax.extend import random as jax_random
+from jax.interpreters import ad
 
 CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat2", "checkpoint", "custom_jvp_call",
                    "custom_vjp_call", "marked_call"})
@@ -25,6 +29,32 @@ lowers to a call that XLA's `CallInliner` inlines (`_pjit_lowering`, jax/_src/pj
 call. A result that is the program's own parameter is its operand's buffer, and one that is a
 cheap value of another is recomputed where it is read, as it would be without the call."""
 
+
+ENTRYWISE = frozenset({
+    "abs", "acos", "acosh", "add", "add_any", "and", "asin", "asinh", "atan", "atan2", "atanh", "bessel_i0e",
+    "bessel_i1e", "cbrt", "ceil", "clamp", "clz", "complex", "conj", "convert_element_type", "copy", "copy_p",
+    "cos", "cosh", "digamma", "div", "eq", "erf", "erf_inv", "erfc", "exp", "exp2", "expm1", "floor", "ge",
+    "gt", "igamma", "igammac", "imag", "integer_pow", "is_finite", "le", "lgamma", "log", "log1p", "logistic",
+    "lt", "max", "min", "mul", "ne", "neg", "nextafter", "not", "or", "polygamma", "population_count", "pow",
+    "real", "reduce_precision", "rem", "round", "rsqrt", "select_n", "shift_left", "shift_right_arithmetic",
+    "shift_right_logical", "sign", "sin", "sinh", "sqrt", "square", "stop_gradient", "sub", "tan", "tanh",
+    "threefry2x32", "xor", "zeta",
+})
+"""The operations whose every output entry reads its operands' entries at its own index (each operand of
+the output's shape, or a scalar) and nothing else, by JAX's name (`jax_name`): the one vocabulary the
+analyses of a program's entries read (`templates.layout`, `dew.interop.sequence_causality`)."""
+
+KEYS = frozenset({"random_bits", "random_fold_in", "random_split", "random_unwrap", "random_wrap"})
+"""The operations on PRNG keys, each output entry its own key's: entrywise over a key array's positions,
+but not over a value's (a key's data extends its shape, and `random_bits` takes the shape it fills), so an
+analysis of positions takes them beside `ENTRYWISE` and one of values' entries does not."""
+
+REDUCTIONS = frozenset({"argmax", "argmin", "reduce_and", "reduce_max", "reduce_min", "reduce_or",
+                        "reduce_prod", "reduce_sum", "reduce_xor"})
+"""The operations that reduce the axes their `axes` parameter names."""
+
+CUMULATIVE = frozenset({"cumlogsumexp", "cummax", "cummin", "cumprod", "cumsum"})
+"""The operations that scan along the axis their `axis` parameter names."""
 
 def platform_branch(platforms: Sequence[Sequence[str] | None], lowering: str) -> int:
     """The index of the branch of a platform choice that a program lowered for `lowering` runs: of a
@@ -53,6 +83,37 @@ def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
         found.extend(each for each in (value if isinstance(value, tuple | list) else (value,))
                      if isinstance(each, jcore.Jaxpr))
     return found
+
+
+@functools.cache
+def _jax_own() -> Mapping[jcore.Primitive, str]:
+    """JAX's own operations by their objects: `jax.lax`'s and `jax.extend.random`'s, the sum JAX's
+    derivatives add with (`add_any`), and those its public random functions bind, which no module of
+    JAX's exports (`random_wrap`, `random_split`, `random_fold_in`, `random_bits`, `random_unwrap`), read
+    off a trace of them once asked."""
+    def drawn(seed_words):
+        # A key of its own implementation, whichever the process's default is (`jax_default_prng_impl`).
+        first, _ = jax.random.split(jax.random.wrap_key_data(seed_words, impl="threefry2x32"))
+        return jax.random.bits(jax.random.fold_in(first, 1), ()), jax.random.key_data(first)
+
+    def each(jaxpr: jcore.Jaxpr):
+        for equation in jaxpr.eqns:
+            yield equation.primitive
+            for inner in jcore.jaxprs_in_params(equation.params):
+                yield from each(inner)
+
+    traced = jax.make_jaxpr(drawn)(jax.ShapeDtypeStruct((2,), jax.numpy.uint32)).jaxpr
+    exported = (primitive for module in (jax.lax, jax_random) for attribute, primitive in vars(module).items()
+                if attribute.endswith("_p") and isinstance(primitive, jcore.Primitive))
+    return {primitive: primitive.name for primitive in (*exported, *each(traced), ad.add_jaxvals_p)}
+
+
+def jax_name(primitive) -> str | None:
+    """`primitive`'s name where it is JAX's own operation (`_jax_own`), None for any other: a primitive
+    of another library or of a user's takes any name, whatever it computes, so a reader that knows an
+    operation by its name knows it by its object. A call (`CALLS`) runs the program it holds, read as
+    such by its name."""
+    return _jax_own().get(primitive)
 
 
 def computed(value) -> TypeGuard[jcore.Var]:

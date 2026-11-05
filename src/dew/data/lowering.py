@@ -134,7 +134,7 @@ from dew.data.pipeline import (
     member_record,
     members_held,
 )
-from dew.data.plan import Manifest
+from dew.data.plan import PLAN_VERSIONS, Manifest
 from dew.data.readers import _FillShare
 from dew.data.shards import bounded as shards_bounded, bounded_places, streamed
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, materialized
@@ -1381,6 +1381,13 @@ class _Build:
     and runs the rest. A mixture's corpora each read in a share of them, or in the workers a corpus
     writes itself. None where the workers read the whole order after its batch, as a read that drops
     nothing is read."""
+    version: int = PLAN_VERSIONS[-1]
+    """The data plan version it reads by (`dew.data.plan.PLAN_VERSIONS`): 9 a corpus's shuffles each by its
+    own key (`ordered`), 8 each by its seed alone."""
+    named: int | None = None
+    """The key of the chain this builds, read outside any mixture, where it was given a name: the key a
+    mixture keys it by as its first member of that name (`dew.data.compile._own_key`), which its shuffles
+    draw by (`ordered`)."""
 
     @property
     def global_order(self) -> bool:
@@ -1823,9 +1830,25 @@ class _Build:
                             members=members, credits=True)
         return rows
 
+    def ordered(self, stage: Shuffle) -> Shuffle:
+        """`stage` as this build reads it: from plan version 9 a shuffle draws from its seed and its corpus's
+        own key, the one it goes by in the mixture that reads it (`corpus`'s last), or, read outside any,
+        its name's where it was given one (`named`), so corpora of one length shuffled by one seed read in
+        orders of their own, and a named corpus reads one order whichever others a mixture holds, however
+        deep, and alone, as a later phase continues it (row 3840); version 8, and an unnamed chain read
+        outside any mixture, by its seed alone."""
+        key = self.corpus[-1] if self.corpus else self.named
+        if self.version < 9 or key is None:
+            return stage
+        keyed = hashlib.blake2b(repr((stage.seed, key)).encode(), digest_size=4).digest()
+        return dataclasses.replace(stage, seed=int.from_bytes(keyed, "big"))
+
     def stage(self, rows: Rows, stage: Stage, pipeline: Pipeline, partition: DataPartition, at: int) -> Rows:
-        """`rows` through `stage`, written at `at` in `pipeline`."""
+        """`rows` through `stage`, written at `at` in `pipeline`, a shuffle as this build orders it
+        (`ordered`)."""
         stage = _for_rows(stage, rows)
+        if isinstance(stage, Shuffle):
+            stage = self.ordered(stage)
         if isinstance(stage, _RECORD):
             return self.record_stage(rows, (stage,), pipeline, partition, at)
         if isinstance(stage, Shuffle) and stage.block_shards is not None:
