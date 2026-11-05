@@ -120,13 +120,13 @@ def as_service(held):
 
 def live_kernel(service, tmp_path):
     """The live page's two sides over a tiny run: the guest's client (its contract read from Dew), the tiny
-    run's pipeline, and the shared process's native models serving it, behind the progress reporter, as
-    "model" at "pinned", with the guidance record and solvers it takes from Dew."""
+    run's pipeline, and the shared process's native models serving it through an engine, as "model" at
+    "pinned", with the guidance record and solvers it takes from Dew."""
     import numpy as np
     from test_inference import make_run
 
     from dew import sampling
-    from dew.inference import TextToImage
+    from dew.inference import Engine, ScoringServer, TextToImage
 
     progress = load("progress", "site/live/container")
     client = load("model_client", "site/live/container")
@@ -134,7 +134,10 @@ def live_kernel(service, tmp_path):
     make_run(tmp_path)
     pipe = TextToImage.from_run(str(tmp_path))
     native = service.NativeModels.__new__(service.NativeModels)
-    native.np, native.progress, native.pipe = np, progress, progress.Reporting(pipe)
+    native.np, native.progress, native.pipe = np, progress, pipe
+    native.images = ScoringServer.from_task(*pipe.scoring(images=1))
+    native.engine = Engine(native.images)
+    native.engine.start()
     native.cfg = sampling.CFG
     native.solvers = {name: getattr(sampling, name)
                       for name in ("DPMSolverMultistep", "EulerAncestral", "Heun")}
