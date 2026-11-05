@@ -1574,7 +1574,11 @@ def test_from_iter_closes_the_native_file_before_restoring_and_on_close(tmp_path
     assert all(iterator.file.closed for iterator in opened)
 
 
-def test_closing_a_compiled_from_iter_reader_finalizes_its_native_generators():
+@pytest.mark.parametrize("cycle", [1, 2])
+def test_closing_a_compiled_from_iter_reader_finalizes_its_native_generators(cycle):
+    """Closing a streamed reader finalizes every native generator it opened: two passes' interleaved
+    (`cycle` 2), Grain's interleave opening the next ahead on its iterator-making executor, or one pass
+    after another (`cycle` 1), each opened as the one before ends (row 4079)."""
     from dew.data import from_iter
     from dew.data.compile import compile
 
@@ -1601,19 +1605,24 @@ def test_closing_a_compiled_from_iter_reader_finalizes_its_native_generators():
         finalizers.append(finalized)
         return iterator
 
-    source = from_iter(factory, identity="closing-generator@1").repeat().batch(2)
+    source = from_iter(factory, identity="closing-generator@1")
+    source = (source.interleave(cycle) if cycle > 1 else source).repeat().batch(2)
     reader = compile(source, read="streamed", loading=Loading(workers=0, threads=1, read_buffer=1)
                      ).train(DataPartition())
     try:
-        assert next(reader)["id"].tolist() == [0, 1]
-        assert both_started.wait(timeout=5)
-        assert sorted(opened) == [0, 1] and not closed
+        # A pass's first two rows, or, interleaved, each pass's first.
+        assert next(reader)["id"].tolist() == ([0, 1] if cycle == 1 else [0, 0])
+        # One pass after another opens the one it reads alone; interleaved, each pass it reads, and those
+        # its iterator-making executor opens ahead.
+        if cycle > 1:
+            assert both_started.wait(timeout=5)
+        assert (opened == [0] if cycle == 1 else len(opened) >= cycle) and not closed
     finally:
         reader.close()
         reader.close()
     # Grain finalizes the unconsumed lookahead on its iterator-making executor.
     assert all(finalized.wait(timeout=5) for finalized in finalizers)
-    assert sorted(closed) == sorted(opened) == [0, 1]
+    assert sorted(closed) == sorted(opened)
 
 
 def test_from_iter_forwards_a_native_stop_request():
