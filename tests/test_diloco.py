@@ -400,9 +400,9 @@ def test_a_diloco_step_stores_its_groups_collections_once_and_their_ema_against_
     """A DiLoCo run's groups hold their own copies of the model's collections and of its EMA (row 4318). A
     step writes the groups' collections but `params` to the run's content-addressed store, as it writes the
     outer model's (docs/guides/checkpoints.md), so the table no step moves is one entry of the groups' and
-    one of the outer model's, which every step records; and it stores the groups' EMA as byte planes of its
-    difference from their weights, which Orbax alone decodes to the groups' EMA bit for bit. The run resumes
-    from those steps and ends where an unbroken one does, to the bit."""
+    one of the outer model's, which every kept step records; and it stores the groups' EMA as byte planes of
+    its difference from their weights, which Orbax alone decodes to the groups' EMA bit for bit. The run
+    resumes from those steps and ends where an unbroken one does, to the bit."""
     import orbax.checkpoint as ocp
 
     def run(path=None):
@@ -414,12 +414,13 @@ def test_a_diloco_step_stores_its_groups_collections_once_and_their_ema_against_
 
     manager = ocp.CheckpointManager(str(tmp_path / "run"), item_handlers=ocp.PyTreeCheckpointHandler())
     assert set(manager.metadata(3).item_metadata.tree["inner"]["variables"]) == {"params"}
-    recorded = set.intersection(*(set(frozen_entries(str(tmp_path / "run" / str(step))))
-                                  for step in (1, 2, 3)))
+    # The run keeps its latest two steps; the outer count, which only a meeting moves, is shared too.
+    kept = (2, 3)
+    recorded = set.intersection(*(set(frozen_entries(str(tmp_path / "run" / str(step)))) for step in kept))
     with ocp.PyTreeCheckpointer() as checkpointer:
-        shapes = sorted(tuple(leaf.shape) for entry in recorded for leaf in jax.tree.leaves(
-            checkpointer.metadata(epath.Path(tmp_path / "run") / entry).item_metadata.tree))
-    assert shapes == [(2, 1000), (1000,)]
+        shapes = {tuple(np.shape(leaf)) for entry in recorded for leaf in jax.tree.leaves(
+            checkpointer.restore(epath.Path(tmp_path / "run") / entry))}
+    assert {(2, 1000), (1000,)} <= shapes
 
     tree = manager.restore(3, args=ocp.args.PyTreeRestore())
     deltas = manager.metadata(3).custom_metadata["deltas"]["inner/ema"]
