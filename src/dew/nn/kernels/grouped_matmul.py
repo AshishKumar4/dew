@@ -1154,6 +1154,15 @@ def _cutlass_registered() -> None:
         jax.ffi.register_ffi_target(target, capsule, platform="CUDA")
 
 
+CUTLASS_TILE = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2, family='wgmma')
+"""The dew-cutlass wheel's one instantiated kernel, as Dew's records name a launch (row 4323): a fact of
+that binary, not a derivation. kernels/cutlass/grouped_sm90.cu's `Kernel`, which every one of its targets
+instantiates, is CUTLASS 3's pointer-array cooperative kernel (two consumer warpgroups) at a
+`Shape<_128, _256, _64>` tile on a `Shape<_2, _1, _1>` cluster; its stages are CUTLASS's own, fitted to the
+shared memory its epilogue leaves (`StageCountAutoCarveout`), and it has no band of column tiles, so the
+record's `stages` and `grid_block_n` describe no choice of the binary's."""
+
+
 class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
     """CUTLASS's grouped GEMMs (`kernels/cutlass`, the dew-cutlass wheel) as XLA FFI calls: on Hopper,
     CUTLASS 3's pointer-array cooperative kernel, a 128 x 256 x 64 tile on a pair of multiprocessors, its
@@ -1195,8 +1204,7 @@ class CutlassGmm(_Cutlass):
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
 
-    TILE: ClassVar[mosaic_gpu.Tiles] = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2,
-                                                         family='wgmma')
+    TILE: ClassVar[mosaic_gpu.Tiles] = CUTLASS_TILE
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
@@ -1220,7 +1228,9 @@ class CutlassTgmm(_Cutlass):
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
 
-    TILE: ClassVar[mosaic_gpu.Tiles] = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, family='wgmma')
+    # Dew's record of a kernel gradient pairs no row tiles (`mosaic_gpu.Tiles.cluster`: `tgmm` takes no pair),
+    # whatever cluster the binary's kernel runs on.
+    TILE: ClassVar[mosaic_gpu.Tiles] = dataclasses.replace(CUTLASS_TILE, cluster=1)
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,

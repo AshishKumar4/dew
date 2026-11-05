@@ -541,7 +541,8 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                                           columns[None, :] == key_index[row, head, rows][:, None], how,
                                           multiplier=zt)
             # At the call's whole scale against the call's own queries, the logits' alone taken by the power.
-            dk, dv, pieces = gradient.dkv_step(*sums, scores, slopes, seen, score_kinds, q, do, denominator,
+            dk, dv = sums
+            dk, dv, pieces = gradient.dkv_step(dk, dv, scores, slopes, seen, score_kinds, q, do, denominator,
                                                scale=grad_scale, transposed=transposed_dot, accurate=accurate,
                                                multiplier=zt)
             return (dk, dv), hooked(i, hooks, pieces)
