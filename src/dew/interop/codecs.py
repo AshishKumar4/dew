@@ -71,6 +71,7 @@ from numpy.typing import ArrayLike, DTypeLike
 
 from dew import _records
 from dew.interop import unread
+from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.unread import Stored, Unread
 from dew.interop.weights import checkpoint_array, checkpoint_dtype
 from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS
@@ -319,19 +320,54 @@ class SourceQuantization:
             raise ValueError(f"{', '.join(lost)} arrive encoded and the checkpoint holds no scale for them")
         return out
 
-    def requantize(self, tensors: Mapping[str, np.ndarray], names: Iterable[str]) -> dict[str, np.ndarray]:
+    def requantize(self, tensors: Mapping[str, np.ndarray], names: Iterable[str],
+                   stored: Mapping[str, jax.ShapeDtypeStruct]) -> LazyTensors[np.ndarray]:
         """Write each of `names` back in the format, for the names a source
-        shipped quantized (`names`). Every other tensor passes through as
-        itself. A part already among the tensors is refused, since the
-        encoding would overwrite it."""
-        out = dict(tensors)
+        shipped quantized (`names`), as the tensors `stored` states it stored
+        them (their headers' shapes and dtypes, `Pretrained.quantized_specs`).
+        Every other tensor passes through as itself. A part already among the
+        tensors is refused, since the encoding would overwrite it.
+
+        The table is lazy (`LazyTensors`): a weight is encoded when the first of
+        its stored tensors is read, the group's others held until they are read,
+        so a writer that reads in the table's order holds one weight's group
+        beside its shard, not the encoded model. An encoding whose tensors are
+        not the ones the source stored, a weight whose geometry changed among
+        them, is refused as it is read."""
+        names = tuple(names)
+        specs = dict(tensor_specs(tensors))
+        groups: dict[str, str] = {}
         for name in names:
-            taken = [partner for partner in self.partners(name) if partner in out]
+            taken = [partner for partner in self.partners(name) if partner in specs]
             if taken:
                 raise ValueError(f"{', '.join(taken)} is already among the tensors to write, so "
                                  f"quantizing {name} would overwrite it")
-            out.update(self.encode(name, np.asarray(out.pop(name))))
-        return out
+            specs.pop(name)
+            for part in (name, *self.partners(name)):
+                if part in stored:
+                    specs[part] = stored[part]
+                    groups[part] = name
+        held: dict[str, dict[str, np.ndarray]] = {}
+
+        def build(part: str) -> np.ndarray:
+            name = groups.get(part)
+            if name is None:
+                return tensors[part]
+            if name not in held:
+                encoded = self.encode(name, np.asarray(tensors[name]))
+                expected = {other for other, owner in groups.items() if owner == name}
+                if set(encoded) != expected or any(
+                        (np.shape(encoded[other]), np.dtype(encoded[other].dtype))
+                        != (tuple(specs[other].shape), np.dtype(specs[other].dtype)) for other in expected):
+                    raise ValueError(f"{name} encodes to tensors other than the ones its source stored "
+                                     f"({sorted(expected)}), so it is not written back in their format")
+                held[name] = encoded
+            value = held[name].pop(part)
+            if not held[name]:
+                del held[name]
+            return value
+
+        return LazyTensors(specs, build)
 
 
 def _encoded(name: str, tensor: Stored) -> bool:
