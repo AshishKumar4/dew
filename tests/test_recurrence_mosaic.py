@@ -500,6 +500,47 @@ def test_a_narrow_key_dimensions_gradient_lowers_its_copies_for_an_ampere_gpu(ta
         jax.jit(jax.grad(loss, argnums=(0, 1, 2, 3, 4))).trace(*operands).lower(lowering_platforms=("cuda",))
 
 
+@pytest.mark.parametrize('dtype', [jnp.bfloat16, jnp.float32], ids=['bf16', 'fp32-accurate'])
+def test_a_launch_states_the_part_pairs_it_issues_and_declares_the_models_products(dtype):
+    """A gated delta rule's forward and gradient through the template, lowered for an H100: each launch
+    states the products it issues, its operands' part pairs (`product.terms`: one for bf16, six for an fp32
+    operand's three bf16 parts under the accurate forms), and declares the model's products apart
+    (`instrumentation.MODEL_FLOPS`), which Dew's FLOP count reads for the model's work."""
+    import re
+
+    from dew.nn.kernels.templates import product
+    from dew.nn.precision import ACCURATE
+    from dew.telemetry.instrumentation import _MODEL_FLOPS, _stated_flops
+
+    rows, length, key_heads, value_heads, width = 1, 256, 2, 4, 64
+    operands = [jax.ShapeDtypeStruct((rows, length, key_heads, width), dtype)] * 2 + [
+        jax.ShapeDtypeStruct((rows, length, value_heads, width), dtype),
+        jax.ShapeDtypeStruct((rows, length, value_heads), jnp.float32),
+        jax.ShapeDtypeStruct((rows, length, value_heads), dtype)]
+
+    def rule(*operands):
+        return mosaic_rule(*operands, tiles=mainloop.Tiles(32, 1), bound=1.0)[0].astype(jnp.float32).sum()
+
+    mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), generation.run_precision(ACCURATE), jax.sharding.use_abstract_mesh(mesh):
+        text = jax.jit(jax.grad(rule, argnums=(0, 1, 2))).trace(*operands).lower(
+            lowering_platforms=("cuda",)).as_text(dialect="hlo")
+    launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
+    ratios = set()
+    for line in launches:
+        declared = _MODEL_FLOPS.search(line)
+        assert declared is not None, line[:200]
+        model, hardware = float(declared.group(1)), _stated_flops(line) or 0.0
+        if model:
+            ratios.add(hardware / model)
+    if dtype == jnp.bfloat16:
+        assert ratios == {1.0}
+    else:
+        # A launch over fp32 operands issues every part pair; one over the rule's bf16 gates, one.
+        pairs = float(len(product.terms(mainloop.PARTS, mainloop.PARTS)))
+        assert pairs in ratios and ratios <= {1.0, pairs}
+
+
 def test_each_launch_lowers_once_however_many_layers_call_it():
     """Two layers' bf16 gated delta rules of one shape, their forward and gradient, lowered for the GPU the
     test runs on, or off one an H100: each of the template's distinct launches is one Mosaic GPU call in the
