@@ -62,6 +62,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     bundle_of,
     extents,
     layouts,
+    query_swizzle,
     reducing,
     refused,
     split_queries,
@@ -515,7 +516,8 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
             phases.append([logits, weights, weights, bits, bits])
     depth = value_width if width is None else width
     products = _products(family, dtype, (block_q, depth, block_k, [logits], False, True),
-                         (block_q, block_k, value_width, [weights], True, False), narrow=tiles.narrow)
+                         (block_q, block_k, value_width, [weights], True, False), narrow=tiles.narrow,
+                         lhs_swizzle=query_swizzle(family))
     carried = [(block_q, value_width, jnp.float32)]
     scored = resources.live_registers(family, carried, [logits, *hooked]) + vectors
     # A training walk's per-query rows (`TRAINING_ROWS`), in the accumulator's row layout.
@@ -534,7 +536,8 @@ def _peaks_registers(family: mosaic.Family, tiles: Tiles, dtype, *, params: tupl
     hooked, vectors = _hook_live(family, block_q, block_k, params)
     logits, bits = (block_q, block_k, jnp.float32), (block_q, block_k, jnp.int32)
     step = [logits, *([] if family.folds_indices(block_k) else [bits, bits])]
-    products = _products(family, dtype, (block_q, width, block_k, [logits], False, True), narrow=tiles.narrow)
+    products = _products(family, dtype, (block_q, width, block_k, [logits], False, True), narrow=tiles.narrow,
+                         lhs_swizzle=query_swizzle(family))
     carried = [(block_q, 1, jnp.float32)]
     scored = resources.live_registers(family, carried, [logits, *hooked]) + vectors
     return max(resources.live_registers(family, carried, step, *products), scored)

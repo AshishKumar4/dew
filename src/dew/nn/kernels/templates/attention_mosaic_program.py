@@ -215,7 +215,8 @@ def _width(width: int, family: mosaic.Family, dtype) -> int:
     return whole(power_of_two(width), family.column_unit(dtype))
 
 
-def _products(family: mosaic.Family, dtype, *products, narrow: bool = False) -> list:
+def _products(family: mosaic.Family, dtype, *products, narrow: bool = False, lhs_swizzle: int | None = None
+              ) -> list:
     """The phases a step's products hold where its family's read their operands from registers
     (`resources.operand_fragments`; none where they read shared memory, wgmma's): each product
     `(rows, depth, columns, beside, register_lhs, rhs_transposed)` its operands' fragments beside the tiles
@@ -224,13 +225,14 @@ def _products(family: mosaic.Family, dtype, *products, narrow: bool = False) -> 
     transpose of its stored tile (`rhs_transposed`: the keys of the logits, the values of dP) loaded at its
     stage's swizzle granule (`Family.rhs_fragment_depth`; mma.sync: ET-CENSUS80, a 64 x 192 forward's keys'
     fragments 162 of its 291 registers at its peak, uncounted), the narrowest where its launch stages them
-    `narrow` (`Tiles.narrow`)."""
+    `narrow` (`Tiles.narrow`); a left operand in shared memory loaded at its stage's (`lhs_swizzle`: a
+    forward's query block, `query_swizzle`; the family's own where None)."""
     if not family.operands_in_registers:
         return []
     narrowest = mosaic.NARROWEST_SWIZZLE_BYTES if narrow else None
     return [list(beside) + resources.operand_fragments(family, rows, depth, columns, dtype, dtype,
                                                        lhs_parts=0 if register_lhs else 1,
-                                                       rhs_transposed=transposed,
+                                                       rhs_transposed=transposed, lhs_swizzle=lhs_swizzle,
                                                        rhs_swizzle=narrowest if transposed else None)
             for rows, depth, columns, beside, register_lhs, transposed in products]
 
