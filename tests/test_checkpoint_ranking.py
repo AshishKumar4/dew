@@ -664,28 +664,36 @@ def test_local_resume_keeps_plateau_patience(tmp_path):
     assert int(result.step) == 4
 
 
-def test_a_runs_persistent_and_local_checkpoints_hold_one_envelope(tmp_path, monkeypatch):
+def test_a_runs_persistent_and_local_checkpoints_hold_one_envelope(tmp_path):
     """A run's persistent checkpoint and its local one are submitted with the same envelope, every field a
     local save takes the persistent save takes alike (the state as saved, its data position, partition,
     stop control, rung, artifact, axes and rollout), each tier adding its own (row 4126: two submissions
     each built field by field, a field added to one missed by the other)."""
     import inspect
+    from typing import ClassVar
 
     local = set(inspect.signature(Checkpoints.save_local).parameters) - {"self", "step"}
-    submitted = {}
-    for tier in ("save", "save_local"):
-        written = getattr(Checkpoints, tier)
 
-        def recorded(self, step, *args, tier=tier, written=written, **fields):
-            submitted.setdefault(tier, (args, fields))
-            return written(self, step, *args, **fields)
-        monkeypatch.setattr(Checkpoints, tier, recorded)
+    class Recorded(Checkpoints):
+        """Checkpoints that keep what each tier's first save was handed."""
+
+        submitted: ClassVar[dict[str, tuple[tuple, dict]]] = {}
+
+        def save(self, step, *args, **fields):
+            self.submitted.setdefault("save", (args, fields))
+            return super().save(step, *args, **fields)
+
+        def save_local(self, step, *args, **fields):
+            self.submitted.setdefault("save_local", (args, fields))
+            return super().save_local(step, *args, **fields)
+
     run = Trainer(Overfit(), optax.sgd(.1), key=jax.random.key(0),
-                  checkpoints=Checkpoints(str(tmp_path / "run"), local_directory=str(tmp_path / "local"),
-                                          local_every=1))
+                  checkpoints=Recorded(str(tmp_path / "run"), local_directory=str(tmp_path / "local"),
+                                       local_every=1))
     run.fit(data(), steps=2, log_every=1, checkpoint_every=2)
     run.checkpoints.wait()
-    (persistent_args, persistent), (local_args, local_fields) = submitted["save"], submitted["save_local"]
+    (persistent_args, persistent), (local_args, local_fields) = (Recorded.submitted["save"],
+                                                                 Recorded.submitted["save_local"])
     assert not persistent_args and not local_args and set(local_fields) == local
     assert {name: type(value) for name, value in persistent.items() if name in local} == {
         name: type(value) for name, value in local_fields.items()}
