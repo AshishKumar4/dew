@@ -735,12 +735,11 @@ def test_the_tpu_persistent_walk_lowers_for_a_v5e():
             lowering_platforms=("tpu",))
 
 
-@pytest.mark.parametrize("programs", [1, 2, 3, 4])
-def test_a_consumer_launched_at_a_residency_raises_to_the_gates_cap_and_holds_its_registers(programs):
-    """A persistent warpgroup-MMA walk, one consumer beside its producer, launched for `programs` programs a
-    multiprocessor on an H100 and compiled as the GPU gate compiles it: the registers its consumer raises
-    to in its PTX (`setmaxnreg.inc`) are the gate's cap for it at that residency (`RegisterModel.cap`), and
-    its binary holds its registers within them, spilling nothing."""
+def test_a_consumer_launched_at_each_residency_its_family_admits_raises_to_the_gates_cap_spill_free():
+    """A persistent warpgroup-MMA walk, one consumer beside its producer, launched at each residency its
+    family admits a multiprocessor on an H100 (`RegisterModel.most`) and compiled as the GPU gate compiles
+    it: the registers its consumer raises to in its PTX (`setmaxnreg.inc`) are the gate's cap for it at that
+    residency (`RegisterModel.cap`), and its binary holds its registers within them, spilling nothing."""
     import kernel_compile
     from fla_gdn_support import KernelCase
 
@@ -748,11 +747,13 @@ def test_a_consumer_launched_at_a_residency_raises_to_the_gates_cap_and_holds_it
 
     with generation.assumed("sm90"):
         family = bundles.of("sm90", jnp.bfloat16)
-        cap = resources.register_model(family, 1, None).cap(programs, honored=True)
+        model = resources.register_model(family, 1, None)
     x, w = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _persisted_operands(family.rows))
-    call = functools.partial(_persisted_products, family=family, interpret=False, resident=programs)
-    case = KernelCase("persisted", lambda: (call, (x, w)))
-    [record] = kernel_compile.compile_mosaic_kernels([case], "sm90")
-    [kernel] = record["kernels"]
-    assert (kernel["raised"], kernel["spilled"]) == (cap, 0), kernel
-    assert kernel["registers"] <= cap
+    for programs in range(1, model.most + 1):
+        call = functools.partial(_persisted_products, family=family, interpret=False, resident=programs)
+        case = KernelCase("persisted", lambda call=call: (call, (x, w)))
+        [record] = kernel_compile.compile_mosaic_kernels([case], "sm90")
+        [kernel] = record["kernels"]
+        cap = model.cap(programs, honored=True)
+        assert (kernel["raised"], kernel["spilled"]) == (cap, 0), (programs, record.get("error"), kernel)
+        assert kernel["registers"] <= cap
