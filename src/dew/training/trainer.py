@@ -1499,7 +1499,7 @@ class Trainer(Generic[Loss, Effects]):
                 if read is None:
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
-                batch, device, ahead = read
+                (batch, device, ahead), read = read, None  # the batch's buffers held by `batch` alone
                 if batch_signature(device) not in compiled and self.rollout is None:
                     # Each batch of a shape the run has not stepped is checked against what the objective
                     # declares, a later ramp's or schedule's stage as the first; a rollout writes its own.
@@ -1953,7 +1953,7 @@ class Trainer(Generic[Loss, Effects]):
                                       phase="cooldown read", branch=True)
                     if read is None:
                         break
-                    batch, device, _ = read
+                    (batch, device, _), read = read, None
                     step, _, cooled = self._compiled_for(run.compiled, cooled, device, branched,
                                                          reported=run.current)
                     factor = decay(shape, done // self.accumulation, steps // self.accumulation)
