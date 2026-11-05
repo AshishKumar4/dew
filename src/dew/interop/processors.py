@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
@@ -289,11 +290,68 @@ class Processor:
 
     def media(self, *, images: Media | None = None,
               **kwargs: Unpack[ProcessorCall]) -> Mapping[str, object]:
-        """Return the source's media fields before Dew aligns them to model rows."""
+        """Return the source's media fields before Dew aligns them to model rows: its processor's own,
+        or, for a processor whose public call takes its media as `medias` (Kimi K2.5's release's), the
+        fields that call gives as the other processors give them (`_medias_fields`)."""
+        if "medias" in inspect.signature(type(self._media_reference).__call__).parameters:
+            return self._medias_fields(images, **kwargs)
         # An audio-only processor takes no images keyword at all.
         if images is None:
             return self._media_reference(**kwargs)
         return self._media_reference(images=images, **kwargs)
+
+    def _medias_fields(self, images: Media | None, **kwargs: Unpack[ProcessorCall]) -> dict[str, np.ndarray]:
+        """The fields of a processor whose public call takes `medias` and `text` (Kimi K2.5's release's
+        KimiK25Processor at 4d01dfe, kimi_k25_processor.py:72-119), as Dew reads every other's: each row
+        asked alone with its own images, its one placeholder an image expanded to the image's merge blocks
+        (one frame's, `pools_frames`), as the release's model expands it, the rows padded as the
+        tokenizer pads, and its `grid_thws` the images' `image_grid_thw`. A row's images are its entry of
+        `images` given one per row, or else the next of them in order, as many as its text's
+        placeholders. Its videos are refused: its call decodes a video from its bytes alone
+        (`split_video_chunks`, with a reader of its own), which the source's processed fields stand for."""
+        if "videos" in kwargs or "audio" in kwargs:
+            raise ValueError(f"{type(self._media_reference).__name__} reads a video from its bytes and no "
+                             "audio: hand the model its processed fields (`from_hf`)")
+        text = kwargs.get("text")
+        if text is None:
+            raise ValueError(f"{type(self._media_reference).__name__} takes its media with their text")
+        rows = [text] if isinstance(text, str) else list(text)
+        # One image (an array, a PIL image) or a sequence of them.
+        given: list[Media] = ([] if images is None else list(images) if isinstance(images, Sequence)
+                              else [images])
+        per_row = len(rows) > 1 and len(given) == len(rows) and all(
+            isinstance(entry, Sequence) for entry in given)
+        image_id, _ = _media_token_ids(self.record)
+        blocks = self._merge_size() ** 2
+        tokens, pixels, grids = [], [], []
+        for index, row in enumerate(rows):
+            if per_row:
+                taken = list(given[index])
+            else:
+                count = int(np.count_nonzero(np.asarray(self.reference(text=row)["input_ids"]) == image_id))
+                taken, given = given[:count], given[count:]
+            values = self._media_reference(medias=[{"type": "image", "image": image} for image in taken],
+                                           text=row, return_tensors="np")
+            ids = np.asarray(values["input_ids"]).reshape(-1)
+            grid = np.asarray(values["grid_thws"]).reshape(-1, 3) if taken else np.zeros((0, 3), np.int64)
+            places = np.flatnonzero(ids == image_id)
+            if len(places) != len(grid):
+                raise ValueError(f"a row holds {len(places)} image placeholders and {len(grid)} images")
+            repeats = np.ones(ids.shape, np.int64)
+            repeats[places] = [int(np.prod(each)) // blocks // (int(each[0]) if self.pools_frames else 1)
+                               for each in grid]
+            tokens.append(np.repeat(ids, repeats))
+            if taken:
+                pixels.append(np.asarray(values["pixel_values"]))
+                grids.append(grid)
+        if not per_row and given:
+            raise ValueError(f"{len(given)} images are left over the rows' placeholders")
+        pad_id, side = _row_padding(self.reference)
+        padded, fields = pad_token_rows(tokens, pad_id=pad_id, padding_side=side)
+        if pixels:
+            fields = {**fields, "pixel_values": np.concatenate(pixels),
+                      "image_grid_thw": np.concatenate(grids)}
+        return {"input_ids": padded, **fields}
 
     def image_text(self) -> str:
         """The text one image stands as in a prompt, as this checkpoint's own chat template writes

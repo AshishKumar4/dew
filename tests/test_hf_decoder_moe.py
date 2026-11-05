@@ -524,6 +524,74 @@ def test_kimi_k25_reads_raw_media_through_its_processor_as_its_fields(kind):
     np.testing.assert_array_equal(logits(called), logits(given))
 
 
+def test_kimi_k25_reads_raw_images_through_its_releases_own_processor(tmp_path):
+    """Kimi K2.5's release ships its own processor (KimiK25Processor and its vision processor at 4d01dfe,
+    the source's code), whose public call takes `medias` and keeps one placeholder an image (row 4367): a
+    load that trusts the source's code reads raw images through it (`Processor.media`), over a row of one
+    image and a row of two of other sizes, as the release lays them out: each row's tokens the release's,
+    each placeholder expanded to as many as the release's own count of its image's tokens
+    (`media_tokens_calculator`), and the images' patches and grids its own, in order. The model reads
+    them: its logits are finite and another image changes them."""
+    import json
+    import shutil
+
+    from tool_support import run_from
+    from transformers import AutoProcessor
+
+    from dew.batch import VALIDITY_FIELD
+
+    source = tmp_path / "source"
+    shutil.copytree(KIMI_K25, source)
+    # The release's own processor in place of transformers' (its processor_config.json), at the fixture's
+    # tiny patches, merge and patch budget.
+    tiny = json.loads((source / "processor_config.json").read_text())["image_processor"]
+    (source / "processor_config.json").unlink()
+    with run_from("remote_code_reference", "tools") as reference:
+        files = reference.RELEASES["kimi-k25-tiny"][2]
+        for file in files:
+            shutil.copy(reference.release_file("kimi-k25-tiny", file), source / file)
+    released = json.loads((source / "preprocessor_config.json").read_text())
+    side = tiny["size"]["max_height"] // tiny["patch_size"]
+    released["media_proc_cfg"].update(patch_size=tiny["patch_size"], merge_kernel_size=tiny["merge_size"],
+                                      in_patch_limit=tiny["max_patches"], in_patch_limit_each_frame=None,
+                                      patch_limit_on_one_side=side)
+    (source / "preprocessor_config.json").write_text(json.dumps(released))
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference", trust_remote_code=True)
+    release = AutoProcessor.from_pretrained(str(source), trust_remote_code=True, local_files_only=True)
+    assert type(release).__name__ == "KimiK25Processor"
+    rng = np.random.default_rng(4367)
+    images = [(rng.random(shape) * 255).astype(np.uint8) for shape in ((12, 8, 3), (8, 16, 3), (10, 10, 3))]
+    rows = ["w5 <|media_pad|> w7", "<|media_pad|> w2 w3 <|media_pad|>"]
+    called = loaded.processor(rows, images=images)
+    image_id = fixture_config("kimi-k25-tiny")["image_token_id"]
+    tokens = np.asarray(called.tokens)
+    valid = np.asarray(called.token_fields.get(VALIDITY_FIELD, np.ones(tokens.shape, bool)), bool)
+    pixels, grids = [], []
+    for row, taken, ours, real in zip(rows, ([images[0]], images[1:]), tokens, valid, strict=True):
+        theirs = release(medias=[{"type": "image", "image": image} for image in taken], text=row,
+                         return_tensors="np")
+        ids = np.asarray(theirs["input_ids"]).reshape(-1)
+        counts = [release.media_processor.media_tokens_calculator({"type": "image", "image": image})
+                  for image in taken]
+        repeats = np.ones(ids.shape, np.int64)
+        repeats[ids == image_id] = counts
+        np.testing.assert_array_equal(ours[real], np.repeat(ids, repeats))
+        pixels.append(np.asarray(theirs["pixel_values"]))
+        grids.append(np.asarray(theirs["grid_thws"]))
+    np.testing.assert_array_equal(np.asarray(called.conditioning["pixel_values"]).reshape(-1),
+                                  np.concatenate(pixels).reshape(-1))
+    np.testing.assert_array_equal(np.asarray(called.conditioning["image_grid_thw"]).reshape(-1, 3),
+                                  np.concatenate(grids))
+
+    def logits(images):
+        inputs = loaded.processor(rows, images=images)
+        return np.asarray(loaded.model.apply(loaded.variables, inputs.tokens, **inputs.kwargs()))
+
+    first = logits(images)
+    assert np.isfinite(first).all()
+    assert not np.array_equal(first, logits([images[0][::-1], *images[1:]]))
+
+
 def test_kimi_k25_text_only_placeholders_match_reference():
     import torch
 
