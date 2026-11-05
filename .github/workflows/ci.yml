@@ -112,7 +112,8 @@ jobs:
   # What a release attaches and Dew's index serves, installed the way a user
   # installs it: the sdist and wheel build, pass twine, and name no requirement
   # by URL, which an index refuses and twine passes; the wheel installs into an
-  # empty environment and runs; and the accelerator extras resolve.
+  # empty environment with pip at the newest release each requirement admits, live, on every push, a
+  # train's among them, and runs the bounds workflow; and the accelerator extras resolve.
   package:
     needs: proven
     if: needs.proven.outputs.run == ''
@@ -129,10 +130,11 @@ jobs:
         python -m build
         python -m twine check --strict dist/*
         python tools/check_distribution.py dist/*
-    - name: Install the wheel into an empty environment, compile it, run `dew --help` and train
+    - name: Install the wheel into an empty environment, compile it and run the bounds workflow
       run: python tools/smoke_wheel.py dist/*.whl
-    # A release publishes this sdist and wheel, the ones built and smoked here (python-publish.yml).
-    - if: github.event_name == 'release'
+    # A release publishes this sdist and wheel, the ones built and smoked here (python-publish.yml), and the
+    # whole suite's runs and a release's give the bounds job's legs the wheel they install.
+    - if: github.event_name == 'release' || github.event_name == 'schedule' || inputs.whole
       uses: actions/upload-artifact@v4
       with:
         name: dist
@@ -155,6 +157,60 @@ jobs:
             | uv pip compile - --extra-index-url "$index" \
               --python-version "$(tr -d '\n' < .python-version)" --python-platform x86_64-manylinux_2_31 --quiet > /dev/null
         done
+
+  # The legs of the bounds job, from pyproject.toml's declarations (tools/check_bounds.py matrix).
+  bounds-legs:
+    if: github.event_name == 'schedule' || inputs.whole || github.event_name == 'release'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.legs.outputs.matrix }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: astral-sh/setup-uv@v6
+    - id: legs
+      run: echo "matrix=$(uv run --no-project --with packaging python tools/check_bounds.py matrix)" >> "$GITHUB_OUTPUT"
+
+  # Dew at the lowest and the highest set its declared dependency ranges admit, each in a clean environment
+  # holding the package job's wheel and its leg's requirements alone (tools/check_bounds.py), running one real
+  # workflow (tools/bounds_workflow.py): the base requirements, each runtime extra that carries a range, and
+  # the accelerator extras resolved. Resolution is live, so a release of any dependency can turn a leg red:
+  # it runs on the whole suite's runs (the daily run and the whole dispatch every fifth publish) and on a
+  # release, whose publish waits on it (python-publish.yml), and never on a train, a push or a pull request.
+  # A red leg fails the run, and the land queue reads each failed job of the daily run as a row of its own.
+  bounds:
+    name: bounds (${{ matrix.name }})
+    needs: [package, bounds-legs]
+    if: github.event_name == 'schedule' || inputs.whole || github.event_name == 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.bounds-legs.outputs.matrix) }}
+    env:
+      MODE: ${{ matrix.mode }}
+      RESOLUTION: ${{ matrix.resolution }}
+      EXTRA: ${{ matrix.extra }}
+      PYTHON: ${{ matrix.python }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: astral-sh/setup-uv@v6
+    - uses: actions/download-artifact@v4
+      with:
+        name: dist
+        path: dist/
+    - name: Resolve or install and run the leg
+      run: |
+        if [ "$MODE" = resolve ]; then
+          uv run --no-project --with packaging python tools/check_bounds.py resolve "$RESOLUTION" --extra "$EXTRA"
+        else
+          uv run --no-project --with packaging python tools/check_bounds.py run "$RESOLUTION" dist/*.whl \
+            ${EXTRA:+--extra "$EXTRA"} --python "$PYTHON" --output bounds
+        fi
+    - if: always() && matrix.mode == 'run'
+      uses: actions/upload-artifact@v4
+      with:
+        name: bounds-${{ strategy.job-index }}
+        path: bounds/
 
   # What the run's suite covers (tools/armada/ci.py policy), read before the test job starts, as its armada
   # group depends on it: the whole suite, daily or dispatched, runs every file with the cache off; any other

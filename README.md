@@ -1493,7 +1493,7 @@ uv pip install -e ".[cuda12]" --extra-index-url https://pypi.dewml.dev/simple
 
 To install the main branch without cloning it, run `uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew" --extra-index-url https://pypi.dewml.dev/simple`. The extras install the accelerator build of jaxlib that matches Dew's JAX build. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on.
 
-`pyproject.toml` lists every optional extra, and the installation guide's [Optional extras](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#optional-extras) says what each adds. `interop` reads and writes safetensors, `vision` provides the host image processors that the multimodal checkpoints call, and `inference-clients` installs the Ollama and OpenAI SDKs used in the serving section. The sections above name the extra each feature needs. The [installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md) covers development dependencies and dataset preparation.
+`pyproject.toml` lists every optional extra, and the installation guide's [Optional extras](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#optional-extras) says what each adds. `vision` provides the host image processors that the multimodal checkpoints call, and `inference-clients` installs the Ollama and OpenAI SDKs used in the serving section. The sections above name the extra each feature needs. The [installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md) covers development dependencies and dataset preparation.
 
 ## Documentation and examples
 

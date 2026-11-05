@@ -79,7 +79,7 @@ print("Devices:", jax.devices())
 
 ## GPUs and TPUs
 
-The `cuda13`, `cuda12` and `tpu` extras each install the accelerator build of jaxlib that matches Dew's JAX build; they are JAX's own extras of the same names. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on. Extras combine, as in `dewml[cuda13,interop,streaming]`.
+The `cuda13`, `cuda12` and `tpu` extras each install the accelerator build of jaxlib that matches Dew's JAX build; they are JAX's own extras of the same names. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on. Extras combine, as in `dewml[cuda13,streaming,vision]`.
 
 ### Which CUDA build
 
@@ -156,7 +156,6 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 |---|---|
 | `cuda12`, `cuda13` | JAX's CUDA build and Dew's FlashAttention wheel for that CUDA major ([Which CUDA build](#which-cuda-build)) |
 | `tpu` | libtpu, for [Cloud TPUs](tpu.md) |
-| `interop` | safetensors reading and writing |
 | `torch` | PyTorch on the host, to read `pytorch_model.bin` files and to check unregistered decoders against Transformers |
 | `diffusers` | Loading original-format single-file diffusion checkpoints (`Pretrained.load(..., single_file=)`) |
 | `gguf` | Loading GGUF files (`Pretrained.load(..., gguf_file=)`) |
@@ -170,7 +169,6 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `av` | Video readers (moviepy, with ffmpeg) |
 | `vision` | Hugging Face image processors, run with torchvision on the host |
 | `augment` | Albumentations pipelines as a seeded random step (`dew.data.images.Albumentations`) |
-| `metrics` | requests, which downloads FID's Inception weights |
 | `wandb`, `mlflow`, `tensorboard` | Experiment trackers |
 | `inference-clients` | The Ollama and OpenAI Python clients, including vLLM-compatible endpoints |
 | `serve` | Starlette and uvicorn, for serving a decision model in Jev's wire format (`examples/serve_decisions.py`) |
@@ -185,19 +183,19 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `ci` | The test suite's whole environment: `test` and every extra a test file imports |
 | `kernel-compile` | JAX's CUDA plugin, CUDA's compiler and libtpu, to compile every kernel config on a host with no accelerator |
 | `notebooks` | nbclient, nbformat and an IPython kernel, to execute notebooks |
-| `tutorials` | The tutorial notebooks' environment outside Colab: `streaming`, `interop`, `notebooks` and matplotlib |
+| `tutorials` | The tutorial notebooks' environment outside Colab: `streaming`, `notebooks` and matplotlib |
 | `live` | The live site container's bridge: its WebSocket release, the kernel gateway, an IPython kernel and ipywidgets |
 <!-- END extras -->
 
 ```bash
-uv pip install 'dewml[interop,streaming] @ git+https://github.com/AshishKumar4/dew' --extra-index-url https://pypi.dewml.dev/simple
+uv pip install 'dewml[streaming] @ git+https://github.com/AshishKumar4/dew' --extra-index-url https://pypi.dewml.dev/simple
 ```
 
 The `vision` extra expects CPU builds of PyTorch and torchvision, installed first, so that no CUDA PyTorch sits beside JAX's accelerator runtime. Without it the native multimodal checkpoints still load, but their processors raise an error when given images.
 
 ```bash
 uv pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cpu
-uv pip install 'dewml[interop,vision] @ git+https://github.com/AshishKumar4/dew' --extra-index-url https://pypi.dewml.dev/simple
+uv pip install 'dewml[vision] @ git+https://github.com/AshishKumar4/dew' --extra-index-url https://pypi.dewml.dev/simple
 ```
 
 Run the first command even if CPU torch is already installed. Installing `vision`

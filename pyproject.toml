@@ -12,6 +12,10 @@ authors = [
   { name="Ashish Kumar Singh", email="ashishkmr472@gmail.com" }
 ]
 dependencies = [
+    # Every requirement here and in a runtime extra states a lower bound (tools/check_bounds.py declared). Those
+    # that stated none take the release locks/cpu.txt holds, which the suite runs on; one is lowered only
+    # with a clean environment resolved at the lower floor (tools/check_bounds.py run lowest-direct) that runs
+    # tools/bounds_workflow.py. The bounds job (.github/workflows/ci.yml) tests the lowest and highest sets.
     # flax.nnx imports on jax 0.12.0.1 from 0.12.10 on (jax.experimental.hijax's
     # HiPrim; qwix imports nnx); <0.13 so that a flax that changes linen or nnx
     # arrives through a bump the suite checks, as jax does below.
@@ -28,16 +32,16 @@ dependencies = [
     "jax>=0.12.0.1.post52,<0.12.1",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",
-    "numpy",
-    "pillow",
+    "numpy>=2.5.4",
+    "pillow>=11.3.0",
     # dew.data.images decodes, resizes and jitters every image record with it.
-    "opencv-python-headless",
-    "einops",
+    "opencv-python-headless>=5.0.0.93",
+    "einops>=0.8.2",
     # dew.nn.engram draws its bucket primes with sympy.nextprime.
-    "sympy",
+    "sympy>=1.14.0",
     # dew.nn.kv_cache's Hadamard rotation (scipy.linalg.hadamard) and dew.nn.mlp's
     # Gaussian cutoff (scipy.special.erfinv); jax already depends on scipy.
-    "scipy",
+    "scipy>=1.18.1",
     # dew.data.dataset's close budget holds grain's worker kill timeout
     # (GRAIN_KILL_SECONDS); 0.2.18 is the release that was tested.
     "grain>=0.2.18,<0.3",
@@ -45,12 +49,15 @@ dependencies = [
     # on rich, so this names a package every install has; 13 has the
     # progress columns the display uses.
     "rich>=13",
-    "tyro",
+    "tyro>=1.0.16",
     "typing_extensions>=4.14",
     "transformers>=5.16.1",
-    "jinja2",
-    "filelock",
-    "huggingface_hub",
+    "jinja2>=3.1.6",
+    "filelock>=4.1.1",
+    "huggingface_hub>=1.33.0",
+    # dew.interop reads and writes every checkpoint's tensors with it (interop/safetensors_io.py);
+    # transformers requires it too.
+    "safetensors>=0.8.0",
     "fsspec>=2026.6.0",
     # dew.data.sources.urls fetches HTTP(S) through fsspec's aiohttp session under aiohttp's total deadline.
     "aiohttp>=3.9",
@@ -62,7 +69,7 @@ dependencies = [
     # dew.nn.kernels.templates.report reads each Mosaic GPU kernel's binary from
     # the protobuf its executable serializes; grain and orbax-checkpoint already
     # depend on it.
-    "protobuf",
+    "protobuf>=6.33.6",
     # dew.nn.kernels.tuning: every Pallas launch is a tokamax Op, whose config
     # is measured per GPU model and shape. 0.0.13 and 0.0.14 pin
     # typeguard==2.13.3, which tyro excludes.
@@ -115,7 +122,7 @@ cuda12 = ["jax-cuda12-plugin[with-cuda]==0.12.0.1.post45", "jax-cuda12-pjrt==0.1
 cuda13 = ["jax-cuda13-plugin[with-cuda]==0.12.0.1.post45", "jax-cuda13-pjrt==0.12.0.1.post45", "jaxlib==0.12.0.1",
           "dew-flash-attn-cu13~=0.3.7; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
           "dew-cutlass-cu13~=0.1.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
-tpu = ["libtpu==0.0.50.*", "requests"]
+tpu = ["libtpu==0.0.50.*", "requests>=2.34.2"]
 # dew.telemetry.profile reads XProf's native converters, the same in 2.23.1
 # and 2.23.2. xprof 2.23.2 declares setuptools<70.0.0, which torch>=2.13's
 # setuptools>=77.0.3 cannot meet; the cap is the build lock's, read into the
@@ -147,8 +154,8 @@ test = [
     # Property, metamorphic and fuzz tests (docs/design/testing.md), under tests/conftest.py's
     # derandomized profile.
     "hypothesis",
-    # The interop suite reads and writes safetensors with its native reader.
-    "dewml[interop]",
+    # tests/interop_support.py and tools/modelopt_nvfp4_reference.py read checkpoint byte ranges with it.
+    "requests",
     # Reference parity and PyTorch checkpoint imports run on the host.
     "dewml[torch]",
     # A published scheduler's beta sigma grid is an inverse incomplete beta,
@@ -196,16 +203,14 @@ test = [
     "lm_eval[hf]==0.4.13",
 ]
 # The video specs: moviepy reads the clips and brings ffmpeg (lazy imports in dew.data)
-av = ["moviepy"]
-# FID's Inception weight download
-metrics = ["requests"]
-wandb = ["wandb"]
+av = ["moviepy>=2.2.1"]
+wandb = ["wandb>=0.30.0"]
 # MLflowTracker: a run in a tracking store, local file store included.
-mlflow = ["mlflow"]
+mlflow = ["mlflow>=3.17.0"]
 # TensorBoardTracker: an event file, written with tensorboard's own writer.
-tensorboard = ["tensorboard"]
+tensorboard = ["tensorboard>=2.21.0"]
 # optuna_search: the sampler behind dew.config.sweep's Optuna backend.
-hpo = ["optuna"]
+hpo = ["optuna>=5.0.0"]
 # Online URL-streaming loader (HF datasets-backed). 5.0.1 is the release the suite passes on; 4.8.5,
 # Colab's, caps fsspec at 2026.2, below the 2026.6 the base needs, and unbounded pip backtracks from
 # it to datasets 1.6.2, whose metadata it can't read.
@@ -230,19 +235,17 @@ eval-harness = ["lm_eval>=0.4.10"]
 # (core/utils/resource_utils, through etils' lazy imports) but declares the
 # backport for Python < 3.9 only, so a 3.12 environment lacks it; it goes when
 # tfds declares it or reads importlib.resources.
-tfds = ["tensorflow-datasets>=4.9.10", "importlib_resources"]
-# Flax <-> safetensors conversion (dew.interop)
-interop = ["safetensors"]
+tfds = ["tensorflow-datasets>=4.9.10", "importlib_resources>=7.1.0"]
 # PyTorch on the host, never for a JAX computation: unpickling pytorch_model.bin
 # once into Dew's cache (dew.interop.pickles), and the tier-2 check that runs
 # transformers' own model for an unregistered decoder (dew.interop.verify).
-torch = ["torch"]
+torch = ["torch>=2.14.1"]
 # Original-format single-file diffusion checkpoints (Pretrained.load(..., single_file=)):
 # diffusers' own key maps, which are written in torch, convert them once.
-diffusers = ["diffusers>=0.34.0", "torch"]
+diffusers = ["diffusers>=0.34.0", "torch>=2.14.1"]
 # Wan 2.1's pipelines clean every prompt with ftfy before UMT5 reads it, and so
 # does dew.inputs.diffusion.WanConditioner.
-wan = ["ftfy"]
+wan = ["ftfy>=6.3.1"]
 # dew.rl.playground: MuJoCo Playground's MJX environments as Envs, its JAX implementation on any backend.
 playground = ["playground==0.2.0"]
 # dew.rl.hyperlux: HyperLux's batch ray tracer drawing the gate race's cameras (an NVIDIA GPU with OptiX).
@@ -282,7 +285,7 @@ kernel-compile = ["jax-cuda12-plugin==0.12.0.1.post45; sys_platform == 'linux' a
 # The test suite's one environment: every package a test file imports, so no test skips for want
 # of one. CI's jobs, armada's (tools/armada/install.sh), the GPU nodes' and dew-ops' GPU jobs install
 # it under constraints.txt, locked in locks/ (tools/lock_environment.sh).
-ci = ["dewml[test,av,tfds,metrics,inference-clients,serve,environments,vision,augment,quantization,profile,torchax,gguf,curation]",
+ci = ["dewml[test,av,tfds,inference-clients,serve,environments,vision,augment,quantization,profile,torchax,gguf,curation]",
       "flake8",
       # The compile gate's SASS rules disassemble the cubins it reads, wherever the suite runs: a CUDA 13 wheel,
       # laid out in nvidia/cu13, which post52's JAX takes as its CUDA root only where it holds ptxas too
@@ -290,9 +293,25 @@ ci = ["dewml[test,av,tfds,metrics,inference-clients,serve,environments,vision,au
       "nvidia-cuda-nvdisasm==13.4.92; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
 # The tutorial notebooks' environment outside Colab: the extras they import and a Jupyter kernel.
 # Tutorial 01, Diffusion from scratch, draws with matplotlib, which Colab installs.
-tutorials = ["dewml[streaming,interop,notebooks]", "matplotlib"]
+tutorials = ["dewml[streaming,notebooks]", "matplotlib"]
 # Execute notebooks through a Jupyter kernel of the selected interpreter.
 notebooks = ["nbclient", "nbformat", "ipykernel"]
+
+# tools/check_bounds.py tests the requirements the library installs, at their lowest and highest compatible
+# releases, in clean environments (.github/workflows/ci.yml's bounds job), and holds each to state a lower bound.
+# These extras are not the library's: the environments of the test suite and the CI jobs (test, ci,
+# kernel-compile), of the tutorial notebooks and the live site (tutorials, notebooks, live), and of the one
+# example that serves a model over HTTP, which no library module imports (serve).
+[tool.dew.bounds]
+tooling = ["test", "ci", "kernel-compile", "tutorials", "notebooks", "live", "serve"]
+
+# These extras' packages load only on hardware the CI runner has not (a GPU's plugins and wheels, a TPU's
+# libtpu): each is resolved at both bounds for every Python tested and the machines named here, and installed
+# nowhere, since the suite runs them on their hardware.
+[tool.dew.bounds.resolve-only]
+cuda12 = ["x86_64", "aarch64"]
+cuda13 = ["x86_64", "aarch64"]
+tpu = ["x86_64"]
 
 # The least uv: 0.13.4 is the first whose own CA store leaves out emSign's (GHSA-hq85-5cpj-mr62). uv refuses
 # to run older in this project, setup-uv installs a release at least this, and site/scripts/gen_install.py

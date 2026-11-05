@@ -20,6 +20,8 @@ from pathlib import Path
 import jax
 import ml_dtypes
 import numpy as np
+import safetensors
+import safetensors.numpy
 
 from dew._coordination import read_home, writes_weights
 from dew._records import JSON
@@ -73,22 +75,6 @@ is the producing codec's convention; safetensors fixes only the byte count.
 """
 
 
-def _safetensors():
-    """Import safetensors and return its reader and NumPy writer modules.
-
-    The import is lazy and in one place, so the reader and the writer raise the
-    same install message when the optional package is missing.
-    """
-    try:
-        import safetensors
-        from safetensors import numpy as safetensors_numpy
-    except ImportError as error:
-        raise ImportError(
-            "dew.interop needs safetensors: pip install dewml[interop]"
-        ) from error
-    return safetensors, safetensors_numpy
-
-
 def _publish(
     tensors: Callable[[], dict[str, np.ndarray]],
     path,
@@ -104,12 +90,12 @@ def _publish(
     TPU array can come back as, would be written transposed. A failed write
     or replacement leaves the old file intact and removes the temporary.
     """
-    _, backend = _safetensors()
     hosted = {name: _host_array(array) for name, array in tensors().items()}
     if not writes_weights():
         return  # read as a pool's publisher reads them, and written by it alone
     with replacing(path) as temporary:
-        backend.save_file(hosted, os.fspath(temporary), metadata=None if metadata is None else dict(metadata))
+        safetensors.numpy.save_file(hosted, os.fspath(temporary),
+                                    metadata=None if metadata is None else dict(metadata))
         if metadata is not None and len(metadata) > 1:
             _sort_metadata(os.fspath(temporary))
 
@@ -291,12 +277,11 @@ def read_file(path, copy_on_write: bool = False) -> tuple[dict[str, np.ndarray],
     only when written, never back to the file.
     """
     filename = os.fspath(path)
-    package, _ = _safetensors()
     # One open file answers for the header, its validation and the bytes: `_publish`
     # replaces the pathname, so a reopened path can be another file. safe_open takes
     # only a path, so it validates the open file through its descriptor's name, which
     # every platform Dew installs on has (grain, a dependency, ships no Windows wheels).
-    with open(filename, "rb") as stream, package.safe_open(f"/dev/fd/{stream.fileno()}", "np") as reader:
+    with open(filename, "rb") as stream, safetensors.safe_open(f"/dev/fd/{stream.fileno()}", "np") as reader:
         length = int.from_bytes(stream.read(8), "little")
         metadata = reader.metadata() or {}
         stored = [(name, reader.get_slice(name)) for name in reader.offset_keys()]
@@ -332,8 +317,7 @@ def header_specs(path) -> dict[str, jax.ShapeDtypeStruct]:
     """The arrays a safetensors file's tensors read as (`read_file`), from its header
     alone; no tensor's bytes are read."""
     filename = os.fspath(path)
-    package, _ = _safetensors()
-    with package.safe_open(filename, "np") as reader:
+    with safetensors.safe_open(filename, "np") as reader:
         names = reader.keys()
         views = [(name, reader.get_slice(name)) for name in names]
         return {name: stored_spec(name, view.get_shape(), view.get_dtype(), filename) for name, view in views}

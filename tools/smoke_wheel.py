@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
-"""Install a built wheel into a new, empty virtual environment and use it.
+"""Install a built wheel into a new, empty virtual environment with pip and use it.
 
     python tools/smoke_wheel.py dist/dewml-*.whl
 
-The wheel is installed from PyPI's index and Dew's package index, which
-serves Dew's JAX build, dewml's releases and the forks Dew carries (`INDEX`),
-as a user installs it, so a requirement neither can serve fails here. Then, from outside the checkout so
-nothing of it is importable:
+The wheel is installed from PyPI's index and Dew's package index, which serves Dew's JAX build, dewml's
+releases and the forks Dew carries (`INDEX`), as a user's pip installs it, so a requirement neither can
+serve fails here. pip takes the newest release each requirement admits, live: this is the base requirements'
+highest set, and CI's package job runs it on every push, a train's among them. Then, from outside the
+checkout so nothing of it is importable:
 
-- every module the wheel installed compiles (`compileall`), so a syntax
-  error anywhere in the package fails, imported or not;
-- the console entry point the wheel declares, `dew --help`, runs;
-- the installed dewml, jax and flax report their versions, and flax.nnx imports;
-- a two-layer grouped-query decoder's jitted forward, on its default attention route, gives finite logits
-  of its shape;
-- a tiny language model trains two steps through `Trainer.fit` on token
-  stores exported here, and its parameters stay finite.
+- every module the wheel installed compiles (`compileall`), so a syntax error anywhere in the package
+  fails, imported or not;
+- tools/bounds_workflow.py runs in the environment: every module imports, the console entry point answers,
+  a decoder runs forward, a language model trains and resumes from a checkpoint, a decoder directory is
+  saved and loaded, records are read. It is the workflow `tools/check_bounds.py` runs at each bound of
+  the declared ranges (.github/workflows/ci.yml's bounds job), with uv, which pip cannot do.
 
-Exits nonzero on the first failure. The release workflow runs this on the
-artifact it then uploads; CI's package job runs it on every push.
+Exits nonzero on the first failure. The release workflow runs this on the artifact it then uploads.
 """
 
 from __future__ import annotations
@@ -31,52 +29,9 @@ import tempfile
 import venv
 from pathlib import Path
 
-INDEX = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src/dew/builds.py"))[
-    "PACKAGE_INDEX"]
+INDEX = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src/dew/builds.py"))["PACKAGE_INDEX"]
 """Dew's package index, the one place Dew's JAX build is served (dew.builds.PACKAGE_INDEX)."""
-
-TRAIN = """
-import sys
-
-import jax, jax.numpy as jnp, numpy as np, optax
-
-import dew
-from dew import Trainer
-from dew.data import Loading, Memory, presets
-from dew.data.compile import compile
-from dew.data.sinks import export
-from dew.data.sources import TokenFiles
-from dew.nn.backbones import CausalTransformer
-from dew.objectives.lm import LMObjective
-
-assert "site-packages" in dew.__file__, dew.__file__
-import importlib.metadata
-import flax.nnx  # imports on jax 0.11.2 from flax 0.12.10 on
-print("dewml", importlib.metadata.version("dewml"), "jax", jax.__version__, "flax",
-      importlib.metadata.version("flax"))
-# A grouped-query decoder's compiled forward, on its default attention route.
-gqa = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=4, num_kv_heads=2,
-                        mlp_features=64, max_seq_len=16)
-ids = jnp.arange(16, dtype=jnp.int32).reshape(2, 8)
-logits = jax.jit(gqa.apply)(gqa.init(jax.random.key(0), ids), ids)
-assert logits.shape == (2, 8, 64) and bool(jnp.all(jnp.isfinite(logits))), logits.shape
-# Four symbols repeated, a token store to train on and one to validate on, as an export commits them.
-stores = {split: f"{sys.argv[1]}-{split}" for split in ("train", "val")}
-for split, repeats in (("train", 64), ("val", 16)):
-    export(Memory([{"text": np.tile(np.arange(1, 5, dtype=np.int32), repeats)}]), stores[split],
-           format="array_record", length_field="text",
-           metadata={"token_store": True, "tokenizer": "symbols", "vocab_size": 8, "dtype": "int32"})
-train = TokenFiles(stores["train"]).shuffle(0).repeat().pipe(presets.token_windows, seq_len=8, batch=4)
-held = TokenFiles(stores["val"]).pipe(presets.token_windows, seq_len=8, batch=4, records=4)
-data = compile(train, validation=held, read="memory", loading=Loading(workers=0, threads=1, read_buffer=2))
-model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
-                          max_seq_len=16, dtype=jnp.float32, attention_impl="xla")
-state = Trainer(LMObjective(model, seq_len=8, ema_decay=None), optax.adam(1e-2),
-                key=jax.random.key(0)).fit(data, steps=2, log_every=1)
-assert int(state.step) == 2, int(state.step)
-assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in jax.tree.leaves(state.variables["params"]))
-print("trained", int(state.step), "steps")
-"""
+WORKFLOW = Path(__file__).with_name("bounds_workflow.py")
 
 
 def run(*command: str | Path, cwd: Path) -> None:
@@ -103,9 +58,8 @@ def main() -> None:
         package = subprocess.run([str(python), "-c", locate], cwd=root, check=True, capture_output=True,
                                  text=True).stdout.strip()
         run(python, "-m", "compileall", "-q", package, cwd=root)
-        run(root / "env" / "bin" / "dew", "--help", cwd=root)
-        run(python, "-c", TRAIN, root / "tokens", cwd=root)
-    print(f"{wheel.name}: installs, compiles, runs `dew --help` and trains")
+        run(python, "-P", WORKFLOW, "--scratch", root / "work", cwd=root)
+    print(f"{wheel.name}: installs, compiles and runs the bounds workflow")
 
 
 if __name__ == "__main__":
