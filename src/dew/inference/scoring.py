@@ -145,9 +145,9 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
             "the server stopped after a step failed")
         """The requests waiting for a pass, or for the rest of their rows."""
         self.arrived: Callable[[], None] = _nothing
+        """Called after each submission: an `Engine` serving this kind wakes to it."""
         self.pooled = False
         """A scoring server's passes run on its own process (`Kind.pooled`)."""
-        """Called after each submission: an `Engine` serving this kind wakes to it."""
         self.programs: tuple[object, ...] = ()
         """The shapes of the programs compiled up front (`from_task`), one each."""
 

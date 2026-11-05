@@ -283,8 +283,8 @@ def test_a_context_reads_logits_enter_the_layers_qk_clip_maxima():
         # The plain loop, a layer a program, as the claims are bitwise: a scan runs the base's like
         # layers as one body, its maxima an ulp from a layer run alone (row 4100), and the reading
         # layers cannot join it.
-        _, held = model.with_scanned_layers(scanned=False).apply(variables, ids, conditioning=conditioning,
-                                                         mutable=["qk"])
+        _, held = model.clone(scan_layers=False).apply(variables, ids, conditioning=conditioning,
+                                                       mutable=["qk"])
         named = ((jax.tree_util.keystr(path), leaf)
                  for path, leaf in jax.tree_util.tree_leaves_with_path(held))
         return {path: np.asarray(leaf) for path, leaf in named if "['max_logits']" in path}

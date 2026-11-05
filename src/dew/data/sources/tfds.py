@@ -319,9 +319,14 @@ class TFDS(Dataset):
     def can_provision(self, read: Read) -> bool:
         return self.path is None or self.remote
 
+    def preparation_bytes(self) -> int | None:
+        """None: a TFDS dataset states its size in its builder, which only the process that prepares it
+        makes (`prepared`, under TensorFlow)."""
+        return None
+
     def provision(self) -> TFDS:
         if self.remote:
-            preparing(self, None, self.directory)
+            preparing(self, self.preparation_bytes(), self.directory)
             changed = self._mirror()
         else:
             if self.path is not None:
@@ -329,7 +334,7 @@ class TFDS(Dataset):
                     f"TFDS {self.name!r} path={self.path!r} is read-only; prepare that directory "
                     "with TFDS or omit path to use Dew's preparation directory"
                 )
-            preparing(self, None, os.path.join(dew_cache_dir(), "tfds"))
+            preparing(self, self.preparation_bytes(), os.path.join(dew_cache_dir(), "tfds"))
             changed = prepared(self.name, config=self.config, version=self.version)
         if changed:
             self.__dict__.pop("builder", None)

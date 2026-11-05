@@ -38,7 +38,14 @@ from dew.nn.kernels.generation import _compute_capability, gpu_target
 from dew.nn.programs import bodies, computed
 from dew.objectives.base import Objective
 from dew.state import TrainState
-from dew.training.compiled_program import VIEWS, Slicing, compiled, deviceless, dimensions, lowering_platform
+from dew.training.compiled_program import (
+    Slicing,
+    bitcast,
+    compiled,
+    deviceless,
+    dimensions,
+    lowering_platform,
+)
 from dew.training.memory import head_fused_of, head_tile_of, judged
 from dew.training.narrow import forward_variables
 from dew.training.transaction import attempt_step
@@ -183,11 +190,13 @@ def derived_terms(loss: Callable, params, arguments: Sequence, *, platform: str,
                   lowering: str | None = None, consumed: bool = False,
                   deferred: bool = False) -> tuple[int, Peak]:
     """`residual_bytes` and `gradient_peak` of `loss(params, *arguments)` from one trace of its forward and
-    backward (`traced_gradient`), as each derives it from its own."""
-    traced = traced_gradient(loss, params, arguments)
-    lowering = lowering or LOWERED.get(platform, platform)
-    return (_kept(*traced, platform, lowering),
-            _peak(*traced, platform, workspace, lowering, consumed, deferred))
+    backward (`traced_gradient`), lowered once (`compiled`, its outputs the gradient and the residuals
+    alike: an equation's lowering reads no output), as each derives it from its own (row 4261: lowered
+    for each, the two lowerings were 16 of a Qwen3.5-4B candidate's 28 seconds)."""
+    program, count, shapes = traced_gradient(loss, params, arguments)
+    lowered = compiled(program, lowering or LOWERED.get(platform, platform))
+    return (_kept(lowered, count, shapes, platform),
+            _peak(lowered, count, platform, workspace, consumed, deferred))
 
 
 def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str,
@@ -201,8 +210,8 @@ def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str
     none. A value the pullback closes over keeps its own traced sharding; one whose trace states none, and
     every other value, count whole. Matching an axis's size to the batch size cannot identify its
     sharding: a weight or a scan's layer axis can have that size too."""
-    lowering = lowering or LOWERED.get(platform, platform)
-    return _kept(*traced_gradient(loss, params, arguments), platform, lowering)
+    program, count, shapes = traced_gradient(loss, params, arguments)
+    return _kept(compiled(program, lowering or LOWERED.get(platform, platform)), count, shapes, platform)
 
 
 def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
@@ -222,22 +231,24 @@ def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
     xla/hlo/transforms/simplifiers/hlo_memory_scheduler.cc; `ScheduleGpuModule`,
     xla/service/gpu/gpu_hlo_schedule.cc). With `deferred`, the gradient's own equations run after the rest
     of the backward (`sunk`)."""
-    return _peak(*traced_gradient(loss, params, arguments), platform, workspace,
-                 lowering or LOWERED.get(platform, platform), consumed, deferred)
+    program, count, _ = traced_gradient(loss, params, arguments)
+    return _peak(compiled(program, lowering or LOWERED.get(platform, platform)), count, platform, workspace,
+                 consumed, deferred)
 
 
-def _kept(program: jcore.Jaxpr, count: int, shapes: Sequence, platform: str, lowering: str) -> int:
-    """`residual_bytes` of `traced_gradient`'s program, its outputs past the first `count` the residuals."""
-    return _residuals(compiled(program.replace(outvars=program.outvars[count:]), lowering), shapes, platform)
+def _kept(lowered: jcore.Jaxpr, count: int, shapes: Sequence, platform: str) -> int:
+    """`residual_bytes` of `traced_gradient`'s program as it is `lowered` (`compiled`), its outputs past
+    the first `count` the residuals."""
+    return _residuals(lowered.replace(outvars=lowered.outvars[count:]), shapes, platform)
 
 
-def _peak(program: jcore.Jaxpr, count: int, shapes: Sequence, platform: str, workspace: Workspace,
-          lowering: str, consumed: bool = False, deferred: bool = False) -> Peak:
-    """`gradient_peak` of `traced_gradient`'s program, its first `count` outputs the gradient."""
-    del shapes
-    lowered = compiled(program.replace(outvars=program.outvars[:count]), lowering)
-    return Peak(peak_bytes(sunk(lowered) if deferred else lowered, platform, workspace, consumed=consumed),
-                not bounded_below(lowered, platform))
+def _peak(lowered: jcore.Jaxpr, count: int, platform: str, workspace: Workspace, consumed: bool = False,
+          deferred: bool = False) -> Peak:
+    """`gradient_peak` of `traced_gradient`'s program as it is `lowered` (`compiled`), its first `count`
+    outputs the gradient."""
+    gradient = lowered.replace(outvars=lowered.outvars[:count])
+    return Peak(peak_bytes(sunk(gradient) if deferred else gradient, platform, workspace, consumed=consumed),
+                not bounded_below(gradient, platform))
 
 
 def sunk(program: jcore.Jaxpr) -> jcore.Jaxpr:
@@ -427,7 +438,7 @@ def sharing(frontier: Frontier, last: Mapping, index: int, equation: jcore.Jaxpr
 class Frontier:
     """Which values of `program` XLA's fusion for `platform` keeps a buffer of: each but one a primitive
     it recomputes in its consumers computes (`recomputed`), which reads those it is computed from in
-    its place, and one a layout primitive (`VIEWS`) makes of another's buffer, which XLA's layout
+    its place, and one a layout primitive (`bitcast`) makes of another's buffer, which XLA's layout
     assignment lays that buffer out for; the program's outputs, where it returns them (`returned`),
     always but as such a view; neither its inputs nor its literals."""
 
@@ -454,7 +465,7 @@ class Frontier:
 
     def view(self, value) -> bool:
         """Whether `value` is another value's storage: a shape primitive's of a value held or read
-        (`VIEWS`), or a transpose's of a value the program computes into a buffer and reads nowhere
+        (`bitcast`), or a transpose's of a value the program computes into a buffer and reads nowhere
         else (`TRANSPOSES`)."""
         equation = self.producers.get(value)
         if value in self.forwards:
@@ -462,7 +473,7 @@ class Frontier:
         if equation is None or not equation.invars or not computed(equation.invars[0]):
             return False
         operand = equation.invars[0]
-        if equation.primitive.name in VIEWS:
+        if bitcast(equation):
             return operand in self.inputs or not self.fused(operand) or self.view(operand)
         # XLA lays a value out once, so a transpose is its storage only where it is its one reader.
         return (equation.primitive.name in TRANSPOSES and operand not in self.inputs
@@ -574,6 +585,9 @@ def recomputed(equation: jcore.JaxprEqn, platform: str) -> bool:
     keep it: on a GPU every elementwise primitive (`ELEMENTWISE`), elsewhere the cheap ones (`CHEAP`, and
     `REAL_CHEAP` over real values). A program it reads has its calls inlined (`compiled`)."""
     name = equation.primitive.name
+    if bitcast(equation):
+        # A bitcast holds no buffer of its own, on any platform.
+        return True
     if platform == "gpu":
         return name in ELEMENTWISE
     if name in REAL_CHEAP:

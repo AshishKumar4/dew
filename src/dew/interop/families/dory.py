@@ -34,6 +34,7 @@ from dew.interop.decoder_parts import (
     native_fields,
     read_rope,
     refuse,
+    specified_layer_types,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
@@ -56,15 +57,18 @@ _DEFAULTS = {'vocab_size': 131072, 'hidden_size': 2560, 'num_hidden_layers': 72,
 (`DecoderFamily.defaults`): transformers writes a config's non-default keys alone."""
 
 
+_PATTERN = ('sliding_attention', 'mlp') * 3 + ('full_attention', 'mlp')
+"""DoryConfig's default cycle of layer kinds (configs/dory.py:41-49): an MLP after each attention,
+the fourth attention full."""
+
+
 def _layer_types(hf_config: Mapping[str, object], used: set[str]) -> tuple[str, ...]:
-    """Each layer's kind, the stated ones or DoryConfig's default pattern (configs/dory.py:41-49):
-    an attention, sliding or full, or an MLP, as DoryConfig validates them (configs/dory.py:63-74)."""
+    """Each layer's kind, the stated ones or DoryConfig's default pattern (`specified_layer_types`,
+    `_PATTERN`): an attention, sliding or full, or an MLP, as DoryConfig validates them
+    (configs/dory.py:63-74)."""
     layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
-    stated = hf_config.get('layer_types')
     used.add('layer_types')
-    types = (tuple(_records.strings(stated, 'layer_types')) if stated is not None else tuple(
-        'mlp' if index % 2 else 'full_attention' if index % 8 == 6 else 'sliding_attention'
-        for index in range(layers)))
+    types = specified_layer_types(hf_config, used, _PATTERN)
     if len(types) != layers:
         refuse(f'layer_types of {len(types)} entries', f'num_hidden_layers is {layers}')
     unknown = sorted(set(types) - {*_SUBLAYERS, 'mlp'})
