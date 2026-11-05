@@ -848,7 +848,7 @@ closed = jax.make_jaxpr(branched)(x, y)
 
 def computed():
     window = jax.jit(algebra.rewritten(sums))(x, y)
-    rewritten = algebra.program_of(closed)
+    rewritten = algebra.rewritten_program(closed)
     body = eval_jaxpr(rewritten.jaxpr, rewritten.consts, x, y)[0]
     return float(jnp.max(jnp.abs(window - sums(x, y)))), float(jnp.max(jnp.abs(body - sums(x, y))))
 
@@ -908,7 +908,7 @@ def test_a_window_rewritten_under_another_matmul_precision_is_derived_again():
     reused = []
     for precision in ("default", "highest"):
         with report.refusals(), jax.default_matmul_precision(precision):
-            algebra.program_of(closed)
+            algebra.rewritten_program(closed)
             reused.append([made.reused for made in report.rewrites()])
     assert reused[0] and not any(reused[0]) and not any(reused[1])
 
