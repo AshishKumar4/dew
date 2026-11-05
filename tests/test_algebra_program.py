@@ -999,36 +999,3 @@ def test_a_tiles_transient_hook_is_released_once_its_trace_is_done():
     held = traced(made())
     gc.collect()
     assert held() is None
-
-
-def test_a_value_times_its_sign_is_its_magnitude_under_either_numerics():
-    """A value times its sign is its magnitude, an exact identity (`signs`) that rounds as its left side
-    does, so the pass rewrites it under the default and the accurate numerics alike: the summed program
-    holds no sign and no multiply of it, and computes bit for bit what it computes as written."""
-    from dew.nn.precision import ACCURATE, Numerics
-
-    def summed(x):
-        return jnp.sum(jnp.sign(x) * x, axis=-1)
-
-    x = rows(18, (4, 64))[0]
-    for policy in (Numerics(), ACCURATE):
-        with generation.run_precision(policy):
-            rewritten = jax.make_jaxpr(algebra.rewritten(summed))(x)
-            np.testing.assert_array_equal(np.asarray(jax.jit(algebra.rewritten(summed))(x)),
-                                          np.asarray(jax.jit(summed)(x)))
-        assert not any(eq.primitive in (jax.lax.sign_p, jax.lax.mul_p) for eq in equations(rewritten)), policy
-
-
-def test_a_complex_value_times_its_sign_is_never_its_magnitude():
-    """A complex value times its sign is no magnitude (1j times sign(1j) is -1, its magnitude 1), so the
-    `signs` rule unites a real value's alone: over a complex value it fires nothing (a union there would be
-    a false equality every later rule could build on, though no form of another type splices), and the
-    program computes, rewritten, what it computes as written."""
-    def summed(x):
-        return jnp.sum(jnp.sign(x) * x, axis=-1)
-
-    real, imaginary = rows(19, (4, 64), (4, 64))
-    x = jax.lax.complex(real, imaginary)
-    assert all(made.fired["signs"] == 0 for made in _rewrites(summed, (x,)))
-    np.testing.assert_array_equal(np.asarray(jax.jit(algebra.rewritten(summed))(x)),
-                                  np.asarray(jax.jit(summed)(x)))

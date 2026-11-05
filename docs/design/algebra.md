@@ -126,10 +126,12 @@ declare each lane's sites.
     and a positive scale out of a maximum or a minimum (`max(c x) = c max(x)` for `c > 0`, a literal's sign
     its fact): attention's derived step takes its raw products' maximum and scales it once, as the hand step
     does;
-  - **identities** (compile time and dev time): commutativity, a saturation aid; and a value times its sign as
-    its magnitude (`signs`, exact). A cast's widening round trip, a reciprocal square root's form, a negation
-    negated and a magnitude's magnitude are XLA's algebraic simplifier's, which every compile runs; exp and log
-    cancel only over a sign and a range the language holds no fact of, and are not built;
+  - **identities** (compile time and dev time): commutativity, a saturation aid. A cast's widening round trip,
+    a reciprocal square root's form, a negation negated and a magnitude's magnitude are XLA's algebraic
+    simplifier's, which every compile runs. A value times its sign is its magnitude in exact arithmetic but not
+    on a lane that flushes a subnormal product (the CPU's, `tests/certified.py`'s `Lane.flushes`: the product
+    is zero where the magnitude keeps its bits), nor for a complex value; exp and log cancel only over a sign
+    and a range the language holds no fact of. None of these is built;
   - **reuse** (compile time and dev time): a value the forward already computed;
   - **decoupled reductions** (dev time): dependent nonlinear reductions broken with correction terms (the running-max
     rescale of online softmax, log-sum-exp merges and folds, moment merges);
@@ -310,7 +312,7 @@ because its Python API is still marked as subject to change.
 |---|---|
 | `dew.algebra.terms` | The term language and its conversion to and from jaxprs |
 | `dew.algebra.facts` | Facts about each value (e-class analyses) |
-| `dew.algebra.rules` | `Rules` and `RuleFamily`, the registry and the sets registered: `identities`, `signs`, `contracted`, `stable`, `linear`, `joined`, each declared as its rewrites with their instances (`reuse` and `error_free`, §1, are not built; `decoupled` and `carried` are the derivations' own sets, never registered) |
+| `dew.algebra.rules` | `Rules` and `RuleFamily`, the registry and the sets registered: `identities`, `contracted`, `stable`, `linear`, `joined`, each declared as its rewrites with their instances (`reuse` and `error_free`, §1, are not built; `decoupled` and `carried` are the derivations' own sets, never registered) |
 | `dew.algebra.linear_scan` | A recurrence's token update read as an affine map by rules, and its chunk form derived by identities and extracted under the work-span model (§6.9) |
 | `dew.algebra.cost` | `Price`, `CostModel` and error-aware DAG extraction |
 | `dew.algebra.error` | Dev time: each candidate DAG's error, sampled on its declaration's cases against the float64 truth |

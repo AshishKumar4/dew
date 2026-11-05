@@ -81,12 +81,6 @@ def unit(term: Term) -> Unit: ...
 
 
 @function
-def real(term: Term) -> Unit: ...
-"""Holds where a term's dtype is real, no complex one: a value times its sign is its magnitude (`_signs`),
-which a complex value's is not (1j times sign(1j) is -1)."""
-
-
-@function
 def positive_scale(term: Term) -> Unit: ...
 """Holds where a term is a scalar literal past zero: a scale by it keeps every comparison, so a maximum or a
 minimum of a scaled value is the scaled maximum or minimum (`_linear`)."""
@@ -261,7 +255,6 @@ def _drawn(*shapes, scale: Callable[[np.random.Generator, tuple[int, ...]], np.n
 
 
 _ROWS, _SCALED = _drawn((64, 1024), (64, 1024), (64, 1024)), _drawn((64, 1024), (64,))
-_ROWS_ONE = _drawn((64, 1024))
 _SMALL = _drawn((64, 1024), scale=lambda rng, shape: (rng.uniform(-0.5, 0.5, shape)
                                                       * 10.0 ** rng.uniform(-6, 0, shape)))
 _FOLDED = _drawn((64, 1024), (64, 1), (64, 1), scale=lambda rng, shape: (
@@ -477,21 +470,6 @@ each bound as the primitive it names (its params'), the multiply priced nothing 
 (`cost.work`)."""
 
 
-def _signs() -> tuple[RuleFamily, ...]:
-    """A real value times its sign, its magnitude: an exact identity of IEEE arithmetic (a sign flip loses no
-    bit, and zeros, infinities and NaNs agree), one multiply fewer an element; a complex value's is no
-    magnitude (`real`). A negation negated and the magnitude
-    of a negation or of a magnitude are XLA's algebraic simplifier's, and cost a fusion nothing."""
-    x, t = vars_("x t", Term)
-    first, multiplied, magnitude = vars_("first multiplied magnitude", i64)
-    signed = (x.unary("sign", first).binary("mul", x, multiplied),
-              x.binary("mul", x.unary("sign", first), multiplied))
-    return (RuleFamily("a value times its sign", tuple(
-        rule(eq(t).to(product), real(x), plain(multiplied), eq(magnitude).to(stock("abs"))).then(
-            union(t).with_(x.unary("abs", magnitude))) for product in signed),
-        (lambda x: jnp.sign(x) * x, jnp.abs, _ROWS_ONE)),)
-
-
 def _contracted() -> tuple[RuleFamily, ...]:
     """A multiply an add or a subtract reads first, contracted into it as a fused multiply-add: the compiler
     fuses the two into one instruction rounding the product once (NVPTX's `fma`), so the pair costs one
@@ -541,7 +519,6 @@ def register(rules: Rules) -> None:
 
 
 register(Rules.declared("identities", "exact", _identities(), "docs/design/algebra.md §1", aid=True))
-register(Rules.declared("signs", "exact", _signs(), "docs/design/algebra.md §1.4; row 4008"))
 register(Rules.declared("contracted", "exact", _contracted(),
                         "docs/design/algebra.md §6.5; the scaled softmax's maximum, ledger 3721", aid=True))
 register(Rules.declared("stable", "bounded", _stable(),
@@ -553,12 +530,11 @@ register(Rules.declared("joined", "reorders", _joined(), "docs/design/algebra.md
 
 HEADS = {"add": frozenset({"reduce_sum", "mul", "dot_general"}), "reduce_sum": frozenset({"mul"}),
          "reduce_max": frozenset({"mul"}), "reduce_min": frozenset({"mul"}),
-         "mul": frozenset({"dot_general", "sign"}), "dot_general": frozenset({"mul"})}
+         "mul": frozenset({"dot_general"}), "dot_general": frozenset({"mul"})}
 """What a rule's left side that may lower a price reads at its head: a sum (`add`) of two reductions, two
 products or two contractions of one kind (`linear`), a reduction of a product (a sum's, or an extremum's of a
 positive scale), a contraction scaled, or a contraction of a scaled operand (a dequant's matrix scale, its
-broadcast within `program.WINDOW`), and a value times its sign (`signs`). Commutativity alone (`identities`)
-leaves every price as it was."""
+broadcast within `program.WINDOW`). Commutativity alone (`identities`) leaves every price as it was."""
 
 
 def heads(primitive: str, operands: Sequence[str | None]) -> bool:
