@@ -257,3 +257,20 @@ def test_a_gate_multiplier_keeps_gate_and_up_joined():
     assert_joined_as_exact("gate_up", with_gradients(layer.apply), draw,
                            with_gradients(layer.clone(dtype=jnp.float64).apply), "gate multiplier joined",
                            seeds=JOINED_SEEDS["gate multiplier"])
+
+
+def test_each_join_runs_joined_on_the_devices_its_receipts_name():
+    """A join runs as one GEMM on the device generations its receipts name, for a call its requirements
+    take: the gate and up projections on an A100, a delta net's gates on an A100 and an H100, and each apart
+    on every other generation (row 3209: `JOINED_FASTER`'s cells became one literal of (join, device)
+    identities thresh registers, with the same routes)."""
+    from dew.nn.joined import JOINS, JoinCase
+    from dew.nn.kernels.selection import select
+
+    case = JoinCase(dense=True, dot_general=True, uniform=True, intercepted=False, held=True)
+    joined = {("gate_up", "sm80"), ("delta_gates", "sm80"), ("delta_gates", "sm90")}
+    for choice in ("gate_up", "delta_gates"):
+        for device in ("sm80", "sm90", "sm100", "sm120"):
+            with generation.assumed(device):
+                assert select(JOINS[choice], case).kernel == (
+                    "joined" if (choice, device) in joined else "apart"), (choice, device)
