@@ -155,7 +155,7 @@ class Forward:
         range reduction would repeat the lowering's own (the softcap's forward, 68 of its conversions to
         integers and back a tile)."""
         if self.base2:
-            return jnp.exp2(x * np.float32(self.scale * LOG2E)) if self.raw else jnp.exp2(x)
+            return fold_exp(x, self.scale * LOG2E) if self.raw else jnp.exp2(x)
         if not self.natural and not self.approximate:
             return jnp.exp(x)
         return natural_exp(x, self.scale) if self.raw else natural_exp(x)
@@ -986,6 +986,12 @@ def carried(spec: Forward, m: jax.Array, safe: jax.Array) -> jax.Array:
     if not spec.natural:
         return spec.power(m - safe)
     return natural_carried(m, safe, raw=spec.raw, scale=spec.scale)
+
+
+def fold_exp(x: jax.Array, scale: float = 1.0) -> jax.Array:
+    """The fold's exponential of `x` times `scale` (`exp2(x c)`, a raw fold's weight of its products'
+    difference `x`, `Forward.subtracted`), the factor rounded to fp32 as the kernels multiply by it."""
+    return jnp.exp2(x * np.float32(scale))
 
 
 def natural_carried(m: jax.Array, safe: jax.Array, *, raw: bool, scale: float) -> jax.Array:
@@ -1858,11 +1864,17 @@ def declaration(*, base2: bool, keys_first: bool = False, factor: float | None =
         return softmax_of(scaled, values, base2=base2, keys_first=keys_first, held=natural and raw is None,
                           raw=raw)
 
-    accurate = {"exponential": natural_exp,
-                "rescale": functools.partial(natural_carried, raw=raw is not None,
-                                             scale=1.0 if raw is None else raw)} if natural else {}
+    if natural:
+        stated = {"exponential": natural_exp,
+                  "rescale": functools.partial(natural_carried, raw=raw is not None,
+                                               scale=1.0 if raw is None else raw)}
+    else:
+        # A raw fold's weights are its products' difference times `raw`, which its exponential and rescale
+        # carry (`fold_exp`).
+        stated = {} if raw is None else {"exponential": fold_exp,
+                                         "rescale": lambda m, safe: fold_exp(m - safe, raw)}
     return derive.Reduction(walked, {"logits": tile, "values": ("keys", "width")}, walked="keys",
-                            exponent=2 if base2 else "e", **accurate)
+                            exponent=2 if base2 else "e", **stated)
 
 
 @functools.cache
