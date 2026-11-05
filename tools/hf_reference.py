@@ -887,24 +887,31 @@ def run_vision_tiny(tower_class, vconf, projector_of, seed: int) -> dict:
             "pixels": pixels, "last": last, "soft": soft}
 
 
-def write_vision_tiny(name: str, system: dict, projector: dict, **inputs: np.ndarray) -> None:
-    """A tiny vision system as Dew reads it, under FIXTURES / `name`: bare tensor names, the
-    tower config, the projector's knobs (`projector`), fixed pixels, any array the tower reads
-    beside them (`inputs`, each saved under its keyword) and both fp32 reference outputs."""
-    from safetensors.torch import save_file
-
-    directory = FIXTURES / name
-    directory.mkdir(parents=True, exist_ok=True)
-    save_file(system["tower"].state_dict(), directory / "model.safetensors")
-    save_file(system["projector"].state_dict(), directory / "projector.safetensors")
-    (directory / "config.json").write_text(
-        json.dumps(system["vconf"].to_dict(), indent=1) + "\n")
-    (directory / "projector.json").write_text(json.dumps(projector, indent=1) + "\n")
+def save_vision_references(directory: Path, system: dict, **inputs: np.ndarray) -> None:
+    """A vision system's fixed pixels, any array its tower reads beside them (`inputs`, each saved
+    under its keyword) and both fp32 reference outputs, under `directory`."""
     np.save(directory / "pixels.npy", system["pixels"])
     for array_name, array in inputs.items():
         np.save(directory / f"{array_name}.npy", array)
     np.save(directory / "tower_ref.npy", system["last"])
     np.save(directory / "projector_ref.npy", system["soft"])
+
+
+def write_vision_tiny(name: str, system: dict, tower: dict[str, torch.Tensor],
+                      projector: dict[str, torch.Tensor], knobs: dict, **inputs: np.ndarray) -> None:
+    """A tiny vision system as Dew reads it, under FIXTURES / `name`: the `tower` and `projector`
+    tensors under their bare names, the tower config, the projector's `knobs` and the references
+    (`save_vision_references`, `inputs` among them)."""
+    from safetensors.torch import save_file
+
+    directory = FIXTURES / name
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(tower, directory / "model.safetensors")
+    save_file(projector, directory / "projector.safetensors")
+    (directory / "config.json").write_text(
+        json.dumps(system["vconf"].to_dict(), indent=1) + "\n")
+    (directory / "projector.json").write_text(json.dumps(knobs, indent=1) + "\n")
+    save_vision_references(directory, system, **inputs)
     size = sum(path.stat().st_size for path in directory.iterdir())
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
 
@@ -912,14 +919,15 @@ def write_vision_tiny(name: str, system: dict, projector: dict, **inputs: np.nda
 def write_siglip_tiny() -> None:
     """The SigLIP trunk and Gemma projector, with the projector's two knobs."""
     system = siglip_tiny_system()
-    write_vision_tiny("siglip-tiny", system, {"text_width": system["text_width"],
-                                              "mm_tokens_per_image": system["mm_tokens"]})
+    write_vision_tiny("siglip-tiny", system, system["tower"].state_dict(), system["projector"].state_dict(),
+                      {"text_width": system["text_width"], "mm_tokens_per_image": system["mm_tokens"]})
 
 
 def write_llama4_vision_tiny() -> None:
     """The Llama 4 trunk and outer projector, with the projector's width."""
     system = llama4_vision_tiny_system()
-    write_vision_tiny("llama4-vision-tiny", system, {"text_width": system["text_width"]})
+    write_vision_tiny("llama4-vision-tiny", system, system["tower"].state_dict(),
+                      system["projector"].state_dict(), {"text_width": system["text_width"]})
 
 
 def wrapper_tensors(vision: dict[str, torch.nn.Module], text: dict[str, torch.Tensor],
@@ -937,46 +945,61 @@ def wrapper_tensors(vision: dict[str, torch.nn.Module], text: dict[str, torch.Te
     return merged
 
 
-def write_wrapper_tiny(name: str, decoder: str, system: dict, vision: dict[str, torch.nn.Module], *,
-                       text_root: str, text_prefix: str, config_class, wrapper_class,
-                       fields: dict[str, int]) -> None:
-    """A wrapper fixture under FIXTURES / `name`: the `vision` parts and the tiny decoder fixture
-    `decoder` merged as the release names them (`wrapper_tensors`: the decoder's tensors from
+def wrapper_logits(wrapper_class, config, merged: dict[str, torch.Tensor],
+                   **inputs: np.ndarray) -> np.ndarray:
+    """The fp32 logits of `wrapper_class(config)` holding `merged`, in eval mode on `inputs` (arrays under
+    the keywords its forward takes them by), with no cache."""
+    with torch.no_grad():
+        wrapper = wrapper_class(config)
+        wrapper.load_state_dict(merged, strict=True)
+        wrapper = wrapper.float().eval()
+        return wrapper(**{key: torch.from_numpy(value) for key, value in inputs.items()},
+                       use_cache=False).logits.to(torch.float32).numpy()
+
+
+def write_wrapper_tiny(name: str, system: dict, merged: dict[str, torch.Tensor], config: dict,
+                       ids: np.ndarray, logits: np.ndarray, **inputs: np.ndarray) -> None:
+    """A wrapper fixture under FIXTURES / `name`: the `merged` tensors, the wrapper's `config` (its
+    config.json), the vision references (`save_vision_references`, `inputs` among them), the two token
+    rows `ids` and the wrapper's `logits` on them."""
+    from safetensors.torch import save_file
+
+    directory = FIXTURES / name
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(merged, directory / "model.safetensors")
+    (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
+    save_vision_references(directory, system, **inputs)
+    np.save(directory / "input_ids.npy", ids)
+    np.save(directory / "wrapper_ref.npy", logits)
+    size = sum(path.stat().st_size for path in directory.iterdir())
+    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
+def write_decoder_wrapper_tiny(name: str, decoder: str, system: dict, vision: dict[str, torch.nn.Module], *,
+                               text_root: str, text_prefix: str, config_class, wrapper_class,
+                               fields: dict[str, int]) -> None:
+    """A wrapper fixture (`write_wrapper_tiny`) around the tiny decoder fixture `decoder`: the `vision`
+    parts and the decoder merged as the release names them (`wrapper_tensors`: the decoder's tensors from
     `text_root` on under `text_prefix`, its head tied as its config says), the wrapper config (the
-    decoder's and the tower's beside `fields`, which hold the special token ids), the vision
-    references, two token rows with an image mark each and the logits of `wrapper_class` on them."""
-    from safetensors.torch import load_file, save_file
+    decoder's and the tower's beside `fields`, which hold the special token ids), and the logits of
+    `wrapper_class` on two token rows with an image mark each."""
+    from safetensors.torch import load_file
 
     text = load_file(str(FIXTURES / decoder / "model.safetensors"))
     text_config = json.loads((FIXTURES / decoder / "config.json").read_text())
     merged = wrapper_tensors(vision, {key.removeprefix(text_root): tensor for key, tensor in text.items()},
                              text_prefix, tied_head=text_config["tie_word_embeddings"])
-    directory = FIXTURES / name
-    directory.mkdir(parents=True, exist_ok=True)
-    save_file(merged, directory / "model.safetensors")
-    (directory / "config.json").write_text(json.dumps({
+    image = fields["image_token_index"]
+    ids = np.array([[2, 5, image, 7, 9], [image, 3, 4, 5, 6]], np.int32)
+    config = config_class(
+        text_config={k: v for k, v in text_config.items() if k not in ("architectures", "model_type")},
+        vision_config=system["vconf"], **fields)
+    logits = wrapper_logits(wrapper_class, config, merged, input_ids=ids, pixel_values=system["pixels"])
+    write_wrapper_tiny(name, system, merged, {
         "model_type": config_class.model_type,
         "text_config": text_config,
         "vision_config": system["vconf"].to_dict(),
-        **fields}, indent=1) + "\n")
-    np.save(directory / "pixels.npy", system["pixels"])
-    np.save(directory / "tower_ref.npy", system["last"])
-    np.save(directory / "projector_ref.npy", system["soft"])
-    image = fields["image_token_index"]
-    ids = np.array([[2, 5, image, 7, 9], [image, 3, 4, 5, 6]], np.int32)
-    with torch.no_grad():
-        wrapper = wrapper_class(config_class(
-            text_config={k: v for k, v in text_config.items() if k not in ("architectures", "model_type")},
-            vision_config=system["vconf"], **fields))
-        wrapper.load_state_dict(merged, strict=True)
-        wrapper = wrapper.float().eval()
-        logits = wrapper(
-            input_ids=torch.from_numpy(ids), pixel_values=torch.from_numpy(
-                system["pixels"]), use_cache=False).logits.to(torch.float32).numpy()
-    np.save(directory / "input_ids.npy", ids)
-    np.save(directory / "wrapper_ref.npy", logits)
-    size = sum(path.stat().st_size for path in directory.iterdir())
-    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+        **fields}, ids, logits)
 
 
 def write_gemma3_mm_tiny() -> None:
@@ -989,7 +1012,7 @@ def write_gemma3_mm_tiny() -> None:
     tower and projector come from the shared SigLIP system at a fresh seed.
     """
     system = siglip_tiny_system(seed=4321, text_width=64)
-    write_wrapper_tiny(
+    write_decoder_wrapper_tiny(
         "gemma3-tiny-mm", "gemma3-tiny", system,
         {"model.vision_tower": system["tower"], "model.multi_modal_projector": system["projector"]},
         text_root="model.", text_prefix="model.language_model", config_class=Gemma3Config,
@@ -1003,7 +1026,7 @@ def write_llama4_mm_tiny() -> None:
     released nesting with no model prefix, with the wrapper config, both
     vision references and the wrapper logits."""
     system = llama4_vision_tiny_system(seed=4321)
-    write_wrapper_tiny(
+    write_decoder_wrapper_tiny(
         "llama4-tiny-mm", "llama4-tiny", system,
         {"vision_model": system["tower"], "multi_modal_projector": system["projector"]},
         text_root="", text_prefix="language_model", config_class=Llama4Config,
@@ -1081,7 +1104,8 @@ def write_gemma4_vision_tiny(*, head_dim: int = 8, device: str = 'cpu',
     the tower config, the text width, fixed patches and positions, and both
     fp32 reference outputs."""
     system = gemma4_vision_tiny_system(head_dim=head_dim, device=device)
-    write_vision_tiny(name, system, {"text_width": G4V_TEXT_WIDTH}, positions=system["positions"])
+    write_vision_tiny(name, system, system["tower"].state_dict(), system["projector"].state_dict(),
+                      {"text_width": G4V_TEXT_WIDTH}, positions=system["positions"])
 
 
 QWEN_VISION_TEXT_WIDTH = 64
@@ -1146,28 +1170,12 @@ def write_qwen35_vision_tiny() -> None:
     """The Qwen 3.5 trunk and merger as Dew reads them: bare tensor names
     with the merger under its released prefix, the tower config, the fixed
     square image, and both fp32 reference outputs."""
-    from safetensors.torch import save_file
-
     system = qwen35_vision_tiny_system()
-    directory = FIXTURES / "qwen35-vision-tiny"
-    directory.mkdir(parents=True, exist_ok=True)
-    tower_tensors = {name: tensor for name, tensor in
-                     system["tower"].state_dict().items()
-                     if not name.startswith("merger.")}
-    merger_tensors = {name: tensor for name, tensor in
-                      system["tower"].state_dict().items()
-                      if name.startswith("merger.")}
-    save_file(tower_tensors, directory / "model.safetensors")
-    save_file(merger_tensors, directory / "projector.safetensors")
-    (directory / "config.json").write_text(
-        json.dumps(system["vconf"].to_dict(), indent=1) + "\n")
-    (directory / "projector.json").write_text(json.dumps(
-        {"text_width": QWEN_VISION_TEXT_WIDTH}, indent=1) + "\n")
-    np.save(directory / "pixels.npy", system["pixels"])
-    np.save(directory / "tower_ref.npy", system["last"])
-    np.save(directory / "projector_ref.npy", system["soft"])
-    size = sum(path.stat().st_size for path in directory.iterdir())
-    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+    state = system["tower"].state_dict()
+    write_vision_tiny("qwen35-vision-tiny", system,
+                      {name: tensor for name, tensor in state.items() if not name.startswith("merger.")},
+                      {name: tensor for name, tensor in state.items() if name.startswith("merger.")},
+                      {"text_width": QWEN_VISION_TEXT_WIDTH})
 
 
 GEMMA4_MM_TEXT: Dict[str, Any] = dict(
@@ -1196,8 +1204,6 @@ def write_gemma4_mm_tiny() -> None:
     grid, and the reference runs without multimodal masks, so the text side
     stays causal the way Dew's decoder runs it.
     """
-    from safetensors.torch import save_file
-
     system = gemma4_vision_tiny_system(seed=4321)
     torch.manual_seed(4321)
     text = Gemma4ForConditionalGeneration(Gemma4Config(
@@ -1206,38 +1212,19 @@ def write_gemma4_mm_tiny() -> None:
     scatter_weights(text, seed=4321)
     merged = wrapper_tensors({"model.vision_tower": system["tower"],
                                "model.embed_vision": system["projector"]}, text.state_dict())
-    directory = FIXTURES / "gemma4-tiny-mm"
-    directory.mkdir(parents=True, exist_ok=True)
-    save_file(merged, directory / "model.safetensors")
-    (directory / "config.json").write_text(json.dumps({
+    text_config = dict(GEMMA4_MM_TEXT, model_type="gemma4_text")
+    tokens = {"boi_token_id": 61, "eoi_token_id": 62, "image_token_id": G4V_IMAGE}
+    ids = np.array([[60, 60, 60, 60, 9], [2, 60, 60, 60, 60]], np.int32)
+    config = Gemma4Config(text_config=text_config, vision_config=system["vconf"], audio_config=None, **tokens)
+    logits = wrapper_logits(Gemma4ForConditionalGeneration, config, merged, input_ids=ids,
+                            pixel_values=system["pixels"], image_position_ids=system["positions"])
+    write_wrapper_tiny("gemma4-tiny-mm", system, merged, {
         "model_type": "gemma4",
-        "text_config": dict(GEMMA4_MM_TEXT, model_type="gemma4_text"),
+        "text_config": text_config,
         "vision_config": system["vconf"].to_dict(),
         "audio_config": None,
         "vision_soft_tokens_per_image": 4,
-        "boi_token_id": 61, "eoi_token_id": 62,
-        "image_token_id": G4V_IMAGE}, indent=1) + "\n")
-    np.save(directory / "pixels.npy", system["pixels"])
-    np.save(directory / "positions.npy", system["positions"])
-    np.save(directory / "tower_ref.npy", system["last"])
-    np.save(directory / "projector_ref.npy", system["soft"])
-    ids = np.array([[60, 60, 60, 60, 9], [2, 60, 60, 60, 60]], np.int32)
-    with torch.no_grad():
-        wrapper = Gemma4ForConditionalGeneration(Gemma4Config(
-            text_config=dict(GEMMA4_MM_TEXT, model_type="gemma4_text"),
-            vision_config=system["vconf"], audio_config=None,
-            image_token_id=G4V_IMAGE, boi_token_id=61, eoi_token_id=62))
-        wrapper.load_state_dict(merged, strict=True)
-        wrapper = wrapper.float().eval()
-        logits = wrapper(
-            input_ids=torch.from_numpy(ids),
-            pixel_values=torch.from_numpy(system["pixels"]),
-            image_position_ids=torch.from_numpy(system["positions"]),
-            use_cache=False).logits.to(torch.float32).numpy()
-    np.save(directory / "input_ids.npy", ids)
-    np.save(directory / "wrapper_ref.npy", logits)
-    size = sum(path.stat().st_size for path in directory.iterdir())
-    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+        **tokens}, ids, logits, positions=system["positions"])
 
 
 def write_qwen35_mm_tiny() -> None:
@@ -1251,45 +1238,28 @@ def write_qwen35_mm_tiny() -> None:
     inputs, which scores with plain sequential positions on both sides.
     """
     from qwen_linear_reference import CONFIG as QWEN35_MM_TEXT
-    from safetensors.torch import save_file
 
     system = qwen35_vision_tiny_system(seed=4321)
     torch.manual_seed(4321)
     text = Qwen3_5ForCausalLM(Qwen3_5TextConfig(**QWEN35_MM_TEXT)).model
     scatter_weights(text, seed=4321)
     merged = wrapper_tensors({"model.visual": system["tower"]}, text.state_dict())
-    directory = FIXTURES / "qwen35-tiny-mm"
-    directory.mkdir(parents=True, exist_ok=True)
-    save_file(merged, directory / "model.safetensors")
-    (directory / "config.json").write_text(json.dumps({
-        "model_type": "qwen3_5",
-        "text_config": dict(QWEN35_MM_TEXT, model_type="qwen3_5_text"),
-        "vision_config": system["vconf"].to_dict(),
-        "image_token_id": QWEN_VISION_IMAGE, "video_token_id": 201,
-        "vision_start_token_id": 202, "vision_end_token_id": 203},
-        indent=1) + "\n")
-    np.save(directory / "pixels.npy", system["pixels"])
-    np.save(directory / "tower_ref.npy", system["last"])
-    np.save(directory / "projector_ref.npy", system["soft"])
+    text_config = dict(QWEN35_MM_TEXT, model_type="qwen3_5_text")
+    tokens = {"image_token_id": QWEN_VISION_IMAGE, "video_token_id": 201,
+              "vision_start_token_id": 202, "vision_end_token_id": 203}
     ids = np.array([[2, 200, 200, 200, 200], [200, 200, 200, 200, 9]], np.int32)
-    with torch.no_grad():
-        wrapper = Qwen3_5ForConditionalGeneration(Qwen3_5Config(
-            text_config=dict(QWEN35_MM_TEXT, model_type="qwen3_5_text"),
-            vision_config=system["vconf"].to_dict(),
-            image_token_id=QWEN_VISION_IMAGE, video_token_id=201,
-            vision_start_token_id=202, vision_end_token_id=203))
-        wrapper.load_state_dict(merged, strict=True)
-        wrapper = wrapper.float().eval()
-        embeds = wrapper.model.get_input_embeddings()(torch.from_numpy(ids))
-        image = torch.from_numpy(system["soft"]).to(embeds.dtype)
-        mask = (torch.from_numpy(ids) == QWEN_VISION_IMAGE).unsqueeze(-1).expand_as(embeds)
-        fused = embeds.masked_scatter(mask, image)
-        logits = wrapper(inputs_embeds=fused, use_cache=False).logits.to(
-            torch.float32).numpy()
-    np.save(directory / "input_ids.npy", ids)
-    np.save(directory / "wrapper_ref.npy", logits)
-    size = sum(path.stat().st_size for path in directory.iterdir())
-    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+    config = Qwen3_5Config(text_config=text_config, vision_config=system["vconf"].to_dict(), **tokens)
+    # The merged image rows replace the image marks' embeddings; the reference takes the result as data.
+    embeds = torch.nn.functional.embedding(
+        torch.from_numpy(ids), merged["model.language_model.embed_tokens.weight"])
+    mask = (torch.from_numpy(ids) == QWEN_VISION_IMAGE).unsqueeze(-1).expand_as(embeds)
+    fused = embeds.masked_scatter(mask, torch.from_numpy(system["soft"]).to(embeds.dtype))
+    logits = wrapper_logits(Qwen3_5ForConditionalGeneration, config, merged, inputs_embeds=fused.numpy())
+    write_wrapper_tiny("qwen35-tiny-mm", system, merged, {
+        "model_type": "qwen3_5",
+        "text_config": text_config,
+        "vision_config": system["vconf"].to_dict(),
+        **tokens}, ids, logits)
 
 
 def write_diffusion_sc_tiny() -> None:
