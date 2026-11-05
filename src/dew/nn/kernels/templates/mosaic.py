@@ -67,28 +67,6 @@ def cluster_index(cluster: int) -> jax.Array | int:
     return lax.axis_index(CLUSTER) if cluster > 1 else 0
 
 
-def meet(halves) -> None:
-    """The two consumer warpgroups wait for each other at `halves`, two barriers of two arrivals, in turn:
-    neither arrives at a barrier's next phase before the other has seen its last, however the meets fall
-    (the interpreter's invariant, and the hardware's parity waits)."""
-    for barrier in (halves.at[0], halves.at[1]):
-        plgpu.barrier_arrive(barrier)
-        plgpu.barrier_wait(barrier)
-
-
-def meeting(consumers: int):
-    """The barriers two consumer warpgroups `meet` at: two, of `consumers` arrivals each."""
-    return plgpu.Barrier(num_arrivals=consumers, num_barriers=2)
-
-
-def staging(name: str, shaped) -> dict:
-    """Each consumer warpgroup's staging buffer for each operand a tile reads (`shaped`: its tile's shape and
-    its operand) and a barrier for each, as `{name}_smems` and `{name}_barriers`."""
-    shaped = list(shaped)
-    return {f'{name}_smems': [plgpu.SMEM((2, *shape), gmem.dtype) for shape, gmem in shaped],
-            f'{name}_barriers': [plgpu.Barrier(num_barriers=2) for _ in shaped]}
-
-
 STAGED_BYTES = 128
 """The widest row, in bytes, a consumer stages an output in at a time: a swizzle's row. A consumer's 256
 bf16 columns written to shared memory as one 512-byte row conflicted on its banks 195 times as often as in
@@ -1662,6 +1640,26 @@ class Transport[Allocated, Opened](abc.ABC):
         """The scoped allocation of `count` whole loads' completions (`loaded`'s barriers), which a program's
         allocations hold beside its streams (`scoped`, `resources.Scope`)."""
         return plgpu.Barrier(num_barriers=count)
+
+    def staging(self, name: str, shaped) -> dict:
+        """The scoped allocations of each consumer's staging of each operand a tile reads whole (`shaped`:
+        its tile's shape and its operand), one for each of up to two consumers, and the completion of its
+        load (`loaded`'s barriers), as `{name}_smems` and `{name}_barriers`."""
+        shaped = list(shaped)
+        return {f'{name}_smems': [plgpu.SMEM((2, *shape), gmem.dtype) for shape, gmem in shaped],
+                f'{name}_barriers': [self.load_barriers(2) for _ in shaped]}
+
+    def meeting(self, consumers: int):
+        """The scoped allocation two consumers `meet` at: two barriers of `consumers` arrivals each."""
+        return plgpu.Barrier(num_arrivals=consumers, num_barriers=2)
+
+    def meet(self, halves) -> None:
+        """The two consumers wait for each other at `halves` (`meeting`'s), two barriers in turn: neither
+        arrives at a barrier's next phase before the other has seen its last, however the meets fall (the
+        interpreter's invariant, and the hardware's parity waits)."""
+        for barrier in (halves.at[0], halves.at[1]):
+            plgpu.barrier_arrive(barrier)
+            plgpu.barrier_wait(barrier)
 
     def schedule(self, consumers: int):
         """The scoped allocation of `consumers`' turns on the tensor cores (`turn`): one barrier each of
