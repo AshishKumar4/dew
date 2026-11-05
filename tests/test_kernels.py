@@ -18,7 +18,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from attention_oracle import attention_and_grads, exact_attention, kept, qkv, value_and_grads
+from attention_oracle import (
+    attention_and_grads,
+    attention_on_par,
+    exact_attention,
+    kept,
+    qkv,
+    value_and_grads,
+)
 from flax import linen as nn
 from reference_error import as_given, assert_as_exact, widened, with_gradients
 
@@ -104,7 +111,7 @@ def flash_through_dews_attention_refuses_rows_it_would_misread(without_determini
                      for shape in ((2, 32, 4, 64), (2, 32, 2, 64), (2, 32, 2, 64), (2, 32, 4, 64)))
 
     for packed in ({}, own):
-        _attention_on_par(attend('flash', **packed), attend('xla', **packed), draw,
+        attention_on_par(attend('flash', **packed), attend('xla', **packed), draw,
                           f"flash {'packed' if packed else 'dense'}")
 
 
@@ -299,19 +306,6 @@ def float64_attention(query, key, value, causal, window=(-1, -1), sinks=None):
     return exact_attention(query[None], key[None], value[None], sinks, keep=keep)[0]
 
 
-ATTENTION_SEEDS = 8
-"""A fused kernel's declared check-1 seeds against the xla kernel (`_attention_on_par`), sized by
-`seeds_for` paired on the GPU it runs on."""
-
-
-def _attention_on_par(fused, reference, draw, label: str, *, truth=None, seeds: int = ATTENTION_SEEDS):
-    """`fused`'s output and its inputs' gradients (`with_gradients`) on par with `reference`'s over `draw`'s
-    inputs and output cotangent (check 1), the truth `truth`'s float64 run (`reference`'s where None), rows
-    sized by their float64 terms, which a causal or packed call's rows of float64 zero need."""
-    assert_as_exact(jax.jit(with_gradients(fused)), jax.jit(with_gradients(reference)), draw, label,
-                    seeds=seeds, truth_fn=None if truth is None else with_gradients(truth), terms=True)
-
-
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("sunk", [False, True])
@@ -351,7 +345,7 @@ def packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_ti
     def dense(q, k, v, s):
         return flash.flash_mha(q[None], k[None], v[None], **options(s))[0]
 
-    _attention_on_par(packed, by_document(dense), draw, "packed documents",
+    attention_on_par(packed, by_document(dense), draw, "packed documents",
                       truth=by_document(lambda q, k, v, s: float64_attention(q, k, v, causal, window,
                                                                              s if sunk else None)))
 
@@ -390,7 +384,7 @@ def queries_packed_against_keys_of_their_own_lengths_attend_their_own_documents(
             for (begin, end), (key_begin, key_end) in pairs if end > begin])
 
     dense = by_document(lambda q, k, v: flash.flash_mha(q[None], k[None], v[None])[0])
-    _attention_on_par(packed, dense, draw, "documents against their own keys",
+    attention_on_par(packed, dense, draw, "documents against their own keys",
                       truth=by_document(lambda q, k, v: float64_attention(q, k, v, causal=False)))
     # A document no query reads leaves its keys and values no gradient.
     q, k, v, dy = draw(0)
@@ -449,7 +443,7 @@ def fused_kernels_are_as_exact_as_the_xla_kernel_from_float64(implementation, he
         return lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=implementation,
                                                             causal=True)
 
-    _attention_on_par(kernel(implementation), kernel('xla'), draw, f"{implementation} at {head_dim}")
+    attention_on_par(kernel(implementation), kernel('xla'), draw, f"{implementation} at {head_dim}")
 
 
 @pytest.mark.parametrize("width, value_width, kv_heads, causal, window, sinks", [
@@ -483,7 +477,7 @@ def flash_with_a_window_and_sinks_is_as_exact_as_the_xla_kernel_from_float64(
         q, k, v, s, _ = draw(0)
         with pytest.raises(KernelRefused):
             jax.jit(kernel('flash'))(q, k, v, s)
-    _attention_on_par(kernel('auto' if sinks else 'flash'), kernel('xla'), draw,
+    attention_on_par(kernel('auto' if sinks else 'flash'), kernel('xla'), draw,
                       f"flash at width {width}, window {window}, sinks {sinks}")
 
 
@@ -587,7 +581,7 @@ def a_window_over_more_keys_than_queries_keeps_the_keys_each_row_centres(without
         return lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=implementation,
                                                             sliding_window=33)
 
-    _attention_on_par(kernel('auto'), kernel('xla'), draw, "a window over more keys than queries",
+    attention_on_par(kernel('auto'), kernel('xla'), draw, "a window over more keys than queries",
                       truth=kernel('reference'))
     query, key, value, _ = draw(0)
     with pytest.raises(ValueError):
@@ -633,7 +627,7 @@ def packed_rows_on_flash_are_as_exact_as_the_document_mask_from_float64(window, 
         q, k, v, s, _ = draw(0)
         with pytest.raises(KernelRefused):
             jax.jit(kernel('flash'))(q, k, v, s)
-    _attention_on_par(kernel('auto' if sinks else 'flash'), kernel('xla'), draw,
+    attention_on_par(kernel('auto' if sinks else 'flash'), kernel('xla'), draw,
                       f"packed rows on flash, window {window}, sinks {sinks}")
 
 
@@ -662,7 +656,7 @@ def queries_reading_another_sequences_documents_on_flash_are_as_exact_as_the_doc
             q, k, v, implementation=implementation, segment_ids=jnp.asarray(queries),
             key_segment_ids=jnp.asarray(keys), max_segments=3)
 
-    _attention_on_par(kernel('flash'), kernel('xla'), draw, "queries reading another sequence's documents")
+    attention_on_par(kernel('flash'), kernel('xla'), draw, "queries reading another sequence's documents")
     query, key, value, _ = draw(0)
     found = np.asarray(jax.jit(kernel('flash'))(query, key, value))
     np.testing.assert_array_equal(found[~np.asarray(real[..., 0, 0])], 0)
@@ -736,7 +730,7 @@ def test_queries_reading_another_sequences_documents_on_the_tpu_kernels_are_as_e
                                                     segment_ids=queries, key_segment_ids=keys, max_segments=3)
         return run
 
-    _attention_on_par(attend("tpu"), attend("xla"), draw, "the tpu kernels over another sequence's documents",
+    attention_on_par(attend("tpu"), attend("xla"), draw, "the tpu kernels over another sequence's documents",
                       truth=attend("reference"), seeds=TPU_DOCUMENT_SEEDS)
 
 

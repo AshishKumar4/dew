@@ -12,6 +12,7 @@ import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
+from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.attention import scaled_dot_product_attention
 
@@ -229,3 +230,16 @@ def exact_value_and_grads(query, key, value, sinks=None, live=None, softcap=None
                 for x in (query, key, value, sinks)]
         (_, out), grads = jax.value_and_grad(loss, argnums=argnums, has_aux=True)(*wide)
         return [np.asarray(x) for x in (out, *grads)]
+
+
+ATTENTION_SEEDS = 8
+"""A fused kernel's declared check-1 seeds against the xla kernel (`attention_on_par`), sized by
+`seeds_for` paired on the GPU it runs on."""
+
+
+def attention_on_par(fused, reference, draw, label: str, *, truth=None, seeds: int = ATTENTION_SEEDS):
+    """`fused`'s output and its inputs' gradients (`with_gradients`) on par with `reference`'s over `draw`'s
+    inputs and output cotangent (check 1), the truth `truth`'s float64 run (`reference`'s where None), rows
+    sized by their float64 terms, which a causal or packed call's rows of float64 zero need."""
+    assert_as_exact(jax.jit(with_gradients(fused)), jax.jit(with_gradients(reference)), draw, label,
+                    seeds=seeds, truth_fn=None if truth is None else with_gradients(truth), terms=True)
