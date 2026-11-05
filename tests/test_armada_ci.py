@@ -642,7 +642,8 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     def ran(stem: str) -> list[list[str]]:
         return lane_runs(tmp_path, stem)
 
-    out = tmp_path / "verdict.json"
+    (tmp_path / ".verdict").mkdir()
+    out = tmp_path / ".verdict/verdict.json"
     assert ci.gpu_lane("3.12", every, out, cache="on", processes=4, deadline=600.0) == 0
     rows = json.loads(out.read_text())["rows"]
     assert [(row["name"], row["exitCode"]) for row in rows] == [
@@ -729,7 +730,8 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
     def ran(stem: str) -> list[list[str]]:
         return lane_runs(tmp_path, stem)
 
-    out = tmp_path / "verdict.json"
+    (tmp_path / ".verdict").mkdir()
+    out = tmp_path / ".verdict/verdict.json"
     assert ci.gpu_lane("3.12", every, out, cache="on", processes=4, deadline=600.0) == 0
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
     borrowed = str(6 * 2 ** 30 / (81920 * 2 ** 20))
@@ -965,16 +967,16 @@ def cached_checkout(ci, root: Path, monkeypatch, cache_worker) -> Path:
     return root / ".verdict/verdict.json"
 
 
-def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
+def cached_runs(ci, root: Path, monkeypatch, cache_worker, counter: str = "runs") -> Callable[[], int]:
     """The checkout's one 3.12 task, run green on one CPU class against the shared test cache as armada
     starts it (`armada_task`) under the cache's policy (`cached_checkout`): each call, how many times its
-    test has run, which it counts in `runs`."""
+    test has run, which it counts in `counter`."""
     verdict = cached_checkout(ci, root, monkeypatch, cache_worker)
 
     def run(policy: str = "on") -> int:
         rows = armada_task(ci, monkeypatch, verdict, policy)
         assert [row["exitCode"] for row in rows] == [0]
-        return len((root / "runs").read_text())
+        return len((root / counter).read_text())
 
     return run
 
@@ -1555,7 +1557,8 @@ def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_
     stay, and its file runs again once the page it trains from changes or a page is added. So are a
     directory `os.walk` lists, the checkout's own directory listed, and a page opened by its name in
     a directory's descriptor. A file it writes is no input, and nor is what the import system or
-    pytest's collection lists."""
+    pytest's collection lists; its counter is in a hidden directory, as a run that lists the checkout's own
+    directory and makes an entry in it keeps no key (row 2559)."""
     (tmp_path / "docs/guides").mkdir(parents=True)
     (tmp_path / "docs/model.md").write_text("width 4\n")
     (tmp_path / "notes").mkdir()
@@ -1564,7 +1567,7 @@ def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_
         "import os\n"
         "from pathlib import Path\n"
         "def test_pages():\n"
-        "    with Path('runs').open('a') as runs: runs.write('x')\n"
+        "    with Path('.verdict/runs').open('a') as runs: runs.write('x')\n"
         "    assert Path('docs/model.md').read_text().startswith('width')\n"
         "    assert sorted(path.name for path in Path('docs').glob('*.md'))\n"
         "    assert [folder for folder, _, _ in os.walk('docs')]\n"
@@ -1574,7 +1577,7 @@ def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_
         "        os.close(os.open('plan.md', os.O_RDONLY, dir_fd=folder))\n"
         "    finally:\n"
         "        os.close(folder)\n")
-    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
+    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker, ".verdict/runs")
     # Each page changed, added or listed anew runs the file again, and the run after reuses that row.
     # Python bytecode a run leaves beside a page (a directory, `None` here) is no change to the pages.
     changes = [(None, "", 1), ("docs/model.md", "width 8\n", 2), ("docs/serving.md", "serve\n", 3),
@@ -2725,3 +2728,73 @@ def test_a_gpu_lane_keys_the_xla_and_jax_settings_its_node_gives_it(ci, tmp_path
     assert lane_run_counts(ci, tmp_path, names) == [2]
     monkeypatch.setenv("JAX_ENABLE_X64", "1")
     assert lane_run_counts(ci, tmp_path, names) == [3]
+
+
+REWRITES = {
+    "a fixture under tests/": (
+        {"tests/fixtures/data.json": '{"v": 1}'},
+        "    data = Path('tests/fixtures/data.json')\n"
+        "    assert json.loads(data.read_text())['v'] >= 1\n"
+        "    data.write_text(json.dumps({'v': 2}))\n"),
+    "a tool's data": (
+        {"tools/data.json": '{"v": 1}'},
+        "    data = Path('tools/data.json')\n"
+        "    assert json.loads(data.read_text())['v'] >= 1\n"
+        "    data.write_text(json.dumps({'v': 2}))\n"),
+    "a page a child rewrites": (
+        {"docs/page.md": "page\n"},
+        "    import subprocess, sys\n"
+        "    child = \"from pathlib import Path; page = Path('docs/page.md'); assert page.read_text(); \"\n"
+        "    child += \"page.write_text('changed\\\\n')\"\n"
+        "    subprocess.run([sys.executable, '-c', child], check=True)\n"),
+    "a file in a directory the run makes": (
+        {},
+        "    Path('tests/fixtures/fresh').mkdir(parents=True, exist_ok=True)\n"
+        "    data = Path('tests/fixtures/fresh/data.json')\n"
+        "    data.write_text(json.dumps({'v': 1}))\n"
+        "    assert json.loads(data.read_text())['v'] >= 1\n"
+        "    data.write_text(json.dumps({'v': 2}))\n"),
+    "a hidden fixture": (
+        {"tests/fixtures/.data.json": '{"v": 1}'},
+        "    data = Path('tests/fixtures/.data.json')\n"
+        "    assert json.loads(data.read_text())['v'] >= 1\n"
+        "    data.write_text(json.dumps({'v': 2}))\n"),
+}
+
+
+@pytest.mark.parametrize("what", list(REWRITES))
+def test_a_run_that_writes_an_input_it_read_keeps_no_key(ci, tmp_path, monkeypatch, cache_worker, what):
+    """A key is made after the run from its inputs' bytes as they stand, so a test that reads a file and then
+    writes it leaves a key over the bytes it wrote, which the next commit holding them reuses though no run
+    read them (row 2559). Every file of the checkout is watched while a task runs, tests/ and src/ as any
+    other directory (a tool's data, a page a followed child rewrites, a hidden fixture, a directory the run
+    makes), so such a row keeps no key and runs again; a row that only reads its input is reused."""
+    files, body = REWRITES[what]
+    for name, text in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    written(tmp_path, {"test_writes.py": "import json\nfrom pathlib import Path\ndef test_writes():\n"
+                       "    with Path('runs').open('a') as runs: runs.write('x')\n" + body})
+    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
+    assert run() == 1
+    assert run() == 2, "the key would stand for the bytes the first run wrote"
+
+
+def test_a_task_that_only_reads_keeps_its_key_beside_one_that_writes(ci, tmp_path, monkeypatch, cache_worker):
+    """What one task writes is no input of another that never read it: each task holds a watch of its own, so
+    the file that read a page and rewrote it runs again, and the file of another task that only read its own
+    page is reused."""
+    (tmp_path / "docs").mkdir()
+    for name in ("page", "other"):
+        (tmp_path / f"docs/{name}.md").write_text("page\n")
+    written(tmp_path, {
+        "test_reads.py": "from pathlib import Path\ndef test_reads():\n"
+                         "    with Path('runs-reads').open('a') as runs: runs.write('x')\n"
+                         "    assert Path('docs/page.md').read_text()\n",
+        "test_rewrites.py": "from pathlib import Path\ndef test_rewrites():\n"
+                            "    with Path('runs-rewrites').open('a') as runs: runs.write('x')\n"
+                            "    page = Path('docs/other.md')\n    assert page.read_text()\n"
+                            "    page.write_text('page\\n')\n"})
+    run = counted_runs(ci, tmp_path, monkeypatch, cache_worker, ("reads", "rewrites"))
+    assert run() == [1, 1]
+    assert run() == [1, 2], "the reader is reused, the file that wrote what it read runs again"
