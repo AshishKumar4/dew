@@ -772,9 +772,11 @@ print(np.asarray(result.tokens))
 `layer_types` names each layer's kind, and `kinds` says what that kind does:
 `sliding_attention` attends to 8 keys including its own, and `full_attention`
 attends to all of them. A Grain `to_iter_dataset()` iterator has
-`get_state` and `set_state`, which `checkpoint_every` needs to record the data
-position. A plain generator has neither, so `Trainer` raises an error if you
-use one with `checkpoint_every`. `objective.pipeline` returns a
+`get_state` and `set_state`, with which `checkpoint_every` records the data
+position, so a resume continues the data exactly. A plain generator has
+neither: it trains and checkpoints its weights and training state, and `fit`
+refuses to resume from such a checkpoint unless the reader is declared to
+replay its batches ([Data position](https://github.com/AshishKumar4/dew/blob/main/docs/guides/checkpoints.md#data-position)). `objective.pipeline` returns a
 `TextGeneration` task that uses the state's weights.
 
 ### Custom Flax models
