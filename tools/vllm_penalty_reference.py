@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Write tests/fixtures/decoding/penalties.npz: vLLM's frequency and
-presence penalties on fixed logits.
+presence penalties on logits drawn over check 1's seeds.
 
 vLLM applies them in `apply_penalties` (vllm/model_executor/layers/utils.py,
 read at the v0.30.0 commit and run as published with
@@ -16,8 +16,10 @@ generated at all, the prompt counting for neither.
 The rows: four histories over a 17-token vocabulary, prompts of up to five
 tokens and outputs of up to four, with tokens that appear in the prompt
 alone, in the output alone, in both and several times, padded with the
-vocabulary size as vLLM pads them. Each penalty pair runs on float32 logits
-and on the same logits in float64.
+vocabulary size as vLLM pads them. Each penalty pair is a site of its own,
+`case_<index>`, recorded over its seeds (`recorded_references.record_case`):
+a seed's float32 logits, standard normal, vLLM's run on them in float32 the
+reference and in float64 the truth.
 
     python tools/vllm_penalty_reference.py
 """
@@ -30,6 +32,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from recorded_references import record_case
 from reference_source import definitions
 
 VLLM = "https://raw.githubusercontent.com/vllm-project/vllm/ced6857afa0ea7b2e3f0846a62e1394e90f15607/"
@@ -56,18 +59,25 @@ def main() -> None:
     sys.modules["vllm._custom_ops"] = types.SimpleNamespace(**ops)
     published = definitions(VLLM + "vllm/model_executor/layers/utils.py",
                             ("get_token_bin_counts_and_mask", "apply_penalties"), {"torch": torch})
-    logits = np.random.default_rng(3).standard_normal((len(PROMPTS), VOCAB)).astype(np.float32)
-    arrays = {"logits": logits, "penalties": np.asarray(PENALTIES),
-              "prompt": padded(PROMPTS).numpy(), "output": padded(OUTPUTS).numpy()}
+    arrays = {"penalties": np.asarray(PENALTIES), "prompt": padded(PROMPTS).numpy(),
+              "output": padded(OUTPUTS).numpy()}
+
+    def draw(seed):
+        rng = np.random.default_rng([0x9E7, seed])
+        return {"logits": rng.standard_normal((len(PROMPTS), VOCAB)).astype(np.float32)}
+
     for index, (frequency, presence) in enumerate(PENALTIES):
-        for dtype, suffix in ((torch.float32, ""), (torch.float64, "_f64")):
-            def column(value, dtype=dtype):
+        def scored(logits, dtype, frequency=frequency, presence=presence):
+            def column(value):
                 return torch.full((len(PROMPTS),), value, dtype=dtype)
 
-            scored = published["apply_penalties"](torch.tensor(logits, dtype=dtype), padded(PROMPTS),
-                                                  padded(OUTPUTS), column(presence), column(frequency),
-                                                  column(1.0))
-            arrays[f"case_{index}{suffix}"] = scored.numpy()
+            penalized = published["apply_penalties"](torch.tensor(logits, dtype=dtype), padded(PROMPTS),
+                                                      padded(OUTPUTS), column(presence), column(frequency),
+                                                      column(1.0))
+            return {"logits": penalized.numpy()}
+
+        arrays.update(record_case(f"case_{index}", draw, lambda inputs, scored=scored: (
+            scored(inputs["logits"], torch.float32), scored(inputs["logits"], torch.float64))))
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
     np.savez(FIXTURE, **arrays)
     print(f"{FIXTURE}: {len(PENALTIES)} penalty pairs over {len(PROMPTS)} rows")
