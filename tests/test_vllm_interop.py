@@ -241,8 +241,9 @@ def test_the_server_reports_dews_own_logprobs(client, reference):
     @as_given
     def dews(ids):
         head, tokens, _ = answered(tuple(np.asarray(ids).tolist()))
-        logits = np.asarray(forward(loaded.variables, jnp.asarray([head + tokens], jnp.int32)))[0]
-        return scored(np.asarray(jax.nn.log_softmax(logits), np.float64), head, tokens)
+        logits = forward(loaded.variables, jnp.asarray([head + tokens], jnp.int32))[0]
+        places = len(head) + np.arange(len(tokens)) - 1
+        return np.asarray(jax.nn.log_softmax(logits)[places, np.asarray(tokens)], np.float64)
 
     @as_given
     def wide(ids):

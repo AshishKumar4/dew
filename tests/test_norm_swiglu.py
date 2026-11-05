@@ -24,7 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import Mesh
-from reference_error import as_given, assert_as_exact, distance, equations, with_gradients
+from reference_error import assert_as_exact, distance, equations, with_gradients
 from tuned import each_config
 
 from dew.nn import attention, norms
@@ -138,11 +138,10 @@ def assert_drawn_as_exact(fused, xla, exact, draw, leaves, label, seeds):
                     draw, label, seeds=seeds, truth_fn=truth)
 
 
-def compare(functions, draw, labels, seeds, *, coefficient=None, judged=None):
-    """Every output's dtype and accumulation on `draw`'s first operands (`gated`); the accuracy of the
-    `judged` labels (every one by default) held by check 1 over `draw`'s `seeds`
-    (`assert_drawn_as_exact`). `coefficient` of the first operands, where the weight gradient's
-    accumulation is held."""
+def compare(functions, draw, labels, seeds, *, coefficient=None):
+    """Every output's dtype and accumulation on `draw`'s first operands (`gated`); their accuracy held by
+    check 1 over `draw`'s `seeds` (`assert_drawn_as_exact`). `coefficient` of the first operands, where
+    the weight gradient's accumulation is held."""
     xla, pallas, exact = functions
     operands, seed = draw(0)
     reference = jax.jit(functools.partial(evaluated, xla))(operands, seed)
@@ -150,10 +149,9 @@ def compare(functions, draw, labels, seeds, *, coefficient=None, judged=None):
     gated(labels, actual, reference, seed, coefficient and coefficient(operands))
 
     def leaves(result):
-        return {label: value for label, value in zip(labels, result, strict=True)
-                if value is not None and label in (judged or labels)}
+        return {label: value for label, value in zip(labels, result, strict=True) if value is not None}
 
-    assert_drawn_as_exact(pallas, xla, exact, draw, leaves, " ".join(judged or labels), seeds)
+    assert_drawn_as_exact(pallas, xla, exact, draw, leaves, " ".join(labels), seeds)
 
 
 def gated(labels, actual, reference, seed, coefficient):
@@ -252,12 +250,10 @@ def test_rms_ragged_widths_and_many_rows(dtype, shape):
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype):
     """Repeated tokens hold the row arithmetic fixed while the column sum grows to Qwen3.5-0.8B's size,
-    isolating partial-sum error from bf16 midpoint flips: the weight gradient holds check 1 over the
-    step's draws. Its output and input gradient are one token's row repeated, which a draw's seeds hold
-    no better than one row's: they hold check 1 at rows of their own (`test_rms_ragged_widths_and_many_rows`,
-    and each config's at 4,099 rows, `every_config_of_the_norm_kernels_holds_the_float64_gate`)."""
+    isolating partial-sum error from bf16 midpoint flips: the output and both gradients hold check 1 over
+    the step's draws."""
     compare(norm_functions(dtype, offset=True, after_cast=True), lambda draw: full_step(dtype, draw),
-            ("y", "x", "scale"), SEEDS[(24576, 1000)], judged=("scale",),
+            ("y", "x", "scale"), SEEDS[(24576, 1000)],
             coefficient=lambda operands: scale_coefficient(operands[0], dtype, after_cast=True))
 
 
@@ -294,31 +290,14 @@ def swiglu_operands(shape, dtype, draw: int = 0):
 
 def each_config_holds(kernel, functions, draw, labels, seeds, coefficient=None):
     """Each config the tuner may pick for `kernel` (`each_config` on `draw`'s first operands): the fused
-    function under it held by check 1 to XLA's over `draw`'s `seeds`, with its dtypes and accumulation
-    (`gated`)."""
-    xla, pallas, exact = functions
+    function, traced under it, held as `compare` holds it."""
     operands, seed = draw(0)
-    reference = jax.jit(functools.partial(evaluated, xla))(operands, seed)
-    configs = each_config(kernel, functools.partial(evaluated, pallas), operands, seed)
+    configs = each_config(kernel, functools.partial(evaluated, functions[1]), operands, seed)
     assert len(configs) > 1
-
-    def leaves(result):
-        return {label: value for label, value in zip(labels, result, strict=True) if value is not None}
-
     for config in configs:
-        with tuning.pinned({kernel: config}):
-            run = jax.jit(functools.partial(evaluated, pallas))
-            gated(labels, run(operands, seed), reference, seed, coefficient and coefficient(operands))
-
-        @as_given
-        def pinned(operands, seed, run=run, config=config):
-            with tuning.pinned({kernel: config}):
-                return leaves(run(operands, seed))
-
         try:
-            assert_as_exact(pinned, jax.jit(lambda operands, seed: leaves(evaluated(xla, operands, seed))),
-                            draw, f"{kernel.__name__} at {config}", seeds=seeds,
-                            truth_fn=lambda operands, seed: leaves(evaluated(exact, operands, seed)))
+            with tuning.pinned({kernel: config}):
+                compare(functions, draw, labels, seeds, coefficient=coefficient)
         except AssertionError as error:
             error.add_note(f"{kernel.__name__} at {config}")
             raise
@@ -329,7 +308,7 @@ def every_config_of_the_norm_kernels_holds_the_float64_gate(kernel, dtype, opera
     a tile holds two of, and at rows narrow enough for its tallest tiles:
     its variants are only configs proven here (`KernelOp.variants`)."""
     draw, shape = {"full step": (functools.partial(full_step, dtype), (24576, 1000)),
-                   "wide rows": (functools.partial(norm_operands, (7, 4096), dtype, jnp.float32), (7, 4096)),
+                   "wide rows": (functools.partial(norm_operands, (3, 4096), dtype, jnp.float32), (3, 4096)),
                    "narrow rows": (functools.partial(norm_operands, (4099, 256), dtype, jnp.float32),
                                    (4099, 256))}[operands]
     each_config_holds(kernel, norm_functions(dtype, offset=True, after_cast=True), draw,

@@ -136,16 +136,6 @@ def test_repeated_image_requests_reuse_their_programs_and_read_back_only_results
     assert [result.host().images.shape for result in results] == [(2, RES, RES, 3)] * 2
 
 
-def nearest_float32(value) -> np.float32:
-    """The float32 nearest the rational `value`, a tie to the even significand: its correct rounding."""
-    from fractions import Fraction
-
-    near = np.float32(float(value))
-    sides = [np.nextafter(near, np.float32(-np.inf)), near, np.nextafter(near, np.float32(np.inf))]
-    return min(sides, key=lambda side: (abs(Fraction(float(side)) - value),
-                                         int(np.asarray(side).view(np.uint32)) & 1))
-
-
 def test_pil_bytes_and_unit_range_are_diffusers_image_processor():
     """Diffusers 0.34.0's `VaeImageProcessor` is the reference both ways.
     `postprocess(..., output_type="pil")` writes the same bytes as `pil()` on
@@ -159,6 +149,7 @@ def test_pil_bytes_and_unit_range_are_diffusers_image_processor():
 
     import torch
     from diffusers.image_processor import VaeImageProcessor
+    from op_certificates import FLOAT32, fraction_rounded
 
     processor = VaeImageProcessor()
     levels = np.arange(256, dtype=np.float64)
@@ -173,7 +164,8 @@ def test_pil_bytes_and_unit_range_are_diffusers_image_processor():
 
     data = np.arange(256, dtype=np.uint8)
     exact = [Fraction(2 * int(byte) - 255, 255) for byte in data]
-    np.testing.assert_array_equal(np.asarray(unit_range(data)), np.asarray(list(map(nearest_float32, exact))))
+    rounded = np.asarray([fraction_rounded(value, FLOAT32) for value in exact], np.float32)
+    np.testing.assert_array_equal(np.asarray(unit_range(data)), rounded)
     # Diffusers' map is the same function: its float64 run within float64's rounding of the exact values.
     normalized = processor.normalize(torch.from_numpy(data.astype(np.float64) / 255.0)).numpy()
     assert_computes_the_oracle(normalized, np.asarray(list(map(float, exact))), "normalize", roundings=3)

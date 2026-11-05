@@ -43,14 +43,12 @@ VIEW_SEEDS = 8
 
 
 def assert_view(view, model, variables, reference, label):
-    """`view(ids)`, a view of `model`'s logits over `variables`, held by check 1 to its plain loop over drawn
-    ids of the reference's shape, the truth the plain loop's own float64 forward (`float64_forward`)."""
-    plain = jax.jit(model.apply)
-    assert_as_exact(as_given(lambda ids: np.asarray(view(ids), np.float64)),
-                    as_given(lambda ids: np.asarray(plain(variables, ids), np.float64)),
+    """`view(ids)`, a view of `model`'s logits over `variables` (a JAX function, which the gate compiles;
+    `as_given` where it runs outside one program), held by check 1 to its plain loop over drawn ids of the
+    reference's shape, the truth the plain loop's own float64 forward (`float64_forward`)."""
+    assert_as_exact(view, lambda ids: model.apply(variables, ids),
                     token_draw(0xF4, int(reference["ids"].max()) + 1, reference["ids"].shape), label,
-                    seeds=VIEW_SEEDS,
-                    truth_fn=as_given(lambda ids: np.asarray(float64_forward(model, variables, ids)[0])))
+                    seeds=VIEW_SEEDS, truth_fn=lambda ids: float64_forward(model, variables, ids)[0])
 
 
 def test_without_its_scales_the_model_fails_the_rule_every_view_is_held_to(case):
@@ -68,8 +66,8 @@ def test_the_scanned_stack_quantizes_each_layer_with_its_own_scales(case):
     """A scanned run stacks every collection on the layer axis, the scales
     with the kernels, so each layer reads its own."""
     _, loaded, reference = case
-    scanned = jax.jit(loaded.model.clone(scan_layers=True).apply)
-    assert_view(lambda ids: scanned(loaded.variables, ids), loaded.model, loaded.variables, reference,
+    scanned = loaded.model.clone(scan_layers=True)
+    assert_view(lambda ids: scanned.apply(loaded.variables, ids), loaded.model, loaded.variables, reference,
                 "scanned")
 
 
@@ -94,8 +92,7 @@ def test_layers_quantized_apart_run_as_scanned_runs_of_their_own(case):
     forward. The stored tree stays one subtree per layer, so the scanned and
     the plain model read and init the same tree."""
     loaded, scanned, ids, variables = quantized_apart(case)
-    run = jax.jit(scanned.apply)
-    assert_view(lambda ids: run(variables, ids), loaded.model, variables, case[2],
+    assert_view(lambda ids: scanned.apply(variables, ids), loaded.model, variables, case[2],
                 "layers quantized apart, scanned")
     initialized = [jax.eval_shape(model.init, jax.random.key(0), ids) for model in (scanned, loaded.model)]
     assert jax.tree.structure(initialized[0]) == jax.tree.structure(initialized[1])
@@ -140,8 +137,8 @@ def test_a_store_that_banks_layers_quantized_apart_reads_as_the_runs_it_banks(ca
     bound = scanned.bind(variables)
     assert bound.groups == ((0, 2), (2, 2))
     store = HeldBanks(variables).place(bound, layout=Layout(min_shard=1, tolerance=1.0))
-    run = jax.jit(scanned.apply)
-    assert_view(lambda ids: run(store, ids), four, variables, reference, "banked runs quantized apart")
+    assert_view(lambda ids: scanned.apply(store, ids), four, variables, reference,
+                "banked runs quantized apart")
 
 
 @pytest.mark.mesh(devices=2)
@@ -153,6 +150,8 @@ def test_the_pipeline_stages_quantize_each_layer_with_its_own_scales(case):
     placed = jax.device_put(loaded.variables, Layout().shardings(mesh, loaded.variables))
     staged = jax.jit(loaded.model.apply)
 
+    # Placed on a mesh and run in microbatches by its own program: as given.
+    @as_given
     def view(ids):
         with jax.set_mesh(mesh), pipeline_microbatches(2):
             return staged(placed, jnp.asarray(ids, jnp.int32))
@@ -172,8 +171,8 @@ def test_packed_projections_carry_their_members_shared_scale(case):
         for part in group.path:
             node = node[part]
         assert group.packed in node and not set(group.members) & set(node)
-    run = jax.jit(loaded.model.apply)
-    assert_view(lambda ids: run(packed, ids), loaded.model, loaded.variables, reference, "packed")
+    assert_view(lambda ids: loaded.model.apply(packed, ids), loaded.model, loaded.variables, reference,
+                "packed")
 
 
 def test_members_scaled_apart_stay_unpacked(case):
@@ -196,8 +195,8 @@ def test_the_served_pipeline_quantizes_as_the_loaded_model(case):
     computes the loaded model's quantized logits."""
     directory, loaded, reference = case
     task = dew.pipeline(str(directory), dtype=jnp.float32)
-    run = jax.jit(task.model.apply)
-    assert_view(lambda ids: run(task.variables, ids), loaded.model, loaded.variables, reference, "pipeline")
+    assert_view(lambda ids: task.model.apply(task.variables, ids), loaded.model, loaded.variables, reference,
+                "pipeline")
 
 
 def test_a_generation_over_the_loaded_tree_packs_under_its_one_scale_in_the_call(case):
