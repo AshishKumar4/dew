@@ -383,10 +383,10 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
-               reducing_warpgroups: int = 0, resident: int = 1) -> Callable:
+               reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0) -> Callable:
         # Its one warpgroup is its consumer, no producer beside it, and no cluster; its kernels' default
         # parameters reserve the scratch an implicit reduction takes (`reduction_scratch`).
-        del reducing_warpgroups
+        del reducing_warpgroups, scalars  # its programs read a table from global memory as any operand
         _one(consumers, clustered=cluster > 1)
         built = launches.kernel(mosaic.dependent(entry, interpret), name=name or self.name,
                                 out_type=out_type, grid=grid, grid_names=grid_names,
