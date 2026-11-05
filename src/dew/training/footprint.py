@@ -215,13 +215,17 @@ def deduplicated(program: jcore.Jaxpr) -> jcore.Jaxpr:
     again for the head are one cast, which the embedding's optimization barrier holds and the head reads
     (Qwen3.5-4B's fused tiled head, 1.18 GiB derived twice: row 4089). An equation with effects is its
     own, as XLA's side-effecting instructions are, and so is an optimization barrier, which a recomputed
-    region reads through to be computed again."""
+    region reads through to be computed again, and one whose parameters hold a function: a callback's is
+    named by its module and qualified name alone (`parameter_key`), which two closures of one factory
+    share, and JAX lowers each callback to a custom call of its own host callback's index
+    (`emit_python_callback`, jax/_src/callback.py), which XLA computes apart."""
     renamed: dict[jcore.Var, jcore.Var] = {}
     first: dict[Hashable, list] = {}
     kept = []
     for equation in program.eqns:
         operands = [renamed.get(value, value) if computed(value) else value for value in equation.invars]
-        own = equation.effects or equation.primitive.name == "optimization_barrier"
+        own = (equation.effects or equation.primitive.name == "optimization_barrier"
+               or any(map(callable, equation.params.values())))
         key = None if own else (parameters_key(equation.primitive, equation.params),
                                 tuple(map(operand_key, operands)))
         if key is not None and key in first:
@@ -282,8 +286,10 @@ def _peak(lowered: jcore.Jaxpr, count: int, platform: str, workspace: Workspace,
           deferred: bool = False) -> Peak:
     """`gradient_peak` of `traced_gradient`'s program as it is `lowered` (`compiled`), its first `count`
     outputs the gradient."""
-    gradient = hoisted(lowered.replace(outvars=lowered.outvars[:count]))
-    return Peak(peak_bytes(sunk(gradient) if deferred else gradient, platform, workspace, consumed=consumed),
+    gradient = lowered.replace(outvars=lowered.outvars[:count])
+    # Hoisted last: a constant the gradient returns runs ahead of the work however its weight gradients run.
+    ordered = hoisted(sunk(gradient) if deferred else gradient)
+    return Peak(peak_bytes(ordered, platform, workspace, consumed=consumed),
                 not bounded_below(gradient, platform))
 
 

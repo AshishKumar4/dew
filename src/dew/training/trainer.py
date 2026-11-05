@@ -1168,7 +1168,8 @@ class Trainer(Generic[Loss, Effects]):
                             and bool(set(COMMIT_FIELDS) & set(self.layout.host)))
         with staging.measured() as cuts:
             if self.tune_kernels and lowering and platforms is None:
-                lowered, launches = tuning.tune(lower, measure=True)
+                # The configs it measures are not the ones a derivation traced: its footprint is traced again.
+                lowered, launches, footprint = *tuning.tune(lower, measure=True), None
             else:
                 # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
                 lowered, launches = lower() if lowering else None, launches or "[]"

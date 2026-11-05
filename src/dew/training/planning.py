@@ -819,6 +819,12 @@ class FitSearch[LossT, EffectsT]:
         footprint the derivation traced of it where it read it (`footprints`)."""
         return self.lower(split, self.narrow, self.footprints.get(self.candidate_key(split, self.narrow)))
 
+    def relowering(self, split: int) -> Candidate:
+        """The step at `split` lowered afresh past a kernel that spilled (`Relowered`), its footprint traced
+        again: the kernel's next config can change the buffers the derivation traced at its first (a
+        Triton attention backward's partial gradients, a block of queries each)."""
+        return self.lower(split, self.narrow, None)
+
     def candidate_key(self, split: int, narrow: bool) -> tuple[str, int]:
         """The step at `split` and `narrow` at the objective's rung, as the derivation's judgments keep it."""
         return json.dumps({**self.current(), "narrow": narrow}, sort_keys=True), split
@@ -952,7 +958,7 @@ class FitSearch[LossT, EffectsT]:
         if ahead is not None:
             executable, self.ahead = ahead.taken(candidate.lowered), None
         else:
-            relowered = Relowered(lambda: self.lowering(split))
+            relowered = Relowered(lambda: self.relowering(split))
             executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered)
             candidate = relowered.candidate(candidate)
         fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
