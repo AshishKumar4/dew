@@ -49,6 +49,7 @@ from ..precision import at_least_fp32, rounded_operand
 from . import generation, selection, tuning
 from .generation import INHERENT
 from .templates import base, bundles, cost, mosaic, report, resources, tail as tail_of
+from .templates.axes import GROUPS, held
 from .templates.gemm import mosaic_gpu, mosaic_tpu
 from .templates.product import EIGHT, Product
 
@@ -187,8 +188,9 @@ def _output_bytes(ba) -> int:
 
 
 def _side_tile_bytes(operands, axes_of, extents: dict) -> int:
-    """The bytes of one tile of each side operand at the block `extents` per launch axis."""
-    return sum(math.prod(extents[axis] for axis in axes) * jnp.dtype(operand.dtype).itemsize
+    """The bytes of one tile of each side operand at the block `extents` per launch axis, one group's of an
+    operand by group (`held`)."""
+    return sum(math.prod(extents[axis] for axis in held(axes)) * jnp.dtype(operand.dtype).itemsize
                for operand, axes in zip(operands, axes_of, strict=True))
 
 
@@ -599,8 +601,11 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # A hooked or exactly summed call runs where its bundle's register model counts what they hold.
         special = ba.arguments['hooks'] != NO_HOOKS or ba.arguments.get('exact_sums')
         family = self._family(ba, target)
+        # A prologue's side operand by group streams with no group's origin here; Triton's and the TPU's
+        # launches read it at their tile's group (`axes.at_group`).
+        grouped = any(GROUPS in axes for axes in ba.arguments['hooks'].prologue_axes)
         return (first == second and (jnp.dtype(first).itemsize == 2 or self._fp8(ba, first, family))
-                and family is not None
+                and family is not None and not grouped
                 and (family.counts_hooks or not special)
                 and self._hooks_lower(ba, first, target)
                 and (self.EXACT_SUMS or not ba.arguments.get('exact_sums'))
@@ -661,7 +666,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         hooks = ba.arguments['hooks']
         if hooks.prologue is None:
             return 0
-        tiles = sum(len(axes) > 1 for axes in hooks.prologue_axes)
+        tiles = sum(len(held(axes)) > 1 for axes in hooks.prologue_axes)
         share = config.block_m * config.block_k // config.warpgroups
         stored = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
         return -(-share * ((1 + tiles) * 4 + stored) // (4 * resources.THREADS))
@@ -691,10 +696,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # excess over the mainloop's held set.
         vectors = sum(family.column_registers(config.block_n, side.dtype)
                       for side, axes in zip(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes,
-                                            strict=True) if axes == ('columns',))
+                                            strict=True) if held(axes) == ('columns',))
         vectors += family.column_registers(config.block_n, jnp.float32) if hooks.accumulators > 1 else 0
         accumulator = -(-config.block_m * config.block_n // config.warpgroups // resources.THREADS)
-        tiles = sum(len(axes) > 1 for axes in hooks.epilogue_axes) * accumulator
+        tiles = sum(len(held(axes)) > 1 for axes in hooks.epilogue_axes) * accumulator
         held = sum(-(-accumulator * jnp.dtype(dtype).itemsize // 4)
                    for dtype in (hooks.out_dtypes or ())[:-1])
         stage = max(staging, resources.CONTROL_REGISTERS) + vectors
@@ -827,7 +832,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         axes = {axis for name, axes_of in (('prologue_operands', hooks.prologue_axes),
                                            ('epilogue_operands', hooks.epilogue_axes))
                 for _, side_axes in zip(ba.arguments.get(name, ()), axes_of, strict=True)
-                if len(side_axes) == 1 for axis in side_axes}
+                if len(held(side_axes)) == 1 for axis in held(side_axes)}
         # A vector the family reads from global memory instead (`copies_vectors`) loads in a role's row
         # tiles: its block along its axis whole roles (ns-regs: a 32-element depth vector on sm86 failed
         # to cast to the 64-row layout).
@@ -1226,8 +1231,8 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
         for name, axes_of in (('prologue_operands', hooks.prologue_axes),
                               ('epilogue_operands', hooks.epilogue_axes)):
             for side, axes in zip(ba.arguments.get(name, ()), axes_of, strict=True):
-                if len(axes) == 1:
-                    axis = index[axes[0]]
+                if len(held(axes)) == 1:
+                    axis = index[held(axes)[0]]
                     least[axis] = max(least[axis], 128 * 4 // jnp.dtype(side.dtype).itemsize)
         return least
 
@@ -1278,10 +1283,14 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
         for name, axes_of in (('prologue_operands', hooks.prologue_axes),
                               ('epilogue_operands', hooks.epilogue_axes)):
             for side, axes in zip(ba.arguments.get(name, ()), axes_of, strict=True):
-                if len(axes) != 1:
+                if len(held(axes)) != 1:
                     continue
-                block = extents[axes[0]]
-                whole = -(-side.shape[0] // block) * block if axes[0] == 'rows' else side.shape[0]
+                axis, = held(axes)
+                extent = side.shape[axes.index(axis)]
+                block = extents[axis]
+                # A side operand by group lays out as its groups' vectors end to end (`mosaic_tpu._laid`).
+                whole = (-(-extent // block) * block if axis == 'rows'
+                         else math.prod(side.shape) if GROUPS in axes else extent)
                 if block != whole and block < 128 * 4 // jnp.dtype(side.dtype).itemsize:
                     return False
         return True

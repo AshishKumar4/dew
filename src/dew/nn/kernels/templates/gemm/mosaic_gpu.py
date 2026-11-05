@@ -381,7 +381,7 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
     blocks = {'rows': ((block_m, block_k), dtype), 'matrix': (rhs_block, rhs_dtype),
               **({'paired': (rhs_block, rhs_dtype)} if paired else {}),
               **{f'side_{i}': (axes.named(prologue_axes[i], extent), prologue_dtypes[i]) for i in stepped}}
-    sides = mosaic.staging('side', [(axes.named(side_axes, {'rows': part[0], 'columns': part[1]}),
+    sides = mosaic.staging('side', [(axes.named(axes.held(side_axes), {'rows': part[0], 'columns': part[1]}),
                                      _typed(side))
                                     for side_axes, side in zip(epilogue_axes, epilogue_dtypes, strict=True)])
     held = mosaic.staging('fixed', [(axes.named(prologue_axes[i], extent), _typed(prologue_dtypes[i]))
@@ -590,6 +590,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                     _finished, family=family, wg=wg, epilogue=epilogue, o_gmems=o_gmems, store=store,
                     sides=tuple(zip(side_gmems, epilogue_axes, side_smems, side_barriers, strict=True)),
                     origins={'rows': pl.ds(part_row, part[0]), 'columns': pl.ds(column, part[1])},
+                    group=jnp.minimum(group.group_id, g - 1),
                     place=(part_row, first, stored, column, min(part[0], m), TMA_ROWS if dense else 1))
                 if tail is None or workspace is None:
                     finished(*accs)
@@ -637,13 +638,18 @@ def _stored_rows(group, part_row, rows: int, m: int, *, dense: bool, row_tile: i
 
 
 def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store, sides: tuple, origins: dict,
-              place: tuple) -> None:
+              group, place: tuple) -> None:
     """Dew: a consumer's share of a `gmm` tile, its accumulators whole (`accs`): its epilogue on its side
-    tiles (`sides`, each its global ref, axes, staging and barrier), loaded at `origins`, then each output
-    stored at `place` (`mosaic.Family.persist`'s `store`)."""
-    family.loaded([(gmem.at[axes.named(side_axes, origins)], smem.at[wg], barrier.at[wg])
+    tiles (`sides`, each its global ref, axes, staging and barrier), loaded at `origins`, a side operand by
+    group at the tile's `group` (the unrouted rows' the last's, as XLA's program reads them) and handed
+    the epilogue at each of the share's rows, then each output stored at `place` (`mosaic.Family.persist`'s
+    `store`)."""
+    family.loaded([(gmem.at[axes.named(side_axes, origins | axes.at_group(side_axes, gmem.shape, group))],
+                    smem.at[wg], barrier.at[wg])
                    for gmem, side_axes, smem, barrier in sides])
-    values = accs if epilogue is None else epilogue(*accs, *(smem[wg] for _, _, smem, _ in sides))
+    rows = origins['rows'].size
+    values = accs if epilogue is None else epilogue(*accs, *(axes.by_rows(smem[wg], side_axes, rows)
+                                                           for _, side_axes, smem, _ in sides))
     values = values if isinstance(values, tuple) else (values,)
     for output, (o_gmem, value) in enumerate(zip(o_gmems, values, strict=True)):
         store(output, value, o_gmem, place)
