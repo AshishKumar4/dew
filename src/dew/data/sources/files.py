@@ -218,8 +218,8 @@ class _Footers:
                 self._held[number] = held
                 return held
         listed = source._listed_files[number]
-        opened = source._parquet.make_fragment(listed.path, source._arrow_files[0],
-                                               partition_expression=listed.partition_expression)
+        opened = listed.format.make_fragment(listed.path, listed.filesystem,
+                                             partition_expression=listed.partition_expression)
         opened.ensure_complete_metadata()
         with self._lock:
             self._held[number] = opened
@@ -856,10 +856,6 @@ class Files(Dataset):
             return tuple(self.arrow.get_fragments())
 
     @cached_property
-    def _parquet(self) -> ds.ParquetFileFormat:
-        return ds.ParquetFileFormat()
-
-    @cached_property
     def _footers(self) -> _Footers:
         return _Footers()
 
@@ -874,10 +870,8 @@ class Files(Dataset):
             rows = [fragment.count_rows() for fragment in listed]
             return _Pieces(np.arange(len(listed), dtype=np.int32), np.zeros(len(listed), np.int32),
                            np.asarray(rows, np.int64))
-        filesystem = self._arrow_files[0]
-
         def counted(fragment: ds.FileFragment) -> np.ndarray:
-            with filesystem.open_input_file(fragment.path) as opened:
+            with fragment.filesystem.open_input_file(fragment.path) as opened:
                 footer = pq.read_metadata(opened)
             return np.asarray([footer.row_group(group).num_rows for group in range(footer.num_row_groups)],
                               np.int64)

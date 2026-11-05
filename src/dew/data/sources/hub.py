@@ -315,16 +315,20 @@ class Hub(Dataset):
             paths = split_files(listed, self.split, configs[self._configuration(configs)], roots)
         else:
             paths = split_files(listed, self.split) if self.name in (None, "default") else []
-        # Not Arrow: the `.arrow` files a dataset repo holds are what `save_to_disk` and
-        # `push_to_hub` write, Arrow's stream format, which no reader can cut into shards or count
-        # without reading it whole; such a split streams its Parquet conversion, or is prepared. JSON
-        # files are read as `datasets` reads them, compressed or not (row 2402).
-        formats: tuple[Format, ...] = ("parquet", "jsonl", "json")
-        for format in formats:
-            matches = [path for path in paths if inferred_format(path) == format]
-            if matches:
-                return matches, format
-        return [], "parquet"
+        # The module `datasets` reads the split by, from its files' most common extension: its Parquet or
+        # JSON files are read natively, compressed or not (row 2402). Not Arrow: the `.arrow` files a
+        # dataset repo holds are what `save_to_disk` and `push_to_hub` write, Arrow's stream format, which no
+        # reader can cut into shards or count without reading it whole; such a split streams its Parquet
+        # conversion, or is prepared.
+        from datasets.load import infer_module_for_data_files_list
+
+        module, _ = infer_module_for_data_files_list(paths)
+        kinds: Mapping[str, tuple[Format, ...]] = {"parquet": ("parquet",), "json": ("jsonl", "json")}
+        matches = [path for path in paths if inferred_format(path) in kinds.get(module or "", ())]
+        if not matches:
+            return [], "parquet"
+        return matches, ("jsonl" if all(inferred_format(path) == "jsonl" for path in matches)
+                         else "json" if module == "json" else "parquet")
 
     def label(self) -> str:
         return self.repo.rsplit("/", 1)[-1]
