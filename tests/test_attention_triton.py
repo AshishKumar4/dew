@@ -901,10 +901,11 @@ def test_an_fp32_training_step_at_its_own_configs_compiles_within_an_a100s_block
 
 
 def test_a_training_forward_derives_the_largest_tile_its_threads_hold():
-    """The forward's derivation on an A100 at 128-wide heads: a plain walk takes the measured 128 by 64; a
-    training walk, whose anchor value row holds 128 more registers a thread, steps down to 64 by 64 (160
-    a thread), where the fixed space it replaced fell to its next fitting entry, 32 by 32, at two to three
-    times the time."""
+    """The forward's derivation on an A100 at 128-wide heads: a plain walk takes the measured 128 by 64, as
+    does a training walk that keeps its output for D (`Kept.OUTPUT`); a training walk of split sums
+    (`residuals=True`, `Kept.SPLIT`), whose anchor value row holds 128 more registers a thread, steps down to
+    64 by 64 (160 a thread), where the fixed space it replaced fell to its next fitting entry, 32 by 32, at
+    two to three times the time."""
     import tokamax
 
     from dew.nn.kernels import generation
@@ -914,4 +915,7 @@ def test_a_training_forward_derives_the_largest_tile_its_threads_hold():
     op, target = attention_triton.TritonForward(), generation.TARGETS["sm80"]
     plain = op.derived(tokamax.BoundArguments(op, arrays), target)
     training = op.derived(tokamax.BoundArguments(op, {**arrays, "residuals": True}), target)
-    assert (plain, training) == (attention_triton.Tiles(128, 64, 4, 2), attention_triton.Tiles(64, 64, 4, 2))
+    output = op.derived(tokamax.BoundArguments(op, {**arrays, "residuals": template.Kept.OUTPUT}), target)
+    assert (plain, output, training) == (attention_triton.Tiles(128, 64, 4, 2),
+                                         attention_triton.Tiles(128, 64, 4, 2),
+                                         attention_triton.Tiles(64, 64, 4, 2))
