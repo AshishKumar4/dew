@@ -705,8 +705,8 @@ class _Numbering:
                 if len(shapes) != 1:
                     return None
                 count, lead = shapes.pop()
-                rows = zip(*(number if isinstance(number, tuple) else (number,) * count for number, _ in outs),
-                           strict=True)
+                each = [number if isinstance(number, tuple) else (number,) * count for number, _ in outs]
+                rows = zip(*each, strict=True)
                 chosen.append((tuple(self.number(("branch", index, row)) for row in rows), lead))
         return chosen
 
