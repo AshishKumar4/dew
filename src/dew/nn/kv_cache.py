@@ -35,7 +35,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Literal
 
 import jax
@@ -848,7 +848,14 @@ def gpu_paged(softcap: float | None):
     turn down included, and forward mode takes the forward-mode path's tangent (`_gathered_tangent`),
     with no context of the caller's. An inactive row reads one slot, so its unused output stays
     finite."""
-    return generation.linear_tangent(functools.partial(_paged_forward, softcap=softcap),
+    return _paged(_paged_forward, softcap)
+
+
+def _paged(forward: Callable, softcap: float | None) -> Callable:
+    """A decode `forward` over the pages under `softcap`, its derivatives at every order the gathered
+    attention's (`generation.linear_tangent`: reverse mode `_paged_backward`, forward mode
+    `_gathered_tangent`), a kernel's glue."""
+    return generation.linear_tangent(functools.partial(forward, softcap=softcap),
                                      functools.partial(_paged_backward, softcap=softcap),
                                      functools.partial(_gathered_tangent, softcap=softcap), kind=KernelGlue())
 
@@ -876,9 +883,7 @@ def template_paged(softcap: float | None):
     """The attention template's decode over the pages (`_template_forward`) under the layer's `softcap`,
     over `(query, key, value, table, lengths, starts, sinks)` as `gpu_paged` takes them, its derivatives at
     every order the gathered attention's (`generation.linear_tangent`), as `gpu_paged`'s."""
-    return generation.linear_tangent(functools.partial(_template_forward, softcap=softcap),
-                                     functools.partial(_paged_backward, softcap=softcap),
-                                     functools.partial(_gathered_tangent, softcap=softcap), kind=KernelGlue())
+    return _paged(_template_forward, softcap)
 
 
 def _pages_per_block(pages: int) -> int:

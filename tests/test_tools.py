@@ -1952,51 +1952,54 @@ def test_a_mosaic_gpu_kernel_outside_the_launch_point_is_reported(tmp_path):
     assert _linted(tmp_path / "suite", {"tests/test_bundle.py": bundle, "tools/bundle.py": bundle}) == []
 
 
-def test_an_outer_program_built_outside_the_compile_point_is_reported(tmp_path):
-    """SLOP025: a program built as an `OuterProgram` of its own, by a call, a `functools.partial` over it, a
-    decorator or an alias of its name, takes no compiler option, so it is reported in any package of
-    `src/<package>` but the compile point's own module; its name in an annotation, or a program built
-    by `program` or `owned_program`, is not, nor an `OuterProgram` in the tests or the tools."""
-    rollout = ("import functools\n"
-               "from sparx.nn.kernels.options import OuterProgram, OuterProgram as Compiled, owned_program\n"
-               "@OuterProgram\n"
-               "def decorated(x): return x\n"
-               "called = OuterProgram(decorated)\n"
-               "@functools.partial(OuterProgram, static_argnums=0)\n"
-               "def partial(x): return x\n"
-               "aliased = Compiled(decorated, donate_argnums=0)\n"
-               "owned = owned_program(decorated)\n"
-               "def accepts(program: OuterProgram) -> tuple[OuterProgram, ...]:\n"
-               "    return (program,)\n")
-    for package in ("rl", "objectives", "training"):
-        assert_reported(tmp_path / package, f"src/sparx/{package}/rollout.py", rollout, "SLOP025",
-                        (3, 5, 6, 8))
-    point = "from sparx.nn.kernels.options import OuterProgram\nfine = OuterProgram(None)\n"
-    assert _linted(tmp_path / "point", {"src/sparx/nn/kernels/options.py": point}) == []
-    assert _linted(tmp_path / "suite", {"tests/test_rollout.py": rollout, "tools/rollout.py": rollout}) == []
+ROLLOUT = ("import functools\n"
+           "from sparx.nn.kernels.options import OuterProgram, OuterProgram as Compiled, owned_program\n"
+           "@OuterProgram\n"
+           "def decorated(x): return x\n"
+           "called = OuterProgram(decorated)\n"
+           "@functools.partial(OuterProgram, static_argnums=0)\n"
+           "def partial(x): return x\n"
+           "aliased = Compiled(decorated, donate_argnums=0)\n"
+           "owned = owned_program(decorated)\n"
+           "def accepts(program: OuterProgram) -> tuple[OuterProgram, ...]:\n"
+           "    return (program,)\n")
+"""SLOP025's site: an `OuterProgram` built by a call, a `functools.partial` over it, a decorator and an
+alias of its name (lines 3, 5, 6, 8); its name in an annotation and a program built by `owned_program`,
+which it is not."""
+
+DERIVATIVE_SITE = ("import functools\n"
+                   "import jax\n"
+                   "from jax import custom_jvp\n"
+                   "from jax.custom_derivatives import custom_vjp\n"
+                   "from sparx.nn import derivatives\n"
+                   "@jax.custom_vjp\n"
+                   "def clipped(x): return x\n"
+                   "partial = functools.partial(jax.custom_jvp, nondiff_argnums=(1,))\n"
+                   "@custom_jvp\n"
+                   "def smoothed(x): return x\n"
+                   "rounded = custom_vjp(clipped)\n"
+                   "declared = derivatives.declared_derivative("
+                   "derivatives.Algebra(), clipped, clipped, clipped)\n")
+"""SLOP026's site: `jax.custom_vjp` and `jax.custom_jvp` as a decorator, within functools.partial, imported by
+their own names and by their module's path (lines 6, 8, 9, 11); a derivative declared through the
+derivatives module's functions, which it is not."""
 
 
-def test_a_custom_derivative_applied_outside_the_derivatives_module_is_reported(tmp_path):
-    """SLOP026: in any package of `src/<package>`, `jax.custom_vjp` and `jax.custom_jvp` as a decorator,
-    within functools.partial, imported by their own names or by their module's path are reported; a
-    derivative declared through the derivatives module's functions is not, nor either in that module, the
-    tests or the tools."""
-    site = ("import functools\n"
-            "import jax\n"
-            "from jax import custom_jvp\n"
-            "from jax.custom_derivatives import custom_vjp\n"
-            "from sparx.nn import derivatives\n"
-            "@jax.custom_vjp\n"
-            "def clipped(x): return x\n"
-            "partial = functools.partial(jax.custom_jvp, nondiff_argnums=(1,))\n"
-            "@custom_jvp\n"
-            "def smoothed(x): return x\n"
-            "rounded = custom_vjp(clipped)\n"
-            "declared = derivatives.declared_derivative(derivatives.Algebra(), clipped, clipped, clipped)\n")
-    for package in ("nn", "precision", "sampling"):
-        assert_reported(tmp_path / package, f"src/sparx/{package}/site.py", site, "SLOP026", (6, 8, 9, 11))
-    owner = "import jax\n@jax.custom_vjp\ndef rule(x): return x\n"
-    assert _linted(tmp_path / "owner", {"src/sparx/nn/derivatives.py": owner}) == []
+@pytest.mark.parametrize(("code", "site", "packages", "lines", "owner"), [
+    ("SLOP025", ROLLOUT, ("rl", "objectives", "training"), (3, 5, 6, 8),
+     ("src/sparx/nn/kernels/options.py",
+      "from sparx.nn.kernels.options import OuterProgram\nfine = OuterProgram(None)\n")),
+    ("SLOP026", DERIVATIVE_SITE, ("nn", "precision", "sampling"), (6, 8, 9, 11),
+     ("src/sparx/nn/derivatives.py", "import jax\n@jax.custom_vjp\ndef rule(x): return x\n")),
+], ids=["outer program", "custom derivative"])
+def test_a_construct_built_outside_its_owner_module_is_reported(tmp_path, code, site, packages, lines, owner):
+    """SLOP025 and SLOP026: a construct one module of `src/<package>` owns (the compile point's
+    `OuterProgram`, JAX's custom derivatives) is reported wherever its site builds it in any package but
+    that module, and not in the owner, the tests or the tools."""
+    for package in packages:
+        assert_reported(tmp_path / package, f"src/sparx/{package}/site.py", site, code, lines)
+    path, text = owner
+    assert _linted(tmp_path / "owner", {path: text}) == []
     assert _linted(tmp_path / "suite", {"tests/test_site.py": site, "tools/site.py": site}) == []
 
 

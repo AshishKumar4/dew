@@ -78,9 +78,7 @@ CONTRACTED = {
         ("test_a_fused_attention_kernel_holds_its_reverse_orders", KERNEL),
     "src/dew/nn/kernels/templates/attention_route.py::_attend":
         ("test_a_fused_attention_kernel_holds_its_reverse_orders", KERNEL),
-    "src/dew/nn/kv_cache.py::gpu_paged.linear_tangent":
-        ("test_the_paged_decode_kernel_holds_every_order", KERNEL),
-    "src/dew/nn/kv_cache.py::template_paged.linear_tangent":
+    "src/dew/nn/kv_cache.py::_paged.linear_tangent":
         ("test_the_paged_decode_kernel_holds_every_order", KERNEL),
     "src/dew/nn/kernels/fla_gdn.py::chunk_gated_delta_rule":
         ("test_the_delta_rule_ports_hold_their_orders", KERNEL),
