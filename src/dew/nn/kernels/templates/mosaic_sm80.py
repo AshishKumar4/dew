@@ -19,6 +19,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn.kernels import launches
 from dew.nn.kernels.templates import mosaic, report, resources
 
 
@@ -356,12 +357,12 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         # parameters reserve the scratch an implicit reduction takes (`reduction_scratch`).
         del reducing_warpgroups
         _one(consumers, clustered=cluster > 1)
-        built = plgpu.kernel(mosaic.dependent(entry, interpret), out_type=out_type, grid=grid,
-                             grid_names=grid_names,
-                             compiler_params=plgpu.CompilerParams(approx_math=approx_math,
-                                                                  min_blocks_per_sm=resident),
-                             interpret=mosaic.interpreted(interpret),
-                             kernel_name=report.named(name), cost_estimate=cost)
+        built = launches.kernel(mosaic.dependent(entry, interpret), name=name or self.name,
+                                out_type=out_type, grid=grid, grid_names=grid_names,
+                                compiler_params=plgpu.CompilerParams(approx_math=approx_math,
+                                                                     min_blocks_per_sm=resident),
+                                interpret=mosaic.interpreted(interpret),
+                                kernel_name=report.named(name), cost_estimate=cost)
         return mosaic.checked(built, name or self.name, resident, model_flops)
 
     def scoped(self, body, *allocations, streams):
