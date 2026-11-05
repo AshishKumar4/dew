@@ -119,7 +119,8 @@ def traced(fn, *args):
 
 SEEDS = {(2, 3, 31): 32, (3, 257, 17): 32, (2, 3, 1000): 32, (4099, 256): 8, (24576, 17): 8,
          "unweighted": 32,
-         "unweighted, one value": 512, (5, 1000): 32, (2, 3, 4, 31): 64, (2, 64, 16, 128): 8,
+         "unweighted, one value": 512,
+         "step of distinct rows": 8, (5, 1000): 32, (2, 3, 4, 31): 64, (2, 64, 16, 128): 8,
          (2, 1, 16, 128): 32, (7, 1000): 32, (3, 4096): 32, (5, 37): 32, (24576, 1000): 8, (2, 31): 32,
          "composed": 32, "gates": 8}
 """Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
@@ -138,10 +139,11 @@ def assert_drawn_as_exact(fused, xla, exact, draw, leaves, label, seeds):
                     draw, label, seeds=seeds, truth_fn=truth)
 
 
-def compare(functions, draw, labels, seeds, *, coefficient=None):
-    """Every output's dtype and accumulation on `draw`'s first operands (`gated`); their accuracy held by
-    check 1 over `draw`'s `seeds` (`assert_drawn_as_exact`). `coefficient` of the first operands, where
-    the weight gradient's accumulation is held."""
+def compare(functions, draw, labels, seeds, *, coefficient=None, judged=None):
+    """Every output's dtype and accumulation on `draw`'s first operands (`gated`); the accuracy of the
+    `judged` labels (every one by default) held by check 1 over `draw`'s `seeds`
+    (`assert_drawn_as_exact`). `coefficient` of the first operands, where the weight gradient's
+    accumulation is held."""
     xla, pallas, exact = functions
     operands, seed = draw(0)
     reference = jax.jit(functools.partial(evaluated, xla))(operands, seed)
@@ -149,9 +151,10 @@ def compare(functions, draw, labels, seeds, *, coefficient=None):
     gated(labels, actual, reference, seed, coefficient and coefficient(operands))
 
     def leaves(result):
-        return {label: value for label, value in zip(labels, result, strict=True) if value is not None}
+        return {label: value for label, value in zip(labels, result, strict=True)
+                if value is not None and label in (judged or labels)}
 
-    assert_drawn_as_exact(pallas, xla, exact, draw, leaves, " ".join(labels), seeds)
+    assert_drawn_as_exact(pallas, xla, exact, draw, leaves, " ".join(judged or labels), seeds)
 
 
 def gated(labels, actual, reference, seed, coefficient):
@@ -250,11 +253,18 @@ def test_rms_ragged_widths_and_many_rows(dtype, shape):
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype):
     """Repeated tokens hold the row arithmetic fixed while the column sum grows to Qwen3.5-0.8B's size,
-    isolating partial-sum error from bf16 midpoint flips: the output and both gradients hold check 1 over
-    the step's draws."""
-    compare(norm_functions(dtype, offset=True, after_cast=True), lambda draw: full_step(dtype, draw),
-            ("y", "x", "scale"), SEEDS[(24576, 1000)],
-            coefficient=lambda operands: scale_coefficient(operands[0], dtype, after_cast=True))
+    isolating partial-sum error from bf16 midpoint flips: the weight gradient holds check 1 over the
+    step's draws. Repeated rows give the output and input gradient one row's evidence a draw, so the same
+    launch holds all three over a step of distinct rows too."""
+    functions = norm_functions(dtype, offset=True, after_cast=True)
+
+    def coefficient(operands):
+        return scale_coefficient(operands[0], dtype, after_cast=True)
+
+    compare(functions, lambda draw: full_step(dtype, draw), ("y", "x", "scale"), SEEDS[(24576, 1000)],
+            coefficient=coefficient, judged=("scale",))
+    compare(functions, functools.partial(norm_operands, (24576, 1000), dtype, jnp.float32),
+            ("y", "x", "scale"), SEEDS["step of distinct rows"], coefficient=coefficient)
 
 
 def test_a_weight_gradient_past_fp32s_range_is_an_infinity_as_xlas():

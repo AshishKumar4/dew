@@ -48,7 +48,8 @@ def assert_view(view, model, variables, reference, label):
     reference's shape, the truth the plain loop's own float64 forward (`float64_forward`)."""
     assert_as_exact(view, lambda ids: model.apply(variables, ids),
                     token_draw(0xF4, int(reference["ids"].max()) + 1, reference["ids"].shape), label,
-                    seeds=VIEW_SEEDS, truth_fn=lambda ids: float64_forward(model, variables, ids)[0])
+                    seeds=VIEW_SEEDS,
+                    truth_fn=as_given(lambda ids: np.asarray(float64_forward(model, variables, ids)[0])))
 
 
 def test_without_its_scales_the_model_fails_the_rule_every_view_is_held_to(case):
