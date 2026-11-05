@@ -269,6 +269,28 @@ def test_a_loops_zero_carry_is_made_where_the_loop_needs_it():
         equation.primitive for equation in program.eqns]
 
 
+def test_a_tied_weights_cast_twice_and_held_by_a_barrier_holds_one_cast():
+    """A tied head's weights cast for the embedding, held through an optimization barrier, and cast again
+    for the head are one cast, as XLA computes equal casts once (`HloCSE`), held in one buffer the barrier
+    and the head share: one bf16 copy of the weights where the derivation held two (Qwen3.5-4B's fused
+    tiled head, 1.18 GiB, row 4089)."""
+    weights = jax.ShapeDtypeStruct((4096, 1024), jnp.float32)
+    rows = jax.ShapeDtypeStruct((64, 1024), jnp.bfloat16)
+
+    def tied(weights, rows):
+        embedded = jax.lax.optimization_barrier(weights.astype(jnp.bfloat16))
+        head = weights.astype(jnp.bfloat16)
+        return jnp.sum((rows @ embedded.T).astype(jnp.float32) * (rows @ head.T).astype(jnp.float32)), ()
+
+    def once(weights, rows):
+        cast = jax.lax.optimization_barrier(weights.astype(jnp.bfloat16))
+        return jnp.sum((rows @ cast.T).astype(jnp.float32) * (rows @ cast.T).astype(jnp.float32)), ()
+
+    peaks = [gradient_peak(function, weights, (rows,), platform="gpu", workspace=Workspace(0, 0)).bytes
+             for function in (tied, once)]
+    assert peaks[0] == peaks[1], peaks
+
+
 def test_a_transposed_input_returned_flat_is_a_copy():
     """A transpose of an input whose layout is fixed reorders its elements into a buffer of their own,
     which a flattening of it returned holds, where a transpose of a value the program computes is laid
