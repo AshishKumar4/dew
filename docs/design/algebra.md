@@ -1026,7 +1026,15 @@ Agreed with the GEMM template's owner (2026-11-03):
   loads: a 32-bit word holds 8 E2M1 codes.
 - Block scales (NVFP4's 1×16, MX's 1×32) are a separate transform of a fixed layout, which feeds the
   template's promotion and epilogue: a form may re-encode the codes, never the scales.
-- The consumer checks in each form it takes: its instructions, its encoder and the encoder's version (in the
+- Each decode a template takes is declared and checked in once, in `dew.algebra.bits`, the one source the
+  engine's and the consumer's tests prove: `NVFP4_BFLOAT16`, eight E2M1 codes of a word in their natural
+  order (code `i` at bits `4i`, a byte's low nibble the earlier element) into four bfloat16 pairs, each the
+  code's value times 2^-126, and its form `NVFP4_BFLOAT16_FORM`, the search's at shifts of up to 6 places.
+  The codec packs codes naturally; the consumer's prepare step stores them in the form's layout once
+  (`BitForm.prepared`, in `jax.numpy`), and its portable path reads a word tile `[r, c]` back as `[r, 8c]`
+  elements in depth order (`BitForm.values`). An E2M1 subnormal (±0.5) decodes to a bfloat16 subnormal, so
+  the portable path scales it in integer exponent arithmetic, never through a lane that flushes subnormals.
+- The consumer records the form it takes: its encoder and the encoder's version (in the
   checkpoint), the decoder's live registers per thread (which `resources.py` prices before a tile is admitted)
   and its issues by pipe (`BitForm.issues`). `Work` holds no integer pipe yet: the consumer's head adds the
   ALU's and the FMA pipe's integer issues to it, each 64 results a clock per multiprocessor (§7.2), so
