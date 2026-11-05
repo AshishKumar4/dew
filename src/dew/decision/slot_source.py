@@ -12,11 +12,12 @@ import numpy as np
 from flax import linen as nn
 
 from dew import _records
+from dew._coordination import read_home, writes_weights
 from dew.batch import Variables
 from dew.data.text import HFTokenizer
 from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
 from dew.interop.pretrained import Pretrained, with_overrides
-from dew.interop.safetensors_io import MAX_SHARD_SIZE
+from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors
 from dew.nn.attention import AttentionImpl
 from dew.registry import dtype_name, from_record, import_path
 
@@ -166,23 +167,28 @@ class SlotSource(SourceKind):
 
             tensors = {name: torch.frombuffer(host, dtype=getattr(torch, str(host.dtype))).reshape(host.shape)
                        for name, host in SlotSource.readout(bundle).items()}
-            torch.save(tensors, root / "readout_head.pt")
+            # Read on every process of a pool, written by the one that publishes (`writes_weights`).
+            if writes_weights():
+                torch.save(tensors, root / "readout_head.pt")
         (root / "readout.json").write_text(json.dumps(readout, indent=2) + "\n")
 
     @staticmethod
-    def readout(bundle: PretrainedDecision) -> dict[str, np.ndarray]:
+    def readout(bundle: PretrainedDecision) -> Mapping[str, np.ndarray]:
         """The slot-and-pointer head's tensors under the release's names (`readout_head.pt`), host
-        arrays in C order; none for the tied label readout, which reads the backbone's own head."""
+        arrays in C order, each read home (`read_home`: the pool's processes together where it spans
+        them, inside the writer's `reading_home`); none for the tied label readout, which reads the
+        backbone's own head."""
         if _records.text(_records.record(bundle.head.record(), "head")["class"], "head.class") != import_path(
                 SlotReadout):
             return {}
         params = bundle.head_variables["params"]
-        return {name: np.array(jax.device_get(params[path[0]]), copy=True, order="C")
-                for name, path in _PATHS.items()}
+        return LazyTensors({name: jax.ShapeDtypeStruct(params[path[0]].shape, params[path[0]].dtype)
+                            for name, path in _PATHS.items()},
+                           lambda name: np.array(read_home(params[_PATHS[name][0]]), copy=True, order="C"))
 
     @staticmethod
     def export(bundle: PretrainedDecision, variables: Mapping[str, object] | None = None
-               ) -> dict[str, np.ndarray]:
+               ) -> Mapping[str, np.ndarray]:
         """Every tensor of the slot release `save` writes: the backbone's under their checkpoint names
         and the slot-and-pointer head's under the release's (`readout_head.pt`), with `variables` in
         place of the backbone's."""
