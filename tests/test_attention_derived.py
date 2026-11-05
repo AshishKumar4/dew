@@ -322,11 +322,11 @@ def test_the_derived_backward_is_on_par_in_every_cell(form, walked):
 
 
 @contextlib.contextmanager
-def fast(derived: bool):
-    """Within the block, the run's fast forms (the base-2 fold the declaration states; the accurate forms it
-    states none of), the template's walks the hand-written forms or the derived ones
+def fast(derived: bool, forms: str = "fast"):
+    """Within the block, the run's `forms` (the fast ones' base-2 fold, or the accurate ones' natural logits,
+    each the declaration states), the template's walks the hand-written forms or the derived ones
     (`dew.algebra.forms.derived`)."""
-    with (generation.run_precision(dataclasses.replace(generation.numerics(), forms="fast")),
+    with (generation.run_precision(dataclasses.replace(generation.numerics(), forms=forms)),
           algebra_forms.derived(derived)):
         yield
 
@@ -337,14 +337,16 @@ forward's step, merge and finish whatever walk the training step takes), and a d
 
 
 @pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
+@pytest.mark.parametrize("numerics", ["fast", "accurate"])
 @pytest.mark.parametrize("call", list(CALLS))
 @pytest.mark.parametrize("form", ["full", "causal"])
-def test_the_portable_mainloop_computes_attention_by_either_forms(form, call, derived):
+def test_the_portable_mainloop_computes_attention_by_either_forms(form, call, numerics, derived):
     """The plain-JAX mainloop's forward (`attention_portable.attend`) over fp16 operands (a plain walk, of no
-    compensation or guard, which the derived forms serve) under the run's fast forms, its walk's step, merge
-    and finish the hand-written forms or the derived ones behind the switch, the product of its weights with
-    the values its own (`Keys.dot`): on par with the reference (check 1) either way, a plain call's, a
-    training call's (with its residuals) and a dropping call's."""
+    compensation or guard, which the derived forms serve) under the run's fast forms or its accurate ones
+    (natural logits, the largest weight held to 1 and the rescale compensated, which the declaration states),
+    its walk's step, merge and finish the hand-written forms or the derived ones behind the switch, the
+    product of its weights with the values its own (`Keys.dot`): on par with the reference (check 1) either
+    way, a plain call's, a training call's (with its residuals) and a dropping call's."""
     spans = template.spans(LENGTH, LENGTH, 1, **SPANS[form])
     rate = CALLS[call].get("drop")
     residuals = CALLS[call].get("residuals", False)
@@ -354,9 +356,10 @@ def test_the_portable_mainloop_computes_attention_by_either_forms(form, call, de
             words, jnp.arange(1, dtype=jnp.int32), jnp.arange(1, dtype=jnp.int32), rate))
 
     def ours(q, k, v, words):
-        with fast(derived):
+        with fast(derived, numerics):
             out = attention_portable.attend(q[None, :, None], k[None, :, None], v[None, :, None], spans,
-                                            hooks(words), residuals=residuals, **TILES)
+                                            hooks(words), residuals=residuals, natural=numerics == "accurate",
+                                            **TILES)
         return (out[0] if residuals else out)[0, :, 0]
 
     def reference(q, k, v, words):
@@ -369,7 +372,7 @@ def test_the_portable_mainloop_computes_attention_by_either_forms(form, call, de
                 jax.random.bits(jax.random.key(seed), (2,), jnp.uint32))
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), operands,
-                    f"portable forward {form} {call} derived {derived}", seeds=16)
+                    f"portable forward {form} {call} {numerics} derived {derived}", seeds=16)
 
 
 @pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
