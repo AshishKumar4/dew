@@ -74,6 +74,19 @@ def test_entries_both_sides_add_at_the_head_of_unreleased_are_both_kept(tmp_path
         "## Unreleased\n\n", "## Unreleased\n\n- Main's new entry.\n- A head's new entry.\n")
 
 
+def test_an_entry_both_sides_carry_merges_once(tmp_path):
+    """Train 451's merge: main took a train's entries, and a head carries the same entries as a commit of its
+    own beside its new one; the two sides' insertions meet at the head of `## Unreleased`, and the entries
+    both hold merge once, the head's new entry beside them (row 3431)."""
+    carried = "- A train's entry.\n- Its second entry.\n"
+    ours = BASE.replace("## Unreleased\n\n", f"## Unreleased\n\n{carried}")
+    theirs = BASE.replace("## Unreleased\n\n", f"## Unreleased\n\n- A head's new entry.\n{carried}")
+    merge, root = merged(tmp_path, ours, theirs)
+    assert merge.returncode == 0, merge.stdout + merge.stderr
+    assert (root / "CHANGELOG.md").read_text() == BASE.replace(
+        "## Unreleased\n\n", f"## Unreleased\n\n{carried}- A head's new entry.\n")
+
+
 def test_a_deletion_apart_from_the_other_sides_new_entry_merges_with_it(tmp_path):
     ours = BASE.replace("## Unreleased\n\n", "## Unreleased\n\n- Main's new entry.\n")
     theirs = BASE.replace(f"{OLD}\n", "")
