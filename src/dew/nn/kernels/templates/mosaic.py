@@ -1530,9 +1530,12 @@ class Transport[Allocated, Opened](abc.ABC):
         if not after_walks:
             return self.program_scoped(body, *allocations, streams=streams)
         if self.walks_scoped:
-            return self.program_scoped(
-                functools.partial(body, after=lambda fn: pl.run_scoped(fn, *after_walks)), *allocations,
-                streams=streams)
+            # The after-walks scope is the program's own kind (`program_scoped`: collective where its
+            # consumers share one).
+            def after(fn):
+                return self.program_scoped(lambda *refs, streams: fn(*refs), *after_walks, streams=streams)
+
+            return self.program_scoped(functools.partial(body, after=after), *allocations, streams=streams)
         held = len(allocations)
 
         def program(*refs, streams):
