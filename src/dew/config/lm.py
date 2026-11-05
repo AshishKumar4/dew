@@ -34,7 +34,7 @@ from dew.registry import ModelConfig, objectives
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
-    from dew.objectives.rl.methods import RolloutSettings
+    from dew.objectives.rl.methods import PromptSettings, RolloutSettings
 
 
 class Tokens(NamedTuple):
@@ -157,19 +157,16 @@ class PromptRollout:
             if not isinstance(score, Real):
                 raise ValueError(f"the reward {self.reward} scored {type(score).__name__}, not a number")
             return float(score)
+        settings: PromptSettings = {"decode": decode, "groups": self.groups,
+                                    "max_new_tokens": self.max_new_tokens, "truncation": self.truncation,
+                                    "sampling": self.sampling, "admit": self.admit,
+                                    "generation_batches": self.generation_batches,
+                                    **self.scheduler_settings()}
         served = self.served
         if served is None:
-            return RolloutScheduler.sampled(objective, reward, decode=decode, groups=self.groups,
-                                            max_new_tokens=self.max_new_tokens, truncation=self.truncation,
-                                            sampling=self.sampling, admit=self.admit,
-                                            generation_batches=self.generation_batches,
-                                            **self.scheduler_settings())
+            return RolloutScheduler.sampled(objective, reward, **settings)
         return RolloutScheduler.served(objective, reward, tasks=tasks, slots=served.slots, ahead=served.ahead,
-                                       max_lag=served.max_lag, sync_every=served.sync_every, decode=decode,
-                                       groups=self.groups, max_new_tokens=self.max_new_tokens,
-                                       truncation=self.truncation, sampling=self.sampling, admit=self.admit,
-                                       generation_batches=self.generation_batches,
-                                       **self.scheduler_settings())
+                                       max_lag=served.max_lag, sync_every=served.sync_every, **settings)
 
 
 @dataclasses.dataclass(frozen=True)
