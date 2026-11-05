@@ -356,7 +356,8 @@ def test_a_decision_release_exports_every_tensor_it_saves(tmp_path, kind):
         assert not hasattr(backbone, "head_variables")
         backbone.save(tmp_path / "backbone")
         alone = written_tensors(tmp_path / "backbone")
-        assert alone.keys() < exported.keys()
+        # The tied label readout reads the backbone's own head and adds no tensor of its own.
+        assert alone.keys() <= exported.keys() and (alone.keys() == exported.keys()) == (kind == "slot_lm")
         for name, tensor in backbone.export().items():
             np.testing.assert_array_equal(alone[name], np.asarray(tensor), err_msg=name, strict=True)
 
