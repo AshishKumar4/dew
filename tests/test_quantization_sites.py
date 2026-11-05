@@ -4,9 +4,10 @@ Each quantized Linear holds its input scale in its own `QUANTIZATION`
 variables, so the views that rename or restack its scope carry the scale
 with its kernel: the scanned stack, the pipeline's stages, the packed query,
 key and value of the serving step, and every entry method of the model. Each
-view's logits are held to the same float64 rule as the plain loop's, against
-the compressed-tensors author's reference (tests/test_codec_checkpoints.py), which
-the model without its input QDQ fails.
+view's logits are held by check 1 to the plain loop's over drawn ids, the truth
+the loaded model's own float64 forward; the plain loop is held to the
+compressed-tensors author's reference in tests/test_codec_checkpoints.py, and the
+model without its input QDQ fails the same check.
 """
 
 import dataclasses
@@ -17,9 +18,8 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from float64_terms import float64_forward
-from interop_support import NVFP4_QDQ_CASES, nvfp4_qdq_case
-from one_draw import assert_as_exact_as_the_reference
-from reference_error import FACTOR, distance
+from interop_support import NVFP4_QDQ_CASES, nvfp4_qdq_case, token_draw
+from reference_error import GateFailure, as_given, assert_as_exact
 
 import dew
 from dew.inference.projections import inference_projections, pending, projection_groups
@@ -33,37 +33,43 @@ from dew.training import Layout, MeshSpec
 
 @pytest.fixture(scope="module", params=NVFP4_QDQ_CASES)
 def case(request):
-    """The checkpoint, loaded, and its reference arrays, with the terms of the logits Dew's own float64
-    forward sums (`float64_forward`), which size each logit the views are held to."""
+    """The checkpoint, loaded, and its reference arrays."""
     directory, reference = nvfp4_qdq_case(request.param)
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
-    _, terms = float64_forward(loaded.model, loaded.variables, reference["ids"].astype(np.int32))
-    return directory, loaded, {**reference, "logits_terms": terms}
+    return directory, Pretrained.load(directory, dtype="float32", attention_impl="reference"), reference
 
 
-def assert_quantized(logits, reference, label):
-    assert_as_exact_as_the_reference(np.asarray(logits), reference["logits"], reference["logits_f64"], label,
-                                     terms=reference["logits_terms"])
+VIEW_SEEDS = 8
+"""Each view's declared check-1 seeds against the plain loop, sized by `seeds_for` paired on armada."""
+
+
+def assert_view(view, model, variables, reference, label):
+    """`view(ids)`, a view of `model`'s logits over `variables`, held by check 1 to its plain loop over drawn
+    ids of the reference's shape, the truth the plain loop's own float64 forward (`float64_forward`)."""
+    plain = jax.jit(model.apply)
+    assert_as_exact(as_given(lambda ids: np.asarray(view(ids), np.float64)),
+                    as_given(lambda ids: np.asarray(plain(variables, ids), np.float64)),
+                    token_draw(0xF4, int(reference["ids"].max()) + 1, reference["ids"].shape), label,
+                    seeds=VIEW_SEEDS,
+                    truth_fn=as_given(lambda ids: np.asarray(float64_forward(model, variables, ids)[0])))
 
 
 def test_without_its_scales_the_model_fails_the_rule_every_view_is_held_to(case):
-    """The rule detects a dropped QDQ: the same weights with no input scale
-    lie far outside it."""
+    """The rule detects a dropped QDQ: the same weights with no input scale fail check 1 against the
+    model with them."""
     _, loaded, reference = case
-    ids = reference["ids"].astype(np.int32)
-    assert_quantized(loaded.model.apply(loaded.variables, ids), reference, "plain loop")
     bare = {name: tree for name, tree in loaded.variables.items() if name != QUANTIZATION}
-    dropped = np.asarray(loaded.model.apply(bare, ids))
-    assert distance(dropped, reference["logits_f64"]) > FACTOR * distance(reference["logits"],
-                                                                        reference["logits_f64"])
+    with pytest.raises(GateFailure):
+        assert_view(lambda ids: loaded.model.apply(bare, ids), loaded.model, loaded.variables, reference,
+                    "without its scales")
 
 
 def test_the_scanned_stack_quantizes_each_layer_with_its_own_scales(case):
     """A scanned run stacks every collection on the layer axis, the scales
     with the kernels, so each layer reads its own."""
     _, loaded, reference = case
-    scanned = loaded.model.clone(scan_layers=True)
-    assert_quantized(scanned.apply(loaded.variables, reference["ids"].astype(np.int32)), reference, "scanned")
+    scanned = jax.jit(loaded.model.clone(scan_layers=True).apply)
+    assert_view(lambda ids: scanned(loaded.variables, ids), loaded.model, loaded.variables, reference,
+                "scanned")
 
 
 def quantized_apart(case):
@@ -87,10 +93,9 @@ def test_layers_quantized_apart_run_as_scanned_runs_of_their_own(case):
     forward. The stored tree stays one subtree per layer, so the scanned and
     the plain model read and init the same tree."""
     loaded, scanned, ids, variables = quantized_apart(case)
-    plain = np.asarray(loaded.model.apply(variables, ids))
-    truth, terms = float64_forward(loaded.model, variables, ids)
-    assert_as_exact_as_the_reference(np.asarray(scanned.apply(variables, ids)), plain, truth,
-                                     "layers quantized apart, scanned", terms=terms)
+    run = jax.jit(scanned.apply)
+    assert_view(lambda ids: run(variables, ids), loaded.model, variables, case[2],
+                "layers quantized apart, scanned")
     initialized = [jax.eval_shape(model.init, jax.random.key(0), ids) for model in (scanned, loaded.model)]
     assert jax.tree.structure(initialized[0]) == jax.tree.structure(initialized[1])
 
@@ -119,7 +124,6 @@ def test_a_store_that_banks_layers_quantized_apart_reads_as_the_runs_it_banks(ca
     from dew.inference.banks import HeldBanks
 
     _, loaded, reference = case
-    ids = reference["ids"].astype(np.int32)
     model = loaded.model
     four = model.clone(num_layers=4, layer_types=None if model.layer_types is None else model.layer_types * 2)
     variables = jax.tree.map(lambda leaf: leaf, dict(loaded.variables))
@@ -135,10 +139,8 @@ def test_a_store_that_banks_layers_quantized_apart_reads_as_the_runs_it_banks(ca
     bound = scanned.bind(variables)
     assert bound.groups == ((0, 2), (2, 2))
     store = HeldBanks(variables).place(bound, layout=Layout(min_shard=1, tolerance=1.0))
-    plain = np.asarray(four.apply(variables, ids))
-    truth, terms = float64_forward(four, variables, ids)
-    assert_as_exact_as_the_reference(np.asarray(scanned.apply(store, ids)), plain, truth,
-                                     "banked runs quantized apart", terms=terms)
+    run = jax.jit(scanned.apply)
+    assert_view(lambda ids: run(store, ids), four, variables, reference, "banked runs quantized apart")
 
 
 @pytest.mark.mesh(devices=2)
@@ -148,9 +150,13 @@ def test_the_pipeline_stages_quantize_each_layer_with_its_own_scales(case):
     _, loaded, reference = case
     mesh = MeshSpec(stage=2).build(jax.devices()[:2])
     placed = jax.device_put(loaded.variables, Layout().shardings(mesh, loaded.variables))
-    with jax.set_mesh(mesh), pipeline_microbatches(2):
-        logits = jax.jit(loaded.model.apply)(placed, jnp.asarray(reference["ids"], jnp.int32))
-    assert_quantized(logits, reference, "two stages")
+    staged = jax.jit(loaded.model.apply)
+
+    def view(ids):
+        with jax.set_mesh(mesh), pipeline_microbatches(2):
+            return staged(placed, jnp.asarray(ids, jnp.int32))
+
+    assert_view(view, loaded.model, loaded.variables, reference, "two stages")
 
 
 def test_packed_projections_carry_their_members_shared_scale(case):
@@ -165,7 +171,8 @@ def test_packed_projections_carry_their_members_shared_scale(case):
         for part in group.path:
             node = node[part]
         assert group.packed in node and not set(group.members) & set(node)
-    assert_quantized(loaded.model.apply(packed, reference["ids"].astype(np.int32)), reference, "packed")
+    run = jax.jit(loaded.model.apply)
+    assert_view(lambda ids: run(packed, ids), loaded.model, loaded.variables, reference, "packed")
 
 
 def test_members_scaled_apart_stay_unpacked(case):
@@ -186,10 +193,10 @@ def test_members_scaled_apart_stay_unpacked(case):
 def test_the_served_pipeline_quantizes_as_the_loaded_model(case):
     """`dew.pipeline` packs the projections once it has placed them; its task
     computes the loaded model's quantized logits."""
-    directory, _, reference = case
+    directory, loaded, reference = case
     task = dew.pipeline(str(directory), dtype=jnp.float32)
-    logits = task.model.apply(task.variables, reference["ids"].astype(np.int32))
-    assert_quantized(logits, reference, "pipeline")
+    run = jax.jit(task.model.apply)
+    assert_view(lambda ids: run(task.variables, ids), loaded.model, loaded.variables, reference, "pipeline")
 
 
 def test_a_generation_over_the_loaded_tree_packs_under_its_one_scale_in_the_call(case):
