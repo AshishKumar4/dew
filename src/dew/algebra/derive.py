@@ -466,6 +466,12 @@ def _decoupled(rescaling: bool = False):
         ]
 
     slotted = eq(i).to(slot(t))
+    # A walked sum of local products states its weights and values as it writes them (no factor: it takes no
+    # rescale), which a mainloop's own accumulator takes (`Accumulated`).
+    stepped, merged = vars_("stepped merged", Term)
+    derived.append(rule(eq(stepped).to(t.stepped()), eq(t).to(x.dot(y, p)), summed(t), local_of(t),
+                        slotted).then(set_(weighed(stepped)).to(x.stepped()),
+                                      set_(weighted(stepped)).to(y.stepped())))
     for combined, which, index in (("max", peaked, largest), ("add", summed, added)):
         stocked = eq(index).to(stock(combined))
         derived += [
@@ -494,7 +500,6 @@ def _decoupled(rescaling: bool = False):
               eq(lift).to(lifts(given, to, along)),
               eq(added).to(stock("add")), eq(multiplied).to(stock("mul")), eq(largest).to(stock("max")),
               eq(floor).to(least(k)), eq(typed).to(retype(i)), slotted)
-    stepped, merged = vars_("stepped merged", Term)
     for summed_term, tile in ((x.reduce(String("sum"), axes, p), x.stepped().reduce(String("sum"), axes, p)),
                               (x.dot(y, p), x.stepped().dot(y.stepped(), p)),
                               (y.dot(x, p), y.stepped().dot(x.stepped(), p))):
@@ -585,9 +590,10 @@ class _Forms:
     walked_leaves: frozenset[int]
     consts: tuple
     report: program.AlgebraReport
-    accumulated: tuple[tuple[Term, Term, Term] | None, ...] = ()
-    """Each reduction's step as a mainloop's accumulator takes it (`rescaled_by`): its row factor, the tile
-    product's weights and values, extracted with the forms; None for a step of no such rule."""
+    accumulated: tuple[tuple[Term | None, Term, Term] | None, ...] = ()
+    """Each reduction's step as a mainloop's accumulator takes it (`rescaled_by`): its row factor (None for a
+    sum that takes no rescale), the tile product's weights and values, extracted with the forms; None for a
+    step of no such rule."""
     added: tuple[tuple[Term, Term, Term] | None, ...] = ()
     """Each reduction's step as a mainloop's own addition takes it (`summand`): its row factor, the tile's sum
     and the terms it sums (`summed_terms`), extracted with the forms; None for a step of no such rule."""
@@ -661,7 +667,8 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
         # them (each value evaluated once), every reduction it leaves (None) by its form.
         taken = (None,) * len(made.steps)
         if stepped is not None:
-            parts = tuple(Accumulated(*map(value, accumulated)) if accumulated is not None
+            parts = tuple(Accumulated(*(None if part is None else value(part) for part in accumulated))
+                          if accumulated is not None
                           else Added(*map(value, added)) if added is not None else None
                           for accumulated, added in zip(made.accumulated, made.added, strict=True))
             taken = tuple(stepped(tuple(state), parts))
@@ -788,8 +795,10 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
 
     accumulating = [index for index, reduction in enumerate(reductions) if stated(weighed, reduction)]
     adding = [index for index, reduction in enumerate(reductions) if stated(summand, reduction)]
+    rescaling = [index for index, reduction in enumerate(reductions) if stated(rescaled_by, reduction)]
     parts = [part(reductions[index].stepped()) for index in range(len(reductions))
-             for part in ((rescaled_by, weighed, weighted) if index in accumulating
+             for part in ((*((rescaled_by,) if index in rescaling else ()), weighed, weighted)
+                          if index in accumulating
                           else (rescaled_by, summand, summed_terms) if index in adding else ())]
     merging = [index for index, reduction in enumerate(reductions)
                if graph.lookup_function_value(merge_factors(reduction.merged())) is not None]
@@ -802,7 +811,8 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     held = iter(chosen[len(roots):])
     accumulated, added = [], []
     for index in range(len(reductions)):
-        accumulated.append((next(held), next(held), next(held)) if index in accumulating else None)
+        accumulated.append(((next(held) if index in rescaling else None), next(held), next(held))
+                           if index in accumulating else None)
         added.append((next(held), next(held), next(held)) if index in adding else None)
     merged = [(next(held), next(held)) if index in merging else None for index in range(len(reductions))]
     chosen = chosen[:len(roots)]
