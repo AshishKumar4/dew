@@ -15,22 +15,25 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from float64_terms import float64_forward
 from interop_support import NVFP4_QDQ_CASES, assert_same_stored_tensors
-from one_draw import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, indexed_recording, recording
+from tool_support import run_from
 
 from dew.interop import Pretrained
 from dew.interop.safetensors_io import read_weights
 
 CODECS = Path(__file__).parent / "fixtures" / "codecs"
+GENERATORS = {"modelopt": "modelopt_nvfp4_reference", "nvfp4_qdq": "nvfp4_qdq_reference",
+              "storage": "nvfp4_storage_reference"}
+"""Each checkpoint kind's generator, whose `draw` the recording's ids are drawn by."""
 CHECKPOINTS = ("modelopt/tiny", "modelopt/mixed", *(f"nvfp4_qdq/{kind}" for kind in NVFP4_QDQ_CASES),
                "storage/fp8", "storage/nvfp4")
 
 
 @pytest.mark.parametrize("name", CHECKPOINTS)
 def test_a_quantized_checkpoint_computes_its_reference_and_saves_its_own_bytes(name, tmp_path):
-    """The reference is the format author's own CPU forward of the same
-    files, held to float64 rounding. Float64 widens the weights the author's
+    """The reference is the format author's own forward of the same files,
+    recorded over check 1's seeds of ids, on par with Dew's (check 1). Float64 widens the weights the author's
     reader decodes exactly (weight-only NVFP4 rounds them to bf16, FP8 to
     its stored scale's dtype), so the format's quantization is common to
     both forwards and the bound measures only their rounding. The checkpoint
@@ -39,13 +42,17 @@ def test_a_quantized_checkpoint_computes_its_reference_and_saves_its_own_bytes(n
     at the masters' width, the same values, and every other tensor's bytes.
     Both reload to the same logits."""
     directory = CODECS / name
-    with np.load(directory / "reference.npz") as reference:
-        ids, expected, truth = reference["ids"].astype(np.int32), reference["logits"], reference["logits_f64"]
+    recorded = recording(directory / "reference.npz")
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
-    actual = np.asarray(loaded.model.apply(loaded.variables, ids))
-    _, terms = float64_forward(loaded.model, loaded.variables, ids)
-    assert_as_exact_as_the_reference(actual, expected, truth, f"{name} logits", terms=terms)
-    np.testing.assert_array_equal(np.argmax(actual, -1), np.argmax(expected, -1))
+    with run_from(GENERATORS[name.split("/")[0]], "tools") as generator:
+        redraw = generator.draw
+    seeds = int(recorded["logits.seeds"])
+    draw, reference, truth = indexed_recording(recorded, "logits", seeds, inputs_of=redraw)
+    assert_as_exact(lambda index, inputs: {"logits": loaded.model.apply(loaded.variables, inputs["ids"])},
+                    reference, draw, f"{name} logits", seeds=seeds, truth_fn=truth)
+    index, inputs = draw(0)
+    ids, actual = inputs["ids"], np.asarray(loaded.model.apply(loaded.variables, inputs["ids"]))
+    np.testing.assert_array_equal(np.argmax(actual, -1), np.argmax(reference(index, inputs)["logits"], -1))
     stored = read_weights(directory)
     own = tmp_path / "own"
     Pretrained.load(directory, dtype="float32", param_dtype="auto", attention_impl="reference").save(own)
