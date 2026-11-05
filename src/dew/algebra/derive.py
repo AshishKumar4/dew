@@ -226,6 +226,12 @@ factor): a mainloop's own addition takes it, as its accumulator takes a product'
 
 
 @function(merge=lambda old, new: old)
+def summed_terms(step: Term) -> Term: ...
+"""The tile's terms `summand` sums, before their reduction: a mainloop's addition that takes them apart (a
+guard's shift on each) reads them."""
+
+
+@function(merge=lambda old, new: old)
 def slot(term: Term) -> i64: ...
 """A walked reduction's index among the walk's, its carried state's (`Term.state`)."""
 
@@ -482,7 +488,8 @@ def _decoupled(rescaling: bool = False):
         # reduction's tile sum its own addition takes (`summand`).
         product = get_callable_args(tile, Term.dot)
         parts = (set_(rescaled_by(stepped)).to(correction(0, k.stepped())),
-                 *((set_(summand(stepped)).to(tile),) if product is None else
+                 *((set_(summand(stepped)).to(tile), set_(summed_terms(stepped)).to(x.stepped()))
+                   if product is None else
                    (set_(weighed(stepped)).to(product[0]), set_(weighted(stepped)).to(product[1]))))
         derived += [
             rule(eq(stepped).to(t.stepped()), *conditions).then(
@@ -562,9 +569,9 @@ class _Forms:
     accumulated: tuple[tuple[Term, Term, Term] | None, ...] = ()
     """Each reduction's step as a mainloop's accumulator takes it (`rescaled_by`): its row factor, the tile
     product's weights and values, extracted with the forms; None for a step of no such rule."""
-    added: tuple[tuple[Term, Term] | None, ...] = ()
-    """Each reduction's step as a mainloop's own addition takes it (`summand`): its row factor and the tile's
-    sum, extracted with the forms; None for a step of no such rule."""
+    added: tuple[tuple[Term, Term, Term] | None, ...] = ()
+    """Each reduction's step as a mainloop's own addition takes it (`summand`): its row factor, the tile's sum
+    and the terms it sums (`summed_terms`), extracted with the forms; None for a step of no such rule."""
 
 
 def context() -> tuple:
@@ -634,8 +641,8 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
                 factor, weights, values = parts
                 stepped.append(accumulate(state[index], value(factor), value(weights), value(values)))
             elif add is not None and (summed := made.added[index]) is not None:
-                factor, tile = summed
-                stepped.append(add(state[index], value(factor), value(tile)))
+                factor, tile, summed_by = summed
+                stepped.append(add(state[index], value(factor), value(tile), value(summed_by)))
             else:
                 stepped.append(value(form))
         if not outputs:
@@ -755,7 +762,7 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     adding = [index for index, reduction in enumerate(reductions) if stated(summand, reduction)]
     parts = [part(reductions[index].stepped()) for index in range(len(reductions))
              for part in ((rescaled_by, weighed, weighted) if index in accumulating
-                          else (rescaled_by, summand) if index in adding else ())]
+                          else (rescaled_by, summand, summed_terms) if index in adding else ())]
     if parts:
         bundle = Term.bundle(Vec[Term](*roots, *parts))
         graph.register(bundle)
@@ -765,7 +772,7 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     accumulated, added = [], []
     for index in range(len(reductions)):
         accumulated.append((next(held), next(held), next(held)) if index in accumulating else None)
-        added.append((next(held), next(held)) if index in adding else None)
+        added.append((next(held), next(held), next(held)) if index in adding else None)
     chosen = chosen[:len(roots)]
     if not math.isfinite(after.value):
         unwritten = next(root for root, form in zip(roots, chosen, strict=True) if not _written(form))

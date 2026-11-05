@@ -1906,7 +1906,8 @@ def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
         assert held_by is not None
         return held_by(acc, scale, (weights,), values)
 
-    def add(total, factor, summed):
+    def add(total, factor, summed, terms):
+        del terms
         assert low is not None
         total, dropped["total"] = kept_in_turn(total * factor, low.total * factor, (summed,))
         return total
