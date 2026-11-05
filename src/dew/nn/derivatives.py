@@ -13,7 +13,8 @@ reads its kind (`dew.algebra.program`): a protected span (`Protected`, an error-
 it is, a surrogate's bodies (`Surrogate`) and a kernel derivative's glue (`KernelGlue`) are rewritten within
 their call, and a derivative written to restructure algebra (`Algebra`) opens into the region around it.
 
-A custom derivative is declared with its kind, which makes it one marked call of that kind:
+A custom derivative is declared with its kind, which makes its primal and each of its rules one marked call
+of that kind within the custom rule:
 `declared_derivative` (a reverse-mode rule, as `jax.custom_vjp` takes one) and `declared_tangent` (a tangent
 rule, as `jax.custom_jvp` takes one), each of any kind, and `surrogate` (a value and its declared derivative).
 Each lane moves its sites onto them (rows 4026 to 4030); then the slop check refuses `jax.custom_vjp` and
@@ -61,7 +62,7 @@ def surrogate[Value](forward: Callable[..., Value], derivative: Callable[..., Va
     declared rule again wherever it differentiates the value (a straight-through rounding's tangent is
     never rounded at a second order)."""
     declared = tuple(nondiff_argnums)
-    rule = jax.custom_jvp(forward, nondiff_argnums=declared)
+    rule = jax.custom_jvp(bound_span(Surrogate(), forward, static=declared), nondiff_argnums=declared)
 
     def tangent(*arguments):
         *fixed, primals, tangents = arguments
@@ -71,21 +72,25 @@ def surrogate[Value](forward: Callable[..., Value], derivative: Callable[..., Va
         value = rule(*operands)
         return value, derivative(*fixed, primals, tangents, value)
 
-    rule.defjvp(tangent)
-    return bound_span(Surrogate(), rule, static=declared)
+    rule.defjvp(bound_span(Surrogate(), tangent, static=range(len(declared))))
+    return rule
 
 
 def declared_derivative[Value](kind: Kind, primal: Callable[..., Value], forward: Callable,
                                backward: Callable, *, nondiff_argnums: Sequence[int] = (),
                                symbolic_zeros: bool = False) -> Callable[..., Value]:
     """`primal` with a declared reverse-mode rule (`forward` saving its residuals, `backward` taking them and
-    the cotangent, as `jax.custom_vjp.defvjp` takes them, with `symbolic_zeros` as it takes it), one marked
-    call of `kind` (`bound_span`): a kernel's glue (`KernelGlue`), a rule its numerics need as written
-    (`Protected`), a derivative of Dew's choosing (`Surrogate`) or one written to restructure algebra
-    (`Algebra`). Forward mode refuses it as a bare `jax.custom_vjp` does."""
-    rule = jax.custom_vjp(primal, nondiff_argnums=tuple(nondiff_argnums))
-    rule.defvjp(forward, backward, symbolic_zeros=symbolic_zeros)
-    return bound_span(kind, rule, static=nondiff_argnums)
+    the cotangent, as `jax.custom_vjp.defvjp` takes them, with `symbolic_zeros` as it takes it), each of the
+    three one marked call of `kind` (`bound_span`) within the custom rule: a kernel's glue (`KernelGlue`), a
+    rule its numerics need as written (`Protected`), a derivative of Dew's choosing (`Surrogate`) or one
+    written to restructure algebra (`Algebra`). The rule outermost, a differentiated call traces its forward
+    alone, not its primal too, and each part is traced where it runs, so a value of that trace it closes over
+    is its own (`marked`). Forward mode refuses it as a bare `jax.custom_vjp` does."""
+    fixed = tuple(nondiff_argnums)
+    rule = jax.custom_vjp(bound_span(kind, primal, static=fixed), nondiff_argnums=fixed)
+    rule.defvjp(bound_span(kind, forward, static=fixed), bound_span(kind, backward, static=range(len(fixed))),
+                symbolic_zeros=symbolic_zeros)
+    return rule
 
 
 def declared_tangent[Value](kind: TangentKind, primal: Callable[..., Value], tangent: Callable, *,
@@ -93,12 +98,14 @@ def declared_tangent[Value](kind: TangentKind, primal: Callable[..., Value], tan
                             symbolic_zeros: bool = False) -> Callable[..., Value]:
     """`primal` with a declared tangent rule (`tangent(primals, tangents)` returning the primal's value and
     its tangent, as `jax.custom_jvp.defjvp` takes it, which reverse mode transposes; with `symbolic_zeros`,
-    an operand no tangent reaches is a `SymbolicZero` there, as `defjvp` gives it), one marked call of
-    `kind` (`bound_span`), as `declared_derivative` takes it; a surrogate's tangent is `surrogate`'s, whose
-    rule reads the surrogate's own value, so a second order meets the rule again (`TangentKind`)."""
-    rule = jax.custom_jvp(primal, nondiff_argnums=tuple(nondiff_argnums))
-    rule.defjvp(tangent, symbolic_zeros=symbolic_zeros)
-    return bound_span(kind, rule, static=nondiff_argnums)
+    an operand no tangent reaches is a `SymbolicZero` there, as `defjvp` gives it), the primal and the rule
+    each one marked call of `kind` (`bound_span`) within the custom rule, as `declared_derivative` declares
+    its; a surrogate's tangent is `surrogate`'s, whose rule reads the surrogate's own value, so a second
+    order meets the rule again (`TangentKind`)."""
+    fixed = tuple(nondiff_argnums)
+    rule = jax.custom_jvp(bound_span(kind, primal, static=fixed), nondiff_argnums=fixed)
+    rule.defjvp(bound_span(kind, tangent, static=range(len(fixed))), symbolic_zeros=symbolic_zeros)
+    return rule
 
 
 def bound_span[Result](kind: Kind, function: Callable[..., Result], *,
