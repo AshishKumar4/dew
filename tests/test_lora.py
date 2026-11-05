@@ -112,6 +112,40 @@ def test_the_unmerged_forward_matches_peft(loaded, reference):
     assert np.max(np.abs(reference["adapted_logits"] - reference["base_logits"])) > 1
 
 
+def _token_loss(objective, params, tokens):
+    """The objective's token loss over the moving factors, the rest of `params` held."""
+    def loss(moving):
+        stats, _ = objective.loss({**params, "params": moving}, {"text": tokens},
+                                  Step(step=jnp.int32(0), key=jax.random.key(1), ema=None))
+        return objective.reduce_loss(stats)[0]
+    return loss
+
+
+def test_a_fused_adapted_site_runs_as_the_branch_does(decoder, loaded, reference):
+    """Named (`generation.chosen(low_rank='fused')`), each plain dense site adapted runs its base product and
+    its update as one template product (`gemm.low_rank`, row 1304), reported as the selector's route, and
+    the adapter's gradients reach every factor the unfused branch's reach, finite. The fused product's
+    values and gradients against the branch's own program are check 1's (test_gemm_template's
+    `test_an_adapted_products_fused_form_holds_check_1`)."""
+    from dew.nn.kernels import generation
+
+    adapter = _rebound(loaded, decoder.model, dropout=0.0)
+    tokens = jnp.asarray(reference["input_ids"])
+    objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=adapter.variables, ema_decay=None)
+    params = nn.unbox(objective.init(jax.random.key(0)))
+
+    loss = _token_loss(objective, params, tokens)
+
+    _, gradient = jax.jit(jax.value_and_grad(loss))(params["params"])
+    with generation.chosen(low_rank="fused"), generation.routes() as routes:
+        fused_value, fused_gradient = jax.jit(jax.value_and_grad(loss))(params["params"])
+    assert {route.kernel for route in routes if route.choice == "low_rank"} == {"fused"}
+    assert bool(jnp.isfinite(fused_value))
+    reached = jax.tree.map(lambda leaf: bool(jnp.any(leaf != 0)), gradient)
+    assert jax.tree.map(lambda leaf: bool(jnp.any(leaf != 0)), fused_gradient) == reached
+    assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in jax.tree.leaves(fused_gradient))
+
+
 def test_eval_prediction_disables_adapter_dropout(loaded, reference):
     adapter = loaded
     ids = jnp.asarray(reference["input_ids"])
@@ -157,10 +191,7 @@ def test_adapter_gradients_of_the_token_loss_match_peft(decoder, loaded, referen
     assert sorted(params) == [FROZEN, "params"]
     assert all(_is_factor(path) for path, _ in jax.tree_util.tree_leaves_with_path(params["params"]))
 
-    def loss(moving):
-        stats, _ = objective.loss({**params, "params": moving}, {"text": tokens},
-                                  Step(step=jnp.int32(0), key=jax.random.key(1), ema=None))
-        return objective.reduce_loss(stats)[0]
+    loss = _token_loss(objective, params, tokens)
 
     value, gradient = jax.jit(jax.value_and_grad(loss))(params["params"])
     np.testing.assert_allclose(value, reference["loss"], atol=1e-5, rtol=0)
