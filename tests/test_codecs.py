@@ -24,6 +24,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 from interop_support import fetch
+from model_support import encoded_form
 
 from dew.interop import Pretrained, codecs
 from dew.interop.safetensors_io import _STORED_DTYPES, read_weights, save_hf_layout
@@ -54,7 +55,7 @@ def test_the_compressed_tensors_export_writes_the_librarys_bytes(dtype):
     weight, codes, exponents = fixture_weight(dtype)
     bias = np.arange(3, dtype=np.float32)
 
-    packed = codecs.PACKED_MXFP4.requantize({"m.weight": weight, "m.bias": bias}, ("m.weight",))
+    packed = encoded_form(codecs.PACKED_MXFP4, {"m.weight": weight, "m.bias": bias}, ("m.weight",))
 
     assert set(packed) == {"m.weight_packed", "m.weight_scale", "m.bias"}
     assert packed["m.bias"] is bias
@@ -73,7 +74,7 @@ def test_an_untrained_re_export_writes_the_same_values(dtype):
     source = {"m.weight_packed": codes, "m.weight_scale": exponents}
     decoded = codecs.PACKED_MXFP4.decode(source, "m.weight")
 
-    again = codecs.PACKED_MXFP4.requantize({"m.weight": decoded.astype(STORED[dtype])}, ("m.weight",))
+    again = encoded_form(codecs.PACKED_MXFP4, {"m.weight": decoded.astype(STORED[dtype])}, ("m.weight",))
 
     np.testing.assert_array_equal(codecs.PACKED_MXFP4.decode(again, "m.weight"), decoded)
     np.testing.assert_array_equal(again["m.weight_scale"], exponents)
@@ -236,7 +237,7 @@ def test_each_v4_layout_moves_a_weight_by_at_most_its_grid_step_and_holds_still_
     names = ("layers.0.attn.wkv.weight", "layers.0.ffn.experts.1.w3.weight", "layers.1.engram.embed.weight")
     read = codecs.deepseek_v4(32, fp4_experts=True).decode
 
-    stored = codecs.deepseek_v4(32, fp4_experts=True).requantize(dense, names)
+    stored = encoded_form(codecs.deepseek_v4(32, fp4_experts=True), dense, names)
 
     assert stored["layers.0.ffn.gate.weight"] is dense["layers.0.ffn.gate.weight"]
     assert [stored[name].dtype for name in names] == [codecs.E4M3, np.int8, codecs.E4M3]
@@ -253,7 +254,7 @@ def test_each_v4_layout_moves_a_weight_by_at_most_its_grid_step_and_holds_still_
                          np.arange(weight.shape[1])[None, :] // unit]
             bound = np.maximum(np.abs(weight) * 2.0 ** -4, cell * 2.0 ** -10)
         assert np.all(np.abs(decoded - weight) <= bound), name
-        again = codecs.deepseek_v4(32, fp4_experts=True).requantize({name: decoded}, (name,))
+        again = encoded_form(codecs.deepseek_v4(32, fp4_experts=True), {name: decoded}, (name,))
         np.testing.assert_array_equal(read(again, name), decoded)
 
 
@@ -391,9 +392,8 @@ def v4_release_storage(
             tensor = (rng.standard_normal(shape) * np.std(tensor)).astype(np.float32)
         dense[name] = tensor
     names = tuple(name for name in dense if V4_QUANTIZED.search(name))
-    stored = codecs.deepseek_v4(128, fp4_experts=experts == "fp4", scale_dtype=scale_dtype).requantize(
-        dense, names
-    )
+    stored = encoded_form(codecs.deepseek_v4(128, fp4_experts=experts == "fp4", scale_dtype=scale_dtype),
+                          dense, names)
     # The decoder is held to the releases' own reading in the tests above.
     read = codecs.deepseek_v4(128, fp4_experts=experts == "fp4", scale_dtype=scale_dtype).decode
     decoded = {**dense, **{name: read(stored, name) for name in names}}
@@ -496,8 +496,8 @@ def test_a_released_v4_tensor_decodes_as_the_release_reads_it_and_encodes_back(
     layout = codecs.deepseek_v4_layout(name, fp4_experts)
 
     decoded = read({name: weight, partner: scale}, name)
-    again = codecs.deepseek_v4(block, fp4_experts=fp4_experts, scale_dtype=scale.dtype.name).requantize(
-        {name: decoded}, (name,))
+    again = encoded_form(codecs.deepseek_v4(block, fp4_experts=fp4_experts, scale_dtype=scale.dtype.name),
+                         {name: decoded}, (name,))
 
     np.testing.assert_array_equal(read(again, name), decoded)
     if layout == "fp4":
@@ -684,7 +684,7 @@ def test_a_compressed_tensors_weight_decodes_and_saves_as_the_library_does(label
     np.testing.assert_array_equal(codec.decode(stored, "m.weight"),
                                   np.load(CT_FIXTURE)[f"{label}/dequantized"])
     for kind, weight in trained.items():
-        written = codec.requantize({"m.weight": weight}, ("m.weight",))
+        written = encoded_form(codec, {"m.weight": weight}, ("m.weight",))
         assert set(written) == set(requantized[kind]), kind
         for name, value in requantized[kind].items():
             assert written[name].dtype == value.dtype, (kind, name)

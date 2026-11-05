@@ -433,8 +433,9 @@ def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     exported = Pretrained.from_run(str(run))
     exported.save(destination)
 
+    # The run's own declaration beside the files every reader reads (row 4314).
     assert {entry.name for entry in destination.iterdir()} == {
-        "config.json", "generation_config.json", "model.safetensors"}
+        "config.json", "dew_release.json", "generation_config.json", "model.safetensors"}
     assert json.loads((destination / "generation_config.json").read_text())["tokenizer_name"] == "byte"
     reloaded = Pretrained.load(destination, dtype="float32", attention_impl="reference")
     ids = jnp.asarray([[3, 4, 5, 6]], jnp.int32)

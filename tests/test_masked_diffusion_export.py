@@ -115,7 +115,8 @@ def test_a_masked_diffusion_run_exports_and_reloads_as_a_masked_decoder(fixture,
     """A run of `MaskedDiffusionObjective` from a loaded checkpoint, read back
     by `Pretrained.from_run`, is a masked decoder by the run's objective; its
     export in the family its model derives is one by the export's own config,
-    which `Pretrained.load` reads to the run's trained logits."""
+    which `Pretrained.load` reads to the run's trained logits and to the run's own
+    masked process, solver, steps and block."""
     import math
 
     import grain.python as grain
@@ -156,5 +157,8 @@ def test_a_masked_diffusion_run_exports_and_reloads_as_a_masked_decoder(fixture,
 
     task, saved = reloaded.text_generation(), MaskedGeneration.from_run(str(tmp_path / "run"))
     assert (task.max_new_tokens, task.pad_token_id) == (saved.max_new_tokens, saved.pad_token_id)
+    # The run's own walk, which the export writes beside its config (row 4314).
+    assert (task.process, task.solver, task.steps, task.block) == (saved.process, saved.solver, saved.steps,
+                                                                   saved.block)
     assert task.max_new_tokens == int(ids.shape[1])
     assert task(ids[:1, :4], 4, key=0).tokens.shape[-1] == 8

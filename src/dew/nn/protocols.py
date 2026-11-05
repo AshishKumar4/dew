@@ -44,7 +44,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
-from flax.typing import PrecisionLike, VariableDict
+from flax.typing import Dtype, PrecisionLike, VariableDict
 from jax.typing import DTypeLike
 
 from dew.batch import Coordinates
@@ -263,6 +263,15 @@ class OutputTable:
         of tokens' vectors (a decision head's lexical prior) takes these."""
         rows = self.matrix if self.vocab_major else self.matrix.T
         return rows if self.scale is None else rows * self.scale[:, None]
+
+
+@runtime_checkable
+class ComputesIn(Protocol):
+    """A model that states the dtype it computes in (`dtype`), a field of its own or its decoder's
+    (DiffusionGemma's); None computes in its parameters' dtype."""
+
+    @property
+    def dtype(self) -> Dtype | None: ...
 
 
 @runtime_checkable

@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import encoded_form
 from reference_error import assert_as_exact
 
 from dew.interop.codecs import MXFP4, dequantize_mxfp4, quantize_mxfp4
@@ -282,7 +283,7 @@ def test_pack_mxfp4_writes_back_the_recorded_stems_and_nothing_else():
 
     unpacked = MXFP4.dequantize(tensors)
     assert set(unpacked) == {stem, *untouched}
-    packed = MXFP4.requantize(unpacked, (stem,))
+    packed = encoded_form(MXFP4, unpacked, (stem,))
     assert set(packed) == set(tensors)
     for name, value in untouched.items():
         assert packed[name] is value
