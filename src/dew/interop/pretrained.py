@@ -448,8 +448,8 @@ class Pretrained:
         return self if record is None else replace(self, adapter=Adapter.recorded(model, variables, record))
 
     @classmethod
-    def load(cls, name_or_dir: str | Path, *, dtype: DTypeLike = jnp.bfloat16,
-             param_dtype: DTypeLike | Literal["auto"] = jnp.float32,
+    def load(cls, name_or_dir: str | Path, *, dtype: DTypeLike | None = None,
+             param_dtype: DTypeLike | Literal["auto"] | None = None,
              attention_impl: AttentionImpl = "auto", max_seq_len: int | None = None,
              revision: str | None = None, subfolder: str | None = None, gguf_file: str | None = None,
              single_file: str | None = None, dduf_file: str | None = None,
@@ -468,8 +468,10 @@ class Pretrained:
         the source has them.
 
         `dtype` sets the compute dtype, and `param_dtype` separately sets the storage
-        dtype of floating parameters. It defaults to FP32 master weights, and 'auto'
-        keeps each tensor in the dtype the checkpoint stores it in; a quantized
+        dtype of floating parameters. They default to BF16 compute over FP32 master
+        weights, or for an export of a run to the run's compute dtype over the weights
+        as the export stores them (`released`); 'auto' keeps each tensor in the dtype
+        the checkpoint stores it in; a quantized
         source's packed weights decode to the dtype it declares (`declared_dtype`).
         `precision`, a run's numerics or their name (`dew.nn.precision.numerics_of`), sets both
         from its dtypes, and the bundle's tasks trace under its precision and forms (`formed`).
@@ -549,19 +551,16 @@ class Pretrained:
                                      dduf_file=dduf_file)
         streaming, placed = _placement(mesh, layout, on_host=on_host, weights=weights)
 
-        numerics, dtype, param_dtype = _load_settings(precision, dtype, param_dtype, prediction_depths)
+        numerics = _load_settings(precision, dtype, param_dtype, prediction_depths)
         # The reference refuses a folder outside the source before anything is fetched.
         directory, reference, composite = _source_metadata(
             sources.SourceReference(str(name_or_dir), revision, subfolder, remote_code=trust_remote_code),
             selected, fallback,
             modeling_overrides)
-        # An export of a run carries the run's declaration, numerics and dtypes (`released`), read from the
-        # folder the load selects; a load that states its own takes their place.
+        # An export of a run carries the run's declaration, numerics and compute dtype (`released`), read
+        # from the folder the load selects; a load that states its own takes their place.
         settings, run_numerics, run_compute = released(reference.directory(directory))
-        if numerics is None and run_compute is not None and (dtype, param_dtype) == ("bfloat16", "float32"):
-            # The load's own dtypes are its defaults (`load`'s, `_load_settings`'s), so it states none: the
-            # run's compute dtype, and its parameters as the export stored them.
-            dtype, param_dtype = run_compute, AUTO
+        dtype, param_dtype = _load_dtypes(numerics, dtype, param_dtype, run_compute)
         loaded, extracted = _loaded_kind(
             reference, directory, composite, fallback=fallback, gguf_file=gguf_file,
             single_file=single_file, dduf_file=dduf_file, placed=placed, streaming=streaming or not weights,
@@ -2082,23 +2081,34 @@ def _selected_payload(fallback: str | None, **files: str | None) -> list[str]:
 
 
 
-def _load_settings(precision: Numerics | str | None, dtype: DTypeLike,
-                   param_dtype: DTypeLike | Literal["auto"], prediction_depths: int | None
-                   ) -> tuple[Numerics | None, DtypeName, DtypeName | Literal["auto"]]:
-    """A load's numerics, where `precision` names them, and the compute and storage dtypes it loads in,
-    by name: the numerics' dtypes, which another dtype stated beside them would contradict, else the
-    ones stated (`Pretrained.load`); `prediction_depths` is refused where it is no count of depths."""
+def _load_settings(precision: Numerics | str | None, dtype: DTypeLike | None,
+                   param_dtype: DTypeLike | Literal["auto"] | None, prediction_depths: int | None
+                   ) -> Numerics | None:
+    """A load's numerics, where `precision` names them, whose dtypes another dtype stated beside them
+    would contradict (`Pretrained.load`); `prediction_depths` is refused where it is no count of
+    depths."""
     if prediction_depths is not None and (isinstance(prediction_depths, bool) or prediction_depths < 0):
         raise ValueError(f"prediction_depths keeps the first that many depths, 0 or more, not "
                          f"{prediction_depths!r}")
     numerics = None if precision is None else numerics_of(precision)
-    stated = (dtype_name(dtype), AUTO if param_dtype == AUTO else dtype_name(param_dtype))
-    if numerics is None:
-        return None, *stated
-    if stated != ("bfloat16", "float32"):
+    if numerics is not None and (dtype is not None or param_dtype is not None):
         raise ValueError("precision sets a load's dtype and param_dtype; pass the numerics or the dtypes, "
                          "not both")
-    return numerics, dtype_name(numerics.dtypes.compute), dtype_name(numerics.dtypes.params)
+    return numerics
+
+
+def _load_dtypes(numerics: Numerics | None, dtype: DTypeLike | None,
+                 param_dtype: DTypeLike | Literal["auto"] | None, released: DtypeName | None
+                 ) -> tuple[DtypeName, DtypeName | Literal["auto"]]:
+    """The compute and storage dtypes a load loads in, by name: its numerics' dtypes, else each one it
+    states, and each it leaves unstated (None) its source's: an export of a run's compute dtype
+    (`released`) over its weights as stored, or BF16 compute over FP32 master weights."""
+    if numerics is not None:
+        return dtype_name(numerics.dtypes.compute), dtype_name(numerics.dtypes.params)
+    compute = dtype_name(dtype) if dtype is not None else released or "bfloat16"
+    params = (param_dtype if param_dtype == AUTO else dtype_name(param_dtype) if param_dtype is not None
+              else AUTO if released is not None else "float32")
+    return compute, params
 
 
 def _source_metadata(requested: sources.SourceReference, selected: list, fallback: str | None,
