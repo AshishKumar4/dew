@@ -1050,6 +1050,25 @@ def test_a_gpu_the_table_does_not_name_keeps_the_resources_its_device_reports():
     assert (hopper.multiprocessors, hopper.shared_limit, hopper.wgmma) == (132, 232448, True)
 
 
+def test_a_gpu_target_takes_the_clocks_bandwidth_and_l2_its_driver_reports():
+    """A real device's target takes its multiprocessor clock, its memory bandwidth (twice the memory clock
+    times the bus's bytes) and its L2 cache from the CUDA driver's attributes, read at the driver's
+    boundary (`read`, `dew._devices.gpu_attribute`'s signature); where no driver loads (`read` gives
+    None), the table's stay."""
+    from dew._devices import CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH, L2_CACHE_SIZE, MEMORY_CLOCK_RATE
+    reported = {CLOCK_RATE: 1_755_000, MEMORY_CLOCK_RATE: 2_619_000, GLOBAL_MEMORY_BUS_WIDTH: 5120,
+                L2_CACHE_SIZE: 52_428_800}
+    device = SimpleNamespace(compute_capability="9.0", core_count=132, shared_memory_per_block_optin=232448,
+                             local_hardware_id=3, device_kind="NVIDIA H100 80GB HBM3")
+    table = GpuTarget("sm90", "NVIDIA H100 80GB HBM3", clock_hz=1830e6, memory_bandwidth=3350e9,
+                      l2_bytes=50 * 2 ** 20)
+    driven = runtime_facts(table, device, read=lambda ordinal, attribute: reported[attribute])
+    assert (driven.clock_hz, driven.memory_bandwidth, driven.l2_bytes) == (
+        1_755_000e3, 2 * 2_619_000e3 * 5120 / 8, 52_428_800)
+    undriven = runtime_facts(table, device, read=lambda ordinal, attribute: None)
+    assert (undriven.clock_hz, undriven.memory_bandwidth, undriven.l2_bytes) == (1830e6, 3350e9, 50 * 2 ** 20)
+
+
 def a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it():
     """The default device's shared memory a block and multiprocessors come from JAX's device: a bare
     target of its generation, holding none of the table's resources, takes the same ones the
