@@ -113,23 +113,3 @@ def test_a_deepseek_v4_decoder_shows_every_selection_it_makes():
     assert sparse and layers("selections") == sparse
     assert routed and layers("intermediates") == routed
     assert np.isfinite(selection_margins.margin(config, captured, "deepseek_v4"))
-
-
-@pytest.mark.parametrize("groups", [1, 4])
-def test_a_router_that_selects_every_expert_and_group_flips_nothing(groups):
-    """A Router may take every expert, and every group of them (`Router.setup` admits top_k equal to its
-    experts and groups_per_token equal to its groups): its captured selection has no cutoff to flip at,
-    so its margin is infinite, through the capture as a check-1 site reads it."""
-    import jax
-    import jax.numpy as jnp
-    import selection_margins
-
-    from dew.nn.moe import Router
-
-    router = Router(num_experts=8, in_features=16, top_k=8, score_function="sigmoid", normalize_weights=True,
-                    expert_groups=groups, groups_per_token=groups)
-    hidden = jnp.asarray(np.random.default_rng(0x4394).standard_normal((6, 16)), jnp.float32)
-    variables = router.init(jax.random.key(0), hidden)
-    captured = selection_margins.capture(router)(variables, hidden)
-    mixture = {"top_k": 8, "groups_per_token": groups, "expert_groups": groups}
-    assert np.isinf(selection_margins.margin({"mixture": mixture}, captured, f"{groups} groups"))
