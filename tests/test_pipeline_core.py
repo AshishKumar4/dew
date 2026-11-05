@@ -995,7 +995,7 @@ class Blocked:
     prefix: int
 
     def __call__(self, row):
-        from dew.nn.visibility import prefix_blocks
+        from dew.batch import prefix_blocks
 
         places = np.arange(len(row["text"]), dtype=np.int32)
         blocks = prefix_blocks(np.ones(len(places), np.int32), places, self.prefix, xp=np)
