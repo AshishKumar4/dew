@@ -12,7 +12,7 @@ import grain.python as pygrain
 import numpy as np
 
 from dew import position
-from dew._records import record
+from dew._records import json_value, record
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS, Batch
 from dew.data.dataset import (
     Closeable,
@@ -30,7 +30,6 @@ from dew.data.dataset import (
 from dew.data.mixing import CorpusCounts, data_metrics, state_counts
 from dew.data.pipeline import HostStep, Map
 from dew.data.plan import COUNTERS, Plan, earlier_position
-from dew.data.shared import plain
 
 READER_FIELDS = (EXAMPLES_CONSUMED, VALID_ROWS)
 """A batch's fields its reader owns, which a host step after the batch neither reads nor writes
@@ -233,7 +232,8 @@ class _PerShare(Forwarding):
             self._publish(state)
         saved = {"dew_data_plan": self._plan.record(), "counters": COUNTERS, "iterator": state}
         # A mix's captured positions are shared mappings (`Shared`), written as the records they read as.
-        return json.dumps({position.REPLICATED: saved} if self._replicated else saved, default=plain).encode()
+        return json.dumps(json_value({position.REPLICATED: saved} if self._replicated else saved,
+                                     "data position")).encode()
 
     def set_state(self, state: bytes) -> None:
         held = position.replicated(state)

@@ -94,9 +94,9 @@ def merge_facts(facts: Iterable[Mapping[str, object]], *,
                 continue
             elif key in measured:
                 combined[key] = max(integer(value, key), integer(combined.get(key, 0), key))
-            elif isinstance(value, PerMember) and isinstance(combined.get(key), PerMember):
+            elif isinstance(value, PerMember) and isinstance(prior := combined.get(key), PerMember):
                 # Each member's value its own corpus's; a member two state otherwise is no fact of the run.
-                held = joined.setdefault(key, PerMember(combined[key]))
+                held = joined.setdefault(key, PerMember(prior))
                 if any(held[member] != stated for member, stated in value.items() if member in held):
                     conflicted.add(key)
                 held.update(value)
