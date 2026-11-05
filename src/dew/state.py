@@ -193,6 +193,22 @@ class TrainState:
         return dataclasses.replace(self, inner=dataclasses.replace(self.inner, accumulation=window))
 
 
+def without_empty_window(state: TrainState) -> TrainState:
+    """`state` as a checkpoint holds it: its window (`window`) left out where it holds no microbatch, at
+    an update's boundary, under DiLoCo every group's. A commit clears every field of the window but its
+    gradient sum, which the next window's first microbatch replaces unread (`dew.training.transaction`),
+    so the empty window a resume allocates (`Trainer._initialize_accumulation`) is the same window, and
+    the sum, a trainable-size float32 tree, is no checkpoint's (row 4309: ~36 GB of a 9B run's ~112 GB).
+    A window part filled is saved whole."""
+    if state.window is None:
+        return state
+    size = int(state.window_size)
+    # The groups' clocks are stacked over the groups, which a pool's processes split.
+    filled = (int(state.microstep) % size if state.inner is None
+              else int(jnp.max(state.inner.microstep % size)))
+    return state.with_window(None) if filled == 0 else state
+
+
 CHECKPOINTED = tuple(field.name for field in dataclasses.fields(TrainState)
                      if field.metadata.get('checkpointed', True))
 """The train-state fields a checkpoint holds, by their names; a field its

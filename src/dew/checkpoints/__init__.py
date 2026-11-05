@@ -1818,7 +1818,8 @@ class Checkpoints:
     @staticmethod
     def _item(state: TrainState, saved: bytes | None, share: DataPartition | None,
               rollout: Mapping[str, object] | None = None) -> dict[str, StateLeaf]:
-        from dew.state import CHECKPOINTED
+        from dew.state import CHECKPOINTED, without_empty_window
+        state = without_empty_window(state)
         state_tree = {name: getattr(state, name) for name in CHECKPOINTED}
         if rollout is not None:
             state_tree['rollout'] = dict(rollout)
