@@ -565,14 +565,18 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
         if made or not frontier.fusing(equation):
             inner = max((peak_bytes(body, platform, workspace, Slicing.entering(equation, body),
                                     returned_carry(equation, body)) for body in bodies(equation)), default=0)
-            operands = sum(map(device_share, unfused(frontier, equation)))
+            made_for = unfused(frontier, equation)
+            operands = sum(map(device_share, made_for))
             products = 0 if not cublas_product(equation) else (
                 workspace.sliced if sliced.fused(equation) else workspace.each)
             # A loop's results (its stacked outputs, its carry) are held beside each turn's own; a call's
             # results are what its body returns.
             running = (looped(frontier, last, index, equation, made, carried) + inner
                        if equation.primitive.name in LOOPS else max(inner, made_bytes) - taken)
-            most = max(most, live + running + operands + products)
+            # The fusions that make its operands run before it, each buffer they alone read freed with them
+            # (`freed`): the most is theirs, or its own past them.
+            freed = sum(map(device_share, dying(frontier, equation, made_for, held, last, index)))
+            most = max(most, live + operands, live - freed + running + operands + products)
         held.update(made)
         live += made_bytes
         for done in [value for value in held if last[value] == index]:
@@ -599,6 +603,22 @@ def unfused(frontier: Frontier, equation: jcore.JaxprEqn) -> set[jcore.Var]:
     if frontier.fusing(equation):
         return set()
     return {value for value in equation.invars if computed(value) and frontier.made_for(value)}
+
+
+def dying(frontier: Frontier, equation: jcore.JaxprEqn, made_for: set[jcore.Var], held: set, last: Mapping,
+          index: int) -> set[jcore.Var]:
+    """The buffers the program holds (`held`) that the fusions making `equation`'s operands (`made_for`,
+    `unfused`) read last, the equation, the program's `index`th, reading none of them itself: each such
+    fusion is a kernel of its own XLA runs before the equation, past which a buffer no other instruction
+    reads is freed (its live range ending at its last use, `HloLiveRange`,
+    xla/hlo/utils/hlo_live_range.cc). A head's weight-gradient product reads the logits' cotangent, which
+    XLA computes from the logits a recomputed head holds behind its barrier and frees them: Qwen3.5-4B's
+    step at four microbatches was derived holding both, 0.95 GiB over XLA's 7.42 (row 4089)."""
+    if not made_for:
+        return set()
+    direct = frontier.reading([value for value in equation.invars if value not in made_for])
+    return {buffer for buffer in frontier.reading(made_for)
+            if buffer in held and last.get(buffer) == index and buffer not in direct}
 
 
 def in_place(frontier: Frontier, equation: jcore.JaxprEqn, held: set, last: Mapping, index: int) -> int:
