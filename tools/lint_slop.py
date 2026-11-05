@@ -1974,8 +1974,8 @@ def compile_points(module: Module) -> Iterator[Finding]:
 
 DERIVATIVE_OWNER = "nn/derivatives.py"
 """The module of `src/<package>` that applies JAX's custom derivatives (SLOP026); every other declares one
-through its functions (`kernel_derivative`, `kernel_tangent`, `numerics_derivative`, `numerics_tangent`,
-`surrogate`), each one marked call of its kind."""
+through its functions (`declared_derivative`, `declared_tangent`, each with its kind, and `surrogate`), each
+one marked call of its kind."""
 
 CUSTOM_DERIVATIVES = frozenset({"jax.custom_vjp", "jax.custom_jvp", "jax.custom_derivatives.custom_vjp",
                                 "jax.custom_derivatives.custom_jvp"})
@@ -1993,8 +1993,8 @@ def custom_derivatives(module: Module) -> Iterator[Finding]:
         named = isinstance(node, (ast.Name, ast.Attribute)) and scopes.resolved(node, table)
         if named in CUSTOM_DERIVATIVES:
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP026",
-                          f"applies {named} itself; declare the derivative through `dew.nn.derivatives` "
-                          "(`kernel_derivative`, `numerics_derivative`, their tangents or `surrogate`)")
+                          f"applies {named} itself; declare it with its kind through `dew.nn.derivatives` "
+                          "(`declared_derivative`, `declared_tangent` or `surrogate`)")
 
 
 GATE = frozenset({"tests/reference_error.py", "tests/check1_statistics.py", "tests/op_certificates.py",
