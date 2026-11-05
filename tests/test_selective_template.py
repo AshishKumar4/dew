@@ -12,6 +12,7 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from generation_support import lowers
 from reference_error import (
@@ -136,6 +137,36 @@ def test_the_template_holds_its_hardest_regimes_interpreted(regime):
                     jax.jit(with_gradients(scanned(portable, starts))), draws,
                     f"the selective template under {regime}", seeds=FEWEST_SEEDS,
                     truth_fn=jax.jit(with_gradients(scanned(portable, starts))))
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+def test_the_template_with_owned_partials_is_as_exact_as_the_portable_scan_interpreted(monkeypatch):
+    """`the_template_is_as_exact_as_the_portable_scan` over packed documents where the backward's programs
+    own their partial sums and walk their channels in turn (`Scan.owned`, a run asking its reductions
+    ordered)."""
+    monkeypatch.setattr(selective, "deterministic_ops_requested", lambda: True)
+    the_template_is_as_exact_as_the_portable_scan("interpreted", packed=True)
+
+
+@pytest.mark.gpu(reason="the backward's atomic adds land in a GPU's order, which an interpreter fixes")
+def test_the_backward_repeats_its_state_gradients_bit_for_bit_where_reductions_are_ordered(monkeypatch):
+    """The template's backward over 512 channels, 16 of them to each partial buffer (`selective.PARTIALS`),
+    under a run asking its reductions ordered (`--xla_gpu_deterministic_ops`, the CUDA test lane's): B's
+    and C's gradients bit for bit the same over repeated runs of one compiled step, the step's other
+    gradients too. With every channel adding atomically, the channels sharing a buffer added in whatever
+    order their programs ran (row 4392)."""
+    monkeypatch.setattr(selective, "deterministic_ops_requested", lambda: True)
+    shape = (1, 256, 512, 16)
+    family = bundles.of(generation.device_generation(), jnp.float32)
+    template = functools.partial(selective.selective_scan, family=family)
+    inputs, starts, dy = draw(jnp.float32, 0, *shape, packed=False)
+    step = jax.jit(with_gradients(scanned(template, starts)))
+    first = jax.block_until_ready(step(*inputs, dy))
+    for _ in range(4):
+        again = jax.block_until_ready(step(*inputs, dy))
+        pairs = zip(jax.tree.leaves(first), jax.tree.leaves(again), strict=True)
+        for leaf, (one, other) in enumerate(pairs):
+            assert np.array_equal(np.asarray(one), np.asarray(other)), leaf
 
 
 SEEDED = Path(__file__).resolve().parent / "fixtures" / "mamba" / "selective_mamba_ssm_seeded.npz"
