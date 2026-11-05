@@ -42,6 +42,7 @@ from dew.nn.kernels.templates.attention import (
     shared_place,
     whole,
 )
+from dew.nn.kernels.templates.cost import estimate
 from dew.nn.programs import CALLS
 
 QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name})
@@ -544,8 +545,8 @@ def _transposable(score_mod, params: tuple) -> bool:
 
 def _entrywise(jaxpr: jax_core.Jaxpr, inputs: set[int], tile: tuple[int, int]) -> bool:
     """Whether every operation of `jaxpr` that reads its `inputs` (by place) acts one entry at a time
-    (`layout.ENTRYWISE`, a scalar's broadcast, a nested call's own operations so), each value it reads of them
-    and each it gives a scalar or the `tile`."""
+    (`dew.nn.programs.ENTRYWISE`, a scalar's broadcast, a nested call's own operations so), each value it
+    reads of them and each it gives a scalar or the `tile`."""
     tainted = {jaxpr.invars[index] for index in inputs}
     for eqn in jaxpr.eqns:
         read = [index for index, var in enumerate(eqn.invars)
@@ -741,9 +742,7 @@ def stated(spec: algebra.Forward, batch: int, heads: int, widths: int, *arrays,
     pairs = issued(spec, tile_walk)
     if pairs is None:
         return None
-    return pl.CostEstimate(flops=2 * batch * heads * pairs * widths, transcendentals=batch * heads * pairs,
-                           bytes_accessed=sum(math.prod(array.shape) * jnp.dtype(array.dtype).itemsize
-                                              for array in arrays))
+    return estimate(2 * batch * heads * pairs * widths, *arrays, transcendentals=batch * heads * pairs)
 
 
 def modelled(spec: algebra.Forward, batch: int, heads: int, queries: int, widths: int) -> int | None:

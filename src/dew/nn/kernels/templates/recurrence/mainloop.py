@@ -60,8 +60,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra, tuning
 from dew.nn.kernels.templates import bundles, mosaic, product, resources
-from dew.nn.kernels.templates.cost import Work
-from dew.nn.kernels.templates.gemm import cost
+from dew.nn.kernels.templates.cost import Work, estimate
 from dew.nn.kernels.templates.operands import Issuer, Parts
 
 
@@ -641,12 +640,12 @@ def _laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, t
 
 def _stated(work: Work, tiles: int, pairs: int, arrays, out_type) -> pl.CostEstimate:
     """A launch's work over its `tiles` as it states it to XLA and to Dew's FLOP count
-    (`templates.gemm.cost`), the hardware's: the model's products times the part `pairs` each issues
+    (`templates.cost.estimate`), the hardware's: the model's products times the part `pairs` each issues
     (`product.terms`: an fp32 operand's bf16 parts), its exponentials, and its operands' and outputs' bytes
     once (row 1895's kernel report: unstated, the recurrence made MFU a lower bound). The model's share,
     `work.flops` a tile, the launch declares apart (`Family.kernel`'s `model_flops`)."""
-    stated = cost(int(work.flops * pairs * tiles), *arrays, *jax.tree.leaves(out_type))
-    return dataclasses.replace(stated, transcendentals=int(work.exponentials * tiles))
+    return estimate(work.flops * pairs * tiles, *arrays, *jax.tree.leaves(out_type),
+                    transcendentals=work.exponentials * tiles)
 
 
 def _tile_at(index, grid: tuple, grid_names: tuple) -> dict:

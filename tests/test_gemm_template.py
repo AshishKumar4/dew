@@ -18,9 +18,9 @@ from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from reference_error import as_given, assert_as_exact, with_gradients
 from tuned import each_config
 
-from dew.nn.kernels import generation, grouped_matmul, tuning
+from dew.nn.kernels import fused_gemm, gemm, generation, grouped_matmul, tuning
 from dew.nn.kernels.templates import mosaic_sm90, product, resources, tail
-from dew.nn.kernels.templates.gemm import fused, mosaic_gpu, mosaic_tpu, template, triton_dense
+from dew.nn.kernels.templates.gemm import mosaic_gpu, mosaic_tpu, triton_dense
 
 pytestmark = pytest.mark.kernel
 
@@ -190,7 +190,7 @@ def _draw(seed):
 def _dew(case, **kw):
     def run(x, w, ms, nw, b, u, s):
         drawn = (x, w, ms, nw, b, u, s)
-        outs = template.gemm(x, w[1] if case.dense else w, None if case.dense else jnp.asarray(SIZES),
+        outs = gemm.gemm(x, w[1] if case.dense else w, None if case.dense else jnp.asarray(SIZES),
                              prologue=case.prologue, prologue_operands=case.prologue_operands(*drawn),
                              epilogue=case.epilogue, epilogue_operands=case.epilogue_operands(*drawn),
                              out_dtype=case.out_dtypes[0],
@@ -341,7 +341,7 @@ def test_every_variant_of_the_mosaic_launches_holds_check_1(generation_name):
 
     def forward(x, w, dy):
         del dy
-        return template.gemm(x, w, sizes, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+        return gemm.gemm(x, w, sizes, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
 
     def plain_forward(x, w, dy, wide=jnp.float32, out=jnp.bfloat16):
         del dy
@@ -350,7 +350,7 @@ def test_every_variant_of_the_mosaic_launches_holds_check_1(generation_name):
 
     def gradient(x, w, dy):
         del w
-        return template.gemm_t(x, dy, sizes, out_dtype=jnp.float32, interpret_on_cpu=True)
+        return gemm.gemm_t(x, dy, sizes, out_dtype=jnp.float32, interpret_on_cpu=True)
 
     def plain_gradient(x, w, dy, wide=jnp.float32, out=jnp.float32):
         del w
@@ -386,7 +386,7 @@ def test_a_stacked_matrix_is_read_in_place_at_a_layer(generation_name):
                 jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16))
 
     def dew(x, stack):
-        return template.gemm(x, stack, sizes, layer=layer, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+        return gemm.gemm(x, stack, sizes, layer=layer, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
 
     def plain(x, stack, wide=jnp.float32, out=jnp.bfloat16):
         matrices = stack[1].astype(wide)
@@ -409,7 +409,7 @@ def test_an_empty_rows_undefined_derivative_reaches_no_shared_gradient():
     w = jnp.ones((1, DEPTH, WIDTH)) / DEPTH
 
     def through(x, ms, nw, w, *, sizes, interpret):
-        out = template.gemm(x, w, jnp.asarray(sizes), prologue=normed,
+        out = gemm.gemm(x, w, jnp.asarray(sizes), prologue=normed,
                             prologue_operands=((ms, ("rows",)), (nw, ("depth",))), out_dtype=jnp.float32,
                             interpret_on_cpu=interpret)
         return jnp.sum(out)
@@ -434,7 +434,7 @@ def test_a_wide_cotangent_meets_the_rounded_matrix_once():
     ct = jnp.zeros((1, WIDTH)).at[0, 0].set(1.00390625)
 
     def loss(x, w, *, interpret):
-        return jnp.sum(template.gemm(x, w, jnp.asarray([1]), out_dtype=jnp.float32,
+        return jnp.sum(gemm.gemm(x, w, jnp.asarray([1]), out_dtype=jnp.float32,
                                      interpret_on_cpu=interpret) * ct)
 
     with generation.assumed("sm80"):
@@ -452,7 +452,7 @@ def test_the_prologues_rounding_is_in_its_derivative():
     ct = jnp.zeros((1, WIDTH)).at[0, :2].set(jnp.asarray([1.0, 0.125]))
 
     def loss(scale, *, interpret):
-        out = template.gemm(x, w, jnp.asarray([1]), prologue=casted,
+        out = gemm.gemm(x, w, jnp.asarray([1]), prologue=casted,
                             prologue_operands=((scale, ("depth",)),), out_dtype=jnp.float32,
                             interpret_on_cpu=interpret)
         return jnp.sum(out * ct)
@@ -475,7 +475,7 @@ def test_a_prologue_never_sees_the_depths_padding(generation_name, sizes):
     x, w = jnp.ones((3, 17), jnp.bfloat16), jnp.ones((1, 17, 16))
     w = w if sizes else w[0]
     with generation.assumed(generation_name):
-        out = jax.jit(lambda x, w: template.gemm(x, w, None if sizes is None else jnp.asarray(sizes),
+        out = jax.jit(lambda x, w: gemm.gemm(x, w, None if sizes is None else jnp.asarray(sizes),
                                                  prologue=reciprocal, out_dtype=jnp.float32,
                                                  interpret_on_cpu=True))(x, w)
     np.testing.assert_array_equal(np.asarray(out), np.full((3, 16), 17.0))
@@ -497,7 +497,7 @@ def test_a_dense_product_whose_extents_no_tile_divides_holds_check_1(transpose_r
         return x, w, ms, nw, b, jnp.asarray(rng.normal(size=(65, 100)), jnp.bfloat16)
 
     def dew(x, w, ms, nw, b):
-        return template.gemm(x, w, None, prologue=normed,
+        return gemm.gemm(x, w, None, prologue=normed,
                              prologue_operands=((ms, ("rows",)), (nw, ("depth",))), epilogue=biased,
                              epilogue_operands=((b, ("columns",)),), out_dtype=jnp.bfloat16,
                              transpose_rhs=transpose_rhs, interpret_on_cpu=True)
@@ -533,7 +533,7 @@ def test_a_named_kernels_derivative_pulled_after_its_block_holds_check_1():
 
     def dew(x, w, cotangent):
         with generation.chosen(grouped_matmul="xla"):
-            y, pull = jax.vjp(lambda x, w: template.gemm(x, w, sizes, out_dtype=jnp.bfloat16), x, w)
+            y, pull = jax.vjp(lambda x, w: gemm.gemm(x, w, sizes, out_dtype=jnp.bfloat16), x, w)
         return (y, *pull(cotangent))
 
     def plain(x, w, cotangent, wide=jnp.float32):
@@ -551,7 +551,7 @@ def test_a_named_kernels_derivative_pulled_after_its_block_holds_check_1():
 def test_a_dense_layers_product_through_the_template_holds_check_1(generation_name):
     """A model's projection, `dew.nn.dense.Dense` over `[batch, sequence, width]` rows with its product as
     GatedMLP and GatedDeltaNet form it (`float32_dot_general`), through the GEMM template's dense product
-    (`template.dot_general`; its launches named, as a dense cell declares XLA's dot faster): the output and
+    (`gemm.dot_general`; its launches named, as a dense cell declares XLA's dot faster): the output and
     the gradients of the rows, the kernel and the bias hold check 1 from float64 against the same layer
     run on XLA's dot."""
     from dew.nn.dense import Dense
@@ -597,7 +597,7 @@ def test_each_dense_launch_lowers_once_however_many_layers_call_it():
             total = jnp.float32(0.0)
             for layer in range(count):
                 # Each layer's own rows, as each layer takes the one before's.
-                out = template.gemm(x * (layer + 1), w, None, out_dtype=jnp.bfloat16)
+                out = gemm.gemm(x * (layer + 1), w, None, out_dtype=jnp.bfloat16)
                 total = total + out.astype(jnp.float32).sum()
             return total
 
@@ -624,8 +624,8 @@ def test_two_launches_whose_padded_shapes_meet_name_their_own_kernels():
     shorter, longer = (jax.ShapeDtypeStruct((rows, 256), jnp.bfloat16) for rows in (4089, 4096))
 
     def both(a, b, w):
-        return (template.gemm(a, w, None, out_dtype=jnp.bfloat16),
-                template.gemm(b, w, None, out_dtype=jnp.bfloat16))
+        return (gemm.gemm(a, w, None, out_dtype=jnp.bfloat16),
+                gemm.gemm(b, w, None, out_dtype=jnp.bfloat16))
 
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
         lowered = jax.jit(both).trace(shorter, longer, weight).lower(lowering_platforms=("cuda",))
@@ -700,7 +700,7 @@ def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
     draw = _dense_draw(256, 96, 128, cotangent=True)
 
     def dew(x, w):
-        return template.gemm(x, w, None, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+        return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
 
     def plain(x, w, wide=jnp.float32, out=jnp.bfloat16):
         # A 16-bit output: an fp32 one's cotangent makes the kernel gradient an fp32 product, XLA's.
@@ -774,7 +774,7 @@ def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width
 
     def dew(x, w, dy):
         del w
-        return template.gemm_t(x, dy, None, out_dtype=jnp.bfloat16, interpret_on_cpu=True)[0]
+        return gemm.gemm_t(x, dy, None, out_dtype=jnp.bfloat16, interpret_on_cpu=True)[0]
 
     def plain(x, w, dy, wide=jnp.float32, out=jnp.bfloat16):
         del w
@@ -831,7 +831,7 @@ def a_dense_products_exact_sums_survive_one_row_tile():
     draw = _dense_draw(64, 4096, 128)
 
     def dew(x, w):
-        return template.gemm(x, w, None, out_dtype=jnp.float32, precision="highest")
+        return gemm.gemm(x, w, None, out_dtype=jnp.float32, precision="highest")
 
     def xla(x, w):
         return jnp.dot(x, w, precision="highest", preferred_element_type=jnp.float32)
@@ -855,7 +855,7 @@ def test_a_side_operands_rows_may_be_any_of_its_dimensions(generation_name):
         def dew(x, w, dy, side, hook=hook, layout=layout, transposed=transposed):
             options = {"prologue": hook, "prologue_operands": ((side.T if transposed else side, layout),),
                        "out_dtype": jnp.float32, "interpret_on_cpu": True}
-            return template.gemm(x, w, sizes, **options), template.gemm_t(x, dy, sizes, **options)
+            return gemm.gemm(x, w, sizes, **options), gemm.gemm_t(x, dy, sizes, **options)
 
         with generation.assumed(generation_name), generation.chosen(grouped_matmul="triton"):
             assert_as_exact(jax.jit(dew), jax.jit(_side_plain()), _side_draw(jnp.float32),
@@ -882,7 +882,7 @@ def test_a_side_operand_names_one_launch_axis_per_dimension():
     for operand, axes in ((jnp.ones((8,)), ("columns",)), (jnp.ones((8, 2)), ("rows", None)),
                           (jnp.ones((1,)), (None,))):
         with pytest.raises(ValueError):
-            template.gemm(x, w, jnp.asarray([8]), prologue=normed, prologue_operands=((operand, axes),),
+            gemm.gemm(x, w, jnp.asarray([8]), prologue=normed, prologue_operands=((operand, axes),),
                           out_dtype=jnp.float32)
 
 
@@ -902,7 +902,7 @@ def test_a_per_group_side_operand_and_its_gradient_hold_check_1(generation_name)
     def dew(x, w, b):
         def loss(b):
             # The groups axis reaches the hook as rows: each row's tile of its group's bias.
-            out = template.gemm(x, w, sizes, epilogue=biased_row,
+            out = gemm.gemm(x, w, sizes, epilogue=biased_row,
                                 epilogue_operands=((b, ("groups", "columns")),), out_dtype=jnp.float32,
                                 interpret_on_cpu=True)
             return jnp.sum(out[:ROUTED] ** 2), out
@@ -932,7 +932,7 @@ depth a whole promotion's 128 or more."""
 @pytest.mark.parametrize("dtype", [jnp.float8_e4m3fn, jnp.float8_e5m2], ids=["e4m3", "e5m2"])
 @pytest.mark.parametrize(("rows", "depth", "width"), FP8_SHAPES)
 def test_an_fp8_product_holds_check_1_under_its_contract(rows, depth, width, dtype):
-    """An FP8 product through the template on an H100 (`template.gemm` of FP8 codes, the matrix K-major
+    """An FP8 product through the template on an H100 (`gemm.gemm` of FP8 codes, the matrix K-major
     `[N, K]` as Hopper's FP8 tensor cores read it, `transpose_rhs`), its rows' and columns' scales applied
     after: on par with the dequantized product with fp32 sums (`quantization._fp8_rows`'s, check 1's
     reference arm) from the float64 product of the operands as quantized (testing.md, FP8 products: no FP8
@@ -946,7 +946,7 @@ def test_an_fp8_product_holds_check_1_under_its_contract(rows, depth, width, dty
         return (jnp.asarray(values, dtype), jnp.asarray(matrix, dtype), row_scales, column_scales)
 
     def dew(values, matrix, row_scales, column_scales):
-        product = template.gemm(values, matrix, None, transpose_rhs=True, out_dtype=jnp.float32,
+        product = gemm.gemm(values, matrix, None, transpose_rhs=True, out_dtype=jnp.float32,
                                 interpret_on_cpu=True)
         return product * row_scales * column_scales
 
@@ -965,7 +965,7 @@ def test_the_epilogue_applies_to_every_row(generation_name):
     """A row past the routed ones sums nothing: its output is the epilogue of zero, the bias."""
     x, w, _, _, b, *_ = _draw(1)
     with generation.assumed(generation_name):
-        out = jax.jit(lambda x, w, b: template.gemm(
+        out = jax.jit(lambda x, w, b: gemm.gemm(
             x, w, jnp.asarray(SIZES), epilogue=biased, epilogue_operands=((b, ("columns",)),),
             out_dtype=jnp.float32, interpret_on_cpu=True))(x, w, b)
     expected = np.broadcast_to(np.asarray(b), (ROWS - ROUTED, WIDTH))
@@ -1028,10 +1028,10 @@ def test_the_fused_epilogue_keeps_the_programs_value(generation_name, consumer):
         return x, w, b, u[:, :WIDTH]
 
     def fusing(x, w, b, r):
-        return consumer(fused.fusible_gemm(x, w, sizes, interpret_on_cpu=True), b, r)
+        return consumer(fused_gemm.fusible_gemm(x, w, sizes, interpret_on_cpu=True), b, r)
 
     def unfused(x, w, b, r):
-        return consumer(template.gemm(x, w, sizes, out_dtype=jnp.float32), b, r)
+        return consumer(gemm.gemm(x, w, sizes, out_dtype=jnp.float32), b, r)
 
     def truth(x, w, b, r):
         matrix = w.astype(jnp.bfloat16).astype(x.dtype)
@@ -1083,8 +1083,8 @@ def test_a_consumer_reading_its_side_off_the_tile_keeps_the_programs_value(gener
     """A consumer whose residual is read at another column block than the product's, by a map that agrees
     with the identity at one point (`_moved_columns`): the fused product keeps the unfused program's value
     on every element (check 1), the consumer refused the epilogue, its map proved not the identity
-    (`fused._followed`), where a map read at (1, 2) alone was taken for the tile and the kernel added each
-    block's own residual (row 3636)."""
+    (`fused_gemm._followed`), where a map read at (1, 2) alone was taken for the tile and the kernel added
+    each block's own residual (row 3636)."""
     sizes = jnp.asarray(SIZES)
 
     def draw(seed):
@@ -1092,10 +1092,10 @@ def test_a_consumer_reading_its_side_off_the_tile_keeps_the_programs_value(gener
         return x, w, u[:, :WIDTH].astype(jnp.float32)
 
     def fusing(x, w, r):
-        return _moved_columns(WIDTH, 64)(fused.fusible_gemm(x, w, sizes, interpret_on_cpu=True), r)
+        return _moved_columns(WIDTH, 64)(fused_gemm.fusible_gemm(x, w, sizes, interpret_on_cpu=True), r)
 
     def unfused(x, w, r):
-        return _moved_columns(WIDTH, 64).fun(template.gemm(x, w, sizes, out_dtype=jnp.float32), r)
+        return _moved_columns(WIDTH, 64).fun(gemm.gemm(x, w, sizes, out_dtype=jnp.float32), r)
 
     def truth(x, w, r):
         matrix = w.astype(jnp.bfloat16).astype(x.dtype)
@@ -1145,10 +1145,11 @@ def test_a_normed_operand_runs_in_the_prologue_with_the_programs_value(generatio
         return x, w, nw
 
     def fusing(x, w, weight):
-        return fused.fusible_gemm(rms_norm(x, weight), w, sizes, interpret_on_cpu=True).astype(jnp.bfloat16)
+        fused = fused_gemm.fusible_gemm(rms_norm(x, weight), w, sizes, interpret_on_cpu=True)
+        return fused.astype(jnp.bfloat16)
 
     def unfused(x, w, weight):
-        return template.gemm(rms_norm(x, weight), w, sizes, out_dtype=jnp.bfloat16)
+        return gemm.gemm(rms_norm(x, weight), w, sizes, out_dtype=jnp.bfloat16)
 
 
     with generation.assumed(generation_name):
@@ -1171,7 +1172,7 @@ def test_a_fused_norm_lowers_for_an_h100(producer):
                 jax.ShapeDtypeStruct((depth,), jnp.float32))
 
     def fusing(x, w, weight):
-        return fused.fusible_gemm(producer(x, weight), w, sizes).astype(jnp.bfloat16)
+        return fused_gemm.fusible_gemm(producer(x, weight), w, sizes).astype(jnp.bfloat16)
 
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
@@ -1180,18 +1181,18 @@ def test_a_fused_norm_lowers_for_an_h100(producer):
 
 def _three_gemms(sizes):
     """A fused producer's product three ways: under `fuser.fuse`, unfused, and its float64 truth."""
-    def fused_gemm(operand, w):
-        return fused.fusible_gemm(operand, w, sizes, interpret_on_cpu=True)
+    def fused_product(operand, w):
+        return fused_gemm.fusible_gemm(operand, w, sizes, interpret_on_cpu=True)
 
-    def plain_gemm(operand, w):
-        return template.gemm(operand, w, sizes, out_dtype=jnp.float32)
+    def plain_product(operand, w):
+        return gemm.gemm(operand, w, sizes, out_dtype=jnp.float32)
 
-    def truth_gemm(operand, w):
+    def truth_product(operand, w):
         # The matrix's value rounded as the program rounds it; its gradient not (straight through).
         matrix = (w + jax.lax.stop_gradient(w.astype(jnp.bfloat16).astype(w.dtype) - w)).astype(operand.dtype)
         return jax.lax.ragged_dot(operand, matrix, sizes, preferred_element_type=operand.dtype)
 
-    return fused_gemm, plain_gemm, truth_gemm
+    return fused_product, plain_product, truth_product
 
 
 @runs("sm80")
@@ -1215,11 +1216,11 @@ def test_a_fused_producers_gradients_are_its_own(producer):
             return _wide(out)  # fp32, or the truth's float64, as the drawn cotangent is widened
         return with_gradients(transform(value))
 
-    fused_gemm, plain_gemm, truth_gemm = _three_gemms(sizes)
+    fused, plain, truth = _three_gemms(sizes)
 
     with generation.assumed("sm80"):
-        assert_as_exact(jax.jit(loss(fused_gemm, fuser.fuse)), jax.jit(loss(plain_gemm)), draw,
-                        f"{producer.__name__} gradients", seeds=SEEDS, truth_fn=loss(truth_gemm))
+        assert_as_exact(jax.jit(loss(fused, fuser.fuse)), jax.jit(loss(plain)), draw,
+                        f"{producer.__name__} gradients", seeds=SEEDS, truth_fn=loss(truth))
 
 
 @runs("sm80")
@@ -1252,11 +1253,11 @@ def test_a_fused_producers_forward_and_higher_derivatives_are_its_own(compositio
             return jax.jvp(lambda x: program(x, w, weight), (x,), along)[1]
         return run
 
-    fused_gemm, plain_gemm, truth_gemm = _three_gemms(sizes)
+    fused, plain, truth = _three_gemms(sizes)
 
     with generation.assumed("sm80"):
-        assert_as_exact(jax.jit(derivative(fused_gemm, fuser.fuse)), jax.jit(derivative(plain_gemm)), draw,
-                        f"normed operand {composition}", seeds=SEEDS, truth_fn=derivative(truth_gemm))
+        assert_as_exact(jax.jit(derivative(fused, fuser.fuse)), jax.jit(derivative(plain)), draw,
+                        f"normed operand {composition}", seeds=SEEDS, truth_fn=derivative(truth))
 
 
 @runs("sm80")
@@ -1270,10 +1271,11 @@ def test_both_fused_stages_chosen_through_xla_are_as_exact_as_the_unfused_progra
         return x, w, nw, b
 
     def fusing(x, w, weight, b):
-        return bias_cast(fused.fusible_gemm(rms_norm(x, weight), w, sizes, interpret_on_cpu=True), b, None)
+        fused = fused_gemm.fusible_gemm(rms_norm(x, weight), w, sizes, interpret_on_cpu=True)
+        return bias_cast(fused, b, None)
 
     def unfused(x, w, weight, b):
-        return bias_cast(template.gemm(rms_norm(x, weight), w, sizes, out_dtype=jnp.float32), b, None)
+        return bias_cast(gemm.gemm(rms_norm(x, weight), w, sizes, out_dtype=jnp.float32), b, None)
 
     def truth(x, w, weight, b):
         return _normed_truth(sizes, x, w, weight) + b[None, :]
@@ -1294,10 +1296,10 @@ def test_a_one_row_normed_operand_fuses():
         return x[:1], w, nw
 
     def fusing(x, w, weight):
-        return fused.fusible_gemm(rms_norm(x, weight), w, sizes, interpret_on_cpu=True)
+        return fused_gemm.fusible_gemm(rms_norm(x, weight), w, sizes, interpret_on_cpu=True)
 
     def unfused(x, w, weight):
-        return template.gemm(rms_norm(x, weight), w, sizes, out_dtype=jnp.float32)
+        return gemm.gemm(rms_norm(x, weight), w, sizes, out_dtype=jnp.float32)
 
 
     with generation.assumed("sm80"):
@@ -1364,6 +1366,24 @@ def _on_a_v5e():
     return generation.assumed("v5e"), jax.sharding.use_abstract_mesh(mesh)
 
 
+def test_a_tpu_launch_takes_a_legal_pin_and_names_why_it_refuses_another():
+    """A TPU launch's pin is judged by its own legality on a TPU, which has no CUDA multiprocessor whose
+    registers a thread's budget would read: the block it derives is pinnable, and a block of its config
+    type its kernel cannot take (no multiple of a lane) or no config of its type is refused with its
+    reason (`unpinnable`), not a CUDA multiprocessor's error."""
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    launch = grouped_matmul.MosaicTpuGmm()
+    args = (bf16((2048, 1536)), bf16((8, 1536, 1536)), jax.ShapeDtypeStruct((8,), jnp.int32))
+    assumed, mesh = _on_a_v5e()
+    with assumed, mesh:
+        ba = launch.bind(*args, out_dtype="bfloat16", trans_rhs=False, interpret=False)
+        target = generation.gpu_target()
+        assert launch.pinnable(ba, launch.derived(ba, target))
+        assert not launch.pinnable(ba, mosaic_tpu.Blocks(8, 8, 8))
+        assert launch.unpinnable(ba, mosaic_tpu.Blocks(8, 8, 8))
+        assert launch.unpinnable(ba, mosaic_gpu.Tiles(64, 64, 64, 2, 1))
+
+
 @pytest.mark.parametrize("side_dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("launch", [grouped_matmul.MosaicTpuGmm(), grouped_matmul.MosaicTpuTgmm()],
                          ids=lambda launch: type(launch).__name__)
@@ -1403,7 +1423,7 @@ def test_a_cuda_call_naming_xla_runs_its_program(generation_name):
     w = jax.ShapeDtypeStruct((2, 128, 256), jnp.bfloat16)
     sizes = jnp.asarray([128, 128], jnp.int32)
     with generation.assumed(generation_name), generation.chosen(grouped_matmul="xla"):
-        jax.jit(lambda x, w: template.gemm(x, w, sizes, out_dtype=jnp.bfloat16)).trace(x, w).lower(
+        jax.jit(lambda x, w: gemm.gemm(x, w, sizes, out_dtype=jnp.bfloat16)).trace(x, w).lower(
             lowering_platforms=("cuda",))
 
 
@@ -1418,10 +1438,10 @@ def test_a_tpu_lowers_xlas_program_for_a_call_no_launch_takes(product):
     sizes = jnp.asarray([32], jnp.int32)
     if product == "gemm":
         def run(x, other):
-            return template.gemm(x, other, sizes, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+            return gemm.gemm(x, other, sizes, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
     else:
         def run(x, other):
-            return template.gemm_t(x, other, sizes, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+            return gemm.gemm_t(x, other, sizes, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
     assumed, mesh = _on_a_v5e()
     with assumed, mesh:
         jax.jit(run).trace(x, other).lower(lowering_platforms=("tpu",))
@@ -1563,7 +1583,7 @@ def test_an_ampere_kernel_gradient_at_a_two_row_warp_step_holds_check_1(generati
 
     def ampere(x, dy):
         # The default precision's sums, which mma.sync's launches take (exact sums are warpgroup MMA's).
-        return template.gemm_t(x, dy, jnp.asarray(SIZES), out_dtype=jnp.float32, precision="default",
+        return gemm.gemm_t(x, dy, jnp.asarray(SIZES), out_dtype=jnp.float32, precision="default",
                                interpret_on_cpu=True)
 
     def plain(x, dy):
@@ -1597,7 +1617,7 @@ def test_exact_sums_add_each_steps_product_as_the_plain_sum_does(generation_name
     for launch, group_sizes, precision in itertools.product(launches, (SIZES, None),
                                                             ("highest", "default")):
         def dew(x, dy, group_sizes=group_sizes, precision=precision):
-            return template.gemm_t(x, dy, None if group_sizes is None else jnp.asarray(group_sizes),
+            return gemm.gemm_t(x, dy, None if group_sizes is None else jnp.asarray(group_sizes),
                                    out_dtype=jnp.float32, precision=precision, interpret_on_cpu=True)
 
         def plain(x, dy, group_sizes=group_sizes):
@@ -1636,7 +1656,7 @@ def test_a_cooperative_tiles_exact_sums_add_as_its_plain_sum_does():
 
     for precision in ("highest", "default"):
         def dew(x, dy, precision=precision):
-            return template.gemm_t(x, dy, jnp.asarray(SIZES), out_dtype=jnp.float32, precision=precision,
+            return gemm.gemm_t(x, dy, jnp.asarray(SIZES), out_dtype=jnp.float32, precision=precision,
                                    interpret_on_cpu=True)
 
         with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"),
@@ -1678,10 +1698,10 @@ def test_a_pin_names_only_a_config_the_launchs_kernel_takes():
     x, w, dy = bf16((256, 128)), bf16((2, 128, 64)), bf16((256, 64))
 
     def forward(x, w):
-        return template.gemm(x, w, sizes, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+        return gemm.gemm(x, w, sizes, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
 
     def gradient(x, dy):
-        return template.gemm_t(x, dy, sizes, out_dtype=jnp.float32, precision="highest",
+        return gemm.gemm_t(x, dy, sizes, out_dtype=jnp.float32, precision="highest",
                                interpret_on_cpu=True)
 
     calls = ((forward, (x, w), "mosaic_gpu", grouped_matmul.MosaicGmm, mosaic_gpu.Tiles(64, 64, 64, 1, 1),
@@ -1791,7 +1811,7 @@ def test_an_integer_side_operand_takes_no_gradient():
 
     def gradient(*, interpret):
         def loss(x, w):
-            out = template.gemm(x, w, jnp.asarray(SIZES), prologue=selected,
+            out = gemm.gemm(x, w, jnp.asarray(SIZES), prologue=selected,
                                 prologue_operands=((mask, ("rows",)),), out_dtype=jnp.float32,
                                 interpret_on_cpu=interpret)
             return jnp.sum(out)
@@ -1832,7 +1852,7 @@ def test_a_consumer_the_kernels_cannot_tile_runs_after_the_product(consumer, exa
         return run
 
     def fusing(x, w):
-        return consumer(fused.fusible_gemm(x, w, sizes, interpret_on_cpu=True), scale)
+        return consumer(fused_gemm.fusible_gemm(x, w, sizes, interpret_on_cpu=True), scale)
 
     with generation.assumed("sm80"):
         assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(plain(consumer)), draw,
@@ -1927,7 +1947,7 @@ def test_the_templates_paired_product_holds_check_1(generation_name, grouped):
     SwiGLU's fp32 cotangents multiply wide, which warpgroup MMA's 16-bit products do not take), each as
     exact as the unfused program's from float64 truth. On mma.sync, which takes no paired call, its two
     products run apart (`grouped_matmul.APART`, a structural handoff a named kernel keeps), each through
-    its own launch, the named one, the SwiGLU in XLA on their fp32 accumulators (`template._apart`). The
+    its own launch, the named one, the SwiGLU in XLA on their fp32 accumulators (`gemm._apart`). The
     gradients run eagerly, as the Mosaic interpreters' ordered callbacks need."""
     rows, depth, width = 136, 128, 256
     sizes = jnp.asarray([70, 66], jnp.int32) if grouped else None
@@ -1942,7 +1962,7 @@ def test_the_templates_paired_product_holds_check_1(generation_name, grouped):
                 jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16))
 
     def dew(x, gate, up):
-        return template.gemm(x, gate, sizes, paired=up, epilogue=swiglu, out_dtype=jnp.bfloat16,
+        return gemm.gemm(x, gate, sizes, paired=up, epilogue=swiglu, out_dtype=jnp.bfloat16,
                              interpret_on_cpu=True)
 
     def plain(x, gate, up, wide=jnp.float32, out=jnp.bfloat16):
@@ -1987,7 +2007,7 @@ def test_a_paired_products_epilogue_reads_its_fp32_accumulators_in_every_mode(ge
                 jnp.asarray(rng.normal(size=(rows, width)), jnp.float32))
 
     def dew(x, gate, up):
-        return template.gemm(x, gate, sizes, paired=up, epilogue=lambda g, u: g * u, compute=jnp.bfloat16,
+        return gemm.gemm(x, gate, sizes, paired=up, epilogue=lambda g, u: g * u, compute=jnp.bfloat16,
                              out_dtype=jnp.float32, precision="default", interpret_on_cpu=True)
 
     def plain(x, gate, up, dtype=jnp.bfloat16):
@@ -2031,7 +2051,7 @@ def test_a_paired_product_at_a_named_compute_dtype_holds_check_1(generation_name
                 tuple(jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16) for _ in range(2)))
 
     def dew(x, gate, up):
-        return template.gemm(x, gate, sizes, paired=up, compute=jnp.bfloat16, out_dtype=jnp.bfloat16,
+        return gemm.gemm(x, gate, sizes, paired=up, compute=jnp.bfloat16, out_dtype=jnp.bfloat16,
                              out_dtypes=(jnp.bfloat16, jnp.bfloat16), interpret_on_cpu=True)
 
     def plain(x, gate, up, dtype=jnp.bfloat16):
@@ -2065,7 +2085,7 @@ def test_the_templates_paired_product_without_an_epilogue_holds_check_1(generati
                 tuple(jnp.asarray(rng.normal(size=(rows, width)), out) for _ in range(2)))
 
     def dew(x, gate, up):
-        return template.gemm(x, gate, None, paired=up, out_dtype=out, out_dtypes=(out, out),
+        return gemm.gemm(x, gate, None, paired=up, out_dtype=out, out_dtypes=(out, out),
                              interpret_on_cpu=generation_name is not None)
 
     def plain(x, gate, up, wide=jnp.float32, cast=out):
@@ -2160,5 +2180,5 @@ def test_a_declared_cell_compiles_nothing_for_the_template_it_prefers(monkeypatc
     x, dy = jax.ShapeDtypeStruct((4096, 1024), jnp.bfloat16), jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16)
     sizes = jnp.full((8,), 512, jnp.int32)
     with generation.assumed("sm80"):
-        jax.jit(lambda x, dy: template.gemm_t(x, dy, sizes, out_dtype=jnp.bfloat16)).trace(x, dy)
+        jax.jit(lambda x, dy: gemm.gemm_t(x, dy, sizes, out_dtype=jnp.bfloat16)).trace(x, dy)
     assert not (tmp_path / "dew" / "kernel-reports").exists()

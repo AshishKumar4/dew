@@ -85,12 +85,14 @@ def _bits(mask: int) -> list[int]:
     return [bit for bit in range(WORD) if mask >> bit & 1]
 
 
-def _parities(words: np.ndarray, rows: Sequence[int]) -> np.ndarray:
-    """Each of `words` mapped by `rows` (its bit `j` the parity of the word's bits in `rows[j]`)."""
-    out = np.zeros_like(words)
+def _parities[Words: (np.ndarray, jax.Array)](words: Words, rows: Sequence[int], xp=np) -> Words:
+    """Each of `words`, unsigned integers of `xp` (NumPy, or `jax.numpy` for a kernel's prepare step), mapped
+    by `rows` (its bit `j` the parity of the word's bits in `rows[j]`): the one evaluation of an encoder."""
+    word = words.dtype.type
+    out = xp.zeros_like(words)
     for index, row in enumerate(rows):
-        bit = np.bitwise_count(words & np.uint64(row)) & np.uint64(1)
-        out |= bit << np.uint64(index)
+        bit = xp.bitwise_count(words & word(row)).astype(words.dtype) & word(1)
+        out |= bit << word(index)
     return out
 
 
@@ -189,8 +191,13 @@ class BitForm:
                      for value in _run(self.steps, self.outputs, words.astype(np.uint32), np))
 
     def encoded(self, inputs: np.ndarray) -> np.ndarray:
-        """The stored word of each of `inputs`."""
+        """The stored word of each of `inputs`, as uint64."""
         return _parities(inputs.astype(np.uint64), self.encoder)
+
+    def prepared(self, inputs: jax.Array) -> jax.Array:
+        """The stored word of each of `inputs` (uint32), as JAX computes it (`_parities`'s, in `jax.numpy`):
+        a consumer's prepare step, which stores its weights in the form's layout once."""
+        return _parities(inputs.astype(jnp.uint32), self.encoder, jnp)
 
     @property
     def issues(self) -> dict[Unit, int]:
@@ -209,6 +216,13 @@ class BitForm:
         """Each output register of each stored word of `words` (uint32), as JAX computes it (`_run`'s, in
         `jax.numpy`): a kernel's portable path and its interpreter's, where no inline assembly runs."""
         return _run(self.steps, self.outputs, words.astype(jnp.uint32), jnp)
+
+    def values(self, words: jax.Array, dtype) -> jax.Array:
+        """The `dtype` elements the registers of each stored word of `words` (uint32, `[..., c]`) hold
+        (`traced`), register by register and each register's low bits first: `[..., c * n]`, `n` the
+        registers' elements a word (a decode's elements in their natural order, `NVFP4_BFLOAT16`'s eight)."""
+        registers = jnp.stack(self.traced(words), axis=-1)
+        return jax.lax.bitcast_convert_type(registers, dtype).reshape(*words.shape[:-1], -1)
 
     def ptx(self, output: int) -> str:
         """Output register `output` of the form as one PTX block over its stored word `$1` into `$0`, the
@@ -488,3 +502,32 @@ def synthesized(transform: BitTransform, *, right: bool = True, lefts: int = 3,
                 proven(transform, form)
                 return form
     raise LookupError(f"{transform.name}: no form of {lefts} left shifts within {reach} places computes it")
+
+
+# E2M1 (OCP Microscaling Formats v1.0, 5.3.3): a mantissa bit, two exponent bits of bias 1, a sign; each
+# field's bit in a bfloat16 half, so the half times 2^126 is the code's value (a zero exponent a subnormal of
+# both).
+_E2M1_IN_BFLOAT16 = {0: 6, 1: 7, 2: 8, 3: 15}
+
+NVFP4_BFLOAT16 = BitTransform.placed(
+    "nvfp4-bf16", WORD, (0x81C081C0,) * 4,
+    {4 * code + field: (code // 2, 16 * (code % 2) + bit)
+     for code in range(8) for field, bit in _E2M1_IN_BFLOAT16.items()})
+"""Eight E2M1 codes of a word in their natural order (code `i` at bits `4i` to `4i + 3`: a byte's low nibble
+the earlier element), decoded into four registers of two bfloat16s, code `2i` the low half of register `i` and
+`2i + 1` the high, each the code's value times 2^-126: the exponent's bias, which the block scale's multiply
+takes (the GEMM template's matrix-operand hook, algebra.md 7.4). Its layout is free."""
+
+NVFP4_BFLOAT16_FORM = BitForm(
+    steps=(BitStep(BitOp.ROTR, (0,), 6, Unit.ALU), BitStep(BitOp.SHL, (0,), 2, Unit.FMA),
+           BitStep(BitOp.SHL, (0,), 6, Unit.FMA), BitStep(BitOp.SHL, (1,), 2, Unit.FMA),
+           *(BitStep(BitOp.LOP3, args, 0x81C081C0, Unit.ALU) for args in ((0, 1), (0, 3), (0, 4), (2,)))),
+    outputs=(5, 6, 7, 8),
+    encoder=(0x4000100, 0x8000202, 0x4040401, 0x2800080, 0x1000000, 0x2000000, 0x4000000, 0x8000002,
+             0x4040001, 0x20000808, 0x4010000, 0x8020002, 0x4000001, 0x8000000, 0x4040005, 0x20000008,
+             0x40001000, 0x80002020, 0x40404010, 0x20080008, 0x10000000, 0x20000000, 0x40000000, 0x80000020,
+             0x40400010, 0x2008080, 0x40100000, 0x80200020, 0x40000010, 0x80000000, 0x40400050, 0x2000080))
+"""`NVFP4_BFLOAT16`'s form as `synthesized(NVFP4_BFLOAT16, reach=6)` finds it, checked in so a kernel reads it
+without searching: a rotation by 6 and left shifts by 2 and 6 and of the rotation's by 2 (on the FMA pipe),
+four masked XORs, the fp4 challenge's price (5 issues on the busiest pipe, 8 instructions). Its encoder is
+the stored layout's version: weights stored in it decode by this form alone."""

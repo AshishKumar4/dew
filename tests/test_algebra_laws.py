@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from map_judge import pooled_units, record_units
+from map_judge import sharded
 
 from dew.algebra import SATURATION, derive
 from dew.nn.kernels import recurrence_algebra
@@ -168,10 +168,7 @@ def _certified_in_shards(label: str, cases: tuple, units: int, certify) -> None:
             certify(*case)
         return stop - start
 
-    if record_units(label, certified):
-        return
-    if pooled_units(label, units) is None:
-        certified(0, units)
+    sharded(label, certified, units)
 
 
 @pytest.mark.shards(units=60, per_task=1)

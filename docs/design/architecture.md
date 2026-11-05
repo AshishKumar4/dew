@@ -125,7 +125,7 @@ The device's family comes from its compute capability: sm80, sm86, sm89 and sm12
 | Attention, fp32, on wgmma and mma.sync GPUs | XLA (declared) |  |
 | Attention, sm100 and sm103 | Template, Pallas-Triton mainloop, or plain JAX | The tcgen05 mainloop is built but not routed. |
 | Attention, decode-shaped | The Pallas-Triton decode kernel |  |
-| Dense GEMM, sm80 and sm90 | XLA's dot, which calls cuBLAS (declared from measurements) | Dense calls reach the template through `template.dot_general`; every dense cell on these GPUs is declared to XLA by receipt. |
+| Dense GEMM, sm80 and sm90 | XLA's dot, which calls cuBLAS (declared from measurements) | Dense calls reach the template through `gemm.dot_general`; every dense cell on these GPUs is declared to XLA by receipt. |
 | Grouped GEMM (MoE) | Template: Mosaic GPU, then Mosaic TPU, then Triton | CUTLASS keeps the wgmma forward and input-gradient cells where installed; Triton keeps one mma.sync cell. |
 | Linear recurrence: gated delta, SSD, selective scan | Template first | The ported kernels (fla, mamba_ssm's SSD) keep their declared wgmma and mma.sync cells. |
 | RMSNorm and SwiGLU | XLA | Pallas-Triton on declared sm80 and sm90 cells: RMSNorm in bf16 and fp16, SwiGLU in bf16. |

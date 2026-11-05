@@ -150,8 +150,8 @@ class Priced:
     """A carried form's price, compared in order: its work that reads the state (once a chunk, in sequence),
     then the rest (every chunk's at once), each in seconds under XLA's schedule (`cost.fused`), where the
     carry runs (a `lax.scan` step a chunk, recurrence_chunk's derived walk): its span at a loop iteration's
-    latency, as `linear_scan`'s, which the tile walk's schedule leaves unpriced (no fact states an in-kernel
-    step's latency, `templates.cost.step_latency`)."""
+    latency, as `linear_scan`'s; a tile walk prices its span at an in-kernel step's, a dependent reduction's
+    (`templates.cost.step_latency`), which the carry, a loop XLA lowers, does not run."""
 
     sequential: cost.Seconds
     parallel: cost.Seconds

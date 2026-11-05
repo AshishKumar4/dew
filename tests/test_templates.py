@@ -33,14 +33,14 @@ def test_a_dependent_named_choice_holds_unless_the_child_names_its_own():
 
 
 def test_a_gemm_pullback_keeps_its_named_choice_and_restores_the_callers_scope():
-    from dew.nn.kernels.templates.gemm import template
+    from dew.nn.kernels import gemm
 
     with jax.enable_x64(new_val=True):
         x = jnp.arange(8, dtype=jnp.float64).reshape(2, 4) / 8
         weight = jnp.arange(12, dtype=jnp.float64).reshape(4, 3) / 16
 
         def projected(x, weight):
-            return template.gemm(x, weight, None, out_dtype=jnp.float64)
+            return gemm.gemm(x, weight, None, out_dtype=jnp.float64)
 
         with generation.chosen(grouped_matmul="xla"):
             value, pullback = jax.vjp(projected, x, weight)
@@ -177,6 +177,18 @@ class Unpriced(Doubling):
 
     def cost(self, ba, config, target):
         raise ValueError("no cost facts")
+
+
+def test_a_selector_serves_a_choice_chosen_may_name_and_no_other():
+    """A selector (`selection.Op`) is built for a choice `generation.chosen` may name, and one built for a
+    name it may not is refused as it is built: no selector serves a choice no call can name. A choice no
+    selector or site reads (a decode once named 'ssd_decode') is none `chosen` takes."""
+    kernels = (Kernel("xla", (), generic=True),)
+    assert Op("swiglu", kernels).choice == "swiglu"
+    with pytest.raises(ValueError):
+        Op("swiglu_packed", kernels)
+    with pytest.raises(ValueError), generation.chosen(ssd_decode="xla"):
+        pass
 
 
 def choose(implementations, x) -> Template:

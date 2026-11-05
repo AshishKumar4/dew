@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from lane_environment import outside_suite
 from tool_support import REPO_ROOT, load
 
 from tools.benchmark_cases import cpu_smoke_cases
@@ -211,8 +212,7 @@ def peak_row(tmp_path, platform: str, *arguments: str, settings: dict[str, str] 
     `platform` with `arguments` and the environment's `settings`, its peak measured in a process of the
     case's own."""
     out = tmp_path / "rows.json"
-    environment = {name: value for name, value in os.environ.items() if name != "XLA_FLAGS"}
-    environment |= settings or {}
+    environment = outside_suite(os.environ) | (settings or {})
     tool = str(REPO_ROOT / "tools/benchmark_step.py")
     done = subprocess.run([sys.executable, tool, "--preset", "cpu-smoke",
                            "--architectures", "causal_transformer", "--warmup", "1", "--steps", "2",

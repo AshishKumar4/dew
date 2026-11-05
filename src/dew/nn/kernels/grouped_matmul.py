@@ -1,4 +1,4 @@
-"""The grouped matmul's kernel launches, which the GEMM template (`templates.gemm.template`) runs and
+"""The grouped matmul's kernel launches, which the GEMM template (`kernels.gemm`) runs and
 differentiates (`dew.nn.moe.expert_projection` through it), and XLA's portable projection.
 
 Three products, in MaxText's megablox shape: the forward `gmm`, the input gradient `gmm` against the
@@ -44,11 +44,12 @@ from jax.custom_derivatives import SymbolicZero
 from jax.experimental.pallas import mosaic_gpu as plgpu, tpu as pltpu
 from jax.extend import core as jax_core
 
-from ..derivatives import marked_call_p
+from ..derivatives import Protected, declared_tangent, marked_call_p
 from ..precision import at_least_fp32, rounded_operand
 from . import generation, selection, tuning
 from .generation import INHERENT
 from .templates import base, bundles, mosaic, report, resources, tail as tail_of
+from .templates.axes import GROUPS, held as held_axes
 from .templates.gemm import mosaic_gpu, mosaic_tpu
 from .templates.product import EIGHT, Product
 
@@ -93,7 +94,7 @@ class Hooks:
     then each side tile's: `prologue_dtypes`, `epilogue_dtypes`). The side operands themselves are the
     launch's `prologue_operands` and `epilogue_operands`. A launch's picks key each hook by what it
     computes (`_GroupedLaunch.traced`), never by the function object. A `paired` product's epilogue takes its
-    two accumulators before its side tiles (`templates.gemm.template.gemm`'s `paired`)."""
+    two accumulators before its side tiles (`gemm.gemm`'s `paired`)."""
     prologue: object = None
     prologue_axes: tuple = ()
     epilogue: object = None
@@ -187,8 +188,9 @@ def _output_bytes(ba) -> int:
 
 
 def _side_tile_bytes(operands, axes_of, extents: dict) -> int:
-    """The bytes of one tile of each side operand at the block `extents` per launch axis."""
-    return sum(math.prod(extents[axis] for axis in axes) * jnp.dtype(operand.dtype).itemsize
+    """The bytes of one tile of each side operand at the block `extents` per launch axis, one group's of an
+    operand by group (`axes.held`)."""
+    return sum(math.prod(extents[axis] for axis in held_axes(axes)) * jnp.dtype(operand.dtype).itemsize
                for operand, axes in zip(operands, axes_of, strict=True))
 
 
@@ -310,7 +312,7 @@ class _Triton(_GroupedLaunch[Tile]):
     GENERATES: ClassVar[bool] = True
 
     def eligible(self, ba, target) -> bool:
-        # Every CUDA GPU the template sends the kernels to (`templates.gemm.template`), and
+        # Every CUDA GPU the template sends the kernels to (`kernels.gemm`), and
         # a CPU, which interprets them, or traces the CUDA branch a GPU's lowering takes; never a TPU (a
         # paired product the selector hands on apart: `_takes_pair`).
         return generation.capability(target.generation) is not None and self.derived(ba, target) is not None
@@ -599,8 +601,11 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # A hooked or exactly summed call runs where its bundle's register model counts what they hold.
         special = ba.arguments['hooks'] != NO_HOOKS or ba.arguments.get('exact_sums')
         family = self._family(ba, target)
+        # A prologue's side operand by group streams with no group's origin here; Triton's and the TPU's
+        # launches read it at their tile's group (`axes.at_group`).
+        grouped = any(GROUPS in axes for axes in ba.arguments['hooks'].prologue_axes)
         return (first == second and (jnp.dtype(first).itemsize == 2 or self._fp8(ba, first, family))
-                and family is not None
+                and family is not None and not grouped
                 and (family.counts_hooks or not special)
                 and self._hooks_lower(ba, first, target)
                 and (self.EXACT_SUMS or not ba.arguments.get('exact_sums'))
@@ -652,19 +657,23 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             return max(2 * accumulator + resources.CONTROL_REGISTERS, plain + max(phases))
         return plain + max(phases)
 
-    @staticmethod
-    def _prologue_registers(ba, config: mosaic_gpu.Tiles) -> int:
-        """A prologue's rewrite of a consumer's share of the rows' stage: that share and each side tile of
-        its shape widened to fp32 as the hook computes them, and its result in the stage's dtype until it is
-        written back (HOOKS1, sm90: a norm's +46..53 and a cast's +47 at a 32-word share, SwiGLU's gate tile
-        +87..91). Vector sides are a share's broadcasts, held within it."""
+    def _prologue_registers(self, ba, config: mosaic_gpu.Tiles) -> int:
+        """A prologue's transform of a consumer's share of the rows' stage: that share and each side tile of
+        its shape widened to fp32 as the hook computes them, and its result in the stage's dtype (HOOKS1,
+        sm90: a norm's +46..53 and a cast's +47 at a 32-word share, SwiGLU's gate tile +87..91). Vector
+        sides are a share's broadcasts, held within it. The forward's products take the result from
+        registers (`mosaic_gpu._gmm_step`), each step's held until its products are done, so beside it each
+        step its family keeps in flight (`Family.in_flight`) still holds its own; the kernel gradient
+        rewrites its stage (`STAGED_ROWS`) and holds none."""
         hooks = ba.arguments['hooks']
         if hooks.prologue is None:
             return 0
-        tiles = sum(len(axes) > 1 for axes in hooks.prologue_axes)
+        tiles = sum(len(held_axes(axes)) > 1 for axes in hooks.prologue_axes)
         share = config.block_m * config.block_k // config.warpgroups
         stored = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
-        return -(-share * ((1 + tiles) * 4 + stored) // (4 * resources.THREADS))
+        family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
+        in_flight = 0 if self.STAGED_ROWS else family.in_flight
+        return -(-share * ((1 + tiles) * 4 + (1 + in_flight) * stored) // (4 * resources.THREADS))
 
     @staticmethod
     def _epilogue_registers(ba, config: mosaic_gpu.Tiles, stored: tuple) -> int:
@@ -691,10 +700,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # excess over the mainloop's held set.
         vectors = sum(family.column_registers(config.block_n, side.dtype)
                       for side, axes in zip(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes,
-                                            strict=True) if axes == ('columns',))
+                                            strict=True) if held_axes(axes) == ('columns',))
         vectors += family.column_registers(config.block_n, jnp.float32) if hooks.accumulators > 1 else 0
         accumulator = -(-config.block_m * config.block_n // config.warpgroups // resources.THREADS)
-        tiles = sum(len(axes) > 1 for axes in hooks.epilogue_axes) * accumulator
+        tiles = sum(len(held_axes(axes)) > 1 for axes in hooks.epilogue_axes) * accumulator
         held = sum(-(-accumulator * jnp.dtype(dtype).itemsize // 4)
                    for dtype in (hooks.out_dtypes or ())[:-1])
         stage = max(staging, resources.CONTROL_REGISTERS) + vectors
@@ -827,7 +836,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         axes = {axis for name, axes_of in (('prologue_operands', hooks.prologue_axes),
                                            ('epilogue_operands', hooks.epilogue_axes))
                 for _, side_axes in zip(ba.arguments.get(name, ()), axes_of, strict=True)
-                if len(side_axes) == 1 for axis in side_axes}
+                if len(held_axes(side_axes)) == 1 for axis in held_axes(side_axes)}
         # A vector the family reads from global memory instead (`copies_vectors`) loads in a role's row
         # tiles: its block along its axis whole roles (ns-regs: a 32-element depth vector on sm86 failed
         # to cast to the 64-row layout).
@@ -1226,8 +1235,8 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
         for name, axes_of in (('prologue_operands', hooks.prologue_axes),
                               ('epilogue_operands', hooks.epilogue_axes)):
             for side, axes in zip(ba.arguments.get(name, ()), axes_of, strict=True):
-                if len(axes) == 1:
-                    axis = index[axes[0]]
+                if len(held_axes(axes)) == 1:
+                    axis = index[held_axes(axes)[0]]
                     least[axis] = max(least[axis], 128 * 4 // jnp.dtype(side.dtype).itemsize)
         return least
 
@@ -1278,10 +1287,14 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
         for name, axes_of in (('prologue_operands', hooks.prologue_axes),
                               ('epilogue_operands', hooks.epilogue_axes)):
             for side, axes in zip(ba.arguments.get(name, ()), axes_of, strict=True):
-                if len(axes) != 1:
+                if len(held_axes(axes)) != 1:
                     continue
-                block = extents[axes[0]]
-                whole = -(-side.shape[0] // block) * block if axes[0] == 'rows' else side.shape[0]
+                axis, = held_axes(axes)
+                extent = side.shape[axes.index(axis)]
+                block = extents[axis]
+                # A side operand by group lays out as its groups' vectors end to end (`mosaic_tpu._laid`).
+                whole = (-(-extent // block) * block if axis == 'rows'
+                         else math.prod(side.shape) if GROUPS in axes else extent)
                 if block != whole and block < 128 * 4 // jnp.dtype(side.dtype).itemsize:
                     return False
         return True
@@ -1493,8 +1506,13 @@ DENSE_MEASURED = _Need('dense', lambda case: not case.kind.startswith('dense'),
 as it measured faster than Triton's on every generation timed; a call naming Triton still runs them."""
 
 
-_GMMS = (MosaicGmm(), MosaicTpuGmm(), Gmm(), CutlassGmm())
-_TGMMS = (MosaicTgmm(), MosaicTpuTgmm(), Tgmm(), CutlassTgmm())
+IMPLEMENTATIONS = ((MosaicGmm(), MosaicTgmm()), (MosaicTpuGmm(), MosaicTpuTgmm()), (Gmm(), Tgmm()),
+                   (CutlassGmm(), CutlassTgmm()))
+"""Each implementation of the grouped product, in `GROUPED`'s order: its launch of a product and its launch
+of a kernel gradient, one name for both."""
+
+_GMMS = tuple(product for product, _ in IMPLEMENTATIONS)
+_TGMMS = tuple(gradient for _, gradient in IMPLEMENTATIONS)
 
 _NEEDS = {'cutlass': (DECLARED_ONLY,), 'triton': (DENSE_MEASURED,)}
 """Each old route's requirements beyond its launch's own: CUTLASS on its declared cells alone, Triton off the
@@ -1509,7 +1527,7 @@ def _takes_pair(name: str, target) -> bool:
 
 class Apart:
     """`launched`'s answer for a paired product no launch takes whole: its two products run apart
-    (`templates.gemm.template._apart`), each through the launches that take it, as the unfused program runs
+    (`gemm._apart`), each through the launches that take it, as the unfused program runs
     them."""
 
     name = 'apart'
@@ -1569,7 +1587,7 @@ def gmm_call(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_oper
              paired: jax.Array | None = None, *, out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS,
              interpret: bool, promoted: bool = False, dense: bool = False) -> tuple:
     """The launches, arguments and options of each group's rows of `tokens` times its matrix of `kernel`,
-    both of one dtype, with the template's hooks (`templates.gemm.template.gemm`). `promoted`,
+    both of one dtype, with the template's hooks (`gemm.gemm`). `promoted`,
     the declared product's (`templates.product.Product`), adds each depth step's partial apart
     (`exact_sums`); `dense`, one group of every row (a dense product), the plain tiled kernel where Triton
     runs it; `paired`, a second matrix of `kernel`'s shape multiplied by the same rows (Mosaic GPU's
@@ -1585,7 +1603,7 @@ def tgmm_call(tokens, cotangent, sizes, prologue_operands: tuple = (), *, out_dt
               hooks: Hooks = NO_HOOKS, interpret: bool, promoted: bool = False, dense: bool = False) -> tuple:
     """The launches, arguments and options of each group's rows of `tokens` transposed times its rows of
     `cotangent`, both of one dtype, with the template's prologue
-    (`templates.gemm.template.gemm_t`); `promoted` and `dense` as `gmm_call`'s."""
+    (`gemm.gemm_t`); `promoted` and `dense` as `gmm_call`'s."""
     arguments = (tokens, cotangent, sizes, tuple(prologue_operands))
     options = {'out_dtype': jnp.dtype(out_dtype).name, 'hooks': hooks, 'interpret': interpret,
                'exact_sums': promoted, 'dense': dense}
@@ -1654,8 +1672,7 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     return jnp.where(grouped, out, 0)
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(3, 4, 5))
-def portable_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
+def _portable_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
                 dtype: Dtype | None, precision: PrecisionLike, out_dtype: Dtype | None = None) -> jax.Array:
     """The grouped projection on `xla_ragged_dot`, in every differentiation mode: `x`'s rows `[rows, in]`
     through each group's matrix of `kernel` `[groups, in, out]`, both cast to `dtype` (flax's promotion
@@ -1664,7 +1681,9 @@ def portable_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     so an input gradient keeps its input's dtype and a kernel gradient its master's: the portable
     projection `dew.nn.moe.expert_projection`'s XLA route and the GEMM template's portable branch run.
     `out_dtype`, where given, is the dtype its sum rounds to in place of the products' (the template's
-    fp32 accumulator, which its epilogue reads)."""
+    fp32 accumulator, which its epilogue reads). A protected span (`portable_projection`,
+    `dew.nn.derivatives.declared_tangent`): each rounded operand and barrier holds a rounding the algebra
+    pass must not move."""
     x, kernel = promote_dtype(x, kernel, dtype=dtype)
     accumulated = xla_ragged_dot(x, kernel, group_sizes, precision=precision,
                                  preferred_element_type=at_least_fp32(x.dtype))
@@ -1709,6 +1728,7 @@ def _portable_projection_jvp(dtype: Dtype | None, precision: PrecisionLike, out_
     return output, tangent
 
 
-portable_projection.defjvp(_portable_projection_jvp, symbolic_zeros=True)
+portable_projection = declared_tangent(Protected(), _portable_projection, _portable_projection_jvp,
+                                       nondiff_argnums=(3, 4, 5), symbolic_zeros=True)
 
 
