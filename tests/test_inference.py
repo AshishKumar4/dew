@@ -688,7 +688,6 @@ def test_a_run_samples_on_every_trainer_layout_what_one_device_samples(tmp_path,
     placed = dew.pipeline(str(run), mesh=MeshSpec(**spec).build(devices), layout=layout)
     wide = dataclasses.replace(alone, model=alone.model.clone(dtype=jnp.float64),
                                variables=widened(alone.variables))
-    server = Server.from_task(placed, slots=2, capacity=64)
 
     def draw(seed):
         return (np.asarray([2 * seed, 2 * seed + 1]),)
@@ -711,6 +710,7 @@ def test_a_run_samples_on_every_trainer_layout_what_one_device_samples(tmp_path,
     label = f"sampled on {spec}"
     count = seeds_for(drawn(alone), draw, label, truth_fn=drawn(wide, "float64"), dew_fn=drawn(placed))
     assert_as_exact(drawn(placed), drawn(alone), draw, label, seeds=count, truth_fn=drawn(wide, "float64"))
+    server = Server.from_task(placed, slots=2, capacity=64)
     assert_as_exact(served, drawn(alone), draw, label, seeds=count, truth_fn=drawn(wide, "float64"))
 
 

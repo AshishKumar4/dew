@@ -518,23 +518,8 @@ def _refuse_unserved_modes(model: nn.Module, *, paged: bool = False, chunked: bo
 
 
 def _served_mesh(task: TextGeneration) -> Mesh | None:
-    """The mesh `task`'s weights lie on, which a server serves on, refused where a server cannot: a
-    stage or sequence axis."""
-    mesh = mesh_of(task.variables)
-    if mesh is None:
-        return None
-    if mesh.shape.get(STAGE_AXIS, 1) > 1:
-        raise ValueError(
-            "a server decodes through the whole layer stack every step; the stage axis "
-            "runs the stack as the training pipeline, which the decoder refuses to decode "
-            "through (one token a step leaves no microbatches to pipeline). Serve on a "
-            "mesh with stage=1"
-        )
-    if mesh.shape.get(SEQUENCE_AXIS, 1) > 1:
-        raise ValueError("a server keeps each row's cached keys whole on the devices of its group, "
-                         "and a decoder refuses to decode under a sequence axis, which splits a "
-                         "sequence's positions. Serve on a mesh with sequence=1")
-    return mesh
+    """The mesh `task`'s weights lie on, which a server serves on."""
+    return mesh_of(task.variables)
 
 class Server:
     """Serves text requests with continuous batching over one resident KV cache.
@@ -704,8 +689,13 @@ class Server:
         """The mesh the model traces under, so a layer that reads it, such as an expert exchange, finds it,
         under the numerics its task's run trained in, with its rows' PRNG implementation the default, so a
         key a layer draws (a stochastic rounding stream) is of the implementation its cache was opened
-        with, whatever thread serves it."""
-        with (contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh),
+        with, whatever thread serves it. A mesh with a stage or sequence axis is not entered: there the
+        training forward pipelines the stack or splits a sequence's positions, which one token a step
+        leaves nothing to do, and the decode runs the whole stack over the weights where they lie, as a
+        task's call does."""
+        trained = self.mesh is not None and (self.mesh.shape.get(STAGE_AXIS, 1) > 1
+                                              or self.mesh.shape.get(SEQUENCE_AXIS, 1) > 1)
+        with (contextlib.nullcontext() if self.mesh is None or trained else jax.set_mesh(self.mesh),
               contextlib.nullcontext() if self.precision is None
               else generation.run_precision(self.precision),
               jax.default_prng_impl(self.prng)):
