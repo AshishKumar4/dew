@@ -1365,26 +1365,26 @@ class _JsonIterator(grain.DatasetIterator):
             # The first byte of the value the file holds, past the whitespace before it.
             while (head := file.read(1)) and head.isspace():
                 pass
-            self.items = json.loads(head + file.read()) if head == b"[" else None
-        self.lines = _LineIterator(source, shard, "jsonl") if self.items is None else None
-        self.item = 0
+            self.array = json.loads(head + file.read()) if head == b"[" else None
+        self.lines = _LineIterator(source, shard, "jsonl") if self.array is None else None
+        self.read = 0
 
     def __next__(self) -> Batch:
         if self.lines is not None:
             return next(self.lines)
-        if self.item >= len(self.items):
+        if self.read >= len(self.array):
             raise StopIteration
-        self.item += 1
-        return self.items[self.item - 1]
+        self.read += 1
+        return self.array[self.read - 1]
 
     def get_state(self) -> dict[str, int]:
-        return self.lines.get_state() if self.lines is not None else {"item": self.item}
+        return self.lines.get_state() if self.lines is not None else {"read": self.read}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         if self.lines is not None:
             self.lines.set_state(state)
             return
-        self.item = integer(state["item"], "JSON array item")
+        self.read = integer(state["read"], "JSON array items read")
 
     def close(self) -> None:
         if self.lines is not None:
