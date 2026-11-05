@@ -55,9 +55,10 @@ def read_generation_config(directory: Path) -> Mapping[str, object]:
 
 def _generation_value(config: Mapping[str, object], generation_config: Mapping[str, object],
                       name: str, default: JSON = None) -> JSON:
-    text = config.get("text_config", config)
-    if not isinstance(text, Mapping):
-        raise ValueError("text_config must be a mapping")
+    # The decoder's scope as its owner reads it: the wrapper's text_config, or a flat config's root.
+    from dew.interop.hf_decoders import text_scope
+
+    text = text_scope(config)
     return _records.json_value(generation_config.get(name, config.get(name, text.get(name, default))), name)
 
 
