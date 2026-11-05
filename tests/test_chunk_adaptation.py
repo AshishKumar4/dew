@@ -7,7 +7,6 @@ the scan, on par with it by check 1 against its own float64 run."""
 
 import functools
 import math
-import os
 from pathlib import Path
 
 import jax
@@ -19,7 +18,7 @@ import pytest
 from affine_run import Replaying, dataset
 from check1_statistics import GateFailure, Inconclusive
 from flax import linen as nn
-from map_judge import DRAWS
+from map_judge import drawing
 from reference_error import (
     MOST_SEEDS,
     as_given,
@@ -450,7 +449,7 @@ def corner_failure(dew, label: str) -> GateFailure | None:
         assert_as_exact(dew, reference(truth=False), draw, label, seeds=MOST_SEEDS,
                         truth_fn=reference(truth=True), conditioning=CORNER_SEEDS["forward", "documents"])
 
-    if os.environ.get(DRAWS):
+    if drawing():
         # A map task records its draws, judging nothing; its judge pools them and decides the failure.
         judged()
         return None
