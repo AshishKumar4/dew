@@ -407,8 +407,9 @@ KIMI_K25_MEDIA = {"image": ((1, 6, 4), (3,)), "video": ((2, 4, 4), (2,))}
 """Each Kimi K2.5 media site's item grid `(t, h, w)` in 2-pixel patches and where its placeholder run
 starts: an image of 6 merge blocks, and a two-frame video whose frames pool into 4 (`sd2_tpool`)."""
 
-KIMI_K25_MEDIA_SEEDS = 64
-"""The media sites' declared check-1 seeds, sized by `seeds_for` on armada."""
+KIMI_K25_MEDIA_SEEDS = 8
+"""The media sites' declared check-1 seeds, sized by `seeds_for` on armada paired with Dew's arm: 8 for
+each site (22 s the image's, 14 s the video's)."""
 
 
 def kimi_k25_media_case(site):
