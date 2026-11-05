@@ -205,8 +205,8 @@ def test_a_vae_encoder_is_as_exact_as_diffusers(batch, backward):
         return run
 
     assert_as_exact(dew, diffusers_walk(encoder, torch.float32, contextlib.nullcontext), draw,
-                    f"batch {batch} {'gradients' if backward else 'moments'}", seeds=VAE_ENCODER_SEEDS[backward],
-                    truth_fn=diffusers_walk(wide, torch.float64, widened_torch))
+                    f"batch {batch} {'gradients' if backward else 'moments'}",
+                    seeds=VAE_ENCODER_SEEDS[backward], truth_fn=diffusers_walk(wide, torch.float64, widened_torch))
 
 
 LINEARIZATION_SEEDS = 8
