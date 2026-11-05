@@ -370,8 +370,10 @@ def test_ranked_loss_and_periodic_retention(tmp_path):
 
 
 def _items(directory, step) -> list[str]:
-    """The Orbax items the step at `step` holds on disk (docs/guides/checkpoints.md)."""
-    return sorted(entry.name for entry in (directory / str(step)).iterdir() if entry.is_dir())
+    """The items of a run's state the step at `step` holds on disk (docs/guides/checkpoints.md), Orbax's
+    own metrics item aside."""
+    return sorted(entry.name for entry in (directory / str(step)).iterdir()
+                  if entry.is_dir() and entry.name in ('model', 'profiles', 'resume', 'default'))
 
 
 def test_older_kept_steps_hold_their_model_alone_and_the_latest_resumes(tmp_path):
@@ -429,15 +431,16 @@ def test_a_step_whose_projection_was_cut_short_reads_as_projected_and_finishes_l
     monkeypatch.setattr(shutil, 'rmtree', rmtree)
     assert 'resume' in _items(directory, 2)
 
+    # Step 1, the fit's own save, is the run's best by its training loss, kept whole.
     reopened = Checkpoints(str(directory), keep=keep)
-    assert {kept.step: kept.kind for kept in reopened.kept()} == {2: 'weights', 3: 'state'}
+    assert {kept.step: kept.kind for kept in reopened.kept()} == {1: 'state', 2: 'weights', 3: 'state'}
     assert reopened.latest == 3
     with pytest.raises(ValueError, match="weights"):
         reopened.restore(run.initial_state(), 2)
     reopened.save(4, state.replace(step=jnp.int32(4)), None)
     reopened.wait()
     assert _items(directory, 2) == ['model']
-    assert {kept.step: kept.kind for kept in reopened.kept()} == {2: 'weights', 4: 'state'}
+    assert {kept.step: kept.kind for kept in reopened.kept()} == {1: 'state', 2: 'weights', 4: 'state'}
 
 
 def test_ranked_ties_keep_the_older_steps(tmp_path):
