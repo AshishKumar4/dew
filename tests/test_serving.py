@@ -1076,6 +1076,29 @@ def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(t
                     truth_fn=by_itself("float64"))
 
 
+def test_a_row_of_an_adapter_sets_base_computes_the_base_bit_for_bit():
+    """A row naming no adapter of a set (`dew.lora.selected`'s -1) takes no branch: beside a row whose
+    adapter's factors overflow its update to inf, its logits are the base model's, bit for bit."""
+    from pathlib import Path
+
+    from dew.interop.pretrained import Pretrained
+    from dew.lora import AdapterSet, LoRA, selected
+
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    decoder = Pretrained.load(fixtures / "hf" / "llama-tiny", dtype="float32", attention_impl="reference")
+    fixture = LoRA.load(decoder.model, decoder.variables, fixtures / "lora" / "llama-tiny" / "adapter",
+                        layouts=decoder.layouts)
+    huge = dataclasses.replace(fixture, variables={**fixture.variables, "params": jax.tree.map(
+        lambda leaf: leaf * 1e30, fixture.variables["params"])})
+    adapters = AdapterSet.of({"huge": huge})
+    tokens = jnp.asarray([[1, 5, 9, 13], [2, 4, 6, 8]], jnp.int32)
+    with selected(jnp.asarray([0, -1], jnp.int32)):
+        served = adapters.model.apply(adapters.variables, tokens)
+    base = decoder.model.apply(decoder.variables, tokens)
+    assert not np.isfinite(np.asarray(served[0])).all()
+    np.testing.assert_array_equal(np.asarray(served[1]), np.asarray(base[1]))
+
+
 @pytest.mark.distributed
 def test_a_server_over_a_pool_draws_what_each_request_draws_alone(tmp_path):
     """One server over a mesh that spans two processes, each seating and reading its own groups of rows and

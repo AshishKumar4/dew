@@ -852,7 +852,7 @@ class _Branch:
         # dropout stream, which is how a training forward is marked; an
         # evaluation forward carries none.
         if self.bound.names:
-            return output + self._selected(module, x, a, b, axes)
+            return self._selected(module, x, a, b, axes, output)
         if self.dropout and module.has_rng("dropout"):
             x = Dropout(self.dropout, deterministic=False)(x)
         x, a, b = promote_dtype(x, a, b, dtype=module.dtype)
@@ -864,10 +864,10 @@ class _Branch:
 
 
     def _selected(self, module: nn.Module, x: jax.Array, a: jax.Array, b: jax.Array,
-                  axes: tuple[int, ...]) -> jax.Array:
-        """An adapter set's update at `module` (`AdapterSet`): each row of `x` through its own adapter's
-        factors (`a` `[N, *in, r]`, `b` `[N, r, *out]`) and scale, as `selected` names them, zero for a
-        row of the base model alone."""
+                  axes: tuple[int, ...], output: jax.Array) -> jax.Array:
+        """An adapter set's `output` at `module` (`AdapterSet`): each row of `x` through its own adapter's
+        factors (`a` `[N, *in, r]`, `b` `[N, r, *out]`) and scale, as `selected` names them, added to the
+        base's; a row of the base model alone takes no branch, its output the base's own bits."""
         where = "/".join((*self.root, *module.path))
         rows = _SELECTED.get()
         if rows is None:
@@ -877,15 +877,16 @@ class _Branch:
             raise ValueError(f"{where} receives {x.shape[0] if x.ndim > len(axes) else 0} rows, not the "
                              f"{rows.shape[0]} the call's adapters name, so its rows' adapters are unknown")
         scales = jnp.asarray(_stored_target(self.bound.scales, self.root, module.path), jnp.float32)
-        # A row of the base model alone takes any adapter's factors and a zero scale.
+        # A row of the base model alone computes with any adapter's factors and keeps the base's output.
         own = jnp.maximum(rows, 0)
         x, a, b = promote_dtype(x, a[own], b[own], dtype=module.dtype)
         hidden = float32_dot_general(x, a, ((axes, tuple(range(1, len(axes) + 1))), ((0,), (0,))),
                                      precision=module.precision)
         delta = float32_dot_general(hidden, b, (((hidden.ndim - 1,), (1,)), ((0,), (0,))),
                                     precision=module.precision)
-        scale = jnp.where(rows >= 0, scales[own], 0.0).astype(delta.dtype)
-        return scale.reshape(-1, *(1,) * (delta.ndim - 1)) * delta
+        per_row = (-1, *(1,) * (delta.ndim - 1))
+        adapted = output + scales[own].astype(delta.dtype).reshape(per_row) * delta
+        return jnp.where((rows >= 0).reshape(per_row), adapted, output)
 
 
 def _refusing_counts(model: nn.Module, base: type[nn.Module], *protocols) -> type[nn.Module]:
