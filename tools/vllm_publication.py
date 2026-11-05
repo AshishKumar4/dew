@@ -31,6 +31,8 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import httpx
 
+from dew.cleanup import owned_group
+
 PROMPTS = ("Name three prime numbers.", "What is the capital of France?", "Write a haiku about rain.")
 BUDGET = 24
 SEED = 7
@@ -47,12 +49,13 @@ def nccl_library(python: str) -> str:
 
 @contextlib.contextmanager
 def engines(python: str, base: Path, policy: Path, gpu: int, out: Path) -> Iterator[dict[str, str]]:
-    """The two replicas from `base` and the reference from `policy`, healthy, stopped after."""
+    """The two replicas from `base` and the reference from `policy`, healthy, stopped after, each with its
+    group and a minute's grace, and its log closed after it; one that will not stop leaves the others'
+    stops and closes to be attempted."""
     bin = str(Path(python).parent)
     environment = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu), "VLLM_SERVER_DEV_MODE": "1",
                    "PATH": os.pathsep.join((bin, os.environ["PATH"]))}
-    started = []
-    try:
+    with contextlib.ExitStack() as stack:
         for name, port in PORTS.items():
             model = policy if name == "reference" else base
             # Every engine holds bfloat16 weights, the dtype the push sends, so a delivered push
@@ -62,17 +65,12 @@ def engines(python: str, base: Path, policy: Path, gpu: int, out: Path) -> Itera
                        "--max-model-len", "2048", "--enforce-eager", "--dtype", "bfloat16"]
             if name != "reference":
                 command += ["--weight-transfer-config", json.dumps({"backend": "nccl"})]
-            log = (out / f"{name}.log").open("w")
-            started.append((subprocess.Popen(command, env=environment, stdout=log, stderr=subprocess.STDOUT),
-                            log))
+            log = stack.enter_context((out / f"{name}.log").open("w"))
+            process = stack.enter_context(owned_group(command, grace=60, env=environment, stdout=log,
+                                                      stderr=subprocess.STDOUT))
             # One at a time: each engine sizes its KV cache from the memory the ones before it left.
-            healthy(f"http://127.0.0.1:{port}", started[-1][0], name)
+            healthy(f"http://127.0.0.1:{port}", process, name)
         yield {name: f"http://127.0.0.1:{port}" for name, port in PORTS.items()}
-    finally:
-        for process, log in started:
-            process.terminate()
-            process.wait(60)
-            log.close()
 
 
 def healthy(root: str, process: subprocess.Popen[bytes], name: str) -> None:
