@@ -429,7 +429,8 @@ class TextToImage(SavedRunTask, InItsForm):
         if isinstance(chosen, (int, float)) and not isinstance(chosen, bool):
             chosen = CFG(float(chosen))
         if chosen is not None and not isinstance(chosen, Guidance):
-            raise ValueError("guidance must be a scale, a guidance value or None")
+            raise ValueError("guidance must be a scale, None, or a guidance (`dew.sampling.Guidance`: its "
+                             "walk, and the modules it runs besides the denoiser, `modules()`)")
         return chosen
 
     def scoring(self, *, steps: int | None = None, guidance: Guidance | float | None | Omitted = OMITTED,

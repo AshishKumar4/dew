@@ -470,7 +470,8 @@ class Autoguidance:
 
 @runtime_checkable
 class Guidance(Protocol):
-    """What `sample` guides with: a walk over the steps for one denoiser.
+    """What `sample` guides with: a walk over the steps for one denoiser, and the modules that walk runs
+    besides the denoiser's model (`modules`, none for most). A guidance of one's own states both.
     CFG, CFG++, APG and autoguidance are four; a run records any by class.
 
     A walk's prediction over an opened denoiser (`Denoiser.opened`, a watched training step's) reads

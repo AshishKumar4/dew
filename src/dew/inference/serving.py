@@ -769,12 +769,13 @@ class Server:
         # One program serves one capacity, so the cache holds whole tiles of it
         # rather than a power-of-two bucket: every decode step's attention reads
         # each slot, and a capacity of 384 bucketed to 512 read a third more.
+        # A model shorter than the tiles keeps whole pages within its max_seq_len, which no row passes.
         unit = math.lcm(64, layout.page_size or 64)
-        rounded = -(-capacity // unit) * unit
-        if rounded > ceiling:
-            raise ValueError(
-                f"a capacity of {capacity} rounds to {rounded}, over the model's max_seq_len of {ceiling}"
-            )
+        page = layout.page_size or 1
+        rounded = min(-(-capacity // unit) * unit, ceiling // page * page)
+        if rounded < capacity:
+            raise ValueError(f"a capacity of {capacity} passes the model's max_seq_len of {ceiling}"
+                             + ("" if page == 1 else f" in whole pages of {page}"))
         groups = _row_groups(mesh)
         model, rows = _cache_rows(cache_sized(model, rounded), layout, slots, rounded, groups, chunk,
                                   prefix_cache, prefix_states, prefix_state_every)
