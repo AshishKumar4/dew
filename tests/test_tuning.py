@@ -472,7 +472,7 @@ import versioned_op
 from dew import _cache
 from dew.nn.kernels import tuning
 shape = jax.ShapeDtypeStruct((16, 64), jax.numpy.float32)
-launch = tokamax.BoundArguments(versioned_op.Versioned(), dict.fromkeys(versioned_op.OPERANDS, shape))
+launch = versioned_op.Versioned().bind(*(shape for _ in versioned_op.OPERANDS))
 timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
                                metadata={})
 pick = tuning.Timings({versioned_op.Rows(*json.loads(sys.argv[1])): timing})
