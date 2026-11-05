@@ -1564,11 +1564,6 @@ SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
     Requirement('tokens', lambda case: case.length >= _selective().CHUNK,
                 lambda case: f"{case.length} tokens, fewer than a chunk of {_selective().CHUNK}: a decode "
                              "step's scan, the portable math's own steps", row=INHERENT, kind='handoff'),
-    Requirement('strided copies', lambda case: case.family != 'mma.sync',
-                "mma.sync's streams copy a channel block untiled by cp.async, which jax 0.12.0.1.post41 "
-                "addresses at the block's width, not its row's stride, reading the wrong rows "
-                "(cp-async-alone4-h100-3674febe1's unfixed run; the jax fork's fix ships in post42)",
-                row='ledger 1300'),
     Requirement('forms', lambda case: case.fast,
                 "the run's accurate forms, whose sums the portable math compensates (row 1698); the template "
                 "sums at mamba_ssm's rounding, the fast forms' bar", row='ledger 2968', kind='measured'),
@@ -1580,7 +1575,7 @@ SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
 """What the template's selective scan (`templates.recurrence.selective`) needs of a call: no caller's
 `shard_map` that checks varying axes, a GPU of a family its bundles cover, 16-bit or fp32 operands, whole
 blocks of channels, at most `SELECTIVE_STATES` states, a chunk's tokens at least (a decode step hands off
-to the portable math), no untiled strided copies (an A100's, until post42), the run's fast forms, and its
+to the portable math), the run's fast forms, and its
 qualification against recorded mamba_ssm on the GPU's family: on an H100 the template is as exact as
 mamba_ssm in every recorded case (tests/test_gpu_recurrence.py)."""
 
