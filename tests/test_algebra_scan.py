@@ -630,20 +630,24 @@ def _primitives(jaxpr):
             yield from _primitives(held)
 
 
-def adjoint(forms, chunk_of_values, count: int, issue=None):
+def adjoint(forms, chunk_of_values, count: int, issue=None, kept: bool = False):
     """A loss's gradient through the derived forms: the chunks walked forward from a zero state (each
     entering state kept), then back through each chunk's `backward`, the cotangents of the outputs and the
-    final state the loss's (`COTANGENT`, a fixed draw), every product a mainloop's `issue`'s where given."""
+    final state the loss's (`COTANGENT`, a fixed draw), every product a mainloop's `issue`'s where given,
+    each chunk's solve the forward's inverse where `kept`, as a training forward keeps it."""
     def run(values, cotangents):
         d_outputs, d_final = cotangents
-        states = [forms.init({})]
+        states, inverses = [forms.init({})], []
         for index in range(count):
-            states.append(forms.step(states[-1], forms.prepare(chunk_of_values(values, index))))
+            prepared = forms.prepare(chunk_of_values(values, index))
+            inverses.append(prepared.inverse if kept else None)
+            states.append(forms.step(states[-1], prepared))
         d_state, grads = d_final, []
         for index in reversed(range(count)):
             chunk = chunk_of_values(values, index)
             d_state, d_chunk = forms.backward(chunk, states[index], d_state,
-                                              d_outputs[index * CHUNK:(index + 1) * CHUNK], issue)
+                                              d_outputs[index * CHUNK:(index + 1) * CHUNK], issue,
+                                              inverse=inverses[index])
             grads.append(d_chunk)
         # A token operand's gradient each chunk's; a constant's (a rate, a skip) summed over them.
         return {name: jnp.concatenate([grad[name] for grad in reversed(grads)]) if grads[0][name].ndim
@@ -692,7 +696,8 @@ def test_the_ssd_chunks_adjoint_is_the_token_scans_gradient():
     assert_as_exact(jax.jit(as_derived), jax.jit(as_tokens), draw_with_cotangents, "ssd adjoint", seeds=16)
 
 
-def assert_delta_adjoint(forms, update_fn, draw_fn, label: str, seeds: int = 16, issue=None) -> None:
+def assert_delta_adjoint(forms, update_fn, draw_fn, label: str, seeds: int = 16, issue=None,
+                         kept: bool = False) -> None:
     """`forms`' chunk adjoint of the delta rule `update_fn`, walked back from each chunk's entering state:
     each token operand's gradient on par with the token-by-token scan's against the float64 truth (check
     1), over `draw_fn`'s draws and a fixed cotangent's."""
@@ -701,7 +706,7 @@ def assert_delta_adjoint(forms, update_fn, draw_fn, label: str, seeds: int = 16,
     def chunked(values, index):
         return {name: value[index * CHUNK:(index + 1) * CHUNK] for name, value in values.items()}
 
-    derived = adjoint(forms, chunked, TOKENS // CHUNK, issue)
+    derived = adjoint(forms, chunked, TOKENS // CHUNK, issue, kept)
 
     def draw_with_cotangents(seed):
         return (*draw_fn(seed), *cotangents_of(seed, (TOKENS, VALUE), (KEY, VALUE)))
@@ -746,6 +751,24 @@ def test_the_delta_rules_chunk_adjoint_through_an_issuer_is_the_token_scans_grad
     assert_delta_adjoint(forms, update_fn, draw_fn, f"{update_fn.__name__} adjoint through an issuer",
                          issue=issue)
     assert {"correct_dlhs", "correct_drhs", "gram_dlhs", "readout_memory_drhs"} <= roles, sorted(roles)
+
+
+def test_the_delta_rules_adjoint_from_the_kept_inverse_solves_nothing():
+    """The gated delta rule's chunk adjoint reading each chunk's solve's inverse as its training forward kept
+    it (`Prepared.inverse`, `backward`'s `inverse`): each token operand's gradient on par with the
+    token-by-token scan's against the float64 truth (check 1), and no product of the solve's doubling issued
+    again."""
+    forms = scan.derive_scan(scan.Scan(gated_delta, gated_readout, GATED, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    roles = set()
+
+    def issue(role, left, right):
+        roles.add(role)
+        return float32_matmul(left, right)
+
+    assert_delta_adjoint(forms, gated_delta, gated_draw, "gated_delta adjoint from its kept inverse",
+                         issue=issue, kept=True)
+    assert "correct_dlhs" in roles and not any(role.startswith("inverse_merge") for role in roles), roles
 
 
 def kimi_draw_float16(seed):
