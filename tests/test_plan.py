@@ -428,7 +428,7 @@ trainer = lm()
 state, _, _ = trainer.place()
 trainer.compile(state, BATCH)
 assert not touched and gc.get_threshold() == thresholds, (touched, gc.get_threshold())
-from dew.nn.kernels.options import held_objects
+from dew.training.planning import held_objects
 with held_objects():
     assert gc.get_threshold()[0] > thresholds[0]
 assert not touched and gc.get_threshold() == thresholds
@@ -448,7 +448,7 @@ def stepped(trainer, steps: int = 3, trials: Callable[[TrainState], Trials] | No
     state, _, _ = trainer.place()
     held = None if trials is None else trials(state)
     # The garbage of the steps before collected, which the plan search would hold frozen while it runs
-    # (`dew.nn.kernels.options.held_objects`) where an executable counted inside it is part of it.
+    # (`dew.training.planning.held_objects`) where an executable counted inside it is part of it.
     gc.collect()
     step = trainer.compile(state, BATCH, held)
     state = state if held is None else held.state

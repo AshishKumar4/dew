@@ -676,7 +676,7 @@ def pool_checkpoint(tmp_path_factory):
 @pytest.mark.distributed
 def test_every_process_plans_from_the_tightest_room_any_of_their_devices_leaves(tmp_path):
     """The derivation's judgments decide which plan compiles first, so every process reads each alike, the
-    tightest any process's devices leave (`planning.agreed`, row 3341's review): over two processes whose
+    tightest any process's devices leave (`memory.pooled_headroom`, row 3341's review): over two processes whose
     devices leave four microbatches room to the byte on one and a byte less on the other, each judges four
     to refuse and compiles eight first, the plan the other compiles, where judged apart one would have
     compiled four and the other eight."""

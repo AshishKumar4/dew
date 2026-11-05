@@ -77,7 +77,7 @@ from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, Logi
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
-from dew.nn.kernels.options import held_objects, owned_program
+from dew.nn.kernels.options import owned_program
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import Link, Schedule, boxed, measured_links, pipeline_microbatches
 from dew.objectives.base import (
@@ -184,6 +184,7 @@ from dew.training.planning import (
     FitSearch,
     Planned,
     Trials,
+    held_objects,
     read_whole,
     settled,
     splits,
@@ -1585,7 +1586,9 @@ class Trainer(Generic[Loss, Effects]):
         # its peers may never finish (`LogWriter.raise_failure`).
         unread = functools.partial(self._read_taken, run, agree=False)
         # This rank's window's export alone: a failed one fails every rank at `_reported_outcome`'s agreement.
-        exported = None if profile is None else functools.partial(telemetry_exported, profile.directory)
+        # A window that reports nothing wrote its manifest as it stopped, and waits on no export.
+        exported = (None if profile is None or not profile.reports
+                    else functools.partial(telemetry_exported, profile.directory))
         cleanups = (("Training log", unread), ("Log writer", run.writer.close), ("Training iterator", close),
                     ("Profiler", stop_trace), ("Profile export", exported),
                     ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
@@ -2387,7 +2390,7 @@ class Trainer(Generic[Loss, Effects]):
         except BaseException as failure:
             if error is None:
                 error = failure
-        error = reported_window(self._report, self._display.note, self.profile, run.profiled, error)
+        error = reported_window(self._report, self._display.note, run.profiled, error)
         if error is None:
             def report_goodput() -> None:
                 if jax.process_index() == 0:
