@@ -314,12 +314,14 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
         return d_accs, (), tuple(jnp.promote_types(d.dtype, compute) == compute for d in d_accs)
     rows = functools.partial(_rows, axes_of=epilogue_axes, group_sizes=group_sizes, rows=acc_shape[0])
     sides = jax.eval_shape(rows, epilogue_arrays)
-    if _reads_accumulators(epilogue, count, acc_shape, sides):
+    # The accumulator the products sum in: fp32, an fp64 product's fp64 (`_portable_gemm`).
+    acc = jax.ShapeDtypeStruct(acc_shape, at_least_fp32(compute))
+    if _reads_accumulators(epilogue, count, acc, sides):
         accs = _as_tuple(_gemm(lhs, matrices[0], group_sizes, prologue, prologue_arrays, prologue_axes, None,
-                               (), (), (jnp.dtype(jnp.float32),) * count, several=count > 1,
+                               (), (), (acc.dtype,) * count, several=count > 1,
                                paired=matrices[1] if count > 1 else None, summed_as=dtypes, **plain))
     else:
-        accs = (jnp.zeros(acc_shape, jnp.float32),) * count
+        accs = (jnp.zeros(acc.shape, acc.dtype),) * count
 
     def epilogued(*args):
         # Each row's side values, whose transpose sums a groups axis's cotangents over each group's rows.
@@ -327,7 +329,7 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
 
     outs, pull = jax.vjp(epilogued, *accs, *epilogue_arrays)
     pulled = pull(tuple(c.astype(out.dtype) for c, out in zip(cotangents, outs, strict=True)))
-    narrow = tuple(_passes_cotangent(epilogue, count, at, acc_shape, sides, dtypes, compute)
+    narrow = tuple(_passes_cotangent(epilogue, count, at, acc, sides, dtypes, compute)
                    for at in range(count))
     return tuple(pulled[:count]), tuple(pulled[count:]), narrow
 
@@ -476,19 +478,19 @@ def _as_cotangent(cotangent, operand):
     return cotangent if cotangent.dtype == jax.dtypes.float0 else cotangent.astype(operand.dtype)
 
 
-def _reads_accumulators(epilogue, count: int, acc_shape: tuple, sides: tuple) -> bool:
+def _reads_accumulators(epilogue, count: int, acc: jax.ShapeDtypeStruct, sides: tuple) -> bool:
     """Whether the epilogue's VJP reads any of its `count` accumulators: a bias's does not, a product with
     a side operand's does. Read from the VJP's own program, shapes alone."""
-    closed, _ = _epilogue_vjp(epilogue, count, acc_shape, sides)
+    closed, _ = _epilogue_vjp(epilogue, count, acc, sides)
     return bool(set(closed.jaxpr.invars[:count]) & _needed(closed.jaxpr, closed.jaxpr.outvars))
 
 
-def _passes_cotangent(epilogue, count: int, at: int, acc_shape: tuple, sides: tuple, dtypes: tuple,
+def _passes_cotangent(epilogue, count: int, at: int, acc: jax.ShapeDtypeStruct, sides: tuple, dtypes: tuple,
                       narrow) -> bool:
     """Whether the epilogue's VJP hands its accumulator `at` (of `count`) one output's cotangent unchanged
     (a bias's, a cast's) whose dtype `narrow` holds exactly: read from the VJP's own program, its result
     traced back through conversions alone."""
-    closed, cotangents = _epilogue_vjp(epilogue, count, acc_shape, sides)
+    closed, cotangents = _epilogue_vjp(epilogue, count, acc, sides)
     var = closed.jaxpr.outvars[at]
     producers = {out: equation for equation in closed.jaxpr.eqns for out in equation.outvars}
     while var in producers and producers[var].primitive.name == 'convert_element_type':
@@ -498,15 +500,15 @@ def _passes_cotangent(epilogue, count: int, at: int, acc_shape: tuple, sides: tu
     return jnp.promote_types(dtypes[cotangents.index(var)], narrow) == jnp.dtype(narrow)
 
 
-def _epilogue_vjp(epilogue, count: int, acc_shape: tuple, sides: tuple):
-    """The epilogue's VJP as a program of its `count` accumulators, its side operands and its outputs'
-    cotangents, and the cotangents' variables in it."""
+def _epilogue_vjp(epilogue, count: int, acc: jax.ShapeDtypeStruct, sides: tuple):
+    """The epilogue's VJP as a program of its `count` accumulators (each `acc`), its side operands and its
+    outputs' cotangents, and the cotangents' variables in it."""
     tupled = functools.partial(_tupled, epilogue)
 
     def pulled(accs, sides, cotangents):
         return jax.vjp(tupled, *accs, *sides)[1](cotangents)
 
-    accs = (jax.ShapeDtypeStruct(acc_shape, jnp.float32),) * count
+    accs = (acc,) * count
     outs = jax.eval_shape(tupled, *accs, *sides)
     closed = jax.make_jaxpr(pulled)(accs, sides, outs)
     return closed, list(closed.jaxpr.invars[count + len(sides):])
