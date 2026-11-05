@@ -443,20 +443,37 @@ def test_distinct_transport_misses_download_concurrently_within_the_shared_budge
     with ThreadPoolExecutor(2) as pool:
         assert list(pool.map(read, paths)) == [path.encode() for path in paths]
     assert cache.metrics()["downloaded_bytes"] == sum(len(path) for path in paths)
-    # A run's data metrics report its process's mirrors beside its corpora's (row 4299).
-    from dew.data import Loading, Memory
+
+
+def test_a_runs_statistics_count_what_its_loading_workers_mirrors_read(tmp_path):
+    """A run's data metrics count what its loading workers' mirrors read, beside the reading process's
+    own (`data/mirror/...`, row 4299): files read through a mirror by two workers count more downloaded
+    bytes than the reading process's mirror read, as many as the files hold or more."""
+    from dew.data import Files, Loading
     from dew.data.compile import compile
     from dew.data.dataset import DataPartition
     from dew.data.pipeline import Pipeline
+    from dew.data.storage import mirrored
 
-    loader = compile(Pipeline(Memory([{"id": 0}])).repeat(1).batch(1), read="indexed",
-                     loading=Loading(workers=0, threads=1, read_buffer=1))
+    paths = []
+    for index in range(4):
+        path = tmp_path / "files" / f"{index}.jsonl"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text("".join(f'{{"id": {index * 10 + row}}}\n' for row in range(3)))
+        paths.append(path)
+    options = {"dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": 2**20}}
+    files = Files(tuple(f"dewcache::file://{path}" for path in paths), format="jsonl",
+                  storage_options=options)
+    loader = compile(Pipeline(files).repeat(1).batch(1), read="streamed",
+                     loading=Loading(workers=2, threads=1, read_buffer=1))
     reader = loader.train(DataPartition())
     try:
-        list(reader)
+        assert len(list(reader)) == 12
+        downloaded = loader.statistics()["data/mirror/downloaded_bytes"]
     finally:
         reader.close()
-    assert loader.statistics()["data/mirror/downloaded_bytes"] >= sum(len(path) for path in paths)
+    assert downloaded > mirrored().get("downloaded_bytes", 0.0)
+    assert downloaded >= sum(path.stat().st_size for path in paths)
 
 
 def test_url_chain_reads_and_writes_memory(tmp_path):

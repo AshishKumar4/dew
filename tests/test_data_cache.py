@@ -1503,6 +1503,32 @@ def test_an_optional_streamed_fill_with_no_room_stops_once_for_its_key(tmp_path,
     assert warned(4) == warned(1)
 
 
+def test_a_stream_into_a_root_with_room_for_one_shard_seals_it_and_writes_no_more(tmp_path, monkeypatch):
+    """A stream's optional fill into a root that evicts nothing and holds one of its four shards (a shard
+    here is one 128 KiB block) seals that shard's writer, is refused the next, and opens no writer after
+    it, its records read as computed (row 4296)."""
+    from uuid import uuid4
+
+    from dew.data import cache as caching
+
+    opened = []
+    writer = caching._Writer
+
+    def counted(*args, **kwargs):
+        opened.append(None)
+        return writer(*args, **kwargs)
+
+    monkeypatch.setattr(caching, "_Writer", counted)
+    source = Memory([{"id": index} for index in range(4)], shard_rows=1)
+    cache = Cache(str(tmp_path), keep_local_bytes=250_000, shard_bytes=1, optional=True, evicts=False)
+    manifest = source.manifest()
+    reader = cache.streamed(manifest.reader, _key(f"one-shard-{uuid4().hex}"), source=source)
+    rows = [row for shard in manifest.shards for row in reader(shard)]
+    assert rows == [{"id": index} for index in range(4)]
+    assert len(opened) == 2
+    assert len(list(tmp_path.rglob("segments/*/seal.json"))) == 1
+
+
 def test_local_retention_counts_what_its_root_holds_once_its_record_passes_the_limit(tmp_path):
     """A local root records the bytes its writes reserve, so a write under the limit counts nothing
     again. Bytes removed outside a reservation leave the record above what the root holds: the next
