@@ -22,7 +22,7 @@ import jax.numpy as jnp
 import tokamax
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import base, bundles, cost, mosaic, report, resources
+from dew.nn.kernels.templates import base, bundles, mosaic, report, resources
 from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward
 
 
@@ -211,7 +211,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def register_budget(self, config: mainloop.Tiles) -> int:
         family = bundle(self.launched())
-        return cost.THREAD_REGISTERS if family is None else family.registers(1)
+        return resources.facts().thread_registers if family is None else family.registers(1)
 
     def _held(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> bool:
         """Whether every forward launch's consumer threads hold their registers at its own roles' budget

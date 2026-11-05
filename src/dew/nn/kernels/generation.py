@@ -140,6 +140,21 @@ lab verifies on the GPU. 'flash' and 'cudnn' name CUDA libraries."""
 
 
 @dataclasses.dataclass(frozen=True)
+class RegisterRaises:
+    """The register counts a warpgroup's `setmaxnreg` moves a thread's allocation to: from `lowest` to
+    `highest` in steps of `step` (PTX ISA, "setmaxnreg": a count in 24 to 256, a multiple of 8, on sm_90a,
+    sm_100f and sm_120f)."""
+
+    lowest: int
+    highest: int
+    step: int
+
+
+SETMAXNREG = RegisterRaises(24, 256, 8)
+"""`setmaxnreg`'s range on every architecture that takes it (PTX ISA, "setmaxnreg")."""
+
+
+@dataclasses.dataclass(frozen=True)
 class Architecture:
     """The facts every device of one instruction family shares, from its compute capability (a TPU's
     generation): the family a template's mainloop claims (`family`), its dense tensor-core FLOPs per clock per
@@ -151,11 +166,31 @@ class Architecture:
     into shared memory by TMA, which it picks from compute capability 9.0 on (its `emit_pipeline` and
     `copy_gmem_to_smem`), where below it they copy by cp.async. `dependent_launch`: PTX's grid dependency
     control (`griddepcontrol`, programmatic dependent launch), sm_90 on. A family of None is no template's:
-    its devices' facts serve the rest of Dew (MFU's peaks)."""
+    its devices' facts serve the rest of Dew (MFU's peaks).
+
+    A multiprocessor's resources, which the templates' register and resource models read
+    (`templates.resources`, `templates.cost`): its 32-bit `registers`, the most a thread holds
+    (`thread_registers`), the allocator's `register_step` a thread (256 a warp), the shared memory the driver
+    reserves for each resident block (`reserved_shared`), the most blocks and threads resident at once
+    (`resident_blocks`, `resident_threads`), the bytes its shared memory serves a clock
+    (`shared_bytes_per_clock`), the base-2 exponentials its special-function units return a clock
+    (`exponentials_per_clock`), and the range its warpgroups' `setmaxnreg` moves a thread's registers in
+    (`register_raises`, None where it takes none). Their defaults are the facts every CUDA compute capability
+    from 7.5 to 12.x shares (CUDA C++ Programming Guide §5.1, Tables 33 and 34; its "Arithmetic Instructions"
+    throughput table; 128 bytes a clock measured 126 to 128 on an A100 and an H800, Luo et al. 2025,
+    "Dissecting the NVIDIA Hopper Architecture through Microbenchmarking", Table 3); a TPU states none."""
 
     family: str | None
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
-    resident_threads: int = 1536
+    resident_threads: int | None = 1536
+    resident_blocks: int | None = 16
+    registers: int | None = 64 * 1024
+    thread_registers: int | None = 255
+    register_step: int | None = 8
+    reserved_shared: int | None = 1024
+    shared_bytes_per_clock: int | None = 128
+    exponentials_per_clock: int | None = 16
+    register_raises: RegisterRaises | None = None
     wgmma: bool = False
     tma: bool = False
     dependent_launch: bool = False
@@ -177,28 +212,39 @@ class Architecture:
 # 16384). Hopper's mma.sync takes none (an m16n8k32 e4m3 assembles to F2FP unpacks and HMMA.16816 on
 # sm_90a; the kernel challenge's judge-facts.md:127), nor does Ampere's: there an FP8 product runs as a
 # 16-bit one.
-_AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128}, resident_threads=2048)
+# Resident blocks and threads a multiprocessor holds are the CUDA C++ Programming Guide's (§5.1, Table 33):
+# 7.5 16 and 1024, 8.0 32 and 2048, 8.6 16 and 1536, 8.9 24 and 1536, 9.0 and 10.0 32 and 2048, 12.x 24 and
+# 1536; setmaxnreg is sm_90a's, sm_100f's and sm_120f's (PTX ISA, `SETMAXNREG`).
+_AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128}, resident_threads=2048,
+                       resident_blocks=32)
 _AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256})
-_ADA = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256})
+_ADA = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256}, resident_blocks=24)
 # Turing's MMA takes no bf16 operands, which every template computes in: it is outside every family.
 _TURING = Architecture(None, {'16bit': 1024, 'fp32': 128}, resident_threads=1024)
 _HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, '8bit': 8192, 'fp32': 256},
-                       resident_threads=2048, wgmma=True, tma=True, dependent_launch=True)
+                       resident_threads=2048, resident_blocks=32, register_raises=SETMAXNREG, wgmma=True,
+                       tma=True, dependent_launch=True)
 # Blackwell's tcgen05 family.
 _BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, '8bit': 16384, 'fp32': 256},
-                          resident_threads=2048,
+                          resident_threads=2048, resident_blocks=32, register_raises=SETMAXNREG,
                           tmem_columns=512, tma=True, dependent_launch=True)
 # Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms, its blocks moved by TMA: Ada's rates.
 _BLACKWELL_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
-                                   tma=True, dependent_launch=True)
+                                   resident_blocks=24, register_raises=SETMAXNREG, tma=True,
+                                   dependent_launch=True)
 # A TPU's: its MXU's FLOPs a clock (v5e 197 TF over 1.5 GHz -> 131072) and the scoped VMEM limit at XLA's
 # default (v5e 16 MiB, read from a Mosaic kernel's refusal: "limit 16.00M"; v6e's pending GEMMTPU-VMEM's).
 # v6e: two 256x256 MXUs, 918 TF over its clock -> 524288. T4: 65 TF fp16 summed in fp32 and 8.1 TF fp32
 # over 40 SMs at 1590 MHz -> 1024 and 128.
 # VMEM capacity: v6e 128 MiB from an allocation refusal ("would exceed memory (size=134217728)",
 # GEMMTPU-GRIDSTEP@v6e1); v5e 128 MiB by Google's specification, pending GEMMTPU-VMEM@v5e1's refusal.
-_TPUS = {'v5e': Architecture('tpu', {'16bit': 131072}, scoped_vmem=16 * 2 ** 20, vmem_bytes=128 * 2 ** 20),
-         'v6e': Architecture('tpu', {'16bit': 524288}, vmem_bytes=128 * 2 ** 20)}
+_TPU = {'resident_threads': None, 'resident_blocks': None, 'registers': None, 'thread_registers': None,
+        'register_step': None, 'reserved_shared': None, 'shared_bytes_per_clock': None,
+        'exponentials_per_clock': None}
+"""A TPU's core states none of a CUDA multiprocessor's resources."""
+_TPUS = {'v5e': Architecture('tpu', {'16bit': 131072}, scoped_vmem=16 * 2 ** 20, vmem_bytes=128 * 2 ** 20,
+                             **_TPU),
+         'v6e': Architecture('tpu', {'16bit': 524288}, vmem_bytes=128 * 2 ** 20, **_TPU)}
 
 
 def architecture(generation: str) -> Architecture | None:

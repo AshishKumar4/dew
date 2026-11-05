@@ -35,7 +35,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.experimental.xla_metadata import set_xla_metadata
 
 from dew.nn.kernels import generation, launches
-from dew.nn.kernels.templates import cost, product, report, resources
+from dew.nn.kernels.templates import product, report, resources
 from dew.telemetry.instrumentation import MODEL_FLOPS
 
 Ref = state_types.AbstractRef | state_types.TransformedRef
@@ -889,7 +889,7 @@ def staged(shape: tuple, dtype, swizzle: int | None = None):
 def roles(wg, consumers: int, consumer, producer) -> None:
     """Each warpgroup's role in a cooperative block: the `consumers` first run `consumer(wg)` with their
     register budget raised to their share at the launch's residency (`resources.raised_registers`,
-    `_RESIDENT`), the last runs `producer()` with its lowered to `resources.PRODUCER_REGISTERS`, where the
+    `_RESIDENT`), the last runs `producer()` with its lowered to `resources.producer_floor`, where the
     GPU's compile honors them (`resources.RAISES_HONORED`)."""
     @pl.when(wg < consumers)
     def _():
@@ -898,7 +898,7 @@ def roles(wg, consumers: int, consumer, producer) -> None:
 
     @pl.when(wg == consumers)
     def _():
-        plgpu.set_max_registers(resources.PRODUCER_REGISTERS, action="decrease")
+        plgpu.set_max_registers(resources.producer_floor(), action="decrease")
         producer()
 
 
@@ -1627,9 +1627,12 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
     consumers: int
     """The compute roles a program may take (sm90 two warpgroups, sm80 one)."""
 
-    register_step: int = cost.REGISTER_STEP
-    """The allocator's registers per thread in one step (setmaxnreg's eight-register granularity).
-    A compile gate tests admits at their actual cap, refusals one such step below it."""
+    @property
+    def register_step(self) -> int:
+        """The allocator's registers per thread in one step (`generation.Architecture.register_step`,
+        setmaxnreg's eight-register granularity). A compile gate tests admits at their actual cap, refusals
+        one such step below it."""
+        return resources.facts().register_step
 
     most_shared: int
     """The most shared memory a block of any GPU of the family holds (CUDA's opt-in limit), which bounds

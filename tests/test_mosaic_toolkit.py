@@ -458,8 +458,8 @@ def test_a_consumer_is_raised_within_the_registers_a_thread_addresses():
 
     with generation.assumed("sm90"):
         family = bundles.of("sm90", jnp.bfloat16)
-    assert resources.raised_registers(1, 1) == 248
-    assert family.registers(1) == 248
+        assert resources.raised_registers(1, 1) == 248
+        assert family.registers(1) == 248
 
 
 def test_the_compile_gate_caps_a_consumer_at_the_registers_its_launch_raises_it_to():
@@ -473,7 +473,7 @@ def test_the_compile_gate_caps_a_consumer_at_the_registers_its_launch_raises_it_
     with generation.assumed("sm90"):
         family = bundles.of("sm90", jnp.bfloat16)
         model = resources.register_model(family, 1, None)
-    assert [model.cap(programs, honored=True) for programs in range(1, 5)] == [248, 232, 136, 104]
+        assert [model.cap(programs, honored=True) for programs in range(1, 5)] == [248, 232, 136, 104]
 
 
 def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():

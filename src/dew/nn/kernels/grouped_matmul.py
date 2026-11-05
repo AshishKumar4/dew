@@ -48,7 +48,7 @@ from ..derivatives import marked_call_p
 from ..precision import at_least_fp32, rounded_operand
 from . import generation, selection, tuning
 from .generation import INHERENT
-from .templates import base, bundles, cost, mosaic, report, resources, tail as tail_of
+from .templates import base, bundles, mosaic, report, resources, tail as tail_of
 from .templates.gemm import mosaic_gpu, mosaic_tpu
 from .templates.product import EIGHT, Product
 
@@ -355,7 +355,7 @@ class _Triton(_GroupedLaunch[Tile]):
         8.5 times slower on an H100, GMM-h100-2)."""
         rows, columns = self.output(config)
         accumulators = 2 if ba.arguments.get('exact_sums') else 1
-        held = accumulators * rows * columns // (32 * config.warps) < cost.THREAD_REGISTERS
+        held = accumulators * rows * columns // (32 * config.warps) < resources.facts().thread_registers
         short = not ba.arguments.get('exact_sums') or self.contraction(config) <= EXACT_STEP
         shared = not (target.wgmma and rows // max(config.warps // 4, 1) % 64)
         return held and short and shared and super().legal(ba, config, target)

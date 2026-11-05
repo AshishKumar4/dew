@@ -23,7 +23,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, recurrence_algebra as algebra, tuning
-from dew.nn.kernels.templates import base, cost, mosaic, report, resources, scan as block_scan
+from dew.nn.kernels.templates import base, mosaic, report, resources, scan as block_scan
 from dew.nn.kernels.templates.recurrence import mainloop
 
 RESET_WIDTH = 32
@@ -246,9 +246,10 @@ def backward_programs(registers: int, target: generation.GpuTarget) -> int:
     """The programs of the backward, one warpgroup and no producer, a multiprocessor of `target` holds at once
     at `registers` a thread: the shared planner's residency (`resources.RegisterModel.resident`) within its
     resident threads."""
-    threads = target.architecture.resident_threads // block_scan.THREADS
-    model = resources.RegisterModel(registers, cost.THREAD_REGISTERS, 1,
-                                    min(resources.RESIDENT_PROGRAMS, threads), cost.REGISTER_STEP, 0)
+    held = target.architecture
+    threads = held.resident_threads // block_scan.THREADS
+    model = resources.RegisterModel(registers, held.thread_registers, 1, min(held.resident_blocks, threads),
+                                    held.register_step, 0)
     return model.resident(registers)
 
 
@@ -265,7 +266,7 @@ def backward_plan(target: generation.GpuTarget) -> tuple[int, int]:
     slowed (sel-sweep-sxm at f3040b154)."""
     plans = []
     positions = 1
-    while backward_registers(positions) <= cost.THREAD_REGISTERS:
+    while backward_registers(positions) <= target.architecture.thread_registers:
         programs = backward_programs(backward_registers(positions), target)
         if programs:
             plans.append(((2 * positions + 2 * SCAN_STEPS) / (positions * programs), -programs, positions))
