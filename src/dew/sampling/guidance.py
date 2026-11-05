@@ -161,36 +161,42 @@ def guide(conditional: jax.Array, unconditional: jax.Array, scale) -> jax.Array:
     return _guided(conditional, unconditional, expand(jnp.asarray(scale, conditional.dtype), conditional))
 
 
-def _normalized(conditional: jax.Array, unconditional: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """The two predictions over 2**exponent, the larger one's power of two where it passes one, and that
-    exponent: a rescaling powers of two make exact, under which their difference and its multiples stay
-    finite wherever the combination they form is, as `_projected_components` forms its dots."""
-    _, exponent = jnp.frexp(jnp.maximum(jnp.abs(conditional), jnp.abs(unconditional)))
-    exponent = jnp.maximum(exponent, 0)
-    return jnp.ldexp(conditional, -exponent), jnp.ldexp(unconditional, -exponent), exponent
+def _spread(conditional: jax.Array, unconditional: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """The two predictions in float32 at least, and the factor they are formed at: one half where the
+    larger passes half the widened dtype's largest, else one. A half-precision pair then differs finitely
+    in float32 and a float32 pair finitely halved, so their difference and its multiples stay finite
+    wherever the combination is."""
+    wide = at_least_fp32(conditional.dtype)
+    held, unheld = conditional.astype(wide), unconditional.astype(wide)
+    large = jnp.maximum(jnp.abs(held), jnp.abs(unheld)) > jnp.finfo(wide).max / 2
+    return held, unheld, jnp.where(large, 0.5, 1.0).astype(wide)
 
 
 @jax.custom_jvp
 def _guided(conditional: jax.Array, unconditional: jax.Array, scale: jax.Array) -> jax.Array:
-    """`guide`'s value: the conditional prediction exactly at a unit scale, the affine combination
-    elsewhere, formed over the predictions `_normalized`, so finite predictions whose combination is
-    finite never overflow on the way (half precision's 40000 and -40000 at a scale of one half give 0)."""
-    held, unheld, exponent = _normalized(conditional, unconditional)
-    return jnp.where(scale == 1, conditional, jnp.ldexp(unheld + scale * (held - unheld), exponent))
+    """`guide`'s value: the conditional prediction exactly at a unit scale and the unconditional at a zero
+    one, the affine combination elsewhere, formed `_spread` and rounded once, so finite predictions whose
+    combination is finite never overflow on the way (half precision's 40000 and -40000 at a scale of one
+    half give 0)."""
+    held, unheld, half = _spread(conditional, unconditional)
+    wide = scale.astype(held.dtype)
+    combined = ((half * unheld + wide * (half * held - half * unheld)) / half).astype(conditional.dtype)
+    return jnp.where(scale == 1, conditional, jnp.where(scale == 0, unconditional, combined))
 
 
 @_guided.defjvp
 def _guided_jvp(primals, tangents):
-    """The affine combination's derivative at every scale, a unit one's included, where the exact
-    conditional the value selects would leave the scale's out."""
+    """The affine combination's derivative at every scale, the endpoints' included, where the exact
+    prediction the value selects would leave the scale's out."""
     conditional, unconditional, scale = primals
     along_conditional, along_unconditional, along_scale = tangents
     # The predictions' direction in the affine order, the conditional's own at a unit scale.
     predicted = jnp.where(scale == 1, along_conditional,
                           along_unconditional + scale * (along_conditional - along_unconditional))
-    # The scale's: the predictions' difference, formed `_normalized` as the value is.
-    held, unheld, exponent = _normalized(conditional, unconditional)
-    return _guided(*primals), predicted + jnp.ldexp((held - unheld) * along_scale, exponent)
+    # The scale's: the predictions' difference, formed `_spread` as the value is.
+    held, unheld, half = _spread(conditional, unconditional)
+    along = ((half * held - half * unheld) * along_scale.astype(held.dtype) / half).astype(conditional.dtype)
+    return _guided(*primals), predicted + along
 
 
 @struct.dataclass
@@ -340,11 +346,13 @@ def _row_scaled(vector: jax.Array) -> tuple[jax.Array, jax.Array]:
     return jnp.ldexp(vector, -exponent), exponent
 
 
-def _norm(vector: jax.Array) -> jax.Array:
-    """Each row's L2 norm over every axis but the first, formed over the row `_row_scaled`."""
+def _clipped(vector: jax.Array, threshold: float) -> jax.Array:
+    """`vector` with each row's L2 norm over every axis but the first clipped at `threshold`. The norm is
+    formed over the row `_row_scaled` and the clip's factor against the threshold scaled alike, so a
+    finite row whose norm passes the dtype's largest is still clipped to its threshold."""
     scaled, exponent = _row_scaled(vector)
     norm = jnp.sqrt(jnp.sum(jnp.square(scaled), axis=tuple(range(1, vector.ndim)), keepdims=True))
-    return jnp.ldexp(norm, exponent)
+    return vector * jnp.minimum(1.0, jnp.ldexp(jnp.asarray(threshold, vector.dtype), -exponent) / norm)
 
 
 @struct.dataclass
@@ -380,13 +388,12 @@ class APG:
 
     def _guided(self, denoise: Denoiser, scale: jax.Array, x, t, average):
         (output, unconditional), sown = denoise.raw_both_observed(x, t)
-        # The direction, its average and its clipping in float32 at least, as the reference's norm
-        # accumulates, so a half-precision direction overflows neither its difference nor its norm.
+        # The direction, its running average (`walk`'s carry) and its clipping in float32 at least, as the
+        # reference's norm accumulates, so a half-precision direction overflows neither its difference,
+        # its average nor its norm.
         wide = at_least_fp32(jnp.result_type(output, unconditional))
-        moved = output.astype(wide) - unconditional.astype(wide) + self.momentum * average
-        direction = moved
-        if self.norm_threshold > 0:
-            direction = direction * jnp.minimum(1.0, self.norm_threshold / _norm(direction))
+        moved = output.astype(wide) - unconditional.astype(wide) + self.momentum * jnp.asarray(average, wide)
+        direction = _clipped(moved, self.norm_threshold) if self.norm_threshold > 0 else moved
         orthogonal, parallel = _projected_components(direction, output)
         update = orthogonal + self.eta * parallel
         off = scale == 1.0
@@ -404,11 +411,12 @@ class APG:
                 lambda index: lambda x, t: self._guided(denoise, scales(index), x, t, 0.0)[0])
 
         def step(x, t, index, average):
-            pair, running = self._guided(denoise, scales(index), x, t, average)
-            return pair, running.astype(average.dtype)
+            return self._guided(denoise, scales(index), x, t, average)
 
-        return Walk(jnp.zeros_like, step, lambda average, index: lambda x, t: self._guided(
-            denoise, scales(index), x, t, average)[0])
+        def predict(average, index):
+            return lambda x, t: self._guided(denoise, scales(index), x, t, average)[0]
+
+        return Walk(lambda x: jnp.zeros(x.shape, at_least_fp32(x.dtype)), step, predict)
 
 
 @struct.dataclass
