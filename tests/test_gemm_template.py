@@ -519,6 +519,62 @@ def test_a_dense_product_whose_extents_no_tile_divides_holds_check_1(transpose_r
                         "dense 65x40x100 gradients", seeds=SEEDS, truth_fn=with_gradients(truth))
 
 
+@INTERPRETS
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+@pytest.mark.parametrize("transpose_rhs", [False, True])
+def test_a_decode_steps_dense_product_runs_swapped_and_holds_check_1(generation_name, transpose_rhs):
+    """A dense product of fewer rows than a role's (a decode step's 4 rows by 256 by 384) derives a swapped
+    tile on each family (its matrix the MMA's rows, the rows its narrow columns, row 1762), and the Mosaic
+    product interpreted at it holds check 1 against the plain program over the draws, the matrix stored
+    either way (read transposed where it lies `[depth, width]`)."""
+    rows, depth, width = 4, 256, 384
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        x = jnp.asarray(rng.normal(size=(rows, depth)), jnp.bfloat16)
+        shape = (width, depth) if transpose_rhs else (depth, width)
+        return x, jnp.asarray(rng.normal(size=shape) / 16, jnp.bfloat16)
+
+    def dew(x, w):
+        return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16, transpose_rhs=transpose_rhs,
+                         interpret_on_cpu=True)
+
+    def plain(x, w, wide=jnp.float32, out=jnp.bfloat16):
+        w = w.T if transpose_rhs else w
+        return jnp.dot(x.astype(wide), w.astype(wide)).astype(out)
+
+    launch = grouped_matmul.MosaicGmm()
+    matrix = (1, width, depth) if transpose_rhs else (1, depth, width)
+    bound = launch.bind(jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16),
+                        jax.ShapeDtypeStruct(matrix, jnp.bfloat16), jax.ShapeDtypeStruct((1,), jnp.int32),
+                        out_dtype="bfloat16", trans_rhs=transpose_rhs, interpret=True, dense=True)
+    with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic_gpu"):
+        tile = launch.derived(bound, generation.gpu_target())
+        assert tile is not None and tile.swapped, tile
+        assert launch.legal(bound, tile, generation.gpu_target())
+        assert_as_exact(dew, jax.jit(plain), draw, f"swapped {rows}x{depth}x{width}", seeds=SEEDS,
+                        truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
+
+
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+@pytest.mark.parametrize("transpose_rhs", [False, True])
+def test_a_swapped_dense_product_lowers_for_cuda(generation_name, transpose_rhs):
+    """The swapped tile of a one-row dense product (an M=1 decode dot over a 2048 x 2048 matrix, row 483)
+    lowers for CUDA on the CPU on each family, the matrix stored either way."""
+    rows, depth, width = 1, 2048, 2048
+    launch = grouped_matmul.MosaicGmm()
+    matrix = (1, width, depth) if transpose_rhs else (1, depth, width)
+    args = (jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16), jax.ShapeDtypeStruct(matrix, jnp.bfloat16),
+            jax.ShapeDtypeStruct((1,), jnp.int32))
+    options = {"out_dtype": "bfloat16", "trans_rhs": transpose_rhs, "interpret": False, "dense": True}
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
+    with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
+        tile = launch.derived(launch.bind(*args, **options), generation.gpu_target())
+        assert tile is not None and tile.swapped, tile
+        jax.jit(functools.partial(launch.replace(config=tile), **options)).trace(*args).lower(
+            lowering_platforms=("cuda",))
+
+
 def test_a_named_kernels_derivative_pulled_after_its_block_holds_check_1():
     """A grouped product traced on an A100 within `generation.chosen(grouped_matmul='xla')`, its pullback
     run after the block closes, as MoE's implementation='xla' scopes only its own call: the value and both
