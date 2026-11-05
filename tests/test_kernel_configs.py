@@ -939,15 +939,22 @@ def test_programs_compiled_at_once_are_the_ones_compiled_in_turn():
     one after another keeps, in the order given; those lowered in distinct MLIR contexts (here, each on a
     thread of its own, as JAX lowers a thread's programs in one) make their first compiles each in a
     thread of its own, and those sharing a context compile in turn in the caller's (`report.attempts`)."""
-    import concurrent.futures
+    import threading
 
     from dew.nn.kernels.templates import report
     from dew.telemetry.compiles import Compiles
 
     square = jax.ShapeDtypeStruct((256, 256), jnp.float32)
     functions = (lambda x, y: x @ y, lambda x, y: jnp.tanh(x) + y, lambda x, y: jnp.sum(x * y, axis=0))
-    with concurrent.futures.ThreadPoolExecutor(3) as pool:
-        apart = list(pool.map(lambda function: jax.jit(function).lower(square, square), functions))
+    apart: list = [None] * len(functions)
+
+    def lowered(index: int) -> None:
+        apart[index] = jax.jit(functions[index]).lower(square, square)
+    threads = [threading.Thread(target=lowered, args=(index,)) for index in range(len(functions))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
     shared = [jax.jit(function).lower(square, square) for function in functions]
     for lowerings, threaded in ((apart, True), (shared, False)):
         with Compiles(None) as compiles:
