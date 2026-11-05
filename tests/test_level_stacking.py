@@ -71,7 +71,10 @@ def chunk_loop(model, variables, tokens, adaptation: ChunkAdaptation, *, truth: 
     (an interceptor applies each block at each version and keeps a token's own); a level's window gradient
     sums its chunks' loss gradients in it, the earlier chunks' versions fixed; at a window's end its level
     steps by its rate times it. A row's `blocks` `[B, S]` (-1 for none), each read whole, put a block's
-    tokens in the chunk its first token is in, every other token in its own."""
+    tokens in the chunk its first token is in, every other token in its own. The decoder runs the plain
+    loop, as the interceptor reads each layer's feed-forward by its own module (`layers_N`), which a scan
+    runs as one body of its run."""
+    model = model.clone(scan_layers=False)
     layers = adaptation.layers
     windows, rates = adaptation.windows(len(layers)), adaptation.rates(len(layers))
     chunk = min(windows)
