@@ -667,6 +667,18 @@ class _Writer:
             self.pool.shutdown(wait=True, cancel_futures=True)
             self.index.close()
             self._release()
+            self._reported()
+
+    def _reported(self) -> None:
+        """Log the fill's report as it ends, in the process that filled it, a loading worker's too (row
+        4121): whether it still admitted records, its spool, the bytes it uploaded and at what rate, and
+        the uploads it abandoned."""
+        held = self.metrics()
+        seconds = held["upload_seconds"]
+        rate = held["uploaded_bytes"] / seconds / 2**20 if seconds else 0.0
+        _log.info("data/cache %s: admitting=%s spool_bytes=%d uploaded_bytes=%d (%.1f MiB/s) abandoned=%d",
+                  self.root.url, held["admitting"], held["spool_bytes"], held["uploaded_bytes"], rate,
+                  held["abandoned"])
 
     def _release(self) -> None:
         """The writer's local spool and its pin let go, once no upload reads them: the one release
@@ -695,6 +707,7 @@ class _Writer:
         self.index.close()
         if self.abandoned:
             _log.warning("data/cache/abandoned=%d at %s", self.abandoned, self.root.url)
+        self._reported()
         if unfinished:
             remaining = set(unfinished)
 
