@@ -504,6 +504,18 @@ class _Forms:
     product's weights and values, extracted with the forms; None for a step of no such rule."""
 
 
+def context() -> tuple:
+    """What a derivation reads where it runs beside its declaration and shapes, the key of every derivation a
+    declaration holds (`derive`'s forms, `scan.derive_scan`'s carry splits): forms traced under one abstract
+    mesh hold its avals in their literals (a sharded step's bound under a local one's mesh refused to lower),
+    and are priced for one target (`cost.target`), under one run's numerics and one matmul precision, with
+    the extractor oracle on or off (`Passes.checked`). Not the whole trace context, whose identity-keyed
+    collections (`dew.cache.KERNEL_ROUTES`, `KERNEL_SEEN`) are new in each lowering: every lowering derived
+    again and the cache grew without end."""
+    return (jax.sharding.get_abstract_mesh(), cost.target(), generation.numerics(),
+            jax.config.jax_default_matmul_precision, ALGEBRA.value.checked)
+
+
 FORMS_HELD = 64
 """The derived forms one declaration keeps, its least recently traced dropped past them: a process's distinct
 meshes, targets, numerics and tile shapes, each a saturation's seconds to derive again."""
@@ -525,15 +537,8 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
         return made
 
     def forms(shapes: Mapping) -> _Forms:
-        # Each context's own that changes a derivation: forms traced under one abstract mesh hold its avals in
-        # their literals (a sharded step's bound under a local one's mesh refused to lower), and are priced
-        # for one target, under one run's numerics and one matmul precision. Not the whole trace context,
-        # whose identity-keyed collections (`dew.cache.KERNEL_ROUTES`, `KERNEL_SEEN`) are new in each
-        # lowering: every lowering derived again and the cache grew without end.
-        contexts = (jax.sharding.get_abstract_mesh(), cost.target(), generation.numerics(),
-                    jax.config.jax_default_matmul_precision, ALGEBRA.value.checked)
-        return derived_at(contexts, tuple((name, tuple(shapes[name][0]), np.dtype(shapes[name][1]))
-                                          for name in names))
+        return derived_at(context(), tuple((name, tuple(shapes[name][0]), np.dtype(shapes[name][1]))
+                                           for name in names))
 
     def shaped(values):
         return {name: (value.shape, value.dtype) for name, value in values.items()}

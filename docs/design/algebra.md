@@ -83,9 +83,14 @@ reference's error, past the gate's 1.5).
 
 Dew holds 58 custom-derivative sites (the inventory of 2026-11-01, by class: 24 kernel, 26 numerics, 8 surrogate),
 and two more since: nGPT's join and normed hidden (`ngpt.stepped`, `ngpt.normed_hidden`, row 1308), which reverse in
-two passes only to restructure the norm's algebra (§0's example) and are the algebra-only sites the engine retires
-first. The engine sees through every one: it rewrites inside each custom VJP's and JVP's forward and backward
-bodies, by the site's declared class:
+two passes only to restructure the norm's algebra (§0's example). They stay hand-written: the one-pass form's
+new intermediates are sums of the raw rows and of the joined rows `start + |alpha scale| (end - start)` against
+the cotangent, and neither the cotangent nor the learned rate has a range the program proves or declares, so no
+reordering to that form meets the dominance rule (§6.3). Autodiff's own backward is no safer: it forms the same
+unscaled products (the pullback of `x r` to `r` is `sum(g x)`), and over residual, branch and cotangent scales
+of 1 to 1e38 in fp32 the hand backward was never non-finite where autodiff's was finite, and finite in 137 cases
+where autodiff's was not (row 4124). The engine sees through every site: it rewrites inside each custom VJP's and
+JVP's forward and backward bodies, by the site's declared class:
 
 - **Kernel** (the norm and SwiGLU kernels, the GEMM and attention templates, the recurrence kernels, the paged and
   Splash attention kernels): the launches are opaque leaves and their XLA glue is `KernelGlue`, rewritten freely.
@@ -132,7 +137,14 @@ Rows 4026 to 4030 declare each lane's sites.
     on a lane that flushes a subnormal product (the CPU's, `tests/certified.py`'s `Lane.flushes`: the product
     is zero where the magnitude keeps its bits), nor for a complex value; exp and log cancel only over a sign
     and a range the language holds no fact of. None of these is built;
-  - **reuse** (compile time and dev time): a value the forward already computed;
+  - **reuse** (compile time and dev time): a value the forward already computed. An equal term is one e-class
+    and extraction prices a shared one once, so a value written twice is read once without a rule. A rule
+    would relate a new value to another the program holds; over benchmark_step's and the parallelism matrix's
+    step programs (2026-11-05, every program the pass saw, bodies included) none takes the square root and its
+    reciprocal of one value or the exponentials of a value and its negation, a handful square a value by a
+    product, and the only pattern of note is a divisor shared by several quotients (42 to 452 of 423 to 794
+    divisions a suite). A shared reciprocal `a (1/y)` overflows where `a / y` is finite (a subnormal `y`) and
+    makes a NaN of a zero `a`, so the dominance rule (§6.3) refuses it. Not built;
   - **decoupled reductions** (dev time): dependent nonlinear reductions broken with correction terms (the running-max
     rescale of online softmax, log-sum-exp merges and folds, moment merges);
   - **stable forms** (dev time; §1.5): `log1p` and `expm1`, log-space divergences, compensated and widened sums,
@@ -184,14 +196,15 @@ Each form is priced in time from the device facts Dew already owns, never from f
   (`joined`; `linear`'s shared operand out of two products), which the device price already prefers, so a
   collective's bytes over `dew.training.distributed.link_figure` would only agree with it. A rule that moves a
   reduction onto or off a sharded axis brings that price with it;
-- the kernel model is the templates' own (`dew.nn.kernels.templates.cost.seconds`);
+- the kernel model is the templates' own (`dew.nn.kernels.templates.cost.walked`);
 - a fact a price needs and no owner holds, such as a reduction's latency, is added to `GpuTarget` or its
   `Architecture`.
 
 A region's seconds are computed once, from its composed terms over the chosen DAG (§6.5): bytes over bandwidth,
-FLOPs over the dtype's rate, collective bytes over the link, each kernel XLA's fusion makes of it (a reduction's
-and a product's, each a fusion's root) at the part's measured fixed latency (its launch and first byte), and
-the longest chain of dependent reductions as latency, combined as `templates.cost` combines a launch's. Row
+FLOPs over the dtype's rate, each kernel XLA's fusion makes of it (a reduction's
+and a product's, each a fusion's root) at the part's measured fixed latency (its launch and first byte), so a
+chain of dependent reductions pays a kernel's latency a link, and the span of a loop XLA lowers at its
+iteration's latency (§6.5), combined as `templates.cost` combines a launch's. Row
 4072's validation priced 1,580 profiled kernels: without a kernel's fixed latency an H100's XLA fusions came
 to 0.02 of their measured time, with it 0.51 (p10 0.40). Prices are checked against measured profiles, not
 fitted to them, and a rule set ships only with measured receipts.
@@ -278,9 +291,8 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
 
 ## 4. What it replaces, and what it leaves
 
-- **It replaces** custom derivatives that exist only to restructure algebra (nGPT's join and normed hidden, §1.3),
-  and
-  hand-derived template algebra and numeric forms wherever a generated form meets both bars:
+- **It replaces** custom derivatives that exist only to restructure algebra where its rules reach their form
+  under the dominance rule (nGPT's join and normed hidden do not, §1.3), and hand-derived template algebra and numeric forms wherever a generated form meets both bars:
   - bible §4: at least as efficient on every scoreboard row and GPU type the route serves, at the derived default,
     in operator rows and the `benchmark_step` step;
   - bible §6: the template's stability suite on both forms, and check 1 and check 2 against the float64 truth.
@@ -563,8 +575,11 @@ def extracted(graph, root, model) -> ...: ...   # the exact extractor (a MILP), 
   an iteration of a loop XLA lowers, its launches and its predicate (`GpuTarget.step_seconds`, each GPU's
   measured as the slope of a loop's time over its iterations: an A100's 5.96 µs, an H100's 4.93 µs, an RTX
   PRO 6000's 3.68 µs); a token loop's tokens and a substitution's rows are a step each. On the template's
-  path a step's latency is its instructions', which the resource model does not state yet, so a span there
-  is priced by no time.
+  path a step is a dependent reduction inside a program, measured as one (`GpuTarget.kernel_step_seconds`:
+  a Pallas program's 128-lane reduction read by the next, an A100's 225.3 ns, an H100's 142.7 ns, an RTX PRO
+  6000's 137.7 ns). The algebra's terms state no span of their own, extraction composing a span as its largest
+  node's (`extract.Level`), so a derived tile form's span is the derivation's to state. A whole launch's step,
+  its tile's load and products where its ring does not hide them, is the launch model's (row 4123).
 - Every rule is the pass's own, applied wherever its cost model prices the rewrite cheaper, with no
   condition on XLA: where XLA would make the same rewrite the result is the same, and where XLA's factoring
   and reassociation are held to integers, powers of two or fast math, the pass's fire on floats wherever the
@@ -886,7 +901,7 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
 - Every custom-derivative site declares itself through one of the three declarations, in place of a bare
   `jax.custom_vjp` or `jax.custom_jvp`. `linear_tangent` takes its caller's declared kind: `KernelGlue` at a kernel
   site, `Protected` at a numerics one (`sampling.flow`'s KL, the chunked heads, `nn.precision`'s products), and
-  `Algebra` at nGPT's join and normed hidden, which the compile-time sets rewrite until the engine retires them. A bare custom derivative in `src/dew` fails a slop check, so the inventory of §1.3 stays complete.
+  `Algebra` at nGPT's join and normed hidden, which the compile-time sets rewrite and which stay (§1.3). A bare custom derivative in `src/dew` fails a slop check, so the inventory of §1.3 stays complete.
 - `surrogate(forward, derivative)`: the forward runs as written and its tangent is `derivative`'s, both bodies
   `Surrogate`. No rule set holds a rule relating a `Surrogate` span to autodiff's derivative of its forward, so the
   engine optimizes inside each body and never replaces the rule.
@@ -1018,11 +1033,26 @@ Agreed with the GEMM template's owner (2026-11-03):
   loads: a 32-bit word holds 8 E2M1 codes.
 - Block scales (NVFP4's 1×16, MX's 1×32) are a separate transform of a fixed layout, which feeds the
   template's promotion and epilogue: a form may re-encode the codes, never the scales.
-- The consumer checks in each form it takes: its instructions, its encoder and the encoder's version (in the
+- Each decode a template takes is declared and checked in once, in `dew.algebra.bits`, the one source the
+  engine's and the consumer's tests prove: `NVFP4_BFLOAT16`, eight E2M1 codes of a word in their natural
+  order (code `i` at bits `4i`, a byte's low nibble the earlier element) into four bfloat16 pairs, each the
+  code's value times 2^-126, and its form `NVFP4_BFLOAT16_FORM`, the search's at shifts of up to 6 places.
+  The codec packs codes naturally; the consumer's prepare step stores them in the form's layout once
+  (`BitForm.prepared`, in `jax.numpy`), and its portable path reads a word tile `[r, c]` back as `[r, 8c]`
+  elements in depth order (`BitForm.values`). An E2M1 subnormal (±0.5) decodes to a bfloat16 subnormal, so
+  the portable path scales it in integer exponent arithmetic, never through a lane that flushes subnormals.
+- The consumer records the form it takes: its encoder and the encoder's version (in the
   checkpoint), the decoder's live registers per thread (which `resources.py` prices before a tile is admitted)
-  and its instruction mix in `Work`'s units (which `cost.py` prices). Its tests prove it again.
-- The decoder is emitted inline (Mosaic GPU takes inline asm through `plgpu.inline_mgpu`) at a matrix-operand
-  hook the GEMM template adds (row 3621).
+  and its issues by pipe (`BitForm.issues`). `Work` holds no integer pipe yet: the consumer's head adds the
+  ALU's and the FMA pipe's integer issues to it, each 64 results a clock per multiprocessor (§7.2), so
+  `cost.py` prices a form's mix beside the tile's other work. Its tests prove the form again.
+- The decoder is emitted inline at a matrix-operand hook the GEMM template adds (row 3621): `BitForm.ptx(i)`
+  writes output register `i` as one PTX block over the stored word (`$1`) into the register (`$0`), each step
+  as its pipe's instruction (`shr`, `shl` and `shf` on the ALU, `mul.lo` and `mul.hi` by a power of two on the
+  FMA pipe, `lop3` for a mask), for Mosaic GPU's or Triton's inline assembly (constraints `=r,r`, a register
+  a block). `BitForm.traced` computes the same registers in `jax.numpy` for the hook's portable path and the
+  interpreter. Both evaluate one definition of each step (`bits._run`), the one `proven` checks. PTX fixes the
+  arithmetic, not the SASS: ptxas chooses the instructions, which the consumer's compile report shows.
 - Scope: NVFP4 and MXFP4 on sm90 and sm80; FP8 on sm80, which has no FP8 MMA; FP8 and FP4 packing in the
   epilogue. FP8 on sm90 needs no decode: wgmma multiplies E4M3 and E5M2 from shared memory.
 - A form is taken only where it is bit-identical over its whole domain and timed no slower on the real GEMM.

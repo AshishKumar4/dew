@@ -78,14 +78,15 @@ def _facts(value: Hashable | Mapping | list) -> Hashable:
     return value
 
 
-CHOICES = frozenset({'attention', 'attention_mainloop', 'decode', 'delta_decode',
-                      'delta_gates', 'gate_up', 'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue',
-                      'grouped_matmul', 'local_attention', 'mla', 'narrow_copies', 'paged_decode', 'rms_norm',
-                      'selective_scan', 'short_conv', 'ssd', 'ssd_decode', 'swiglu'})
-"""The choices a dispatch reports (`route`), and so the ones `chosen` may name (`chosen_kernel`)."""
+CHOICES = frozenset({'attention', 'attention_mainloop', 'decode', 'delta_decode', 'delta_gates', 'gate_up',
+                     'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue', 'grouped_matmul', 'narrow_copies',
+                     'paged_decode', 'rms_norm', 'selective_scan', 'short_conv', 'ssd', 'swiglu'})
+"""The choices a dispatch reports (`route`), and so the ones `chosen` may name (`chosen_kernel`): every one a
+selector serves (`selection.Op`, which refuses a choice this does not hold as it is built) or a site reads
+(`chosen_kernel`, likewise)."""
 
 
-def _named(choices: Iterable[str]) -> None:
+def known_choices(choices: Iterable[str]) -> None:
     """Refuse any of `choices` that `CHOICES` does not hold, naming every one it holds."""
     if unknown := set(choices) - CHOICES:
         raise ValueError(f"no kernel choice is named {', '.join(sorted(unknown))}; "
@@ -101,7 +102,7 @@ def chosen(**kernels: str) -> Iterator[None]:
     outside the block traces again within it."""
     from dew import cache
 
-    _named(kernels)
+    known_choices(kernels)
     with cache.KERNEL_CHOICES(tuple(sorted({**dict(cache.KERNEL_CHOICES.value), **kernels}.items()))):
         yield
 
@@ -300,25 +301,12 @@ class Measured:
     the plateau a long transfer reaches, below what the memory clock and bus give; `launch`, the seconds a
     kernel launch adds to a program that runs kernels one after another; and `handoff`, a GPU-scope semaphore
     signal another program of the same launch waits on, where the part's ring families fix tiles up across
-    programs (the balanced tail's partials). None where not measured.
-
-    The latencies a kernel's synchronization and loads meet on the part's die, in its clock's cycles: a
-    block's mbarrier arrival observed by another of its warps (`barrier_cycles`), a cluster's
-    (`cluster_barrier_cycles`), a shared-memory load's use (`shared_cycles`), a hit in the near half of the
-    L2 (`l2_cycles`) and a GPU-scope acquire-release fence (`fence_cycles`); and the device-memory bytes a
-    second that 16-byte asynchronous copies of scattered 128-byte rows reach (`gather_bytes_per_second`),
-    below the stream's plateau. The algebra's cost model prices by them (`dew.algebra.cost`)."""
+    programs (the balanced tail's partials). None where not measured."""
 
     fixed: float
     bytes_per_second: float
     launch: float | None = None
     handoff: float | None = None
-    barrier_cycles: float | None = None
-    cluster_barrier_cycles: float | None = None
-    shared_cycles: float | None = None
-    l2_cycles: float | None = None
-    fence_cycles: float | None = None
-    gather_bytes_per_second: float | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -379,6 +367,11 @@ class GpuTarget:
     """One dependent step's latency on XLA's path: an iteration of a loop XLA lowers, its launches and its
     predicate, each reading the last (the work-span model's step, `templates.cost.Work.span`), measured per
     GPU (FS-STEP-SECONDS1's receipts); None where none was, so a form's span there is priced by no time."""
+    kernel_step_seconds: float | None = None
+    """One dependent step's latency within a kernel: a tile's 128-lane reduction broadcast into the next
+    step's operand, in one program, each reading the last (a template walk's span, `templates.cost.walked`),
+    measured per GPU as the slope over 1,024 to 16,384 steps (FS-STEP-SECONDS1's kernel path); None where
+    none was."""
 
     @property
     def architecture(self) -> Architecture:
@@ -447,6 +440,13 @@ class GpuTarget:
         return self.memory_bandwidth if part is None else part.bytes_per_second
 
     @property
+    def fixed_seconds(self) -> float | None:
+        """The seconds a kernel's stream spends before its bytes arrive, its launch and first byte, measured
+        on the part (`Measured.fixed`); None where no one measured it."""
+        part = self.part
+        return None if part is None else part.fixed
+
+    @property
     def launch_seconds(self) -> float | None:
         """The seconds a kernel launch adds to a program of kernels one after another, measured on the part
         (`Measured.launch`); None where no one measured it."""
@@ -501,7 +501,7 @@ class GpuTarget:
 # RTX PRO 6000 Blackwell Server 188, from NVIDIA's architecture whitepapers and datasheets.
 # Boost clock (MHz) and memory bandwidth (GB/s) of each canonical device, from the same datasheets:
 # A100 SXM4 80GB 1410/2039, A10 1695/600, L4 2040/300, H100 SXM 1830/3350, RTX PRO 6000 Blackwell
-# Server 2617/1792. The rates, latencies and L2 a family shares are `architecture`'s.
+# Server 2617/1597. The rates, latencies and L2 a family shares are `architecture`'s.
 # Opted-in shared memory per block, in KiB: Turing64, A100163, Ampere/Ada/RTX
 # Blackwell99, Hopper227. The SM reservation is already excluded:
 # https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html
@@ -537,11 +537,12 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), multiprocessors=108, clock_hz=1410e6,
               memory_bandwidth=2039e9, triton_gemm_fusions=False, step_seconds=5.96e-6,
+              # In-kernel: a dependent lane reduction's 225.3 ns (FS-STEP-SECONDS1-a100, its two rounds 225.32
+              # and 225.25).
+              kernel_step_seconds=225.3e-9,
               # tools/device_facts.py on an A100-SXM4-40GB: its stream FS-DEVICEFACTS2-a100's (1.555 TB/s by
-              # its clocks), its launch FS-DEVICEFACTS4-a100's; its die's shared-memory and near-L2 latencies
-              # an A100 PCIe's (GA100), Luo et al. 2025, arXiv:2501.12084, Tables 3 and 4.
-              measured={'NVIDIA A100-SXM4-40GB': Measured(6.04e-6, 1.486e12, launch=2.11e-6, shared_cycles=29,
-                                                          l2_cycles=208)}),
+              # its clocks), its launch FS-DEVICEFACTS4-a100's.
+              measured={'NVIDIA A100-SXM4-40GB': Measured(6.04e-6, 1.486e12, launch=2.11e-6)}),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024,
               # The RTX A6000's 154.8 TF dense (its datasheet's 309.7 with sparsity; the RTX PRO Blackwell
               # architecture whitepaper's Table 4), a real one's other facts its driver's (`runtime_facts`).
@@ -570,26 +571,19 @@ TARGETS = {target.generation: target for target in (
               # RTX PRO 6000 (row 3341's calibration, compile-only; an L4's attention kernel compiles
               # for none).
               late_weight_gradients=True,
+              # In-kernel: a dependent lane reduction's 142.7 ns on an H100 80GB HBM3 (FS-STEP-SECONDS1-h100,
+              # its two rounds 142.72 and 142.61).
+              kernel_step_seconds=142.7e-9,
               # tools/device_facts.py on an H100 SXM and a GH200: their streams FS-DEVICEFACTS2-h100's and
               # -gh200's, their launches and hand-offs FS-DEVICEFACTS4's; the H200's stream the same line
               # through the kernel challenge's best read at each size, 16.8 MB to 805 MB, cold L2 under graph
               # replay (judge-facts.md:3-18).
               # The H100 PCIe's two rounds of tools/device_facts.py agreed to 1% (ET-DEVICEFACTS-h100pcie),
               # its hand-off 0.695 us in both; its launch fit no line (negative slopes).
-              # The GH100 die's shared-memory and near-L2 latencies an H800 PCIe's (Luo et al. 2025,
-              # arXiv:2501.12084, Tables 3 and 4); the H200's the kernel challenge's calibration on the
-              # judge's H200 (h200-lean calibration/params.md, lines 39, 49, 59, 66, 67 and 71: the shared
-              # load, the near L2 hit at 260 to 280, the cp.async gather at two blocks a multiprocessor, the
-              # mbarrier arrival in a block and across a cluster, the GPU-scope acquire-release fence).
-              measured={'NVIDIA H100 80GB HBM3': Measured(1.87e-6, 3.190e12, launch=1.02e-6, handoff=0.78e-6,
-                                                          shared_cycles=29, l2_cycles=258),
-                        'NVIDIA H100 PCIe': Measured(2.11e-6, 1.980e12, handoff=0.695e-6, shared_cycles=29,
-                                                     l2_cycles=258),
-                        'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6,
-                                                       shared_cycles=29, l2_cycles=258),
-                        'NVIDIA H200': Measured(2.81e-6, 4.617e12, barrier_cycles=65,
-                                                cluster_barrier_cycles=395, shared_cycles=28, l2_cycles=270,
-                                                fence_cycles=274, gather_bytes_per_second=3.80e12)}),
+              measured={'NVIDIA H100 80GB HBM3': Measured(1.87e-6, 3.190e12, launch=1.02e-6, handoff=0.78e-6),
+                        'NVIDIA H100 PCIe': Measured(2.11e-6, 1.980e12, handoff=0.695e-6),
+                        'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6),
+                        'NVIDIA H200': Measured(2.81e-6, 4.617e12)}),
     # Datasheet facts alone, no routes: what a compile-only sm100 device needs (`tests/kernel_compile.py`),
     # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,
@@ -617,7 +611,9 @@ TARGETS = {target.generation: target for target in (
               # datasheet); 1.792 TB/s is the Workstation part's (the RTX PRO Blackwell architecture
               # whitepaper, p.12).
               aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1597e9,
-              step_seconds=3.68e-6),
+              # In-kernel: a dependent lane reduction's 137.7 ns (FS-STEP-SECONDS1-g4, its two rounds 137.68
+              # and 137.66).
+              step_seconds=3.68e-6, kernel_step_seconds=137.7e-9),
     GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}),
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
     GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}),
@@ -857,7 +853,7 @@ def chosen_kernel(choice: str, default: str) -> str:
     without a selector (the attention template's form, a step's narrow copies)."""
     from dew import cache
 
-    _named((choice,))
+    known_choices((choice,))
     return dict(cache.KERNEL_CHOICES.value).get(choice, default)
 
 
@@ -928,7 +924,7 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
     both and the refusal's reason; one that runs the preferred kernel logs nothing."""
     from dew import cache
 
-    _named((choice,))
+    known_choices((choice,))
     generation = device_generation()
     preferred = preferred or dict(cache.KERNEL_CHOICES.value).get(choice) or kernel
     found = Route(choice, kernel, preferred, refusal, ran or kernel, generation, _site(), forced)

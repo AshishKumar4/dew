@@ -33,11 +33,12 @@ from test_recurrence_chunk import (
 )
 
 from dew.nn.kernels import generation, recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk, chunk_rounding, fast_rounding, mosaic_rule
+from dew.nn.kernels.recurrence_chunk import Chunk, chunk_rounding, fast_rounding
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import bundles, mosaic, product, report, resources
 from dew.nn.kernels.templates.base import Unfitted
 from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward, template
+from dew.nn.kernels.templates.recurrence.template import mosaic_rule
 
 pytestmark = pytest.mark.kernel
 
@@ -421,7 +422,7 @@ def test_the_template_on_an_unseen_gpu_is_as_exact_as_its_reference():
 def test_the_mosaic_launches_state_their_work(training):
     """A bf16 gated delta rule's forward, or its forward and gradient, through the template, lowered for the
     GPU the test runs on, or off one an H100 (Mosaic GPU lowers no Hopper copy for an A100's device):
-    every launch states its cost (`_kernel`'s, `templates.gemm.cost`), which Dew's FLOP count reads to
+    every launch states its cost (`_kernel`'s, `templates.cost.estimate`), which Dew's FLOP count reads to
     size it (`instrumentation._stated_flops`: no launch unsized, row 1895's kernel report), their products
     together at least the model's recurrent function's (`flops.delta_flops`: the chunked form's preparation
     and inversion are work past it)."""

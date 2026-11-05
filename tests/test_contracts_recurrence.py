@@ -16,7 +16,7 @@ from ssd_support import stepwise_scan
 from dew.algebra import SATURATION, forms as algebra_forms, scan
 from dew.nn.kernels import fla_gdn, fla_kda, mamba_ssd, recurrence, recurrence_chunk, short_conv, ssd
 from dew.nn.kernels.templates import mosaic_sm90
-from dew.nn.kernels.templates.recurrence import mainloop, selective
+from dew.nn.kernels.templates.recurrence import mainloop, selective, template
 
 DELTA_RULE_EDGES = {"normal": 1.0, "the largest its chunk holds": 2.0**62, "near the largest": 2.0**63,
                     "near the least normal": 2.0**-63}
@@ -202,7 +202,7 @@ def test_the_delta_rule_ports_hold_their_orders(per_key, edge):
 # finite (ledger 2656).
 @pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
 def test_the_template_rule_holds_its_orders(edge):
-    """The recurrence template's chunked rule (`recurrence_chunk.mosaic_rule`, a custom VJP over the
+    """The recurrence template's chunked rule (`template.mosaic_rule`, a custom VJP over the
     mainloop's launches, interpreted off a GPU), a 16-bit call with its chunk inverse's declared bound (keys
     of unit norm, sigmoid write gates: its domain), from a zero memory: the primal and reverse derivative of
     the output finite wherever float64 is a normal float32 and the delta rule a token at a time is
@@ -216,7 +216,7 @@ def test_the_template_rule_holds_its_orders(edge):
     (cotangent,) = normal_draw(2665, value.shape)
 
     def rule(*operands):
-        return recurrence_chunk.mosaic_rule(*operands, tiles=mainloop.Tiles(32, 1), bound=1.0)[0]
+        return template.mosaic_rule(*operands, tiles=mainloop.Tiles(32, 1), bound=1.0)[0]
 
     def recurrent(*operands):
         operands = tuple(x.astype(jnp.promote_types(x.dtype, jnp.float32)) for x in operands)

@@ -65,13 +65,28 @@ def test_a_trees_banks_spread_back_into_its_rows():
         np.testing.assert_array_equal(actual, expected)
 
 
-def test_a_run_places_bank_by_bank_and_again_on_the_programs_it_compiled(tmp_path):
+def test_a_run_places_bank_by_bank_and_again_on_the_programs_it_compiled(tmp_path, monkeypatch):
     """A stack of two runs of two layers each: each bank the source places is its layers of the
-    trained state stacked, and a second load stacks them with the program the first compiled."""
+    trained state stacked, and a second load stacks them with the program the first compiled. A load
+    opens the run's checkpoints once, whatever its banks and layers, so it reads their metadata once
+    (ledger 3949)."""
+    import orbax.checkpoint as ocp
+
     model = decoder(bank_layers=2)
     state = trained(tmp_path / "run", LMObjective(model, 8, head_chunks=1), DEVICE)
     mesh = MeshSpec().build()
-    first = CheckpointBanks(str(tmp_path / "run")).place(model, mesh=mesh, layout=DEVICE)
+    source = CheckpointBanks(str(tmp_path / "run"))
+    opened = []
+    manager = ocp.CheckpointManager.__init__
+
+    def counted(self, *arguments, **keywords):
+        opened.append(self)
+        manager(self, *arguments, **keywords)
+
+    monkeypatch.setattr(ocp.CheckpointManager, "__init__", counted)
+    first = source.place(model, mesh=mesh, layout=DEVICE)
+    monkeypatch.undo()
+    assert len(opened) == 1
     with steady_state(allow=("host_to_device",)):
         second = CheckpointBanks(str(tmp_path / "run")).place(model, mesh=mesh, layout=DEVICE)
     params = state.variables["params"]

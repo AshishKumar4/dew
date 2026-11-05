@@ -112,8 +112,10 @@ class Template[Config: Hashable](tuning.KernelOp):
         return isinstance(config, self.config_cls)
 
     def _held(self, ba: tokamax.BoundArguments, config: Config) -> bool:
-        """Whether `config`'s threads hold their registers (`registers` within `register_budget`)."""
-        return (self.registers(ba, config) or 0) <= self.register_budget(config)
+        """Whether `config`'s threads hold their registers (`registers` within `register_budget`); a launch
+        stating none (a TPU's, the XLA program's) holds any."""
+        registers = self.registers(ba, config)
+        return registers is None or registers <= self.register_budget(config)
 
     def fitting(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Config, ...]:
         """The configs that fit (`fits`). A call none fits raises, naming the least any config stages and
@@ -134,9 +136,9 @@ class Template[Config: Hashable](tuning.KernelOp):
         outside what the launch's kernel takes (its legality's other rules, or a fixed space)."""
         if not self._typed(config):
             return f"it is no {self.config_cls.__name__}"
-        registers, budget = self.registers(ba, config) or 0, self.register_budget(config)
         if not self._held(ba, config):
-            return f"its threads hold {registers} registers live, past the {budget} a thread has"
+            return (f"its threads hold {self.registers(ba, config)} registers live, past the "
+                    f"{self.register_budget(config)} a thread has")
         target = generation.gpu_target()
         staged, shared = self.staged_bytes(ba, config, target), self.program_shared(config, target)
         if staged > shared:

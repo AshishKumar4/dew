@@ -481,6 +481,31 @@ def test_an_fp8_product_is_priced_in_the_tensor_mode_its_gpu_runs_it_in(generati
     assert seconds(jnp.float8_e4m3fn) == seconds(jnp.bfloat16) / speedup
 
 
+def test_xlas_schedule_prices_each_kernel_its_parts_fixed_latency():
+    """XLA's schedule (`cost.fused`) prices each kernel of a form, a product's or a reduction's (a root of
+    XLA's fusion), at its part's measured fixed latency (`GpuTarget.fixed_seconds`, its launch and first
+    byte) beside its work: a traced product and a chunk form's products (`cost.product_work`, one a product)
+    alike, row 4081's receipts finding a small fusion's time that latency. On a part no one measured, the
+    kernels are work no rate prices (`Schedule.unpriced`)."""
+    hopper = generation.gpu_target("NVIDIA H100 80GB HBM3")
+    schedule = cost.fused(hopper)
+
+    def priced(fn, *shapes):
+        region = terms.region(jax.make_jaxpr(fn)(*(jnp.ones(shape, jnp.bfloat16) for shape in shapes)))
+        graph, bundle, _ = program.graphed(region)
+        return graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                             cost_model=cost.model(region, schedule))[1].work
+
+    traced = priced(lambda a, b: jnp.sum(jnp.dot(a, b), axis=-1), (64, 64), (64, 64))
+    assert traced.kernels == 2
+    one, two = cost.product_work(64, 64, 64), cost.product_work(64, 64, 64, count=2)
+    throughput = sum(kernel_cost.units(one, kernel_cost.rates(hopper, device=True))[0])
+    # Exact: two products' work and kernels are one's doubled, each unit's seconds a power of two apart.
+    assert schedule(one) == throughput + hopper.fixed_seconds
+    assert schedule(two) == 2 * (throughput + hopper.fixed_seconds)
+    assert cost.fused(generation.gpu_target("sm86")).unpriced(two)[-1] == 2
+
+
 def test_device_memory_is_priced_at_the_parts_measured_stream():
     """A GPU's device-memory bytes are priced at its part's measured stream (`GpuTarget.part`,
     tools/device_facts.py's plateau), whatever bandwidth its memory clock and bus state, which no transfer
@@ -691,6 +716,18 @@ def _marked_kinds(closed) -> list:
     from dew.nn.derivatives import marked_call_p
 
     return [equation.params["kind"] for equation in equations(closed) if equation.primitive is marked_call_p]
+
+
+@pytest.mark.parametrize(("generation_name", "measured"), [("sm80", 225.3e-9), ("sm90", 142.7e-9),
+                                                         ("sm120", 137.7e-9)])
+def test_a_template_walks_span_is_priced_at_its_gpus_kernel_step(generation_name, measured):
+    """A template's tile walk prices its span, a chain of dependent steps each reading the last, at its GPU's
+    in-kernel step: one dependent reduction of a tile within a program, measured as the slope over 1,024 to
+    16,384 steps (FS-STEP-SECONDS1's kernel path: an A100's 225.3 ns, an H100's 142.7, an RTX PRO 6000
+    Server's 137.7), so a walk of 10,000 such steps and little work is that span's time (row 4080)."""
+    target = generation.gpu_target(generation_name)
+    work = kernel_cost.Work(flops=1.0, span=10_000)
+    assert kernel_cost.walked(work, target) == 10_000 * measured
 
 
 def test_a_protected_span_is_kept_as_traced_however_often_the_pass_runs():
@@ -965,7 +1002,7 @@ def test_a_fused_gemms_producer_passes_the_algebra_pass_before_the_fuser_places_
     """A fused GEMM's producer is rewritten by the algebra pass before the fuser stages it (algebra.md §2):
     a producer of two scales of one operand summed is staged as its cheaper form, its window's rewrite
     spliced (the fused products' values against their references: tests/test_gemm_template.py)."""
-    from dew.nn.kernels.templates.gemm import fused
+    from dew.nn.kernels import fused_gemm
 
     def producer(values):
         x, a, b = values
@@ -973,7 +1010,7 @@ def test_a_fused_gemms_producer_passes_the_algebra_pass_before_the_fuser_places_
         return capped * jnp.tanh(a) + capped * jnp.tanh(b)
 
     with report.refusals():
-        fused._split(producer, _scaled_operands(1, (64, 128)))
+        fused_gemm._split(producer, _scaled_operands(1, (64, 128)))
         assert any(made.spliced for made in report.rewrites())
 
 

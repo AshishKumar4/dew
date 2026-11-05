@@ -353,14 +353,6 @@ def register_programs(family: "Family", consumers: int, registers: int | None = 
     return 0
 
 
-def resident_programs(family: "Family", consumers: int, registers: int | None, target) -> int:
-    """The most programs of a launch of `consumers` consumer roles a multiprocessor of `target` holds at
-    once, each consumer thread holding `registers`: its registers' (`Family.programs`) within its resident
-    threads (an sm86's or sm120's 1536, twelve warpgroups)."""
-    threads = target.multiprocessor.resident_threads // (family.warpgroups(consumers) * THREADS)
-    return min(family.programs(consumers, registers), threads)
-
-
 @dataclasses.dataclass(frozen=True)
 class RegisterModel:
     """A launch's register decision as its template's model states it, which the compile gate holds the
@@ -409,12 +401,8 @@ def register_model(family: "Family", consumers: int, registers: int | None, *,
     (`RegisterModel`): its producer's registers where its layout has one (`Family.warpgroups`), and the most
     programs a multiprocessor holds of it at those registers (`register_programs`), as its plan's."""
     warpgroups = family.warpgroups(consumers)
-    if target is None:
-        most = register_programs(family, consumers, registers)
-    else:
-        from dew.nn.kernels import generation
-
-        most = resident_programs(family, consumers, registers, target)
+    most = family.programs(consumers, registers)
+    if target is not None:
         if shared is not None:
             block = generation.shared_budget(target)
             most = next((count for count in range(most, 0, -1) if shared <= program_shared(block, count)), 0)
@@ -504,14 +492,12 @@ def plan(launches, family: "Family", target, *, programs: int | None = None) -> 
 
 def _planned(launches, family: "Family", target, programs: int | None) -> tuple[LaunchPlan, ...] | None:
     """`plan`'s plans."""
-    from dew.nn.kernels import generation
-
     block = generation.shared_budget(target)
     plans = []
     for launch in launches:
         if launch.registers > family.registers(launch.consumers):
             return None
-        most = resident_programs(family, launch.consumers, launch.registers, target)
+        most = family.programs(launch.consumers, launch.registers)
         residencies = range(most, 0, -1) if programs is None else (programs,) if programs <= most else ()
         order = hidden(family, launch.consumers)
         found = None

@@ -822,8 +822,9 @@ class StackView:
         """What one scanned body has to share beyond its spec, for each of `layers`
         stored layers: the runs a collection holds as one bank (`layers_3_7`) that
         hold it, and the structure of its subtree in every collection that keeps
-        one per layer (`layers_N`), as layers a checkpoint quantizes differently,
-        or adapts in part, differ. A banked run stays the run its store holds
+        one per layer (`layers_N`) with each leaf's shape and dtype, as layers a
+        checkpoint quantizes differently, or adapts in part or at their own ranks
+        (a LoRA rank pattern), differ. A banked run stays the run its store holds
         (`bank_sites`), each of its layers read as its first, so rows it holds
         unlike are refused by name where they stack (`StackView.stack`). A
         collection no layer is held in adds nothing."""
@@ -835,7 +836,11 @@ class StackView:
                 for index in range(run.start, min(run.stop, layers)):
                     banks[index] += (name,)
                     read[index] = min(read[index], run.start)
-        own = [tuple((collection, jax.tree.structure(tree[f'layers_{index}']))
+        def held(tree) -> tuple:
+            leaves, structure = jax.tree.flatten(tree)
+            return structure, tuple((jnp.shape(leaf), jnp.result_type(leaf)) for leaf in leaves)
+
+        own = [tuple((collection, *held(tree[f'layers_{index}']))
                      for collection, tree in sorted(variables.items()) if f'layers_{index}' in tree)
                for index in range(layers)]
         return tuple((held, own[first]) for held, first in zip(banks, read, strict=True))

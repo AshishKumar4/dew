@@ -8,14 +8,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.custom_derivatives import SymbolicZero
 from jax.experimental import checkify
 from jax.sharding import Mesh, PartitionSpec
 from reference_error import equations
 
 from dew.nn import derivatives
-from dew.nn.derivatives import Algebra, KernelGlue, Protected, Surrogate, marked, marked_call_p
+from dew.nn.derivatives import KernelGlue, Protected, Surrogate, marked, marked_call_p
 
-KINDS = [Protected(), Surrogate(), KernelGlue(), Algebra()]
+KINDS = [kind() for kind in typing.get_args(derivatives.Kind.__value__)]
+"""Every kind a span is marked as, each through either builder (`derivatives.Kind`'s)."""
 
 
 def kinds_of(closed) -> list:
@@ -87,10 +89,6 @@ def _scaled_backward(scale: float):
     return primal, forward, backward
 
 
-KINDS = [kind() for kind in typing.get_args(derivatives.Kind.__value__)]
-"""Every kind a site declares its derivative as (`derivatives.Kind`'s), each through either builder."""
-
-
 @pytest.mark.parametrize("kind", KINDS, ids=lambda kind: type(kind).__name__)
 def test_a_declared_derivative_is_one_marked_call_and_differentiates_as_its_rule(kind):
     """A custom derivative declared with its kind (`declared_derivative`: no bare `jax.custom_vjp`) is one
@@ -126,11 +124,12 @@ def test_a_declared_derivative_is_one_marked_call_and_differentiates_as_its_rule
                                   np.asarray(jax.vmap(bare)(x[:, None], factor[:, None])))
 
 
-@pytest.mark.parametrize("kind", KINDS, ids=lambda kind: type(kind).__name__)
+@pytest.mark.parametrize("kind", [kind() for kind in typing.get_args(derivatives.TangentKind.__value__)],
+                         ids=lambda kind: type(kind).__name__)
 def test_a_declared_tangent_is_one_marked_call_and_differentiates_as_its_rule(kind):
-    """A tangent rule declared with its kind (`declared_tangent`: no bare `jax.custom_jvp`) is one marked
-    call of that kind, which forward mode and reverse mode (its tangent transposed) keep, each from the
-    declared tangent (doubled here, so a test sees it ran)."""
+    """A tangent rule declared with its kind (`declared_tangent`: no bare `jax.custom_jvp`; a surrogate's is
+    `surrogate`'s) is one marked call of that kind, which forward mode and reverse mode (its tangent
+    transposed) keep, each from the declared tangent (doubled here, so a test sees it ran)."""
     def primal(x):
         return jnp.sin(x)
 
@@ -149,6 +148,65 @@ def test_a_declared_tangent_is_one_marked_call_and_differentiates_as_its_rule(ki
     assert not np.array_equal(np.asarray(jax.grad(lambda x: jnp.sum(bare(x)))(x)), np.asarray(jnp.cos(x)))
     found = kinds_of(jax.make_jaxpr(jax.grad(lambda x: jnp.sum(declared(x))))(x))
     assert found and all(seen == kind for seen in found)
+
+
+def test_an_eager_call_of_a_marked_span_traces_no_program():
+    """A marked span called eagerly, outside any trace, a call no program records, is its function's own
+    call: once its operations have run, it traces and compiles nothing again (a decision task's eager
+    scores in a step's steady state, train 586), and computes its function's values. Inside a trace it is
+    one marked call, its arguments traced or concrete."""
+    from dew.nn.categorical import label_terms
+    from dew.telemetry.compiles import Compiles
+
+    logits = jnp.asarray(np.random.default_rng(0).normal(size=(4, 8)), jnp.float32)
+    labels = jnp.asarray([0, 3, 7, 2])
+    first = label_terms(logits, labels)
+    with Compiles(None) as heard:
+        again = label_terms(logits, labels)
+    assert not heard.programs, [(program.kind, program.name, program.where) for program in heard.programs]
+    for each, expected in zip(again, first, strict=True):
+        np.testing.assert_array_equal(np.asarray(each), np.asarray(expected))
+    for traced in (jax.make_jaxpr(label_terms)(logits, labels).jaxpr,
+                   jax.make_jaxpr(lambda: label_terms(logits, labels))().jaxpr):
+        assert [equation.primitive for equation in traced.eqns] == [derivatives.marked_call_p], traced
+
+
+def test_a_declared_rule_with_symbolic_zeros_meets_one_where_no_tangent_reaches():
+    """With `symbolic_zeros`, an operand no tangent reaches is a `SymbolicZero` in a declared tangent rule
+    (`declared_tangent`) and unperturbed in a declared forward (`declared_derivative`), through the marked
+    call as the bare `jax.custom_jvp` and `jax.custom_vjp` give it, and each differentiates as the bare one
+    does: a rule that skips a zero's term (a tangent JAX cannot transpose through a barrier) sees it."""
+    seen = []
+
+    def primal(x, y):
+        return jnp.sin(x) * y
+
+    def tangent(primals, tangents):
+        (x, y), (dx, dy) = primals, tangents
+        seen.append(type(dy))
+        return primal(x, y), 2.0 * jnp.cos(x) * y * dx
+
+    def forward(x, y):
+        seen.append(y.perturbed)
+        return primal(x.value, y.value), (x.value, y.value)
+
+    def backward(residuals, cotangent):
+        x, y = residuals
+        return 3.0 * cotangent * jnp.cos(x) * y, jnp.zeros_like(y)
+
+    tangents = derivatives.declared_tangent(Protected(), primal, tangent, symbolic_zeros=True)
+    bare_tangents = jax.custom_jvp(primal)
+    bare_tangents.defjvp(tangent, symbolic_zeros=True)
+    derivative = derivatives.declared_derivative(Protected(), primal, forward, backward, symbolic_zeros=True)
+    bare_derivative = jax.custom_vjp(primal)
+    bare_derivative.defvjp(forward, backward, symbolic_zeros=True)
+    x, y = jnp.linspace(0.1, 1.0, 8), jnp.full(8, 2.0)
+    for declared, bare, unreached in ((tangents, bare_tangents, SymbolicZero),
+                                      (derivative, bare_derivative, False)):
+        seen.clear()
+        np.testing.assert_array_equal(np.asarray(jax.grad(lambda x, f=declared: jnp.sum(f(x, y)))(x)),
+                                      np.asarray(jax.grad(lambda x, f=bare: jnp.sum(f(x, y)))(x)))
+        assert seen and set(seen) == {unreached}, seen
 
 
 def test_a_surrogate_is_one_surrogate_call():

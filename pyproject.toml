@@ -114,7 +114,10 @@ cuda12 = ["jax-cuda12-plugin[with-cuda]==0.12.0.1.post45", "jax-cuda12-pjrt==0.1
           "dew-cutlass-cu12~=0.1.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
 cuda13 = ["jax-cuda13-plugin[with-cuda]==0.12.0.1.post45", "jax-cuda13-pjrt==0.12.0.1.post45", "jaxlib==0.12.0.1",
           "dew-flash-attn-cu13~=0.3.7; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-          "dew-cutlass-cu13~=0.1.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
+          "dew-cutlass-cu13~=0.1.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+          # The compile gate's SASS rules on the GPU tier, beside the plugin's own cu13 toolkit (nvidia/cu13/bin/ptxas),
+          # which JAX reads as its CUDA root; none in cuda12, whose JAX would read nvidia/cu13 for its root too.
+          "nvidia-cuda-nvdisasm==13.4.92; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
 tpu = ["libtpu==0.0.50.*", "requests"]
 # dew.telemetry.profile reads XProf's native converters, the same in 2.23.1
 # and 2.23.2. xprof 2.23.2 declares setuptools<70.0.0, which torch>=2.13's
@@ -277,6 +280,8 @@ kernel-compile = ["jax-cuda12-plugin==0.12.0.1.post45; sys_platform == 'linux' a
                   "jax-cuda12-pjrt==0.12.0.1.post45; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-nvcc-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-nvcc==13.4.92; sys_platform == 'linux' and platform_machine == 'x86_64'",
+                  # The compile gate's SASS rules disassemble the cubins it reads. A CUDA 13 wheel: it lays out
+                  # nvidia/cu13, which JAX reads as its CUDA root, so it goes only beside cu13's own nvcc.
                   "nvidia-cuda-nvdisasm==13.4.92; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "libtpu==0.0.50.*; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 # The test suite's one environment: every package a test file imports, so no test skips for want

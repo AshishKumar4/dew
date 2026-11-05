@@ -6,6 +6,7 @@ class Aux(metrics: dict[str, jax.Array], variables: Variables | None = None, qk_
 class Best(metric: str | Metric | TrainingScalar | Summary | types.MethodType | Callable[[Mapping], float], top: int = 1, mode: Literal['min', 'max'] | None = None, threshold: float | None = None, weights_only: bool = False, split: str | None = None, *, _source: Metric | TrainingScalar | Summary | Callable[[Mapping], float] | None = None)  [dew.training.selection]
   .resolved(self, scored: Mapping[str, Sequence[Metric | Summary]]) -> Best
 class CFG(scale: float, interval: tuple[float, float] = (0.0, 1.0), rescale: float = 0.0) -> None  [dew.sampling.guidance]
+  .modules(self) -> tuple[nn.Module, ...]
   .replace(self, **updates)
   .walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk
 class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str | None = None, local_every: int | str | None = None)  [dew.checkpoints]
