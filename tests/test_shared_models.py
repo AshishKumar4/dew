@@ -201,6 +201,42 @@ def test_a_live_cell_takes_dews_arguments_and_is_refused_only_what_the_service_d
 
 
 
+SLOW = {"op": "sample", "repo": "model", "revision": "pinned", "prompt": "a lake", "negative": None,
+        "prepare_key": 3, "prepare_steps": 40, "key": 5, "steps": 40, "solver": None}
+"""An image request whose 40-step walk compiles past a shortened wait."""
+DESCRIBE = {"op": "describe", "repo": "model", "revision": "pinned"}
+
+
+def connected(path, payload):
+    """A guest's connection to the service at `path` carrying `payload`, and its lines."""
+    import json
+    import socket
+
+    client = socket.socket(socket.AF_UNIX)
+    client.connect(str(path))
+    client.sendall(json.dumps(payload).encode() + b"\n")
+    return client, client.makefile()
+
+
+def reply(lines):
+    """A connection's reply, after the progress before it."""
+    import json
+
+    return next(message for message in map(json.loads, lines) if "result" in message or "error" in message)
+
+
+@contextlib.contextmanager
+def serving(service, native, path):
+    """The service over `native`, admitting this process's uid as a guest's."""
+    import os
+
+    shared = service.ModelService(path, native, uids=(os.getuid(),))
+    try:
+        yield shared
+    finally:
+        shared.server_close()
+
+
 def test_a_guest_whose_request_outlasts_its_connection_stays_admitted_until_the_engine_settles_it(
         service, tmp_path, monkeypatch):
     """A guest's image request the engine still runs when its connection's wait runs out keeps the guest's
@@ -208,40 +244,72 @@ def test_a_guest_whose_request_outlasts_its_connection_stays_admitted_until_the_
     while the first runs, and the guest is admitted again once the engine has settled it, so a slow pass
     never lets one guest queue a second job past the service's bounds. The service's real models run
     the request (`live_kernel`), its 40-step walk compiling past the shortened wait."""
-    import json
-    import os
-    import socket
-
     _, _, native = live_kernel(service, tmp_path)
     monkeypatch.setattr(service, "REQUEST_SECONDS", 0.05)
-    request = {"op": "sample", "repo": "model", "revision": "pinned", "prompt": "a lake", "negative": None,
-               "prepare_key": 3, "prepare_steps": 40, "key": 5, "steps": 40, "solver": None}
-
-    def connected(payload):
-        client = socket.socket(socket.AF_UNIX)
-        client.connect(str(tmp_path / "model.sock"))
-        client.sendall(json.dumps(payload).encode() + b"\n")
-        return client, client.makefile()
-
-    def reply(lines):
-        """The connection's reply, after the progress before it."""
-        return next(message for message in map(json.loads, lines)
-                    if "result" in message or "error" in message)
-
-    shared = service.ModelService(tmp_path / "model.sock", native, uids=(os.getuid(),))
-    try:
-        first, lines = connected(request)
+    path = tmp_path / "model.sock"
+    with serving(service, native, path):
+        first, lines = connected(path, SLOW)
         with first:
             assert reply(lines)["error"]["name"] == "TimeoutError"
             # The reply ends the connection's output: no progress of the running walk follows it.
             assert lines.read() == ""
-        second, lines = connected(request)
+        second, lines = connected(path, SLOW)
         with second:
             assert reply(lines)["error"]["name"] == "ValueError"
         # The engine answers requests in order: once this one is answered, the first has been settled.
-        native.sample(service.validate({**request, "key": 6}), lambda _: None)
-        third, lines = connected({"op": "describe", "repo": "model", "revision": "pinned"})
+        native.sample(service.validate({**SLOW, "key": 6}), lambda _: None)
+        third, lines = connected(path, DESCRIBE)
         with third:
             assert "result" in reply(lines)
-    finally:
-        shared.server_close()
+
+
+def test_a_guest_whose_queued_request_times_out_frees_its_admission_and_its_request_never_runs(
+        service, tmp_path, monkeypatch):
+    """A guest's request still queued behind another when its connection's wait runs out is cancelled: the
+    engine drops it where it would take it, never running it, and the guest is admitted again at once,
+    while the request ahead still runs."""
+    _, _, native = live_kernel(service, tmp_path)
+    monkeypatch.setattr(service, "REQUEST_SECONDS", 0.05)
+    submitted, held = [], native.submitted
+
+    def spied(request, emit):
+        future, answered = held(request, emit)
+        submitted.append(future)
+        return future, answered
+
+    monkeypatch.setattr(native, "submitted", spied)
+    path = tmp_path / "model.sock"
+    with serving(service, native, path):
+        native.submitted(service.validate({**SLOW, "key": 6}), lambda _: None)
+        queued, lines = connected(path, SLOW)
+        with queued:
+            assert reply(lines)["error"]["name"] == "TimeoutError"
+        described, lines = connected(path, DESCRIBE)
+        with described:
+            assert "result" in reply(lines)
+        ahead, behind = submitted
+        ahead.result()
+    assert behind.cancelled() and not ahead.cancelled()
+
+
+def test_a_guest_whose_request_fails_in_the_engine_hears_why_and_is_admitted_again(service, tmp_path,
+                                                                                   monkeypatch):
+    """A request whose pass fails stops the engine: its connection hears the failure and nothing after it,
+    and the guest is admitted again."""
+    from dew.inference.images import ImageScoring
+
+    _, _, native = live_kernel(service, tmp_path)
+
+    def failing(self, variables, rows):
+        raise RuntimeError("an injected pass failure")
+
+    monkeypatch.setattr(ImageScoring, "forward", failing)
+    path = tmp_path / "model.sock"
+    with serving(service, native, path):
+        failed, lines = connected(path, SLOW)
+        with failed:
+            assert reply(lines)["error"]["name"] == "RuntimeError"
+            assert lines.read() == ""
+        described, lines = connected(path, DESCRIBE)
+        with described:
+            assert "result" in reply(lines)

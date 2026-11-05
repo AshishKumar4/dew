@@ -361,6 +361,9 @@ class ModelRequest(socketserver.StreamRequestHandler):
             try:
                 result = future.result(REQUEST_SECONDS)
             except FuturesTimeout:
+                # A request still queued is dropped where the engine would take it; a running one finishes,
+                # and holds the guest's admission until it has.
+                future.cancel()
                 raise TimeoutError("the shared model did not finish within 90 seconds") from None
             emit({"result": answered(result)}, final=True)
         except Exception as error:
