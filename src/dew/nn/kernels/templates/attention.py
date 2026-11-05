@@ -435,6 +435,16 @@ def _uniform_doc(ids: jax.Array | None, block: int) -> jax.Array | None:
     return jnp.where(jnp.all(blocks == first, axis=-1), first[..., 0], 0)
 
 
+def key_tiles(form: str, first_query, block_q: int, block_k: int, keys: int) -> tuple:
+    """The key tiles `[lo, hi)` a query block of `block_q` queries from `first_query` walks in a call of no
+    spans, by its form (`attention_algebra.Forward.form`): under the causal one the tiles at or before its
+    last query, else every tile of the `keys`. A call of spans walks its `BlockMap`'s (`block_map`)."""
+    tiles = -(-keys // block_k)
+    if form == "causal":
+        return 0, jnp.minimum(-(-(first_query + block_q) // block_k), tiles)
+    return 0, tiles
+
+
 def block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
     """The `BlockMap` of `spans` at `block_q` by `block_k` tiles. One interval a query is a call of one
     run: each run's tile envelope over a block's queries and its tiles every query of the block sees whole,

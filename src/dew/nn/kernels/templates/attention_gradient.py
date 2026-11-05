@@ -32,6 +32,7 @@ from dew.nn.kernels.templates.attention_algebra import (
     power2,
     split_output,
     summed_products,
+    value_operands,
     weights_parts,
 )
 from dew.nn.precision import Running, added_to, compensated_sum, compensates_loops, running_sum, running_total
@@ -504,6 +505,48 @@ def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array,
         return where_seen(seen, weights * (relative - expand(delta, relative)), 0.0)
     centred = (relative - expand(delta, relative)) * expand(inverse_total, relative)
     return where_seen(seen, exponentials * centred, 0.0)
+
+
+class TileScores(NamedTuple):
+    """A key tile's softmax as a backward recomputes it (`tile_scores`), fp32 `[bq, bk]`."""
+
+    exponentials: jax.Array
+    """`exp(s - m)` against the forward's maximum (`below`)."""
+    weights: jax.Array
+    """The exponentials over each query's denominator."""
+    cotangents: jax.Array
+    """The score cotangents `p (dP - D)` (`grad_scores`)."""
+
+
+def tile_scores(logits: jax.Array, products: jax.Array, peak: jax.Array, total: jax.Array, anchor: jax.Array,
+                delta: jax.Array, seen: jax.Array | None, at_anchor: jax.Array | None, how: Recompute = PLAIN,
+                *, multiplier: jax.Array | None = None) -> TileScores:
+    """A key tile's softmax and score cotangents under the forward's maximum `peak` and denominator `total`,
+    its weights recomputed as the forward computed them (`how`, `normalized`) and its cotangents from the
+    products `dP = dO V^T` about each query's `anchor` (`grad_scores`, a dropping call's `multiplier` on
+    them): the one step a plain backward's dQ and dK/dV launches each take of a tile (the Pallas-Triton
+    and portable mainloops'), whichever of its parts they read."""
+    inverse_total = inverse(total)
+    exponentials, weights = normalized(logits, peak, inverse_total, how)
+    cotangents = grad_scores(exponentials, products, anchor, delta, seen, at_anchor, inverse_total,
+                             multiplier=multiplier)
+    return TileScores(exponentials, weights, cotangents)
+
+
+def dkv_step(dk: jax.Array, dv: jax.Array, scores: TileScores, slopes, seen: jax.Array | None,
+             kinds: tuple[Kind, ...], query: jax.Array, dout: jax.Array, total: jax.Array, *, scale: float,
+             transposed: Callable[[jax.Array, jax.Array], jax.Array], accurate: bool,
+             multiplier: jax.Array | None = None) -> tuple[jax.Array, jax.Array, tuple]:
+    """A query tile's share of a key tile's dK and dV `[bk, D]` under `scores` (`tile_scores`), by the
+    mainloop's transposed product (`transposed(a, b) = aᵀ @ b`): dV from the unnormalized weights against
+    `dO / T` (`value_operands`, under a dropping call's `multiplier`), dK from the score cotangents through
+    the hook (`pulled`) at the call's whole `scale` against the call's own queries (`cotangent_product`); and
+    the hook's pieces (`pulled`), which each mainloop writes or sums where its parameters lie."""
+    logits, pieces = pulled(scores.cotangents, slopes, seen, kinds)
+    dv = dv + transposed(*value_operands(scores.exponentials, scores.weights, dout, total,
+                                         multiplier=multiplier))
+    dk = dk + cotangent_product(logits * scale, query, transposed, accurate=accurate)
+    return dk, dv, pieces
 
 
 def refinement(residual: jax.Array, mass: jax.Array, peak0: jax.Array, shares: tuple[jax.Array, jax.Array],
