@@ -49,6 +49,7 @@ from dew.nn.kernels.templates.attention import (
 )
 from dew.nn.kernels.templates.attention_mosaic_program import (
     Tiles,
+    TileWalk,
     _block,
     _columns,
     _coords,
@@ -1093,10 +1094,12 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     # inference call's columns its `P V` and its share of `Q K^T` (`shared_by`); a rerun (a guarded launch,
     # the fold's natural walk) none, as the FLOP count bounds a conditional by every branch, which would
     # count the call's work twice every step where it reruns at most rarely.
-    issued = width if peaks else width + value_width
+    columns = width if peaks else width + value_width
     owned_value = 0 if peaks else value_width
     owned_query = 0 if training and not peaks else width
-    cost = (stated(spec, batch, heads, spec.queries or queries, issued, query, key, value) if counted
+    cost = (stated(spec, batch, heads, columns, query, key, value,
+                   tile_walk=TileWalk((queries, keys_count), (block_q, block_k), consumers,
+                                      common=family.feeds_itself)) if counted
             else pl.CostEstimate(flops=0, transcendentals=0, bytes_accessed=0))
     query_share = modelled(spec, batch, heads, spec.queries or queries, owned_query)
     value_share = modelled(spec, batch, heads, spec.queries or queries, owned_value)

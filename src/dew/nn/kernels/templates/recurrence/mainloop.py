@@ -639,12 +639,13 @@ def _laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, t
     return _planned_launch(call, scope, registers, floor=floor, most=most, consumers=consumers), tiles
 
 
-def _stated(work: Work, tiles: int, arrays, out_type) -> pl.CostEstimate:
+def _stated(work: Work, tiles: int, pairs: int, arrays, out_type) -> pl.CostEstimate:
     """A launch's work over its `tiles` as it states it to XLA and to Dew's FLOP count
-    (`templates.gemm.cost`): the model's products (an fp32 call's parts aside), its exponentials, and its
-    operands' and outputs' bytes once (row 1895's kernel report: unstated, the recurrence made MFU a lower
-    bound)."""
-    stated = cost(int(work.flops * tiles), *arrays, *jax.tree.leaves(out_type))
+    (`templates.gemm.cost`), the hardware's: the model's products times the part `pairs` each issues
+    (`product.terms`: an fp32 operand's bf16 parts), its exponentials, and its operands' and outputs' bytes
+    once (row 1895's kernel report: unstated, the recurrence made MFU a lower bound). The model's share,
+    `work.flops` a tile, the launch declares apart (`Family.kernel`'s `model_flops`)."""
+    stated = cost(int(work.flops * pairs * tiles), *arrays, *jax.tree.leaves(out_type))
     return dataclasses.replace(stated, transcendentals=int(work.exponentials * tiles))
 
 
@@ -687,6 +688,8 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                                                              reduces=reduces,
                                                              after=after)
     tiles = math.prod(grid)
+    # The products the issuer takes for its parts (`product.terms`), each a pair of the model's product.
+    pairs = len(product.terms(call.held.parts, call.held.parts))
     threads = 128 * family.warpgroups(consumers)
 
     found, programs = _laid(call, scope, registers, tiles, stages=None if persistent else stages,
@@ -706,8 +709,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
             stepped = sum(math.prod(shape) * jnp.dtype(dtype).itemsize for shape, dtype in blocks.values())
             # A persistent program's work is its tiles' (`work` is a tile's), the most any program takes.
             each = -(-tiles // programs)
-            # The products the issuer takes for its parts (`product.terms`).
-            flops = work.flops * len(product.terms(call.held.parts, call.held.parts)) * each
+            flops = work.flops * pairs * each
             collected.append(Launch(name, programs, threads, resources.shared_bytes(family, scope(stages)),
                                     registers, work.span * each, stages, stepped, flops,
                                     work.exponentials * each, moved, found.programs if found else 0,
@@ -767,7 +769,8 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
         # At its plan's residency (`resources.LaunchPlan.programs`), which its registers fit and its roles
         # raise to the share of (two query/key programs where one held, FS-WHY3-h100).
         return family.kernel(entry, out_type=out_type, **laid, consumers=consumers, interpret=call.interpret,
-                             name=name, cost=_stated(work, tiles, arrays, out_type),
+                             name=name, cost=_stated(work, tiles, pairs, arrays, out_type),
+                             model_flops=int(work.flops * tiles),
                              resident=found.programs if found else 1)(*arrays)
 
     return launched

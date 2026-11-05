@@ -17,6 +17,7 @@ from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import mosaic
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
+    TileWalk,
     _coords,
     _rows,
     _Spans,
@@ -172,9 +173,10 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         approx_math=walk.approx_math, name="attention_dkv_shared",
         # The products this launch issues (`stated`): its `S` recomputed, dP's, dV's, and each part of dK's
         # and of dQ's (`part_count`); the model's of them it owns (`modelled`): dQ's, dK's, dV's and dP's.
-        cost=stated(walk.spec, batch, heads, walk.spec.queries or queries,
+        cost=stated(walk.spec, batch, heads,
                     width + 2 * value.shape[-1] + 2 * part_count(query.dtype, walk.accurate) * width,
-                    query, key, value, dout),
+                    query, key, value, dout,
+                    tile_walk=TileWalk((queries, keys_padded), (block_q, block_k), keyed=True)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              2 * width + 2 * value.shape[-1]))
     dq = jax.new_ref(jnp.zeros((batch, queries, heads, width), jnp.float32))

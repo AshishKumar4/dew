@@ -75,6 +75,18 @@ def test_each_rule_holds_its_right_side_to_its_left_side():
         assert_as_exact(jax.jit(right), jax.jit(left), draw, name, seeds=16)
 
 
+def test_each_rewrites_right_side_holds_check_2():
+    """Each registered rewrite's right side (`rules.instances`), run one operation at a time, holds every
+    element within its operation's certified contract (check 2, tests/certified.py; docs/design/algebra.md
+    §3: at each rule's site), on the first rows of its own draws."""
+    from certified import assert_certified
+
+    for name, (_, right, draw) in algebra.rules.instances().items():
+        def rows(seed, draw=draw):
+            return tuple(operand[:8] if operand.ndim else operand for operand in draw(seed))
+        assert_certified(right, rows, name, seeds=2)
+
+
 def test_every_registered_rule_set_is_qualified_by_instances_of_its_own():
     """The qualification inventory is the registry's (`rules.instances`): every registered set's instances
     name it, every set has some, and a set registered with none is refused, so no set enters the pass

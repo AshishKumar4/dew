@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, OWN_FORWARD_ORDERS, assert_contract, normal_draw
+from contract_support import EDGES, OWN_FORWARD_ORDERS, REVERSE_ONLY, assert_contract, normal_draw
 
 from dew.nn import ngpt, precision
 from dew.nn.activations import exact_gelu, gated_product
@@ -64,6 +64,45 @@ def test_the_precision_seams_hold_every_order(edge):
 def plain_rms(x, epsilon: float = 1e-6):
     """x over its root mean square, the RMS norm as written."""
     return x / jnp.sqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + epsilon)
+
+
+def _declared_cube(declare: str):
+    """The cube declared through `dew.nn.derivatives`' function `declare`, its rule the cube's own derivative
+    (a backward over residuals, or a tangent), so every order it takes is the plain formula's."""
+    from dew.nn import derivatives
+
+    def cube(x):
+        return x * x * x
+
+    if declare.endswith("tangent"):
+        def tangent(primals, tangents):
+            [x], [dx] = primals, tangents
+            return cube(x), 3 * x * x * dx
+        return getattr(derivatives, declare)(cube, tangent)
+
+    def forward(x):
+        return cube(x), x
+
+    def backward(x, cotangent):
+        return (3 * x * x * cotangent,)
+    return getattr(derivatives, declare)(cube, forward, backward)
+
+
+@pytest.mark.parametrize("declare", ["kernel_derivative", "numerics_derivative", "kernel_tangent",
+                                     "numerics_tangent"])
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_declared_derivative_holds_every_order(declare, edge):
+    """`dew.nn.derivatives`' declaring functions (a kernel's or a rule's reverse-mode derivative, a kernel's
+    or a rule's tangent): a cube declared with its own derivative holds every order it takes finite wherever
+    float64 is a normal float32 and the plain formula is; a reverse-mode rule takes no forward order, as a
+    bare `jax.custom_vjp` takes none (`REVERSE_ONLY`)."""
+    declared = _declared_cube(declare)
+    (x,) = normal_draw(4012, (5,), scale=EDGES[edge] ** (1 / 3))
+    (direction,) = normal_draw(4013, (5,), scale=EDGES[edge] ** (1 / 3))
+    (cotangent,) = normal_draw(4014, (5,))
+    assert_contract(declared, (x,), (direction,), cotangent, f"{declare} {edge}",
+                    plain_fn=lambda x: x * x * x,
+                    without=() if declare.endswith("tangent") else REVERSE_ONLY)
 
 
 @pytest.mark.parametrize("edge", EDGES)

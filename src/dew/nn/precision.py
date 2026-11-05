@@ -29,7 +29,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
-import inspect
 import math
 import os
 from collections.abc import Callable, Hashable, Sequence
@@ -42,7 +41,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.extend import core
 from jax.typing import DTypeLike
 
-from dew.nn.derivatives import Protected, marked, surrogate
+from dew.nn.derivatives import Protected, bound_span, surrogate
 from dew.nn.nested import nested
 from dew.nn.sharding import explicit_spec
 
@@ -827,30 +826,10 @@ def rounded_to(x: jax.Array, dtype: Dtype) -> jax.Array:
 
 
 def _protected(transform: Callable) -> Callable:
-    """`transform` as one span the algebra pass keeps as it is (`dew.nn.derivatives.Protected`), a call
-    every transform of it keeps (`marked`), as reassociation would cancel the residual an error-free
-    transform keeps. Its arrays, passed by position or by name, are the span's operands; its constants (a
-    kernel's static factor, a Python number) and its options are bound in, so a constant still splits
-    where it is known (`two_product`)."""
-    signature = inspect.signature(transform)
-
-    @functools.wraps(transform)
-    def kept(*args, **kwargs):
-        bound = signature.bind(*args, **kwargs)
-        leaves, structure = jax.tree.flatten((bound.args, bound.kwargs))
-        traced = [index for index, leaf in enumerate(leaves) if isinstance(leaf, jax.Array)]
-        if not traced:
-            return transform(*args, **kwargs)
-
-        def span(*operands):
-            filled = list(leaves)
-            for index, operand in zip(traced, operands, strict=True):
-                filled[index] = operand
-            positional, named = jax.tree.unflatten(structure, filled)
-            return transform(*positional, **named)
-
-        return marked(Protected(), span)(*(leaves[index] for index in traced))
-    return kept
+    """`transform` as one span the algebra pass keeps as it is (`dew.nn.derivatives.Protected`), as
+    reassociation would cancel the residual an error-free transform keeps (`bound_span`: its arrays the span's
+    operands, its constants bound in, so a constant still splits where it is known, `two_product`)."""
+    return bound_span(Protected(), transform)
 
 
 @_protected
