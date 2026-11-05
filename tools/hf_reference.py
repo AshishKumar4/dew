@@ -880,10 +880,10 @@ def run_vision_tiny(tower_class, vconf, projector_of, seed: int) -> dict:
             "pixels": pixels, "last": last, "soft": soft}
 
 
-def write_vision_tiny(name: str, system: dict, projector: dict) -> None:
+def write_vision_tiny(name: str, system: dict, projector: dict, **inputs: np.ndarray) -> None:
     """A tiny vision system as Dew reads it, under FIXTURES / `name`: bare tensor names, the
-    tower config, the projector's knobs (`projector`), fixed pixels and both fp32 reference
-    outputs."""
+    tower config, the projector's knobs (`projector`), fixed pixels, any array the tower reads
+    beside them (`inputs`, each saved under its keyword) and both fp32 reference outputs."""
     from safetensors.torch import save_file
 
     directory = FIXTURES / name
@@ -894,6 +894,8 @@ def write_vision_tiny(name: str, system: dict, projector: dict) -> None:
         json.dumps(system["vconf"].to_dict(), indent=1) + "\n")
     (directory / "projector.json").write_text(json.dumps(projector, indent=1) + "\n")
     np.save(directory / "pixels.npy", system["pixels"])
+    for array_name, array in inputs.items():
+        np.save(directory / f"{array_name}.npy", array)
     np.save(directory / "tower_ref.npy", system["last"])
     np.save(directory / "projector_ref.npy", system["soft"])
     size = sum(path.stat().st_size for path in directory.iterdir())
@@ -1086,23 +1088,8 @@ def write_gemma4_vision_tiny(*, head_dim: int = 8, device: str = 'cpu',
     """The Gemma 4 trunk and embedder as Dew reads them: bare tensor names,
     the tower config, the text width, fixed patches and positions, and both
     fp32 reference outputs."""
-    from safetensors.torch import save_file
-
     system = gemma4_vision_tiny_system(head_dim=head_dim, device=device)
-    directory = FIXTURES / name
-    directory.mkdir(parents=True, exist_ok=True)
-    save_file(system["tower"].state_dict(), directory / "model.safetensors")
-    save_file(system["projector"].state_dict(), directory / "projector.safetensors")
-    (directory / "config.json").write_text(
-        json.dumps(system["vconf"].to_dict(), indent=1) + "\n")
-    (directory / "projector.json").write_text(json.dumps(
-        {"text_width": G4V_TEXT_WIDTH}, indent=1) + "\n")
-    np.save(directory / "pixels.npy", system["pixels"])
-    np.save(directory / "positions.npy", system["positions"])
-    np.save(directory / "tower_ref.npy", system["last"])
-    np.save(directory / "projector_ref.npy", system["soft"])
-    size = sum(path.stat().st_size for path in directory.iterdir())
-    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+    write_vision_tiny(name, system, {"text_width": G4V_TEXT_WIDTH}, positions=system["positions"])
 
 
 QWEN_VISION_TEXT_WIDTH = 64
