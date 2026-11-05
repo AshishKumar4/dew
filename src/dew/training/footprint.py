@@ -195,9 +195,36 @@ def derived_terms(loss: Callable, params, arguments: Sequence, *, platform: str,
     alike: an equation's lowering reads no output), as each derives it from its own (row 4261: lowered
     for each, the two lowerings were 16 of a Qwen3.5-4B candidate's 28 seconds)."""
     program, count, shapes = traced_gradient(loss, params, arguments)
-    lowered = compiled(program, lowering or LOWERED.get(platform, platform))
+    lowered = deduplicated(compiled(program, lowering or LOWERED.get(platform, platform)))
     return (_kept(lowered, count, shapes, platform),
             _peak(lowered, count, platform, workspace, consumed, deferred))
+
+
+def deduplicated(program: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`program` with each equation that repeats an earlier one, its primitive and parameters over the
+    same operands (`parameters_key`), read as that one, as XLA computes it once (`HloCSE`,
+    xla/hlo/transforms/simplifiers/hlo_cse.cc): a tied head's weights cast for the embedding and cast
+    again for the head are one cast, which the embedding's optimization barrier holds and the head reads
+    (Qwen3.5-4B's fused tiled head, 1.18 GiB derived twice: row 4089). An equation with effects is its
+    own, as XLA's side-effecting instructions are, and so is an optimization barrier, which a recomputed
+    region reads through to be computed again."""
+    renamed: dict[jcore.Var, jcore.Var] = {}
+    first: dict[Hashable, list] = {}
+    kept = []
+    for equation in program.eqns:
+        operands = [renamed.get(value, value) if computed(value) else value for value in equation.invars]
+        own = equation.effects or equation.primitive.name == "optimization_barrier"
+        key = None if own else (parameters_key(equation.primitive, equation.params), tuple(
+            value if computed(value) else ("literal", str(value.aval), parameter_key(value.val))
+            for value in operands))
+        if key is not None and key in first:
+            renamed.update(zip(equation.outvars, first[key], strict=True))
+            continue
+        if key is not None:
+            first[key] = equation.outvars
+        kept.append(equation.replace(invars=operands))
+    return program.replace(eqns=kept, outvars=[renamed.get(value, value) if computed(value) else value
+                                               for value in program.outvars])
 
 
 def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str,
@@ -508,6 +535,7 @@ class Frontier:
         self.forwards = {out: operand for equation in program.eqns
                          if equation.primitive.name == "optimization_barrier"
                          for out, operand in zip(equation.outvars, equation.invars, strict=True)}
+        self.barred = {operand for operand in self.forwards.values() if computed(operand)}
 
     def stored(self, operand) -> bool:
         """Whether `operand` is held in a buffer: an input, a value computed into one, or a view of one."""
@@ -531,8 +559,10 @@ class Frontier:
                 and self.readers[operand] == 1 and (not self.fused(operand) or self.view(operand)))
 
     def fused(self, value) -> bool:
-        """Whether `value` holds no buffer of its own: recomputed where it is read, or a view."""
-        if not computed(value) or value in self.inputs:
+        """Whether `value` holds no buffer of its own: recomputed where it is read, or a view; a value an
+        optimization barrier reads is computed into a buffer of its own, which the barrier's result is
+        and every other reader reads (`forwards`)."""
+        if not computed(value) or value in self.inputs or value in self.barred:
             return False
         equation = self.producers.get(value)
         if value in self.forwards:
