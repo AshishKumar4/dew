@@ -781,9 +781,9 @@ class _CachedOutputs:
 
 
 def _transparent(pipeline: Pipeline, cache: int) -> bool:
-    """Whether a stream reads the cache at `cache` as the steps it stands for read: an automatic cache's,
+    """Whether a read takes the cache at `cache` as the steps it stands for read: an automatic cache's,
     whose steps keep or reject each input, so a position saved with it resumes without it and the
-    reverse (row 4217)."""
+    reverse, by index and by stream (rows 803, 4217)."""
     stage = pipeline.stages[cache]
     return isinstance(stage, Artifact) and stage.automatic
 
@@ -1620,10 +1620,11 @@ class _Build:
         view = self.viewed(self.shared(placed, pipeline, partition), pipeline, partition, cache)
         if self.lowering.one_to_one:
             return view, cache + 1, self.dealt(partition, lambda: len(inputs))
-        if not any(isinstance(stage, (FlatMap, Batched)) for stage in prefix.stages):
-            # Steps that keep or reject each input give one output an input, a record or its marker, read
-            # as the uncached run's rows are read and dropped (`record_stage`), so a position either saves
-            # resumes in the other, the cache on or off (row 803).
+        if _transparent(pipeline, cache):
+            # An automatic cache's maps keep or reject each input, one output an input, a record or its
+            # marker, read as the uncached run's rows are read and dropped (`record_stage`), so a position
+            # either saves resumes in the other, the cache on or off (row 803); a chain's own cache keeps
+            # the form its positions saved.
             single = _as_iter(view.map(_CachedOne()), self.loading)
             kept = single if marked else Accepted(single, _name(pipeline), _label(pipeline))
             return kept, cache + 1, None
