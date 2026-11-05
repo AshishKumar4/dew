@@ -134,7 +134,7 @@ from dew.data.pipeline import (
     member_record,
     members_held,
 )
-from dew.data.plan import Manifest
+from dew.data.plan import PLAN_VERSIONS, Manifest
 from dew.data.readers import _FillShare
 from dew.data.shards import bounded as shards_bounded, bounded_places, streamed
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, materialized
@@ -1381,6 +1381,9 @@ class _Build:
     and runs the rest. A mixture's corpora each read in a share of them, or in the workers a corpus
     writes itself. None where the workers read the whole order after its batch, as a read that drops
     nothing is read."""
+    version: int = PLAN_VERSIONS[-1]
+    """The data plan version it reads by (`dew.data.plan.PLAN_VERSIONS`): 9 a corpus's shuffles each its
+    own in the mixtures above it (`ordered`), 8 each by its seed alone."""
 
     @property
     def global_order(self) -> bool:
@@ -1823,9 +1826,22 @@ class _Build:
                             members=members, credits=True)
         return rows
 
+    def ordered(self, stage: Shuffle) -> Shuffle:
+        """`stage` as this build reads it: from plan version 9 a shuffle of a mixture's corpus draws from its
+        seed and the corpus's key in each mixture above it (`corpus`), so corpora of one length shuffled by
+        one seed read in orders of their own, and a corpus keeps its order whichever others the mixture
+        holds (row 3840); version 8, and a shuffle of no mixture's corpus, by its seed alone."""
+        if self.version < 9 or not self.corpus:
+            return stage
+        keyed = hashlib.blake2b(repr((stage.seed, *self.corpus)).encode(), digest_size=4).digest()
+        return dataclasses.replace(stage, seed=int.from_bytes(keyed, "big"))
+
     def stage(self, rows: Rows, stage: Stage, pipeline: Pipeline, partition: DataPartition, at: int) -> Rows:
-        """`rows` through `stage`, written at `at` in `pipeline`."""
+        """`rows` through `stage`, written at `at` in `pipeline`, a shuffle as this build orders it
+        (`ordered`)."""
         stage = _for_rows(stage, rows)
+        if isinstance(stage, Shuffle):
+            stage = self.ordered(stage)
         if isinstance(stage, _RECORD):
             return self.record_stage(rows, (stage,), pipeline, partition, at)
         if isinstance(stage, Shuffle) and stage.block_shards is not None:

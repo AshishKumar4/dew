@@ -135,7 +135,7 @@ from dew.data.pipeline import (
     with_children,
     with_stores,
 )
-from dew.data.plan import Plan, StepIdentity, fingerprint, unplaced
+from dew.data.plan import PLAN_VERSIONS, Plan, StepIdentity, fingerprint, unplaced
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
 from dew.data.sources.base import (
     Read,
@@ -693,11 +693,13 @@ def _made(prepared: Sequence[Pipeline], read: Read, counts: Sequence[dict[str, C
 
 
 def _build(branch: Pipeline, read: Read, loading: Loading, *, batch: int, training: bool, seed: int = 0,
-           lowering: _Lowering | None = None) -> _Build:
+           lowering: _Lowering | None = None, version: int = PLAN_VERSIONS[-1]) -> _Build:
     """The build a reader of a prepared `branch` reads it by, in batches of `batch`: training's, or a
-    scored or published pass's, by the lowering its analysis gives unless `lowering` says otherwise."""
+    scored or published pass's, by the lowering its analysis gives unless `lowering` says otherwise, and
+    the data plan `version` it reads by."""
     lowered = _analyzed(branch, read, validation=not training) if lowering is None else lowering
-    return _Build(read, loading, seed, batch, lowered, training=training, elastic=branch._elastic)
+    return _Build(read, loading, seed, batch, lowered, training=training, elastic=branch._elastic,
+                  version=version)
 
 
 @compiling
@@ -717,6 +719,7 @@ def compile(
     widths: Mapping[str, object] | None = None,
     measured: _Measured | None = None,
     epochs: int | None = None,
+    plan_version: int = PLAN_VERSIONS[-1],
 ) -> Loader:
     """Check every leaf before opening readers, then build both branches; `widths` are the run's
     static widths its steps bind to (`run_widths`), and `measured` its training branch as their
@@ -725,7 +728,12 @@ def compile(
     its first that many source examples, before they are packed and before the objective makes rows
     of them (`_bounded`), a run's `examples=` budget. `epochs` reads the chain endlessly, or, where its
     read has no record count, bounds it to that many passes over the source examples it states a pass
-    holds once it is prepared (`_staged`, `Loader.pass_examples`)."""
+    holds once it is prepared (`_staged`, `Loader.pass_examples`). `plan_version` is the data plan version
+    it reads by (`dew.data.plan.PLAN_VERSIONS`): this Dew's, or the one a resumed run saved under, which
+    reads its order as it did (`dew.config.RunConfig`'s `trainer.data_plan`)."""
+    if plan_version not in PLAN_VERSIONS:
+        raise ValueError(f"this Dew reads data plans by version {', '.join(map(str, PLAN_VERSIONS))}, not "
+                         f"{plan_version}: resume a run saved under another with the Dew that wrote it")
     branches = (train,) if validation is None else (train, validation)
     read = read or train.mode or _preferred_read(branches, provision=provision)
     loading = loading or train._loading or _DEFAULT_LOADING
@@ -741,10 +749,11 @@ def compile(
             seed=seed,
             rejections=rejections,
             resume=resume,
+            plan_version=plan_version,
         )
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
                      seed=seed, rejections=rejections, examples=examples, widths=widths, measured=measured,
-                     epochs=epochs)
+                     epochs=epochs, version=plan_version)
     loader = _compiled(staged, _coordinated(staged.train), host=host, resume=resume)
     if staged.passes is not None and epochs is not None:
         return dataclasses.replace(loader, examples=epochs * staged.passes, epochs=epochs,
@@ -821,6 +830,7 @@ def _staged(
     widths: Mapping[str, object] | None = None,
     measured: _Measured | None = None,
     epochs: int | None = None,
+    version: int = PLAN_VERSIONS[-1],
 ) -> _Staged:
     if rejections == "mask":
         raise ValueError(
@@ -842,7 +852,8 @@ def _staged(
     # A memory read that kept none of the scored records scores none.
     if validation_counts and not any(count.accepted for count in validation_counts.values()):
         validation = None
-    build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed)
+    build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed,
+                   version=version)
     passes = None
     if epochs is not None and measured.ahead == "layout":
         # The bound it held with its pack counted its passes as it held the documents (`Limit.passes`). The
@@ -857,14 +868,16 @@ def _staged(
         passes = _pass_examples(train, read)
         if passes is not None:
             original, train = _rebound(original, epochs * passes), _rebound(train, epochs * passes)
-            build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed)
+            build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed,
+                   version=version)
     elif epochs is not None:
         # Epochs of a read with a record count count it, read endlessly; of one with none, the source
         # examples a pass holds, its prepared rows as held, bounded to that many passes (`_bounded`).
         passes = None if _epoch_records(train, build) is not None else _pass_examples(train, read)
         original, train = ((_endless(original), _endless(train)) if passes is None else
                            (_bounded(original, epochs * passes), _bounded(train, epochs * passes)))
-        build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed)
+        build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed,
+                   version=version)
     return _Staged(train, validation, original, build, counts, validation_counts, batch_tokens, passes)
 
 
@@ -1030,6 +1043,7 @@ def _compiled(
         volatile=any(_volatile(stage) for stage in
                      (*_steps(original), *(stage for source in sources for stage in _written(source, ())))),
         stores=tuple(store for source in sources for store in _token_stores(source)),
+        version=build.version,
     )
     tuned = build.tuned(train)
     # The training read's workers move before what drops records (`pooled`); validation reads its own.
@@ -1188,6 +1202,7 @@ def _compile_phases(
     seed: int,
     rejections: Literal["drop", "mask"],
     resume: Literal["exact", "non-exact"],
+    plan_version: int = PLAN_VERSIONS[-1],
 ) -> Loader:
     source = train.source
     if not isinstance(source, Phases):
@@ -1198,7 +1213,8 @@ def _compile_phases(
         """Phase `index`, each corpus it reads continued past what the phases before it read of it."""
         return _staged(_continued(source.pipelines[index], consumed)._then(*train.stages),
                        validation if index == 0 else None, objective=objective, read=read,
-                       provision=provision, loading=loading, seed=seed, rejections=rejections)
+                       provision=provision, loading=loading, seed=seed, rejections=rejections,
+                       version=plan_version)
 
     def consumed_by(phases: Sequence[_Staged], ends: Sequence[int]) -> dict[str, int]:
         """What `phases` read of each corpus, each ending at its record end of `ends`: its members a
@@ -1687,6 +1703,7 @@ def fitted[Entry](
     seed: int = 0,
     examples: int | None = None,
     epochs: int | None = None,
+    plan_version: int = PLAN_VERSIONS[-1],
 ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
     """`dataset` and each validation dataset as `Trainer.fit` reads them,
     compiled with the objective's own stages and the run's data `seed`,
@@ -1733,7 +1750,7 @@ def fitted[Entry](
                   if scored else {})
         loader = compile(trained, objective=objective, provision=True, seed=seed, examples=examples,
                          widths=widths, read=read, measured=measured,
-                         epochs=epochs if examples is None else None)
+                         epochs=epochs if examples is None else None, plan_version=plan_version)
     else:
         widths = run_widths(list(scored.values()), objective) if scored else {}
         loader = dataset

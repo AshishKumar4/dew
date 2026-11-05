@@ -13,7 +13,7 @@ import platform
 import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import jax
 import numpy as np
@@ -657,16 +657,41 @@ def read_otherwise_at_8(saved: Mapping[str, object]) -> str | None:
             "takes it across them, so this position goes on only as 7 read it, the take once a worker")
 
 
+def read_otherwise_at_9(saved: Mapping[str, object]) -> str | None:
+    """Why version 9 reads a version 8 data plan's order otherwise, None where it reads it alike: where a
+    corpus of a mixture its order holds, at any depth, shuffles its records, which version 9 draws by the
+    corpus's key in the mixture too (`dew.data.lowering._Build.ordered`, row 3840)."""
+    def shuffled_member(node: JSON, *, within: bool) -> bool:
+        if isinstance(node, list):
+            return any(shuffled_member(child, within=within) for child in node)
+        if not isinstance(node, dict):
+            return False
+        stages = node.get("stages")
+        if within and isinstance(stages, list) and any(
+                isinstance(stage, str) and stage.startswith("Shuffle(") for stage in stages):
+            return True
+        return any(shuffled_member(child, within=within or key == "corpora") for key, child in node.items())
+
+    if not shuffled_member(json_value(saved.get("order", {}), "saved order"), within=False):
+        return None
+    return ("version 8 shuffled each corpus of a mixture by its seed alone, and version 9 by its key in the "
+            "mixture too, so this position goes on only as 8 read it")
+
+
 def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object]:
     """`saved`, a data plan a saved position records, as `plan`, this run's, reads it (`Plan.check`): the
-    position's one translation, where a reader's `set_state` decodes it. A token store a Dew before row 3028
+    position's one translation, where a reader's `set_state` decodes it. A plan of version 7 reads as 8, and
+    one of 8 as 9, where the later reads its order alike (`read_otherwise_at_8`, `read_otherwise_at_9`). A
+    token store a Dew before row 3028
     named without saying how its documents are read is named as today's names it where that Dew read the
     same documents of it (`_named_as_today`); its derived order holds today's lengths (`plan`'s) of each
     source that Dew stated none for (`_unstated_lengths`), where the plan names the source as today's does;
     the saved and current manifests' sources are numbered as their derived facts number them. Carried to
     1.0 (ledger 1552)."""
-    if saved.get("version") == 7 and plan.version == 8 and read_otherwise_at_8(saved) is None:
+    if saved.get("version") == 7 and plan.version >= 8 and read_otherwise_at_8(saved) is None:
         saved = {**saved, "version": 8}
+    if saved.get("version") == 8 and plan.version == 9 and read_otherwise_at_9(saved) is None:
+        saved = {**saved, "version": 9}
     # A plan of another version is refused as it is (`Plan.check`), so nothing of it is read here.
     if saved.get("version") != plan.version:
         return saved
@@ -835,6 +860,13 @@ def _steps_grown(saved: dict[str, JSON] | list[JSON] | str | int | float | bool 
         for before, after in zip(saved, current, strict=True))
 
 
+PLAN_VERSIONS = (8, 9)
+"""The versions this Dew reads a plan into rows by, the latest a new run's: 9 folds a mixture member's key
+into each shuffle of its own, so members of one length shuffled by one seed read in orders of their own
+(row 3840), where 8 read them in one permutation; a run saved under 8 reads by 8 (carried to 1.0, ledger
+1552)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Plan:
     """Order-defining fields checked before a restored iterator opens readers.
@@ -862,7 +894,9 @@ class Plan:
         default_factory=dict, compare=False, repr=False)
     """Each of `members`' manifests, undigested, with the token stores the member reads, from which a
     resume makes the digests an earlier Dew made of it (`earlier_plan`); no part of the plan's record."""
-    version: ClassVar[int] = 8
+    version: int = PLAN_VERSIONS[-1]
+    """The version the plan is read into rows by (`PLAN_VERSIONS`): this Dew's, or the one a run saved
+    under, which reads it as it did (`dew.data.compile.compile`'s `plan_version`)."""
 
     def record(self) -> dict[str, JSON]:
         return {
@@ -915,11 +949,14 @@ class Plan:
         per-share plan."""
         current = self.record()
         if current["version"] != saved.get("version"):
-            otherwise = read_otherwise_at_8(saved) if saved.get("version") == 7 else None
+            otherwise = (read_otherwise_at_8(saved) if saved.get("version") == 7 else
+                         read_otherwise_at_9(saved) if saved.get("version") == 8 else None)
             raise ValueError(
                 f"the saved data position was written under data plan version {saved.get('version')!r}, "
-                f"and this Dew reads plans by version {current['version']!r}, which makes other rows or "
-                f"draws from the same plan{f' ({otherwise})' if otherwise else ''}; {_RESUMED}"
+                f"and this read is of version {current['version']!r}, which makes other rows or "
+                f"draws from the same plan{f' ({otherwise})' if otherwise else ''}; compile the chain with "
+                f"plan_version={saved.get('version')!r} where this Dew reads it (versions "
+                f"{', '.join(map(str, PLAN_VERSIONS))}), as a run config's resume does, or {_RESUMED}"
             )
         if (not self.manifest.exact or not saved.get("exact", False)) and resume != "non-exact":
             raise ValueError(
