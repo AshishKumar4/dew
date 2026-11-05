@@ -2486,3 +2486,19 @@ def test_a_version_7_position_of_a_two_share_streamed_read_resumes_where_8_reads
         assert [np.asarray(next(stream)["id"]).tolist() for _ in range(2)] == saved["after"]
     finally:
         stream.close()
+
+
+def unsized(record):
+    """A step that reads a field the seventh record lacks."""
+    return {**record, "size": record["sizes"][0]}
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_raising_step_raises_its_own_error_naming_the_step_and_its_record(read):
+    """A record step that raises raises its own error, noting which step raised, in every read (row
+    4117)."""
+    rows = tuple({"id": index, "sizes": [index]} if index != 7 else {"id": index} for index in range(12))
+    with pytest.raises(KeyError) as raised:
+        list(iterate(Pipeline(Memory(rows)).map(unsized), read=read))
+    (note,) = raised.value.__notes__
+    assert unsized.__qualname__ in note
