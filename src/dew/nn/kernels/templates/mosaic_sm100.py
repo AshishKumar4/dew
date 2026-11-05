@@ -12,7 +12,7 @@ barrier's completions no later turn waited for are observed before the program e
 Unlike Hopper's and Ampere's bundles (`mosaic.Family`), a thread holds no accumulator between products: the
 registers a program takes are its warpgroups' entry share alone (`registers`), the issuing warpgroup's few
 (addresses and counters) left to a per-launch rule once a liveness model prices its branch
-(`resources.PRODUCER_REGISTERS`)."""
+(`resources.producer_floor`)."""
 
 import dataclasses
 import functools
