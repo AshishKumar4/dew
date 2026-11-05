@@ -478,11 +478,12 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
     together (512 of them, drawn past every run's seeds)."""
     import numpy as np
     from arm_arithmetic import unrewritten
-    from reference_error import NO_ZERO_ROWS, REDRAW, _drawn, _Draws, _staged
+    from check1_wire import staged_units
+    from reference_error import NO_ZERO_ROWS, _drawn, _Draws, _staged
 
     # The same draws under either procedure, so their verdicts compare run by run.
     rng = np.random.default_rng([chunk, int(ratio * 1000), seeds])
-    span = (1 + REDRAW) * seeds
+    span = staged_units(seeds)
     if law in CLASSES:
         reference, draw, truth, *_ = CLASSES[law]()
         # The reference and its truth run their programs unrewritten, as a site's do.
@@ -522,10 +523,11 @@ def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int,
     least factor that would have failed it at both stages (`_staged`'s second stage is drawn only where
     the first fails), whose high quantiles calibrate NARROW_FACTORS."""
     import numpy as np
-    from reference_error import NO_ZERO_ROWS, REDRAW, _Draws, _largest_share, _staged, _verdict
+    from check1_wire import staged_units
+    from reference_error import NO_ZERO_ROWS, _Draws, _largest_share, _staged, _verdict
 
     rng = np.random.default_rng([0x5A, width, rows, seeds, chunk, int(amplified) + 2 * int(shared)])
-    span = (1 + REDRAW) * seeds
+    span = staged_units(seeds)
     verdicts, statistics = [], []
     for _ in range(runs):
         truth = np.sqrt(np.mean(np.square(rng.standard_normal((span, rows, width))), axis=2))

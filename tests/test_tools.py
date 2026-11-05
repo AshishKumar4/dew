@@ -642,11 +642,11 @@ def test_prepared_windows_hold_every_draw_a_windowed_run_reads():
     """A prepare run with a window of two draws keeps both draws of every check-1 seed and of its
     redraw's (`REDRAW`): a run reading those references finds the reference and the float64 anchor of
     the last draw a windowed check reads, and none past it."""
-    from reference_error import REDRAW
+    from check1_wire import staged_units
 
     tool = load("layout_parity")
     _, reference = tool.model_case("jepa", "float32", {}, {})
-    last = (1 + REDRAW) * 2 * 2 - 1
+    last = staged_units(2) * 2 - 1
     with jax.enable_x64(new_val=True), tempfile.TemporaryDirectory() as directory:
         prepare = tool.References(Path(directory), prepare=True)
         assert tool.prepared(["jepa"], dtype="float32", seeds=2, windows=2, mixture={}, objective={},

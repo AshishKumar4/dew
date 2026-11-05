@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from check1_wire import staged_units
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
@@ -1481,7 +1482,7 @@ def test_a_recording_keeps_the_larger_count_sized_on_another_backend(planned):
                                         summary=True, start=256)
     seeds = int(recorded["site.seeds"])
     assert seeds >= 256
-    assert len(recorded["site.input_digest"]) == (1 + REDRAW) * seeds
+    assert len(recorded["site.input_digest"]) == staged_units(seeds)
     drawn, reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw,
                                                 truth_fn=product)
     assert_as_exact(lambda index, inputs: product(inputs), reference, drawn, "larger backend",

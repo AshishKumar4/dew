@@ -28,6 +28,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from check1_wire import staged_units
 from fetched_fixtures import save
 from reference_error import (
     FEWEST_SEEDS,
@@ -132,7 +133,7 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
     def recorded_draw(seed):
         return np.int32(seed), record(int(seed))[0]
 
-    ensure((1 + REDRAW) * planned)
+    ensure(staged_units(planned))
     # The recorded reference is read by index from the host's records, as given.
     confirmed = seeds_for(as_given(lambda index, inputs: records[int(index)][1]), recorded_draw, label,
                           start=start,
@@ -140,7 +141,7 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
                           dew_fn=None if dew is None else as_given(lambda index, inputs: dew(inputs)))
     # The recording is the confirmed count's draws and their redraw, no more: a proxy that planned more
     # than the recorded reference confirms leaves draws the recording does not keep.
-    kept = (1 + REDRAW) * confirmed
+    kept = staged_units(confirmed)
     ensure(kept)
     kept_records = [records[seed] for seed in range(kept)]
     if summary:
@@ -277,7 +278,7 @@ def record_distances(label: str, draw, distances: Mapping[str, np.ndarray], trut
     errors = np.stack([np.mean(np.square(rows), axis=1) if rows.shape[1] else np.zeros(rows.shape[0])
                        for rows in (np.asarray(distances[name], np.float64) for name in names)], axis=1)
     confirmed = seeds_resolving(errors, names, label)
-    kept = (1 + REDRAW) * confirmed
+    kept = staged_units(confirmed)
 
     def records():
         for seed in range(kept):
@@ -312,7 +313,7 @@ def merge_shards(label: str, shards: Sequence[Mapping[str, np.ndarray]]) -> dict
     names = [key.removeprefix(f"{label}.mse.") for key in joined if key.startswith(f"{label}.mse.")]
     confirmed = seeds_resolving(np.stack([joined[f"{label}.mse.{name}"] for name in names], axis=1),
                                 names, label)
-    kept = (1 + REDRAW) * confirmed
+    kept = staged_units(confirmed)
     if len(drawn) < kept:
         raise ValueError(f"{label}: {confirmed} seeds resolve, and their redraw needs {kept} seeds; the "
                          f"shards hold {len(drawn)}")
@@ -398,7 +399,7 @@ def _evidence(label: str, seeds: range, records) -> dict[str, np.ndarray]:
 def _finished(label: str, evidence: Mapping[str, np.ndarray], confirmed: int) -> dict[str, np.ndarray]:
     """The recording `evidence` (`_evidence`) makes at `confirmed` declared seeds: its first (1 + REDRAW)
     times that many seeds, each leaf's rows of float64 zero by their span a seed (`zero_offsets`)."""
-    result = _kept(label, evidence, (1 + REDRAW) * confirmed)
+    result = _kept(label, evidence, staged_units(confirmed))
     result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
     return result
 
