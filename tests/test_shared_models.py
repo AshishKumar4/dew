@@ -1,7 +1,9 @@
 """Shared model requests keep untrusted inputs away from model memory."""
 import ast
 import contextlib
+import dataclasses
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -239,86 +241,58 @@ def serving(service, native, path):
         shared.server_close()
 
 
-@contextlib.contextmanager
-def held_in_its_walk(native, monkeypatch):
-    """The engine held inside the next image request's first step until the context ends: its preview
-    signals `running` and waits for the release, so a test knows the request runs, not by a clock."""
-    import threading
+@dataclasses.dataclass
+class Holding:
+    """A double of the pipeline's image kind (`TextToImage.scoring`) whose passes wait for `release` once
+    they start, so a test knows a request runs, not by a clock: `entered` is set as a pass starts, and
+    `passed` holds each pass's request keys."""
 
-    running, release = threading.Event(), threading.Event()
-    preview = native.progress.preview_png
+    entered: threading.Event = dataclasses.field(default_factory=threading.Event)
+    release: threading.Event = dataclasses.field(default_factory=threading.Event)
+    passed: list = dataclasses.field(default_factory=list)
 
-    def holding(latent):
-        running.set()
-        release.wait()
-        return preview(latent)
+    def __call__(self, scoring):
+        import jax
 
-    monkeypatch.setattr(native.progress, "preview_png", holding)
-    try:
-        yield running
-    finally:
-        release.set()
+        from dew.inference.images import ImageScoring
 
+        holding = self
 
-def spied_submissions(native, monkeypatch):
-    """The futures the service hands the engine, in order."""
-    submitted, held = [], native.submitted
+        class Held(ImageScoring):
+            def forward(self, variables, rows):
+                holding.passed.append([int(jax.random.key_data(row.key)[-1]) for row in rows])
+                holding.entered.set()
+                assert holding.release.wait(timeout=600)
+                return super().forward(variables, rows)
 
-    def spied(request, emit):
-        future, answered = held(request, emit)
-        submitted.append(future)
-        return future, answered
-
-    monkeypatch.setattr(native, "submitted", spied)
-    return submitted
+        return Held(**{field.name: getattr(scoring, field.name) for field in dataclasses.fields(scoring)})
 
 
 def test_a_guest_whose_request_outlasts_its_connection_stays_admitted_until_the_engine_settles_it(
         service, tmp_path, monkeypatch):
     """A guest's image request the engine runs when its connection's wait runs out keeps the guest's one
-    admission: its connection hears the timeout and nothing after it, a second request is refused while
-    the first runs, and the guest is admitted again once the engine has settled it, so a slow pass never
-    lets one guest queue a second job past the service's bounds. The service's real models run it
-    (`live_kernel`), held inside its walk while the test looks (`held_in_its_walk`), and the connection's
-    wait runs out once the walk runs, not by a clock."""
-    from concurrent.futures import TimeoutError as FuturesTimeout
-
-    _, _, native = live_kernel(service, tmp_path)
-    submitted = spied_submissions(native, monkeypatch)
+    admission: its connection hears the timeout and nothing after it, its request runs on (its cancel
+    fails), a second request of the guest's is refused while it runs, and the guest is admitted again once
+    the engine has settled it, so a slow pass never lets one guest queue a second job past the service's
+    bounds. The service's real models run it through the socket, their pass held (`Holding`)."""
+    holding = Holding()
+    _, _, native = live_kernel(service, tmp_path, served=holding)
+    monkeypatch.setattr(service, "REQUEST_SECONDS", 5)
     path = tmp_path / "model.sock"
     with serving(service, native, path):
-        with held_in_its_walk(native, monkeypatch) as running:
-            engine = native.submitted
-
-            def outlasted(request, emit):
-                """The engine's future, whose wait runs out once its walk runs."""
-                future, answered = engine(request, emit)
-
-                # A walk that fails before its first step ends the wait with its failure.
-                future.add_done_callback(lambda _: running.set())
-
-                class Waited:
-                    def __getattr__(self, name):
-                        return getattr(future, name)
-
-                    def result(self, timeout=None):
-                        assert running.wait(timeout=600)
-                        if future.done():
-                            return future.result()
-                        raise FuturesTimeout
-
-                return Waited(), answered
-
-            monkeypatch.setattr(native, "submitted", outlasted)
+        try:
             first, lines = connected(path, SLOW)
             with first:
                 assert reply(lines)["error"]["name"] == "TimeoutError"
+                assert holding.entered.is_set()
                 second, refused = connected(path, SLOW)
                 with second:
                     assert reply(refused)["error"]["name"] == "ValueError"
-                assert len(submitted) == 1
-        # Released: the walk finishes, and its progress reaches no one after the reply.
-        submitted[0].result()
+                assert len(holding.passed) == 1
+        finally:
+            holding.release.set()
+        # The engine answers in order: once a later request is answered, the first has been settled.
+        native.sample(service.validate({**SLOW, "key": 6}), lambda _: None)
         assert lines.read() == ""
         third, lines = connected(path, DESCRIBE)
         with third:
@@ -330,30 +304,33 @@ def test_a_guest_whose_queued_request_times_out_frees_its_admission_and_its_requ
     """A guest's request still queued behind a running one when its connection's wait runs out is
     cancelled: the guest is admitted again at once, and the engine drops the request where it would take
     it, never running it, while the request ahead runs on."""
-    _, _, native = live_kernel(service, tmp_path)
+    holding = Holding()
+    _, _, native = live_kernel(service, tmp_path, served=holding)
     monkeypatch.setattr(service, "REQUEST_SECONDS", 0.05)
-    submitted = spied_submissions(native, monkeypatch)
     path = tmp_path / "model.sock"
     with serving(service, native, path):
-        with held_in_its_walk(native, monkeypatch) as running:
-            native.submitted(service.validate({**SLOW, "key": 6}), lambda _: None)
-            assert running.wait(timeout=600)
+        ahead = threading.Thread(target=native.sample, args=(service.validate({**SLOW, "key": 6}),
+                                                             lambda _: None))
+        ahead.start()
+        try:
+            assert holding.entered.wait(timeout=600)
             queued, lines = connected(path, SLOW)
             with queued:
                 assert reply(lines)["error"]["name"] == "TimeoutError"
             described, lines = connected(path, DESCRIBE)
             with described:
                 assert "result" in reply(lines)
-        ahead, behind = submitted
-        ahead.result()
-    assert behind.cancelled() and not ahead.cancelled()
+        finally:
+            holding.release.set()
+        ahead.join()
+        # The engine answers in order: once a later request is answered, every earlier one is settled.
+        native.sample(service.validate({**SLOW, "key": 7}), lambda _: None)
+    assert [held for passed in holding.passed for held in passed] == [6, 7]
 
 
 def test_a_guest_whose_request_fails_in_the_engine_hears_why_and_is_admitted_again(service, tmp_path):
     """A request whose pass fails stops the engine: its connection hears the failure and nothing after it,
     and the guest is admitted again."""
-    import dataclasses
-
     from dew.inference.images import ImageScoring
 
     class Failing(ImageScoring):

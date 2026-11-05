@@ -7,8 +7,10 @@ proceeds alone to deadlock its peers at the next collective. The trainer reports
 """
 
 import dataclasses
+import functools
 import gzip
 import json
+import logging
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -25,6 +27,9 @@ if TYPE_CHECKING:
     from dew.telemetry.profile import Profiler
 
 
+_log = logging.getLogger(__name__)
+
+
 @dataclasses.dataclass(frozen=True)
 class ProfileWindow:
     """A request for one profiler window per fit.
@@ -38,10 +43,12 @@ class ProfileWindow:
     host events at level 2, no Python calls (the Python tracer slows Python-heavy host work several
     times over), and on GPU at most its `activity_cap` CUDA activity events.
 
-    A window that names no `directory` is a run's own (`dew.config.TrainerConfig.profile`, which every
-    run holds by default): its capture is kept with the run's records, under its directory, and taken
-    where the process can take one (`capturable`), none under JAX's AutoPGLE, inside another capture or
-    without XProf, where a window naming its directory refuses to run.
+    A window that names no `directory` traces into one of its own (`dew.Profiler`'s), a run's own
+    (`run_window`, every run's by default, `dew.config.TrainerConfig.profile`) kept with the run's
+    records and taken where the process can take one (`capturable`): none under JAX's AutoPGLE or inside
+    another capture, where a window a run names refuses to run. A window that `reports` nothing keeps its
+    trace and manifest alone, which needs no XProf and its stop writes at once; one that reports converts
+    its capture's reports as its stop is waited for at the fit's end, minutes for a training window.
 
     `dew.Profiler` is the other way to capture a trace, as a context manager
     around any code; a fit refuses to schedule a window inside one. The loop
@@ -53,6 +60,7 @@ class ProfileWindow:
     warmup: int = 2
     capture: telemetry_profile.CaptureOptions = dataclasses.field(
         default_factory=telemetry_profile.CaptureOptions)
+    reports: bool = True
 
 
 def pgle_runs() -> int:
@@ -76,17 +84,16 @@ PGLE_CAPTURE = (
 
 def run_window() -> ProfileWindow:
     """A run's own window, every run's by default (`dew.config.TrainerConfig.profile`): two steps traced
-    once ten have run past its first compile, kept under the run's directory."""
-    return ProfileWindow(None, 2, warmup=10)
+    once ten have run past its first compile, kept with the run's records, its trace and manifest alone
+    (no `reports`: no XProf asked, no conversion the run's end waits for)."""
+    return ProfileWindow(None, 2, warmup=10, reports=False)
 
 
 def capturable() -> bool:
-    """Whether every process can take a capture: none holds another (`dew.Profiler`), none runs under
-    JAX's AutoPGLE (`pgle_runs`) and XProf is installed on each (`profile_installed`); a run's own window
-    (`ProfileWindow`, no `directory`) is taken where they can, a window naming its directory refuses
-    where they cannot (`owned_capture`)."""
-    local = (telemetry_profile.active_profile() is None and not pgle_runs()
-             and telemetry_profile.profile_installed())
+    """Whether every process can take a capture: none holds another (`dew.Profiler`) and none runs under
+    JAX's AutoPGLE (`pgle_runs`); a run's own window (`run_window`), which reports nothing and so asks no
+    XProf, is taken where they can, a window a run names refuses where they cannot (`owned_capture`)."""
+    local = telemetry_profile.active_profile() is None and not pgle_runs()
     return all(from_every_process(local))
 
 
@@ -114,12 +121,10 @@ def owned_capture(window: ProfileWindow | None) -> "Profiler | None":
                 "profiler before fitting")
         if pgle_runs():
             raise ValueError(PGLE_CAPTURE)
-        telemetry_profile.require_profile_support()
-        if window.directory is None:
-            raise ValueError("a run's own profile window is kept under the run's directory, which its "
-                             "config names (`dew.config.TrainerConfig.profile`); a trainer given a window "
-                             "names its directory")
-        return telemetry_profile.Profiler(window.directory, options=window.capture.profile_options())
+        if window.reports:
+            telemetry_profile.require_profile_support()
+        return telemetry_profile.Profiler(window.directory, options=window.capture.profile_options(),
+                                          reports=window.reports)
 
     return agreed("profiling window setup", own_window)
 
@@ -148,14 +153,17 @@ def start_capture(profiler: "Profiler") -> None:
         raise
 
 
-def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
-    """Stop the window's owned capture on every rank.
+def stop_capture(profiler: "Profiler", loss: "jax.Array | None", window: ProfileWindow) -> None:
+    """Stop `window`'s owned capture on every rank.
 
     The core Profiler drains the backend and stops the trace here, and
     exports its native reports in a process of its own while the run
     trains on (`Profiler.stop`, row 2017), which the run's cleanup waits
     for (`dew.telemetry.profile.exported`). The run's last `loss` is blocked
-    on only to order the primary's failure ahead of the profiler's own drain."""
+    on only to order the primary's failure ahead of the profiler's own drain.
+    A window that reports nothing writes its manifest as it stops, a
+    diagnostic of the run's: its write failing is logged, and the run trains
+    on (`dew.telemetry.profile.ExportFailed`)."""
     def stop() -> None:
         try:
             if loss is not None:
@@ -164,6 +172,11 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
             primary = sys.exception()
             try:
                 profiler.stop(wait=False)
+            except telemetry_profile.ExportFailed as failure:
+                if window.reports:
+                    raise
+                _log.warning("the run's profile window traced, and its manifest was not written: %s (%s)",
+                             failure, failure.exceptions)
             except BaseException as failure:
                 if primary is None:
                     raise
@@ -172,19 +185,37 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
     agreed("profile stop", stop)
 
 
+def waited_export(window: ProfileWindow | None, profiler: "Profiler | None") -> Callable[[], None] | None:
+    """What a fit's cleanup waits for of its `window`'s capture by `profiler`: this rank's export of the
+    reports it converts, of the captures under the profiler's own directory alone
+    (`dew.telemetry.profile.exported`), a failed one failing every rank at the run's outcome's agreement;
+    none for a window that reports nothing, whose manifest its stop wrote, or that never started."""
+    if window is None or not window.reports or profiler is None:
+        return None
+    return functools.partial(_exported_under, profiler)
+
+
+def _exported_under(profiler: "Profiler") -> None:
+    """`profiler`'s exports waited for, under the directory it captured into once it started; none where it
+    never did."""
+    if profiler.directory is not None:
+        telemetry_profile.exported(profiler.directory)
+
+
 def reported_window(report: Callable[[Record, int], None], note: Callable[[str], None],
-                    window: ProfileWindow | None, profiled: tuple[int, int] | None,
+                    profiled: tuple[int, int, str] | None,
                     error: BaseException | None) -> BaseException | None:
-    """Report a fit's window that stopped, `profiled` its steps traced and the step it stopped at, once
-    every rank's export is written and the pool agreed the run's outcome (`Trainer._reported_outcome`),
-    whatever that outcome: its record (`report`) and its note on process zero (`note`). Returns the run's
-    `error`, or a failed report as the error of a run that had none, noted on one that had."""
-    if window is None or window.directory is None or profiled is None:
+    """Report a fit's window that stopped, `profiled` its steps traced, the step it stopped at and the
+    directory its capture is in, once every rank's export is written and the pool agreed the run's
+    outcome (`Trainer._reported_outcome`), whatever that outcome: its record (`report`) and its note on
+    process zero (`note`). Returns the run's `error`, or a failed report as the error of a run that had
+    none, noted on one that had."""
+    if profiled is None:
         return error
-    traced, step = profiled
+    traced, step, directory = profiled
     try:
-        report(ProfileTraced(window.directory, traced), step)
-        wrote = f"Wrote profile for {traced} steps to {window.directory}"
+        report(ProfileTraced(directory, traced), step)
+        wrote = f"Wrote profile for {traced} steps to {directory}"
         agreed("profile announcement", lambda: note(wrote))
     except BaseException as failure:
         if error is None:

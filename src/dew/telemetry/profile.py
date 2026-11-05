@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
-import importlib.util
 import json
 import logging
 import os
@@ -43,12 +42,6 @@ class _Converter(Protocol):
 _active: Profiler | None = None
 _lifecycle = threading.Lock()
 _logger = logging.getLogger(__name__)
-
-
-def profile_installed() -> bool:
-    """Whether XProf, the `dewml[profile]` extra a capture reports through, is installed, asked of the
-    import system without importing it (`require_profile_support` resolves its converters)."""
-    return importlib.util.find_spec("xprof") is not None
 
 
 def require_profile_support() -> _Converter:
@@ -525,21 +518,32 @@ def exported(directory: str | os.PathLike[str] | None = None) -> None:
         raise RuntimeError("Profile export failed for " + ", ".join(failed))
 
 
+class ExportFailed(ExceptionGroup):
+    """A capture stopped as it should and its reports or manifest could not be written: what it traced is
+    in its directory, what reads it lacks."""
+
+
 def _export(capture: Path, converter: _Converter | None, metadata: dict[str, JSON],
             failures: list[BaseException]) -> None:
     """Export a stopped `capture`: its status from what it holds (`held_back`), its native reports where
     it has a `converter` and its manifest (`_reports`, `_manifest`), raising every failure of the stop
-    (`failures`) and of the export together."""
+    (`failures`) and of the export together, or the export's alone as `ExportFailed` where the stop
+    failed in nothing."""
     reasons = [] if failures else held_back(capture, metadata)
     metadata["capture_status"] = "failed" if failures else "partial" if reasons else "completed"
     metadata["capture_errors"] = [str(error) for error in failures]
     metadata["capture_reasons"] = [*reasons]
+    stopped = bool(failures)
     try:
         if converter is None:
             metadata["reports"] = []
             _manifest(capture, metadata, [])
         else:
             _reports(capture, converter, metadata)
+    except Exception as error:
+        if not stopped:
+            raise ExportFailed(f"writing {capture}'s reports or manifest failed", [error]) from None
+        failures.append(error)
     except BaseException as error:
         failures.append(error)
     if failures:

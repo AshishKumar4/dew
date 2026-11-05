@@ -884,12 +884,12 @@ def _closed(tracker, checkpoints: Checkpoints | None, primary: BaseException | N
         error = failure
     failed = None
     try:
-        agree_process_phase(error, phase="tracker close")
+        agree_process_phase(error, phase="run close")
     except BaseException as failure:
         if primary is None:
             failed = failure
         else:
-            primary.add_note(f"Tracker close failed: {failure!r}")
+            primary.add_note(f"Closing the run failed: {failure!r}")
     raised = primary if primary is not None else failed
     if checkpoints is not None:
         checkpoints.__exit__(None if raised is None else type(raised), raised, None)
