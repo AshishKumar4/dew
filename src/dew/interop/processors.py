@@ -313,11 +313,14 @@ class Processor:
         (one frame's, `pools_frames`), as the release's model expands it, the rows padded as the
         tokenizer pads, and its `grid_thws` the images' `image_grid_thw`. A row's images are its entry of
         `images` given one per row, or else the next of them in order, as many as its text's
-        placeholders. Its videos are refused: its call decodes a video from its bytes alone
+        placeholders; an array image is handed as the PIL image its call reads (`_to_pil` reads an image,
+        a path or bytes). Its videos are refused: its call decodes a video from its bytes alone
         (`split_video_chunks`, with a reader of its own), which the source's processed fields stand for."""
         if "videos" in kwargs or "audio" in kwargs:
             raise ValueError(f"{type(self._media_reference).__name__} reads a video from its bytes and no "
                              "audio: hand the model its processed fields (`from_hf`)")
+        from PIL import Image as PILImage
+
         text = kwargs.get("text")
         if text is None:
             raise ValueError(f"{type(self._media_reference).__name__} takes its media with their text")
@@ -337,8 +340,9 @@ class Processor:
             else:
                 count = int(np.count_nonzero(np.asarray(self.reference(text=row)["input_ids"]) == image_id))
                 taken, given = given[:count], given[count:]
-            values = self._media_reference(medias=[{"type": "image", "image": image} for image in taken],
-                                           text=row, return_tensors="np")
+            medias = [{"type": "image", "image": PILImage.fromarray(np.asarray(image))
+                       if isinstance(image, np.ndarray) else image} for image in taken]
+            values = self._media_reference(medias=medias, text=row, return_tensors="np")
             ids = np.asarray(values["input_ids"]).reshape(-1)
             grid = np.asarray(values["grid_thws"]).reshape(-1, 3) if taken else np.zeros((0, 3), np.int64)
             places = np.flatnonzero(ids == image_id)

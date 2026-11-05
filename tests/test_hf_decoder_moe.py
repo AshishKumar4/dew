@@ -536,6 +536,7 @@ def test_kimi_k25_reads_raw_images_through_its_releases_own_processor(tmp_path):
     import json
     import shutil
 
+    from PIL import Image
     from tool_support import run_from
     from transformers import AutoProcessor
 
@@ -568,7 +569,9 @@ def test_kimi_k25_reads_raw_images_through_its_releases_own_processor(tmp_path):
     tokens = np.asarray(called.tokens)
     valid = np.asarray(called.token_fields.get(VALIDITY_FIELD, np.ones(tokens.shape, bool)), bool)
     pixels, grids = [], []
-    for row, taken, ours, real in zip(rows, ([images[0]], images[1:]), tokens, valid, strict=True):
+    # The release's call reads PIL images (its `_to_pil`), as Dew hands it the arrays.
+    pictures = [Image.fromarray(image) for image in images]
+    for row, taken, ours, real in zip(rows, ([pictures[0]], pictures[1:]), tokens, valid, strict=True):
         theirs = release(medias=[{"type": "image", "image": image} for image in taken], text=row,
                          return_tensors="np")
         ids = np.asarray(theirs["input_ids"]).reshape(-1)
@@ -594,7 +597,7 @@ def test_kimi_k25_reads_raw_images_through_its_releases_own_processor(tmp_path):
     np.testing.assert_array_equal(np.asarray(chatted.conditioning["pixel_values"]),
                                   np.asarray(direct.conditioning["pixel_values"]))
     assert np.count_nonzero(np.asarray(chatted.tokens) == image_id) == \
-        release.media_processor.media_tokens_calculator({"type": "image", "image": images[1]})
+        release.media_processor.media_tokens_calculator({"type": "image", "image": pictures[1]})
 
     def logits(images):
         inputs = loaded.processor(rows, images=images)
