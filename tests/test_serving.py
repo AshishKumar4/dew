@@ -1386,24 +1386,26 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode
 
 
 @pytest.mark.mesh(devices=4)
-@pytest.mark.parametrize("decoding", [2, 1], ids=["two", "one"])
+@pytest.mark.parametrize("decoding", [2, 1, 0], ids=["two", "one", "unmeshed"])
 def test_a_server_that_prefills_on_a_mesh_of_its_own_draws_what_one_mesh_draws(decoding):
     """Disaggregated serving: the prompts prefill on two devices of their own and their rows' decoder state
-    moves to the decoding devices, a mesh of two or of one, where they decode; every request, a prompt
-    arriving while others decode among them, draws what its lone call draws, and a reload reaches the
-    prefill mesh's copy as the decoding one's (ledger 875)."""
+    moves to the decoding devices, a mesh of two or of one or one device with no mesh, where they decode;
+    every request, a prompt arriving while others decode among them, draws what its lone call draws, and
+    a reload reaches the prefill mesh's copy as the decoding one's (ledger 875)."""
     from dew.training import Layout, MeshSpec
 
     devices = jax.devices()[:4]
     bound = task(Sampling(temperature=1.0))
     layout = Layout(min_shard=1, tolerance=1.0)
     with boxed(decoder_axes(bound.model)):
-        decoded = place(bound.variables, MeshSpec(fsdp=decoding).build(devices[4 - decoding:]), layout)
+        decoded = (place(bound.variables, MeshSpec(fsdp=decoding).build(devices[4 - decoding:]), layout)
+                   if decoding else jax.device_put(bound.variables, jax.devices()[0]))
     served = dataclasses.replace(bound, variables=decoded)
     alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-    server = Server.from_task(served, slots=4, capacity=128, admission=2,
-                              prefill_mesh=MeshSpec(fsdp=2).build(devices[:2]))
+    # Two devices apart from the decoding ones.
+    prefilling = MeshSpec(fsdp=2).build(devices[:2] if decoding else devices[1:3])
+    server = Server.from_task(served, slots=4, capacity=128, admission=2, prefill_mesh=prefilling)
     server, tickets = served_by(server)
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), row)

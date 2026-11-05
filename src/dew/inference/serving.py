@@ -139,6 +139,7 @@ from dew.nn.inputs import (
     CONTEXT_LENGTHS,
     CrossContext,
     ModelInputs,
+    default_placement,
     host_token_rows,
     mesh_of,
     request_key,
@@ -672,6 +673,9 @@ class Server:
         self.prefill_mesh = mesh
         if mesh is None:
             return
+        if self.pooled or mesh.devices.size != len(mesh.local_devices):
+            raise ValueError("a server moves its prefilled rows between its meshes within one process; serve "
+                             "a pool's server without prefill_mesh")
         rows = self.rows
         if not isinstance(rows, DenseRows) or rows.chunk is not None or rows.placement.plan is not None:
             raise ValueError("a server that prefills on a mesh of its own prefills each prompt whole over a "
@@ -1113,8 +1117,9 @@ class Server:
         with jax.set_mesh(mesh), whole():
             prefilled = self._prefill(self.model, self._prefill_variables, self.pad_id, self.rows.placement,
                                       rows, self.progress)
-        # Onto the decoding rows: the server's mesh's, or the default device's without one.
-        return dataclasses.replace(admission, prefilled=jax.device_put(prefilled, self._admitted))
+        # Onto the decoding rows: the server's mesh's, or the default device's, where an unmeshed state is.
+        return dataclasses.replace(admission, prefilled=jax.device_put(
+            prefilled, default_placement() if self._admitted is None else self._admitted))
 
     def _owed(self) -> dict[str, list[list[int]]]:
         """The page copies this process's seating owes (`dew.inference.pages.Transfers`), by the pool's and
