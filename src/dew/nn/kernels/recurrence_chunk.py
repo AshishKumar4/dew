@@ -671,8 +671,10 @@ PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
                "rows' 0.65 and its keys' weighted launch 0.25 against the port's 0.17 "
                "(window-h100-c70aaa8-b8109ee)"),
 }
-"""The cells, each an instruction family and a product (`PortCase.cell`), where a receipt shows the fla
-port faster than the recurrence template, each its old route's kernel and that receipt: the delta rule's
+"""The cells, each an instruction family and a product (`PortCase.cell`), where a receipt shows Dew's port
+of fla's kernels (`fla_rule`; "the port" below) faster than the recurrence template, each its old route's
+kernel and that receipt; every time below sets the template against that port, not against upstream fla's
+own kernels or FlashQLA's (tools/benchmark_recurrence.py's `fla` and `flashqla` arms): the delta rule's
 selector runs the port on them where it takes the call (`Op.declared`, owner, bible da64ae5); the list
 shrinks as the template wins its cells, and no cell is picked or ranked at run time. A gated delta net's
 cells are all the template's. An A100's forward of Kimi delta attention is the template's, 5.06 ms against
@@ -1382,8 +1384,10 @@ SCAN_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
                   "4.217 on Nemotron-H 4B's SSD and 1.584 against 2.200 on 30B's (ssd-train-a100-fdab2424c)"),
 }
 """The cells, each an instruction family and a product (`ScanCase.cell`), where a receipt timing the same
-product (`chunk(SSD, ...)` with its skip, output width, chunk and geometry, row 1964) shows the port of
-mamba_ssm's kernels faster than the recurrence template, each its old route's kernel and that receipt: the
+product (`chunk(SSD, ...)` with its skip, output width, chunk and geometry, row 1964) shows Dew's port of
+mamba_ssm's kernels (`mamba_ssd.ssd_scan`; "the port" below) faster than the recurrence template, each its
+old route's kernel and that receipt; every time below sets the template against that port, not against
+mamba_ssm's own kernels (tools/benchmark_recurrence.py's `mamba_ssm` arm): the
 scan's selector runs the port on them where it takes the call (`Op.declared`); the list shrinks as the
 template wins its cells. An A100's forward is the template's: 1.418 ms against the port's 1.506 on Nemotron-H
 4B's and 0.510 against 0.541 on 30B's (ssd-rounded-a100-fdab2424c), and warpgroup MMA's: on an H100 80GB HBM3

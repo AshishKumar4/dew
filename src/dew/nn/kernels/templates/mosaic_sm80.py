@@ -419,16 +419,16 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             if not interpret:
                 plgpu.wait_gmem_to_smem(0)
 
-        @plgpu.nd_loop(tiles, collective_axes=axis)
-        def _(loop: plgpu.NDLoopInfo):
-            active, steps, views, tile = schedule(loop.index)
+        def walking(counter, active, steps, views):
+            del counter, active
 
             def walk(step, start, shapes, *, initial=None):
                 return self.walk(self.opened(streams, views), ((step, 0, steps),), start, shapes,
                                  interpret, initial=initial)
 
-            pl.when(active)(lambda: consumer(0, tile, walk, store, active=True))
-            pl.when(~active)(lambda: consumer(0, tile, mosaic.unwalked(self), store, active=False))
+            return walk
+
+        mosaic.consumed(self, tiles, schedule, consumer, store, 0, walking, axis=axis)
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,

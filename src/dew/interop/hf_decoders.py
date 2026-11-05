@@ -53,6 +53,7 @@ from dew.interop.decoder_parts import (
     SourceCode,
     WrapperFields,
     _unread,
+    folder_config,
     held_parts,
     hf_activation,
     modeling_overrides,
@@ -131,7 +132,8 @@ _TEXT_TYPES = {"lfm3_vl": "lfm3"}
 defaults its text_config to Lfm3Config (configuration_lfm3_vl.py, `__post_init__`)."""
 
 
-def _typed(hf_config: Mapping[str, object], nested: Mapping[str, object], part: str) -> Mapping[str, object]:
+def typed_part(hf_config: Mapping[str, object], nested: Mapping[str, object],
+               part: str) -> Mapping[str, object]:
     """A wrapper's nested `part` config (text, vision or audio), typed as its wrapper declares it where it
     names no type: `<wrapper model_type>_<part>` (a text config `_TEXT_TYPES`' type), the class the
     wrapper config builds from a raw dict (its `sub_configs`), so a checkpoint's copy need not repeat the
@@ -158,6 +160,12 @@ _TEXT_VLMS = (*_FLAT_TEXT_TYPES, "qwen3_vl", "qwen3_vl_moe")
 """The VLM wrappers whose config reads a flat root as its text config (`_QWEN_VL_TEXT_FIELDS`)."""
 
 
+def text_scope(hf_config: Mapping[str, object]) -> Mapping[str, object]:
+    """The scope a wrapper states its decoder's fields in, as its config holds them: its text_config, or the
+    root of a bundle that nests none (MiMo-V2.6's, `bundles`)."""
+    return _records.record(hf_config.get("text_config", hf_config), "text_config")
+
+
 def carries_text(hf_config: Mapping[str, object]) -> bool:
     """Whether a config is a wrapper's, its decoder its text config: nested under text_config, or a flat
     Qwen2-VL's or Qwen2.5-VL's root (`vlm_text`)."""
@@ -178,7 +186,7 @@ def vlm_text(hf_config: Mapping[str, object], used: set[str]) -> Mapping[str, ob
         text = {field: hf_config[field] for field in _QWEN_VL_TEXT_FIELDS if field in hf_config}
         dtype = hf_config.get("torch_dtype", hf_config.get("dtype"))
         nested = {**text, **({} if dtype is None else {"torch_dtype": dtype})}
-    return {**dict(_typed(hf_config, _records.record(nested, "text_config"), "text")),
+    return {**dict(typed_part(hf_config, _records.record(nested, "text_config"), "text")),
             "tie_word_embeddings": vlm_tied(hf_config)}
 
 
@@ -230,7 +238,7 @@ def plain_text_rope(text: Mapping[str, object]) -> dict:
 
 def _text_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     """The decoder config a wrapper's language model is: its text_config, typed as the wrapper declares
-    it (`_typed`), a VLM text decoder's as the family it follows (`TEXT_FAMILIES`), with the wrapper's own
+    it (`typed_part`), a VLM text decoder's as the family it follows (`TEXT_FAMILIES`), with the wrapper's own
     head policy."""
     if hf_config.get("model_type") in _TEXT_VLMS:
         text = dict(vlm_text(hf_config, set()))
@@ -240,7 +248,7 @@ def _text_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     if not isinstance(text, Mapping):
         refuse("text_config",
                 f"a wrapper carries its decoder under text_config, got {text!r}")
-    text = dict(_typed(hf_config, text, "text"))
+    text = dict(typed_part(hf_config, text, "text"))
     if hf_config.get("model_type") != "llama4":
         # These conditional models own their lm_head at wrapper scope; the
         # nested text model has no head. Llama4 nests a complete causal LM.
@@ -320,7 +328,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int,
                    audio_token_id: int) -> AudioFields:
     """Read the optional audio tower and its embedder for a Gemma wrapper, beside the placeholder id
     the wrapper read for it (`audio_token_id`), its audio_config typed as the wrapper declares it
-    (`_typed`).
+    (`typed_part`).
 
     Gemma 4 projects encoded frames through the same norm-and-project
     embedder as its images, at the encoder's output width; the processor
@@ -333,7 +341,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int,
     used.update(("audio_config", "audio_soft_tokens_per_image"))
     if stated is None:
         return NO_AUDIO.copy()
-    audio = _typed(hf_config, _records.record(stated, "audio_config"), "audio")
+    audio = typed_part(hf_config, _records.record(stated, "audio_config"), "audio")
     if audio["model_type"] == "gemma4_unified_audio":
         # No encoder: the embedder projects raw frames of audio_embed_dim samples each, one placeholder
         # a frame (Gemma4UnifiedAudioConfig's default 640, configuration_gemma4_unified.py:46 at 5.17.0).
@@ -394,7 +402,7 @@ def _gemma4_unified_wrapper(hf_config: Mapping[str, object], used: set[str]) -> 
     vision = hf_config.get('vision_config')
     tower = projector = None
     if vision is not None:
-        vision = _typed(hf_config, _records.record(vision, 'vision_config'), 'vision')
+        vision = typed_part(hf_config, _records.record(vision, 'vision_config'), 'vision')
         tower = translate_gemma4_unified_vision_config(vision)
         projector = translate_gemma4_projector_config(vision, width,
                                                       record_int(tower['fields'], 'mm_embed_dim'))
@@ -553,8 +561,9 @@ def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
     4 keeps its embedder under `embed_vision` and Qwen 3.5 its merger inside
     the vision model, so the projector prefix runs before the tower's. Gemma
     3n and Gemma 4 nest their audio encoder and embedder beside the vision
-    ones. A family that reads its media bundle whole keeps the decoder's
-    tensors unprefixed.
+    ones; an audio tower stored under several roots (`TowerLayout.roots`,
+    MiMo-V2.6's) keeps its names whole. A family that reads its media bundle
+    whole keeps the decoder's tensors unprefixed.
     """
     from dew.interop.codecs import SIDECARS
 
@@ -568,6 +577,8 @@ def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
     projector_prefix = (None if record["projector"] is None else
                         vision_nn.projector_layout(_kind_name(record, "projector")).prefix)
     audio = record.get("audio_projector") is not None
+    audio_layout = (None if record.get("audio") is None
+                    else towers[_kind_name(record, "audio")].checkpoint)
     bundled = _bundled(record["model_type"])
     bare = name.removeprefix("model.")
     for prefix in record.get("unported", {}):
@@ -585,6 +596,8 @@ def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
             return "projector", bare[len(prefix):]
     if tower_prefix is not None and bare.startswith(tower_prefix):
         return "tower", bare[len(tower_prefix):]
+    if audio_layout is not None and audio_layout.roots and bare.startswith(audio_layout.roots):
+        return "audio_tower", bare
     if audio and bare.startswith("embed_audio."):
         return "audio_projector", bare[len("embed_audio."):]
     if record.get("audio") is not None and bare.startswith("audio_tower."):
@@ -974,10 +987,12 @@ def read_wrapper(
     audio = record.get("audio")
     if audio is not None:
         encoder = towers.from_record(audio)
-        if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
-            raise ValueError(f"audio tower {audio['class']!r} has no weight map here")
-        variables["audio_tower"], placed["audio_tower"] = audio_nn.audio_weights(
-            tables["audio_tower"], encoder, param_dtype=param_dtype)
+        # A Gemma tower's tensors are named under its own map; any other's sit where its class says
+        # (`TowerBase.checkpoint`).
+        variables["audio_tower"], placed["audio_tower"] = (
+            audio_nn.audio_weights(tables["audio_tower"], encoder, param_dtype=param_dtype)
+            if isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio))
+            else vision_nn.tower_variables(_kind_name(record, "audio"), tables["audio_tower"], param_dtype))
     if record.get("audio_projector") is not None:
         audio_projector, audio_layouts = vision_nn.projector_variables(
             _kind_name(record, "audio_projector"), tables["audio_projector"], param_dtype)
@@ -1461,12 +1476,17 @@ def _bundled(model_type: str) -> DecoderFamily | None:
     return family if family is not None and family.wrapper is not None else None
 
 
+_BUNDLE_MEDIA = ("vision_config", "audio_config")
+"""The sections a media bundle's config names its towers in (`bundles`)."""
+
+
 def bundles(config: Mapping[str, object]) -> bool:
     """Whether a source config is a media bundle its own decoder family reads
-    whole (`DecoderFamily.wrapper`): one that names its vision_config."""
+    whole (`DecoderFamily.wrapper`): one that names a tower (`_BUNDLE_MEDIA`), a section that states
+    nothing naming none, as the releases' config classes read an empty one (MiMoV2Config's `{}`)."""
     model_type = config.get("model_type")
     return (isinstance(model_type, str) and _bundled(model_type) is not None
-            and config.get("vision_config") is not None)
+            and any(config.get(section) for section in _BUNDLE_MEDIA))
 
 
 WHOLE_DECODER = ("text_only takes a media wrapper's language model; DiffusionGemma's decoder is its whole "
@@ -1502,8 +1522,11 @@ def decoder_config(config: Mapping[str, object],
 
 def bundle_text_config(config: Mapping[str, object]) -> Mapping[str, object]:
     """A media bundle's config as its family's text checkpoint states it: the same record without its
-    vision_config, which its decoder family reads as text alone."""
-    return {name: value for name, value in config.items() if name != "vision_config"}
+    towers' sections (`_BUNDLE_MEDIA`) and its folders' configs (`DecoderFamily.wrapper_folders`),
+    which its decoder family reads as text alone."""
+    family = _bundled(_records.text(config["model_type"], "model_type"))
+    folders = () if family is None else tuple(folder_config(folder) for folder in family.wrapper_folders)
+    return {name: value for name, value in config.items() if name not in (*_BUNDLE_MEDIA, *folders)}
 
 
 @functools.cache

@@ -73,9 +73,9 @@ class Tiles:
     consumer warpgroups beside a producer that issues the loads, CUTLASS's cooperative sm90 schedule), and
     the multiprocessors of a cluster (`cluster`: 2 pair two row tiles of one group of `gmm`, which load
     their matrix block once between them, multicast), only for a cooperative tile; `tgmm` takes no pair;
-    and the bundle that runs it (`family`, `bundles.named`: Hopper's warpgroup MMA, its loads a producer
-    warpgroup's or, 'wgmma.fed', its first consumer's, or Ampere's mma.sync, one warpgroup whose loads
-    `emit_pipeline` issues, the plain product alone); and the programs
+    and the bundle that runs it (`family`, `bundles.named`, which each tile names: Hopper's warpgroup MMA,
+    its loads a producer warpgroup's or, 'wgmma.fed', its first consumer's, or Ampere's mma.sync, one
+    warpgroup whose loads `emit_pipeline` issues, the plain product alone); and the programs
     a multiprocessor runs at once (`programs`, at most its family's, `mosaic.Family.programs`), each in its
     share of the multiprocessor's shared memory (`resources.program_shared`); and the slices a kernel
     gradient's contraction splits into (`splits`, `tgmm`: each group's rows in that many runs of whole steps,
@@ -90,7 +90,7 @@ class Tiles:
     grid_block_n: int
     warpgroups: int = 1
     cluster: int = 1
-    family: str = 'wgmma'
+    family: str = dataclasses.field(kw_only=True)
     programs: int = 1
     splits: int = 1
     swapped: bool = False
@@ -1170,9 +1170,11 @@ def _sliced(group_sizes: jax.Array, block_k: int, splits: int) -> jax.Array:
 
 
 def _group_blocks(group_sizes: jax.Array, block_k: int) -> tuple:
-    """Each group's first row, end, count of `block_k`-row blocks, and its first block's first row."""
-    group_starts = jnp.concatenate([jnp.zeros(1, jnp.int32), jnp.cumsum(group_sizes)[:-1]]).astype(jnp.int32)
-    group_ends = jnp.cumsum(group_sizes).astype(jnp.int32)
+    """Each group's first row, end, count of `block_k`-row blocks, and its first block's first row, from the
+    groups' one prefix sum (`_prefix_sums`, as `tile_groups` reads them)."""
+    group_sizes = group_sizes.astype(jnp.int32)
+    group_ends = _prefix_sums(group_sizes)
+    group_starts = group_ends - group_sizes
     group_block_starts = group_starts // block_k * block_k
     group_block_ends = -(group_ends // -block_k) * block_k
     return group_starts, group_ends, (group_block_ends - group_block_starts) // block_k, group_block_starts

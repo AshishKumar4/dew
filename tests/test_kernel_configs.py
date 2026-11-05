@@ -203,8 +203,9 @@ def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources
             model = _model(launch, ba, tiles)
         return support.KernelCase(f"gmm {tiles}", lambda: launch.lowering(ba, tiles), {"dew_gmm": model})
 
-    found = compile_mosaic_kernels([case(mosaic_gpu.Tiles(128, 128, 64, 3, 1)),
-                                    case(mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2))], "sm90")
+    found = compile_mosaic_kernels([case(mosaic_gpu.Tiles(128, 128, 64, 3, 1, family='wgmma')),
+                                    case(mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2,
+                                                          family='wgmma'))], "sm90")
     assert len(found) == 2 and all(record.get("kernels") for record in found), found
     failed = mosaic_failures(found) + model_failures(found)
     assert not failed, "\n".join(failed)
@@ -224,7 +225,7 @@ def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
     def call():
         def gmm(lhs, rhs, sizes):
             return mosaic_gpu.gmm(lhs, rhs, sizes, tiles=mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2,
-                                                                          cluster=2),
+                                                                          cluster=2, family='wgmma'),
                                   transpose_rhs=False, out_dtype=jnp.bfloat16, dense=True,
                                   multiprocessors=generation.gpu_target("sm90").multiprocessors)
 
@@ -396,17 +397,20 @@ FP8_FORMS = ("forward fp8",)
 HOOKED_FORMS = ("kernel gradient exact fp32", "normed biased forward", "normed biased input gradient",
                 "normed kernel gradient", "exact normed kernel gradient", "fp16 normed biased forward",
                 "cast forward", "gated forward", "gated kernel gradient", "residual forward",
-                "two bf16 outputs forward", "scaled forward", "row scaled forward", "paired swiglu forward",
-                "paired forward")
+                "two bf16 outputs forward", "scaled forward", "row scaled forward")
 """The hooked and exactly summed forms a family whose model counts what they hold emits
 (`Family.counts_hooks`): prologues (a norm, a cast, SwiGLU's gate tile), epilogues over side vectors and a
-side tile, a second output, a paired product, and the running sum, each priced by what it materializes
+side tile, a second output, and the running sum, each priced by what it materializes
 (`grouped_matmul._Mosaic.registers`)."""
+
+PAIRED_FORMS = ("paired swiglu forward", "paired forward")
+"""The paired products a family whose consumers issue no ring's loads emits beside those counting hooks,
+their only hook the epilogue over their two accumulators (`grouped_matmul._pair_alone`, row 2100)."""
 
 
 def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
-    """Each GEMM Mosaic launch form (`PLAIN_FORMS`, `HOOKED_FORMS`) at a projection's extents: its name,
-    launch, abstract operands and options."""
+    """Each GEMM Mosaic launch form (`PLAIN_FORMS`, `PAIRED_FORMS`, `HOOKED_FORMS`) at a projection's
+    extents: its name, launch, abstract operands and options."""
     from test_gemm_template import (
         biased,
         casted,
@@ -565,7 +569,8 @@ def _emitted_forms(family, shape: str | None = None) -> set[str]:
     and whose contraction steps by its narrowest depth (`Family.column_unit`, `Family.depths`)."""
     if family is None:
         return set()
-    forms = {*PLAIN_FORMS, *(HOOKED_FORMS if family.counts_hooks else ()),
+    forms = {*PLAIN_FORMS, *(PAIRED_FORMS if family.counts_hooks or not family.feeds_itself else ()),
+             *(HOOKED_FORMS if family.counts_hooks else ()),
              *(FP8_FORMS if family.takes_fp8 else ())}
     if shape is None:
         return forms
@@ -961,7 +966,7 @@ def test_refusals_cross_processes_only_through_an_explicit_handoff(tmp_path):
     import subprocess
     import sys
 
-    tile = "mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2)"
+    tile = "mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, family='wgmma')"
     preamble = ("import json, sys\n"
                 "from dew.nn.kernels import tuning\n"
                 "from dew.nn.kernels.templates import report\n"

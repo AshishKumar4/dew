@@ -70,7 +70,7 @@ import math
 import os
 from collections.abc import Callable, Mapping, Sequence
 from types import TracebackType
-from typing import TYPE_CHECKING, Literal, Protocol, overload, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, overload, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -221,6 +221,22 @@ def location(directory: str) -> epath.Path:
     """
     path = epath.Path(directory)
     return path if is_uri(directory) else path.resolve()
+
+
+class Envelope(TypedDict):
+    """What a checkpoint of a run's state holds on every tier, as `Checkpoints.save` and `save_local` each
+    take it, their own metadata beside it: the state as saved, its data position (`saved`), the partition
+    it was read by, the stop control, the rung, the artifact, the boxed axes and the rollout's tree
+    (`dew.training.Trainer`'s one envelope, row 4126)."""
+
+    state: TrainState
+    saved: bytes | None
+    share: DataPartition | None
+    control: dict | None
+    rung: JSON
+    artifact: JSON
+    boxed: Mapping[tuple[str, ...], LogicalAxes] | None
+    rollout: Mapping[str, object] | None
 
 
 @dataclasses.dataclass(frozen=True)

@@ -247,7 +247,7 @@ def test_the_template_holds_check_1_with_its_hooks(generation_name, case):
                         seeds=SEEDS, truth_fn=_drop(_plain(spec, truth=True)))
 
 
-COOPERATIVE = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2)
+COOPERATIVE = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, family='wgmma')
 """A tile two consumer warpgroups compute, on one multiprocessor."""
 
 FED = dataclasses.replace(COOPERATIVE, family=mosaic_sm90.FED.name)
@@ -1437,7 +1437,7 @@ def test_a_tpu_launch_takes_a_legal_pin_and_names_why_it_refuses_another():
         assert launch.pinnable(ba, launch.derived(ba, target))
         assert not launch.pinnable(ba, mosaic_tpu.Blocks(8, 8, 8))
         assert launch.unpinnable(ba, mosaic_tpu.Blocks(8, 8, 8))
-        assert launch.unpinnable(ba, mosaic_gpu.Tiles(64, 64, 64, 2, 1))
+        assert launch.unpinnable(ba, mosaic_gpu.Tiles(64, 64, 64, 2, 1, family='wgmma'))
 
 
 @pytest.mark.parametrize("side_dtype", [jnp.float32, jnp.bfloat16])
@@ -1569,7 +1569,8 @@ def test_the_mosaic_kernels_load_a_side_operands_rows_from_any_dimension():
     with the plain program's over the draws (check 1), truth the plain program's in float64 (eagerly: the
     interpreter's ordered callbacks)."""
     sizes = jnp.asarray(SIDE_SIZES)
-    common = {"tiles": mosaic_gpu.Tiles(64, 64, 64, 2, 1), "out_dtype": jnp.float32, "multiprocessors": 1,
+    common = {"tiles": mosaic_gpu.Tiles(64, 64, 64, 2, 1, family='wgmma'), "out_dtype": jnp.float32,
+              "multiprocessors": 1,
               "interpret": grouped_matmul.INTERPRETED}
     for hook, layout, transposed in SIDE_LAYOUTS:
         def dew(x, w, dy, side, hook=hook, layout=layout, transposed=transposed):
@@ -1590,7 +1591,7 @@ def test_a_split_kernel_gradient_holds_check_1(splits):
     no whole step, an empty group among them and one of a row, with more runs than some groups have blocks:
     each group's gradient on par with XLA's over the draws (check 1), truth float64's."""
     sizes = jnp.asarray(SIZES)
-    tiles = mosaic_gpu.Tiles(64, 64, 64, 2, 1, splits=splits)
+    tiles = mosaic_gpu.Tiles(64, 64, 64, 2, 1, splits=splits, family='wgmma')
 
     def split(x, dy):
         return mosaic_gpu.tgmm(x, dy, sizes, tiles=tiles, out_dtype=jnp.float32, multiprocessors=1,
@@ -1668,7 +1669,7 @@ def test_exact_sums_add_each_steps_product_as_the_plain_sum_does(generation_name
     plain kernel gradient over the draws (check 1), truth the plain kernel gradient in float64."""
     # One tile both ways, a step of EXACT_STEP rows.
     tiles = {grouped_matmul.Tgmm: grouped_matmul.Tile(64, 128, 64, 4, 2),
-             grouped_matmul.MosaicTgmm: mosaic_gpu.Tiles(64, 128, 64, 2, 1)}
+             grouped_matmul.MosaicTgmm: mosaic_gpu.Tiles(64, 128, 64, 2, 1, family='wgmma')}
     launches = ("triton", "mosaic_gpu") if generation_name == "sm90" else ("triton",)
     for launch, group_sizes, precision in itertools.product(launches, (SIZES, None),
                                                             ("highest", "default")):
@@ -1728,8 +1729,8 @@ def test_a_tile_states_a_schedule_the_kernels_run():
     for fields in ({"warpgroups": 1, "cluster": 2}, {"warpgroups": 3}, {"warpgroups": 2, "cluster": 4},
                    {"warpgroups": 2, "stages": 1}):
         with pytest.raises(ValueError):
-            mosaic_gpu.Tiles(**{"block_m": 128, "block_n": 128, "block_k": 64, "stages": 3, "grid_block_n": 1}
-                             | fields)
+            mosaic_gpu.Tiles(**{"block_m": 128, "block_n": 128, "block_k": 64, "stages": 3, "grid_block_n": 1,
+                                "family": "wgmma"} | fields)
     launch = grouped_matmul.MosaicTgmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     with generation.assumed("sm90"):
@@ -1740,7 +1741,7 @@ def test_a_tile_states_a_schedule_the_kernels_run():
     x = jnp.zeros((ROWS, 512), jnp.bfloat16)
     with pytest.raises(ValueError):
         mosaic_gpu.tgmm(x, jnp.zeros((ROWS, WIDTH), jnp.bfloat16), jnp.asarray(SIZES),
-                        tiles=mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, cluster=2),
+                        tiles=mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, cluster=2, family='wgmma'),
                         out_dtype=jnp.float32, multiprocessors=2)
 
 
@@ -1760,8 +1761,9 @@ def test_a_pin_names_only_a_config_the_launchs_kernel_takes():
         return gemm.gemm_t(x, dy, sizes, out_dtype=jnp.float32, precision="highest",
                                interpret_on_cpu=True)
 
-    calls = ((forward, (x, w), "mosaic_gpu", grouped_matmul.MosaicGmm, mosaic_gpu.Tiles(64, 64, 64, 1, 1),
-              mosaic_gpu.Tiles(64, 64, 64, 2, 1)),
+    calls = ((forward, (x, w), "mosaic_gpu", grouped_matmul.MosaicGmm,
+              mosaic_gpu.Tiles(64, 64, 64, 1, 1, family='wgmma'),
+              mosaic_gpu.Tiles(64, 64, 64, 2, 1, family='wgmma')),
              (gradient, (x, dy), "triton", grouped_matmul.Tgmm, grouped_matmul.Tile(128, 128, 64, 4, 3),
               grouped_matmul.Tile(64, 128, 64, 4, 3)))
     for run, args, named, launch, refused, legal in calls:
@@ -1818,7 +1820,8 @@ def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
         [tile] = launch.fitting(exact, target)
         budget = mosaic_gpu.family_of(tile, jnp.bfloat16).registers(tile.warpgroups)
         assert 2 * tile.block_m * tile.block_n // (128 * tile.warpgroups) < budget
-        narrow, wide = (mosaic_gpu.Tiles(128, width, 64, 2, 1, warpgroups=2) for width in (128, 256))
+        narrow, wide = (mosaic_gpu.Tiles(128, width, 64, 2, 1, warpgroups=2, family='wgmma')
+                        for width in (128, 256))
         assert launch.legal(exact, narrow, target) and launch.legal(plain, narrow, target)  # 128 a thread
         assert not launch.legal(exact, wide, target) and launch.legal(plain, wide, target)  # 256
         # Triton's kernel gradient with exact sums takes at most EXACT_STEP rows a step.
@@ -2001,9 +2004,8 @@ def test_the_templates_paired_product_holds_check_1(generation_name, grouped):
     gradient (the rows', both matrices') through the paired product's own reverse mode on the routes the
     selector takes (its two accumulators recomputed, the input gradient's two products summed wide: the
     SwiGLU's fp32 cotangents multiply wide, which warpgroup MMA's 16-bit products do not take), each as
-    exact as the unfused program's from float64 truth. On mma.sync, which takes no paired call, its two
-    products run apart (`grouped_matmul.APART`, a structural handoff a named kernel keeps), each through
-    its own launch, the named one, the SwiGLU in XLA on their fp32 accumulators (`gemm._apart`). The
+    exact as the unfused program's from float64 truth. On mma.sync too the paired product is one launch,
+    its only hook the epilogue over its two accumulators (`grouped_matmul._pair_alone`, row 2100). The
     gradients run eagerly, as the Mosaic interpreters' ordered callbacks need."""
     rows, depth, width = 136, 128, 256
     sizes = jnp.asarray([70, 66], jnp.int32) if grouped else None
@@ -2038,10 +2040,11 @@ def test_the_templates_paired_product_holds_check_1(generation_name, grouped):
     label = f"paired {'grouped' if grouped else 'dense'} product on {generation_name}"
     truth = functools.partial(plain, wide=jnp.float64, out=jnp.float64)
     with generation.assumed(generation_name):
-        # Named: on mma.sync, which takes no pair, the call hands its two products on apart, each Mosaic's.
-        with generation.chosen(grouped_matmul="mosaic_gpu"):
+        # Named, the value is the one paired launch's on either family.
+        with generation.chosen(grouped_matmul="mosaic_gpu"), generation.routes() as routes:
             assert_as_exact(jax.jit(valued(dew)), jax.jit(valued(plain)), draw, label, seeds=SEEDS,
                             truth_fn=valued(truth))
+        assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic_gpu"}
         assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), draw, f"{label}, gradients",
                         seeds=SEEDS, truth_fn=with_gradients(truth))
 
