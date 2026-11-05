@@ -527,7 +527,7 @@ def _expressions(layered, stacked, inputs: Sequence, outputs: Sequence) -> list[
     refusals = []
     for output, returned in zip(outputs, stack_results, strict=True):
         places = output.places if isinstance(output, _Rows) else (output,)
-        rows = _rows_of(numbering.read(stack, returned), output, leads.get(returned))
+        rows = _rows_of(numbering.read(stack, returned), output, leads.get(returned), numbering.uniform)
         if rows is None or any(row != numbering.read(lay, lay_results[place])
                                for row, place in zip(rows, places, strict=True)):
             refusals.append(f"its output {places[0]} computes its layer otherwise over the stack, or by no "
@@ -535,14 +535,14 @@ def _expressions(layered, stacked, inputs: Sequence, outputs: Sequence) -> list[
     return refusals
 
 
-def _rows_of(number, output, lead: int | None) -> tuple | None:
+def _rows_of(number, output, lead: int | None, uniform: set[int]) -> tuple | None:
     """Each row's number of a result the stacked program numbered `number`, returned as `output`: a
-    stack's rows on the leading axes `output` holds them on; one number of no stack, the same each row's
-    (a scalar's broadcast); None where the two disagree."""
+    stack's rows on the leading axes `output` holds them on; one number of no stack, each row's only where
+    it is one value at every entry (`uniform`, a scalar's broadcast); None where the two disagree."""
     if not isinstance(output, _Rows):
         return None if isinstance(number, tuple) or number is None else (number,)
     if not isinstance(number, tuple):
-        return None if number is None else (number,) * len(output.places)
+        return None if number not in uniform else (number,) * len(output.places)
     if len(number) != len(output.places) or lead != output.lead:
         return None
     return number
@@ -556,7 +556,11 @@ class _Numbering:
 
     def __init__(self):
         self.numbers: dict[Hashable, int] = {}
-        self.sums: dict[int, tuple[int, ...]] = {}
+        self.sums: dict[int, tuple[tuple[int, int], ...]] = {}
+        self.nonnegative: set[int] = set()
+        """The numbers of values no entry of which is negative: squares, magnitudes, their sums and roots,
+        whose sums reassociated round within the same bound in any order (no cancellation), so their
+        order is no part of their expression (`summed`)."""
         self.uniform: set[int] = set()
         """The numbers of a scalar's broadcasts, a value the same at every entry, so the same in each row of
         a stack of its shape."""
@@ -565,10 +569,17 @@ class _Numbering:
         return self.numbers.setdefault(key, len(self.numbers))
 
     def summed(self, terms: Sequence[int]) -> int:
-        """The number of the sum of `terms`, each sum among them read as its own terms, in any order."""
-        parts = tuple(sorted(part for term in terms for part in self.sums.get(term, (term,))))
+        """The number of the sum of `terms`, each non-negative (`nonnegative`), each sum among them read as
+        its own terms, in any order: its terms and how many times each, so a sum of a thousand leaves is
+        kept as its terms, not as every prefix's."""
+        counts: dict[int, int] = {}
+        for term in terms:
+            for part, times in self.sums.get(term, ((term, 1),)):
+                counts[part] = counts.get(part, 0) + times
+        parts = tuple(sorted(counts.items()))
         total = self.number(("sum", parts))
         self.sums[total] = parts
+        self.nonnegative.add(total)
         return total
 
     def read(self, numbers: dict, value) -> int | tuple[int, ...] | None:
@@ -584,7 +595,8 @@ class _Numbering:
         sum of their terms (`summed`)."""
         name = equation.primitive.name
         spread = name == "broadcast_in_dim" and tuple(shapes[0]) == ()
-        if name == "add" and all(tuple(shape) == () for shape in shapes):
+        if name == "add" and all(tuple(shape) == () for shape in shapes) and all(
+                operand in self.nonnegative for operand in operands):
             return [self.summed(operands)]
         held = {key: setting for key, setting in params.items() if not (spread and key in _SHAPED)}
         _, keyed = parameters_key(equation.primitive, held)
@@ -600,6 +612,8 @@ class _Numbering:
                       for operand, shape in zip(operands, shapes, strict=True))
         if spread or (free and name in ENTRYWISE and uniform):
             self.uniform.update(made)
+        if _keeps_sign(name, params, operands, self.nonnegative):
+            self.nonnegative.update(made)
         return made
 
     def program(self, equations, named: dict, leads: dict) -> dict:
@@ -653,8 +667,9 @@ class _Numbering:
                 stacked.append(index)
         row_shapes = [shape[held:] if index in stacked else shape for index, shape in enumerate(shapes)]
         every = _full_sum(equation, held)
-        if every is not None:
-            # A sum over every axis of a stack: the sum of each row's sum over its own axes.
+        if every is not None and all(row in self.nonnegative for row in operands[0]):
+            # A sum over every axis of a stack of no negative entry: the sum of each row's sum over its own
+            # axes, in any order (`summed`).
             return [(self.summed([self.equation(equation, every, [operands[0][row]], row_shapes)[0]
                                   for row in range(count)]), None)]
         form = _row_form(equation, held, set(stacked), shapes)
@@ -703,8 +718,10 @@ class _Numbering:
                 if out is None or any(isinstance(number, tuple) for number, _ in out[carries:]):
                     return None
                 carry, steps[step] = out[:carries], [number for number, _ in out[carries:]]
-            stacked = [(self.number(("stacked steps", tuple(steps[step][index] for step in sorted(steps)))),
-                        None) for index in range(len(equation.outvars) - carries)]
+            # A loop's stacked results, its steps' on a new leading axis, keyed by their shapes too.
+            stacked = [(self.number(("stacked steps", tuple(equation.outvars[carries + index].aval.shape),
+                                     tuple(steps[step][index] for step in sorted(steps)))), None)
+                       for index in range(len(equation.outvars) - carries)]
             return [*carry, *stacked]
         index, *given = operands
         if isinstance(index, tuple):
@@ -767,12 +784,28 @@ UNROLLED = 256
 numbered once a step; a longer one keeps every layer whole."""
 
 
+def _keeps_sign(name: str, params: Mapping, operands: Sequence, nonnegative: set[int]) -> bool:
+    """Whether an equation `name` under `params` over `operands` makes no negative entry: a square (`x * x`,
+    `square`, an even integer power), a magnitude, an exponential, or a sum, product, maximum, quotient,
+    root or conversion of values that make none."""
+    if name in ("abs", "exp", "square") or (name == "mul" and len(operands) == 2
+                                             and operands[0] == operands[1]):
+        return True
+    if name == "integer_pow" and params.get("y", 1) % 2 == 0:
+        return True
+    return name in ("add", "mul", "div", "max", "sqrt", "rsqrt", "reduce_sum", "reduce_max",
+                    "convert_element_type", "broadcast_in_dim", "reshape", "squeeze", "expand_dims") and all(
+        operand in nonnegative for operand in operands)
+
+
 def _moved(equation, operands: list, leads: list) -> tuple | None:
     """A stack's rows moved whole, each row as it was: a reshape that keeps every row's own shape after
     its rows' axes (merging, splitting or adding them, a value of no stack becoming a stack of one row,
     one row its value again), a squeeze of its rows' axes of one row, a slice of rows along its one axis
     of them, or a concatenation of stacks along it. None for any other equation."""
     name, params = equation.primitive.name, equation.params
+    if name not in ("reshape", "squeeze", "slice", "concatenate"):
+        return None
     shape = tuple(equation.invars[0].aval.shape)
     number, lead = operands[0], leads[0]
     out = tuple(equation.outvars[0].aval.shape)
