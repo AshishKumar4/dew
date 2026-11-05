@@ -938,7 +938,7 @@ dew.training.inspection.Inspection
   cotangents: bool = False
   histogram: bool = False
 dew.training.profiling.ProfileWindow
-  directory: str
+  directory: str | None
   steps: int
   warmup: int = 2
   capture: dew.telemetry.profile.CaptureOptions = dew.telemetry.profile.CaptureOptions()
