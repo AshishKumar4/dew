@@ -9,12 +9,17 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import BATCH, FEATURES, Counting, dataset
+from affine_run import BATCH, FEATURES, Counting, Regression, dataset
+from etils import epath
 from flax import linen as nn
+from model_support import largest_difference
 from recording import bits
 from reference_error import assert_computes_the_oracle
 
-from dew.objectives.base import Aux, Objective, Ratio, Weighted
+from dew.averaging import power_decay
+from dew.checkpoints import frozen_entries
+from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Weighted
+from dew.optim import power_profiles
 from dew.training import Checkpoints, DiLoCo, Layout, MeshSpec, Trainer
 
 RATE, OUTER_RATE, MOMENTUM = 0.05, 0.7, 0.9
@@ -344,3 +349,93 @@ def test_a_replicas_fields_are_the_train_states_marked_ones_and_its_typed_view_n
     assert tuple(name for name, _ in marked) == REPLICA_FIELDS
     view = {name: kind for name, kind in ReplicaState.__annotations__.items() if not name.startswith("__")}
     assert view == dict(marked)
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_diloco_runs_profiles_are_kept_snapshots_that_rebuild_its_groups_mean_average(tmp_path):
+    """Under DiLoCo the configured optimizer, and the power profiles it keeps, are the groups' inner ones
+    (`DiLoCo.started`). Each checkpoint is a snapshot of them, kept past `keep` (row 4317), and the post-hoc
+    EMA rebuilt from them is the groups' mean of each group's own reconstruction: within fp32 rounding at
+    the weights' scale of the mean of the EMAs the groups track directly, as a run of one copy's is, each
+    stored profile's mean over a hundred times that bound from it."""
+    objective = Regression()
+    objective.ema = EMASpec(decay=power_decay(0.07))
+    run = Trainer(objective, power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0),
+                  layout=Layout(min_shard=1, tolerance=1.0), mesh=MeshSpec(diloco=2).build(jax.devices()[:2]),
+                  diloco=DiLoCo(every=2), checkpoints=Checkpoints(str(tmp_path / "run"), keep=1))
+    state = run.fit(dataset(), steps=96, log_every=96, checkpoint_every=4)
+    run.checkpoints.wait()
+
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    assert checkpoints.profile_steps() == list(range(4, 97, 4))
+    groups_mean = jax.tree.map(lambda leaf: np.mean(np.asarray(leaf), axis=0), state.inner.ema["params"])
+    rebuilt = checkpoints.posthoc_ema(0.07)
+    scale = max(float(np.max(np.abs(leaf))) for leaf in jax.tree.leaves(groups_mean))
+    bound = 2 * np.finfo(np.float32).eps * scale
+    assert largest_difference(rebuilt, groups_mean) <= bound
+    for average in checkpoints.restore_profiles(96):
+        mean = jax.tree.map(lambda leaf: np.mean(leaf, axis=0), average)
+        assert largest_difference(mean, groups_mean) > 100 * bound
+
+
+class Tabled(Objective):
+    """A regression whose `count` collection moves every step, beside a `constants` table no step moves,
+    with an EMA of its weights."""
+
+    def __init__(self):
+        self.ema = EMASpec(decay=optax.constant_schedule(0.5))
+
+    def fresh_variables(self, key, held):
+        return {"params": {"w": jnp.zeros((FEATURES,))}, "count": {"n": jnp.zeros(())},
+                "constants": {"table": jnp.arange(1000.0)}}
+
+    def loss(self, variables, batch, step):
+        error = jnp.square(batch["x"] @ variables["params"]["w"] - batch["y"][:, 0])
+        return (Ratio(jnp.sum(error), jnp.asarray(error.size, jnp.float32)),
+                Aux(metrics={}, variables={"count": {"n": variables["count"]["n"] + 1}}))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_diloco_step_stores_its_groups_collections_once_and_their_ema_against_their_weights(tmp_path):
+    """A DiLoCo run's groups hold their own copies of the model's collections and of its EMA (row 4318). A
+    step writes the groups' collections but `params` to the run's content-addressed store, as it writes the
+    outer model's (docs/guides/checkpoints.md), so the table no step moves is one entry of the groups' and
+    one of the outer model's, which every step records; and it stores the groups' EMA as byte planes of its
+    difference from their weights, which Orbax alone decodes to the groups' EMA bit for bit. The run resumes
+    from those steps and ends where an unbroken one does, to the bit."""
+    import orbax.checkpoint as ocp
+
+    def run(path=None):
+        return trainer(2, diloco=DiLoCo(every=2, rate=OUTER_RATE, momentum=MOMENTUM), objective=Tabled(),
+                       path=path)
+
+    unbroken = run().fit(dataset(), steps=5, log_every=1)
+    stopped = run(tmp_path / "run").fit(dataset(), steps=3, checkpoint_every=1, log_every=1)
+
+    manager = ocp.CheckpointManager(str(tmp_path / "run"), item_handlers=ocp.PyTreeCheckpointHandler())
+    assert set(manager.metadata(3).item_metadata.tree["inner"]["variables"]) == {"params"}
+    recorded = set.intersection(*(set(frozen_entries(str(tmp_path / "run" / str(step))))
+                                  for step in (1, 2, 3)))
+    with ocp.PyTreeCheckpointer() as checkpointer:
+        shapes = sorted(tuple(leaf.shape) for entry in recorded for leaf in jax.tree.leaves(
+            checkpointer.metadata(epath.Path(tmp_path / "run") / entry).item_metadata.tree))
+    assert shapes == [(2, 1000), (1000,)]
+
+    tree = manager.restore(3, args=ocp.args.PyTreeRestore())
+    deltas = manager.metadata(3).custom_metadata["deltas"]["inner/ema"]
+    weights = dict(jax.tree_util.tree_flatten_with_path(tree["inner"]["variables"])[0])
+    averages = dict(jax.tree_util.tree_flatten_with_path(stopped.inner.ema)[0])
+    assert deltas
+    for path, stored in jax.tree_util.tree_flatten_with_path(tree["inner"]["ema"])[0]:
+        want = np.asarray(averages[path])
+        if jax.tree_util.keystr(path) in deltas:
+            live = np.asarray(weights[path])
+            unsigned = np.dtype(f"uint{8 * live.dtype.itemsize}")
+            planes = np.asarray(stored)
+            bits_of = sum(planes[k].astype(unsigned) << unsigned.type(8 * k) for k in range(len(planes)))
+            stored = (live.view(unsigned) ^ bits_of).view(live.dtype)
+        np.testing.assert_array_equal(np.asarray(stored), want)
+
+    resumed = run(tmp_path / "run").fit(dataset(), steps=5, checkpoint_every=1, log_every=1)
+    for mine, theirs in zip(bits(resumed), bits(unbroken), strict=True):
+        np.testing.assert_array_equal(mine, theirs)
