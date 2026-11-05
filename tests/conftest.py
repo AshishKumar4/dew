@@ -165,7 +165,31 @@ def pytest_terminal_summary(terminalreporter):
         terminalreporter.write_line(_remote.summary())
 
 
+def release_unheld(requirement: str) -> str | None:
+    """Why this interpreter cannot run a test marked release_env(`requirement`), a release's own code
+    under the package it pins apart from the suite's, or None where it holds that package: the overlay CI's
+    release task runs it under (tools/armada/ci.py `released`) named, where the release's own loader
+    would fail opaquely in its subprocess (row 3576)."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    from packaging.requirements import Requirement
+
+    pinned = Requirement(requirement)
+    try:
+        held = version(pinned.name)
+    except PackageNotFoundError:
+        held = None
+    if held is not None and pinned.specifier.contains(held, prereleases=True):
+        return None
+    return (f"this release's own code runs under {requirement}, and this interpreter holds {pinned.name} "
+            f"{held or 'not at all'}: run it under that overlay, as CI's release task does: "
+            f"uv run --with '{requirement}' -- python -m pytest <test>")
+
+
 def pytest_runtest_setup(item):
+    released = item.get_closest_marker("release_env")
+    if released is not None and (unheld := release_unheld(released.args[0])) is not None:
+        pytest.fail(unheld, pytrace=False)
     marker = item.get_closest_marker("mesh")
     needed = marker.kwargs.get("devices", lane_environment.MESH_DEVICES) if marker else 0
     if jax.device_count() < needed:

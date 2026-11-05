@@ -73,9 +73,9 @@ class Tiles:
     consumer warpgroups beside a producer that issues the loads, CUTLASS's cooperative sm90 schedule), and
     the multiprocessors of a cluster (`cluster`: 2 pair two row tiles of one group of `gmm`, which load
     their matrix block once between them, multicast), only for a cooperative tile; `tgmm` takes no pair;
-    and the bundle that runs it (`family`, `bundles.named`: Hopper's warpgroup MMA, its loads a producer
-    warpgroup's or, 'wgmma.fed', its first consumer's, or Ampere's mma.sync, one warpgroup whose loads
-    `emit_pipeline` issues, the plain product alone); and the programs
+    and the bundle that runs it (`family`, `bundles.named`, which each tile names: Hopper's warpgroup MMA,
+    its loads a producer warpgroup's or, 'wgmma.fed', its first consumer's, or Ampere's mma.sync, one
+    warpgroup whose loads `emit_pipeline` issues, the plain product alone); and the programs
     a multiprocessor runs at once (`programs`, at most its family's, `mosaic.Family.programs`), each in its
     share of the multiprocessor's shared memory (`resources.program_shared`); and the slices a kernel
     gradient's contraction splits into (`splits`, `tgmm`: each group's rows in that many runs of whole steps,
@@ -90,7 +90,7 @@ class Tiles:
     grid_block_n: int
     warpgroups: int = 1
     cluster: int = 1
-    family: str = 'wgmma'
+    family: str = dataclasses.field(kw_only=True)
     programs: int = 1
     splits: int = 1
     swapped: bool = False

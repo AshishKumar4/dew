@@ -550,6 +550,29 @@ def test_layout_parity_reads_the_first_step_as_the_trainer_does():
     assert int(step.committed) == 5 and step.example_count == 4
 
 
+def test_layout_parity_reads_every_first_step_through_the_trainers(monkeypatch):
+    """The reference's audit, its float64 anchor and the anchor's loss each read the trainer's first step
+    (`first_step`, ledger 3057, 3092) over the state they judge, which the test above holds to the
+    trainer's: a site that built its Step by hand would pass by it, and is caught here."""
+    tool = load("layout_parity")
+    read = []
+    first_step = tool.first_step
+
+    def spied(state, variables, ema, batch):
+        read.append(int(state.updates))
+        return first_step(state, variables, ema, batch)
+
+    monkeypatch.setattr(tool, "first_step", spied)
+    _, reference = tool.model_case("jepa", "float32", {}, {})
+    with jax.enable_x64(new_val=True), tempfile.TemporaryDirectory() as directory:
+        tool.Judge(reference, tool.References(Path(directory)), "jepa").audit()
+        tool.Anchor(reference, "jepa")
+        state, _, _ = tool._trainer(reference, {}, one_device=True).place()
+        tool.anchor_loss(reference, tool.drawn_batch(reference, 0), state.replace(
+            updates=jnp.asarray(5, jnp.int32)))
+    assert read == [0, 0, 5]
+
+
 def test_layout_parity_holds_every_arm_to_the_references_sample():
     """An arm that drew and started from the reference's values, at every example, is coupled to it; one
     whose draw is transformed for one example, or that records a name the reference does not, is
