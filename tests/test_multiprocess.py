@@ -305,15 +305,42 @@ def test_a_decision_release_partitioned_over_a_pool_publishes_its_readout(tmp_pa
 
 @pytest.mark.distributed
 def test_a_pool_refuses_serving_from_one_processs_engine_before_it_compiles(tmp_path):
-    """Over two processes, an engine over a scoring server whose weights span both, and a served GRPO
-    rollout, whose engine steps one process's server, are each refused by name on every process before
-    any program compiles (rows 4361 and 4363; the served run's path is row 4279)."""
+    """Over two processes, an engine over a scoring server whose weights span both is refused by name on
+    every process before any program compiles (row 4361)."""
     reports = run_pool("served_refusals", tmp_path, 2, timeout=120,
                        script=Path(__file__).with_name("serving_pool_worker.py"))
     for report in reports:
         assert "an engine steps kinds of one process" in report["scoring"], report
-        assert "a served rollout's engine steps one process's server" in report["served"], report
         assert report["compiled"] == 0, report
+
+
+@pytest.mark.distributed
+def test_a_pool_draws_its_rollouts_ahead_from_one_server_it_steps_together(tmp_path):
+    """A GRPO run over two processes whose rollouts are served (`RolloutScheduler.served`) draws them from
+    one server over both processes' devices, which every process steps together on its run's own thread
+    as each call admits its groups, with no engine thread, and reloads at each push (row 4279): both
+    train three updates, each call admitting a group of every task, and a batch submitted a step ahead
+    trails the trainer's weights by the third (a lag above 0)."""
+    reports = run_pool("served_rollout", tmp_path, 2, timeout=300,
+                       script=Path(__file__).with_name("serving_pool_worker.py"))
+    for report in reports:
+        assert report["step"] == 3 and report["pooled"] and report["engines"] == [], report
+        assert report["groups"] == [4, 4, 4], report
+        assert max(report["lags"]) > 0, report
+
+
+@pytest.mark.distributed
+def test_a_pooled_servers_step_failing_on_one_process_stops_it_on_every_one(tmp_path):
+    """A served GRPO run over two processes whose server's step fails on one process alone fails on both,
+    neither left waiting on a round the other never reads: the failing process raises its own error, the
+    other hears it at the step's agreement (`PeerFailure`), and each server then refuses a draw as
+    stopped (row 4279's review)."""
+    reports = run_pool("served_step_failure", tmp_path, 2, timeout=300,
+                       script=Path(__file__).with_name("serving_pool_worker.py"))
+    assert reports[1]["raised"].startswith("RuntimeError: an injected step failure"), reports
+    assert reports[0]["raised"].startswith("PeerFailure"), reports
+    for report in reports:
+        assert report["stopped"] is not None and "stopped" in report["stopped"], report
 
 
 def document_corpus(directory: Path, documents: int, length) -> Corpus:
