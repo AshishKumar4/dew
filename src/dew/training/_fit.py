@@ -360,7 +360,7 @@ class FitRun:
     emptied: Emptied | None = None
     """A pooled run's batches of the pool's tree with nothing in them, which a share that ran out steps
     with (`pooled_read`)."""
-    profiled: tuple[int, int] | None = None
+    profiled: tuple[int, int, str] | None = None
     """The steps a stopped profile window traced and the step it stopped at, whose export the run's
     cleanup waits for before it reports the window (`Trainer._exported_profile`)."""
     best: HeldBest = dataclasses.field(default_factory=HeldBest)
@@ -389,12 +389,12 @@ class FitRun:
             start_capture(profiler)
             self.tracing = True
 
-    def close_window(self, profiler: Profiler) -> None:
+    def close_window(self, profiler: Profiler, window: ProfileWindow) -> None:
         """Stop the window's owned capture (`stop_capture`), its reports exported beside the steps after
         it until the run's cleanup waits for them and its outcome reports the window
         (`Trainer._reported_outcome`)."""
-        stop_capture(profiler, self.loss)
-        self.profiled = (self.traced, self.current)
+        stop_capture(profiler, self.loss, window)
+        self.profiled = (self.traced, self.current, str(profiler.directory))
 
     def committed_examples(self, interval: Interval, points: Sequence[int], state: TrainState,
                            window: int) -> tuple[int, int]:
