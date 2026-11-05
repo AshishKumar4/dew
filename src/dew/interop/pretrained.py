@@ -190,6 +190,25 @@ def on_default_device(variables: Variables) -> Variables:
                          if isinstance(leaf, (np.ndarray, np.generic)) else leaf, in_place=True)
 
 
+def _extension_drawn(model: nn.Module, selected: Callable[[tuple[str, ...]], bool], key: int | jax.Array, *,
+                     shaped: bool = False) -> Variables:
+    """The variables an extension adds to a source (cross-attention's blocks, DEX's projections and
+    constants): `model`, the source with the extension, drawn from `key` (`request_key`) over a token more
+    than the prediction depths it carries, which each read one further on, and the leaves whose path
+    `selected` takes kept, plain. Only those leave the program, so the source's own draws are dead code to
+    XLA; with `shaped`, a source loaded without its weights, their shapes alone."""
+    from dew.batch import select, thaw
+    from dew.nn.inputs import request_key
+    from dew.nn.protocols import Predicting
+
+    length = 1 + (model.num_nextn_predict_layers if isinstance(model, Predicting) else 0)
+
+    def drawn(draw: jax.Array) -> Variables:
+        return select(thaw(unboxed(model.init(draw, jnp.zeros((1, length), jnp.int32)))), selected)
+
+    return jax.eval_shape(drawn, request_key(key)) if shaped else owned_program(drawn)(request_key(key))
+
+
 @dataclass(frozen=True)
 class Pretrained:
     """A native model with explicit variables and its checkpoint's host processor.
@@ -598,10 +617,9 @@ class Pretrained:
         cross-attention, so `save` and `export` refuse the result; a run's
         checkpoint keeps it.
         """
-        from dew.batch import freeze, merge, select, thaw
+        from dew.batch import freeze, merge
         from dew.nn.cross_attention import NAME, crossing
-        from dew.nn.inputs import request_key
-        from dew.nn.protocols import CrossAttending, Predicting
+        from dew.nn.protocols import CrossAttending
         from dew.optim import parameter_name
 
         if not isinstance(self.model, CrossAttending):
@@ -609,16 +627,7 @@ class Pretrained:
         if self.model.cross_attention is not None:
             raise ValueError("this bundle already reads a context; attach cross-attention to the source")
         model = self.model.with_cross_attention(cross)
-        # A token more than the prediction depths a source carries, which each read one further on.
-        length = 1 + (model.num_nextn_predict_layers if isinstance(model, Predicting) else 0)
-
-        def drawn(draw: jax.Array) -> Variables:
-            # Only the blocks leave the program, so the source's own draws are dead code to XLA; they
-            # join the loaded tree plain, as the tree entered.
-            return select(thaw(unboxed(model.init(draw, jnp.zeros((1, length), jnp.int32)))),
-                          lambda path: path[0] == "params" and crossing(path))
-
-        blocks = owned_program(drawn)(request_key(key))
+        blocks = _extension_drawn(model, lambda path: path[0] == "params" and crossing(path), key)
         variables = merge(self.variables, blocks)
         # Each block's module, its path under `params` to and with the block's own name.
         added = {"/".join(keys[1:keys.index(NAME) + 1]) for keys in (
@@ -637,26 +646,17 @@ class Pretrained:
         extension: `save` and `export` write each layer's differential at its learned lambda folded into
         its output projection (`dew.nn.dex.folded`), what the model computes outside a run, and refuse a
         layer whose heads' outputs pass through more before it; a run's checkpoint keeps the extension."""
-        from dew.batch import FROZEN, freeze, merge, select, thaw
+        from dew.batch import FROZEN, freeze, merge
         from dew.nn.dex import DEX_COLLECTION, DEX_CONSTANTS, DEX_PARAMETERS
-        from dew.nn.inputs import request_key
-        from dew.nn.protocols import Differential, Predicting
+        from dew.nn.protocols import Differential
 
         if not isinstance(self.model, Differential):
             raise TypeError(f"a {type(self.model).__name__} takes no differential extension")
         model = self.model.with_dex(extension)
-        # A token more than the prediction depths a source carries, which each read one further on.
-        length = 1 + (model.num_nextn_predict_layers if isinstance(model, Predicting) else 0)
-
-        def drawn(draw: jax.Array) -> Variables:
-            # Only the extension leaves the program, so the source's own draws are dead code to XLA; it
-            # joins the loaded tree plain, as the tree entered.
-            return select(thaw(unboxed(model.init(draw, jnp.zeros((1, length), jnp.int32)))),
-                          lambda path: (path[0] == "params" and path[-1] in DEX_PARAMETERS)
-                          or (path[0] == DEX_COLLECTION and path[-1] in DEX_CONSTANTS))
-
         shaped = any(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(self.variables))
-        added = jax.eval_shape(drawn, request_key(key)) if shaped else owned_program(drawn)(request_key(key))
+        added = _extension_drawn(
+            model, lambda path: (path[0] == "params" and path[-1] in DEX_PARAMETERS)
+            or (path[0] == DEX_COLLECTION and path[-1] in DEX_CONSTANTS), key, shaped=shaped)
         variables = merge(self.variables, added)
         if extension.trains == "attention":
             decoder, attention = model.dex_sites()
@@ -2240,10 +2240,6 @@ def native_backbone(directory: str | Path, *, param_dtype: str) -> tuple[Mapping
     return component.config, translated.built.variables
 
 
-DEPTH_COUNTS = ("num_nextn_predict_layers", "mtp_num_hidden_layers", "num_mtp_layers", "n_mtp_layers")
-"""The fields a source's config counts its multi-token prediction depths by, family by family."""
-
-
 def _scopes(config: dict) -> list[dict]:
     """The scopes a decoder's fields are stated in: `config`'s top, then its `text_config` if any."""
     text = config.get("text_config")
@@ -2251,25 +2247,26 @@ def _scopes(config: dict) -> list[dict]:
 
 
 def _kept_depths(config: Mapping[str, object], kept: int) -> dict:
-    """`config` as the config of a checkpoint holding its first `kept` prediction depths alone: each
-    depth count it states (`DEPTH_COUNTS`, at its top or in its `text_config`) at most `kept`. A DSpark
-    drafter's stages, which its `compress_ratios` list past the trunk's layers, draft as one, its heads
-    on its last stage (`dew.interop.families.deepseek`), so it is kept whole or, at 0, not at all;
-    a count between is refused. A load reads, builds and saves the source this config states
-    (`Pretrained.load(prediction_depths=)`)."""
+    """`config` as the config of a checkpoint holding its first `kept` prediction depths alone: each of
+    its scopes (its top, its `text_config`) as its family keeps them (`DecoderFamily.kept_depths`: its
+    own count fields at most `kept`, a DSpark drafter whole or not at all), a wrapper's text by the type
+    the wrapper declares for it (`typed_part`), else by the wrapper's family; a scope no
+    decoder family reads holds no depths a load builds. A load reads, builds and saves the source this
+    config states (`Pretrained.load(prediction_depths=)`)."""
     written = copy.deepcopy(dict(config))
+    families = decoders.families()
+
+    def family_of(scope: Mapping[str, object]):
+        model_type = scope.get("model_type")
+        return families.get(model_type) if isinstance(model_type, str) else None
+
+    top = family_of(written)
     for scope in _scopes(written):
-        for counted in DEPTH_COUNTS:
-            if isinstance(scope.get(counted), int) and scope[counted] > kept:
-                scope[counted] = kept
-        ratios, layers = scope.get("compress_ratios"), scope.get("num_hidden_layers")
-        if scope.get("dspark_block_size") and isinstance(ratios, list) and isinstance(layers, int):
-            stages = len(ratios) - layers
-            if 0 < kept < stages:
-                raise ValueError(f"a DSpark drafter's {stages} stages draft as one, its heads on the last: "
-                                 f"prediction_depths keeps all of them or none (0), not {kept}")
-            if not kept:
-                scope["compress_ratios"], scope["dspark_block_size"] = ratios[:layers], 0
+        # A wrapper's text config typed as the wrapper declares it where it names no type (`typed_part`).
+        typed = scope if scope is written else decoders.typed_part(written, scope, "text")
+        family = family_of(typed) or top
+        if family is not None:
+            scope.update(family.kept_depths(scope, kept))
     return written
 
 

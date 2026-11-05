@@ -1524,7 +1524,7 @@ class CausalTransformer(LinearProducts):
         does; `layer_state` reads one layer back. Neither is a Flax method, so
         the filter the capture calls on every module runs no module call.
         """
-        return method == "__call__" and (module.name or "").startswith("layers_")
+        return method == "__call__" and group_layers(module.name or "") is not None
 
     layer_collections: ClassVar[tuple[str, ...]] = (_INTERMEDIATES, _FINAL)
     """The collections a reader of layer states opens (`LayerStates`)."""
@@ -2242,10 +2242,9 @@ class CausalTransformer(LinearProducts):
         return self.clone(dex=extension)
 
     @nn.nowrap
-    def with_scanned_layers(self, *, scanned: bool = True) -> Self:
-        """This decoder running its like and periodic runs under the scan (`scan_layers`), or with
-        `scanned` False the plain loop."""
-        return self.clone(scan_layers=scanned)
+    def with_scanned_layers(self) -> Self:
+        """This decoder running its like and periodic runs under the scan (`scan_layers`)."""
+        return self.clone(scan_layers=True)
 
     @nn.nowrap
     def reads_progress(self) -> bool:

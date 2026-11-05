@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, REVERSE_ONLY, assert_contract, normal_draw
+from contract_support import EDGES, FORWARD_ORDERS, REVERSE_ONLY, assert_contract, normal_draw
 from ssd_support import stepwise_scan
 
 from dew.algebra import SATURATION, forms as algebra_forms, scan
@@ -167,6 +167,38 @@ def delta_rule_draw(seed: int, scale: float, *, key_heads: int, value_heads: int
                       for at, along in enumerate(drawn))
     cotangent = normal_draw(seed + 2, value.shape, state.shape)
     return primals, direction, cotangent
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("edge", sorted(EDGES))
+def test_a_split_convs_bias_holds_its_orders(edge):
+    """A conv over a sequence split four ways (`linear.sequence_conv` under `over_sequence`), its replicated
+    bias read through `_shards_summed` (a custom VJP whose backward adds the shards' partial sums in one
+    rounding), on packed rows: the primal and every reverse order finite wherever float64's are normal
+    float32s and the unsplit conv's are, at activations and biases scaled to the edge. Forward mode does
+    not run (`FORWARD_ORDERS`, a custom VJP's)."""
+    from sequence_split_support import SPLIT_ROWS
+
+    from dew.nn.linear import held_conv1d, over_sequence, sequence_conv
+    from dew.training import MeshSpec
+
+    valid, segments = (jnp.asarray(np.broadcast_to(field, (2, 32))) for field in SPLIT_ROWS["packed"])
+    mixed, direction, cotangent = normal_draw(2169, (2, 32, 8), (2, 32, 8), (2, 32, 8), scale=EDGES[edge])
+    taps, bias = normal_draw(2170, (8, 4), (8,))
+    mesh = MeshSpec(sequence=4).build(jax.devices()[:4])
+
+    def split(mixed, bias):
+        return over_sequence(lambda mixed, valid, segments, taps, bias: sequence_conv(
+            mixed, taps, bias, segments, valid), 4, (mixed, valid, segments),
+            (taps.astype(mixed.dtype), bias))
+
+    def whole(mixed, bias):
+        return held_conv1d(mixed, taps.astype(mixed.dtype), valid, bias=bias, segments=segments)[0]
+
+    # The mesh set around the contract, whose orders trace the split inside their own programs.
+    with jax.set_mesh(mesh):
+        assert_contract(split, (mixed, bias), (direction, jnp.ones_like(bias)), cotangent,
+                        f"a split conv's bias {edge}", truth_fn=whole, plain_fn=whole, without=FORWARD_ORDERS)
 
 
 # The ports near float32's largest: their reverse derivatives are NaN at entries the recurrence keeps finite,

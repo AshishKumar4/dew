@@ -23,7 +23,7 @@ import json
 import jax
 import numpy as np
 import pytest
-from map_judge import pooled_units, record_units
+from map_judge import sharded
 from option_witness import SETTINGS, TASK_RUNS, same, saved_with, witnessed_on
 from run_kinds import ADAPTED, DEFAULT_METRICS, KINDS, RATE, TINY_LAYA, decision, dreamed, scalars, trained
 
@@ -205,10 +205,9 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
 def test_each_option_a_decision_task_is_built_with_reaches_it_from_the_command_line(tmp_path):
     """`test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line`'s witness of
     DecideSettings, each option on the run that witnesses it (`WITNESSED_ON`), one option a unit of armada's
-    map tasks, or one of its alternatives (`ALTERNATIVE_UNITS`), that records what its run witnessed
-    (`map_judge.record_units`) and a judge that pools them
-    (`pooled_units`) and holds every option the runs hold assigned and witnessed; run whole, the units in
-    turn."""
+    map tasks, or one of its alternatives (`ALTERNATIVE_UNITS`), that records what its run witnessed,
+    and a judge that pools them (`map_judge.sharded`) and holds every option the runs hold assigned and
+    witnessed; run whole, the units in turn."""
     from dew.decision.task import DecideSettings
 
     runs = {builder.__name__: (builder, objective) for builder, objective in TASK_RUNS["DecideSettings"]}
@@ -233,11 +232,10 @@ def test_each_option_a_decision_task_is_built_with_reaches_it_from_the_command_l
             found.append((sorted(options), failures, exports, sorted(holding), option))
         return found
 
-    if record_units(label, witness):
+    pooled = sharded(label, witness, len(units))
+    if pooled is None:
         return
-    pooled = pooled_units(label, len(units))
-    witnessed = witness(0, len(units)) if pooled is None else [unit for _, _, payload in pooled
-                                                              for unit in payload]
+    witnessed = [unit for payload in pooled for unit in payload]
     held = {option for *_, holding, _ in witnessed for option in holding}
     assigned = {option for _, option, _ in units}
     assert held <= assigned, f"DecideSettings' options no run here is assigned: {sorted(held - assigned)}"
