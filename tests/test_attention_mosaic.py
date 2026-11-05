@@ -1571,8 +1571,9 @@ def the_backward_is_on_par_under_every_score_hook_on_an_h100(hooks, form):
 
 @pytest.mark.parametrize("causal, queries, keys, pairs", [
     (True, 256, 256, 256 * 257 // 2), (True, 128, 256, 128 * 129 // 2),
-    (True, 256, 128, 128 * 129 // 2 + 128 * 128), (False, 256, 256, 256 * 256)],
-    ids=["causal", "causal-fewer-queries", "causal-more-queries", "full"])
+    (True, 256, 128, 128 * 129 // 2 + 128 * 128), (True, 64, 192, 64 * 65 // 2),
+    (False, 256, 256, 256 * 256)],
+    ids=["causal", "causal-fewer-queries", "causal-more-queries", "causal-padded", "full"])
 def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, keys, pairs):
     """A bf16 call's plain forward, training forward and backward through the Mosaic mainloop, each lowered
     for an H100: every launch states its hardware work (`attention_mosaic_program.stated`), which Dew's FLOP
@@ -1581,12 +1582,12 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
     reached pair, head and product column (a causal call's `pairs` each query's keys up to its own place,
     written out: the first key aligned to the first query, as the mainloop masks them): the forward's two
     products, the training forward's two and the backward's four (`instrumentation._fused_attention_flops`).
-    The hardware's work is every tile its walk issues, whole: each 64 by 64 tile holding a reached pair
-    (padded rows and a causal diagonal tile's masked half computed with the rest, as an H100's tensor-pipe
-    counts read them, row 3948's receipt), and one recomputed `Q K^T` more in the training forward and in the
-    backward; a rerun (the guarded launch, the fold's natural walk) adds none. The launches' own statements
-    are read: the training forward's overflowed rows rerun the plain-JAX walk in a conditional, whose
-    products the count bounds apart."""
+    The hardware's work is every tile its walk issues, whole: each 64 by 64 tile holding a reached pair over
+    the padded rows (a padded consumer's and a causal diagonal tile's masked half computed with the rest, as
+    an H100's tensor-pipe counts read them, row 3948's receipt), and one recomputed `Q K^T` more in the
+    training forward and in the backward; a rerun (the guarded launch, the fold's natural walk) adds none. The
+    launches' own statements are read: the training forward's overflowed rows rerun the plain-JAX walk in a
+    conditional, whose products the count bounds apart."""
     import re
 
     from dew.telemetry.instrumentation import _MODEL_FLOPS, _stated_flops, hlo_flops
@@ -1596,11 +1597,13 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
     key = jax.ShapeDtypeStruct((rows, keys, kv_heads, width), jnp.bfloat16)
     spans = template.spans(queries, keys, rows, causal=causal)
     forward = 2 * rows * heads * pairs * (width + width)
-    # The 64 by 64 tiles the pinned launches walk that hold a reached pair (a key at or before its query
-    # where causal), each computed whole.
-    block = 64
-    walked = sum(block * block for first_q in range(0, queries, block) for first_k in range(0, keys, block)
-                 if not causal or first_k <= min(first_q + block, queries) - 1)
+    # The 64 by 64 tiles the pinned launches walk that hold a pair a causal call reaches (a key at or before
+    # its query), each computed whole, over the queries padded to a program's two consumers' rows: a padded
+    # consumer walks its keys as a real one does.
+    block, consumers = 64, 2
+    padded = -(-queries // (consumers * block)) * consumers * block
+    walked = sum(block * block for first_q in range(0, padded, block) for first_k in range(0, keys, block)
+                 if not causal or first_k < first_q + block)
     issued = 2 * rows * heads * walked * (width + width)
 
     # Lowered deviceless for an H100 whatever the host, so a GPU host of another generation lowers no TMA
