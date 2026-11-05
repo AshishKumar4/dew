@@ -1307,7 +1307,7 @@ def test_llada_moe_trained_exports_reload_and_run(llada_moe_source, tmp_path, de
     assert_as_exact(as_given(lambda seed: actual(draws[int(seed)])),
                     as_given(lambda seed: expected(draws[int(seed)])),
                     lambda seed: (np.asarray(seed, np.int32),), name + ' trained export', seeds=8,
-                    truth_fn=lambda seed: np.asarray(expected(draws[int(seed)]), np.float64))
+                    truth_fn=as_given(lambda seed: np.asarray(expected(draws[int(seed)]), np.float64)))
     prompt = ids[:1, :4]
     generated = reloaded.text_generation()(prompt, 4, key=7, steps=3).host().tokens
     np.testing.assert_array_equal(generated[:, :4], prompt)

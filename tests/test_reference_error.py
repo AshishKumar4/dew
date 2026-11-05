@@ -865,9 +865,9 @@ def test_an_arm_compiled_outside_the_gates_policy_is_refused():
 def test_a_float64_truth_runs_as_one_compiled_program():
     """The gate compiles a JAX truth (`_truth_program`) from its first call on, never running it eagerly, so
     a seed's truth is the same whichever seed a process draws first, and its values are the eager truth's
-    own. A NumPy truth (it cannot be traced, and returns host values) runs as given, and so do a truth
-    `as_given`, one compiled already and a window loop's by its own; a check over a compiled truth judges
-    as over the eager one."""
+    own. A truth doing host work fails at its first call unless its site states it (`as_given`, ledger 3198);
+    a truth `as_given`, one compiled already and a window loop's by its own run as they are; a check over a
+    compiled truth judges as over the eager one."""
     from arm_arithmetic import Truth
     from reference_error import _truth_program, _Windowed, as_given, over_windows
 
@@ -884,13 +884,11 @@ def test_a_float64_truth_runs_as_one_compiled_program():
         assert calls == [True]
         np.testing.assert_array_equal(first["y"], later["y"])
         np.testing.assert_allclose(first["y"], truth(x, w)["y"], rtol=1e-14)
-        numpy = _truth_program(lambda x, w: {"y": np.asarray(x) @ np.asarray(w)})
-        numpy(x, w)
-        assert numpy.run.wrapped is numpy.fn
-        # A truth that widens its inputs on the host and returns JAX values fails at its first call.
-        hosted = _truth_program(lambda x, w: truth(np.asarray(x, np.float64), np.asarray(w, np.float64)))
-        with pytest.raises(jax.errors.TracerArrayConversionError):
-            hosted(x, w)
+        # A truth that does host work, NumPy's or a widening on the host, fails at its first call, unstated.
+        for hosted in (lambda x, w: {"y": np.asarray(x) @ np.asarray(w)},
+                       lambda x, w: truth(np.asarray(x, np.float64), np.asarray(w, np.float64))):
+            with pytest.raises(jax.errors.TracerArrayConversionError):
+                _truth_program(hosted)(x, w)
     # A truth run as given, or compiled already, is itself, its programs unrewritten.
     given = as_given(truth)
     assert _truth_program(given).wrapped is given and _truth_program(_product).wrapped is _product
@@ -2286,6 +2284,7 @@ def rounded_apart(arm: int, factor: float = 1.0, *, every: int = 1):
     return run
 
 
+@as_given
 def exact_value(x, scale, sizes):
     return np.asarray(x, np.float64)
 
@@ -2365,6 +2364,7 @@ def stacked_arm(arm: int, factor: float = 1.0, every: int = 0):
     return run
 
 
+@as_given
 def exact_rows(x, scale, sizes):
     return {"rows": np.asarray(x, np.float64)}
 

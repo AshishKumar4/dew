@@ -309,7 +309,7 @@ def test_yarn_matches_the_reference_derivation():
         return (np.random.default_rng(seed).integers(0, 4096 * 40, 64).astype(np.int32),)
 
     assert_as_exact(ours, reference, draw, "yarn rotary", seeds=SEEDS["yarn"],
-                    truth_fn=lambda positions: reference(positions, wide_run=True))
+                    truth_fn=as_given(lambda positions: reference(positions, wide_run=True)))
 
 
 def test_yarn_over_a_partial_rotary_ramps_the_rotated_width_and_refuses_a_proportional_one():

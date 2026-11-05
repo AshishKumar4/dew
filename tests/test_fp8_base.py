@@ -170,6 +170,7 @@ def exactly(codes, scales) -> np.ndarray:
     return np.asarray(codes).astype(np.float64) * np.asarray(scales).astype(np.float64)
 
 
+@as_given
 def exact_products(x, forward, forward_scale, dgrad, dgrad_scale, cotangent):
     """The float64 products of the FP8 block cast's rows and the packed rows, each code times its scale
     in float64, as the codes stand for them."""
@@ -236,6 +237,7 @@ def decoded_tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):
                           preferred_element_type=jnp.float32)
 
 
+@as_given
 def exact_tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):
     """The float64 product of the cast rows (`exact_products`) and the direction times the decoded
     forward rows in float64."""

@@ -234,7 +234,7 @@ def test_a_pass_packs_rows_into_windows_and_answers_each_as_it_is_alone(decide):
         return real(task.scored(rows, variables))
 
     def alone(task: Decide):
-        return lambda variables: real([task.scored([row], variables)[0] for row in rows])
+        return as_given(lambda variables: real([task.scored([row], variables)[0] for row in rows]))
 
     assert_as_exact(packed, dew_programs(alone(task)), draw, "packed pass", seeds=PACKED_SEEDS,
                     truth_fn=alone(wide))
@@ -482,8 +482,8 @@ def test_score_is_a_validation_pass_through_the_task_s_temperatures(decide):
                         [found for _, _, found in passed(objective, variables, examples)])),
                     as_given(lambda variables: tempered(variables, float32_softmax)), draw,
                     "tempered probabilities", seeds=TEMPERED_SEEDS,
-                    truth_fn=lambda variables: tempered(variables, lambda logits, scale: softmax(
-                        logits.astype(np.float64), scale)))
+                    truth_fn=as_given(lambda variables: tempered(variables, lambda logits, scale: softmax(
+                        logits.astype(np.float64), scale))))
     scores = decide.score(examples)
     assert set(scores) == {"accuracy", "macro_f1", "ece", "aurc", "log_loss", "brier", "scored_questions"}
     assert scores["accuracy"] == pytest.approx(np.mean([int(np.argmax(answer.probabilities)) == 0
@@ -752,6 +752,7 @@ def test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh(decide):
     def alone(variables) -> np.ndarray:
         return held_logits(replace(task, variables=variables))
 
+    @as_given
     def truth(variables) -> np.ndarray:
         return held_logits(replace(wide, variables=variables))
 

@@ -1029,6 +1029,7 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
                                           lone.raw_log_probs[0, lone.lengths[0]:])
         return likelihoods(rows_served)
 
+    @as_given
     def truth(seed):
         """The float64 model's raw log-likelihood of each lone row's tokens, teacher-forced."""
         bound, alone, _ = drawn(int(seed))

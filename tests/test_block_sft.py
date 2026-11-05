@@ -163,6 +163,7 @@ the gate's 0.40. Each example keeps the site's geometry, its rows and shapes."""
 def stacked(fn, *, given: bool = False):
     """`fn(values, rows)` over a draw's stacked examples (`STACKED`): each example's leaves stacked as rows
     of one, as the gate reads a draw. A `given` arm stays one the gate runs as given (`as_given`)."""
+    @as_given
     def each(examples):
         return stacked_on_host([fn(*example) for example in examples])
 

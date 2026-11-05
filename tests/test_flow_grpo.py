@@ -147,6 +147,7 @@ def test_recorded_trajectory_rescores_under_shifted_guided_process():
     ordinary = sample(denoiser(offset), x, 5, solver=solver, guidance=guidance, key=key)
     np.testing.assert_array_equal(trajectory.samples, ordinary)
 
+    @as_given
     def truth(start, offset):
         return guided_density(walked_in_float32(walk, start, offset), offset, np.float64)
 
@@ -211,7 +212,7 @@ def test_flow_objective_uses_converted_predictions(prediction):
     assert_as_exact(recorded_and_rescored(walk, rescore, variables),
                     as_given(lambda start: rectified(walk(start), np.float32)), drawn_rows((2,)),
                     f"{prediction} converted", seeds=SEEDS['converted'],
-                    truth_fn=lambda start: rectified(walked_in_float32(walk, start), np.float64))
+                    truth_fn=as_given(lambda start: rectified(walked_in_float32(walk, start), np.float64)))
     trajectory = walk(jnp.asarray([[0.2, -0.5], [-0.1, 0.7]]))
     batch = trajectory_batch(trajectory, [-1, 1])
     loss, _ = objective.scalar_loss(variables, batch, Step(jnp.asarray(0), jax.random.key(32), None))
@@ -284,7 +285,7 @@ def test_a_prediction_undefined_at_pure_noise_is_refused_only_where_a_walk_evalu
 
     assert_as_exact(scored, as_given(lambda start: closed(walk(start)[0], np.float32)), drawn_rows((2,)),
                     f"{type(prediction).__name__} rescored walk", seeds=SEEDS['rescored walk'],
-                    truth_fn=lambda start: closed(walked_in_float32(walk, start)[0], np.float64))
+                    truth_fn=as_given(lambda start: closed(walked_in_float32(walk, start)[0], np.float64)))
 
 
 def clipped_terms(gain, frozen, states, times, advantages):
@@ -403,7 +404,7 @@ def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
     assert_as_exact(recorded_and_rescored(walk, rescore, old),
                     as_given(lambda start: walked(walk(start), np.float32)),
                     drawn_rows((2,)), "rescored clipping walk", seeds=SEEDS['rescored walk'],
-                    truth_fn=lambda start: walked(walked_in_float32(walk, start), np.float64))
+                    truth_fn=as_given(lambda start: walked(walked_in_float32(walk, start), np.float64)))
 
     start, advantages, mask, _ = (value[0] for value in draw(0))
     trajectory = walk(start)
@@ -1043,7 +1044,7 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
 
     assert_as_exact(evaluated_with, walked(initial.variables, np.float32), draw, "prompt evaluation",
                     seeds=SEEDS['prompt evaluation'],
-                    truth_fn=lambda key: walked(widened(initial.variables), np.float64)(key))
+                    truth_fn=as_given(lambda key: walked(widened(initial.variables), np.float64)(key)))
     assert previewed.images.shape == (min(4, count), 4, 4, 1)
     assert len(previewed.captions) == min(4, count)
     data = Loader(

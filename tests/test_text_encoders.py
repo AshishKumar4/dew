@@ -404,6 +404,7 @@ def test_clip_image_transform_matches_the_reference_processor(config, height, wi
     def draw(seed):
         return (np.random.RandomState(seed).randint(0, 256, (1, height, width, 3), dtype=np.uint8),)
 
+    @as_given
     def normalized(pixels):
         """The processor's resized and cropped integers, rescaled and normalized in float64."""
         crop = np.asarray(resized(list(np.asarray(pixels, np.uint8)), return_tensors="np")["pixel_values"],

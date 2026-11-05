@@ -109,6 +109,7 @@ def test_m3s_directions_are_algorithm_1s_across_its_chunks():
     def reference(gradients):
         return jax.tree.map(lambda leaf: m3_directions(leaf, orthogonalized), gradients)
 
+    @as_given
     def truth(gradients):
         return jax.tree.map(m3_directions, gradients)
 

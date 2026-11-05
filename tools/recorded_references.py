@@ -136,7 +136,7 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
     # The recorded reference is read by index from the host's records, as given.
     confirmed = seeds_for(as_given(lambda index, inputs: records[int(index)][1]), recorded_draw, label,
                           start=start,
-                          truth_fn=lambda index, inputs: records[int(index)][2],
+                          truth_fn=as_given(lambda index, inputs: records[int(index)][2]),
                           dew_fn=None if dew is None else as_given(lambda index, inputs: dew(inputs)))
     # The recording is the confirmed count's draws and their redraw, no more: a proxy that planned more
     # than the recorded reference confirms leaves draws the recording does not keep.
