@@ -868,8 +868,8 @@ def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
     while another prompt runs, its state kept in a store of four entries, and its repeat reads its pages
     back (a pool without the tier reads none: its other prompt takes the pages); in a pool of eight pages
     two other prompts reclaim a prompt's two shared pages, and a tier of one host slot keeps one of them
-    alone, where the store holds the state after the deepest page only, so the repeat reads nothing back
-    (where a tier of eight reads both). Each request
+    alone, where the store holds the state after the deepest page only, so the repeat reads nothing back.
+    Each request
     draws what it draws alone and scores it as a full
     forward does (check 1)."""
     # A vocabulary of 256 at least and eight draws a request, so each request's scores spread enough to
