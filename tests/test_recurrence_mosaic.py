@@ -896,35 +896,43 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
     assert narrower == (kernel == 'recurrence_states')
 
 
-def test_a_refusal_under_the_remat_rung_is_the_one_the_route_judges(monkeypatch):
-    """Under the remat rung recomputing the delta rule's memory (`recurrence_chunk.recomputing`), the
-    selector's bind of a training call (`port_kernel`) and the run's (`template_rule`) are one launch
-    (`report._identity`), so a compile's refusal of its every tile reaches the route, which takes another
-    kernel: the selector once bound it as kept, another launch than the run's (row 4133)."""
+def test_a_refusal_under_the_remat_rung_reaches_the_route():
+    """Under the remat rung recomputing the delta rule's memory (`recurrence_chunk.recomputing`), a compile's
+    refusal of every tile the run's training call launches at (each launch as its lowering for an H100 names
+    it, `report.traced`) reaches the selector, which takes another kernel for that call: its bind is the
+    run's launch, the rung's flag resolved alike (`recurrence_chunk.recomputed_memory`); bound as kept, it
+    judged another launch than the run's (row 4133)."""
     from dew.nn.kernels import recurrence_chunk
+    from dew.training._lowering import kernel_calls
 
-    bound = []
-    binding = template.Mosaic.bind
-    monkeypatch.setattr(template.Mosaic, "bind", lambda op, *a, **k: bound.append(binding(op, *a, **k))
-                        or bound[-1])
-    operands = [jnp.zeros(arg.shape, arg.dtype) for arg in resource_operands('qwen3.5-27b-gdn', jnp.bfloat16,
-                                                                             1, 256)[:5]]
-    with report.refusals(), generation.assumed('sm90'), recurrence_chunk.recomputing(('delta_memory',)):
-        target = template.Mosaic.launched()
-        assert recurrence_chunk.port_kernel(*operands, bound=1.0, product='training', report=False) == \
-            'mosaic_gpu'
-        selected = bound[-1]
+    operands = [jnp.zeros(shape, dtype) for shape, dtype in (
+        ((1, 64, 1, 64), jnp.bfloat16), ((1, 64, 1, 64), jnp.bfloat16), ((1, 64, 2, 64), jnp.bfloat16),
+        ((1, 64, 2), jnp.float32), ((1, 64, 2), jnp.bfloat16))]
+
+    def loss(*given):
         # The run's call as the chunked op's route makes it (`recurrence_chunk.chunk`'s options).
-        jax.eval_shape(lambda *given: recurrence_chunk.template_rule(
-            *given, max_segments=None, scale=None, delta=True, wide=False, floor=None, bound=1.0,
-            rounded=True)[0], *operands)
-        assert report._identity(template.MOSAIC, bound[-1]) == report._identity(template.MOSAIC, selected)
-        while (tiles := template.MOSAIC.derived(selected, target)) is not None:
-            report.refuse([(report._identity(template.MOSAIC, selected), tiles,
-                            {launch.name for launch in template.MOSAIC._launches(selected, tiles, target,
-                                                                                  backward=True)})])
-        assert recurrence_chunk.port_kernel(*operands, bound=1.0, product='training', report=False) != \
-            'mosaic_gpu'
+        out, final = recurrence_chunk.template_rule(*given, max_segments=None, scale=None, delta=True,
+                                                    wide=False, floor=None, bound=1.0, rounded=True)
+        return out.astype(jnp.float32).sum() + final.sum()
+
+    def selected() -> str:
+        return recurrence_chunk.port_kernel(*operands, bound=1.0, product='training', report=False)
+
+    with report.refusals(), generation.assumed('sm90'), recurrence_chunk.recomputing(('delta_memory',)):
+        assert selected() == 'mosaic_gpu'
+        while True:
+            try:
+                lowered = jax.jit(jax.grad(loss, argnums=(0, 1, 2))).trace(*operands).lower(
+                    lowering_platforms=('cuda',))
+            except REFUSED:
+                break
+            launched: dict[str, set] = {}
+            for call in kernel_calls(lowered):
+                if call.kind == 'mosaic_gpu' and call.launch is not None:
+                    launched.setdefault(call.launch, set()).add(call.name)
+            report.refuse([(launch.identity, launch.config, names) for launch, names in
+                           ((report.traced(digest), names) for digest, names in launched.items())])
+        assert selected() != 'mosaic_gpu'
 
 
 def _model(launch: mainloop.Launch, family: mosaic.Family) -> resources.RegisterModel:
