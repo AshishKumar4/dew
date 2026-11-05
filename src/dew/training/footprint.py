@@ -216,37 +216,36 @@ def folded(program: jcore.Jaxpr) -> jcore.Jaxpr:
     buffer, which the scatter writes in place (`in_place`). Qwen3.5-4B's step under 'full' was derived
     holding the product, the scatter and their sum at its end, 7.1 GiB against XLA's 4.4 (row 4089)."""
     producers = {out: equation for equation in program.eqns for out in equation.outvars}
-    readers = collections.Counter(value for equation in program.eqns
-                                  for value in equation.invars if computed(value))
-    readers.update(value for value in program.outvars if computed(value))
-    folding: dict[int, jcore.JaxprEqn] = {}
+    readers = collections.Counter(value for equation in program.eqns for value in equation.invars
+                                  if isinstance(value, jcore.Var))
+    readers.update(value for value in program.outvars if isinstance(value, jcore.Var))
+    dropped: set[int] = set()
+    replaced: dict[int, list[jcore.JaxprEqn]] = {}
     for equation in program.eqns:
         if equation.primitive.name not in ("add", "add_any") or len(equation.invars) != 2:
             continue
-        for scattered, other in (equation.invars, reversed(equation.invars)):
-            scatter = producers.get(scattered) if computed(scattered) else None
+        first, second = equation.invars
+        for scattered, other in ((first, second), (second, first)):
+            scatter = producers.get(scattered) if isinstance(scattered, jcore.Var) else None
             if (scatter is None or scatter.primitive.name != "scatter-add" or readers[scattered] != 1
-                    or scattered.aval != equation.outvars[0].aval or id(scatter) in folding):
+                    or scattered.aval != equation.outvars[0].aval or id(scatter) in dropped):
                 continue
             base, *rest = scatter.invars
-            zero = producers.get(base) if computed(base) else None
-            if zero is not None and zero.primitive.name == "broadcast_in_dim" and not computed(
-                    zero.invars[0]) and not np.any(np.asarray(zero.invars[0].val)):
-                summed = [other]
+            zero = producers.get(base) if isinstance(base, jcore.Var) else None
+            fill = None if zero is None or zero.primitive.name != "broadcast_in_dim" else zero.invars[0]
+            if isinstance(fill, jcore.Literal) and not np.any(np.asarray(fill.val)):
+                summed, sums = other, []
             else:
-                total = jcore.Var(equation.outvars[0].aval)
-                summed = [equation.replace(invars=[other, base], outvars=[total]), total]
-            folding[id(scatter)] = None
-            folding[id(equation)] = [*summed[:-1], scatter.replace(invars=[summed[-1], *rest],
-                                                                    outvars=equation.outvars)]
+                summed = jcore.Var(equation.outvars[0].aval)
+                sums = [equation.replace(invars=[other, base], outvars=[summed])]
+            dropped.add(id(scatter))
+            replaced[id(equation)] = [*sums, scatter.replace(invars=[summed, *rest],
+                                                             outvars=equation.outvars)]
             break
-    if not folding:
+    if not replaced:
         return program
-    equations = []
-    for equation in program.eqns:
-        replaced = folding.get(id(equation), [equation])
-        equations.extend(replaced or ())
-    return program.replace(eqns=equations)
+    return program.replace(eqns=[each for equation in program.eqns if id(equation) not in dropped
+                                 for each in replaced.get(id(equation), [equation])])
 
 
 def operand_key(value: jcore.Var | jcore.Literal) -> Hashable:
@@ -481,7 +480,7 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
             # A loop's results (its stacked outputs, its carry) are held beside each turn's own; a call's
             # results are what its body returns.
             running = (looped(frontier, last, index, equation, made, carried) + inner
-                       if equation.primitive.name in LOOPS else max(inner, made_bytes - taken))
+                       if equation.primitive.name in LOOPS else max(inner, made_bytes) - taken)
             most = max(most, live + running + operands + products)
         held.update(made)
         live += made_bytes
