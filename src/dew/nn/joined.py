@@ -104,7 +104,11 @@ def _join(choice: str) -> Op[JoinCase]:
                         for (join, device), receipt in JOINED_FASTER.items() if join == choice})
 
 
-JOINS = {choice: _join(choice) for choice in dict.fromkeys(join for join, _ in JOINED_FASTER)}
+CHOICES = ('gate_up', 'delta_gates')
+"""The joins layers ask for (`joins`): named apart from their cells, so a join whose every cell is retired
+keeps its selector and runs its projections apart."""
+
+JOINS = {choice: _join(choice) for choice in CHOICES}
 """The join's selector of each choice a layer joins projections for."""
 
 
