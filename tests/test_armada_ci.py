@@ -2503,15 +2503,13 @@ def install_inputs(root: Path, script: str) -> set[str]:
     those the shell scripts among them name in turn: a limited check of what an install runs or reads (shlex,
     comments set aside), not a shell interpreter, so a path a variable builds (`locks/$name.txt`) is none
     of them."""
-    found, pending = set(), [script]
+    found, pending = {script}, [script]
     while pending:
-        name = pending.pop()
-        if name in found:
-            continue
-        found.add(name)
-        words = [word for line in (root / name).read_text().splitlines()
+        words = [word for line in (root / pending.pop()).read_text().splitlines()
                  for word in shlex.split(line, comments=True)]
-        pending.extend(word for word in words if not word.startswith(("/", "..")) and (root / word).is_file())
+        files = {word for word in words if not word.startswith(("/", "..")) and (root / word).is_file()}
+        pending.extend(sorted(name for name in files - found if name.endswith(".sh")))
+        found |= files
     return found
 
 
@@ -2540,3 +2538,4 @@ def test_the_environments_key_names_every_file_its_install_script_runs_or_reads(
     after = load("ci", "tools/armada", tmp_path).PYTHONS
     assert after == (*before, "3.15")
     assert "pyproject.toml" in keyed
+
