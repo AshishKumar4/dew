@@ -77,7 +77,7 @@ from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, Logi
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
-from dew.nn.kernels.options import owned_program
+from dew.nn.kernels.options import held_objects, owned_program
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import Link, Schedule, boxed, measured_links, pipeline_microbatches
 from dew.objectives.base import (
@@ -1058,6 +1058,9 @@ class Trainer(Generic[Loss, Effects]):
                 return (together(moving, frozen), *(outputs[0] if split == 1 else whole_step(outputs)))
         return run
 
+    # The search's own Python and every compile it makes hold the run's objects out of Python's collector
+    # (`held_objects`), whose full collections walked them (row 2440).
+    @held_objects()
     def _planned(self, state: TrainState, batch: Batch, mesh: Mesh, schedule: Schedule, resumed: JSON,
                  trials: Trials | None, capacity: int | None,
                  frontier: bool) -> tuple[Planned, StepFlops | None]:
