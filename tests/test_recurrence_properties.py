@@ -5,7 +5,7 @@ whatever form the route runs. Hypothesis draws each transformation (the suite's 
 docs/design/testing.md): the chunk size the portable math walks, and a sequence split into two calls, the
 second entering the first's final memory. Every hook combination the chunked op takes runs the properties on
 its portable math, one row and packed documents; the template's split runs interpreted, as an H100 runs it,
-on the forms it takes."""
+on the forms it takes, at fixed splits where Hypothesis's draws do not fit a group's time."""
 
 import dataclasses
 import functools
@@ -28,8 +28,10 @@ PORTABLE = hypothesis.settings(max_examples=2, deadline=None)
 """Each portable property's draws: a draw's three compiles (each arm and the truth at its shape), about 17 s a
 case at four draws on armada's CPU (props at f3cf82c98), every form one row and packed."""
 
-INTERPRETED = hypothesis.settings(max_examples=2, deadline=None)
-"""Each interpreted split's draws: the template's launches interpreted twice a draw."""
+TEMPLATE_SPLITS = (30, 64)
+"""Where the template's call is split: inside a chunk and a document, and on a chunk's edge. Each is a check-1
+site over map tasks of two draws (`check1_shards`): at two drawn splits a form, Kimi delta attention's took
+371 s interpreted, the gated delta net's 145 (props2 at e9406e7d8), past a group's two minutes."""
 
 FORMS = HOOKS + FORMED
 """Every hook combination the chunked op takes (test_recurrence_chunk's)."""
@@ -108,14 +110,13 @@ def test_the_portable_math_carried_across_a_split_is_the_whole_recurrence(hooks,
                     truth_fn=functools.partial(token_by_token, hooks))
 
 
+@pytest.mark.parametrize("at", TEMPLATE_SPLITS)
 @pytest.mark.parametrize("hooks", TEMPLATE_FORMS, ids=ids(TEMPLATE_FORMS))
-@INTERPRETED
-@hypothesis.given(cut=st.floats(0.0, 1.0))
-def test_the_template_carried_across_a_split_is_the_whole_recurrence_interpreted(hooks, cut):
-    """The template's 16-bit call over packed documents split at a drawn token into two, the second entering
-    the first's final memory, interpreted: its output and final memory on par with the call whole."""
+@pytest.mark.check1_shards(seeds=8, per_task=2)
+def test_the_template_carried_across_a_split_is_the_whole_recurrence_interpreted(hooks, at):
+    """The template's 16-bit call over packed documents split at token `at` into two, the second entering the
+    first's final memory, interpreted: its output and final memory on par with the call whole."""
     length = 70
-    at = 1 + int(cut * (length - 2))
     whole = functools.partial(chunk_on, "mosaic_gpu", hooks)
     assert_as_exact(jax.jit(split("mosaic_gpu", hooks, at, length)), jax.jit(whole),
                     _drawn(hooks, packed=True, length=length, narrow=True),
