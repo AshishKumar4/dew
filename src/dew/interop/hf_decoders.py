@@ -86,6 +86,11 @@ from dew.registry import from_record, towers
 
 GENERATION_CONFIG_FILE = "generation_config.json"
 
+RELEASE_FILE = "dew_release.json"
+"""The release metadata an export of a run writes beside its config (`save_export_assets`): the run's
+own task declaration and the numerics its tasks build under, which `Pretrained.load` reads back in
+place of the family's defaults; generation_config.json is derived from it for every other reader."""
+
 
 def _kind_name(record: Mapping[str, object], section: str) -> str:
     """Return the alias a nested value record names its class by."""
@@ -1212,8 +1217,10 @@ def save_export_assets(
     tokenizer: str | ExportTokenizer | None = None,
     generation_config: Mapping[str, object] | None = None,
     named: bool = True,
+    release: Mapping[str, object] | None = None,
 ) -> None:
-    """Write the tokenizer files and generation_config.json beside exported weights.
+    """Write the tokenizer files and generation_config.json beside exported weights, and the run's
+    release metadata where the export has one (`release`, `RELEASE_FILE`).
 
     Readers of the HF layout (transformers, llama.cpp and the runtimes on it) locate the
     vocabulary through tokenizer_config.json, so the tokenizer writes its own files here
@@ -1255,6 +1262,11 @@ def save_export_assets(
     if byte:
         values['tokenizer_name'] = "byte"
     write_atomically(os.path.join(directory, GENERATION_CONFIG_FILE), json.dumps(values, indent=2))
+    if release is not None:
+        write_atomically(os.path.join(directory, RELEASE_FILE), json.dumps(dict(release), indent=2))
+    else:
+        # An export without a run's declaration replaces one an earlier export of the directory wrote.
+        Path(directory, RELEASE_FILE).unlink(missing_ok=True)
 
 
 def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, object],
