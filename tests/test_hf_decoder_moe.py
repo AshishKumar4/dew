@@ -18,7 +18,6 @@ from interop_support import (
     transformers_model,
 )
 from model_support import decode_steps, flat_tree, stepped_outputs
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
     as_given,
@@ -246,21 +245,40 @@ def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
 @pytest.mark.network
 def test_gpt_oss_20b_matches_transformers_on_the_real_weights():
     """The released MXFP4 checkpoint through the loader, its weights in the bf16 the blocks decode to
-    (`param_dtype="auto"`, 42 GB on the device, where FP32 master weights would take 84), on the prompt
-    the recording read: Dew's bf16 logits as near the float64 truth as transformers' own bf16 forward
-    on a GPU, its experts dequantized as Dew's are (the one-draw rule, ledger 1719). Both are recorded
-    by tools/gpt_oss_20b_reference.py: the truth holds the released weights in float64, 168 GB, which
-    no test process holds."""
-    from tools.fetched_fixtures import local
-    from tools.gpt_oss_20b_reference import FIXTURE, RELEASED
+    (`param_dtype="auto"`, 42 GB on the device, where FP32 master weights would take 84): Dew's bf16
+    logits over drawn tokens on par with transformers' own bf16 forward on a GPU, its experts dequantized
+    as Dew's are, from float64 (check 1, ledger 3990), over the seeds tools/gpt_oss_20b_reference.py
+    recorded each seed's reference distance and its truth's sketch over. The truth is Dew's own float64
+    path, held to that sketch, run on the host: the released weights in float64 are 168 GB, which no GPU
+    holds (a GH200's host holds them beside the bf16 load)."""
+    import jax
+    from reference_error import as_given, declared_seeds, indexed_recording, recording
 
-    with np.load(local(FIXTURE)) as recorded:
-        ids, reference, truth = (recorded[name] for name in ("input_ids", "reference", "truth"))
+    from tools.gpt_oss_20b_reference import FIXTURE, POSITIONS, RELEASED, SITE, draw
+
     repo, revision = RELEASED
     pretrained = Pretrained.load(repo, dtype="bfloat16", param_dtype="auto", attention_impl="xla",
-                                 max_seq_len=int(ids.shape[1]), revision=revision)
-    logits = np.asarray(pretrained.model.apply(pretrained.variables, jnp.asarray(ids)), np.float32)[0]
-    assert_as_exact_as_the_reference(logits, reference, truth, "GPT OSS 20B logits")
+                                 max_seq_len=POSITIONS, revision=revision)
+    forward = jax.jit(pretrained.model.apply)
+    host = jax.devices("cpu")[0]
+    with jax.enable_x64(new_val=True), jax.default_device(host):
+        wide = Pretrained.load(repo, dtype="float64", param_dtype="float64", attention_impl="xla",
+                               max_seq_len=POSITIONS, revision=revision)
+        wide_forward = jax.jit(wide.model.apply)
+
+    def dew(inputs):
+        return {"logits": np.asarray(forward(pretrained.variables, jnp.asarray(inputs["input_ids"])),
+                                     np.float32)[0]}
+
+    def truth(inputs):
+        with jax.default_device(host):
+            return {"logits": np.asarray(wide_forward(wide.variables, jnp.asarray(inputs["input_ids"])))[0]}
+
+    seeds = declared_seeds(FIXTURE)[SITE]
+    drawn, reference, held = indexed_recording(recording(FIXTURE), SITE, seeds, inputs_of=draw,
+                                               truth_fn=as_given(truth))
+    assert_as_exact(as_given(lambda index, inputs: dew(inputs)), reference, drawn, "GPT OSS 20B logits",
+                    seeds=seeds, truth_fn=held)
 
 
 # --------------------------------------------------------------------------
