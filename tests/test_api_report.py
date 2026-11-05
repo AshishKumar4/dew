@@ -13,17 +13,46 @@ def test_the_api_report_reads_every_section_and_names_no_address():
     assert " at 0x" not in report
 
 
+def listed_fields(lines, cls) -> tuple[list[str], list[str]]:
+    """What the config section lists under `cls` and what its fields are, as the section writes them."""
+    start = lines.index(f"{cls.__module__}.{cls.__qualname__}")
+    expected = [f"  {line}" for line in load("api_report").fields(cls)]
+    return lines[start + 1:start + 1 + len(expected)], expected
+
+
 @pytest.mark.parametrize("module, name", [("dew.optim", "OptimConfig"), ("dew.lora", "LoRA"),
                                           ("dew.optim", "ParamGroup")])
 def test_a_dataclass_a_config_field_names_is_listed_with_its_fields_wherever_it_is_defined(module, name):
     """A run config's field typed by another module's dataclass lists that dataclass's fields and defaults,
     so changing one moves a line: `optim` names OptimConfig outright, `lora` names LoRA in an `Annotated`
     optional, and OptimConfig's `param_groups` names ParamGroup in a tuple."""
-    report = load("api_report")
-    expected = [f"  {line}" for line in report.fields(getattr(importlib.import_module(module), name))]
-    lines = report.config()
-    start = lines.index(f"{module}.{name}")
-    assert lines[start + 1:start + 1 + len(expected)] == expected
+    cls = getattr(importlib.import_module(module), name)
+    listed, expected = listed_fields(load("api_report").config(), cls)
+    assert listed == expected
+
+
+def test_the_dataclasses_a_run_field_names_through_a_type_alias_are_listed_with_their_fields():
+    """`DecisionRunConfig.segments` names a row's parts by the PEP 695 alias `RowSegment`, which `get_args`
+    sees nothing through: every part of its union is listed with its fields."""
+    import typing
+
+    from dew.decision.layout import RowSegment
+
+    lines = load("api_report").config()
+    parts = typing.get_args(RowSegment.__value__)
+    assert len(parts) > 1
+    for part in parts:
+        listed, expected = listed_fields(lines, part)
+        assert listed == expected
+
+
+def test_an_alias_that_names_itself_is_looked_through_once_and_its_dataclasses_are_reached():
+    """A recursive alias ends the walk where it began, with the dataclasses it holds reached."""
+    from dew.optim import ParamGroup
+
+    type Nested = list[Nested] | tuple[ParamGroup, ...] | None
+
+    assert set(load("api_report").reaches(Nested)) == {ParamGroup}
 
 
 def test_a_field_the_constructor_takes_by_keyword_or_not_at_all_is_marked():

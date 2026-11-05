@@ -203,18 +203,25 @@ def exports() -> list[str]:
     return lines
 
 
-def reaches(hint) -> Iterator[type]:
+def reaches(hint, expanded: frozenset[typing.TypeAliasType] = frozenset()) -> Iterator[type]:
     """The dataclasses of Dew a type annotation names, itself or inside it: through `Annotated`, a union and
-    a generic's arguments, a callable's parameters among them."""
+    a generic's arguments, a callable's parameters among them, and a PEP 695 alias, which `get_origin` and
+    `get_args` see nothing through (`dew.registry.resolve_alias`), looked through once, since one may name
+    itself (`expanded` holds those being looked through)."""
+    from dew.registry import resolve_alias
+
     if isinstance(hint, list):
         for item in hint:
-            yield from reaches(item)
+            yield from reaches(item, expanded)
         return
     cls = typing.get_origin(hint) or hint
-    if inspect.isclass(cls) and dataclasses.is_dataclass(cls) and cls.__module__.split(".")[0] == "dew":
+    if isinstance(cls, typing.TypeAliasType):
+        if cls not in expanded:
+            yield from reaches(resolve_alias(cls), expanded | {cls})
+    elif inspect.isclass(cls) and dataclasses.is_dataclass(cls) and cls.__module__.split(".")[0] == "dew":
         yield cls
     for argument in typing.get_args(hint):
-        yield from reaches(argument)
+        yield from reaches(argument, expanded)
 
 
 def config() -> list[str]:
