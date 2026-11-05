@@ -94,7 +94,7 @@ from dew.optim import STACKED_OPTIMIZERS, declaring, held_rates, scaled_rates, s
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
-from dew.telemetry.profile import exported as telemetry_exported, region
+from dew.telemetry.profile import region
 from dew.telemetry.records import AxisLink, CheckpointRequested, FitEnded, FitStarted, Record, StepCompiled
 from dew.training import staging
 from dew.training._fit import (
@@ -184,12 +184,13 @@ from dew.training.planning import (
     FitSearch,
     Planned,
     Trials,
+    held_objects,
     read_whole,
     settled,
     splits,
     whole_step,
 )
-from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window
+from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, waited_export
 from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics, rolled_out
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
@@ -998,7 +999,7 @@ class Trainer(Generic[Loss, Effects]):
         links = self._links(mesh)
         shaped = self._at_base_rung(batch)
         resumed, self._resumed_rung = self._resumed_rung if shaped is None else shaped, None
-        with self._traced_on(mesh, links) as schedule:
+        with self._traced_on(mesh, links) as schedule, held_objects():
             planned, flops = self._planned(state, batch, mesh, schedule, resumed, trials, capacity, frontier)
             split, candidate, self.executable = planned.split, planned.candidate, planned.executable
             self._split = split
@@ -1191,8 +1192,7 @@ class Trainer(Generic[Loss, Effects]):
         (`transaction.consumed_where_made`), over the state its commit reads: under DiLoCo a group's own
         (`group_of`), not the outer optimizer's."""
         with group_of(prepared, micro) as (view, _):
-            return consumed_where_made(self.objective, self.optimizer, view, window,
-                                       shared=pooled_by_mean(shapes[0]),
+            return consumed_where_made(self.optimizer, view, window, shared=pooled_by_mean(shapes[0]),
                                        progressed=self._examples is not None)
 
     def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, split: int,
@@ -1557,7 +1557,7 @@ class Trainer(Generic[Loss, Effects]):
                 if run.traced == profile.steps:
                     run.tracing = False
                     assert profiler is not None
-                    run.close_window(profiler)
+                    run.close_window(profiler, profile)
             if stopped:
                 break
         return self._wind_down(plan, run, interval, state, shardings, position, profiler)
@@ -1580,13 +1580,12 @@ class Trainer(Generic[Loss, Effects]):
         if run.tracing and profile is not None:
             run.tracing = False
             assert profiler is not None
-            stop_trace = functools.partial(run.close_window, profiler)
+            stop_trace = functools.partial(run.close_window, profiler, profile)
         error = primary
         # A run's last log is written at its cleanup, a failed run's only where no write waits on a step
         # its peers may never finish (`LogWriter.raise_failure`).
         unread = functools.partial(self._read_taken, run, agree=False)
-        # This rank's window's export alone: a failed one fails every rank at `_reported_outcome`'s agreement.
-        exported = None if profile is None else functools.partial(telemetry_exported, profile.directory)
+        exported = waited_export(profile, profiler)
         cleanups = (("Training log", unread), ("Log writer", run.writer.close), ("Training iterator", close),
                     ("Profiler", stop_trace), ("Profile export", exported),
                     ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
@@ -2092,7 +2091,7 @@ class Trainer(Generic[Loss, Effects]):
             run.tracing = False
             # The window outlived the run, and a trace left running takes the next one down with it.
             assert profiler is not None
-            run.close_window(profiler)
+            run.close_window(profiler, profile)
         interval.check_finite(current, self._display)
         if loss is not None:
             # The last step has to land before the wall time is read.
@@ -2388,7 +2387,7 @@ class Trainer(Generic[Loss, Effects]):
         except BaseException as failure:
             if error is None:
                 error = failure
-        error = reported_window(self._report, self._display.note, self.profile, run.profiled, error)
+        error = reported_window(self._report, self._display.note, run.profiled, error)
         if error is None:
             def report_goodput() -> None:
                 if jax.process_index() == 0:

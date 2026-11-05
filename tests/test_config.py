@@ -4,6 +4,7 @@ import dataclasses
 import json
 import os
 from collections.abc import Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import jax.numpy as jnp
@@ -415,6 +416,93 @@ def test_train_runs_the_trainer_its_config_describes(tmp_path):
     assert state.scale is not None
     assert state.accumulation is not None
     assert any(path.is_file() for path in trace.rglob("*"))
+
+
+def test_every_run_profiles_a_short_window_of_its_own_steps_kept_with_its_records(tmp_path):
+    """A run profiles two of its steps once ten have run past its first compile, by default, through Dew's
+    own profiler, its capture kept under the run's directory and reported beside its records
+    (`ProfileTraced`); a run naming no window traces none; inside another capture (`dew.Profiler`), which
+    holds the process's one profiling session, a run's own window yields where one naming its directory
+    refuses (row 4112)."""
+    import dew
+    from dew.config import local_records
+    from dew.training import ProfileWindow
+
+    def trained(name: str, **fields) -> Path:
+        config = TrainerConfig(name=name, checkpoint_dir=str(tmp_path / "runs"), steps=14, eval_every=None,
+                               checkpoint_every=None, **fields)
+        RunConfig(trainer=config).train(Regression(), Loader(lambda partition: batches(), None, None, 8),
+                                        name=name)
+        return tmp_path / "runs" / name
+
+    # The run's window keeps its trace and manifest alone: it asks no XProf and converts no reports.
+    from dew.telemetry import profile as telemetry_profile
+
+    def unasked():
+        raise AssertionError("a run's own window asked for XProf")
+
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(telemetry_profile, "require_profile_support", unasked)
+        profiled = trained("profiled")
+    assert any(path.is_file() for path in (profiled / "profile").rglob("*"))
+    assert not any(path.name == "reports" for path in (profiled / "profile").rglob("*"))
+    written = (profiled / "tracking" / "records.jsonl").read_text().splitlines()
+    records = [json.loads(line) for line in written]
+    (traced,) = [row["value"] for row in records if row["type"] == "ProfileTraced"]
+    assert traced["steps"] == 2
+    # A run in a bucket keeps its capture with its other local records, in Dew's cache (`local_records`).
+    remote = TrainerConfig(name="remote", checkpoint_dir="gs://bucket/runs").window("gs://bucket/runs/remote",
+                                                                                   "remote")
+    assert remote is not None and remote.directory == local_records("gs://bucket/runs/remote", "remote",
+                                                                    "profile")
+    assert "://" not in remote.directory
+    plain = trained("plain", profile=None)
+    assert not (plain / "profile").exists()
+    with dew.Profiler(tmp_path / "outer"):
+        inside = trained("inside")
+        with pytest.raises(ValueError):
+            trained("asked", profile=ProfileWindow(str(tmp_path / "asked"), 2))
+    assert not (inside / "profile").exists()
+
+
+def test_a_runs_own_window_whose_manifest_is_not_written_leaves_the_run_training(caplog):
+    """A run's own profile window is a diagnostic of the run's: where its capture's manifest cannot be
+    written as it stops (`dew.telemetry.profile.ExportFailed`), the stop logs it and the run trains on,
+    where a window that reports fails the run as before (train 607's review)."""
+    import logging
+
+    from dew.telemetry.profile import ExportFailed
+    from dew.training.profiling import ProfileWindow, run_window, stop_capture
+
+    class Unwritten:
+        """A profiler whose capture stopped and whose manifest could not be written."""
+
+        def stop(self, *, wait: bool = True) -> None:
+            raise ExportFailed("writing the capture's manifest failed", [OSError("read-only directory")])
+
+    with caplog.at_level(logging.WARNING, logger="dew"):
+        stop_capture(Unwritten(), None, run_window())
+    assert any(record.name == "dew.training.profiling" and record.levelno == logging.WARNING
+               for record in caplog.records)
+    with pytest.raises(ExportFailed):
+        stop_capture(Unwritten(), None, ProfileWindow("asked", 2))
+
+
+def test_a_trainer_given_a_window_naming_no_directory_traces_into_one_of_its_own(tmp_path):
+    """A trainer given a profile window that names no directory traces it into a directory of the
+    profiler's own (`dew.Profiler`'s), which its `ProfileTraced` record names, where it refused to run
+    (train 607's review)."""
+    from dew.training import LocalTracker, ProfileWindow
+
+    tracking = tmp_path / "tracking"
+    config = TrainerConfig(steps=4, eval_every=None, checkpoint_every=None)
+    trainer = RunConfig(trainer=config).built(Regression(), config.mesh, None,
+                                              tracker=LocalTracker(str(tracking)),
+                                              profile=ProfileWindow(None, 1, warmup=1, reports=False))
+    trainer.fit(Loader(lambda partition: batches(), None, None, 8), steps=4)
+    records = [json.loads(line) for line in (tracking / "records.jsonl").read_text().splitlines()]
+    (traced,) = [row["value"] for row in records if row["type"] == "ProfileTraced"]
+    assert traced["steps"] == 1 and any(path.is_file() for path in Path(traced["directory"]).rglob("*"))
 
 
 def test_a_saved_runs_profile_window_reads_its_capture_options_as_its_captures(tmp_path):

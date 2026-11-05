@@ -1574,7 +1574,11 @@ def test_from_iter_closes_the_native_file_before_restoring_and_on_close(tmp_path
     assert all(iterator.file.closed for iterator in opened)
 
 
-def test_closing_a_compiled_from_iter_reader_finalizes_its_native_generators():
+@pytest.mark.parametrize("cycle", [1, 2])
+def test_closing_a_compiled_from_iter_reader_finalizes_its_native_generators(cycle):
+    """Closing a streamed reader finalizes every native generator it opened: two passes' interleaved
+    (`cycle` 2), Grain's interleave opening the next ahead on its iterator-making executor, or one pass
+    after another (`cycle` 1), each opened as the one before ends (row 4079)."""
     from dew.data import from_iter
     from dew.data.compile import compile
 
@@ -1601,19 +1605,24 @@ def test_closing_a_compiled_from_iter_reader_finalizes_its_native_generators():
         finalizers.append(finalized)
         return iterator
 
-    source = from_iter(factory, identity="closing-generator@1").repeat().batch(2)
+    source = from_iter(factory, identity="closing-generator@1")
+    source = (source.interleave(cycle) if cycle > 1 else source).repeat().batch(2)
     reader = compile(source, read="streamed", loading=Loading(workers=0, threads=1, read_buffer=1)
                      ).train(DataPartition())
     try:
-        assert next(reader)["id"].tolist() == [0, 1]
-        assert both_started.wait(timeout=5)
-        assert sorted(opened) == [0, 1] and not closed
+        # A pass's first two rows, or, interleaved, each pass's first.
+        assert next(reader)["id"].tolist() == ([0, 1] if cycle == 1 else [0, 0])
+        # One pass after another opens the one it reads alone; interleaved, each pass it reads, and those
+        # its iterator-making executor opens ahead.
+        if cycle > 1:
+            assert both_started.wait(timeout=5)
+        assert (opened == [0] if cycle == 1 else len(opened) >= cycle) and not closed
     finally:
         reader.close()
         reader.close()
     # Grain finalizes the unconsumed lookahead on its iterator-making executor.
     assert all(finalized.wait(timeout=5) for finalized in finalizers)
-    assert sorted(closed) == sorted(opened) == [0, 1]
+    assert sorted(closed) == sorted(opened)
 
 
 def test_from_iter_forwards_a_native_stop_request():
@@ -1670,6 +1679,25 @@ def test_two_unnamed_grain_stores_keep_their_own_rows_and_counts_in_phases_and_a
         stream.close()
     counts = mix([Pipeline(first), Pipeline(second)]).stats(records=10)
     assert sorted(value for name, value in counts.items() if name.startswith("data/rows/")) == [5, 5]
+
+
+@pytest.mark.parametrize("threads", [0, 2])
+def test_a_filtered_grain_source_streams_its_kept_records_on_any_share_of_threads(threads):
+    """A Grain dataset filtered by index (`MapDataset.filter`, which leaves a dropped index None) streams the
+    records it keeps, in order, whatever share of the loading's threads it reads on: none, as a member of
+    a mix of more members than threads reads on the thread that draws it, or some (4079's review: a reader
+    of its own for no threads returned the dropped indices)."""
+    from dew.data import from_grain
+    from dew.data.pipeline import Pipeline
+
+    rows = grain.MapDataset.source([{"id": index} for index in range(12)])
+    kept = rows.filter(lambda row: row["id"] % 3 == 0)
+    stream = compile(Pipeline(from_grain(kept)).batch(1), read="streamed",
+                     loading=Loading(workers=0, threads=threads, read_buffer=2)).train(DataPartition())
+    try:
+        assert [int(batch["id"][0]) for batch in itertools.islice(stream, 4)] == [0, 3, 6, 9]
+    finally:
+        stream.close()
 
 
 @pytest.mark.parametrize("table", ["pandas", "arrow"])

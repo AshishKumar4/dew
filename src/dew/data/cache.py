@@ -45,7 +45,7 @@ from dew.data.once import LOCK, locked_cached_property
 from dew.data.pipeline import Record, Rejected, Volatile
 from dew.data.retention import LocalRetention
 from dew.data.sinks import write_array_record
-from dew.data.sources.base import Shard, Source
+from dew.data.sources.base import Shard, ShardOpener, Source
 from dew.data.sources.codec import Unencodable, encode
 from dew.data.sources.records import ArrayRecords
 from dew.data.storage import PreconditionFailed, Store, _byte_size
@@ -236,12 +236,12 @@ class Cache:
 
     def streamed(
         self,
-        reader: Callable[[Shard], grain.IterDataset],
+        reader: ShardOpener,
         key: DependencyManifest,
         *,
         transform: Transform | None = None,
         threads: int | None = None,
-    ) -> Callable[[Shard], grain.IterDataset]:
+    ) -> ShardOpener:
         computed = (reader if transform is None
                     else _PassthroughReader(reader, _Passthrough(transform), threads))
         if transform is not None and _volatile(transform):
@@ -813,28 +813,29 @@ class _Applied:
 
 @dataclass(frozen=True)
 class _PassthroughReader:
-    reader: Callable[[Shard], grain.IterDataset]
+    reader: ShardOpener
     transform: _Passthrough
     threads: int | None = None
 
-    def __call__(self, shard: Shard) -> grain.IterDataset:
+    def __call__(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
         if self.threads is None:
-            return self.reader(shard).map_with_index(self.transform)
+            return self.reader(shard, options).map_with_index(self.transform)
         # A fetch with a pool of its own runs its records at once, in their order.
-        indexed = self.reader(shard).map_with_index(_Indexed())
+        indexed = self.reader(shard, options).map_with_index(_Indexed())
         return Concurrently(indexed, _Applied(self.transform), self.threads)
 
 
 @dataclass(frozen=True)
 class _CachedReader:
-    reader: Callable[[Shard], grain.IterDataset]
+    reader: ShardOpener
     cache: Cache
     key: DependencyManifest
     transform: Transform | None
     published: _Published | None
 
-    def __call__(self, shard: Shard) -> grain.IterDataset:
-        return _CachedIter(self.reader(shard), self.cache, self.key, shard, self.transform, self.published)
+    def __call__(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
+        return _CachedIter(self.reader(shard, options), self.cache, self.key, shard, self.transform,
+                           self.published)
 
 
 class _CachedIter(grain.IterDataset):

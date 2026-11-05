@@ -50,10 +50,11 @@ from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._records import JSON, duration, earlier_fields, is_share, recorded_duration
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
+from dew.cleanup import attempted
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.data import records
 from dew.data.compile import fitted
-from dew.data.dataset import Loader, Ramp, Reader, ramped
+from dew.data.dataset import Closeable, Loader, Ramp, Reader, ramped
 from dew.data.pipeline import Dataset, ObjectiveData
 from dew.data.plan import PLAN_VERSIONS, SCHEDULE, PlanOrderChanged
 from dew.distributed.placement import Layout, MeshSpec
@@ -95,7 +96,7 @@ from dew.training.diloco import DiLoCo
 from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Split, Summary
 from dew.training.inspection import Inspection
-from dew.training.profiling import ProfileReport, ProfileWindow
+from dew.training.profiling import ProfileReport, ProfileWindow, run_window
 from dew.training.quantization import quantize_trunk
 from dew.training.rollout import Rollout
 from dew.training.selection import Best
@@ -571,10 +572,14 @@ class TrainerConfig:
     """Microbatches a pipelined step feeds through the mesh's stages, a
     multiple of `mesh.stage`; unset feeds one a stage."""
     layout: Layout = dataclasses.field(default_factory=Layout)
-    profile: ProfileWindow | None = None
+    profile: ProfileWindow | None = dataclasses.field(default_factory=run_window)
     """One profiler window: the steps to trace, the warmup before them and the output directory.
 
-    Unset traces nothing.
+    By default every run traces two of its steps once ten have run past its first compile, through Dew's
+    own profiler, kept with its records under its directory (`profile`, a window naming no directory),
+    where the process can take a capture (`dew.training.profiling.capturable`): a capture's fixed cost,
+    about a second on a CPU host whatever its steps (row 4112), a run of minutes does not see, and a run
+    shorter than its warmup takes none. None traces nothing.
     """
     compilation_cache_dir: str | None = None
     """The directory of JAX's persistent compilation cache, so a restart skips recompiling the step.
@@ -750,6 +755,20 @@ class TrainerConfig:
         """The directory of the run `name`'s checkpoints and record, in `checkpoint_dir`."""
         return os.path.join(self.checkpoint_dir, name)
 
+    def window(self, directory: str, name: str) -> ProfileWindow | None:
+        """The profile window the run `name` under `directory` traces: `profile` as it names its directory,
+        a run's own (no directory) kept with the run's local records (`local_records`: its directory's
+        `profile`, or Dew's cache for a run in a bucket) where the process can take a capture
+        (`capturable`), none where it cannot or the run traces none."""
+        from dew.training.profiling import capturable
+
+        window = self.profile
+        if window is None or window.directory is not None:
+            return window
+        if not capturable():
+            return None
+        return dataclasses.replace(window, directory=local_records(directory, name, "profile"))
+
     def checkpoints(self, name: str, directory: str | None = None) -> Checkpoints:
         """The checkpoints of the run `name` in `checkpoint_dir` (`directory`), or in `directory` where
         given (a saved run read where it lies), keeping `keep`, with its local tier under `name` in
@@ -826,43 +845,51 @@ class TrainerConfig:
         return dataset.epoch_steps(window=self.accumulation)
 
 
-def _local_tracker(directory: str, name: str):
-    """Return the journal directory for a run, beside its checkpoints where it can be.
+def local_records(directory: str, name: str, kind: str) -> str:
+    """Where the run `name` under `directory` keeps its local records of `kind` (its journal, `tracking`,
+    or its profile's capture, `profile`), beside its checkpoints where it can be.
 
-    A bucket URI is not a directory this process can write journals into, so a
-    remote run journals under Dew's cache (`dew_cache_dir`), keyed by the run name and
-    a digest of the bucket path.
+    A bucket URI is not a directory this process can write into, so a remote run keeps them under Dew's
+    cache (`dew_cache_dir`), keyed by the run name and a digest of the bucket path.
     """
     if "://" not in directory:
-        return LocalTracker(os.path.join(directory, "tracking"))
-    return LocalTracker(os.path.join(dew_cache_dir(), "tracking",
-                                     _artifact_name(name) + "-"
-                                     + hashlib.sha256(directory.encode()).hexdigest()[:12]))
+        return os.path.join(directory, kind)
+    return os.path.join(dew_cache_dir(), kind,
+                        _artifact_name(name) + "-" + hashlib.sha256(directory.encode()).hexdigest()[:12])
 
 
-def _closed(tracker, checkpoints: Checkpoints | None, primary: BaseException | None) -> None:
-    """Close `tracker` on every rank and agree on the outcome, then close `checkpoints`, even where
-    the tracker's close failed.
+def _local_tracker(directory: str, name: str):
+    """Return the journal of a run, kept where its local records are (`local_records`)."""
+    return LocalTracker(local_records(directory, name, "tracking"))
+
+
+def _closed(tracker, checkpoints: Checkpoints | None, primary: BaseException | None,
+            rollout: Closeable | None = None) -> None:
+    """Close `rollout` (what it runs beside the trainer: a served policy's engine, a reward pool), then
+    `tracker` on every rank and agree on the outcome, then `checkpoints`, each even where one before it
+    failed.
 
     `primary` is the exception the run is already unwinding with, if any. A
     close that fails is noted on it rather than replacing it, since the run's
     own failure is the one a caller wants; without one, the first failure is
-    raised with the other noted on it.
+    raised with the others noted on it.
     """
+    closes = [*([] if rollout is None else [("closing the rollout", rollout.close)]),
+              *([] if tracker is None else
+                [("closing the tracker", functools.partial(tracker.__exit__, type(primary), primary, None))])]
     error = None
     try:
-        if tracker is not None:
-            tracker.__exit__(type(primary), primary, None)
+        attempted(closes)
     except BaseException as failure:
         error = failure
     failed = None
     try:
-        agree_process_phase(error, phase="tracker close")
+        agree_process_phase(error, phase="run close")
     except BaseException as failure:
         if primary is None:
             failed = failure
         else:
-            primary.add_note(f"Tracker close failed: {failure!r}")
+            primary.add_note(f"Closing the run failed: {failure!r}")
     raised = primary if primary is not None else failed
     if checkpoints is not None:
         checkpoints.__exit__(None if raised is None else type(raised), raised, None)
@@ -2079,7 +2106,8 @@ class RunConfig:
             # and the rest are fit's arguments or built the checkpoints and the tracker.
             ahead = None if trainer.ahead is None else AheadOfTime.load(trainer.ahead)
             built = self.built(objective, trainer.mesh, rollout, checkpoints=checkpoints, tracker=tracker,
-                               profile=trainer.profile, lower_for=trainer.lower_for, ahead=ahead)
+                               profile=trainer.window(checkpoints.directory, name),
+                               lower_for=trainer.lower_for, ahead=ahead)
 
             def record_run() -> None:
                 """Write the run's record and name where it is tracked, on rank zero."""
@@ -2125,7 +2153,8 @@ class RunConfig:
             return state
 
         finally:
-            _closed(tracker, checkpoints, sys.exception())
+            _closed(tracker, checkpoints, sys.exception(),
+                    rollout if isinstance(rollout, Closeable) else None)
 
     def compiled_ahead[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
                                          steps: int | None, rollout: Rollout | None,

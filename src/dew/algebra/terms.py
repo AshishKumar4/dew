@@ -52,6 +52,10 @@ REDUCTIONS = {"reduce_sum": "sum", "reduce_max": "max", "reduce_min": "min"}
 SHAPES = frozenset({"broadcast_in_dim", "reshape", "transpose", "squeeze", "expand_dims"})
 """The primitives of the language (§1): elementwise arithmetic and comparisons, casts, the layout changes, the
 reductions a rule reads, and products (`dot_general`). Every other equation is a leaf of the region."""
+RESCALE = "rescale"
+"""A binary no program holds: a derived walk's rescale of a carried state from its first operand's anchor to
+its second's where the declaration states its own (`derive.Reduction.rescale`), evaluated by that function
+(`forms.evaluator`) and priced as an exponential (`cost.work`); no rule rewrites it."""
 
 
 class Term(Expr):

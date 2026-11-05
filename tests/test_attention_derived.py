@@ -240,36 +240,54 @@ def forward_rows(form: str):
 def derived_backward(form: str, along: str):
     """The backward declaration's derived forms walked `along` key tiles (queries first) or query tiles (keys
     first), from the template forward's residual rows (`forward_rows`): its logits the tile's, -inf where
-    unseen, and D about no anchor (its whole `delta`)."""
+    unseen, and D about no anchor (its whole `delta`), each step's products the template's CPU mainloop's
+    issuer (`attention.interpreted_dot`), scheduled as a mainloop tiles the walk: keys first, a key tile's dK
+    and dV the walk's over the query tiles; queries first, each query tile walking the key tiles, its dQ the
+    walk's and each key tile's dK and dV its share, summed over the query tiles in order (row 3310: one
+    contraction over a key tile's every query at once, no mainloop's schedule, erred 1.63 times the
+    template's in dV)."""
     forms = derive.derive(attention_backward_algebra.backward_declaration(scale=SCALE, walked=along),
                           accurate=False, saturation=SATURATION)
     seen = seen_of(form)
     rows_of = forward_rows(form)
+    tiles = LENGTH // BLOCK
+    by_row = ("q", "dout", "peak", "total", "anchor", "delta", "logits", "seen")
 
     def tile(values: dict, index: int) -> dict:
         part = slice(index * BLOCK, (index + 1) * BLOCK)
-        tiled = (("q", "dout", "peak", "total", "anchor", "delta", "logits", "seen") if along == "rows"
-                 else ("k", "values"))
 
         def part_of(name, value):
-            if along == "keys" and name in ("logits", "seen"):
+            if along == "rows":
+                return value[part] if name in by_row else value
+            if name in ("logits", "seen"):
                 return value[:, part]
-            return value[part] if name in tiled else value
+            return value[part] if name in ("k", "values") else value
 
         return {name: part_of(name, value) for name, value in values.items()}
+
+    def walk(values: dict):
+        parts = [tile(values, index) for index in range(tiles)]
+        mapped = [forms.mapped(part) for part in parts]
+        return forms.finish(walked(forms, parts, template.interpreted_dot), values,
+                            shapes=shaped(parts[0])), mapped
 
     def run(q, k, v, d):
         _, peak, total, delta = rows_of(q, k, v, d)
         logits = jnp.where(seen, float32_einsum("qd,kd->qk", q, k) * SCALE, -jnp.inf)
         values = {"logits": logits, "q": q, "k": k, "values": v, "dout": d, "peak": peak, "total": total,
                   "anchor": jnp.zeros_like(delta), "delta": delta, "seen": seen}
-        parts = [tile(values, index) for index in range(LENGTH // BLOCK)]
-        mapped = [forms.mapped(part) for part in parts]
-        dq, dk, dv, *_ = forms.finish(walked(forms, parts), values, shapes=shaped(parts[0]))
         if along == "rows":
+            (_, dk, dv, *_), mapped = walk(values)
             return jnp.concatenate([parts[0] for parts in mapped]), dk, dv
-        return (dq, jnp.concatenate([parts[1] for parts in mapped]),
-                jnp.concatenate([parts[2] for parts in mapped]))
+        dq, dk, dv = [], 0.0, 0.0
+        for block in range(tiles):
+            part = slice(block * BLOCK, (block + 1) * BLOCK)
+            rows = {name: value[part] if name in by_row else value for name, value in values.items()}
+            (block_dq, *_), mapped = walk(rows)
+            dq.append(block_dq)
+            dk = dk + jnp.concatenate([parts[1] for parts in mapped])
+            dv = dv + jnp.concatenate([parts[2] for parts in mapped])
+        return jnp.concatenate(dq), dk, dv
 
     return run
 
@@ -292,33 +310,23 @@ def oracle_backward(form: str):
     return run
 
 
-SERVED_BY_TEMPLATE = {("causal", "keys"), ("started", "keys")}
-"""The backward cells the template's own form serves, the derived form not on par there until the engine's
-error-aware extraction prices the choice that passes (docs/design/algebra.md §1.5, the generator's first
-acceptance case, row 3310; a causal call walked queries first, whose derived dV erred 1.62 times the
-template's, 1.74 where its first queries see no key)."""
-
-
 @pytest.mark.parametrize("walked", ["keys", "rows"], ids=["queries-first", "keys-first"])
 @pytest.mark.parametrize("form", list(SPANS))
-def test_the_backward_serving_each_cell_is_on_par(form, walked):
-    """The backward form serving each cell on par against the float64 gradients (check 1): the backward
-    declaration's derived forms, walked queries first or keys first, held to the template's own backward at
-    the same tiles; the template's form where it serves (`SERVED_BY_TEMPLATE`), held to XLA's."""
-    if (form, walked) in SERVED_BY_TEMPLATE:
-        served, reference = oracle_backward(form), xla_backward(form)
-    else:
-        served, reference = derived_backward(form, walked), oracle_backward(form)
+def test_the_derived_backward_is_on_par_in_every_cell(form, walked):
+    """The backward's derived forms on par against the float64 gradients (check 1) in every cell: the backward
+    declaration's forms, walked queries first or keys first as a mainloop schedules them
+    (`derived_backward`), held to the template's own backward at the same tiles."""
+    served, reference = derived_backward(form, walked), oracle_backward(form)
     assert_as_exact(jax.jit(served), jax.jit(reference), backward_draw,
                     f"attention backward {form} {walked}", seeds=16, truth_fn=xla_backward(form))
 
 
 @contextlib.contextmanager
-def fast(derived: bool):
-    """Within the block, the run's fast forms (the base-2 fold the declaration states; the accurate forms it
-    states none of), the template's walks the hand-written forms or the derived ones
+def fast(derived: bool, forms: str = "fast"):
+    """Within the block, the run's `forms` (the fast ones' base-2 fold, or the accurate ones' natural logits,
+    each the declaration states), the template's walks the hand-written forms or the derived ones
     (`dew.algebra.forms.derived`)."""
-    with (generation.run_precision(dataclasses.replace(generation.numerics(), forms="fast")),
+    with (generation.run_precision(dataclasses.replace(generation.numerics(), forms=forms)),
           algebra_forms.derived(derived)):
         yield
 
@@ -329,14 +337,16 @@ forward's step, merge and finish whatever walk the training step takes), and a d
 
 
 @pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
+@pytest.mark.parametrize("numerics", ["fast", "accurate"])
 @pytest.mark.parametrize("call", list(CALLS))
 @pytest.mark.parametrize("form", ["full", "causal"])
-def test_the_portable_mainloop_computes_attention_by_either_forms(form, call, derived):
+def test_the_portable_mainloop_computes_attention_by_either_forms(form, call, numerics, derived):
     """The plain-JAX mainloop's forward (`attention_portable.attend`) over fp16 operands (a plain walk, of no
-    compensation or guard, which the derived forms serve) under the run's fast forms, its walk's step, merge
-    and finish the hand-written forms or the derived ones behind the switch, the product of its weights with
-    the values its own (`Keys.dot`): on par with the reference (check 1) either way, a plain call's, a
-    training call's (with its residuals) and a dropping call's."""
+    compensation or guard, which the derived forms serve) under the run's fast forms or its accurate ones
+    (natural logits, the largest weight held to 1 and the rescale compensated, which the declaration states),
+    its walk's step, merge and finish the hand-written forms or the derived ones behind the switch, the
+    product of its weights with the values its own (`Keys.dot`): on par with the reference (check 1) either
+    way, a plain call's, a training call's (with its residuals) and a dropping call's."""
     spans = template.spans(LENGTH, LENGTH, 1, **SPANS[form])
     rate = CALLS[call].get("drop")
     residuals = CALLS[call].get("residuals", False)
@@ -346,9 +356,10 @@ def test_the_portable_mainloop_computes_attention_by_either_forms(form, call, de
             words, jnp.arange(1, dtype=jnp.int32), jnp.arange(1, dtype=jnp.int32), rate))
 
     def ours(q, k, v, words):
-        with fast(derived):
+        with fast(derived, numerics):
             out = attention_portable.attend(q[None, :, None], k[None, :, None], v[None, :, None], spans,
-                                            hooks(words), residuals=residuals, **TILES)
+                                            hooks(words), residuals=residuals, natural=numerics == "accurate",
+                                            **TILES)
         return (out[0] if residuals else out)[0, :, 0]
 
     def reference(q, k, v, words):
@@ -361,7 +372,7 @@ def test_the_portable_mainloop_computes_attention_by_either_forms(form, call, de
                 jax.random.bits(jax.random.key(seed), (2,), jnp.uint32))
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), operands,
-                    f"portable forward {form} {call} derived {derived}", seeds=16)
+                    f"portable forward {form} {call} {numerics} derived {derived}", seeds=16)
 
 
 @pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])

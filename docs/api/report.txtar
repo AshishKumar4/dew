@@ -200,7 +200,7 @@ class Process(schedule: NoiseScheduler, prediction: PredictionTransform, weighti
   .times(self, steps: int) -> jax.Array
   .variances(self, t, *, like: jax.Array) -> tuple[jax.Array, jax.Array]
   .weight(self, t) -> jax.Array
-class ProfileWindow(directory: str, steps: int, warmup: int = 2, capture: dew.telemetry.profile.CaptureOptions = <factory>) -> None  [dew.training.profiling]
+class ProfileWindow(directory: str | None, steps: int, warmup: int = 2, capture: dew.telemetry.profile.CaptureOptions = <factory>, reports: bool = True) -> None  [dew.training.profiling]
 class Profiler(directory: str | os.PathLike[str] | None = None, *, options: jax.profiler.ProfileOptions | None = None, reports: bool = True) -> None  [dew.telemetry.profile]
   .captures: property -> tuple[Path, ...]
   .directory: property -> Path | None
@@ -295,7 +295,7 @@ class Trackers(*trackers: Tracker)  [dew.training.tracker]
   .artifact(self, value: Reported, step: int) -> None
   .close(self) -> None
   .log(self, scalars: Mapping[str, float], step: int) -> None
-class TrainState(step: jax.Array, microstep: jax.Array, updates: jax.Array, variables: Variables, opt_state: optax.OptState, ema: Variables | None, key: jax.Array, scale: DynamicScale | None, window_size: jax.Array, accumulation: Accumulation | None = None, consumed: jax.Array | None = None, deferred: jax.Array | None = None, inner: Replicas | None = None, compute: Variables | None = None) -> None  [dew.state]
+class TrainState(step: jax.Array, microstep: jax.Array, updates: jax.Array, variables: Variables, opt_state: optax.OptState, ema: Variables | None, key: jax.Array, scale: DynamicScale | None, window_size: jax.Array, accumulation: Accumulation | None = None, consumed: jax.Array | None = None, deferred: jax.Array | None = None, inner: ReplicaState | None = None, compute: Variables | None = None) -> None  [dew.state]
   .averaged: property -> Variables
   .pending_tokens: property -> jax.Array | None
   .replace(self, **updates)
@@ -419,7 +419,7 @@ dew.config.TrainerConfig
   mesh: dew.distributed.placement.MeshSpec = dew.distributed.placement.MeshSpec()
   microbatches: int | None = None
   layout: dew.distributed.placement.Layout = dew.distributed.placement.Layout()
-  profile: dew.training.profiling.ProfileWindow | None = None
+  profile: dew.training.profiling.ProfileWindow | None = dew.training.profiling.run_window()
   compilation_cache_dir: str | None = None
   wandb: dew.training.tracker.Wandb | None = None
   publish: bool = False
@@ -514,6 +514,13 @@ dew.config.lm.PromptRollout
   admit: int | None = None
   overlong_cache: int | None = None
   generation_batches: int = 1
+  served: Annotated[ServedRollout, tyro.conf.subcommand('served')] | None = None
+dew.config.lm.ServedRollout
+  slots: int = 8
+  ahead: int = 1
+  max_lag: int = 1
+  sync_every: int = 1
+  page_size: int | None = None
 dew.config.sweep.GridSearch
 dew.config.sweep.OptunaSearch
   seed: int = 0

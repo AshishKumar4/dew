@@ -137,7 +137,7 @@ from dew.data.pipeline import (
 from dew.data.plan import PLAN_VERSIONS, Manifest
 from dew.data.readers import _FillShare
 from dew.data.shards import bounded as shards_bounded, bounded_places, streamed
-from dew.data.sources.base import Read, Shard, ShardManifest, Source, materialized
+from dew.data.sources.base import Read, Shard, ShardManifest, ShardOpener, Source, materialized
 from dew.data.sources.urls import Fetch
 from dew.data.steps.text import LayoutRule, ValidTargets, counted_window, recounted
 from dew.data.text import Chunks
@@ -414,11 +414,11 @@ class _Rest:
 
 @dataclasses.dataclass(frozen=True)
 class _PlacedShards:
-    reader: Callable[[Shard], pygrain.IterDataset]
+    reader: ShardOpener
     starts: Mapping[str, int]
 
-    def __call__(self, shard: Shard) -> pygrain.IterDataset:
-        return self.reader(shard).map_with_index(_Placed(self.starts[shard.id]))
+    def __call__(self, shard: Shard, options: pygrain.ReadOptions | None = None) -> pygrain.IterDataset:
+        return self.reader(shard, options).map_with_index(_Placed(self.starts[shard.id]))
 
 
 def _positioned(manifest: ShardManifest) -> ShardManifest:
@@ -730,15 +730,15 @@ class _ShardSteps:
     flattens the shards where it stands. Rejected rows stay marked for the
     accepting reader after it."""
 
-    reader: Callable[[Shard], pygrain.IterDataset]
+    reader: ShardOpener
     stages: tuple[Map | MapWithIndex | Filter | FlatMap, ...]
     cached: bool
     name: str
     label: str
     loading: Loading
 
-    def __call__(self, shard: Shard) -> pygrain.IterDataset:
-        rows = self.reader(shard)
+    def __call__(self, shard: Shard, options: pygrain.ReadOptions | None = None) -> pygrain.IterDataset:
+        rows = self.reader(shard, options)
         rows = gx.FlatMapIterDataset(rows, _CachedOutputs()) if self.cached else rows
         start = 0
         while start < len(self.stages):
