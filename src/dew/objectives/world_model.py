@@ -28,6 +28,7 @@ from flax import linen as nn
 from dew.batch import Batch, Variables, unboxed
 from dew.inputs import unit_range
 from dew.nn.attention import reference_attention
+from dew.nn.scan_orders import patchify, unpatchify
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step
 
 
@@ -73,19 +74,17 @@ class CausalTokenizer(nn.Module):
         return (height // self.patch) * (width // self.patch)
 
     def _patchify(self, frames: jax.Array) -> jax.Array:
+        """Frames `[..., H, W, C]` as `nn.scan_orders.patchify`'s row-major patches, its batch the frames'
+        leading axes."""
         *lead, height, width, channels = frames.shape
-        p = self.patch
-        x = frames.reshape(*lead, height // p, p, width // p, p, channels)
-        x = jnp.moveaxis(x, -4, -3)
-        return x.reshape(*lead, (height // p) * (width // p), p * p * channels)
+        patches = patchify(frames.reshape(-1, height, width, channels), self.patch)
+        return patches.reshape(*lead, *patches.shape[1:])
 
     def _unpatchify(self, patches: jax.Array) -> jax.Array:
-        *lead, _, _ = patches.shape
-        height, width, channels = self.frame
-        p = self.patch
-        x = patches.reshape(*lead, height // p, width // p, p, p, channels)
-        x = jnp.moveaxis(x, -3, -4)
-        return x.reshape(*lead, height, width, channels)
+        """`_patchify`'s inverse (`nn.scan_orders.unpatchify`)."""
+        *lead, count, size = patches.shape
+        frames = unpatchify(patches.reshape(-1, count, size), self.patch, *self.frame)
+        return frames.reshape(*lead, *self.frame)
 
     def setup(self) -> None:
         self.embed = nn.Dense(self.width)
