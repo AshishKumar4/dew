@@ -38,7 +38,8 @@ from dew.distributed.batches import shard_batch
 from dew.inference.banks import HeldBanks
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
-from dew.nn.backbones.decoder_stack import StackView
+from dew.nn.backbones.decoder_stack import StackView, stacked_rows
+from dew.nn.backbones.layer_names import array_rows, stored_layers
 from dew.nn.mixers.attention import ATTENTION_AXES
 from dew.nn.mlp import MLP_AXES
 from dew.nn.moe import BANKED_EXPERTS, experts_apart
@@ -516,6 +517,39 @@ def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loo
 
     assert_as_exact(steps(deep), steps(plain), draw, "periodic decode steps", seeds=PERIODIC_SEEDS,
                     truth_fn=truth)
+
+
+def test_a_one_stage_state_holds_a_scanned_stack_as_its_scan_reads_it():
+    """On one stage a scanned decoder's stage-local state (`stage_sites` at one stage, `StackView.
+    stage_form`) holds each run as the scan reads it, a periodic run stacked by position of its period,
+    under the one stage's index: the stack reads it in place, its logits and its parameters' gradient,
+    which comes back in the same form, the per-layer store's bit for bit, and its program holds no stacked
+    copy of the run beside it, as a per-layer store's restacked every step does (row 4098). Its layers
+    come back as they were stored (`layer_form`, `stored_layers`)."""
+    model = hybrid(3, scan_layers=True)
+    ids = jax.random.randint(jax.random.key(1), (2, 10), 0, VOCAB)
+    params = nn.unbox(model.init(jax.random.key(0), ids))["params"]
+    (site,) = model.stage_sites({"params": params}, 1)
+    assert (site.view.groups, site.view.periods) == (((0, 12),), (4,))
+    staged = site.view.stage_form("params", dict(params), stacked_rows)
+    assert set(staged) == {"embed_tokens", "norm", "stages"}
+    assert set(staged["stages"]["layers_0_11"]) == {f"layers_{position}" for position in range(4)}
+
+    def same(left, right):
+        assert jax.tree.structure(left) == jax.tree.structure(right)
+        for one, other in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True):
+            np.testing.assert_array_equal(np.asarray(one), np.asarray(other))
+
+    same(site.view.layer_form(staged, array_rows), params)
+    same(stored_layers(model, {"params": staged})["params"], params)
+    apply = jax.jit(model.apply)
+    same(apply({"params": staged}, ids), apply({"params": params}, ids))
+    gradient = jax.jit(jax.grad(lambda params: jnp.mean(model.apply({"params": params}, ids) ** 2)))
+    same(site.view.layer_form(gradient(staged), array_rows), gradient(params))
+    run = sum(np.asarray(leaf).nbytes for leaf in jax.tree.leaves(staged["stages"]))
+    staged_temporaries, layered_temporaries = (
+        gradient.lower(tree).compile().memory_analysis().temp_size_in_bytes for tree in (staged, params))
+    assert staged_temporaries + run <= layered_temporaries, (staged_temporaries, run, layered_temporaries)
 
 
 BANKED_EXPERT_SEEDS = 8
