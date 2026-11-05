@@ -44,7 +44,7 @@ from dew.distributed.batches import split_fields
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import peak_memory
-from receipt_paths import recorded
+from receipt_paths import named, recorded
 
 
 @dataclass
@@ -255,9 +255,11 @@ def training_timing(config, backend):
 
 
 def recorded_config(config: Config) -> dict:
-    """`config` as the receipt records it (`receipt_paths.recorded`): the flowers' directory, given as a
-    string, by its name outside the checkout; where the receipt is written left out."""
-    return {name: value for name, value in recorded(config, paths=("flowers",)).items() if name != "out"}
+    """`config` as the receipt records it (`receipt_paths.recorded`): the flowers' TFDS directory, given as a
+    string, as its dataset and version outside the checkout (`named`), a bucket's URI as given; where the
+    receipt is written left out."""
+    return {name: value for name, value in {**recorded(config), "flowers": named(config.flowers, 2)}.items()
+            if name != "out"}
 
 
 def main(config):

@@ -36,6 +36,9 @@ from dew.telemetry.benchmark import resident_memory
 from dew.telemetry.profile import Profiler
 from dew.training import Layout, MeshSpec
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from receipt_paths import named, recorded
+
 
 @dataclass(frozen=True)
 class DiskConfig:
@@ -84,6 +87,12 @@ def serial_probe(source, layers, device):
         del staged, row
     return {"layers": layers, "bytes": read_bytes, "read_seconds": read_seconds,
             "h2d_seconds": transfer_seconds}
+
+
+def recorded_config(config: DiskConfig) -> dict:
+    """`config` as the receipt records it (`receipt_paths.recorded`): its checkpoint and trace by name
+    outside the checkout, no host directory whole."""
+    return recorded(config, paths=("trace",))
 
 
 def measure(config: DiskConfig):
@@ -150,7 +159,7 @@ def measure(config: DiskConfig):
         after_io = storage_reads()
         decode_seconds = sum(run[1] for run in runs)
         report = {"device": device.device_kind, "platform": device.platform,
-                  "checkpoint": str(config.checkpoint.resolve()), "config": dataclasses.asdict(config),
+                  "checkpoint": named(config.checkpoint), "config": recorded_config(config),
                   "weight_bytes": weight_bytes, "cache_budget_bytes": source.cache_limit,
                   "layer_bytes": [source.layer_bytes(index) for index in range(model.num_layers)],
                   "prefill_seconds": [run[0] for run in runs], "decode_seconds": [run[1] for run in runs],
