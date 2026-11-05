@@ -910,12 +910,50 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
     assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
 
 
-@pytest.mark.parametrize("host_pages", [0, 8], ids=["device", "host"])
-def test_a_host_tier_keeps_prefix_pages_the_pool_reclaims(host_pages):
+def test_a_host_tier_reads_back_a_prefix_whose_upload_reclaims_the_last_device_pages():
+    """A pool of two pages and one host slot: a prompt's one shared page goes to the slot when another
+    prompt's two named pages take the pool, and the first prompt reads it back while its fresh pages reclaim
+    the other prompt's, which the full slot cannot keep: its upload reads the slot as the spill left it. A
+    reserve released before its copies are made leaves its upload's page cached, and a prompt that takes
+    that page back finds the slot still holding the first prompt's page, not the device page the upload
+    never wrote (`dew.inference.pages.Pages`, ledger 874)."""
+    from dew.inference.pages import Pages
+
+    pages = Pages(2, 4, prefix_cache=True, host=1)
+    first, other = np.arange(1, 6), np.arange(20, 28)
+
+    def ran(prompt):
+        held, prefilled, _, _ = pages.reserve(prompt, 8)
+        pages.publish(prompt, held)
+        pages.release(held)
+        return held, prefilled
+
+    def spilled():
+        held, _ = ran(first)
+        ran(other)
+        assert pages.drained().spills == [(held[0], 0)]
+
+    spilled()
+    held, prefilled, _, _ = pages.reserve(first, 8)
+    owed = pages.drained()
+    assert (prefilled, owed.spills, owed.uploads) == (4, [], [(0, held[0])])
+    pages.release(held)
+    spilled()
+    held, prefilled, _, _ = pages.reserve(first, 8)
+    assert prefilled == 4
+    pages.release(held)
+    pages.reserve(other, 8)
+    owed = pages.drained()
+    assert (owed.spills, owed.uploads, pages.shared(first)) == ([], [], [-1])
+
+
+@pytest.mark.parametrize("host_pages, hits", [(0, 0), (1, 4), (8, 8)], ids=["device", "one-slot", "host"])
+def test_a_host_tier_keeps_prefix_pages_the_pool_reclaims(host_pages, hits):
     """A prefix cache of eight pages of four tokens, one slot: a prompt's two shared pages are cached as it
     ends, then two other prompts take the pool's pages and it reclaims them. With a host tier the reclaimed
-    pages go to host memory and the prompt again reads its 8 tokens back from there; without one it
-    prefills them again. Every request draws what its lone call draws (ledger 874)."""
+    pages go to host memory and the prompt again reads its 8 tokens back from there, or its first 4 where
+    one host slot keeps the page reclaimed last; without one it prefills them again. Every request draws
+    what its lone call draws (ledger 874)."""
     bound = task(Sampling(temperature=1.0))
     shared, others, budget = "123456781", ["987654329876", "555544443333"], 6
     requests = [shared, *others, shared]
@@ -927,7 +965,7 @@ def test_a_host_tier_keeps_prefix_pages_the_pool_reclaims(host_pages):
         ticket = server.submit(held, budget, key=index)
         server.run()
         drawn.append(ticket.result())
-    assert server.prefix_hits == (8 if host_pages else 0)
+    assert server.prefix_hits == hits
     for generation, lone in zip(drawn, alone, strict=True):
         assert_same_generation(generation, lone)
 
