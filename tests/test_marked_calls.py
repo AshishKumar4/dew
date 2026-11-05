@@ -157,3 +157,28 @@ def test_a_surrogate_is_one_surrogate_call():
     x = jnp.linspace(0.1, 4.0, 8)
     assert kinds_of(jax.make_jaxpr(rounded)(x)) == [Surrogate()]
     np.testing.assert_array_equal(np.asarray(jax.grad(lambda x: jnp.sum(rounded(x)))(x)), np.ones(8))
+
+
+def test_a_declared_derivatives_nondifferentiable_array_is_bound_not_traced():
+    """An array at a declared derivative's nondifferentiable position (`nondiff_argnums`, a table the rule
+    reads as a constant) reaches the rule as the bare `jax.custom_vjp` takes it, concrete, eagerly and under a
+    jit, not as a traced operand of the marked call, which the custom derivative would refuse."""
+    def primal(table, x):
+        return jnp.sin(x) * table[0]
+
+    def forward(table, x):
+        return primal(table, x), x
+
+    def backward(table, x, cotangent):
+        return (3.0 * cotangent * jnp.cos(x) * table[0],)
+
+    declared = derivatives.kernel_derivative(primal, forward, backward, nondiff_argnums=(0,))
+    bare = jax.custom_vjp(primal, nondiff_argnums=(0,))
+    bare.defvjp(forward, backward)
+    table, x = jnp.asarray([2.0]), jnp.linspace(0.1, 1.0, 8)
+
+    def gradient(function):
+        return jax.grad(lambda x: jnp.sum(function(table, x)))(x)
+
+    for run in (lambda f: f, jax.jit):
+        np.testing.assert_array_equal(np.asarray(run(gradient)(declared)), np.asarray(run(gradient)(bare)))
