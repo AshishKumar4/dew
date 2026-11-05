@@ -11,7 +11,7 @@ from flax import linen as nn
 from process_support import serve_mode, worker_parser
 from test_env_rollout import Walk
 
-from dew.objectives.rl.config import idle
+from dew.config.env import idle
 from dew.objectives.rl.control import ActorCritic, ControlPPOObjective, ControlRollout
 from dew.rl.env import Batched, TimeLimit
 from dew.training import Trainer

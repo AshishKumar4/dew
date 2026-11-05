@@ -1,5 +1,5 @@
 """The FPV gate race's training phases (`dew.rl.flight` in JAX; images by HyperLux, `dew.rl.hyperlux`), each
-an environment run (`dew.objectives.rl.config.EnvRunConfig`) under OUT, which the phase run again goes on
+an environment run (`dew.config.env.EnvRunConfig`) under OUT, which the phase run again goes on
 from, beside a JSON report.
 
     python tools/fpv_race.py check OUT --assets A        The renderer on this GPU: frames of the race, and
@@ -56,7 +56,7 @@ from flax import serialization, traverse_util
 
 from dew.checkpoints import Checkpoints, Keep
 from dew.config import ObjectiveConfig, TrainerConfig
-from dew.objectives.rl.config import EnvConfig, EnvRunConfig, RolloutConfig, TeacherConfig
+from dew.config.env import EnvConfig, EnvRunConfig, RolloutConfig, TeacherConfig
 from dew.optim import Linear, OptimConfig
 from dew.registry import ModelConfig
 

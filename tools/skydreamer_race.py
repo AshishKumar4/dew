@@ -1,7 +1,7 @@
 """The base check of the FPV pipeline: SkyDreamer's recipe (Verraest et al., arXiv 2510.14783) learning online
 from scratch on its race (`dew.rl.skydreamer`) from the camera's RGB image, by collective thrust and body
 rates, its world model decoding the privileged state; an environment run
-(`dew.objectives.rl.config.EnvRunConfig`) under OUT, which the tool run again goes on from, trained to
+(`dew.config.env.EnvRunConfig`) under OUT, which the tool run again goes on from, trained to
 `--steps` environment steps and judged greedy about every `--every` into OUT/base.json against the
 untrained policy judged alike (`untrained`): on Table III's evaluation starts (each before the first gate)
 and gates (1 m in size), and on held-out episodes of the training task, each from the same seed at every
@@ -47,7 +47,7 @@ import numpy as np
 
 from dew.checkpoints import Checkpoints, Keep
 from dew.config import ObjectiveConfig, TrainerConfig
-from dew.objectives.rl.config import EnvConfig, EnvRunConfig, RolloutConfig
+from dew.config.env import EnvConfig, EnvRunConfig, RolloutConfig
 from dew.optim import Linear, OptimConfig
 from dew.registry import ModelConfig
 from dew.rl.hyperlux import HyperLuxRenderer

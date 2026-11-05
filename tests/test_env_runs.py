@@ -1,4 +1,4 @@
-"""Environment runs built from their records (`dew.objectives.rl.config.EnvRunConfig`): an agent trained in
+"""Environment runs built from their records (`dew.config.env.EnvRunConfig`): an agent trained in
 the gate race as the same run composed in Python trains, its record read back training it again, a teacher
 saved as a run labelling and demonstrating the steps its own policy would, stages chained from the run before
 them, a resume ending where the run that never stopped ends, and each setup the kind refuses."""
@@ -16,8 +16,8 @@ from recording import bits
 from test_env_rollout import evaluation_key
 
 from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
+from dew.config.env import EnvConfig, EnvRunConfig, EpisodesConfig, RolloutConfig, TeacherConfig
 from dew.nn.kernels import generation
-from dew.objectives.rl.config import EnvConfig, EnvRunConfig, EpisodesConfig, RolloutConfig, TeacherConfig
 from dew.objectives.rl.control import ActorCritic, ControlPPOObjective, ControlRollout
 from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, WorldModel
 from dew.objectives.rl.tssm import TSSM

@@ -393,7 +393,7 @@ def test_a_recipes_run_reads_back_as_itself(setting):
     and each of its phases reads back from its record as itself."""
     from tool_support import load
 
-    from dew.objectives.rl.config import EnvRunConfig
+    from dew.config.env import EnvRunConfig
 
     tool = load("skydreamer_race")
     chosen = getattr(tool, setting)

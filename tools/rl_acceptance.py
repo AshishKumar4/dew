@@ -38,10 +38,10 @@ import numpy as np
 import optax
 
 from dew.config import ObjectiveConfig, TrainerConfig
+from dew.config.env import EnvConfig, EnvRunConfig, EpisodesConfig, RolloutConfig
 from dew.config.world_model import TokenizerConfig, WorldModelRunConfig
 from dew.data.dataset import Loader
 from dew.data.pipeline import Pipeline
-from dew.objectives.rl.config import EnvConfig, EnvRunConfig, EpisodesConfig, RolloutConfig
 from dew.optim import Linear, OptimConfig
 from dew.registry import ModelConfig
 from dew.training import LocalTracker
