@@ -832,6 +832,32 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     assert mosaic_failures([{**record, "kernels": [unbound]}])
 
 
+def test_a_gate_holding_its_models_fails_a_spill_free_disagreement_and_an_unmodelled_launch():
+    """A family's gate that holds its register model to ptxas (`model_failures`, row 1971) fails a kernel
+    whose model decides otherwise than ptxas (here four programs where ptxas holds two) and a launch with
+    no model, as the resource gate fails a spill; a kernel whose model agrees passes."""
+    from kernel_compile import model_failures, mosaic_failures
+
+    need = {"admitted": True, "programs": 2, "budget": 255, "refusal_holds": True, "refusal_programs": 2,
+            "caps": [{"cap": 255, "registers": 96, "spilled": 0, "compiled": True, "holds": True}]}
+    kernel = {"kernel": "dew_gmm", "launch": None, "unread": [], "shared": 1024, "tmem": 0, "registers": 96,
+              "spilled": 0, "need": need}
+
+    def judged(most: int) -> list[str]:
+        model = resources.RegisterModel(96, 255, 1, most, 8, 0, shared=1024)
+        record = {"name": "forward", "generation": "sm120", "limit": 101376, "tmem_limit": 0,
+                  "models": {}, "lowered_models": {"dew_gmm": model.record()}, "kernels": [kernel]}
+        assert not mosaic_failures([record])
+        return model_failures([record])
+
+    assert judged(most=2) == []
+    assert judged(most=4)
+    unmodelled = {"name": "forward", "generation": "sm90", "limit": 232448, "tmem_limit": 0, "models": {},
+                  "lowered": {"dew_gmm": ["launch"]}, "kernels": [kernel]}
+    mosaic_failures([unmodelled])
+    assert model_failures([unmodelled])
+
+
 def test_a_kernel_is_judged_by_the_model_its_launch_lowered_not_the_cases_declared_one():
     """A kernel whose launch lowered its own register model (`lowered_models`: its plan's two programs)
     is judged by that model, whose residency ptxas's need was searched at: the case's declared model for
