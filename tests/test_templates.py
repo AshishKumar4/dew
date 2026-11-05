@@ -4,6 +4,7 @@ implementation, as a selector over them takes it (`dew.nn.kernels.selection`), t
 that runs the call."""
 
 import dataclasses
+import unittest.mock
 from typing import ClassVar
 
 import jax
@@ -177,6 +178,36 @@ class Unpriced(Doubling):
 
     def cost(self, ba, config, target):
         raise ValueError("no cost facts")
+
+
+def test_a_launch_derives_once_for_what_its_derivation_reads():
+    """A launch's derivation (`Template.derived`) runs once for what it reads: the call (its arguments'
+    shapes and dtypes, its hooks), the target, the configs its compiles refused and the numerics and forms
+    the run traces under; every eligibility check and planner candidate after reads that once. A change in
+    any of them derives again (row 4259: the GEMM tile derived at every check took 36 s of a Qwen3.5-4B
+    step's compile_ahead)."""
+    from dew.nn.kernels import grouped_matmul
+    from dew.nn.kernels.templates.gemm import mosaic_gpu
+
+    calls = []
+    plain = mosaic_gpu.derived
+
+    def counted(*args, **kwargs):
+        calls.append(kwargs["rows"])
+        return plain(*args, **kwargs)
+
+    launch = grouped_matmul.MosaicGmm()
+    bf16 = jax.ShapeDtypeStruct
+    with generation.assumed("sm90"), unittest.mock.patch.object(mosaic_gpu, "derived", counted):
+        target = generation.gpu_target()
+        for rows in (2048, 2048, 4096, 2048):
+            args = (bf16((rows, 1024), jnp.bfloat16), bf16((4, 1024, 2048), jnp.bfloat16),
+                    bf16((4,), jnp.int32))
+            launch.derived(launch.bind(*args, out_dtype="bfloat16", trans_rhs=False, interpret=False), target)
+        halved = dataclasses.replace(target, multiprocessors=target.multiprocessors // 2)
+        with generation.assumed(halved):
+            launch.derived(launch.bind(*args, out_dtype="bfloat16", trans_rhs=False, interpret=False), halved)
+    assert calls == [2048, 4096, 2048]
 
 
 def test_a_selector_serves_a_choice_chosen_may_name_and_no_other():

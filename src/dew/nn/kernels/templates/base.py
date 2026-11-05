@@ -9,13 +9,41 @@ every run.
 """
 
 import dataclasses
+import functools
+import threading
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import ClassVar, TypeGuard
 
 import tokamax
 
+from dew import cache
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import report, resources
+
+_DERIVED: dict[Hashable, Hashable] = {}
+"""Each launch's derived config by what its derivation reads (`_derived_once`)."""
+
+_DERIVED_GUARD = threading.Lock()
+
+
+def _derived_once(derive: Callable) -> Callable:
+    """A launch's `derived`, run once for what it reads: the call, the target and the configs its compiles
+    refused (`report.derivation_inputs`), and the run's numerics, its algebra pass, its derived forms and its
+    kernel choices, the contexts a derivation's forms and costs read (`dew.cache`); every eligibility check
+    and planner candidate after reads that once (row 4259: the GEMM's tile, derived at every check, took 36
+    s of a Qwen3.5-4B step's compile_ahead)."""
+    @functools.wraps(derive)
+    def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget):
+        key = (derive, report.derivation_inputs(self, ba, target), cache.NUMERICS.value, cache.ALGEBRA.value,
+               cache.DERIVED.value, cache.KERNEL_CHOICES.value)
+        with _DERIVED_GUARD:
+            if key in _DERIVED:
+                return _DERIVED[key]
+        config = derive(self, ba, target)
+        with _DERIVED_GUARD:
+            return _DERIVED.setdefault(key, config)
+
+    return derived
 
 
 class Template[Config: Hashable](tuning.KernelOp):
@@ -30,6 +58,12 @@ class Template[Config: Hashable](tuning.KernelOp):
 
     name: ClassVar[str] = "template"
     """The implementation's name, as a route reports it and `generation.chosen` may name it."""
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        # Each launch's own derivation runs once for what it reads (`_derived_once`).
+        if "derived" in vars(cls):
+            cls.derived = _derived_once(vars(cls)["derived"])
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Config | None:
         """The one config the launch generates for `ba` on `target`, from the device's and its family's
