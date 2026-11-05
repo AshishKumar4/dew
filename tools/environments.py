@@ -34,7 +34,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "dew" / "environments"
-"""Where the environments are kept by default, beside Dew's other caches (`dew.cache.dew_cache_dir`)."""
+"""Where the environments are kept by default, beside Dew's other caches (`dew._cache.dew_cache_dir`)."""
 
 
 class Unlocked(Exception):
@@ -42,7 +42,7 @@ class Unlocked(Exception):
 
 
 def _builds():
-    """dew.builds, this checkout's own, loaded by its path: Dew's
+    """dew._builds, this checkout's own, loaded by its path: Dew's
     package imports JAX, which no environment holds yet."""
     path = Path(__file__).resolve().parents[1] / "src" / "dew" / "builds.py"
     spec = importlib.util.spec_from_file_location("dew_builds", path)
@@ -54,9 +54,9 @@ def _builds():
 
 def machine_lock() -> str:
     """The lock this machine installs: the newest of JAX's CUDA builds its
-    NVIDIA driver and GPUs run (`dew.builds`), else cpu, where
+    NVIDIA driver and GPUs run (`dew._builds`), else cpu, where
     Dew's own runtime check speaks for a GPU no build runs on
-    (`dew.devices.cpu_only_refusal`)."""
+    (`dew._devices.cpu_only_refusal`)."""
     builds = _builds()
     if shutil.which("nvidia-smi") is None:
         return "cpu"

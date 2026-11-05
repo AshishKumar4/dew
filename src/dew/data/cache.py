@@ -22,7 +22,7 @@ from typing import Literal, TypedDict, overload
 import grain.python as grain
 import numpy as np
 
-from dew.cache import dew_cache_dir
+from dew._cache import dew_cache_dir
 from dew.data.concurrent import Concurrently
 from dew.data.dataset import _QUIET_STOP_SECONDS, Loading
 from dew.data.declared import Declared
@@ -61,7 +61,7 @@ deterministic steps in (`automatic_root`), or turns that off (`off`)."""
 def automatic_root(loading: Loading) -> str | None:
     """Where a run caches what its chains' leading deterministic steps make of their records, with no
     `cache=` (`dew.data.compile._automatic`): `$DEW_DATA_CACHE`, else `data` in Dew's cache directory
-    (`dew.cache.dew_cache_dir`), a local root holding at most `Cache.keep_local_bytes`, its oldest
+    (`dew._cache.dew_cache_dir`), a local root holding at most `Cache.keep_local_bytes`, its oldest
     generations evicted first (`LocalRetention`). None where the run's `loading` opts out
     (`Loading(cache=False)`) or the process does (`DEW_DATA_CACHE=off`)."""
     named = os.environ.get(AUTOMATIC)

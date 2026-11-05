@@ -637,17 +637,17 @@ dew.objectives.rl.config.TeacherConfig
   demonstrates: bool = False
 -- cli --
 dew  [tyro config: FlagCreatePairsOff, PositionalMetavarFromFieldName]
-dew export  [dew.cli.main.Export]
+dew export  [dew._cli.main.Export]
   run: str  [Positional]
   destination: str  [Positional]
   ema: bool | None = None
   step: int | str | None = None
   trust: tuple[str, ...] = ()
-dew inspect  [dew.cli.main.Inspect]
+dew inspect  [dew._cli.main.Inspect]
   run: str  [Positional]
   set: tuple[str, ...] = ()  [UseAppendAction]
   trust: tuple[str, ...] = ()
-dew launch  [dew.cli.launch.Launch]
+dew launch  [dew._cli.launch.Launch]
   command: tuple[str, ...]  [Positional]
   hosts: tuple[str, ...] = ()  [metavar='NAME']
   hostfile: pathlib.Path | None = None  [metavar='FILE']
@@ -660,7 +660,7 @@ dew launch  [dew.cli.launch.Launch]
   env: tuple[str, ...] = ()  [metavar='NAME=VALUE']  [UseAppendAction]
   cwd: str | None = None  [metavar='DIR']
   dry_run: bool = False
-dew profile  [dew.cli.main.Profile]
+dew profile  [dew._cli.main.Profile]
   run: str  [Positional]
   warmup: int = 20
   steps: int = 10
@@ -670,12 +670,12 @@ dew profile  [dew.cli.main.Profile]
   host_tracer_level: int | None = None
   python_tracer_level: int | None = None
   activity_cap: int | None = None
-dew train  [dew.cli.main.Train]
+dew train  [dew._cli.main.Train]
   run: str  [Positional]
   set: tuple[str, ...] = ()  [UseAppendAction]
   trust: tuple[str, ...] = ()
 dew data  [tyro config: FlagCreatePairsOff, PositionalMetavarFromFieldName]
-dew data export  [dew.cli.main.DataExport]
+dew data export  [dew._cli.main.DataExport]
   data: str  [Positional]
   destination: str  [Positional]
   format: Literal['parquet', 'array_record'] | None = None
@@ -685,29 +685,29 @@ dew data export  [dew.cli.main.DataExport]
   provision: bool = False
   tokenizer: str | None = None
   eos: bool = False
-dew data provision  [dew.cli.main.DataProvision]
+dew data provision  [dew._cli.main.DataProvision]
   source: str  [Positional]
-dew data publish  [dew.cli.main.DataPublish]
+dew data publish  [dew._cli.main.DataPublish]
   data: str  [Positional]
   destination: str  [Positional]
   branch: Literal['train', 'validation'] = 'train'
   read: Literal['memory', 'indexed', 'streamed'] = 'streamed'
   provision: bool = False
 dew tpu  [tyro config: FlagCreatePairsOff, PositionalMetavarFromFieldName]
-dew tpu attach-disk  [dew.cli.tpu.AttachDisk]
+dew tpu attach-disk  [dew._cli.tpu.AttachDisk]
   zone: str | None = None  [metavar='ZONE']
   dry_run: bool = False
   name: str  [Positional]
   disk: str  [Positional]
   read_only: bool = False
-dew tpu copy  [dew.cli.tpu.Copy]
+dew tpu copy  [dew._cli.tpu.Copy]
   zone: str | None = None  [metavar='ZONE']
   dry_run: bool = False
   name: str  [Positional]
   src: str  [Positional]
   dst: str  [Positional]
   worker: str = 'all'  [metavar='N|all']
-dew tpu create  [dew.cli.tpu.Create]
+dew tpu create  [dew._cli.tpu.Create]
   zone: str | None = None  [metavar='ZONE']
   dry_run: bool = False
   name: str  [Positional]
@@ -716,15 +716,15 @@ dew tpu create  [dew.cli.tpu.Create]
   queued: bool = False
   version: str | None = None  [metavar='VERSION']
   disk: str | None = None  [metavar='DISK']
-dew tpu delete  [dew.cli.tpu.Delete]
+dew tpu delete  [dew._cli.tpu.Delete]
   zone: str | None = None  [metavar='ZONE']
   dry_run: bool = False
   name: str  [Positional]
-dew tpu describe  [dew.cli.tpu.Describe]
+dew tpu describe  [dew._cli.tpu.Describe]
   zone: str | None = None  [metavar='ZONE']
   dry_run: bool = False
   name: str  [Positional]
-dew tpu init  [dew.cli.tpu.Init]
+dew tpu init  [dew._cli.tpu.Init]
   project: str | None = None  [metavar='PROJECT']
   zones: str | None = None  [metavar='ZONES']
   accelerator_type: str | None = None  [metavar='TYPE']
@@ -734,10 +734,10 @@ dew tpu init  [dew.cli.tpu.Init]
   data_disk: str | None = None  [metavar='DISK']
   python_version: str | None = None  [metavar='X.Y']
   dry_run: bool = False
-dew tpu list  [dew.cli.tpu.List]
+dew tpu list  [dew._cli.tpu.List]
   zone: str | None = None  [metavar='ZONE']
   dry_run: bool = False
-dew tpu logs  [dew.cli.tpu.Logs]
+dew tpu logs  [dew._cli.tpu.Logs]
   zone: str | None = None  [metavar='ZONE']
   dry_run: bool = False
   name: str  [Positional]
@@ -745,18 +745,18 @@ dew tpu logs  [dew.cli.tpu.Logs]
   worker: str = '0'  [metavar='N|all']
   follow: bool = False
   lines: int = 200
-dew tpu reset  [dew.cli.tpu.Reset]
+dew tpu reset  [dew._cli.tpu.Reset]
   zone: str | None = None  [metavar='ZONE']
   dry_run: bool = False
   name: str  [Positional]
-dew tpu run  [dew.cli.tpu.Run]
+dew tpu run  [dew._cli.tpu.Run]
   zone: str | None = None  [metavar='ZONE']
   dry_run: bool = False
   name: str  [Positional]
   worker: str = 'all'  [metavar='N|all']
   detach: bool = False
   job: str = ''  [metavar='JOB']
-dew tpu setup  [dew.cli.tpu.Setup]
+dew tpu setup  [dew._cli.tpu.Setup]
   zone: str | None = None  [metavar='ZONE']
   dry_run: bool = False
   name: str  [Positional]
@@ -768,7 +768,7 @@ dew tpu setup  [dew.cli.tpu.Setup]
   type: str | None = None  [metavar='TYPE']
   delete: bool = False
   git_key: pathlib.Path | None = None  [metavar='FILE']
-dew tpu spawn  [dew.cli.tpu.Spawn]
+dew tpu spawn  [dew._cli.tpu.Spawn]
   zone: str | None = None  [metavar='ZONE']
   dry_run: bool = False
   base: str  [Positional]
@@ -777,35 +777,35 @@ dew tpu spawn  [dew.cli.tpu.Spawn]
   spot: bool = False
   queued: bool = False
   extras: str = ''  [metavar='LIST']
-dew tpu ssh  [dew.cli.tpu.Ssh]
+dew tpu ssh  [dew._cli.tpu.Ssh]
   zone: str | None = None  [metavar='ZONE']
   dry_run: bool = False
   name: str  [Positional]
   worker: int = 0
   forward: tuple[int, ...] = ()  [UseAppendAction]  [aliases=('-L',)]  [metavar='PORT']
-dew tpu ssh-config  [dew.cli.tpu.SshConfig]
+dew tpu ssh-config  [dew._cli.tpu.SshConfig]
   zone: str | None = None  [metavar='ZONE']
   dry_run: bool = False
   name: str  [Positional]
-dew tpu start  [dew.cli.tpu.Start]
+dew tpu start  [dew._cli.tpu.Start]
   zone: str | None = None  [metavar='ZONE']
   dry_run: bool = False
   name: str  [Positional]
-dew tpu status  [dew.cli.tpu.Status]
+dew tpu status  [dew._cli.tpu.Status]
   zone: str | None = None  [metavar='ZONE']
   dry_run: bool = False
   name: str  [Positional]
-dew tpu stop  [dew.cli.tpu.Stop]
+dew tpu stop  [dew._cli.tpu.Stop]
   zone: str | None = None  [metavar='ZONE']
   dry_run: bool = False
   name: str  [Positional]
-dew tpu sync  [dew.cli.tpu.Sync]
+dew tpu sync  [dew._cli.tpu.Sync]
   zone: str | None = None  [metavar='ZONE']
   dry_run: bool = False
   name: str  [Positional]
   exclude: tuple[str, ...] = ()  [UseAppendAction]  [metavar='PATTERN']
   delete: bool = False
-dew tpu train  [dew.cli.tpu.Train]
+dew tpu train  [dew._cli.tpu.Train]
   zone: str | None = None  [metavar='ZONE']
   dry_run: bool = False
   name: str  [Positional]

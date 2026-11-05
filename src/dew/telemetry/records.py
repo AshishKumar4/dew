@@ -20,7 +20,7 @@ from typing import Literal
 
 from dew import _checkout
 from dew._records import JSON
-from dew.pool import PREEMPTED_EXIT
+from dew._pool import PREEMPTED_EXIT
 
 _log = logging.getLogger(__name__)
 

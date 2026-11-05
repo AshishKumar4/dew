@@ -14,7 +14,7 @@ from typing import BinaryIO
 
 from filelock import FileLock
 
-from dew.files import write_atomically
+from dew._files import write_atomically
 
 
 def read_pin(path: Path) -> BinaryIO:

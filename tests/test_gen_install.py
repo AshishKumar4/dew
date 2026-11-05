@@ -1,7 +1,7 @@
 """site/scripts/gen_install.py writes the install facts their owners declare into the files that repeat them,
 and holds docs/installation.md's extras table to the extras pyproject.toml declares: on a scratch copy of the
 files it reads and writes, a new extra fails it until the table names it, a new JAX requirement is written
-into the page, and the standalone installer picks the CUDA build dew.builds picks, a build added
+into the page, and the standalone installer picks the CUDA build dew._builds picks, a build added
 there included."""
 
 import shutil
@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from dew import builds
+from dew import _builds
 
 REPO = Path(__file__).resolve().parents[1]
 READ = ("pyproject.toml", "constraints.txt", "README.md", "docs/installation.md", "tools/pip.txt",
@@ -62,8 +62,8 @@ def test_a_new_jax_requirement_is_written_into_the_page(tmp_path):
 
 def test_a_new_package_index_is_the_one_the_installer_and_the_pages_name(tmp_path):
     root = scratch(tmp_path)
-    table = root / Path(builds.__file__).resolve().relative_to(REPO)
-    table.write_text(table.read_text().replace(builds.PACKAGE_INDEX, "https://index.example/simple", 1))
+    table = root / Path(_builds.__file__).resolve().relative_to(REPO)
+    table.write_text(table.read_text().replace(_builds.PACKAGE_INDEX, "https://index.example/simple", 1))
     assert generate(root, "--check") == 1
     assert generate(root) == 0
     assert generate(root, "--check") == 0
@@ -120,13 +120,13 @@ def installed(root: Path, answer: str, *options: str, uv: str = "99.0.0") -> tup
 def test_the_installer_installs_the_build_the_driver_and_gpus_run(tmp_path, answer):
     root = scratch(tmp_path)
     _, driver, sm = (field.strip() for field in answer.split(","))
-    build = builds.newest_build((driver, tuple(map(int, sm.split(".")))))
+    build = _builds.newest_build((driver, tuple(map(int, sm.split(".")))))
     assert installed(root, answer)[0][-1] == (f"dewml[{build}]" if build else "dewml")
 
 
 def test_a_build_the_table_adds_is_the_installers_too(tmp_path):
     root = scratch(tmp_path)
-    table = root / Path(builds.__file__).resolve().relative_to(REPO)
+    table = root / Path(_builds.__file__).resolve().relative_to(REPO)
     newer = '("cuda14", 600, (8, 0), 14000), '
     table.write_text(table.read_text().replace("CUDA_BUILDS = (", f"CUDA_BUILDS = ({newer}", 1))
     assert generate(root) == 0

@@ -68,7 +68,7 @@ from dew.decision.questions import (
     Question,
     ScoreAnswer,
 )
-from dew.files import write_atomically
+from dew._files import write_atomically
 from dew.inference import scoring
 from dew.inference.tasks import (
     InItsForm,

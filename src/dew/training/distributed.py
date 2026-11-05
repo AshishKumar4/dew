@@ -25,7 +25,7 @@ from dew.batch import EXAMPLE_ROWS, Batch, Variables
 from dew.data.dataset import Checkpointable, DataPartition, RampedStream, rows_of, stream_identity
 from dew.distributed.batches import Signature
 from dew.distributed.placement import Layout, Placement, link_topology
-from dew.files import write_atomically
+from dew._files import write_atomically
 from dew.mesh import STAGE_AXIS, LayoutRefused, batch_axes
 from dew.nn.kernels.options import Placements, owned_program
 from dew.nn.sharding import microbatched

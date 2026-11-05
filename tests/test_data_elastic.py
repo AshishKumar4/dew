@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 from data_support import WideDraw, listed
 
-from dew import position
+from dew import _position
 from dew.batch import VALID_ROWS
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading, Ramp, ramped
@@ -115,7 +115,7 @@ def test_an_elastic_position_is_every_readers_and_resumes_on_another_count(saved
     states = {share.get_state() for share in shares}
     assert len(states) == 1
     (state,) = states
-    assert position.translates(state) and position.decode(state) is None
+    assert _position.translates(state) and _position.decode(state) is None
     one = reader(stream(elastic=False), 0, 1)
     whole = [rows(batch) for batch in itertools.islice(one, 5)][3:]
     again = [reader(stream(), index, resumed) for index in range(resumed)]

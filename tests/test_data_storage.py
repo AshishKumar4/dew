@@ -85,7 +85,7 @@ def test_a_conditional_s3_write_is_the_filesystems_own_request():
 @pytest.mark.parametrize("publish", ["write", "put_if_absent"])
 def test_a_local_publication_has_a_plain_writes_mode_and_a_failed_one_leaves_nothing(tmp_path, monkeypatch,
                                                                                        publish):
-    """A local write, plain or conditional, publishes by one rename (dew.files.write_atomically): the file
+    """A local write, plain or conditional, publishes by one rename (dew._files.write_atomically): the file
     has the mode a plain write gives under the umask, not a temporary file's private one, and a write
     that fails leaves no temporary beside its target."""
     target = tmp_path / "value"

@@ -31,7 +31,7 @@ from dew.data import Loading, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, GlobalStream
 from dew.data.sources.tokens import TokenFiles
-from dew.files import write_atomically
+from dew._files import write_atomically
 from dew.interop import Pretrained
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective

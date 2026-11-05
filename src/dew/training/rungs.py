@@ -28,9 +28,9 @@ import numpy as np
 from jax.sharding import Mesh
 from jaxlib.xla_client import LoadedExecutable
 
-from dew import cache
+from dew import _cache
 from dew._records import JSON, json_value, record
-from dew.files import write_atomically
+from dew._files import write_atomically
 from dew.nn.kernels.generation import assumption, gpu_target
 from dew.nn.sharding import trace_context
 from dew.telemetry.instrumentation import StepFlops, step_flops
@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 def rung_records() -> Path | None:
     """Where a step's rung is recorded: DEW_RUNG_RECORDS when set, else beside
     the persistent compilation cache, or nowhere when the process keeps none."""
-    return cache.beside_compilation_cache('DEW_RUNG_RECORDS', 'dew-rungs')
+    return _cache.beside_compilation_cache('DEW_RUNG_RECORDS', 'dew-rungs')
 
 
 RECORD_VERSION = 2
@@ -58,7 +58,7 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     """What a recorded rung was decided for, read before the step traces: the
     configuration of the `modules` its programs run at the rung it starts from
     (`Objective.program_key`) and a custom `step`'s name, the code that builds
-    them (`dew.cache.package_digest`), the step's `arguments` (each leaf's path, shape, dtype and
+    them (`dew._cache.package_digest`), the step's `arguments` (each leaf's path, shape, dtype and
     placement), the `splits` its plan chooses among (one where the run pins it),
     the mesh and its devices' kind and allocator limit, the kernels their
     generation runs (`gpu_target`), what a model reads from context as it traces
@@ -82,7 +82,7 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     # A module's configuration as its repr reads it, a function field by its name: the address
     # Python prints beside one is this process's alone.
     configured = [re.sub(r' at 0x[0-9a-f]+', '', repr(module)) for module in modules]
-    program = repr([RECORD_VERSION, configured, named, cache.package_digest(), leaves,
+    program = repr([RECORD_VERSION, configured, named, _cache.package_digest(), leaves,
                     list(splits), dict(mesh.shape), target, trace_context(), jax.__version__,
                     importlib.metadata.version('jaxlib'), allocator])
     return {'program': hashlib.sha256(program.encode()).hexdigest(), 'devices': devices_seen,

@@ -42,7 +42,7 @@ from dew.data.pipeline import Pipeline
 from dew.data.sinks import export
 from dew.data.sources import Source, from_torch, source as stored_source
 from dew.data.steps.generic import Formatting
-from dew.position import ENVELOPE
+from dew._position import ENVELOPE
 
 WORKERS = {"loading": Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)}
 

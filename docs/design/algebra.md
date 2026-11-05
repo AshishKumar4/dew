@@ -550,7 +550,7 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   every node it prices, and the chosen DAG is extracted by egglog with every chosen node free. Over the
   algebra's and the templates' test derivations it priced no template's form below greedy's and took twice its
   time, so greedy stays the default. The test suite holds each derivation's greedy choice to the exact optimum
-  (`dew.cache.Passes.checked`); a declaration greedy prices dearer is refused there until it is extracted
+  (`dew._cache.Passes.checked`); a declaration greedy prices dearer is refused there until it is extracted
   exactly (`derive.Reduction.exact`).
 - A price states itself as levels compared in order (`extract.Linear`). Each level is the larger of its
   pieces, each a sum over the chosen nodes, and its nodes' largest peak (a span), plus what the nodes add
@@ -654,12 +654,12 @@ def rewritten(fn: Callable, *, saturation: Saturation, static_argnums=(), static
     # `dew.algebra.rewritten_program` bind `SATURATION`
 
 @dataclass(frozen=True)
-class Passes:                         # dew.cache
+class Passes:                         # dew._cache
     on: bool = True                   # the pass runs
     target: str | None = None         # the GpuTarget whose facts it prices for; None: the process's own
     checked: bool = False             # each derivation's greedy extraction held to the exact optimum
 
-ALGEBRA = jax.make_user_context(default_value=Passes())   # dew.cache, in JAX's trace context
+ALGEBRA = jax.make_user_context(default_value=Passes())   # dew._cache, in JAX's trace context
 
 @contextlib.contextmanager
 def passes(on: bool = True, target: str | None = None) -> Iterator[None]: ...   # sets ALGEBRA

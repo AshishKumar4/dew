@@ -36,7 +36,7 @@ from dew._coordination import agree_process_phase, agreed, agreed_same, broadcas
 from dew._records import JSON, boolean, json_value, record
 from dew.batch import CLOSES_WINDOW, FROZEN, Batch, owned_dicts, select, unboxed
 from dew.checkpoints import Checkpoints, Envelope, Ranking, Resume
-from dew.cleanup import attempted
+from dew._cleanup import attempted
 from dew.data.compile import Handed
 from dew.data.dataset import (
     Closeable,

@@ -45,7 +45,7 @@ from dew.algebra.cost import Work
 from dew.algebra.extract import Level
 from dew.algebra.forms import Refused
 from dew.algebra.terms import Term
-from dew.cache import ALGEBRA
+from dew._cache import ALGEBRA
 
 
 @function(merge=lambda old, new: old)

@@ -46,8 +46,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from dew._records import JSON
-from dew.cache import dew_cache_dir
-from dew.files import staged, stat_identity
+from dew._cache import dew_cache_dir
+from dew._files import staged, stat_identity
 from dew.interop import sources
 from dew.interop.pickles import host_view
 from dew.interop.safetensors_io import WEIGHT_STEMS, folder_weights, read_file, write_file

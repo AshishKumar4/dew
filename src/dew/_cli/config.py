@@ -1,4 +1,4 @@
-"""Defaults for dew tpu, kept in Dew's configuration directory (`dew.cache.dew_config_dir`), tpu.toml.
+"""Defaults for dew tpu, kept in Dew's configuration directory (`dew._cache.dew_config_dir`), tpu.toml.
 
 Also holds what an accelerator type implies: runtime version, worker count and
 device count. Everything here is a pure function of strings, so the commands
@@ -15,8 +15,8 @@ from pathlib import Path
 from filelock import FileLock
 
 from dew._records import JSON
-from dew.cache import dew_config_dir
-from dew.files import write_atomically
+from dew._cache import dew_config_dir
+from dew._files import write_atomically
 
 DEFAULT_ZONES = ("us-central2-b", "europe-west4-a", "us-east1-d")
 

@@ -23,8 +23,8 @@ from jax.experimental import multihost_utils
 
 from dew import communicators
 from dew._coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
-from dew.cache import enable_compilation_cache, persist_compilations
-from dew.devices import (
+from dew._cache import enable_compilation_cache, persist_compilations
+from dew._devices import (
     apply_xla_flags,
     backend_open,
     cuda_plugin,
@@ -34,8 +34,8 @@ from dew.devices import (
     refuse_cpu_only_jax,
     xla_flag,
 )
-from dew.logging import configure as configure_logging
-from dew.pool import (
+from dew._logging import configure as configure_logging
+from dew._pool import (
     PREEMPTED_EXIT,
     PROCESS_COUNT,
     PROCESS_ID,
@@ -84,14 +84,14 @@ def prepare_process(wandb: Wandb | None = None,
     `compilation_cache_dir` names the directory of JAX's persistent
     compilation cache, which a pool across hosts must keep on storage they
     share; without one the process caches under the user's cache directory
-    where its pool shares it (`dew.cache.persist_compilations`), and
+    where its pool shares it (`dew._cache.persist_compilations`), and
     JAX_ENABLE_COMPILATION_CACHE=false turns the cache off.
 
     `xla_flags` reaches XLA through XLA_FLAGS, which XLA parses once per
     runtime it loads, at the first use of its debug options. Flags set here
     before the backend opens are written into XLA_FLAGS, as XLA may not have
     parsed them yet; where `import dew` has loaded jaxlib, it may have, and
-    Dew warns that they are unproven (`dew.devices.flags_hold`). Setting
+    Dew warns that they are unproven (`dew._devices.flags_hold`). Setting
     XLA_FLAGS before the process starts makes them certain, as Dew's command
     line does for a run's `trainer.xla_flags`. Flags asked for after the
     backend opened are refused.
@@ -126,10 +126,10 @@ def unprepared(multi_host: bool | None, xla_flags: str | None,
 
 def ready_process() -> None:
     """What every Dew run needs of its process and `import dew` leaves alone: Dew's log handler
-    (`dew.logging.configure`), the persistent compilation cache under the user's cache directory
-    (`dew.cache.persist_compilations`), which a run's own directory, a pool whose processes do not
+    (`dew._logging.configure`), the persistent compilation cache under the user's cache directory
+    (`dew._cache.persist_compilations`), which a run's own directory, a pool whose processes do not
     share it, or JAX_ENABLE_COMPILATION_CACHE=false leaves alone, and the refusal of a machine with
-    an NVIDIA GPU whose JAX opened with none (`dew.devices.refuse_cpu_only_jax`), which
+    an NVIDIA GPU whose JAX opened with none (`dew._devices.refuse_cpu_only_jax`), which
     opens the backend, so the cache's flags come first. `prepare_process` readies the process once
     its flags are set and its pool joined, and `Trainer.fit` readies one no `prepare_process` did;
     each step is idempotent."""

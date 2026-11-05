@@ -443,13 +443,13 @@ def test_snapshot_reads_a_prepared_hub_without_physical_shards(tmp_path, monkeyp
 def test_a_hub_split_prepared_online_reads_its_own_commits_rows_with_the_hub_offline(tmp_path, monkeypatch):
     """A Hub split prepared online at two commits reads, with the Hub offline (HF_HUB_OFFLINE),
     the rows of the commit each source pins: the commit is the answer the Hub gave online
-    (`dew.cache.hub_answer`), the default branch's the last given, even where another tool has since
+    (`dew._cache.hub_answer`), the default branch's the last given, even where another tool has since
     moved the Hub cache's ref of the branch, and the Arrow is the cache `datasets` prepared at that
     commit, which `datasets` itself does not find offline."""
     import datasets
     from hub_support import native_hub, offline
 
-    from dew.cache import hub_ref
+    from dew._cache import hub_ref
     from dew.data import Hub
     from dew.data.compile import compile
     from dew.data.pipeline import Pipeline

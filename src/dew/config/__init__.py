@@ -48,9 +48,9 @@ import dew.io
 from dew import _records, registry, training
 from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._records import JSON, duration, earlier_fields, is_share, recorded_duration
-from dew.cache import dew_cache_dir
+from dew._cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
-from dew.cleanup import attempted
+from dew._cleanup import attempted
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.data import records
 from dew.data.compile import fitted
@@ -58,7 +58,7 @@ from dew.data.dataset import Closeable, Loader, Ramp, Reader, ramped
 from dew.data.pipeline import Dataset, ObjectiveData
 from dew.data.plan import PLAN_VERSIONS, SCHEDULE, PlanOrderChanged
 from dew.distributed.placement import Layout, MeshSpec
-from dew.files import write_atomically
+from dew._files import write_atomically
 from dew.interop.weights import AUTO
 from dew.lora import LoRA
 from dew.nn.dex import DifferentialExtension
@@ -607,7 +607,7 @@ class TrainerConfig:
     """Extra XLA_FLAGS for this run, appended to the environment by `prepare_process`.
 
     `dew train` sets them in XLA_FLAGS before the process loads jaxlib, so they hold
-    for every runtime XLA loads (`dew.devices.hold_xla_flags`); `prepare_process`
+    for every runtime XLA loads (`dew._devices.hold_xla_flags`); `prepare_process`
     appends them before JAX opens a backend, unproven where jaxlib has loaded.
     Library users set XLA_FLAGS before the process starts to make them certain;
     docs/performance.md records what was measured.

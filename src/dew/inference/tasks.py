@@ -50,7 +50,7 @@ from dew.batch import (
     token_positions,
     token_validity,
 )
-from dew.cache import persist_compilations
+from dew._cache import persist_compilations
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, Confident, DiscreteProcess, Unmask, refuse_causal
 from dew.inference.projections import packed_owned

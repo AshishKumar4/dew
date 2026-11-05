@@ -99,7 +99,7 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                    "dew.rl.replay", "dew.rl.playground", "dew.rl.distributions", "dew.rl.aggregation",
                    "dew.rl.skydreamer",
                    "dew.rl.evaluation",
-                   "dew.artifacts", "dew.distributed", "dew.cache", "dew.telemetry.profile",
+                   "dew.artifacts", "dew.distributed", "dew._cache", "dew.telemetry.profile",
                    "dew.telemetry.benchmark", "dew.figures"]),
 ]
 # Places that show users Dew code; every Dew name they use must resolve to the

@@ -1822,7 +1822,7 @@ certain by setting `XLA_FLAGS` before the process starts.
 
 Separately, `import dew` sets `--xla_allow_excess_precision=false` unless
 `XLA_FLAGS` already names that flag
-(`dew.devices.keep_roundings`). With XLA's default, a fusion may
+(`dew._devices.keep_roundings`). With XLA's default, a fusion may
 skip a bf16 rounding the program states, and which roundings it skips
 depends on the layout, so one device and four devices computed different
 bf16 forwards of the same model. `import dew` sets the flag before anything

@@ -69,7 +69,7 @@ from dew.batch import (
     thaw,
     unboxed,
 )
-from dew.cache import INTERCEPTED
+from dew._cache import INTERCEPTED
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_names import group_layers, stored_layers

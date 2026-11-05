@@ -17,7 +17,7 @@ from jax.core import ShapedArray
 from jax.extend import core as jcore
 
 from dew.algebra import program, terms
-from dew.cache import DERIVED
+from dew._cache import DERIVED
 from dew.nn.precision import float32_dot_general
 
 
@@ -215,7 +215,7 @@ def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
 def derived(on: bool = True) -> Iterator[None]:
     """Within the block, the templates take their algebra's derived forms (`derive`, `scan`) where they hold
     them in place of their hand-written ones (`on`), or the hand-written ones: a context of JAX's trace
-    (`dew.cache.DERIVED`), so a program held across the switch traces afresh. The one switch the derived and
+    (`dew._cache.DERIVED`), so a program held across the switch traces afresh. The one switch the derived and
     hand-written forms swap behind, which check 1 drives both ways (docs/design/algebra.md §6.9)."""
     with DERIVED(on):
         yield

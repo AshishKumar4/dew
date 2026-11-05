@@ -24,7 +24,7 @@ import numpy as np
 from dew._coordination import read_home, writes_weights
 from dew._records import JSON
 from dew.batch import unboxed
-from dew.files import replacing, write_atomically
+from dew._files import replacing, write_atomically
 from dew.interop.unread import Stored, Unread
 from dew.interop.weights import ParamTree, insert
 
@@ -469,7 +469,7 @@ def save_hf_layout(params, config: Mapping[str, object], directory,
     """Write the weights and config.json into `directory`, the layout a Hugging Face style loader reads.
 
     `save_sharded` writes the weights, as one file or as shards of at most
-    `max_shard_size`, and every file is replaced whole (`dew.files.replacing`), so a reader of the
+    `max_shard_size`, and every file is replaced whole (`dew._files.replacing`), so a reader of the
     directory never reads one half written. `params` is a flat table of named tensors, or a tree
     whose '/'-joined paths name them. The config is written as given; Dew
     does not translate its own config vocabulary into anyone else's.

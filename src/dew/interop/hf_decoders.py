@@ -40,7 +40,7 @@ import numpy as np
 from dew import _records
 from dew._model_types import QWEN35_TEXT_TYPES, QWEN35_TYPES
 from dew.batch import Variables
-from dew.files import write_atomically
+from dew._files import write_atomically
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_families import ENTRIES
 from dew.interop.decoder_parts import (

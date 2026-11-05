@@ -1,5 +1,5 @@
 """A run's setup stops a process whose JAX opened on the CPU beside an NVIDIA
-GPU, with the install that fixes it (`dew.devices`), and `import dew`
+GPU, with the install that fixes it (`dew._devices`), and `import dew`
 does not. The GPU is nvidia-smi's answer, its CUDA version the user-mode
 driver's (libcuda's `cuDriverGetVersion`) and JAX's CUDA builds the plugins
 installed, so stand-ins for nvidia-smi, the driver library and the plugins
@@ -16,7 +16,7 @@ import sys
 import pytest
 from lane_environment import without_flags
 
-from dew.builds import CUDA_BUILDS
+from dew._builds import CUDA_BUILDS
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -66,7 +66,7 @@ def run():
     fit_one_step()
 
 
-from dew.devices import CPUOnlyJax
+from dew._devices import CPUOnlyJax
 
 try:
     run()
@@ -222,7 +222,7 @@ def test_import_dew_keeps_every_bf16_rounding_a_program_states(imported, named, 
     assert done.returncode == 0, done.stderr[-2000:]
     seen = json.loads(done.stdout.splitlines()[-1])
     assert seen["rounded"] is rounded
-    assert seen["warnings"] == (["dew.devices"] if warned else [])
+    assert seen["warnings"] == (["dew._devices"] if warned else [])
 
 
 ROUTED = """

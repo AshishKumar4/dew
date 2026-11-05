@@ -22,7 +22,7 @@ import pytest
 import remote_cache
 from tool_support import load
 
-from dew.cache import default_compilation_cache_dir, enable_compilation_cache
+from dew._cache import default_compilation_cache_dir, enable_compilation_cache
 
 # The suite's Hypothesis profile (docs/design/testing.md): the same examples on every run, so a red
 # reproduces anywhere; no example database; 50 generated examples, each under a soft 2 s deadline. A test
@@ -40,7 +40,7 @@ hypothesis.settings.load_profile("dew")
 # cost; the numbers in docs/performance.md were taken with it set.
 _remote = None
 if os.environ.get("DEW_TEST_NO_CACHE"):
-    # JAX's own switch, which a run's setup reads too (`dew.cache.persist_compilations`), for this
+    # JAX's own switch, which a run's setup reads too (`dew._cache.persist_compilations`), for this
     # process and the processes its tests start.
     os.environ["JAX_ENABLE_COMPILATION_CACHE"] = "false"
     jax.config.update("jax_enable_compilation_cache", val=False)
@@ -203,10 +203,10 @@ def pytest_runtest_setup(item):
 
 @pytest.fixture(autouse=True)
 def exact_oracle():
-    """Each template derivation's greedy extraction held to the exact optimum (`dew.cache.Passes.checked`):
+    """Each template derivation's greedy extraction held to the exact optimum (`dew._cache.Passes.checked`):
     a declaration greedy prices dearer is refused (`dew.algebra.extract.Dearer`) until it is extracted
     exactly (`dew.algebra.derive.Reduction.exact`)."""
-    from dew.cache import ALGEBRA
+    from dew._cache import ALGEBRA
 
     with ALGEBRA(dataclasses.replace(ALGEBRA.value, checked=True)):
         yield
@@ -292,7 +292,7 @@ def with_deterministic_ops(monkeypatch):
 def caplog(caplog):
     """Capture Dew's logger as well as the application's root logger. Dew's records reach the
     capture once, through a handler of their own that does not pass them on to the root, whether
-    or not the run's setup configured the logger (`dew.logging.configure`), which then leaves it."""
+    or not the run's setup configured the logger (`dew._logging.configure`), which then leaves it."""
     logger = logging.getLogger("dew")
     propagated = logger.propagate
     logger.addHandler(caplog.handler)

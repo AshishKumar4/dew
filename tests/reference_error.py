@@ -113,7 +113,7 @@ from float64_terms import float64_terms
 from map_judge import DRAWS, PoolRefused, ask_later, drawing, judging, pooled_units, record_units
 from site_draws import _Draws
 
-from dew.accuracy import distance, reduction_bound, within
+from dew._accuracy import distance, reduction_bound, within
 
 PRECISION = "precision"
 """The entry of a reference's array file that records the precision its generator's matmuls took."""
@@ -613,7 +613,7 @@ def dot_precisions(function, *arguments) -> list:
 
 def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
     """Two fp32 reductions differ by at most 2 gamma_n sum(abs(products))
-    (`dew.accuracy.reduction_bound`): `magnitudes` holds the elementwise sum of
+    (`dew._accuracy.reduction_bound`): `magnitudes` holds the elementwise sum of
     absolute products and `terms` counts the products and any bias term in each
     reduction."""
     error = np.abs(np.asarray(dew, np.float64) - np.asarray(reference, np.float64))
@@ -981,9 +981,9 @@ def _of_its_seed(label: str, draw, seed, inputs) -> None:
 
 def _repeat_promised() -> bool:
     """Whether a run promises its arms a bitwise repeat (docs/design/testing.md, check 1): on a CPU, or in
-    deterministic mode (`dew.devices.deterministic_ops_requested`). A GPU default that reduces with
+    deterministic mode (`dew._devices.deterministic_ops_requested`). A GPU default that reduces with
     atomics (a backward's dQ summed in arrival order) promises none."""
-    from dew.devices import deterministic_ops_requested
+    from dew._devices import deterministic_ops_requested
 
     return jax.default_backend() == "cpu" or deterministic_ops_requested()
 

@@ -22,7 +22,7 @@ from test_lm_recipe import SEQ, export_tiny_decoder, recipe_args, write_token_fi
 from test_run_option_matrix import recorded
 
 from dew.checkpoints import Checkpoints
-from dew.cli.main import main
+from dew._cli.main import main
 from dew.config import RunConfig, earlier_run
 from dew.config.lm import LMRunConfig
 from dew.data import Loading, presets

@@ -77,7 +77,7 @@ def flowers(batch: int) -> "Pipeline":
 class Benchmark:
     data: str | None = None
     """The chain to time: a Python file whose `data` is one, a chain's `.json` record, or a store's
-    URL read in batches of `batch` (`dew.cli.main.chain_of`); none times Oxford Flowers (`flowers`)."""
+    URL read in batches of `batch` (`dew._cli.main.chain_of`); none times Oxford Flowers (`flowers`)."""
     batch: int = 32
     """Global batch size, where the chain states none."""
     steps: int = 100
@@ -128,7 +128,7 @@ def benchmark(args: list[str]) -> Benchmark:
 
 
 def main(config: Benchmark) -> None:
-    from dew.cli.main import chain_of
+    from dew._cli.main import chain_of
     from dew.data.compile import compile
 
     chain = flowers(config.batch) if config.data is None else chain_of(config.data, "train")

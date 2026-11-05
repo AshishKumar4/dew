@@ -59,7 +59,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
-from dew.cleanup import end_group, exit_code, signal_group
+from dew._cleanup import end_group, exit_code, signal_group
 from dew.inference.rollouts import INFRASTRUCTURE
 from dew.objectives.rl.sessions import Call, Session, Status, Task
 

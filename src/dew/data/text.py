@@ -29,7 +29,7 @@ import numpy as np
 
 from dew.data.pipeline import TOKEN_FIELDS, Rejected
 from dew.data.tokens import chunk_table
-from dew.files import published
+from dew._files import published
 
 if TYPE_CHECKING:
     from datatrove.pipeline.filters.base_filter import BaseFilter
@@ -399,7 +399,7 @@ def tokenizer_name(tokenizer: str | SavedTokenizer) -> str:
     import shutil
     import tempfile
 
-    from dew.cache import dew_cache_dir
+    from dew._cache import dew_cache_dir
 
     root = Path(dew_cache_dir(), "tokenizers")
     root.mkdir(parents=True, exist_ok=True)
@@ -677,7 +677,7 @@ class Classifier(Curated):
         which holds a local path's first bytes too."""
         from datatrove.io import cached_asset_path_or_download
 
-        from dew.files import write_atomically
+        from dew._files import write_atomically
 
         source = Path(self.model)
         if not source.is_file():
@@ -722,7 +722,7 @@ class Decontaminated(Curated):
         from datatrove.utils.hashes.xxhash import xxhash64
         from datatrove.utils.text import ngrams, simplify_text
 
-        from dew.files import write_atomically
+        from dew._files import write_atomically
 
         # DataTrove's default hash, xxhash at 64 bits, which the filter hashes each n-gram with.
         config = NGramsDecontConfig(n_grams=self.n)

@@ -28,7 +28,7 @@ from jax.extend import core as jcore
 
 from dew.algebra import cost, extract, rules, terms
 from dew.algebra.extract import Linear
-from dew.cache import ALGEBRA
+from dew._cache import ALGEBRA
 from dew.nn.derivatives import Algebra, KernelGlue, Surrogate, marked_call_p
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
@@ -85,7 +85,7 @@ class Rewrite:
 def passes(on: bool = True, target: str | None = None) -> Iterator[None]:
     """Within the block, the programs Dew compiles are rewritten (`on`) or not, priced for the GPU `target`
     names (None: the process's own): a context of JAX's trace, so a program held across the switch traces
-    afresh (`dew.cache.ALGEBRA`). The accuracy gate holds it off for a reference arm and the float64 truth."""
+    afresh (`dew._cache.ALGEBRA`). The accuracy gate holds it off for a reference arm and the float64 truth."""
     with ALGEBRA(dataclasses.replace(ALGEBRA.value, on=on, target=target)):
         yield
 

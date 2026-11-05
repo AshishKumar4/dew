@@ -125,7 +125,7 @@ def test_a_point_sets_a_runs_fields_and_its_chains_settings_together():
 def test_a_python_run_whose_chain_is_unrecorded_trains_from_dew_train(tmp_path):
     """`dew train run.py` trains a run whose chain holds a step only Python has (a lambda) as the file
     built it, and its run.json says why it can't be rebuilt from the record."""
-    from dew.cli.main import main
+    from dew._cli.main import main
 
     (tmp_path / "unrecorded_run.py").write_text(
         "import dataclasses\n"
@@ -171,7 +171,7 @@ def test_dew_profile_trains_a_run_afresh_and_reports_where_its_window_spent_the_
     import autoencoder_experiment
 
     from dew.checkpoints import Checkpoints
-    from dew.cli.main import main
+    from dew._cli.main import main
 
     out = tmp_path / "profile"
     command = ["profile", autoencoder_experiment.__file__, "--warmup", "2", "--steps", "2", "--out", str(out)]
@@ -189,7 +189,7 @@ def test_dew_profiles_capture_options_reach_the_capture(tmp_path):
     pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
     import autoencoder_experiment
 
-    from dew.cli.main import main
+    from dew._cli.main import main
 
     out = tmp_path / "profile"
     assert main(["profile", autoencoder_experiment.__file__, "--warmup", "2", "--steps", "2", "--out",
@@ -214,7 +214,7 @@ def test_dew_profile_with_no_output_prepares_its_process_before_naming_its_direc
         "    return dataclasses.replace(built, trainer=trainer)\n")
     root = Path(__file__).resolve().parents[1]
     environment = {**os.environ, "PYTHONPATH": os.pathsep.join([str(root / "src"), str(root / "tests")])}
-    done = subprocess.run([sys.executable, "-m", "dew.cli.main", "profile", str(tmp_path / "dumped.py"),
+    done = subprocess.run([sys.executable, "-m", "dew._cli.main", "profile", str(tmp_path / "dumped.py"),
                            "--warmup", "2", "--steps", "2"],
                           cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=900)
     assert done.returncode == 0, done.stderr[-4000:]
@@ -521,7 +521,7 @@ def test_a_python_runs_trust_holds_while_its_file_builds_it(tmp_path):
     """`--trust` holds before a Python run's file runs (`run_named`), whether or not its chain is
     recorded: a source the file loads while it builds the run (a source directory beside it, which
     `dew.registry.trusts_source` reads) is trusted there, so its own code runs where its load reads it."""
-    from dew.cli.main import run_named
+    from dew._cli.main import run_named
 
     source = tmp_path / "source"
     source.mkdir()

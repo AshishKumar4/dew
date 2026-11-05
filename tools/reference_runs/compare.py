@@ -40,7 +40,7 @@ from pathlib import Path
 import numpy as np
 from common import kernel_summary, trimmed_kernels
 
-from dew.accuracy import rms
+from dew._accuracy import rms
 
 CONDITIONS = ("batch", "seq", "schedule_steps", "data_sha256", "lr_peak", "lr_init", "lr_end", "warmup",
               "b1", "b2", "eps", "weight_decay", "clip")

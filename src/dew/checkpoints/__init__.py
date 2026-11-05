@@ -6,7 +6,7 @@ state, the EMA, the key, the loss scaler and a partial accumulation window,
 and, when the data iterator can report one, `position`. The narrow compute
 copies derive from the variables and are rebuilt on resume. A position
 is either global, which any partition of the data can read, or one share's own
-offset, which only a reader of that same share can read; `dew.position` marks
+offset, which only a reader of that same share can read; `dew._position` marks
 the difference and `read_position` acts on it. A state that is not a training
 run's, such as a simulation's, is saved as a mapping of arrays and restored
 through a mapping template, with the same asynchronous writes, retention and
@@ -87,8 +87,8 @@ from dew._records import JSON, duration, json_value, record, share, text
 from dew.batch import PARAMETER_ROOTS, Variables
 from dew.checkpoints._step_records import counted_processes, gather_positions, read_position, step_record
 from dew.checkpoints.served import unpacked
-from dew.cleanup import attempted
-from dew.files import write_atomically
+from dew._cleanup import attempted
+from dew._files import write_atomically
 from dew.mesh import LogicalAxes, mesh_axes
 from dew.nn import sharding
 from dew.nn.kernels.options import owned_program, program

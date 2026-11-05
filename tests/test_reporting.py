@@ -26,7 +26,7 @@ from dew.artifacts import Decisions, ImageGrid, Representations, TextSamples, To
 from dew.data import Memory
 from dew.data.dataset import Loader
 from dew.data.pipeline import Pipeline
-from dew.pool import PREEMPTED_EXIT
+from dew._pool import PREEMPTED_EXIT
 from dew.telemetry.records import FitEnded, FitStarted
 from dew.training import Checkpoints, LocalTracker, Trackers, Trainer
 

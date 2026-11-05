@@ -251,7 +251,7 @@ seams: "dump-flags": {
 seams: commands: {
 	kind:    "declared-set"
 	purpose: "each command is a verb of the dew CLI users' scripts call"
-	paths:   ["src/dew/cli/main.py"]
+	paths:   ["src/dew/_cli/main.py"]
 	entries: "COMMANDS"
 	declared: {
 		export:  "export a run's weights"
@@ -265,7 +265,7 @@ seams: commands: {
 seams: "data-commands": {
 	kind:    "declared-set"
 	purpose: "each command is a verb of dew data users' scripts call"
-	paths:   ["src/dew/cli/main.py"]
+	paths:   ["src/dew/_cli/main.py"]
 	entries: "DATA_COMMANDS"
 	declared: {
 		export:    "export a dataset"

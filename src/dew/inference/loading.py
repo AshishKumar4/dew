@@ -20,7 +20,7 @@ from etils import epath
 from jax.typing import DTypeLike
 
 from dew.batch import Variables
-from dew.cache import persist_compilations
+from dew._cache import persist_compilations
 from dew.checkpoints import PYTHON_RUN, RUN_FILE
 from dew.config import SourceOptions
 from dew.inference.images import TextToImage

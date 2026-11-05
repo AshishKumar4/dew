@@ -637,7 +637,7 @@ def test_dew_export_writes_a_decision_run_in_the_tasks_own_release(decide, tmp_p
     import optax
 
     from dew.checkpoints import Checkpoints
-    from dew.cli.main import Export
+    from dew._cli.main import Export
     from dew.decision import DecisionObjective
     from dew.training.trainer import Trainer
 
