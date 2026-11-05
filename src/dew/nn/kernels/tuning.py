@@ -545,7 +545,7 @@ class KernelOp(tokamax.Op):
         pick = _pick(self.keyed(ba)) if _READING.get() else None
         # A pick measured at another shape of its key the launch's own shapes cannot take is not taken.
         if pick is None or not self.pinnable(ba, pick.fastest_config):
-            return ba.heuristics_config
+            return _derived(ba)
         return pick.fastest_config
 
     def variants(self, ba: tokamax.BoundArguments) -> tuple[Hashable, ...]:
@@ -842,6 +842,20 @@ def _kind(ba: tokamax.BoundArguments) -> str:
         return kinds.pop()
     device = jax.sharding.get_abstract_mesh().abstract_device
     return (device or get_default_device()).device_kind
+
+
+_DERIVED: dict[Hashable, Hashable] = {}
+"""Each launch's derived config by what its derivation reads (`report.derivation_inputs`): one derivation per
+distinct launch a process traces, where a model's layers and each plan the planner tries traced it again
+(row 2440: 39 s of the first 1208 a Qwen3.5-4B step's compile_ahead spent tracing, FS2440-4B-STACKS)."""
+
+
+def _derived(ba: tokamax.BoundArguments) -> Hashable:
+    """`ba`'s derived config (`heuristics_config`), derived once for what its derivation reads."""
+    inputs = report.derivation_inputs(ba.op, ba)
+    if (config := _DERIVED.get(inputs)) is None:
+        config = _DERIVED.setdefault(inputs, ba.heuristics_config)
+    return config
 
 
 def _pick(ba: tokamax.BoundArguments) -> Timings | None:

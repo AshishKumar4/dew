@@ -263,6 +263,17 @@ def spilled(op, arguments: tokamax.BoundArguments, config: Hashable) -> frozense
         return registry.refused.get(identity, frozenset())
 
 
+def derivation_inputs(op, arguments: tokamax.BoundArguments) -> Hashable:
+    """What a launch's derivation of its config reads: the launch's identity (`_identity`), the whole target,
+    whose rates price its schedules (a balanced tail's hand-off, a split's passes), and each config this
+    context's compiles refused it (`refused`), so a refusal recorded after a derivation derives it again."""
+    identity = _identity(op, arguments)
+    with _GUARD:
+        refused = frozenset((config, kernels) for (launch, config), kernels in _registry().refused.items()
+                            if launch == identity)
+    return identity, generation.gpu_target(), refused
+
+
 def refused_launches() -> tuple[tuple[str, Hashable, frozenset[str]], ...]:
     """Every (launch identity, config, spilled kernel names) refused in this context (a `refusals` scope's or
     the process's), ordered. A validated plan can hand them to another process explicitly (`refuse` within
