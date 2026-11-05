@@ -1729,8 +1729,8 @@ def test_a_tile_states_a_schedule_the_kernels_run():
     for fields in ({"warpgroups": 1, "cluster": 2}, {"warpgroups": 3}, {"warpgroups": 2, "cluster": 4},
                    {"warpgroups": 2, "stages": 1}):
         with pytest.raises(ValueError):
-            mosaic_gpu.Tiles(**{"block_m": 128, "block_n": 128, "block_k": 64, "stages": 3, "grid_block_n": 1}
-                             | fields)
+            mosaic_gpu.Tiles(**{"block_m": 128, "block_n": 128, "block_k": 64, "stages": 3, "grid_block_n": 1,
+                                "family": "wgmma"} | fields)
     launch = grouped_matmul.MosaicTgmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     with generation.assumed("sm90"):
