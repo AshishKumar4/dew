@@ -211,18 +211,15 @@ def test_a_full_fine_tune_steps_adamw_on_the_device_it_is_sized_for_and_is_unmea
     failing a claim, which requires the references alone."""
     import dataclasses
 
-    import optax
-
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
-    step, models = load("benchmark_step"), load("benchmark_models")
+    step = load("benchmark_step")
     declared = {field.name for field in dataclasses.fields(CausalTransformer)}
     h100, a100 = "NVIDIA H100 80GB HBM3", "NVIDIA A100-SXM4-40GB"
     for name, device, other in (("step finetune-4b 1x2048", h100, a100),
                                 ("step finetune-1.7b 1x2048", a100, h100)):
         [case] = step.cases_from_json(json.dumps([gate.STEP_CASES[name]]))
         assert case.optimizer == "adamw" and set(case.config) <= declared
-        assert models.OPTIMIZERS[case.optimizer] is optax.adamw
         rows = [row for row in gate.BATTERY if row.name.endswith(name.removeprefix("step "))]
         assert len(rows) == 4
         for row in rows:

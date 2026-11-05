@@ -25,7 +25,7 @@ changed and marked `# Dew:`: the prologue and epilogue hooks with their side
 operands (`_side_tile`), tgmm's output cast, and gmm's zeroing when every
 group is empty. The file's `ragged_dot_general`
 adapter is left out: Dew calls the kernels itself, through the GEMM template
-(`templates.gemm.template`), which differentiates them, the way MaxText calls megablox.
+(`kernels.gemm`), which differentiates them, the way MaxText calls megablox.
 
 Every global load and store is masked on every dimension, rows included, and
 each output past the routed rows is the epilogue of a zero accumulator, zero
@@ -49,6 +49,7 @@ from jax.typing import DTypeLike
 
 from dew.nn.kernels import launches
 from dew.nn.kernels.options import program
+from dew.nn.kernels.templates.axes import at_group, by_rows, held, named
 
 DEFAULT_BLOCK_M = 64
 DEFAULT_BLOCK_N = 64
@@ -126,14 +127,15 @@ def _make_gmm_group_metadata(
   )
 
 
-def _side_tile(ref, axes, origins: dict, masks: dict):
+def _side_tile(ref, axes, origins: dict, masks: dict, group):
   """Dew: a side operand's tile, loaded at the launch's own origins: each of its dimensions follows the
   launch axis `axes` names ('rows', 'depth', 'columns'), its start, extent and mask from `origins` and
-  `masks`. A vector is one axis's, which the hook broadcasts itself."""
-  index = tuple(pl.ds(*origins[axis]) for axis in axes)
-  first, *rest = (masks[axis] for axis in axes)
+  `masks`, or 'groups', read at the tile's `group` and handed the hook at each of the tile's rows
+  (`axes.by_rows`). A vector is one axis's, which the hook broadcasts itself."""
+  at = {axis: pl.ds(*origin) for axis, origin in origins.items()} | at_group(axes, ref.shape, group)
+  first, *rest = (masks[axis] for axis in held(axes))
   mask = first[:, None] & rest[0][None, :] if rest else first
-  return plgpu.load(ref.at[index], mask=mask, other=0)
+  return by_rows(plgpu.load(ref.at[named(axes, at)], mask=mask, other=0), axes, origins['rows'][1])
 
 
 def _gpu_ragged_dot_kernel(
@@ -190,7 +192,7 @@ def _gpu_ragged_dot_kernel(
       if prologue is not None:
         # Dew: the prologue, on the loaded tile and its side operands' tiles.
         tiles = [_side_tile(ref, axes, {'rows': (ridx, block.m), 'depth': (k * block.k, block.k)},
-                            {'rows': lhs_rows_mask, 'depth': inner_mask})
+                            {'rows': lhs_rows_mask, 'depth': inner_mask}, pid.gi)
                  for ref, axes in zip(prologue_refs, prologue_axes, strict=True)]
         # Dew: the padding a hook made something of (1 / 0) is zero again before the product.
         x = jnp.where(mask, prologue(x, *tiles), 0)
@@ -214,7 +216,7 @@ def _gpu_ragged_dot_kernel(
 
     acc = jnp.zeros((block.m, block.n), dtype=acc_dtype)
     acc = lax.fori_loop(0, pl.cdiv(size.k, block.k), inner_compute, acc)
-    stored(acc, ridx, lhs_rows_mask)
+    stored(acc, ridx, lhs_rows_mask, pid.gi)
 
   # Dew: the epilogue on each fp32 accumulator tile and its side operands' tiles, its outputs stored.
   stored = partial(_store_epilogued, out_refs, epilogue, epilogue_refs, epilogue_axes, pid.j, block, size)
@@ -231,14 +233,15 @@ def _summed(acc, partial_sum, live, *, exact_sums: bool):
   return acc + partial_sum
 
 
-def _store_epilogued(out_refs, epilogue, refs, axes_of, column_block, block, size, acc, row, rows_mask):
-  """Dew: each output of the epilogue on an fp32 accumulator tile at `row` and its side operands' tiles
-  (the accumulator itself without one), stored at its rows and the program's columns."""
+def _store_epilogued(out_refs, epilogue, refs, axes_of, column_block, block, size, acc, row, rows_mask,
+                     group):
+  """Dew: each output of the epilogue on an fp32 accumulator tile at `row` of `group` and its side operands'
+  tiles (the accumulator itself without one), stored at its rows and the program's columns."""
   cols_mask = (column_block * block.n + arange(block.n)) < size.n
   outs = (acc,)
   if epilogue is not None:
     tiles = [_side_tile(ref, axes, {'rows': (row, block.m), 'columns': (column_block * block.n, block.n)},
-                        {'rows': rows_mask, 'columns': cols_mask})
+                        {'rows': rows_mask, 'columns': cols_mask}, group)
              for ref, axes in zip(refs, axes_of, strict=True)]
     outs = epilogue(acc, *tiles)
     outs = outs if isinstance(outs, tuple) else (outs,)
@@ -249,7 +252,8 @@ def _store_epilogued(out_refs, epilogue, refs, axes_of, column_block, block, siz
 
 def _store_past_routed(stored, group_metadata_ref, pid, block, size, acc_dtype):
   """Dew: the rows past sum(group_sizes) sum nothing: by the last program along m, each output there is
-  the epilogue of a zero accumulator, zero without one (`stored`)."""
+  the epilogue of a zero accumulator, zero without one (`stored`), a side operand by group read at the
+  last group's, as XLA's program repeats it there."""
   last_offset = (
     group_metadata_ref.group_offsets[size.g - 1]
     + group_metadata_ref.group_sizes[size.g - 1]
@@ -264,7 +268,7 @@ def _store_past_routed(stored, group_metadata_ref, pid, block, size, acc_dtype):
   def _():
     def store_empty(i, _):
       row = last_offset + i * block.m
-      stored(jnp.zeros((block.m, block.n), acc_dtype), row, (row + arange(block.m)) < size.m)
+      stored(jnp.zeros((block.m, block.n), acc_dtype), row, (row + arange(block.m)) < size.m, size.g - 1)
 
     lax.fori_loop(0, pl.cdiv(size.m - last_offset, block.m), store_empty, None)
 
@@ -428,7 +432,7 @@ def _tgmm_ragged_dot_kernel(
         # Dew: the prologue, on the loaded rows of `x` and its side operands' tiles, then the rows
         # past the group zeroed again, which no hook may bring back.
         tiles = [_side_tile(ref, axes, {'rows': (ridx, block.m), 'depth': (pid.r * block.k, block.k)},
-                            {'rows': xy_rows_mask, 'depth': k_mask})
+                            {'rows': xy_rows_mask, 'depth': k_mask}, pid.gi)
                  for ref, axes in zip(prologue_refs, prologue_axes, strict=True)]
         x = jnp.where(mask, prologue(x, *tiles), 0)
       mask = xy_rows_mask[:, None] & cols_mask[None, :]

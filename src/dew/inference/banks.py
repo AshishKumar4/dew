@@ -20,12 +20,13 @@ instead, and the prefetch loop reads them during execution.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import itertools
 import math
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from types import MappingProxyType
@@ -45,6 +46,7 @@ from dew.nn.hyper_connections import Carried
 from dew.nn.kernels.options import program
 
 if TYPE_CHECKING:
+    from dew.checkpoints import Checkpoints
     from dew.distributed.placement import Layout, MeshSpec, Placement
 
 
@@ -213,6 +215,41 @@ class CheckpointBanks(LayerBanks):
         return self.stored["variables"]
 
     def entry(self, placement: Placement) -> Variables:
+        with self._opened() as restoring:
+            return restoring.entry(placement)
+
+    def bank(self, layers: Sequence[int], placement: Placement, *,
+             namespace: tuple[str, ...] = ()) -> Variables:
+        with self._opened() as restoring:
+            return restoring.bank(layers, placement, namespace=namespace)
+
+    def place(self, model: BankedModel, *, mesh: MeshSpec | Mesh | None = None,
+              layout: Layout | None = None) -> Variables:
+        """`LayerBanks.place`, every entry and bank of the load read through one reader of the run, so the
+        checkpoint's metadata is read once a load, not once a layer."""
+        with self._opened() as restoring:
+            return restoring.place(model, mesh=mesh, layout=layout)
+
+    @contextlib.contextmanager
+    def _opened(self) -> Iterator[_Restoring]:
+        from dew.checkpoints import Checkpoints
+
+        with Checkpoints(self.directory) as checkpoints:
+            yield _Restoring(self, checkpoints)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Restoring(LayerBanks):
+    """A `CheckpointBanks` source's banks, restored through `checkpoints`, one reader of its run held open
+    for as many reads as its caller makes."""
+
+    source: CheckpointBanks
+    checkpoints: Checkpoints
+
+    def shapes(self) -> Variables:
+        return self.source.shapes()
+
+    def entry(self, placement: Placement) -> Variables:
         return self._restored(placement)
 
     def bank(self, layers: Sequence[int], placement: Placement, *,
@@ -227,17 +264,15 @@ class CheckpointBanks(LayerBanks):
     def _restored(self, placement: Placement) -> Variables:
         """Restore the variables `placement` names onto its shardings, as every load of a run's
         variables restores them (`Checkpoints.materialized`)."""
-        from dew.checkpoints import Checkpoints
-
+        source = self.source
         shapes = narrowed(self.shapes(), placement)
         template, placements = {"variables": shapes}, {"variables": narrowed(placement, shapes)}
-        if self.ema:
-            averaged = narrowed(self.stored["ema"], placement)
+        if source.ema:
+            averaged = narrowed(source.stored["ema"], placement)
             if averaged:
                 template["ema"], placements["ema"] = averaged, narrowed(placement, averaged)
-        assert self.step is not None
-        with Checkpoints(self.directory) as checkpoints:
-            return checkpoints.materialized(template, placements, step=self.step)
+        assert source.step is not None
+        return self.checkpoints.materialized(template, placements, step=source.step)
 
 
 @dataclasses.dataclass(frozen=True)

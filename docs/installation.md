@@ -99,10 +99,10 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post51,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post52,<0.12.1`.
 <!-- END JAX requirement -->
 
-It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of its native code, post45's, which post46's to post51's Python fixes left as it was, carrying the Mosaic GPU fixes below that live in them, and the index serves them too. Every other package, jaxlib included, comes from PyPI. The fixes:
+It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of its native code, post45's, which post46's to post52's Python fixes left as it was, carrying the Mosaic GPU fixes below that live in them, and the index serves them too. Every other package, jaxlib included, comes from PyPI. The fixes:
 
 - A Pallas Triton kernel's cache key leaves out its source locations ([jax-ml/jax#41502](https://github.com/jax-ml/jax/issues/41502)), so two checkouts share one compiled kernel. JAX is removing its Pallas Triton backend and takes no change to it, so this fix stays in the build while Dew runs Pallas Triton.
 - The device-to-host transfer guard holds on a CPU array's first implicit host read (`float`, `item`, `np.asarray`, its buffer), as on the copy an accelerator array's first read caches.
@@ -119,6 +119,8 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - A Mosaic GPU kernel's debug info stays out of the persistent compilation cache key, so the same kernel compiled from two checkouts keys alike.
 - A Pallas kernel's body may call a call primitive (a span a library marks, as `jax.extend.core.create_call_primitive` makes one): on Mosaic GPU, Triton and Mosaic TPU it lowers as its body, inlined where it is.
 - Under `checkify` a call primitive is checked within its body and kept a call, as `jit`'s is; it raised a `TypeError` before.
+- Under `vmap`, a staged `custom_jvp` call with a mapped input is batched alike in its primal and its JVP, so its gradient is its function's: a jitted `custom_jvp` under `vmap` with an unmapped argument doubled it before. Returning such a call's output shared (`out_axes=None`, or `sum_match`) is refused, naming the call; an unjitted one, or one with no mapped input, returns it shared as before.
+- JAX takes as its CUDA root only a package that holds `ptxas`: CUDA 13's wheels share `nvidia/cu13`, so one of its other tools installed beside CUDA 12's compiler (`nvdisasm`, which the test suite's environment carries) left JAX's root the string `None`, and XLA linked the system CUDA's libdevice.
 - A mesh of compile-only GPUs (a topology's devices, which state their compute capability) carries that capability into its abstract device, so a step compiled ahead for an A100 on a host with no GPU lowers its Mosaic kernels for sm80; they were lowered for sm90, which an A100 cannot run.
 - A compile-only Mosaic GPU target, one that states its compute capability or, stating none, another GPU's kind (an H100 lowered on an A100's host), is held to its own default shared memory limit, not the attached device's.
 - A transformation keeps a wide dtype its trace already holds, while a Python type asked of a wide value still narrows as a user's request.

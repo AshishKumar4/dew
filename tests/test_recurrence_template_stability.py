@@ -1,5 +1,5 @@
 """The recurrence template's stability on the path a call takes: its Mosaic GPU mainloop
-(`recurrence_chunk.mosaic_rule`, the template named to the selectors, `chunk_on('mosaic_gpu', ...)`), forward
+(`template.mosaic_rule`, the template named to the selectors, `chunk_on('mosaic_gpu', ...)`), forward
 and fast backward, over every form the stability suite holds (test_recurrence_stability's `SITES`: the gated
 delta rule a decay a head and a key dimension, a write gate without the delta rule, the gated delta net's
 formed gates and Mamba2's rated decay) under its regimes (`REGIMES`: decays near one and near zero, the

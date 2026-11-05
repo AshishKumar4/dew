@@ -329,3 +329,18 @@ def test_a_meeting_and_a_new_stage_drop_each_groups_part_filled_window():
         assert after.inner.microstep.tolist() == [6, 4] and int(after.microstep) == 6
         assert after.inner.accumulation.mass.tolist() == [0.0, 0.0]
         assert after.inner.accumulation.statistics[0].tolist() == [0.0, 0.0]
+
+
+def test_a_replicas_fields_are_the_train_states_marked_ones_and_its_typed_view_names_them():
+    """A DiLoCo replica holds its own of exactly the `TrainState` fields marked `REPLICA`, in their order
+    and with their types (row 4139: `Replicas` redeclared eight of them), and `ReplicaState`, the view
+    DiLoCo's readers are typed through, names the same fields with the same types."""
+    from dew.state import REPLICA, REPLICA_FIELDS, Replicas, ReplicaState, TrainState
+
+    marked = [(field.name, field.type) for field in dataclasses.fields(TrainState)
+              if all(field.metadata.get(key) == value for key, value in REPLICA.items())]
+    assert len(marked) == 8
+    assert [(field.name, field.type) for field in dataclasses.fields(Replicas)] == marked
+    assert tuple(name for name, _ in marked) == REPLICA_FIELDS
+    view = {name: kind for name, kind in ReplicaState.__annotations__.items() if not name.startswith("__")}
+    assert view == dict(marked)

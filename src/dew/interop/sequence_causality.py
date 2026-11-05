@@ -36,7 +36,7 @@ from jax.core import ShapedArray
 from jax.extend import core
 
 from dew.nn.nested import nested
-from dew.nn.programs import CALLS, bodies, jax_name
+from dew.nn.programs import CALLS, CUMULATIVE, ENTRYWISE, KEYS, REDUCTIONS, bodies, jax_name
 
 CAUSAL_ATTENTION = "causal attention"
 """The rule of a program tier 3's attention runs (`torchax_fallback._dew_attention`, `attested`), causal
@@ -756,27 +756,16 @@ def _cond(walk: _Walk, eqn, given, operands) -> list[Held]:
     return merged
 
 
-_ENTRYWISE = frozenset({
-    "add", "sub", "mul", "div", "rem", "pow", "max", "min", "neg", "abs", "sign", "floor", "ceil", "round",
-    "exp", "exp2", "log", "log1p", "expm1", "tanh", "logistic", "sin", "cos", "tan", "asin", "acos", "atan",
-    "atan2", "sinh", "cosh", "asinh", "acosh", "atanh", "sqrt", "rsqrt", "cbrt", "square", "integer_pow",
-    "erf", "erfc", "erf_inv", "lgamma", "digamma", "is_finite", "not", "and", "or", "xor", "eq", "ne", "lt",
-    "le", "gt", "ge", "select_n", "convert_element_type", "copy", "copy_p", "reduce_precision", "clamp",
-    "nextafter", "shift_left", "shift_right_logical", "shift_right_arithmetic", "population_count", "clz",
-    "real", "imag", "conj", "complex", "stop_gradient", "random_wrap", "random_unwrap", "random_bits",
-    "random_fold_in", "random_split", "threefry2x32", "polygamma", "igamma", "igammac",
-    "bessel_i0e", "bessel_i1e", "zeta"})
+_ENTRYWISE = ENTRYWISE | KEYS
 """The operations whose every output entry reads its operands' entries at its own index (over operands
-broadcast to its shape) and nothing else: the walk keeps their positions' axis. Any operation it holds
-no rule for gives every entry the latest of what its operands read."""
+broadcast to its shape) and nothing else, a key's among them: the walk keeps their positions' axis. Any
+operation it holds no rule for gives every entry the latest of what its operands read."""
 
 type _Rule = Callable[[_Walk, core.JaxprEqn, list[Held], list[np.ndarray | None]], list[Held]]
 
 _RULES: Mapping[str, _Rule] = {
     "broadcast_in_dim": _broadcast_in_dim, "reshape": _reshape, "squeeze": _squeeze, "transpose": _transpose,
-    **dict.fromkeys(("reduce_sum", "reduce_max", "reduce_min", "reduce_prod", "reduce_and", "reduce_or",
-                     "reduce_xor", "argmax", "argmin"), _reduce),
-    **dict.fromkeys(("cumsum", "cumprod", "cummax", "cummin", "cumlogsumexp"), _cumulative),
+    **dict.fromkeys(REDUCTIONS, _reduce), **dict.fromkeys(CUMULATIVE, _cumulative),
     "dot_general": _dot_general, "conv_general_dilated": _conv, "gather": _gather, "sort": _sort,
     "top_k": _top_k, "slice": _slice, "rev": _rev, "pad": _pad, "concatenate": _concatenate,
     "dynamic_slice": _dynamic_slice, "dynamic_update_slice": _dynamic_update_slice, "split": _split,

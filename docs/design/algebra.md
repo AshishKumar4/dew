@@ -27,7 +27,7 @@ checked-in output yet. The text stays as the design to resume.
 | Mode | When | Input | Rule sets | Output |
 |---|---|---|---|---|
 | Dev time | `python -m dew.algebra.generate`, run by a developer when a declaration or a rule changes | declarations: template algebra (attention's reduction, a recurrence's update), stable numeric forms, surrogate gradients' bodies | every set, with sampled error estimates (§1.5) | Python modules and their tests, checked in and reviewed like hand-written code |
-| Compile time | the program pass, once per program Dew compiles at its seam (§2) | the traced jaxpr of a training step, an evaluation, a rollout or a serving program, a step's backward included | `linear`, `identities`, `joined`: small and fast, admitted by rounding class (§1.4) | the rewritten jaxpr, compiled under the program's own options |
+| Compile time | the program pass, once per program Dew compiles at its seam (§2) | the traced jaxpr of a training step, an evaluation, a rollout or a serving program, a step's backward included | `identities`, `contracted`, `linear`, `joined`: small and fast, admitted by rounding class (§1.4) | the rewritten jaxpr, compiled under the program's own options |
 | Runtime | never | — | — | — |
 
 - **Dev time** covers everything whose code Dew knows in advance: a template's forward and backward tiled forms,
@@ -63,8 +63,8 @@ checked-in output yet. The text stays as the design to resume.
   transpose rules bracket the span's tangent and cotangent too, so a span keeps its marker through autodiff. A
   marker carries its kind as an object, never a name string:
   - `Protected`: the error-free transforms of `dew.nn.precision` (`two_sum`, `two_product`, `compensated_add`,
-    `compensated_difference`, `compensated_sum`, `widened_reduction`) and the numerics bodies of custom derivatives
-    (§1.3). A protected span is a boundary no region crosses. At compile time it is one opaque leaf. At dev time
+    `compensated_difference`; `compensated_sum` and `widened_reduction` with their site's declaration, row 4026)
+    and the numerics bodies of custom derivatives (§1.3). A protected span is a boundary no region crosses. At compile time it is one opaque leaf. At dev time
     the generator may propose another form for it, which extraction admits only when its error estimate meets the
     span's own (§1.5), and which lands only as reviewed generated code.
   - `Surrogate`: a declared surrogate gradient's forward or backward body (§1.3). Rules rewrite inside it, and no
@@ -83,16 +83,21 @@ reference's error, past the gate's 1.5).
 
 Dew holds 58 custom-derivative sites (the inventory of 2026-11-01, by class: 24 kernel, 26 numerics, 8 surrogate),
 and two more since: nGPT's join and normed hidden (`ngpt.stepped`, `ngpt.normed_hidden`, row 1308), which reverse in
-two passes only to restructure the norm's algebra (§0's example) and are the algebra-only sites the engine retires
-first. The engine sees through every one: it rewrites inside each custom VJP's and JVP's forward and backward
-bodies, by the site's declared class:
+two passes only to restructure the norm's algebra (§0's example). They stay hand-written: the one-pass form's
+new intermediates are sums of the raw rows and of the joined rows `start + |alpha scale| (end - start)` against
+the cotangent, and neither the cotangent nor the learned rate has a range the program proves or declares, so no
+reordering to that form meets the dominance rule (§6.3). Autodiff's own backward is no safer: it forms the same
+unscaled products (the pullback of `x r` to `r` is `sum(g x)`), and over residual, branch and cotangent scales
+of 1 to 1e38 in fp32 the hand backward was never non-finite where autodiff's was finite, and finite in 137 cases
+where autodiff's was not (row 4124). The engine sees through every site: it rewrites inside each custom VJP's and
+JVP's forward and backward bodies, by the site's declared class:
 
 - **Kernel** (the norm and SwiGLU kernels, the GEMM and attention templates, the recurrence kernels, the paged and
   Splash attention kernels): the launches are opaque leaves and their XLA glue is `KernelGlue`, rewritten freely.
   A kernel site's `linear_tangent` portable tangents are ordinary math and are rewritten as well.
 - **Numerics** (`nn.categorical`'s label, soft-label and divergence tangents, `sampling.flow`'s range-safe KL,
   `nn.precision`'s compensated and correctly rounded functions, the recurrence algebra's decay prefix and readout,
-  the chunked heads' logit tangents, `exact_gelu`, the grouped projection's widened sums, among them): both bodies
+  `exact_gelu`, the grouped projection's widened sums, among them): both bodies
   are `Protected`. They exist to restructure math for accuracy, often at a cost (the decay prefix costs 4–26% more
   for 3.6–4.5 times less error), so no compile-time rule undoes them. At dev time the generator searches each
   body's alternatives and proposes one only where its sampled error meets the body's own (§1.5).
@@ -104,26 +109,27 @@ bodies, by the site's declared class:
 
 Each site declares its class where it defines its derivative (`dew.nn.derivatives`: `declared_derivative` or
 `declared_tangent` with its kind, or `surrogate`; §6.10), so the class is read from the site, never inferred. A
-bare custom derivative in `src/dew` fails a slop check, not a default. Each declaring function wraps
+bare custom derivative in `src/dew` is to fail a slop check, not take a default. Each declaring function wraps
 `jax.custom_vjp` or `jax.custom_jvp` and returns the derivative as one marked call of its kind, its primal,
 forward and backward one span (`dew.nn.derivatives.bound_span`: its arrays the operands, its other arguments
-and its `nondiff_argnums` bound in), so the check (SLOP026) refuses `jax.custom_vjp` and `jax.custom_jvp`
-anywhere in `src/dew` but `dew/nn/derivatives.py` (a reference to JAX's `custom_vjp_call_p` is no application).
-Rows 4026 to 4030 declare each lane's sites.
+and its `nondiff_argnums` bound in), so the check (SLOP026, row 4012) refuses `jax.custom_vjp` and
+`jax.custom_jvp` anywhere in `src/dew` but `dew/nn/derivatives.py` (a reference to JAX's `custom_vjp_call_p` is
+no application). Rows 4026 to 4030 declare each lane's sites; the check lands after them. Until a site is
+declared, its custom call's bodies are rewritten as any glue is (§6.2), reorderings over its values held by
+the dominance rule alone (§6.3).
 
 ### 1.4 Facts and rules
 
-- **Facts about each value** (e-class analyses):
-  - its shape and dtype;
-  - the axes it is constant along;
-  - whether each axis is local or sharded (a sum over a sharded axis is a collective);
-  - its range where cheap, and the rounding class of the forms that produce it (error is measured per candidate,
-    never held as a fact; §1.5).
+- **Facts about each value** (e-class analyses): its shape, and a bound on its magnitude where the program
+  proves one (§6.3). Its dtype and parameters are the region's tables (`terms.Region`). Constant and sharded
+  axes and a rounding class per value are not built: a hoisting rule reads a broadcast's laid axes, no price
+  reads a link, and a rule set states its rounding class (§6.4). Error is measured per candidate, never held
+  as a fact (§1.5).
 - **Rules,** in declared sets in one place, each set tagged with the modes it runs in:
-  - **linear algebra** (compile time and dev time): linearity of sums, scalars hoisted out of reductions along
-    constant axes, distributivity, `dot_general` ⇄ multiply and sum, inner products moved across linear maps
-    (⟨x, L y⟩ = ⟨Lᵀ x, y⟩), a scale moved through a contraction (`(diag(1/t) E)ᵀ dO ≡ Eᵀ (diag(1/t) dO)`),
-    and a positive scale out of a maximum or a minimum (`max(c x) = c max(x)` for `c > 0`, a literal's sign
+  - **linear algebra** (compile time and dev time): linearity of sums (`joined`), a laid factor hoisted out
+    of a sum, distributivity, a product's bilinearity (a shared operand out of two products, a power of two's
+    scale on either operand), a row or column scale moved through a contraction (a dequant's, or
+    `(diag(1/t) E)ᵀ dO ≡ Eᵀ (diag(1/t) dO)`), and a positive scale out of a maximum or a minimum (`max(c x) = c max(x)` for `c > 0`, a literal's sign
     its fact): attention's derived step takes its raw products' maximum and scales it once, as the hand step
     does;
   - **identities** (compile time and dev time): commutativity, a saturation aid. A cast's widening round trip,
@@ -132,12 +138,24 @@ Rows 4026 to 4030 declare each lane's sites.
     on a lane that flushes a subnormal product (the CPU's, `tests/certified.py`'s `Lane.flushes`: the product
     is zero where the magnitude keeps its bits), nor for a complex value; exp and log cancel only over a sign
     and a range the language holds no fact of. None of these is built;
-  - **reuse** (compile time and dev time): a value the forward already computed;
+  - **reuse** (compile time and dev time): a value the forward already computed. An equal term is one e-class
+    and extraction prices a shared one once, so a value written twice is read once without a rule. A rule
+    would relate a new value to another the program holds; over benchmark_step's and the parallelism matrix's
+    step programs (2026-11-05, every program the pass saw, bodies included) none takes the square root and its
+    reciprocal of one value or the exponentials of a value and its negation, a handful square a value by a
+    product, and the only pattern of note is a divisor shared by several quotients (42 to 452 of 423 to 794
+    divisions a suite). A shared reciprocal `a (1/y)` overflows where `a / y` is finite (a subnormal `y`) and
+    makes a NaN of a zero `a`, so the dominance rule (§6.3) refuses it. Not built;
   - **decoupled reductions** (dev time): dependent nonlinear reductions broken with correction terms (the running-max
     rescale of online softmax, log-sum-exp merges and folds, moment merges);
-  - **stable forms** (dev time; §1.5): `log1p` and `expm1`, log-space divergences, compensated and widened sums,
-    near-equal differences rearranged to cancel exactly, products and quotients scaled to range;
-  - **linear scans** and **error-free transforms** (dev time; §6.9).
+  - **stable forms** (dev time; §1.5): `log1p` and `expm1`, and a sum's logarithm taken out of its exponent
+    (the log-sum-exp fold), built; log-space divergences, compensated and widened sums, near-equal
+    differences rearranged to cancel exactly, and products and quotients scaled to range are the generator's
+    (parked, §6.11);
+  - **linear scans** (dev time; §6.9), built as the derivation's own sets; **error-free transforms**
+    (`error_free`, §6.9), not built;
+  - **contracted** (compile time and dev time): a multiply its add or subtract reads first, as the fused
+    multiply-add the compiler makes of the pair, a pricing aid that rounds as the form it replaces.
 - **Rounding:** a rewrite that rounds identically (`exact`) always applies. One that reorders rounding (`reorders`:
   linearity, hoisting, distributivity) applies at compile time under default numerics and never under
   the accurate numerics (`precision="accurate"`). The compile-time pass estimates no error per program: a `reorders` rule is admitted
@@ -179,19 +197,20 @@ floating-point expressions:
 Each form is priced in time from the device facts Dew already owns, never from facts of its own:
 
 - the program model reads `dew.nn.kernels.generation.gpu_target()` (memory bandwidth, dense peaks by precision,
-  the architecture's load latency), so every process of a pool prices with the same numbers. No price reads
+  the part's measured latencies: a kernel's fixed seconds, a loop's and an in-kernel step's), so every process of a pool prices with the same numbers. No price reads
   links: every registered rule either keeps a reduction's axes and count or joins two reductions into one
   (`joined`; `linear`'s shared operand out of two products), which the device price already prefers, so a
   collective's bytes over `dew.training.distributed.link_figure` would only agree with it. A rule that moves a
   reduction onto or off a sharded axis brings that price with it;
-- the kernel model is the templates' own (`dew.nn.kernels.templates.cost.seconds`);
+- the kernel model is the templates' own (`dew.nn.kernels.templates.cost.walked`);
 - a fact a price needs and no owner holds, such as a reduction's latency, is added to `GpuTarget` or its
   `Architecture`.
 
 A region's seconds are computed once, from its composed terms over the chosen DAG (§6.5): bytes over bandwidth,
-FLOPs over the dtype's rate, collective bytes over the link, each kernel XLA's fusion makes of it (a reduction's
-and a product's, each a fusion's root) at the part's measured fixed latency (its launch and first byte), and
-the longest chain of dependent reductions as latency, combined as `templates.cost` combines a launch's. Row
+FLOPs over the dtype's rate, each kernel XLA's fusion makes of it (a reduction's
+and a product's, each a fusion's root) at the part's measured fixed latency (its launch and first byte), so a
+chain of dependent reductions pays a kernel's latency a link, and the span of a loop XLA lowers at its
+iteration's latency (§6.5), combined as `templates.cost` combines a launch's. Row
 4072's validation priced 1,580 profiled kernels: without a kernel's fixed latency an H100's XLA fusions came
 to 0.02 of their measured time, with it 0.51 (p10 0.40). Prices are checked against measured profiles, not
 fitted to them, and a rule set ships only with measured receipts.
@@ -200,13 +219,13 @@ fitted to them, and a rule set ships only with measured receipts.
 
 - **Programs (compile time):** the pass runs where a function is jitted, so lowering, tracing, compiling and
   relowering all read one program:
-  - `OuterProgram._jitted` jits `dew.algebra.rewritten(fn)` (`dew.nn.kernels.options`). Every outer program Dew
-    builds through it gets the pass: `options.program` for evaluation and loads, `Objective.program` for the
+  - An `OuterProgram` (`dew.nn.kernels.options`) rewrites the trace its jit makes (`_traced`,
+    `dew.algebra.rewritten_program`), and its eager call runs `dew.algebra.rewritten(fn)`. Every outer program Dew
+    builds gets the pass: `options.program` for evaluation and loads, `Objective.program` for the
     host-master step's forward and the evaluation, rollout and sample programs, and the serving kernel's step and
     decode programs, whose tuner lowers and compiles the same function.
-  - The resident training step, `Trainer._jitted`'s `jax.jit(step, …)` (`dew.training.trainer`), which every
-    default `dew train` runs and the planner compiles through `compiled_if_it_fits`, jits the rewritten step the
-    same way, and so does every objective's step it builds, an RL update's included.
+  - The resident training step, `Trainer._jitted`'s `owned_program(step, …)` (`dew.training.trainer`), which every
+    default `dew train` runs and the planner compiles through `compiled_if_it_fits`, is such an outer program, and so does every objective's step it builds, an RL update's included.
   - The host-master phases (`dew.training.transaction`) and the RL rollouts (`dew.objectives.rl.control`,
     `dreamer`, `dew.rl.simulator`, `dew.rl.flight`, `dew.rl.hyperlux`) jit theirs the same way: the rollout over
     an environment through `Objective.program`, the rest through `options.program` and `owned_program`, so none
@@ -278,9 +297,8 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
 
 ## 4. What it replaces, and what it leaves
 
-- **It replaces** custom derivatives that exist only to restructure algebra (nGPT's join and normed hidden, §1.3),
-  and
-  hand-derived template algebra and numeric forms wherever a generated form meets both bars:
+- **It replaces** custom derivatives that exist only to restructure algebra where its rules reach their form
+  under the dominance rule (nGPT's join and normed hidden do not, §1.3), and hand-derived template algebra and numeric forms wherever a generated form meets both bars:
   - bible §4: at least as efficient on every scoreboard row and GPU type the route serves, at the derived default,
     in operator rows and the `benchmark_step` step;
   - bible §6: the template's stability suite on both forms, and check 1 and check 2 against the float64 truth.
@@ -314,15 +332,17 @@ because its Python API is still marked as subject to change.
 | Module | Holds |
 |---|---|
 | `dew.algebra.terms` | The term language and its conversion to and from jaxprs |
-| `dew.algebra.facts` | Facts about each value (e-class analyses) |
-| `dew.algebra.rules` | `Rules` and `RuleFamily`, the registry and the sets registered: `identities`, `contracted`, `stable`, `linear`, `joined`, each declared as its rewrites with their instances (`reuse` and `error_free`, §1, are not built; `decoupled` and `carried` are the derivations' own sets, never registered) |
+| `dew.algebra.rules` | The shape of each value a rule makes (`FACTS`, an e-class analysis; the magnitude bound is the region's, `terms.Region.magnitudes`, §6.3), `Rules` and `RuleFamily`, the registry and the sets registered: `identities`, `contracted`, `stable`, `linear`, `joined`, each declared as its rewrites with their instances (`reuse` and `error_free`, §1, are not built; `decoupled` and `carried` are the derivations' own sets, never registered) |
 | `dew.algebra.linear_scan` | A recurrence's token update read as an affine map by rules, and its chunk form derived by identities and extracted under the work-span model (§6.9) |
-| `dew.algebra.cost` | `Price`, `CostModel` and error-aware DAG extraction |
-| `dew.algebra.error` | Dev time: each candidate DAG's error, sampled on its declaration's cases against the float64 truth |
+| `dew.algebra.cost` | A node's work in the cost vocabulary (`work`, `templates.cost.Work`), the two schedules (`fused`, `walk`) that turn it into seconds, and the DAG cost models extraction reads (`model`, `stable`) |
+| `dew.algebra.extract` | Extraction: egglog's greedy DAG (`cheapest`) and the exact one, its oracle (§6.5) |
+| `dew.algebra.error` | Dev time: a function's candidate forms in order of price and the first its caller's admission takes (`choose`, §6.5) |
 | `dew.nn.derivatives` | Below the engine, so every model module can import it: the marker primitive, its kinds, and the custom-derivative declarations (`declared_derivative`, `declared_tangent`, each of a kind, and `surrogate`, row 3271) |
 | `dew.algebra.program` | The compile-time pass (`rewritten`), its switch (`passes`) and its report |
-| `dew.algebra.derive` | Template declarations and their derived forms |
-| `dew.algebra.generate` | The dev-time generator and its `--check` |
+| `dew.algebra.derive` | A monoid walk's declaration (`Reduction`) and its derived forms; the derivation context every derivation keys on (`context`) |
+| `dew.algebra.scan`, `dew.algebra.carry` | A recurrence's declaration (`Scan`) and its chunk forms, split into what every chunk computes at once and what its carry runs in sequence |
+| `dew.algebra.forms` | What every derivation shares: the derived forms (`Derived`), their refusal, their evaluation, and the switch the templates take them behind (`derived`) |
+| `dew.algebra.generate` | Parked (§6.11): the dev-time generator and its `--check` |
 | `dew.algebra.bits` | Bit-level forms (§7): a declared GF(2)-linear transform of a stored word, its cheapest instruction form over the integer pipes and its proof |
 
 ### 6.2 Terms
@@ -375,8 +395,9 @@ class Term(Expr):
 - `terms.form_value(region, form, values)` evaluates an extracted form over its leaves' values, each equation
   rebuilt from its interned parameters, which a splice traces into the window's place (`program._splices`).
 - A surviving custom-derivative call (`custom_jvp_call`, `custom_vjp_call`, in a program no transform has traced
-  through) is a region of its own: its `call_jaxpr` is rewritten in place by its marked kind, and the call, its
-  rules and their derivative programs are rebuilt as they were, so the custom derivative stays the site's. Its
+  through) is a region of its own: its `call_jaxpr` is rewritten in place (a declared site's body is a marked
+  call of its kind within it, read as §6.10 reads one), and the call, its rules and their derivative programs
+  are rebuilt as they were, so the custom derivative stays the site's. Its
   rules are rewritten where autodiff materializes them, as marked bodies (§6.10).
 - A region is a maximal set of equations of the language. It never crosses:
   - a checkpoint (remat) boundary;
@@ -386,25 +407,23 @@ class Term(Expr):
 
 ### 6.3 Facts
 
-Each fact is an egglog `@function` from `Term` to a primitive sort. Its `merge` is the lattice join, and its rules
-derive it from its arguments' facts.
+Each fact is an egglog `@function` from `Term` to a primitive sort, and its rules derive it from its
+arguments' facts (`rules.FACTS`, the magnitudes' rules beside the reorderings they hold).
 
 | Fact | Sort | Join | Read by |
 |---|---|---|---|
-| `shape(t)` | `Vec[i64]` | equal or fail | every rule that names an axis |
-| `dtype(t)` | `String` | equal or fail | casts, rounding |
-| `constant_axes(t)` | `Set[i64]` | union | hoisting a scalar out of a reduction |
-| `sharded_axes(t)` | `Map[i64, String]` (axis to mesh axes) | equal or fail | a sum over a sharded axis is a collective |
-| `walked_axis(t)` | `i64` (−1 for none) | equal or fail | the toolkit's derived forms |
-| `per_token(t)` | `Bool` (varies along the walked axis) | or | hoisting across tiles; factors that commute through WY |
-| `decay(t)` | `String` (`scalar`, `per_head`, `per_key`) | equal or fail | a recurrence's decay hoisting |
-| `structure(t)` | `String` (a state update's `A_t`: `scalar`, `diagonal`, `rank_one_correction`) | equal or fail | the linear-scan rules |
-| `range(t)` | `Pair[f64, f64]` (bounds, where cheap) | intersect | a stable correction (exp arguments at most 0); a condition bound |
-| `rounding(t)` | `String` (`exact`, `reorders`, `bounded`) | the worse | the compile-time admission of a set |
+| `shape(t)` | `Vec[i64]` | the first stated (every member's is one shape) | every rule that names an axis |
+| `log2_bound(t)` | `i64`, a power of two over the value's magnitude | the first stated (each a true bound of every member) | the dominance rule: a reordering's new intermediates |
+| `reach()` | `i64`, the narrowest float's largest power of two | — | the dominance rule |
 
-What is built of the table: `shape`, and `range` as a bound on each value's magnitude
-(`terms.Magnitude`): a number, `|x| <= 2**log2`, proved from the program's constants, its declared ranges and
-its equations, or none. The region states it as it traces a program (`terms.Region.magnitudes`). A
+A value's dtype and its equation's parameters are the region's tables (`terms.Region`), read by the rules
+that need them. Not built, and read by nothing: constant axes (a hoisting rule reads a broadcast's laid axes),
+sharded axes (no price reads a link, §1.6), a walked axis (the derivation's own `walked` fact, `derive.py`),
+per-token, decay and structure facts (`linear_scan`'s affine forms hold them), and a rounding class per value
+(each rule set states its own, §6.4).
+
+The magnitude bound (`log2_bound`, `terms.Magnitude`): a number, `|x| <= 2**log2`, proved from the program's
+constants, its declared ranges and its equations, or none. The region states it as it traces a program (`terms.Region.magnitudes`). A
 constant's bound is its largest element's magnitude (a complex one's modulus), and a declared operand's is its
 range (`scan.Scan.ranges`, `derive.Reduction.ranges`, by input, the program's constants apart: l2-normalised
 keys 1, a sigmoid's gate 1, a recurrence's decays 1). An operand with no declared range, and an equation
@@ -445,8 +464,7 @@ form (two state products a chunk where the derivation keeps three): the values h
 `L U` is no number bound. A dequant scale folds out of a matrix product where its codes are declared (FP8's
 448), and not over unbounded operands. Error-aware extraction then checks precision against float64 (§1.5).
 
-Two notes on the table:
-- "equal or fail" means members of one e-class that disagree raise, naming the rule that united them.
+Notes on the table:
 - Every fact is invariant under equality, as congruence requires. Error is not: it is measured per candidate
   (§1.5, §6.5).
 - The inputs' facts come from the traced avals, their shardings, and a declaration's roles (§6.9).
@@ -464,21 +482,25 @@ about `exp`, not about the monoid).
 ### 6.4 Rules
 
 ```python
-class Mode(Enum):
-    DEV = "dev"                              # the generator (§6.11)
-    COMPILE = "compile"                      # the program pass (§6.7)
+@dataclass(frozen=True)
+class RuleFamily:
+    name: str                                # one rewrite of a set
+    rules: tuple                             # its egglog rules, each direction and layout of it
+    instance: Instance                       # the rewrite written as JAX, its accuracy test's (§3)
 
 @dataclass(frozen=True)
 class Rules:
-    name: str                                # "identities", "stable", "linear", "joined"
+    name: str                                # "identities", "contracted", "stable", "linear", "joined"
     rounding: Literal["exact", "reorders", "bounded"]   # the rounding class each of its rewrites gives
-    modes: frozenset[Mode]                   # identities, linear, joined: both; stable: DEV
-    ruleset: egglog.Ruleset
+    ruleset: egglog.Ruleset                  # its families' rules (`Rules.declared`)
     receipt: str                             # the measurement it ships with: a ledger row and its receipts
+    families: tuple[RuleFamily, ...] = ()
+    dev: bool = False                        # dev time alone (stable): each candidate's error measured first
+    aid: bool = False                        # only aids saturation (identities, contracted)
 
 RULES: Mapping[str, Rules]                   # every registered set, by name
 def register(rules: Rules) -> None: ...
-def admitted(numerics, mode: Mode) -> tuple[Rules, ...]   # the sets a mode and a precision policy allow
+def admitted(accurate: bool, *, dev: bool = False) -> tuple[Rules, ...]   # the sets numerics and a mode allow
 ```
 
 - A set's rules are egglog `rewrite`/`birewrite`/`rule` objects in its `ruleset`.
@@ -495,26 +517,31 @@ def admitted(numerics, mode: Mode) -> tuple[Rules, ...]   # the sets a mode and 
 ```python
 def work(graph: EGraph, node, region: Region, held: dict | None = None) -> templates.cost.Work: ...
     # a node's work alone: device and shared bytes at its dtypes' sizes, tensor-core and CUDA-core FLOPs by
-    # mode, operations, exponentials, conversions, and its span (the tile walk's longest dependent chain)
+    # mode, operations, exponentials, conversions, and the kernels XLA's fusion makes of it
 
 class Schedule(Protocol):            # how a chosen DAG's composed work becomes seconds
-    def pieces(self, work: Work) -> ...: ...
+    def pieces(self, done: Work) -> tuple[float, ...]: ...
+    def spanned(self, done: Work) -> float: ...
 def fused(facts: GpuTarget) -> Fused: ...  # the compile-time pass: XLA's fusion
 def walk(facts: GpuTarget) -> Walk: ...    # a template's interface: the tile walk
 
 def model(region: Region, schedule: Schedule) -> DagCostModel[Seconds]: ...  # egglog's DAG cost model
-def cheapest(graph, root, model) -> ...: ...    # extract.py: greedy-dag, each shared node once
-def extracted(graph, root, model) -> ...: ...   # the exact extractor (a MILP), check 1's oracle under checked
+def cheapest(graph, root, model, *, exact=False, checked=False): ...  # extract.py: greedy-dag, each shared node once
+def extracted(graph, root, model): ...          # the exact extractor (a MILP), the oracle under `checked`
 ```
 
 - A cost model gives a node's work alone. Extraction composes it over the chosen DAG: bytes and FLOPs add up
-  with each shared e-class counted once, and the span is the longest dependent path. Seconds are computed once
-  from the composed work, as `templates.cost` combines a launch's, so a longest path stays a latency and never
-  becomes a count.
-- `admits` decides a candidate: at compile time, whether every rule set it drew on is admitted (§6.4); at dev
-  time, whether its sampled error meets the declared accuracy (§1.5), which `dew.algebra.error` measures on the
-  candidate itself. The candidates come cheapest first, so the first admitted is the answer; the form as written
-  is always a candidate, so one is always admitted.
+  with each shared e-class counted once, and a span is the largest any chosen node states (`extract.Level`'s
+  peak), extraction's composition being additive; a derivation that prices a path's length composes it itself
+  (`linear_scan`'s candidates, their critical path). Seconds are computed once from the composed work, as
+  `templates.cost` combines a launch's, so a span stays a latency and never becomes a count.
+- A candidate is admitted at compile time where every rule set it drew on is (§6.4). At dev time
+  `dew.algebra.error.choose` proposes candidates cheapest first (the form as written, the cheapest and the most
+  stable extractions, and each root's variants) and takes the first its caller's `admits(candidate,
+  reference)` passes, the gate's check of the two against the float64 truth (§1.5): under default numerics
+  against the form as written, which is always a candidate, so one is always admitted; under the accurate
+  numerics against every other candidate, which may admit none, and then nothing is chosen. No module calls
+  `choose` yet (the generator is parked, §6.11).
 - Extraction is egglog's `greedy-dag` (`dew.algebra.extract.cheapest`), each shared node priced once; its
   exact counterpart (`extract.extracted`) is the oracle. The exact extraction finds the roots' forms whose nodes
   together cost least as a mixed integer program, solved by HiGHS through SciPy: one binary choice per node; a
@@ -563,8 +590,11 @@ def extracted(graph, root, model) -> ...: ...   # the exact extractor (a MILP), 
   an iteration of a loop XLA lowers, its launches and its predicate (`GpuTarget.step_seconds`, each GPU's
   measured as the slope of a loop's time over its iterations: an A100's 5.96 µs, an H100's 4.93 µs, an RTX
   PRO 6000's 3.68 µs); a token loop's tokens and a substitution's rows are a step each. On the template's
-  path a step's latency is its instructions', which the resource model does not state yet, so a span there
-  is priced by no time.
+  path a step is a dependent reduction inside a program, measured as one (`GpuTarget.kernel_step_seconds`:
+  a Pallas program's 128-lane reduction read by the next, an A100's 225.3 ns, an H100's 142.7 ns, an RTX PRO
+  6000's 137.7 ns). The algebra's terms state no span of their own, extraction composing a span as its largest
+  node's (`extract.Level`), so a derived tile form's span is the derivation's to state. A whole launch's step,
+  its tile's load and products where its ring does not hide them, is the launch model's (row 4123).
 - Every rule is the pass's own, applied wherever its cost model prices the rewrite cheaper, with no
   condition on XLA: where XLA would make the same rewrite the result is the same, and where XLA's factoring
   and reassociation are held to integers, powers of two or fast math, the pass's fire on floats wherever the
@@ -591,10 +621,10 @@ def extracted(graph, root, model) -> ...: ...   # the exact extractor (a MILP), 
 ```python
 @dataclass(frozen=True)
 class Saturation:
-    growth: float           # nodes allowed a region, per equation of it
+    growth: int             # nodes allowed a region, per equation of it
     depth: int              # iterations allowed, per level of the region's longest chain
 
-def limits(region, saturation: Saturation) -> tuple[int, int]: ...   # (nodes, iterations) for this region
+    def limits(self, region) -> tuple[int, int]: ...   # (nodes, iterations) for this region
 ```
 
 - The limits are derived from the region's size where they are set (`limits`): nodes at `growth` times its
@@ -613,26 +643,31 @@ def limits(region, saturation: Saturation) -> tuple[int, int]: ...   # (nodes, i
 ### 6.7 The program pass
 
 ```python
-def rewritten_jaxpr(closed: jax.extend.core.ClosedJaxpr, *, numerics, cost: CostModel,
-                    saturation: Saturation) -> Rewrite: ...
+def rewritten_program(closed: jax.extend.core.Jaxpr, *, saturation: Saturation) -> jax.extend.core.Jaxpr: ...
+    # a jit's own trace, rewritten where the switch is on; the same inputs, outputs, avals and shardings, and
+    # `closed` itself where no rule changes it (the numerics read from the trace context, the prices from
+    # `cost.target`)
 
-def rewritten(fn: Callable, *, static_argnums=(), static_argnames=()) -> Callable: ...
-    # public: fn traced over its dynamic arguments, its static ones bound first as jit binds them, rewritten as
-    # the seam would, and evaluated, its outputs' pytree as fn's
+def rewritten(fn: Callable, *, saturation: Saturation, static_argnums=(), static_argnames=()) -> Callable: ...
+    # fn traced over its dynamic arguments, its static ones bound first as jit binds them, rewritten as
+    # the seam would, and evaluated, its outputs' pytree as fn's; `dew.algebra.rewritten` and
+    # `dew.algebra.rewritten_program` bind `SATURATION`
 
 @dataclass(frozen=True)
-class Passes:
-    on: bool                          # the pass runs
-    target: str | None                # the GpuTarget whose facts it prices for; None: the process's own
+class Passes:                         # dew.cache
+    on: bool = True                   # the pass runs
+    target: str | None = None         # the GpuTarget whose facts it prices for; None: the process's own
+    checked: bool = False             # each derivation's greedy extraction held to the exact optimum
 
-PASSES = jax.make_user_context(Passes(on=True, target=None))   # in JAX's trace context, as dew.cache's are
+ALGEBRA = jax.make_user_context(default_value=Passes())   # dew.cache, in JAX's trace context
 
 @contextlib.contextmanager
-def passes(on: bool = True, target: str | None = None) -> Iterator[None]: ...   # sets PASSES
+def passes(on: bool = True, target: str | None = None) -> Iterator[None]: ...   # sets ALGEBRA
 
 @dataclass(frozen=True)
-class Rewrite:
-    closed: jax.extend.core.ClosedJaxpr   # same inputs, outputs, avals and shardings
+class Rewrite:                        # one region's
+    region: terms.Region
+    picked: Mapping[Hashable, terms.Term]   # each root's cheaper form by its key; empty where none is
     report: AlgebraReport
 ```
 
@@ -659,7 +694,7 @@ class Rewrite:
   and the target it is priced for.
   Every layer of a stack and every compile of one step (the planner's candidates, a resumed run's
   relowering) take the first derivation, spliced into each program apart.
-- `passes` is the seam's switch. `PASSES` lives in JAX's trace context, so every jit and every executable map
+- `passes` is the seam's switch. `ALGEBRA` lives in JAX's trace context, so every jit and every executable map
   that keys on `trace_context` (jit's own, `OuterProgram._keyed`) retraces when it changes: a program already held
   never runs a form traced under another switch or priced for another target. The gate opens it per arm: off for
   the reference and the float64 truth, on for the candidate, priced at a named target (§3). Outside any `passes`,
@@ -762,7 +797,7 @@ forms where the declarations state the walk:
   (`derived_rule`), differentiated at every order (the decays' and the solve's rules through
   `generation.linear_tangent`: reverse mode their protected rules, forward mode their own tangent), its
   carries typed as every operand varies, its decays' prefix restarting at a token whose decay vanishes in
-  its dtype (`_vanishing`, a segmented compensated scan: a span through it is zero, and no later span's sum
+  its dtype (`dew.nn.precision.vanishing`, a segmented compensated scan: a span through it is zero, and no later span's sum
   holds its exponent: a prefix of -2**127 twice is -inf, one of -2**70 loses a later -1), a pair no decay
   joins selected away before its decay multiplies it. The Mosaic mainloop takes its system's pairs and its readout's scores from the derived forms of tile
   declarations (`recurrence_algebra.pairs_of`, `scores_of`) over its own products and its compensated
@@ -777,9 +812,16 @@ Those are rounding and representation choices the fast class does not make. The 
 a derived form replaces a hand-written one only where it states the walk, passes check 1 and is no slower.
 
 **Drift to fix.**
-- Error-aware extraction with the compensation rules (`error_free`'s TwoSum and product splitting,
-  rewriting into compensated forms where check 1 needs them) is the next derivation build. It covers the
-  accurate forms and the guard.
+- The accurate forms (row 4228, theme AL03) are the declaration's numerics, not rewrites: the accurate
+  numerics admit only the `exact` sets, so no rule could reach them. A declaration states its exponential's
+  implementation (`Reduction.exponential`) and the rescale a carried state takes from one anchor to the next
+  (`Reduction.rescale`, the language's binary `rescale`, `terms.RESCALE`, which no rule rewrites), and may
+  hold its largest weight to 1 by a select (`exp(where(x < b, x - b, 0))`, `b` the broadcast of `x`'s own
+  maximum). A compensated walk's running sums are the mainloop's own additions over the derived forms
+  (`Derived.step`'s `add`, beside the accumulator's `accumulate`). The template's hand forms run until it
+  takes these (row 4228); the guard's shifted sums follow, its control flow the template's. Error-aware
+  extraction (§1.5) waits for a cell whose cheapest form fails check 1 where an equal one passes: row 3310's
+  was the test's schedule, not a form.
 - The chunk's decays (`scan._decays`: the compensated prefix and its exponentials) and a gram's evaluation
   by decay kind (`scan._paired`) are written, not extracted. The compensated prefix is the declaration's
   numerics, not a candidate: a plain prefix loses about 1e-6 of a deep decay, which no price weighs.
@@ -787,38 +829,46 @@ a derived form replaces a hand-written one only where it states the walk, passes
   Mosaic recurrence takes derived tile algebra inside its own launches.
 - The derived forms run at trace time.
 
-Derivation runs at dev time, in the generator (§6.11); its output is a checked-in module. A declaration states
+Derivation runs at trace time today (`derive.derive`, `scan.derive_scan`, where a template calls them); the
+design moves it to dev time, in the generator (parked, §6.11), its output a checked-in module. A declaration states
 semantics only: plain JAX on whole operands, or token functions along a walked axis. It never states a
 hand-written form.
 
 ```python
 @dataclass(frozen=True)
 class Reduction:                     # attention, and any walk whose state is a monoid's
-    function: jax.extend.core.ClosedJaxpr   # the math on whole operands: softmax_keys(where(seen, score(q, k), -inf)) @ v
+    function: Callable               # the math on whole operands: softmax_keys(where(seen, score(q, k), -inf)) @ v
     operands: Mapping[str, Axes]     # each operand's named axes: q (rows, d), k (keys, d), v (keys, e)
     walked: str                      # the axis the kernel walks in tiles: "keys"
     exponent: Literal[2, "e"]        # stated by each template per call (a scale folded with log2(e)), never found
-    hooks: tuple[Hook, ...] = ()     # score, mask and output hooks with their parameter kinds
+    ranges: Mapping[str, float] = {} # operands' magnitude bounds by name (§6.3)
+    exact: bool = False              # extracted exactly where greedy prices dearer (§6.5)
+    exponential: Callable | None = None   # its exponential's implementation, which its forms evaluate by
+    rescale: Callable | None = None  # (carried, now) -> the factor a carried state takes; None: exp(carried - now)
 
 @dataclass(frozen=True)
 class Scan:                          # a recurrence
-    update: jax.extend.core.ClosedJaxpr     # (h, x_t) -> h, read as h <- A_t h + B_t U_t^T by rules
-    readout: jax.extend.core.ClosedJaxpr    # (h, x_t) -> o_t
+    update: Callable                 # (h, x_t) -> h, read as h <- A_t h + B_t U_t^T by rules
+    readout: Callable                # (h, x_t) -> o_t
     operands: Mapping[str, Axes]
     walked: str                      # "time"
+    state: tuple[tuple[int, ...], jnp.dtype]   # the state's shape (keys by values) and dtype
+    reset: str | None = None         # an operand whose tokens start a document
+    ranges: Mapping[str, float | tuple[float, float]] = {}   # bounds, "state" and "overlap" among them
 
-Declaration = Reduction | Scan
+class Derived(NamedTuple):           # dew.algebra.forms
+    init: Callable                   # shapes -> the empty state
+    step: Callable                   # (state, tiles) -> state; a scan's (state, prepared)
+    merge: Callable                  # two states of disjoint walks joined: split walks, the work scheduler's fix-up
+    finish: Callable                 # (state, operands) -> the outputs the walk reduces
+    mapped: Callable                 # a tile's outputs along the walked axis; a scan's (prepared, state)
+    report: Mapping                  # what the derivation decoupled and its rounding class
+    backward: Callable | None = None # a scan's chunk adjoint; a reduction's backward is a declaration of its own
+    prepare: Callable = ...          # a tile's values that read no state, for every tile at once
+    slots: Callable | None = None    # a reduction's carried states' roles (max, sum, contraction) and shapes
 
-class Derived(NamedTuple):
-    state: Pytree                    # the per-row values carried along the walked axis
-    init: Callable                   # rows -> state, the empty partial
-    step: Callable                   # (state, tile as the template forms it, coords) -> state
-    merge: Callable                  # (state, state) -> state: split walks, the work scheduler's fix-up
-    finish: Callable                 # state -> outputs and the residuals a backward reads
-    backward: Derived | None         # the same for the backward walk
-    report: AlgebraReport            # rule sets fired, price, each form's rounding class and error bound
-
-def derive(declaration: Declaration, numerics, cost: CostModel) -> Derived: ...   # dev time only
+def derive(declaration: Reduction, *, accurate: bool, saturation: Saturation) -> Derived: ...
+def derive_scan(declaration: Scan, *, saturation: Saturation, splits_held: int = FORMS_HELD) -> Derived: ...
 ```
 
 - `step` takes the walk's tile as the template forms it: logits scaled, coordinates, and the mask and score
@@ -840,8 +890,7 @@ def derive(declaration: Declaration, numerics, cost: CostModel) -> Derived: ... 
 
 ### 6.10 Marked regions and custom derivatives
 
-These live in `dew.nn.derivatives`, below `dew.algebra`; `dew.nn.surrogate` is row 3271's declaration, exported
-from there. What exists: the four kinds, `marked_call_p` with its transform rules and their prototype test,
+These live in `dew.nn.derivatives`, below `dew.algebra`, `surrogate` (row 3271's declaration) among them. What exists: the four kinds, `marked_call_p` with its transform rules and their prototype test,
 `surrogate`, the precision transforms marked `Protected`, and the pass reading a marked call's kind
 (`program._within`, `program._opened`: a protected call an opaque leaf, a surrogate's and a kernel glue's body
 rewritten within its call, an Algebra span opened into the region around it, its call kept where no form
@@ -857,12 +906,12 @@ class Algebra: ...                    # a derivative written only to restructure
 
 Kind = Protected | Surrogate | KernelGlue | Algebra
 
-marked_call_p: jax.extend.core.Primitive   # a call: params jaxpr (a ClosedJaxpr) and kind (a Kind instance)
+marked_call_p: jax.extend.core.Primitive   # a call: params call_jaxpr (a ClosedJaxpr) and kind (a Kind instance)
 
-def marked(kind: Kind, fn: Callable) -> Callable: ...   # fn traced as one marked_call of its body
+def marked(kind: Kind, function: Callable) -> Callable: ...   # function traced as one marked_call of its body
 
-def declared_derivative(kind, fn, fwd, bwd, *, nondiff_argnums=()) -> Callable: ...  # a custom_vjp of `kind`
-def declared_tangent(kind, fn, jvp, *, nondiff_argnums=()) -> Callable: ...         # a custom_jvp of `kind`
+def declared_derivative(kind, primal, forward, backward, *, nondiff_argnums=()) -> Callable: ...  # a custom_vjp
+def declared_tangent(kind: TangentKind, primal, tangent, *, nondiff_argnums=()) -> Callable: ...  # a custom_jvp
 def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
     # row 3271: the value forward's exactly; derivative(primals, tangents, value) the declared output tangent,
     # linear in the tangents, so reverse mode transposes it and higher orders differentiate it
@@ -879,19 +928,19 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
 - A prototype test holds the marker before anything builds on it: a body's forward, tangent and cotangent each
   arrive as marked calls of their kind through `jax.grad`, `jvp`, `linearize`, `vmap`, `jax.checkpoint` and
   `shard_map`.
-- The pass reads `kind` as an object (`isinstance`), never a name or a scope string, and `rebuilt` inlines every
-  marked call, so the compiled program holds none.
+- The pass reads `kind` as an object (`isinstance`), never a name or a scope string, and the pass inlines every
+  marked call (`dew.nn.programs.inlined`, through `program._opened`), so the compiled program holds none.
 - `dew.nn.precision`'s error-free transforms are `marked(Protected(), …)`, replacing the name scope the first cut
   reads.
 - Every custom-derivative site declares itself through one of the three declarations, in place of a bare
-  `jax.custom_vjp` or `jax.custom_jvp`. `linear_tangent` takes its caller's declared kind: `KernelGlue` at a kernel
-  site, `Protected` at a numerics one (`sampling.flow`'s KL, the chunked heads, `nn.precision`'s products), and
-  `Algebra` at nGPT's join and normed hidden, which the compile-time sets rewrite until the engine retires them. A bare custom derivative in `src/dew` fails a slop check, so the inventory of §1.3 stays complete.
+  `jax.custom_vjp` or `jax.custom_jvp`. `linear_tangent` is to take its caller's declared kind (row 4026, after
+  the fork's staged custom_jvp batching, row 4067): `KernelGlue` at a kernel site, `Protected` at a numerics one
+  (`sampling.flow`'s KL, `nn.precision`'s products), and `Algebra` at nGPT's join and normed hidden, which the
+  compile-time sets rewrite and which stay (§1.3). Once every site is declared, a bare custom derivative in
+  `src/dew` fails a slop check (row 4012), so the inventory of §1.3 stays complete.
 - `surrogate(forward, derivative)`: the forward runs as written and its tangent is `derivative`'s, both bodies
   `Surrogate`. No rule set holds a rule relating a `Surrogate` span to autodiff's derivative of its forward, so the
   engine optimizes inside each body and never replaces the rule.
-- Row 3271 lands `dew.nn.derivatives` with `surrogate` alone; the marker, its kinds and the other three
-  declarations build on that module.
 
 ### 6.11 The generator
 
@@ -1018,11 +1067,26 @@ Agreed with the GEMM template's owner (2026-11-03):
   loads: a 32-bit word holds 8 E2M1 codes.
 - Block scales (NVFP4's 1×16, MX's 1×32) are a separate transform of a fixed layout, which feeds the
   template's promotion and epilogue: a form may re-encode the codes, never the scales.
-- The consumer checks in each form it takes: its instructions, its encoder and the encoder's version (in the
+- Each decode a template takes is declared and checked in once, in `dew.algebra.bits`, the one source the
+  engine's and the consumer's tests prove: `NVFP4_BFLOAT16`, eight E2M1 codes of a word in their natural
+  order (code `i` at bits `4i`, a byte's low nibble the earlier element) into four bfloat16 pairs, each the
+  code's value times 2^-126, and its form `NVFP4_BFLOAT16_FORM`, the search's at shifts of up to 6 places.
+  The codec packs codes naturally; the consumer's prepare step stores them in the form's layout once
+  (`BitForm.prepared`, in `jax.numpy`), and its portable path reads a word tile `[r, c]` back as `[r, 8c]`
+  elements in depth order (`BitForm.values`). An E2M1 subnormal (±0.5) decodes to a bfloat16 subnormal, so
+  the portable path scales it in integer exponent arithmetic, never through a lane that flushes subnormals.
+- The consumer records the form it takes: its encoder and the encoder's version (in the
   checkpoint), the decoder's live registers per thread (which `resources.py` prices before a tile is admitted)
-  and its instruction mix in `Work`'s units (which `cost.py` prices). Its tests prove it again.
-- The decoder is emitted inline (Mosaic GPU takes inline asm through `plgpu.inline_mgpu`) at a matrix-operand
-  hook the GEMM template adds (row 3621).
+  and its issues by pipe (`BitForm.issues`). `Work` holds no integer pipe yet: the consumer's head adds the
+  ALU's and the FMA pipe's integer issues to it, each 64 results a clock per multiprocessor (§7.2), so
+  `cost.py` prices a form's mix beside the tile's other work. Its tests prove the form again.
+- The decoder is emitted inline at a matrix-operand hook the GEMM template adds (row 3621): `BitForm.ptx(i)`
+  writes output register `i` as one PTX block over the stored word (`$1`) into the register (`$0`), each step
+  as its pipe's instruction (`shr`, `shl` and `shf` on the ALU, `mul.lo` and `mul.hi` by a power of two on the
+  FMA pipe, `lop3` for a mask), for Mosaic GPU's or Triton's inline assembly (constraints `=r,r`, a register
+  a block). `BitForm.traced` computes the same registers in `jax.numpy` for the hook's portable path and the
+  interpreter. Both evaluate one definition of each step (`bits._run`), the one `proven` checks. PTX fixes the
+  arithmetic, not the SASS: ptxas chooses the instructions, which the consumer's compile report shows.
 - Scope: NVFP4 and MXFP4 on sm90 and sm80; FP8 on sm80, which has no FP8 MMA; FP8 and FP4 packing in the
   epilogue. FP8 on sm90 needs no decode: wgmma multiplies E4M3 and E5M2 from shared memory.
 - A form is taken only where it is bit-identical over its whole domain and timed no slower on the real GEMM.

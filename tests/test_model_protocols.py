@@ -62,7 +62,7 @@ from architecture_cases import CASES as ARCHITECTURES
 from checkpoint_cases import CHECKPOINTS, DECODERS, FIXTURES, LENGTH, OWN, PATHS, ROWS, loaded, reads, tokens
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jepa_cases import MASK
-from model_support import float64_twin, moved
+from model_support import float64_twin, floating_gradient, moved
 from reference_error import as_given, assert_as_exact, summed_as_run, widened
 from tiny_models import build_model, tiny_inputs
 
@@ -102,17 +102,9 @@ def _cotangent(logits: jax.Array) -> jax.Array:
 
 
 def gradient(model, variables, tokens, cotangent, **apply) -> dict:
-    """The gradient of `<model's output, cotangent>` in every floating
-    parameter, by path; integer parameters are held as they are."""
-    flat = flatten_dict(variables["params"])
-    floats = {path: leaf for path, leaf in flat.items() if jnp.issubdtype(leaf.dtype, jnp.inexact)}
-    held = {path: leaf for path, leaf in flat.items() if path not in floats}
-
-    def loss(trained):
-        params = unflatten_dict({**held, **trained})
-        return jnp.sum(model.apply({**variables, "params": params}, tokens, **apply) * cotangent)
-
-    return jax.grad(loss)(floats)
+    """The gradient of `<model's output, cotangent>` in every floating parameter, by path
+    (`floating_gradient`)."""
+    return floating_gradient(lambda held: model.apply(held, tokens, **apply), variables, cotangent)
 
 
 dtypes = pytest.mark.parametrize("dtype", DTYPES)

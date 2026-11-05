@@ -38,6 +38,7 @@ from dew.batch import (
     thaw,
     token_layout,
     token_positions,
+    valid_order,
 )
 from dew.inference.tasks import BlockGeneration, BlockSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
@@ -101,7 +102,7 @@ def _cache_geometry(valid: jax.Array, selected: jax.Array, prompt_length: int, c
     batch, total = valid.shape
     response = total - prompt_length
     physical = jnp.arange(total)
-    ordered = jnp.argsort(~valid, axis=-1, stable=True)
+    ordered, _ = valid_order(valid)
     packed_valid = jnp.take_along_axis(valid, ordered, axis=-1)
     positions = real_places(valid) if positions is None else positions
     packed_positions = jnp.take_along_axis(positions, ordered, axis=-1)

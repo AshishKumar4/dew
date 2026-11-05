@@ -564,17 +564,17 @@ def decoded_stored(variables: Variables) -> Variables:
 
 def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.Array:
     """`values @ rows.T`, `[M, K]` by E4M3 `[N, K]`, in float32: `values`' rows cast by the FP8 block cast
-    and multiplied by `rows` as the GEMM template multiplies FP8 (`templates.gemm.template.gemm`): on
+    and multiplied by `rows` as the GEMM template multiplies FP8 (`gemm.gemm`): on
     Hopper's FP8 tensor cores, each 128-deep step's product promoted into the fp32 sum apart, within the
     FP8 contract (testing.md, FP8 products: 2.8 to 12.8 times closer to float64 than cuBLASLt's FP8 GEMM, 1.36
     times its time at a training shape, row 3620); elsewhere the codes as exact bfloat16 values summed in
     fp32, held apart from XLA's FP8 GEMM, whose sum is narrower (ledger 1625). Both rows' scales apply
     after (`_scaled`)."""
     from dew.interop.codecs import fp8_block_cast
-    from dew.nn.kernels.templates.gemm import template
+    from dew.nn.kernels import gemm
 
     codes, scales = fp8_block_cast(values, (1, values.shape[1]))
-    product = template.gemm(codes, rows, transpose_rhs=True, out_dtype=jnp.float32)
+    product = gemm.gemm(codes, rows, transpose_rhs=True, out_dtype=jnp.float32)
     return _scaled(product, scales, row_scales.T)
 
 

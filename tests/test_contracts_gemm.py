@@ -15,7 +15,7 @@ from reference_error import assert_as_exact
 
 from dew.nn import precision
 from dew.nn.blocks import table_rows
-from dew.nn.kernels.templates.gemm import template
+from dew.nn.kernels import gemm
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -99,7 +99,7 @@ def test_a_wide_cpu_sum_of_products_holds_every_order(monkeypatch, edge):
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_a_grouped_gemm_holds_every_order(edge):
-    """The GEMM template's grouped product (`template.gemm`, its custom derivative through
+    """The GEMM template's grouped product (`gemm.gemm`, its custom derivative through
     `generation.linear_tangent`): every order runs in the rows and the matrices, the group sizes not
     differentiable, finite wherever float64 is a normal float32 and wherever the plain grouped product is
     (each row's product with its group's matrix, by a mask, its float64 run the truth), at values whose
@@ -111,7 +111,7 @@ def test_a_grouped_gemm_holds_every_order(edge):
     (cotangent,) = normal_draw(148, (8, 4))
 
     def grouped(rows, matrices):
-        return template.gemm(rows, matrices, sizes, out_dtype=rows.dtype)
+        return gemm.gemm(rows, matrices, sizes, out_dtype=rows.dtype)
 
     def plain(rows, matrices):
         return jnp.einsum("rg,rk,gkn->rn", jax.nn.one_hot(groups, 3, dtype=rows.dtype), rows, matrices)
@@ -185,10 +185,10 @@ def rms_producer(lhs, scale):
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_a_gemm_prologue_holds_every_order(edge):
-    """The GEMM template's prologue (`template._prologued`, a custom JVP whose tangent is the producer's own,
+    """The GEMM template's prologue (`gemm._prologued`, a custom JVP whose tangent is the producer's own,
     as the fused GEMM hands it, `fused._whole_jvp`): every order finite wherever float64 is a normal float32
     and the producer as written is."""
-    from dew.nn.kernels.templates.gemm.template import _prologued
+    from dew.nn.kernels.gemm import _prologued
 
     prologued = _prologued(rms_producer, lambda *primals: lambda *tangents: jax.jvp(
         rms_producer, primals, tangents)[1])

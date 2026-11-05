@@ -1,7 +1,7 @@
 """The grouped GEMM template under `jax.experimental.pallas.fuser`: a call site's consumers of the
 product become the template's epilogue, and its left operand's producer the template's prologue.
 
-Inside a function `fuser.fuse` transforms, `fusible_gemm(lhs, rhs, group_sizes)` is `template.gemm`'s
+Inside a function `fuser.fuse` transforms, `fusible_gemm(lhs, rhs, group_sizes)` is `gemm.gemm`'s
 fp32 product, and whatever the function computes from it elementwise or by broadcasting (a bias, a scale,
 a residual, an activation, the final cast) runs in the kernel's epilogue on each accumulator tile, the
 arrays it reads loaded beside the tile:
@@ -46,8 +46,8 @@ from jax.extend import core as jax_core
 
 from dew import algebra
 from dew.nn import programs
+from dew.nn.kernels import gemm
 from dew.nn.kernels.selection import Kernel, Op, Refusal, analysed, select
-from dew.nn.kernels.templates.gemm import template
 
 FUSION_ROW = 'ledger 1295'
 """The fusion analysis's limits."""
@@ -59,7 +59,7 @@ AXES = ('rows', 'columns')
 
 def fusible_gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *,
                  transpose_rhs: bool = False, interpret_on_cpu: bool = False) -> jax.Array:
-    """`template.gemm`'s fp32 product of each group's rows of `lhs` and its matrix of `rhs`, its consumers
+    """`gemm.gemm`'s fp32 product of each group's rows of `lhs` and its matrix of `rhs`, its consumers
     fused into the epilogue under `fuser.fuse` (the module's docstring)."""
     fusible = fuser.fusible(output_fusion_prefix=True)(
         functools.partial(_product, transpose_rhs, interpret_on_cpu, group_sizes is None))
@@ -75,7 +75,7 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions)
     rhs, *rest = (fusion() for fusion in rest_fusions)
     group_sizes = None if dense else rest[0]
     if out_fusion is None:
-        return template.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=jnp.float32,
+        return gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=jnp.float32,
                              interpret_on_cpu=interpret_on_cpu, **prologue)
     width = rhs.shape[-2] if transpose_rhs else rhs.shape[-1]
     acc = jax.ShapeDtypeStruct((lhs.shape[0], width), jnp.float32)
@@ -84,7 +84,7 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions)
     axes = _stage(EPILOGUE, Refusal('scalar_prefetch', "the consumer reads scalar prefetch")
                   if prefetch else _axes(consumer, values, acc))
     if axes is None:
-        summed = template.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=jnp.float32,
+        summed = gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=jnp.float32,
                                interpret_on_cpu=interpret_on_cpu, **prologue)
         return consumer(values, summed)
     out_leaves, out_treedef = jax.tree.flatten(jax.eval_shape(consumer, values, acc))
@@ -92,7 +92,7 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions)
     epilogue = functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc.shape)
     dtypes = tuple(leaf.dtype for leaf in out_leaves)
     several = len(dtypes) > 1
-    consumed = template.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, epilogue=epilogue,
+    consumed = gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, epilogue=epilogue,
                              epilogue_operands=tuple(zip(leaves, axes, strict=True)),
                              out_dtype=dtypes[0], out_dtypes=dtypes if several else None,
                              interpret_on_cpu=interpret_on_cpu, **prologue)
@@ -165,7 +165,7 @@ def _split(producer, values):
 
     The prologue's derivative is the whole producer's (`_whole_jvp`), the side arrays it computes (a row's
     statistics) taking none of their own: forward mode takes it, reverse mode transposes it and every
-    higher order differentiates it (`template.gemm`'s `prologue_jvp`), so every path from an input joins
+    higher order differentiates it (`gemm.gemm`'s `prologue_jvp`), so every path from an input joins
     where the producer joins it, at its precision, its custom derivatives kept, and none twice."""
     leaves, treedef = jax.tree.flatten(values)
 
@@ -214,7 +214,7 @@ def _split(producer, values):
 
 
 def _whole_jvp(flat, leaves: tuple, places: tuple, shapes: tuple, base, *sides):
-    """The producer's own JVP as the prologue's derivative (`template.gemm`'s `prologue_jvp`): the
+    """The producer's own JVP as the prologue's derivative (`gemm.gemm`'s `prologue_jvp`): the
     template's base and side arrays put back among the producer's inputs (`places`, each one's index there,
     None for a computed one), and a function of the base's and each side array's tangent giving the
     operand's, a computed side's tangent unread (the producer's own derivative carries its statistics)."""
@@ -356,7 +356,7 @@ def _prologue_axes(whole, arrays: list, shape: tuple) -> tuple | Refusal:
               for block, array in zip(specs, arrays, strict=True)]
     ids = (jnp.int32(0), jnp.int32(0))
     closed = jax.make_jaxpr(lambda ids, *blocks: tiled(ids, (), *blocks))(ids, *blocks)
-    if any(var in template._needed(closed.jaxpr, closed.jaxpr.outvars) for var in closed.jaxpr.invars[:2]):
+    if any(var in gemm._needed(closed.jaxpr, closed.jaxpr.outvars) for var in closed.jaxpr.invars[:2]):
         return Refusal('reads_position', "the producer reads its tile's position")
     return tuple(axes)
 
@@ -470,7 +470,7 @@ def _reads_position(tiled, value_specs, values, probe) -> bool:
     tile = jax.ShapeDtypeStruct(probe, jnp.float32)
     closed = jax.make_jaxpr(lambda ids, tiles, tile: tiled(ids, (), tiles, tile))(
         (jnp.int32(0), jnp.int32(0)), tiles, tile)
-    needed = template._needed(closed.jaxpr, closed.jaxpr.outvars)
+    needed = gemm._needed(closed.jaxpr, closed.jaxpr.outvars)
     return any(var in needed for var in closed.jaxpr.invars[:2])
 
 

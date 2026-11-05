@@ -282,7 +282,7 @@ attention's 64 are sized paired (`seeds_for` with the packed row as its Dew arm,
 compared with themselves its documents alone take 512."""
 
 
-SHARDED = {"kimi_delta_attention", "mamba2", "memory"}
+SHARDED = {"gated_delta_net", "kimi_delta_attention", "mamba2", "memory"}
 """The kinds whose packed rows' draws run as armada's map tasks (`check1_shards`), each a test of its own."""
 
 
@@ -290,6 +290,13 @@ SHARDED = {"kimi_delta_attention", "mamba2", "memory"}
 def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     """`assert_packs_as_alone` over every mixer in the registry but the sharded ones (`SHARDED`)."""
     assert_packs_as_alone(kind)
+
+
+@pytest.mark.check1_shards(seeds=512, per_task=128)
+def test_a_packed_row_of_gated_delta_net_computes_what_its_documents_compute_alone():
+    """`assert_packs_as_alone` over the gated delta net, whose 512 seeds took 39 s of 96 on armada's CI
+    CPU and 128 s in train 580's CI: CI draws them in map tasks of 128 (ledger 4039)."""
+    assert_packs_as_alone("gated_delta_net")
 
 
 @pytest.mark.check1_shards(seeds=64, per_task=8)
@@ -446,7 +453,7 @@ def test_no_token_reaches_another_document(kind):
 
 POLICY_VALUES = {"force_fp32_for_softmax": False, "attn_logit_softcap": 30.0, "attention_sinks": True,
                  "value_scale": 0.5, "key_multiplier": 0.5, "o_proj_bias": True,
-                 "attention_dropout_rate": 0.1}
+                 "attention_dropout_rate": 0.1, "wide_logits": True}
 """A value each attention policy (`MixerContext.policies`) asks with."""
 
 KIND_CONTEXT = {"llama4": {"qk_norm": False}, "deepseek_v4": {"sliding_window": 8}}
@@ -487,6 +494,44 @@ def test_every_attention_mixer_implements_or_refuses_each_policy_it_is_asked(kin
         held = built.keywords.get("ctx")
         taken = built.keywords.get(policy) if held is None else getattr(held, policy)
         assert taken == POLICY_VALUES[policy]
+
+
+def test_wide_logits_reach_the_reference_attention_and_are_refused_elsewhere():
+    """Wide logits (`MixerContext.wide_logits`, the dispatcher's `wide_logits`) are arithmetic only the
+    reference attention performs (`reference_only`): 'auto' and xla route a call asking them to it, and
+    the dispatcher's output for bf16 inputs is `reference_attention`'s with them, bit for bit, and not its
+    output with logits formed in bf16; a fused kernel a call names refuses them, among its refusals, as
+    does a layer asking them on a cached call, whose kernels form logits in the inputs' dtype (row 4149:
+    the world model's blocks attended so, which the shared mixer had no way to ask)."""
+    from dew.nn.attention import reference_attention, resolve_implementation, scaled_dot_product_attention
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.selection import KernelRefused
+    from dew.nn.mixers.attention import CausalSelfAttention
+
+    rng = np.random.default_rng(21)
+    q, k, v = (jnp.asarray(rng.normal(scale=4.0, size=(2, 16, 2, 32)), jnp.bfloat16) for _ in range(3))
+    # The reference route's products as the dispatcher takes them (`attention_route.FORMS`).
+    precision = jax.lax.Precision.HIGHEST if generation.numerics().forms == "accurate" else None
+
+    def through(*, wide):
+        return np.asarray(scaled_dot_product_attention(q, k, v, implementation="reference", wide_logits=wide))
+
+    np.testing.assert_array_equal(
+        through(wide=True), np.asarray(reference_attention(q, k, v, precision=precision, wide_logits=True)))
+    assert not np.array_equal(through(wide=True), through(wide=False))
+    for named in ("auto", "xla"):
+        assert resolve_implementation(named, q, k, wide_logits=True).ran == "reference"
+    with pytest.raises(KernelRefused) as refused:
+        resolve_implementation("cudnn", q, k, wide_logits=True)
+    assert "arithmetic" in {refusal.code for refusal in refused.value.refusals}
+    context = MixerContext(emb_features=64, num_heads=2, num_kv_heads=2, head_dim=32, max_seq_len=8,
+                           attention_impl="reference", wide_logits=True)
+    layer = CausalSelfAttention(ctx=context)
+    x = jnp.ones((1, 4, 64))
+    variables = layer.init(jax.random.key(22), x)
+    with pytest.raises(MixerRefused) as refused:
+        layer.apply(variables, x[:, :1], MixerCall(decode=True), mutable=["cache"])
+    assert refused.value.names == ("wide_logits",)
 
 
 def test_a_mixers_refusal_names_its_kind_and_entries_across_a_process_boundary():
