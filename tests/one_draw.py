@@ -1,4 +1,4 @@
-"""The one-draw rule (`assert_as_exact_as_the_reference`, `assert_leaves_as_exact`, `assert_no_less_exact`): a
+"""The one-draw rule (`assert_as_exact_as_the_reference`, `assert_no_less_exact`): a
 site's one recorded or drawn comparison, held by its distance from float64 and its rows against the
 reference's (`rows_over`), which G02 moves to check 1 site by site (`reference_error.assert_as_exact`). Its
 rows' sizes and errors, and the gate's findings, are reference_error's; its sites import it from here.
@@ -6,7 +6,6 @@ rows' sizes and errors, and the gate's findings, are reference_error's; its site
 
 import math
 
-import jax
 import numpy as np
 import reference_error as gate
 
@@ -80,42 +79,3 @@ def assert_no_less_exact(dew, reference, truth, label: str) -> None:
     mine, theirs = gate.distance(dew, truth), gate.distance(reference, truth)
     assert gate.within(mine, theirs), (
         f"{label}: {mine:.3e} from float64 (rms), the unchanged source {theirs:.3e}")
-
-
-def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=None,
-                           rows: bool = True) -> None:
-    """Each leaf of the tree `dew` gate.within gate.FACTOR times the matching leaf of
-    `reference`'s RMS gate.distance from float64 (`truth`), the three trees alike.
-
-    A port that sums `reductions` terms the reference sums in another order
-    rounds by up to sqrt(reductions) float32 units of what it sums in RMS,
-    so the reference's gate.distance counts as at least that: one draw of
-    rounding below it is luck, not a bar, and a leaf that lost a term still
-    fails by orders of magnitude. What a leaf sums is its own float64 size,
-    or, where `terms` gives the tree of each leaf's terms (`float64_terms`),
-    the larger of that and their root sum of squares, the size of the
-    partial sums a reordered sum rounds. A leaf whose sum cancels, as a key
-    bias's gradient does under the softmax's shift invariance, is held to
-    its terms' rounding, not to its own near-zero size; one whose terms'
-    signs are independent keeps about its own. Each leaf's rows are held to
-    the reference's too (`rows_over`), unless `rows` is false: after a
-    second training step a row inherits the first step's rounding through
-    the parameters it reads, which its own terms do not see, so such a
-    comparison holds each tensor alone and its first step holds the rows."""
-    unit = float(np.finfo(np.float32).eps)
-    spread = np.sqrt(reductions)
-    sizes = jax.tree.leaves(truth) if terms is None else jax.tree.leaves(terms)
-    over = []
-    leaves = zip(jax.tree_util.tree_leaves_with_path(dew), jax.tree.leaves(reference), jax.tree.leaves(truth),
-                 sizes, strict=True)
-    for (path, mine), theirs, true, summed in leaves:
-        scale = max(gate.distance(true, 0), gate.distance(summed, 0))
-        bar = gate.FACTOR * max(gate.distance(theirs, true), spread * unit * scale)
-        if not gate.within(gate.distance(mine, true), bar):
-            over.append(f"{jax.tree_util.keystr(path)}: {gate.distance(mine, true):.3e} from float64 (rms), "
-                        f"the reference {gate.distance(theirs, true):.3e}, allowed {bar:.3e}")
-        # Each row over its own terms where they are given, the order floor in those units.
-        over += [f"{jax.tree_util.keystr(path)}: {message}"
-                 for _, _, message in (rows_over(mine, theirs, true, None if terms is None else summed,
-                                                 spread * unit) if rows else ())]
-    assert not over, "\n".join(over)

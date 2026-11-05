@@ -386,6 +386,7 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
         at = stepped(seed)
         return trained(through_explicit(values, explicit(rows, masked(values, rows, at)), at))
 
+    @as_given
     def truth(values, rows, seed):
         at = stepped(seed)
         tokens = explicit(rows, masked(jax.tree.map(lambda leaf: np.asarray(leaf, np.float32)
@@ -549,7 +550,7 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
                                      lambda variables: objective_gradient(objective, variables, whole, info)))
     truth = float64_gradient(twin, info)
     assert_as_exact(pooled, alone, moved_weights(template.variables), "pooled update", seeds=POOLED_SEEDS,
-                    truth_fn=lambda variables: truth(variables, float64_pixels(whole)))
+                    truth_fn=as_given(lambda variables: truth(variables, float64_pixels(whole))))
 
 
 HOST_MASTER_SEEDS = 16
@@ -600,7 +601,7 @@ def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does(
     truth = float64_gradient(float64_twin(objective), info)
     assert_as_exact(host, resident, moved_weights(template.variables), "host-master update",
                     seeds=HOST_MASTER_SEEDS,
-                    truth_fn=lambda variables: truth(variables, float64_pixels(batch)))
+                    truth_fn=as_given(lambda variables: truth(variables, float64_pixels(batch))))
 
 
 def captioned(count):

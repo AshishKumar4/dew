@@ -63,6 +63,21 @@ def test_each_contract_holds_the_lanes_own_operation_and_refuses_a_step_off_it(n
         assert not held[3]
 
 
+@pytest.mark.parametrize("name, fn", [("expm1", jnp.expm1), ("log1p", jnp.log1p)])
+def test_a_primitive_keeping_a_subnormal_its_lanes_multiply_flushes_is_held_as_it_computes(name, fn):
+    """A lane flushes per primitive (ledger 4023): XLA's CPU multiply reads a subnormal as zero, its expm1
+    and log1p return one as it is. Each holds its contract at subnormal arguments of either sign, as the lane
+    computes it, and a result moved a step off it breaks it there."""
+    x = np.float32([-(2.0 ** -148), 2.0 ** -140, -(2.0 ** -130), 2.0 ** -127, 2.0 ** -149])
+    ct.assert_certified(fn, lambda seed: (x,), name, seeds=1)
+    result = np.asarray(fn(x))
+    stepped = result.copy()
+    for _ in range(2 * max(ct.lane().reach[name, "float32"], 1)):
+        stepped[1] = np.nextafter(stepped[1], np.float32(np.inf))
+    held = ct.CONTRACTS[name]({}, [x], stepped, oc.FLOAT32)
+    assert not held[1] and np.all(np.delete(held, 1))
+
+
 def test_a_division_by_a_broadcast_divisor_is_held_at_its_own_forms_reach():
     """A division whose divisor is broadcast along a size-1 axis (a row's scale), which XLA may compute as
     a multiply by the divisor's reciprocal, is held at that form's measured reach (`certified.BROADCAST`):
@@ -149,6 +164,16 @@ def test_a_computation_is_certified_through_its_calls_and_a_primitive_without_a_
     assert len(findings) == 1 and "no contract for sin" in findings[0]
     with pytest.raises(AssertionError):
         ct.assert_certified(lambda x: jnp.sin(x), lambda seed: (x,), "sine", seeds=1)
+
+
+def test_an_equation_whose_result_nothing_reads_is_held_too():
+    """Check 2 holds every equation the program executes: a primitive without a contract whose result the
+    output never reads (a sine dropped before the return, inside a call too) is still a finding."""
+    x = np.float32(np.linspace(0.1, 3, 32))
+    for discarded in (lambda x: (jnp.sin(x), x + 1)[1],
+                      lambda x: jax.jit(lambda x: (jnp.sin(x), x * 2))(x)[1]):
+        _, findings = ct.certified(discarded, x)
+        assert len(findings) == 1 and "no contract for sin" in findings[0], findings
 
 
 def test_an_equation_past_the_lanes_reach_is_a_finding_by_its_path():

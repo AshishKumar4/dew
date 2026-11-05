@@ -93,29 +93,15 @@ class Unrewritten:
 
 
 class Truth:
-    """A check's float64 truth as the gate runs it (`reference_error._truth_program`): compiled from its
-    first call, or, where it cannot be traced and returns host values run as it is given (a NumPy truth), as
-    given. A truth that returns JAX values and cannot be traced does host work on its inputs (a widening or a
-    conversion on the host): it fails at its first seed with its trace's error, naming itself; it passes
-    `as_given`."""
+    """A check's float64 truth as the gate runs it (`reference_error._truth_program`): its own function
+    jitted, which every site of it shares, run unrewritten (`unrewritten`), compiled from its first call and
+    never run eagerly, so a seed's truth is the same whichever seed a process draws first (a map task's,
+    DRAWS) and a large truth pays no eager run. A truth that does host work on its values (NumPy, torch, a
+    fetch to the host) states it, `as_given`, and the gate runs it so; unstated, its trace fails at its
+    first seed, naming it (ledger 3198)."""
 
     def __init__(self, fn):
-        self.fn, self.run = fn, None
+        self.fn, self.run = fn, unrewritten(jax.jit(fn))
 
     def __call__(self, *inputs):
-        if self.run is not None:
-            return self.run(*inputs)
-        # Its own function jitted, which every site of it shares, run unrewritten (`unrewritten`).
-        compiled = unrewritten(jax.jit(self.fn))
-        try:
-            # Compiled from the first call on, never run eagerly: a seed's truth is the same whichever seed
-            # a process draws first (a map task's, DRAWS), and a large truth pays no eager run.
-            values = compiled(*inputs)
-        except Exception as untraced:
-            first = unrewritten(self.fn)(*inputs)
-            if all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(first)):
-                raise untraced
-            self.run = unrewritten(self.fn)
-            return first
-        self.run = compiled
-        return values
+        return self.run(*inputs)
