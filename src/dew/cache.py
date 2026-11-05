@@ -18,7 +18,7 @@ from pathlib import Path
 
 import jax
 
-from dew.devices import deterministic_ops_requested, xla_flag
+from dew.devices import cuda_builds, deterministic_ops_requested, xla_flag
 
 __all__ = ["enable_compilation_cache"]
 
@@ -158,9 +158,10 @@ def enable_compilation_cache(path: str):
     recompiles the same step function from scratch.
 
     XLA's GPU compile measures each fusion's candidate kernels on the device.
-    The picks go to `<path>/autotune/jaxlib-<version>`, one file a fusion keyed
-    by the fusion and the GPU model, for this XLA alone, so a later compile of
-    the same fusions takes them without measuring. A process beside other work
+    The picks go to `<path>/autotune/jaxlib-<version>` and, for each CUDA build installed
+    (`dew.devices.cuda_builds`), `-<build>-pjrt-<version of its PJRT plugin>` after it (`autotune_dir`),
+    one file a fusion keyed by the fusion and the GPU model, for this XLA and this plugin build alone, so a
+    later compile of the same fusions takes them without measuring. A process beside other work
     on its GPU would measure unfairly, so it reads them and adds none
     (`gpu-run -n 0.5` sets XLA's AUTOTUNE_CACHE_MODE_READ). Neither the
     directory nor the mode is in JAX's cache key, so a run and a process
@@ -232,11 +233,15 @@ def uncached() -> Iterator[None]:
 
 
 def autotune_dir(path: str) -> str:
-    """Where the GPU picks of the executables cached under `path` go, for this
-    jaxlib alone: XLA's per fusion, and Dew's kernels' beside them
-    (`kernel_picks_path`). jaxlib pins XLA, Triton and Mosaic, which each
-    pick's speed depends on."""
-    return os.path.join(path, 'autotune', f"jaxlib-{importlib.metadata.version('jaxlib')}")
+    """Where the GPU picks of the executables cached under `path` go, for this jaxlib and the PJRT plugin
+    builds this process can run: XLA's per fusion, and Dew's kernels' beside them (`kernel_picks_path`).
+    jaxlib pins XLA's source, but XLA's GPU compile, Triton and Mosaic GPU run in the PJRT plugin
+    (`jax-<build>-pjrt`), whose builds (post42 to post45) share one jaxlib: a pick measured under one build
+    is not read under another. A process with no CUDA build has no GPU picks to read, and names jaxlib's
+    alone."""
+    plugins = "".join(f"-{build}-pjrt-{importlib.metadata.version(f'jax-{build}-pjrt')}"
+                      for build in cuda_builds())
+    return os.path.join(path, 'autotune', f"jaxlib-{importlib.metadata.version('jaxlib')}{plugins}")
 
 
 def kernel_picks_path(device_kind: str) -> str:

@@ -170,7 +170,8 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     assert all(entry["op"]["fields"]["bypass_device_check"] is False for entry in written["data"])
     flags = f"{keeping_picks()} {READ_ONLY}".strip()
     [path] = fresh(STORED, with_foreign(json.dumps(written)), cache_dir=tmp_path / "cache", flags=flags)
-    assert path.startswith(str(tmp_path / "cache" / "autotune" / "jaxlib-")) and path.endswith(".json")
+    assert Path(path).is_relative_to(tuning.cache.autotune_dir(str(tmp_path / "cache")))
+    assert path.endswith(".json")
     stored, tuned = fresh(READ, cache_dir=tmp_path / "cache", flags=flags)
     heuristics = {str(rows): launches(step(), *operands(rows)) for rows in (13, 15, 40)}
     heuristics = json.loads(json.dumps(heuristics))

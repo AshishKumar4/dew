@@ -7,6 +7,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- The GPU autotuner's picks, XLA's and Dew's kernels', are kept per PJRT plugin build as well as per jaxlib
+  (`<cache>/autotune/jaxlib-<version>-cuda12-pjrt-<plugin version>`): XLA's, Triton's and Mosaic GPU's compile
+  run in the plugin, whose post42 to post45 builds share one jaxlib, so a pick measured under one build was
+  read under another. A GPU run after this release measures its picks once more; the earlier
+  `jaxlib-<version>` directory is no longer read.
 - `dew.algebra.extract` adds exact DAG extraction, an integer program over the e-graph's nodes with each shared
   node priced once. egglog's greedy DAG extraction stays the default: the exact one priced no template's forms
   lower and took twice as long. A template declaration can ask for exact extraction
