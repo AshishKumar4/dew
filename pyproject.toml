@@ -269,10 +269,10 @@ augment = ["albumentations>=2"]
 # streams the checkpoint by name and holds no copy of the model on the host.
 torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922", "accelerate>=1.15"]
 # tests/kernel_compile.py compiles every declared Pallas kernel config for each GPU generation with the
-# compiler the GPU runs, XLA's CUDA backend of this jaxlib for a compile-only device (the Triton jaxlib
-# bundles, CUDA's libdevice and ptxas from the nvcc wheel, which Mosaic GPU's kernels compile through
-# too), and each Mosaic TPU kernel with libtpu for a compile-only TPU, on a host with no accelerator:
-# locks/cpu.txt takes this extra, and a GPU host's lock has its own CUDA plugin already
+# compiler the GPU runs, XLA's CUDA backend of Dew's PJRT plugin (jax-cuda12-pjrt) for a compile-only
+# device (the Triton it builds, CUDA's libdevice and ptxas from the nvcc wheel, which Mosaic GPU's kernels
+# compile through too), and each Mosaic TPU kernel with libtpu for a compile-only TPU, on a host with no
+# accelerator: locks/cpu.txt takes this extra, and a GPU host's lock has its own CUDA plugin already
 # (tools/lock_environment.sh).
 kernel-compile = ["jax-cuda12-plugin==0.12.0.1.post45; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "jax-cuda12-pjrt==0.12.0.1.post45; sys_platform == 'linux' and platform_machine == 'x86_64'",
