@@ -534,8 +534,6 @@ class Mma(MmaIssuer, CpAsync):
     # not, where two programs took 0.73 to 0.89 (CONSUMERS3).
     consumers = 1
 
-    most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
-
     def column_unit(self, dtype) -> int:
         # Its stores move rows through registers, laid over the role's threads (`stores_columns`): half a
         # role's threads at least, each holding an element (UNIT64-2: every sm8x GEMM form lowers at 64

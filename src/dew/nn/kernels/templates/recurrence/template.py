@@ -519,10 +519,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def _staged(self, ba: tokamax.BoundArguments, block: int, target: generation.GpuTarget, *,
                 walkers: int = 1, wide: int | None = None) -> mainloop.Tiles | None:
         """`block`'s tiles at `walkers` walk roles (`Tiles.walkers`) with the widest output block legal beside
-        it (`Tiles.block_o`; `wide` where given), at the ring of the states launch's steps, within
-        `Family.most_shared` over a step's bytes, whose plan hides the most latency, its programs a
-        multiprocessor running at once (`_running`) and its depth one choice (`resources.hidden`); None
-        where no output block is legal beside it."""
+        it (`Tiles.block_o`; `wide` where given), at the ring of the states launch's steps, within the
+        GPU's block (`generation.shared_budget`) over a step's bytes, whose plan hides the most latency,
+        its programs a multiprocessor running at once (`_running`) and its depth one choice
+        (`resources.hidden`); None where no output block is legal beside it."""
         family = bundle(target, _dtype(ba))
         assert family is not None
         widths = self._blocks(ba, family) if wide is None else [wide]
@@ -536,7 +536,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         order = resources.hidden(family, states.consumers)
         deeper = (dataclasses.replace(shallowest, stages=stages)
                   for stages in range(2, min(resources.MOST_STAGES,
-                                             family.most_shared // max(states.step_bytes, 1)) + 1))
+                                             generation.shared_budget(target)
+                                             // max(states.step_bytes, 1)) + 1))
         rings = [shallowest, *(tiles for tiles in deeper if self.legal(ba, tiles, target))]
         return max(rings, key=lambda tiles: order(self._running(ba, tiles, target), tiles.stages))
 
