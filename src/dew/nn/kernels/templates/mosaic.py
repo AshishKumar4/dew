@@ -947,16 +947,29 @@ def staged(shape: tuple, dtype, swizzle: int | None = None):
 
 
 def roles(wg, consumers: int, consumer, producer) -> None:
-    """Each warpgroup's role in a cooperative block: the `consumers` first run `consumer(wg)` with their
-    register budget raised to their share at the launch's residency (`resources.raised_registers`,
-    `_RESIDENT`), the last runs `producer()` with its lowered to `resources.producer_floor`, where the
-    GPU's compile honors them (`resources.RAISES_HONORED`)."""
-    @pl.when(wg < consumers)
-    def _():
-        plgpu.set_max_registers(resources.raised_registers(consumers, _RESIDENT.get()), action="increase")
-        consumer(wg)
+    """Each warpgroup's role in a cooperative block: the `consumers` first run `consumer(wg)`, the last
+    `producer()` (`tabled`'s one row)."""
+    tabled(wg, ((consumers, consumer),), producer)
 
-    @pl.when(wg == consumers)
+
+def tabled(wg, table: tuple, producer) -> None:
+    """Each warpgroup's role in a cooperative block from a role table: each of `table`'s rows, `(count,
+    body)` in turn, its `count` warpgroups running `body(index)` (`index` the warpgroup's own among
+    them), every one with its register budget raised to its share at the launch's residency
+    (`resources.raised_registers`, `_RESIDENT`); the warpgroup after them runs `producer()` with its
+    lowered to `resources.producer_floor`, where the GPU's compile honors them
+    (`resources.RAISES_HONORED`)."""
+    total = sum(count for count, _ in table)
+    first = 0
+    for count, body in table:
+        @pl.when((wg >= first) & (wg < first + count))
+        def _(body=body, first=first):
+            plgpu.set_max_registers(resources.raised_registers(total, _RESIDENT.get()), action="increase")
+            body(wg - first)
+
+        first += count
+
+    @pl.when(wg == total)
     def _():
         plgpu.set_max_registers(resources.producer_floor(), action="decrease")
         producer()
