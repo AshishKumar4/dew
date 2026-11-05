@@ -121,10 +121,13 @@ def test_a_declared_derivative_is_one_marked_call_and_differentiates_as_its_rule
                                   np.asarray(jax.vmap(bare)(x[:, None], factor[:, None])))
 
 
-def test_a_declared_tangent_is_one_protected_call_and_differentiates_as_its_rule():
-    """A tangent rule declared through `numerics_tangent` (no bare `jax.custom_jvp`) is one protected call,
-    which forward mode, reverse mode (its tangent transposed) and a second order all keep, each from the
-    declared tangent (doubled here, so a test sees it ran)."""
+@pytest.mark.parametrize("declare, kind", [(lambda *rule: derivatives.numerics_tangent(*rule), Protected()),
+                                           (lambda *rule: derivatives.kernel_tangent(*rule), KernelGlue())],
+                         ids=["numerics_tangent", "kernel_tangent"])
+def test_a_declared_tangent_is_one_marked_call_and_differentiates_as_its_rule(declare, kind):
+    """A tangent rule declared through its class's function (`numerics_tangent`, `kernel_tangent`: no bare
+    `jax.custom_jvp`) is one marked call of its kind, which forward mode and reverse mode (its tangent
+    transposed) keep, each from the declared tangent (doubled here, so a test sees it ran)."""
     def primal(x):
         return jnp.sin(x)
 
@@ -132,16 +135,16 @@ def test_a_declared_tangent_is_one_protected_call_and_differentiates_as_its_rule
         [x], [dx] = primals, tangents
         return jnp.sin(x), 2.0 * jnp.cos(x) * dx
 
-    declared = derivatives.numerics_tangent(primal, tangent)
+    declared = declare(primal, tangent)
     bare = jax.custom_jvp(primal)
     bare.defjvp(tangent)
     x = jnp.linspace(0.1, 1.0, 8)
-    assert kinds_of(jax.make_jaxpr(declared)(x)) == [Protected()]
+    assert kinds_of(jax.make_jaxpr(declared)(x)) == [kind]
     for function in (lambda f: jax.jvp(f, (x,), (jnp.ones_like(x),))[1],
                      lambda f: jax.grad(lambda x: jnp.sum(f(x)))(x)):
         np.testing.assert_array_equal(np.asarray(function(declared)), np.asarray(function(bare)))
     assert not np.array_equal(np.asarray(jax.grad(lambda x: jnp.sum(bare(x)))(x)), np.asarray(jnp.cos(x)))
-    assert kinds_of(jax.make_jaxpr(jax.grad(lambda x: jnp.sum(declared(x))))(x)) == [Protected()]
+    assert kinds_of(jax.make_jaxpr(jax.grad(lambda x: jnp.sum(declared(x))))(x)) == [kind]
 
 
 def test_a_surrogate_is_one_surrogate_call():
