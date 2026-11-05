@@ -40,17 +40,24 @@ def swizzled(shape: tuple[int, ...], dtype) -> tuple:
     return mosaic.swizzle_transforms(dtype, mosaic.copied_swizzle(shape, dtype))
 
 
+def _swizzle(ref) -> int:
+    """The swizzle, in bytes, a shared-memory operand's rows are staged at: 0 where it is staged plain."""
+    if not isinstance(ref, state_types.TransformedRef):
+        return mosaic.UNSWIZZLED
+    return max((transform.swizzle for transform in ref.transforms
+                if isinstance(transform, plgpu_core.UnswizzleRef)), default=mosaic.UNSWIZZLED)
+
+
 def _depth_granule(ref, axis: int, instruction: int) -> int:
-    """The depth slice a ref's staging allows: one MMA, or a whole swizzle along its tiled columns."""
+    """The depth slice a ref's staging allows: one MMA, or a whole swizzle along its tiled columns (no
+    narrower slice of a swizzled tile lowers, FS-NARROW-LOWER1)."""
     if not isinstance(ref, state_types.TransformedRef):
         return instruction
     transposed = sum(isinstance(transform, state_types.TransposeTransform)
                      and transform.permutation == (1, 0) for transform in ref.transforms) % 2
     if axis != (0 if transposed else 1):
         return instruction
-    swizzle = max((transform.swizzle for transform in ref.transforms
-                   if isinstance(transform, plgpu_core.UnswizzleRef)), default=0)
-    return max(instruction, mosaic.swizzle_columns(ref.dtype, swizzle))
+    return max(instruction, mosaic.swizzle_columns(ref.dtype, _swizzle(ref)))
 
 
 class Slots:
@@ -159,8 +166,11 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # its rows' 8-row tiles.
         return self._staged_depth(depth, swizzle) if transposed else self.fragment_depth(depth)
 
-    def lhs_fragment_depth(self, depth: int) -> int:
-        return self._staged_depth(depth)
+    def lhs_fragment_depth(self, depth: int, *, swizzle: int | None = None) -> int:
+        # A whole tile of the swizzle its stage takes: one instruction's depth where it is staged plain or
+        # narrowest, as a D128 attention forward's queries are, which held 64 deep spilled the 16 registers
+        # of its 128 x 64 tile (FS-4324-NARROW2).
+        return self._staged_depth(depth, swizzle)
 
     def _staged_depth(self, depth: int, swizzle: int | None = None) -> int:
         """The depth a load of a stage whose rows are `depth` deep takes: one tile of its `swizzle` (bytes;
@@ -260,7 +270,8 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # an A100 took 12 to 14% less time, its outputs bitwise the same, the forward and input gradient
         # unchanged (FS-C1-NARROW1-a100).
         instruction = self.fragment_depth(int(rhs.shape[0]))
-        lhs_depth = max(_depth_granule(lhs, 1, instruction), self.lhs_fragment_depth(int(lhs.shape[1])))
+        lhs_depth = max(_depth_granule(lhs, 1, instruction),
+                        self.lhs_fragment_depth(int(lhs.shape[1]), swizzle=_swizzle(lhs)))
         rhs_depth = _depth_granule(rhs, 0, instruction)
         held = self._left(lhs) if isinstance(lhs, jax.Array) else None
         lefts: dict[int, jax.Array] = {}
