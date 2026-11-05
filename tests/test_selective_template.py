@@ -254,16 +254,14 @@ def routed(target: str, states: int, c_dtype=jnp.float32, *, forms: str = "fast"
 def test_the_selector_takes_the_template_where_it_is_qualified():
     """An H100's scan of whole blocks of Mamba's 16 states takes the template under the fast forms, held to
     recorded mamba_ssm there (row 2968), and the portable math under the accurate forms with those its
-    refusal, as a call naming the template overrides; an A100's refuses it for its strided copies whatever
-    the call names."""
-    from dew.nn.kernels.selection import KernelRefused
-
+    refusal, as a call naming the template overrides; an A100's takes the portable math, the template
+    unqualified there, and the template where a call names it, its strided channel blocks' copies right
+    from the jax fork's post42 (row 3300)."""
     assert routed("sm90", 16) == {("mosaic_gpu", None)}
     assert routed("sm90", 16, forms="accurate") == {("xla", "forms")}
     assert routed("sm90", 16, forms="accurate", named=True) == {("mosaic_gpu", None)}
-    with pytest.raises(KernelRefused) as refused:
-        routed("sm80", 16, named=True)
-    assert [refusal.code for refusal in refused.value.refusals] == ["strided copies"]
+    assert routed("sm80", 16) == {("xla", "qualified")}
+    assert routed("sm80", 16, named=True) == {("mosaic_gpu", None)}
 
 
 @pytest.mark.parametrize("states", [4, 12])

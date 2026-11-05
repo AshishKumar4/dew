@@ -570,11 +570,6 @@ PER_SHARD_STEPS = {"expert layer": _expert_layer_step, "rms norm": _norm_step, "
 """Each op whose kernels run per shard (row 1923, bible §7), its step at a number of rows. Each lane adds its
 ops here."""
 
-UNTAKEN = {("sm80", "selective scan")}
-"""The steps whose template a GPU's kernel refuses whatever a call names: an A100's selective scan, its
-strided channel blocks' untiled copies wrong until the jax fork's post42 (`recurrence_chunk.SELECTIVE`)."""
-
-
 def _kernel_launches(loss, args, generation: str, devices: int) -> tuple[list, str]:
     """The Pallas launches (`custom_calls`) of `loss`'s value and gradient lowered for `generation`'s GPU on
     an abstract mesh of `devices` that splits the rows, and the program's text."""
@@ -592,8 +587,7 @@ def _kernel_launches(loss, args, generation: str, devices: int) -> tuple[list, s
 
 
 @pytest.mark.parametrize(("generation", "op"),
-                         [(generation, op) for generation in ("sm80", "sm90") for op in PER_SHARD_STEPS
-                          if (generation, op) not in UNTAKEN])
+                         [(generation, op) for generation in ("sm80", "sm90") for op in PER_SHARD_STEPS])
 def test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh(generation, op):
     """Bible §7, row 1923: an op's forward and backward, lowered for the GPU on an abstract two-device mesh
     that splits its rows, launches the kernels it launches on one device, each reading fewer elements than
@@ -670,11 +664,11 @@ def _mamba1_lowered(generation_name: str, layers: int = 1):
         return tuning.tune(lower)[0]
 
 
-@pytest.mark.parametrize("generation_name", ["sm90"])
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
 def test_a_mamba_layer_lowers_its_template_scan_for_each_gpu_it_takes(generation_name):
     """A Mamba layer, its selective scan the template's and its launches settled as the trainer settles
-    them, lowers on this CPU for each GPU the template takes it on (an H100; an A100's strided copies wait
-    for post42, `UNTAKEN`), forward and backward each a Mosaic GPU launch."""
+    them, lowers on this CPU for each GPU the template takes it on (an A100's and an H100's), forward and
+    backward each a Mosaic GPU launch."""
     from dew.training._lowering import kernel_calls
 
     names = {call.name for call in kernel_calls(_mamba1_lowered(generation_name))
