@@ -140,15 +140,16 @@ def test_a_fused_value_a_product_reads_is_held_while_it_multiplies():
     """A value XLA's fusion would recompute is held where a matrix product reads it, which takes its
     operands from memory: the exponentials of the rows, a product's operand, and the cotangent of the
     product's hyperbolic tangent, the weight's gradient's operand, are both held beside that gradient as
-    it is computed, with the product the cotangent is recomputed from."""
+    it is computed. The product the cotangent is computed from is not: the fusion making the cotangent
+    runs before the gradient's product and frees it, its last reader (`dying`)."""
     rows, weights = jax.ShapeDtypeStruct((8, 16), jnp.float32), jax.ShapeDtypeStruct((16, 32), jnp.float32)
 
     def loss(weights, rows):
         return jnp.sum(jnp.tanh(jnp.exp(rows) @ weights)), ()
 
-    # The gradient (16 x 32), the exponentials (8 x 16), the cotangent and the product (8 x 32 each).
+    # The gradient (16 x 32), the exponentials (8 x 16) and the cotangent (8 x 32).
     assert gradient_peak(loss, weights, (rows,), platform="gpu", workspace=Workspace(0, 0)).bytes == (
-        16 * 32 + 8 * 16 + 2 * 8 * 32) * 4
+        16 * 32 + 8 * 16 + 8 * 32) * 4
 
 
 def test_a_gradient_a_fused_chain_computes_is_held():

@@ -286,7 +286,10 @@ def test_a_compile_only_gpus_gemm_holds_the_workspace_its_deviceless_compile_giv
     from dew.training.ahead import compile_only_gpus
 
     (gpu,) = compile_only_gpus(generation, 1, 1 << 30)
-    weights, rows = jax.ShapeDtypeStruct((64, 64), jnp.float32), jax.ShapeDtypeStruct((512, 64), jnp.float32)
+    # A gradient larger than the product its operand is computed from, which that operand's fusion frees
+    # (`dying`), so the gradient's product, its workspace beside it, is the step's peak.
+    weights = jax.ShapeDtypeStruct((1024, 64), jnp.float32)
+    rows = jax.ShapeDtypeStruct((512, 1024), jnp.float32)
 
     def loss(weights, rows):
         return jnp.sum((rows @ weights) ** 2), ()
