@@ -4,6 +4,7 @@ import dataclasses
 import json
 import os
 from collections.abc import Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import jax.numpy as jnp
@@ -393,6 +394,37 @@ def test_train_runs_the_trainer_its_config_describes(tmp_path):
     assert state.scale is not None
     assert state.accumulation is not None
     assert any(path.is_file() for path in trace.rglob("*"))
+
+
+def test_every_run_profiles_a_short_window_of_its_own_steps_kept_with_its_records(tmp_path):
+    """A run profiles two of its steps once ten have run past its first compile, by default, through Dew's
+    own profiler, its capture kept under the run's directory and reported beside its records
+    (`ProfileTraced`); a run naming no window traces none; inside another capture (`dew.Profiler`), which
+    holds the process's one profiling session, a run's own window yields where one naming its directory
+    refuses (row 4112)."""
+    import dew
+    from dew.training import ProfileWindow
+
+    def trained(name: str, **fields) -> Path:
+        config = TrainerConfig(name=name, checkpoint_dir=str(tmp_path / "runs"), steps=14, eval_every=None,
+                               checkpoint_every=None, **fields)
+        RunConfig(trainer=config).train(Regression(), Loader(lambda partition: batches(), None, None, 8),
+                                        name=name)
+        return tmp_path / "runs" / name
+
+    profiled = trained("profiled")
+    assert any(path.is_file() for path in (profiled / "profile").rglob("*"))
+    written = (profiled / "tracking" / "records.jsonl").read_text().splitlines()
+    records = [json.loads(line) for line in written]
+    (traced,) = [row["value"] for row in records if row["type"] == "ProfileTraced"]
+    assert traced["steps"] == 2
+    plain = trained("plain", profile=None)
+    assert not (plain / "profile").exists()
+    with dew.Profiler(tmp_path / "outer"):
+        inside = trained("inside")
+        with pytest.raises(ValueError):
+            trained("asked", profile=ProfileWindow(str(tmp_path / "asked"), 2))
+    assert not (inside / "profile").exists()
 
 
 def test_a_saved_runs_profile_window_reads_its_capture_options_as_its_captures(tmp_path):
