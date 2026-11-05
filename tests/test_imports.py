@@ -195,41 +195,76 @@ print(json.dumps(sorted(sys.modules)))
             if name in foreign or name.startswith(tuple(f"{prefix}." for prefix in foreign))] == []
 
 
-def test_only_the_rl_packages_import_dew_rl_and_it_imports_no_training():
-    """Only `dew.rl` and `dew.objectives.rl` import `dew.rl`, and `dew.rl` imports nothing of
-    `dew.training` (docs/design/architecture.md). The test reads every module's imports, absolute
-    and relative, from its source."""
-    package = SOURCE / "dew"
+FEATURES = ("dew.nn", "dew.data", "dew.inputs", "dew.objectives", "dew.training", "dew.inference",
+            "dew.interop", "dew.rl", "dew.decision", "dew.cli", "dew.config", "dew.checkpoints",
+            "dew.diffusion", "dew.sampling", "dew.eval", "dew.lora", "dew.quantization", "dew.telemetry",
+            "dew.io", "dew.cleanup", "dew.figures")
+"""Dew's feature packages, which the layers below them import none of."""
 
-    def imported(path: Path) -> set[str]:
-        module = ".".join(path.relative_to(SOURCE).with_suffix("").parts)
-        # A relative import resolves from the module's package; an __init__'s module ends in __init__.
-        parts = module.split(".")[:-1]
-        names = set()
-        for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.Import):
-                names.update(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom):
-                base = node.module or ""
-                if node.level:
-                    base = ".".join([*parts[: len(parts) - node.level + 1], *([base] if base else [])])
-                names.add(base)
-                names.update(f"{base}.{alias.name}" for alias in node.names)
-        return names
+LAYERS: dict[str, tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = {
+    "conditioning inputs import no objective or trainer": (
+        ("dew.inputs",), (), ("dew.objectives", "dew.training", "dew.inference", "dew.rl", "dew.decision",
+                              "dew.cli", "dew.config", "dew.checkpoints", "dew.sampling", "dew.eval",
+                              "dew.lora", "dew.quantization", "dew.io", "dew.cleanup", "dew.figures")),
+    "telemetry imports nothing above the network layer": (
+        ("dew.telemetry",), (), tuple(name for name in FEATURES if name not in ("dew.nn", "dew.telemetry"))),
+    "training imports no front end": (("dew.training",), (), ("dew.cli", "dew.decision")),
+    "checkpoints import no front end or configuration": (
+        ("dew.checkpoints",), (), ("dew.cli", "dew.decision", "dew.config")),
+    # A run's source is loaded as its record states it, so inference reads the run record's own types
+    # (`SourceOptions`, dew.config): the contract allows dew.config (row 4268, Serving & RL).
+    "inference imports no trainer or front end": (
+        ("dew.inference",), (), ("dew.training", "dew.cli", "dew.decision", "dew.io")),
+    "reinforcement learning imports no trainer": (("dew.rl",), (), ("dew.training",)),
+    "only the reinforcement-learning packages import dew.rl": (
+        ("dew",), ("dew.rl", "dew.objectives.rl"), ("dew.rl",)),
+}
+"""The layering contracts (docs/design/architecture.md; row 1557): each one's modules, those among them it
+leaves out, and the packages none of them imports directly (absolute, relative, function-local or under
+TYPE_CHECKING). Each contract here holds on main; a layer whose crossings are still open (models reading
+weight interop, the registry's lazy family table, objectives' RL run config, interop reading the decision
+front end, the kernel report reading training, the data layer's block steps reading the network layer)
+joins when its owner settles them (rows 4264-4271)."""
 
-    def within(name: str, prefix: str) -> bool:
-        return name == prefix or name.startswith(prefix + ".")
 
-    importers, trained = [], []
-    for path in sorted(package.rglob("*.py")):
+def _within(name: str, prefix: str) -> bool:
+    return name == prefix or name.startswith(prefix + ".")
+
+
+def _imported(path: Path) -> set[str]:
+    """The modules and names `path`'s source imports, absolute and relative: an import's module and each
+    name it takes from one, a relative import resolved from the module's package."""
+    module = ".".join(path.relative_to(SOURCE).with_suffix("").parts)
+    # A relative import resolves from the module's package; an __init__'s module ends in __init__.
+    parts = module.split(".")[:-1]
+    names = set()
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            if node.level:
+                base = ".".join([*parts[: len(parts) - node.level + 1], *([base] if base else [])])
+            names.add(base)
+            names.update(f"{base}.{alias.name}" for alias in node.names)
+    return names
+
+
+@pytest.mark.parametrize("contract", sorted(LAYERS))
+def test_a_layer_imports_none_of_the_packages_its_contract_forbids(contract):
+    """No module a contract holds (`LAYERS`) imports, directly, a package it forbids: each module's imports
+    read from its source, a crossing named by its module and the package it reaches."""
+    sources, excepted, forbidden = LAYERS[contract]
+    crossings = []
+    for path in sorted((SOURCE / "dew").rglob("*.py")):
         module = ".".join(path.relative_to(SOURCE).with_suffix("").parts).removesuffix(".__init__")
-        names = imported(path)
-        rl = within(module, "dew.rl") or within(module, "dew.objectives.rl")
-        if not rl and any(within(name, "dew.rl") for name in names):
-            importers.append(module)
-        if within(module, "dew.rl") and any(within(name, "dew.training") for name in names):
-            trained.append(module)
-    assert importers == [] and trained == []
+        if not any(_within(module, source) for source in sources):
+            continue
+        if any(_within(module, left) for left in excepted):
+            continue
+        crossings += sorted({(module, package) for name in _imported(path) for package in forbidden
+                             if _within(name, package)})
+    assert crossings == []
 
 
 @pytest.mark.parametrize(("package", "read"), [("dew.sampling", "text.Sampling"),
