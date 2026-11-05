@@ -932,3 +932,21 @@ def test_refusals_cross_processes_only_through_an_explicit_handoff(tmp_path):
     handed = subprocess.run([sys.executable, "-c", handoff], check=True, env=environment,
                             input=exported, capture_output=True, text=True)
     assert json.loads(handed.stdout) == json.loads(exported)
+
+
+def test_programs_compiled_at_once_are_the_ones_compiled_in_turn():
+    """Programs compiled at once (`report.compiled_at_once`) make their first compiles each in a thread of
+    its own and keep, in turn, the executables compiling them one after another keeps, in the order given."""
+    from dew.nn.kernels.templates import report
+    from dew.telemetry.compiles import Compiles
+
+    square = jax.ShapeDtypeStruct((256, 256), jnp.float32)
+    lowerings = [jax.jit(function).lower(square, square) for function in (
+        lambda x, y: x @ y, lambda x, y: jnp.tanh(x) + y, lambda x, y: jnp.sum(x * y, axis=0))]
+    with Compiles(None) as compiles:
+        together = report.compiled_at_once([(lowered, None, lambda lowered=lowered: lowered)
+                                            for lowered in lowerings])
+    threads = [program.thread for program in compiles.programs if program.kind == "compiled"]
+    assert len(threads) == 3 and all(thread.startswith("dew-compile") for thread in threads), threads
+    alone = [report.compiled(lowered, relower=lambda lowered=lowered: lowered) for lowered in lowerings]
+    assert [executable.as_text() for executable in together] == [executable.as_text() for executable in alone]

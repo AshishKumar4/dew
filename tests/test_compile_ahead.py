@@ -955,7 +955,7 @@ def a_run_takes_the_saved_offline_split_before_loading_its_executable(tmp_path):
 
 def test_programs_compiled_ahead_compile_at_once():
     """Named programs compiled ahead (`compile_programs`) are lowered in turn and compiled at once, each in a
-    thread of its own (`report.compiled_at_once`), the programs the same as compiled one by one."""
+    thread of its own (`report.compiled_at_once`), each with the trees it has compiled alone."""
     from dew.telemetry.compiles import Compiles
     from dew.training.ahead import compile_programs
 
@@ -968,7 +968,8 @@ def test_programs_compiled_ahead_compile_at_once():
     assert threads and all(thread.startswith("dew-compile") for thread in threads), threads
     alone = {name: compile_programs({name: program}, "sm90").programs[name]
              for name, program in programs.items()}
-    assert built.programs == alone
+    assert {name: each.trees for name, each in built.programs.items()} == {
+        name: each.trees for name, each in alone.items()}
 
 
 def test_programs_compiled_ahead_save_and_load_whole_and_load_only_on_their_own_target(tmp_path):
