@@ -199,6 +199,32 @@ def test_a_walks_sums_added_by_its_mainloop_take_each_tiles_factor_and_sum():
                     "attention, its sums added twice", seeds=16)
 
 
+def test_a_walks_merge_by_its_mainloop_takes_each_sums_two_factors():
+    """A mainloop that merges two walks' sums itself (`Derived.merge`'s `merged`, a guarded walk's join of
+    shifts) takes each rescaled sum's two factors (`Merged`), the maximum left to the forms: the denominator's
+    merged twice over, the merged walk's attention is the declared function's halved, on par against the
+    float64 truth (check 1)."""
+    forms = derive.derive(declared(attention), accurate=False, saturation=SATURATION)
+    tiles = KEYS // TILE
+
+    def run(q, k, v):
+        values = operands(q, k, v)
+        shapes = shaped(tile_of(values, 0))
+        roles = [role for role, _ in forms.slots(shapes)]
+
+        def doubled(firsts, seconds, parts):
+            return tuple(2 * (first * part.first + second * part.second) if role == "sum" else None
+                         for role, first, second, part in zip(roles, firsts, seconds, parts, strict=True))
+
+        first = walked(forms, [tile_of(values, tile) for tile in range(tiles // 2)])
+        second = walked(forms, [tile_of(values, tile) for tile in range(tiles // 2, tiles)])
+        return forms.finish(forms.merge(first, second, values, shapes=shapes, merged=doubled), values,
+                            shapes=shapes)
+
+    assert_as_exact(jax.jit(run), jax.jit(lambda q, k, v: whole(attention)(q, k, v) / 2), draw,
+                    "attention, its sums merged twice", seeds=16)
+
+
 def held(q, k, v, rows, keys):
     """Attention whose largest logit weighs exactly 1, its exponent held to 0 by a select (the accurate
     form's weights over scaled logits, against a compiler's contraction of the scale into the subtraction)."""
