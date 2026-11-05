@@ -3165,7 +3165,23 @@
      "runs": "transformers"
     }
    ],
-   "note": "Records transformer gradients and pipeline/text outputs; replaces only sinusoidal frequency rounding, tools/diffusers_qwen_image_reference.py:148."
+   "note": "The source's models the checks run: each transformer case and the whole pipeline, saved by diffusers (the transformer perturbed by a seeded draw), and qwen_image.json, the record of each case's geometry and the pipeline's prompts and size; the recordings over check 1's seeds are qwen_image_seeds.npz's."
+  },
+  "qwen_image_seeds.npz": {
+   "tool": "tools/diffusers_qwen_image_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "6256aa7666cedd47443adc8f82da9a10e110b09c",
+     "runs": "diffusers"
+    },
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "Fetched by its pin (qwen_image_seeds.npz.fetched.json). Check 1's recordings over tests/qwen_image_draws.py's draws, torch 2.14.0+cpu: each transformer case's walk summarized (record_case: the reference's evidence and its float64 truth's sketch), and the prompt encoding and the pipeline walk whole, the float32 reference and the float64 twin's truth (float64_twin, the scheduler's tables widened by float64_scheduler); the twin replaces only the source's sinusoidal frequency rounding (tools/torch_precision.py's float64_twin)."
   },
   "qwen_image_vae.tar.xz": {
    "tool": "tools/diffusers_qwen_image_vae_reference.py",
