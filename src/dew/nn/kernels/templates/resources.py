@@ -96,17 +96,18 @@ def live_registers(family: "Family", carried, *phases, addressed=()) -> int:
 
 
 def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs, rhs, *, lhs_parts: int = 1,
-                      rhs_parts: int = 1, rhs_transposed: bool = False,
+                      rhs_parts: int = 1, rhs_transposed: bool = False, lhs_swizzle: int | None = None,
                       rhs_swizzle: int | None = None) -> list:
     """The operand fragments a product `[rows, depth] @ [depth, columns]` holds at once where its family's
-    products read registers (`Family.operands_in_registers`), none where they read shared memory: its left
-    operand's loaded depth (`Family.lhs_fragment_depth`), its right one's at its stage's swizzle
-    (`Family.rhs_fragment_depth`; `rhs_swizzle` bytes, the family's default where None), each in the warps
+    products read registers (`Family.operands_in_registers`), none where they read shared memory: each
+    operand's loaded depth at its stage's swizzle (`Family.lhs_fragment_depth`, `Family.rhs_fragment_depth`;
+    `lhs_swizzle`, `rhs_swizzle` bytes, the family's default where None), each in the warps
     replicating it (`lhs_copies`, `rhs_copies`) and its dtype (`lhs`, `rhs`), repeated for its parts (an
     fp32 operand split into 16-bit parts): GEMM's, recurrence's and attention's products'."""
     if not family.operands_in_registers:
         return []
-    return ([(rows * family.lhs_copies, family.lhs_fragment_depth(depth), lhs)] * lhs_parts
+    left = (rows * family.lhs_copies, family.lhs_fragment_depth(depth, swizzle=lhs_swizzle), lhs)
+    return ([left] * lhs_parts
             + [(family.rhs_fragment_depth(depth, transposed=rhs_transposed, swizzle=rhs_swizzle),
                 columns * family.rhs_copies, rhs)] * rhs_parts)
 

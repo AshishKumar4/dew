@@ -1103,8 +1103,10 @@ class Issuer[Accumulator](abc.ABC):
         del transposed, swizzle
         return self.fragment_depth(depth)
 
-    def lhs_fragment_depth(self, depth: int) -> int:
-        """The left operand's depth held in registers by a product at the family's default staging."""
+    def lhs_fragment_depth(self, depth: int, *, swizzle: int | None = None) -> int:
+        """The left operand's depth held in registers by a product, by its stage's swizzle (bytes; the
+        family's default staging where None)."""
+        del swizzle
         return depth
 
     widest_product: int | None = None
