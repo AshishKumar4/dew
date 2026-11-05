@@ -446,19 +446,22 @@ def _kimi_k25_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrappe
     """Read a Kimi K2.5 bundle whole (transformers 5.17.0's Kimi_K25ForConditionalGeneration, the
     release's own at 4d01dfe): its decoder as the text half reads it (`_kimi_k25_config`), MoonViT and its
     patch merger (`dew.nn.vision.moonvit`), and the media placeholder each of an item's projected merge
-    blocks fills, as its processor expands it (`Kimi_K25Processor`); the decoder's tensors keep their
-    names under `language_model.`, which the text half's map reads."""
+    blocks fills, as its processor expands it (`Kimi_K25Processor`); the decoder's tensors, under
+    `language_model.`, read as Kimi K2's (`DEEPSEEK_V3`, its text_config's own model type)."""
     text = _kimi_k25_config(hf_config, used)
+    # The decoder's own record, which the language model's reader and writer read.
+    text_type = _records.text(_records.record(hf_config['text_config'], 'text_config').get(
+        'model_type', 'deepseek_v3'), 'model_type')
     width = record_int(text, 'emb_features')
     image = hf_config.get('image_token_id', hf_config.get('media_placeholder_token_id', 163605))
     video = hf_config.get('video_token_id')
-    return {'model_type': 'kimi_k25', 'text_model_type': 'kimi_k25', 'text': text,
+    return {'model_type': 'kimi_k25', 'text_model_type': text_type, 'text': text,
             'tower': translate_moonvit_config(hf_config),
             'projector': translate_moonvit_projector_config(hf_config, width),
             'image_token_id': record_int({'image_token_id': image}, 'image_token_id'),
             'tokens_per_image': None,
             'video_token_id': None if video is None else record_int(hf_config, 'video_token_id'),
-            'extra_placeholder_ids': (), 'text_unprefixed': ('language_model.',), **NO_AUDIO}
+            'extra_placeholder_ids': (), **NO_AUDIO}
 
 
 def _kimi_k25_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
