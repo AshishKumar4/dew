@@ -694,7 +694,7 @@ def _compiled_here(cases, generation: str, *, least: bool = False) -> list[dict]
                 # The registers its consumers raise to, as its PTX states (`setmaxnreg.inc`); None where they
                 # raise none or no PTX was printed for it.
                 ptx = printed.get(name, PTX.get(kernel["module"], ""))
-                kernel["raised"] = int(found.group(1)) if (found := RAISED.search(ptx)) else None
+                kernel["raised"] = int(raise_.group(1)) if (raise_ := RAISED.search(ptx)) else None
                 if least:
                     kernel["least"] = _least(kernel["module"], generation)
         record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
