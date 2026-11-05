@@ -33,7 +33,7 @@ from dew.interop.unread import Stored, held
 from dew.interop.weights import Tree, checkpoint_array, insert, placed
 from dew.nn.activations import activation as named_activation
 from dew.nn.backbones.decoder_block import DecoderBlock
-from dew.nn.blocks import table_rows, torch_bicubic_resize
+from dew.nn.blocks import table_rows, torch_bicubic_resize, torch_cubic_weights
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
 from dew.nn.flops import matching_lengths, patch_lengths, projection_flops
@@ -42,6 +42,7 @@ from dew.nn.mixers.short_conv import GatedGridConv
 from dew.nn.mlp import GatedMLP
 from dew.nn.norms import LayerNorm, RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
+from dew.nn.rope import sinusoid_frequencies, sinusoids
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import declared
 from dew.nn.text_encoders import clip_layer
@@ -49,7 +50,7 @@ from dew.nn.text_encoders import clip_layer
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
 
-Attention = Literal["full", "band", "window", "conv"]
+Attention = Literal["full", "band", "window", "conv", "item"]
 Order = Literal["patches", "columns", "windows"]
 
 
@@ -78,6 +79,9 @@ class LearnedPositions:
     compute_dtype: bool = True
     align_corners: bool = True
     antialias: bool = False
+    border: bool = False
+    """Out-of-range bilinear taps held at the table's edge, as `F.interpolate` holds them (MoonViT's),
+    where `F.grid_sample`'s zero padding weighs them zero; bicubic taps are held there always."""
     initializer: Initializer = nn.Embed.embedding_init
 
 
@@ -114,25 +118,26 @@ def _documents(segment):
 class ViTLayout:
     """The geometry and wiring of one family's tower.
 
-    `attention`, `order` and `sinks` name each layer's: its keys (a frame's every patch, `band` keys
-    either side in the layer's order, or the patches of its `window`-patch square) or, for `conv`, a
-    gated `conv_kernel`-square convolution over its frame's patch grid in the attention's place
-    (LFM3-VL's, `GatedGridConv`, which reads each patch's grid place as its rotary position), the order
-    its tokens run in (the processor's, merge blocks column by column, or window by window), and
-    whether a learned logit per head joins the first key of each frame (MiMo's sinks). `rotary_columns_first`
-    turns the first rotary half by the column and the second by the row, both counted from
-    `rotary_origin`; `positions` keeps a fixed grid or resizes its square table by its stated
-    interpolation. Bilinear sampling without aligned corners gives out-of-range taps zero weight
-    (`F.grid_sample`'s zero padding). `merge_blocks` is the processor's patch order: merge block by
-    merge block, else raster; `channels_first` its pixel order in a patch, channels then time, else
-    time then channels. `mlp_packed` keeps a gated feed-forward's gate and up maps in one (as
-    `packed` the attention's queries, keys and values). `post_norm` names the norm after the
-    blocks, a layer or an RMS norm, or none. `output` selects the sequence, patches alone or a
-    `[B, rows, columns, F]` patch grid; `post_norm_scope` distinguishes CLIP's normalized class row
-    from a normalized whole sequence. `pre_norm` names the norm after the patch map, as `post_norm`
-    does. `attention_bias` biases the attention's maps, and `qk_norm` norms each head's queries and keys
-    (an RMS norm at the layers' epsilon) before the rotary; under `scale_after_cast` every RMS norm
-    weighs its normalized input after its cast back, as Llama's does.
+    `attention`, `order` and `sinks` name each layer's: its keys (a frame's every patch, a row's every
+    patch across its frames (`item`, MoonViT's), `band` keys
+    either side in the layer's order, or the patches of its `window`-patch square) or, for `conv`, a gated
+    `conv_kernel`-square convolution over its frame's patch grid in the attention's place (LFM3-VL's,
+    `GatedGridConv`, which reads each patch's grid place as its rotary position), the order its tokens run
+    in (the processor's, merge blocks column by column, or window by window), and whether a learned logit
+    per head joins the first key of each frame (MiMo's sinks). `rotary_columns_first` turns the first
+    rotary half by the column and the second by the row, both counted from `rotary_origin`, or under
+    `rotary_interleaved` the two axes pair by pair (MoonViT's); `positions` keeps a fixed grid or resizes
+    its square table by its stated interpolation. Bilinear sampling without aligned corners gives out-of-
+    range taps zero weight (`F.grid_sample`'s zero padding). `merge_blocks` is the processor's patch
+    order: merge block by merge block, else raster; `channels_first` its pixel order in a patch, channels
+    then time, else time then channels. `mlp_packed` keeps a gated feed-forward's gate and up maps in one
+    (as `packed` the attention's queries, keys and values). `post_norm` names the norm after the blocks, a
+    layer or an RMS norm, or none. `output` selects the sequence, patches alone or a `[B, rows, columns,
+    F]` patch grid; `post_norm_scope` distinguishes CLIP's normalized class row from a normalized whole
+    sequence. `pre_norm` names the norm after the patch map, as `post_norm` does. `attention_bias` biases
+    the attention's maps, and `qk_norm` norms each head's queries and keys (an RMS norm at the layers'
+    epsilon) before the rotary; under `scale_after_cast` every RMS norm weighs its normalized input after
+    its cast back, as Llama's does.
     """
 
     depth: int
@@ -167,9 +172,17 @@ class ViTLayout:
     outer_norm_eps: float = 1e-5
     mlp_packed: bool = False
     output: Literal["sequence", "patches", "patch_grid"] = "sequence"
+    frame_positions: int | None = None
+    """A fixed 1-D sinusoidal table of this many frames, MAE's computed in float32
+    (`dew.nn.rope.sinusoid_frequencies`' `powered`), added with the learned positions to each frame's
+    patches of a row of more than one frame (MoonViT's `Learnable2DInterpPosEmbDivided_fixed`)."""
+    pool_frames: bool = False
+    """Whether a row's merge blocks are averaged over its frames after the blocks, the row returning its
+    first frame's places and zeros past them (MoonViT's temporal pooling, `tpool_patch_merger`)."""
     branch_scale: float | None = None
     rope_theta: float = 10000.0
     rotary_columns_first: bool = False
+    rotary_interleaved: bool = False
     rotary_origin: int = 0
     band: int = 0
     window: int = 0
@@ -196,33 +209,42 @@ class ViTLayout:
                              "from another origin or holding special tokens does not state")
 
 
-def _interp_taps(index, size, side: int, align_corners: bool, dtype):
+def _interp_taps(index, size, side: int, align_corners: bool, dtype, *, border: bool = False,
+                 cubic: bool = False):
     """Bilinear taps into a `side`-long table for positions along one axis, and their weights in
     `at_least_fp32(dtype)`: transformers' `_interpolation_axis_taps_weights` (vision_utils.py) with
-    aligned corners, or with half-pixel centres and out-of-range taps weighing zero."""
+    aligned corners, or with half-pixel centres and out-of-range taps weighing zero, or under `border`
+    held at the table's edge (`F.interpolate`'s); `cubic`'s four taps by the Keys kernel
+    (`dew.nn.blocks.torch_cubic_weights`), held at the edge."""
     index = index.astype(at_least_fp32(dtype))
     if align_corners:
         source = index * (side - 1) / jnp.maximum(size - 1, 1)
     else:
         source = (index + 0.5) * side / size - 0.5
     floor = jnp.floor(source)
+    distance = source - floor
+    if cubic:
+        raw = floor.astype(jnp.int32)[..., None] + jnp.arange(-1, 3)
+        return jnp.clip(raw, 0, side - 1), torch_cubic_weights(distance)
     raw = floor.astype(jnp.int32)[..., None] + jnp.arange(2)
-    distance = (source - floor)[..., None]
-    weights = jnp.concatenate([1 - distance, distance], axis=-1).clip(min=0)
-    if not align_corners:
+    weights = jnp.concatenate([1 - distance[..., None], distance[..., None]], axis=-1).clip(min=0)
+    if not (align_corners or border):
         weights = weights * ((raw >= 0) & (raw <= side - 1))
     return jnp.clip(raw, 0, side - 1), weights
 
 
-def resampled_positions(table, rows, columns, heights, widths, *, align_corners: bool, dtype=None):
-    """The learned square table resampled to each patch's grid place: bilinear over its rows and
-    columns separately, the outer product of the taps (vision_utils.py,
-    get_vision_interpolation_indices_and_weights)."""
+def resampled_positions(table, rows, columns, heights, widths, *, align_corners: bool, dtype=None,
+                        border: bool = False, cubic: bool = False):
+    """The learned square table resampled to each patch's grid place: bilinear or bicubic over its rows
+    and columns separately, the outer product of the taps (vision_utils.py,
+    get_vision_interpolation_indices_and_weights; `_interp_taps`)."""
     side, dtype = round(len(table) ** 0.5), table.dtype if dtype is None else dtype
-    row_taps, row_weights = _interp_taps(rows, heights, side, align_corners, dtype)
-    column_taps, column_weights = _interp_taps(columns, widths, side, align_corners, dtype)
-    indices = (row_taps[..., :, None] * side + column_taps[..., None, :]).reshape(*rows.shape, 4)
-    weights = (row_weights[..., :, None] * column_weights[..., None, :]).reshape(*rows.shape, 4)
+    taps = functools.partial(_interp_taps, side=side, align_corners=align_corners, dtype=dtype,
+                             border=border, cubic=cubic)
+    (row_taps, row_weights), (column_taps, column_weights) = taps(rows, heights), taps(columns, widths)
+    taps = row_taps.shape[-1] * column_taps.shape[-1]
+    indices = (row_taps[..., :, None] * side + column_taps[..., None, :]).reshape(*rows.shape, taps)
+    weights = (row_weights[..., :, None] * column_weights[..., None, :]).reshape(*rows.shape, taps)
     gathered = table_rows(table, indices, dtype)
     return (gathered * weights[..., None]).sum(axis=-2)
 
@@ -242,7 +264,8 @@ def vit_block(layout: ViTLayout, index: int, *, dtype: Dtype | None,
                       eps=layout.norm_eps, norm_type=layout.norm_type, norm_bias=layout.norm_bias,
                       mlp_bias=layout.mlp_bias, mlp_packed=layout.mlp_packed,
                       rotary_axes=None if layout.rotary is None else (layout.head_dim // 2,) * 2,
-                      rotary_pairs=layout.rotary or "half", rope_theta=layout.rope_theta,
+                      rotary_pairs=layout.rotary or "half", rotary_interleaved=layout.rotary_interleaved,
+                      rope_theta=layout.rope_theta,
                       branch_scale=layout.branch_scale, attention_bias=layout.attention_bias,
                       qk_norm=layout.qk_norm, scale_after_cast=layout.scale_after_cast, mixer=mixer,
                       packed=layout.packed, window=layout.band if band else None, dtype=dtype,
@@ -333,7 +356,8 @@ class VisionTransformer(nn.Module):
         valid = place < jnp.prod(grid, axis=1, keepdims=True)
         frame = place // area
 
-        hidden = self._embedded(pixel_values, pixels, rows, columns, heights, widths, images)
+        hidden = self._embedded(pixel_values, pixels, rows, columns, heights, widths, images,
+                                frame=frame, times=grid[:, 0:1])
         tokens = lay.special_tokens
         if lay.pre_norm == "layer":
             hidden = LayerNorm(epsilon=lay.outer_norm_eps, dtype=self.dtype, name="pre_norm")(hidden)
@@ -373,6 +397,7 @@ class VisionTransformer(nn.Module):
             "full": None if images else jnp.where(valid, frame + 1, 0),
             "band": jnp.where(valid, frame + 1, 0),
             "conv": jnp.where(valid, frame + 1, 0),
+            "item": jnp.where(valid, 1, 0),
             "window": None if windows is None else jnp.where(valid, windows + 1, 0),
         }
         current = "patches"
@@ -402,6 +427,14 @@ class VisionTransformer(nn.Module):
             hidden = _gather(hidden, jnp.argsort(leaving, axis=1))
         if lay.post_norm is not None and lay.post_norm_scope == "sequence":
             hidden = self.post_norm(hidden)
+        if lay.pool_frames:
+            # Each place's mean over the row's frames, at the place's own index in its first frame, which
+            # the merge blocks then gather as one frame's.
+            summed = jax.vmap(lambda row, at: jnp.zeros_like(row).at[at].add(row))(
+                jnp.where(valid[..., None], hidden, 0), jnp.where(valid, within, 0))
+            # A padded row's grid holds no frame: it divides by one, its places kept zero.
+            frames = jnp.maximum(grid[:, 0:1, None], 1).astype(summed.dtype)
+            hidden = jnp.where((valid & (place < area))[..., None], summed / frames, 0)
         if not lay.merge_blocks and merge > 1:
             # Raster patches into merge blocks, each block's patches consecutive (pixel_shuffle's gather).
             block = frame * area + (rows // merge) * merge * widths + (columns // merge) * merge * merge
@@ -409,8 +442,9 @@ class VisionTransformer(nn.Module):
             hidden = _gather(hidden, jnp.argsort(jnp.where(valid, key, last), axis=1, stable=True))
         return hidden
 
-    def _embedded(self, pixel_values, pixels, rows, columns, heights, widths, images):
-        """Patch projection, positioned patch/class rows, and unpositioned register insertion."""
+    def _embedded(self, pixel_values, pixels, rows, columns, heights, widths, images, *, frame, times):
+        """Patch projection, positioned patch/class rows, and unpositioned register insertion; a row of
+        more than one frame (`times`) adds each `frame`'s fixed position (`ViTLayout.frame_positions`)."""
         lay = self.layout
         if lay.patch_projection == "conv":
             if not images:
@@ -435,9 +469,11 @@ class VisionTransformer(nn.Module):
             if tokens.cls is not None:
                 class_position = (table[:1] if tokens.cls == "first" else table[-1:]).astype(compute)
                 table = table[1:] if tokens.cls == "first" else table[:-1]
-            if spec.mode == "bilinear":
+            if spec.mode == "bilinear" or (spec.mode == "bicubic" and not images):
+                # A packed row's grid is its own: bicubic positions resample per place (`F.interpolate`'s).
                 position = resampled_positions(table, rows, columns, heights, widths,
-                                                align_corners=spec.align_corners, dtype=compute)
+                                                align_corners=spec.align_corners, dtype=compute,
+                                                border=spec.border, cubic=spec.mode == "bicubic")
             elif spec.mode == "bicubic":
                 if not images:
                     raise ValueError("bicubic positions take an image's rectangular patch grid")
@@ -448,6 +484,13 @@ class VisionTransformer(nn.Module):
                 position = position.reshape(1, height * width, lay.hidden_size)
             else:
                 position = self.position_table(jnp.arange(table.shape[0]) + int(tokens.cls == "first"))[None]
+            if lay.frame_positions is not None:
+                width = lay.hidden_size // 2
+                frequencies = sinusoid_frequencies(width, width, dtype=np.float32, powered=True)
+                table = sinusoids(np.arange(lay.frame_positions, dtype=np.float32)[:, None] * frequencies,
+                                  xp=np)
+                at = jnp.minimum(frame, lay.frame_positions - 1)
+                position = position + jnp.where((times > 1)[..., None], jnp.asarray(table, compute)[at], 0)
             hidden = hidden + position
         if tokens.cls is not None:
             shape = (1, 1, lay.hidden_size) if tokens.singleton else (lay.hidden_size,)
@@ -579,7 +622,8 @@ class MergeProjector(nn.Module):
 
 
 PATCH_CONVOLUTION = "patch_embed.proj.weight"
-"""Where the Qwen-style towers keep their patch map: a `[out, in, time, h, w]` convolution."""
+"""Where the Qwen-style towers keep their patch map: a `[out, in, time, h, w]` convolution, or MoonViT's
+`[out, in, h, w]`."""
 
 
 def translate_vit_weights(hf_tensors: Mapping[str, Stored],
@@ -595,7 +639,7 @@ def translate_vit_weights(hf_tensors: Mapping[str, Stored],
                                  if name != PATCH_CONVOLUTION}, path_of, param_dtype)
     if PATCH_CONVOLUTION in hf_tensors:
         conv = checkpoint_array(hf_tensors[PATCH_CONVOLUTION], param_dtype)
-        dense = held(conv.transpose(1, 2, 3, 4, 0).reshape(-1, conv.shape[0]), contiguous=True)
+        dense = held(conv.transpose(*range(1, conv.ndim), 0).reshape(-1, conv.shape[0]), contiguous=True)
         insert(variables, ("params", "patch_embed", "kernel"), dense, PATCH_CONVOLUTION)
         # The Dense map's transpose is the convolution, its input axes flattened.
         kernel = ("params", "patch_embed", "kernel")

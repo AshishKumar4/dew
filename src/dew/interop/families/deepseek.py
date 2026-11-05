@@ -21,6 +21,7 @@ from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
     MOE_NAMES,
+    NO_AUDIO,
     PLAIN_SPELLING,
     SERIALIZED_ENCODER_FIELDS,
     SERIALIZED_TEXT_FIELDS,
@@ -32,6 +33,7 @@ from dew.interop.decoder_parts import (
     Ramp,
     Ropes,
     RopeSpelling,
+    WrapperFields,
     base_config,
     dew_path,
     layer_depth,
@@ -55,6 +57,7 @@ from dew.nn.deepseek_v4 import DeepseekV4Mixer
 from dew.nn.dspark import DSpark
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mla import MLAMixer
+from dew.nn.vision.moonvit import translate_moonvit_config, translate_moonvit_projector_config
 
 # MiniMaxM2Config's default_theta (configuration_minimax_m2.py:74).
 _MINIMAX_M2_SPELLING = RopeSpelling(theta=5000000.0)
@@ -437,6 +440,28 @@ def _kimi_k25_config(hf_config: Mapping[str, object], used: set[str]) -> Decoder
         placeholders.append(value)
     config['embedding_zero_ids'] = tuple(placeholders)
     return config
+
+
+def _kimi_k25_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
+    """Read a Kimi K2.5 bundle whole (transformers 5.17.0's Kimi_K25ForConditionalGeneration, the
+    release's own at 4d01dfe): its decoder as the text half reads it (`_kimi_k25_config`), MoonViT and its
+    patch merger (`dew.nn.vision.moonvit`), and the media placeholder each of an item's projected merge
+    blocks fills, as its processor expands it (`Kimi_K25Processor`); the decoder's tensors, under
+    `language_model.`, read as Kimi K2's (`DEEPSEEK_V3`, its text_config's own model type)."""
+    text = _kimi_k25_config(hf_config, used)
+    # The decoder's own record, which the language model's reader and writer read.
+    text_type = _records.text(_records.record(hf_config['text_config'], 'text_config').get(
+        'model_type', 'deepseek_v3'), 'model_type')
+    width = record_int(text, 'emb_features')
+    image = hf_config.get('image_token_id', hf_config.get('media_placeholder_token_id', 163605))
+    video = hf_config.get('video_token_id')
+    return {'model_type': 'kimi_k25', 'text_model_type': text_type, 'text': text,
+            'tower': translate_moonvit_config(hf_config),
+            'projector': translate_moonvit_projector_config(hf_config, width),
+            'image_token_id': record_int({'image_token_id': image}, 'image_token_id'),
+            'tokens_per_image': None,
+            'video_token_id': None if video is None else record_int(hf_config, 'video_token_id'),
+            'extra_placeholder_ids': (), **NO_AUDIO}
 
 
 def _kimi_k25_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
@@ -1218,6 +1243,7 @@ KIMI_K25 = DecoderFamily(
     weight_path=_kimi_k25_path,
     preserve_source_layout=True,
     tied_head_names=('language_model.lm_head.weight', 'language_model.model.embed_tokens.weight'),
+    wrapper=_kimi_k25_wrapper,
 )
 
 # Kimi K2 is DeepSeek V3's computation under another name; a derived model
