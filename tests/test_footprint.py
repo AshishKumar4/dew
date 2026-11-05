@@ -629,11 +629,12 @@ def test_a_gradient_states_its_peak_a_bound_from_below_where_a_nested_ragged_pro
 def test_a_derived_peak_is_of_the_program_the_algebra_pass_makes_of_the_step():
     """The algebra pass rewrites the program a step compiles (`algebra.rewritten_program`,
     docs/design/algebra.md §6.7): two products of one operand summed become one product of it with the
-    summed others, so the forward holds one 256 x 1024 product, not two, and the backward reads one. The
-    derived peak and residuals are that program's (row 3445): below the unrewritten program's, which the
-    pass turned off (`algebra.passes`) derives."""
+    summed others, and the derivation reads that program (row 3445), one product forward where the
+    pass turned off (`algebra.passes`) leaves two. Both hold what XLA's compile of each holds: XLA folds
+    one product of the two into the other's GEMM as its bias (`biased`), so the pass saves the product's
+    work and no memory (each compiled for an H100, 3,145,728 bytes of temporaries either way)."""
     from dew import algebra
-    from dew.training.footprint import derived_terms
+    from dew.training.footprint import derived_terms, traced_gradient
 
     def loss(weights, x):
         shared = jnp.tanh(x)
@@ -644,12 +645,14 @@ def test_a_derived_peak_is_of_the_program_the_algebra_pass_makes_of_the_step():
     x = jax.ShapeDtypeStruct((256, 64), jnp.float32)
 
     def derived():
+        program, _, _ = traced_gradient(loss, weights, (x,))
         residuals, peak = derived_terms(loss, weights, (x,), platform="gpu", workspace=Workspace(0, 0))
-        return residuals, peak.bytes
+        forward = [equation for equation in program.eqns if equation.primitive.name == "dot_general"
+                   and equation.outvars[0].aval.shape == (256, 1024)]
+        return len(forward), residuals, peak.bytes
 
     rewritten = derived()
     with algebra.passes(on=False):
         plain = derived()
-    product = 256 * 1024 * 4
-    assert rewritten[0] <= plain[0] - product and rewritten[1] <= plain[1] - product, (rewritten, plain)
-
+    assert (rewritten[0], plain[0]) == (1, 2), (rewritten, plain)
+    assert rewritten[1:] == plain[1:], (rewritten, plain)
