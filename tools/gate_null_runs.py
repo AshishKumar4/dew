@@ -594,13 +594,16 @@ def main(argv: list[str]) -> int:
     if options.rows is not None:
         if options.today or options.paired or options.orders or options.fault or options.seeds is None:
             parser.error("--rows takes the rows a draw as its name and --seeds, and no other mode's flags")
+        if not options.amplified and (options.shared or options.steepest != 24):
+            parser.error("--shared and --steepest shape --amplified's element, which they need")
         verdicts, statistics = row_controls(options.rows, int(options.name), options.seeds, options.runs,
                                             options.chunk, options.amplified, options.shared,
                                             options.steepest)
         import numpy as np
 
         print(json.dumps({"rows": int(options.name), "width": options.rows, "seeds": options.seeds,
-                          "amplified": options.amplified, "shared": options.shared, "chunk": options.chunk,
+                          "amplified": options.amplified, "shared": options.shared,
+                          "steepest": options.steepest, "chunk": options.chunk,
                           "runs": len(verdicts),
                           "reds": sum(verdict != "pass" for verdict, _ in verdicts),
                           "quantiles": {str(tail): float(np.quantile(statistics, 1 - tail))
