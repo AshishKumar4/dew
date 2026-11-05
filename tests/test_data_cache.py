@@ -1409,27 +1409,28 @@ def test_transient_failures_never_certify_cache_coverage_but_permanent_rejection
     assert generation.outputs(0)[0].reason == "http_404"
 
 
+def _filled_once(cache: Cache, key, source: Memory):
+    """`source`'s first record read through `cache` under `key`, its fill finished and closed."""
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
+    try:
+        return rows[0]
+    finally:
+        rows.finish()
+        rows.close()
+
+
 def test_local_retention_keeps_pinned_generations_and_evicts_closed_ones(tmp_path):
     source = Memory([{"id": 0}])
     cache = Cache(str(tmp_path), keep_local_bytes=250_000, shard_bytes=1)
     first_key, second_key = _key("one"), _key("two")
-    first = cache.mapped(grain.MapDataset.source(source.records("indexed")), first_key)
-    first[0]
-    first.finish()
-    first.close()
+    _filled_once(cache, first_key, source)
     generation = cache.publish(first_key, source)
-    second = cache.mapped(grain.MapDataset.source(source.records("indexed")), second_key)
-    second[0]
-    second.finish()
-    second.close()
+    _filled_once(cache, second_key, source)
     assert generation[0] == {"id": 0}
     with pytest.raises(ValueError):
         cache.publish(second_key, source)
     generation.close()
-    retry = cache.mapped(grain.MapDataset.source(source.records("indexed")), second_key)
-    retry[0]
-    retry.finish()
-    retry.close()
+    _filled_once(cache, second_key, source)
     assert cache.publish(second_key, source)[0] == {"id": 0}
     assert cache.generation(first_key) is None
 
@@ -1441,16 +1442,10 @@ def test_a_fill_that_evicts_nothing_stops_at_its_roots_free_room_and_keeps_its_g
     source = Memory([{"id": 0}])
     published = Cache(str(tmp_path), keep_local_bytes=250_000, shard_bytes=1)
     first_key, second_key = _key("one"), _key("two")
-    first = published.mapped(grain.MapDataset.source(source.records("indexed")), first_key)
-    first[0]
-    first.finish()
-    first.close()
+    _filled_once(published, first_key, source)
     published.publish(first_key, source).close()
     holding = Cache(str(tmp_path), keep_local_bytes=250_000, shard_bytes=1, optional=True, evicts=False)
-    second = holding.mapped(grain.MapDataset.source(source.records("indexed")), second_key)
-    assert second[0] == {"id": 0}
-    second.finish()
-    second.close()
+    assert _filled_once(holding, second_key, source) == {"id": 0}
     assert holding.generation(second_key) is None
     assert published.generation(first_key)[0] == {"id": 0}
 
