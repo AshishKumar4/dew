@@ -82,7 +82,7 @@ Library stages are values of these shapes. `images.Resize(256)` is a `RecordFn` 
 | `from_iter(factory, identity=None, state=, load_state=)` | Any resumable iterator: WebDataset, torchdata, Mosaic Streaming, Ray | the library's own state |
 | `from_iter(factory, replay=True)` | An iterator that reads the same records each time `factory()` opens it | replay to the count read, guarded by the last batch's digest |
 
-A torch, Grain or iterator source holds no content version of its own. Given `name=` (`identity=` for torch), its plan names it, an exact resume finds the same records, and a cache keys it. Given none, it trains as well, but nothing says a later run reads the same records: resuming its position takes `resume="non-exact"`, and a cache of it is refused.
+A torch, Grain or iterator source holds no content version of its own. Given `identity=`, its content version, its plan names it, an exact resume finds the same records, and a cache keys it. Given none, it trains as well, but nothing says a later run reads the same records: resuming its position takes `resume="non-exact"`, and a cache of it is refused.
 
 Preparing a Hub dataset happens on first use, with one log line naming what is prepared and its size. `.read("memory" | "indexed" | "streamed")` overrides how it is read.
 
