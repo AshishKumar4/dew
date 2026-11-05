@@ -1129,7 +1129,7 @@ class Server:
                       for page in self._host[batch[0][0]]]
             for index, (held, _) in enumerate(batch):
                 for value, page in zip(values, self._host[held], strict=True):
-                    value[:, index] = page
+                    value[:, index] = 0
             self._resident, self._carried = self._written_pages(self._resident, self._carried, pages,
                                                                 jax.tree.unflatten(self._host_tree, values))
 
