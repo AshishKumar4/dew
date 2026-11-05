@@ -179,22 +179,22 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
     return algebra.headroomed(algebra.guarded(walk, walk))
 
 
-def _guarded(launch: Callable[[algebra.Forward, jax.Array], jax.Array], spec: algebra.Forward,
-             spans: jax.Array) -> jax.Array:
+def _guarded(launch: Callable[..., jax.Array], spec: algebra.Forward, spans: jax.Array) -> jax.Array:
     """`launch(spec, spans)`'s output with its sums guarded only where they overflow: under headroom
     (`algebra.Forward.headroom`) the plain launch first, then the guarded one over the rows some output of
     which is not finite (an overflowed sum's, or a merge's of two finite slices; or a call's own non-finite
     input, which the guarded launch gives again), every other row's span empty, so it walks no key of them,
     and its rows taken where they overflowed. The guarded launch runs every step, no branch: a branch's
     predicate is read on the host before its launch may run, a decode step's round trip (row 1978: 0.280 ms
-    wall against 0.015 on the device), where a launch of empty walks costs its prologue (the template's
-    `algebra.walked_launches` with `masked`). The guarded launch is a kernel of its own name (`_headroom`),
-    as the Triton forward's is."""
+    wall against 0.015 on the device). It walks a live row's keys in one slice (`launch`'s `splits`): a
+    row overflows rarely, and a sliced launch of empty walks cost its slices' merge every step, 12 us a step
+    at one row over 4096 keys on an H100, 43 against 31 (ET-1978-h100). The guarded launch is a kernel of
+    its own name (`_headroom`), as the Triton forward's is."""
     if not spec.headroom:
         return launch(spec, spans)
     out = launch(dataclasses.replace(spec, headroom=False), spans)
     over = ~jnp.all(jnp.isfinite(out), axis=tuple(range(1, out.ndim)))
-    guarded = launch(spec, jnp.where(over[:, None], spans, 0))
+    guarded = launch(spec, jnp.where(over[:, None], spans, 0), 1)
     return jnp.where(over.reshape(-1, *(1,) * (out.ndim - 1)), guarded, out)
 
 
@@ -354,7 +354,7 @@ class DecodeAttention(tuning.KernelOp):
         summed = pl.BlockSpec((None, None, QUERIES, None, width),
                               lambda row, head, split: (row, split, 0, head, 0))
         reduced = pl.BlockSpec((None, None, QUERIES, None), lambda row, head, split: (row, split, 0, head))
-        def launch(spec: algebra.Forward, spans: jax.Array) -> jax.Array:
+        def launch(spec: algebra.Forward, spans: jax.Array, splits: int = splits) -> jax.Array:
             out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 1, queried, summed, reduced,
                                             headroom=spec.headroom)
             out = launches.pallas_call(
@@ -423,7 +423,7 @@ class PagedDecodeAttention(tuning.KernelOp):
         reduced = pl.BlockSpec((None, None, None, QUERIES), lambda row, head, split: (row, head, split, 0))
         sunk = [] if sinks is None else [pl.BlockSpec((None, QUERIES), lambda row, head, split: (head, 0))]
 
-        def launch(spec: algebra.Forward, spans: jax.Array) -> jax.Array:
+        def launch(spec: algebra.Forward, spans: jax.Array, splits: int = splits) -> jax.Array:
             out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 2, queried, summed, reduced,
                                             headroom=spec.headroom)
             out = launches.pallas_call(
