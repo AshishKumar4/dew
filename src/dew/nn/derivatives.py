@@ -73,25 +73,27 @@ def surrogate[Value](forward: Callable[..., Value], derivative: Callable[..., Va
 
 
 def declared_derivative[Value](kind: Kind, primal: Callable[..., Value], forward: Callable,
-                               backward: Callable, *,
-                               nondiff_argnums: Sequence[int] = ()) -> Callable[..., Value]:
+                               backward: Callable, *, nondiff_argnums: Sequence[int] = (),
+                               symbolic_zeros: bool = False) -> Callable[..., Value]:
     """`primal` with a declared reverse-mode rule (`forward` saving its residuals, `backward` taking them and
-    the cotangent, as `jax.custom_vjp.defvjp` takes them), one marked call of `kind` (`bound_span`): a
-    kernel's glue (`KernelGlue`), a rule its numerics need as written (`Protected`), a derivative of Dew's
-    choosing (`Surrogate`) or one written to restructure algebra (`Algebra`). Forward mode refuses it as a
-    bare `jax.custom_vjp` does."""
+    the cotangent, as `jax.custom_vjp.defvjp` takes them, with `symbolic_zeros` as it takes it), one marked
+    call of `kind` (`bound_span`): a kernel's glue (`KernelGlue`), a rule its numerics need as written
+    (`Protected`), a derivative of Dew's choosing (`Surrogate`) or one written to restructure algebra
+    (`Algebra`). Forward mode refuses it as a bare `jax.custom_vjp` does."""
     rule = jax.custom_vjp(primal, nondiff_argnums=tuple(nondiff_argnums))
-    rule.defvjp(forward, backward)
+    rule.defvjp(forward, backward, symbolic_zeros=symbolic_zeros)
     return bound_span(kind, rule, static=nondiff_argnums)
 
 
 def declared_tangent[Value](kind: Kind, primal: Callable[..., Value], tangent: Callable, *,
-                            nondiff_argnums: Sequence[int] = ()) -> Callable[..., Value]:
+                            nondiff_argnums: Sequence[int] = (),
+                            symbolic_zeros: bool = False) -> Callable[..., Value]:
     """`primal` with a declared tangent rule (`tangent(primals, tangents)` returning the primal's value and
-    its tangent, as `jax.custom_jvp.defjvp` takes it, which reverse mode transposes), one marked call of
+    its tangent, as `jax.custom_jvp.defjvp` takes it, which reverse mode transposes; with `symbolic_zeros`,
+    an operand no tangent reaches is a `SymbolicZero` there, as `defjvp` gives it), one marked call of
     `kind` (`bound_span`), as `declared_derivative` takes it."""
     rule = jax.custom_jvp(primal, nondiff_argnums=tuple(nondiff_argnums))
-    rule.defjvp(tangent)
+    rule.defjvp(tangent, symbolic_zeros=symbolic_zeros)
     return bound_span(kind, rule, static=nondiff_argnums)
 
 
