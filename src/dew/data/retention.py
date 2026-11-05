@@ -43,8 +43,8 @@ def evictable(path: Path) -> Iterator[bool]:
 
 
 class LocalRetention:
-    def __init__(self, directory: Path, max_bytes: int):
-        self.directory, self.max_bytes = directory, max_bytes
+    def __init__(self, directory: Path, max_bytes: int, *, evicts: bool = True):
+        self.directory, self.max_bytes, self.evicts = directory, max_bytes, evicts
 
     @staticmethod
     def pin(directory: Path) -> BinaryIO:
@@ -132,7 +132,7 @@ class LocalRetention:
                 (manifest.stat().st_atime_ns, manifest.parent)
                 for key in self._keys()
                 for manifest in (key / "generations").glob("*/manifest.json")
-                if re.fullmatch(r"[a-f0-9]{32}", manifest.parent.name)
+                if self.evicts and re.fullmatch(r"[a-f0-9]{32}", manifest.parent.name)
             )
             for _, generation in candidates:
                 if self._size() + needed <= self.max_bytes:

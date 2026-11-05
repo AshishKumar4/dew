@@ -213,7 +213,8 @@ def _automatic(pipeline: Pipeline, read: Read, root: str | None) -> Pipeline:
     key = _cache_key(pipeline.source, prefix, read)
     if key is None or not (key.clean and key.exact):
         return pipeline
-    cached = Artifact(Cache(root, optional=True), automatic=True)
+    # A stream's corpus may be larger than the root: its fill takes only the room the root has free.
+    cached = Artifact(Cache(root, optional=True, evicts=read != "streamed"), automatic=True)
     return dataclasses.replace(pipeline, stages=(*prefix, cached, *pipeline.stages[at:]))
 
 

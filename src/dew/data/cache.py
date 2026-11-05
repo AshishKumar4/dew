@@ -146,6 +146,11 @@ class Cache:
     index's database full or read-only): a cache the compiler placed (`dew.data.compile._automatic`),
     which a run never needs, then looks nothing up, stops admitting and its records are computed,
     as they are with no cache (`read_on`). A cache a chain names stops the run."""
+    evicts: bool = True
+    """Whether a fill in a local root evicts its oldest generations to stay within `keep_local_bytes`
+    (`LocalRetention`), or holds to the room the root has free and stops there: a stream's automatic
+    cache, whose corpus may be larger than the root, so a fill that cannot complete takes no generation
+    another read keeps (row 4217)."""
 
     def read_on(self, error: OSError | sqlite3.Error | ValueError | TypeError, doing: str) -> bool:
         """Whether this cache reads on uncached after its storage raised `error` while `doing`: it is
@@ -199,7 +204,8 @@ class Cache:
         fs, path, scheme = base._backend()
         if scheme == "file":
             base = Store(
-                fs.unstrip_protocol(path), self.storage_options, LocalRetention(Path(path), self.local_limit)
+                fs.unstrip_protocol(path), self.storage_options,
+                LocalRetention(Path(path), self.local_limit, evicts=self.evicts),
             )
         return base.child(manifest.key)
 
