@@ -40,6 +40,10 @@ class DecodeAudio(grain.MapTransform):
     external: ClassVar[bool] = True
     """A file a record names by path is read from storage (`dew.data.pipeline.External`)."""
 
+    def reads_storage(self, record: Batch) -> bool:
+        """Whether `record`'s media is a path rather than its bytes (`dew.data.video.local_file`)."""
+        return not isinstance(record[self.field], bytes)
+
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """Mono samples at `sample_rate` over the window and `context` either side, under `to`, with
         their validity: `audio_seconds` long."""

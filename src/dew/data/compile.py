@@ -119,6 +119,7 @@ from dew.data.pipeline import (
     Pipeline,
     Prefetch,
     RandomMap,
+    ReadsStorage,
     RecordStep,
     Repeat,
     Shuffle,
@@ -196,7 +197,7 @@ def _automatic(pipeline: Pipeline, read: Read, root: str | None) -> Pipeline:
 
     def kept(stage: Stage) -> bool:
         return (isinstance(stage, (Map, MapWithIndex)) and _cacheable(stage) and not _volatile(stage)
-                and not _external(stage))
+                and (not _external(stage) or isinstance(stage.step, ReadsStorage)))
 
     at = next((index for index, stage in enumerate(pipeline.stages) if not kept(stage)), len(pipeline.stages))
     prefix = pipeline.stages[:at]

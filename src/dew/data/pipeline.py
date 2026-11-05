@@ -394,9 +394,23 @@ class External(Protocol):
     """A step that reads the storage a record names by path, as a media decoder does when its field
     holds a path rather than bytes: what it makes is keyed by the path, not by what the path holds, so
     no automatic cache's prefix runs past it (`dew.data.compile._automatic`), a file replaced at the same
-    path reading anew; a chain's own `cache=` keeps what it made, as it is told to."""
+    path reading anew, unless it says which records it reads by path (`ReadsStorage`); a chain's own
+    `cache=` keeps what it made, as it is told to."""
 
     external: bool
+
+
+@runtime_checkable
+class ReadsStorage(External, Protocol):
+    """An external step that says which records it reads by path: an automatic cache stands for it,
+    keeping what it made of records holding their content, and stops its fill at the first record it
+    reads by path (`dew.data.lowering._Prefix.storage`), which then reads on as computed. Keyed by the
+    version of each file read is not built: a remote store's version check costs more than the decode it
+    would save (row 4212)."""
+
+    def reads_storage(self, record: Batch) -> bool:
+        """Whether it reads `record`'s content from storage by a path the record names."""
+        ...
 
 
 @runtime_checkable

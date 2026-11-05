@@ -93,6 +93,13 @@ class DecodeImage(grain.MapTransform):
     external: ClassVar[bool] = True
     """An image a record names by path is read from storage (`dew.data.pipeline.External`)."""
 
+    def reads_storage(self, record: Batch | bytes) -> bool:
+        """Whether `record`'s image is a value naming a path with no bytes (`_payload`)."""
+        if isinstance(record, bytes):
+            return False
+        image = record[self.field]
+        return isinstance(image, Mapping) and not isinstance(image.get("bytes"), bytes)
+
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """RGB pixels under `to`, each image its own height and width, in place of the bytes in `field`."""
         return shaped(unshaped(facts, self.field), self.to, [None, None, 3])
