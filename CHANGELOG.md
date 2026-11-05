@@ -7,6 +7,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- The `cuda12` and `cuda13` extras install `dew-cutlass` 0.1.0 (`dew-cutlass-cu12` or `dew-cutlass-cu13`, on
+  Linux x86_64 and aarch64), Dew's build of CUTLASS's grouped GEMMs, whose kernels are Hopper's. On an sm90
+  GPU (an H100, an H200 or a GH200) a mixture of experts' projection now runs CUTLASS on the two grouped cells
+  declared for it, the forward and the input gradient, where Dew's Mosaic GPU template ran them: on an H100
+  the template took 1.019x CUTLASS's time on the forward and 1.018x on the input gradient (geomean of seven
+  MoE rows). Hopper's grouped kernel gradient stays on the template, every other cell keeps the route it had,
+  and a call CUTLASS cannot run (operands that are not bf16, a width that is not a multiple of 8, a fused hook,
+  exact sums) takes the selector's next route, as before.
 - Dew's support modules are private: `dew.accuracy`, `dew.builds`, `dew.cache`, `dew.cleanup`, `dew.devices`,
   `dew.files`, `dew.logging`, `dew.pool`, `dew.position` and `dew.cli` are now `dew._accuracy` and so on, with
   no alias left, and the API reference no longer lists `dew.cache`. `CPUOnlyJax`, which a run raises where JAX

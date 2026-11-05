@@ -860,32 +860,6 @@ def _bucketed(spec: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
     return jax.ShapeDtypeStruct((1 << max(spec.shape[0] - 1, 0).bit_length(), *spec.shape[1:]), spec.dtype)
 
 
-def _kernel_times(cupti, executable, *args) -> list[tuple[str, float]]:
-    """Each kernel's name and device milliseconds over one run of
-    `executable`, read by `cupti` (a mosaic `profiler.Cupti`); none where it
-    launched none."""
-    _, kernels = cupti.measure(executable, aggregate=False)(*args)
-    return kernels if isinstance(kernels, list) else []
-
-
-def _another_subscriber(error: RuntimeError) -> bool:
-    """Whether CUPTI refused the tuner's subscription for another subscriber's, a profile capture or
-    Nsight's: the launch keeps its heuristic until a later compile. Mosaic's profiler raises it as a
-    RuntimeError naming the other subscriber; every other failure is the tuner's to report."""
-    return "another subscriber" in str(error)
-
-
-def _detach(profiler, evicting: jax.stages.Compiled, flush: jax.Array) -> None:
-    """Detach CUPTI from the process with a finalizing read of `evicting`, so a profiler can subscribe
-    after; where one already holds it (`_another_subscriber`), there is nothing of the tuner's to
-    detach."""
-    try:
-        _kernel_times(profiler.Cupti(), evicting, flush)
-    except RuntimeError as error:
-        if not _another_subscriber(error):
-            raise
-
-
 def _resource_exhausted(error: Exception) -> bool:
     """Whether a config failed for a block past the GPU's own resources, the failures a config of a
     launch's space may meet on a GPU it was not declared for: its shared memory as XLA's compile
@@ -917,9 +891,10 @@ def materialized(op: KernelOp, ba: tokamax.BoundArguments):
 def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     """Every config of `ba`'s launch (at its key's shapes), each compiled on a
     thread and timed alone: the device time CUPTI reads for the launch's own
-    kernels (Mosaic GPU's profiler's `Cupti`), each run after `FLUSH_BYTES` are
-    read, so every config starts with its operands out of cache."""
-    from jax.experimental.mosaic.gpu import profiler
+    kernels (`dew.telemetry.benchmark.device_time`), each run after
+    `FLUSH_BYTES` are read, so every config starts with its operands out of
+    cache."""
+    from dew.telemetry.benchmark import CuptiHeld, device_time
 
     arrays, fill = materialized(op, ba)
     flush = jnp.zeros(FLUSH_BYTES // 4, jnp.float32)
@@ -946,40 +921,39 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     read = {}
     with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
         futures = {config: pool.submit(compiled, config) for config in ba.autotuning_configs}
-    # CUPTI reads every run, the flush's own first, subscribing for each and
-    # unsubscribing after. It takes one subscriber, so where a profile capture
-    # holds it, from the first run or any later one, the launch keeps its
-    # heuristic until a later compile.
-    cupti = profiler.Cupti(finalize=False)
-    flushes: set[str] = set()
+    # CUPTI reads every run, the flush's own first. It takes one subscriber, so
+    # where a profile capture holds it, from the first run or any later one,
+    # the launch keeps its heuristic until a later compile.
     try:
-        flushes = {name for name, _ in _kernel_times(cupti, evicting, flush)}
-        for config, future in futures.items():
-            try:
-                executable, lowering, compiling = future.result()
-                runs = [_kernel_times(cupti, executable, flush, arrays) for _ in range(REPEATS)]
-            except jax.errors.JaxRuntimeError as error:
-                if not _resource_exhausted(error):
-                    raise
-                timings[config] = error
-                continue
-            read[config] = runs, lowering, compiling
-    except RuntimeError as error:
-        if not _another_subscriber(error):
-            raise
+        with device_time() as device:
+            flushes = {kernel.name for kernel in device.kernels(evicting, flush)}
+            for config, future in futures.items():
+                try:
+                    executable, lowering, compiling = future.result()
+                    runs = [device.kernels(executable, flush, arrays) for _ in range(REPEATS)]
+                except jax.errors.JaxRuntimeError as error:
+                    if not _resource_exhausted(error):
+                        raise
+                    timings[config] = error
+                    continue
+                read[config] = runs, lowering, compiling
+    except CuptiHeld as error:
         return Timings(dict.fromkeys(ba.autotuning_configs, error))
-    finally:
-        _detach(profiler, evicting, flush)
     return Timings({**timings, **_benchmarks(read, flushes)})
 
 
-def _benchmarks(read: Mapping, flushes: set[str]) -> dict[Hashable, tokamax.BenchmarkData]:
-    """The configs `_measured` timed, each run's time the sum of its own kernels', the flush's left out."""
-    benchmarks = {}
+def _benchmarks(read: Mapping, flushes: set[str]) -> dict[Hashable, tokamax.BenchmarkData | Exception]:
+    """The configs `_measured` timed, each run's time the sum of its own kernels', the flush's left out;
+    a config a run of which CUPTI read none of its own kernels in is no pick, as its time would read as
+    zero."""
+    benchmarks: dict[Hashable, tokamax.BenchmarkData | Exception] = {}
     for config, (runs, lowering, compiling) in read.items():
-        times = tuple(sum(milliseconds for name, milliseconds in run if name not in flushes) for run in runs)
+        own = [[ms for name, ms in run if name not in flushes] for run in runs]
+        if not all(own):
+            benchmarks[config] = ValueError(f"CUPTI read none of config {config}'s own kernels")
+            continue
         benchmarks[config] = tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering,
-                                                   metadata={}, evaluation_times_ms=times)
+                                                   metadata={}, evaluation_times_ms=tuple(map(sum, own)))
     return benchmarks
 
 

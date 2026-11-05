@@ -26,6 +26,7 @@ import math
 import jax
 import jax.numpy as jnp
 import numpy as np
+from arm_arithmetic import summed_as_run
 from jax.sharding import NamedSharding, PartitionSpec
 from reference_error import as_given, assert_as_exact, without_ynn
 
@@ -112,6 +113,21 @@ def placed(tree, mesh: jax.sharding.Mesh, *spec):
     return jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=sharding), tree)
 
 
+def placed_on(args, specs, mesh: jax.sharding.Mesh) -> list:
+    """`args` put on `mesh`, each by its PartitionSpec in `specs`."""
+    return [jax.device_put(arg, NamedSharding(mesh, spec)) for arg, spec in zip(args, specs, strict=True)]
+
+
+def split_executable(run, args, specs, mesh: jax.sharding.Mesh):
+    """`run` (a jitted function) compiled for `args` placed on `mesh` by `specs`: the split arm's one
+    executable, which `assert_runs_per_shard` inspects and runs every draw. Compiled in the scope the
+    gate runs each arm in (`summed_as_run`): a compiled executable never retraces, so the arithmetic its
+    trace chose is the one every draw runs, and the one-device arm's, traced in that scope, is the same
+    (ledger 4393: compiled outside it, a CPU suite's wide sums were frozen into it)."""
+    with jax.set_mesh(mesh), summed_as_run():
+        return run.lower(*placed_on(args, specs, mesh)).compile()
+
+
 def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, truth_fn, moves=(),
                           donate=(), arm=None, also=None) -> None:
     """The custom-kernel contract (module docstring): `fn` on `draw(seed)`'s arguments placed on `mesh`
@@ -131,12 +147,7 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
     whole contract: `also`, `(label, arm)`, is that second arm, compared with the same split runs (each
     draw's split run once, `assert_as_exact`'s further references)."""
     run = without_ynn(fn, donate_argnums=donate)
-
-    def put(args):
-        return [jax.device_put(arg, NamedSharding(mesh, spec)) for arg, spec in zip(args, specs, strict=True)]
-
-    with jax.set_mesh(mesh):
-        compiled = run.lower(*put(draw(0))).compile()
+    compiled = split_executable(run, draw(0), specs, mesh)
     text = compiled.as_text()
     moved = [(op, shapes) for op, shapes in collectives(text) if op in MOVES and op not in moves]
     assert not moved, f"the step moves operands between devices: {moved}"
@@ -149,7 +160,7 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
 
     def split(*args):
         with jax.set_mesh(mesh):
-            return compiled(*put(kept(args)))
+            return compiled(*placed_on(kept(args), specs, mesh))
 
     def one_device(*args):
         return run(*kept(args))

@@ -8,7 +8,7 @@ of one launch (row 3613's fixed costs of a launch and of the balanced tail's par
     python tools/device_facts.py --out facts.json
 
 Each point reads an array of N bytes once (its sum, `read`) or reads and writes it (`copy`), after a write of
-twice the L2 that evicts it (`cold`); CUPTI times the kernel alone (`jax.experimental.mosaic.gpu.profiler`),
+twice the L2 that evicts it (`cold`); CUPTI times the kernel alone (`dew.telemetry.benchmark.device_time`),
 the median of `--repeats` after `--warmup`. An H200's read, measured so, ramps from 2.6 TB/s at 16.8 MB to
 4.5 at 805 MB over a 2.5-2.8 us fixed cost, which a peak bandwidth alone prices as free at small transfers.
 
@@ -29,10 +29,9 @@ import statistics
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.experimental.mosaic.gpu import profiler
 
 from dew.nn.kernels import generation
-from dew.telemetry.benchmark import samples
+from dew.telemetry.benchmark import device_time, samples
 
 SIZES = tuple(2 ** power for power in range(20, 31))
 """The bytes each point streams: 1 MiB to 1 GiB, by doubling."""
@@ -47,14 +46,13 @@ ROUND_TRIPS = (16, 64, 256, 1024)
 def timed(fn, args, *, flush, warmup: int, repeats: int) -> float:
     """The median device seconds of `fn`'s kernels over `repeats` calls after `warmup`, each call after
     `flush` evicts the L2 (CUPTI times `fn`'s kernels alone)."""
-    cupti = profiler.Cupti(finalize=False)
     seconds = []
-    for index in range(warmup + repeats):
-        jax.block_until_ready(flush())
-        _, read = cupti.measure(fn, aggregate=False)(*args)
-        if index >= warmup:
-            seconds.append(sum(ms for _, ms in read or []) / 1e3)
-    profiler.Cupti().measure(fn, aggregate=False)(*args)
+    with device_time() as device:
+        for index in range(warmup + repeats):
+            jax.block_until_ready(flush())
+            measured = device.seconds(fn, *args)
+            if index >= warmup:
+                seconds.append(measured)
     return statistics.median(seconds)
 
 
