@@ -27,7 +27,8 @@ Two more fixtures:
   ORDERS orders of the stand-in's hidden units (tests/residual_orders.py),
   for tests/reference_error.py's K-order rule; order 1 in float64 is
   checked to land on the float64 gradient.
-- preprocessed.npz: 256-pixel images through `preprocess_raw_image`'s
+- preprocessed.npz: over check 1's seeds (`preprocessed_draw`, summarized),
+  256-pixel images through `preprocess_raw_image`'s
   "dinov2" branch (/255, ImageNet's normalization, bicubic to 224) and
   iREPA's `DINOv2Encoder.preprocess`, then iREPA's `spatial_zscore` of
   them read as features, as published.
@@ -243,28 +244,38 @@ def composed() -> None:
     print(f"{FIXTURE}: REPA's composed loss and its gradient")
 
 
+def preprocessed_draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's two 256-pixel images, 8-bit, channels last (the test draws them again)."""
+    return {"pixels": np.random.default_rng([12, seed]).integers(0, 256, (2, 256, 256, 3), dtype=np.uint8)}
+
+
 def preprocessed() -> None:
-    generator = np.random.default_rng(12)
-    pixels = generator.integers(0, 256, (2, 256, 256, 3), dtype=np.uint8)
+    from recorded_references import record_case
     from torchvision.transforms import Normalize
+
     repa = definitions(REPA + "train.py", ("preprocess_raw_image",),
                      {"torch": torch, "Normalize": Normalize, **TIMM})
     irepa = definitions(IREPA + "vision_encoder.py", ("DINOv2Encoder",),
                       {"torch": torch, "Normalize": Normalize, "VisionEncoder": object, "Dict": dict,
                        "Optional": object, **TIMM})
     zscore = definitions(IREPA + "utils.py", ("spatial_zscore",), {"torch": torch})["spatial_zscore"]
-    arrays = {"pixels": pixels, "gamma": np.asarray(GAMMA)}
-    for dtype, suffix in ((torch.float64, "_f64"), (torch.float32, "")):
+
+    def run(pixels, dtype):
         raw = torch.as_tensor(pixels, dtype=dtype).permute(0, 3, 1, 2)
         dinov2 = repa["preprocess_raw_image"](raw, "dinov2")
-        encoder = types.SimpleNamespace(resolution=256)
-        same = irepa["DINOv2Encoder"].preprocess(encoder, raw)
+        same = irepa["DINOv2Encoder"].preprocess(types.SimpleNamespace(resolution=256), raw)
         assert torch.equal(same, dinov2), "REPA's and iREPA's DINOv2 preprocessing differ"
         features = dinov2.permute(0, 2, 3, 1).reshape(2, -1, 3)
-        arrays[f"dinov2{suffix}"] = features.double().numpy()
-        arrays[f"zscore{suffix}"] = zscore(features, alpha=GAMMA).double().numpy()
+        return {"dinov2": features.numpy(), "zscore": zscore(features, alpha=GAMMA).numpy()}
+
+    arrays = {"gamma": np.asarray(GAMMA)}
+    # The reference's evidence alone over check 1's seeds: its outputs over them would be gigabytes.
+    arrays.update(record_case("preprocessed", preprocessed_draw,
+                              lambda inputs: (run(inputs["pixels"], torch.float32),
+                                              run(inputs["pixels"], torch.float64)),
+                              store_inputs=False, summary=True))
     np.savez(FIXTURE / "preprocessed.npz", **arrays)
-    print(f"{FIXTURE}: REPA's and iREPA's DINOv2 preprocessing at 256 pixels")
+    print(f"{FIXTURE}: REPA's and iREPA's DINOv2 preprocessing at 256 pixels over check 1's seeds")
 
 
 if __name__ == "__main__":
