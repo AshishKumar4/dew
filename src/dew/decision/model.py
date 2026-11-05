@@ -12,7 +12,7 @@ from dew.decision.layout import DecisionInputs
 from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, ModelInputs
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
-from dew.nn.protocols import TokenModel, VocabularyRows, forward_method
+from dew.nn.protocols import TokenModel, VocabularyRows
 from dew.nn.scatter import gather_positions
 from dew.nn.visibility import block_ends, block_starts
 from dew.nn.wrapping import HeadedModel
@@ -98,10 +98,7 @@ class DecisionModel(HeadedModel):
             out = self.backbone.apply(backbone, *args, mutable=list(opened) or False, **kwargs)
             return out if opened else (out, {})
         # The backbone's final states: its `hidden_states`, or a native encoder's own forward.
-        states_method = forward_method(self.backbone, "hidden_states")
-        if states_method is None:
-            raise TypeError(f"a decision reads its backbone's final states, and a "
-                            f"{type(self.backbone).__name__} declares no hidden_states and no forward")
+        states_method = self.states_method
         laid = inputs.coordinates()
         # A row in blocks is read by the backbone's attention whole within each block, on the kinds
         # that read blocks (`AttentionMetadata.block_groups`); a row in order passes none.

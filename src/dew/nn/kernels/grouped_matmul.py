@@ -42,10 +42,10 @@ from jax._src.pallas.mosaic_gpu import (
 )
 from jax.custom_derivatives import SymbolicZero
 from jax.experimental.pallas import mosaic_gpu as plgpu, tpu as pltpu
-from jax.extend import core as jax_core
 
 from ..derivatives import Protected, declared_tangent, marked_call_p
 from ..precision import at_least_fp32, rounded_operand
+from ..programs import equations
 from . import generation, selection, tuning
 from .generation import INHERENT
 from .templates import base, bundles, mosaic, report, resources, tail as tail_of
@@ -149,13 +149,6 @@ EXACT_STEP = 64
 each add within a step's MMA chain, and exact sums promote only between steps."""
 
 
-def _equations(jaxpr):
-    """Every equation of `jaxpr` and of the programs nested in it, at any depth."""
-    yield from jaxpr.eqns
-    for inner in jax_core.subjaxprs(jaxpr):
-        yield from _equations(inner)
-
-
 def _lowers(hook, tiles: tuple, sides, rules) -> bool:
     """Whether a Pallas lowering's `rules` hold a rule for every primitive of `hook` on its `tiles` and its
     side tiles: Mosaic GPU's, at warpgroup semantics, have none for a transpose, which Triton's lowering
@@ -163,7 +156,7 @@ def _lowers(hook, tiles: tuple, sides, rules) -> bool:
     if hook is None:
         return True
     return all(equation.primitive in rules or equation.primitive is marked_call_p
-               for equation in _equations(jax.make_jaxpr(hook)(*tiles, *sides).jaxpr))
+               for equation in equations(jax.make_jaxpr(hook)(*tiles, *sides).jaxpr))
 
 
 def _hooks_lower(ba, dtype, rules) -> bool:

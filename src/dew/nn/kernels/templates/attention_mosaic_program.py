@@ -43,7 +43,7 @@ from dew.nn.kernels.templates.attention import (
     whole,
 )
 from dew.nn.kernels.templates.cost import estimate
-from dew.nn.programs import CALLS
+from dew.nn.programs import CALLS, equations
 
 QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name})
 """The bundles the attention mainloop is qualified on: wgmma's, with a producer and with consumers that
@@ -503,13 +503,6 @@ def _varying_slopes(score_mod, params: tuple, graded: tuple[Kind, ...]) -> int:
     return count
 
 
-def _holds_custom_vjp(jaxpr: jax_core.Jaxpr) -> bool:
-    """Whether `jaxpr` calls a `jax.custom_vjp`, itself or within a call it makes."""
-    return any(equation.primitive is jax_core.primitives.custom_vjp_call_p
-               or any(_holds_custom_vjp(inner) for inner in jax_core.jaxprs_in_params(equation.params))
-               for equation in jaxpr.eqns)
-
-
 def _reaches_custom_vjp(jaxpr: jax_core.Jaxpr, starts: set) -> bool:
     """Whether any of `starts`, `jaxpr`'s inputs, reaches a `jax.custom_vjp` call along its tangent
     (`_tangent_reach`)."""
@@ -522,7 +515,7 @@ def _tangent_reach(jaxpr: jax_core.Jaxpr, starts: set) -> tuple[bool, set]:
     sub-program takes the call's operands and gives its outputs in order (a jit's, a custom JVP's), by the
     operands reached into that program and the outputs it reaches back out; through any other holding a
     sub-program, a branch or a loop body not followed operand by operand, wherever that program calls one
-    (`_holds_custom_vjp`), else to every output."""
+    (`_primitives`), else to every output."""
     reached = set(starts)
     for equation in jaxpr.eqns:
         hit = [index for index, var in enumerate(equation.invars)
@@ -540,7 +533,7 @@ def _tangent_reach(jaxpr: jax_core.Jaxpr, starts: set) -> tuple[bool, set]:
             reached.update(out for out, inner_out in zip(equation.outvars, inner[0].outvars, strict=True)
                            if inner_out in outputs)
             continue
-        if any(_holds_custom_vjp(program) for program in inner):
+        if any(jax_core.primitives.custom_vjp_call_p.name in _primitives(program) for program in inner):
             return True, set()
         reached.update(equation.outvars)
     return False, {var for var in jaxpr.outvars if not isinstance(var, jax_core.Literal) and var in reached}
@@ -614,12 +607,8 @@ def _entrywise(jaxpr: jax_core.Jaxpr, inputs: set[int], tile: tuple[int, int]) -
 
 
 def _primitives(jaxpr: jax_core.Jaxpr) -> set[str]:
-    """The names of the operations of `jaxpr` and of every jaxpr inside it."""
-    names = {eqn.primitive.name for eqn in jaxpr.eqns}
-    for eqn in jaxpr.eqns:
-        for inner in jax_core.jaxprs_in_params(eqn.params):
-            names |= _primitives(inner)
-    return names
+    """The names of the operations of `jaxpr` and of every jaxpr inside it (`dew.nn.programs.equations`)."""
+    return {eqn.primitive.name for eqn in equations(jaxpr)}
 
 
 def _columns(array: jax.Array, unit: int) -> jax.Array:
