@@ -118,10 +118,11 @@ def as_service(held):
         sys.meta_path[:] = finders
 
 
-def live_kernel(service, tmp_path):
+def live_kernel(service, tmp_path, served=None):
     """The live page's two sides over a tiny run: the guest's client (its contract read from Dew), the tiny
     run's pipeline, and the shared process's native models serving it through an engine, as "model" at
-    "pinned", with the guidance record and solvers it takes from Dew."""
+    "pinned", with the guidance record and solvers it takes from Dew. `served` makes the engine's image
+    kind of the pipeline's (`TextToImage.scoring`), a double of it where a test hands one."""
     import numpy as np
     from test_inference import make_run
 
@@ -135,7 +136,8 @@ def live_kernel(service, tmp_path):
     pipe = TextToImage.from_run(str(tmp_path))
     native = service.NativeModels.__new__(service.NativeModels)
     native.np, native.progress, native.pipe = np, progress, pipe
-    native.images = ScoringServer.from_task(*pipe.scoring(images=1))
+    scoring, variables = pipe.scoring(images=1)
+    native.images = ScoringServer.from_task(scoring if served is None else served(scoring), variables)
     native.engine = Engine(native.images)
     native.engine.start()
     native.cfg = sampling.CFG
@@ -347,18 +349,21 @@ def test_a_guest_whose_queued_request_times_out_frees_its_admission_and_its_requ
     assert behind.cancelled() and not ahead.cancelled()
 
 
-def test_a_guest_whose_request_fails_in_the_engine_hears_why_and_is_admitted_again(service, tmp_path,
-                                                                                   monkeypatch):
+def test_a_guest_whose_request_fails_in_the_engine_hears_why_and_is_admitted_again(service, tmp_path):
     """A request whose pass fails stops the engine: its connection hears the failure and nothing after it,
     and the guest is admitted again."""
+    import dataclasses
+
     from dew.inference.images import ImageScoring
 
-    _, _, native = live_kernel(service, tmp_path)
+    class Failing(ImageScoring):
+        def forward(self, variables, rows):
+            raise RuntimeError("an injected pass failure")
 
-    def failing(self, variables, rows):
-        raise RuntimeError("an injected pass failure")
+    def failing(scoring):
+        return Failing(**{field.name: getattr(scoring, field.name) for field in dataclasses.fields(scoring)})
 
-    monkeypatch.setattr(ImageScoring, "forward", failing)
+    _, _, native = live_kernel(service, tmp_path, served=failing)
     path = tmp_path / "model.sock"
     with serving(service, native, path):
         failed, lines = connected(path, SLOW)

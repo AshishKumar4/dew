@@ -57,7 +57,18 @@ from flax.linen.module import Interceptor
 from flax.nnx import bridge
 
 from dew._records import finite
-from dew.batch import FROZEN, Path, Variables, freeze, merge as overlay, part, select, thaw, unboxed
+from dew.batch import (
+    FROZEN,
+    Path,
+    Variables,
+    freeze,
+    leaves_by_path,
+    merge as overlay,
+    part,
+    select,
+    thaw,
+    unboxed,
+)
 from dew.cache import INTERCEPTED
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
@@ -617,8 +628,7 @@ class AdapterSet:
         if any(unadapted(adapter.model) != base for adapter in adapters.values()):
             raise ValueError("an adapter set's adapters are bound over one base model")
         weights = unboxed(thaw(first.variables))
-        factors = {name: traverse_util.flatten_dict(unboxed(adapter.variables)["params"])
-                   for name, adapter in adapters.items()}
+        factors = {name: leaves_by_path(adapter.variables["params"]) for name, adapter in adapters.items()}
         paths = sorted({path for adapter in adapters.values() for path in adapter.targets})
         stacked, scales, targets = {}, {}, {}
         for path in paths:
