@@ -33,7 +33,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.algebra import derive, rewritten
-from dew.algebra.forms import Accumulated, Added, Operand, derived_on
+from dew.algebra.forms import Accumulated, Added, Merged, Operand, derived_on
 from dew.nn.kernels.templates import layout, product
 from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Draw, within
 from dew.nn.precision import float32_einsum, two_product, two_sum
@@ -1485,18 +1485,27 @@ def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     """Two states over disjoint keys as one, `first`'s keys before `second`'s: each taken to the larger
     maximum and summed, in that order. Either may hold no key whatever the call (a slice past a row's
     keys), so `empty` is its identity under every spec. Behind the switch, the derived forms'
-    (`dew.algebra.forms.derived`, `_derived_merge`)."""
-    if states_derived(spec, first, second):
+    (`dew.algebra.forms.derived`, `_derived_merge`), a guarded state's join of its sums the template's
+    (`_guarded_merge`) over the factors they evaluate."""
+    if states_derived(spec, first._replace(guard=None), second._replace(guard=None)):
         return _derived_merge(spec, first, second)
     m = jnp.maximum(first.m, second.m)
     safe = jnp.where(m == -jnp.inf, 0.0, m)
+    factors = carried(spec, first.m, safe), carried(spec, second.m, safe)
     if first.guard is None and second.guard is None:
-        a, b = carried(spec, first.m, safe), carried(spec, second.m, safe)
+        a, b = factors
         acc = expand(a, first.acc) * first.acc + expand(b, second.acc) * second.acc
         return Partial(acc, m, a * first.total + b * second.total)
+    return _guarded_merge(first, second, m, factors)
+
+
+def _guarded_merge(first: Partial, second: Partial, m: jax.Array, factors: tuple[jax.Array, jax.Array]
+                   ) -> Partial:
+    """`merge`'s join of two states one of which is guarded (`Guard`), each taken to the joined maximum `m` by
+    its factor of `factors`, its shifted sums at the larger shift, or more where the join overflows, and its
+    unshifted ones beside them."""
     ones, others = headroom_of(first), headroom_of(second)
     reach = jnp.maximum(ones.reach, others.reach)
-    factors = carried(spec, first.m, safe), carried(spec, second.m, safe)
     natural = (power2(factors[0] * first.total, ones.shift)
                + power2(factors[1] * second.total, others.shift))
 
@@ -1930,23 +1939,39 @@ def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
 
 def _rows(state: Partial) -> Partial:
     """`state` with its leading axes and its rows one axis of rows (`acc` `[rows, Dv]`, `m` and `total`
-    `[rows]`): each row's softmax is its own, so a merge or a finish of a split decode's states
-    (`[..., splits, ..., bq]`, `decode_attention._combined`) is the declaration's over all their rows."""
-    return state._replace(acc=state.acc.reshape(-1, state.acc.shape[-1]), m=state.m.reshape(-1),
-                          total=state.total.reshape(-1))
+    `[rows]`, a guard's alike): each row's softmax is its own, so a merge or a finish of a split decode's
+    states (`[..., splits, ..., bq]`, `decode_attention._combined`) is the declaration's over all their
+    rows."""
+    leading = state.m.ndim
+    return jax.tree.map(lambda part: part.reshape(-1, *part.shape[leading:]), state)
 
 
 def _derived_merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     """`merge` by the derived forms (`_stated`'s), over the states' rows whatever their leading axes
-    (`_rows`)."""
-    flat = _rows(first)
+    (`_rows`): a guarded state's sums joined as the template joins them (`_guarded_merge`) over the
+    factors the forms evaluate, through the forms' merge hook."""
+    flat, other = _rows(first), _rows(second)
     key, shapes = _stated(spec, flat)
     fields = _slotted(key, shapes)
-    other = _rows(second)
+    joined: list[Partial] = []
+
+    def own(firsts, seconds, parts):
+        del firsts, seconds
+        factor = dict(zip(fields, parts, strict=True))["total"]
+        assert isinstance(factor, Merged)
+        m = jnp.maximum(flat.m, other.m)
+        joined.append(_guarded_merge(flat, other, m, (factor.first, factor.second)))
+        return tuple(getattr(joined[0], field) if field in ("acc", "total") else None for field in fields)
+
+    guarded = first.guard is not None or second.guard is not None
     merged = derived_forms(*key).merge(tuple(getattr(flat, field) for field in fields),
-                                       tuple(getattr(other, field) for field in fields), shapes=shapes)
-    return Partial(**{field: value.reshape(getattr(first, field).shape)
-                      for field, value in zip(fields, merged, strict=True)})
+                                       tuple(getattr(other, field) for field in fields), shapes=shapes,
+                                       merged=own if guarded else None)
+    found = Partial(**dict(zip(fields, merged, strict=True)))
+    if joined:
+        found = found._replace(guard=joined[0].guard)
+    leading = first.m.shape
+    return jax.tree.map(lambda part: part.reshape(*leading, *part.shape[1:]), found)
 
 
 def _derived_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
