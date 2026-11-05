@@ -14,7 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from dew._coordination import agreed
+from dew._coordination import agreed, from_every_process
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.records import ProfileTraced, Record
 from dew.training.tracker import LocalTracker
@@ -38,12 +38,17 @@ class ProfileWindow:
     host events at level 2, no Python calls (the Python tracer slows Python-heavy host work several
     times over), and on GPU at most its `activity_cap` CUDA activity events.
 
+    A window that names no `directory` is a run's own (`dew.config.TrainerConfig.profile`, which every
+    run holds by default): its capture is kept with the run's records, under its directory, and taken
+    where the process can take one (`capturable`), none under JAX's AutoPGLE, inside another capture or
+    without XProf, where a window naming its directory refuses to run.
+
     `dew.Profiler` is the other way to capture a trace, as a context manager
     around any code; a fit refuses to schedule a window inside one. The loop
     reports the window it wrote as the `ProfileTraced` record of
     `dew.telemetry.records`.
     """
-    directory: str
+    directory: str | None
     steps: int
     warmup: int = 2
     capture: telemetry_profile.CaptureOptions = dataclasses.field(
@@ -67,6 +72,16 @@ PGLE_CAPTURE = (
     "JAX_ENABLE_PGLE=1 to fill the compilation cache with the guided programs, then capture a run under "
     "JAX_COMPILATION_CACHE_EXPECT_PGLE=1, which loads them")
 """Why a capture refuses to run where JAX's AutoPGLE profiles programs, and JAX's own way round it."""
+
+
+def capturable() -> bool:
+    """Whether every process can take a capture: none holds another (`dew.Profiler`), none runs under
+    JAX's AutoPGLE (`pgle_runs`) and XProf reports on each (`profile_support`); a run's own window
+    (`ProfileWindow`, no `directory`) is taken where they can, a window naming its directory refuses
+    where they cannot (`owned_capture`)."""
+    local = (telemetry_profile.active_profile() is None and not pgle_runs()
+             and telemetry_profile.profile_support() is not None)
+    return all(from_every_process(local))
 
 
 def owned_capture(window: ProfileWindow | None) -> "Profiler | None":
@@ -94,6 +109,10 @@ def owned_capture(window: ProfileWindow | None) -> "Profiler | None":
         if pgle_runs():
             raise ValueError(PGLE_CAPTURE)
         telemetry_profile.require_profile_support()
+        if window.directory is None:
+            raise ValueError("a run's own profile window is kept under the run's directory, which its "
+                             "config names (`dew.config.TrainerConfig.profile`); a trainer given a window "
+                             "names its directory")
         return telemetry_profile.Profiler(window.directory, options=window.capture.profile_options())
 
     return agreed("profiling window setup", own_window)

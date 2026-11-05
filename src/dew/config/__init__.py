@@ -571,10 +571,15 @@ class TrainerConfig:
     """Microbatches a pipelined step feeds through the mesh's stages, a
     multiple of `mesh.stage`; unset feeds one a stage."""
     layout: Layout = dataclasses.field(default_factory=Layout)
-    profile: ProfileWindow | None = None
+    profile: ProfileWindow | None = dataclasses.field(
+        default_factory=lambda: ProfileWindow(None, 2, warmup=10))
     """One profiler window: the steps to trace, the warmup before them and the output directory.
 
-    Unset traces nothing.
+    By default every run traces two of its steps once ten have run past its first compile, through Dew's
+    own profiler, kept with its records under its directory (`profile`, a window naming no directory),
+    where the process can take a capture (`dew.training.profiling.capturable`): a capture's fixed cost,
+    about a second on a CPU host whatever its steps (row 4112), a run of minutes does not see, and a run
+    shorter than its warmup takes none. None traces nothing.
     """
     compilation_cache_dir: str | None = None
     """The directory of JAX's persistent compilation cache, so a restart skips recompiling the step.
@@ -749,6 +754,19 @@ class TrainerConfig:
     def directory(self, name: str) -> str:
         """The directory of the run `name`'s checkpoints and record, in `checkpoint_dir`."""
         return os.path.join(self.checkpoint_dir, name)
+
+    def window(self, directory: str) -> ProfileWindow | None:
+        """The profile window the run under `directory` traces: `profile` as it names its directory, a run's
+        own (no directory) kept under the run's (`directory/profile`) where the process can take a capture
+        (`capturable`), none where it cannot or the run traces none."""
+        from dew.training.profiling import capturable
+
+        window = self.profile
+        if window is None or window.directory is not None:
+            return window
+        if not capturable():
+            return None
+        return dataclasses.replace(window, directory=os.path.join(directory, "profile"))
 
     def checkpoints(self, name: str) -> Checkpoints:
         """The checkpoints of the run `name` in `checkpoint_dir` (`directory`), keeping `keep`, with its
@@ -2021,7 +2039,8 @@ class RunConfig:
             # and the rest are fit's arguments or built the checkpoints and the tracker.
             ahead = None if trainer.ahead is None else AheadOfTime.load(trainer.ahead)
             built = self.built(objective, trainer.mesh, rollout, checkpoints=checkpoints, tracker=tracker,
-                               profile=trainer.profile, lower_for=trainer.lower_for, ahead=ahead)
+                               profile=trainer.window(checkpoints.directory), lower_for=trainer.lower_for,
+                               ahead=ahead)
 
             def record_run() -> None:
                 """Write the run's record and name where it is tracked, on rank zero."""
