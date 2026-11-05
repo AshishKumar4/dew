@@ -455,8 +455,16 @@ class Processor:
             audio_fields, audio_conditioning = self._audio(values, tokens)
             token_fields.update(audio_fields)
             conditioning = {**conditioning, **audio_conditioning}
-        if np.any(tokens < 0) or np.any(tokens >= self.vocab_size):
-            raise ValueError("input_ids must lie in the text vocabulary, including any hard media ranges")
+        # A placeholder its media fill reads no embedding row, so it may lie past the text vocabulary (Kimi
+        # K2.5's video placeholder), as its model zeroes it before the lookup.
+        filled = np.zeros(tokens.shape, bool)
+        for field in ("image_indices", "audio_indices"):
+            if field in token_fields:
+                filled |= np.asarray(token_fields[field]) >= 0
+        text = tokens[~filled]
+        if np.any(text < 0) or np.any(text >= self.vocab_size):
+            raise ValueError("input_ids must lie in the text vocabulary, including any hard media ranges, "
+                             "save the placeholders media fill")
         prepared = ModelInputs(jnp.asarray(tokens, jnp.int32), token_fields, conditioning)
         prepared.validate()
         return prepared
