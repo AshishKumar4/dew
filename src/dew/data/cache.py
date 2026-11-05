@@ -649,7 +649,13 @@ class _Writer:
                 raise
 
     def _published(self) -> None:
+        """Publish the stream's generation once as many writers have sealed as its store has shards: each
+        shard's writer seals as it reads the shard whole, so the publication's check of every sealed
+        record runs once a stream ends, not at each of its shards' ends (row 4211)."""
         assert self.source is not None
+        fs, path = self.root.child("segments").resolve()
+        if len(fs.glob(f"{path}/*/seal.json")) < len(self.source.manifest().shards):
+            return
         try:
             with ExitStack() as pins:
                 _publish(self.cache, self.key, self.source, None, pins, of_several=True)
