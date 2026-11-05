@@ -55,7 +55,7 @@ CONTRACTED = {
     "src/dew/diffusion/schedules/flow.py::time_shift":
         ("test_a_time_shift_holds_every_order", NUMERICS),
     "src/dew/nn/inspection.py::tapped":
-        ("test_a_probes_tap_holds_its_orders", KERNEL),
+        ("test_a_probes_tap_holds_its_orders", SURROGATE),
     "src/dew/nn/categorical.py::_probabilities":
         ("test_the_categorical_losses_hold_every_order", NUMERICS),
     "src/dew/nn/categorical.py::label_terms":

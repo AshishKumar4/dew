@@ -15,7 +15,6 @@ from typing import TypeGuard
 
 import jax
 import jax.extend.core as jcore
-from jax.extend import random as jax_random
 from jax.interpreters import ad
 
 CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat2", "checkpoint", "custom_jvp_call",
@@ -87,25 +86,21 @@ def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
 
 @functools.cache
 def _jax_own() -> Mapping[jcore.Primitive, str]:
-    """JAX's own operations by their objects: `jax.lax`'s and `jax.extend.random`'s, the sum JAX's
-    derivatives add with (`add_any`), and those its public random functions bind, which no module of
-    JAX's exports (`random_wrap`, `random_split`, `random_fold_in`, `random_bits`, `random_unwrap`), read
-    off a trace of them once asked."""
-    def drawn(seed_words):
+    """JAX's own operations by their objects: every primitive `jax.lax`, `jax.lax.linalg` and
+    `jax.extend.core.primitives` export (the random operations' `random_seed`, `random_split`,
+    `random_fold_in`, `random_bits` and `random_gamma` among them, and the sum JAX's derivatives add with,
+    `add_any`), and the three its public random functions bind that no module of JAX's exports
+    (`random_wrap`, `random_unwrap`, `random_clone`), read off a trace of them once asked."""
+    def keyed(seed_words):
         # A key of its own implementation, whichever the process's default is (`jax_default_prng_impl`).
-        first, _ = jax.random.split(jax.random.wrap_key_data(seed_words, impl="threefry2x32"))
-        return jax.random.bits(jax.random.fold_in(first, 1), ()), jax.random.key_data(first)
+        key = jax.random.wrap_key_data(seed_words, impl="threefry2x32")
+        return jax.random.key_data(jax.random.clone(key))
 
-    def each(jaxpr: jcore.Jaxpr):
-        for equation in jaxpr.eqns:
-            yield equation.primitive
-            for inner in jcore.jaxprs_in_params(equation.params):
-                yield from each(inner)
-
-    traced = jax.make_jaxpr(drawn)(jax.ShapeDtypeStruct((2,), jax.numpy.uint32)).jaxpr
-    exported = (primitive for module in (jax.lax, jax_random) for attribute, primitive in vars(module).items()
-                if attribute.endswith("_p") and isinstance(primitive, jcore.Primitive))
-    return {primitive: primitive.name for primitive in (*exported, *each(traced), ad.add_jaxvals_p)}
+    traced = jax.make_jaxpr(keyed)(jax.ShapeDtypeStruct((2,), jax.numpy.uint32)).jaxpr
+    exported = (primitive for module in (jax.lax, jax.lax.linalg, jcore.primitives)
+                for primitive in vars(module).values() if isinstance(primitive, jcore.Primitive))
+    return {primitive: primitive.name
+            for primitive in (*exported, *(equation.primitive for equation in traced.eqns), ad.add_jaxvals_p)}
 
 
 def jax_name(primitive) -> str | None:
