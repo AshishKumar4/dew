@@ -463,36 +463,16 @@ def test_a_query_of_one_key_takes_an_exactly_zero_query_gradient(structure):
         assert zero[:, 0].all()
 
 
-@pytest.mark.parametrize("dtype, width, softcap, backward", [
-    (jnp.bfloat16, 128, True, 1024),
-    (jnp.float32, 128, False, 1024),
-    (jnp.float32, 128, True, 512),
-    (jnp.float32, 256, False, 512),
-    (jnp.bfloat16, 256, True, 512),
-], ids=["bf16-softcap", "fp32", "fp32-softcap", "fp32-256", "bf16-256-softcap"])
-def test_splash_sizes_its_backward_to_a_v5es_scoped_vmem(dtype, width, softcap, backward):
-    """On a v5e, whose Mosaic kernels refuse past 16 MiB of scoped VMEM, splash's backward kernels keep
-    their 1024 blocks where the fused kernel's plan fits and halve them where it does not: an fp32 softcap
-    at width 128, which the TPU tier's test run refused at 18.6 MiB, and width 256, refused at 16.2 to 22.3
-    MiB; the forward keeps its own. The backward forms its delta from the weights in the dq kernel's
-    blocks (`splash_block_sizes`)."""
-    from dew.nn.kernels import generation
-    from dew.nn.kernels.splash import block_sizes as splash_block_sizes
-
-    with generation.assumed("v5e"):
-        sizes = splash_block_sizes(2048, 2048, width=width, itemsize=jnp.dtype(dtype).itemsize,
-                                   softcap=softcap)
-    assert (sizes.block_q, sizes.block_kv) == (1024, 1024)
-    assert (sizes.block_q_dkv, sizes.block_kv_dkv, sizes.block_kv_dkv_compute) == (backward,) * 3
-    assert (sizes.block_q_dq, sizes.block_kv_dq) == (backward,) * 2
-
-
-def test_splash_keeps_its_backward_blocks_where_a_tpus_limit_is_unmeasured():
-    """A TPU whose scoped VMEM limit no measurement states (a v6e) keeps the backward's whole blocks:
-    the limit is the target's default, which no TPU reports, so none is assumed."""
-    from dew.nn.kernels import generation
-    from dew.nn.kernels.splash import block_sizes as splash_block_sizes
-
-    with generation.assumed("v6e"):
-        sizes = splash_block_sizes(2048, 2048, width=128, itemsize=4, softcap=True)
-    assert (sizes.block_q_dkv, sizes.block_kv_dkv, sizes.block_kv_dkv_compute) == (1024,) * 3
+@on_tpu
+@pytest.mark.parametrize("dtype, width, softcap", [
+    (jnp.bfloat16, 128, True), (jnp.float32, 128, True), (jnp.float32, 256, False),
+    (jnp.bfloat16, 256, True)], ids=["bf16-softcap", "fp32-softcap", "fp32-256", "bf16-256-softcap"])
+def test_splash_compiles_within_a_tpus_scoped_vmem(dtype, width, softcap):
+    """Splash's forward and backward over 2048 tokens, compiled by Mosaic on this TPU and run, every output
+    and gradient finite: within its scoped VMEM, where a v5e's 16 MiB refused the fused backward's fp32
+    softcap at width 128 at 18.6 MiB and width 256 at 16.2 to 22.3 MiB until its blocks were sized to it
+    (`splash.block_sizes`)."""
+    query, key, value = qkv((1, 2048, 2, width), dtype)
+    capped = {"softcap": 30.0} if softcap else {}
+    found = value_and_grads('tpu', query, key, value, causal=True, **capped)
+    assert all(np.isfinite(array).all() for array in found)

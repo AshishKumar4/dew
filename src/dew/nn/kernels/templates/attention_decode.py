@@ -124,7 +124,7 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     whole step took 13)."""
     op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=False,
                                               out_dtype=jnp.float32, masked=True, table=table,
-                                              sources=sources)
+                                              sources=sources, subtracted=True)
     ba = op.bind(*args, residuals=Kept.OUTPUT, interpret=False)
     config = op.derived(ba, target)
     if config is None:
@@ -156,8 +156,8 @@ def merged(spec: algebra.Forward, out: jax.Array, maximum: jax.Array, total: jax
     its normalized output and its mass, its denominator folded into its maximum (`m + log(total)`), so no
     output multiplied back by its denominator passes fp32's largest; a state of no mass adds nothing, and a
     row of none is zero, as the reference's."""
-    if not spec.natural:
-        raise ValueError("the template's decode merges natural states")
+    if not (spec.natural or spec.raw):
+        raise ValueError("the template's decode merges natural states or a raw fold's")
     m, mass = (jnp.transpose(array, (0, 2, 3, 1)) for array in (maximum, total))
     if initial is not None:
         held = initial.total > 0
@@ -175,14 +175,15 @@ def merged(spec: algebra.Forward, out: jax.Array, maximum: jax.Array, total: jax
 
 
 def _spec(query: jax.Array, spans: KeySpans, hooks: Hooks, *, scale: float | None) -> algebra.Forward:
-    """The natural form of the call as the template's forward takes it (`attention_mosaic_forward._prepared`):
-    the units its finished rows' maxima are in (`algebra.finished_rows`: natural from the fold and from the
-    fast form a score hook keeps, its rewalk's, `algebra.unfolded`), which its merge takes."""
+    """The call's form as the template's forward takes it (`attention_mosaic_forward._prepared`), its fold of
+    raw products (`algebra.Forward.subtracted`): the units its finished rows' maxima are in
+    (`algebra.finished_rows`: raw products where its fold keeps them, else natural, a score hook's fold's
+    rewalk's, `algebra.unfolded`), which its merge takes."""
     power, factor = prescale(query.dtype, query.shape[3], scale)
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=factor,
                            score_mod=hooks.score_mod, natural=False, initial=hooks.initial is not None,
-                           prescale=power)
-    return spec if spec.natural else algebra.unfolded(spec)
+                           prescale=power, subtracted=True)
+    return spec if spec.natural or spec.raw else algebra.unfolded(spec)
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
@@ -218,12 +219,12 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
         with tuning.pinned({attention_mosaic.MosaicForward: work.config}):
             out = attention_mosaic.forward(rows, key, value, row_spans, whole, scale=scale, natural=False,
                                            residuals=Kept.NONE, interpret=interpret, masked=True, table=table,
-                                           sources=sources)
+                                           sources=sources, subtracted=True)
         return ungrouped_rows(out, heads)
     with tuning.pinned({attention_mosaic.MosaicForward: work.config}):
         out, maximum, total = attention_mosaic.forward(
             rows, key, value, row_spans, walked, scale=scale, natural=False, residuals=Kept.OUTPUT,
             interpret=interpret, out_dtype=jnp.float32, masked=True, splits=work.slices, table=table,
-            sources=sources)[:3]
+            sources=sources, subtracted=True)[:3]
     merged_rows = merged(_spec(rows, row_spans, walked, scale=scale), out, maximum, total, initial)
     return ungrouped_rows(merged_rows, heads).astype(query.dtype)
