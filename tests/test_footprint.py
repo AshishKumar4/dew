@@ -428,11 +428,25 @@ def test_a_scatter_whose_updates_read_its_base_holds_them_apart():
         indices = jnp.arange(10 * size, dtype=jnp.int32) % size
         return flat.at[indices].add(jnp.concatenate([flat] * 10))
 
-    def peak(function):
-        return peak_bytes(simplified(jax.make_jaxpr(function)(*shapes).jaxpr, "gpu"), "gpu", Workspace(0, 0))
+    def peak(function, *specs):
+        return peak_bytes(simplified(jax.make_jaxpr(function)(*(specs or shapes)).jaxpr, "gpu"), "gpu",
+                          Workspace(0, 0))
 
     assert peak(viewed) >= 2 * size * 4, peak(viewed)
     assert peak(repeated) >= (1 + 10 + 1) * size * 4, peak(repeated)
+
+    # So where the base is the program's input, or a view of it: the updates' ten copies and the result.
+    def into_input(flat):
+        indices = jnp.arange(10 * size, dtype=jnp.int32) % size
+        return flat.at[indices].add(jnp.concatenate([flat] * 10))
+
+    def into_view(square):
+        flat = square.reshape(size)
+        indices = jnp.arange(10 * size, dtype=jnp.int32) % size
+        return flat.at[indices].add(jnp.concatenate([flat] * 10))
+
+    assert peak(into_input, jax.ShapeDtypeStruct((size,), jnp.float32)) >= (10 + 1) * size * 4
+    assert peak(into_view, jax.ShapeDtypeStruct((size // 256, 256), jnp.float32)) >= (10 + 1) * size * 4
 
 
 def test_a_transposed_input_returned_flat_is_a_copy():
