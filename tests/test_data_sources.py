@@ -1605,8 +1605,8 @@ def test_closing_a_compiled_from_iter_reader_finalizes_its_native_generators(cyc
         finalizers.append(finalized)
         return iterator
 
-    source = from_iter(factory, identity="closing-generator@1").repeat()
-    source = (source.interleave(cycle) if cycle > 1 else source).batch(2)
+    source = from_iter(factory, identity="closing-generator@1")
+    source = (source.interleave(cycle) if cycle > 1 else source).repeat().batch(2)
     reader = compile(source, read="streamed", loading=Loading(workers=0, threads=1, read_buffer=1)
                      ).train(DataPartition())
     try:
