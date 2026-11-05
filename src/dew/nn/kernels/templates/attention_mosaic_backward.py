@@ -138,9 +138,9 @@ def _centre_launch(query, key, value, dout, peak, spans: _Spans | None, score_pa
         grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
         interpret=walk.interpret, approx_math=False, name="attention_centre",
         # Its `S` and `dP`, recomputed for dropout's first pass: the hardware's alone.
-        cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, width + value.shape[-1], query,
+        cost=stated(walk.spec, batch, heads, width + value.shape[-1], query,
                     key, value, dout,
-                    blocks=(program.tiles.block_q, program.tiles.block_k)),
+                    extents=(queries, key.shape[1]), blocks=(program.tiles.block_q, program.tiles.block_k)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries, 0)
     )(query, key, value, dout, peak, *leaves)
     return gradient.Centre(out[0], out[1] > 0, out[2:2 + parts], out[2 + parts:])

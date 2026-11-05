@@ -493,11 +493,12 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
         # The products this launch issues (`stated`): its `S` and `dP` recomputed, its share of dV's, and
         # each part of its share of dK's and of dQ's where it adds it (`part_count`); the model's of them it
         # owns (`modelled`): its shares of dK's and dV's, dP's in the first share's and dQ's where it adds it.
-        cost=stated(walk.spec, batch, heads, walk.spec.queries or queries,
+        cost=stated(walk.spec, batch, heads,
                     width + value_width + shares[1][1]
                     + part_count(query.dtype, walk.accurate)
                     * (shares[0][1] + (width if walk.fused else 0)),
                     query, key, value, dout,
+                    extents=(queries, keys_padded),
                     blocks=(walk.program.tiles.block_q, walk.program.tiles.block_k)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              (width if walk.fused else 0) + shares[0][1] + shares[1][1]

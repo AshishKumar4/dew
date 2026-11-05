@@ -688,31 +688,33 @@ def reached(spec: algebra.Forward, queries: int) -> int | None:
     return None
 
 
-def issued(spec: algebra.Forward, queries: int, blocks: tuple[int, int]) -> int | None:
+def issued(spec: algebra.Forward, extents: tuple[int, int], blocks: tuple[int, int]) -> int | None:
     """The query and key pairs a launch walking tiles of `blocks` (a consumer's query block and the key
-    block) computes: each tile holding a pair its call reaches (`reached`), whole, its padded rows and a
-    causal diagonal tile's masked part computed with the rest (on an H100, the tensor pipes' counts of a
-    causal call at 2048 queries and 128-row tiles: 6.25% past its reached pairs, row 3948); None for a spans
-    call."""
-    block_q, block_k = blocks
-    query_tiles, key_tiles = -(-queries // block_q), -(-spec.keys // block_k)
+    block) over its padded `extents` (its queries' rows and keys, as its arrays hold them) computes: each tile
+    holding a pair its call's form reaches, whole, the first key aligned to the first query: its padded rows
+    (a padded consumer walks its keys as a real one does) and a causal diagonal tile's masked part computed
+    with the rest (on an H100, the tensor pipes' counts of a causal call at 2048 queries and 128-row tiles:
+    6.25% past its reached pairs, row 3948); None for a spans call."""
+    (queries, keys), (block_q, block_k) = extents, blocks
+    query_tiles, key_tiles = -(-queries // block_q), -(-keys // block_k)
     if spec.form == "full":
         return query_tiles * block_q * key_tiles * block_k
     if spec.form == "causal":
-        return sum(block_q * block_k * -(-min(spec.keys, min((tile + 1) * block_q, queries)) // block_k)
+        return sum(block_q * block_k * min(key_tiles, -(-(tile + 1) * block_q // block_k))
                    for tile in range(query_tiles))
     return None
 
 
-def stated(spec: algebra.Forward, batch: int, heads: int, queries: int, widths: int, *arrays,
+def stated(spec: algebra.Forward, batch: int, heads: int, widths: int, *arrays, extents: tuple[int, int],
            blocks: tuple[int, int]) -> pl.CostEstimate | None:
     """A launch's cost as it states it to XLA and to Dew's FLOP count (`dew.telemetry.instrumentation`), the
-    hardware's work: a multiply-add a pair its walk of `blocks` tiles issues (`issued`), head and row for each
+    hardware's work: a multiply-add a pair its walk of `blocks` tiles over its padded `extents` issues
+    (`issued`), head and row for each
     of `widths` product columns the launch issues, its recomputed ones (a backward's `S`) and each part a
     cotangent's product takes (`part_count`) among them, a transcendental an issued pair, and the bytes of
     each of `arrays` once; None for a spans call, whose pairs no launch knows (`reached`): its FLOPs count as
     unsized, never as 0. The model's share of it the launch declares apart (`modelled`)."""
-    pairs = issued(spec, queries, blocks)
+    pairs = issued(spec, extents, blocks)
     if pairs is None:
         return None
     return pl.CostEstimate(flops=2 * batch * heads * pairs * widths, transcendentals=batch * heads * pairs,
