@@ -201,11 +201,12 @@ class _Walk:
         if not any(isinstance(value, Reads) for value in given):
             return [None] * len(eqn.outvars), self.evaluated(eqn, operands)
         # Any operation but a call by its object: another's of a lax name reads its operands whole.
-        rule = _RULES.get(jax_name(eqn.primitive))
+        known = jax_name(eqn.primitive)
+        rule = None if known is None else _RULES.get(known)
         if rule is not None:
             return rule(self, eqn, given, operands), [None] * len(eqn.outvars)
         shape = _shape(eqn.outvars[0])
-        if jax_name(eqn.primitive) in _ENTRYWISE and all(_shape(var) == shape for var in eqn.outvars) and all(
+        if known in _ENTRYWISE and all(_shape(var) == shape for var in eqn.outvars) and all(
                 _fits(_shape(var), shape) for var, value in zip(eqn.invars, given, strict=True)
                 if isinstance(value, Reads)):
             return [_combined(given, shape)] * len(eqn.outvars), [None] * len(eqn.outvars)
