@@ -427,10 +427,10 @@ def _with_mode(findings: list, arms) -> list:
 def _truth_program(fn):
     """`fn`, a check's float64 truth, as the gate runs it, unrewritten (`arm_arithmetic.unrewritten`):
     compiled, once a signature, so the truth runs as one float64 program on the device's FP64 units rather
-    than one eager dispatch an equation, every primitive at its own float64 semantics. A truth the gate runs
-    as given (`as_given`: torch, a recording, a host loop), one compiled already (a jit, `dew_programs`), or
-    none, as it is; a window loop's by its own; a NumPy truth (its first call returns host values) as given
-    after that call. A JAX truth with host work inside fails at its trace, loudly, and passes `as_given`."""
+    than one eager dispatch an equation, every primitive at its own float64 semantics (`Truth`). A truth the
+    gate runs as given (`as_given`: NumPy, torch, a recording, a host loop), one compiled already (a jit,
+    `dew_programs`), or none, as it is; a window loop's by its own. A truth with host work inside that does
+    not state it fails at its trace, loudly, and passes `as_given`."""
     if fn is None or _given(fn) or getattr(fn, "dew_programs", False) or hasattr(fn, "lower"):
         return unrewritten(fn)
     if isinstance(fn, _Windowed):
@@ -1491,33 +1491,26 @@ def _cancelling_terms(draw, truth, program=None):
     alone before any arm runs (bible §7, ledger 2851): a row whose truth is exactly zero or cancels is judged
     at the size of what it sums, as the one-draw rule judges it, not held to the reference's residue there (a
     fused attention's causal first row, whose one key makes its gradient exactly zero in float64, its
-    rounding's residue Dew's and the reference's alike). None where no row is zero, or where the truth is not
-    a JAX program its terms can be traced from (run as given, recorded, a window loop's). `program`, the truth
-    as the draws run it (`_truth_program`), evaluates the first draw's truth, so its first call's run and
-    trace serve the draws too, once a process (a map task's draws, DRAWS); a reference standing for it runs
+    rounding's residue Dew's and the reference's alike). None where no row is zero, or where the site
+    states a truth no program's terms are traced from (run as given, recorded, a window loop's; ledger
+    3198): every other truth traces, and a failure to is the site's. `program`, the truth as the draws
+    run it (`_truth_program`), evaluates the first draw's truth, so its first call's run and trace serve
+    the draws too, once a process (a map task's draws, DRAWS); a reference standing for it runs
     compiled, not eagerly (ledger 3774)."""
     if truth is None or isinstance(truth, _Windowed) or _given(truth) or getattr(truth, "recorded", False):
         return None
     # The truth on the site's first draw, and its terms only where it holds a zero row: only a zero row whose
     # terms are not zero too gains a size, so a site whose zero rows sum nothing (a query that keeps no key)
-    # keeps the reference's residue rule without tracing its terms a draw. A truth whose program cannot be
-    # run or traced so (host work on its values, NumPy or torch; a kernel that refuses float64) has no
-    # terms: it keeps the residue rule and runs as it always has, the gate's own run of it reporting any
-    # failure of its own.
+    # keeps the reference's residue rule without tracing its terms a draw.
     run = program or unrewritten(jax.jit(truth))
-    try:
-        with jax.enable_x64(new_val=True):
-            leaves = [*map(np.asarray, jax.tree.leaves(run(*widened(draw(0)))))]
-            if not np.any(_LaidTruths.of(leaves).sizes == 0):
-                return None
-            truths, terms = float64_terms(truth, *widened(draw(0)))
-    except Exception as untraced:
-        found = f"untraced: {type(untraced).__name__}"
-    else:
-        plain, termed = _LaidTruths.of(jax.tree.leaves(truths)), _LaidTruths.of(
-            jax.tree.leaves(truths), _term_leaves(terms, truths))
-        found = bool(np.any((plain.sizes == 0) & (termed.sizes > 0)))
-    return truth if found is True else None
+    with jax.enable_x64(new_val=True):
+        leaves = [*map(np.asarray, jax.tree.leaves(run(*widened(draw(0)))))]
+        if not np.any(_LaidTruths.of(leaves).sizes == 0):
+            return None
+        truths, terms = float64_terms(truth, *widened(draw(0)))
+    plain, termed = _LaidTruths.of(jax.tree.leaves(truths)), _LaidTruths.of(
+        jax.tree.leaves(truths), _term_leaves(terms, truths))
+    return truth if bool(np.any((plain.sizes == 0) & (termed.sizes > 0))) else None
 
 
 def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn, library_row, library_leaves,
