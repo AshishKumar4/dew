@@ -574,7 +574,7 @@ class _Numbering:
             return self.number(("literal", str(value.aval), parameter_key(value.val)))
         return numbers.get(value)
 
-    def equation(self, equation, params: Mapping, operands: Sequence[int], shapes: Sequence) -> list[int]:
+    def equation(self, equation, params: Mapping, operands: Sequence, shapes: Sequence) -> list[int]:
         """The numbers of `equation`'s results over `operands` of `shapes` under `params`: an entry of a
         scalar's broadcast is the scalar, whatever shape it fills; an entrywise result's entry is its
         operands' entries'; any other's reads its operands' shapes too. A scalar's sum of scalars is one
@@ -593,41 +593,157 @@ class _Numbering:
     def program(self, equations, named: dict, leads: dict) -> dict:
         """Each value of `equations` over the inputs `named` to its expression's number, in program order, a
         stack's its rows' numbers, its leading axes of rows in `leads`, which this extends by each stack it
-        makes; a value that reads a stack otherwise than row by row (`_row_form`, `_full_sum`) has none."""
+        makes; a value that reads a stack otherwise than row by row (`made`) has none."""
         numbers = dict(named)
         for equation in equations:
             operands = [self.read(numbers, operand) for operand in equation.invars]
             if any(operand is None for operand in operands):
                 continue
-            stacked = [index for index, operand in enumerate(operands) if isinstance(operand, tuple)]
-            shapes = [operand.aval.shape for operand in equation.invars]
-            if not stacked:
-                made = self.equation(equation, equation.params, operands, shapes)
-                numbers.update(zip(equation.outvars, made, strict=True))
+            made = self.made(equation, operands, [leads.get(operand) if isinstance(number, tuple) else None
+                                                   for operand, number in zip(equation.invars, operands,
+                                                                              strict=True)])
+            if made is None:
                 continue
-            rows = {len(operands[index]) for index in stacked}
-            lead = {leads[equation.invars[index]] for index in stacked}
-            if len(rows) != 1 or len(lead) != 1:
-                continue
-            count, held = rows.pop(), lead.pop()
-            row_shapes = [shape[held:] if index in stacked else shape for index, shape in enumerate(shapes)]
-            every = _full_sum(equation, held)
-            if every is not None:
-                # A sum over every axis of a stack: the sum of each row's sum over its own axes.
-                terms = [self.equation(equation, every, [operands[0][row]], row_shapes)[0]
-                         for row in range(count)]
-                numbers[equation.outvars[0]] = self.summed(terms)
-                continue
-            form = _row_form(equation, held, set(stacked), shapes)
-            if form is None:
-                continue
-            by_row = [self.equation(equation, form, [operand[row] if isinstance(operand, tuple) else operand
-                                                     for operand in operands], row_shapes)
-                      for row in range(count)]
-            for index, out in enumerate(equation.outvars):
-                numbers[out] = tuple(made[index] for made in by_row)
-                leads[out] = held
+            for out, (number, lead) in zip(equation.outvars, made, strict=True):
+                numbers[out] = number
+                if lead is not None:
+                    leads[out] = lead
         return numbers
+
+    def made(self, equation, operands: list, leads: list) -> list[tuple] | None:
+        """`equation`'s results over numbered `operands` (a stack's held on its `leads`), each its number
+        and the leading axes of rows of a stack it makes: a loop or a branch read through its programs
+        (`inlined`); a stack's rows moved whole (`_moved`); an equation of no stack as it is; and one over
+        a stack row by row (`_row_form`), or a sum over every axis of one (`_full_sum`). None where a row
+        reads another."""
+        name = equation.primitive.name
+        if name in ("scan", "cond"):
+            return self.inlined(equation, operands, leads)
+        moved = _moved(equation, operands, leads)
+        if moved is not None:
+            return [moved]
+        stacked = [index for index, operand in enumerate(operands) if isinstance(operand, tuple)]
+        shapes = [operand.aval.shape for operand in equation.invars]
+        if not stacked:
+            return [(number, None) for number in self.equation(equation, equation.params, operands, shapes)]
+        if len({(len(operands[index]), leads[index]) for index in stacked}) != 1:
+            return None
+        count, held = len(operands[stacked[0]]), leads[stacked[0]]
+        row_shapes = [shape[held:] if index in stacked else shape for index, shape in enumerate(shapes)]
+        every = _full_sum(equation, held)
+        if every is not None:
+            # A sum over every axis of a stack: the sum of each row's sum over its own axes.
+            return [(self.summed([self.equation(equation, every, [operands[0][row]], row_shapes)[0]
+                                  for row in range(count)]), None)]
+        form = _row_form(equation, held, set(stacked), shapes)
+        if form is None:
+            return None
+        by_row = [self.equation(equation, form, [operand[row] if isinstance(operand, tuple) else operand
+                                                 for operand in operands], row_shapes)
+                  for row in range(count)]
+        return [(tuple(made[index] for made in by_row), held) for index in range(len(equation.outvars))]
+
+    def inlined(self, equation, operands: list, leads: list) -> list[tuple] | None:
+        """A loop's (`scan`) or a branch's (`cond`) results read through its programs over `operands`: a loop
+        of at most `UNROLLED` steps unrolled, its carry through each step and each step's slice of what it
+        scans, which a stack is none of; a branch's each program's results, one where they agree, else the
+        branch's choice among them, row by row of a stack. None for a longer loop."""
+        from dew.training.staging import flattened
+
+        def run(closed, values: list, held: list) -> list[tuple] | None:
+            body, results = flattened(closed.jaxpr, closed.jaxpr.invars, closed.consts)
+            inner = {var: lead for var, lead in zip(closed.jaxpr.invars, held, strict=True)
+                     if lead is not None}
+            numbers = self.program(body, dict(zip(closed.jaxpr.invars, values, strict=True)), inner)
+            out = [self.read(numbers, value) for value in results]
+            if any(number is None for number in out):
+                return None
+            return [(number, inner.get(value) if isinstance(number, tuple) else None)
+                    for number, value in zip(out, results, strict=True)]
+
+        params = equation.params
+        if equation.primitive.name == "scan":
+            consts, carries = params["num_consts"], params["num_carry"]
+            scanned = operands[consts + carries:]
+            if params["length"] > UNROLLED or any(isinstance(value, tuple) for value in scanned):
+                return None
+            carry = list(zip(operands[consts:consts + carries], leads[consts:consts + carries], strict=True))
+            steps: dict[int, list] = {}
+            order = range(params["length"] - 1, -1, -1) if params["reverse"] else range(params["length"])
+            for step in order:
+                sliced = [self.number(("scanned", value, step)) for value in scanned]
+                values = [*operands[:consts], *(number for number, _ in carry), *sliced]
+                held = [*leads[:consts], *(lead for _, lead in carry), *([None] * len(sliced))]
+                out = run(params["jaxpr"], values, held)
+                if out is None or any(isinstance(number, tuple) for number, _ in out[carries:]):
+                    return None
+                carry, steps[step] = out[:carries], [number for number, _ in out[carries:]]
+            stacked = [(self.number(("stacked steps", tuple(steps[step][index] for step in sorted(steps)))),
+                        None) for index in range(len(equation.outvars) - carries)]
+            return [*carry, *stacked]
+        index, *given = operands
+        if isinstance(index, tuple):
+            return None
+        branches = [run(branch, given, leads[1:]) for branch in params["branches"]]
+        if any(branch is None for branch in branches):
+            return None
+        chosen = []
+        for outs in zip(*branches, strict=True):
+            if len(set(outs)) == 1:
+                chosen.append(outs[0])
+            elif all(not isinstance(number, tuple) for number, _ in outs):
+                chosen.append((self.number(("branch", index, tuple(number for number, _ in outs))), None))
+            elif len({(len(number), lead) if isinstance(number, tuple) else None
+                      for number, lead in outs}) == 1:
+                rows = zip(*(number for number, _ in outs), strict=True)
+                chosen.append((tuple(self.number(("branch", index, row)) for row in rows), outs[0][1]))
+            else:
+                return None
+        return chosen
+
+
+UNROLLED = 256
+"""The longest loop the stage-local check reads through step by step (`_Numbering.inlined`), its program
+numbered once a step; a longer one keeps every layer whole."""
+
+
+def _moved(equation, operands: list, leads: list) -> tuple | None:
+    """A stack's rows moved whole, each row as it was: a reshape that keeps every row's own shape after
+    its rows' axes (merging, splitting or adding them, a value of no stack becoming a stack of one row,
+    one row its value again), a squeeze of its rows' axes of one row, a slice of rows along its one axis
+    of them, or a concatenation of stacks along it. None for any other equation."""
+    name, params = equation.primitive.name, equation.params
+    shape = tuple(equation.invars[0].aval.shape)
+    number, lead = operands[0], leads[0]
+    out = tuple(equation.outvars[0].aval.shape)
+    if name in ("reshape", "squeeze"):
+        if name == "reshape" and params.get("dimensions") is not None:
+            return None
+        held = 0 if lead is None else lead
+        row = shape[held:]
+        if len(out) < len(row) or (row and out[len(out) - len(row):] != row):
+            return None
+        rows = out[:len(out) - len(row)]
+        count = 1 if lead is None else len(number)
+        if math.prod(rows) != count or (name == "squeeze" and rows):
+            return None
+        if not rows:
+            # One row, its value again.
+            return (number[0], None) if isinstance(number, tuple) else None
+        return ((number,) if lead is None else number), len(rows)
+    if lead != 1:
+        return None
+    if name == "slice":
+        strides = params["strides"]
+        start, limit = tuple(params["start_indices"]), tuple(params["limit_indices"])
+        whole = start[1:] == (0,) * (len(shape) - 1) and limit[1:] == shape[1:]
+        if (strides is not None and any(stride != 1 for stride in strides)) or not whole:
+            return None
+        return number[start[0]:limit[0]], 1
+    if name == "concatenate" and params["dimension"] == 0 and all(
+            isinstance(operand, tuple) for operand in operands) and all(held == 1 for held in leads):
+        return tuple(row for operand in operands for row in operand), 1
+    return None
 
 
 _SHAPED = frozenset({"shape", "broadcast_dimensions", "sharding"})
