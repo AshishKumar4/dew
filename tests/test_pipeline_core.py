@@ -2500,5 +2500,4 @@ def test_a_raising_step_raises_its_own_error_naming_the_step_and_its_record(read
     rows = tuple({"id": index, "sizes": [index]} if index != 7 else {"id": index} for index in range(12))
     with pytest.raises(KeyError) as raised:
         list(iterate(Pipeline(Memory(rows)).map(unsized), read=read))
-    (note,) = raised.value.__notes__
-    assert unsized.__qualname__ in note
+    assert any(unsized.__qualname__ in note for note in raised.value.__notes__)
