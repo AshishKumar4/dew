@@ -172,10 +172,26 @@ class NativeModels:
             raise self.progress.StalePage("This page was updated. Reload it to use the current model.")
         return {"repo": self.repo, "revision": self.revision}
 
-    def sample(self, request, emit, timeout=None):
+    def sample(self, request, emit):
         """The request's image, as Dew's `pipe(pipe.prepare([prompt], key=prepare_key, steps=prepare_steps,
         unconditional=negative), key=key, steps=steps, ...)` draws it, each step's preview emitted as the
         walk runs (`progress.preview_png`), then the decode's."""
+        answer, answered = self.submitted(request, emit)
+        return answered(answer.result())
+
+    def text(self, request, emit):
+        """The request's greedy continuation, its text streamed as its tokens arrive."""
+        answer, answered = self.submitted(request, emit)
+        return answered(answer.result())
+
+    def submitted(self, request, emit):
+        """A validated sample or text request submitted to the engine: its future, and what turns the
+        future's result into the reply, run on the caller's thread, off the engine's."""
+        if request["op"] == "text":
+            return self._text(request, emit)
+        return self._sample(request, emit)
+
+    def _sample(self, request, emit):
         from dew.inference import ImageRequest
         from dew.objectives.base import OMITTED
 
@@ -200,7 +216,10 @@ class NativeModels:
             prepare_key=request["prepare_key"],
             prepare_steps=self.pipe.steps if request["prepare_steps"] is None else request["prepare_steps"],
             on_step=stepped))
-        result = answer.result(timeout).host()
+        return answer, self._image_reply
+
+    def _image_reply(self, images):
+        result = images.host()
         if not self.np.isfinite(self.np.asarray(result.images)).all():
             raise ArithmeticError("the sampler returned non-finite pixels")
         encoded = []
@@ -215,8 +234,7 @@ class NativeModels:
                 "shape": list(pixels.shape),
                 "dtype": pixels.dtype.name if pixels.dtype.name == "bfloat16" else pixels.dtype.str}
 
-    def text(self, request, emit, timeout=None):
-        """The request's greedy continuation, its text streamed as its tokens arrive."""
+    def _text(self, request, emit):
         if request["model"] not in self.text_servers:
             raise ValueError("the live kernel serves only its pinned text models")
         server = self.text_servers[request["model"]]
@@ -227,15 +245,7 @@ class NativeModels:
             emit({"text": decoded, "first_token_seconds": ticket.first - ticket.submitted})
 
         ticket.add_tokens_callback(streamed)
-        return {"text": ticket.result(timeout).text}
-
-    def served(self, request, emit, timeout):
-        """The answer to a validated request, its progress emitted on the way."""
-        if request["op"] == "describe":
-            return self.describe(request)
-        if request["op"] == "text":
-            return self.text(request, emit, timeout)
-        return self.sample(request, emit, timeout)
+        return ticket, lambda generation: {"text": generation.text}
 
 
 class ModelService(socketserver.ThreadingUnixStreamServer):
@@ -256,6 +266,7 @@ class ModelService(socketserver.ThreadingUnixStreamServer):
 
     def process_request(self, request, address):
         uid = struct.unpack("3i", request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
+        token = {"submitted": False}
         with self.lock:
             if uid not in self.uids:
                 error = {"name": "PermissionError",
@@ -263,7 +274,7 @@ class ModelService(socketserver.ThreadingUnixStreamServer):
             elif uid in self.pending or len(self.pending) >= CAPACITY:
                 error = {"name": "ValueError", "message": "the shared model request queue is full; try again"}
             else:
-                self.pending[uid] = True
+                self.pending[uid] = token
                 error = None
         if error is not None:
             try:
@@ -277,19 +288,31 @@ class ModelService(socketserver.ThreadingUnixStreamServer):
         try:
             super().process_request(request, address)
         except Exception:
-            self.release(uid)
+            self.release(uid, token)
             raise
 
     def process_request_thread(self, request, address):
         uid = struct.unpack("3i", request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
+        token = self.pending[uid]
         try:
             super().process_request_thread(request, address)
         finally:
-            self.release(uid)
+            # A request the engine holds keeps its guest's admission until the engine settles it
+            # (`submitted`); any other ends with its connection.
+            if not token["submitted"]:
+                self.release(uid, token)
 
-    def release(self, uid):
+    def submitted(self, uid, future):
+        """`future`, the engine's work for `uid`'s request, holds the guest's admission until it settles,
+        however long its connection waits for it."""
+        token = self.pending[uid]
+        token["submitted"] = True
+        future.add_done_callback(lambda _: self.release(uid, token))
+
+    def release(self, uid, token):
         with self.lock:
-            self.pending.pop(uid, None)
+            if self.pending.get(uid) is token:
+                del self.pending[uid]
 
     def server_close(self):
         self.shutdown()
@@ -299,7 +322,14 @@ class ModelService(socketserver.ThreadingUnixStreamServer):
 
 class ModelRequest(socketserver.StreamRequestHandler):
     def handle(self):
+        uid = struct.unpack("3i", self.request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
+        connected = threading.Event()
+        connected.set()
+
         def emit(value):
+            # The engine's progress for a request whose connection has ended reaches no one.
+            if not connected.is_set():
+                return
             try:
                 try:
                     line = json.dumps(value, allow_nan=False)
@@ -319,13 +349,20 @@ class ModelRequest(socketserver.StreamRequestHandler):
             if not raw.endswith(b"\n") or len(raw) > MAX_REQUEST:
                 raise ValueError("the model request is too large")
             request = validate(json.loads(raw))
+            if request["op"] == "describe":
+                emit({"result": self.server.models.describe(request)})
+                return
+            future, answered = self.server.models.submitted(request, emit)
+            self.server.submitted(uid, future)
             try:
-                result = self.server.models.served(request, emit, REQUEST_SECONDS)
+                result = future.result(REQUEST_SECONDS)
             except FuturesTimeout:
                 raise TimeoutError("the shared model did not finish within 90 seconds") from None
-            emit({"result": result})
+            emit({"result": answered(result)})
         except Exception as error:
             emit({"error": {"name": type(error).__name__, "message": str(error)}})
+        finally:
+            connected.clear()
 
 
 if __name__ == "__main__":

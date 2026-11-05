@@ -50,10 +50,11 @@ from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._records import JSON, duration, earlier_fields, is_share, recorded_duration
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
+from dew.cleanup import attempted
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.data import records
 from dew.data.compile import fitted
-from dew.data.dataset import Loader, Ramp, Reader, ramped
+from dew.data.dataset import Closeable, Loader, Ramp, Reader, ramped
 from dew.data.pipeline import Dataset, ObjectiveData
 from dew.data.plan import PLAN_VERSIONS, SCHEDULE, PlanOrderChanged
 from dew.distributed.placement import Layout, MeshSpec
@@ -2125,7 +2126,13 @@ class RunConfig:
             return state
 
         finally:
-            _closed(tracker, checkpoints, sys.exception())
+            try:
+                # What the rollout runs beside the trainer (a served policy's engine, a reward pool) ends
+                # with the run.
+                if isinstance(rollout, Closeable):
+                    attempted([("closing the rollout", rollout.close)], primary=sys.exception())
+            finally:
+                _closed(tracker, checkpoints, sys.exception())
 
     def compiled_ahead[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
                                          steps: int | None, rollout: Rollout | None,

@@ -611,6 +611,8 @@ class RolloutScheduler:
         self.generation_batches = generation_batches
         self.metrics: dict[str, float] = {}
         self._branch: str | None = None
+        self._owned: tuple[Callable[[], None], ...] = ()
+        """What it built itself and closes at its end (`served`'s source and server)."""
 
     @property
     def draws_further(self) -> bool:
@@ -679,10 +681,13 @@ class RolloutScheduler:
         source = PromptSource(server, reward, decode=decode, max_new_tokens=max_new_tokens)
         acquisition = Asynchronous(source, server, objective, width=width, rows=tasks * groups, ahead=ahead,
                                    max_lag=max_lag, sync_every=sync_every)
-        return cls(acquisition, tasks=prompt_tasks, groups=groups, estimator=estimator, truncation=truncation,
-                   log=log, varied=varied, overlong=overlong, admit=admit,
-                   reference=objective if objective.reward_kl > 0 else None,
-                   generation_batches=generation_batches)
+        scheduler = cls(acquisition, tasks=prompt_tasks, groups=groups, estimator=estimator,
+                        truncation=truncation, log=log, varied=varied, overlong=overlong, admit=admit,
+                        reference=objective if objective.reward_kl > 0 else None,
+                        generation_batches=generation_batches)
+        # The source and the server it built end with it: the reward pool, then the engine.
+        scheduler._owned = (source.close, server.close)
+        return scheduler
 
     @classmethod
     def episodes(cls, policy: EpisodeInference, environment: EnvironmentFactory, verifier: Verifier, *,
@@ -702,8 +707,11 @@ class RolloutScheduler:
         return self.acquisition.tasks(dataset, self.tasks_of)
 
     def close(self) -> None:
-        """Cancel every rollout in flight. The caller closes the source; this method does not."""
+        """Cancel every rollout in flight, and end what it built itself (`served`'s source and server);
+        a source its caller built, its caller closes."""
         self.acquisition.close()
+        for close in self._owned:
+            close()
 
     @contextlib.contextmanager
     def branch(self, name: str) -> Iterator[None]:
@@ -722,10 +730,10 @@ class RolloutScheduler:
             yield
         except BaseException as failure:
             # The branch's failure stays the one raised; a cancellation's is noted on it.
-            attempted([("cancelling the branch's rollouts", self.close)], primary=failure)
+            attempted([("cancelling the branch's rollouts", self.acquisition.close)], primary=failure)
             raise
         else:
-            self.close()
+            self.acquisition.close()
         finally:
             self.metrics, self.log, self._branch = metrics, log, branch
 

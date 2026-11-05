@@ -475,10 +475,13 @@ class NativeRolloutServer:
     def load(self, variables: Variables, version: int) -> None:
         if self._server is None:
             assert self._build is not None, "a server is given or deferred"
+            # A copy of its own, as every later load copies its weights (`Server.reload`): the trainer
+            # donates the arrays it hands over to its next update.
+            owned = jax.tree.map(lambda leaf: jnp.array(leaf, copy=True), thaw(variables))
             with self._futures:
                 if self._closed:
                     raise RuntimeError("the rollout server is closed")
-                self._served(self._build(thaw(variables), version), version)
+                self._served(self._build(owned, version), version)
             return
         server, engine = self._server, self._engine
         assert engine is not None, "a served server has its engine"

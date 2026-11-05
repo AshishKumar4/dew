@@ -475,63 +475,48 @@ class TextToImage(SavedRunTask, InItsForm):
 
         prepared = [inputs(request) for request in requests]
         with _streams(requests, [inputs.rows for inputs in prepared]) as streams:
-            if len(requests) == 1:
-                # A pass of one request walks it with its lone call's own programs (`_walked`), so its
-                # images are that call's, pixel for pixel.
-                (request,), (held,) = requests, prepared
-                served = [self._walked(held, walking.process, walking.times, walking.count, walking.solver,
-                                       walking.guidance, walking.decode, request.key,
-                                       None if streams is None else streams[0])]
-            else:
-                served = self._walked_together(requests, prepared, walking, streams)
-            if streams is not None:
-                # Its streams close once every step has reached the host.
-                jax.block_until_ready(served)
-        return served
+            return self._walked(prepared, walking, [request.key for request in requests], streams)
 
-    def _walked_together(self, requests: Sequence[_Drawn], prepared: Sequence[DenoisingInputs],
-                         walking: _Walking, streams: jax.Array | None) -> list[Images]:
-        """Several served requests' walks as one program mapped over the requests (`_walks`)."""
-        noise, conditions, unconditional = (jax.tree.map(lambda *leaves: jnp.stack(leaves), *branch)
-                                            for branch in zip(*((inputs.noise, dict(inputs.conditions),
-                                                                 dict(inputs.unconditional))
-                                                                for inputs in prepared), strict=True))
-        walks = jnp.stack([jax.random.fold_in(request.key, 1) for request in requests])
+    def _walked(self, prepared: Sequence[DenoisingInputs], walking: _Walking, requests: Sequence[jax.Array],
+                streams: jax.Array | None = None) -> list[Images]:
+        """The walks of `prepared` inputs under `walking`, each drawing its request's: the solver's state
+        built on the grid, then the walk, each step's clean prediction sent to its request's stream where
+        `streams` names them (`ImageRequest.on_step`). One request walks through a lone call's own
+        programs, so a served request alone draws its lone call's pixels; several through those programs
+        mapped over the requests (`_initials`, `_walks`), the weights and the grid shared."""
+        walks = [jax.random.fold_in(request, 1) for request in requests]
         grid = _default_grid(walking.process, walking.count) if walking.times is None else walking.times
+        models = sampling_modules(self.model, walking.guidance, self.autoencoder)
+        statics = (self.model, walking.process, self.autoencoder, self.finish, self.final_denoise,
+                   walking.decode)
+        times = np.asarray(grid, np.float32)
         with region("inference.image"):
+            if len(prepared) == 1:
+                (inputs,), (walk,) = prepared, walks
+                assert inputs.rows is not None
+                plan = RowPlan.over(mesh_of(self.variables), inputs.rows)
+                initial = program(_initial, static_argnums=(0, 1, 2), in_shardings=(plan.sharding, None))(
+                    walking.solver, walking.process, grid, inputs.noise, walk)
+                walked = program(_walk, *models, static_argnums=(0, 1, 2, 3, 4, 5),
+                                 in_shardings=(None, None, None, None, None, plan.sharding, None,
+                                               plan.sharding, None, None),
+                                 out_shardings=plan.sharding)
+                generated = walked(*statics, walking.solver, walking.guidance, times, initial, self.variables,
+                                   inputs.conditions, inputs.unconditional, inputs.noise, walk,
+                                   None if streams is None else streams[0])
+                return [replace(generated, rows=plan.rows)]
+            noise, conditions, unconditional = (jax.tree.map(lambda *leaves: jnp.stack(leaves), *branch)
+                                                for branch in zip(*((inputs.noise, dict(inputs.conditions),
+                                                                     dict(inputs.unconditional))
+                                                                    for inputs in prepared), strict=True))
+            keys = jnp.stack(walks)
             initial = program(_initials, static_argnums=(0, 1, 2))(walking.solver, walking.process, grid,
-                                                                   noise, walks)
-            models = sampling_modules(self.model, walking.guidance, self.autoencoder)
+                                                                   noise, keys)
             generated = program(_walks, *models, static_argnums=(0, 1, 2, 3, 4, 5))(
-                self.model, walking.process, self.autoencoder, self.finish, self.final_denoise,
-                walking.decode, walking.solver, walking.guidance, np.asarray(grid, np.float32), initial,
-                self.variables, conditions, unconditional, noise, walks, streams)
+                *statics, walking.solver, walking.guidance, times, initial, self.variables, conditions,
+                unconditional, noise, keys, streams)
         return [replace(jax.tree.map(lambda leaf, index=index: leaf[index], generated), rows=inputs.rows)
                 for index, inputs in enumerate(prepared)]
-
-    def _walked(self, prepared: DenoisingInputs, process: Process, times: tuple[float, ...] | None,
-                count: int, solver: Solver, guidance: Guidance | None, decode: bool, request: jax.Array,
-                stream: jax.Array | None = None) -> Images:
-        """A call's walk over its `prepared` inputs: the solver's state built on its grid, then the walk,
-        its draws `request`'s; each step's clean prediction sent to `stream` where one is given
-        (`ImageRequest.on_step`)."""
-        assert prepared.rows is not None
-        plan = RowPlan.over(mesh_of(self.variables), prepared.rows)
-        walk = jax.random.fold_in(request, 1)
-        grid = _default_grid(process, count) if times is None else times
-        with region("inference.image"):
-            initial = program(_initial, static_argnums=(0, 1, 2), in_shardings=(plan.sharding, None))(
-                solver, process, grid, prepared.noise, walk)
-            models = sampling_modules(self.model, guidance, self.autoencoder)
-            walked = program(_walk, *models, static_argnums=(0, 1, 2, 3, 4, 5),
-                             in_shardings=(None, None, None, None, None, plan.sharding, None, plan.sharding,
-                                           None),
-                             out_shardings=plan.sharding)
-            generated = walked(self.model, process, self.autoencoder, self.finish, self.final_denoise, decode,
-                               solver if stream is None else _Streaming(solver, stream), guidance,
-                               np.asarray(grid, np.float32), initial, self.variables, prepared.conditions,
-                               prepared.unconditional, prepared.noise, walk)
-        return replace(generated, rows=plan.rows)
 
     def _settings(self, mesh, prompts, *, steps, guidance, solver, key, decode):
         """Everything one call settles on the host before it runs the model.
@@ -807,7 +792,7 @@ class TextToImage(SavedRunTask, InItsForm):
         if prepared is None:
             assert settled is not None, "prompts are resolved in the agreement above"
             prepared = self._inputs(settled, owns_grid=self.grid is not None)
-        return self._walked(prepared, process, times, count, solver, chosen, decode, request)
+        return self._walked([prepared], _Walking(count, process, times, chosen, solver, decode), [request])[0]
 
 
 @dataclass(frozen=True)
@@ -859,6 +844,8 @@ def _streams(requests: Sequence[_Drawn], rows: Sequence[int | None]) -> Iterator
                          if request.on_step is not None})
     try:
         yield jnp.asarray(numbers, jnp.int32)
+        # Every step's callback has run once the pass's effects have, its stream whole before its answer.
+        jax.effects_barrier()
     finally:
         with _STREAMING:
             for number in numbers:
@@ -876,23 +863,6 @@ def _streamed(numbers: np.ndarray, denoised: np.ndarray) -> None:
     for stream, rows in zip(streams, denoised, strict=True):
         if stream is not None:
             stream(rows)
-
-
-@struct.dataclass
-class _Streaming:
-    """`inner`, sending each step's clean prediction to its request's stream (`ImageRequest.on_step`):
-    the walk's solver where a request in it streams, `number` its stream (`_streams`), data, so one
-    program serves every stream, each request's own where a pass maps the walk over them (`_walks`)."""
-
-    inner: Solver
-    number: jax.Array
-
-    def init(self, x, times, process, *, key):
-        return self.inner.init(x, times, process, key=key)
-
-    def step(self, x, t, t_next, denoised, eps, state, key, process, denoise, /):
-        jax.debug.callback(_streamed, self.number, denoised)
-        return self.inner.step(x, t, t_next, denoised, eps, state, key, process, denoise)
 
 
 @dataclass(frozen=True)
@@ -1154,28 +1124,32 @@ def _walks(model, process, autoencoder, finish, final_denoise, decode,
            solver, guidance, times, initial, params, given, null, x_T, keys, streams):
     """`_walk` of each request's rows, mapped over the requests, the weights and the grid shared, so a
     served pass runs each request's walk as its lone call does under one program, each request's steps
-    sent to its own of `streams` where they stream (`_Streaming`)."""
+    sent to its own of `streams` where they stream."""
     def walked(initial, given, null, x_T, key, stream):
-        stepping = solver if stream is None else _Streaming(solver, stream)
-        return _walk(model, process, autoencoder, finish, final_denoise, decode, stepping, guidance, times,
-                     initial, params, given, null, x_T, key)
+        return _walk(model, process, autoencoder, finish, final_denoise, decode, solver, guidance, times,
+                     initial, params, given, null, x_T, key, stream)
 
     return jax.vmap(walked)(initial, given, null, x_T, keys, streams)
 
 
 def _walk(model, process, autoencoder, finish, final_denoise, decode,
-          solver, guidance, times, initial, params, given, null, x_T, key):
+          solver, guidance, times, initial, params, given, null, x_T, key, stream=None):
     """The walk over the rows, compiled with the XLA options of its denoiser, its guidance's guide and
     its autoencoder (`program`), so a quantized model and another never share it. Rebinding weights
     must not change the static compilation identity, nor a solver's or guidance's numbers, nor the
     grid's values: the solver and the guidance are pytrees whose structure is static and whose numbers
     (a guidance scale, a Brownian seed) are data, and the grid is data with the solver state
-    `_initial` built from it."""
+    `_initial` built from it. Each step's clean prediction goes to `stream` where one is given
+    (`ImageRequest.on_step`), through the walk's own step reader (`sample`'s `record`)."""
     variables = {name: value for name, value in params.items() if name not in ("encoders", "autoencoder")}
     denoise = process.denoiser(model, variables, given, None if guidance is None else null)
+
+    def streamed(x, state, denoised) -> None:
+        jax.debug.callback(_streamed, stream, denoised)
+
     images, latents = walk_and_decode(denoise, autoencoder, params, x_T, solver=solver, guidance=guidance,
                                       key=key, times=times, final_denoise=final_denoise, initial=initial,
-                                      decode=decode)
+                                      decode=decode, record=None if stream is None else streamed)
     if finish is not None and images is not None:
         images = finish(params, images)
     return Images(images, latents=latents)
