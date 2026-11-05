@@ -479,6 +479,38 @@ def test_a_loops_carry_summed_with_a_product_holds_no_product_beside_it():
     assert peak(summed) == peak(written)
 
 
+def test_a_products_operand_computed_from_a_held_value_frees_it():
+    """A product's operand that a fused chain computes from a value held behind a barrier is a kernel of its
+    own, run before the product, past which the held value no other instruction reads is freed: a head's
+    weight gradient reading the logits' cotangent, computed from the logits a recomputed head holds,
+    holds what one reading a cotangent held itself holds, where the derivation held the logits and the
+    cotangent at once (Qwen3.5-4B's step at four microbatches, 0.95 GiB over XLA's 7.42: row 4089)."""
+    from dew.training.footprint import peak_bytes, simplified
+
+    tokens, width, vocab = 256, 512, 4096
+    shapes = (jax.ShapeDtypeStruct((tokens, width), jnp.float32),
+              jax.ShapeDtypeStruct((width, vocab), jnp.float32))
+
+    def cotangent(logits):
+        return (jnp.exp(logits.astype(jnp.float32)) * 2.0).astype(jnp.bfloat16)
+
+    def gradient(cotangents, hidden):
+        return jax.lax.dot_general(cotangents, hidden.astype(jnp.bfloat16), (((0,), (0,)), ((), ())),
+                                   preferred_element_type=jnp.float32)
+
+    def from_logits(hidden, weights):
+        logits = jax.lax.optimization_barrier((hidden @ weights).astype(jnp.bfloat16))
+        return gradient(cotangent(logits), hidden)
+
+    def held_cotangent(hidden, weights):
+        return gradient(jax.lax.optimization_barrier(cotangent(hidden @ weights)), hidden)
+
+    def peak(function):
+        return peak_bytes(simplified(jax.make_jaxpr(function)(*shapes).jaxpr, "gpu"), "gpu", Workspace(0, 0))
+
+    assert peak(from_logits) == peak(held_cotangent)
+
+
 def test_a_transposed_input_returned_flat_is_a_copy():
     """A transpose of an input whose layout is fixed reorders its elements into a buffer of their own,
     which a flattening of it returned holds, where a transpose of a value the program computes is laid
