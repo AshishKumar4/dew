@@ -745,7 +745,7 @@ def compile(
     read has no record count, bounds it to that many passes over the source examples it states a pass
     holds once it is prepared (`_staged`, `Loader.pass_examples`). `plan_version` is the data plan version
     it reads by (`dew.data.plan.PLAN_VERSIONS`): this Dew's, or the one a resumed run saved under, which
-    reads its order as it did (`dew.config.RunConfig`'s `trainer.data_plan`)."""
+    reads its order as it did (`dew.config.RunConfig.data_plan_version`)."""
     if plan_version not in PLAN_VERSIONS:
         raise ValueError(f"this Dew reads data plans by version {', '.join(map(str, PLAN_VERSIONS))}, not "
                          f"{plan_version}: resume a run saved under another with the Dew that wrote it")

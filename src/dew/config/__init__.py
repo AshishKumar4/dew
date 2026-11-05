@@ -1047,13 +1047,13 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def earlier_data_plan(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A saved run's record that states no data plan version (`RunConfig.data_plan`): it was written
+    """A saved run's record that states no data plan version (`RunConfig.data_plan_version`): it was written
     before the field, under version 8, which read a mixture's corpora shuffled by one seed in one
     permutation, so it reads by 8 (row 3840). Carried to 1.0 (ledger 1552)."""
     named = registry.class_record(record)
-    if named is None or named[0] not in registry.runs or "data_plan" in named[1]:
+    if named is None or named[0] not in registry.runs or "data_plan_version" in named[1]:
         return record
-    return {**record, "fields": {**named[1], "data_plan": 8}}
+    return {**record, "fields": {**named[1], "data_plan_version": 8}}
 
 
 def earlier_option_text(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -1386,12 +1386,12 @@ class RunConfig:
     it trains, which the resume must keep (`check_resume`), and so does `trainer.quantization`, which
     changes the forward pass the weights train through."""
 
-    BUILT: ClassVar[tuple[str, ...]] = ("source.param_dtype", "source.step", "data_plan")
+    BUILT: ClassVar[tuple[str, ...]] = ("source.param_dtype", "source.step", "data_plan_version")
     """The fields, by their dotted paths, a run may leave None for its build or its pinning to resolve,
     whose resolution a later Dew, or a later state of what it reads, may change: the storage of the
     source it reads (`SourceOptions.param_dtype`), the step of a saved Dew run it starts from, which
     that run's later checkpoints move (`with_pinned_run`), the data plan version its order is read by
-    (`data_plan`), and in a kind of run that adds them its own
+    (`data_plan_version`), and in a kind of run that adds them its own
     (a decision run's option text). A run that leaves one None and resumes a saved run under its name
     takes the saved run's value (`resumed`), so running the same command again resumes what it trained;
     one it sets is its own, and a resume refuses it where it differs (`check_resume`). A saved run whose
@@ -1415,7 +1415,7 @@ class RunConfig:
     stage or the training batch."""
     data_seed: int = 0
     """The seed of the data's order and of its random steps."""
-    data_plan: int | None = None
+    data_plan_version: int | None = None
     """The data plan version the run reads its order by (`dew.data.plan.PLAN_VERSIONS`): None for this
     Dew's, which its record holds resolved (`pinned`), so a resume reads the order it read whatever a
     later Dew's is (`BUILT`); a saved run that recorded none read by version 8 (`earlier_data_plan`)."""
@@ -1870,12 +1870,13 @@ class RunConfig:
                                validation: Dataset | Mapping[str, Dataset | Entry] | None,
                                ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
         """`dataset` and `validation` as the run trains on them (`fitted`): compiled with `objective`'s
-        stages, `data_seed` and `data_plan`, the training read bounded to `trainer.examples` where the run
-        counts them, or to `trainer.epochs` passes over its source examples where its read has no record
-        count, so its length is read off the loader this returns."""
+        stages, `data_seed` and `data_plan_version`, the training read bounded to `trainer.examples` where
+        the run counts them, or to `trainer.epochs` passes over its source examples where its read has no
+        record count, so its length is read off the loader this returns."""
         return fitted(dataset, validation, objective=objective, seed=self.data_seed,
                       examples=self.trainer.examples, epochs=self.trainer.epochs,
-                      plan_version=PLAN_VERSIONS[-1] if self.data_plan is None else self.data_plan)
+                      plan_version=PLAN_VERSIONS[-1] if self.data_plan_version is None
+                      else self.data_plan_version)
 
     def run(self) -> TrainState:
         """Prepare the process, build what this run trains (`prepare`) and train it.
@@ -1895,12 +1896,12 @@ class RunConfig:
         """This run with its Hub sources named at the commits they resolve to now, as its record names
         them and `prepare` loads them: here an imported adapter's (`LoRA.resolved`); a kind of run pins
         its own sources beside it. Its data plan version is this Dew's where it names none
-        (`data_plan`). Itself where nothing is left to pin."""
+        (`data_plan_version`). Itself where nothing is left to pin."""
         lora = None if self.lora is None else self.lora.resolved()
-        plan = PLAN_VERSIONS[-1] if self.data_plan is None else self.data_plan
-        if lora == self.lora and plan == self.data_plan:
+        plan = PLAN_VERSIONS[-1] if self.data_plan_version is None else self.data_plan_version
+        if lora == self.lora and plan == self.data_plan_version:
             return self
-        return dataclasses.replace(self, lora=lora, data_plan=plan)
+        return dataclasses.replace(self, lora=lora, data_plan_version=plan)
 
     def with_pinned_run(self, pretrained: str | None) -> Self:
         """This run with the checkpoint it reads of the saved Dew run it starts from (`pretrained`, a

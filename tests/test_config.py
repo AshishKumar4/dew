@@ -91,15 +91,15 @@ def test_a_run_records_the_data_plan_it_reads_by_and_one_saved_before_reads_by_e
 
     config = RunConfig(data=TokenFiles("tokens/train").pipe(presets.token_windows, seq_len=8, batch=2),
                        trainer=TrainerConfig(steps=1))
-    assert config.data_plan is None and config.pinned().data_plan == PLAN_VERSIONS[-1] == 9
+    assert config.data_plan_version is None and config.pinned().data_plan_version == PLAN_VERSIONS[-1] == 9
     saved = config.pinned().record()
-    assert RunConfig.read(saved).data_plan == 9
+    assert RunConfig.read(saved).data_plan_version == 9
     earlier = {**saved, "fields": {name: value for name, value in saved["fields"].items()
-                                   if name != "data_plan"}}
+                                   if name != "data_plan_version"}}
     directory = tmp_path / "planned"
     directory.mkdir()
     (directory / "run.json").write_text(json.dumps(earlier))
-    assert RunConfig.load(str(directory)).data_plan == 8
+    assert RunConfig.load(str(directory)).data_plan_version == 8
 
 
 def test_a_record_with_an_unknown_field_or_without_a_required_one_is_refused():
