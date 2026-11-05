@@ -1642,7 +1642,8 @@ class _Build:
         if cache is not None:
             filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
             shards = _positioned(shards) if 0 <= last < cache else shards
-            reader = filled.streamed(shards.reader, manifest, transform=prefix, threads=prefix.threads)
+            reader = filled.streamed(shards.reader, manifest, transform=prefix, threads=prefix.threads,
+                                     source=source)
             shards = dataclasses.replace(shards, reader=reader)
         shards = _positioned(shards) if last >= start else shards
         written = stages[start : start if interleave is None else interleave]
