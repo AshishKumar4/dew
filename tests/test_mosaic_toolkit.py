@@ -436,6 +436,19 @@ def test_a_launch_with_a_producer_takes_the_plan_holding_the_most_bytes_in_fligh
     assert (single.programs, single.stages) == (3, 1)
 
 
+def test_a_light_launch_is_held_within_the_threads_its_multiprocessor_runs():
+    """A one-warpgroup mma.sync launch of a few registers a thread on an L4 (sm89), whose multiprocessor runs
+    1536 threads in at most 24 blocks (CUDA C++ Programming Guide §5.1, Table 33): its registers would hold
+    sixteen programs, its threads hold twelve, and the residency it is planned at is twelve, where an A100's
+    2048 threads hold sixteen."""
+    from dew.nn.kernels.templates import bundles, resources
+
+    for generation_name, programs in (("sm89", 12), ("sm80", 16)):
+        with generation.assumed(generation_name):
+            family = bundles.of(generation_name, jnp.bfloat16)
+            assert resources.register_programs(family, 1, 32) == programs
+
+
 def test_a_consumer_is_raised_within_the_registers_a_thread_addresses():
     """One warpgroup-MMA consumer beside its producer, one program a multiprocessor on an H100, raises to 248,
     the largest of setmaxnreg's steps of 8 within the 255 a thread addresses, and holds them
