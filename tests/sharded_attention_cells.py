@@ -18,7 +18,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from dew.cache import enable_compilation_cache
 from dew.nn.attention import scaled_dot_product_attention
 from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
-from dew.training._lowering import custom_calls
+from dew.nn.kernels.lowered import custom_calls
 enable_compilation_cache(sys.argv[1])
 count_compilation_cache()
 rng = np.random.default_rng(0)

@@ -842,7 +842,7 @@ def test_two_launches_whose_padded_lengths_meet_name_their_own_kernels():
     chunks, so its launches' statics meet, and each launch's kernels still carry its own launch's digest
     (`tuning.lowered_once` keys a trace on the launch tracing it). They shared one trace and the second's
     kernels were named for the first, a spill of one refused as the other (row 2941)."""
-    from dew.training._lowering import kernel_calls
+    from dew.nn.kernels.lowered import kernel_calls
 
     target = 'sm90'
     family, facts = bundles.of(target, jnp.bfloat16), generation.gpu_target(target)
@@ -1190,7 +1190,7 @@ def test_a_training_launchs_backward_kernels_carry_its_launch():
     its training tiles (row 3851)."""
     from kernel_compile import lowered_for
 
-    from dew.training._lowering import kernel_calls
+    from dew.nn.kernels.lowered import kernel_calls
 
     name = 'qwen3.5-27b-gdn'
     args = resource_operands(name, jnp.bfloat16, 1, 256)

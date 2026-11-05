@@ -644,7 +644,7 @@ def test_the_mosaic_mainloop_lowers_on_each_shards_own_rows_and_heads(axes, whol
 
     from jax.sharding import AxisType, NamedSharding
 
-    from dew.training._lowering import custom_calls, operations
+    from dew.nn.kernels.lowered import custom_calls, operations
 
     devices = jax.make_mesh(tuple(axes.values()), tuple(axes), axis_types=(AxisType.Auto,) * len(axes),
                             devices=jax.devices()[:math.prod(axes.values())])
