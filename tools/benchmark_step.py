@@ -69,10 +69,10 @@ import jax
 import numpy as np
 import tyro
 
-from dew.files import write_atomically
+from dew._files import write_atomically
 from dew.nn.attention import AttentionImpl
 from dew.nn.flops import MissingFlopsCount
-from dew.pool import joins_pool, pool_cluster
+from dew._pool import joins_pool, pool_cluster
 from dew.registry import models
 from dew.telemetry.benchmark import carried
 from dew.telemetry.profile import Profiler

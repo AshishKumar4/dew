@@ -141,7 +141,9 @@ def test_a_split_saved_as_arrow_streams_its_parquet_conversion(monkeypatch, nati
     reader = data.train(DataPartition())
     try:
         assert [int(value) for _ in range(3) for value in next(reader)["id"]] == list(range(12))
-        assert {name.split("/")[2] for name in data.statistics()} == {"data"}
+        # Each corpus's metrics go by its repository's name, beside the run's mirrors' (`data/mirror/...`).
+        corpora = {name.split("/")[2] for name in data.statistics() if not name.startswith("data/mirror/")}
+        assert corpora == {"data"}
     finally:
         reader.close()
     assert Hub("owner/data", revision="original").streamed is None
@@ -446,13 +448,13 @@ def test_snapshot_reads_a_prepared_hub_without_physical_shards(tmp_path, monkeyp
 def test_a_hub_split_prepared_online_reads_its_own_commits_rows_with_the_hub_offline(tmp_path, monkeypatch):
     """A Hub split prepared online at two commits reads, with the Hub offline (HF_HUB_OFFLINE),
     the rows of the commit each source pins: the commit is the answer the Hub gave online
-    (`dew.cache.hub_answer`), the default branch's the last given, even where another tool has since
+    (`dew._cache.hub_answer`), the default branch's the last given, even where another tool has since
     moved the Hub cache's ref of the branch, and the Arrow is the cache `datasets` prepared at that
     commit, which `datasets` itself does not find offline."""
     import datasets
     from hub_support import native_hub, offline
 
-    from dew.cache import hub_ref
+    from dew._cache import hub_ref
     from dew.data import Hub
     from dew.data.compile import compile
     from dew.data.pipeline import Pipeline

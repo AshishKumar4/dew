@@ -636,7 +636,7 @@ def mode_schedule_fit(args) -> dict:
     """`--steps` of `token_trainer` on a schedule of `--tokens` read in two orders, the first stage for
     60 committed tokens (`dew.data.schedule`): the step the run reached, the record its first stage
     ended at in the saved position, and the parameters beside the report."""
-    from dew import position
+    from dew import _position
     from dew.data import presets, schedule
     from dew.data.sources.tokens import TokenFiles
 
@@ -648,7 +648,7 @@ def mode_schedule_fit(args) -> dict:
     state = trainer.fit(schedule([(ordered(0), 60), (ordered(1), None)]).batch(BATCH), steps=args.steps)
     dump_params(args.out.with_suffix(".npz"), state.variables)
     _, saved = restored_state(trainer)
-    completed = [] if saved is None else position.read(saved.encode()).completed
+    completed = [] if saved is None else _position.read(saved.encode()).completed
     return {"step": int(as_numpy(state.step)), "stage_ends": [end for _, end in completed]}
 
 

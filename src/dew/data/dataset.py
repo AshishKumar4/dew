@@ -32,7 +32,7 @@ import jax
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from dew import position
+from dew import _position
 from dew._records import record
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS, Batch, padded_rows
 from dew.data import cgroups
@@ -809,7 +809,7 @@ type Position = bytes | Mapping[str, object]
 
 Dew's own envelope is bytes, and Grain reports a JSON object, which
 `dew.distributed.batches` encodes before a checkpoint stores it.
-`dew.position` tells which of the two kinds a saved position is."""
+`dew._position` tells which of the two kinds a saved position is."""
 
 
 @runtime_checkable
@@ -818,7 +818,7 @@ class Checkpointable(Protocol):
 
     Grain's iterators satisfy this, and so does `GlobalStream`, and so does
     a stream a reader declares to replay (`replayed`). The state itself is
-    opaque here; `dew.position` tells which of its two kinds a checkpoint
+    opaque here; `dew._position` tells which of its two kinds a checkpoint
     holds.
     """
 
@@ -1194,7 +1194,7 @@ class GlobalStream:
     The offset alone would resume that many records into whatever order the
     run now has, so the plan's order (`order`) and the plan are saved with
     it and a restore whose plan disagrees is refused (`Plan.check`).
-    `dew.position` defines the format that both this class and
+    `dew._position` defines the format that both this class and
     `dew.checkpoints` read.
 
     Every share steps as many batches of the order, its whole batches where
@@ -1238,8 +1238,8 @@ class GlobalStream:
         return batch
 
     def get_state(self) -> bytes:
-        return position.encode(
-            position.Global(
+        return _position.encode(
+            _position.Global(
                 records=self._records,
                 order=self._order,
                 plan=self._plan.record(),
@@ -1263,7 +1263,7 @@ class GlobalStream:
         return self._plan.identity()
 
     def set_state(self, state: bytes) -> None:
-        saved = position.read(state)
+        saved = _position.read(state)
         if saved.plan is not None:
             from dew.data.plan import earlier_plan
 
@@ -1456,8 +1456,8 @@ class PhasedStream:
                 self._streams[self._current].close()
             stream = self._stream(phase)
             stream.set_state(
-                position.encode(
-                    position.Global(records=self._records - self._start(phase), order=stream.order)
+                _position.encode(
+                    _position.Global(records=self._records - self._start(phase), order=stream.order)
                 )
             )
             self._current = phase
@@ -1487,12 +1487,12 @@ class PhasedStream:
         else:
             phase = self._phase(self._records - 1) if self._records else 0
         plans = [
-            position.read(_global_position(self._stream(index).get_state())).plan
+            _position.read(_global_position(self._stream(index).get_state())).plan
             for index in range(phase + 1)
         ]
         completed = tuple((self._stream(index).order, self._start(index + 1)) for index in range(phase))
-        return position.encode(
-            position.Global(
+        return _position.encode(
+            _position.Global(
                 records=self._records,
                 order=self._stream(phase).order,
                 completed=completed,
@@ -1503,7 +1503,7 @@ class PhasedStream:
         )
 
     def set_state(self, state: bytes) -> None:
-        saved = position.read(state)
+        saved = _position.read(state)
         from dew.data.plan import same_order
 
         if self._tokens is not None:
@@ -1535,8 +1535,8 @@ class PhasedStream:
                 end = saved.completed[index][1] if index < len(saved.completed) else saved.records
                 stream = self._stream(index)
                 stream.set_state(
-                    position.encode(
-                        position.Global(records=end - self._start(index), order=stream.order, plan=plan)
+                    _position.encode(
+                        _position.Global(records=end - self._start(index), order=stream.order, plan=plan)
                     )
                 )
 
@@ -1704,13 +1704,13 @@ class RampedStream(Forwarding):
         return step
 
     def get_state(self) -> bytes:
-        place = position.read(_global_position(self._source.get_state()))
-        return position.encode(dataclasses.replace(place, records=self._records))
+        place = _position.read(_global_position(self._source.get_state()))
+        return _position.encode(dataclasses.replace(place, records=self._records))
 
     def set_state(self, state: bytes) -> None:
         self._source.set_state(state)
         self._held = None
-        self._records = position.read(state).records
+        self._records = _position.read(state).records
         stage = self._stage()
         if (self._records - stage.records) % stage.batch:
             raise ValueError(
@@ -1753,7 +1753,7 @@ def ramped(dataset: Loader, ramp: Ramp) -> Loader:
             state = stream.get_state()
             # A global record count alone: an elastic read's position is the order's, which the
             # ramp's steps, cut from a global order, do not save or restore (`RampedStream`).
-            if isinstance(state, bytes) and position.decode(state) is not None:
+            if isinstance(state, bytes) and _position.decode(state) is not None:
                 return RampedStream(stream, ramp.stages(dataset.batch, partition.window), partition,
                                     tail=dataset.tail, order_records=dataset.order_records)
         if isinstance(stream, Closeable):

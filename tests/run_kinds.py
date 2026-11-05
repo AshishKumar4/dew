@@ -14,7 +14,7 @@ from test_lm_recipe import SEQ, write_token_files
 from token_support import write_token_corpus
 
 from dew import registry
-from dew.cli.main import main
+from dew._cli.main import main
 from dew.config import ObjectiveConfig, RunConfig, SourceOptions, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.config.jepa import JepaRunConfig

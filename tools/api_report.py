@@ -7,8 +7,8 @@ A txtar archive of four sections, each a contract consumers outside the reposito
 - `config`: each dataclass of `dew.config` and of the modules of the run kinds, and each dataclass of Dew
   the run kinds' fields reach, wherever it is defined: its fields with their types and defaults, and a field
   that is keyword-only or no constructor argument marked so.
-- `cli`: each command of `dew` (`dew.cli.main.COMMANDS`, `DATA_COMMANDS` under `dew data`,
-  `dew.cli.tpu.COMMANDS` under `dew tpu`), each argument as the command declares it to tyro: its field's
+- `cli`: each command of `dew` (`dew._cli.main.COMMANDS`, `DATA_COMMANDS` under `dew data`,
+  `dew._cli.tpu.COMMANDS` under `dew tpu`), each argument as the command declares it to tyro: its field's
   name, type (aliases resolved) and default, and the markers and spelling tyro is told of; and the
   configuration each group passes tyro (`CONFIG`), which spells them all.
 - `records`: each run record type (`dew.telemetry.records.RECORD_TYPES`), its fields as `config`'s, and
@@ -291,7 +291,7 @@ def configured(configured_markers) -> str:
 
 
 def cli() -> list[str]:
-    from dew.cli import main, tpu
+    from dew._cli import main, tpu
 
     lines = []
     groups = (("dew", main.COMMANDS, main.CONFIG), ("dew data", main.DATA_COMMANDS, main.CONFIG),

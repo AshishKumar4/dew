@@ -12,7 +12,7 @@ from float64_terms import float64_terms
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import Mesh, PartitionSpec as P
 
-from dew.accuracy import reduction_bound, within
+from dew._accuracy import reduction_bound, within
 
 
 def loss_of(keys, query, values):
