@@ -1154,6 +1154,12 @@ def _cutlass_registered() -> None:
         jax.ffi.register_ffi_target(target, capsule, platform="CUDA")
 
 
+def _cutlass_call(target: str, out: jax.ShapeDtypeStruct) -> Callable:
+    """dew_cutlass's FFI call `target` giving `out`, a mapped call running its maps in turn, one launch
+    each (row 4389: JAX's FFI batching refuses a call that states no rule)."""
+    return jax.ffi.ffi_call(target, out, vmap_method='sequential')
+
+
 CUTLASS_TILE = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2, family='wgmma')
 """The dew-cutlass wheel's one instantiated kernel, as Dew's records name a launch (row 4323): a fact of
 that binary, not a derivation. kernels/cutlass/grouped_sm90.cu's `Kernel`, which every one of its targets
@@ -1217,8 +1223,8 @@ class CutlassGmm(_Cutlass):
         _cutlass_registered()
         width = kernel.shape[1] if trans_rhs else kernel.shape[2]
         out = jax.ShapeDtypeStruct((tokens.shape[0], width), jnp.dtype(out_dtype))
-        return jax.ffi.ffi_call('dew_cutlass_grouped_gemm', out)(tokens, kernel, sizes,
-                                                                 transpose_w=trans_rhs), None
+        call = _cutlass_call('dew_cutlass_grouped_gemm', out)
+        return call(tokens, kernel, sizes, transpose_w=trans_rhs), None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1240,7 +1246,7 @@ class CutlassTgmm(_Cutlass):
         _cutlass_registered()
         out = jax.ShapeDtypeStruct((sizes.shape[0], tokens.shape[1], cotangent.shape[1]),
                                    jnp.dtype(out_dtype))
-        return jax.ffi.ffi_call('dew_cutlass_grouped_gemm_k', out)(tokens, cotangent, sizes), None
+        return _cutlass_call('dew_cutlass_grouped_gemm_k', out)(tokens, cotangent, sizes), None
 
 
 class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
@@ -1538,12 +1544,6 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
 
 
 DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('mma.sync', 'grouped input_gradient'):
-        ('triton', "FSCELLS1-a100 and FSCELLS2-a100 (base/kernels 1bb380d7d and 6c9d4214b, A100-SXM4-40GB, "
-                   "the routed experts' products of Qwen3-30B-A3B, Qwen3-235B-A22B, DeepSeek-V3, Mixtral "
-                   "8x7B and Kimi Linear, gate and down apart, groups balanced): the template 1.014x "
-                   "Triton's time, geomean of 10 rows (worst 2.00x, Mixtral's down; best 0.59x, "
-                   "Qwen3-30B-A3B's gate); its kernel gradient 0.880x and forward below 0.8x on those rows"),
     ('mma.sync', 'dense forward'):
         ('xla', "DENSE1 (A100, a55c8ffb2, one program a multiprocessor): Mosaic 1.923x and Triton 1.947x "
                 "XLA's dot (cuBLAS), geomean of 10 projections at 8192 tokens"),

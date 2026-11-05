@@ -27,6 +27,7 @@ from typing import Any, NamedTuple, Self
 
 import jax
 from jax import lax, numpy as jnp
+from jax._src.pallas import core as pallas_core
 from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
@@ -1646,7 +1647,7 @@ class Transport[Allocated, Opened](abc.ABC):
         accumulator's axes a vector follows, where a family stages its loads through registers in the
         accumulator's layouts (`mosaic_sm80.Mma`); a vector whose axes go unstated follows its columns."""
 
-    def load_barriers(self, count: int) -> Any:
+    def load_barriers(self, count: int) -> pallas_core.ScratchShape:
         """The scoped allocation of `count` whole loads' completions (`loaded`'s barriers), which a program's
         allocations hold beside its streams (`scoped`, `resources.Scope`): a backend's own kind of scoped
         allocation (a GPU's barriers, a TPU's DMA semaphores)."""
