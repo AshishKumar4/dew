@@ -24,8 +24,9 @@ pytestmark = pytest.mark.kernel
 
 SEEDS = 8
 
-PORTABLE = hypothesis.settings(max_examples=4, deadline=None)
-"""Each portable property's draws: a draw's three compiles (each arm and the truth at its shape)."""
+PORTABLE = hypothesis.settings(max_examples=2, deadline=None)
+"""Each portable property's draws: a draw's three compiles (each arm and the truth at its shape), about 17 s a
+case at four draws on armada's CPU (props at f3cf82c98), every form one row and packed."""
 
 INTERPRETED = hypothesis.settings(max_examples=2, deadline=None)
 """Each interpreted split's draws: the template's launches interpreted twice a draw."""
