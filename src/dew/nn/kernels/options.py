@@ -169,7 +169,6 @@ def held_objects() -> Iterator[None]:
     with _HELD_GUARD:
         if not _HELD:
             _THRESHOLDS[:] = gc.get_threshold()
-            gc.freeze()
             gc.set_threshold(TRACING_COLLECTIONS, *_THRESHOLDS[1:])
         _HELD += 1
     try:
@@ -179,7 +178,6 @@ def held_objects() -> Iterator[None]:
             _HELD -= 1
             if not _HELD:
                 gc.set_threshold(*_THRESHOLDS)
-                gc.unfreeze()
 
 
 type Placements = (Sharding | Format | None | tuple[Placements, ...] | Mapping[str, Placements]
