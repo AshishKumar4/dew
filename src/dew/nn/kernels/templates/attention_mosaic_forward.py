@@ -207,7 +207,7 @@ def _walked_blocks(live: jax.Array, splits: int, block_q: int) -> jax.Array:
 def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
                     scale: float, natural: bool, tiles: Tiles, interpret: bool, rows: bool = False,
                     out_dtype=None, masked: bool = False, splits: int = 1, table: jax.Array | None = None,
-                    sources: jax.Array | None = None):
+                    sources: jax.Array | None = None, subtracted: bool = False):
     """The inference walk's launches: its spec, `launch(form, live, again)` and `kept` as
     `algebra.walked_launches` takes them and `finished`, its outputs from the walk's: `MosaicForward`'s launch
     without residuals, at `tiles`, under the default's guards over whole launches (`algebra.walked_launches`).
@@ -226,7 +226,7 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
     family = bundle_of(tiles, query.dtype)
     call, spec, (raw, k, v), (spans_of, hooked), taken = _prepared(
         query, key, value, spans, hooks, scale=scale, natural=natural, tiles=tiles, family=family,
-        table=table, inference=True)
+        table=table, inference=True, subtracted=subtracted)
     # A paged call's table, its rows' pages whole blocks of the call's, and its pools' page (`_launch`'s
     # `table`).
     paged = None if call.table is None or call.page is None else (call.table, call.page)
@@ -469,7 +469,7 @@ def _widened(array: jax.Array, width: int) -> jax.Array:
 
 def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
               scale: float, natural: bool, tiles: Tiles, family: mosaic.Family,
-              table: jax.Array | None = None, inference: bool = False):
+              table: jax.Array | None = None, inference: bool = False, subtracted: bool = False):
     """A call as this mainloop takes it at `tiles`: padded to the program's blocks (`padded_call`, `_block`;
     an `inference` walk's queries to its query blocks alone, which every launch of it divides: a decode step's
     four rows padded to 128 took 21 of B128's 795 us at 4096 keys, ET-DECODE7-h100) and its heads to whole
@@ -477,7 +477,9 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     overflow them, the fold its logits' reach, `algebra.walked_launches`) and the arrays its programs read
     beside the operands (`_Spans`, `_Hooked`), and the power of two its plain launch took into its scale (1
     where none, `_rewalked`). A call it takes none of is refused (`refused`, which the op's eligibility reads
-    too)."""
+    too). A `subtracted` fold's logits are a difference of raw products scaled after it is taken
+    (`algebra.Forward.subtracted`): no fold's reach, so no natural rewalk (a decode step's, whose walk the
+    memory bounds, row 1955)."""
     if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family):
         raise NotImplementedError(reason)
     # The query's power of two before its products (`prescale`). A folding call every row of which sees a
@@ -496,7 +498,7 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                            score_mod=hooks.score_mod, natural=natural, headroom=algebra.headroom(value.dtype),
                            initial=hooks.initial is not None,
                            queries=call.queries if call.query.shape[1] > call.queries else None,
-                           prescale=power / taken)
+                           prescale=power / taken, subtracted=subtracted)
     unit = family.column_unit(query.dtype)
     operands = tuple(_columns(array, unit) for array in (call.query, call.key, call.value))
     read = (_spans_of(spec, call, tiles.block_q, tiles.block_k), _hooked_of(hooks, call, unit))
