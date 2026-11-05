@@ -527,6 +527,20 @@ review's measurement, the median over 200 sums, was 37 units in the sum's last p
 wherever the pooled ratio does not see it."""
 
 
+RULED_SHARE = 0.9
+"""The share of a row's squared error one element carries past which the row is that element's: its worst
+row is judged at a row of one value's factor (NARROW_FACTORS[1]) whatever its width (`_Draws.factor`, row
+3684). A row one element rules (an input amplified through 2^k, k up to 24, the weighed check's case) parts
+from its reference as one value's error does, a ratio of two of its roundings, which ROW_FACTOR failed on
+equally exact pairs in up to 5% of runs at one row a draw (1 row of 16 values, 8 seeds: 154 of 4,000 runs
+with k apart in each arm, 35 with one k for both) and in none at the width-one factor (armada
+vq-3684-dom2, 4,000 runs a layout over 1 to 16 rows a draw, 3 to 64 values a row, 8 and 64 seeds). A
+Gaussian row of 8 values or more has its largest element carry nine tenths of its error almost never,
+so their power is unchanged; rows of 3 and 4 values sometimes do, and a row ten times off at one of four
+seeds is refused in 25% and 10% fewer runs there (2,079 against 1,492 of 4,000 runs at 1 row of 3 values,
+8 seeds). A row one element rules gives up its row power: its value's error is check 2's to bound."""
+
+
 def row_factor(width: int) -> float:
     """The worst-row rule's factor for rows of `width` values: NARROW_FACTORS' at one or two, else ROW_FACTOR;
     every path of check 1 reads its rows' factor here (a weighed class's rows by the class's values a row)."""
