@@ -116,3 +116,35 @@ def test_a_form_wrong_on_one_bit_is_unproven(fault):
     steps[index] = step._replace(immediate=moved)
     with pytest.raises(bits.Unproven):
         bits.proven(transform, dataclasses.replace(form, steps=tuple(steps)))
+
+
+def test_a_fixed_layouts_zero_field_takes_no_instruction_of_its_own():
+    """A fixed layout's register whose low byte is its input's and whose high byte the consumer reads as zero:
+    one LOP3 over the stored word, its mask narrowed to the byte it reads, no shift made to produce the
+    zeros."""
+    transform = bits.BitTransform.placed("low-byte", 16, (0xFFFF,), {bit: (0, bit) for bit in range(8)},
+                                         free=False)
+    form = bits.synthesized(transform)
+    assert form.price == (1, 1)
+    words = np.arange(1 << 16, dtype=np.uint64)
+    np.testing.assert_array_equal(form.decoded(words)[0], words & np.uint64(0xFF))
+
+
+def test_a_fixed_layouts_form_reads_the_input_as_stored():
+    """A fixed layout's form proven on the input as it is stored: a decoder reading input bit 1 behind an
+    encoder that moves bit 0 there computes the transform end to end, but not on the stored input, and is
+    refused."""
+    transform = bits.BitTransform.placed("bit-0", 2, (1,), {0: (0, 0)}, free=False)
+    swapped = bits.Form((bits.Step(bits.Op.SHR, (0,), 1, bits.Unit.ALU),
+                         bits.Step(bits.Op.LOP3, (1,), 1, bits.Unit.ALU)), (2,), (2, 1))
+    with pytest.raises(bits.Unproven):
+        bits.proven(transform, swapped)
+
+
+def test_a_transform_kept_off_the_fma_pipe_takes_its_shifts_on_the_alu():
+    """The NVFP4 decode declared for a consumer whose FMA pipe is its own (`units`): its form's every shift
+    issues on the ALU, its price the ALU's, and it is proven."""
+    transform = dataclasses.replace(_nvfp4(), units=frozenset({bits.Unit.ALU}))
+    form = bits.synthesized(transform, reach=6)
+    assert form.issues[bits.Unit.FMA] == 0
+    assert form.price == (len(form.steps), len(form.steps))
