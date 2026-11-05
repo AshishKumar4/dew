@@ -223,6 +223,21 @@ def test_a_transposed_hooks_custom_derivative_holds_every_order(edge):
                     f"a transposed hook's custom derivative {edge}", truth_fn=plain, plain_fn=plain)
 
 
+def test_a_transposed_hook_through_a_primitive_taking_an_entrywise_name_is_refused():
+    """A hook through a primitive of its own named `exp`, an entrywise operation's name, that reads its
+    operand whole is no operation `layout.transposed` takes entry for entry: refused, where it was bound on
+    the transposed tile as JAX's own `exp` (train 587's review)."""
+    from jax.extend.core import Primitive
+
+    from dew.nn.kernels.templates import layout
+
+    spread = Primitive("exp")
+    spread.def_abstract_eval(lambda value: value)
+    spread.def_impl(lambda value: jnp.broadcast_to(jnp.sum(value), value.shape))
+    with pytest.raises(layout.Untransposable):
+        layout.transposed(spread.bind)(jnp.ones((6, 4), jnp.float32))
+
+
 @pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
 def test_a_stored_expert_primal_holds_every_order(edge):
     """An expert layer's primal over its parameters as stored (`moe._stored_primal`, differentiated over them

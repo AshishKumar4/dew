@@ -59,7 +59,8 @@ from dew.algebra.terms import parameter_key, parameters_key
 from dew.batch import unboxed
 from dew.mesh import STAGE_AXIS, LayoutRefused
 from dew.nn.kernels.options import owned_program, program
-from dew.nn.kernels.templates.layout import ENTRYWISE, entrywise, jax_name
+from dew.nn.kernels.templates.layout import ENTRYWISE, entrywise
+from dew.nn.programs import jax_name
 from dew.nn.sharding import abstract, held_by_stage
 
 if TYPE_CHECKING:
