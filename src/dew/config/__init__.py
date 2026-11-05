@@ -1279,11 +1279,11 @@ def _recorded_at(config: "RunConfig", path: str) -> JSON:
     return node.get(field)
 
 
-def _group_of(config: "RunConfig", path: str) -> object:
+def _group_of(config: "RunConfig", path: str) -> "DataclassInstance | None":
     """The record the dotted `path`'s field is read in, its groups walked from `config`: None past an
     optional record `config` holds none of (a teacher of None); a name no group of the run record has is
     refused."""
-    held: object = config
+    held: DataclassInstance | None = config
     for group in path.split(".")[:-1]:
         if held is None:
             return None

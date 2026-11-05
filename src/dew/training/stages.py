@@ -595,8 +595,8 @@ def _hashable(setting):
     if isinstance(setting, np.ndarray):
         return ("array", str(setting.dtype), setting.shape, setting.tobytes())
     if isinstance(setting, tuple | list):
-        items = tuple(_hashable(item) for item in setting)
-        return _UNKEYED if any(item is _UNKEYED for item in items) else (type(setting).__name__, items)
+        entries = tuple(_hashable(entry) for entry in setting)
+        return _UNKEYED if any(entry is _UNKEYED for entry in entries) else (type(setting).__name__, entries)
     return setting if isinstance(setting, Hashable) else _UNKEYED
 
 
