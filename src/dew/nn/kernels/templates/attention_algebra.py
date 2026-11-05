@@ -1955,7 +1955,8 @@ def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
             factor = accumulated.factor
 
             def scale(held):
-                return keys.coords.queries(factor, held) * held
+                # A sum the walk rescales (the weighted values': its factor a row's), else as it is.
+                return held if factor is None else keys.coords.queries(factor, held) * held
 
             acc = held_by(states[fields.index("acc")], scale, (accumulated.weights,), accumulated.values)
             return tuple(acc if field == "acc" else total if field == "total" else None for field in fields)
