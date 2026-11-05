@@ -19,6 +19,7 @@ import optax
 import pytest
 from affine_run import Replaying
 from diffusion_stubs import STUB_TEXT
+from reference_error import assert_computes_the_oracle
 from steady_state import steady_state
 
 import dew
@@ -135,18 +136,29 @@ def test_repeated_image_requests_reuse_their_programs_and_read_back_only_results
     assert [result.host().images.shape for result in results] == [(2, RES, RES, 3)] * 2
 
 
+def nearest_float32(value) -> np.float32:
+    """The float32 nearest the rational `value`, a tie to the even significand: its correct rounding."""
+    from fractions import Fraction
+
+    near = np.float32(float(value))
+    sides = [np.nextafter(near, np.float32(-np.inf)), near, np.nextafter(near, np.float32(np.inf))]
+    return min(sides, key=lambda side: (abs(Fraction(float(side)) - value),
+                                         int(np.asarray(side).view(np.uint32)) & 1))
+
+
 def test_pil_bytes_and_unit_range_are_diffusers_image_processor():
     """Diffusers 0.34.0's `VaeImageProcessor` is the reference both ways.
     `postprocess(..., output_type="pil")` writes the same bytes as `pil()` on
     every level's centre, every tie between two levels, the float32
     neighbours either side of each, and values past the range (both round
     half to even in float32, so both miss exact rounding on the same 191
-    near-tie inputs). `unit_range` holds the float64 rule against
-    `pil_to_numpy`'s division and `normalize` over all 256 bytes (3.7e-8
-    against 2.7e-8 rms)."""
+    near-tie inputs). `unit_range` is every byte's value in [-1, 1]
+    correctly rounded, one IEEE division of an exact difference (`divided`),
+    where `pil_to_numpy`'s division and `normalize` round twice."""
+    from fractions import Fraction
+
     import torch
     from diffusers.image_processor import VaeImageProcessor
-    from one_draw import assert_as_exact_as_the_reference
 
     processor = VaeImageProcessor()
     levels = np.arange(256, dtype=np.float64)
@@ -160,8 +172,11 @@ def test_pil_bytes_and_unit_range_are_diffusers_image_processor():
     np.testing.assert_array_equal(ours, theirs)
 
     data = np.arange(256, dtype=np.uint8)
-    normalized = processor.normalize(torch.from_numpy(data.astype(np.float32) / 255.0)).numpy()
-    assert_as_exact_as_the_reference(np.asarray(unit_range(data)), normalized, data / 127.5 - 1, "unit_range")
+    exact = [Fraction(2 * int(byte) - 255, 255) for byte in data]
+    np.testing.assert_array_equal(np.asarray(unit_range(data)), np.asarray(list(map(nearest_float32, exact))))
+    # Diffusers' map is the same function: its float64 run within float64's rounding of the exact values.
+    normalized = processor.normalize(torch.from_numpy(data.astype(np.float64) / 255.0)).numpy()
+    assert_computes_the_oracle(normalized, np.asarray(list(map(float, exact))), "normalize", roundings=3)
 
     padded = np.concatenate([pixels, pixels, np.full_like(pixels, -1)], axis=0)
     pictures = Images(jnp.asarray(padded), rows=2).pil()
