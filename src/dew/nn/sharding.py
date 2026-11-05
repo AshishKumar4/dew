@@ -110,17 +110,33 @@ class Schedule:
 _SCHEDULE: contextvars.ContextVar[Schedule | None] = contextvars.ContextVar(
     'pipeline_schedule', default=None)
 
+_WHOLE: contextvars.ContextVar[bool] = contextvars.ContextVar('whole_stack', default=False)
+
+
+@contextlib.contextmanager
+def whole() -> Iterator[None]:
+    """Run the model's layer stack and sequences whole: under it `pipeline_stages()` and `sequence_shards()`
+    read 1, so a model traced on a mesh with a stage or sequence axis runs every layer on every token as
+    one device does, while the mesh, its expert axis among it, stays in context for the layers that read
+    it (an expert exchange). A server decodes a run trained on such a mesh under it (`dew.inference.Server`),
+    one token a step leaving no microbatches to pipeline and no sequence to split."""
+    token = _WHOLE.set(True)
+    try:
+        yield
+    finally:
+        _WHOLE.reset(token)
+
 
 def pipeline_stages() -> int:
-    """How many pipeline stages the mesh in context has, 1 with no mesh or no
-    such axis.
+    """How many pipeline stages the mesh in context has, 1 with no mesh, no
+    such axis, or under `whole`.
 
     The trainer runs its compiled step under `jax.set_mesh`, and that puts
     the mesh in context while the step traces; a model called outside it
     runs its layer stack whole.
     """
     mesh = jax.sharding.get_abstract_mesh()
-    return 1 if mesh.empty else mesh.shape.get(STAGE_AXIS, 1)
+    return 1 if mesh.empty or _WHOLE.get() else mesh.shape.get(STAGE_AXIS, 1)
 
 
 @contextlib.contextmanager
@@ -356,7 +372,7 @@ def down_projection(x: jax.Array, latent: int) -> LogicalAxes:
 
 def sequence_shards() -> int:
     """How many ways the mesh in context splits the sequence axis, 1 with no
-    mesh or no such axis.
+    mesh, no such axis, or under `whole`.
 
     The trainer runs its compiled step under `jax.set_mesh`, so the mesh is
     in context while the step traces; a model called outside
@@ -365,7 +381,7 @@ def sequence_shards() -> int:
     which is how Ulysses's exchange runs a whole-sequence kernel.
     """
     mesh = jax.sharding.get_abstract_mesh()
-    if mesh.empty or SEQUENCE_AXIS in mesh.manual_axes:
+    if mesh.empty or _WHOLE.get() or SEQUENCE_AXIS in mesh.manual_axes:
         return 1
     return mesh.shape.get(SEQUENCE_AXIS, 1)
 

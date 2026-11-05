@@ -851,3 +851,19 @@ def test_a_models_own_parameter_takes_no_axes_from_another_models_names():
     mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
     placed = Layout(min_shard=1).shardings(mesh, variables)
     assert placed["params"]["gate"].spec == P(None, "fsdp")
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_stage_and_sequence_mesh_runs_whole_under_whole():
+    """On a mesh with a stage and a sequence axis in context, the model reads both counts, and under
+    `whole` it reads one of each, the mesh and its expert axis still in context (`dew.nn.sharding.whole`)."""
+    from dew.nn.sharding import pipeline_stages, sequence_shards, whole
+    from dew.training import MeshSpec
+
+    mesh = MeshSpec(stage=2, sequence=2).build(jax.devices()[:4])
+    with jax.set_mesh(mesh):
+        assert (pipeline_stages(), sequence_shards()) == (2, 2)
+        with whole():
+            assert (pipeline_stages(), sequence_shards()) == (1, 1)
+            assert jax.sharding.get_abstract_mesh().shape == mesh.shape
+        assert (pipeline_stages(), sequence_shards()) == (2, 2)

@@ -85,7 +85,7 @@ from jax.experimental import checkify
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
-from dew._coordination import agreed_reads, from_every_process
+from dew._coordination import agreed_reads
 from dew._hashing import array_fingerprint
 from dew._records import JSON
 from dew.batch import (
@@ -129,7 +129,7 @@ from dew.inference.tasks import (
     shape_bucket,
 )
 from dew.lora import adapter_names
-from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
+from dew.mesh import batch_axes
 from dew.nn.cross_attention import CrossBlocks
 from dew.nn.inputs import (
     CONTEXT,
@@ -147,6 +147,7 @@ from dew.nn.precision import Numerics
 from dew.nn.progress import END, Progress
 from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
 from dew.nn.scatter import DROPPED
+from dew.nn.sharding import whole
 from dew.nn.visibility import with_served_blocks
 from dew.sampling.decoding import Finishing, LogitsTransform, StopStrings
 from dew.sampling.guided import Grammar
@@ -689,13 +690,10 @@ class Server:
         """The mesh the model traces under, so a layer that reads it, such as an expert exchange, finds it,
         under the numerics its task's run trained in, with its rows' PRNG implementation the default, so a
         key a layer draws (a stochastic rounding stream) is of the implementation its cache was opened
-        with, whatever thread serves it. A mesh with a stage or sequence axis is not entered: there the
-        training forward pipelines the stack or splits a sequence's positions, which one token a step
-        leaves nothing to do, and the decode runs the whole stack over the weights where they lie, as a
-        task's call does."""
-        trained = self.mesh is not None and (self.mesh.shape.get(STAGE_AXIS, 1) > 1
-                                              or self.mesh.shape.get(SEQUENCE_AXIS, 1) > 1)
-        with (contextlib.nullcontext() if self.mesh is None or trained else jax.set_mesh(self.mesh),
+        with, whatever thread serves it. The model runs its stack and sequences whole (`whole`): on a mesh
+        with a stage or sequence axis the training forward pipelines the stack or splits a sequence's
+        positions, which one token a step leaves nothing to do."""
+        with (contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh), whole(),
               contextlib.nullcontext() if self.precision is None
               else generation.run_precision(self.precision),
               jax.default_prng_impl(self.prng)):
@@ -1050,12 +1048,18 @@ class Server:
             # Nothing to run anywhere: the host reads the last call's draws.
             self._settle()
             return
-        admission = self._admit(pending, max(held["waiting"] for held in said),
-                                max(held["widest"] for held in said),
-                                sorted({name for held in said for name in held["fields"]}))
         restores = [tuple(pair) for held in said for pair in held["restores"]]
-        captures = [tuple(pair) for held in from_every_process(self._captures)
-                    for pair in held] if self.pooled else self._captures
+
+        def admitted() -> tuple[Admission | None, list]:
+            admission = self._admit(pending, max(held["waiting"] for held in said),
+                                    max(held["widest"] for held in said),
+                                    sorted({name for held in said for name in held["fields"]}))
+            return admission, [list(pair) for pair in self._captures]
+
+        # The admission is built on every process, and a failure building it stops every one, as the
+        # seating's does; each process's captures come back with it.
+        (admission, _), booked = self._agreed("serving admission", admitted, lambda held: held[1])
+        captures = [tuple(pair) for held in booked for pair in held]
         with self._context():
             if restores:
                 self._resident, self._carried = self._restored(
@@ -1075,10 +1079,15 @@ class Server:
         self._pending = (error, draws)
 
     def run(self) -> None:
-        """Step until every queued and running request has resolved."""
-        while any(self._agreed("serving run", self._busy, bool)[1]):
-            self.step()
-        self._settle()
+        """Step until every queued and running request has resolved. A step that fails stops the server:
+        every request it holds settles with the failure (`fail`), which `run` raises."""
+        try:
+            while any(self._agreed("serving run", self._busy, bool)[1]):
+                self.step()
+            self._settle()
+        except BaseException as failure:
+            self.fail(failure)
+            raise
 
     def _busy(self) -> bool:
         """Whether a request of this process's waits for a slot or holds one, refused once the server
