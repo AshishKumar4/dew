@@ -456,10 +456,10 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
     """The facts `region`'s parameters and literals state, registered in `graph` (`graphed`'s) beside
     `registered` in one call (egglog's every call its own program: 200 facts took 98 ms one at a time, 53 at
     once): each term's shape, which arithmetic computes in its operands' dtype, which broadcasts lay along one
-    axis, which literals are powers of two or one, the primitives a stable rule writes, each term's number
-    bound (`rules.log2_bound`), the program's reach (`rules.reach`), which a reordering's new intermediates
-    are held under (§6.3), each extent's power of two (`rules.log2_of`) and each reduction's length's
-    (`rules.sum_length`)."""
+    axis, which literals are powers of two or one, which terms are real (`rules.real`), the primitives a
+    stable rule writes, each term's number bound (`rules.log2_bound`), the program's reach (`rules.reach`),
+    which a reordering's new intermediates are held under (§6.3), each extent's power of two
+    (`rules.log2_of`) and each reduction's length's (`rules.sum_length`)."""
     facts: list = [*registered]
     facts += [set_(rules.shape(term)).to(Vec[i64](*(i64(size) for size in extent)))
               for term, extent in region.shapes]
@@ -477,6 +477,9 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
     sizes = {size for _, extent in region.shapes for size in extent}
     facts += [set_(rules.log2_of(i64(size))).to(i64(max(size - 1, 0).bit_length())) for size in sorted(sizes)]
     for term, _ in region.shapes:
+        dtype = region.dtypes.get(terms.key(term))
+        if dtype is not None and not jnp.issubdtype(dtype, jnp.complexfloating):
+            facts.append(rules.real(term))
         bound = region.magnitudes.get(terms.key(term))
         if bound is not None:
             facts += rules.made(term, i64(bound))

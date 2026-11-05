@@ -81,6 +81,12 @@ def unit(term: Term) -> Unit: ...
 
 
 @function
+def real(term: Term) -> Unit: ...
+"""Holds where a term's dtype is real, no complex one: a value times its sign is its magnitude (`_signs`),
+which a complex value's is not (1j times sign(1j) is -1)."""
+
+
+@function
 def positive_scale(term: Term) -> Unit: ...
 """Holds where a term is a scalar literal past zero: a scale by it keeps every comparison, so a maximum or a
 minimum of a scaled value is the scaled maximum or minimum (`_linear`)."""
@@ -472,15 +478,16 @@ each bound as the primitive it names (its params'), the multiply priced nothing 
 
 
 def _signs() -> tuple[RuleFamily, ...]:
-    """A value times its sign, its magnitude: an exact identity of IEEE arithmetic (a sign flip loses no bit,
-    and zeros, infinities and NaNs agree), one multiply fewer an element. A negation negated and the magnitude
+    """A real value times its sign, its magnitude: an exact identity of IEEE arithmetic (a sign flip loses no
+    bit, and zeros, infinities and NaNs agree), one multiply fewer an element; a complex value's is no
+    magnitude (`real`). A negation negated and the magnitude
     of a negation or of a magnitude are XLA's algebraic simplifier's, and cost a fusion nothing."""
     x, t = vars_("x t", Term)
     first, multiplied, magnitude = vars_("first multiplied magnitude", i64)
     signed = (x.unary("sign", first).binary("mul", x, multiplied),
               x.binary("mul", x.unary("sign", first), multiplied))
     return (RuleFamily("a value times its sign", tuple(
-        rule(eq(t).to(product), plain(multiplied), eq(magnitude).to(stock("abs"))).then(
+        rule(eq(t).to(product), real(x), plain(multiplied), eq(magnitude).to(stock("abs"))).then(
             union(t).with_(x.unary("abs", magnitude))) for product in signed),
         (lambda x: jnp.sign(x) * x, jnp.abs, _ROWS_ONE)),)
 
