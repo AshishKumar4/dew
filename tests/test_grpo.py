@@ -18,8 +18,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from one_draw import assert_as_exact_as_the_reference
-from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, with_gradients
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    declared_seeds,
+    indexed_recording,
+    recording,
+    with_gradients,
+)
 from rl_support import Published, ScriptedSource, TinyHead, TinyLogits, clipped_surrogate, token_mean
 from steady_state import steady_state
 
@@ -212,19 +218,31 @@ def test_a_rollout_after_the_first_reuses_its_programs_and_reads_only_what_it_sc
     assert all(rows[IDS_KEY].shape == (4, PROMPT_WIDTH + RESPONSE_WIDTH) for rows in rolled)
 
 
+K3_SEEDS = 8
+"""Check 1's seeds for the k3 estimate at small log ratios, sized by `seeds_for` paired."""
+
+
 def test_a_small_log_ratios_k3_estimate_keeps_its_leading_term():
     """The k3 estimate `exp(d) - d - 1` of a log ratio `d` near zero is `d**2 / 2` to leading order. In
     float32 `exp(d)` rounds to a spacing of `2**-24` about 1, which `- 1` leaves standing: at `d` of 1e-6
     the estimate is off by most of itself. Through `expm1` (`dew.rl.surrogate.sampled_kl`) the estimate
-    is on par with NumPy's float32 `expm1(d) - d` from float64's (check 1)."""
+    is on par with NumPy's float32 `expm1(d) - d` from float64's (check 1), over log ratios drawn
+    log-uniformly from 1e-7 to 1 in size, of either sign, rows of 64."""
     from dew.rl.surrogate import sampled_kl
 
-    log_ratio = np.asarray([1e-6, -1e-6, 3e-5, -2e-4, 0.1, -0.5], np.float32)
-    estimate = np.asarray(k3_kl(jnp.zeros_like(log_ratio), jnp.asarray(log_ratio)))
-    wide = log_ratio.astype(np.float64)
-    assert_as_exact_as_the_reference(estimate, np.expm1(log_ratio) - log_ratio, np.expm1(wide) - wide,
-                                     "k3 at small log ratios")
-    np.testing.assert_array_equal(np.asarray(sampled_kl(jnp.asarray(log_ratio))), estimate)
+    def draw(seed):
+        rng = np.random.default_rng([4096, seed])
+        size = 10.0 ** rng.uniform(-7, 0, (16, 64))
+        return (np.float32(size * rng.choice([-1.0, 1.0], size.shape)),)
+
+    def reference(log_ratio):
+        return np.expm1(log_ratio) - log_ratio
+
+    assert_as_exact(lambda log_ratio: k3_kl(jnp.zeros_like(log_ratio), log_ratio), as_given(reference), draw,
+                    "k3 at small log ratios", seeds=K3_SEEDS)
+    (log_ratio,) = draw(0)
+    np.testing.assert_array_equal(np.asarray(sampled_kl(jnp.asarray(log_ratio))),
+                                  np.asarray(k3_kl(jnp.zeros_like(log_ratio), jnp.asarray(log_ratio))))
 
 
 def test_a_synchronous_collection_refuses_a_ratio_read_at_another_temperature():

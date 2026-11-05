@@ -84,7 +84,6 @@ from check1_statistics import (
     NARROW_FACTORS,
     PARITY,
     PREVIOUS_TAILS,
-    REDRAW,
     ROW_FACTOR,
     UPPER_TAIL,
     Finding,
@@ -106,12 +105,15 @@ from check1_statistics import (
     log_sum,
     pooled_zero_rows,
     root_mean,
+    row_factor,
     shown,
 )
+from check1_wire import DRAWS, REDRAW, STAGES, staged_units
 from conditioning import Conditioning, conditioned
 from float64_terms import float64_terms
-from map_judge import DRAWS, PoolRefused, ask_later, drawing, judging, pooled_units, record_units
+from map_judge import PoolRefused, ask_later, drawing, judging, pooled_units, record_units
 from site_draws import _Draws
+from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
 
 from dew.accuracy import distance, reduction_bound, within
 
@@ -427,10 +429,10 @@ def _with_mode(findings: list, arms) -> list:
 def _truth_program(fn):
     """`fn`, a check's float64 truth, as the gate runs it, unrewritten (`arm_arithmetic.unrewritten`):
     compiled, once a signature, so the truth runs as one float64 program on the device's FP64 units rather
-    than one eager dispatch an equation, every primitive at its own float64 semantics. A truth the gate runs
-    as given (`as_given`: torch, a recording, a host loop), one compiled already (a jit, `dew_programs`), or
-    none, as it is; a window loop's by its own; a NumPy truth (its first call returns host values) as given
-    after that call. A JAX truth with host work inside fails at its trace, loudly, and passes `as_given`."""
+    than one eager dispatch an equation, every primitive at its own float64 semantics (`Truth`). A truth the
+    gate runs as given (`as_given`: NumPy, torch, a recording, a host loop), one compiled already (a jit,
+    `dew_programs`), or none, as it is; a window loop's by its own. A truth with host work inside that does
+    not state it fails at its trace, loudly, and passes `as_given`."""
     if fn is None or _given(fn) or getattr(fn, "dew_programs", False) or hasattr(fn, "lower"):
         return unrewritten(fn)
     if isinstance(fn, _Windowed):
@@ -663,104 +665,6 @@ def _row_sizes(truth: np.ndarray, terms=None) -> tuple[np.ndarray, np.ndarray]:
 NO_ZERO_ROWS: ZeroRows = (np.zeros(0, np.int64), np.zeros(0), np.zeros(0))
 
 
-SKETCH = 32
-"""The random sign projections a recording keeps of each leaf of its reference's float64 truth
-(`truth_sketch`): a move of the truth independent of the signs, a wrong row or index, moves their root
-mean square by about its own norm (a single element's by exactly its size); a move built against the
-signs, in the span their complement leaves, is not seen, which no fixed sketch can exclude."""
-SKETCH_DEVIATIONS = 2.0
-"""How many times the oracle rule's bound on a difference's norm the root mean square of its SKETCH sign
-projections may reach. A truth recomputed within the oracle rule, its difference independent of the
-signs, is refused with probability under 1e-11 (a Rademacher sum's square is no heavier-tailed than a
-normal's: Chernoff's bound on a chi-square of SKETCH degrees past 2² times its mean). A single
-element's move past twice the bound and the sketches' own rounding (`sketch_rounding`) is refused
-always; a wider move past them in norm is refused but
-for its chance of lying near the signs' complement, which is no guarantee: two entries swapped whose
-sign words agree move no projection, one pair in 2^32 at a seed, and each seed draws its own signs, so
-a wrong truth repeated over a site's seeds hides at all of them only by that chance to their power."""
-SKETCH_BLOCK = 64
-"""The entries `truth_sketch` sums in float64 in one block, each block's sum then summed exactly: its
-rounding at most gamma(SKETCH_BLOCK) of the magnitudes', in whatever order a host takes a block."""
-
-
-def _sign_bits(size: int, seed: int) -> np.ndarray:
-    """SKETCH random signs for each of `size` entries at a recorded seed, one bit a sign, the same on every
-    host and run, and drawn apart at every seed."""
-    return np.random.default_rng([0x5E7C4, size, seed]).integers(0, 1 << SKETCH, size, dtype=np.uint64)
-
-
-_BYTE_SIGNS = ((np.arange(256)[:, None] >> np.arange(8)) & 1) * 2.0 - 1
-"""A (256, 8) float64 table whose [byte, k] entry is +1.0 where the byte's bit k is set and -1.0 where it
-is not, least significant bit first."""
-
-
-def truth_sketch(truth, seed: int) -> np.ndarray:
-    """A float64 truth leaf's sketch `[SKETCH]` at a recorded seed: its entries summed under SKETCH random
-    signs of that seed's own (`_sign_bits`), each sign's
-    product exact, in blocks of SKETCH_BLOCK whose float64 sums are summed exactly (`math.fsum`), so a
-    truth recomputed apart is held to the recorded one without the recording keeping it, every host
-    rounding the sketch alike within `sketch_rounding` (`indexed_recording`). The products and the
-    blocks' sums run on a GPU's float64 units where the process has one (`_device_partials`), never on
-    its host while the GPU idles (ledger 1568), and on the host otherwise (`_host_partials`); the signs
-    and the exact sum are the host's either way."""
-    flat = np.asarray(truth, np.float64).reshape(-1)
-    if not flat.size:
-        return np.zeros(SKETCH)
-    bits = _sign_bits(flat.size, seed)
-    partials = (_device_partials if jax.default_backend() == "gpu" else _host_partials)(flat, bits)
-    return np.asarray([math.fsum(column) for column in partials.T.tolist()])
-
-
-def _host_partials(flat: np.ndarray, bits: np.ndarray) -> np.ndarray:
-    """`flat`'s blocks' sums `[blocks, SKETCH]` under the signs `bits` holds, on the host, the last block
-    padded with zeros: a block's entries summed by each sign byte's value (`np.bincount`) times its eight
-    signs (`_BYTE_SIGNS`), one order of its exact products, within gamma(SKETCH_BLOCK) (ledger 2807)."""
-    partials = []
-    for start in range(0, flat.size, 1 << 12):
-        chunk = flat[start:start + (1 << 12)]
-        # Sign k of an entry is its word's bit k: its low four bytes, read little-endian whatever the host's
-        # order, so the first byte holds bits 0 to 7. An entry's bins: its block's, its byte's, the value's.
-        words = bits[start:start + chunk.size].astype("<u8").view(np.uint8).reshape(chunk.size, 8)[:, :4]
-        bins = (np.arange(chunk.size)[:, None] // SKETCH_BLOCK * 4 + np.arange(4)) * 256 + words
-        summed = np.bincount(bins.reshape(-1), np.repeat(chunk, 4), -(-chunk.size // SKETCH_BLOCK) * 1024)
-        partials.append((summed.reshape(-1, 256) @ _BYTE_SIGNS).reshape(-1, SKETCH))
-    return np.concatenate(partials)
-
-
-DEVICE_CHUNK = 1 << 20
-"""The entries one call of `_device_block_sums` takes: their `[DEVICE_CHUNK, SKETCH]` float64 products,
-256 MiB, a multiple of SKETCH_BLOCK so its blocks are the host's."""
-
-
-@jax.jit
-def _device_block_sums(chunk: jax.Array, words: jax.Array) -> jax.Array:
-    """`chunk`'s blocks' sums `[DEVICE_CHUNK // SKETCH_BLOCK, SKETCH]` under the signs `words` hold, each
-    sign its word's bit."""
-    signs = ((words[:, None] >> jnp.arange(SKETCH, dtype=jnp.uint64)) & 1).astype(jnp.float64) * 2 - 1
-    return (chunk[:, None] * signs).reshape(-1, SKETCH_BLOCK, SKETCH).sum(axis=1)
-
-
-def _device_partials(flat: np.ndarray, bits: np.ndarray) -> np.ndarray:
-    """`_host_partials` on the default device in float64: the same products, exact, each block summed
-    in whatever order the device takes it, within gamma(SKETCH_BLOCK) of its magnitudes, a chunk at a
-    time (`DEVICE_CHUNK`, the last padded with zeros, whose blocks past the entries' are dropped)."""
-    blocks = -(-flat.size // SKETCH_BLOCK)
-    padded = -flat.size % DEVICE_CHUNK
-    flat, bits = np.pad(flat, (0, padded)), np.pad(bits, (0, padded))
-    with jax.enable_x64(new_val=True):
-        partials = [np.asarray(_device_block_sums(jnp.asarray(flat[start:start + DEVICE_CHUNK]),
-                                                  jnp.asarray(bits[start:start + DEVICE_CHUNK])))
-                    for start in range(0, flat.size, DEVICE_CHUNK)]
-    return np.concatenate(partials)[:blocks]
-
-
-def sketch_rounding(magnitude: float) -> float:
-    """The most `truth_sketch` of a leaf whose magnitudes sum to `magnitude` may round by, on any host:
-    gamma(SKETCH_BLOCK) of it within the blocks, and the exact sum's one rounding."""
-    eps = float(np.finfo(np.float64).eps)
-    return (SKETCH_BLOCK * eps / 2 / (1 - SKETCH_BLOCK * eps / 2) + eps / 2) * magnitude
-
-
 @dataclasses.dataclass(frozen=True)
 class RecordedLeaf:
     """A recorded reference's evidence for one leaf at one seed, all check 1 reads of it (`_drawn`): its
@@ -776,6 +680,9 @@ class RecordedLeaf:
     dtype: str
     zero_sizes: np.ndarray | None = None
     worst_log: float | None = None
+    share: float | None = None
+    """The share of its worst sized row's squared error the row's largest element carries (`_Draws.factor`),
+    zero where no row is sized; None where the leaf was recorded as rows alone (`rows_summary`)."""
 
     @property
     def log_worst(self) -> float:
@@ -889,6 +796,16 @@ def _rows(values: np.ndarray, runs) -> list[np.ndarray]:
     return [values[start:stop].reshape(-1, width) for width, (start, stop) in spans.items()]
 
 
+def _largest_share(rows: np.ndarray) -> np.ndarray:
+    """Each row's largest element's share of the row's squared error, the row scaled by its largest first so
+    no square overflows: one for a row one element holds alone, zero for a row of zeros."""
+    rows = np.abs(np.asarray(rows, np.float64))
+    largest = np.max(rows, axis=1, keepdims=True) if rows.shape[1] else np.zeros((len(rows), 1))
+    scaled = np.square(rows / np.where(largest > 0, largest, 1.0))
+    total = np.sum(scaled, axis=1)
+    return np.where(total > 0, 1.0 / np.where(total > 0, total, 1.0), 0.0)
+
+
 def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
     """Each reference leaf's evidence against its truth in `held` (`_LaidTruths.of`) as check 1 reads it
     (`RecordedLeaf`), every leaf read in C order with the others in a few passes; None for a reference of
@@ -918,6 +835,7 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
     errors = values - held.values
     mse = np.concatenate([np.mean(block, axis=1) for block in _blocks(np.square(errors), held.runs)])
     rows = np.concatenate([np.zeros(0), *map(_scaled_rms, _rows(errors, held.runs))])
+    shares = np.concatenate([np.zeros(0), *map(_largest_share, _rows(errors, held.runs))])
     # Each laid leaf's rows, its first among them, and those sized past RESOLUTION.
     counts = np.repeat([size // width if width else 0 for _, size, width in held.runs],
                        [leaves for leaves, _, _ in held.runs])
@@ -928,24 +846,29 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
     logs, over = log_over(rows[sized], held.sizes[sized]), _over(rows[sized], held.sizes[sized])
     # The worst sized row of each leaf that has one: the largest of its run of the sized rows.
     some = taken > 0
-    worst_log, worst = np.full(len(counts), LOG_ZERO), np.zeros(len(counts))
+    worst_log, worst, share = np.full(len(counts), LOG_ZERO), np.zeros(len(counts)), np.zeros(len(counts))
     if some.any():
         firsts = (np.cumsum(taken) - taken)[some]
         worst_log[some] = np.maximum.reduceat(logs, firsts)
         worst[some] = np.maximum.reduceat(over, firsts)
+        # The worst row's largest element's share of its squared error, each leaf's worst sized row's.
+        sized_shares = shares[sized]
+        share[some] = [sized_shares[first + int(np.argmax(logs[first:first + count]))]
+                       for first, count in zip(firsts.tolist(), taken[some].tolist(), strict=True)]
     # The rows of float64 zero, each leaf's its span of them.
     unsized = np.flatnonzero(~sized)
     zero_rows = unsized - np.repeat(starts, counts - taken)
     zero_errors, zero_sizes = rows[unsized], held.own[unsized]
     ends = list(itertools.accumulate((counts - taken).tolist(), initial=0))
-    mse, worst, worst_log, finite = mse.tolist(), worst.tolist(), worst_log.tolist(), (
+    mse, worst, worst_log, share, finite = mse.tolist(), worst.tolist(), worst_log.tolist(), share.tolist(), (
         finite & held.finite).tolist()
     for index, at in enumerate(held.laid):
         if read[index]:
             span = slice(ends[index], ends[index + 1])
             summaries[at] = RecordedLeaf(mse[index], worst[index], zero_rows[span], zero_errors[span],
                                          finite=finite[index], dtype=dtype(references[at]),
-                                         zero_sizes=zero_sizes[span], worst_log=worst_log[index])
+                                         zero_sizes=zero_sizes[span], worst_log=worst_log[index],
+                                         share=share[index])
     return summaries
 
 
@@ -1002,9 +925,12 @@ def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
 
 def _over_orders(first: list[tuple], later: list[tuple]) -> list[tuple]:
     """An arm's evidence on a draw (`_evidence`) over two of its orders: each leaf's errors and rows of
-    float64 zero the first order's, its worst rows the worse of the two, its values finite at both."""
+    float64 zero the first order's, its worst rows the worse of the two, each worst row's share
+    (`RecordedLeaf.share`) that of the order it is, its values finite at both."""
     return [(one[0], one[1], float(np.fmax(one[2], other[2])), float(np.fmax(one[3], other[3])), one[4],
-             one[5] and other[5]) for one, other in zip(first, later, strict=True)]
+             one[5] and other[5], tuple(other[6][arm] if other[2 + arm] > one[2 + arm] else one[6][arm]
+                                        for arm in (0, 1)))
+            for one, other in zip(first, later, strict=True)]
 
 
 def _conditioning(reference_fn, truth_fn, draw, seeds, ran=None) -> Conditioning:
@@ -1078,6 +1004,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     stacked: list = [None for _ in arms]
     stacked_rows: list = [None for _ in arms]
     per_example: list[list] = [[] for _ in arms]
+    shares: list[list] = [[] for _ in arms]
     per_example_rows: list[list] = [[] for _ in arms]
 
     def truth_and_terms(inputs):
@@ -1156,15 +1083,23 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
             worst[at_arm].append([(entry[2], entry[3]) for entry in row])
             zero_rows[at_arm].append([entry[4] for entry in row])
             finite[at_arm].append([entry[5] for entry in row])
+            shares[at_arm].append([entry[6] for entry in row])
             per_example[at_arm].append(stacked[at_arm])
             per_example_rows[at_arm].append(stacked_rows[at_arm])
     drawn = [_Draws(names, np.asarray(mine), np.asarray(theirs[at_arm]),
                     np.asarray(worst[at_arm]).reshape(len(mine), -1, 2), zero_rows[at_arm],
                     np.asarray(finite[at_arm]), widths, per_example[at_arm] if examples else None,
-                    per_example_rows[at_arm] if examples else None)
+                    per_example_rows[at_arm] if examples else None, _shares(shares[at_arm], len(mine)))
              for at_arm in range(len(arms))]
     first = drawn[0] if library_fn is None else drawn[0].against_larger(drawn[1], library_leaves)
     return [first, *drawn[len(arms) - len(also):]] if also else first
+
+
+def _shares(found: list[list], count: int) -> np.ndarray:
+    """The worst rows' shares over a run's seeds (`_Draws.shares`, seed by leaf by arm), NaN where one is
+    unknown (a recording's summary keeps no row's elements)."""
+    return np.asarray([[[np.nan if share is None else share for share in pair] for pair in seed]
+                       for seed in found], np.float64).reshape(count, -1, 2)
 
 
 def _example_ratios(leaves, references, truths) -> list[np.ndarray | None]:
@@ -1296,7 +1231,7 @@ def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, thei
             # adds no error and resolves nothing.
             kept = str(jnp.dtype(leaf.dtype))
             assert kept == their.dtype, (path, kept, their.dtype)
-            row.append((0.0, 0.0, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True))
+            row.append((0.0, 0.0, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True, (0.0, 0.0)))
             continue
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
         paired = was or shared or np.array_equal(np.asarray(true), np.asarray(their_true))
@@ -1325,7 +1260,7 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     `paired`, the two held to truths of their own draws (`null_runs`), no row is paired."""
     if not paired:
         return (mine.mse, theirs.mse, mine.log_worst, theirs.log_worst, NO_ZERO_ROWS,
-                mine.finite and theirs.finite)
+                mine.finite and theirs.finite, (mine.share, theirs.share))
     at_zero = dict(zip(theirs.zero_rows.tolist(), theirs.zero_errors.tolist(), strict=True))
     unrecorded = [at for at in mine.zero_rows.tolist() if at not in at_zero]
     if unrecorded:
@@ -1345,8 +1280,11 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
             zero.append((at, error, at_zero[at]))
     rows, errors, their_errors = (np.asarray(column, dtype) for column, dtype in zip(
         zip(*zero, strict=True) if zero else ((), (), ()), (np.int64, np.float64, np.float64), strict=True))
+    # A measured row of float64 zero that became an arm's worst keeps no share of its own: unknown.
+    shares = (mine.share if worst == mine.log_worst else None,
+              theirs.share if their_worst == theirs.log_worst else None)
     return (mine.mse, theirs.mse, worst, their_worst, (rows, errors, their_errors),
-            mine.finite and theirs.finite)
+            mine.finite and theirs.finite, shares)
 
 
 def _judged(draws: _Draws, index: int, tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)
@@ -1398,7 +1336,9 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
                 over.append(Finding(leaf, "pooled", measure, f"{leaf}: dew's RMS error from float64 is "
                                     f"{ratio:.3f} times the reference's over {count} seeds, interval "
                                     f"[{low:.3f}, {high:.3f}] (allowed {PARITY})"))
-        factor = draws.factor(index)
+        # The paired examples' test keeps its width's factor (its null is exchangeability, whatever a row's
+        # error is); the maximum's takes a row one value rules at one value's (`_Draws.factor`).
+        factor = row_factor(draws.widths[index])
         paired = draws.of_example_rows(index) if contained else None
         if paired is not None and (found_rows := _paired_rows(paired, factor)) < tails[0]:
             # A site that stacks examples: each example's worst row against the reference's on it.
@@ -1408,6 +1348,7 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
                 f"{int(np.sum(paired > math.log(factor)))} of {len(paired)} examples, the reference's past "
                 f"it on {int(np.sum(paired < -math.log(factor)))} (p {found_rows:.1e}; `_paired_rows`)"))
         my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
+        factor = draws.factor(index)
         if paired is None and not my_row <= math.log(factor) + their_row:
             over.append(Finding(leaf, "row", my_row - their_row,
                                 f"{leaf}: the worst row over {count} seeds is {shown(my_row)} from float64 "
@@ -1441,16 +1382,16 @@ def _staged(drawn, seeds: int, label: str, *,
         further = any(np.sum(draws.theirs[:, index]) > 0 and _judged(draws, index, tails)[0] > PARITY
                       for index in range(len(draws.names)))
     if further:
-        draws = draws.joined(drawn(seeds, (1 + REDRAW) * seeds))
+        draws = draws.joined(drawn(seeds, staged_units(seeds)))
     # The stage drawn by the pooled ratio alone; the final verdict's leaves it leaves inconclusive asked of
     # their typical draw (`_judgement`'s `typical`).
     return (*_judgement(draws, label, tails, contained=two_stage, typical=two_stage), 2 if further else 1)
 
 
-STAGES_LOG = "DEW_CHECK1_STAGES"
-"""The environment variable naming a file each check-1 judgement appends its stage, its verdict and its
-leaves of narrow rows (NARROW_FACTORS) to, one JSON line (`_logged`): what a train reads every site's
-stage-two rate from, every attempt counted, and which sites' local errors rest on check 2."""
+STAGES_LOG = STAGES
+"""The environment variable (`check1_wire.STAGES`) naming a file each check-1 judgement appends its stage, its
+verdict and its leaves of narrow rows (NARROW_FACTORS) to, one JSON line (`_logged`): what a train reads every
+site's stage-two rate from, every attempt counted, and which sites' local errors rest on check 2."""
 
 
 def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str], ynn: str | None = None) -> None:
@@ -1491,33 +1432,29 @@ def _cancelling_terms(draw, truth, program=None):
     alone before any arm runs (bible §7, ledger 2851): a row whose truth is exactly zero or cancels is judged
     at the size of what it sums, as the one-draw rule judges it, not held to the reference's residue there (a
     fused attention's causal first row, whose one key makes its gradient exactly zero in float64, its
-    rounding's residue Dew's and the reference's alike). None where no row is zero, or where the truth is not
-    a JAX program its terms can be traced from (run as given, recorded, a window loop's). `program`, the truth
-    as the draws run it (`_truth_program`), evaluates the first draw's truth, so its first call's run and
-    trace serve the draws too, once a process (a map task's draws, DRAWS); a reference standing for it runs
+    rounding's residue Dew's and the reference's alike). None where no row is zero, or where the site
+    states a truth no program's terms are traced from (run as given, recorded, a window loop's; ledger
+    3198): every other truth traces, and a failure to is the site's. `program`, the truth as the draws
+    run it (`_truth_program`), evaluates the first draw's truth, so its first call's run and trace serve
+    the draws too, once a process (a map task's draws, DRAWS); a reference standing for it runs
     compiled, not eagerly (ledger 3774)."""
     if truth is None or isinstance(truth, _Windowed) or _given(truth) or getattr(truth, "recorded", False):
         return None
     # The truth on the site's first draw, and its terms only where it holds a zero row: only a zero row whose
     # terms are not zero too gains a size, so a site whose zero rows sum nothing (a query that keeps no key)
-    # keeps the reference's residue rule without tracing its terms a draw. A truth whose program cannot be
-    # run or traced so (host work on its values, NumPy or torch; a kernel that refuses float64) has no
-    # terms: it keeps the residue rule and runs as it always has, the gate's own run of it reporting any
-    # failure of its own.
+    # keeps the reference's residue rule without tracing its terms a draw.
     run = program or unrewritten(jax.jit(truth))
-    try:
-        with jax.enable_x64(new_val=True):
-            leaves = [*map(np.asarray, jax.tree.leaves(run(*widened(draw(0)))))]
-            if not np.any(_LaidTruths.of(leaves).sizes == 0):
-                return None
-            truths, terms = float64_terms(truth, *widened(draw(0)))
-    except Exception as untraced:
-        found = f"untraced: {type(untraced).__name__}"
-    else:
-        plain, termed = _LaidTruths.of(jax.tree.leaves(truths)), _LaidTruths.of(
-            jax.tree.leaves(truths), _term_leaves(terms, truths))
-        found = bool(np.any((plain.sizes == 0) & (termed.sizes > 0)))
-    return truth if found is True else None
+    # The draw as every seed's is drawn, outside float64, then widened (under x64 a draw's own defaults
+    # would draw float64 values the arms never see).
+    inputs = widened(draw(0))
+    with jax.enable_x64(new_val=True):
+        leaves = [*map(np.asarray, jax.tree.leaves(run(*inputs)))]
+        if not np.any(_LaidTruths.of(leaves).sizes == 0):
+            return None
+        truths, terms = float64_terms(truth, *inputs)
+    plain, termed = _LaidTruths.of(jax.tree.leaves(truths)), _LaidTruths.of(
+        jax.tree.leaves(truths), _term_leaves(terms, truths))
+    return truth if bool(np.any((plain.sizes == 0) & (termed.sizes > 0))) else None
 
 
 def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn, library_row, library_leaves,
@@ -1694,7 +1631,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     # own, the shards cut at the most of them, and a recording holds no more.
     _site_judged(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
                  library_fn=library_fn, library_row=library_row, library_leaves=library_leaves, also=also,
-                 terms=terms, examples=examples, weighing=None, upto=(1 + REDRAW) * seeds)
+                 terms=terms, examples=examples, weighing=None, upto=staged_units(seeds))
 
 
 def _deferred(dew_fn, reference_fn, draw, label: str, *, seeds: int, conditioning: int, truth_fn, orders,
@@ -1704,7 +1641,7 @@ def _deferred(dew_fn, reference_fn, draw, label: str, *, seeds: int, conditionin
     elements classed over the draws it takes, alike in every process that runs it. A sharded site's map
     tasks draw each check's units apart, the weighed check's past the unweighted one's in the plan's units
     (tools/armada/ci.py `draws_of`), and its judge pools the weighed check's where it defers."""
-    plain, span = (1 + REDRAW) * seeds, (1 + REDRAW) * conditioning
+    plain, span = staged_units(seeds), staged_units(conditioning)
 
     def weighed():
         _site_judged(dew_fn, reference_fn, draw, f"{label}, conditioned", seeds=conditioning,
@@ -1860,7 +1797,7 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
     draws = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn, label=label)
     moved, kept, unresolved = _moved(draws, 1)
     if not moved:
-        further = range(seeds, (1 + REDRAW) * seeds)
+        further = range(seeds, staged_units(seeds))
         draws = draws.joined(_drawn(changed_fn, original_fn, draw, further, truth_fn, label=label))
         moved, kept, unresolved = _moved(draws, 2)
     if not moved:
@@ -1944,7 +1881,7 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     _refuse_numpy_arms(draw, *([dew_fn] if paired else []), reference_fn)
     # A weighed site (`assert_as_exact`'s `conditioning`) is sized as it is judged, weighed, its heavy
     # elements classed over its first stages' draws.
-    weighing = (_conditioning(reference_fn, truth_fn, draw, range((1 + REDRAW) * max(start, FEWEST_SEEDS)))
+    weighing = (_conditioning(reference_fn, truth_fn, draw, range(staged_units(max(start, FEWEST_SEEDS))))
                 if conditioning else None)
     dew_fn, reference_fn = _arms(dew_fn if paired else reference_fn, reference_fn)
     dew_fn = dew_fn if paired else None
@@ -2077,7 +2014,7 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
     verdicts = []
     # Each run's draws: both budgets whole, the unweighted check's and the weighed one's, and the
     # reference's own beside them where unpaired, so no two runs share a draw.
-    span = (1 + REDRAW) * max(seeds, conditioning or 0)
+    span = staged_units(max(seeds, conditioning or 0))
     for run in range(first, first + runs):
         base = run * 2 * span
 
@@ -2094,7 +2031,7 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
         verdict = _verdict(over, unresolved)
         if conditioning is not None and verdict == "inconclusive":
             weighing = _conditioning(reference_fn, truth_fn, draw,
-                                     range(base, base + (1 + REDRAW) * conditioning))
+                                     range(base, base + staged_units(conditioning)))
             over, unresolved, stage = judged(weighing, conditioning)
             verdict = f"{_verdict(over, unresolved)}, conditioned"
         verdicts.append((verdict, stage, [str(finding) for finding in over + unresolved]))
@@ -2223,9 +2160,9 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
     recorded = [*reference.values(), *truth.values(),
                 *(inputs.values() if inputs_of is None else [digests])]
     count = min(len(value) for value in recorded)
-    if count < (1 + REDRAW) * seeds:
+    if count < staged_units(seeds):
         raise AssertionError(f"{site}: {count} recorded seeds, and check 1 over {seeds} may draw "
-                             f"{(1 + REDRAW) * seeds}; record (1 + REDRAW) times the declared seeds")
+                             f"{staged_units(seeds)}; record (1 + REDRAW) times the declared seeds")
 
     def draw(seed):
         if inputs_of is None:
@@ -2269,9 +2206,9 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
     pilots = len(stored.get(f"{site}.pilot.input_digest", ()))
     count = min([len(value) for part in (mse, worst, finite, sketch) for value in part.values()]
                 + [len(value) - 1 for value in zero_offsets.values()])
-    if min(count, len(digests)) < (1 + REDRAW) * seeds:
+    if min(count, len(digests)) < staged_units(seeds):
         raise AssertionError(f"{site}: {min(count, len(digests))} recorded seeds, and check 1 over {seeds} "
-                             f"may draw {(1 + REDRAW) * seeds}")
+                             f"may draw {staged_units(seeds)}")
     roundings = {}
 
     def held(seed):
