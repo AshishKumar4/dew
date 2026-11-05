@@ -160,11 +160,14 @@ class AttentionCase:
 
     @property
     def cell(self) -> tuple[str | None, str]:
-        """The call's cell among attention's declared ones (`DECLARED`): the target's instruction family and
-        the kind of call, a 16-bit call's or an fp32 call's ('float32 attention'), each its forward and its
-        training alike, as the kernel is chosen before the call is differentiated (`attention_route.attend`'s
-        `custom_vjp`)."""
+        """The call's cell among its selector's declared ones: attention's (`DECLARED`) the target's
+        instruction family and the kind of call, a 16-bit call's or an fp32 call's ('float32 attention'), each
+        its forward and its training alike, as the kernel is chosen before the call is differentiated
+        (`attention_route.attend`'s `custom_vjp`); a decode step's (`DECODE_DECLARED`, `decodes`) the
+        device's generation and 'decode' alike, as its kernels' speeds part by generation within a family."""
         kind = 'attention' if self.dtype in CUDNN_DTYPES else f"{jnp.dtype(self.dtype).name} attention"
+        if decodes(self):
+            return device_generation(), kind.replace('attention', 'decode')
         return generation.family(device_generation()), kind
 
 
@@ -531,11 +534,29 @@ reference path, which takes every call, so it runs where the preference names it
 
 
 def _decode_preferred(case: AttentionCase) -> str:
-    """The kernel a decode call runs: on a GPU the hand-written decode kernel (`decode_attention`, no
-    template's yet: ledger row 3424; measured 1.57 times as fast as cuDNN in geometric mean on an A100 over
-    Qwen3-0.6B's 28 decode shapes; no cell declares cuDNN, `generation.TARGETS`' note), which hands a call
-    it does not take to the next kernel by legality; xla elsewhere."""
+    """The kernel a decode call runs: on a GPU the hand-written decode kernel (`decode_attention`; the
+    template's decode does not yet match it, rows 4042 to 4045), which hands a call it does not take to the
+    next kernel by legality, a declared cell's old route first (`DECODE_DECLARED`); xla elsewhere."""
     return 'decode' if generation.backend() == 'gpu' else 'xla'
+
+
+_FP32_DECODE = ("jax.nn's xla attention measured faster than the decode kernel at every fp32 decode shape "
+                "timed, its products IEEE fp32 as the kernel's (`highest`; wall a step over 50 steps in one "
+                "loop, five interleaved rounds, 1 to 128 rows over 4096 and 32768 keys, 32 or 16 query "
+                "heads over 8, 128 or 64 wide): {}")
+DECODE_DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
+    ('sm80', 'float32 decode'): ('xla', _FP32_DECODE.format(
+        "on an A100 2.63 to 3.64 times as fast, 51.2 against 140.5 us at one row over 4096 keys, 7311 "
+        "against 25058 at 32 rows over 32768 (ET-DFP32B-a100)")),
+    ('sm90', 'float32 decode'): ('xla', _FP32_DECODE.format(
+        "on an H100 2.75 to 3.60 times as fast, 23.8 against 72.4 us at one row over 4096 keys, 3870 "
+        "against 12351 at 32 rows over 32768 (ET-DFP32B-h100)")),
+}
+"""The decode selector's declared cells (`Op.declared`), by (device generation, kind of call), each an old
+route measured faster than the decode kernel at every shape a receipt timed on the generation, and that
+receipt. cuDNN declares none: faster at most 16-bit rows, it measured slower at some on each generation timed
+(an A100's 8 rows over 32768 keys, 756 against 734 us, ET-DCELL-a100; an H100 PCIe's one row over 4096, 40.5
+to 65 against 35.6, ET-DFP32-h100-pcie)."""
 
 
 DECODE = Op[AttentionCase]('decode', (
@@ -543,9 +564,10 @@ DECODE = Op[AttentionCase]('decode', (
     Kernel[AttentionCase]('cudnn', CUDNN_SUPPORTS),
     Kernel[AttentionCase]('xla', XLA_SUPPORTS, generic=True),
     Kernel[AttentionCase]('reference', (), generic=True),
-), _decode_preferred, _hosted)
+), _decode_preferred, _hosted, DECODE_DECLARED)
 """The selector of a call of few query positions over key lengths (`decodes`): the decode kernel
-(`decode_attention.attend`), cuDNN and the folded xla attention (`folded_attention`)."""
+(`decode_attention.attend`), cuDNN and the folded xla attention (`folded_attention`), a declared cell's
+kernel first (`DECODE_DECLARED`)."""
 
 
 def decodes(case: AttentionCase) -> bool:
