@@ -49,6 +49,19 @@ def scanned(states, initial, reverse: bool):
     return jax.lax.scan(step, initial, states[0], reverse=reverse)[1][None]
 
 
+def spread_primitive():
+    """A primitive of its own named `exp`, an entrywise operation's name, that gives each entry the sum of
+    its operand: no operation one entry at a time, whatever its name."""
+    from jax.extend.core import Primitive
+
+    spread = Primitive("exp")
+    spread.def_abstract_eval(lambda value: value)
+    return spread
+
+
+SPREAD = spread_primitive()
+
+
 def shifted_left(states):
     """Each position takes the next one's state (slice and concatenate, no contraction)."""
     return jnp.concatenate([states[:, 1:], jnp.zeros_like(states[:, :1])], axis=1)
@@ -94,6 +107,7 @@ REFUSED = {
     "a left shift named token-wise": lambda tokens: named(lambda x: shifted_left(x[None])[0], TOKENWISE)(
         embedded(tokens)[0])[None],
     "a reversed sequence": lambda tokens: embedded(tokens)[:, ::-1],
+    "a primitive taking an entrywise name": lambda tokens: SPREAD.bind(embedded(tokens)),
     "an operation with no rule": lambda tokens: jax.lax.linalg.tridiagonal_solve(
         jnp.full((tokens.shape[1],), 0.5), jnp.full((tokens.shape[1],), 2.0),
         jnp.full((tokens.shape[1],), 0.5), embedded(tokens)[0, :, :1])[None],
