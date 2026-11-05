@@ -85,6 +85,15 @@ family without one (mma.sync's, until its thin mainloop) takes another mainloop 
 `MosaicBackward.eligible`)."""
 
 
+def query_swizzle(family: mosaic.Family) -> int | None:
+    """The swizzle a forward stages its query block at, the left operand of its logits' product: the
+    narrowest where its family loads operands into registers (`Family.operands_in_registers`), 8-row tiles
+    32 bytes wide, so a load of the block's fragments one instruction deep (16 of a 16-bit row) is a whole
+    tile and its 8 rows' 16-byte reads take every bank once, where a plain block's 256-byte rows take one
+    bank group 8 times; layout inference's otherwise (`mosaic.staged`). The query is written once a tile."""
+    return mosaic.NARROWEST_SWIZZLE_BYTES if family.operands_in_registers else None
+
+
 def transposed_swizzles(tiles: "Tiles | BackwardTiles", *names: str) -> dict[str, int]:
     """The swizzles `Family.streams` stages the streams `names` at, which a launch's products read
     transposed: the narrowest where `tiles` stage them so (`Tiles.narrow`), the family's own otherwise."""
