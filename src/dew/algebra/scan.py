@@ -117,7 +117,12 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
     each operand but the reset's. Refused (`Refused`) where the update or the readout is not of the
     module's form. `init(shapes)` given a chunk's operands (or their shapes and dtypes) starts a walk that
     merges (`Walk`), its transfer carried where its tokens correct the state; given none, one that steps
-    alone."""
+    alone. `prepare`, `step`, `mapped` and `merge` each take a mainloop's issuer, `issue(role, lhs, rhs)`
+    (`lhs @ rhs`), which makes every matrix product of the forms, each by its role: `scores`, `gram`,
+    `inverse_merge`, `apply` and `carry` prepared; `correct` and `carry` stepped (`carry.CARRY_ROLES`);
+    `readout_memory` and `readout_local` mapped (`carry.EMIT_ROLES`); `transfer_carry`, `transfer_apply`
+    and `transfer_compose` forming and joining a walk's transfer. The same forms without one take Dew's
+    products, the portable route's."""
     names = tuple(name for name in declaration.operands if name != declaration.reset)
     shape, dtype = declaration.state
     if len(shape) != 2:
@@ -160,7 +165,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
 
     splits: collections.OrderedDict = collections.OrderedDict()  # the least recently prepared first
 
-    def prepare(chunk):
+    def prepare(chunk, issue=None):
         affine, (exponent, *values) = parts(chunk)
         decays = _decays(exponent, affine.base2)
         natural = _walked(exponent, affine.base2)
@@ -170,7 +175,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         form = _form(extents, corrected)
         # The form's largest values that read no state, prepared with the chunk's decays and tokens: the
         # operands of its function, whose state the carry reads (`carry.split`).
-        held = _prepared(form, tokens, decays)
+        held = _prepared(form, tokens, decays, issue or _issued)
         given = (*decays, *(tokens[name] for name in TOKENS), *held.values())
         # A split is priced and traced where it is derived (`derive.context`): one derived under another
         # target, precision, numerics or mesh is none of this one's.
@@ -185,25 +190,25 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         splits.move_to_end(key)
         return Prepared((natural, split.prepare(*given)), split, corrected)
 
-    def step(state, prepared):
+    def step(state, prepared, issue=None):
         decay, h = state[:2]
         natural, values = prepared.values
-        (leaving,) = prepared.split.carry(values, h)
+        (leaving,) = prepared.split.carry(values, h, issue)
         decay = _held(decay + natural.astype(decay.dtype))
         if not isinstance(state, Walk):
             return decay, leaving
         if prepared.corrected and state.transfer is None:
             raise Refused("a walk started for tokens that do not correct the state steps a chunk whose do")
-        transfer = None if state.transfer is None else _transferred(prepared, state.transfer, h)
+        transfer = None if state.transfer is None else _transferred(prepared, state.transfer, h, issue)
         return Walk(decay, leaving, transfer)
 
-    def mapped(prepared, state):
-        (outputs,) = prepared.split.emit(prepared.values[1], state[1])
+    def mapped(prepared, state, issue=None):
+        (outputs,) = prepared.split.emit(prepared.values[1], state[1], issue)
         return outputs
 
-    def merge(a, b, operands):
+    def merge(a, b, operands, issue=None):
         del operands
-        return _merged(a, b, carried)
+        return _merged(a, b, carried, issue or _issued)
 
     def finish(state, operands):
         del operands
@@ -248,7 +253,7 @@ class Walk(NamedTuple):
     transfer: jax.Array | None
 
 
-def _merged(a, b, carried) -> Walk:
+def _merged(a, b, carried, issue: Callable) -> Walk:
     """Two consecutive walks' states joined (`derive_scan`'s `merge`), the later's from zero applying its
     transfer to the state before it: its decay per key (its exponent sum in natural units) where no token
     corrects the state, else the transfer it carried; each in `carried`, the walks' accumulation dtype."""
@@ -258,19 +263,23 @@ def _merged(a, b, carried) -> Walk:
         h = jnp.exp(b.decay)[:, None] * a.h + b.h
         transfer = None if a.transfer is None else jnp.exp(b.decay)[:, None] * a.transfer
     else:
-        h = float32_matmul(b.transfer, a.h) + b.h
+        h = issue("transfer_apply", b.transfer, a.h) + b.h
         transfer = (b.transfer * jnp.exp(a.decay)[None, :] if a.transfer is None
-                    else float32_matmul(b.transfer, a.transfer))
+                    else issue("transfer_compose", b.transfer, a.transfer))
     return Walk(_held(a.decay + b.decay), h.astype(carried),
                 None if transfer is None else transfer.astype(carried))
 
 
-def _transferred(prepared: Prepared, transfer: jax.Array, h: jax.Array) -> jax.Array:
+def _transferred(prepared: Prepared, transfer: jax.Array, h: jax.Array, issue: Callable | None) -> jax.Array:
     """The chunk's transfer applied to a walk's (`transfer`, keys by keys): its carry's linear part in the
     state (`jax.linearize` at the state `h` entering it, the carry affine in it), over the transfer's
     columns a state's width at a time."""
     keys, width = h.shape
-    _, linear = jax.linearize(lambda state: prepared.split.carry(prepared.values[1], state)[0], h)
+    def transferring(role, left, right):
+        return issue("transfer_carry", left, right)
+
+    _, linear = jax.linearize(lambda state: prepared.split.carry(
+        prepared.values[1], state, None if issue is None else transferring)[0], h)
     blocks = -(-keys // width)
     padded = jnp.pad(transfer.astype(h.dtype), ((0, 0), (0, blocks * width - keys)))
     columns = jax.vmap(linear, in_axes=1, out_axes=1)(padded.reshape(keys, blocks, width))
@@ -378,17 +387,20 @@ def _chunk(form: linear_scan.Form, held: tuple, h, entering, to_last, whole, bet
             _evaluated(form.state, tokens, decays, h, known))
 
 
-def _prepared(form: linear_scan.Form, tokens: Mapping, decays: _Decays) -> dict:
+def _prepared(form: linear_scan.Form, tokens: Mapping, decays: _Decays, issue: Callable) -> dict:
     """The form's largest values that read no state but its tokens and decays (a solve's inverse, a gram,
-    a token decayed), by node, evaluated."""
+    a token decayed), by node, evaluated, each product `issue`'s (`_evaluated`)."""
     known: dict = {}
     nodes = linear_scan.prepared((form.outputs, form.state))
-    return {node: _evaluated(node, tokens, decays, None, known) for node in nodes}
+    return {node: _evaluated(node, tokens, decays, None, known, issue) for node in nodes}
 
 
-def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict):
+def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Callable | None = None):
     """A node of the chunk's language (`linear_scan.Chunk`) at the chunk's tokens, decays and entering state
-    `h`, each node once (`known`, by node)."""
+    `h`, each node once (`known`, by node), each matrix product `issue(role, lhs, rhs)`'s (`_issued`, Dew's,
+    where none is given): a pair's scores (`scores`) or a strict gram (`gram`), the inverse's doubling
+    (`inverse_merge`), an application (`apply`) and a write's `Kᵀ V` (`carry`)."""
+    issue = issue or _issued
     from egglog import get_callable_args
 
     Chunk = linear_scan.Chunk
@@ -397,7 +409,7 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict):
         return known[named]
 
     def of(child):
-        return _evaluated(child, tokens, decays, h, known)
+        return _evaluated(child, tokens, decays, h, known, issue)
 
     if (args := get_callable_args(node, Chunk.token)) is not None:
         value = tokens[terms.text(args[0])]
@@ -421,13 +433,13 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict):
         if strict:
             below = jnp.tril(jnp.ones(between.shape[:2], bool), -1)[:, :, None]
             between = jnp.where(below, between, 0.0)
-        value = _paired(of(args[0]), of(args[1]), between)
+        value = _paired(of(args[0]), of(args[1]), between, issue, "gram" if strict else "scores")
     elif (args := get_callable_args(node, Chunk.rows)) is not None:
         value = of(args[1])[:, None] * of(args[0])
     elif (args := get_callable_args(node, Chunk.times)) is not None:
         value = of(args[0]) * of(args[1])
     elif (args := get_callable_args(node, Chunk.matmul)) is not None:
-        value = float32_matmul(of(args[0]), of(args[1]))
+        value = issue("apply", of(args[0]), of(args[1]))
     elif (args := get_callable_args(node, Chunk.plus)) is not None:
         value = of(args[0]) + of(args[1])
     elif (args := get_callable_args(node, Chunk.minus)) is not None:
@@ -435,9 +447,10 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict):
     elif (args := get_callable_args(node, Chunk.decayed)) is not None:
         value = decays.whole[:, None] * of(args[0])
     elif (args := get_callable_args(node, Chunk.written)) is not None:
-        value = float32_einsum("tk,tv->kv", of(args[0]) * decays.to_last, of(args[1]))
+        value = issue("carry", (of(args[0]) * decays.to_last).T, of(args[1]))
     elif (args := get_callable_args(node, Chunk.doubled)) is not None:
-        value = _lowered(of(args[0]))
+        # Differentiated by its own rule where Dew's products make it (`_lowered`); a mainloop's are forward.
+        value = _lowered(of(args[0])) if issue is _issued else _doubled(of(args[0]), issue)
     elif (args := get_callable_args(node, Chunk.substituted)) is not None:
         value = _substituted(of(args[0]), of(args[1]))
     else:
@@ -503,7 +516,7 @@ def _token(parts: linear_scan.Parts, token: tuple) -> tuple:
     return exponent, B, U, s, C, along(parts.reader, keys), along(parts.free, values)
 
 
-def _paired(left, right, between):
+def _paired(left, right, between, issue: Callable | None = None, role: str = "scores"):
     """Each pair's decayed contraction over keys, `sum_k left_ik right_jk between_ijk` `[C, C]`: a decay a
     key dimension's over the pairs' every key; a scalar decay's (`between` `[C, C, 1]`) the keys'
     product decayed after it, `(left right^T) between`, which spans no `[C, C, K]` tensor (Qwen3.5-27B's
@@ -516,7 +529,7 @@ def _paired(left, right, between):
     if between.shape[-1] == 1:
         # The product selected before its decay multiplies it: an inactive pair's may overflow, whose zero
         # decay's derivative would read it.
-        return jnp.where(active, float32_matmul(left, right.T), 0.0) * between[..., 0]
+        return jnp.where(active, (issue or _issued)(role, left, right.T), 0.0) * between[..., 0]
     return jnp.where(active, float32_einsum("ik,ijk->ij", left, right[None] * between), 0.0)
 
 
@@ -531,11 +544,16 @@ def _lowered(overlaps):
     return _lowered_rule()(overlaps)
 
 
-def _doubled(overlaps):
+def _doubled(overlaps, issue: Callable | None = None):
+    """`_lowered`'s doubling, its products `issue`'s under the role `inverse_merge` (Dew's where none is
+    given)."""
     # The template's algebra imports the compile point, which imports this package: read at a call.
     from dew.nn.kernels import recurrence_algebra
 
-    return _below(recurrence_algebra.doubled(-overlaps, _issued))
+    if issue is None:
+        return _below(recurrence_algebra.doubled(-overlaps, _issued))
+    return _below(recurrence_algebra.doubled(-overlaps, lambda name, left, right: issue(
+        "inverse_" + name, left, right)))
 
 
 def _issued(name: str, left, right):
