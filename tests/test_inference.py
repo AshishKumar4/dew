@@ -1051,8 +1051,9 @@ def test_a_run_draws_images_on_every_trainer_layout_as_one_device_does(tmp_path,
     alone = TextToImage.from_run(str(tmp_path))
     placed = dew.pipeline(str(tmp_path), mesh=MeshSpec(**spec).build(devices), layout=layout)
     server = ScoringServer.from_task(*placed.scoring(steps=3, images=2))
+    # The twin on the host, as its prepared inputs are.
     wide = dataclasses.replace(alone, model=alone.model.clone(dtype=jnp.float64),
-                               variables=widened(alone.variables))
+                               variables=widened(jax.device_get(alone.variables)))
     prompts = ["a", "b"]
 
     def draw(seed):
