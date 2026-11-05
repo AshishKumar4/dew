@@ -186,11 +186,11 @@ def _stated(source: Source, read: Read, measuring: Sequence[Measuring] = (),
         return None, source.metadata()
     store = _store(source)
     views = list(beneath(source, SAME_ROWS))[:-1]
-    parted = measuring and whole is not None and views and all(isinstance(view, Selection) for view in views)
-    if parted:
+    parts = [view for view in views if isinstance(view, Selection)]
+    if measuring and whole is not None and views and len(parts) == len(views):
         # Parts of one store measured over it whole take their parts of the one read of it (`whole`).
         rows = whole(store)
-        held = functools.reduce(lambda records, view: view.part(records), reversed(views), rows)
+        held = functools.reduce(lambda records, part: part.part(records), reversed(parts), rows)
     else:
         held = source.records(read)
         measured = store.whole if isinstance(store, SelectedGeneration) else store
