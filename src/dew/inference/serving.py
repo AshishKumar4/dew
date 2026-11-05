@@ -294,6 +294,9 @@ class _Row:
     """What the prompt's keys depend on beside its tokens, its context's digest and its groups with the
     tokens up to its last grouped one, under which its prefix pages are named (`dew.inference.pages`);
     empty for none."""
+    writing: tuple[bytes, ...] = ()
+    """The hashes of the full prompt pages the row writes that no page names yet (`Pages.reserve`),
+    which a prompt sharing them waits for until the row publishes them or ends."""
     restore: int | None = None
     """The `States` entry the row's slot starts from after its shared prefix pages, before its first piece;
     None where it starts afresh."""
@@ -429,8 +432,10 @@ class PagedRows:
         """Seat queued requests in order while some group's part of the pool covers the next one."""
         seated: list[tuple[int, _Row]] = []
         taken = [0] * len(free)
-        while queue:
-            row = queue[0]
+        for row in list(queue):
+            if any(part.waits(row.prompt, row.salt) for part in self.pages):
+                # Another row writes this prompt's next page now: it reads that page once written.
+                continue
             open_groups = sorted((group for group, slots in enumerate(free) if taken[group] < len(slots)),
                                  key=lambda group: (len(self.pages[group].shared(row.prompt, row.salt)),
                                                     self.pages[group].available), reverse=True)
@@ -438,7 +443,7 @@ class PagedRows:
                 part = self.pages[group]
                 reserved = part.reserve(row.prompt, len(row.prompt) + row.budget, row.salt)
                 if reserved is not None:
-                    row.pages, row.prefilled, entry = reserved
+                    row.pages, row.prefilled, entry, row.writing = reserved
                     row.restore = None if entry is None else group * self.states + entry
                     row.weights = self.weights
                     if part.states is not None:
@@ -446,7 +451,7 @@ class PagedRows:
                     break
             else:
                 break
-            queue.popleft()
+            queue.remove(row)
             seated.append(_seated_in(group, free, taken, row))
         return seated
 
@@ -459,9 +464,14 @@ class PagedRows:
         reload and its earlier pieces kept the old weights' keys."""
         if row.weights == self.weights:
             self.pages[row.group].publish(row.prompt, row.pages, row.salt)
+        self.pages[row.group].written(row.writing)
+        row.writing = ()
 
     def release(self, row: _Row) -> None:
-        self.pages[row.group].release(row.pages)
+        part = self.pages[row.group]
+        part.written(row.writing)
+        row.writing = ()
+        part.release(row.pages)
 
     def kept(self, row: _Row) -> int | None:
         """The `States` entry, global over the groups, that keeps the row's state after its prompt's first
