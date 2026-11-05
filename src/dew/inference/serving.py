@@ -1486,7 +1486,10 @@ def _moved[T](tree: T, shardings: object, *, phase: str) -> T:
     if all(leaf.is_fully_addressable and target.is_fully_addressable
            for leaf, target in zip(leaves, targets, strict=True)):
         return jax.device_put(tree, shardings)
-    home = collective_host(leaves, phase=phase)
+    # Gathered under the mesh the leaves lie on, whatever mesh the caller traces under.
+    source = next(leaf.sharding.mesh for leaf in leaves if isinstance(leaf.sharding, NamedSharding))
+    with jax.set_mesh(source):
+        home = collective_host(leaves, phase=phase)
     return jax.tree.unflatten(structure, [
         jax.make_array_from_callback(held.shape, target, lambda index, held=held: held[index])
         for held, target in zip(home, targets, strict=True)])
