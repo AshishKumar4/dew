@@ -49,6 +49,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import pallas as pl
 
+from ..derivatives import KernelGlue
 from . import generation, tuning
 from .generation import INHERENT
 from .selection import Kernel, Op, Requirement
@@ -548,5 +549,6 @@ def conv(x, taps, bias, valid, documents, parts, *, activation: bool, eps: float
         return xla_conv1d(x, taps, activation, bias, valid=valid, segments=documents, parts=parts,
                           dtype=dtype)
 
-    return generation.linear_tangent(forward, backward, portable)(x, taps, bias, valid, documents)
+    return generation.linear_tangent(forward, backward, portable, kind=KernelGlue())(x, taps, bias, valid,
+                                                                                     documents)
 

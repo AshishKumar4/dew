@@ -46,6 +46,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.batch import prefix_sum
 from dew.mesh import LayoutRefused, logical_spec, mesh_axes
+from dew.nn.derivatives import KernelGlue
 from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import INHERENT, backend
 from dew.nn.kernels.selection import Kernel, Op, Requirement, selected
@@ -849,7 +850,7 @@ def gpu_paged(softcap: float | None):
     finite."""
     return generation.linear_tangent(functools.partial(_paged_forward, softcap=softcap),
                                      functools.partial(_paged_backward, softcap=softcap),
-                                     functools.partial(_gathered_tangent, softcap=softcap))
+                                     functools.partial(_gathered_tangent, softcap=softcap), kind=KernelGlue())
 
 
 def _template_forward(query, key, value, table, lengths, starts=None, sinks=None, *, softcap=None):
@@ -877,7 +878,7 @@ def template_paged(softcap: float | None):
     every order the gathered attention's (`generation.linear_tangent`), as `gpu_paged`'s."""
     return generation.linear_tangent(functools.partial(_template_forward, softcap=softcap),
                                      functools.partial(_paged_backward, softcap=softcap),
-                                     functools.partial(_gathered_tangent, softcap=softcap))
+                                     functools.partial(_gathered_tangent, softcap=softcap), kind=KernelGlue())
 
 
 def _pages_per_block(pages: int) -> int:

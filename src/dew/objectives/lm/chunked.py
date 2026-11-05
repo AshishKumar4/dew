@@ -53,6 +53,7 @@ from dew.nn.categorical import (
     segment_log_partition,
     target_loss,
 )
+from dew.nn.derivatives import Protected
 from dew.nn.kernels.generation import linear_tangent
 from dew.nn.precision import (
     added_to,
@@ -444,7 +445,7 @@ def _bounded_head(hidden, table, targets, excluded, chunks: int, tile: tuple[int
     statics = (chunks, tile, precision, predict, temperature, picked, group)
     return linear_tangent(functools.partial(_bounded_head_fwd, *statics),
                           functools.partial(_bounded_head_bwd, *statics),
-                          functools.partial(_bounded_head_impl, *statics))(
+                          functools.partial(_bounded_head_impl, *statics), kind=Protected())(
         hidden, table, targets, excluded, softcap, columns)
 
 
@@ -630,7 +631,8 @@ def _whole_head(hidden, table, targets, excluded, softcap, chunks: int, precisio
     statics = (chunks, precision, predict, temperature, picked, group)
     tiled = functools.partial(_whole_head_impl, *statics)
     return linear_tangent(functools.partial(_whole_head_fwd, *statics),
-                          functools.partial(_whole_head_bwd, *statics), tiled, primal=tiled)(
+                          functools.partial(_whole_head_bwd, *statics), tiled, kind=Protected(),
+                          primal=tiled)(
         hidden, table, targets, excluded, softcap, columns)
 
 
@@ -905,7 +907,7 @@ def _fused(hidden, table, labels, weights, columns, z_loss: float, cap, chunk: i
     (`_fused_moved`, `linear_tangent`)."""
     statics = (z_loss, cap, chunk, precision, predict, temperature, excluded)
     return linear_tangent(functools.partial(_fused_fwd, *statics), functools.partial(_fused_bwd, *statics),
-                          functools.partial(_fused_moved, *statics),
+                          functools.partial(_fused_moved, *statics), kind=Protected(),
                           primal=functools.partial(_fused_impl, *statics))(hidden, table, labels, weights,
                                                                            columns)
 
