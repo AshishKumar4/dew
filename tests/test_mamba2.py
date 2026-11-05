@@ -21,6 +21,7 @@ from reference_error import (
     indexed_recording,
     recording,
     widened,
+    with_gradients,
 )
 from sequence_split_support import SPLIT_ROWS, assert_split_as_whole
 from ssd_support import (
@@ -154,6 +155,43 @@ def test_the_layer_matches_mamba2_mixer(seeded_reference):
     template = nn.unbox(jax.eval_shape(mamba2_layer().init, jax.random.key(0), jnp.zeros((1, 4, width))))
     assert jax.tree.map(jnp.shape, variables) == jax.tree.map(jnp.shape, template)
     assert_recorded_as_exact(seeded_reference, "layer")
+
+
+ON_A_TPU = pytest.mark.tpu(reason="the layer as a TPU runs it, its scan the Pallas kernel (row 678)")
+
+
+@pytest.mark.parametrize("site", [pytest.param("layer", marks=ON_A_TPU, id="layer-tpu"),
+                                  pytest.param("layer_bf16", marks=ON_A_TPU, id="layer_bf16-tpu")])
+def test_the_layer_on_a_tpu_matches_mamba2_mixer(seeded_reference, site):
+    """The mixer's forward on a TPU, its scan the route's (`recurrence_chunk.SCAN`: the Pallas kernel,
+    `ssd.ssd_chunk_scan`), against transformers' recorded mixer, the truth the float64 twin on the host (check
+    1): the step a TPU runs, not its lowering's printed calls (row 678)."""
+    assert_recorded_as_exact(seeded_reference, site)
+
+
+@ON_A_TPU
+def test_the_layers_gradient_on_a_tpu_is_as_exact_as_its_portable_math():
+    """The mixer's output and the gradients of its every weight and its hidden states on a TPU, its scan the
+    route's Pallas kernel, against the same mixer with its scan the portable math (`generation.chosen`) on the
+    TPU, the truth the float64 mixer on the host (check 1): the backward a TPU runs (row 678)."""
+    from dew.nn.kernels import generation
+
+    def draw(seed):
+        arrays = mamba2_layer_draw(seed)
+        cotangent = np.random.default_rng(np.random.SeedSequence([seed, 3])).standard_normal(
+            LAYER_SHAPES["hidden"]).astype(np.float32)
+        return mamba2_layer_params(arrays), jnp.asarray(arrays["hidden"]), jnp.asarray(cotangent)
+
+    def run(variables, hidden):
+        return mamba2_layer(hidden.dtype).apply(variables, hidden)
+
+    def portable(variables, hidden):
+        with generation.chosen(ssd="xla"):
+            return run(variables, hidden)
+
+    assert_as_exact(jax.jit(with_gradients(run)), jax.jit(with_gradients(portable)), draw,
+                    "the Mamba-2 mixer's gradient on a TPU", seeds=64,
+                    truth_fn=jax.jit(with_gradients(portable)))
 
 
 def test_the_layer_in_bfloat16_matches_the_reference_in_bfloat16(seeded_reference):
