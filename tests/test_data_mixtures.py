@@ -195,6 +195,35 @@ def test_a_position_saved_under_plan_version_8_resumes_by_8_or_by_9_where_9_read
                 resumed.close()
 
 
+def test_a_named_chains_order_is_its_names_and_a_position_of_another_name_is_refused():
+    """A named chain read alone shuffles by its name from data plan version 9, as a mixture reads it as its
+    member, so its plan records the name: a position it saved is refused by the chain under another name,
+    which reads another permutation of the same records, and resumes under its own (row 3840)."""
+    def opened(name: str):
+        chain = Pipeline(Memory(Indexed(1, 16)), name=name).shuffle(5).repeat().batch(4)
+        return compile(chain, read="indexed", loading=READ).train(DataPartition())
+
+    saving = opened("wiki")
+    try:
+        taken(saving, 1)
+        saved = saving.get_state()
+        expected = taken(saving, 1)
+    finally:
+        saving.close()
+    other = opened("code")
+    try:
+        with pytest.raises(ValueError):
+            other.set_state(saved)
+    finally:
+        other.close()
+    same = opened("wiki")
+    try:
+        same.set_state(saved)
+        assert taken(same, 1) == expected
+    finally:
+        same.close()
+
+
 def test_a_mixtures_position_resumes_on_another_process_count():
     """The mixing runs ahead of the shard, so global batch k is the same
     records at any process count and the count two processes saved is where
