@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from reference_error import as_given, assert_as_exact, indexed_recording, recording
+from reference_error import assert_as_exact, indexed_recording, recording
 from token_support import byte_level_tokenizer
 from tool_support import run_from
 from transformers.generation.logits_process import (
@@ -368,9 +368,9 @@ def test_frequency_and_presence_penalties_are_vllms(case):
         PENALTIES, site, int(PENALTIES[f"{site}.seeds"]), inputs_of=redraw,
         truth_fn=lambda inputs: {"logits": jnp.asarray(inputs["logits"], jnp.float64) - frequency * counts
                                  - presence * (counts > 0)})
-    assert_as_exact(as_given(lambda index, inputs: {"logits": np.asarray(native(state, inputs["logits"]))}),
-                    reference, draw, f"penalties {frequency}, {presence}",
-                    seeds=int(PENALTIES[f"{site}.seeds"]), truth_fn=truth)
+    seeds = int(PENALTIES[f"{site}.seeds"])
+    assert_as_exact(lambda index, inputs: {"logits": native(state, inputs["logits"])}, reference, draw,
+                    f"penalties {frequency}, {presence}", seeds=seeds, truth_fn=truth)
 
 
 def stop_string_tokenizer(tmp_path):
