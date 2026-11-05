@@ -18,7 +18,7 @@ from dew.data import Loading, presets
 from dew.data.compile import compile, held, iterate
 from dew.data.dataset import Loader
 from dew.data.pipeline import Dataset, Pipeline
-from dew.data.plan import earlier_plan
+from dew.data.plan import PLAN_VERSIONS, earlier_plan
 from dew.data.sources.tokens import TokenFiles
 from dew.inference import TextGeneration
 from dew.objectives.lm import LMObjective
@@ -126,8 +126,9 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     # context included, so the front door rebuilds it without the recipe.
     recorded = LMRunConfig.load(str(run))
     assert recorded.model.fields["vocab_size"] == 256 and recorded.model.fields["max_seq_len"] == SEQ
-    # The record is the run as its build pinned it: its data plan version is this Dew's (`RunConfig.pinned`).
-    assert dataclasses.replace(recorded, model=config.model) == config.pinned()
+    # The record is the run as it trained: its data plan version this Dew's (`RunConfig.resumed`).
+    assert dataclasses.replace(recorded, model=config.model) == dataclasses.replace(
+        config, data_plan_version=PLAN_VERSIONS[-1])
     task = dew.pipeline(str(run))
     assert isinstance(task, TextGeneration) and task.max_new_tokens == 4
     drawn = task("the ", key=1, sampling=Sampling(temperature=0))

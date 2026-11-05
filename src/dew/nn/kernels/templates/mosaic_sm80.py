@@ -259,7 +259,10 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
             then()
         return out
 
-    def products(self, acc, lhs, rhs, interpret: bool):
+    def products(self, acc, lhs, rhs, interpret: bool, *, accumulate: bool = True):
+        if not accumulate:
+            # A fresh product: onto zeros, its accumulator a value (`read` is that value).
+            acc = self.zeros(acc.shape)
         if jnp.dtype(lhs.dtype) != self.dtype:
             # Another dtype's operands (fp32's, as TF32) by that dtype's issuer: its fragments' layouts and
             # depths are its own, its accumulator's the same.
@@ -463,10 +466,13 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, held_past: tuple[str, ...] = (), finish: Callable | None = None
+                ) -> tuple[C, tuple[jax.Array, ...]]:
         # Its products are synchronous: none stays in flight past its step, and `emit_pipeline` gives
-        # each stage back as its step ends.
+        # each stage back as its step ends, so no step holds one past it.
         del first, in_flight, unrolled
+        if held_past or finish is not None:
+            raise NotImplementedError(f"{self.name}'s pipeline gives each stage back as its step ends")
         blocks = streams.pipeline.blocks
         names = tuple(blocks)
         carry = (start, self.started(shapes, initial))

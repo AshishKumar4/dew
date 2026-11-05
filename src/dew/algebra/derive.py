@@ -426,6 +426,18 @@ exponential's factor."""
 SHAPES = _shapes()
 
 
+def _parts_of(value: Callable, accumulated, added) -> Accumulated | Added | None:
+    """A reduction's step's parts as a mainloop's own step takes them (`Derived.step`'s `stepped`), each
+    evaluated by `value`: a product's (`Accumulated`), a sum's (`Added`), or None."""
+    if accumulated is not None:
+        factor, weights, values = accumulated
+        return Accumulated(None if factor is None else value(factor), value(weights), value(values))
+    if added is not None:
+        factor, summed, terms_of = added
+        return Added(value(factor), value(summed), value(terms_of))
+    return None
+
+
 def _decoupled(rescaling: bool = False):
     """The derivation's rules (the module's account): each reading distributes over the language, and a walked
     reduction's step, merge and finish are its monoid's, a sum that scales with an anchor rescaled first, by
@@ -667,9 +679,7 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
         # them (each value evaluated once), every reduction it leaves (None) by its form.
         taken = (None,) * len(made.steps)
         if stepped is not None:
-            parts = tuple(Accumulated(*(None if part is None else value(part) for part in accumulated))
-                          if accumulated is not None
-                          else Added(*map(value, added)) if added is not None else None
+            parts = tuple(_parts_of(value, accumulated, added)
                           for accumulated, added in zip(made.accumulated, made.added, strict=True))
             taken = tuple(stepped(tuple(state), parts))
         stepped = [value(form) if own is None else own for own, form in zip(taken, made.steps, strict=True)]

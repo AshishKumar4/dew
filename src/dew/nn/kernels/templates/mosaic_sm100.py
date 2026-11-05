@@ -161,12 +161,7 @@ class Tcgen05:
     def issued(load: Callable[[], None], products: Callable[[], None]) -> None:
         """The issuing warpgroup's warps alone (a program's end, `drain`'s, and each tile's in `roles`): its
         load warp runs `load`, its product warp `products`."""
-        @pl.when(lax.axis_index("wg") == ISSUE)
-        def _():
-            @plgpu.warp_map
-            def _(warp):
-                pl.when(warp == LOAD_WARP)(load)
-                pl.when(warp == MMA_WARP)(products)
+        pl.when(lax.axis_index("wg") == ISSUE)(lambda: _issuing(load, products))
 
 
 TCGEN05 = Tcgen05()
@@ -458,14 +453,14 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
         columns = width - first if columns is None else columns
         if acc.ref is None:
             return self.zeros((rows, columns))
-        return plgpu.async_load_tmem(acc.ref.at[:, pl.ds(first, columns)], layout=STORED)
+        return plgpu.async_load_tmem(_columns(acc.ref, first, columns), layout=STORED)
 
     def write(self, acc: Accumulator, value: jax.Array, *, first: int = 0) -> None:
         """`value` into the tile's columns from `first` in tensor memory, in its dtype, visible to a product
         once a signal publishes it (`Signal.published`): a softmax's narrowed weights for P·V, a state
         rescaled in place."""
-        columns = acc.ref.at[:, pl.ds(first, value.shape[-1])]
-        plgpu.async_store_tmem(columns, value.astype(jnp.dtype(acc.dtype)))
+        plgpu.async_store_tmem(_columns(_tensor_memory(acc), first, value.shape[-1]),
+                               value.astype(jnp.dtype(acc.dtype)))
 
     def tensor_memory(self, shape: tuple[int, int], dtype=jnp.float32):
         """A scoped allocation of a tile of `shape` in tensor memory (`pl.run_scoped`'s), 16-bit elements two
@@ -488,8 +483,8 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
             return tuple(initial)
         return tuple(Accumulator(None, shape) for shape in shapes)
 
-    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool, initial: tuple | None = None
-                       ) -> tuple[C, tuple]:
+    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool, initial: tuple | None = None,
+                       finish=None) -> tuple[C, tuple]:
         # The accumulators stay in tensor memory, out of the loops' carries: a step's products add onto them
         # but at the walk's first step.
         del interpret
@@ -506,14 +501,15 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
             carry = lax.fori_loop(loop.lo, loop.hi, stepped, carry)
             if loop.then is not None:
                 loop.then()
-        return carry, accumulators
+        return (carry, accumulators) if finish is None else finish(carry, accumulators)
 
-    def products(self, acc: Accumulator, lhs, rhs, interpret: bool) -> Accumulator:
+    def products(self, acc: Accumulator, lhs, rhs, interpret: bool, *, accumulate: bool = True
+                 ) -> Accumulator:
         # The left operand from shared memory, or from tensor memory (an `Accumulator` a role wrote,
         # tcgen05's TS form: FlashAttention 4's P·V); the right from shared memory.
         del interpret  # Mosaic GPU's interpreter models tensor memory and tcgen05's products
-        left = lhs.ref if isinstance(lhs, Accumulator) else lhs
-        plgpu.tcgen05_mma(acc.ref, left, rhs, accumulate=acc.accumulate)
+        left = _tensor_memory(lhs) if isinstance(lhs, Accumulator) else lhs
+        plgpu.tcgen05_mma(_tensor_memory(acc), left, rhs, accumulate=acc.accumulate if accumulate else False)
         return dataclasses.replace(acc, accumulate=True)
 
     def settled(self, pending: int = 0) -> None:
@@ -523,7 +519,7 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
     def held(self, ref):
         return ref
 
-    def zeros(self, shape: tuple[int, int]) -> jax.Array:
+    def zeros(self, shape: tuple[int, ...]) -> jax.Array:
         return plgpu.layout_cast(jnp.zeros(shape, jnp.float32), STORED)
 
     def added_into(self, acc, value, interpret: bool):
@@ -575,13 +571,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         body)` in turn, `count` warpgroups each running `body(index)`, its index among them; then the
         issuing warpgroup, its load warp running `load()` and its product warp `products()` (`kernel`'s
         warpgroups: the table's and one)."""
-        def issuing():
-            @plgpu.warp_map
-            def _(warp):
-                pl.when(warp == LOAD_WARP)(load)
-                pl.when(warp == MMA_WARP)(products)
-
-        mosaic.tabled(lax.axis_index("wg"), table, issuing)
+        mosaic.tabled(lax.axis_index("wg"), table, lambda: _issuing(load, products))
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
@@ -678,3 +668,23 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
 RINGS = Tcgen05Rings()
 """The tcgen05 bundle (`bundles.of` on sm100 and sm103)."""
+
+
+def _issuing(load: Callable[[], None], products: Callable[[], None]) -> None:
+    """The issuing warpgroup's warps: its load warp runs `load`, its product warp `products`."""
+    @plgpu.warp_map
+    def _(warp):
+        pl.when(warp == LOAD_WARP)(load)
+        pl.when(warp == MMA_WARP)(products)
+
+
+def _tensor_memory(acc: Accumulator) -> Ref:
+    """A tile's tensor memory; a tile that multiplies nothing has none to issue into or write."""
+    if acc.ref is None:
+        raise ValueError("a tile that multiplies nothing holds no tensor memory")
+    return acc.ref
+
+
+def _columns(ref, first, columns: int):
+    """Columns `first` to `first + columns` of a tile in tensor memory."""
+    return ref.at[:, pl.ds(first, columns)]

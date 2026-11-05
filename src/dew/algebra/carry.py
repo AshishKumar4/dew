@@ -240,8 +240,7 @@ def split(function: Callable, state, operands: Sequence, carried: Sequence[int],
 
     def reading_forms(chosen: list[Term], roles: tuple[str, str]) -> Callable:
         # A product of the state itself takes the side's first role, every other its second.
-        def named(term: Term) -> str:
-            left, right, _ = get_callable_args(term, Term.dot)
+        def named(left: Term, right: Term) -> str:
             return roles[0] if state in (terms.key(left), terms.key(right)) else roles[1]
 
         def run(given: tuple, h, issue=None) -> tuple:

@@ -142,17 +142,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
 
     def parts(chunk: Mapping):
         affine = affine_of(chunk)
-        # An operand with no walked axis (a rate, a skip) is every token's.
-        axes = [declaration.operands[name].index(declaration.walked)
-                if declaration.walked in declaration.operands[name] else None for name in names]
-        exponent, *values = jax.vmap(lambda *xs: _token(affine, xs), in_axes=axes)(
-            *[chunk[name] for name in names])
-        # The exponents summed in float32 at least: a narrower prefix loses a decay's digits to its partials'
-        # magnitude, and float16's overflows past six resets (65504).
-        exponent = exponent.astype(at_least_fp32(exponent.dtype))
-        if declaration.reset is not None:
-            exponent = jnp.where(chunk[declaration.reset][:, None], RESET_DECAY, exponent)
-        return affine, (exponent, *values)
+        return affine, _token_parts(declaration, names, affine, chunk)
 
     # A walk's decay and state carried in its chunks' accumulation (`parts`' float32 at least; a float64
     # state's, float64), the state rounded to its declared dtype once, at the finish: a 16-bit state carried
@@ -225,22 +215,43 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         return state[1].astype(dtype)
 
     def backward(chunk, state, d_state, d_outputs, issue=None, inverse=None):
-        # The chunk's forms' adjoint: the reverse scan's step, each chunk's transition transposed, as the
-        # forward forms' derivative (their prefix, substitution and Dew products differentiated), each
-        # product's adjoint the issuer's where one is given (`_adjoined`).
-        # The reset's booleans held, no operand of the derivative.
-        issued = None if issue is None else _adjoined(issue)
-
-        def forward(h, operands):
-            entering, prepared = (state[0], h), prepare({**chunk, **operands}, issued, inverse=inverse)
-            return mapped(prepared, entering, issued), step(entering, prepared, issued)[1]
-
-        _, pullback = jax.vjp(forward, state[1], {name: chunk[name] for name in names})
-        d_h, d_chunk = pullback((d_outputs, d_state))
-        return d_h, d_chunk
+        return _backward((prepare, mapped, step), names, chunk, state, d_state, d_outputs, issue, inverse)
 
     return Derived(init, step, merge, finish, mapped,
                    {"rounding": "compensated prefix", "walked": declaration.walked}, backward, prepare)
+
+
+def _token_parts(declaration: Scan, names: Sequence[str], affine, chunk: Mapping) -> tuple:
+    """A chunk's tokens' exponents and the affine map's parts at each (`_token`), the exponents in float32
+    at least: a narrower prefix loses a decay's digits to its partials' magnitude, and float16's overflows
+    past six resets (65504); a reset token's decay `RESET_DECAY`."""
+    # An operand with no walked axis (a rate, a skip) is every token's.
+    axes = [declaration.operands[name].index(declaration.walked)
+            if declaration.walked in declaration.operands[name] else None for name in names]
+    exponent, *values = jax.vmap(lambda *xs: _token(affine, xs), in_axes=axes)(
+        *[chunk[name] for name in names])
+    exponent = exponent.astype(at_least_fp32(exponent.dtype))
+    if declaration.reset is not None:
+        exponent = jnp.where(chunk[declaration.reset][:, None], RESET_DECAY, exponent)
+    return exponent, *values
+
+
+def _backward(forms: tuple, names: Sequence[str], chunk, state, d_state, d_outputs, issue, inverse):
+    """A chunk's forms' adjoint (`derive_scan`'s `backward`, `forms` its prepare, mapped and step): the
+    reverse scan's step, each chunk's transition transposed, as the forward forms' derivative (their prefix,
+    substitution and Dew products differentiated), each product's adjoint the issuer's where one is given
+    (`_adjoined`), the solve the forward's kept `inverse` where given. The reset's booleans held, no operand
+    of the derivative."""
+    prepare, mapped, step = forms
+    issued = None if issue is None else _adjoined(issue)
+
+    def forward(h, operands):
+        entering, prepared = (state[0], h), prepare({**chunk, **operands}, issued, inverse=inverse)
+        return mapped(prepared, entering, issued), step(entering, prepared, issued)[1]
+
+    _, pullback = jax.vjp(forward, state[1], {name: chunk[name] for name in names})
+    d_h, d_chunk = pullback((d_outputs, d_state))
+    return d_h, d_chunk
 
 
 @functools.partial(jax.tree_util.register_dataclass, data_fields=["values", "transition", "inverse"],
@@ -457,12 +468,9 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
     elif (args := get_callable_args(node, Chunk.state)) is not None:
         value = of(args[0])[1]
     elif (args := get_callable_args(node, Chunk.gram)) is not None:
-        strict = terms.integer(args[2])
-        between = decays.between
-        if strict:
-            below = jnp.tril(jnp.ones(between.shape[:2], bool), -1)[:, :, None]
-            between = jnp.where(below, between, 0.0)
-        value = _paired(of(args[0]), of(args[1]), between, issue, "gram" if strict else "scores")
+        strict = bool(terms.integer(args[2]))
+        value = _paired(of(args[0]), of(args[1]), decays.between, issue, "gram" if strict else "scores",
+                        strict=strict)
     elif (args := get_callable_args(node, Chunk.rows)) is not None:
         value = of(args[1])[:, None] * of(args[0])
     elif (args := get_callable_args(node, Chunk.times)) is not None:
@@ -549,7 +557,8 @@ def _token(parts: linear_scan.Parts, token: tuple) -> tuple:
     return exponent, B, U, s, C, along(parts.reader, keys), along(parts.free, values)
 
 
-def _paired(left, right, between, issue: Callable | None = None, role: str = "scores"):
+def _paired(left, right, between, issue: Callable | None = None, role: str = "scores", *,
+            strict: bool = False):
     """Each pair's decayed contraction over keys, `sum_k left_ik right_jk between_ijk` `[C, C]`: a decay a
     key dimension's over the pairs' every key; a scalar decay's (`between` `[C, C, 1]`) the keys'
     product decayed after it, `(left right^T) between`, which spans no `[C, C, K]` tensor (Qwen3.5-27B's
@@ -558,23 +567,29 @@ def _paired(left, right, between, issue: Callable | None = None, role: str = "sc
     keys decayed from it, the diagonal sub-chunks' alone elementwise. A pair no decay joins (`between` zero,
     a token's future) is zero, selected, not multiplied: its product, or its cotangent, may be infinite near
     float32's largest (a future corrected write's), whose product by a zero decay is NaN in every query's
-    gradient the pair reads (the chunked op's reverse mode, near the largest) and in the decays'."""
-    active = jnp.any(between != 0, axis=-1)
+    gradient the pair reads (the chunked op's reverse mode, near the largest) and in the decays'. A `strict`
+    pairing's diagonal (a gram's own token) is no pair."""
+    joined = between
+    if strict:
+        joined = jnp.where(jnp.tril(jnp.ones(between.shape[:2], bool), -1)[:, :, None], between, 0.0)
+    active = jnp.any(joined != 0, axis=-1)
     issue = issue or _issued
     if between.shape[-1] == 1:
         # The product selected before its decay multiplies it: an inactive pair's may overflow, whose zero
         # decay's derivative would read it.
-        return jnp.where(active, issue(role, left, right.T), 0.0) * between[..., 0]
-    return jnp.where(active, _factored(left, right, between, issue, role), 0.0)
+        return jnp.where(active, issue(role, left, right.T), 0.0) * joined[..., 0]
+    # The factors read the reference's own decay (1, on the diagonal a strict pairing excludes).
+    return jnp.where(active, _factored(left, right, between, joined, issue, role), 0.0)
 
 
-def _factored(left, right, between, issue: Callable, role: str):
+def _factored(left, right, between, joined, issue: Callable, role: str):
     """A per-key decay's pairs `sum_k left_ik right_jk between_ijk` over sub-chunks of `SUB` rows
     (`recurrence_algebra.SUB`, fla's BC): a pair of an earlier sub-chunk's key `j` and a later one's row `i`
     is the product of the row decayed to the reference `p` before its sub-chunk and the key decayed from it,
     `(left_i between_ip) (right_j between_pj)`, each factor at most 1 (every exponent at most zero, each span
     across a vanished token zero, `_decays_value`), a matrix product `issue` makes; a sub-chunk's own pairs
-    elementwise over its keys (at most SUB^2 K a sub-chunk, not C^2 K)."""
+    elementwise over its keys (at most SUB^2 K a sub-chunk, not C^2 K), by the pairing's own decays
+    (`joined`: `between` less a strict pairing's diagonal)."""
     from dew.nn.kernels import recurrence_algebra
 
     count = left.shape[0]
@@ -589,7 +604,7 @@ def _factored(left, right, between, issue: Callable, role: str):
             if start > first:
                 blocks.append(jnp.zeros((own.stop - own.start, keys.stop - keys.start), jnp.float32))
             elif start == first:
-                blocks.append(float32_einsum("ik,ijk->ij", left[own], right[None, keys] * between[own, keys]))
+                blocks.append(float32_einsum("ik,ijk->ij", left[own], right[None, keys] * joined[own, keys]))
             else:
                 reference = first - 1
                 blocks.append(issue(role, left[own] * between[own, reference],

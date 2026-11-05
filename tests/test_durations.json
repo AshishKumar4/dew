@@ -9367,7 +9367,6 @@
 "tests/test_attention_triton.py::test_the_shared_memory_bound_keeps_what_triton_compiles_and_prunes_what_it_refuses[forward-128-tiles4-None-sm86]": 0.006,
 "tests/test_attention_triton.py::test_the_shared_memory_bound_keeps_what_triton_compiles_and_prunes_what_it_refuses[forward-256-tiles5-102400-sm86]": 0.007,
 "tests/test_attention_triton.py::test_the_shared_memory_bound_keeps_what_triton_compiles_and_prunes_what_it_refuses[forward-256-tiles6-229376-sm86]": 0.008,
-"tests/test_attention_triton_race_compile.py::test_hopper_attention_backward_preserves_its_multiuse_query_tile": 3.617,
 "tests/test_attribute_step.py::test_a_capture_attributes_its_time_by_part_and_kind": 0.023,
 "tests/test_attribute_step.py::test_a_fusion_that_reads_optimizer_state_is_the_optimizers": 0.009,
 "tests/test_attribute_step.py::test_a_gemm_is_judged_at_its_compiled_flops_against_its_own_precisions_peak": 0.012,
