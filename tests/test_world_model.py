@@ -214,3 +214,26 @@ def test_a_tokenizers_patches_are_each_frames_row_major_pixels_whatever_its_lead
     placed[:, :, (r // 4) * 3 + c // 4, ((r % 4) * 4 + c % 4) * 2 + k] = np.asarray(frames)
     np.testing.assert_array_equal(patches, placed)
     np.testing.assert_array_equal(np.asarray(tokenizer._unpatchify(jnp.asarray(patches))), np.asarray(frames))
+
+
+def test_a_world_models_tokenizer_rides_in_its_state_and_its_loss_reads_it_there():
+    """The world model's frozen tokenizer is state (row 4148: it lived on the objective, a compiled constant
+    outside the tree placement and checkpoints share): the drawn tree holds the given weights beside the
+    dynamics' under its own collection, which the optimizer never sees, and the loss encodes with the
+    weights the tree holds, other weights giving another loss."""
+    from dew.objectives.base import Step
+    from dew.objectives.world_model import TOKENIZER, WorldModelObjective
+
+    tokenizer, tokens, dynamics = _tiny_models()
+    objective = WorldModelObjective(dynamics, tokenizer, tokens)
+    variables = objective.init(jax.random.key(5))
+    assert jax.tree.structure(variables[TOKENIZER]) == jax.tree.structure(tokens)
+    for held, given in zip(jax.tree.leaves(variables[TOKENIZER]), jax.tree.leaves(tokens), strict=True):
+        np.testing.assert_array_equal(np.asarray(held), np.asarray(given))
+    assert TOKENIZER not in variables["params"]
+    video = jnp.asarray(np.random.default_rng(18).uniform(-1, 1, (2, 4, 8, 8, 1)), jnp.float32)
+    step = Step(jnp.asarray(0), jax.random.key(19), None)
+    other = tokenizer.init(jax.random.key(20), jnp.zeros((1, 8, 8, 1)))
+    held, _ = objective.loss(variables, {"video": video}, step)
+    swapped, _ = objective.loss({**variables, TOKENIZER: other}, {"video": video}, step)
+    assert float(held.total) != float(swapped.total)
