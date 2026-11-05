@@ -297,8 +297,24 @@ def _outputs(
     targets counted on the row as `recounted` keeps them. A marker passes
     through and a missing row is rejected. `position` is the row's source
     position, as `Pipeline.map_with_index` defines it. When `counts` is given,
-    a chunk expansion counts its document and fan-out as it runs.
+    a chunk expansion counts its document and fan-out as it runs. A step that
+    raises raises its own error, noting the step and the row's source position
+    where the read knows it (row 4117).
     """
+    try:
+        return _made(stage, position, value, rng, counts=counts)
+    except Exception as error:
+        at = position if position is not None else _position(value)
+        error.add_note(f"in data step {_identity(stage).name}"
+                       + ("" if at is None else f", on the record at source position {at}"))
+        raise
+
+
+def _made(
+    stage: Stage, position: int | None, value: Record, rng: np.random.Generator | None,
+    *, counts: CorpusCounts | None,
+) -> tuple[Record, ...]:
+    """`_outputs`' outputs, as its step makes them."""
     if isinstance(value, Rejected):
         return (value,)
     if value is None:
