@@ -569,7 +569,7 @@ Questions 1 and 2 as recommended. Question 3: support all of them (§12). Questi
 | 41 | accurate D | algebra | `delta` ∈ {(a), (b), (b′)} | |
 | 42 | dV form by dtype (FA form for bf16, the reference's order for fp16/fp32) | algebra | a rounding point | |
 | 43 | atomic default / deterministic option | mainloop | atomic dQ by default; fused ticket or split under the deterministic flag | |
-| 44 | GQA reductions | mainloop | an in-program loop over the group (fused) or an XLA sum (split) | |
+| 44 | GQA reductions | mainloop | the one launch (fused, shared keys) adds each query head's dK and dV into its key head's by atomic TMA reduce-adds across programs; two launches (deterministic mode's form, and a hooked or accurate call's) write each query head's and sum its group in XLA, in a fixed order | |
 
 #### FP8
 

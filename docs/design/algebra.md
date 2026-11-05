@@ -102,9 +102,14 @@ bodies, by the site's declared class:
   optimizes inside each body (`Surrogate`) and never replaces the rule with autodiff's derivative of the forward,
   nor equates the two.
 
-Each site declares its class where it defines its derivative (`dew.nn.derivatives`: `kernel_derivative`,
-`numerics_derivative`, `numerics_tangent`, `surrogate`; §6.10), so the class is read from the site, never
-inferred. A bare custom derivative in `src/dew` fails a slop check, not a default.
+Each site declares its class where it defines its derivative (`dew.nn.derivatives`: `declared_derivative` or
+`declared_tangent` with its kind, or `surrogate`; §6.10), so the class is read from the site, never inferred. A
+bare custom derivative in `src/dew` fails a slop check, not a default. Each declaring function wraps
+`jax.custom_vjp` or `jax.custom_jvp` and returns the derivative as one marked call of its kind, its primal,
+forward and backward one span (`dew.nn.derivatives.bound_span`: its arrays the operands, its other arguments
+and its `nondiff_argnums` bound in), so the check (SLOP026) refuses `jax.custom_vjp` and `jax.custom_jvp`
+anywhere in `src/dew` but `dew/nn/derivatives.py` (a reference to JAX's `custom_vjp_call_p` is no application).
+Rows 4026 to 4030 declare each lane's sites.
 
 ### 1.4 Facts and rules
 
@@ -121,7 +126,12 @@ inferred. A bare custom derivative in `src/dew` fails a slop check, not a defaul
     and a positive scale out of a maximum or a minimum (`max(c x) = c max(x)` for `c > 0`, a literal's sign
     its fact): attention's derived step takes its raw products' maximum and scales it once, as the hand step
     does;
-  - **identities** (compile time and dev time): rsqrt and sqrt, exp and log, abs and sign, cast chains;
+  - **identities** (compile time and dev time): commutativity, a saturation aid. A cast's widening round trip,
+    a reciprocal square root's form, a negation negated and a magnitude's magnitude are XLA's algebraic
+    simplifier's, which every compile runs. A value times its sign is its magnitude in exact arithmetic but not
+    on a lane that flushes a subnormal product (the CPU's, `tests/certified.py`'s `Lane.flushes`: the product
+    is zero where the magnitude keeps its bits), nor for a complex value; exp and log cancel only over a sign
+    and a range the language holds no fact of. None of these is built;
   - **reuse** (compile time and dev time): a value the forward already computed;
   - **decoupled reductions** (dev time): dependent nonlinear reductions broken with correction terms (the running-max
     rescale of online softmax, log-sum-exp merges and folds, moment merges);
@@ -169,15 +179,21 @@ floating-point expressions:
 Each form is priced in time from the device facts Dew already owns, never from facts of its own:
 
 - the program model reads `dew.nn.kernels.generation.gpu_target()` (memory bandwidth, dense peaks by precision,
-  the architecture's load latency) and, for collectives, the pool-agreed link figure
-  (`dew.training.distributed.link_figure`), so every process of a pool prices with the same numbers;
+  the architecture's load latency), so every process of a pool prices with the same numbers. No price reads
+  links: every registered rule either keeps a reduction's axes and count or joins two reductions into one
+  (`joined`; `linear`'s shared operand out of two products), which the device price already prefers, so a
+  collective's bytes over `dew.training.distributed.link_figure` would only agree with it. A rule that moves a
+  reduction onto or off a sharded axis brings that price with it;
 - the kernel model is the templates' own (`dew.nn.kernels.templates.cost.seconds`);
 - a fact a price needs and no owner holds, such as a reduction's latency, is added to `GpuTarget` or its
   `Architecture`.
 
 A region's seconds are computed once, from its composed terms over the chosen DAG (§6.5): bytes over bandwidth,
-FLOPs over the dtype's rate, collective bytes over the link, and the longest chain of dependent reductions as
-latency, combined as `templates.cost` combines a launch's. Prices are checked against measured profiles, not
+FLOPs over the dtype's rate, collective bytes over the link, each kernel XLA's fusion makes of it (a reduction's
+and a product's, each a fusion's root) at the part's measured fixed latency (its launch and first byte), and
+the longest chain of dependent reductions as latency, combined as `templates.cost` combines a launch's. Row
+4072's validation priced 1,580 profiled kernels: without a kernel's fixed latency an H100's XLA fusions came
+to 0.02 of their measured time, with it 0.51 (p10 0.40). Prices are checked against measured profiles, not
 fitted to them, and a rule set ships only with measured receipts.
 
 ## 2. Where it applies
@@ -303,10 +319,11 @@ because its Python API is still marked as subject to change.
 | `dew.algebra.linear_scan` | A recurrence's token update read as an affine map by rules, and its chunk form derived by identities and extracted under the work-span model (§6.9) |
 | `dew.algebra.cost` | `Price`, `CostModel` and error-aware DAG extraction |
 | `dew.algebra.error` | Dev time: each candidate DAG's error, sampled on its declaration's cases against the float64 truth |
-| `dew.nn.derivatives` | Below the engine, so every model module can import it: the marker primitive, its kinds, and the custom-derivative declarations (`kernel_derivative`, `numerics_derivative`, `numerics_tangent`, `surrogate`, row 3271) |
+| `dew.nn.derivatives` | Below the engine, so every model module can import it: the marker primitive, its kinds, and the custom-derivative declarations (`declared_derivative`, `declared_tangent`, each of a kind, and `surrogate`, row 3271) |
 | `dew.algebra.program` | The compile-time pass (`rewritten`), its switch (`passes`) and its report |
 | `dew.algebra.derive` | Template declarations and their derived forms |
 | `dew.algebra.generate` | The dev-time generator and its `--check` |
+| `dew.algebra.bits` | Bit-level forms (§7): a declared GF(2)-linear transform of a stored word, its cheapest instruction form over the integer pipes and its proof |
 
 ### 6.2 Terms
 
@@ -476,40 +493,24 @@ def admitted(numerics, mode: Mode) -> tuple[Rules, ...]   # the sets a mode and 
 ### 6.5 Cost and extraction
 
 ```python
-@dataclass(frozen=True)
-class Terms:                          # a node's, or a chosen DAG's, composed
-    bytes: int                        # passes over large tensors
-    flops: Mapping[str, int]          # by dtype
-    collective_bytes: int             # over links
-    depth: int                        # the longest chain of dependent reductions
+def work(graph: EGraph, node, region: Region, held: dict | None = None) -> templates.cost.Work: ...
+    # a node's work alone: device and shared bytes at its dtypes' sizes, tensor-core and CUDA-core FLOPs by
+    # mode, operations, exponentials, conversions, and its span (the tile walk's longest dependent chain)
 
-@dataclass(frozen=True)
-class Price:
-    seconds: float                    # CostModel.seconds of its composed terms
-    terms: Terms
+class Schedule(Protocol):            # how a chosen DAG's composed work becomes seconds
+    def pieces(self, work: Work) -> ...: ...
+def fused(facts: GpuTarget) -> Fused: ...  # the compile-time pass: XLA's fusion
+def walk(facts: GpuTarget) -> Walk: ...    # a template's interface: the tile walk
 
-class CostModel(Protocol):
-    def terms(self, node: Node, facts: Facts) -> Terms: ...         # the node alone
-    def seconds(self, terms: Terms) -> float: ...                     # once per region, from its composed terms
-
-def candidates(graph: egglog.EGraph, roots: Sequence[Term], cost: CostModel) -> Iterator[Extraction]: ...
-    # concrete DAGs, every child chosen, in order of price
-
-def extracted(graph: egglog.EGraph, roots: Sequence[Term], cost: CostModel,
-              admits: Callable[[Extraction], bool]) -> Extraction: ...   # the cheapest candidate admitted
-
-@dataclass(frozen=True)
-class Extraction:
-    roots: tuple[Term, ...]
-    price: Price                      # the region's, each shared value priced once
-    fired: Mapping[str, int]          # rule set name: the extracted nodes it introduced
-    error: float | None = None        # dev time: the candidate's sampled check 1 statistic; None at compile time
+def model(region: Region, schedule: Schedule) -> DagCostModel[Seconds]: ...  # egglog's DAG cost model
+def cheapest(graph, root, model) -> ...: ...    # extract.py: greedy-dag, each shared node once
+def extracted(graph, root, model) -> ...: ...   # the exact extractor (a MILP), check 1's oracle under checked
 ```
 
-- A cost model gives a node's terms alone. Extraction composes them over the chosen DAG: `bytes`, `flops` and
-  `collective_bytes` add up with each shared e-class counted once, and `depth` is the longest path of
-  reductions. `seconds` is computed once from the composed terms, as `templates.cost` combines a launch's, so a
-  longest path stays a latency and never becomes a count.
+- A cost model gives a node's work alone. Extraction composes it over the chosen DAG: bytes and FLOPs add up
+  with each shared e-class counted once, and the span is the longest dependent path. Seconds are computed once
+  from the composed work, as `templates.cost` combines a launch's, so a longest path stays a latency and never
+  becomes a count.
 - `admits` decides a candidate: at compile time, whether every rule set it drew on is admitted (§6.4); at dev
   time, whether its sampled error meets the declared accuracy (§1.5), which `dew.algebra.error` measures on the
   candidate itself. The candidates come cheapest first, so the first admitted is the answer; the form as written
@@ -530,8 +531,8 @@ class Extraction:
   the next. Each level is solved in turn with the ones before it held at their optimum; a level whose
   additions are infinite on every DAG (a reading the derivation left) ties, as its prices compare.
 - `fired` comes from the nodes each set's run added, recorded between runs of the sets.
-- The facts are the owners' (§1.6): `gpu_target()` for bandwidth, peaks by precision and latencies, and the
-  pool-agreed `link_figure` for links, so every process prices with the same numbers. A fact no owner holds is
+- The facts are the owners' (§1.6): `gpu_target()` for bandwidth, peaks by precision and latencies, so every
+  process prices with the same numbers. A fact no owner holds is
   added to `GpuTarget` or its `Architecture`, never to the engine. Prices are checked against measured profiles,
   never fitted to them; a form whose price and profile disagree is a finding against the cost model.
 - One cost vocabulary, two schedules. Every price is told in one vocabulary, the toolkit's `templates.cost.Work`:
@@ -581,9 +582,9 @@ class Extraction:
   declaration (`terms.key`), not its text, which egglog formats through black at about a millisecond a term.
 - Extraction for a template's interface (`derive`) prices candidates through the tile walk; the compile-time
   pass and the derived scan's carry split price them through XLA's fusion. Each shared term is priced once either way.
-- The tile walk does not yet read registers (the liveness pass) or the walk's rings when pricing a candidate.
-  Both are properties of a whole chosen DAG, not of a node, and the template's compile gate checks them on the
-  form chosen.
+- The tile walk reads no registers or rings when pricing a candidate: both are properties of a whole chosen DAG
+  at a tile size the derivation does not yet know. The template's register model (`MosaicForward.registers`,
+  `_hook_live`) sizes its tiles to the form chosen, and its compile gate refuses a spill.
 
 ### 6.6 Saturation
 
@@ -599,9 +600,11 @@ def limits(region, saturation: Saturation) -> tuple[int, int]: ...   # (nodes, i
 - The limits are derived from the region's size where they are set (`limits`): nodes at `growth` times its
   equations, iterations at `depth` times its longest chain. egglog has no node limit of its own, so the count is
   checked between iterations.
-- `growth` and `depth` are measured per mode. At compile time they are the largest the compile-time sets reach
-  at their fixpoint on the eval's programs; at dev time, on the declarations. They are recorded with the rule
-  sets' receipts and re-measured when a set changes.
+- `growth` and `depth` are measured per mode. At compile time they sit above the largest the compile-time sets
+  reach at their fixpoint on Dew's step programs: none of 756 windows (a UNet's fsdp2 x tensor2 matrix cell,
+  benchmark_step's cpu-smoke steps) reached either of 64 and 4, the largest using under a quarter of each,
+  and none priced lower at four times both (`SATURATION`'s receipt). At dev time they are measured on the
+  declarations when the generator resumes. They are re-measured when a set changes.
 - A region that reaches a limit keeps the cheapest form found so far, and the report says so.
 - Sets run in registry order, one iteration each, until no set changes the graph or a limit is reached.
 - The e-graph runs with one thread and is built in equation order, so the same input gives the same output in any
@@ -842,7 +845,8 @@ from there. What exists: the four kinds, `marked_call_p` with its transform rule
 `surrogate`, the precision transforms marked `Protected`, and the pass reading a marked call's kind
 (`program._within`, `program._opened`: a protected call an opaque leaf, a surrogate's and a kernel glue's body
 rewritten within its call, an Algebra span opened into the region around it, its call kept where no form
-lands). Not yet: the custom-derivative sites marked, and the slop check.
+lands), the declaring functions (`declared_derivative`, `declared_tangent`, `surrogate`), and the slop check
+(SLOP026), which lands once each lane's sites are declared through them (rows 4026 to 4030).
 
 ```python
 class Protected: ...                  # error-free transforms and numerics bodies (§1.2, §1.3)
@@ -857,9 +861,8 @@ marked_call_p: jax.extend.core.Primitive   # a call: params jaxpr (a ClosedJaxpr
 
 def marked(kind: Kind, fn: Callable) -> Callable: ...   # fn traced as one marked_call of its body
 
-def kernel_derivative(fn, fwd, bwd) -> Callable: ...    # custom_vjp with KernelGlue bodies
-def numerics_derivative(fn, fwd, bwd) -> Callable: ...  # custom_vjp with Protected bodies
-def numerics_tangent(fn, jvp) -> Callable: ...          # custom_jvp with a Protected rule
+def declared_derivative(kind, fn, fwd, bwd, *, nondiff_argnums=()) -> Callable: ...  # a custom_vjp of `kind`
+def declared_tangent(kind, fn, jvp, *, nondiff_argnums=()) -> Callable: ...         # a custom_jvp of `kind`
 def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
     # row 3271: the value forward's exactly; derivative(primals, tangents, value) the declared output tangent,
     # linear in the tangents, so reverse mode transposes it and higher orders differentiate it
@@ -880,7 +883,7 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
   marked call, so the compiled program holds none.
 - `dew.nn.precision`'s error-free transforms are `marked(Protected(), …)`, replacing the name scope the first cut
   reads.
-- Every custom-derivative site declares itself through one of the four declarations, in place of a bare
+- Every custom-derivative site declares itself through one of the three declarations, in place of a bare
   `jax.custom_vjp` or `jax.custom_jvp`. `linear_tangent` takes its caller's declared kind: `KernelGlue` at a kernel
   site, `Protected` at a numerics one (`sampling.flow`'s KL, the chunked heads, `nn.precision`'s products), and
   `Algebra` at nGPT's join and normed hidden, which the compile-time sets rewrite until the engine retires them. A bare custom derivative in `src/dew` fails a slop check, so the inventory of §1.3 stays complete.
@@ -937,3 +940,102 @@ def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tupl
 - `--check` regenerates in memory and fails where the checked-in output differs, in CI's lint lane; a changed
   rule or declaration therefore lands as a reviewed diff of generated code.
 - Sampling is seeded and its families fixed, so generation is deterministic across processes (§3).
+
+## 7. Bit-level forms
+
+Design record, 2026-11-05 (theme T82). The e-graph engine derives real-valued forms; this part derives the
+cheapest instruction form of a declared bit-level transform, a low-precision format's decode first, over a
+GPU's integer pipes, and proves it exact on every input. Its output is a form a template takes, so nothing
+about it is an estimate.
+
+### 7.1 What it derives
+
+- **A transform** (`BitTransform`) maps a stored word of at most 32 bits to registers, each with a mask: the
+  bits its consumer reads, every other bit zero. It is GF(2)-linear, each bit read the parity of some input
+  bits (`rows`), so a format's decode is one: its codes' fields placed where the consumer's multiply reads
+  them (`BitTransform.placed`), the exponent's bias folded into the block scale's multiply (an E2M1 code at a
+  bfloat16's mantissa's top bit and its exponent's two low bits is the code's value times 2^-126). A transform
+  that is not linear is not declarable: its proof over a 32-bit word would need a solver, and no consumer has
+  one yet (a rounding pack's own search waits for its consumer).
+- **Its layout** is fixed (the stored word is the input) or free: the stored word may be any invertible
+  re-encoding of the input, chosen with the form. The encoder runs once where the weights are stored (Dew's
+  quantization codec), the decoder each time they are read. Its `units` are the pipes its form may issue on:
+  the ALU always (every LOP3's), the FMA pipe unless the consumer's own math holds it.
+- **A form** (`BitForm`) is a list of instructions over the stored word, the register each output is, and the
+  encoder (its bit `j` the parity of the input's bits `encoder[j]` names).
+
+### 7.2 Vocabulary and price
+
+- The instructions are those a decode needs, each GF(2)-linear (`BitOp`): a logical right shift and a left shift
+  (SHF on the ALU, or IMAD.HI and IMAD.SHL, a multiply by a power of two, on the FMA pipe), a rotation (SHF's
+  funnel shift, the ALU's alone), and LOP3 masking the XOR of one or two values (the mask an immediate). Every
+  architecture from sm75 to sm120 issues them alike.
+- **Price** (`BitForm.price`): the busiest pipe's issues, then the instruction count. Nsight Compute's Kernel
+  Profiling Guide (its pipelines) puts logic, shifts and every integer instruction but IMAD and IMUL on the
+  ALU, and IMAD and IMUL on the FMA pipe; the CUDA C++ Best Practices Guide 13 (Table 5) gives a shift, a
+  bitwise operation and an integer multiply-add 64 results a clock per multiprocessor on every compute
+  capability from 7.5 to 12.1. A decoder's words are many and independent, so throughput prices it, not its
+  chain's latency, and a shift goes on whichever pipe balances the two. A form is checked against measured
+  kernels where a consumer takes it, never against instruction counts alone (§7.4).
+
+### 7.3 Search and proof
+
+- **Search** (`synthesized`): one LOP3 per output register, `mask & (u ^ v)` or `mask & u`, over the stored
+  word, at most one right shift or rotation of it by any amount, and up to `lefts` left shifts of it or of
+  that, each by at most `reach` places; a register may read an earlier one, and a fixed layout's mask leaves
+  out the bits its transform holds zero. Shapes (which shifts) are walked in increasing price,
+  so the first form found is the cheapest the vocabulary holds. A free layout's registers need only be
+  independent over GF(2) (an invertible read), checked row by row as each register is chosen, after a
+  necessary count (each register's bit a parity of the sources' bits at its place) rejects most shift sets
+  before any; a fixed layout's must equal the transform's rows. Every shift must be read, else a cheaper
+  shape reads the same. The encoder is the form's map inverted, after the transform.
+- **Proof** (`proven`): every instruction is GF(2)-linear, so a form and its encoder are linear maps, and two
+  linear maps that agree on each basis word agree on all 2^width; a word of 16 bits or fewer is checked on
+  every word besides. A fixed layout's encoder must be the identity: its form reads the input as stored. A
+  form not proven is never returned, and a checked-in form is proven again by its consumer's tests. That
+  proof replaces the sampled checks a real-valued form gets.
+- The fp4 challenge, the evidence for the technique, searched this space in C: its NVFP4 decode into
+  bfloat16 pairs takes 4 LOP3 + 1 SHF + 3 IMAD.SHL against the 7 + 2 before, bit-identical, +0.4% end to end.
+  The search here re-derives it from the decode's declaration (2026-11-05, one armada core): at left shifts of
+  up to 31 places it walks every shape of four issues on the busiest pipe and finds none, then returns a form
+  of the challenge's price, a rotation by 6, shifts by 2 and 6 and the rotation's by 2 and four masked XORs,
+  in 27 seconds (left shifts to 6 places: 2.3 seconds, the test's). No form without a right-moving shift
+  exists within three left shifts.
+- **Not in the vocabulary yet** (row 4050): PRMT's byte permutes, LOP3's other linear tables (a three-way
+  XOR, a bit select), and transforms that are not linear (a rounding pack, an integer decode through fp16
+  arithmetic), whose search over LOP3's truth tables, IADD3 and HFMA2 is a bit-vector synthesis (Z3) and whose
+  proof over a 32-bit word is Z3's equivalence. Each joins when a consumer's transform needs it: sm80's FP8
+  and FP4 epilogue packing (row 3733) is the first. No target varies the vocabulary: the pipes and rates above
+  hold from sm75 to sm120, so the search takes no target.
+
+### 7.4 Interface with the GEMM template (its first consumer, row 3733)
+
+Agreed with the GEMM template's owner (2026-11-03):
+
+- A declaration names the fragment layout the family's MMA reads, which the family bundle supplies: on sm90
+  the wgmma A-operand fragment, the weight taken as A and swapped onto M at decode shapes so the decoder writes
+  straight into it; on sm100 the tcgen05 and tensor-memory layouts. A thread's input is the packed words it
+  loads: a 32-bit word holds 8 E2M1 codes.
+- Block scales (NVFP4's 1×16, MX's 1×32) are a separate transform of a fixed layout, which feeds the
+  template's promotion and epilogue: a form may re-encode the codes, never the scales.
+- The consumer checks in each form it takes: its instructions, its encoder and the encoder's version (in the
+  checkpoint), the decoder's live registers per thread (which `resources.py` prices before a tile is admitted)
+  and its instruction mix in `Work`'s units (which `cost.py` prices). Its tests prove it again.
+- The decoder is emitted inline (Mosaic GPU takes inline asm through `plgpu.inline_mgpu`) at a matrix-operand
+  hook the GEMM template adds (row 3621).
+- Scope: NVFP4 and MXFP4 on sm90 and sm80; FP8 on sm80, which has no FP8 MMA; FP8 and FP4 packing in the
+  epilogue. FP8 on sm90 needs no decode: wgmma multiplies E4M3 and E5M2 from shared memory.
+- A form is taken only where it is bit-identical over its whole domain and timed no slower on the real GEMM.
+
+### 7.5 Prior art
+
+- Massalin's superoptimizer (ASPLOS 1987): exhaustive search over short instruction sequences, which this
+  generalises.
+- STOKE (Schkufza, Sharma and Aiken, "Stochastic Superoptimization", ASPLOS 2013): long sequences explored by
+  MCMC and verified by a solver; forms this short are found exhaustively, their optimum included.
+- Souper (Sasnauskas et al., arXiv 1711.04422): LLVM IR rewrites synthesized with SMT, on IR rather than target
+  instructions, with no layout freedom.
+- Rosette (Torlak and Bodik, Onward! 2013 and PLDI 2014): bit-vector synthesis by symbolic evaluation into
+  SMT, the kind of query a non-linear transform's search would make.
+- New here: the search is joint with a free invertible re-encoding of the stored word, which none of the above
+  search, and it is priced per pipe for a GPU's ALU and FMA.

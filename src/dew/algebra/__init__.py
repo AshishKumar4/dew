@@ -19,12 +19,14 @@ from dew.algebra.program import AlgebraReport, Rewrite, Saturation, passes
 from dew.algebra.scan import Scan
 
 SATURATION = Saturation(growth=64, depth=4)
-"""The limits the engine runs at until they are measured (§6.6)."""
+"""The limits the engine runs at (§6.6), above every compile-time fixpoint measured: none of the 756 windows
+of a UNet's fsdp2 x tensor2 matrix cell and benchmark_step's cpu-smoke steps reached either, the largest
+using under a quarter of each, and none gained at four times both (row 4010)."""
 rewritten = functools.partial(program.rewritten, saturation=SATURATION)
 """`program.rewritten` at `SATURATION`: a function with its program rewritten."""
-program_of = functools.partial(program.program_of, saturation=SATURATION)
-"""`program.program_of` at `SATURATION`: a jit's own trace of a program, rewritten."""
+rewritten_program = functools.partial(program.rewritten_program, saturation=SATURATION)
+"""`program.rewritten_program` at `SATURATION`: a jit's own trace of a program, rewritten."""
 
 __all__ = ["SATURATION", "AlgebraReport", "Derived", "Reduction", "Refused", "Rewrite", "Saturation", "Scan",
-           "cost", "derive", "error", "forms", "passes", "program", "program_of", "rewritten", "rules",
+           "cost", "derive", "error", "forms", "passes", "program", "rewritten", "rewritten_program", "rules",
            "scan", "terms"]

@@ -153,9 +153,11 @@ def test_a_diffusion_run_starts_from_a_saved_diffusion_run_as_from_its_task(tmp_
     """A diffusion run that starts from a saved diffusion run (`--pretrained <run>`, `--source.step latest`)
     starts from the weights the run's own task restores (`TextToImage.from_run`), bit for bit, and samples
     by that task's policy where it states none. It trains a step, and its record names the run it started
-    from and the step it read; an adapter over it trains its factors over the run's frozen weights, and a
-    run that trained an adapter starts another with its base frozen. The source is at the run's own size,
-    another refused, and a language model's loader refuses a diffusion run, which has no release."""
+    from and the step it read; an adapter over it trains its factors over the run's frozen weights. The
+    source is at the run's own size, another refused, and a language model's loader refuses a diffusion
+    run, which has no release. A run that trained an adapter starts another with its base frozen
+    (`test_a_diffusion_run_starts_from_an_adapted_run_with_its_base_frozen`; the two took 135 s as one
+    test, ledger 3899)."""
     first = diffusion(tmp_path, drawn=False)
     trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
     source = tmp_path / "runs" / "first"
@@ -176,20 +178,29 @@ def test_a_diffusion_run_starts_from_a_saved_diffusion_run_as_from_its_task(tmp_
     factors = sum(leaf.size for leaf in jax.tree.leaves(adapted.variables["params"]))
     assert 0 < factors < sum(leaf.size for leaf in jax.tree.leaves(task.variables["params"]))
 
-    # A run that trained an adapter starts another with its base frozen and its factors training.
-    trained(first, tmp_path, "adapted_first", trainer={"checkpoint_final": True},
-            lora=LoRA(rank=2, modules=("ada_proj",)))
-    from_adapted, _ = trained(dataclasses.replace(run, pretrained=str(tmp_path / "runs" / "adapted_first")),
-                              tmp_path, "from_adapted")
-    assert FROZEN in from_adapted.variables
-    assert sum(leaf.size for leaf in jax.tree.leaves(from_adapted.variables["params"])) == factors
-
     sized = load_diffusion_source(str(source), dtype="float32", size=task.inputs.sample.shape[:-1])
     assert sized.inputs.sample == task.inputs.sample
     with pytest.raises(ValueError):
         load_diffusion_source(str(source), dtype="float32", size=(8, 8))
     with pytest.raises(ValueError):
         released_run(source)
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_diffusion_run_starts_from_an_adapted_run_with_its_base_frozen(tmp_path):
+    """A run that trained an adapter starts another (`--pretrained <run>`) with its base frozen and its
+    factors training: as many as the adapter it starts from trained."""
+    first = diffusion(tmp_path, drawn=False)
+    adapter, _ = trained(first, tmp_path, "adapted_first", trainer={"checkpoint_final": True},
+                         lora=LoRA(rank=2, modules=("ada_proj",)))
+    run = dataclasses.replace(first, pretrained=str(tmp_path / "runs" / "adapted_first"),
+                              source=SourceOptions(step="latest"), text=None,
+                              model=ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)),
+                              objective=ObjectiveConfig("diffusion", {}))
+    from_adapted, _ = trained(run, tmp_path, "from_adapted")
+    assert FROZEN in from_adapted.variables
+    factors = sum(leaf.size for leaf in jax.tree.leaves(adapter.variables["params"]))
+    assert 0 < sum(leaf.size for leaf in jax.tree.leaves(from_adapted.variables["params"])) == factors
 
 
 WORKER = Path(__file__).with_name("saved_export_worker.py")

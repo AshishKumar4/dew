@@ -14,9 +14,9 @@ from contract_support import LessFinite, assert_contract
 
 SOURCE = Path(__file__).resolve().parents[1] / "src" / "dew"
 
-CUSTOM = frozenset({"custom_jvp", "custom_vjp", "surrogate"})
-"""JAX's custom derivatives and Dew's declared one (`dew.nn.derivatives.surrogate`), as a decorator, a
-call, or within functools.partial."""
+CUSTOM = frozenset({"custom_jvp", "custom_vjp", "surrogate", "declared_derivative", "declared_tangent"})
+"""JAX's custom derivatives and Dew's declaring functions (`dew.nn.derivatives`: a surrogate, a derivative and
+a tangent of a declared kind), as a decorator, a call, or within functools.partial."""
 
 KERNEL, NUMERICS, SURROGATE = "kernel", "numerics", "surrogate"
 """Each seam's kind (`CONTRACTED`)."""
@@ -127,7 +127,9 @@ CONTRACTED = {
     "src/dew/nn/kernels/templates/gemm/template.py::_prologued.prologued":
         ("test_a_gemm_prologue_holds_every_order", KERNEL),
     "src/dew/nn/kernels/templates/layout.py::_custom.held":
-        ("test_a_transposed_hooks_custom_derivative_holds_every_order_it_takes", KERNEL),
+        ("test_a_transposed_hooks_custom_vjp_holds_every_reverse_order", KERNEL),
+    "src/dew/nn/kernels/templates/layout.py::_held_jvp.held":
+        ("test_a_transposed_hooks_custom_derivative_holds_every_order", KERNEL),
     "src/dew/nn/moe.py::_stored_primal":
         ("test_a_stored_expert_primal_holds_every_order", NUMERICS),
     "src/dew/nn/precision.py::at_default_precision.run":
@@ -144,6 +146,10 @@ CONTRACTED = {
         ("test_a_guided_prediction_holds_every_order", NUMERICS),
     "src/dew/nn/derivatives.py::surrogate.rule":
         ("test_a_surrogate_holds_every_order", SURROGATE),
+    "src/dew/nn/derivatives.py::declared_derivative.rule":
+        ("test_a_declared_derivative_holds_every_order", KERNEL),
+    "src/dew/nn/derivatives.py::declared_tangent.rule":
+        ("test_a_declared_derivative_holds_every_order", NUMERICS),
 }
 """Each contracted seam, `path::qualified name`, the test of tests/test_contracts_*.py that holds it, and its
 kind: a kernel's derivative (`KERNEL`: a launch's own backward, or the tangent of the code it stands for),

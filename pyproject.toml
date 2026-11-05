@@ -192,9 +192,6 @@ test = [
     # HFLM imports accelerate, which the hf extra brings.
     "lm_eval[hf]==0.4.13",
 ]
-# Run mutation tests in CI, one source module at a time. Pin the operators so
-# two reports describe the same mutation population.
-mutation = ["cosmic-ray==8.7.0"]
 # The video specs: moviepy reads the clips and brings ffmpeg (lazy imports in dew.data)
 av = ["moviepy"]
 # FID's Inception weight download
@@ -278,6 +275,7 @@ kernel-compile = ["jax-cuda12-plugin==0.12.0.1.post45; sys_platform == 'linux' a
                   "jax-cuda12-pjrt==0.12.0.1.post45; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-nvcc-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-nvcc==13.4.92; sys_platform == 'linux' and platform_machine == 'x86_64'",
+                  "nvidia-cuda-nvdisasm==13.4.92; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "libtpu==0.0.50.*; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 # The test suite's one environment: every package a test file imports, so no test skips for want
 # of one. CI's jobs, armada's (tools/armada/install.sh), the GPU nodes' and dew-ops' GPU jobs install

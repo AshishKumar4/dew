@@ -9,6 +9,7 @@ program merely named like one is walked inside."""
 import jax
 import jax.numpy as jnp
 import pytest
+from process_support import assert_exits_cleanly
 
 from dew.interop.sequence_causality import CAUSAL_ATTENTION, TOKENWISE, attested, causality_refusal
 
@@ -49,6 +50,19 @@ def scanned(states, initial, reverse: bool):
     return jax.lax.scan(step, initial, states[0], reverse=reverse)[1][None]
 
 
+def spread_primitive():
+    """A primitive of its own named `exp`, an entrywise operation's name, that gives each entry the sum of
+    its operand: no operation one entry at a time, whatever its name."""
+    from jax.extend.core import Primitive
+
+    spread = Primitive("exp")
+    spread.def_abstract_eval(lambda value: value)
+    return spread
+
+
+SPREAD = spread_primitive()
+
+
 def shifted_left(states):
     """Each position takes the next one's state (slice and concatenate, no contraction)."""
     return jnp.concatenate([states[:, 1:], jnp.zeros_like(states[:, :1])], axis=1)
@@ -74,6 +88,8 @@ ADMITTED = {
         embedded(tokens)[0])[None],
     "layers scanned": lambda tokens: jax.lax.scan(lambda h, w: (jnp.cumsum(h @ w, axis=1), None),
                                                   embedded(tokens), jnp.ones((3, D, D)))[0],
+    "a token's own random bits": lambda tokens: jax.vmap(jax.vmap(lambda token: jax.random.bits(
+        jax.random.fold_in(jax.random.key(0), token), ())))(tokens)[..., None],
 }
 
 REFUSED = {
@@ -94,6 +110,7 @@ REFUSED = {
     "a left shift named token-wise": lambda tokens: named(lambda x: shifted_left(x[None])[0], TOKENWISE)(
         embedded(tokens)[0])[None],
     "a reversed sequence": lambda tokens: embedded(tokens)[:, ::-1],
+    "a primitive taking an entrywise name": lambda tokens: SPREAD.bind(embedded(tokens)),
     "an operation with no rule": lambda tokens: jax.lax.linalg.tridiagonal_solve(
         jnp.full((tokens.shape[1],), 0.5), jnp.full((tokens.shape[1],), 2.0),
         jnp.full((tokens.shape[1],), 0.5), embedded(tokens)[0, :, :1])[None],
@@ -117,6 +134,20 @@ REFUSED = {
         lambda h, w: (h @ w - (h @ w).mean(axis=1, keepdims=True), None), embedded(tokens),
         jnp.ones((3, D, D)))[0],
 }
+
+
+def test_an_operation_is_known_by_its_object_whatever_the_processs_random_keys():
+    """JAX's own operations are read by their objects, its random ones off a trace of its public random
+    functions (`dew.nn.programs.jax_name`), in a process whose keys are another implementation's too
+    (`jax_default_prng_impl`), where the trace's key is its own."""
+    assert_exits_cleanly("""
+import jax
+jax.config.update("jax_default_prng_impl", "rbg")
+from dew.nn.programs import jax_name
+assert jax_name(jax.lax.exp_p) == "exp"
+folded = jax.make_jaxpr(lambda key: jax.random.fold_in(key, 1))(jax.random.key(0)).jaxpr.eqns
+assert "random_fold_in" in {jax_name(equation.primitive) for equation in folded}, folded
+""")
 
 
 def refusal(function, lengths=LENGTHS):

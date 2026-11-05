@@ -2,6 +2,8 @@
 (`dew.nn.derivatives.marked`), which every transform keeps a call of that kind, so the algebra pass reads a
 span's kind from the program it rewrites, its forward, tangent and cotangent alike."""
 
+import typing
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -10,6 +12,7 @@ from jax.experimental import checkify
 from jax.sharding import Mesh, PartitionSpec
 from reference_error import equations
 
+from dew.nn import derivatives
 from dew.nn.derivatives import Algebra, KernelGlue, Protected, Surrogate, marked, marked_call_p
 
 KINDS = [Protected(), Surrogate(), KernelGlue(), Algebra()]
@@ -66,3 +69,117 @@ def test_a_marked_spans_gradient_is_its_bodys():
     plain = jax.grad(lambda x, y: jnp.sum(body(x, y)), argnums=(0, 1))
     for got, expected in zip(jax.jit(spanned)(x, y), jax.jit(plain)(x, y), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
+
+
+def _scaled_backward(scale: float):
+    """A function `sin` whose declared backward scales its cotangent by `scale`, so a test sees the rule ran,
+    its static `scale` passed beside the arrays."""
+    def primal(x, factor):
+        return jnp.sin(x) * factor
+
+    def forward(x, factor):
+        return primal(x, factor), (x, factor)
+
+    def backward(saved, cotangent):
+        x, factor = saved
+        return scale * cotangent * jnp.cos(x) * factor, jnp.zeros_like(factor)
+
+    return primal, forward, backward
+
+
+KINDS = [kind() for kind in typing.get_args(derivatives.Kind.__value__)]
+"""Every kind a site declares its derivative as (`derivatives.Kind`'s), each through either builder."""
+
+
+@pytest.mark.parametrize("kind", KINDS, ids=lambda kind: type(kind).__name__)
+def test_a_declared_derivative_is_one_marked_call_and_differentiates_as_its_rule(kind):
+    """A custom derivative declared with its kind (`declared_derivative`: no bare `jax.custom_vjp`) is one
+    marked call of that kind, its primal, forward and backward together, which every transform keeps: its
+    value is its primal's, reverse mode runs its declared backward (a cotangent scaled by 3) in calls of its
+    kind, a second order differentiates that backward, and forward mode refuses it exactly as a bare
+    `jax.custom_vjp` does."""
+    primal, forward, backward = _scaled_backward(3.0)
+    declared = derivatives.declared_derivative(kind, primal, forward, backward)
+    bare = jax.custom_vjp(primal)
+    bare.defvjp(forward, backward)
+    x, factor = jnp.linspace(0.1, 1.0, 8), jnp.full(8, 2.0)
+    np.testing.assert_array_equal(np.asarray(declared(x, factor)), np.asarray(primal(x, factor)))
+    assert kinds_of(jax.make_jaxpr(declared)(x, factor)) == [kind]
+
+    def loss(function):
+        return lambda x: jnp.sum(function(x, factor))
+
+    np.testing.assert_array_equal(np.asarray(jax.grad(loss(declared))(x)),
+                                  np.asarray(jax.grad(loss(bare))(x)))
+    assert not np.array_equal(np.asarray(jax.grad(loss(bare))(x)), np.asarray(jax.grad(loss(primal))(x)))
+    # Reverse mode splits the call into its forward and its transpose, each a call of its kind.
+    found = kinds_of(jax.make_jaxpr(jax.grad(loss(declared)))(x))
+    assert found and all(seen == kind for seen in found)
+    np.testing.assert_array_equal(np.asarray(jax.grad(lambda x: jnp.sum(jax.grad(loss(declared))(x)))(x)),
+                                  np.asarray(jax.grad(lambda x: jnp.sum(jax.grad(loss(bare))(x)))(x)))
+    with pytest.raises(TypeError) as marked_error:
+        jax.jvp(lambda x: declared(x, factor), (x,), (x,))
+    with pytest.raises(TypeError) as bare_error:
+        jax.jvp(lambda x: bare(x, factor), (x,), (x,))
+    assert str(marked_error.value) == str(bare_error.value)
+    np.testing.assert_array_equal(np.asarray(jax.vmap(declared)(x[:, None], factor[:, None])),
+                                  np.asarray(jax.vmap(bare)(x[:, None], factor[:, None])))
+
+
+@pytest.mark.parametrize("kind", KINDS, ids=lambda kind: type(kind).__name__)
+def test_a_declared_tangent_is_one_marked_call_and_differentiates_as_its_rule(kind):
+    """A tangent rule declared with its kind (`declared_tangent`: no bare `jax.custom_jvp`) is one marked
+    call of that kind, which forward mode and reverse mode (its tangent transposed) keep, each from the
+    declared tangent (doubled here, so a test sees it ran)."""
+    def primal(x):
+        return jnp.sin(x)
+
+    def tangent(primals, tangents):
+        [x], [dx] = primals, tangents
+        return jnp.sin(x), 2.0 * jnp.cos(x) * dx
+
+    declared = derivatives.declared_tangent(kind, primal, tangent)
+    bare = jax.custom_jvp(primal)
+    bare.defjvp(tangent)
+    x = jnp.linspace(0.1, 1.0, 8)
+    assert kinds_of(jax.make_jaxpr(declared)(x)) == [kind]
+    for function in (lambda f: jax.jvp(f, (x,), (jnp.ones_like(x),))[1],
+                     lambda f: jax.grad(lambda x: jnp.sum(f(x)))(x)):
+        np.testing.assert_array_equal(np.asarray(function(declared)), np.asarray(function(bare)))
+    assert not np.array_equal(np.asarray(jax.grad(lambda x: jnp.sum(bare(x)))(x)), np.asarray(jnp.cos(x)))
+    found = kinds_of(jax.make_jaxpr(jax.grad(lambda x: jnp.sum(declared(x))))(x))
+    assert found and all(seen == kind for seen in found)
+
+
+def test_a_surrogate_is_one_surrogate_call():
+    """A surrogate (`surrogate`: a value and its declared derivative rule) is one marked call of its kind,
+    which reverse mode keeps, its derivative its rule's."""
+    rounded = derivatives.surrogate(lambda x: jnp.round(x), lambda primals, tangents, value: tangents[0])
+    x = jnp.linspace(0.1, 4.0, 8)
+    assert kinds_of(jax.make_jaxpr(rounded)(x)) == [Surrogate()]
+    np.testing.assert_array_equal(np.asarray(jax.grad(lambda x: jnp.sum(rounded(x)))(x)), np.ones(8))
+
+
+def test_a_declared_derivatives_nondifferentiable_array_is_bound_not_traced():
+    """An array at a declared derivative's nondifferentiable position (`nondiff_argnums`, a table the rule
+    reads as a constant) reaches the rule as the bare `jax.custom_vjp` takes it, concrete, eagerly and under a
+    jit, not as a traced operand of the marked call, which the custom derivative would refuse."""
+    def primal(table, x):
+        return jnp.sin(x) * table[0]
+
+    def forward(table, x):
+        return primal(table, x), x
+
+    def backward(table, x, cotangent):
+        return (3.0 * cotangent * jnp.cos(x) * table[0],)
+
+    declared = derivatives.declared_derivative(KernelGlue(), primal, forward, backward, nondiff_argnums=(0,))
+    bare = jax.custom_vjp(primal, nondiff_argnums=(0,))
+    bare.defvjp(forward, backward)
+    table, x = jnp.asarray([2.0]), jnp.linspace(0.1, 1.0, 8)
+
+    def gradient(function, run):
+        return run(jax.grad(lambda x: jnp.sum(function(table, x))))(x)
+
+    for run in (lambda f: f, jax.jit):
+        np.testing.assert_array_equal(np.asarray(gradient(declared, run)), np.asarray(gradient(bare, run)))

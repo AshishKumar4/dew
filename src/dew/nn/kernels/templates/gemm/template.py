@@ -37,6 +37,7 @@ from flax.typing import PrecisionLike
 from jax.custom_derivatives import zero_from_primal
 from jax.extend import core as jax_core
 
+from dew.nn.derivatives import KernelGlue, declared_tangent
 from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.templates.product import declared
 from dew.nn.precision import at_least_fp32
@@ -401,14 +402,12 @@ def _prologued(prologue, prologue_jvp):
     if prologue is None or prologue_jvp is None:
         return prologue
 
-    @jax.custom_jvp
-    def prologued(lhs, *sides):
-        return prologue(lhs, *sides)
-
-    @prologued.defjvp
-    def _(primals, tangents):
+    def tangent(primals, tangents):
         return prologued(*primals), prologue_jvp(*primals)(*tangents)
 
+    # The fused kernel's derivative glue (`derivatives.KernelGlue`): the producer's own derivative, true and
+    # rewritten as any other math, written once for the prologue the kernel applies to its tiles.
+    prologued = declared_tangent(KernelGlue(), lambda lhs, *sides: prologue(lhs, *sides), tangent)
     return prologued
 
 

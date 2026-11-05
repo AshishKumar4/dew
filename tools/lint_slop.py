@@ -67,6 +67,11 @@ Scope is per rule, because the rules are not all about the same thing:
   takes the options its models and the run's seam hold, admits its
   communicators and takes the algebra pass, and a trace that compiles nothing
   traces (`jax.make_jaxpr`, `jax.eval_shape`).
+- SLOP027 is about `src/<package>`: no kernel is launched by Pallas's own
+  `pallas_call`, by any name it is imported as, but the launch point's
+  (`nn/kernels/launches.py`), whose `pallas_call` holds each launch to the
+  per-shard boundary (`sharding.per_shard`), so no route launches a kernel over
+  operands an automatic mesh axis splits (rows 1897, 1923).
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -1968,6 +1973,27 @@ def compile_points(module: Module) -> Iterator[Finding]:
                               "it runs, or an objective's `Objective.program`")
 
 
+LAUNCH_POINT = "nn/kernels/launches.py"
+"""The module of `src/<package>` that calls Pallas's own `pallas_call` (SLOP027): Dew's launch point."""
+
+PALLAS_CALL = "jax.experimental.pallas.pallas_call"
+"""Pallas's own launch, which SLOP027 reports outside `LAUNCH_POINT`."""
+
+
+def pallas_launches(module: Module) -> Iterator[Finding]:
+    """SLOP027: Pallas's own `pallas_call` (`PALLAS_CALL`), its name read through the imports of its scope,
+    anywhere in `src/<package>` but the launch point (`LAUNCH_POINT`), whose `pallas_call` holds each launch
+    to the per-shard boundary."""
+    prefix = f"src/{module.package}/"
+    if not module.relative.startswith(prefix) or module.relative.removeprefix(prefix) == LAUNCH_POINT:
+        return
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
+        if isinstance(node, (ast.Name, ast.Attribute)) and scopes.resolved(node, table) == PALLAS_CALL:
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP027",
+                          "launches by Pallas's own pallas_call; launch through "
+                          "`dew.nn.kernels.launches.pallas_call`, which holds the launch per shard")
+
+
 GATE = frozenset({"tests/reference_error.py", "tests/check1_statistics.py", "tests/op_certificates.py",
                   "tests/certified.py",
                   "tests/reference_graph.py", "tests/reference_trees.py", "tests/residual_orders.py",
@@ -2252,7 +2278,8 @@ def tolerances(module: Module) -> Iterator[Finding]:
                       f"{what} compares floats within a tolerance ({why}); {gate}")
 
 
-CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections, compile_points)
+CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections, compile_points,
+                  pallas_launches)
 UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private)
 
 

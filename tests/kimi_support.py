@@ -20,6 +20,7 @@ from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
+from dew.registry import ModelConfig
 from dew.sampling import Sampling, generate
 
 
@@ -74,17 +75,25 @@ def recorded_dew(directory: Path, leaves: tuple[str, ...]):
     """The site's `dew(dtype, inputs)` (tests/reference_runs.py): the fixture at `directory` loaded once at
     each dtype, its `leaves` over a drawn batch: each valid position's logits of its forward (`logits`)
     and the first row's from its cached decode (`stepped`, `stepped_logits`)."""
-    loaded: dict[str, Pretrained] = {}
+    loaded: dict[str, tuple] = {}
 
     def dew(dtype, inputs) -> dict[str, jax.Array]:
         name = jnp.dtype(dtype).name
         if name not in loaded:
             # Loaded where its weights stay concrete, though its first call traces: the cache outlives
-            # the trace, and the truth's arm traces it again (`reference_error`'s rounding count).
+            # the trace, and the truth's arm traces it again (`reference_error`'s rounding count). Loaded
+            # once, in float32; a wider dtype's model built from it (`ModelConfig.with_dtype`), its
+            # variables widened, the float64 load's leaf for leaf (ledger 3900: a second load took 17 s).
             with jax.ensure_compile_time_eval():
-                loaded[name] = Pretrained.load(directory, dtype=name, param_dtype=name,
-                                               attention_impl="reference")
-        model, variables = loaded[name].model, loaded[name].variables
+                if "float32" not in loaded:
+                    narrow = Pretrained.load(directory, dtype="float32", param_dtype="float32",
+                                             attention_impl="reference")
+                    loaded["float32"] = narrow.model, narrow.variables
+                model, variables = loaded["float32"]
+                widened = jax.tree.map(lambda leaf: jnp.asarray(leaf, name)
+                                       if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, variables)
+                loaded[name] = ModelConfig.from_model(model).with_dtype(name).build(), widened
+        model, variables = loaded[name]
         ids = jnp.asarray(inputs["input_ids"], jnp.int32)
         found = {"logits": model.apply(variables, ids,
                                        attention_mask=jnp.asarray(inputs["attention_mask"], bool))[VALID]}

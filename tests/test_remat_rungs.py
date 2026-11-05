@@ -186,8 +186,13 @@ def _climbs_and_restores(model, variables, inputs, **apply) -> None:
     saved = [_saved(rung, variables, inputs, **apply) for rung in rungs]
     assert all(above < below for below, above in itertools.pairwise(saved)), list(zip(records, saved,
                                                                                          strict=True))
-    written = model.apply(variables, *inputs, mutable=True, **apply)[1].keys()
-    assert rungs[-1].apply(variables, *inputs, mutable=True, **apply)[1].keys() == written
+    # The collections each call writes, traced abstractly: op by op the two calls took most of the
+    # test (ledger 3905).
+    def written(rung):
+        return jax.eval_shape(lambda variables: rung.apply(variables, *inputs, mutable=True, **apply)[1],
+                              variables).keys()
+
+    assert written(rungs[-1]) == written(model)
 
 
 def _zeros_drawn(variables):
