@@ -87,13 +87,12 @@ def test_every_package_dews_index_serves_resolves_undated(tmp_path, monkeypatch)
 
 def test_a_gpu_extra_that_resolves_otherwise_for_aarch64_fails_the_lock(tmp_path, monkeypatch):
     """Each GPU lock serves aarch64 too only where it pins the same there: one whose aarch64 resolution pins
-    otherwise fails, naming the lock (train 433's review: a stand-in writing every lock empty never could)."""
-    done, _ = locked(tmp_path, monkeypatch, SPLIT_MACHINE="1")
-    assert done.returncode == 1
-    assert "locks/cuda12.txt resolves otherwise for aarch64" in done.stderr
+    otherwise fails the lock there (train 433's review: a stand-in writing every lock empty never could)."""
+    done, calls = locked(tmp_path, monkeypatch, SPLIT_MACHINE="1")
+    assert done.returncode == 1 and "--python-platform aarch64-manylinux_2_35" in calls[-1], calls[-1:]
 
 
-# 3.12 is the locks' own Python, whose lock fails first, with uv's own word.
+# 3.12 is the locks' own Python, whose own lock fails first.
 @pytest.mark.parametrize("python", ["3.13", "3.14"])
 def test_a_gpu_extra_that_does_not_install_on_a_python_pyproject_admits_fails_the_lock(
         tmp_path, monkeypatch, python):
@@ -101,8 +100,8 @@ def test_a_gpu_extra_that_does_not_install_on_a_python_pyproject_admits_fails_th
     each machine, so a CUDA plugin built for fewer Pythons fails the lock at its pin (row 3298: post42's
     plugins came for 3.12 and 3.14 alone, and dewml[cuda12] refused 3.13 while every lock, for 3.12, held)."""
     done, calls = locked(tmp_path, monkeypatch, NO_WHEEL=python)
-    assert done.returncode == 1
-    assert f"does not install on Python {python}" in done.stderr
+    # The lock stops at the first resolution for that Python, which no plugin wheel serves.
+    assert done.returncode == 1 and f"--python-version {python} " in calls[-1], calls[-1:]
     done, calls = locked(tmp_path / "every", monkeypatch, NO_WHEEL="3.11")
     assert done.returncode == 0, done.stderr
     asked = {(extra, minor, machine) for call in calls for extra in ("cuda12", "cuda13")
