@@ -100,7 +100,7 @@ Issues = "https://github.com/AshishKumar4/dew/issues"
 Changelog = "https://github.com/AshishKumar4/dew/blob/main/CHANGELOG.md"
 
 [project.scripts]
-dew = "dew.cli.main:main"
+dew = "dew._cli.main:main"
 
 [project.optional-dependencies]
 # FlashAttention-2 (kernels/flash_attn), which attention_impl 'auto' runs on an

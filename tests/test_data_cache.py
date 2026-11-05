@@ -1472,17 +1472,26 @@ def test_a_local_fill_leaves_its_disks_headroom_free_whatever_its_budget(tmp_pat
     assert not list(tmp_path.rglob("*.array_record"))
 
 
-def test_an_optional_streamed_fill_with_no_room_stops_once_for_its_key(tmp_path, caplog):
-    """A stream's optional fill that runs out of room stops once: its later shards' records are computed
-    and their writers write nothing, so a store of four shards reports the stop as a store of one does,
-    not once a shard (row 4296)."""
+@pytest.mark.parametrize("full", ["spool", "disk"])
+def test_an_optional_streamed_fill_with_no_room_stops_once_for_its_key(tmp_path, caplog, monkeypatch, full):
+    """A stream's optional fill that runs out of room, in its spool or on a disk a root that evicts nothing
+    writes to, stops once: its later shards' records are computed and their writers write nothing, so a
+    store of four shards reports the stop as a store of one does, not once a shard (row 4296)."""
     import logging
+    import shutil
+    from collections import namedtuple
     from uuid import uuid4
+
+    from dew.data.retention import DISK_HEADROOM
+
+    if full == "disk":
+        usage = namedtuple("usage", "total used free")
+        monkeypatch.setattr(shutil, "disk_usage", lambda path: usage(2**40, 2**40, DISK_HEADROOM))
 
     def warned(records: int) -> int:
         source = Memory([{"id": index} for index in range(records)], shard_rows=1)
-        cache = Cache(str(tmp_path / str(records)), keep_local_bytes=1, shard_bytes=1, spool_bytes=1,
-                      optional=True)
+        budgets = {"spool_bytes": 1, "keep_local_bytes": 1} if full == "spool" else {"evicts": False}
+        cache = Cache(str(tmp_path / str(records)), shard_bytes=1, optional=True, **budgets)
         manifest = source.manifest()
         reader = cache.streamed(manifest.reader, _key(f"halted-{uuid4().hex}"), source=source)
         caplog.clear()
@@ -1492,6 +1501,25 @@ def test_an_optional_streamed_fill_with_no_room_stops_once_for_its_key(tmp_path,
         return len([record for record in caplog.records if record.levelno >= logging.WARNING])
 
     assert warned(4) == warned(1)
+
+
+def test_a_stream_into_a_root_with_room_for_one_shard_seals_it_and_writes_no_more(tmp_path, caplog):
+    """A stream's optional fill into a root that evicts nothing and holds one of its four shards (a shard
+    here is one 128 KiB block) seals that shard's writer, is refused the next, says so once and writes
+    nothing after it, its records read as computed (row 4296)."""
+    import logging
+    from uuid import uuid4
+
+    source = Memory([{"id": index} for index in range(4)], shard_rows=1)
+    cache = Cache(str(tmp_path), keep_local_bytes=250_000, shard_bytes=1, optional=True, evicts=False)
+    manifest = source.manifest()
+    reader = cache.streamed(manifest.reader, _key(f"one-shard-{uuid4().hex}"), source=source)
+    with caplog.at_level(logging.WARNING, logger="dew.data.cache"):
+        rows = [row for shard in manifest.shards for row in reader(shard)]
+    assert rows == [{"id": index} for index in range(4)]
+    assert len(list(tmp_path.rglob("segments/*/seal.json"))) == 1
+    assert len(list(tmp_path.rglob("shards/*/*.array_record"))) == 1
+    assert len([record for record in caplog.records if record.levelno >= logging.WARNING]) == 1
 
 
 def test_local_retention_counts_what_its_root_holds_once_its_record_passes_the_limit(tmp_path):

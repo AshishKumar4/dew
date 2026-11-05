@@ -243,7 +243,7 @@ def test_a_pool_reads_a_saved_runs_release_through_one_publisher(tmp_path, monke
     default, the writer held the whole release, which tracemalloc did not see (ledger 3794). Both read
     the one release. `dew export` to a destination they share writes it once
     likewise, the tensors one process's export writes."""
-    from dew.cli.main import main
+    from dew._cli.main import main
     from dew.registry import ModelConfig
 
     run = dataclasses.replace(lm(tmp_path, drawn=False), model=ModelConfig(

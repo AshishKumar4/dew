@@ -37,7 +37,7 @@ import jax.numpy as jnp
 import numpy as np
 
 import dew
-from dew.accuracy import rms
+from dew._accuracy import rms
 from dew.inference.serving import Server
 from dew.interop import Pretrained
 from dew.nn.categorical import token_log_probs

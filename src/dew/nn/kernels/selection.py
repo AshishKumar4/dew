@@ -14,7 +14,7 @@ the next generic one.
 
 Selection reads only the call's static facts and the target's while a program traces: it adds no
 operation to the program, and outside `generation.routes()` it records nothing
-(`dew.cache.KERNEL_ROUTES` stays `()`), so a run's trace keys are those of a run that never selects.
+(`dew._cache.KERNEL_ROUTES` stays `()`), so a run's trace keys are those of a run that never selects.
 """
 
 from __future__ import annotations
@@ -204,9 +204,9 @@ class KernelRefused(ValueError):
 
 def forced(choice: str) -> str | None:
     """The kernel `generation.chosen` names for `choice` within its block, or None."""
-    from dew import cache
+    from dew import _cache
 
-    return dict(cache.KERNEL_CHOICES.value).get(choice)
+    return dict(_cache.KERNEL_CHOICES.value).get(choice)
 
 
 def _named(op: Op, named: str | None) -> str | None:

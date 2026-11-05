@@ -10,7 +10,7 @@ usual, then wraps it before the objective ever sees it. A direct
 public rule query (`qwix.pallas.get_current_rule`) and leave a matched
 product to Qwix. Quantize a model once, through either path. A direct
 call's traces are not keyed apart from the plain model's as
-`Quantization.apply`'s are (`dew.cache.QUANTIZED_TRACE`), so a jitted helper
+`Quantization.apply`'s are (`dew._cache.QUANTIZED_TRACE`), so a jitted helper
 the two share needs Qwix's `disable_jit=True`. A run that sets
 `--trainer.quantization` passes the objective to `RunConfig.train` instead,
 and the model the objective holds is wrapped there, before anything
@@ -71,8 +71,8 @@ from flax import core, linen as nn
 from flax.core import meta
 from flax.traverse_util import flatten_dict, unflatten_dict
 
+from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Coordinates, unboxed
-from dew.cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.derivatives import surrogate
 from dew.nn.kernels.generation import backend, linear_map
@@ -1008,13 +1008,13 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
     are settled (`dew.nn.kernels.tuning`): the sites decide which kernels a
     rank's train state holds packed, so ranks timing their own would build
     different states. A process beside other work on its GPU measures
-    unfairly (`dew.cache.measures_picks`) and is refused, where a recorded
+    unfairly (`dew._cache.measures_picks`) and is refused, where a recorded
     `InputQuantization` reproduces the choice instead. Every rank looks the
     sites up in its own tree first, and the pool agrees on what they found,
     so a rank whose tree lacks one is refused with its peers rather than
     leaving them at the measurement's agreement.
     """
-    from dew import _coordination, cache
+    from dew import _cache, _coordination
     from dew.nn.kernels.generation import device_generation, fp8_tensor_cores
 
     variables = unboxed(variables)
@@ -1032,7 +1032,7 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
         generation = device_generation()
         if not fp8_tensor_cores(generation):
             raise ValueError(f"{generation} has no FP8 tensor cores to run a frozen base in FP8 on")
-        if not cache.measures_picks():
+        if not _cache.measures_picks():
             raise ValueError("frozen FP8 sites are measured on a GPU the process holds alone, and this "
                              "one shares its GPU (AUTOTUNE_CACHE_MODE_READ, as gpu-run -n 0.5 sets): "
                              "measure on a whole GPU, or pass the InputQuantization a run recorded")

@@ -168,7 +168,7 @@ import jax
 if sys.argv[4] == "bumped":
     jax.__version__ += ".post999"
 import remote_cache
-from dew.cache import enable_compilation_cache
+from dew._cache import enable_compilation_cache
 from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
 enable_compilation_cache(sys.argv[1])
 remote = remote_cache.install(sys.argv[2], "token")
@@ -445,7 +445,7 @@ import sys
 import jax
 from jax.experimental.compilation_cache import compilation_cache
 import remote_cache
-from dew.cache import enable_compilation_cache
+from dew._cache import enable_compilation_cache
 from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
 enable_compilation_cache(sys.argv[1])
 remote = remote_cache.install(sys.argv[2], "token")
@@ -469,7 +469,7 @@ def test_a_program_fetched_and_not_used_again_stays_in_its_bundle(cache_worker, 
 import sys
 import jax
 import remote_cache
-from dew.cache import enable_compilation_cache
+from dew._cache import enable_compilation_cache
 enable_compilation_cache(sys.argv[1])
 remote = remote_cache.install(sys.argv[2], "token")
 remote.opened("tests/test_kept.py")
@@ -496,7 +496,7 @@ def test_a_url_that_is_no_address_leaves_the_local_cache_as_it_is(tmp_path):
     script = """
 import sys
 import remote_cache
-from dew.cache import enable_compilation_cache
+from dew._cache import enable_compilation_cache
 enable_compilation_cache(sys.argv[1])
 print(*(remote_cache.install(url, "token") is None for url in ("http://[::1", "http://host:port", "ftp://host")))
 """

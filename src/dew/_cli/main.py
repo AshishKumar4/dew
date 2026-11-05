@@ -19,9 +19,9 @@ from typing import TYPE_CHECKING, Annotated, Literal
 
 import tyro
 
-from dew.cli import tpu
-from dew.cli.gcloud import emit
-from dew.cli.launch import Launch
+from dew._cli import tpu
+from dew._cli.gcloud import emit
+from dew._cli.launch import Launch
 
 if TYPE_CHECKING:
     from dew.config import RunConfig
@@ -197,8 +197,8 @@ def run_named(named: str, trust: tuple[str, ...]) -> RunConfig:
 def run_held(named: str, trust: tuple[str, ...], assigned: tuple[str, ...]) -> RunConfig:
     """The run `named` names (`run_named`) with its `assigned` fields, its `trainer.xla_flags` held for every
     runtime XLA loads: where they do not hold, the command runs again from its start with them in XLA_FLAGS
-    (`dew.devices.hold_xla_flags`), as `import dew` loads jaxlib before the run is read."""
-    from dew.devices import hold_xla_flags
+    (`dew._devices.hold_xla_flags`), as `import dew` loads jaxlib before the run is read."""
+    from dew._devices import hold_xla_flags
 
     run = run_named(named, trust).assigned(assigned)
     hold_xla_flags(run.trainer.xla_flags)
