@@ -1170,9 +1170,11 @@ def _sliced(group_sizes: jax.Array, block_k: int, splits: int) -> jax.Array:
 
 
 def _group_blocks(group_sizes: jax.Array, block_k: int) -> tuple:
-    """Each group's first row, end, count of `block_k`-row blocks, and its first block's first row."""
-    group_starts = jnp.concatenate([jnp.zeros(1, jnp.int32), jnp.cumsum(group_sizes)[:-1]]).astype(jnp.int32)
-    group_ends = jnp.cumsum(group_sizes).astype(jnp.int32)
+    """Each group's first row, end, count of `block_k`-row blocks, and its first block's first row, from the
+    groups' one prefix sum (`_prefix_sums`, as `tile_groups` reads them)."""
+    group_sizes = group_sizes.astype(jnp.int32)
+    group_ends = _prefix_sums(group_sizes)
+    group_starts = group_ends - group_sizes
     group_block_starts = group_starts // block_k * block_k
     group_block_ends = -(group_ends // -block_k) * block_k
     return group_starts, group_ends, (group_block_ends - group_block_starts) // block_k, group_block_starts
