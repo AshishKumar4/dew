@@ -238,33 +238,38 @@ def test_compiled_samples_follow_the_substituted_masked_model():
     assert objective._sample is objective._sample
 
 
+UNMASKING_SEEDS = 8
+"""An unmasking step's declared check-1 seeds, sized by `seeds_for` paired."""
+
+
 @pytest.mark.parametrize("name", ["llada-tiny", "dream-tiny"])
 def test_a_masked_family_unmasks_each_position_from_the_logits_its_reference_reads(name):
     """LLaDA predicts each position's token from its own logits; Dream-v0, continued from an
     autoregressive model, from the position before (its reference shifts the logits right, the first
     repeated). One unmasking step's distribution at every position is the softmax of those logits of
-    the released model, the mask's column left out, as exact as the release's own float32 forward
-    is to float64."""
-    from one_draw import assert_as_exact_as_the_reference
-
+    the model, the mask's column left out, on par with a plain softmax of the same logits over drawn
+    ids (check 1, the truth the float64 forward's); the logits themselves are the release's
+    (tests/test_remote_code_releases.py)."""
     from dew.diffusion.discrete import DiscreteProcess, LogLinear
 
     model, variables = loaded(name)
-    directory = FIXTURES / name
-    ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
+    denoise = DiscreteProcess(LogLinear(), mask_id=120).denoiser(model, variables)
+    shape = np.load(FIXTURES / name / "input_ids.npy").shape
 
-    def unmasking(logits):
-        logits = np.asarray(logits, np.float64)
-        if name == "dream-tiny":
-            logits = np.concatenate([logits[:, :1], logits[:, :-1]], axis=1)
-        logits[..., 120] = -np.inf
-        shifted = logits - logits.max(axis=-1, keepdims=True)
-        return np.exp(shifted) / np.exp(shifted).sum(axis=-1, keepdims=True)
+    def unmasking(model, variables):
+        def run(ids):
+            logits = model.apply(variables, ids)
+            if name == "dream-tiny":
+                logits = jnp.concatenate([logits[:, :1], logits[:, :-1]], axis=1)
+            return jax.nn.softmax(logits.at[..., 120].set(-jnp.inf), axis=-1)
+        return run
 
-    _, log_probs = DiscreteProcess(LogLinear(), mask_id=120).denoiser(model, variables)(ids, jnp.ones((1,)))
-    assert_as_exact_as_the_reference(np.exp(np.asarray(log_probs, np.float64)),
-                                      unmasking(np.load(directory / "logits.npy")),
-                                      unmasking(np.load(directory / "logits_f64.npy")), f"{name} unmasking")
+    def draw(seed):
+        return (np.random.default_rng([0x0D, seed]).integers(0, 120, shape).astype(np.int32),)
+
+    assert_as_exact(lambda ids: jnp.exp(denoise(ids, jnp.ones((1,)))[1]), unmasking(model, variables), draw,
+                    f"{name} unmasking", seeds=UNMASKING_SEEDS,
+                    truth_fn=unmasking(model.clone(dtype=jnp.float64), widened(variables)))
 
 
 def test_a_shifted_model_reads_each_document_and_padded_row_as_if_alone():
