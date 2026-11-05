@@ -126,7 +126,7 @@ PROGRAMS = {
     "jit": jax.jit(_arithmetic),
     "custom_vjp": _custom,
     "scan": lambda x: jax.lax.scan(lambda carry, row: (carry + _arithmetic(row), carry * row), x[0], x)[1],
-    # A remat's call, which the replay opens as the gate does (`float64_terms.CALLS`).
+    # A remat's call, which the replay opens as the gate does (`dew.nn.programs.CALLS`).
     "remat": jax.checkpoint(_arithmetic),
     # A marked span's call (`dew.nn.derivatives.marked`: an error-free transform's), opened so too.
     "marked": marked(Protected(), _arithmetic),

@@ -7,13 +7,15 @@ import optax
 
 from dew._moments import bias_corrected
 from dew.nn.precision import at_least_fp32
+from dew.nn.sharding import layer_norms, layers_of
 
 
 def clip_by_agc(clip: float = 0.3, floor: float = 1e-3) -> optax.GradientTransformation:
     """Adaptive gradient clipping (Brock et al., arXiv 2102.06171) as DreamerV3's code takes it
     (embodied/jax/opt.py:109-123): each parameter's update scaled down until its norm is at most `clip`
     times the parameter's own, which `floor` keeps from reaching zero with the parameter (a bias drawn at
-    zero still moves), one norm over the whole array. A `clip` of 0 clips nothing. The update reads the
+    zero still moves), one norm over each stored layer (`dew.nn.sharding.layers_of`): the whole array, or
+    each layer of a stage-local run's stacked leaf. A `clip` of 0 clips nothing. The update reads the
     parameters."""
     if not clip:
         return optax.identity()
@@ -22,11 +24,14 @@ def clip_by_agc(clip: float = 0.3, floor: float = 1e-3) -> optax.GradientTransfo
         if params is None:
             raise ValueError("adaptive gradient clipping reads the parameters, so its update needs them")
 
-        def clipped(param, update):
-            limit = clip * jnp.maximum(floor, jnp.linalg.norm(param.ravel()))
-            return update * (1 / jnp.maximum(1.0, jnp.linalg.norm(update.ravel()) / limit))
+        def clipped(path, param, update):
+            # Each stored layer clipped by its own norms (`layer_norms`): a stage-local run's stacked leaf
+            # clips its layers as the replicated run clips each (row 3933).
+            stacked = layers_of(path)[1]
+            limit = clip * jnp.maximum(floor, layer_norms(param, stacked))
+            return update * (1 / jnp.maximum(1.0, layer_norms(update, stacked) / limit))
 
-        return jax.tree.map(clipped, params, updates), state
+        return jax.tree_util.tree_map_with_path(clipped, params, updates), state
 
     return optax.GradientTransformation(lambda params: optax.EmptyState(), update_fn)
 

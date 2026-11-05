@@ -164,13 +164,21 @@ class TrainState:
 
     @property
     def pending_tokens(self) -> jax.Array | None:
-        """The real tokens an update's open window holds (`Accumulation.tokens`, two words), which a run's
-        clocks count pending (`TokenClock`): its own window's, or under DiLoCo the first group's, each group
-        counting the whole batch's tokens as the run commits them; None for no window or no count."""
+        """The real tokens consumed but not yet committed, two words, which a run's clocks count pending
+        (`TokenClock`): an update's open window's (`Accumulation.tokens`) and those the optimizer holds back
+        for the update that applies them (`deferred`), the run's own, or under DiLoCo the first group's,
+        each group counting the whole batch's tokens as the run commits them; None where it counts neither
+        (row 3930: the held tokens left out, a budget's bound fell short of what the next update commits)."""
         window = self.window
-        if window is None or window.tokens is None:
-            return None
-        return window.tokens if self.inner is None else window.tokens[0]
+        held = self.deferred if self.inner is None else self.inner.deferred
+        windowed = None if window is None or window.tokens is None else window.tokens
+        if self.inner is not None:
+            windowed, held = (None if words is None else words[0] for words in (windowed, held))
+        if windowed is None or held is None:
+            return held if windowed is None else windowed
+        from dew.training.model_flops import _TokenCount
+
+        return _TokenCount.add(windowed, held)
 
     def with_window(self, window: Accumulation | None) -> TrainState:
         """This state with `window` as the window its step reads (`window`)."""

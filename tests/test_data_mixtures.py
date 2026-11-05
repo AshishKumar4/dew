@@ -178,6 +178,25 @@ def test_a_cut_stream_maps_every_batch_and_is_read_by_one_process():
             reader(DataPartition(0, 2))
 
 
+def test_a_validation_pass_keeps_its_rows_mask_through_a_host_projection():
+    """Three records read in batches of two fill their last batch with a copy its real-row mask
+    (`VALID_ROWS`) marks: a host step after the batch that returns only the fields it projects keeps the
+    reader's mask, as it keeps its examples count, so the copy is counted once, where the projection
+    dropped the mask and a loss counted the third record twice (row 3937)."""
+    def projected(batch):
+        return {"id": batch["id"]}
+
+    held = validation(Pipeline(Memory(Indexed(1, 3))).batch(2).map(projected), batch=2,
+                      loading=READ)(DataPartition())
+    try:
+        # A whole batch marks no row, each one real (`Objective.row_weights`).
+        masks = [np.asarray(batch[VALID_ROWS]).tolist() if VALID_ROWS in batch else [True] * len(batch["id"])
+                 for batch in held]
+    finally:
+        held.close()
+    assert masks == [[True, True], [True, False]]
+
+
 def test_a_validation_pass_over_a_mixture_reads_each_record_at_most_once():
     """A mixed pass keeps the weights and each split's own order, and stops
     before any corpus comes round, so a score is a score of the same records
@@ -1222,6 +1241,16 @@ def test_a_fit_repeats_a_chain_only_where_its_read_can_end(tmp_path, name):
     assert_same(parameters(fitted), parameters(written), f"{name} as the fit reads it")
 
 
+def test_phases_of_another_batch_are_refused_before_their_step_ends_are_counted():
+    """Phases read until training steps, so each is of the run's one batch (`phases`): one batched by 4
+    between two batched by 8 is refused, where its end was counted at 4 records a step and the stream
+    moved on a step early under a loader declaring 8 (row 3940)."""
+    first = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
+    with pytest.raises(ValueError):
+        compile(phases((first.batch(8), 1), (first.batch(4), 4), (first.batch(8), None)), read="memory",
+                loading=READ)
+
+
 class TokenCounted(Regression):
     """`Regression` whose records each commit `id % 3 + 1` real tokens, so the steps of a run commit
     unevenly."""
@@ -1498,6 +1527,33 @@ def test_a_window_a_rejection_shifted_is_dropped_where_a_ramp_stage_begins(route
                       checkpoint_every=2)
     state = trainer().fit(ramped(indexed_data(records, 16, seed), ramp), steps=4, log_every=100)
     assert (int(state.step), int(state.microstep), int(state.updates)) == (4, 2, 1)
+
+
+def test_a_resumed_runs_step_compiled_ahead_reads_the_batch_its_resume_reads(tmp_path):
+    """The batch a resumed run's first step is compiled ahead over and inspected on (`first_step_batch`) is
+    the one its resume reads: its stream cut as fit cuts it, each ramp stage beginning where an update of
+    its accumulation does. A ramp of a step of eight records, one of sixteen, then twenty-four, read two
+    steps to an update, reads two of eight and then twenty-four, its stage of sixteen dropped where no
+    update begins it: resumed after its first update, its next step reads the twenty-four records after
+    the first sixteen, where the stream cut a step at a time reads sixteen (row 3917)."""
+    from dew.training.ahead import first_step_batch
+
+    records, seed = 4096, 7
+    ramp = Ramp(start=8, increment=8, samples=16)
+    stream = ramped(indexed_data(records, 24, seed), ramp).train(DataPartition(window=2))
+    try:
+        read = [np.asarray(batch["id"]).tolist() for batch in itertools.islice(stream, 3)]
+    finally:
+        stream.close()
+
+    def trainer():
+        return Trainer(Pooled(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
+                       layout=Layout(min_shard=1, tolerance=1.0),
+                       checkpoints=Checkpoints(str(tmp_path / "run"), keep=8))
+
+    trainer().fit(ramped(indexed_data(records, 24, seed), ramp), steps=2, log_every=100, checkpoint_every=2)
+    batch = first_step_batch(trainer(), ramped(indexed_data(records, 24, seed), ramp), steps=6)
+    assert np.asarray(batch["id"]).tolist() == read[2] and [len(ids) for ids in read] == [8, 8, 24]
 
 
 def test_each_aligned_stage_begins_from_its_own_schedule_and_one_left_no_step_is_dropped():

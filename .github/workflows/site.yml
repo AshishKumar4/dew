@@ -5,7 +5,8 @@
 # and checks it beside CI and keeps the build as its artifact `site`; a red
 # build holds a deploy, never a train, which publishes on CI alone.
 #
-# Deploys are manual, from that artifact of the commit main is at:
+# Deploys are manual, from that artifact of the commit main is at, which its
+# revision.txt names (served at dewml.dev/revision.txt):
 #   gh run download <run> -n site -D site/dist && (cd site && pnpm run deploy)
 #   (cd site && node live/deploy.mjs <commit> -- --secrets-file <live secrets>)
 
@@ -55,6 +56,8 @@ jobs:
         node site/scripts/render-posts.mjs --check
     - uses: astral-sh/setup-uv@v6
     - run: pnpm build
+    # The commit the build is of, served at /revision.txt, so the site's source reads against main's.
+    - run: echo "${{ github.sha }}" > dist/revision.txt
     - run: pnpm live:check
     - run: pnpm live:test
     - run: pnpm test  # Chrome, which ubuntu-latest has

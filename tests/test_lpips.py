@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_arithmetic import float64_held
 from reference_error import assert_computes_the_oracle, chain_roundings
 from tool_support import load
 
@@ -46,7 +47,7 @@ def test_the_distance_and_its_gradient_are_repa_es():
     np.testing.assert_allclose(np.asarray(distance), reference["distance_f64"], rtol=1e-6)
 
     with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
+        wide = float64_held(variables)
         first, second = (jnp.asarray(reference[key], jnp.float64) for key in ("images", "references"))
 
         def mean(images):

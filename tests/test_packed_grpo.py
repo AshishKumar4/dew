@@ -10,7 +10,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, widened
+from arm_arithmetic import float64_held
+from reference_error import assert_as_exact
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Step
@@ -126,7 +127,7 @@ def test_packed_grpo_computes_per_call_grpo_on_the_unmerged_chains(policy_loss):
         return params, jax.tree.map(lambda leaf: leaf * 0.9, params)
 
     def truth(params, reference):
-        return _step(twin, params, jax.tree.map(jnp.asarray, widened(unmerged)), reference)
+        return _step(twin, params, float64_held(unmerged), reference)
 
     with jax.default_device(jax.devices("cpu")[0]):
         assert_as_exact(lambda params, reference: _step(objective, params, packed, reference),

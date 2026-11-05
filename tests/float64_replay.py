@@ -150,7 +150,7 @@ def _replayed_equation(equation, values, used):
         raise NotImplementedError(f"float64_replay has no float64 rule for complex {name}")
     body = _body(equation)
     if body is not None:
-        # A call the gate opens (`float64_terms.CALLS`: a jit, a remat, a custom rule's primal, a marked
+        # A call the gate opens (`dew.nn.programs.CALLS`: a jit, a remat, a custom rule's primal, a marked
         # span), replayed inside as the gate evaluates it.
         return _replayed(*body, values, used)
     if name == "reduce":

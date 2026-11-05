@@ -194,7 +194,8 @@ class Abstention:
         meets the target when the accepted answers err at most `target_error`,
         counting a group of tied answers as a whole; with `conservative`, the error
         is estimated as (errors + 1) / (accepted + 1). A bucket that no threshold
-        satisfies gets 1.0 (Laya's `fit_abstention_thresholds`).
+        satisfies gets `REJECT_ALL`, above every probability, so serving abstains on all its answers
+        (Laya's `fit_abstention_thresholds` gives 1.0, which served an answer of top 1).
         """
         thresholds = {}
         for name in sorted({held.bucket for held in scored}):

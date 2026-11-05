@@ -367,6 +367,18 @@ def test_abstention_serves_every_answer_its_fit_accepted():
     assert len(served(calibration, question, scored)) == 100
 
 
+def test_a_bucket_no_threshold_fits_abstains_on_every_answer_however_confident():
+    """A hundred wrong answers whose calibrated top probability is exactly 1 (logits 1,000 apart, softmax
+    1 in float64) meet no 10% target, so the fit gives their bucket no threshold that serves any: serving
+    abstains on all hundred, as on any answer below 1, where a threshold of 1 abstained only strictly
+    below it and served every one (row 3939)."""
+    question = Choice("pick", ["a", "b"])
+    wrong = Scored(question.kind, np.asarray([1000.0, 0.0]), np.eye(2)[1])
+    assert float(softmax(wrong.logits, 1.0).max()) == 1.0
+    calibration = Calibration(abstention=Abstention.fit([wrong] * 100, Temperatures(), target_error=0.1))
+    assert served(calibration, question, [wrong] * 100) == []
+
+
 def test_binning_maps_each_bin_to_its_accuracy():
     scored = synthetic(1.0, 1000, 2, seed=3)
     temperatures = Temperatures()

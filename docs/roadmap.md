@@ -23,6 +23,24 @@ A full audit of `main` on 2026-10-27, each finding re-checked by a second review
 - Prove behaviour through the shared gates: no prose or whitespace pins, no mocks of Dew internals, learning judged by independent runs. [1878]
 - Answer each decision question's tournament on its own finalists. [1879]
 
+A second full audit of `main` (e4f857000c) on 2026-11-04, grouped by shared cause.
+
+- Keep the numerical gate's references and float64 truth outside the algebra pass, and key every derivation cache on the GPU it was priced for. [3921, 3922]
+- Finish the algebra as specified: template hooks and derivative traces through the pass, true element sizes per dtype, one open monoid registry, the qualification inventory derived from the registered rules, and the remaining gaps in the audit's section table. [3923, 3924, 3925, 3926, 3927, 3928]
+- Count only real rows: Gauss-Newton systems and host batch projections honour the row mask, and abstention, empty prompts and phase batch sizes mean what they document. [3929, 3937, 3939, 3940, 3941]
+- Advance clocks and minibatches on what actually committed, and restore every build-resolved field on resume: deferred tokens in the token clock, control minibatches, the teacher step, exact step identities by content. [3930, 3931, 3932, 3938]
+- Give optimizers one stated layout and reduction contract: AGC per stored layer, reduction semantics declared rather than inferred, layout coverage taken from the registry. [3933, 3934, 3936]
+- Stay finite where the math is finite: the sqrt-softplus router's backward, and classifier-free and adaptive projected guidance in half precision. [3919, 3944, 3945]
+- Keep one authority for runtime configuration through lazy compilation and child processes: the server's PRNG implementation, and the GPUs JAX selected when sizing communicators. [3943, 3947]
+- Count hardware FLOPs from the products a kernel executes, recomputation included. [3948]
+- Type the registry's contracts, and rebuild records by their annotations so data stays data. [3920, 3957]
+- Read spills from Triton programs as well as Mosaic ones. [3960]
+- Make native recurrence match its reference on H100, and draw recorded inputs independently of JAX. [3961, 3962]
+- Prove behaviour, not wording or fixed bounds: record-text pins, the host placement scan bound, selective-scan route pins, a stray GPU marker. [3950, 3954, 3964, 3973]
+- Remove second owners and dead paths: group side operands, guidance's module inventory, one reader per banked load, program inspection below interop and training, the accuracy merge, resume's re-fit, publish's objective reader, saved-run translations outside the pinned path, duplicated fixtures and directories, a one-caller wrapper, a second process-isolation mechanism. [3963, 3946, 3949, 3959, 3942, 3966, 3967, 3968, 3918, 3972, 3974, 3975, 3977]
+- Verify what a run summary reads from its manifest, test model fixes against their source rather than Dew itself, and name the right API in generic refusals. [3969, 3970, 3976]
+- Keep the templates spec's status current per row, and deploy the site from `main` with its source commit recorded. [3965, 3955]
+
 ## Models and interop
 
 - One cross-attention block for every consumer: the language model's gated adapter, the decision model and diffusion conditioning compose the same block and its cache instead of parallel copies. [1629]

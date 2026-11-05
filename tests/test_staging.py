@@ -180,3 +180,18 @@ def a_staged_commit_holds_two_layers_of_host_resident_moments_at_once():
     memory = jax.jit(chunked).lower(state, params, params).compile().memory_analysis()
     assert memory is not None
     assert memory.temp_size_in_bytes <= 2 * (2 * 512 * 512 * 4)
+
+
+def test_flattening_runs_a_plain_call_in_its_caller_and_keeps_a_marked_span_a_call():
+    """A staged commit runs an optax helper's `jit` in its caller (`flattened`) and keeps a marked span
+    (`dew.nn.derivatives.marked`) a call of its own: the algebra pass reads its boundary, and a protected
+    span's inside no rule touches, so flattened its sums would be rewritten together."""
+    from dew.nn.derivatives import Protected, marked
+
+    def two_sums(x):
+        return jnp.sum(x) + jnp.sum(2 * x)
+
+    closed = jax.make_jaxpr(lambda x: jax.jit(lambda y: marked(Protected(), two_sums)(y + 1))(x))(jnp.ones(4))
+    equations, _ = flattened(closed.jaxpr, closed.jaxpr.invars, closed.consts)
+    names = [equation.primitive.name for equation in equations]
+    assert names.count("marked_call") == 1 and not {"jit", "pjit"} & set(names), names

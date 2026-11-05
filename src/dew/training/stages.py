@@ -23,11 +23,12 @@ Invariants:
 - Per layer, exactly. The optimizer steps the stacked leaves, so a rule that reads a leaf as one layer
   reads it as the stored layers it stacks (`dew.nn.sharding.stacked_layers`): Dew's
   weight-decay mask, Muon's matrix axes, a param group's patterns, int8 moments' size threshold,
-  LAMB's trust ratio and QK-Clip's per-layer maxima each give what they give unstacked. An optax
-  transformation given as it is runs over the stacked leaf, so where its state names a transform Dew
-  does not know to act a number at a time, the run keeps every layer whole on every stage, the
-  replicated layout's memory, which trains it exactly (`StageLocal.of`); a stateless one
-  (`optax.EmptyState`) that reduces over a whole leaf cannot be told apart, and the docs say so.
+  LAMB's trust ratio, LaProp's adaptive clip and QK-Clip's per-layer maxima each give what they give
+  unstacked. An optax transformation given as it is runs over the stacked leaf, so unless every state it
+  holds names a transform Dew knows to act a number at a time, the run keeps every layer whole on every
+  stage, the replicated layout's memory, which trains it exactly (`StageLocal.of`): a stateless
+  transform (`optax.EmptyState`) says nothing of what it reads, and optax's LAMB trust ratio, its
+  adaptive clip and a constant rate's scale all hold one (row 3934).
 
 Rejected: the stage axis as one more axis the state splits over, as fsdp splits it, which keeps each
 leaf one layer but moves the run's parameters to their stage and its gradients back every step, the
@@ -124,10 +125,13 @@ def _sharded(sharding: NamedSharding, mesh: Mesh, spec: Sequence) -> NamedShardi
 @dataclasses.dataclass(frozen=True)
 class StageLocal:
     """How a trainer over `mesh` keeps the runs `sites` declare stacked by stage (module docstring);
-    with no site, every conversion leaves a tree as it is."""
+    with no site, every conversion leaves a tree as it is. `read_whole` names the transforms of an optimizer
+    given built that kept every layer whole on every stage instead (`whole_reading`), which the run's plan
+    reports (`Trainer.plan`); none otherwise."""
 
     sites: tuple[DecoderBank, ...]
     mesh: Mesh
+    read_whole: tuple[str, ...] = ()
 
     @classmethod
     def of(cls, objective, mesh: Mesh, *, local: bool = True,
@@ -139,8 +143,8 @@ class StageLocal:
         a transformation Dew does not build, holds a transform that may read a parameter whole
         (`whole_reading`): no per-layer view of a transform whose reductions only its own code knows is
         exact short of each layer a leaf of its own, which one program holds on every stage alone, so the
-        run keeps every layer whole on every stage, as `Layout(stage_local=False)` does. Dew's own
-        optimizers read a stacked leaf as its layers."""
+        run keeps every layer whole on every stage, as `Layout(stage_local=False)` does, said once and
+        named in its plan (`read_whole`). Dew's own optimizers read a stacked leaf as its layers."""
         stages = mesh.shape.get(STAGE_AXIS, 1)
         if not local or stages == 1:
             return cls((), mesh)
@@ -148,10 +152,11 @@ class StageLocal:
         shapes = unboxed(abstract(objective.initializer, jax.random.key(0)))
         whole = whole_reading(optimizer, shapes.get("params", {}))
         if whole:
-            _log.info("the optimizer holds %s, transforms that may read a parameter whole, so each pipelined "
-                      "run keeps every layer whole on every stage, without stage-local storage's 1/%d of "
-                      "the run a device", whole, stages)
-            return cls((), mesh)
+            _log.warning("the optimizer given built holds %s, transforms that may read a parameter whole, so "
+                         "each pipelined run keeps every layer whole on every stage, without stage-local "
+                         "storage's 1/%d of the run a device; a named optimizer (OptimConfig(optimizer=...)) "
+                         "reads each stored layer and keeps them stage-local", whole, stages)
+            return cls((), mesh, tuple(whole))
         declared = objective.stage_sites(shapes, stages)
         if not declared:
             _log.info("%s declares no run a pipeline over %d stages stacks (Objective.stage_sites), so its "

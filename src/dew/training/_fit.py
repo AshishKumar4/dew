@@ -817,12 +817,12 @@ def fit_policies[LossT, EffectsT](objective: Objective[LossT, EffectsT], best, s
     return selection, plateau, pause
 
 
-def first_batch(loader: Loader, mesh: Mesh, position: bytes | None = None) -> Batch:
-    """The first batch `loader`'s training stream gives this process's share of `mesh`, from the saved
-    `position` a resume continues at where given, the stream then closed: what an objective that names
-    its input alone reads the shape off (`Trainer._declare_input`), once, before the run opens its stream
-    where it starts, and the batch a step compiled ahead is compiled over (`AheadTarget.compiled`)."""
-    partition = DataPartition.of(mesh)
+def first_batch(loader: Loader, partition: DataPartition, position: bytes | None = None) -> Batch:
+    """The first batch `loader`'s training stream gives this process's share, `partition`, the one its
+    run opens (`Trainer._stream_partition`), from the saved `position` a resume continues at where given,
+    the stream then closed: what an objective that names its input alone reads the shape off
+    (`Trainer._declare_input`), once, before the run opens its stream where it starts, and the batch a
+    step compiled ahead is compiled over (`AheadTarget.compiled`)."""
     batch = _first_read(loader, partition, position)
     # A share a pool's bound in examples deals none of its first examples reads no batch of its own, and
     # every share's batch is of the pool's tree (`pooled_read`).

@@ -16,8 +16,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_arithmetic import float64_held
 from jax.sharding import NamedSharding, PartitionSpec as P
-from reference_error import as_given, assert_as_exact, widened, without_ynn
+from reference_error import as_given, assert_as_exact, without_ynn
 
 from dew.diffusion.process import DenoisingCondition
 from dew.mesh import batch_axes
@@ -155,8 +156,7 @@ def float64_pulled(model, variables, call):
     gate compiles for every draw. Returned to the host, the gate would run it as a NumPy truth, op by
     op, which took a UNet cell's draw 1.2 s against the arms' 0.16 s."""
     wide = model.clone(dtype=jnp.float64)
-    with jax.enable_x64(new_val=True):
-        held = jax.tree.map(jnp.asarray, widened(variables))
+    held = float64_held(variables)
     run = pulled(wide, call)
     return lambda inputs, cotangent: run(held, inputs, cotangent)
 

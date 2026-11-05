@@ -1114,6 +1114,9 @@ class Trainer(Generic[Loss, Effects]):
         if record_path is not None:
             keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches})
         self.plan = settled(planned, probes, search, above)
+        if self._staging.read_whole:
+            # A transformation given built that kept every layer whole on every stage (`StageLocal.of`).
+            self.plan = {**self.plan, "layers_whole_for": list(self._staging.read_whole)}
         search.told(planned)
         if planned.split != candidates[0]:
             _log.info("the step fits the devices in the plan %s", self.plan)
@@ -1610,7 +1613,7 @@ class Trainer(Generic[Loss, Effects]):
         under "never" into a directory that holds no run either. An objective that names its input field
         alone declares it first (`_declare_input`)."""
         checkpoints = self.checkpoints
-        self._declare_input(lambda: first_batch(dataset, self.device_mesh))
+        self._declare_input(lambda: first_batch(dataset, self._stream_partition()))
         if resume == "require" and (checkpoints is None or initial is not None):
             raise ValueError("resume='require' continues the checkpointer's latest checkpoint, which a "
                              "trainer with no checkpointer, or a run given its state=, starts without")

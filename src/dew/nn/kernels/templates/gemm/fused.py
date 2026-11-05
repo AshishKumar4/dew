@@ -158,11 +158,6 @@ def _prologue(fusion) -> tuple[jax.Array, dict]:
                   'prologue_jvp': jvp}
 
 
-CALLS = programs.CALLS | {'remat', 'custom_vjp_call_jaxpr'}
-"""The equations whose bodies the split reads through (a jitted, checkpointed or custom-derivative call, as
-Dew's own norms are): their values are their bodies'; their derivatives stay the producer's (`_whole_jvp`)."""
-
-
 def _split(producer, values):
     """`producer(values)`'s kernel stage and what it reads (`_prologue`): the base array, the prologue on its
     tile and the side arrays' tiles, the side arrays, the launch axes each follows, and the producer's whole
@@ -239,25 +234,31 @@ def _whole_jvp(flat, leaves: tuple, places: tuple, shapes: tuple, base, *sides):
 
 
 def _inlined(closed, *args):
-    """`closed` evaluated with every call (`CALLS`) read through to its body, so the split sees a norm's
-    statistics however its producer wraps them."""
-    env = dict(zip(closed.jaxpr.invars, args, strict=True)) | dict(zip(closed.jaxpr.constvars, closed.consts,
-                                                                       strict=True))
+    """`closed` evaluated with every call (`dew.nn.programs.CALLS`: a jitted, checkpointed or
+    custom-derivative call, as Dew's own norms are) read through to its body, so the split sees a norm's
+    statistics however its producer wraps them: their values are their bodies'; their derivatives stay the
+    producer's (`_whole_jvp`)."""
+    return _evaluated(closed.jaxpr, closed.consts, args)
+
+
+def _evaluated(program, consts, args):
+    """`program` evaluated over `args` and its constants `consts`, each call it makes read through its own
+    program (`dew.nn.programs.called`, its operands its program's one for one)."""
+    env = dict(zip(program.invars, args, strict=True)) | dict(zip(program.constvars, consts, strict=True))
 
     def read(var):
         return var.val if isinstance(var, jax_core.Literal) else env[var]
 
-    for eqn in closed.jaxpr.eqns:
-        body = (eqn.params.get('jaxpr') or eqn.params.get('call_jaxpr') or eqn.params.get('fun_jaxpr')
-                if eqn.primitive.name in CALLS else None)
+    for eqn in program.eqns:
+        body = programs.called(eqn)
         invals = [read(var) for var in eqn.invars]
         if body is not None:
-            outvals = _inlined(body, *invals[len(invals) - len(body.jaxpr.invars):])
+            outvals = _evaluated(body, body.consts, invals)
         else:
             outvals = eqn.primitive.bind(*invals, **eqn.params)
             outvals = outvals if eqn.primitive.multiple_results else [outvals]
         env.update(zip(eqn.outvars, outvals, strict=True))
-    return [read(var) for var in closed.jaxpr.outvars]
+    return [read(var) for var in program.outvars]
 
 
 def _shape(var) -> tuple:

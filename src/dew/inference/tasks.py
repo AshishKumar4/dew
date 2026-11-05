@@ -306,6 +306,15 @@ def _requested(generated: Generation, budget: int, padding: int) -> Generation:
                    raw_log_probs=generated.raw_log_probs[:, :budget])
 
 
+def declared_objective(record: Mapping[str, object]) -> type[Objective]:
+    """The objective class a step's inference declaration `record` names (`Checkpoints.artifact`): where a
+    saved run's readers, its export's fingerprint and its publication read it (`SavedRun.objective`,
+    `dew.interop.saved_sources.step_records`)."""
+    from dew.registry import objectives
+
+    return objectives[named(record['objective'], 'objective')]
+
+
 @dataclass(frozen=True)
 class SavedRun:
     """One checkpoint of a run, pinned, as every loader of a run reads it (a task's `from_run`,
@@ -359,7 +368,7 @@ class SavedRun:
         """The checkpoint of the run in `directory` at `step`, its latest where None, whatever step its task
         loads by default (`pinned`): the step an average of runs reads (`dew.checkpoints.averaged`)."""
         from dew.checkpoints import Checkpoints
-        from dew.registry import import_trusted, objectives
+        from dew.registry import import_trusted
         persist_compilations()
         with Checkpoints(directory) as checkpoints:
             step = checkpoints.pinned(step)
@@ -371,7 +380,7 @@ class SavedRun:
         record = earlier_shapes(named_fields(record, 'checkpoint artifact'))
         if 'unrecorded' in record:
             raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
-        objective = objectives[named(record['objective'], 'objective')]
+        objective = declared_objective(record)
         declared = frozenset() if objective.settings is None else settings_fields(objective.settings)
         stray = set(record) - {'objective', 'model', 'precision', UNREAD, *declared}
         if stray:
@@ -381,10 +390,8 @@ class SavedRun:
 
     @property
     def objective(self) -> type[Objective]:
-        """The objective class the run trained, which its record names."""
-        from dew.registry import objectives
-
-        return objectives[named(self.record['objective'], 'objective')]
+        """The objective class the run trained, which its record names (`declared_objective`)."""
+        return declared_objective(self.record)
 
     def variables(self, *, ema: bool | None, mesh: MeshSpec | Mesh | None = None,
                   layout: Layout | None = None, param_dtype: DTypeLike | None = None,

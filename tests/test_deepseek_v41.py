@@ -27,6 +27,7 @@ twin's distance from the truth.
 """
 
 import dataclasses
+import functools
 import json
 from collections.abc import Mapping
 from pathlib import Path
@@ -404,23 +405,34 @@ def test_speculative_decoding_drafts_with_dspark_and_emits_the_greedy_walk(sourc
     np.testing.assert_array_equal(np.asarray(speculated.lengths), 8)
 
 
+DRAFT_SEEDS = 8
+"""The cached draft's declared check-1 seeds against the uncached one, sized by `seeds_for` on armada."""
+
+
 def test_the_decode_ops_draft_what_dspark_drafts_over_the_history(source):
     """After a prefill and a verified stretch whose rows keep different
     counts, the block the decode ops draft is the one the drafter drafts
     uncached over each row's real history: the prompt's and the stretch's
-    context reach its windows at their own positions. Two runs each within
-    FACTOR of the reference's rounding lie within twice that of each other.
-    Each side is one compiled program, where run op by op they took two
-    minutes of the test on armada (3820)."""
+    context reach its windows at their own positions. Over drawn rows whose
+    drafted tokens clear their greedy choice, and whose trunk's and drafter's
+    selections (its indexer top-k, candidate pool and routing) clear theirs,
+    by `selection_margins.MARGIN`, so every run chooses alike, the cached
+    block's logits are on par with the uncached ones from the float64
+    drafter's (check 1, ledger 2739). Each side is one compiled program, where
+    run op by op they took two minutes of the test on armada (3820)."""
+    import selection_margins
+    from model_support import float64_twin
+    from reference_error import assert_as_exact
+
     from dew.sampling.text import decode_ops, prefill_state
 
     loaded, plain, reference = source
-    ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
-    kept = jnp.asarray([3, 1])
-    drawn = ids[:, prompt + 3]
+    shape, prompt = reference["input_ids"].shape, int(reference["decode_prompt"])
+    counts = (3, 1)
+    kept = jnp.asarray(counts)
 
-    @jax.jit
-    def drafted(variables):
+    def drafted(variables, ids):
+        drawn = ids[:, prompt + 3]
         ops = decode_ops(plain, variables, 0, 0)
         assert ops.record is not None and ops.draft is not None and ops.verify is not None
         state, _ = prefill_state(plain, variables, ModelInputs(ids[:, :prompt]), ops)
@@ -437,16 +449,51 @@ def test_the_decode_ops_draft_what_dspark_drafts_over_the_history(source):
         ops.draft(state, drawn, choose)
         return jnp.stack(scored, 1)
 
-    @jax.jit
-    def uncached(variables, history, token):
-        _, sown = plain.apply(variables, history, mutable=["prediction_inputs"])
-        whole = plain.apply(variables, sown["prediction_inputs"], method="draft_context")
-        return plain.apply(variables, whole, token, decode=False, method="draft")[1]
+    def histories(ids):
+        """Each row's real history and the token its draft starts from."""
+        return [(ids[row:row + 1, :prompt + counts[row]], ids[row:row + 1, prompt + 3])
+                for row in range(ids.shape[0])]
 
-    scored = drafted(loaded.variables)
-    for row in range(2):
-        logits = uncached(loaded.variables, ids[row:row + 1, :prompt + int(kept[row])], drawn[row:row + 1])
-        assert distance(scored[row], logits[0]) <= 2 * FACTOR * rounding("draft_logits")
+    def uncached(model, apply=None):
+        """The drafter's block over each row's real history, uncached; by `apply`, `model.apply` or a
+        capture of it (`selection_margins.capturing`), with what each call captured."""
+        apply = apply or model.apply
+
+        def drafted_alone(variables, ids):
+            rows, captured = [], []
+            for history, token in histories(ids):
+                _, trunk = apply(variables, history, mutable=["prediction_inputs"])
+                whole = model.apply(variables, trunk["prediction_inputs"], method="draft_context")
+                block, drafter = apply(variables, whole, token, method=lambda module, whole, token: (
+                    module.draft(whole, token, decode=False)), mutable=[])
+                rows.append(block[1][0])
+                captured += [trunk, drafter]
+            return jnp.stack(rows), captured
+        return drafted_alone
+
+    def logits(drafted_alone):
+        return lambda variables, ids: drafted_alone(variables, ids)[0]
+
+    # One program for the uncached block and every selection it makes: the trunk's and the drafter's.
+    selecting = jax.jit(uncached(plain, functools.partial(selection_margins.capturing, plain)))
+
+    def clears(inputs):
+        block, captured = selecting(*inputs)
+        smallest = float(np.min(selection_margins.top_margin(np.asarray(block), 1)))
+        for selections in captured:
+            smallest = min(smallest, selection_margins.margin(loaded.model_config, selections,
+                                                              "dspark draft"))
+        return smallest > selection_margins.MARGIN
+
+    variables = jax.tree.map(jnp.asarray, loaded.variables)
+
+    def draw(seed):
+        ids = np.random.default_rng([0x2739, seed]).integers(0, plain.vocab_size, shape).astype(np.int32)
+        return variables, jnp.asarray(ids)
+
+    truth = jax.jit(logits(uncached(float64_twin(plain))))
+    assert_as_exact(drafted, logits(uncached(plain)), selection_margins.clearing(draw, clears),
+                    "dspark draft", seeds=DRAFT_SEEDS, truth_fn=truth)
 
 
 @pytest.mark.parametrize("quantized", [None, "int8", "float8_e4m3fn"])

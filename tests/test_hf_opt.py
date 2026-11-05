@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from arm_arithmetic import float64_held
 from flax import linen as nn
 from interop_support import (
     assert_exported_decoder_follows_transformers,
@@ -183,7 +184,7 @@ def test_a_projected_decoders_prediction_depth_and_table_context_read_the_stream
     for seed in range(PROJECTED_TWIN_DRAWS):
         params, ids, context = draw(seed)
         with jax.enable_x64(new_val=True):
-            wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params)
+            wide = float64_held(params)
             dew = scored(projected.clone(dtype=jnp.float64), lambda params: params)
             found = jax.device_get(dew(wide, ids, context))
             oracle = scored(twin.clone(dtype=jnp.float64), twinned)

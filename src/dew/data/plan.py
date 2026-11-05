@@ -20,7 +20,7 @@ import numpy as np
 
 from dew import _checkout
 from dew._hashing import array_header
-from dew._records import ADDED, JSON, integer, json_value, record, set_added, without_removed
+from dew._records import ADDED, JSON, integer, json_value, listed, record, set_added, without_removed
 from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
 from dew.position import PER_SHARE
@@ -41,12 +41,11 @@ _RESUMED = ("resume with the Dew that wrote it, or go on from its weights as a n
 
 REBUILD = "build its chain as it was"
 RECORD = "resume it from its record, which holds the chain it read (`dew train <run directory>/run.json`)"
-SCHEDULE = ('read its mix unseeded, in the schedule it saved (`mix(..., seed=None)`, a decision mixture\'s '
-            '`mixture(..., order="schedule")`)')
+SCHEDULE = "read its mix unseeded, in the schedule it saved (`mix(..., seed=None)`)"
 """The routes a run whose chain changed since it saved its position takes (`PlanOrderChanged.routes`):
 built as it was; resumed from a record that holds its chain (`RunConfig.train` names it where the saved
-run's record does); a decision mixture saved before its corpus order was seeded read in that schedule
-(rows 3870, 3881)."""
+run's record does); a mix saved before its order was seeded read in that schedule (rows 3870, 3881), which
+a layer above spells as its own API reads it (`PlanOrderChanged.routed`, a decision mixture's)."""
 
 
 def _absent(value: JSON | None) -> str:
@@ -54,9 +53,10 @@ def _absent(value: JSON | None) -> str:
 
 
 class PlanOrderChanged(ValueError):
-    """A saved data position's plan whose order is not the chain's now: each order key `changed`, its saved
-    value and its value now (None where one holds none), and the `routes` its run goes on by (`REBUILD`,
-    `RECORD`, `SCHEDULE`), a mix saved unseeded and seeded now naming `SCHEDULE`."""
+    """A saved data position's plan whose order is not the chain's now: each path of the order `changed`
+    (`selection_seed`, `phases[1].selection_seed`), its saved value and its value now (None where one holds
+    none), and the `routes` its run goes on by (`REBUILD`, `RECORD`, `SCHEDULE`), a mix saved unseeded and
+    seeded now, nothing else changed, naming `SCHEDULE`."""
 
     def __init__(self, changed: Mapping[str, tuple[JSON | None, JSON | None]], routes: tuple[str, ...]):
         self.changed, self.routes = dict(changed), routes
@@ -66,23 +66,42 @@ class PlanOrderChanged(ValueError):
 
     @classmethod
     def between(cls, saved: Mapping[str, object], now: Mapping[str, object]) -> PlanOrderChanged:
-        """The refusal of a position saved under order `saved`, read under `now`: each top-level key
-        whose value differs."""
-        changed = {key: (json_value(saved.get(key), key) if key in saved else None,
-                         json_value(now.get(key), key) if key in now else None)
-                   for key in sorted(set(saved) | set(now)) if saved.get(key) != now.get(key)}
-        # A mix saved unseeded and seeded now reads as it was saved unseeded again; another seed, as built.
-        seeded = changed.get("selection_seed")
-        unseeded = seeded is not None and seeded[0] is None
+        """The refusal of a position saved under order `saved`, read under `now`, as the check compares
+        them (`unplaced`, `Plan.check`): each path whose value differs, a mix's corpora, a phase's and a
+        mix of mixes' members by their places (row 3914)."""
+        changed = dict(_differing(unplaced(json_value(saved, "saved order")),
+                                  unplaced(json_value(now, "order"))))
+        # Mixes saved unseeded and seeded now, and nothing else, read as they were saved unseeded again;
+        # another seed, or a seed beside another change, as built.
+        unseeded = bool(changed) and all(path.rpartition(".")[2] == "selection_seed" and before is None
+                                         for path, (before, _) in changed.items())
         return cls(changed, (*((SCHEDULE,) if unseeded else ()), REBUILD))
 
-    def routed(self, *, recorded: bool) -> PlanOrderChanged:
-        """This refusal with the record route first where the saved run's record holds its chain."""
-        return PlanOrderChanged(self.changed, ((RECORD,) if recorded else ()) + self.routes)
+    def routed(self, *, recorded: bool, unseeded: str = SCHEDULE) -> PlanOrderChanged:
+        """This refusal with the record route first where the saved run's record holds its chain, and the
+        schedule's route as the run's own layer spells it (`unseeded`)."""
+        routes = tuple(unseeded if route == SCHEDULE else route for route in self.routes)
+        return PlanOrderChanged(self.changed, ((RECORD,) if recorded else ()) + routes)
 
     def __reduce__(self):
         # Rebuilt from its own fields, as a pickle or a process boundary carries it.
         return type(self), (self.changed, self.routes)
+
+
+def _differing(saved: dict[str, JSON] | list[JSON] | str | int | float | bool | None,
+               now: dict[str, JSON] | list[JSON] | str | int | float | bool | None,
+               path: str = "") -> Iterator[tuple[str, tuple[JSON, JSON]]]:
+    """Each path at which `now` differs from `saved`, with both values there (None where one holds none):
+    into the records and lists of equal length both hold, a record's field by its name and a list's entry
+    by its place."""
+    if isinstance(saved, dict) and isinstance(now, dict):
+        for name in sorted(set(saved) | set(now)):
+            yield from _differing(saved.get(name), now.get(name), f"{path}.{name}" if path else name)
+    elif isinstance(saved, list) and isinstance(now, list) and len(saved) == len(now):
+        for index, (before, after) in enumerate(zip(saved, now, strict=True)):
+            yield from _differing(before, after, f"{path}[{index}]")
+    elif saved != now:
+        yield path, (saved, now)
 
 
 def _canonical(value: JSON | Mapping[str, object]) -> bytes:
@@ -146,7 +165,9 @@ def callable_name(step: Callable[..., Batch]) -> str:
 class StepIdentity:
     """What a step computes (`semantic`), and the bytes of each external
     module its code comes from (`modules`): its own, then those of the
-    factory that configured it."""
+    factory that configured it. `code` places among `modules` those of a
+    function outside Dew that declares no identity, which state nothing of
+    what it computes but its code (`Plan.check`); no record holds it."""
 
     name: str
     config: str
@@ -154,6 +175,7 @@ class StepIdentity:
     modules: tuple[str, ...] = ()
     declared: str | None = None
     dependencies: Mapping[str, object] = dataclasses.field(default_factory=dict)
+    code: tuple[int, ...] = ()
 
     @classmethod
     def of(cls, step: object, identity: str | None = None, *, cache: bool = False) -> StepIdentity:
@@ -187,10 +209,23 @@ class StepIdentity:
         if dataclasses.is_dataclass(step) and not isinstance(step, type) and (
                 dependencies or _holds_arrays(step) or set_added(step)):
             config = json.dumps(_configuration(step), sort_keys=True)
-        named = cls(name, config, exact, modules, declared, dependencies)
+        code = (0,) if inspect.isfunction(step) and declared is None and modules else ()
+        named = cls(name, config, exact, modules, declared, dependencies, code)
         if cache and not named.keyable(function=inspect.isfunction(step), external=external):
             raise ValueError(f"cache prefix step {name} needs identity='name@version'")
         return named
+
+    def record(self) -> dict[str, JSON]:
+        """The identity as a manifest records it: every field but `code`, which its modules' places say."""
+        return {field.name: json_value(getattr(self, field.name), field.name)
+                for field in dataclasses.fields(self) if field.name != "code"}
+
+    def composed(self, factory: StepIdentity, config: str) -> StepIdentity:
+        """This step's identity as the `Configured` stage `factory` resolved it, under `config`: the
+        factory's modules after its own, and their places of code (`code`) with them."""
+        return dataclasses.replace(
+            self, config=config, modules=(*self.modules, *factory.modules),
+            code=(*self.code, *(len(self.modules) + place for place in factory.code)))
 
     def keyable(self, *, function: bool, external: bool) -> bool:
         """Whether a cache can key what the step computes: a stable identity,
@@ -201,8 +236,7 @@ class StepIdentity:
     def semantic(self) -> dict[str, JSON]:
         """What the step computes, on any host: its identity without its
         modules' bytes, which only a manifest's environment records."""
-        recorded = dataclasses.asdict(self)
-        return {name: json_value(value, name) for name, value in recorded.items() if name != "modules"}
+        return {name: value for name, value in self.record().items() if name != "modules"}
 
 
 @runtime_checkable
@@ -312,7 +346,9 @@ def _environment(recorded: Mapping[str, object]) -> dict[str, JSON]:
     module's bytes, for the steps a memory read ran and then the plan's own.
     A step states a change to what it computes in its configuration or
     declared identity; its modules' bytes change with any edit to their
-    files, as Dew's revision does with any edit to Dew."""
+    files, as Dew's revision does with any edit to Dew. A function outside
+    Dew states none, so its modules' bytes are what it computes, which an
+    exact resume holds (`Plan.check`)."""
     steps = (*_identities(recorded["ran"]), *_identities(recorded["steps"]))
     return {**{name: json_value(recorded[name], name) for name in _ENVIRONMENT},
             "modules": [step["modules"] for step in steps]}
@@ -392,8 +428,8 @@ class Manifest:
             for field in dataclasses.fields(self)
             if field.name not in ("steps", "ran")
         }
-        recorded["steps"] = [json_value(dataclasses.asdict(step), "step") for step in self.steps]
-        recorded["ran"] = [json_value(dataclasses.asdict(step), "step") for step in self.ran]
+        recorded["steps"] = [step.record() for step in self.steps]
+        recorded["ran"] = [step.record() for step in self.ran]
         return recorded
 
     def semantic(self) -> dict[str, JSON]:
@@ -873,7 +909,8 @@ class Plan:
     ) -> tuple[str, ...]:
         """Refuse a saved plan whose rows this plan does not make again: another
         version, order, derived order fact, per-share topology or semantic
-        manifest (`Manifest.semantic`). A changed environment
+        manifest (`Manifest.semantic`), or, resumed exactly, a step outside Dew
+        whose code changed and that declares no identity. A changed environment
         (`Manifest.environment`) is returned and warned of, and refused for a
         per-share plan."""
         current = self.record()
@@ -944,6 +981,21 @@ class Plan:
         # The plan's steps state what they compute (`Manifest.semantic`), so a resume of an unchanged plan
         # and topology reads on under another Dew, a global order's or a share's, the change reported.
         changes = _changed(saved_environment, environment)
+        if resume != "non-exact" and edited is None:
+            # A function outside Dew that declares no identity, a step's or the factory's that configured
+            # it, is what its code computes: its module's bytes changed, it may make other rows from the
+            # same records (row 3938).
+            saved_modules = listed(saved_environment.get("modules", []), "saved data modules",
+                                   read=json_value, what="each step's module digests")
+            rewritten = [step.name for step, before in zip(
+                (*self.manifest.ran, *self.manifest.steps), saved_modules, strict=False)
+                if isinstance(before, list) and len(before) == len(step.modules)
+                and any(before[place] != step.modules[place] for place in step.code)]
+            if rewritten:
+                raise ValueError(
+                    f"the code of data step {', '.join(rewritten)} changed since the position was saved, "
+                    "and it declares no identity saying it computes the same; declare one "
+                    "(identity='name@version') to resume exactly, or resume='non-exact'")
         if changes:
             _log.warning("data environment changed under an unchanged plan: %s", ", ".join(changes))
         if self.volatile:
