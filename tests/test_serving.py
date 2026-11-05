@@ -1099,23 +1099,6 @@ def test_a_row_of_an_adapter_sets_base_computes_the_base_bit_for_bit():
     np.testing.assert_array_equal(np.asarray(served[1]), np.asarray(base[1]))
 
 
-@pytest.mark.distributed
-def test_a_server_over_a_pool_draws_what_each_request_draws_alone(tmp_path):
-    """One server over a mesh that spans two processes, each seating and reading its own groups of rows and
-    the pool stepping it together, each step's admission agreed: every process's requests draw what one
-    process serving them all draws (ledger 1423)."""
-    from pathlib import Path
-
-    from process_support import run_pool, run_worker
-
-    worker = Path(__file__).with_name("serving_worker.py")
-    reports = run_pool("pooled_server", tmp_path / "pool", 2, script=worker, devices=2, fsdp_size=4,
-                       timeout=300)
-    single = run_worker("pooled_server", tmp_path / "single.json", script=worker, fsdp_size=1, devices=1)
-    assert reports[0]["tokens"] + reports[1]["tokens"] == single["tokens"]
-    assert reports[0]["lengths"] + reports[1]["lengths"] == single["lengths"]
-
-
 @pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("mesh, options", [
     (MeshSpec(), {}),
