@@ -622,7 +622,8 @@ class MergeProjector(nn.Module):
 
 
 PATCH_CONVOLUTION = "patch_embed.proj.weight"
-"""Where the Qwen-style towers keep their patch map: a `[out, in, time, h, w]` convolution."""
+"""Where the Qwen-style towers keep their patch map: a `[out, in, time, h, w]` convolution, or MoonViT's
+`[out, in, h, w]`."""
 
 
 def translate_vit_weights(hf_tensors: Mapping[str, Stored],
@@ -638,7 +639,7 @@ def translate_vit_weights(hf_tensors: Mapping[str, Stored],
                                  if name != PATCH_CONVOLUTION}, path_of, param_dtype)
     if PATCH_CONVOLUTION in hf_tensors:
         conv = checkpoint_array(hf_tensors[PATCH_CONVOLUTION], param_dtype)
-        dense = held(conv.transpose(1, 2, 3, 4, 0).reshape(-1, conv.shape[0]), contiguous=True)
+        dense = held(conv.transpose(*range(1, conv.ndim), 0).reshape(-1, conv.shape[0]), contiguous=True)
         insert(variables, ("params", "patch_embed", "kernel"), dense, PATCH_CONVOLUTION)
         # The Dense map's transpose is the convolution, its input axes flattened.
         kernel = ("params", "patch_embed", "kernel")
