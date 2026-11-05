@@ -423,11 +423,24 @@ def whole_reading(optimizer: optax.GradientTransformation | None, shapes, local:
         return []
     with local.held():
         params = local.staged_shapes(shapes)["params"]
-        state = jax.eval_shape(optimizer.init, params)
+        # The state as a run holds it: built over the layer tree, then stacked (`StageLocal.state`).
+        layered = jax.eval_shape(optimizer.init, shapes["params"])
+        state = local.staged_shapes(layered)
         if solves_equations(state):
             # Its update is a solve of the step's system over every parameter at once (`dew.gauss_newton`),
             # read from the statistics the step hands it, not its gradient a layer at a time.
             return ["a Gauss-Newton solve, over every parameter at once"]
+        try:
+            built = jax.eval_shape(optimizer.init, params)
+        except ValueError:
+            # A transformation built against the layer tree (a mask of its paths) builds over no other.
+            return ["a transformation built against the layer tree, which builds over no stacked one"]
+        if jax.tree.structure(built) != jax.tree.structure(state) or any(
+                (one.shape, one.dtype) != (other.shape, other.dtype)
+                for one, other in zip(jax.tree.leaves(built), jax.tree.leaves(state), strict=True)):
+            # Its static choices read the tree's shapes (a mask by rank): over the stacked tree it decides
+            # otherwise than over the layers it holds.
+            return ["a transformation whose build reads its tree's shapes, deciding otherwise when stacked"]
         arguments = (params, state, params)
         given, structure = jax.tree_util.tree_flatten_with_path(arguments)
         stacked = [layers_of(path)[1] for path, _ in given]
@@ -435,6 +448,8 @@ def whole_reading(optimizer: optax.GradientTransformation | None, shapes, local:
                   if held else leaf for (_, leaf), held in zip(given, stacked, strict=True)]
         returned, _ = jax.tree_util.tree_flatten_with_path(jax.eval_shape(optimizer.update, *arguments))
         made = [layers_of(path)[1] for path, _ in returned]
+        lengths = [math.prod(leaf.shape[:held]) if held else None
+                   for (_, leaf), held in zip(returned, made, strict=True)]
 
         def update(*leaves, flipped: frozenset[int] = frozenset(), flipping: frozenset[int] = frozenset()):
             # The stacked leaves' layers on one axis each, reversed where the walk reads them reversed.
@@ -447,17 +462,18 @@ def whole_reading(optimizer: optax.GradientTransformation | None, shapes, local:
                    for leaf, held in zip(out, made, strict=True)]
             return [jax.numpy.flip(leaf, 0) if index in flipping else leaf for index, leaf in enumerate(out)]
 
+        forward = jax.make_jaxpr(update)(*merged)
         refusals = []
         for length in sorted({leaf.shape[0] for leaf, held in zip(merged, stacked, strict=True) if held}):
             inputs = {index: 0 for index, (leaf, held) in enumerate(zip(merged, stacked, strict=True))
                       if held and leaf.shape[0] == length}
-            outputs = {index: 0 for index, ((_, leaf), held) in enumerate(zip(returned, made, strict=True))
-                       if held and math.prod(leaf.shape[:held]) == length}
-            for flips in ((frozenset(), frozenset()), (frozenset(inputs), frozenset(outputs))):
-                traced = functools.partial(update, flipped=flips[0], flipping=flips[1])
-                closed = jax.make_jaxpr(traced)(*merged)
-                refused = positional_refusal(closed, inputs, length, outputs)
+            outputs = {index: 0 for index, made_length in enumerate(lengths) if made_length == length}
+            # A stacked output of other layers reads none of these: no layer of its lines up with theirs.
+            apart = [index for index, made_length in enumerate(lengths) if made_length not in (None, length)]
+            reversed_ = jax.make_jaxpr(functools.partial(update, flipped=frozenset(inputs),
+                                                         flipping=frozenset(outputs)))(*merged)
+            for way, closed in (("", forward), (" reversed", reversed_)):
+                refused = positional_refusal(closed, inputs, length, outputs, apart)
                 if refused is not None:
-                    way = " reversed" if flips[0] else ""
                     refusals.append(f"over {length} stored layers{way}, {refused}")
     return refusals

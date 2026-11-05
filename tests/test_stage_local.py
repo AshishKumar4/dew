@@ -457,17 +457,19 @@ def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trai
     (`whole_reading`): optax's Adam at a constant rate, its moments and its scale a number at a time
     (rows 3995, 4015). One whose update reads a leaf whole, optax's LAMB, whose trust ratio would take one
     ratio over both stages, and Adafactor, whose factored moments and block clip read the leaf, given built
-    or named by its import path in an `OptimConfig`, keeps every layer whole on every stage, and the run's
-    plan names what kept them whole. No per-layer view of a transform whose reductions only its own code
-    knows is exact short of each layer a leaf of its own, so the run trains as `Layout(stage_local=False)`
-    trains it, and steps."""
+    or named by its import path in an `OptimConfig`, and one whose build reads its tree's shapes (a decay
+    masked by rank), keep every layer whole on every stage, and the run's plan names what kept them whole.
+    No per-layer view of a transform whose reductions only its own code knows is exact short of each layer a
+    leaf of its own, so the run trains as `Layout(stage_local=False)` trains it, and steps."""
     model = decoder()
     for local in (optax.adam(1e-3), optax.adam(1e-3)):
         assert saving(functools.partial(trainer, model, local, STAGED, 8, ema=None)) > 0
         run = trainer(model, local, STAGED, 8, ema=None)
         assert int(run.fit(stream(), steps=1, log_every=1).step) == 1
         assert "layers_whole_for" not in run.plan
-    for given in (optax.lamb(1e-3), optax.adafactor(1e-3),
+    # A decay masked by rank decides otherwise over a stacked leaf, whose bias is rank three.
+    by_rank = optax.adamw(1e-3, mask=lambda params: jax.tree.map(lambda leaf: leaf.ndim > 1, params))
+    for given in (optax.lamb(1e-3), optax.adafactor(1e-3), by_rank,
                   OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3)):
         # An OptimConfig's transformation is built over the run's length, which fit gives.
         assert saving(functools.partial(trainer, model, given, STAGED, 8, ema=None)) == 0

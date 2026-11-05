@@ -129,13 +129,15 @@ def causality_refusal(closed: core.Jaxpr, tokens: int, length: int,
 
 
 def positional_refusal(closed: core.Jaxpr, inputs: Mapping[int, int], length: int,
-                       outputs: Mapping[int, int]) -> str | None:
+                       outputs: Mapping[int, int], apart: Sequence[int] = ()) -> str | None:
     """Why the program `closed` is not provably causal along an axis of `length` positions, or None where
     each of its `outputs` (by index, to the axis its positions lie on) reads at a position that position
     and earlier ones alone of its `inputs` (by index, to the axis their positions lie on): a forward's
     tokens (`causality_refusal`), or the stored layers of an update's stacked leaves
     (`dew.training.stages.whole_reading`). Over the program with the positions reversed it says whether
-    each reads that position and later ones alone; together, that position alone."""
+    each reads that position and later ones alone; together, that position alone. Each output `apart`
+    (by index) reads none of the positional inputs at all: another axis's positions, which no position
+    of these lines up with."""
     held: list[Held] = [None] * len(closed.jaxpr.invars)
     for index, axis in inputs.items():
         held[index] = Reads(axis, np.arange(length, dtype=np.int64))
@@ -150,6 +152,9 @@ def positional_refusal(closed: core.Jaxpr, inputs: Mapping[int, int], length: in
         if output is not None and _later(output, length, axis):
             where = f"; first at {walk.first}" if walk.first else ""
             return f"its output {index}'s entry reads a later position at {length} positions{where}"
+    reached = [index for index in apart if read[index] is not None]
+    if reached:
+        return f"its outputs {reached}, of other positions, read these {length} positions"
     return None
 
 
