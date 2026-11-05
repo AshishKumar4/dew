@@ -12,7 +12,7 @@ from dew.decision.layout import DecisionInputs
 from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, ModelInputs
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
-from dew.nn.protocols import TokenModel, VocabularyRows
+from dew.nn.protocols import TokenModel, VocabularyRows, forward_method
 from dew.nn.scatter import gather_positions
 from dew.nn.visibility import block_ends, block_starts
 from dew.nn.wrapping import HeadedModel
@@ -97,6 +97,11 @@ class DecisionModel(HeadedModel):
         def applied(*args, **kwargs) -> tuple[jax.Array, Variables]:
             out = self.backbone.apply(backbone, *args, mutable=list(opened) or False, **kwargs)
             return out if opened else (out, {})
+        # The backbone's final states: its `hidden_states`, or a native encoder's own forward.
+        states_method = forward_method(self.backbone, "hidden_states")
+        if states_method is None:
+            raise TypeError(f"a decision reads its backbone's final states, and a "
+                            f"{type(self.backbone).__name__} declares no hidden_states and no forward")
         laid = inputs.coordinates()
         # A row in blocks is read by the backbone's attention whole within each block, on the kinds
         # that read blocks (`AttentionMetadata.block_groups`); a row in order passes none.
@@ -129,8 +134,8 @@ class DecisionModel(HeadedModel):
                     held = kwargs.get("conditioning", {})
                     assert isinstance(held, Mapping)
                     kwargs["conditioning"] = {**held, **conditioning}
-                return module.hidden_states(rows.tokens, train=train, coordinates=laid, **kwargs, **blocked,
-                                            **stepped)
+                return getattr(module, states_method)(rows.tokens, train=train, coordinates=laid, **kwargs,
+                                                      **blocked, **stepped)
             states, sown = applied(inputs, media, rngs=rngs, method=read_media)
             return _array(states), spanned, sown
         if inputs.streams is not None:
@@ -140,13 +145,13 @@ class DecisionModel(HeadedModel):
             # Each token reads the streams its record says, as runs over its document's (`stream_runs`).
             runs = stream_runs(inputs.streams, inputs.segments, inputs.reads, inputs.fragments)
             states, sown = applied(inputs.tokens, train=train, coordinates=laid, attention_key_runs=runs,
-                                   attention_key_positions=inputs.positions, method="hidden_states",
+                                   attention_key_positions=inputs.positions, method=states_method,
                                    conditioning=conditioning, rngs=rngs, **stepped)
             return _array(states), spanned, sown
         if inputs.slots is None:
             def read(module, tokens):
-                return module.hidden_states(tokens, train=train, coordinates=laid, conditioning=conditioning,
-                                            **blocked, **stepped)
+                return getattr(module, states_method)(tokens, train=train, coordinates=laid,
+                                                      conditioning=conditioning, **blocked, **stepped)
             states, sown = applied(inputs.tokens, rngs=rngs, method=read)
             return _array(states), spanned, sown
         if blocked:
@@ -156,7 +161,7 @@ class DecisionModel(HeadedModel):
         causal = isinstance(self.backbone, TokenModel) and self.backbone.causal
         runs = key_runs(inputs.slots, inputs.segments, inputs.options.shape[-1], causal=causal)
         states, sown = applied(inputs.tokens, train=train, coordinates=laid, attention_key_runs=runs,
-                               attention_key_positions=inputs.positions, method="hidden_states",
+                               attention_key_positions=inputs.positions, method=states_method,
                                conditioning=conditioning, rngs=rngs, **stepped)
         return _array(states), spanned, sown
 

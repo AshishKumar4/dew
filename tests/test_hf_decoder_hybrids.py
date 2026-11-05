@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from interop_support import assert_decodes_as_it_scores
-from model_support import flat_tree
+from model_support import flat_tree, prediction_logits
 from test_hf_decoders import fixture_config, fp32_decoder, recorded_logit_difference, scaled_difference
 
 from dew.interop import Pretrained
@@ -226,8 +226,7 @@ def test_qwen3_next_prediction_layer_matches_the_published_composition():
     ids = jnp.asarray(np.load(QWEN3_NEXT / "input_ids.npy"), jnp.int32)
     reference = np.load(QWEN3_NEXT / "mtp_reference.npz")
 
-    hidden = model.apply(variables, ids, method=model.hidden_states)
-    predictions = model.apply(variables, hidden, ids, method=model.mtp_logits)[0]
+    predictions = prediction_logits(model, variables, ids)
 
     assert scaled_difference(np.asarray(predictions), reference["logits"]) < 1e-4
 
