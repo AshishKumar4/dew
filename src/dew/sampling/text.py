@@ -392,8 +392,10 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     whose cursors say where each prompt resumes; None allocates an empty one. `rounding` is each
     row's stochastic-rounding key data (`rounding_keys`), which the cache then holds for every later
     call (`dew.nn.kv_cache.with_rounding_keys`); None leaves the cache's. `adapters` is each row's adapter
-    of an adapter set's model, which every forward of the row names (`DecoderState.adapters`).
+    of an adapter set's model, held as int32, which every forward of the row names
+    (`DecoderState.adapters`).
     """
+    adapters = None if adapters is None else jnp.asarray(adapters, jnp.int32)
     batch, width = inputs.tokens.shape
     held = (_empty_cache(model, params, batch, ops.depths, ops.record is not None, adapters) if cache is None
             else cache)

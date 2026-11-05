@@ -1270,6 +1270,55 @@ def test_a_row_of_an_adapter_sets_base_computes_the_base_bit_for_bit():
     np.testing.assert_array_equal(np.asarray(served[1]), np.asarray(base[1]))
 
 
+def test_an_adapter_sets_decode_carries_each_rows_adapter_through_a_reindex():
+    """An adapter set's decode carries each row's adapter in its state (`DecoderState.adapters`, int32):
+    four prompts prefilled under the set's two adapters and the base (-1), their rows reordered,
+    duplicated and one dropped (`DecodeOps.reindex`, as a fork of a row's draws moves them) and advanced a
+    token, each row's logits are those of its prompt prefilled in that place under its own adapter and
+    advanced alike, bit for bit (row 4222)."""
+    from pathlib import Path
+
+    from dew.interop.pretrained import Pretrained
+    from dew.lora import AdapterSet, LoRA
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling.text import decode_ops, prefill_state
+
+    decoder = Pretrained.load(Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny",
+                              dtype="float32", attention_impl="reference")
+
+    def drawn(layer: int, key: int):
+        adapter = LoRA(rank=2, modules=(f"layers.{layer}.self_attn.q_proj",)).apply(
+            decoder.model, decoder.variables, key=key, layouts=decoder.layouts)
+        factors = jax.tree_util.tree_map_with_path(
+            lambda path, leaf: (jax.random.normal(jax.random.key(key), leaf.shape, leaf.dtype)
+                                if jax.tree_util.keystr(path).endswith("'lora_B']") else leaf),
+            adapter.variables["params"])
+        return dataclasses.replace(adapter, variables={**adapter.variables, "params": factors})
+
+    adapters = AdapterSet.of({"first": drawn(0, 1), "second": drawn(1, 2)})
+    model, variables = adapters.model, adapters.variables
+    prompts = jnp.asarray([[1, 5, 9, 13], [2, 4, 6, 8], [3, 7, 11, 15], [6, 2, 9, 4]], jnp.int32)
+    rows = np.asarray([0, 1, -1, 1], np.int64)
+    order = jnp.asarray([2, 0, 0, 3], jnp.int32)
+    following, active = jnp.asarray([17, 19, 21, 23], jnp.int32), jnp.ones((4,), bool)
+    ops = decode_ops(model, variables, 0, None)
+
+    def advanced(tokens, held):
+        return ops.advance(prefill_state(model, variables, ModelInputs(tokens), ops, adapters=held)[0],
+                           following, active)
+
+    state = prefill_state(model, variables, ModelInputs(prompts), ops, adapters=rows)[0]
+    assert state.adapters is not None and state.adapters.dtype == jnp.int32
+    moved = ops.reindex(state, order)
+    assert moved.adapters is not None and moved.adapters.tolist() == [-1, 0, 0, 1]
+    stepped = ops.advance(moved, following, active)
+    expected = advanced(prompts[order], rows[np.asarray(order)])
+    np.testing.assert_array_equal(np.asarray(stepped.logits), np.asarray(expected.logits))
+    # The rows' adapters change what they compute: the base row's prompt under the first adapter differs.
+    under = advanced(prompts[order], np.asarray([0, 0, 0, 1]))
+    assert not np.array_equal(np.asarray(under.logits[0]), np.asarray(stepped.logits[0]))
+
+
 @pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("mesh, options", [
     (MeshSpec(), {}),

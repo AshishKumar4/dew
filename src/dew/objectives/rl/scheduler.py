@@ -148,7 +148,7 @@ import numpy as np
 
 from dew._cleanup import attempted
 from dew._coordination import agreed, agreed_count, from_every_process
-from dew.batch import Batch, Variables
+from dew.batch import VALID_ROWS, Batch, Variables
 from dew.data.dataset import DataPartition, Loader, tapped
 from dew.distributed.batches import first_reader_batch, shard_batch
 from dew.nn.inputs import local_rows, mesh_of
@@ -272,12 +272,17 @@ class _Group:
     latencies: list[float] = field(default_factory=list)
     failures: Counter[int] = field(default_factory=Counter)
     abandoned: bool = False
+    real: bool = True
+    """Whether its task comes of a real row of its batch, not a repeat that fills the batch out
+    (`VALID_ROWS`), which is neither admitted nor trained on."""
 
 
 @dataclass
 class _Entry:
     serial: int
     tasks: tuple[Task, ...]
+    real: tuple[bool, ...]
+    """Which of `tasks` come of real rows of the batch (`real_rows`)."""
     groups: list[_Group] = field(default_factory=list)
     complete: list[_Group] = field(default_factory=list)
     packs: _Entry | None = None
@@ -293,6 +298,20 @@ class _Tally:
     cut: int = 0
     uniform: int = 0
     """Complete groups left out whose returns all agreed (`RolloutScheduler.varied`)."""
+
+
+def real_rows(batch: Batch, tasks: Sequence[Task]) -> tuple[bool, ...]:
+    """Which of a batch's `tasks`, one a row, come of its real rows: those its `VALID_ROWS` marks, every
+    one where it marks none. A batch filled out with repeats of its own rows (`FilledBatch`, a stream's
+    last partial batch) marks them, and their tasks are drawn where a collection draws every row together,
+    but none is admitted or trained on (ledger 4408)."""
+    if VALID_ROWS not in batch:
+        return (True,) * len(tasks)
+    marked = tuple(bool(valid) for valid in np.asarray(batch[VALID_ROWS], bool).reshape(-1))
+    if len(marked) != len(tasks):
+        raise ValueError(f"a batch marking its real rows ({len(marked)}) maps each row to a task, not "
+                         f"{len(tasks)}")
+    return marked
 
 
 def _done(session: Session) -> Future[Session]:
@@ -332,7 +351,8 @@ class Synchronous:
         """Nothing is published: the collector draws from the snapshot itself."""
 
     def entries(self, batch: Batch, tasks_of: Callable[[Batch], Sequence[Task]]) -> list[_Entry]:
-        entry = _Entry(self._serial, tuple(tasks_of(batch)))
+        tasks = tuple(tasks_of(batch))
+        entry = _Entry(self._serial, tasks, real_rows(batch, tasks))
         self._serial += 1
         return [entry]
 
@@ -354,7 +374,7 @@ class Synchronous:
                                  f"not {samples}")
             entry.groups.append(_Group(task, f"{entry.serial}/{row}", [
                 _Sample(index, 0, snapshot.updates, _done(session), began)
-                for index, session in enumerate(sessions)]))
+                for index, session in enumerate(sessions)], real=entry.real[row]))
 
     def redrawn(self, group: _Group, sample: _Sample, cause: str) -> None:
         """None: the draw was one program every process entered, which no process reruns alone."""
@@ -440,7 +460,7 @@ class Asynchronous:
         assert self._tasks_of is not None, "tasks() names the conversion before its stream opens"
         tasks = tuple(self._tasks_of(batch))
         with self._lock:
-            self._registered.append(_Entry(self._serial, tasks))
+            self._registered.append(_Entry(self._serial, tasks, real_rows(batch, tasks)))
             self._serial += 1
 
     def begin(self, snapshot: Snapshot, partition: DataPartition) -> None:
@@ -489,9 +509,11 @@ class Asynchronous:
         if entry.groups:
             return
         for row, task in enumerate(entry.tasks):
-            group = _Group(task, f"{entry.serial}/{row}")
+            group = _Group(task, f"{entry.serial}/{row}", real=entry.real[row])
             entry.groups.append(group)
-            self._submit(group, [(index, 0) for index in range(samples)])
+            # A repeat that fills the batch out draws nothing: no process draws its rows with another.
+            if group.real:
+                self._submit(group, [(index, 0) for index in range(samples)])
 
     def _submit(self, group: _Group, samples: Sequence[tuple[int, int]]) -> None:
         """Submit `(index, attempt)` samples of one group under the served
@@ -868,8 +890,10 @@ class RolloutScheduler:
         group.live.clear()
 
     def _target(self, home: _Entry) -> int:
-        """The groups a call admits: `admit`, or every task of its step's batch (`home`)."""
-        return len(home.groups) if self.admit is None else min(self.admit, len(home.groups))
+        """The groups a call admits: `admit`, or every task of its step's batch (`home`), of those that
+        come of its real rows (`real_rows`)."""
+        real = sum(group.real for group in home.groups)
+        return real if self.admit is None else min(self.admit, real)
 
     def _admit(self, entry: _Entry, updates: int, tally: _Tally) -> None:
         """Wait until the call's first entry holds its `_target` complete groups that fit, or `entry`
@@ -880,7 +904,7 @@ class RolloutScheduler:
         def pending() -> list[Future[Session]]:
             # The futures the admission waits on, none once it holds its target or has nothing to complete.
             pending = [group for group in entry.groups
-                       if not group.abandoned and len(group.done) < self.groups]
+                       if group.real and not group.abandoned and len(group.done) < self.groups]
             for group in pending:
                 self._harvest(entry, group, updates, tally)
             pending = [group for group in pending if not group.abandoned and len(group.done) < self.groups]
@@ -891,14 +915,19 @@ class RolloutScheduler:
         try:
             self.acquisition.waited(pending)
         finally:
-            leftover = [sample for group in entry.groups for sample in group.live]
+            # A repeat's samples, drawn with the batch's real rows where a collection draws them all, count
+            # as none of its draws.
+            leftover = [sample for group in entry.groups if group.real for sample in group.live]
             tally.cancelled += len(leftover)
             self.acquisition.cancel(leftover)
             for group in entry.groups:
                 group.live.clear()
 
     def _admitted_groups(self, home: _Entry, tally: _Tally, drawn: int) -> list[_Group]:
-        """The call's admitted groups, its first `_target` complete ones; refused where none completed."""
+        """The call's admitted groups, its first `_target` complete ones, none for a batch of no real row
+        (a pool's share whose stream ran out); refused where none completed."""
+        if not self._target(home):
+            return []
         if not home.complete and tally.uniform:
             raise RuntimeError(
                 f"no group of batch {home.serial} varied: the members of each of the {tally.uniform} "
