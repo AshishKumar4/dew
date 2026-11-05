@@ -1493,8 +1493,13 @@ DENSE_MEASURED = _Need('dense', lambda case: not case.kind.startswith('dense'),
 as it measured faster than Triton's on every generation timed; a call naming Triton still runs them."""
 
 
-_GMMS = (MosaicGmm(), MosaicTpuGmm(), Gmm(), CutlassGmm())
-_TGMMS = (MosaicTgmm(), MosaicTpuTgmm(), Tgmm(), CutlassTgmm())
+IMPLEMENTATIONS = ((MosaicGmm(), MosaicTgmm()), (MosaicTpuGmm(), MosaicTpuTgmm()), (Gmm(), Tgmm()),
+                   (CutlassGmm(), CutlassTgmm()))
+"""Each implementation of the grouped product, in `GROUPED`'s order: its launch of a product and its launch
+of a kernel gradient, one name for both."""
+
+_GMMS = tuple(product for product, _ in IMPLEMENTATIONS)
+_TGMMS = tuple(gradient for _, gradient in IMPLEMENTATIONS)
 
 _NEEDS = {'cutlass': (DECLARED_ONLY,), 'triton': (DENSE_MEASURED,)}
 """Each old route's requirements beyond its launch's own: CUTLASS on its declared cells alone, Triton off the
