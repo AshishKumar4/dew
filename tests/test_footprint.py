@@ -371,10 +371,36 @@ def test_a_tied_embeddings_gradient_holds_its_heads_product_alone():
     def tied(ids, hidden, logits, rows):
         return head(ids, hidden, logits, rows) + jnp.zeros((vocab, width), jnp.float32).at[ids].add(rows)
 
+    # And where the head's product is read through a view of its buffer (a scanned head's stacked carry).
+    def viewed(ids, hidden, logits, rows):
+        product = jax.lax.squeeze(jax.lax.reshape(head(ids, hidden, logits, rows), (1, vocab, width)), (0,))
+        return product + jnp.zeros((vocab, width), jnp.float32).at[ids].add(rows)
+
     def peak(function):
         return peak_bytes(simplified(jax.make_jaxpr(function)(*shapes).jaxpr, "gpu"), "gpu", Workspace(0, 0))
 
-    assert peak(tied) == peak(head)
+    assert peak(tied) == peak(viewed) == peak(head)
+
+
+def test_a_gradient_added_to_a_zero_carry_holds_the_gradient_alone():
+    """A sum of a value and a zero is that value, as XLA's simplifier makes it (`A + 0 => A`,
+    `AlgebraicSimplifierVisitor::HandleAdd`): a tiled head of one tile adds its weight gradient to its
+    loop's zero carry, which its body runs inline, and holds the gradient alone, where the derivation held
+    the sum beside it (row 4089)."""
+    from dew.training.footprint import peak_bytes, simplified
+
+    shapes = (jax.ShapeDtypeStruct((512, 4096), jnp.float32), jax.ShapeDtypeStruct((512, 256), jnp.float32))
+
+    def product(logits, hidden):
+        return jax.lax.dot_general(logits, hidden, (((0,), (0,)), ((), ())))
+
+    def carried(logits, hidden):
+        return jnp.zeros((4096, 256), jnp.float32) + product(logits, hidden)
+
+    def peak(function):
+        return peak_bytes(simplified(jax.make_jaxpr(function)(*shapes).jaxpr, "gpu"), "gpu", Workspace(0, 0))
+
+    assert peak(carried) == peak(product)
 
 
 def test_a_transposed_input_returned_flat_is_a_copy():
