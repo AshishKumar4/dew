@@ -360,6 +360,11 @@ class Synchronous:
         """None: the draw was one program every process entered, which no process reruns alone."""
         return
 
+    def waited(self, pending: Callable[[], Sequence[Future[Session]]]) -> None:
+        """Return once `pending` gives none, at once: every collected session is finished."""
+        while live := pending():
+            wait(live, return_when=FIRST_COMPLETED)
+
     def cancel(self, samples: Sequence[_Sample]) -> None:
         """Nothing runs: every collected session is finished."""
 
@@ -513,6 +518,19 @@ class Asynchronous:
 
     def stale(self, sample: _Sample, updates: int) -> bool:
         return updates - sample.submitted > self.lag
+
+    def waited(self, pending: Callable[[], Sequence[Future[Session]]]) -> None:
+        """Return once `pending`, read afresh as rollouts finish, gives none. Every process calls it at
+        each admission, a share's later reader with nothing pending: Dew's own server over a mesh of
+        several processes is stepped there, by every process together (`NativeRolloutServer.waited`);
+        any other source's rollouts finish on their own."""
+        from dew.inference.rollouts import NativeRolloutServer
+
+        if isinstance(self.weights, NativeRolloutServer):
+            self.weights.waited(pending)
+            return
+        while live := pending():
+            wait(live, return_when=FIRST_COMPLETED)
 
     def rescore(self, variables: Variables, packed: Mapping[str, np.ndarray], progress: Progress
                 ) -> np.ndarray:
@@ -668,7 +686,10 @@ class RolloutScheduler:
         under the trainer's weights, so a `max_lag` above 0 needs `objective.behavior_importance`. A
         reward-side reference penalty (`GRPOObjective.reward_kl`) is `objective`'s own, as `sampled`'s.
         With `page_size` the server pages its cache in pages of that many slots and shares prompt pages,
-        so a group's samples of one prompt prefill it once (`dew.inference.pages.Pages.waits`)."""
+        so a group's samples of one prompt prefill it once (`dew.inference.pages.Pages.waits`). A run over
+        several processes serves from one server over its mesh, each process's rows seated on its own
+        devices, which every process steps together as it admits each call's groups and reloads at each
+        push (`NativeRolloutServer.waited`): its draws run between the trainer's steps, not beside them."""
         from dew.inference.rollouts import NativeRolloutServer
         from dew.inference.serving import Server
         from dew.nn.kv_cache import KVCache
@@ -676,10 +697,6 @@ class RolloutScheduler:
 
         from .sources import PromptSource
 
-        if jax.process_count() > 1:
-            raise ValueError("a served rollout's engine steps one process's server, and a run over several "
-                             "processes places its policy over all of them; draw each step's own completions "
-                             "(no --rollout.served)")
         drawing = objective.sampled(Sampling() if sampling is None else sampling)
         width = objective.seq_len + 1
 
@@ -859,19 +876,20 @@ class RolloutScheduler:
         has none left to complete, then cancel the rest of `entry`'s."""
         home = entry.packs or entry
         target = self._target(home)
+
+        def pending() -> list[Future[Session]]:
+            # The futures the admission waits on, none once it holds its target or has nothing to complete.
+            pending = [group for group in entry.groups
+                       if not group.abandoned and len(group.done) < self.groups]
+            for group in pending:
+                self._harvest(entry, group, updates, tally)
+            pending = [group for group in pending if not group.abandoned and len(group.done) < self.groups]
+            if len(home.complete) >= target or not pending:
+                return []
+            return [sample.future for group in pending for sample in group.live]
+
         try:
-            while True:
-                pending = [group for group in entry.groups
-                           if not group.abandoned and len(group.done) < self.groups]
-                for group in pending:
-                    self._harvest(entry, group, updates, tally)
-                pending = [
-                    group for group in pending if not group.abandoned and len(group.done) < self.groups
-                ]
-                if len(home.complete) >= target or not pending:
-                    break
-                live = [sample.future for group in pending for sample in group.live]
-                wait(live, return_when=FIRST_COMPLETED)
+            self.acquisition.waited(pending)
         finally:
             leftover = [sample for group in entry.groups for sample in group.live]
             tally.cancelled += len(leftover)
@@ -958,6 +976,8 @@ class RolloutScheduler:
                 self.acquisition.open(pending, self.groups + self.oversample, keyed)
             if admitting:
                 self._admit(opened[0], snapshot.updates, tally)
+            else:
+                self.acquisition.waited(list)
 
         def short() -> bool:
             return admitting and len(home.complete) < self._target(home)
@@ -969,7 +989,10 @@ class RolloutScheduler:
 
         opened: Sequence[_Entry] = entries
         while True:
-            admission = functools.partial(admitted, opened, drawn) if acquiring else list
+            # A share's later reader admits nothing, and waits with every process on a server they step
+            # together (`Asynchronous.waited`).
+            admission = (functools.partial(admitted, opened, drawn) if acquiring
+                         else functools.partial(self.acquisition.waited, list))
             _within(mesh, "rollout admission", admission)
             if drawn == self.generation_batches or not agreed_count("rollout draw", short, bool)[1]:
                 break
