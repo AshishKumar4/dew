@@ -527,9 +527,8 @@ def test_a_runs_own_window_and_a_named_one_round_trip_through_its_record(tmp_pat
     for trainer in (TrainerConfig(run_profile=RunProfile(3, 4, CaptureOptions(host_tracer_level=1))),
                     TrainerConfig(profile=ProfileWindow(str(tmp_path / "named"), 5, warmup=6)),
                     TrainerConfig(run_profile=None)):
-        run = RunConfig(trainer=trainer)
-        run.save(str(tmp_path / "run.json"))
-        assert RunConfig.load(str(tmp_path / "run.json")).trainer == trainer
+        saved = RunConfig(trainer=trainer).save(str(tmp_path / "saved"))
+        assert RunConfig.load(saved).trainer == trainer
 
 
 def test_a_saved_runs_profile_window_reads_its_capture_options_as_its_captures(tmp_path):
