@@ -661,7 +661,8 @@ def read_otherwise_at_9(saved: Mapping[str, object]) -> str | None:
     """Why version 9 reads a version 8 data plan's order otherwise, None where it reads it alike: where a
     corpus of a mixture its order holds, at any depth, shuffles its records, which version 9 draws by the
     corpus's key in the mixture too (`dew.data.lowering._Build.ordered`, row 3840)."""
-    def shuffled_member(node: JSON, *, within: bool) -> bool:
+    def shuffled_member(node: dict[str, JSON] | list[JSON] | str | int | float | bool | None, *,
+                        within: bool) -> bool:
         if isinstance(node, list):
             return any(shuffled_member(child, within=within) for child in node)
         if not isinstance(node, dict):

@@ -83,6 +83,7 @@ from dew.data.lowering import (
     _Build,
     _epoch_records,
     _Locality,
+    _member_key,
     _order_records,
     _Present,
     _split_spans,
@@ -693,13 +694,15 @@ def _made(prepared: Sequence[Pipeline], read: Read, counts: Sequence[dict[str, C
 
 
 def _build(branch: Pipeline, read: Read, loading: Loading, *, batch: int, training: bool, seed: int = 0,
-           lowering: _Lowering | None = None, version: int = PLAN_VERSIONS[-1]) -> _Build:
+           lowering: _Lowering | None = None, version: int = PLAN_VERSIONS[-1],
+           corpus: tuple[int, ...] = ()) -> _Build:
     """The build a reader of a prepared `branch` reads it by, in batches of `batch`: training's, or a
     scored or published pass's, by the lowering its analysis gives unless `lowering` says otherwise, and
-    the data plan `version` it reads by."""
+    the data plan `version` it reads by, a corpus a phase reads alone keyed as a mixture keys it
+    (`corpus`)."""
     lowered = _analyzed(branch, read, validation=not training) if lowering is None else lowering
     return _Build(read, loading, seed, batch, lowered, training=training, elastic=branch._elastic,
-                  version=version)
+                  version=version, corpus=corpus)
 
 
 @compiling
@@ -831,6 +834,7 @@ def _staged(
     measured: _Measured | None = None,
     epochs: int | None = None,
     version: int = PLAN_VERSIONS[-1],
+    corpus: tuple[int, ...] = (),
 ) -> _Staged:
     if rejections == "mask":
         raise ValueError(
@@ -853,7 +857,7 @@ def _staged(
     if validation_counts and not any(count.accepted for count in validation_counts.values()):
         validation = None
     build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed,
-                   version=version)
+                   version=version, corpus=corpus)
     passes = None
     if epochs is not None and measured.ahead == "layout":
         # The bound it held with its pack counted its passes as it held the documents (`Limit.passes`). The
@@ -869,7 +873,7 @@ def _staged(
         if passes is not None:
             original, train = _rebound(original, epochs * passes), _rebound(train, epochs * passes)
             build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed,
-                   version=version)
+                   version=version, corpus=corpus)
     elif epochs is not None:
         # Epochs of a read with a record count count it, read endlessly; of one with none, the source
         # examples a pass holds, its prepared rows as held, bounded to that many passes (`_bounded`).
@@ -877,7 +881,7 @@ def _staged(
         original, train = ((_endless(original), _endless(train)) if passes is None else
                            (_bounded(original, epochs * passes), _bounded(train, epochs * passes)))
         build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed,
-                   version=version)
+                   version=version, corpus=corpus)
     return _Staged(train, validation, original, build, counts, validation_counts, batch_tokens, passes)
 
 
@@ -1209,12 +1213,18 @@ def _compile_phases(
         raise TypeError("phased compilation needs a Phases source")
     _tokenizer_contract((train,) if validation is None else (train, validation))
 
+    mixed = _mixed_names(source.pipelines)
+
     def staged_at(index: int, consumed: Mapping[str, int]) -> _Staged:
-        """Phase `index`, each corpus it reads continued past what the phases before it read of it."""
-        return _staged(_continued(source.pipelines[index], consumed)._then(*train.stages),
+        """Phase `index`, each corpus it reads continued past what the phases before it read of it. A
+        corpus it reads alone that another phase mixes is keyed as a mixture keys it, so it reads in the
+        order its mix reads it and picks up where those phases left it (`_Build.ordered`)."""
+        phase = source.pipelines[index]
+        keyed = not isinstance(phase.source, Mixture) and _name(phase) in mixed
+        return _staged(_continued(phase, consumed)._then(*train.stages),
                        validation if index == 0 else None, objective=objective, read=read,
                        provision=provision, loading=loading, seed=seed, rejections=rejections,
-                       version=plan_version)
+                       version=plan_version, corpus=(_member_key([_name(phase)], 0),) if keyed else ())
 
     def consumed_by(phases: Sequence[_Staged], ends: Sequence[int]) -> dict[str, int]:
         """What `phases` read of each corpus, each ending at its record end of `ends`: its members a
@@ -1282,6 +1292,22 @@ def _compile_phases(
     return dataclasses.replace(built[0][0], train=training, tail=built[-1][0].tail, order_records=None,
                                token_ends=source.ends if tokens else None,
                                widths=merge_facts(loaded.widths for loaded, _ in built))
+
+
+def _mixed_names(pipelines: Sequence[Pipeline]) -> frozenset[str]:
+    """The names of the corpora a mixture among `pipelines` reads, at any depth."""
+    names: set[str] = set()
+
+    def walk(pipeline: Pipeline, *, mixed: bool) -> None:
+        if isinstance(pipeline.source, Mixture):
+            for child in pipeline.source.pipelines:
+                walk(child, mixed=True)
+        elif mixed:
+            names.add(_name(pipeline))
+
+    for pipeline in pipelines:
+        walk(pipeline, mixed=False)
+    return frozenset(names)
 
 
 def _continued(pipeline: Pipeline, consumed: Mapping[str, int]) -> Pipeline:

@@ -1828,12 +1828,14 @@ class _Build:
 
     def ordered(self, stage: Shuffle) -> Shuffle:
         """`stage` as this build reads it: from plan version 9 a shuffle of a mixture's corpus draws from its
-        seed and the corpus's key in each mixture above it (`corpus`), so corpora of one length shuffled by
-        one seed read in orders of their own, and a corpus keeps its order whichever others the mixture
-        holds (row 3840); version 8, and a shuffle of no mixture's corpus, by its seed alone."""
+        seed and the corpus's own key, its name in the mixture that reads it (`corpus`'s last), so corpora
+        of one length shuffled by one seed read in orders of their own, and a corpus keeps its order
+        whichever others a mixture holds, however deep, and in a phase that reads it alone where another
+        mixes it (`dew.data.compile._compile_phases`), as a later phase continues it (row 3840); version
+        8, and a shuffle of no mixture's corpus, by its seed alone."""
         if self.version < 9 or not self.corpus:
             return stage
-        keyed = hashlib.blake2b(repr((stage.seed, *self.corpus)).encode(), digest_size=4).digest()
+        keyed = hashlib.blake2b(repr((stage.seed, self.corpus[-1])).encode(), digest_size=4).digest()
         return dataclasses.replace(stage, seed=int.from_bytes(keyed, "big"))
 
     def stage(self, rows: Rows, stage: Stage, pipeline: Pipeline, partition: DataPartition, at: int) -> Rows:
