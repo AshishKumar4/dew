@@ -165,7 +165,7 @@ def tiny(*, mixed: bool = False) -> None:
                         max_position_embeddings=64, tie_word_embeddings=True)
     config._attn_implementation = "eager"
     config.architectures = ["Qwen3ForCausalLM"]
-    ids = torch.from_numpy(draw(0)["ids"]).long().to("cuda")
+    ids = torch.tensor([[2, 8, 17, 5, 23, 9, 51, 43], [31, 16, 3, 19, 42, 11, 78, 39]], device="cuda")
     model = Qwen3ForCausalLM(config).to("cuda", dtype=torch.bfloat16).eval()
     scheme = copy.deepcopy(mtq.NVFP4_DEFAULT_CFG)
     if mixed:

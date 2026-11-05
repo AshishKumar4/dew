@@ -42,10 +42,19 @@ def draw(seed: int) -> dict[str, np.ndarray]:
     return {"ids": np.random.default_rng([2038, seed]).integers(0, 96, (2, 12)).astype(np.int32)}
 
 
-def recorded_logits(model, exact) -> dict[str, np.ndarray]:
+def recorded_logits(model, exact, directory: Path) -> dict[str, np.ndarray]:
     """The float32 read's logits (`model`) and its float64 twin's (`exact`) over check 1's seeds of `draw`
-    (`recorded_references.record_case`), the twin's quantizer defining its discrete function in fp32."""
+    (`recorded_references.record_case`), the twin's quantizer defining its discrete function in fp32. The
+    count confirmed paired with Dew's own read of `directory` (`dew`): the activations' QDQ makes both
+    arms' errors heavy-tailed across draws alike, where the reference compared with itself never
+    resolves."""
+    import jax
     from recorded_references import record_case
+
+    from dew.interop import Pretrained
+
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    forward = jax.jit(loaded.model.apply)
 
     direct_float = torch.Tensor.float
 
@@ -67,7 +76,8 @@ def recorded_logits(model, exact) -> dict[str, np.ndarray]:
                 "compressed_tensors.quantization.lifecycle.forward.forward_quantize", quantize_wide):
             return {"logits": narrow}, {"logits": exact(ids, use_cache=False).logits.numpy()}
 
-    return record_case("logits", draw, evaluate, store_inputs=False)
+    return record_case("logits", draw, evaluate, store_inputs=False,
+                       dew=lambda inputs: {"logits": np.asarray(forward(loaded.variables, inputs["ids"]))})
 
 
 def checkpoint(e4m3: bool) -> None:
@@ -81,7 +91,8 @@ def checkpoint(e4m3: bool) -> None:
                               scale_dtype=torch.float8_e4m3fn if e4m3 else None)
     scheme = QuantizationScheme(targets=["Linear"], weights=QuantizationArgs(**ARGS["nvfp4"]),
                                 input_activations=inputs)
-    ids = torch.from_numpy(draw(0)["ids"]).long()
+    ids = torch.tensor([[2, 8, 17, 5, 23, 9, 51, 43, 19, 6, 65, 11],
+                        [31, 16, 3, 19, 42, 11, 78, 39, 61, 52, 36, 17]])
     calibration = {}
     hooks = []
     for name, module in model.named_modules():
@@ -118,7 +129,7 @@ def checkpoint(e4m3: bool) -> None:
             module.quantization_status = QuantizationStatus.COMPRESSED
     with torch.no_grad():
         np.testing.assert_array_equal(model(ids, use_cache=False).logits.numpy(), reference)
-    arrays = {"calibration_ids": ids.numpy()}
+    arrays = {"ids": ids.numpy()}
     for name, module in model.named_modules():
         if name not in calibration:
             continue
@@ -150,7 +161,7 @@ def checkpoint(e4m3: bool) -> None:
     for module in exact.modules():
         if hasattr(module, "quantization_status"):
             module.quantization_status = QuantizationStatus.COMPRESSED
-    arrays.update(recorded_logits(model, exact))
+    arrays.update(recorded_logits(model, exact, directory))
     for module in model.modules():
         module.quantization_enabled = False
     with torch.no_grad():

@@ -98,7 +98,7 @@ def checkpoint(kind: str) -> None:
     save_file(tensors, directory / "model.safetensors", metadata={"format": "pt"})
     loaded = AutoModelForCausalLM.from_pretrained(directory, dtype=torch.float32,
                                                 attn_implementation="eager").eval()
-    ids = torch.from_numpy(draw(0)["ids"]).long()
+    ids = torch.tensor([[2, 8, 17, 5, 23, 9], [31, 16, 3, 19, 42, 11]])
     published_reader = (AutoModelForCausalLM.from_pretrained(directory, dtype=torch.bfloat16,
                                                            attn_implementation="eager").eval()
                         if kind == "nvfp4" else loaded)
