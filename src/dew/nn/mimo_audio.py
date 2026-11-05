@@ -478,11 +478,11 @@ def _read_mimo_audio(tensors: Mapping[str, Stored], path_of, param_dtype: str
     tokenizer's key maps, which carry no bias, beside a zero one."""
     variables, layouts = placed(tensors, path_of, param_dtype)
     for name, tensor in tensors.items():
-        path = path_of(name) if name.endswith("k_proj.weight") else None
+        bias = name.removesuffix("weight") + "bias"
+        path = path_of(name) if name.endswith("k_proj.weight") and bias not in tensors else None
         if path is not None:
             insert(variables, (*path[:-1], "bias"),
-                   held(np.zeros(tensor.shape[0], checkpoint_dtype(held(tensor).dtype, param_dtype))),
-                   name.removesuffix("weight") + "bias")
+                   held(np.zeros(tensor.shape[0], checkpoint_dtype(held(tensor).dtype, param_dtype))), bias)
     return variables, layouts
 
 
