@@ -46,20 +46,41 @@ def of(generation_name: str, dtype) -> mosaic.Family | None:
     if architecture.family == mosaic_sm90.WGMMA.name:
         return mosaic_sm90.WGMMA
     if architecture.family == mosaic_sm80.Mma.name:
-        return (MmaFed if architecture.tma else mosaic_sm80.Mma)(jnp.dtype(dtype))
+        return _mma(architecture, dtype)
     return None
 
 
-def layouts(generation_name: str, dtype) -> tuple[mosaic.Family, ...]:
+def _mma(architecture: generation.Architecture, dtype) -> mosaic.Family:
+    """mma.sync's bundle on a device of `architecture`: its blocks staged by cp.async (`mosaic_sm80.Mma`),
+    or through TMA rings where the device moves blocks by TMA (`MmaFed`)."""
+    return (MmaFed if architecture.tma else mosaic_sm80.Mma)(jnp.dtype(dtype))
+
+
+def useful_rows(family: mosaic.Family, rows: int) -> float:
+    """The share of the rows `family`'s products issue for a launch of `rows` rows that are the launch's: its
+    rows padded to the issuer's least (`Issuer.rows`), so 8 rows fill half of mma.sync's 16 and an eighth of
+    wgmma's 64."""
+    return rows / (-(-rows // family.rows) * family.rows)
+
+
+def layouts(generation_name: str, dtype, rows: int | None = None) -> tuple[mosaic.Family, ...]:
     """The bundles a launch on a device of `generation_name` may take for operands of `dtype`, in preference
     order: its instruction family's (`of`) first, a producer's layout, whose loads overlap no consumer's
     issue; then, on warpgroup MMA, its layout without a producer (`mosaic_sm90.FED`), whose consumers hold
-    the program's entry registers, for a tile whose consumers need more than a producer leaves them. None
-    where its family has no bundle."""
-    first = of(generation_name, dtype)
-    if first is None:
+    the program's entry registers, for a tile whose consumers need more than a producer leaves them. Given a
+    launch's `rows`, also mma.sync's where the device issues it beside its own family
+    (`generation.issuers`), every bundle ordered by the share of its padded rows the launch fills
+    (`useful_rows`), that order on a tie: a decode step's 8 rows take mma.sync's 16 before wgmma's 64 (row
+    4042), where a launch's tile pads its rows to the bundle's least. None where its family has no bundle."""
+    first, architecture = of(generation_name, dtype), generation.architecture(generation_name)
+    if first is None or architecture is None:
         return ()
-    return (first, mosaic_sm90.FED) if first is mosaic_sm90.WGMMA else (first,)
+    found = (first, mosaic_sm90.FED) if first is mosaic_sm90.WGMMA else (first,)
+    if rows is None:
+        return found
+    if first.name != mosaic_sm80.Mma.name and mosaic_sm80.Mma.name in generation.issuers(generation_name):
+        found = (*found, _mma(architecture, dtype))
+    return tuple(sorted(found, key=lambda family: -useful_rows(family, rows)))
 
 
 def named(name: str, dtype) -> mosaic.Family:

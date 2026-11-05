@@ -293,6 +293,16 @@ def family(generation: str) -> str | None:
     return None if found is None else found.family
 
 
+def issuers(generation: str) -> tuple[str, ...]:
+    """The matrix instruction families a device of `generation` issues, its own first (`family`): a GPU of
+    a family after Ampere issues mma.sync too, beside Hopper's wgmma or Blackwell's tcgen05; none outside
+    every family."""
+    own = family(generation)
+    if own is None:
+        return ()
+    return (own,) if own in ('mma.sync', 'tpu') else (own, 'mma.sync')
+
+
 @dataclasses.dataclass(frozen=True)
 class Measured:
     """One part's facts as its kernels meet them, measured (tools/device_facts.py): its device-memory read
