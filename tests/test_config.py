@@ -81,7 +81,7 @@ def test_named_validation_splits_read_back_in_their_order(tmp_path):
 
 
 def test_a_run_records_the_data_plan_it_reads_by_and_one_saved_before_reads_by_eight(tmp_path):
-    """A run leaves its data plan version to its build, which records this Dew's (`RunConfig.pinned`), so
+    """A run leaves its data plan version to its build, which records this Dew's (`RunConfig.resumed`), so
     a resume reads its order as it did whatever version a later Dew reads by; a saved run whose record
     names none was written under version 8, which it reads by (`earlier_data_plan`, row 3840); its command
     run again resumes there (tests/test_saved_runs.py, each saved run of an earlier main)."""
@@ -91,8 +91,8 @@ def test_a_run_records_the_data_plan_it_reads_by_and_one_saved_before_reads_by_e
 
     config = RunConfig(data=TokenFiles("tokens/train").pipe(presets.token_windows, seq_len=8, batch=2),
                        trainer=TrainerConfig(steps=1))
-    assert config.data_plan_version is None and config.pinned().data_plan_version == PLAN_VERSIONS[-1] == 9
-    saved = config.pinned().record()
+    assert config.data_plan_version is None and config.resumed().data_plan_version == PLAN_VERSIONS[-1] == 9
+    saved = config.resumed().record()
     assert RunConfig.read(saved).data_plan_version == 9
     earlier = {**saved, "fields": {name: value for name, value in saved["fields"].items()
                                    if name != "data_plan_version"}}
