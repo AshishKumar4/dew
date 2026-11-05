@@ -446,7 +446,8 @@ def attempts(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.CompilerOpt
     with unregistered dialect`)."""
     groups: dict[int, list[int]] = {}
     for index, (lowered, _) in enumerate(programs):
-        groups.setdefault(id(lowered.compiler_ir("stablehlo").context), []).append(index)
+        module = lowered.compiler_ir("stablehlo")
+        groups.setdefault(id(lowered if module is None else module.context), []).append(index)
     found: list[Attempt | None] = [None] * len(programs)
 
     def turn(indices: list[int]) -> None:
