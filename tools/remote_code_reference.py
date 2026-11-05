@@ -454,7 +454,7 @@ def released_outputs(model, site: str, inputs: dict, name: str = "") -> dict[str
         if site == "biased":
             logits = model(input_ids=ids, attention_mask=torch.from_numpy(inputs["attention_mask"])).logits
             return {"row0": logits[0].numpy(), "row1": logits[1, PADDED:].numpy()}
-        if site in ("image", "video"):
+        if site in ("image", "video", "frames"):
             # The patch vectors in the model's dtype, as its processor's float32 ones are cast to it.
             dtype = next(model.parameters()).dtype
             spelled = SPELLED.get(name, {})

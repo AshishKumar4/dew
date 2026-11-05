@@ -337,10 +337,10 @@ def remote_code_site(source, site: str, *, wide: bool = False) -> Callable[[dict
     positions from 0; `decode` through the decode cache in `CHUNKS`; `gradients`, the parameters'
     gradient of the logits' product with the cotangent, by each parameter's dotted path; `update`, the
     logits after one SGD step at `RATE` on the rows' next-token cross-entropy; `biased` over left-padded
-    rows, each row's real slots alone (`row0`, `row1`); `image`, `video` and `audio` over a row whose
-    placeholders its drawn media fill, laid out as the source's processor reads its own processor's fields
-    (`Processor.from_hf`); `mtp`, its language model's first prediction depth's logits over plain rows
-    (`prediction_logits`)."""
+    rows, each row's real slots alone (`row0`, `row1`); `image`, `video`, `frames` (a video's frames side
+    by side in one run) and `audio` over a row whose placeholders its drawn media fill, laid out as the
+    source's processor reads its own processor's fields (`Processor.from_hf`); `mtp`, its language model's
+    first prediction depth's logits over plain rows (`prediction_logits`)."""
     import optax
     from reference_error import widened
     from remote_code_draws import CHUNKS, DOCUMENTS, PADDED, RATE, positions
@@ -396,7 +396,7 @@ def remote_code_site(source, site: str, *, wide: bool = False) -> Callable[[dict
             logits = model.apply(variables, inputs["ids"], attention_mask=mask)
             return {"row0": logits[0], "row1": logits[1, PADDED:]}
         return jax.jit(biased)
-    if site in ("image", "video", "audio"):
+    if site in ("image", "video", "frames", "audio"):
         from remote_code_draws import draw
 
         from dew.nn.inputs import ModelInputs
@@ -406,7 +406,8 @@ def remote_code_site(source, site: str, *, wide: bool = False) -> Callable[[dict
         # patch vector, or each clip's frame, marked by its index, one past it, where `from_hf` places it,
         # which a traced draw's vectors then fill.
         template = draw(site, 0, dict(source.config))
-        drawn = {"image": "pixel_values", "video": "pixel_values_videos", "audio": "input_features"}[site]
+        drawn = {"image": "pixel_values", "video": "pixel_values_videos", "frames": "pixel_values_videos",
+                 "audio": "input_features"}[site]
         held = "input_features" if site == "audio" else "pixel_values"
         shape = template[drawn].shape
         count = int(np.prod(shape[:-1]))

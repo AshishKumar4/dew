@@ -30,9 +30,10 @@ VIDEO_GRID = (2, 4, 4)
 """A drawn video's patch grid `(t, h, w)` (`video`): two temporal patches, each a frame of four merge
 blocks of a 2 x 2 merge."""
 
-IMAGE_AT, VIDEO_AT = (3,), (2, 9)
+IMAGE_AT, VIDEO_AT, FRAMES_AT = (3,), (2, 9), (2,)
 """Where each drawn image's placeholder run starts, and each drawn video frame's: a frame's run apart from
-the next, as the release's processor sets a frame's timestamp and its bounds between them."""
+the next, as the release's processor sets a frame's timestamp and its bounds between them; or the frames'
+one run, side by side, which a release that fills its placeholders by count reads alike (`frames`)."""
 
 AUDIO_FRAMES = (45, 13)
 """A drawn audio row's clips, by their mel frames (`audio`): over MiMo-V2.6's tiny segments of 20 frames,
@@ -43,15 +44,17 @@ AUDIO_AT = (2, 9)
 
 SITES = {"lfm3-tiny": ("logits", "packed", "decode", "gradients", "update"), "lfm3-biased-tiny": ("biased",),
          "lfm3-vl-tiny": ("logits", "image", "video"),
-         "mimo-v2-tiny": ("logits",), "mimo-v2-vl-tiny": ("logits", "image", "video", "audio", "mtp"),
+         "mimo-v2-tiny": ("logits",),
+         "mimo-v2-vl-tiny": ("logits", "image", "video", "frames", "audio", "mtp"),
          "dream-tiny": ("logits",), "llada-tiny": ("logits",)}
 """Each release fixture's sites: its logits over plain rows; LFM3's over a packed row, through the decode
 cache in chunks, its parameter gradients under a drawn cotangent, and its logits after one SGD step at
 `RATE` on the rows' next-token cross-entropy (`update`), the tied embedding and head stepped once; with
 its convolution's bias (`conv_bias`), over left-padded rows; LFM3-VL's and MiMo-V2.6's over a row whose
 placeholders a drawn image fills (`image`), or a drawn video's frames (`video`), each packed as its
-processor packs it; and MiMo-V2.6's over one whose placeholders drawn audio clips fill (`audio`), and its
-prediction layer's over plain rows (`mtp`)."""
+processor packs it; and MiMo-V2.6's over a row whose video frames' placeholders sit side by side in one run
+(`frames`), over one whose placeholders drawn audio clips fill (`audio`), and its prediction layer's over
+plain rows (`mtp`)."""
 
 
 def vocabulary(config: dict) -> int:
@@ -68,7 +71,7 @@ def draw(site: str, seed: int, config: dict) -> dict[str, np.ndarray]:
     patch's channels, then its temporal patch's frames, then its pixels, in merge-block order, as
     the release's processor packs them, and its grid (`image_grid_thw`, `video_grid_thw`)."""
     rng = np.random.default_rng([sum(map(ord, site)), seed])
-    if site in ("image", "video"):
+    if site in ("image", "video", "frames"):
         return _media(rng, site, config)
     if site == "audio":
         return _audio(rng, config)
@@ -84,23 +87,26 @@ def draw(site: str, seed: int, config: dict) -> dict[str, np.ndarray]:
 
 
 def _media(rng: np.random.Generator, site: str, config: dict) -> dict[str, np.ndarray]:
-    """An `image` or `video` site's row (`draw`)."""
+    """An `image`, `video` or `frames` site's row (`draw`): a video's frames each a run of their own, or
+    side by side in one (`frames`, at `FRAMES_AT`)."""
     vision = config["vision_config"]
     merge = vision["spatial_merge_size"]
     grid, starts, token = ((IMAGE_GRID, IMAGE_AT, config["image_token_id"]) if site == "image"
-                           else (VIDEO_GRID, VIDEO_AT, config["video_token_id"]))
+                           else (VIDEO_GRID, FRAMES_AT if site == "frames" else VIDEO_AT,
+                                 config["video_token_id"]))
     frames, height, width = grid
     ids = rng.integers(0, min(config["image_token_id"], config["video_token_id"]), (1, LENGTH))
-    runs = 1 if site == "image" else frames
+    runs = frames if site == "video" else 1
     for start in starts[:runs]:
         ids[0, start:start + height * width * frames // runs // merge ** 2] = token
     # MiMo-V2.6's vision config names its channels as its ViT does (`in_chans`).
     channels = vision["in_channels"] if "in_channels" in vision else vision["in_chans"]
     patch = channels * vision["temporal_patch_size"] * vision["patch_size"] ** 2
     pixels = rng.normal(size=(frames * height * width, patch)).astype(np.float32)
+    kind = "image" if site == "image" else "video"
     name = "" if site == "image" else "_videos"
     return {"ids": ids.astype(np.int32), f"pixel_values{name}": pixels,
-            f"{site}_grid_thw": np.asarray([grid], np.int64)}
+            f"{kind}_grid_thw": np.asarray([grid], np.int64)}
 
 
 def audio_tokens(frames: int, processing: dict) -> int:

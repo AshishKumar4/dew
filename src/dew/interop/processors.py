@@ -113,6 +113,32 @@ def _in_text_order[T](streams: Mapping[int, Sequence[T]], tokens: np.ndarray,
     return ordered
 
 
+def _payload_spans(runs: list[list[np.ndarray]], tokens: np.ndarray,
+                   sizes: Mapping[int, Sequence[int]]) -> list[list[np.ndarray]]:
+    """Each run of placeholders cut into the spans its payloads fill, in row and placeholder order, each
+    payload taking the next of its kind's `sizes` placeholders: a run holds one payload's, or several
+    payloads' side by side, as a release that fills its placeholders by count reads a video's frames with
+    nothing between them (MiMo-V2.6's `_replace_modal_embeddings_inplace`). No payload's placeholders cross
+    two runs."""
+    offsets = dict.fromkeys(sizes, 0)
+    spans = []
+    for row, held in enumerate(runs):
+        cut = []
+        for run in held:
+            token = int(tokens[row, run[0]])
+            while len(run):
+                if token not in sizes or offsets[token] == len(sizes[token]):
+                    raise ValueError("media placeholders exceed their payloads")
+                size = sizes[token][offsets[token]]
+                if size > len(run):
+                    raise ValueError("a media payload's placeholders cross two runs")
+                offsets[token] += 1
+                cut.append(run[:size])
+                run = run[size:]
+        spans.append(cut)
+    return spans
+
+
 def _placed(runs: list[list[np.ndarray]], selected: Sequence[np.ndarray], capacity: int,
             shape: tuple[int, ...], what: str) -> tuple[np.ndarray, list[tuple[int, int, np.ndarray]]]:
     """Check each run's length against its item's and return the slot each
@@ -468,7 +494,8 @@ class Processor:
                 supplied_types = np.asarray(values.get("mm_token_type_ids"))
                 if not np.array_equal(supplied_types, expected_types):
                     raise ValueError("mm_token_type_ids must identify each image and video placeholder")
-            chunks, grid, merge = self._qwen_frames(values, tokens, runs)
+            chunks, grid, merge, runs = self._qwen_frames(values, tokens, runs)
+            image_counts = np.array([len(row) for row in runs], np.int32)
             shape = (max(chunk.shape[0] for chunk in chunks), chunks[0].shape[-1])
             selected = [np.arange(length) for length in np.prod(grid, axis=1) // merge ** 2]
             capacity = shape[0] // merge ** 2
@@ -615,8 +642,9 @@ class Processor:
         return _records.integer(projector[name], name)
 
     def _qwen_frames(self, values: Mapping[str, object], tokens: np.ndarray, runs):
-        """Return views of packed image/video patches in text order, one item per frame: Qwen 3.5's
-        and Muse Glimmer's, whose processors pack alike.
+        """Return views of packed image/video patches in text order, one item per frame, and the
+        placeholder runs cut into each frame's span (`_payload_spans`): Qwen 3.5's, Muse Glimmer's and
+        MiMo-V2.6's, whose processors pack alike.
 
         Qwen3.5 get_rope_index repeats video grids by their temporal count and
         resets each frame's temporal coordinate to zero. The processor places
@@ -653,14 +681,17 @@ class Processor:
             if type(token_id) is not int:
                 raise ValueError(f"{token_name} must be an integer")
             streams[token_id] = pieces
-        ordered = _in_text_order(streams, tokens, runs)
+        sizes = {token: [int(np.prod(grid)) // merge ** 2 for _, grid in pieces]
+                 for token, pieces in streams.items()}
+        spans = _payload_spans(runs, tokens, sizes)
+        ordered = _in_text_order(streams, tokens, spans)
         if not ordered:
             raise ValueError("visual payloads and placeholder frame counts disagree")
         chunks, grids = zip(*ordered, strict=True)
         widths = {chunk.shape[-1] for chunk in chunks}
         if len(widths) != 1:
             raise ValueError("image and video patch widths must agree")
-        return list(chunks), np.asarray(grids, np.int32), merge
+        return list(chunks), np.asarray(grids, np.int32), merge, spans
 
     def _image_rotary_positions(self, tokens: np.ndarray, valid: np.ndarray,
                                 groups: jax.Array, grids: jax.Array) -> jax.Array:

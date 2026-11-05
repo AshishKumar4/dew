@@ -307,7 +307,8 @@ class WrapperFields(AudioFields):
     text: DecoderFields
     tower: Mapping[str, object] | None
     projector: Mapping[str, object] | None
-    image_token_id: int
+    image_token_id: int | None
+    """None for a bundle without a vision tower, whose config may state none (MiMo-V2.6 with audio alone)."""
     tokens_per_image: int | None
     video_token_id: int | None
     extra_placeholder_ids: tuple[int, ...]

@@ -181,6 +181,58 @@ def test_a_release_without_its_audio_tokenizer_is_refused_whole_and_loads_as_tex
     assert text.model.num_nextn_predict_layers == 1
 
 
+@pytest.mark.parametrize('emptied', [('audio_config',), ('vision_config',),
+                                     ('vision_config', 'audio_config')],
+                         ids=['vision alone', 'audio alone', 'text alone'])
+def test_a_tower_section_that_states_nothing_builds_no_tower(tmp_path, emptied):
+    """MiMoV2Config reads an absent tower section as `{}` and MiMoV2ForCausalLM builds a tower only for a
+    section that states something, so a release that saves one empty is the model without that tower: its
+    other tower loads, without the audio tokenizer's folder where audio is gone, an audio-only release
+    states no image placeholder, and with neither the release is its text decoder. The decoder computes
+    the whole release's logits over text, bit for bit, and the absent tower's tensors ride along."""
+    from dew.nn.multimodal import MultimodalTransformer
+
+    def edit(config):
+        config.update({section: {} for section in emptied})
+        if 'vision_config' in emptied:
+            config['image_token_id'] = None
+        return config
+
+    source = respelled(WHOLE, tmp_path / 'release', edit)
+    if 'audio_config' in emptied:
+        shutil.rmtree(source / 'audio_tokenizer')
+    loaded = Pretrained.load(source, dtype='float32', attention_impl='reference')
+    whole = Pretrained.load(WHOLE, dtype='float32', attention_impl='reference')
+    model = loaded.model
+    if len(emptied) == 2:
+        assert not isinstance(model, MultimodalTransformer)
+    else:
+        assert isinstance(model, MultimodalTransformer)
+        assert (model.vision is None, model.audio is None) == ('vision_config' in emptied,
+                                                              'audio_config' in emptied)
+    ids = np.load(WHOLE / 'input_ids.npy')
+    np.testing.assert_array_equal(np.asarray(model.apply(loaded.variables, ids)),
+                                  np.asarray(whole.model.apply(whole.variables, ids)))
+
+
+@pytest.mark.parametrize('stated', [None, 0, 1])
+def test_a_trunk_of_full_layers_alone_builds_a_prediction_layer_only_where_it_cannot(stated):
+    """A prediction layer attends with the sliding layers' geometry (vLLM's `MiMoV2MTPLayer`): a trunk of
+    full layers alone builds none where its config states none or 0 (Dew's export of such a model), and
+    one that states a depth is refused."""
+    from dew.interop.hf_decoders import translate_config
+
+    config = {**json.loads((TINY / 'config.json').read_text()), 'hybrid_layer_pattern': [0, 0, 0, 0],
+              'add_swa_attention_sink_bias': False}
+    if stated is not None:
+        config['num_nextn_predict_layers'] = stated
+    if stated:
+        with pytest.raises(ValueError):
+            translate_config(config)
+        return
+    assert translate_config(config)['num_nextn_predict_layers'] == 0
+
+
 def test_a_release_without_a_processor_of_its_own_refuses_raw_media_and_reads_its_fields():
     """MiMo-V2.6 ships no processor, only its config's `processor_config`: raw images are refused, and the
     processed fields it states lay out into the model's inputs (`Processor.from_hf`)."""

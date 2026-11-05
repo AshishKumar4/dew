@@ -373,22 +373,26 @@ def _mimo_v2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         # A windowed kind rotates whole heads unless it states its own
         # factor (`LayerKind`); MiMoV2Attention turns the same third of both.
         kinds['sliding_attention'].update(num_kv_heads=swa_kv_heads, partial_rotary_factor=factor)
-    if 'sliding_attention' in kinds:
-        # The prediction depths: the count a config states (Dew's export of one without them, 0), else the
-        # one depth the release's code skips on load and vLLM drafts with (mimo_v2_mtp.py at 19aba3e,
-        # `MiMoV2MTPLayer`, one layer for the Pro and the Flash alike), each the sliding kind's attention
-        # over a dense feed-forward at `intermediate_size`. A checkpoint without their tensors holds none
-        # (`hf_decoders.held_depths`).
-        depths = _records.integer(hf.get('num_nextn_predict_layers', 1), 'num_nextn_predict_layers')
-        used.add('num_nextn_predict_layers')
-        if depths:
-            kinds[_PREDICTION_FEEDFORWARD] = native_fields(LayerKind)(mixer=MLPMixer(
-                intermediate_size=_records.integer(config['mlp_features'], 'intermediate_size'),
-                activation=_records.text(config['mlp'], 'hidden_act')))
-        # Each depth's residual plain, as a record a load keeps the trunk alone of states it too.
-        config.update(num_nextn_predict_layers=depths, mtp_layer_type='sliding_attention' if depths else None,
-                      mtp_feedforward_type=_PREDICTION_FEEDFORWARD if depths else None,
-                      mtp_hyper_connections=None)
+    # The prediction depths: the count a config states (Dew's export of one, 0 where it holds none), else
+    # the one depth the release's code skips on load and vLLM drafts with (mimo_v2_mtp.py at 19aba3e,
+    # `MiMoV2MTPLayer`, one layer for the Pro and the Flash alike), each attending with the sliding layers'
+    # geometry over a dense feed-forward at `intermediate_size`; a trunk of full layers alone, which no
+    # release is, builds none unless its config states one. A checkpoint without their tensors holds none
+    # (`hf_decoders.held_depths`).
+    sliding = 'sliding_attention' in kinds
+    depths = _records.integer(hf.get('num_nextn_predict_layers', int(sliding)), 'num_nextn_predict_layers')
+    used.add('num_nextn_predict_layers')
+    if depths and not sliding:
+        refuse(f'num_nextn_predict_layers {depths}', "a MiMo-V2 prediction layer attends with the sliding "
+                                                     "layers' geometry, and this trunk has no sliding layer")
+    if depths:
+        kinds[_PREDICTION_FEEDFORWARD] = native_fields(LayerKind)(mixer=MLPMixer(
+            intermediate_size=_records.integer(config['mlp_features'], 'intermediate_size'),
+            activation=_records.text(config['mlp'], 'hidden_act')))
+    # Each depth's residual plain, as a record a load keeps the trunk alone of states it too.
+    config.update(num_nextn_predict_layers=depths, mtp_layer_type='sliding_attention' if depths else None,
+                  mtp_feedforward_type=_PREDICTION_FEEDFORWARD if depths else None,
+                  mtp_hyper_connections=None)
     return _attention_and_experts(config, hf, used, kinds, value_dim=value_dim,
                                   scale=None, factor=factor, count=count,
                                   sparse=sparse)
@@ -467,17 +471,20 @@ def _mimo_v2_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
     # The decoder's translation read every field at the root or refused it.
     used.update(hf_config)
     width = record_int(text, 'emb_features')
-    vision = hf_config.get('vision_config') is not None
+    # A section that states nothing builds no tower (MiMoV2ForCausalLM tests each for truth).
+    vision = bool(hf_config.get('vision_config'))
     fields: WrapperFields = {
         'model_type': 'mimo_v2', 'text_model_type': 'mimo_v2', 'text': text,
         'tower': translate_mimo_vision_config(hf_config) if vision else None,
         'projector': translate_mimo_projector_config(hf_config, width) if vision else None,
-        'image_token_id': record_int(hf_config, 'image_token_id'), 'tokens_per_image': None,
+        'image_token_id': (record_int(hf_config, 'image_token_id')
+                           if vision or hf_config.get('image_token_id') is not None else None),
+        'tokens_per_image': None,
         'video_token_id': (None if hf_config.get('video_token_id') is None
                            else record_int(hf_config, 'video_token_id')),
         'extra_placeholder_ids': (), 'text_unprefixed': ('embed_tokens.', 'layers.', 'norm.', 'mtp.'),
         **NO_AUDIO}
-    stated = hf_config.get('audio_config')
+    stated = hf_config.get('audio_config') or None
     tokenizer = hf_config.get(folder_config(_AUDIO_TOKENIZER))
     if stated is not None and tokenizer is None:
         # The language model alone loads (`text_only`); a whole load is refused by the encoder's name.

@@ -1476,10 +1476,11 @@ _BUNDLE_MEDIA = ("vision_config", "audio_config")
 
 def bundles(config: Mapping[str, object]) -> bool:
     """Whether a source config is a media bundle its own decoder family reads
-    whole (`DecoderFamily.wrapper`): one that names a tower (`_BUNDLE_MEDIA`)."""
+    whole (`DecoderFamily.wrapper`): one that names a tower (`_BUNDLE_MEDIA`), a section that states
+    nothing naming none, as the releases' config classes read an empty one (MiMoV2Config's `{}`)."""
     model_type = config.get("model_type")
     return (isinstance(model_type, str) and _bundled(model_type) is not None
-            and any(config.get(section) is not None for section in _BUNDLE_MEDIA))
+            and any(config.get(section) for section in _BUNDLE_MEDIA))
 
 
 WHOLE_DECODER = ("text_only takes a media wrapper's language model; DiffusionGemma's decoder is its whole "

@@ -243,7 +243,7 @@ class MultimodalTransformer(DecoderWrapper):
     vision: TowerBase | None
     projection: ProjectorBase | None
     family: str
-    image_token_id: int
+    image_token_id: int | None
     pad_token_id: int = 0
     extra_placeholder_ids: tuple[int, ...] = ()
     audio: TowerBase | None = None

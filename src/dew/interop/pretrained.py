@@ -1646,10 +1646,11 @@ def _with_folders(config: Mapping[str, object], source: sources.SourceReference,
 def _with_folder_tensors(tensors: Mapping[str, unread.Stored], config: Mapping[str, object],
                          source: sources.SourceReference, root: Path, *, weights: bool
                          ) -> Mapping[str, unread.Stored]:
-    """`tensors` with each of the bundle's folders' (`_folders`) under `decoder_parts.folder_name`, read
-    as the load reads the source's own: whole, or by their headers alone without its weights."""
+    """`tensors` with each of the bundle's folders' (`_folders`) whose config the source holds
+    (`_with_folders`) under `decoder_parts.folder_name`, read as the load reads the source's own: whole,
+    or by their headers alone without its weights."""
     held = dict(tensors)
-    for folder in _folders(config):
+    for folder in (folder for folder in _folders(config) if decoder_parts.folder_config(folder) in config):
         part = source.component(folder)
         stored = (sources.load_shards(part.directory(part.weights(root))) if weights
                   else sources.stored_tensors(part, root) or {})
