@@ -1259,6 +1259,18 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
                     lambda seed: (np.int32(seed),), f"a server on {mesh}", seeds=MESH_SEEDS, truth_fn=truth)
 
 
+def expert_generation(dispatch: str, params, *, layers: int) -> TextGeneration:
+    """A greedy task over a decoder of `layers` layers whose mixture of four experts dispatches as
+    `dispatch`, over `params`, or drawn weights where None."""
+    model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=layers, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=128, dtype="float32",
+                              mixture=Mixture(experts=4, top_k=2, dispatch=dispatch))
+    if params is None:
+        params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+    return TextGeneration(model, params, RunProcessor(Digits()),
+                          sampling=Sampling(temperature=0, eos_token_ids=EOS))
+
+
 @pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("decode_steps", [1, 4])
 @pytest.mark.parametrize("dispatch", ["global"])
@@ -1272,14 +1284,7 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode
     TextGeneration, whose loop carries each draw's checks into the next
     step's model call, refuses the exchange."""
     def generation(dispatch, params):
-        model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                                  mlp_features=32, max_seq_len=128, dtype="float32",
-                                  mixture=Mixture(experts=4, top_k=2, dispatch=dispatch))
-        if params is None:
-            params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
-        return TextGeneration(
-            model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0, eos_token_ids=EOS)
-        )
+        return expert_generation(dispatch, params, layers=1)
 
     lone = generation("global", None)
     alone = [lone(prompt, budget, key=index)
@@ -1302,23 +1307,13 @@ def test_a_server_on_an_expert_and_stage_mesh_exchanges_its_experts_and_runs_its
     stage axis beside it, and built and stepped inside that training mesh's scope: the server decodes its
     stack whole while the expert axis stays in context for the exchange (`dew.nn.sharding.whole`), and
     serves what the global dispatch draws alone on one device (ledger 1817)."""
-    def generation(dispatch, params):
-        model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8,
-                                  mlp_features=32, max_seq_len=128, dtype="float32",
-                                  mixture=Mixture(experts=4, top_k=2, dispatch=dispatch))
-        if params is None:
-            params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
-        return TextGeneration(
-            model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0, eos_token_ids=EOS)
-        )
-
-    lone = generation("global", None)
+    lone = expert_generation("global", None, layers=2)
     alone = [lone(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     spec = MeshSpec(expert=2, stage=2)
     with boxed(decoder_axes(lone.model)):
         placed = place(lone.variables, spec, Layout(min_shard=1, tolerance=1.0))
-    served = generation("exchange", placed)
+    served = expert_generation("exchange", placed, layers=2)
     with jax.set_mesh(spec.build()):
         _, tickets = served_alongside(served, slots=8, admission=8)
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):

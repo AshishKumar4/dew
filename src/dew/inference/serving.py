@@ -1169,11 +1169,11 @@ class Server:
                          "restores": [list(pair) for pair in self._restores]}
 
     def _admit(self, pending: list[list[tuple[int, _Row]]], waiting_most: int, longest: int,
-               fields: list[str]) -> Admission | None:
+               grouped: list[str]) -> Admission | None:
         """This step's admission of the `pending` pieces (`_seated`), at the shape every process agreed
         on: `waiting_most` rows a group, a piece `longest` tokens wide at most, carrying the group
-        `fields` some process's pieces carry. The admission's rows come group by group, as the slots do,
-        and each names its slot within its group."""
+        fields some process's pieces carry (`grouped`). The admission's rows come group by group, as the
+        slots do, and each names its slot within its group."""
         if not waiting_most:
             return None
         size, share = self.slots // self.groups, self.admission // self.groups
@@ -1212,7 +1212,7 @@ class Server:
         contexts = np.zeros((count, context_length, features), dtype)
         context_lengths = np.zeros((count,), np.int32)
         # A group field goes in where an admitted row carries it: prompts without groups keep the causal call.
-        pieces = {name: np.full((count, width), -1, np.int32) for name in fields}
+        pieces = {name: np.full((count, width), -1, np.int32) for name in grouped}
         for index, slot, row in chosen:
             piece = row.prompt[row.prefilled:ends[slot]]
             tokens[index, width - len(piece):] = piece
