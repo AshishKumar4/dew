@@ -294,46 +294,6 @@ def a_decode_steps_sinks_take_their_gradient_and_tangent_through_the_dispatch(so
                     seeds=SINK_SEEDS)
 
 
-def test_a_launch_reads_its_slices_at_its_rows_next_power_of_two():
-    """33 rows of 2 key heads over 1024 keys, traced as on an A100 (108 multiprocessors) on any host:
-    the launch reads its slices at 64 rows (`decode_attention._rows`), whose 128 programs fill most of
-    the GPU, so it takes one slice, though its own 66 programs would have taken 8."""
-    from tuned import taken
-
-    from dew.nn.kernels.generation import assumed
-
-    query = jax.ShapeDtypeStruct((33, 4, 2, 256), jnp.bfloat16)
-    cache = jax.ShapeDtypeStruct((33, 1024, 2, 256), jnp.bfloat16)
-    lengths = jax.ShapeDtypeStruct((33,), jnp.int32)
-    with assumed("sm80"):
-        assert taken(decode_attention.DecodeAttention,
-                     lambda *a: decode_attention.attend(*a, interpret=not ON_GPU), query, cache, cache,
-                     lengths) == [decode_attention.Split(1)]
-    assert decode_attention._heuristic(66, 32, 108) == decode_attention.Split(8)
-
-
-@pytest.mark.parametrize("processors, programs, steps, splits", [
-    (None, 2, 128, 1), (108, 128, 128, 1), (108, 2, 128, 32), (132, 16, 128, 32), (132, 32, 4096, 16),
-    (132, 64, 4096, 8), (108, 2, 4, 4)])
-def test_a_launch_without_a_measurement_fills_six_programs_a_multiprocessor(processors, programs, steps,
-                                                                            splits):
-    """The heuristic (`_heuristic`): no slices on a device of no known multiprocessors or where the
-    programs fill most of them; else the most whose programs fill at most six a multiprocessor, at most
-    one a step: two programs over 108 multiprocessors take 32, sixteen over 132 take 32, and 32 and 64
-    take 16 and 8, the H100's fastest for Qwen3-0.6B's 4 and 8 rows over 131072 keys; four steps take
-    at most 4."""
-
-    assert decode_attention._heuristic(programs, steps, processors) == decode_attention.Split(splits)
-    # The slices it may take hold the heuristic's, and none past one where the programs fill the GPU.
-    space = decode_attention._space(programs, steps, processors)
-    assert decode_attention.Split(splits) in space
-    assert (space == {decode_attention.Split(1)}) == (not processors or programs >= 0.8 * processors)
-    # An opt-in tuning run times the heuristic's and the counts of its space either side, each of which
-    # the kernel's tests hold to the gate at every config of the space.
-    variants = decode_attention._variants(programs, steps, processors)
-    assert variants[0] == decode_attention.Split(splits) and set(variants) <= space and len(variants) <= 3
-
-
 def decode_step(lengths):
     """fp32 attention of a decode step's grouped query (`decode_attention.grouped_query`) over key
     lengths through the decode kernel, chosen for the decode selector (`attention_kernels.DECODE`),

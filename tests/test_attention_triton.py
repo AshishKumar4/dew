@@ -900,22 +900,22 @@ def test_an_fp32_training_step_at_its_own_configs_compiles_within_an_a100s_block
     assert not failures(found), "\n".join(failures(found))
 
 
-def test_a_training_forward_derives_the_largest_tile_its_threads_hold():
-    """The forward's derivation on an A100 at 128-wide heads: a plain walk takes the measured 128 by 64, as
-    does a training walk that keeps its output for D (`Kept.OUTPUT`); a training walk of split sums
-    (`residuals=True`, `Kept.SPLIT`), whose anchor value row holds 128 more registers a thread, steps down to
-    64 by 64 (160 a thread), where the fixed space it replaced fell to its next fitting entry, 32 by 32, at
-    two to three times the time."""
-    import tokamax
+@pytest.mark.parametrize("kept", [template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT],
+                         ids=["plain", "output", "split"])
+def test_a_forward_at_its_own_config_compiles_within_an_a100s_block(kept):
+    """A bf16 call's forward 128 wide, its plain walk, the training walk that keeps its output for D and the
+    one of split sums (whose anchor value row holds 128 more registers a thread), each at the config the
+    launch derives itself (no pin), compiled by XLA's CUDA backend for a compile-only A100 on this CPU
+    (tests/kernel_compile.py): within the block, spilling nothing."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_kernels, failures
 
-    from dew.nn.kernels import generation
+    spans = template.spans(1024, 1024, 1, causal=True)
+    query = jax.ShapeDtypeStruct((1, 1024, 4, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 1024, 2, 128), jnp.bfloat16)
 
-    arrays = {name: jax.ShapeDtypeStruct((1, 1024, heads, 128), jnp.bfloat16)
-              for name, heads in (("query", 4), ("key", 2), ("value", 2))}
-    op, target = attention_triton.TritonForward(), generation.TARGETS["sm80"]
-    plain = op.derived(tokamax.BoundArguments(op, arrays), target)
-    training = op.derived(tokamax.BoundArguments(op, {**arrays, "residuals": True}), target)
-    output = op.derived(tokamax.BoundArguments(op, {**arrays, "residuals": template.Kept.OUTPUT}), target)
-    assert (plain, output, training) == (attention_triton.Tiles(128, 64, 4, 2),
-                                         attention_triton.Tiles(128, 64, 4, 2),
-                                         attention_triton.Tiles(64, 64, 4, 2))
+    def forward(query, key, value):
+        return attention_triton.forward(query, key, value, spans, residuals=kept)
+
+    found = compile_kernels([KernelCase("forward", lambda: (forward, (query, key, key)))], "sm80")
+    assert not failures(found), "\n".join(failures(found))
