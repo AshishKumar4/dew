@@ -162,7 +162,7 @@
    "lane": "Kernels"
   },
   "tests/test_decode_cache.py": {
-   "comparisons": 4,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_decoder_export.py": {
@@ -322,7 +322,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoder_hybrids.py": {
-   "comparisons": 10,
+   "comparisons": 9,
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoder_moe.py": {
@@ -339,10 +339,6 @@
   },
   "tests/test_hf_qwen35_moe_wrapper.py": {
    "comparisons": 3,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_host_placement.py": {
-   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_host_training.py": {
@@ -742,7 +738,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_vision.py": {
-   "comparisons": 25,
+   "comparisons": 21,
    "lane": "Models, Serving & RL"
   },
   "tests/test_vllm_interop.py": {

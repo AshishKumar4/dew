@@ -411,6 +411,7 @@ QWEN3_5_MOE_TEXT = DecoderFamily(
     preserve_source_layout=True,
     padding_idx=True,
     defaults={'max_position_embeddings': 32768},
+    prediction_counts=('mtp_num_hidden_layers',),
 )
 
 QWEN3_5_TEXT = DecoderFamily(
@@ -426,6 +427,7 @@ QWEN3_5_TEXT = DecoderFamily(
     preserve_source_layout=True,
     padding_idx=True,
     defaults={'max_position_embeddings': 32768},
+    prediction_counts=('mtp_num_hidden_layers',),
 )
 
 QWEN3_MOE = DecoderFamily(

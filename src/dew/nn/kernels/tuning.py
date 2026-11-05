@@ -171,8 +171,8 @@ def encoded(value: object) -> JSON:
 
 def decoded(value: _records.JSON) -> Rebuilt:
     """What `encoded` wrote, rebuilt. A class it names that this checkout lacks, a dataclass whose
-    stored fields are not this checkout's, or JSON it did not write raises `Unreadable`; whatever the
-    rebuilt classes raise propagates."""
+    stored fields are not this checkout's (but for fields it added with a default, which read as their
+    default), or JSON it did not write raises `Unreadable`; whatever the rebuilt classes raise propagates."""
     if isinstance(value, list):
         return [decoded(element) for element in value]
     if not isinstance(value, dict):
@@ -195,8 +195,11 @@ def decoded(value: _records.JSON) -> Rebuilt:
     if "dataclass" in value:
         cls = _located(_field(_records.text, value.get("dataclass"), "dataclass"))
         fields = value.get("fields")
+        # A field the checkout added with a default reads as that default: the pick was made without it.
         if not dataclasses.is_dataclass(cls) or not isinstance(fields, dict) or set(fields) != {
-                field.name for field in dataclasses.fields(cls) if field.init}:
+                field.name for field in dataclasses.fields(cls) if field.init and (
+                    field.name in fields or (field.default is dataclasses.MISSING
+                                             and field.default_factory is dataclasses.MISSING))}:
             raise Unreadable(f"{cls.__qualname__}'s stored fields are not this checkout's: {fields!r}")
         return cls(**{name: decoded(field) for name, field in fields.items()})
     if "tuple" in value:

@@ -550,6 +550,29 @@ def test_layout_parity_reads_the_first_step_as_the_trainer_does():
     assert int(step.committed) == 5 and step.example_count == 4
 
 
+def test_layout_parity_reads_every_first_step_through_the_trainers(monkeypatch):
+    """The reference's audit, its float64 anchor and the anchor's loss each read the trainer's first step
+    (`first_step`, ledger 3057, 3092) over the state they judge, which the test above holds to the
+    trainer's: a site that built its Step by hand would pass by it, and is caught here."""
+    tool = load("layout_parity")
+    read = []
+    first_step = tool.first_step
+
+    def spied(state, variables, ema, batch):
+        read.append(int(state.updates))
+        return first_step(state, variables, ema, batch)
+
+    monkeypatch.setattr(tool, "first_step", spied)
+    _, reference = tool.model_case("jepa", "float32", {}, {})
+    with jax.enable_x64(new_val=True), tempfile.TemporaryDirectory() as directory:
+        tool.Judge(reference, tool.References(Path(directory)), "jepa").audit()
+        tool.Anchor(reference, "jepa")
+        state, _, _ = tool._trainer(reference, {}, one_device=True).place()
+        tool.anchor_loss(reference, tool.drawn_batch(reference, 0), state.replace(
+            updates=jnp.asarray(5, jnp.int32)))
+    assert read == [0, 0, 5]
+
+
 def test_layout_parity_holds_every_arm_to_the_references_sample():
     """An arm that drew and started from the reference's values, at every example, is coupled to it; one
     whose draw is transformed for one example, or that records a name the reference does not, is
@@ -2128,15 +2151,35 @@ def test_every_fixture_archive_names_nothing_of_the_machine_that_wrote_it():
     assert (stamped, placed) == ({}, {})
 
 
-def test_an_image_pipeline_receipt_names_no_directory_of_the_host_that_ran_it(tmp_path):
+def test_an_image_pipeline_receipt_names_its_dataset_and_none_of_its_hosts_directories(tmp_path):
     """The image pipeline's receipt records its config as the data benchmark's does (tools/receipt_paths):
-    the flowers' directory, given shell-expanded outside the checkout, by its name (row 2872: a receipt
-    recorded /home/<user>/...)."""
+    the flowers' TFDS directory, given shell-expanded outside the checkout as its docstring lays it out
+    (`<data dir>/oxford_flowers102/<version>`), as its dataset and version, a bucket's URI as given and a
+    local file's URI as its path (rows 2872, 4209: a receipt recorded /home/<user>/..., then the version
+    directory alone, and a gs:// path as gs:/bucket; the review of 4209: a file:// URI kept whole)."""
     tool = load("benchmark_image_pipeline")
-    config = tool.Config(flowers=str(tmp_path / "data" / "oxford_flowers102"), out=tmp_path / "out")
+    config = tool.Config(flowers=str(tmp_path / "data" / "oxford_flowers102" / "2.1.1"), out=tmp_path / "out")
     recorded = tool.recorded_config(config)
-    assert recorded["flowers"] == "oxford_flowers102" and "out" not in recorded
+    assert recorded["flowers"] == "oxford_flowers102/2.1.1" and "out" not in recorded
     assert recorded["images"] == config.images
+    bucket = "gs://tfds-data/datasets/oxford_flowers102/2.1.1"
+    assert tool.recorded_config(tool.Config(flowers=bucket))["flowers"] == bucket
+    local = (tmp_path / "data" / "oxford_flowers102" / "2.1.1").as_uri()
+    assert tool.recorded_config(tool.Config(flowers=local))["flowers"] == "oxford_flowers102/2.1.1"
+
+
+def test_the_disk_bank_and_host_offload_receipts_name_none_of_their_hosts_directories(tmp_path):
+    """The disk-bank and host-offload benchmarks record their configs through tools/receipt_paths: a
+    checkpoint, a trace and an output outside the checkout by name, none whole (row 4210: their receipts
+    recorded resolved paths)."""
+    banks = load("benchmark_disk_banks")
+    config = banks.DiskConfig(checkpoint=tmp_path / "models" / "qwen3", trace=str(tmp_path / "trace"))
+    assert banks.recorded_config(config) == {**dataclasses.asdict(config), "checkpoint": "qwen3",
+                                            "trace": "trace"}
+    offload = load("benchmark_host_offload")
+    written = tmp_path / "offload.json"
+    offload.main(offload.OffloadConfig(depths=[], out=str(written)))
+    assert json.loads(written.read_text())["config"]["out"] == "offload.json"
 
 
 def test_a_saved_run_archive_takes_the_fixture_writer_with_its_own_cleaning_and_modes():

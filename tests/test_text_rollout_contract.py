@@ -71,7 +71,9 @@ SEEDS = {'attention cache capacity': 32, 'attention cached scores raw': 8,
          'parallel registered scores policy': 8, 'qsa_attention registered scores raw': 8,
          'qsa_attention registered scores policy': 8, 'short_conv registered scores raw': 16,
          'short_conv registered scores policy': 32}
-"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada): by the reference
+compared with itself, but Kimi delta attention's two registered-score sites, sized paired (`seeds_for` with
+the site's Dew arm, ledger 2889), whose reference alone resolves at 512 and 64."""
 
 
 def prompts():

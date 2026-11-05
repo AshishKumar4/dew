@@ -532,6 +532,32 @@ class _HookHolder:
         return tile
 
 
+@dataclasses.dataclass(frozen=True)
+class _Grown:
+    """A config a checkout grew a field of since a pick of it was stored: `swapped`, with a default."""
+    block: int
+    swapped: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class _Required:
+    """A config a checkout grew a field of with no default."""
+    block: int
+    stages: int
+
+
+def test_a_stored_config_reads_a_field_its_checkout_added_with_a_default_as_that_default():
+    """A pick stored before its config grew a field with a default (an orientation the launch did not have
+    when the pick was measured) reads back with that default; a field added with no default, or a stored
+    field the checkout no longer has, leaves the pick unreadable."""
+    name = f"{__name__}:{_Grown.__qualname__}"
+    assert tuning.decoded({"dataclass": name, "fields": {"block": 64}}) == _Grown(64)
+    with pytest.raises(tuning.Unreadable):
+        tuning.decoded({"dataclass": f"{__name__}:{_Required.__qualname__}", "fields": {"block": 64}})
+    with pytest.raises(tuning.Unreadable):
+        tuning.decoded({"dataclass": name, "fields": {"block": 64, "gone": 1}})
+
+
 def test_a_module_level_hook_round_trips_and_any_other_callable_is_refused():
     """A template launch's hook enters its stored key by its module and name and comes back as that very
     function; a lambda, a closure and a local function have no name to store; a stored name that a

@@ -71,7 +71,6 @@ import functools
 import hashlib
 import logging
 import math
-import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterator, Sequence
@@ -86,7 +85,9 @@ from jax.experimental import checkify
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
+from dew._coordination import agreed_reads
 from dew._hashing import array_fingerprint
+from dew._records import JSON
 from dew.batch import (
     COORDINATES_FIELD,
     POSITIONS_FIELD,
@@ -96,7 +97,7 @@ from dew.batch import (
     token_positions,
     token_validity,
 )
-from dew.inference.engine import Timed, normalized, reloaded, settled
+from dew.inference.engine import Timed, Waiting, normalized, reloaded, settled
 from dew.inference.pages import Pages, States, prefix_hashes
 from dew.inference.projections import pack_projections, packed_layout
 from dew.inference.serving_kernel import (
@@ -127,7 +128,8 @@ from dew.inference.tasks import (
     resident,
     shape_bucket,
 )
-from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
+from dew.lora import adapter_names
+from dew.mesh import batch_axes
 from dew.nn.cross_attention import CrossBlocks
 from dew.nn.inputs import (
     CONTEXT,
@@ -145,6 +147,7 @@ from dew.nn.precision import Numerics
 from dew.nn.progress import END, Progress
 from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
 from dew.nn.scatter import DROPPED
+from dew.nn.sharding import whole
 from dew.nn.visibility import with_served_blocks
 from dew.sampling.decoding import Finishing, LogitsTransform, StopStrings
 from dew.sampling.guided import Grammar
@@ -267,7 +270,7 @@ def _row_keys(keys: tuple[jax.Array | np.ndarray, ...], seeds: jax.Array, seeded
     return jax.vmap(folded)(jnp.where(seeded[:, None], made, jnp.stack(keys)), folds)
 
 
-@dataclass
+@dataclass(eq=False)
 class _Row:
     """One request on the host: its prompt, budget and key, and what it drew."""
 
@@ -295,6 +298,12 @@ class _Row:
     """What the prompt's keys depend on beside its tokens, its context's digest and its groups with the
     tokens up to its last grouped one, under which its prefix pages are named (`dew.inference.pages`);
     empty for none."""
+    writing: tuple[bytes, ...] = ()
+    """The hashes of the full prompt pages the row writes that no page names yet (`Pages.reserve`),
+    which a prompt sharing them waits for until the row publishes them or ends."""
+    adapter: int = -1
+    """The row's adapter of an adapter set's model, its place in the set's names (`dew.lora.AdapterSet`),
+    -1 for the base model alone."""
     restore: int | None = None
     """The `States` entry the row's slot starts from after its shared prefix pages, before its first piece;
     None where it starts afresh."""
@@ -430,8 +439,10 @@ class PagedRows:
         """Seat queued requests in order while some group's part of the pool covers the next one."""
         seated: list[tuple[int, _Row]] = []
         taken = [0] * len(free)
-        while queue:
-            row = queue[0]
+        for row in list(queue):
+            if any(part.waits(row.prompt, row.salt) for part in self.pages):
+                # Another row writes this prompt's next page now: it reads that page once written.
+                continue
             open_groups = sorted((group for group, slots in enumerate(free) if taken[group] < len(slots)),
                                  key=lambda group: (len(self.pages[group].shared(row.prompt, row.salt)),
                                                     self.pages[group].available), reverse=True)
@@ -439,7 +450,7 @@ class PagedRows:
                 part = self.pages[group]
                 reserved = part.reserve(row.prompt, len(row.prompt) + row.budget, row.salt)
                 if reserved is not None:
-                    row.pages, row.prefilled, entry = reserved
+                    row.pages, row.prefilled, entry, row.writing = reserved
                     row.restore = None if entry is None else group * self.states + entry
                     row.weights = self.weights
                     if part.states is not None:
@@ -447,7 +458,8 @@ class PagedRows:
                     break
             else:
                 break
-            queue.popleft()
+            # By identity: a row is one request, and its arrays compare by value.
+            queue.remove(row)
             seated.append(_seated_in(group, free, taken, row))
         return seated
 
@@ -460,9 +472,14 @@ class PagedRows:
         reload and its earlier pieces kept the old weights' keys."""
         if row.weights == self.weights:
             self.pages[row.group].publish(row.prompt, row.pages, row.salt)
+        self.pages[row.group].written(row.writing)
+        row.writing = ()
 
     def release(self, row: _Row) -> None:
-        self.pages[row.group].release(row.pages)
+        part = self.pages[row.group]
+        part.written(row.writing)
+        row.writing = ()
+        part.release(row.pages)
 
     def kept(self, row: _Row) -> int | None:
         """The `States` entry, global over the groups, that keeps the row's state after its prompt's first
@@ -502,26 +519,8 @@ def _refuse_unserved_modes(model: nn.Module, *, paged: bool = False, chunked: bo
 
 
 def _served_mesh(task: TextGeneration) -> Mesh | None:
-    """The mesh `task`'s weights lie on, which a server serves on, refused where a server cannot: a
-    stage or sequence axis, or one over several processes."""
-    mesh = mesh_of(task.variables)
-    if mesh is None:
-        return None
-    if mesh.shape.get(STAGE_AXIS, 1) > 1:
-        raise ValueError(
-            "a server decodes through the whole layer stack every step; the stage axis "
-            "runs the stack as the training pipeline, which the decoder refuses to decode "
-            "through (one token a step leaves no microbatches to pipeline). Serve on a "
-            "mesh with stage=1"
-        )
-    if mesh.shape.get(SEQUENCE_AXIS, 1) > 1:
-        raise ValueError("a server keeps each row's cached keys whole on the devices of its group, "
-                         "and a decoder refuses to decode under a sequence axis, which splits a "
-                         "sequence's positions. Serve on a mesh with sequence=1")
-    if not NamedSharding(mesh, P()).is_fully_addressable:
-        raise ValueError("a server schedules its rows from one process; a mesh over several "
-                         "processes would need them to agree on every step's admission")
-    return mesh
+    """The mesh `task`'s weights lie on, which a server serves on."""
+    return mesh_of(task.variables)
 
 class Server:
     """Serves text requests with continuous batching over one resident KV cache.
@@ -555,8 +554,6 @@ class Server:
                  progress: Progress = END) -> None:
         if type(slots) is not int or slots < 1:
             raise ValueError("slots must be a positive number of resident rows")
-        if type(admission) is not int or not 1 <= admission <= slots:
-            raise ValueError("admission must be between one and the slot count")
         _refuse_unserved_modes(
             model, paged=isinstance(rows, PagedRows), chunked=rows.chunk is not None,
             prefix=isinstance(rows, PagedRows) and any(part.prefix_cache for part in rows.pages),
@@ -569,6 +566,8 @@ class Server:
         if slots % self.groups or admission % self.groups:
             raise ValueError(f"slots ({slots}) and admission ({admission}) must divide by the "
                              f"{self.groups} groups the mesh splits rows into")
+        if type(admission) is not int or not 1 <= admission <= slots:
+            raise ValueError("admission must be between one and the slot count")
         self.model = model
         self.cross: tuple[CrossBlocks, int, np.dtype] | None = None
         """The model's cross-attention layers and its context's width and dtype, where a request may
@@ -599,18 +598,13 @@ class Server:
         self.progress = progress
         # The PRNG implementation its rows' keys are of: the default one as its rows were made.
         self.decode_steps, self.steps, self.prng = decode_steps, 0, rows.placement.prng
-        self._queue: deque[_Row] = deque()
-        """The requests waiting for a slot, oldest first. `submit` appends on
-        the right while a step seats from the left, so a submitting thread
-        never waits for a step (a deque's append and popleft are atomic)."""
-        self._ingress = threading.Lock()
-        """Orders a submission's append with a failure's sweep."""
+        self._waiting: Waiting[_Row] = Waiting("the server stopped after a device check failed")
+        """The requests waiting for a slot."""
         self.arrived: Callable[[], None] = _nothing
         """Called after each submission: an `Engine` serving this kind wakes to it
         (`dew.inference.engine.Kind`)."""
         self._rows: dict[int, _Row] = {}
         self._pending: tuple[checkify.Error, Draws] | None = None
-        self._failed: BaseException | None = None
         self.rows = rows
         self.grammar = grammar
         self.prefix_hits = 0
@@ -618,6 +612,13 @@ class Server:
         self._admitted = (
             None if self.mesh is None else NamedSharding(self.mesh, P(batch_axes(self.mesh) or None))
         )
+        self._local = _local_groups(self._admitted, slots, self.groups)
+        """The groups of slots on this process's devices, which it seats and reads: every group on one
+        process; on a mesh over several, each process its own, and every step agreed among them
+        (`_agreed`)."""
+        self.pooled = self._admitted is not None and not self._admitted.is_fully_addressable
+        """Whether the server's mesh spans several processes, which step it together (`run`, `step`); an
+        `Engine` steps a server of one process."""
 
         with self._context():
             groups, source_shapes = packed_layout(model, variables)
@@ -689,8 +690,10 @@ class Server:
         """The mesh the model traces under, so a layer that reads it, such as an expert exchange, finds it,
         under the numerics its task's run trained in, with its rows' PRNG implementation the default, so a
         key a layer draws (a stochastic rounding stream) is of the implementation its cache was opened
-        with, whatever thread serves it."""
-        with (contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh),
+        with, whatever thread serves it. The model runs its stack and sequences whole (`whole`): on a mesh
+        with a stage or sequence axis the training forward pipelines the stack or splits a sequence's
+        positions, which one token a step leaves nothing to do."""
+        with (contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh), whole(),
               contextlib.nullcontext() if self.precision is None
               else generation.run_precision(self.precision),
               jax.default_prng_impl(self.prng)):
@@ -730,8 +733,10 @@ class Server:
         and the pages are split over its row axes, so the number of row
         groups must divide the slots and the admission. The admission
         defaults to the largest multiple of the group count up to eight rows
-        an iteration. A stage or sequence axis larger than one, or a mesh
-        over several processes, is refused.
+        an iteration. The model decodes its stack and sequences whole on a
+        mesh with a stage or sequence axis (`dew.nn.sharding.whole`). On a
+        mesh over several processes each process seats and reads its own
+        groups' rows and the pool steps the server together (`run`).
 
         `decode_steps` runs that many iterations per device call, so the host
         launches the step's kernels once per call; on a tensor axis those
@@ -775,12 +780,13 @@ class Server:
         # One program serves one capacity, so the cache holds whole tiles of it
         # rather than a power-of-two bucket: every decode step's attention reads
         # each slot, and a capacity of 384 bucketed to 512 read a third more.
+        # A model shorter than the tiles keeps whole pages within its max_seq_len, which no row passes.
         unit = math.lcm(64, layout.page_size or 64)
-        rounded = -(-capacity // unit) * unit
-        if rounded > ceiling:
-            raise ValueError(
-                f"a capacity of {capacity} rounds to {rounded}, over the model's max_seq_len of {ceiling}"
-            )
+        page = layout.page_size or 1
+        rounded = min(-(-capacity // unit) * unit, ceiling // page * page)
+        if rounded < capacity:
+            raise ValueError(f"a capacity of {capacity} passes the model's max_seq_len of {ceiling}"
+                             + ("" if page == 1 else f" in whole pages of {page}"))
         groups = _row_groups(mesh)
         model, rows = _cache_rows(cache_sized(model, rounded), layout, slots, rounded, groups, chunk,
                                   prefix_cache, prefix_states, prefix_state_every)
@@ -824,12 +830,12 @@ class Server:
 
     @property
     def queued(self) -> int:
-        return len(self._queue)
+        return len(self._waiting.queue)
 
     @property
     def busy(self) -> bool:
         """Whether a request waits or runs, or a call's draws wait to be read."""
-        return bool(self._queue or self._rows or self._pending is not None)
+        return bool(self._waiting.queue or self._rows or self._pending is not None)
 
     def reload(self, variables: Variables, progress: Progress | None = None) -> None:
         """Serve `variables` from the next step on, in place of the current weights, at the run's
@@ -867,7 +873,7 @@ class Server:
         self.rows.reloaded()
 
     def submit(self, prompt: Prompt, max_new_tokens: int | None = None, *,
-               key: int | jax.Array) -> Ticket:
+               key: int | jax.Array, adapter: str | None = None) -> Ticket:
         """Queue one request and return a ticket that resolves to its `Generation`.
 
         `prompt` is one text prompt, `ModelInputs` row or token row, without
@@ -882,24 +888,33 @@ class Server:
         request with a zero budget resolves at once, with the prompt alone.
         Another thread may submit while one steps. The request is validated
         here and queued at once; a step seats it when a slot is free.
+        `adapter` names the request's adapter where the task's model is an
+        adapter set's (`dew.lora.AdapterSet`), each row drawing under its own:
+        a request draws what a task over that adapter alone draws, and the
+        base model's where it names none.
         """
         # One row's key, folded the way `RowPlan.keys` folds row zero.
-        return self._enqueued(prompt, max_new_tokens, _seed(key, self.prng), 0)
+        return self._enqueued(prompt, max_new_tokens, _seed(key, self.prng), 0, adapter)
 
     def _enqueued(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array,
-                  fold: int) -> Ticket:
-        row = self._prepared(prompt, max_new_tokens, seed, fold)
-        with self._ingress:
-            if self._failed is not None:
-                raise RuntimeError("the server stopped after a device check failed") from self._failed
-            if row.budget:
-                self._queue.append(row)
+                  fold: int, adapter: str | None = None) -> Ticket:
+        row = self._prepared(prompt, max_new_tokens, seed, fold, adapter)
+        if row.budget:
+            self._waiting.append(row)
+        else:
+            self._waiting.check()
         self.arrived()
         if not row.budget:
             self._finish(row, terminated=False)
         return row.ticket
 
-    def _prepared(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array, fold: int) -> _Row:
+    def _prepared(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array, fold: int,
+                  adapter: str | None = None) -> _Row:
+        names = adapter_names(self.model)
+        if adapter is not None and adapter not in names:
+            raise ValueError(f"this server's model holds no adapter named {adapter!r}"
+                             + (f": it holds {', '.join(names)}" if names else ""))
+        chosen = -1 if adapter is None else names.index(adapter)
         positions = None
         context = None
         if isinstance(prompt, (str, ModelInputs)):
@@ -945,8 +960,11 @@ class Server:
         groups = {name: np.asarray(fields[name])[0][valid[0]].astype(np.int32)
                   for name in GROUPS if name in fields and name in self.group_fields}
         salt = b""
-        if context is not None or groups or self.keyed:
+        if context is not None or groups or self.keyed or chosen >= 0:
             hasher = hashlib.blake2b(digest_size=16)
+            if chosen >= 0:
+                # A prompt's keys are its adapter's: its prefix pages are shared under that adapter alone.
+                hasher.update(b"adapter" + np.int32(chosen).tobytes())
             if self.keyed:
                 # A cached memory rounds by the request's own key (`dew.nn.kv_cache.ROUNDING_KEYS`), so the
                 # state after a prefix is that key's: the prefix is shared only under one key.
@@ -966,7 +984,8 @@ class Server:
                     hasher.update(held[:reach].tobytes())
                 hasher.update(tokens[:reach].tobytes())
             salt = hasher.digest()
-        return _Row(tokens, budget, seed, fold, Ticket(), context=context, salt=salt, groups=groups)
+        return _Row(tokens, budget, seed, fold, Ticket(), context=context, salt=salt, groups=groups,
+                    adapter=chosen)
 
     def _book_capture(self, slot: int, row: _Row) -> None:
         """Keep the state the call leaves in `slot` where the row's piece ends at a boundary it keeps
@@ -1026,36 +1045,73 @@ class Server:
         The call admits the queued requests that fit and runs `decode_steps`
         iterations. Its own draws are read by the next `step`, or by `run`.
         """
-        if self._failed is not None:
-            raise RuntimeError("the server stopped after a device check failed") from self._failed
-        if not (self._queue or self._rows):
-            # Nothing to run: the host reads the last call's draws.
+        (pending, _), said = self._agreed("serving step", self._seated, lambda held: held[1])
+        if not any(held["busy"] for held in said):
+            # Nothing to run anywhere: the host reads the last call's draws.
             self._settle()
             return
-        admission = self._admit()
+        restores = [tuple(pair) for held in said for pair in held["restores"]]
+
+        def admitted() -> tuple[Admission | None, list]:
+            admission = self._admit(pending, max(held["waiting"] for held in said),
+                                    max(held["widest"] for held in said),
+                                    sorted({name for held in said for name in held["fields"]}))
+            return admission, [list(pair) for pair in self._captures]
+
+        # The admission is built on every process, and a failure building it stops every one, as the
+        # seating's does; each process's captures come back with it.
+        (admission, _), booked = self._agreed("serving admission", admitted, lambda held: held[1])
+        captures = [tuple(pair) for held in booked for pair in held]
         with self._context():
-            if self._restores:
+            if restores:
                 self._resident, self._carried = self._restored(
-                    self._resident, self._carried, self._states, *_padded(self._restores, self.slots, 0))
+                    self._resident, self._carried, self._states, *_padded(restores, self.slots, 0))
                 self._restores = []
             program = self._step if admission is None else self._admitting
             error, (self._resident, self._carried, draws) = program(
                 self.model, self.variables, self.pad_id, self.rows.placement, self.decode_steps,
                 self._resident, self._carried, admission, self.transforms, self.stopping, self.grammar,
                 self.progress)
-            if self._captures:
+            if captures:
                 self._states = self._captured(self._states, self._resident, self._carried,
-                                              *_padded(self._captures, self.admission, 1))
+                                              *_padded(captures, self.admission, 1))
                 self._captures = []
         self.steps += self.decode_steps
         self._settle()
         self._pending = (error, draws)
 
     def run(self) -> None:
-        """Step until every queued and running request has resolved."""
-        while self._queue or self._rows:
-            self.step()
-        self._settle()
+        """Step until every queued and running request has resolved. A step that fails stops the server:
+        every request it holds settles with the failure (`fail`), which `run` raises."""
+        try:
+            while any(self._agreed("serving run", self._busy, bool)[1]):
+                self.step()
+            self._settle()
+        except BaseException as failure:
+            self.fail(failure)
+            raise
+
+    def _busy(self) -> bool:
+        """Whether a request of this process's waits for a slot or holds one, refused once the server
+        failed."""
+        self._waiting.check()
+        return bool(self._waiting.queue or self._rows)
+
+    def _agreed[T](self, phase: str, operation: Callable[[], T],
+                   said: Callable[[T], JSON]) -> tuple[T, list]:
+        """`operation`'s outcome on this process, and what `said` gives of each process's, in rank order,
+        for the choices each step makes alike on every process (whether it runs, how many rows a group
+        admits and how wide, which fields they carry, which states it restores): this process's alone on
+        a mesh within one process. On a mesh over several, a process whose `operation` fails stops every
+        process at the agreement, as `dew._coordination.agreed` does. A step is one program every process
+        enters, so a server over several processes is stepped on each of them together, through `run` or
+        `step`, not by an `Engine` of each's own."""
+        if not self.pooled:
+            held = operation()
+            return held, [said(held)]
+        held, words = agreed_reads(phase, (operation() for _ in range(1)), said)
+        assert held is not None, "a step's local phase returns its outcome"
+        return held, words
 
     def __call__(
         self,
@@ -1077,21 +1133,19 @@ class Server:
         self.run()
         return [ticket.result() for ticket in tickets]
 
-    def _admit(self) -> Admission | None:
-        """Seat queued requests in free slots, then pick this step's prompt pieces.
-
-        Rows still prefilling send their next piece, oldest first, each
-        group's share of `admission` a step; a piece is the rest of the
-        prompt, or at most `chunk` tokens when the rows prefill in pieces,
-        but for a prefix block the cut would split, which goes whole
-        (`_piece_end`).
-        The admission's rows come group by group, as the slots do, and each
-        names its slot within its group.
-        """
+    def _seated(self) -> tuple[list[list[tuple[int, _Row]]], dict]:
+        """Seat queued requests in free slots, then pick this step's prompt pieces: each group's rows
+        still prefilling, oldest first, its share of `admission` a step; and what every process agrees
+        on before the step (`_agreed`): whether this process has work, its most pieces a group and its
+        widest piece, its pieces' group fields and the states it restores. A piece is the rest of the
+        prompt, or at most `chunk` tokens when the rows prefill in pieces, but for a prefix block the cut
+        would split, which goes whole (`_piece_end`)."""
+        busy = self._busy()
         size, share = self.slots // self.groups, self.admission // self.groups
+        # Another process's groups hold no slot this one seats.
         free = [[slot for slot in range(group * size, (group + 1) * size) if slot not in self._rows]
-                for group in range(self.groups)]
-        seated = self.rows.seat(self._queue, free, share)
+                if group in self._local else [] for group in range(self.groups)]
+        seated = self.rows.seat(self._waiting.queue, free, share)
         # After seating: a request another thread submitted while the queue
         # was read is seated too, and is admitted after it was submitted.
         now = time.perf_counter()
@@ -1110,20 +1164,33 @@ class Server:
             waiting = pending[slot // size]
             if row.prefilled < len(row.prompt) and len(waiting) < share:
                 waiting.append((slot, row))
-        if not any(pending):
+        widest = max((self._piece_end(row) - row.prefilled for waiting in pending for _, row in waiting),
+                     default=0)
+        fields = sorted({name for waiting in pending for _, row in waiting for name in row.groups})
+        return pending, {"busy": busy, "waiting": max(map(len, pending)), "widest": widest, "fields": fields,
+                         "restores": [list(pair) for pair in self._restores]}
+
+    def _admit(self, pending: list[list[tuple[int, _Row]]], waiting_most: int, longest: int,
+               grouped: list[str]) -> Admission | None:
+        """This step's admission of the `pending` pieces (`_seated`), at the shape every process agreed
+        on: `waiting_most` rows a group, a piece `longest` tokens wide at most, carrying the group
+        fields some process's pieces carry (`grouped`). The admission's rows come group by group, as the
+        slots do, and each names its slot within its group."""
+        if not waiting_most:
             return None
+        size, share = self.slots // self.groups, self.admission // self.groups
+        ends = {slot: self._piece_end(row) for waiting in pending for slot, row in waiting}
         # Padded to the fewest rows that hold every group's pieces, not to the
         # whole admission: a request arriving alone prefills one row.
-        share = admission_share(max(map(len, pending)), share)
-        chosen = [(group * share + index, slot, row) for group, waiting in enumerate(pending)
-                  for index, (slot, row) in enumerate(waiting)]
+        share = admission_share(waiting_most, share)
+        # This process's rows of the admission, its groups' in order (`_local_groups`).
+        chosen = [(position * share + index, slot, row) for position, group in enumerate(self._local)
+                  for index, (slot, row) in enumerate(pending[group])]
         # The capacity is whole tiles, not a bucket, so a piece's width bucket can pass it.
-        ends = {slot: self._piece_end(row) for _, slot, row in chosen}
-        longest = max(ends[slot] - row.prefilled for _, slot, row in chosen)
         width = min(shape_bucket(longest, 64), self.capacity)
         if self.rows.chunk is not None and longest <= self.rows.chunk:
             width = min(width, self.rows.chunk)
-        count, capacity = share * self.groups, self.capacity
+        count, capacity = share * len(self._local), self.capacity
         tokens = np.zeros((count, width), np.int32)
         valid = np.zeros((count, width), bool)
         slots = np.full((count,), size, np.int32)
@@ -1138,6 +1205,7 @@ class Server:
         final = np.zeros((count,), bool)
         history = np.zeros((count, capacity), np.int32)
         history_valid = np.zeros((count, capacity), bool)
+        adapters = np.full((count,), -1, np.int32)
         cross = self.cross
         # Every piece carries its row's context, so a row continuing over a former occupant's slot,
         # or after shared prefix pages, reads its own; a row without one reads none.
@@ -1146,8 +1214,7 @@ class Server:
         contexts = np.zeros((count, context_length, features), dtype)
         context_lengths = np.zeros((count,), np.int32)
         # A group field goes in where an admitted row carries it: prompts without groups keep the causal call.
-        pieces = {name: np.full((count, width), -1, np.int32)
-                  for name in sorted({name for _, _, row in chosen for name in row.groups})}
+        pieces = {name: np.full((count, width), -1, np.int32) for name in grouped}
         for index, slot, row in chosen:
             piece = row.prompt[row.prefilled:ends[slot]]
             tokens[index, width - len(piece):] = piece
@@ -1167,32 +1234,40 @@ class Server:
             final[index] = row.prefilled == len(row.prompt)
             history[index, capacity - len(row.prompt):] = row.prompt
             history_valid[index, capacity - len(row.prompt):] = True
+            adapters[index] = row.adapter
             if cross is not None and row.context is not None:
                 contexts[index, :len(row.context)] = row.context
                 context_lengths[index] = len(row.context)
             if final[index]:
                 self.rows.prefilled(row)
-        placed = jax.device_put(
-            [
-                tokens,
-                valid,
-                slots,
-                budgets,
-                _row_keys(tuple(keys), seeds, seeded, folds, self.prng),
-                tables,
-                cursors,
-                final,
-                history,
-                history_valid,
-                *([] if cross is None else [contexts, context_lengths]),
-                *pieces.values(),
-            ],
-            self._admitted,
-        )
-        conditioning = {} if cross is None else {CONTEXT: placed[10], CONTEXT_LENGTHS: placed[11]}
+        placed = self._placed([
+            tokens,
+            valid,
+            slots,
+            budgets,
+            _row_keys(tuple(keys), seeds, seeded, folds, self.prng),
+            tables,
+            cursors,
+            final,
+            history,
+            history_valid,
+            adapters,
+            *([] if cross is None else [contexts, context_lengths]),
+            *pieces.values(),
+        ])
+        conditioning = {} if cross is None else {CONTEXT: placed[11], CONTEXT_LENGTHS: placed[12]}
         fields = {VALIDITY_FIELD: placed[1], **dict(zip(pieces, placed[len(placed) - len(pieces):],
                                                           strict=True))}
-        return Admission(ModelInputs(placed[0], fields, conditioning), *placed[2:10])
+        return Admission(ModelInputs(placed[0], fields, conditioning), *placed[2:11])
+
+    def _placed(self, local: list) -> list[jax.Array]:
+        """This process's rows of an admission's arrays placed as the admission is (`_admitted`): every row
+        where one process holds the mesh, and on a mesh over several, the admission's global arrays made
+        of each process's rows."""
+        if not self.pooled:
+            return jax.device_put(local, self._admitted)
+        assert self._admitted is not None, "a server over several processes is on a mesh"
+        return [jax.make_array_from_process_local_data(self._admitted, np.asarray(leaf)) for leaf in local]
 
     def _settle(self) -> None:
         """Read the previous call's draws into their rows, iteration by
@@ -1201,7 +1276,7 @@ class Server:
         iteration's last."""
         if self._pending is None:
             return
-        error, draws = jax.device_get(self._pending)
+        error, draws = jax.tree.map(_held_here, self._pending)
         self._pending = None
         try:
             error.throw()
@@ -1233,11 +1308,8 @@ class Server:
     def fail(self, failure: BaseException) -> None:
         """Stop after `failure`: every waiting and running request settles with it, and a later
         submission or step is refused."""
-        with self._ingress:
-            self._failed = failure
-            waiting = [*self._rows.values(), *self._queue]
-            self._rows.clear()
-            self._queue.clear()
+        waiting = self._waiting.failed(failure, *self._rows.values())
+        self._rows.clear()
         for row in waiting:
             settled(row.ticket, failure)
 
@@ -1255,6 +1327,35 @@ class Server:
         settled(row.ticket, Generation(
             np.concatenate([row.prompt[None], drawn], axis=1), np.array([count], np.int32),
             np.array([terminated]), behavior, raw, rows=1, decoder=decoder))
+
+
+def _local_groups(rows: NamedSharding | None, slots: int, groups: int) -> tuple[int, ...]:
+    """The groups of a server's slots on this process's devices, in order: every group without a mesh or
+    on one within one process; on a mesh over several, those its devices hold, each group's devices all
+    one process's, which alone seats and reads its rows. A mesh splitting a group's devices over
+    processes (a tensor axis across them) is refused: two processes would write the group's slots
+    apart."""
+    if rows is None or rows.is_fully_addressable:
+        return tuple(range(groups))
+    size = slots // groups
+    owners: dict[int, set[int]] = {}
+    for device, index in rows.devices_indices_map((slots,)).items():
+        owners.setdefault((index[0].start or 0) // size, set()).add(device.process_index)
+    if any(len(held) > 1 for held in owners.values()):
+        raise ValueError("a server's group of rows is seated and read by one process, and this mesh "
+                         "splits a group's devices over several: lay the processes along the batch axes")
+    return tuple(sorted(group for group, held in owners.items() if held == {jax.process_index()}))
+
+
+def _held_here(leaf: jax.Array) -> np.ndarray:
+    """`leaf` on the host, the parts this process's devices hold filled in where its mesh spans several
+    processes: a step's draws are read by the process whose rows drew them."""
+    if leaf.is_fully_addressable:
+        return np.asarray(jax.device_get(leaf))
+    held = np.zeros(leaf.shape, leaf.dtype)
+    for shard in leaf.addressable_shards:
+        held[shard.index] = np.asarray(shard.data)
+    return held
 
 
 def _served_plan(strategy: Strategy, mesh: Mesh | None, chunk: int | None,
