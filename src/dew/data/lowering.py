@@ -1382,8 +1382,12 @@ class _Build:
     writes itself. None where the workers read the whole order after its batch, as a read that drops
     nothing is read."""
     version: int = PLAN_VERSIONS[-1]
-    """The data plan version it reads by (`dew.data.plan.PLAN_VERSIONS`): 9 a corpus's shuffles each its
-    own in the mixtures above it (`ordered`), 8 each by its seed alone."""
+    """The data plan version it reads by (`dew.data.plan.PLAN_VERSIONS`): 9 a corpus's shuffles each by its
+    own key (`ordered`), 8 each by its seed alone."""
+    named: int | None = None
+    """The key of the chain this builds, read outside any mixture, where it was given a name: the key a
+    mixture would key it by as its first member of that name (`_member_key`), which its shuffles draw by
+    (`ordered`)."""
 
     @property
     def global_order(self) -> bool:
@@ -1827,15 +1831,16 @@ class _Build:
         return rows
 
     def ordered(self, stage: Shuffle) -> Shuffle:
-        """`stage` as this build reads it: from plan version 9 a shuffle of a mixture's corpus draws from its
-        seed and the corpus's own key, its name in the mixture that reads it (`corpus`'s last), so corpora
-        of one length shuffled by one seed read in orders of their own, and a corpus keeps its order
-        whichever others a mixture holds, however deep, and in a phase that reads it alone where another
-        mixes it (`dew.data.compile._compile_phases`), as a later phase continues it (row 3840); version
-        8, and a shuffle of no mixture's corpus, by its seed alone."""
-        if self.version < 9 or not self.corpus:
+        """`stage` as this build reads it: from plan version 9 a shuffle draws from its seed and its corpus's
+        own key, the one it goes by in the mixture that reads it (`corpus`'s last), or, read outside any,
+        its name's where it was given one (`named`), so corpora of one length shuffled by one seed read in
+        orders of their own, and a named corpus reads one order whichever others a mixture holds, however
+        deep, and alone, as a later phase continues it (row 3840); version 8, and an unnamed chain read
+        outside any mixture, by its seed alone."""
+        key = self.corpus[-1] if self.corpus else self.named
+        if self.version < 9 or key is None:
             return stage
-        keyed = hashlib.blake2b(repr((stage.seed, self.corpus[-1])).encode(), digest_size=4).digest()
+        keyed = hashlib.blake2b(repr((stage.seed, key)).encode(), digest_size=4).digest()
         return dataclasses.replace(stage, seed=int.from_bytes(keyed, "big"))
 
     def stage(self, rows: Rows, stage: Stage, pipeline: Pipeline, partition: DataPartition, at: int) -> Rows:

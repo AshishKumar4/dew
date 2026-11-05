@@ -659,24 +659,24 @@ def read_otherwise_at_8(saved: Mapping[str, object]) -> str | None:
 
 def read_otherwise_at_9(saved: Mapping[str, object]) -> str | None:
     """Why version 9 reads a version 8 data plan's order otherwise, None where it reads it alike: where a
-    corpus of a mixture its order holds, at any depth, shuffles its records, which version 9 draws by the
-    corpus's key in the mixture too (`dew.data.lowering._Build.ordered`, row 3840)."""
-    def shuffled_member(node: dict[str, JSON] | list[JSON] | str | int | float | bool | None, *,
-                        within: bool) -> bool:
+    chain its order holds shuffles its records, a mixture's corpus at any depth or a chain read alone,
+    which version 9 draws by the corpus's key too, a chain read alone by its name where it has one, which
+    the saved order does not say (`dew.data.lowering._Build.ordered`, row 3840)."""
+    def shuffles(node: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> bool:
         if isinstance(node, list):
-            return any(shuffled_member(child, within=within) for child in node)
+            return any(map(shuffles, node))
         if not isinstance(node, dict):
             return False
         stages = node.get("stages")
-        if within and isinstance(stages, list) and any(
-                isinstance(stage, str) and stage.startswith("Shuffle(") for stage in stages):
+        if isinstance(stages, list) and any(isinstance(stage, str) and stage.startswith("Shuffle(")
+                                            for stage in stages):
             return True
-        return any(shuffled_member(child, within=within or key == "corpora") for key, child in node.items())
+        return any(map(shuffles, node.values()))
 
-    if not shuffled_member(json_value(saved.get("order", {}), "saved order"), within=False):
+    if not shuffles(json_value(saved.get("order", {}), "saved order")):
         return None
-    return ("version 8 shuffled each corpus of a mixture by its seed alone, and version 9 by its key in the "
-            "mixture too, so this position goes on only as 8 read it")
+    return ("version 8 shuffled each corpus by its seed alone, and version 9 by its key too, so this "
+            "position goes on only as 8 read it")
 
 
 def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object]:
@@ -862,9 +862,10 @@ def _steps_grown(saved: dict[str, JSON] | list[JSON] | str | int | float | bool 
 
 
 PLAN_VERSIONS = (8, 9)
-"""The versions this Dew reads a plan into rows by, the latest a new run's: 9 folds a mixture member's key
-into each shuffle of its own, so members of one length shuffled by one seed read in orders of their own
-(row 3840), where 8 read them in one permutation; a run saved under 8 reads by 8 (carried to 1.0, ledger
+"""The versions this Dew reads a plan into rows by, the latest a new run's: 9 folds a corpus's key, its name
+in the mixture that reads it or a named chain's own, into each shuffle of its own, so corpora of one length
+shuffled by one seed read in orders of their own and a named corpus reads one order mixed or alone (row
+3840), where 8 read them in one permutation; a run saved under 8 reads by 8 (carried to 1.0, ledger
 1552)."""
 
 
