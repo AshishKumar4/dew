@@ -141,7 +141,7 @@ class Summed:
 
     tree: str = dataclasses.field(metadata={"static": True})
 
-    def at(self, index: int) -> "Summed":
+    def at(self, index: int, name: str | None = None) -> "Summed":
         return self
 
     def held(self, dtype):

@@ -96,7 +96,7 @@ class Replay:
     """The walk's rule of a float64 replay (`float64_terms.Rule`, `float64_replay`): each float operation
     in float64 from its operands widened, a formatted one or one on integers, bits and keys as traced."""
 
-    def at(self, index: int) -> "Replay":
+    def at(self, index: int, name: str | None = None) -> "Replay":
         return self
 
     def held(self, dtype):

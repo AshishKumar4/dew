@@ -217,11 +217,12 @@ def _compiled(jaxpr):
 
 class Rule(Protocol):
     """How a walk other than the terms' evaluates each primitive (`_evaluated`'s `rule`): its outputs from
-    its inputs (`primitive`), and the rule of a walk's equation, step or iteration `index` within it
-    (`at`), so a rule that draws reads a draw of its own at every equation it meets
-    (tests/rounding_bound.py's taps), and the dtype its values hold each traced type in (`held`)."""
+    its inputs (`primitive`), and the rule of a walk's equation, step or iteration `index` within it, an
+    equation's primitive `name` given (`at`), so a rule that draws reads a draw of its own at every
+    equation it meets (tests/rounding_bound.py's taps) and check 2 names each equation by its path
+    (tests/certified.py), and the dtype its values hold each traced type in (`held`)."""
 
-    def at(self, index: int) -> Rule: ...
+    def at(self, index: int, name: str | None = None) -> Rule: ...
 
     def primitive(self, equation, inputs: list) -> list: ...
 
@@ -288,7 +289,8 @@ def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False, rule=No
             with equation.ctx.manager:
                 outputs, made = _applied(equation, inputs, [energy(var) for var in equation.invars],
                                          any(var in wanted for var in equation.outvars), compiling,
-                                         None if rule is None else rule.at(start), reading)
+                                         None if rule is None else rule.at(start, equation.primitive.name),
+                                         reading)
             written = equation.outvars
             freed = [var for var in equation.invars
                      if not isinstance(var, Literal) and last.get(var) == start]
@@ -420,8 +422,8 @@ def _span(jaxpr, start: int, stop: int):
                 inputs = [var.val if isinstance(var, Literal) else values[var] for var in equation.invars]
                 given = [None if isinstance(var, Literal) else energies.get(var) for var in equation.invars]
                 with equation.ctx.manager:
-                    outputs, made = _applied(equation, inputs, given, mark,
-                                             rule=None if rule is None else rule.at(index))
+                    at = None if rule is None else rule.at(index, equation.primitive.name)
+                    outputs, made = _applied(equation, inputs, given, mark, rule=at)
                 values.update(zip(equation.outvars, outputs, strict=True))
                 energies.update(zip(equation.outvars, made, strict=True))
             return [values[var] for var in kept], [energies[var] for var in kept]

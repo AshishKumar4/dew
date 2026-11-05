@@ -90,7 +90,7 @@ class TapRule:
     key: jax.Array
     scale: float
 
-    def at(self, index: int) -> TapRule:
+    def at(self, index: int, name: str | None = None) -> TapRule:
         return TapRule(_mixed(self.key + _GOLDEN * (jnp.asarray(index, jnp.int64).astype(jnp.uint64) + 1)),
                        self.scale)
 

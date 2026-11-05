@@ -1026,58 +1026,46 @@ def certified(fn, *arguments) -> tuple:
     bind, its own compiled program, under its equation's own context), and each held to its contract
     (CONTRACTS) on the operands it was given: `(outputs, findings)`, the outputs as that run computed
     them, and every equation whose result breaks its contract or that has none, by its path, with its
-    first element that breaks. This certifies the op-by-op program; a fused program's internals are
-    check 1's."""
+    first element that breaks. The program is walked as the gate walks every program
+    (`float64_terms.walked`, by `Certifying`): its calls, branches and scans inside, a scan a step at a
+    time, each step's equations by the step's path. This certifies the op-by-op program; a fused
+    program's internals are check 1's."""
     import jax
+    from float64_terms import evaluated_on, walked
 
     closed, shape = jax.make_jaxpr(fn, return_shape=True)(*arguments)
     findings: list[str] = []
-    outputs = _run(closed.jaxpr, closed.consts, jax.tree.leaves(arguments), findings)
+    leaves = jax.tree.leaves(arguments)
+    with evaluated_on(leaves):
+        outputs = walked(closed.jaxpr, closed.consts, leaves, Certifying(findings))
     return jax.tree.unflatten(jax.tree.structure(shape), outputs), findings
 
 
-def _run(jaxpr, consts, arguments, findings, where: str = "") -> list:
-    from float64_terms import _body
-    from jax.extend import core
+@dataclasses.dataclass(frozen=True)
+class Certifying:
+    """The walk's rule of check 2 (`float64_terms.Rule`, `certified`): each primitive bound natively on its
+    operands, a literal at its traced type, and held to its contract (`_held`), its findings appended to
+    `findings` by its path: each call's equation `name#index`, a scan's step its index, joined by `/`."""
 
-    env = {}
+    findings: list
+    path: tuple[str, ...] = ()
 
-    def read(var):
+    def at(self, index: int, name: str | None = None) -> "Certifying":
+        return Certifying(self.findings, (*self.path, str(index) if name is None else f"{name}#{index}"))
+
+    def held(self, dtype):
+        return dtype
+
+    def primitive(self, eqn, values: list) -> list:
+        from jax.extend import core
+
         # A literal at its traced type: its Python value may be wider (a float64 scalar for a float32).
-        return np.asarray(var.val, var.aval.dtype) if isinstance(var, core.Literal) else env[var]
-
-    env.update(zip(jaxpr.constvars, consts, strict=True))
-    env.update(zip(jaxpr.invars, arguments, strict=True))
-    for index, eqn in enumerate(jaxpr.eqns):
-        operands = [read(var) for var in eqn.invars]
-        at = f"{where}{eqn.primitive.name}#{index}"
-        with eqn.ctx.manager:
-            body = _body(eqn)
-            if eqn.primitive.name == "cond":
-                branch = eqn.params["branches"][int(np.asarray(operands[0]))]
-                results = _run(branch.jaxpr, branch.consts, operands[1:], findings, at + "/")
-            elif eqn.primitive.name == "scan":
-                results = _scanned(eqn.params, operands, findings, at + "/")
-            elif body is not None:
-                results = _run(*body, operands, findings, at + "/")
-            else:
-                results = eqn.primitive.bind(*operands, **eqn.params)
-                results = list(results) if eqn.primitive.multiple_results else [results]
-                _held(eqn, operands, results, findings, at)
-        env.update(zip(eqn.outvars, results, strict=True))
-    return [read(var) for var in jaxpr.outvars]
-
-
-def _scanned(params, operands, findings, where: str) -> list:
-    """A scan run a step at a time (`float64_terms.scanned_steps`, `_run` of its body), every step's
-    equations held to their contracts as the program's are, each by its step's path."""
-    from float64_terms import scanned_steps
-
-    body = params["jaxpr"]
-    walked = scanned_steps(params, [(value,) for value in operands], lambda step, inputs: [
-        (value,) for value in _run(body.jaxpr, body.consts, [value for (value,) in inputs], findings,
-                                   f"{where}{step}/")], lanes=1)
-    return [value for (value,) in walked]
+        operands = [np.asarray(value, var.aval.dtype) if isinstance(var, core.Literal) else value
+                    for value, var in zip(values, eqn.invars, strict=True)]
+        results = eqn.primitive.bind(*operands, **eqn.params)
+        results = list(results) if eqn.primitive.multiple_results else [results]
+        _held(eqn, operands, results, self.findings, "/".join(self.path))
+        return results
 
 
 _OBSERVING: list[list] = []
