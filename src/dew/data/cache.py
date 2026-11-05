@@ -242,10 +242,12 @@ class Cache:
         transform: Transform | None = None,
         threads: int | None = None,
         source: Source | None = None,
+        transparent: bool = False,
     ) -> ShardOpener:
         """`reader`'s shards read through the cache: a published generation's records read back, or each
         shard's fill written as it is read, `source`'s generation published by the last of its shards'
-        fills to seal (row 4211)."""
+        fills to seal (row 4211). A `transparent` read saves each shard's position as its reader does,
+        so a position saved with the cache resumes without it and the reverse (row 4217)."""
         computed = (reader if transform is None
                     else _PassthroughReader(reader, _Passthrough(transform), threads))
         if transform is not None and _volatile(transform):
@@ -259,7 +261,8 @@ class Cache:
             return computed
         return _CachedReader(reader, self, key, transform,
                              None if published is None
-                             else _Published(published, transform, self if self.optional else None), source)
+                             else _Published(published, transform, self if self.optional else None), source,
+                             transparent)
 
     def generation(self, key: DependencyManifest) -> Generation | None:
         root = self._root(key)
@@ -871,10 +874,11 @@ class _CachedReader:
     transform: Transform | None
     published: _Published | None
     source: Source | None = None
+    transparent: bool = False
 
     def __call__(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
         return _CachedIter(self.reader(shard, options), self.cache, self.key, shard, self.transform,
-                           self.published, self.source)
+                           self.published, self.source, self.transparent)
 
 
 class _CachedIter(grain.IterDataset):
@@ -887,13 +891,16 @@ class _CachedIter(grain.IterDataset):
         transform: Transform | None,
         published: _Published | None,
         source: Source | None,
+        transparent: bool,
     ):
         super().__init__(parent)
         self.cache, self.key, self.shard, self.transform = cache, key, shard, transform
         self.published, self.input_parent, self.source = published, parent, source
+        self.transparent = transparent
 
     def __iter__(self) -> grain.DatasetIterator:
-        return _CachedIterator(self.input_parent.__iter__(), self.writer, self.shard, self.transform)
+        return _CachedIterator(self.input_parent.__iter__(), self.writer, self.shard, self.transform,
+                               self.transparent)
 
     def writer(self) -> _Writer | _Published | _Computed:
         """Where its shard's records are written or read. A shard keeps its iterator's state either
@@ -913,11 +920,15 @@ class _CachedIterator(grain.DatasetIterator):
         opens: Callable[[], _Writer | _Published | _Computed],
         shard: Shard,
         transform: Transform | None,
+        transparent: bool = False,
     ):
         super().__init__(parent)
         self.parent, self.opens, self.shard, self.transform = parent, opens, shard, transform
+        self.transparent = transparent
         self.writer: _Writer | _Published | _Computed | None = None
-        self.ordinal = 0
+        self.ordinal: int | None = 0
+        """Its records' place in the shard, the key of each; None once a transparent read resumed, whose
+        saved position holds no place, so the rest of its shard is computed and kept nowhere."""
 
     def __next__(self):
         # The writer opens with the first record, so building the iterator reads no storage: Grain
@@ -925,20 +936,28 @@ class _CachedIterator(grain.DatasetIterator):
         # construction of a thread prefetch over the pool, which a refusal raised there leaves half
         # built for the collector to close (grain 0.2.18, ThreadPrefetchDatasetIterator.__init__).
         if self.writer is None:
-            self.writer = self.opens()
+            self.writer = self.opens() if self.ordinal is not None else _Computed()
         try:
             value = next(self.parent)
         except StopIteration:
             self.writer.finish()
             raise
-        value = self.writer.process((self.shard.id, self.ordinal), self.ordinal, value, self.transform)
-        self.ordinal += 1
+        ordinal = 0 if self.ordinal is None else self.ordinal
+        value = self.writer.process((self.shard.id, ordinal), ordinal, value, self.transform)
+        if self.ordinal is not None:
+            self.ordinal += 1
         return value
 
-    def get_state(self) -> dict:
+    def get_state(self) -> Mapping[str, object]:
+        if self.transparent:
+            return self.parent.get_state()
         return {"parent": self.parent.get_state(), "ordinal": self.ordinal}
 
     def set_state(self, state: Mapping[str, object]) -> None:
+        if self.transparent:
+            self.parent.set_state(state)
+            self.ordinal = None
+            return
         ordinal = state["ordinal"]
         parent = state["parent"]
         if not isinstance(ordinal, int) or not isinstance(parent, Mapping):

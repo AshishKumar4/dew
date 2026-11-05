@@ -752,10 +752,15 @@ class _ShardSteps:
     name: str
     label: str
     loading: Loading
+    transparent: bool = False
+    """Whether its cache is read as the steps it stands for are, an output an input (`_transparent`)."""
 
     def __call__(self, shard: Shard, options: pygrain.ReadOptions | None = None) -> pygrain.IterDataset:
         rows = self.reader(shard, options)
-        rows = gx.FlatMapIterDataset(rows, _CachedOutputs()) if self.cached else rows
+        if self.cached and self.transparent:
+            rows = rows.map(_CachedOne())
+        elif self.cached:
+            rows = gx.FlatMapIterDataset(rows, _CachedOutputs())
         start = 0
         while start < len(self.stages):
             run = _run(self.stages, start, len(self.stages), marked=True, indexed=False)
@@ -772,6 +777,14 @@ class _CachedOutputs:
     def flat_map(self, outputs: Sequence[Record]) -> tuple[Record, ...]:
         held = tuple(Rejected("missing") if value is None else value for value in outputs)
         return held if held else (Rejected("empty_expansion"),)
+
+
+def _transparent(pipeline: Pipeline, cache: int) -> bool:
+    """Whether a stream reads the cache at `cache` as the steps it stands for read: an automatic cache's,
+    whose steps keep or reject each input, so a position saved with it resumes without it and the
+    reverse (row 4217)."""
+    stage = pipeline.stages[cache]
+    return isinstance(stage, Artifact) and stage.automatic
 
 
 class _CachedOne:
@@ -1638,23 +1651,25 @@ class _Build:
         stages = pipeline.stages
         cache, interleave = self.lowering.cache, self.lowering.interleave
         start = 0 if cache is None else cache + 1
+        transparent = cache is not None and _transparent(pipeline, cache)
         shards = source.manifest()
         if cache is not None:
             filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
             shards = _positioned(shards) if 0 <= last < cache else shards
             reader = filled.streamed(shards.reader, manifest, transform=prefix, threads=prefix.threads,
-                                     source=source)
+                                     source=source, transparent=transparent)
             shards = dataclasses.replace(shards, reader=reader)
         shards = _positioned(shards) if last >= start else shards
         written = stages[start : start if interleave is None else interleave]
         local = tuple(stage for stage in written if isinstance(stage, _LOCAL))
         steps = _ShardSteps(shards.reader, local, cache is not None, _name(pipeline), _label(pipeline),
-                            self.stream_loading)
+                            self.stream_loading, transparent)
         shards = dataclasses.replace(shards, reader=steps)
         consumed = start if interleave is None else interleave + 1
         # A shard's stated rows are the examples it holds where the bound is only where nothing before
         # the bound drops any.
-        dropping = cache is not None or any(_drops(stage) for stage in local)
+        ran = (*stages[:cache], *local) if transparent else local
+        dropping = (cache is not None and not transparent) or any(_drops(stage) for stage in ran)
         examples = None if dropping else self.dealt_examples(pipeline, partition, consumed)
         places, held = None, None
         if examples is not None:
