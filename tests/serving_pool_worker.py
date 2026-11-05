@@ -7,8 +7,9 @@ from collections.abc import Callable
 
 import numpy as np
 from flax import linen as nn
-from multiprocess_worker import TINY, rollout_prompts
+from multiprocess_worker import TINY
 from process_support import serve_mode, worker_parser
+from rl_support import pooled_rollout
 
 
 def mode_served_refusals(args) -> dict:
@@ -55,23 +56,16 @@ def served_run(records: list) -> tuple:
     trainer (`RolloutScheduler.served`), its weights pushed every second update: the rollout, the trainer
     and each process's prompt stream, its call records logged into `records`."""
     import jax
-    import jax.numpy as jnp
     import optax
 
     from dew.data.dataset import Loader
-    from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.rl import GRPOObjective, RolloutScheduler
     from dew.sampling import Sampling
     from dew.training import Layout, MeshSpec, Trainer
 
-    rank, processes = jax.process_index(), jax.process_count()
-    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
-                              head_dim=8, mlp_features=32, max_seq_len=12,
-                              dtype="float32", attention_impl="xla")
-    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
-    batch = rollout_prompts()
-    rows = len(batch["prompt"]) // processes
-    local = {name: value[rank * rows:(rank + 1) * rows] for name, value in batch.items()}
+    processes = jax.process_count()
+    model, params, _, local = pooled_rollout()
+    rows = len(local["prompt"])
     objective = GRPOObjective(model, seq_len=7, variables=params, behavior_importance=2.0)
     rollout = RolloutScheduler.served(objective, lambda text, record: float(len(text)), tasks=rows, slots=8,
                                       groups=2, max_new_tokens=4, sampling=Sampling(temperature=1.0),

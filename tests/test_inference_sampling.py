@@ -3,6 +3,7 @@
 Bindings, shape buckets and cache pause/gather are Dew policies; Transformers oracles their tokens.
 """
 
+import functools
 from dataclasses import replace
 
 import jax
@@ -111,30 +112,6 @@ def warped(logits, sampling):
     return scores.log_softmax(-1).numpy()
 
 
-@pytest.mark.parametrize("sampling", [
-    Sampling(temperature=0.7, top_p=0.6),
-    Sampling(temperature=1.3, min_p=0.4),
-    Sampling(temperature=0.8, top_k=9, top_p=0.8, min_p=0.35),
-])
-def test_cached_generation_records_the_transformers_filtered_distribution(task, sampling):
-    """Transformers 5.16.1 filters in temperature/top-k/top-p/min-p order.
-    The selected action's raw and filtered log probabilities agree to 3e-6.
-    """
-    inputs = jnp.array([[1, 2], [4, 5]])
-    actual = task(inputs, 4, key=jax.random.key(1), sampling=sampling)
-    for step in range(4):
-        logits = task.model.apply(task.variables, actual.tokens[:, :2 + step])[:, -1]
-        filtered = warped(logits, sampling)
-        selected = np.asarray(actual.tokens[:, 2 + step])
-        expected = filtered[np.arange(2), selected]
-        assert np.all(np.isfinite(expected))
-        np.testing.assert_allclose(actual.behavior_log_probs[:, step], expected, atol=3e-6, rtol=0)
-        raw = torch.tensor(np.asarray(logits).copy()).log_softmax(-1).numpy()[np.arange(2), selected]
-        np.testing.assert_allclose(actual.raw_log_probs[:, step], raw, atol=3e-6, rtol=0)
-    repeated = task(inputs, 4, key=jax.random.key(1), sampling=sampling)
-    np.testing.assert_array_equal(repeated.tokens, actual.tokens)
-
-
 SOURCE_CHAIN = {"do_sample": True, "temperature": 0.7, "top_p": 0.9, "min_p": 0.05, "repetition_penalty": 1.3,
                 "typical_p": 0.9, "epsilon_cutoff": 0.01}
 """A source's generation config of every control transformers' chain applies beside the common ones."""
@@ -155,25 +132,45 @@ def source_warped(prefix, logits) -> np.ndarray:
     return scores.log_softmax(-1).numpy()
 
 
-def test_a_sources_chain_records_the_transformers_filtered_distribution(task):
-    """A source whose generation config names controls beyond the common ones (a repetition penalty,
-    typical and epsilon sampling) draws from its own chain (`PretrainedDecoder.text_generation`): every
-    draw lies in the support transformers' chain leaves over the same prefix, and its likelihood under
-    that chain agrees to 3e-6 (row 4410)."""
+@pytest.mark.parametrize("sampling", [
+    Sampling(temperature=0.7, top_p=0.6),
+    Sampling(temperature=1.3, min_p=0.4),
+    Sampling(temperature=0.8, top_k=9, top_p=0.8, min_p=0.35),
+    None,
+])
+def test_cached_generation_records_the_transformers_filtered_distribution(task, sampling):
+    """Transformers 5.16.1 filters in temperature/top-k/top-p/min-p order.
+    The selected action's raw and filtered log probabilities agree to 3e-6.
+    None is a source whose generation config names controls beyond the
+    common ones (`SOURCE_CHAIN`): it draws from its own chain
+    (`PretrainedDecoder.text_generation`) as transformers' chain built from
+    that config filters (`source_warped`), every draw in its support
+    (row 4410).
+    """
     from pathlib import Path
 
     from dew.interop.pretrained import PretrainedDecoder
 
-    source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {},
-                               generation_config=SOURCE_CHAIN)
-    actual = source.text_generation()(jnp.array([[1, 2], [4, 5]]), 4, key=jax.random.key(1), n=1)
-    rows = np.arange(2)
+    inputs = jnp.array([[1, 2], [4, 5]])
+    if sampling is None:
+        source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {},
+                                   generation_config=SOURCE_CHAIN)
+        generation = source.text_generation()
+    else:
+        generation = functools.partial(task, sampling=sampling)
+    actual = generation(inputs, 4, key=jax.random.key(1))
     for step in range(4):
         prefix = actual.tokens[:, :2 + step]
         logits = task.model.apply(task.variables, prefix)[:, -1]
-        expected = source_warped(prefix, logits)[rows, np.asarray(actual.tokens[:, 2 + step])]
+        filtered = source_warped(prefix, logits) if sampling is None else warped(logits, sampling)
+        selected = np.asarray(actual.tokens[:, 2 + step])
+        expected = filtered[np.arange(2), selected]
         assert np.all(np.isfinite(expected))
         np.testing.assert_allclose(actual.behavior_log_probs[:, step], expected, atol=3e-6, rtol=0)
+        raw = torch.tensor(np.asarray(logits).copy()).log_softmax(-1).numpy()[np.arange(2), selected]
+        np.testing.assert_allclose(actual.raw_log_probs[:, step], raw, atol=3e-6, rtol=0)
+    repeated = generation(inputs, 4, key=jax.random.key(1))
+    np.testing.assert_array_equal(repeated.tokens, actual.tokens)
 
 
 def test_every_continuation_records_the_likelihoods_of_its_own_draw(task):

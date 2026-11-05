@@ -49,7 +49,7 @@ from dew.sampling import decoding
 from dew.sampling.decoding import LogitsTransform, StepState
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import DecoderState, Speculative, block_step, row_step
-from dew.sampling.text import decode_ops, prediction_depths, prefill_state, rounding_keys
+from dew.sampling.text import adapter_field, decode_ops, prediction_depths, prefill_state, rounding_keys
 
 
 @struct.dataclass
@@ -320,7 +320,7 @@ class Paged:
         # The cache's allocation runs the model too (a forward over a dummy token): under the rows' adapters.
         allocated = with_rounding_keys(
             model.apply(params, rows, method="init_cache", mutable=["cache"],
-                        **({} if adapters is None else {"adapters": adapters}))[1]["cache"],
+                        **adapter_field(adapters))[1]["cache"],
             rounding_keys(jax.random.wrap_key_data(admission.keys, impl=self.prng)))
         continues = admission.cursors > 0
 

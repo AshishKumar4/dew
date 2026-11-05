@@ -1118,26 +1118,32 @@ def test_a_server_over_a_pool_draws_what_each_request_draws_alone(tmp_path, page
     assert (reports[1]["shared"] > 0) == paged
 
 
+def drawn_adapter(model, variables, module: str, key: int, layouts=None):
+    """A rank-2 adapter of `module` over `model`, its B drawn from `key` (its init holds B at zero, which
+    adapts nothing), as the adapter-set sites draw each of theirs."""
+    from dew.lora import LoRA
+
+    adapter = LoRA(rank=2, modules=(module,)).apply(model, variables, key=key, layouts=layouts)
+    factors = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: (jax.random.normal(jax.random.key(key), leaf.shape, leaf.dtype)
+                            if jax.tree_util.keystr(path).endswith("'lora_B']") else leaf),
+        adapter.variables["params"])
+    return dataclasses.replace(adapter, variables={**adapter.variables, "params": factors})
+
+
 def test_a_speculating_server_over_an_adapter_set_reseeds_its_depths_under_each_rows_adapter():
     """A speculating server (`Speculative`) over an adapter set whose adapters adapt the stream's input
     map (`project_in`, which reseeding a block's prediction depths reads, `DecodeOps.embed`) draws each
     request at zero temperature as the greedy walk under its own adapter, or the base, each block's
     reseeding under the row's adapter (row 4222's review)."""
-    from dew.lora import AdapterSet, LoRA
+    from dew.lora import AdapterSet
     from dew.sampling import Sampling, Speculative
 
     model = decoder().clone(max_seq_len=32, num_nextn_predict_layers=1, embedding_features=8)
     params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
 
-    def drawn(key: int):
-        adapter = LoRA(rank=2, modules=("project_in",)).apply(model, params, key=key)
-        factors = jax.tree_util.tree_map_with_path(
-            lambda path, leaf: (jax.random.normal(jax.random.key(key), leaf.shape, leaf.dtype)
-                                if jax.tree_util.keystr(path).endswith("'lora_B']") else leaf),
-            adapter.variables["params"])
-        return dataclasses.replace(adapter, variables={**adapter.variables, "params": factors})
-
-    adapters = AdapterSet.of({"first": drawn(1), "second": drawn(2)})
+    adapters = AdapterSet.of({"first": drawn_adapter(model, params, "project_in", 1),
+                              "second": drawn_adapter(model, params, "project_in", 2)})
     served = TextGeneration(adapters.model, adapters.variables, RunProcessor(Digits()),
                             sampling=Sampling(temperature=0), strategy=Speculative(block=3))
     server = Server.from_task(served, slots=3, capacity=32)
@@ -1254,19 +1260,14 @@ def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own
     from reference_error import as_given, assert_as_exact, seeds_for
 
     from dew.interop.pretrained import Pretrained
-    from dew.lora import AdapterSet, LoRA
+    from dew.lora import AdapterSet
 
     decoder = Pretrained.load(Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny",
                               dtype="float32", attention_impl="reference")
 
     def drawn(layer: int, key: int):
-        adapter = LoRA(rank=2, modules=(f"layers.{layer}.self_attn.q_proj",)).apply(
-            decoder.model, decoder.variables, key=key, layouts=decoder.layouts)
-        factors = jax.tree_util.tree_map_with_path(
-            lambda path, leaf: (jax.random.normal(jax.random.key(key), leaf.shape, leaf.dtype)
-                                if jax.tree_util.keystr(path).endswith("'lora_B']") else leaf),
-            adapter.variables["params"])
-        return dataclasses.replace(adapter, variables={**adapter.variables, "params": factors})
+        return drawn_adapter(decoder.model, decoder.variables, f"layers.{layer}.self_attn.q_proj", key,
+                             layouts=decoder.layouts)
 
     first, second = drawn(0, 1), drawn(1, 2)
     adapters = AdapterSet.of({"first": first, "second": second})
@@ -1329,7 +1330,7 @@ def test_an_adapter_sets_decode_carries_each_rows_adapter_through_a_reindex():
     from pathlib import Path
 
     from dew.interop.pretrained import Pretrained
-    from dew.lora import AdapterSet, LoRA
+    from dew.lora import AdapterSet
     from dew.nn.inputs import ModelInputs
     from dew.sampling.text import decode_ops, prefill_state
 
@@ -1337,13 +1338,8 @@ def test_an_adapter_sets_decode_carries_each_rows_adapter_through_a_reindex():
                               dtype="float32", attention_impl="reference")
 
     def drawn(layer: int, key: int):
-        adapter = LoRA(rank=2, modules=(f"layers.{layer}.self_attn.q_proj",)).apply(
-            decoder.model, decoder.variables, key=key, layouts=decoder.layouts)
-        factors = jax.tree_util.tree_map_with_path(
-            lambda path, leaf: (jax.random.normal(jax.random.key(key), leaf.shape, leaf.dtype)
-                                if jax.tree_util.keystr(path).endswith("'lora_B']") else leaf),
-            adapter.variables["params"])
-        return dataclasses.replace(adapter, variables={**adapter.variables, "params": factors})
+        return drawn_adapter(decoder.model, decoder.variables, f"layers.{layer}.self_attn.q_proj", key,
+                             layouts=decoder.layouts)
 
     adapters = AdapterSet.of({"first": drawn(0, 1), "second": drawn(1, 2)})
     model, variables = adapters.model, adapters.variables

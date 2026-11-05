@@ -21,7 +21,7 @@ import hashlib
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Generic, Literal, get_args
+from typing import Generic, Literal, TypedDict, get_args
 
 import jax
 import jax.numpy as jnp
@@ -372,7 +372,13 @@ def rounding_keys(keys: jax.Array) -> jax.Array:
     return jax.vmap(derived)(jax.random.key_data(keys))
 
 
-def _rows(adapters: jax.Array | None) -> dict[str, jax.Array]:
+class AdapterField(TypedDict, total=False):
+    """A forward's field naming each row's adapter of an adapter set's model (`dew.lora.AdapterSet`)."""
+
+    adapters: jax.Array
+
+
+def adapter_field(adapters: jax.Array | None) -> AdapterField:
     """The call field naming each row's adapter of an adapter set's model (`DecoderState.adapters`), none
     for a model of no set."""
     return {} if adapters is None else {"adapters": adapters}
@@ -417,7 +423,7 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
         capture_intermediates=False,
         **inputs.kwargs(),
         **progressed(model, progress),
-        **_rows(adapters),
+        **adapter_field(adapters),
     )
     states, logits = answer if exposed or selective else (None, answer)
     if ops.record is not None:
@@ -456,7 +462,7 @@ def _empty_cache(model: nn.Module, params: Variables, batch: int, depths: int, d
     as a forward allocates it. A decoder whose every mixer is tokenwise (`MLPMixer`) keeps no cache, and
     its collection is empty."""
     def initialized(method: str) -> dict:
-        _, mutated = model.apply(params, batch, method=method, mutable=["cache"], **_rows(adapters))
+        _, mutated = model.apply(params, batch, method=method, mutable=["cache"], **adapter_field(adapters))
         return flatten_dict(dict(mutated["cache"])) if "cache" in mutated else {}
 
     cache = initialized("init_cache")
@@ -468,7 +474,8 @@ def _empty_cache(model: nn.Module, params: Variables, batch: int, depths: int, d
 def _context(model: nn.Module, params: Variables, updated: Mapping,
              adapters: jax.Array | None = None) -> jax.Array:
     """The block drafter's context `[B, S, targets * D]` a forward recorded, under the rows' `adapters`."""
-    context = model.apply(params, updated["prediction_inputs"], method="draft_context", **_rows(adapters))
+    context = model.apply(params, updated["prediction_inputs"], method="draft_context",
+                          **adapter_field(adapters))
     assert isinstance(context, jax.Array)
     return context
 
@@ -573,7 +580,7 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
                 {**params, "cache": state.cache}, jnp.where(valid, tokens, pad_id),
                 decode=True, coordinates=laid, mutable=["cache", *recorded], rngs=None,
                 method="states_and_logits" if exposed else None, capture_intermediates=False, **at,
-                **_rows(state.adapters))
+                **adapter_field(state.adapters))
 
         history, lengths, drafts, rebuilt = state.tokens, state.lengths, state.drafts, None
         if original is not None and history is not None and lengths is not None:
@@ -665,7 +672,7 @@ def _rebuilt(model: nn.Module, params: Variables, ops: DecodeOps, state: Decoder
         mutable=['cache', *(['embeddings'] if ops.depths else []),
                  *(['prediction_inputs'] if drafter else [])],
         method='states_and_logits' if exposed else None, **progressed(model, progress),
-        **_rows(state.adapters))
+        **adapter_field(state.adapters))
     states = answer[0] if exposed else None
     reseeded = dataclasses.replace(state, cache=updated['cache'])
     context = None
@@ -703,12 +710,12 @@ def _drafting(model: nn.Module, params: Variables, pad_id: int):
             {**params, "cache": state.cache}, hidden, ids, depth=depth, coordinates=laid,
             rotary_positions=positions if rotary else None, input_embeddings=embeds, decode=True,
             mutable=["cache"], rngs=None, prediction_phase=prediction_phase,
-            method="mtp_step", capture_intermediates=False, **_rows(state.adapters))
+            method="mtp_step", capture_intermediates=False, **adapter_field(state.adapters))
         return dataclasses.replace(state, cache=updated["cache"]), logits, states
 
     def embed(tokens: jax.Array, adapters: jax.Array | None = None) -> jax.Array:
         # Under the rows' adapters, as every forward of them (`DecoderState.adapters`).
-        prepared = model.apply(params, tokens, method="stream_embeddings", **_rows(adapters))
+        prepared = model.apply(params, tokens, method="stream_embeddings", **adapter_field(adapters))
         assert isinstance(prepared, jax.Array)
         return prepared
 
@@ -720,13 +727,13 @@ def _block_drafting(model: nn.Module, params: Variables):
     def record(state: DecoderState, context: jax.Array, valid: jax.Array) -> DecoderState:
         _, updated = model.apply({**params, "cache": state.cache}, context, None,
                                  coordinates=laid_out(valid.shape, valid=valid), method="draft",
-                                 mutable=["cache"], **_rows(state.adapters))
+                                 mutable=["cache"], **adapter_field(state.adapters))
         return dataclasses.replace(state, cache=updated["cache"])
 
     def draft(state: DecoderState, tokens: jax.Array,
               choose: Callable[[int, jax.Array], jax.Array]) -> None:
         model.apply({**params, "cache": state.cache}, None, tokens, choose=choose,
-                    method="draft", mutable=["cache"], **_rows(state.adapters))
+                    method="draft", mutable=["cache"], **adapter_field(state.adapters))
 
     return record, draft
 
