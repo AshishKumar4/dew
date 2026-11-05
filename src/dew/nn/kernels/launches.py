@@ -13,26 +13,23 @@ from dew.nn.sharding import per_shard
 
 
 def pallas_call(kernel: Callable, *, name: str, **params) -> Callable:
-    """`jax.experimental.pallas.pallas_call(kernel, name=name, **params)`, each call raising unless it runs
-    per shard (`per_shard`), the refusal naming the launch by its `name`, which its profile names it by."""
-    call = pl.pallas_call(kernel, name=name, **params)
-
-    @functools.wraps(call)
-    def launched(*operands, **options):
-        per_shard(name)
-        return call(*operands, **options)
-
-    return launched
+    """`jax.experimental.pallas.pallas_call(kernel, name=name, **params)` held per shard (`_held`), named by
+    its `name`, which its profile names it by."""
+    return _held(pl.pallas_call(kernel, name=name, **params), name)
 
 
 def kernel(entry: Callable, *, name: str, **params) -> Callable:
-    """`jax.experimental.pallas.mosaic_gpu.kernel(entry, **params)`, each call raising unless it runs per
-    shard (`per_shard`), the refusal naming the launch by `name`."""
-    built = plgpu.kernel(entry, **params)
+    """`jax.experimental.pallas.mosaic_gpu.kernel(entry, **params)` held per shard (`_held`), named by
+    `name`."""
+    return _held(plgpu.kernel(entry, **params), name)
 
-    @functools.wraps(built)
+
+def _held(launch: Callable, name: str) -> Callable:
+    """`launch`, each call raising unless it runs per shard (`per_shard`), the refusal naming it `name`."""
+
+    @functools.wraps(launch)
     def launched(*operands, **options):
         per_shard(name)
-        return built(*operands, **options)
+        return launch(*operands, **options)
 
     return launched
