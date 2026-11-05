@@ -112,6 +112,7 @@ from dew.inference.serving_kernel import (
     mixed_refusal,
     opened,
     opened_in,
+    page_programs,
     resident_formats,
     row_state,
     split_donated,
@@ -684,6 +685,19 @@ class Server:
                 self.cache)
             self._states = states
             self._restored, self._captured = map(Fetched, state_programs(formats, states))
+        self._host: dict[tuple[int, int], list[np.ndarray]] = {}
+        """Each (group, host slot)'s prefix page, a pool leaf's page each (`Transfers`), in the order of
+        `_host_tree`'s leaves."""
+        self._host_tree: jax.tree_util.PyTreeDef | None = None
+        if isinstance(rows, PagedRows) and any(part.host for part in rows.pages):
+            if rows.stateful:
+                raise ValueError("a host tier keeps a prefix's pages, and this model's rows read a prefix "
+                                 "with the state its prompt left beside them, which stays on the device; "
+                                 "serve it without host_pages")
+            if self.pooled:
+                raise ValueError("a host tier copies a process's pages through its own host; serve a pool's "
+                                 "server without host_pages")
+            self._read_pages, self._written_pages = map(Fetched, page_programs(formats))
 
     @contextlib.contextmanager
     def _context(self) -> Iterator[None]:
@@ -703,7 +717,8 @@ class Server:
     def from_task(cls, task: TextGeneration, *, slots: int, capacity: int,
                   admission: int | None = None, kv_cache: KVCache | None = None,
                   chunk: int | None = None, prefix_cache: bool = False, prefix_states: int | None = None,
-                  prefix_state_every: int | None = None, decode_steps: int = 1) -> Server:
+                  prefix_state_every: int | None = None, host_pages: int = 0,
+                  decode_steps: int = 1) -> Server:
         """Build a server over the task's model, weights, processor and policy.
 
         `capacity` is rounded up to whole 64-slot tiles and whole pages, and
@@ -727,7 +742,11 @@ class Server:
         prompt's deepest shareable page boundary and every
         `prefix_state_every` pages below it, a piece cut to end there, and a
         request reuses pages as deep as a state is kept
-        (`dew.inference.pages.States`).
+        (`dew.inference.pages.States`). `host_pages` keeps that many more
+        prefix pages in host memory, split over the groups: a cached page the
+        pool reclaims goes to the host first, and a prompt that shares it reads
+        it back into a fresh page before its prefill (`dew.inference.pages`), so
+        a prefix cache holds more than the device's pages.
 
         Weights on a mesh are served on that mesh. The slots, the admission
         and the pages are split over its row axes, so the number of row
@@ -789,7 +808,7 @@ class Server:
                              + ("" if page == 1 else f" in whole pages of {page}"))
         groups = _row_groups(mesh)
         model, rows = _cache_rows(cache_sized(model, rounded), layout, slots, rounded, groups, chunk,
-                                  prefix_cache, prefix_states, prefix_state_every)
+                                  prefix_cache, prefix_states, prefix_state_every, host_pages)
         if plan is not None:
             if isinstance(rows, PagedRows):
                 raise ValueError("speculative rows rewind a block's rejected keys from the cache saved "
@@ -1063,6 +1082,7 @@ class Server:
         (admission, _), booked = self._agreed("serving admission", admitted, lambda held: held[1])
         captures = [tuple(pair) for held in booked for pair in held]
         with self._context():
+            self._transferred()
             if restores:
                 self._resident, self._carried = self._restored(
                     self._resident, self._carried, self._states, *_padded(restores, self.slots, 0))
@@ -1079,6 +1099,39 @@ class Server:
         self.steps += self.decode_steps
         self._settle()
         self._pending = (error, draws)
+
+    def _transferred(self) -> None:
+        """Make the page copies the seating owes (`dew.inference.pages.Transfers`) before the step's program
+        writes any page: each reclaimed prefix page out to its host slot, then each shared one back from its
+        slot into its fresh page."""
+        if not isinstance(self.rows, PagedRows) or not any(part.host for part in self.rows.pages):
+            return
+        per, width = self.rows.pages[0].count, self.admission * self.rows.width
+        owed = [part.drained() for part in self.rows.pages]
+        spills = [(group * per + page, (group, slot)) for group, held in enumerate(owed)
+                  for page, slot in held.spills]
+        uploads = [((group, slot), group * per + page) for group, held in enumerate(owed)
+                   for slot, page in held.uploads]
+        for start in range(0, len(spills), width):
+            batch = spills[start:start + width]
+            pages = np.zeros(width, np.int32)
+            pages[:len(batch)] = [page for page, _ in batch]
+            read, self._host_tree = jax.tree.flatten(jax.device_get(
+                self._read_pages(self._resident, self._carried, pages)))
+            for index, (_, held) in enumerate(batch):
+                self._host[held] = [leaf[:, index].copy() for leaf in read]
+        for start in range(0, len(uploads), width):
+            batch = uploads[start:start + width]
+            pages = np.full(width, DROPPED, np.int32)
+            pages[:len(batch)] = [page for _, page in batch]
+            assert self._host_tree is not None, "a page comes back from the host only after it went there"
+            values = [np.zeros((page.shape[0], width, *page.shape[1:]), page.dtype)
+                      for page in self._host[batch[0][0]]]
+            for index, (held, _) in enumerate(batch):
+                for value, page in zip(values, self._host[held], strict=True):
+                    value[:, index] = page
+            self._resident, self._carried = self._written_pages(self._resident, self._carried, pages,
+                                                                jax.tree.unflatten(self._host_tree, values))
 
     def run(self) -> None:
         """Step until every queued and running request has resolved. A step that fails stops the server:
@@ -1378,9 +1431,14 @@ def _served_plan(strategy: Strategy, mesh: Mesh | None, chunk: int | None,
 
 
 def _cache_rows(model: nn.Module, layout: KVCache, slots: int, capacity: int, groups: int, chunk: int | None,
-                prefix_cache: bool, states: int | None, every: int | None) -> tuple[nn.Module, Rows]:
+                prefix_cache: bool, states: int | None, every: int | None,
+                host: int = 0) -> tuple[nn.Module, Rows]:
     """The model over its cache's layout, its pages pooled for `slots` rows of `capacity` slots in `groups`
     where it pages, and the rows' host side (`Server.from_task`'s arguments)."""
+    if host and not prefix_cache:
+        raise ValueError("a host tier keeps a prefix cache's pages; serve with prefix_cache=True")
+    if host % groups:
+        raise ValueError(f"host_pages ({host}) split over the {groups} groups the mesh splits rows into")
     if layout.page_size is None:
         if prefix_cache:
             raise ValueError("prefix caching runs over a paged cache; "
@@ -1390,7 +1448,8 @@ def _cache_rows(model: nn.Module, layout: KVCache, slots: int, capacity: int, gr
     # Only a model that declares its layout has a paged one; the default pages nothing.
     assert isinstance(model, Layered)
     model = model.with_kv_cache(dataclasses.replace(layout, pages=count, groups=groups))
-    return model, PagedRows([Pages(count // groups, layout.page_size, prefix_cache=prefix_cache)
+    return model, PagedRows([Pages(count // groups, layout.page_size, prefix_cache=prefix_cache,
+                                   host=host // groups)
                              for _ in range(groups)], chunk, capacity // layout.page_size,
                             states=slots // groups if states is None else states, every=every)
 

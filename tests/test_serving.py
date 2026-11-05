@@ -910,6 +910,28 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
     assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
 
 
+@pytest.mark.parametrize("host_pages", [0, 8], ids=["device", "host"])
+def test_a_host_tier_keeps_prefix_pages_the_pool_reclaims(host_pages):
+    """A prefix cache of eight pages of four tokens, one slot: a prompt's two shared pages are cached as it
+    ends, then two other prompts take the pool's pages and it reclaims them. With a host tier the reclaimed
+    pages go to host memory and the prompt again reads its 8 tokens back from there; without one it
+    prefills them again. Every request draws what its lone call draws (ledger 874)."""
+    bound = task(Sampling(temperature=1.0))
+    shared, others, budget = "123456781", ["987654329876", "555544443333"], 6
+    requests = [shared, *others, shared]
+    alone = [bound(held, budget, key=index) for index, held in enumerate(requests)]
+    server = Server.from_task(bound, slots=1, capacity=64, admission=1, prefix_cache=True,
+                              kv_cache=KVCache(page_size=4, pages=8), host_pages=host_pages)
+    drawn = []
+    for index, held in enumerate(requests):
+        ticket = server.submit(held, budget, key=index)
+        server.run()
+        drawn.append(ticket.result())
+    assert server.prefix_hits == (8 if host_pages else 0)
+    for generation, lone in zip(drawn, alone, strict=True):
+        assert_same_generation(generation, lone)
+
+
 def test_samples_of_one_prompt_prefill_it_once_and_each_draws_what_it_draws_alone():
     """Four samples of one prompt and another prompt behind them, submitted together to a paged server with
     a prefix cache: the first sample writes the prompt's full pages, the other three wait and read them
