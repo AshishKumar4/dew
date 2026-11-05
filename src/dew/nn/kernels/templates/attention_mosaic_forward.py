@@ -49,7 +49,7 @@ from dew.nn.kernels.templates.attention import (
 )
 from dew.nn.kernels.templates.attention_mosaic_program import (
     Tiles,
-    Tiling,
+    TileWalk,
     _block,
     _columns,
     _coords,
@@ -1098,8 +1098,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     owned_value = 0 if peaks else value_width
     owned_query = 0 if training and not peaks else width
     cost = (stated(spec, batch, heads, columns, query, key, value,
-                   tiling=Tiling((queries, keys_count), (block_q, block_k), consumers,
-                                 common=family.feeds_itself)) if counted
+                   tile_walk=TileWalk((queries, keys_count), (block_q, block_k), consumers,
+                                      common=family.feeds_itself)) if counted
             else pl.CostEstimate(flops=0, transcendentals=0, bytes_accessed=0))
     query_share = modelled(spec, batch, heads, spec.queries or queries, owned_query)
     value_share = modelled(spec, batch, heads, spec.queries or queries, owned_value)

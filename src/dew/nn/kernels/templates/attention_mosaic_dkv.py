@@ -18,7 +18,7 @@ from dew.nn.kernels.templates import attention_algebra as algebra, attention_gra
 from dew.nn.kernels.templates.attention import DKV_GRADS, Dropout, Kind, by_power, shared_place
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
-    Tiling,
+    TileWalk,
     _coords,
     _Spans,
     _streamed,
@@ -499,9 +499,9 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
                     + part_count(query.dtype, walk.accurate)
                     * (shares[0][1] + (width if walk.fused else 0)),
                     query, key, value, dout,
-                    tiling=Tiling((queries, keys_padded), (tiles.block_q, tiles.block_k),
-                                  holders(family, consumers), keyed=True,
-                                  common=family.feeds_itself or tiles.shared_dq or tiles.staged_logits)),
+                    tile_walk=TileWalk((queries, keys_padded), (tiles.block_q, tiles.block_k),
+                                       holders(family, consumers), keyed=True,
+                                       common=family.feeds_itself or tiles.shared_dq or tiles.staged_logits)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              (width if walk.fused else 0) + shares[0][1] + shares[1][1]
                              + (value_width if shares[0][0] == 0 else 0)))

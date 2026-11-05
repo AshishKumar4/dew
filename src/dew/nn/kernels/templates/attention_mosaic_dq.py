@@ -14,7 +14,7 @@ from dew.nn.kernels.templates import attention_algebra as algebra, attention_gra
 from dew.nn.kernels.templates.attention import Dropout
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
-    Tiling,
+    TileWalk,
     _coords,
     _rows,
     _Spans,
@@ -227,8 +227,8 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
                     width + value_width
                     + (part_count(key.dtype, walk.accurate) + walk.accurate) * share[1],
                     query, key, value, dout,
-                    tiling=Tiling((queries, key.shape[1]), (block_q, block_k), consumers,
-                                  common=family.feeds_itself)),
+                    tile_walk=TileWalk((queries, key.shape[1]), (block_q, block_k), consumers,
+                                       common=family.feeds_itself)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries, share[1]))(
             query, key, value, dout, peak, prior, anchor, delta, key_index, *leaves)
     dq, keyed, rows = out if walk.accurate else (out[0], None, out[1])

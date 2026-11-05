@@ -688,7 +688,7 @@ def reached(spec: algebra.Forward, queries: int) -> int | None:
     return None
 
 
-class Tiling(NamedTuple):
+class TileWalk(NamedTuple):
     """A launch's walk of its tiles as the work it issues reads it (`issued`): its padded `extents` (its
     arrays' query rows and keys, whole programs of both), its tiles' `blocks` (a consumer's query block and
     the key block), the tiles a program holds on its walk's axis (`holders`: its consumers' query blocks, or
@@ -703,8 +703,8 @@ class Tiling(NamedTuple):
     common: bool = False
 
 
-def issued(spec: algebra.Forward, tiling: Tiling) -> int | None:
-    """The query and key pairs a launch walking `tiling` computes: each tile holding a pair its call's form
+def issued(spec: algebra.Forward, tile_walk: TileWalk) -> int | None:
+    """The query and key pairs a launch walking `tile_walk` computes: each tile holding a pair its call's form
     reaches, whole, the first key aligned to the first query, as its program reads them (a query block's key
     tiles up to its diagonal, `_Program.walked`, or a key block's query tiles from it, `_Program.readers`):
     every padded row's (a padded consumer walks its keys as a real one does), a causal diagonal tile's
@@ -713,31 +713,32 @@ def issued(spec: algebra.Forward, tiling: Tiling) -> int | None:
     each holder, one wholly past the keys too (`algebra.Forward.walked_keys`); None for a spans call."""
     if spec.form == "spans":
         return None
-    (queries, keys), (block_q, block_k) = tiling.extents, tiling.blocks
+    (queries, keys), (block_q, block_k) = tile_walk.extents, tile_walk.blocks
     query_tiles, causal = queries // block_q, spec.form == "causal"
     seen = min(-(-spec.keys // block_k), keys // block_k)
-    if tiling.keyed:
+    if tile_walk.keyed:
         # A key block's readers, from its diagonal where causal; a block wholly past the keys has none.
         firsts = [min(tile * block_k // block_q, query_tiles) if causal else 0 for tile in range(seen)]
         walks = [query_tiles - first for first in firsts] + [0] * (keys // block_k - seen)
     else:
         walks = [min(-(-(tile + 1) * block_q // block_k), seen) if causal else seen
                  for tile in range(query_tiles)]
-    if tiling.common:
-        programs = (walks[first:first + tiling.holders] for first in range(0, len(walks), tiling.holders))
+    if tile_walk.common:
+        holders = tile_walk.holders
+        programs = (walks[first:first + holders] for first in range(0, len(walks), holders))
         walks = [len(program) * max(program) for program in programs]
     return block_q * block_k * sum(walks)
 
 
 def stated(spec: algebra.Forward, batch: int, heads: int, widths: int, *arrays,
-           tiling: Tiling) -> pl.CostEstimate | None:
+           tile_walk: TileWalk) -> pl.CostEstimate | None:
     """A launch's cost as it states it to XLA and to Dew's FLOP count (`dew.telemetry.instrumentation`), the
-    hardware's work: a multiply-add a pair its walk (`tiling`) issues (`issued`), head and row for each of
+    hardware's work: a multiply-add a pair its walk (`tile_walk`) issues (`issued`), head and row for each of
     `widths` product columns the launch issues, its recomputed ones (a backward's `S`) and each part a
     cotangent's product takes (`part_count`) among them, a transcendental an issued pair, and the bytes of
     each of `arrays` once; None for a spans call, whose pairs no launch knows (`reached`): its FLOPs count as
     unsized, never as 0. The model's share of it the launch declares apart (`modelled`)."""
-    pairs = issued(spec, tiling)
+    pairs = issued(spec, tile_walk)
     if pairs is None:
         return None
     return pl.CostEstimate(flops=2 * batch * heads * pairs * widths, transcendentals=batch * heads * pairs,
