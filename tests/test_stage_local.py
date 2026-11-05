@@ -155,14 +155,6 @@ OPTIMIZERS = {
         **SMOOTH, "per_head": {"layers_*/self_attn/q_proj/kernel": 8}}), {}),
     "normuon": (OptimConfig(optimizer="muon", learning_rate=1e-2,
                             optimizer_opts={**SMOOTH, "neuron_beta2": 0.95}), {}),
-    # M3 on every matrix, its matrices by its own default (rows the reduction), Adam on the vectors, each
-    # stepped at its rate by a schedule, whose state names the transform that steps a number at a time.
-    "m3": (optax.multi_transform(
-        {"m3": optax.chain(scale_by_m3(beta1=0.9, beta2=0.95, beta3=0.99, alpha=5.0, eps=1e-8, frequency=2),
-                           optax.scale_by_schedule(lambda count: -1e-2)),
-         "adam": optax.adam(1e-2)},
-        lambda params: jax.tree.map(lambda matrix: "m3" if matrix else "adam", weight_decay_mask(params))),
-        {}),
     # A layer's 8 x 256 up projection is below int8's threshold of 4096 values, two layers stacked are not.
     "int8": (OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1, state_dtype="int8",
                          optimizer_opts=SMOOTH),
@@ -171,8 +163,8 @@ OPTIMIZERS = {
 """Each optimizer whose rules read a leaf as one layer, with the decoder fields its rule needs to act:
 every named optimizer Dew stacks (`STACKED_OPTIMIZERS`), its weight-decay mask's rank, Muon's matrix axes,
 QK-Clip's per-layer maxima, LAMB's trust ratio and LaProp's clip; a param group's patterns, int8 moments'
-threshold and Muon's variants; and a transformation given as it is whose every state names its transform,
-M3's (one that may read a leaf whole keeps every layer whole: optax's LAMB, row 3934)."""
+threshold and Muon's variants. A transformation given built is stage-local where its update is its layers'
+expression row by row (`whole_reading`), as optax's Adam's is, which the read-whole test reads."""
 
 LORA_OPTIMIZER = OptimConfig(optimizer="adamw", learning_rate=1e-2, optimizer_opts=SMOOTH)
 """What the LoRA cell trains its factors with."""
@@ -450,6 +442,17 @@ def test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one(tmp_path):
     assert int(alone.fit(stream(), steps=3, log_every=1).step) == 3
 
 
+RAW_M3 = optax.multi_transform(
+    {"m3": optax.chain(scale_by_m3(beta1=0.9, beta2=0.95, beta3=0.99, alpha=5.0, eps=1e-8, frequency=2),
+                       optax.scale_by_schedule(lambda count: -1e-2)),
+     "adam": optax.adam(1e-2)},
+    lambda params: jax.tree.map(lambda matrix: "m3" if matrix else "adam", weight_decay_mask(params)))
+"""M3 on every matrix, its matrices by its own default (rows the reduction), Adam on the vectors, each
+stepped at its rate by a schedule, given built: M3's batched products over a stacked leaf are no entrywise
+expression of a layer's, so a run of it keeps every layer whole (`whole_reading`), where M3 named
+(`OptimConfig(optimizer="m3")`) reads each stored layer and keeps them stage-local."""
+
+
 @pytest.mark.mesh(devices=8)
 def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trains():
     """Over two stages, a transformation given built whose update reads each stored layer of a stacked leaf
@@ -457,8 +460,9 @@ def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trai
     (`whole_reading`): optax's Adam at a constant rate, its moments and its scale a number at a time
     (rows 3995, 4015). One whose update reads a leaf whole, optax's LAMB, whose trust ratio would take one
     ratio over both stages, and Adafactor, whose factored moments and block clip read the leaf, given built
-    or named by its import path in an `OptimConfig`, and one whose build reads its tree's shapes (a decay
-    masked by rank), keep every layer whole on every stage, and the run's plan names what kept them whole.
+    or named by its import path in an `OptimConfig`, one whose build reads its tree's shapes (a decay
+    masked by rank), and M3's batched products given built (`RAW_M3`), keep every layer whole on every
+    stage, and the run's plan names what kept them whole.
     No per-layer view of a transform whose reductions only its own code knows is exact short of each layer a
     leaf of its own, so the run trains as `Layout(stage_local=False)` trains it, and steps."""
     model = decoder()
@@ -469,7 +473,7 @@ def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trai
         assert "layers_whole_for" not in run.plan
     # A decay masked by rank decides otherwise over a stacked leaf, whose bias is rank three.
     by_rank = optax.adamw(1e-3, mask=lambda params: jax.tree.map(lambda leaf: leaf.ndim > 1, params))
-    for given in (optax.lamb(1e-3), optax.adafactor(1e-3), by_rank,
+    for given in (optax.lamb(1e-3), optax.adafactor(1e-3), by_rank, RAW_M3,
                   OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3)):
         # An OptimConfig's transformation is built over the run's length, which fit gives.
         assert saving(functools.partial(trainer, model, given, STAGED, 8, ema=None)) == 0
