@@ -40,6 +40,7 @@ from dew.interop.decoder_parts import (
     refuse,
     renamed_path,
     softmax_top_k,
+    specified_layer_types,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -97,16 +98,16 @@ def _layer_types(hf: Mapping[str, object], used: set[str], layers: int) -> tuple
     """Each layer's attention, `linear_attention` or `full_attention`: `layer_types`, else the releases'
     `attn_type_list`, else MiniMaxConfig's alternation from a softmax layer."""
     used.update(('layer_types', 'attn_type_list'))
-    if 'layer_types' in hf:
-        types = _records.strings(hf['layer_types'], 'layer_types')
-    elif 'attn_type_list' in hf:
+    if 'layer_types' not in hf and 'attn_type_list' in hf:
         names = {0: 'linear_attention', 1: 'full_attention'}
         listed = _records.integers(hf['attn_type_list'], 'attn_type_list')
         if set(listed) - set(names):
             refuse(f'attn_type_list {listed}', 'a layer is lightning (0) or softmax (1) attention')
-        types = tuple(names[kind] for kind in listed)
-    else:
-        types = tuple('full_attention' if (index + 1) % 2 else 'linear_attention' for index in range(layers))
+        hf = {**hf, 'layer_types': [names[kind] for kind in listed]}
+    elif 'layer_types' in hf and hf['layer_types'] is None:
+        # A stated null is no list of kinds, as MiniMaxConfig reads it; the shared reading takes it for none.
+        refuse('layer_types None', "a MiniMax config states each layer's kind, or no layer_types at all")
+    types = specified_layer_types(hf, used, ('full_attention', 'linear_attention'))
     unknown = sorted(set(types) - {'linear_attention', 'full_attention'})
     if unknown or len(types) != layers:
         refuse(f'layer_types {list(types)}',

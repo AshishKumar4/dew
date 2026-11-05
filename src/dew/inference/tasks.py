@@ -1204,8 +1204,9 @@ class MaskedGeneration(_NativeTextTask):
         record declares, over the checkpoint's weights,
         and refines responses with MDLM over the run's own mask token, using
         the solver and step count the run saved. The model must score the
-        whole row with every position reading the others (`Logits`, and
-        `TokenModel` with `causal` False) and name a mask token (`TokenModel.mask_token_id`)
+        whole row with every position reading the others (its logits or its
+        own forward, `dew.nn.protocols.forward_method`, and `TokenModel` with
+        `causal` False) and name a mask token (`TokenModel.mask_token_id`)
         that matches the saved process, or loading raises `ValueError`.
 
         The arguments work as in `TextGeneration.from_saved`, and the run's

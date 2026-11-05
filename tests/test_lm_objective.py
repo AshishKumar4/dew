@@ -165,6 +165,110 @@ def test_loss_is_the_cross_entropy_of_the_shifted_sequence():
     assert written_cross_entropy(objective.model)(params, tokens) != unshifted
 
 
+class NativeLanguageModel(nn.Module):
+    """A Linen language model as one writes it with no Dew contract in mind: its `__call__` gives the
+    sequence's logits, and it names no `logits` method."""
+
+    causal: bool = True
+
+    @nn.compact
+    def __call__(self, tokens, **_):
+        return nn.Dense(VOCAB, dtype=jnp.float32)(nn.Embed(VOCAB, 8)(tokens))
+
+
+class AliasedLanguageModel(NativeLanguageModel):
+    """`NativeLanguageModel` with the method that only forwards to its call, which the objective required."""
+
+    def logits(self, tokens, **fields):
+        return self(tokens, **fields)
+
+
+def test_a_native_models_call_is_scored_with_no_method_that_forwards_to_it():
+    """A model whose `__call__` gives its logits and which names no `logits` is scored by its own forward
+    (`forward_method`), as a caller of `apply` reads it: the objective's loss over it and its gradient are
+    the ones the same model with a `logits` that only forwards to `__call__` gives, bit for bit, where the
+    objective refused it without that method (row 171)."""
+    from dew.nn.protocols import forward_method
+
+    native, aliased = NativeLanguageModel(), AliasedLanguageModel()
+    assert forward_method(native, "logits") == forward_method(native, "hidden_states") == "__call__"
+    assert forward_method(aliased, "logits") == "logits"
+    batch = token_batch()
+    scored = []
+    for model in (native, aliased):
+        objective = make_objective(model=model, ema_decay=None, token_accuracy=False)
+        params = objective.init(jax.random.key(0))
+        def loss(params, objective=objective):
+            return objective.scalar_loss(params, batch, step_at())[0]
+
+        scored.append(jax.jit(jax.value_and_grad(loss))(params))
+    for native_leaf, aliased_leaf in zip(*map(jax.tree.leaves, scored), strict=True):
+        np.testing.assert_array_equal(np.asarray(native_leaf), np.asarray(aliased_leaf))
+
+
+class NativeEncoder(nn.Module):
+    """A Linen module whose `__call__` gives its hidden states, not logits, beside a declared vocabulary
+    (`Bounded`)."""
+
+    vocab_size: int = VOCAB
+    max_seq_len: int | None = None
+    causal: bool = True
+
+    @nn.compact
+    def __call__(self, tokens, **_):
+        return nn.Embed(self.vocab_size, 6)(tokens)
+
+
+class Forwardless(nn.Module):
+    """A Linen module that declares no forward of its own."""
+
+    @nn.compact
+    def encode(self, tokens):
+        return nn.Embed(VOCAB, 8)(tokens)
+
+
+def test_a_bridged_nnx_models_own_methods_are_read_before_its_forward():
+    """Flax's NNX bridge exposes its module's methods by name (`ToLinen.__getattr__`): a method the NNX
+    model defines is the one read (`forward_method`), its `hidden_states` and `logits` too, and its own
+    call where it defines none."""
+    from flax import nnx
+    from flax.nnx import bridge
+
+    from dew.nn.protocols import forward_method
+
+    class Plain(nnx.Module):
+        def __init__(self, *, rngs):
+            self.embed = nnx.Embed(VOCAB, 8, rngs=rngs)
+
+        def __call__(self, tokens):
+            return self.embed(tokens)
+
+    class Named(Plain):
+        def hidden_states(self, tokens):
+            return self.embed(tokens)
+
+        def logits(self, tokens):
+            return self.embed.attend(self.embed(tokens))
+
+    named, plain = bridge.ToLinen(Named), bridge.ToLinen(Plain)
+    assert forward_method(named, "logits") == "logits"
+    assert forward_method(named, "hidden_states") == "hidden_states"
+    assert forward_method(plain, "logits") == forward_method(plain, "hidden_states") == "__call__"
+
+
+def test_a_native_forward_that_gives_no_logits_is_refused_by_name():
+    """A module whose `__call__` gives `[B, S, 6]` beside a vocabulary of `VOCAB` is refused where the
+    objective reads it, naming the module and the method read, where its hidden states would have been
+    scored as logits; one that declares no forward of its own, Flax's base apart, gives none to read."""
+    from dew.nn.protocols import forward_method
+
+    assert forward_method(Forwardless(), "logits") is None
+    objective = make_objective(model=NativeEncoder(), ema_decay=None, token_accuracy=False)
+    params = objective.init(jax.random.key(0))
+    with pytest.raises(ValueError):
+        objective.scalar_loss(params, token_batch(), step_at())
+
+
 VALID_SEEDS = 8
 """Check 1's declared seeds for the loss of rows whose last token is invalid (`seeds_for`, paired)."""
 

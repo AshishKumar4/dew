@@ -47,6 +47,7 @@ from dew.nn.kernels import recurrence, short_conv
 
 from .attention_masks import repeat_kv_heads
 from .blocks import normal_kernel
+from .derivatives import Protected, declared_derivative
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
 from .joined import joined_dense, joins
@@ -61,7 +62,14 @@ from .kernels.recurrence_chunk import (
 )
 from .kernels.selection import Kernel, Op, Requirement, select
 from .norms import gated_rms_normalized
-from .precision import L2NORM_EPS, asks_default_precision, at_least_fp32, float32_dot_general, l2norm
+from .precision import (
+    L2NORM_EPS,
+    asks_default_precision,
+    at_least_fp32,
+    compensated_sum,
+    float32_dot_general,
+    l2norm,
+)
 from .sharding import (
     HEADS,
     MLP_HIDDEN,
@@ -399,6 +407,7 @@ def sequence_conv(mixed, taps, bias, segments, valid, *, parts=None, dtype=None)
         raise LayoutRefused(
             f"each sequence shard holds {length} tokens, fewer than the {width} the "
             f"conv reads behind its first; use fewer sequence shards or longer sequences")
+    bias = None if bias is None else _shards_summed(bias)
     if valid is not None:
         halo = sequence_halo(mixed, valid, segments, width)
         convolved, _ = held_conv1d(mixed, taps, valid, halo, bias=bias, segments=segments, parts=parts,
@@ -414,6 +423,32 @@ def sequence_conv(mixed, taps, bias, segments, valid, *, parts=None, dtype=None)
     convolved = causal_conv1d(stream, taps, bias=bias, segments=owners, parts=parts, dtype=dtype)
     return (convolved[:, width:] if parts is None
             else tuple(piece[:, width:] for piece in convolved))
+
+
+def _shard_bias(bias):
+    """A replicated conv bias read inside the sequence shards (`sequence_conv`), its gradient's cross-shard
+    sum added in one rounding (`_shard_bias_backward`, row 2169: summed as the boundary sums, four rounded
+    partials added in float32, its error from float64 doubled the unsplit conv's on packed rows). A
+    protected span (`_shards_summed`, `dew.nn.derivatives.declared_derivative`): its sum is the one the
+    algebra pass must not reassociate."""
+    return bias
+
+
+def _shard_bias_forward(bias):
+    return bias, None
+
+
+def _shard_bias_backward(_, cotangent):
+    """A replicated weight's cotangent summed over the sequence shards accurately: the shards' partial
+    sums gathered and added by `compensated_sum` in one rounding, the total given on the first shard and
+    zero on the others, so the boundary's sum (`manual_map`'s transpose of a weight every shard reads)
+    adds only zeros to it. Its partials stay the shard's own reductions, XLA's at the shard's shape."""
+    partials = jax.lax.all_gather(cotangent, SEQUENCE_AXIS)
+    total = compensated_sum(partials, (0,))
+    return (jnp.where(jax.lax.axis_index(SEQUENCE_AXIS) == 0, total, jnp.zeros_like(total)),)
+
+
+_shards_summed = declared_derivative(Protected(), _shard_bias, _shard_bias_forward, _shard_bias_backward)
 
 
 def sequence_halo(mixed, valid, segments, width: int):

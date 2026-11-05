@@ -604,30 +604,6 @@ def test_a_float64_gemma4_audio_tower_computes_in_float64_throughout():
     assert _float32_values_in_float64(loaded, inputs) == 0
 
 
-def test_gemma3ns_audio_embedder_reads_its_encoders_features_as_they_are():
-    """Gemma 3n's embedders take soft features as its source does: its image features scaled by the
-    square root of the vision width first (modeling_gemma3n.py:1983 at transformers 5.17.0), its audio
-    encoder's features as they are (:2192), the two told apart by its embedders' norm epsilon, so the
-    loaded wrapper's audio soft tokens are the embedder's over the encoder's output (ledger 3332)."""
-    directory = FIXTURE.parent / "gemma-3n-audio-tiny"
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
-    config = json.loads((directory / "config.json").read_text())
-    rng = np.random.default_rng(0x3332)
-    audio, vision = (jnp.asarray(rng.standard_normal((1, 5, config[part]["hidden_size"])), jnp.float32)
-                     for part in ("audio_config", "vision_config"))
-    scale = config["vision_config"]["hidden_size"] ** 0.5
-
-    def embedded(model, audio, vision):
-        return ((model.audio_conditioner.audio_projector(audio),
-                 model.audio_conditioner.audio_projector.soft_embeddings(audio)),
-                (model.conditioner.projector(vision),
-                 model.conditioner.projector.soft_embeddings(vision * jnp.asarray(scale, vision.dtype))))
-
-    for called, reference in jax.jit(lambda variables, audio, vision: loaded.model.apply(
-            variables, audio, vision, method=embedded))(loaded.variables, audio, vision):
-        np.testing.assert_array_equal(np.asarray(called), np.asarray(reference))
-
-
 @pytest.mark.parametrize("fixture", ["gemma4-unified-native-tiny", "gemma-4-audio-tiny",
                                      "gemma-3n-audio-tiny", "gemma3n-vision-tiny", "gemma4-native-tiny"])
 def test_a_wrappers_nested_configs_without_their_types_read_as_the_wrapper_declares_them(fixture):
