@@ -357,8 +357,11 @@ def test_frequency_and_presence_penalties_are_vllms(case):
                       for name in ("prompt", "output"))
     native = decoding.chain((decoding.FrequencyPenalty(frequency), decoding.PresencePenalty(presence)))
     state, label = rows(prompts, drawn), f"penalties {frequency}, {presence}"
+    # vLLM holds each penalty in a float32 tensor, as Dew's float32 run takes it: its float64 run reads that.
+    held = decoding.chain((decoding.FrequencyPenalty(float(np.float32(frequency))),
+                           decoding.PresencePenalty(float(np.float32(presence)))))
     with jax.enable_x64(new_val=True):
-        wide = np.asarray(native(state, jnp.asarray(PENALTIES["logits"], jnp.float64)))
+        wide = np.asarray(held(state, jnp.asarray(PENALTIES["logits"], jnp.float64)))
     assert_computes_the_oracle(wide, PENALTIES[f"case_{case}_f64"], label, roundings=2)
     assert_certified(lambda logits: native(state, logits), lambda seed: (np.asarray(PENALTIES["logits"]),),
                      label, seeds=1)
