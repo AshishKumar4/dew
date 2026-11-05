@@ -42,9 +42,9 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
-import hashlib
 import logging
 import math
+import secrets
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, overload
 
@@ -59,7 +59,7 @@ from dew.algebra.terms import parameter_key, parameters_key
 from dew.batch import unboxed
 from dew.mesh import STAGE_AXIS, LayoutRefused
 from dew.nn.kernels.options import owned_program, program
-from dew.nn.kernels.templates.layout import ENTRYWISE, entrywise
+from dew.nn.kernels.templates.layout import ENTRYWISE, entrywise, jax_name
 from dew.nn.sharding import abstract, held_by_stage
 
 if TYPE_CHECKING:
@@ -561,6 +561,9 @@ class _Numbering:
     def __init__(self):
         self.numbers: dict[Hashable, int] = {}
         self.sums: dict[int, tuple[int, int, int]] = {}
+        self.words: dict[int, tuple[int, int]] = {}
+        """Each summed term's two words, drawn at random for this numbering once its programs are traced
+        (`summed`)."""
         self.nonnegative: set[int] = set()
         """The numbers of values no entry of which is negative: squares, magnitudes, their sums and roots,
         whose sums reassociated round within the same bound in any order (no cancellation), so their
@@ -574,17 +577,20 @@ class _Numbering:
 
     def summed(self, terms: Sequence[int]) -> int:
         """The number of the sum of `terms`, each non-negative (`nonnegative`), each sum among them read as
-        its own terms, in any order: the multiset of its terms, named by two 64-bit sums of each term's
-        own random word (`_word`) and its count of terms, a few integers a sum however many terms it
-        holds, so no sum keeps its prefixes (a collision of both words over distinct multisets is a
-        2**-128 chance)."""
+        its own terms, in any order: the multiset of its terms, named by its count of terms and two exact
+        sums of each term's two words times its multiplicity, a few integers a sum however many terms it
+        holds, so no sum keeps its prefixes. The words are drawn at random, 64 bits each, once the programs
+        are traced (`words`): two distinct multisets differ in some term's multiplicity, and the one value
+        of that term's word that would make their sums agree, the rest drawn, is a 2**-64 chance a word,
+        so whatever the programs compute, two sums are named alike unequal with a 2**-128 chance. A word
+        fixed by its term, or a sum kept modulo a power of two, a program could reach a collision of
+        (doubling a sum 64 times empties it modulo 2**64)."""
         first = second = count = 0
         for term in terms:
             held = self.sums.get(term)
             if held is None:
-                low, high = _word(term)
-                held = (low, high, 1)
-            first, second, count = (first + held[0]) % 2**64, (second + held[1]) % 2**64, count + held[2]
+                held = (*self.words.setdefault(term, (secrets.randbits(64), secrets.randbits(64))), 1)
+            first, second, count = first + held[0], second + held[1], count + held[2]
         total = self.number(("sum", first, second, count))
         self.sums[total] = (first, second, count)
         self.nonnegative.add(total)
@@ -606,7 +612,7 @@ class _Numbering:
         scalar's broadcast is the scalar, whatever shape it fills; an entrywise result's entry is its
         operands' entries'; any other's reads its operands' shapes too. A scalar's sum of scalars is one
         sum of their terms (`summed`)."""
-        name = equation.primitive.name
+        name = jax_name(equation.primitive)
         spread = name == "broadcast_in_dim" and tuple(shapes[0]) == ()
         if name == "add" and all(tuple(shape) == () for shape in shapes) and all(
                 operand in self.nonnegative for operand in operands):
@@ -655,7 +661,7 @@ class _Numbering:
         (`inlined`); a stack's rows moved whole (`_moved`); an equation of no stack as it is; and one over
         a stack row by row (`_row_form`), or a sum over every axis of one (`_full_sum`). None where a row
         reads another."""
-        name = equation.primitive.name
+        name = jax_name(equation.primitive)
         if name in ("scan", "cond"):
             return self.inlined(equation, operands, leads)
         moved = _moved(equation, operands, leads)
@@ -712,7 +718,7 @@ class _Numbering:
                     for number, value in zip(out, returned, strict=True)]
 
         params = equation.params
-        if equation.primitive.name == "scan":
+        if jax_name(equation.primitive) == "scan":
             counts = _scan_counts(equation)
             if counts is None:
                 return None
@@ -797,13 +803,6 @@ UNROLLED = 256
 numbered once a step; a longer one keeps every layer whole."""
 
 
-def _word(term: int) -> tuple[int, int]:
-    """Two 64-bit words drawn for expression number `term`, fixed by it, which a sum's name adds
-    (`_Numbering.summed`)."""
-    digest = hashlib.blake2b(term.to_bytes(8, "little"), digest_size=16).digest()
-    return int.from_bytes(digest[:8], "little"), int.from_bytes(digest[8:], "little")
-
-
 def _keeps_sign(equation, name: str, params: Mapping, operands: Sequence, nonnegative: set[int]) -> bool:
     """Whether an equation `name` under `params` over `operands` makes no negative entry, its operands and
     results all real floating point (an integer's magnitude or square can overflow negative, a
@@ -828,7 +827,7 @@ def _moved(equation, operands: list, leads: list) -> tuple | None:
     its rows' axes (merging, splitting or adding them, a value of no stack becoming a stack of one row,
     one row its value again), a squeeze of its rows' axes of one row, a slice of rows along its one axis
     of them, or a concatenation of stacks along it. None for any other equation."""
-    name, params = equation.primitive.name, equation.params
+    name, params = jax_name(equation.primitive), equation.params
     if name not in ("reshape", "squeeze", "slice", "concatenate"):
         return None
     shape = tuple(equation.invars[0].aval.shape)
@@ -878,7 +877,7 @@ def _shifted(axes, held: int) -> tuple[int, ...] | None:
 def _full_sum(equation, held: int) -> Mapping | None:
     """A sum of a stack over every axis (`reduce_sum`), as each row's sum over its own axes's parameters;
     None for any other equation."""
-    if equation.primitive.name != "reduce_sum":
+    if jax_name(equation.primitive) != "reduce_sum":
         return None
     rank = len(equation.invars[0].aval.shape)
     if tuple(sorted(equation.params["axes"])) != tuple(range(rank)):
@@ -893,7 +892,7 @@ def _row_form(equation, held: int, stacked: set[int], shapes: Sequence) -> Mappi
     a cumulative one, a squeeze, an expansion or a concatenation along a row's own axes; a product of rows
     batched on their leading axes, or of a stack's rows and one operand of no stack. None where a row
     reads another, or the rows leave their leading axes."""
-    name, params = equation.primitive.name, dict(equation.params)
+    name, params = jax_name(equation.primitive), dict(equation.params)
     out = equation.outvars[0].aval.shape
     rows = shapes[next(iter(stacked))][:held]
     if tuple(out[:held]) != tuple(rows):

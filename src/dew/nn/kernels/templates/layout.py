@@ -8,6 +8,7 @@ from typing import Any
 
 import jax
 import jax.extend.core as jax_core
+from jax.interpreters import ad
 
 from dew.nn.programs import CALLS
 
@@ -155,11 +156,24 @@ def _tiles_in(closed) -> bool:
             or literal_tiles(closed.jaxpr))
 
 
+_JAX_OWN = {primitive: primitive.name for attribute, primitive in vars(jax.lax).items()
+            if attribute.endswith("_p") and isinstance(primitive, jax_core.Primitive)} | {
+    ad.add_jaxvals_p: ad.add_jaxvals_p.name}
+"""JAX's own operations by their objects: `jax.lax`'s, and the sum JAX's derivatives add with (`add_any`)."""
+
+
+def jax_name(primitive) -> str | None:
+    """`primitive`'s name where it is JAX's own operation (`_JAX_OWN`), None for any other: a primitive
+    of another library or of a user's takes any name, whatever it computes, so a reader that knows an
+    operation by its name knows it by its object."""
+    return _JAX_OWN.get(primitive)
+
+
 def entrywise(eqn) -> bool:
     """Whether `eqn` acts one entry at a time: one of `ENTRYWISE`, or a scalar's broadcast. The one test of
     an equation's kind its readers share, each with its own of the shapes it reads (`_axis_free`, the
     Mosaic program's `_entrywise`, `dew.training.stages`)."""
-    name = eqn.primitive.name
+    name = jax_name(eqn.primitive)
     return name in ENTRYWISE or (name == "broadcast_in_dim" and _rank(eqn.invars[0]) == 0)
 
 
