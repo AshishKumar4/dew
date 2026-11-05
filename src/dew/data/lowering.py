@@ -3,7 +3,7 @@
 Each stage kind has one definition here, which every read applies and the
 memory executor (`dew.data.materialize`) calls for the stages it runs over
 the whole source: `_outputs` for a record step, `_reordered` for an order
-stage over indexed rows, `TokenSplitRows` for a token split, `_packed` for
+stage over indexed rows, `_TokenSplit` for a token split, `_packed` for
 a pack's packer, and `_fill` with `_CachedOutputs` for opening a cache and
 reading what it holds.
 
@@ -26,7 +26,7 @@ import hashlib
 import itertools
 import logging
 import math
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol, overload, runtime_checkable
 
 import grain.experimental as gx
@@ -114,7 +114,6 @@ from dew.data.pipeline import (
     Pipeline,
     Prefetch,
     RandomMap,
-    ReadsStorage,
     Record,
     Rejected,
     Repeat,
@@ -142,7 +141,7 @@ from dew.data.sources.base import Read, Shard, ShardManifest, ShardOpener, Sourc
 from dew.data.sources.urls import Fetch
 from dew.data.steps.text import LayoutRule, ValidTargets, counted_window, recounted
 from dew.data.text import Chunks
-from dew.data.tokens import TokenSplitRows
+from dew.data.tokens import _WrappingDataset
 
 if TYPE_CHECKING:
     from dew.data.cache import Cache
@@ -723,8 +722,6 @@ class _Groups:
 @dataclasses.dataclass(frozen=True)
 class _Prefix:
     stages: tuple[Stage, ...]
-    automatic: bool = False
-    """Whether an automatic cache stands for them, stopping at a record read by path (`storage`)."""
 
     @property
     def threads(self) -> int | None:
@@ -740,30 +737,6 @@ class _Prefix:
         if position is not None:
             index, raw = position, _unplaced(raw)
         return _chained(self.stages, index, raw)
-
-    def storage(self, index: int, raw: Record) -> str | None:
-        """The step of an automatic cache's that reads `raw` by a path it names (`ReadsStorage`), or None;
-        the steps before the last such step run to say it, none where it leads (row 4212)."""
-        reading = [at for at, stage in enumerate(self.stages) if self.automatic
-                   and isinstance(stage, (Map, MapWithIndex)) and isinstance(stage.step, ReadsStorage)]
-        position = _position(raw)
-        index, held = (index, (raw,)) if position is None else (position, (_unplaced(raw),))
-        for at, stage in enumerate(self.stages[:reading[-1] + 1] if reading else ()):
-            if at in reading and any(not isinstance(value, Rejected) and stage.step.reads_storage(value)
-                                     for value in held):
-                return _identity(stage).name
-            held = tuple(made for value in held for made in _chained((stage,), index, value))
-        return None
-        position = _position(raw)
-        if position is not None:
-            index, raw = position, _unplaced(raw)
-        held: tuple[Record, ...] = (raw,)
-        for at, stage in enumerate(self.stages[:reading[-1] + 1]):
-            if at in reading and any(not isinstance(value, Rejected) and stage.step.reads_storage(value)
-                                     for value in held):
-                return _identity(stage).name
-            held = tuple(made for value in held for made in _chained((stage,), index, value))
-        return None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -827,8 +800,51 @@ def _fill(pipeline: Pipeline, source: Source, at: int, read: Read) -> tuple[Cach
     artifact, prefix = pipeline.stages[at], pipeline.stages[:at]
     if not isinstance(artifact, Artifact):
         raise ValueError(f"stage {at} of {_name(pipeline)} is not a cache")
-    return (_filled(artifact), _cache_manifest(source, prefix, read),
-            _Prefix(_cache_steps(prefix), artifact.automatic))
+    return _filled(artifact), _cache_manifest(source, prefix, read), _Prefix(_cache_steps(prefix))
+
+
+def _token_spans(documents: Iterable[Record], split: TokenSplit) -> list[tuple[int, int, int]]:
+    """The documents a token split keeps, in the order it reads them, as
+    (document, first, last) token spans. The held side is the first
+    `fraction` of all their tokens and the trained side the rest, so the two
+    are disjoint and together are the corpus."""
+    sizes = []
+    for document in documents:
+        columns = [np.asarray(record(document, "token split document")[name]) for name in split.fields]
+        if any(column.ndim != 1 for column in columns):
+            raise ValueError("token split fields must be one-dimensional token arrays")
+        sizes.append(len(columns[0]))
+    total = sum(sizes)
+    boundary = min(int(total * split.fraction), max(0, total - 1))
+    start, stop = (0, boundary) if split.held else (boundary, total)
+    spans = []
+    offset = 0
+    for index, size in enumerate(sizes):
+        first, last = max(0, start - offset), min(size, stop - offset)
+        if first < last:
+            spans.append((index, first, last))
+        offset += size
+    return spans
+
+
+class _TokenSplit(_WrappingDataset):
+    """A token split of a finite indexed order, such as a shuffled corpus:
+    the spans `_token_spans` keeps, computed once over the order as it reads."""
+
+    def __init__(self, parent: pygrain.MapDataset, split: TokenSplit):
+        super().__init__(parent)
+        self._split = split
+        self.spans = _token_spans((parent[index] for index in range(len(parent))), split)
+
+    def __len__(self) -> int:
+        return len(self.spans)
+
+    def record(self, index: int) -> Batch:
+        document, first, last = self.spans[index]
+        return {
+            key: np.asarray(column)[first:last] if key in self._split.fields else column
+            for key, column in record(self._parent[document], "token split document").items()
+        }
 
 
 def _dies_with_parent(index: int, count: int) -> None:
@@ -1923,7 +1939,7 @@ class _Build:
         if isinstance(stage, TokenSplit):
             if not isinstance(rows, pygrain.MapDataset):
                 raise ValueError(f"token split in {_name(pipeline)} needs a finite indexed order")
-            rows = TokenSplitRows(rows, stage)
+            rows = _TokenSplit(rows, stage)
         elif isinstance(stage, (Pack, Windows)):
             ruled = _Ruled(_as_iter(rows, self.loading), stage, consumed=_consumes(pipeline),
                            members=bool(self.counted_members(pipeline)))
@@ -2354,7 +2370,7 @@ def _tail(train: Pipeline, build: _Build) -> Tail:
 def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, int, int]]]:
     """The spans each token split in the lowered order keeps
     (`_Lowering.splits`), those of the corpora a pipeline mixes first: the
-    lowering's own split (`TokenSplitRows`) of the indexed order before it, built
+    lowering's own split (`_TokenSplit`) of the indexed order before it, built
     with the analysis of the pipeline it is written in, so they are the
     documents and token offsets a reader of the plan trains on."""
     for index, child in enumerate(children(pipeline)):
@@ -2366,7 +2382,7 @@ def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, 
             if not isinstance(rows, pygrain.MapDataset):
                 raise ValueError(f"token split in {_name(pipeline)} needs a finite indexed order")
             with _closing(rows) as read:
-                spans = TokenSplitRows(read, split).spans
+                spans = _TokenSplit(read, split).spans
             yield spans
 
 

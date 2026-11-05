@@ -38,6 +38,7 @@ from dew.data.lowering import (
     _outputs,
     _packed,
     _threads,
+    _TokenSplit,
 )
 from dew.data.mixing import CorpusCounts
 from dew.data.pipeline import (
@@ -63,7 +64,6 @@ from dew.data.pipeline import (
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _uncounted
 from dew.data.steps.text import CountRule, CountTargets, LayoutRule, ValidTargets, counted_window
-from dew.data.tokens import TokenSplitRows
 
 _log = logging.getLogger(__name__)
 
@@ -243,7 +243,7 @@ def _memory_stages(
         elif isinstance(stage, Limit):
             rows, pipeline = _limited(pipeline, consumed, rows, cycled)
         elif isinstance(stage, TokenSplit):
-            split = TokenSplitRows(pygrain.MapDataset.source([value for _, value in rows]), stage)
+            split = _TokenSplit(pygrain.MapDataset.source([value for _, value in rows]), stage)
             spans = enumerate(split.spans)
             rows = [((*rows[row][0], first, last), split[index]) for index, (row, first, last) in spans]
         elif isinstance(stage, Windows):

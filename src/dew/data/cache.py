@@ -17,7 +17,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
 from pathlib import Path
-from typing import Literal, Protocol, TypedDict, overload, runtime_checkable
+from typing import Literal, TypedDict, overload
 
 import grain.python as grain
 import numpy as np
@@ -81,14 +81,6 @@ def _opened_writer(cache: Cache, key: DependencyManifest, *, expected: int | Non
         if not cache.read_on(error, "writes nothing"):
             raise
         return _Computed()
-
-
-@runtime_checkable
-class Storing(Protocol):
-    """A fill's steps that say which of their inputs a step reads by a path it names (`storage`), which
-    stops the fill (`dew.data.lowering._Prefix`)."""
-
-    def storage(self, index: int, raw: Record) -> str | None: ...
 
 
 class Abandoned(RuntimeError):
@@ -415,14 +407,6 @@ class _Writer:
 
     def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> CachedValue:
         self._completed()
-        if self.admitting and isinstance(transform, Storing) and (step := transform.storage(ordinal, value)):
-            with self.lock:
-                if self.admitting:
-                    # What a path holds keys none of the cache's records: the fill stops, its records
-                    # computed from here on and none published (row 4212).
-                    _log.info("data/cache %s: %s reads a record's file by path; this fill stops",
-                              self.root.url, step)
-                    self._stopped()
         row_key = _row_key(row_id)
         with self.lock:
             existing = None if self.closing else self.pending.get(row_key)

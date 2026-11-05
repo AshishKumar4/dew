@@ -132,10 +132,6 @@ class DecodeVideo(grain.MapTransform):
     external: ClassVar[bool] = True
     """A video a record names by path is read from storage (`dew.data.pipeline.External`)."""
 
-    def reads_storage(self, record: Batch) -> bool:
-        """Whether `record`'s clip is a path rather than its bytes (`local_file`)."""
-        return not isinstance(record[self.field], bytes)
-
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """`frames` RGB frames at `fps`, each a `size` square, under `to`."""
         return {**shaped(facts, self.to, [self.frames, self.size, self.size, 3]), "fps": self.fps}

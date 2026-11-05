@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING, overload
+from collections.abc import Mapping, Sequence
+from typing import overload
 
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import record
 from dew.batch import Batch
-
-if TYPE_CHECKING:
-    from dew.data.pipeline import TokenSplit
 
 
 def share_tokens(lengths: Sequence[int], room: int, *, caps: Sequence[int | None] | None = None,
@@ -253,47 +249,3 @@ class _WrappingDataset(pygrain.MapDataset[Batch]):
         if isinstance(index, slice):
             return self.slice(index)
         return self.record(index % len(self))
-
-
-def _token_spans(documents: Iterable[Batch], split: TokenSplit) -> list[tuple[int, int, int]]:
-    """The documents a token split keeps, in the order it reads them, as
-    (document, first, last) token spans. The held side is the first
-    `fraction` of all their tokens and the trained side the rest, so the two
-    are disjoint and together are the corpus."""
-    sizes = []
-    for document in documents:
-        columns = [np.asarray(record(document, "token split document")[name]) for name in split.fields]
-        if any(column.ndim != 1 for column in columns):
-            raise ValueError("token split fields must be one-dimensional token arrays")
-        sizes.append(len(columns[0]))
-    total = sum(sizes)
-    boundary = min(int(total * split.fraction), max(0, total - 1))
-    start, stop = (0, boundary) if split.held else (boundary, total)
-    spans = []
-    offset = 0
-    for index, size in enumerate(sizes):
-        first, last = max(0, start - offset), min(size, stop - offset)
-        if first < last:
-            spans.append((index, first, last))
-        offset += size
-    return spans
-
-
-class TokenSplitRows(_WrappingDataset):
-    """A token split of a finite indexed order, such as a shuffled corpus:
-    the spans `_token_spans` keeps, computed once over the order as it reads."""
-
-    def __init__(self, parent: pygrain.MapDataset, split: TokenSplit):
-        super().__init__(parent)
-        self._split = split
-        self.spans = _token_spans((parent[index] for index in range(len(parent))), split)
-
-    def __len__(self) -> int:
-        return len(self.spans)
-
-    def record(self, index: int) -> Batch:
-        document, first, last = self.spans[index]
-        return {
-            key: np.asarray(column)[first:last] if key in self._split.fields else column
-            for key, column in record(self._parent[document], "token split document").items()
-        }
