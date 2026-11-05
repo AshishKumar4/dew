@@ -259,6 +259,9 @@ class Pretrained:
 
     They are kept as the source stored them.
     """
+    quantized_specs: Mapping[str, jax.ShapeDtypeStruct] = field(default_factory=dict, repr=False)
+    """The stored tensors of each of `quantized_tensors` as the source's headers state them: the tensors
+    an export writes the weight back as, known before any is encoded (`SourceQuantization.requantize`)."""
     revision: str | None = None
     """The Hub commit the source resolved to, whatever branch or tag was requested.
 
@@ -297,7 +300,8 @@ class Pretrained:
     """A saved run's own task declaration (`from_saved`), which its tasks build from as the run's own
     loader builds them (`TextGeneration.from_settings`: its prefix, policy and budget), where a source
     read from its files builds them from its generation config, which an export writes as the
-    representation its format's readers read (ledger 3007)."""
+    representation its format's readers read (ledger 3007). An export writes it beside its config and a
+    load reads it back (`released`, ledger 4314)."""
     names_tokenizer: ClassVar[bool] = True
     """Whether generation_config.json may record the tokenizer's name.
 
@@ -551,6 +555,13 @@ class Pretrained:
             sources.SourceReference(str(name_or_dir), revision, subfolder, remote_code=trust_remote_code),
             selected, fallback,
             modeling_overrides)
+        # An export of a run carries the run's declaration, numerics and dtypes (`released`), read from the
+        # folder the load selects; a load that states its own takes their place.
+        settings, run_numerics, run_compute = released(reference.directory(directory))
+        if numerics is None and run_compute is not None and (dtype, param_dtype) == ("bfloat16", "float32"):
+            # The load's own dtypes are its defaults (`load`'s, `_load_settings`'s), so it states none: the
+            # run's compute dtype, and its parameters as the export stored them.
+            dtype, param_dtype = run_compute, AUTO
         loaded, extracted = _loaded_kind(
             reference, directory, composite, fallback=fallback, gguf_file=gguf_file,
             single_file=single_file, dduf_file=dduf_file, placed=placed, streaming=streaming or not weights,
@@ -563,7 +574,7 @@ class Pretrained:
         extended = _extended(_published(loaded, name_or_dir, selected=bool(selected) or extracted
                                         or reference.subfolder is not None), dex, placed, scan_layers)
         return replace(_resident(extended, weights=weights, streaming=streaming, on_host=on_host),
-                       numerics=numerics)
+                       settings=settings, numerics=run_numerics if precision is None else numerics)
 
     @property
     def layouts(self) -> Mapping[str, WeightLayout]:
@@ -712,14 +723,12 @@ class Pretrained:
                        if layout.paths[0][-1] == "layer_scalar"]
             scalar_mode = layer_scalar_mode(values, scalars[0]) if scalars else None
             layouts = {layout.name: layout for layout in self.weight_layouts}
-            if quantization is None:
-                return decoder_parts.layout_tensors(layouts, values, scalar_mode, retained)
-            tensors = {**retained,
-                       **{name: layout.export(values, scalar_mode) for name, layout in layouts.items()}}
+            tensors = decoder_parts.layout_tensors(layouts, values, scalar_mode, retained)
         else:
             raise ValueError("this source has no reversible weight layout")
         if quantization is not None:
-            tensors = quantization.requantize(tensors, self.quantized_tensors)
+            # Each weight encoded when its stored tensors are read, a group at a time.
+            tensors = quantization.requantize(tensors, self.quantized_tensors, self.quantized_specs)
         return tensors
 
     def _quantization(self) -> SourceQuantization | None:
@@ -750,7 +759,7 @@ class Pretrained:
         decoders.save_export_assets(destination,
                                     tokenizer=self.processor if self.tokenizer is None else self.tokenizer,
                                     generation_config=dict(self.generation_config),
-                                    named=self.names_tokenizer)
+                                    named=self.names_tokenizer, release=self._release())
         for name, module in sorted(modules.items()):
             written = destination / name
             written.parent.mkdir(parents=True, exist_ok=True)
@@ -764,6 +773,26 @@ class Pretrained:
         save_hf_layout(_folder_part(tensors, "") if folders else tensors,
                        {key: value for key, value in self.config.items() if key not in folders},
                        destination, max_shard_size)
+
+    def _release(self) -> dict[str, object] | None:
+        """The release metadata `save` writes beside the config (`decoders.RELEASE_FILE`) where the bundle
+        holds a run's own declaration (`settings`): its task settings' record, its numerics and the dtype
+        its model computes in (its own `dtype`, else its parameters', which a module without one computes
+        in; the parameters' own are the export's), under the release record's `task`
+        (`dew.config.Release`), which `load` reads back (`released`)."""
+        if self.settings is None:
+            return None
+        from dew.inference.tasks import TaskSettings as Settings
+        from dew.registry import to_record
+
+        numerics = None if self.numerics is None else to_record(self.numerics, Numerics)
+        held = jnp.result_type(*(leaf.dtype for leaf in jax.tree.leaves(unboxed(self.variables))
+                                 if jnp.issubdtype(leaf.dtype, jnp.floating)))
+        model = self.model
+        stated = model.dtype if isinstance(model, CausalTransformer | DiffusionGemma) else None
+        compute = held if stated is None else stated
+        return {"task": {"settings": to_record(self.settings, Settings), "numerics": numerics,
+                         "dtypes": {"compute": dtype_name(compute)}}}
 
     def push_to_hub(self, repo_id: str, *, variables: Mapping[str, object] | None = None,
                     private: bool = False, commit_message: str = "Upload dew export",
@@ -1596,18 +1625,42 @@ def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
     return config, None
 
 
+def released(directory: Path) -> tuple[TaskSettings | None, Numerics | None, DtypeName | None]:
+    """The run's own task settings, numerics and compute dtype an export of it wrote
+    (`decoders.RELEASE_FILE`, `Pretrained.save`): its tasks' declaration, the numerics they trace under,
+    and the dtype its model computed in, or None for each where the directory holds none: a source with
+    no run behind it builds its tasks from its own files, in the load's dtypes."""
+    from dew.inference.tasks import TaskSettings as Settings
+
+    path = directory / decoders.RELEASE_FILE
+    if not path.is_file():
+        return None, None, None
+    record = _records.record(json.loads(path.read_text()), decoders.RELEASE_FILE)
+    task = _records.record(record["task"], "task")
+    numerics, dtypes = task.get("numerics"), _records.record(task["dtypes"], "dtypes")
+    return (from_record(Settings, task["settings"], dtypes=False),
+            None if numerics is None else from_record(Numerics, numerics, dtypes=False),
+            dtype_name(_records.text(dtypes["compute"], "compute")))
+
+
 def _decoded(tensors: Mapping[str, unread.Stored], config: Mapping[str, object], param_dtype: str, *,
              media: bool) -> tuple[Mapping[str, unread.Stored], tuple[str, ...], str | None,
-                                   dict[str, unread.Stored], decoders.Checked]:
+                                   dict[str, unread.Stored], decoders.Checked,
+                                   Mapping[str, jax.ShapeDtypeStruct]]:
     """The tensors with a quantized source's weights decoded, and what `save`
     needs to write them back: the quantized names, the scales' dtype and the
-    integer formats' grid; and the spellings checked equal before a narrowing
-    cast, which the readers then take as equal (`decoders.Checked`). `media`
+    integer formats' grid; the spellings checked equal before a narrowing
+    cast, which the readers then take as equal (`decoders.Checked`); and the
+    stored tensors of each quantized weight as their headers state them, which
+    an export writes it back as (`SourceQuantization.requantize`). `media`
     is whether the loader reads the source as a media wrapper (`_media_wrapper`)."""
     quantization = source_quantization(config)
     if quantization is None:
-        return tensors, (), None, {}, decoders.NOTHING_CHECKED
+        return tensors, (), None, {}, decoders.NOTHING_CHECKED, {}
     quantized_tensors, scale_dtype = quantization.names(tensors), quantization.scale_dtype(tensors)
+    specs = tensor_specs(tensors)
+    stored = {part: specs[part] for name in quantized_tensors for part in (name, *quantization.partners(name))
+              if part in specs}
     grid = {part: tensors[part] for name in quantized_tensors for part in quantization.grid(name)
             if part in tensors}
     aliases: tuple[tuple[str, str], ...] = ()
@@ -1617,7 +1670,7 @@ def _decoded(tensors: Mapping[str, unread.Stored], config: Mapping[str, object],
             config, media=media)
     tensors = quantization.dequantize(tensors, param_dtype=param_dtype)
     _share_quantized_aliases(tensors, aliases, quantized_tensors)
-    return tensors, quantized_tensors, scale_dtype, grid, decoders.checked_groups(aliases)
+    return tensors, quantized_tensors, scale_dtype, grid, decoders.checked_groups(aliases), stored
 
 
 def _folders(config: Mapping[str, object]) -> tuple[str, ...]:
@@ -1917,9 +1970,13 @@ def _spelled_source_weights(spelling: Mapping[str, str], model: CausalTransforme
                             variables: Mapping[str, object], config: Mapping[str, object]
                             ) -> Mapping[str, np.ndarray]:
     """`decoders.export_decoder_weights` under the source's own names: `spelling` maps each name the
-    family's encoder writes to the one the source stored it under (`DecoderFamily.spelling`)."""
+    family's encoder writes to the one the source stored it under (`DecoderFamily.spelling`); each tensor
+    built as it is read, as the encoder's table builds it."""
     written = decoders.export_decoder_weights(model, variables, config)
-    return {spelling.get(name, name): tensor for name, tensor in written.items()}
+    named = {spelling.get(name, name): name for name in written}
+    specs = tensor_specs(written)
+    return LazyTensors({stored: specs[name] for stored, name in named.items()},
+                       lambda stored: written[named[stored]])
 
 
 def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.Stored], directory: Path,
@@ -2237,6 +2294,7 @@ class _Translated(NamedTuple):
     quantized_tensors: tuple[str, ...]
     scale_dtype: str | None
     grid: dict[str, unread.Stored]
+    stored: Mapping[str, jax.ShapeDtypeStruct]
 
 
 def _translated(config: Mapping[str, object],
@@ -2246,7 +2304,7 @@ def _translated(config: Mapping[str, object],
     """`config`'s native model and variables over `tensors`, as `route` reads them: a quantized source's
     weights decoded, the decoder, media wrapper or DiffusionGemma translated and checked against its
     tree, and any stored input scales bound. No processor, generation config or bundle is built."""
-    tensors, quantized_tensors, scale_dtype, grid, checked = _decoded(
+    tensors, quantized_tensors, scale_dtype, grid, checked, stored = _decoded(
         tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype,
         media=isinstance(route, WrapperRoute))
     match route:
@@ -2274,7 +2332,8 @@ def _translated(config: Mapping[str, object],
                 max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming,
                 quantized=source_quantization(config) is not None, checked=checked)
     model, variables = _input_quantization(built.model, built.variables, built.layouts, config, grid)
-    return _Translated(built._replace(model=model, variables=variables), quantized_tensors, scale_dtype, grid)
+    return _Translated(built._replace(model=model, variables=variables), quantized_tensors, scale_dtype, grid,
+                       stored)
 
 
 def native_backbone(directory: str | Path, *, param_dtype: str) -> tuple[Mapping[str, object], Variables]:
@@ -2428,7 +2487,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     translated = _translated(config, route, tensors, directory, dtype=dtype, param_dtype=param_dtype,
                              attention_impl=attention_impl, max_seq_len=max_seq_len, streaming=streaming)
     model, variables, record, built, layouts, retained, export_adapter = translated.built
-    quantized_tensors, scale_dtype, grid = translated[1:]
+    quantized_tensors, scale_dtype, grid, stored = translated[1:]
     resolved_commit = commit
     if component is None and commit is not None:
         resolved_commit = root.name
@@ -2444,7 +2503,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         return kind(model, placed(variables, axes=decoder_parts.decoder_axes(model)), processor, config,
                     directory, built, generation_config,
                     layouts, retained, export_adapter, quantized_tensors=quantized_tensors,
-                    quantized_scale_dtype=scale_dtype, quantization_grid=grid,
+                    quantized_scale_dtype=scale_dtype, quantization_grid=grid, quantized_specs=stored,
                     # The weights' commit: a pickle repo's may be its conversion's.
                     revision=resolved_commit,
                     tokenizer="byte" if named == "byte" else None,

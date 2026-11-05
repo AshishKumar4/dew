@@ -165,30 +165,41 @@ def pytest_terminal_summary(terminalreporter):
         terminalreporter.write_line(_remote.summary())
 
 
-def release_unheld(requirement: str) -> str | None:
-    """Why this interpreter cannot run a test marked release_env(`requirement`), a release's own code
-    under the package it pins apart from the suite's, or None where it holds that package: the overlay CI's
-    release task runs it under (tools/armada/ci.py `released`) named, where the release's own loader
-    would fail opaquely in its subprocess (row 3576)."""
+def release_unheld(requirement: str, test: str) -> str | None:
+    """Why this interpreter cannot run `test`, marked release_env(`requirement`): a release's own code under
+    the package it pins apart from the suite's, a requirement or a wheel's path as CI's release task hands
+    it to its overlay (tools/armada/ci.py `pytest_command`); or None where it holds that package. The reason
+    names CI's own release operation, which runs the test under that overlay, where the release's own
+    loader would fail opaquely in its subprocess (row 3576)."""
     from importlib.metadata import PackageNotFoundError, version
 
     from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_version, parse_wheel_filename
 
-    pinned = Requirement(requirement)
+    if requirement.endswith(".whl"):
+        name, wheel, _, _ = parse_wheel_filename(Path(requirement).name)
+        pinned, wanted = str(name), canonicalize_version(wheel)
+    else:
+        parsed = Requirement(requirement)
+        pinned, wanted = parsed.name, parsed.specifier
     try:
-        held = version(pinned.name)
+        held = version(pinned)
     except PackageNotFoundError:
         held = None
-    if held is not None and pinned.specifier.contains(held, prereleases=True):
+    if held is not None and (canonicalize_version(held) == wanted if isinstance(wanted, str)
+                             else wanted.contains(held, prereleases=True)):
         return None
-    return (f"this release's own code runs under {requirement}, and this interpreter holds {pinned.name} "
-            f"{held or 'not at all'}: run it under that overlay, as CI's release task does: "
-            f"uv run --with '{requirement}' -- python -m pytest <test>")
+    file = test.split("::", 1)[0]
+    python = ".".join(map(str, sys.version_info[:2]))
+    return (f"this release's own code runs under {requirement}, and this interpreter holds {pinned} "
+            f"{held or 'not at all'}: run it as CI's release task does, under that overlay: "
+            f"python tools/armada/ci.py release --python {python} --requirement '{requirement}' "
+            f"--tests {file} --out <rows.json>")
 
 
 def pytest_runtest_setup(item):
     released = item.get_closest_marker("release_env")
-    if released is not None and (unheld := release_unheld(released.args[0])) is not None:
+    if released is not None and (unheld := release_unheld(released.args[0], item.nodeid)) is not None:
         pytest.fail(unheld, pytrace=False)
     marker = item.get_closest_marker("mesh")
     needed = marker.kwargs.get("devices", lane_environment.MESH_DEVICES) if marker else 0
