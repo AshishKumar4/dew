@@ -119,6 +119,10 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     score_dtypes: tuple[str, ...] = ()
     scale: float = 1.0
     natural: bool = NATURAL
+    subtracted: bool = False
+    """Whether an inference walk's fold takes its logits as a difference of raw products scaled after it is
+    taken (`algebra.Forward.subtracted`: no fold's reach, no natural rewalk), a decode step's
+    (`attention_decode`), whose walk the memory bounds."""
 
     def spans(self, start, end, query_ids, key_ids) -> KeySpans:
         """The call's spans from its arrays and the op's static form and key count."""
@@ -254,7 +258,8 @@ class MosaicForward(_Mainloop[Tiles]):
                 # The inference walk, its rows beside the output where it keeps them.
                 return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
                                       out_dtype=self.out_dtype, masked=self.masked, splits=self.splits,
-                                      table=table, sources=sources, **form), None
+                                      table=table, sources=sources, subtracted=self.subtracted,
+                                      **form), None
 
     def completed(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
         """A pin's or an explicit config's natural rewalk derived once where it names none (`_relaunched`,
@@ -273,7 +278,7 @@ class MosaicForward(_Mainloop[Tiles]):
         rewalks at its own tiles, which must hold (rows 2621, 2647)."""
         if not self._launch_legal(ba, config, target):
             return False
-        if config.natural_form or self._natural(ba.arguments["query"]):
+        if config.natural_form or self._unrewalked(ba.arguments["query"]):
             return True
         relaunch = config.relaunch
         return (config.block_k % relaunch.block_k == 0 and relaunch.consumers <= config.consumers
@@ -360,7 +365,7 @@ class MosaicForward(_Mainloop[Tiles]):
         tiles it spilled 2 KB at width 64); a call that keeps its logits natural rewalks nothing. None where
         no tile holds the rewalk."""
         config = dataclasses.replace(config, relaunch_k=None, relaunch_consumers=None, relaunch_columns=None)
-        if self._natural(ba.arguments["query"]):
+        if self._unrewalked(ba.arguments["query"]):
             return config
         query, value = ba.arguments["query"], ba.arguments["value"]
         family = bundle_of(config, query.dtype)
@@ -395,6 +400,18 @@ class MosaicForward(_Mainloop[Tiles]):
         rewalk."""
         power, scale = prescale(query.dtype, query.shape[3], self.scale)
         return not algebra.folds(scale, power, natural=self.natural, score_mod=self.score_mod)
+
+    def _unrewalked(self, query: jax.Array) -> bool:
+        """Whether the call of `query` walks no natural rewalk: its logits natural (`_natural`), or a fold no
+        logit's reach passes (`algebra.Forward.reaches`: a subtracted fold's raw products), at the scale its
+        launch takes (`attention_mosaic_forward._prepared`)."""
+        if self._natural(query):
+            return True
+        power, scale = prescale(query.dtype, query.shape[3], self.scale)
+        taken = power if self.form != "spans" else 1.0
+        return not algebra.Forward(self.form, self.keys, ids=False, scale=scale * taken,
+                                   score_mod=self.score_mod, natural=self.natural, prescale=power / taken,
+                                   subtracted=self.subtracted).reaches
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         """The program's shared memory (`_forward_allocations`, `resources.shared_bytes`), at the call's
@@ -617,7 +634,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
             *, scale: float | None = None, natural: bool = NATURAL, residuals: Kept = Kept.NONE,
             interpret: bool = False, out_dtype=None, masked: bool = False, splits: int = 1,
-            table: jax.Array | None = None, sources: jax.Array | None = None):
+            table: jax.Array | None = None, sources: jax.Array | None = None, subtracted: bool = False):
     """The template's forward on this mainloop (`MosaicForward`): `query` `[B, Q, H, D]` over `key`
     `[B, K, Hk, D]` and `value` `[B, K, Hk, Dv]`, and the keys `spans` leaves each query under `hooks`, as
     `dew.nn.kernels.templates.attention.reference` computes it; with `residuals` `Kept.SPLIT` the training
@@ -631,10 +648,12 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     A paged call's `key` and `value` are its pools `[Hk, P, page, D]` and `table` its page table `[B, pages
     a row]` int32: row `b`'s key `s` at offset `s % page` of page `table[b, s // page]`. With `sources`
     `[B]` int32 (a call of rows of keys, inference), batch row `b` reads key row `sources[b]` of `key` and
-    `value` `[R, K, Hk, D]`: a serving step's work list over its cache's rows, no row copied.
+    `value` `[R, K, Hk, D]`: a serving step's work list over its cache's rows, no row copied. `subtracted`
+    an inference walk's fold of raw products (`MosaicForward.subtracted`).
     """
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
-                             out_dtype=out_dtype, masked=masked, splits=splits, table=table, sources=sources)
+                             out_dtype=out_dtype, masked=masked, splits=splits, table=table, sources=sources,
+                             subtracted=subtracted)
     return op(*args, residuals=residuals, interpret=interpret)
 
 
@@ -649,8 +668,8 @@ def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
 
 def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
                   scale: float | None, natural: bool, out_dtype=None, masked: bool = False,
-                  splits: int = 1, table: jax.Array | None = None, sources: jax.Array | None = None
-                  ) -> tuple[MosaicForward, tuple]:
+                  splits: int = 1, table: jax.Array | None = None, sources: jax.Array | None = None,
+                  subtracted: bool = False) -> tuple[MosaicForward, tuple]:
     """`forward`'s op and its arguments, a dropping call's draw among them, which its legality rule refuses
     (`refused`)."""
     hooks = Hooks() if hooks is None else hooks
@@ -662,7 +681,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        output_width=power_of_two(value.shape[3]), form=spans.form, keys=spans.keys,
                        scale=logit_scale(query.shape[3], scale), natural=natural,
                        out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name, masked=masked,
-                       splits=splits)
+                       splits=splits, subtracted=subtracted)
     return op, (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params),
                 tuple(param.value for param in hooks.output_params), hooks.initial, hooks.drop,
