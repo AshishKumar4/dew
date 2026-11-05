@@ -512,8 +512,9 @@ def _expressions(layered, stacked, inputs: Sequence, outputs: Sequence) -> list[
     rows', and a scalar's sums of non-negative floating terms are one sum whatever their order
     (`_Numbering.summed`), as a clip by the global norm forms it: the two programs' sums then round
     within one bound of the exact sum, though not to one value, so a comparison after them may decide
-    otherwise at its threshold (the admission row 4036 asked for, a global-norm clip stage-local). Row r of a stack of n rows is read against row r of every stacked input of n
-    rows; a stack of another count is no row's."""
+    otherwise at its threshold (the admission row 4036 asked for, a global-norm clip stage-local). Row
+    r of a stack of n rows is read against row r of every stacked input of n rows; a stack of another
+    count is no row's."""
     from dew.training.staging import flattened
 
     numbering = _Numbering()
