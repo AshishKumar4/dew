@@ -123,13 +123,16 @@ class BitTransform:
     `outputs[i]` (a mask: the bits its consumer reads, every other bit zero), each the parity of the input's
     bits its row names (`rows`: register by register, each mask's bits lowest first). `free`: the stored word
     may be any invertible re-encoding of the input (its encoder run where the weights are stored), so a form
-    need only read its bits back in some order; else the stored word is the input."""
+    need only read its bits back in some order; else the stored word is the input. `units`: the pipes its
+    form may issue on (the ALU always, which issues every LOP3; a consumer whose own math holds the FMA pipe
+    keeps its decode off it)."""
 
     name: str
     width: int
     outputs: tuple[int, ...]
     rows: tuple[int, ...]
     free: bool = True
+    units: frozenset[Unit] = frozenset(Unit)
 
     def __post_init__(self):
         if not 0 < self.width <= WORD or len(self.rows) != sum(len(_bits(mask)) for mask in self.outputs):
@@ -138,6 +141,8 @@ class BitTransform:
             raise ValueError(f"{self.name}: a row reads a bit past its {self.width}-bit input")
         if self.free and (len(self.rows) != self.width or _inverse(self.rows) is None):
             raise ValueError(f"{self.name}: a free layout reads each of its input's bits back exactly once")
+        if Unit.ALU not in self.units:
+            raise ValueError(f"{self.name}: every form masks on the ALU, which its units leave out")
 
     @classmethod
     def placed(cls, name: str, width: int, outputs: Sequence[int], placement: Mapping[int, tuple[int, int]],
@@ -210,9 +215,9 @@ def proven(transform: BitTransform, form: Form) -> None:
     vocabulary is GF(2)-linear (`Op`), so the form and its encoder are linear maps, and two linear maps that
     agree on each basis word agree on all 2^width; the input's every word is checked besides where it has 16
     bits or fewer. Bits outside a register's mask are proven zero by the same argument."""
-    if len(form.encoder) != transform.width:
-        raise Unproven(f"{transform.name}: an encoder of {len(form.encoder)} bits for a "
-                       f"{transform.width}-bit input")
+    identity = tuple(1 << bit for bit in range(transform.width))
+    if len(form.encoder) != transform.width or (not transform.free and form.encoder != identity):
+        raise Unproven(f"{transform.name}: its form reads a stored word its layout does not store")
     inputs = (np.arange(1 << transform.width, dtype=np.uint64) if transform.width <= 16
               else np.array([1 << bit for bit in range(transform.width)], dtype=np.uint64))
     got = form.decoded(form.encoded(inputs))
@@ -255,12 +260,13 @@ def _shifted(bits: Sequence[int], op: Op, amount: int) -> tuple[int, ...]:
     return tuple(bits[t - amount] if t >= amount else -1 for t in range(WORD))
 
 
-def _priced(shape: _Shape, registers: int) -> tuple[tuple[int, int], int]:
+def _priced(shape: _Shape, registers: int, units: frozenset[Unit]) -> tuple[tuple[int, int], int]:
     """A shape's price (`Form.price`) with one LOP3 a register, and its shifts on the ALU: a rotation there
-    (the ALU's alone), the rest split so the two pipes balance."""
+    (the ALU's alone), the rest split so the two pipes balance, or all of them where `units` holds no FMA."""
     shifts = (shape.right is not None) + shape.lefts
     rotations = int(shape.right is Op.ROTR)
-    on_alu = min(shifts, max(rotations, -(-(shifts - registers) // 2)))
+    on_alu = (shifts if Unit.FMA not in units
+              else min(shifts, max(rotations, -(-(shifts - registers) // 2))))
     return (max(registers + on_alu, shifts - on_alu), registers + shifts), on_alu
 
 
@@ -316,12 +322,11 @@ def _independent(basis: dict[int, int], rows: Sequence[int]) -> dict[int, int] |
 def _registers(transform: BitTransform, shifts: Sequence[_Shift]) -> Iterator[list[tuple[int, int]]]:
     """Each assignment of a LOP3 a register, `mask & (u ^ v)` or `mask & u` (a pair `(u, u)`) over the
     sources (0 the stored word, `i + 1` shift `i`) and the registers before it, under which the form reads the
-    transform back: its registers' rows the transform's own (a fixed layout) or independent (a free one), and
-    every shift read, directly or through a shift or a register reading it (else a cheaper set reads the
-    same)."""
+    transform back: its registers' rows the transform's own (a fixed layout's, its mask narrowed to the bits
+    its transform does not hold zero, `_narrowed`) or independent (a free one's), and every shift read,
+    directly or through a shift or a register reading it (else a cheaper set reads the same)."""
     masks = [_bits(mask) for mask in transform.outputs]
-    starts = list(itertools.accumulate((len(bits) for bits in masks), initial=0))
-    wanted = [transform.rows[starts[i]:starts[i + 1]] for i in range(len(masks))]
+    wanted = _wanted(transform)
     sources = [_stored(transform.width), *(shift.bits for shift in shifts)]
     count = len(sources)
     bases = {shift.base for shift in shifts if shift.op is Op.SHL and shift.base}
@@ -352,6 +357,7 @@ def _registers(transform: BitTransform, shifts: Sequence[_Shift]) -> Iterator[li
                     if grown is None:
                         continue
                 else:
+                    rows = [row if want else 0 for row, want in zip(rows, wanted[index], strict=True)]
                     if tuple(rows) != wanted[index]:
                         continue
                     grown = basis
@@ -359,6 +365,21 @@ def _registers(transform: BitTransform, shifts: Sequence[_Shift]) -> Iterator[li
                 yield from search(index + 1, [*built, rows], [*chosen, (first, second)], grown, reads)
 
     yield from search(0, [], [], {}, frozenset())
+
+
+def _wanted(transform: BitTransform) -> list[tuple[int, ...]]:
+    """The transform's rows, register by register."""
+    starts = list(itertools.accumulate((len(_bits(mask)) for mask in transform.outputs), initial=0))
+    return [transform.rows[starts[i]:starts[i + 1]] for i in range(len(transform.outputs))]
+
+
+def _narrowed(transform: BitTransform, register: int) -> int:
+    """Register `register`'s LOP3 mask: its output mask, a fixed layout's without the bits its transform
+    holds zero, which the mask zeroes as it masks the rest."""
+    mask = transform.outputs[register]
+    if transform.free:
+        return mask
+    return sum(1 << t for t, row in zip(_bits(mask), _wanted(transform)[register], strict=True) if row)
 
 
 def _form(transform: BitTransform, shifts: Sequence[_Shift], on_alu: int,
@@ -373,7 +394,7 @@ def _form(transform: BitTransform, shifts: Sequence[_Shift], on_alu: int,
     for register, (first, second) in enumerate(registers):
         ids = tuple(arg if arg < sources else outputs[arg - sources]
                     for arg in ((first,) if first == second else (first, second)))
-        steps.append(Step(Op.LOP3, ids, transform.outputs[register], Unit.ALU))
+        steps.append(Step(Op.LOP3, ids, _narrowed(transform, register), Unit.ALU))
         outputs.append(len(steps))
     plain = Form(tuple(steps), tuple(outputs), tuple(1 << bit for bit in range(transform.width)))
     if not transform.free:
@@ -393,15 +414,15 @@ def _form(transform: BitTransform, shifts: Sequence[_Shift], on_alu: int,
 def synthesized(transform: BitTransform, *, right: bool = True, lefts: int = 3,
                 reach: int = WORD - 1) -> Form:
     """The cheapest proven form of `transform` (`Form.price`) of one LOP3 a register over the stored word, at
-    most one right shift or rotation of it (`right`) and `lefts` left shifts of it or of that, each by at most
-    `reach` places, each shift on the pipe that balances the two: the search walks shapes in increasing price
-    and returns the first form found, proven (`proven`). Raises LookupError where no form within the bounds
-    computes it."""
-    registers = len(transform.outputs)
+    most one right shift or rotation of it by any amount (`right`) and `lefts` left shifts of it or of that,
+    each by at most `reach` places, each shift on the pipe that balances the two among the transform's
+    `units`: the search walks shapes in increasing price and returns the first form found, proven (`proven`).
+    Raises LookupError where no form within the bounds computes it."""
+    registers, units = len(transform.outputs), transform.units
     shapes = [_Shape(op, count) for op in (None, *((Op.SHR, Op.ROTR) if right else ()))
               for count in range(lefts + 1)]
-    for shape in sorted(shapes, key=lambda shape: _priced(shape, registers)[0]):
-        on_alu = _priced(shape, registers)[1]
+    for shape in sorted(shapes, key=lambda shape: _priced(shape, registers, units)[0]):
+        on_alu = _priced(shape, registers, units)[1]
         for shifts in _configs(shape, reach, transform.width):
             if transform.free and not _covered(transform, shifts):
                 continue

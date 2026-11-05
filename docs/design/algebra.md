@@ -956,7 +956,8 @@ about it is an estimate.
   one yet (a rounding pack's own search waits for its consumer).
 - **Its layout** is fixed (the stored word is the input) or free: the stored word may be any invertible
   re-encoding of the input, chosen with the form. The encoder runs once where the weights are stored (Dew's
-  quantization codec), the decoder each time they are read.
+  quantization codec), the decoder each time they are read. Its `units` are the pipes its form may issue on:
+  the ALU always (every LOP3's), the FMA pipe unless the consumer's own math holds it.
 - **A form** (`Form`) is a list of instructions over the stored word, the register each output is, and the
   encoder (its bit `j` the parity of the input's bits `encoder[j]` names).
 
@@ -977,8 +978,9 @@ about it is an estimate.
 ### 7.3 Search and proof
 
 - **Search** (`synthesized`): one LOP3 per output register, `mask & (u ^ v)` or `mask & u`, over the stored
-  word, at most one right shift or rotation of it, and up to `lefts` left shifts of it or of that, each by at
-  most `reach` places; a register may read an earlier one. Shapes (which shifts) are walked in increasing price,
+  word, at most one right shift or rotation of it by any amount, and up to `lefts` left shifts of it or of
+  that, each by at most `reach` places; a register may read an earlier one, and a fixed layout's mask leaves
+  out the bits its transform holds zero. Shapes (which shifts) are walked in increasing price,
   so the first form found is the cheapest the vocabulary holds. A free layout's registers need only be
   independent over GF(2) (an invertible read), checked row by row as each register is chosen, after a
   necessary count (each register's bit a parity of the sources' bits at its place) rejects most shift sets
@@ -986,14 +988,22 @@ about it is an estimate.
   shape reads the same. The encoder is the form's map inverted, after the transform.
 - **Proof** (`proven`): every instruction is GF(2)-linear, so a form and its encoder are linear maps, and two
   linear maps that agree on each basis word agree on all 2^width; a word of 16 bits or fewer is checked on
-  every word besides. A form not proven is never returned, and a checked-in form is proven again by its
-  consumer's tests. That proof replaces the sampled checks a real-valued form gets.
+  every word besides. A fixed layout's encoder must be the identity: its form reads the input as stored. A
+  form not proven is never returned, and a checked-in form is proven again by its consumer's tests. That
+  proof replaces the sampled checks a real-valued form gets.
 - The fp4 challenge, the evidence for the technique, searched this space in C: its NVFP4 decode into
   bfloat16 pairs takes 4 LOP3 + 1 SHF + 3 IMAD.SHL against the 7 + 2 before, bit-identical, +0.4% end to end.
-  The search here re-derives it from the decode's declaration (2026-11-05, one armada core): at shifts of up
-  to 31 places it walks every shape of four issues on the busiest pipe and finds none, then returns a form of
-  that price, a rotation by 6, shifts by 2 and 6 and the rotation's by 2 and four masked XORs, in 27 seconds
-  (6 places: 2.3 seconds, the test's). No form without a right-moving shift exists within three left shifts.
+  The search here re-derives it from the decode's declaration (2026-11-05, one armada core): at left shifts of
+  up to 31 places it walks every shape of four issues on the busiest pipe and finds none, then returns a form
+  of the challenge's price, a rotation by 6, shifts by 2 and 6 and the rotation's by 2 and four masked XORs,
+  in 27 seconds (left shifts to 6 places: 2.3 seconds, the test's). No form without a right-moving shift
+  exists within three left shifts.
+- **Not in the vocabulary yet** (row 4050): PRMT's byte permutes, LOP3's other linear tables (a three-way
+  XOR, a bit select), and transforms that are not linear (a rounding pack, an integer decode through fp16
+  arithmetic), whose search over LOP3's truth tables, IADD3 and HFMA2 is a bit-vector synthesis (Z3) and whose
+  proof over a 32-bit word is Z3's equivalence. Each joins when a consumer's transform needs it: sm80's FP8
+  and FP4 epilogue packing (row 3733) is the first. No target varies the vocabulary: the pipes and rates above
+  hold from sm75 to sm120, so the search takes no target.
 
 ### 7.4 Interface with the GEMM template (its first consumer, row 3733)
 
