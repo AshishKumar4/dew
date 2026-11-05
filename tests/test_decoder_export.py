@@ -96,7 +96,7 @@ from lane_environment import outside_suite
 from flax import linen as nn
 from float64_terms import float64_forward
 from interop_support import assert_restores, assert_same_stored_tensors, written_tensors
-from model_support import cached_round_trips, flat_tree, prediction_logits, streamed_export
+from model_support import cached_round_trips, encoded_form, flat_tree, prediction_logits, streamed_export
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
@@ -703,7 +703,7 @@ def test_a_quantized_source_of_a_preparing_family_exports_updated_weights_in_its
     config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}
     quantization = source_quantization(config)
     assert quantization is not None
-    source = quantization.requantize(tensors, (name,))
+    source = encoded_form(quantization, tensors, (name,))
     save_hf_layout(source, config, tmp_path / "fp8")
     loaded = Pretrained.load(tmp_path / "fp8", dtype="float32", attention_impl="reference")
     assert loaded.quantized_tensors == (name,)
@@ -719,7 +719,7 @@ def test_a_quantized_source_of_a_preparing_family_exports_updated_weights_in_its
                                    load_shards(tmp_path / "export"))
     dense = {stored.removeprefix(bare): tensor for stored, tensor in
              dataclasses.replace(loaded, config=plain, quantized_tensors=()).export(updated).items()}
-    expected = quantization.requantize(dense, (name,))
+    expected = encoded_form(quantization, dense, (name,))
     exported = load_shards(tmp_path / "export")
     assert json.loads((tmp_path / "export" / "config.json").read_text()) == config
     assert set(exported) == set(expected) == set(source)
@@ -730,6 +730,72 @@ def test_a_quantized_source_of_a_preparing_family_exports_updated_weights_in_its
     reloaded = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
     decoded = Pretrained.load(tmp_path / "decoded", dtype="float32", attention_impl="reference")
     assert_restores(decoded.model, decoded.variables, reloaded, np.load(FIXTURES / fixture / "input_ids.npy"))
+
+
+def test_a_quantized_export_encodes_each_weight_as_it_is_read_against_its_stored_tensors(tmp_path):
+    """A quantized source's export is a table built as it is read (row 4316): building it over parameters
+    whose values are gone reads none of them, the family's spelled encoder included, its specs its
+    source's stored tensors, and only a read finds them gone. The format's table
+    (`SourceQuantization.requantize`) reads and encodes no weight before a writer reads one of its
+    tensors, each weight's group once however its tensors are read (the weight twice before its scale,
+    from several threads); a weight whose geometry no longer fits what its source stored is refused as it
+    is read, and one whose stored tensors are unknown at once; a composite of two tables refuses a name
+    both hold."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from dew.interop import codecs
+    from dew.interop.safetensors_io import LazyTensors, joined_tensors, tensor_specs
+
+    fixture, name, bare = PREPARED["gpt-neox"]
+    tensors = {stored.removeprefix(bare): tensor
+               for stored, tensor in load_shards(FIXTURES / fixture).items()}
+    config = json.loads((FIXTURES / fixture / "config.json").read_text())
+    config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}
+    quantization = codecs.source_quantization(config)
+    assert quantization is not None
+    save_hf_layout(encoded_form(quantization, tensors, (name,)), config, tmp_path / "fp8")
+    loaded = Pretrained.load(tmp_path / "fp8", dtype="float32", attention_impl="reference")
+    stored = loaded.quantized_specs
+    assert set(stored) == {name, f"{name}_scale_inv"}
+    headers = tensor_specs(load_shards(tmp_path / "fp8"))
+    gone = jax.tree.map(jax.numpy.array, loaded.variables)
+    for leaf in jax.tree.leaves(gone):
+        leaf.delete()
+    table = loaded.export(gone)
+    assert isinstance(table, LazyTensors)
+    with pytest.raises(RuntimeError):
+        table[name]
+    assert {part: tensor_specs(table)[part] for part in stored} == {part: headers[part] for part in stored}
+    written = loaded.export()
+    for part, spec in stored.items():
+        assert (written[part].shape, written[part].dtype) == (spec.shape, spec.dtype), part
+    with pytest.raises(ValueError):
+        dataclasses.replace(loaded, quantized_specs={}).export()
+
+    dense = {**tensors, name: quantization.decode(written, name)}
+    reads, encoded = [], []
+    lazy = LazyTensors(tensor_specs(dense), lambda part: reads.append(part) or dense[part])
+    counted = dataclasses.replace(quantization, encode=lambda weight, value: encoded.append(weight)
+                                  or quantization.encode(weight, value))
+    table = counted.requantize(lazy, (name,), stored)
+    assert reads == encoded == []
+    first, again, scale = table[name], table[name], table[f"{name}_scale_inv"]
+    np.testing.assert_array_equal(first, again)
+    assert encoded == [name] and reads == [name]
+    with ThreadPoolExecutor(4) as pool:
+        every = dict(zip(table, pool.map(table.__getitem__, list(table)), strict=True))
+    assert encoded == [name, name]
+    np.testing.assert_array_equal(every[f"{name}_scale_inv"], scale)
+    resized = {part: jax.ShapeDtypeStruct((spec.shape[0] + 1, *spec.shape[1:]), spec.dtype)
+               for part, spec in stored.items()}
+    with pytest.raises(ValueError):
+        quantization.requantize(dense, (name,), resized)[name]
+    with pytest.raises(ValueError):
+        quantization.requantize(dense, (name,), {})
+    with pytest.raises(ValueError):
+        joined_tensors({"backbone": {"w": np.zeros(2)}, "readout": {"w": np.ones(2)}})
+    joined = joined_tensors({"backbone": table, "readout": {"head.weight": np.ones(2, np.float32)}})
+    assert isinstance(joined, LazyTensors) and set(joined) == {*table, "head.weight"}
 
 
 def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(tmp_path):
@@ -745,7 +811,7 @@ def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(
     source = FIXTURES / "gpt-oss-tiny"
     tensors = load_file(str(source / "model.safetensors"))
     stems = tuple(name for name in tensors if name.endswith((".experts.gate_up_proj", ".experts.down_proj")))
-    packed = MXFP4.requantize(tensors, stems)
+    packed = encoded_form(MXFP4, tensors, stems)
     config = json.loads((source / "config.json").read_text())
     config["quantization_config"] = {"quant_method": "mxfp4"}
     directory = tmp_path / "source"
@@ -837,7 +903,7 @@ def test_codec_rejects_integer_parameter_storage(kind):
         with pytest.raises(ValueError):
             fp8_blocks(1).dequantize(packed, param_dtype="int32")
     else:
-        packed = MXFP4.requantize({"weight": np.full((1, 32, 2), 1.5, np.float32)}, ("weight",))
+        packed = encoded_form(MXFP4, {"weight": np.full((1, 32, 2), 1.5, np.float32)}, ("weight",))
         with pytest.raises(ValueError):
             MXFP4.dequantize(packed, param_dtype="int32")
 
@@ -852,13 +918,14 @@ def test_public_quantized_load_obeys_parameter_storage(tmp_path, kind):
     tensors = load_shards(fixture)
     config = json.loads((fixture / "config.json").read_text())
     if kind == "fp8":
-        packed = fp8_blocks(128, ue8m0=False).requantize(tensors, ("model.layers.0.self_attn.o_proj.weight",))
+        packed = encoded_form(fp8_blocks(128, ue8m0=False), tensors,
+                              ("model.layers.0.self_attn.o_proj.weight",))
         config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3",
                                          "weight_block_size": [128, 128]}
     else:
         stems = tuple(name for name in tensors if name.endswith(
             (".experts.gate_up_proj", ".experts.down_proj")))
-        packed = MXFP4.requantize(tensors, stems)
+        packed = encoded_form(MXFP4, tensors, stems)
         config["quantization_config"] = {"quant_method": "mxfp4"}
     directory = tmp_path / "quantized"
     save_hf_layout(packed, config, directory)
