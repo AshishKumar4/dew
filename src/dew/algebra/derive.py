@@ -37,6 +37,7 @@ import numpy as np
 from egglog import (
     DagCostModel,
     EGraph,
+    Ruleset,
     Schedule,
     String,
     Unit,
@@ -229,9 +230,11 @@ def slot(term: Term) -> i64: ...
 """A walked reduction's index among the walk's, its carried state's (`Term.state`)."""
 
 
-def _exponentials() -> list:
-    """The rules that find what scales as `exp(-k)` of an anchor `k` (`scales`), from its exponential."""
-    x, y, z, k, t, base = vars_("x y z k t base", Term)
+def _exponentials(scaled: bool = False) -> list:
+    """The rules that find what scales as `exp(-k)` of an anchor `k` (`scales`), from its exponential; and
+    `scaled`, as `exp(-c k)`, an exponential of a difference times a positive literal `c` (raw logits, the
+    scale after the subtraction), which a declaration's own rescale alone carries (`Reduction.rescale`)."""
+    x, y, z, k, t, base, c_ = vars_("x y z k t base c_", Term)
     name = var("name", String)
     p, q, c, d, e, s, f = vars_("p q c d e s f", i64)
     axes = var("axes", Vec[i64])
@@ -251,8 +254,13 @@ def _exponentials() -> list:
         bounds = (eq(k).to(x.reduce(String("max"), axes, p)),
                   eq(k).to(x.reduce(String("max"), axes, p).binary(String("max"), z, f)),
                   eq(k).to(z.binary(String("max"), x.reduce(String("max"), axes, p), f)))
-        for exponential, conditions in ((difference.unary(name, e), ()),
-                                        *((held.unary(name, e), (zero(y), bound)) for bound in bounds)):
+        forms = ((difference.unary(name, e), ()),
+                 *((held.unary(name, e), (zero(y), bound)) for bound in bounds))
+        if scaled:
+            forms = tuple((product.unary(name, e), (rules.positive_scale(c_), eq(c_).to(Term.literal(f))))
+                          for product in (difference.binary(String("mul"), c_, d),
+                                          c_.binary(String("mul"), difference, d)))
+        for exponential, conditions in forms:
             found += [
                 rule(eq(t).to(exponential), *broadcast, *conditions, lays(q, i64(0), c)).then(
                     scales(t, k, name, e, s, c)),
@@ -262,8 +270,9 @@ def _exponentials() -> list:
     return found
 
 
-def _walking():
-    """The facts' rules (the module's account)."""
+def _walking(scaled: bool = False):
+    """The facts' rules (the module's account); `scaled`, with an exponential of a difference times a positive
+    literal among what scales (`_exponentials`)."""
     x, y, z, k, t = vars_("x y z k t", Term)
     name, layout = vars_("name layout", String)
     p, q, a, b, c, d, e, s = vars_("p q a b c d e s", i64)
@@ -334,7 +343,7 @@ def _walking():
     ]
     # What scales as exp(-k) (`_exponentials`), and what multiplies, divides, selects against zeros, sums,
     # casts or lays it out with local values, each equation moving the anchor's axis.
-    walking += _exponentials()
+    walking += _exponentials() + (_exponentials(scaled=True) if scaled else [])
     for side in (0, 1):
         def product(scaled, other, params, side=side):
             return scaled.binary(String("mul"), other, params) if side == 0 else other.binary(
@@ -365,7 +374,7 @@ def _walking():
         rule(eq(t).to(x.dot(y, p)), eq(walked(y)).to(a), contracts_right(p, a), scales(y, k, name, e, s, c),
              local(x), right_of(p, c, d)).then(summed(t), set_(anchored(t)).to(d)),
     ]
-    return ruleset(*walking, name="walking")
+    return ruleset(*walking, name="walking scaled" if scaled else "walking")
 
 
 def _shapes():
@@ -389,6 +398,9 @@ def _shapes():
 
 
 WALKING = _walking()
+WALKING_SCALED = _walking(scaled=True)
+"""`WALKING` for a declaration that states its own rescale (`Reduction.rescale`), which carries a scaled
+exponential's factor."""
 SHAPES = _shapes()
 
 
@@ -698,10 +710,11 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
                                    if name in declaration.ranges})
     graph = EGraph()
     _register(graph, region, closed, names, walked_axes)
-    graph.run(WALKING.saturate())
-    for term in _opaque_locals(graph, region):
+    walking = WALKING if declaration.rescale is None else WALKING_SCALED
+    graph.run(walking.saturate())
+    for term in _opaque_locals(graph, region, walking):
         graph.register(local(term))
-    graph.run(WALKING.saturate())
+    graph.run(walking.saturate())
     graph.run(PLAIN.saturate())
     found = [term for term, _ in region.shapes if _holds(graph, summed(term)) or _holds(graph, peaked(term))]
     reductions = tuple({terms.key(term): term for term in found}.values())
@@ -728,7 +741,7 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     graph.register(declared, bundle)
     schedule = cost.walk(cost.target())
     _, before = extract.cheapest(graph, declared, cost.model(region, schedule))
-    facts = seq(rules.FACTS.saturate(), SHAPES.saturate(), WALKING.saturate())
+    facts = seq(rules.FACTS.saturate(), SHAPES.saturate(), walking.saturate())
     decoupled = DECOUPLED if declaration.rescale is None else DECOUPLED_RESCALED
     _decoupled_through(graph, region, facts, decoupled)
     saturated = program.saturate(graph, region, (*rules.admitted(accurate), decoupled),
@@ -907,7 +920,7 @@ def _dot_ranks(region: terms.Region, index: int) -> tuple[int, int]:
     return 0, 0
 
 
-def _opaque_locals(graph: EGraph, region: terms.Region) -> list[Term]:
+def _opaque_locals(graph: EGraph, region: terms.Region, walking: Ruleset) -> list[Term]:
     """The outputs of equations outside the language (`terms.Opaque`), each over local, unwalked inputs alone:
     local themselves, in program order, so an equation over an earlier one's outputs reads them as local. An
     equation outside the language over a value the walk reads is refused: over a walked value its axis is
@@ -924,7 +937,7 @@ def _opaque_locals(graph: EGraph, region: terms.Region) -> list[Term]:
         for leaf in opaque.outputs:
             found.append(Term.leaf(i64(leaf)))
             graph.register(local(Term.leaf(i64(leaf))), unwalked(Term.leaf(i64(leaf))))
-        graph.run(WALKING.saturate())
+        graph.run(walking.saturate())
     return found
 
 
