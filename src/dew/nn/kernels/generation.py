@@ -358,6 +358,10 @@ class GpuTarget:
     multiprocessors: int | None = None
     clock_hz: float | None = None
     memory_bandwidth: float | None = None
+    l2_bytes: int | None = None
+    """The L2 cache's bytes, which a launch whose operands are re-read across its programs (a split
+    contraction's) holds its re-read footprint against: the datasheet's, where NVIDIA's tuning guide states
+    it, else unknown; a real device's own (`runtime_facts`)."""
     measured: Mapping[str, Measured] = dataclasses.field(default_factory=dict, hash=False)
     int8_triton_gemm: bool = False
     """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
@@ -547,6 +551,8 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), multiprocessors=108, clock_hz=1410e6,
               memory_bandwidth=2039e9, triton_gemm_fusions=False, step_seconds=5.96e-6,
+              # The Ampere Tuning Guide's "Increased L2 Capacity": A100's 40 MB.
+              l2_bytes=40 * 2 ** 20,
               # In-kernel: a dependent lane reduction's 225.3 ns (FS-STEP-SECONDS1-a100, its two rounds 225.32
               # and 225.25).
               kernel_step_seconds=225.3e-9,
@@ -573,6 +579,8 @@ TARGETS = {target.generation: target for target in (
               # A loop iteration on XLA's path, 4.93 us (FS-STEP-SECONDS1-h100's second round, 0.3% from the
               # line; its first's 4.80 us lay 17% from it).
               clock_hz=1830e6, memory_bandwidth=3350e9, triton_gemm_fusions=False, step_seconds=4.93e-6,
+              # The Hopper Tuning Guide's "Increased L2 Capacity": H100's 50 MB.
+              l2_bytes=50 * 2 ** 20,
               # A step whose head takes its gradient in the backward a tile at a time, unfused, compiled for
               # an H100: Qwen3.5-4B's at 2 x 4096 tokens under 'full' holds 36.6 GiB of temporaries, 29
               # layers' four [8192, 9216] product operands at its peak and no layer's gradient, its weight
@@ -599,6 +607,8 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,
               dense_peaks={'NVIDIA B200': {'bf16': 2.25e15, 'fp8': 4.5e15}}, multiprocessors=148,
               clock_hz=1965e6, memory_bandwidth=8e12,
+              # The Blackwell Tuning Guide's "Increased L2 Capacity" (1.4.2.2): GB200's GPU, 126 MB.
+              l2_bytes=126 * 2 ** 20,
               # Qwen3.5-0.8B's step at 8 x 3072 tokens under 'full', its head tiled and unfused, compiled for
               # a B200 holds 22.9 GiB of temporaries, against 5.6 with the head fused: some of its weight
               # gradients run after the backward, which the derivation bounds from above by running all
@@ -762,6 +772,15 @@ def _clocks(ordinal: int) -> tuple[tuple[str, float], ...]:
     return ('clock_hz', clock * 1e3), ('memory_bandwidth', 2 * memory_clock * 1e3 * bus / 8)
 
 
+@functools.cache
+def _l2_bytes(ordinal: int) -> int | None:
+    """The visible GPU `ordinal`'s L2 cache in bytes, from the CUDA driver (`dew.devices.gpu_attribute`),
+    read once a process; None where no driver loads."""
+    from dew.devices import L2_CACHE_SIZE, gpu_attribute
+
+    return gpu_attribute(ordinal, L2_CACHE_SIZE)
+
+
 def _one_kind(devices) -> None:
     """Refuse a run whose processes read their facts from GPUs of different kinds: every process traces
     the same program, so the kernel choices each makes from its first GPU's facts (`gpu_target`) must be
@@ -782,7 +801,7 @@ def runtime_facts(target: GpuTarget, device) -> GpuTarget:
     runtime, its family's facts its capability's (`architecture`). A GPU the table does not name so
     keeps every resource a kernel's requirements and cost read."""
     facts = {'multiprocessors': _multiprocessors(device), 'shared_limit': _shared_memory(device),
-             **dict(_clocks(device.local_hardware_id))}
+             **dict(_clocks(device.local_hardware_id)), 'l2_bytes': _l2_bytes(device.local_hardware_id)}
     return dataclasses.replace(target, **{name: value for name, value in facts.items() if value is not None})
 
 
