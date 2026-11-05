@@ -459,7 +459,18 @@ def kimi_k25_media_case(site):
 
     def logits(network, ids, patches):
         dtype = next(network.parameters()).dtype
-        return network(input_ids=ids, **{pixels: patches.to(dtype), grids: torch.tensor([grid])}).logits
+        if site == "image":
+            return network(input_ids=ids, **{pixels: patches.to(dtype), grids: torch.tensor([grid])}).logits
+        # transformers 5.17 splits a video's projected tokens by t·h·w/4 where its tower pools the frames
+        # to h·w/4 (`get_image_features`), so its forward refuses a clip of more than one frame: its own
+        # tower, projector and decoder, placed as its forward places them (`Kimi_K25Model.forward`: the
+        # placeholders read token 0, then the projected tokens scattered over them).
+        inner, placed = network.model, ids == token
+        embeds = inner.get_input_embeddings()(ids.masked_fill(placed, 0))
+        tower = inner.vision_tower(patches.to(dtype), grid_thw=torch.tensor([grid])).pooler_output
+        projected = inner.mm_projector(tower).squeeze(1).to(embeds.dtype)
+        embeds = embeds.masked_scatter(placed[..., None], projected)
+        return network(inputs_embeds=embeds).logits
 
     reference, truth = transformers_arms(network.eval(), logits)
     # The decoder's routing over the row with its media, as the compared runs route it.
