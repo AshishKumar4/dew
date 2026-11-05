@@ -37,6 +37,7 @@ from flax.typing import PrecisionLike
 from jax.custom_derivatives import zero_from_primal
 from jax.extend import core as jax_core
 
+from dew.nn.derivatives import KernelGlue
 from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.templates.product import declared
 from dew.nn.precision import at_least_fp32
@@ -137,7 +138,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
         return tuple(leaves[index] for index in live)
 
     differentiable = generation.linear_tangent(forward, grouped_matmul.GROUPED.bound(backward), portable,
-                                                live_cotangents=True)
+                                                kind=KernelGlue(), live_cotangents=True)
     return differentiable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired)
 
 

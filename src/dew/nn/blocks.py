@@ -16,6 +16,7 @@ from dew.nn.dropout import Dropout
 
 from . import activations
 from .conv import Conv
+from .derivatives import Protected
 from .flops import projection_flops
 from .kernels.generation import linear_tangent
 from .norms import GroupNorm, RMSNorm
@@ -58,7 +59,8 @@ def _rows(dtype: jnp.dtype) -> Callable:
     def forward(table, ids):
         return _table_rows(table, ids, dtype), (table, ids)
 
-    return linear_tangent(forward, _table_rows_backward, lambda table, ids: _table_rows(table, ids, dtype))
+    return linear_tangent(forward, _table_rows_backward, lambda table, ids: _table_rows(table, ids, dtype),
+                          kind=Protected())
 
 
 def _table_rows_backward(saved: tuple[jax.Array, jax.Array], operands: tuple, cotangent: jax.Array

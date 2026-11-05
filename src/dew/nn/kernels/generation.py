@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from jax.sharding import AbstractMesh, Mesh
 
+    from dew.nn.derivatives import Kind
     from dew.nn.precision import Numerics
 
     from .selection import Refusal
@@ -816,7 +817,7 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
     return found
 
 
-def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
+def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *, kind: Kind,
                    live_cotangents: bool = False, primal: Callable | None = None,
                    nested: bool = True) -> Callable:
     """A fused kernel as one function of its operands, differentiated at every order through
@@ -840,27 +841,26 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     cotangent is never formed. `primal(*operands)` gives the output where no derivative is taken (a kernel
     that saves nothing), `forward`'s where None. Without `nested`, a derivative's level runs `forward` as
     it is, not as a custom JVP of its own: a value it names (`checkpoint_name`) is a residual a remat
-    policy can keep, and no higher order differentiates through it (a kernel's custom VJP takes none)."""
+    policy can keep, and no higher order differentiates through it (a kernel's custom VJP takes none).
+
+    Each of its three custom JVPs is one marked call of `kind` (`dew.nn.derivatives.declared_tangent`), the
+    caller's, which the algebra pass reads it by: a kernel's glue (`KernelGlue`), a rule its numerics need
+    as written (`Protected`) or one written to restructure algebra (`Algebra`)."""
     import jax
     from jax.custom_derivatives import SymbolicZero, zero_from_primal
 
-    @jax.custom_jvp
-    def produced(*operands):
-        return forward(*operands)
+    from dew.nn.derivatives import declared_tangent
 
-    @produced.defjvp
-    def _(primals, tangents):
+    def produced_tangent(primals, tangents):
         output, saved = produced(*primals)
         # `saved` reaches only `pulled`, whose tangent reads the operands' instead.
         return (output, saved), (jax.jvp(portable, primals, tangents)[1], zero_from_primal(saved))
 
-    @functools.partial(jax.custom_jvp, nondiff_argnums=(3,))
-    def pulled(saved, operands, cotangent, live):
-        arguments = (saved, operands, cotangent) if live is None else (saved, operands, cotangent, live)
-        return backward(*arguments)
+    @functools.partial(declared_tangent, kind, tangent=produced_tangent)
+    def produced(*operands):
+        return forward(*operands)
 
-    @pulled.defjvp
-    def _(live, primals, tangents):
+    def pulled_tangent(live, primals, tangents):
         _, operands, cotangent = primals
         _, doperands, dcotangent = tangents
 
@@ -871,9 +871,10 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
         return pulled(*primals, live), jax.jvp(pullback, (operands, cotangent), (doperands, dcotangent))[1]
 
-    @jax.custom_jvp
-    def bounded(*operands):
-        return forward(*operands)[0] if primal is None else primal(*operands)
+    @functools.partial(declared_tangent, kind, tangent=pulled_tangent, nondiff_argnums=(3,))
+    def pulled(saved, operands, cotangent, live):
+        arguments = (saved, operands, cotangent) if live is None else (saved, operands, cotangent, live)
+        return backward(*arguments)
 
     def bounded_jvp(primals, tangents):
         output, saved = (produced if nested else forward)(*primals)
@@ -905,7 +906,10 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
         typed = jax.tree.map(lambda leaf: jax.typeof(leaf).to_tangent_aval(), output)
         return output, linear_map(tangent, transposed, (primals, saved), moving, out_aval=typed)
 
-    bounded.defjvp(bounded_jvp, symbolic_zeros=True)
+    @functools.partial(declared_tangent, kind, tangent=bounded_jvp, symbolic_zeros=True)
+    def bounded(*operands):
+        return forward(*operands)[0] if primal is None else primal(*operands)
+
     return bounded
 
 
@@ -997,6 +1001,12 @@ def _linear_primitive() -> type:
         def batch(self, axis_data, args, dims):
             # A linear map again, of `apply` and `pullback` mapped, so a batch transposes to the pullback.
             residual_axes, moving_axes = dims
+            if all(axis is None for axis in jax.tree.leaves(dims, is_leaf=lambda axis: axis is None)):
+                # No operand varies over the batch (a call's tangent a vmap leaves unbatched): the map
+                # itself, unbatched as they are. Mapped, its output took the batch, and a custom JVP
+                # whose primal did not broadcast it again (a jit of a kernel under a vmap of shared
+                # weights drew its output and its weights' gradient twice over the batch).
+                return self(*args), jax.tree.map(lambda _: None, self.out_aval)
             mapped = {"axis_size": axis_data.size, "axis_name": axis_data.name,
                       "spmd_axis_name": axis_data.spmd_name or axis_data.explicit_mesh_axis}
 

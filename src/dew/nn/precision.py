@@ -41,7 +41,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.extend import core
 from jax.typing import DTypeLike
 
-from dew.nn.derivatives import Protected, bound_span, surrogate
+from dew.nn.derivatives import Protected, bound_span, declared_derivative, declared_tangent, surrogate
 from dew.nn.nested import nested
 from dew.nn.sharding import explicit_spec
 
@@ -545,7 +545,8 @@ def _summed_wide(product: Callable, preferred_element_type, *operands) -> jax.Ar
             return tuple(transposed(index) for index in live)
 
     # Forward mode differentiates `summed` as it traces, inside its scope; reverse mode runs `pulled`.
-    wide = linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True)
+    wide = linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, kind=Protected(),
+                          live_cotangents=True)
     return jax.lax.platform_dependent(*operands, cpu=wide, default=narrow)
 
 
@@ -885,8 +886,8 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
     return product, rounded(tail - lost if subtract else lost + tail)
 
 
-@jax.custom_jvp
-def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike) -> jax.Array:
+def _correctly_rounded_divide(numerator: jax.typing.ArrayLike,
+                              denominator: jax.typing.ArrayLike) -> jax.Array:
     """The correctly rounded fp32 quotient, IEEE division's, on XLA's approximate
     dividers too: XLA:CPU rewrites a division by a broadcast into a multiplication
     by its reciprocal (openxla/xla#51148), and XLA:GPU's fp32 a / b is off IEEE on
@@ -970,10 +971,14 @@ def _rounded_significand(numerator: jax.Array, denominator: jax.Array) -> tuple[
     return rounded, jnp.sign((numerator - product) - error)
 
 
-@correctly_rounded_divide.defjvp
 def _divide_jvp(primals, tangents):
     """The rounding is a selection among neighbours, so the quotient's tangent is the division's."""
     return correctly_rounded_divide(*primals), jax.jvp(jnp.divide, primals, tangents)[1]
+
+
+correctly_rounded_divide = declared_tangent(Protected(), _correctly_rounded_divide, _divide_jvp)
+"""`_correctly_rounded_divide`, its tangent the division's: a protected span
+(`dew.nn.derivatives.declared_tangent`), whose error-free steps the algebra pass must not reassociate."""
 
 
 def divided(numerator, rate):
@@ -1042,8 +1047,7 @@ def compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
     return _compensated_sum(values, tuple(axes))
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
-def _compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
+def _compensated(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
     wide = values.astype(at_least_fp32(values.dtype))
     zero = jnp.zeros((), wide.dtype)
     hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), compensated_add, axes)
@@ -1123,10 +1127,14 @@ def compensated_total(pair: tuple[jax.Array, jax.Array], plain: jax.Array) -> ja
     return jnp.where(jnp.isfinite(plain), pair[0] + pair[1], plain)
 
 
-@_compensated_sum.defjvp
 def _compensated_sum_jvp(axes: tuple[int, ...], primals: tuple[jax.Array],
                          tangents: tuple[jax.Array]) -> tuple[jax.Array, jax.Array]:
     return _compensated_sum(primals[0], axes), jnp.sum(tangents[0], axes)
+
+
+_compensated_sum = declared_tangent(Protected(), _compensated, _compensated_sum_jvp, nondiff_argnums=(1,))
+"""`_compensated`, the sum over `axes` its pair rounds once, its tangent the plain sum's: a protected span
+(`dew.nn.derivatives.declared_tangent`), whose compensation the algebra pass must not cancel."""
 
 def _rounded(x: jax.Array, dtype: Dtype) -> jax.Array:
     """The value `x` takes in `dtype`, held in `x`'s own dtype (`rounded_operand`'s value).
@@ -1294,7 +1302,8 @@ def bf16_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers) -> jax.A
     def forward(lhs, rhs):
         return typed(lhs, rhs, numbers)
 
-    return linear_tangent(lambda lhs, rhs: (forward(lhs, rhs), ()), pulled, forward)(lhs, rhs)
+    return linear_tangent(lambda lhs, rhs: (forward(lhs, rhs), ()), pulled, forward,
+                          kind=Protected())(lhs, rhs)
 
 
 def _transposed(cotangent, operands, numbers, side: int, product) -> jax.Array:
@@ -1347,11 +1356,6 @@ def at_default_precision[Output](fn: Callable[..., Output]) -> Callable[..., Out
     does. The kernels take no per-dot precision, so there is no other setting.
     The backward is traced after the forward returns, so it is held under the
     same setting by hand."""
-    @jax.custom_vjp
-    def run(*args):
-        with jax.default_matmul_precision('default'):
-            return fn(*args)
-
     def forward(*args):
         with jax.default_matmul_precision('default'):
             return jax.vjp(fn, *args)
@@ -1360,7 +1364,12 @@ def at_default_precision[Output](fn: Callable[..., Output]) -> Callable[..., Out
         with jax.default_matmul_precision('default'):
             return pullback(cotangent)
 
-    run.defvjp(forward, backward)
+    # A protected span: the precision it holds is the kernels' own, which no rewrite may change.
+    @functools.partial(declared_derivative, Protected(), forward=forward, backward=backward)
+    def run(*args):
+        with jax.default_matmul_precision('default'):
+            return fn(*args)
+
     return run
 
 

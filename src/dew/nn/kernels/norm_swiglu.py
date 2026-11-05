@@ -80,6 +80,7 @@ from jax.experimental.pallas import triton as plgpu
 
 from dew.mesh import logical_spec
 
+from ..derivatives import KernelGlue
 from ..precision import (
     activation_and_slope,
     at_least_fp32,
@@ -813,7 +814,7 @@ def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after
         # The sum's two addends share its cotangent: one buffer, read by both.
         return dstream, dstream, dscale
 
-    local = generation.linear_tangent(forward, backward, _stored(portable, norm, 2))
+    local = generation.linear_tangent(forward, backward, _stored(portable, norm, 2), kind=KernelGlue())
     return _per_shard(local, axes, (x, branch, _widened(scale)), (False, False, True))
 
 
@@ -833,7 +834,7 @@ def rms_norm(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool, po
         dx, _, dscale = _rms_backward_call(x, scale, None, mean_square, dy, None, norm)
         return dx, dscale
 
-    local = generation.linear_tangent(forward, backward, _stored(portable, norm, 1))
+    local = generation.linear_tangent(forward, backward, _stored(portable, norm, 1), kind=KernelGlue())
     return _per_shard(local, axes, (x, _widened(scale)), (False, True))
 
 
@@ -852,7 +853,7 @@ def gated_rms_norm(x, gate, scale, epsilon: float, dtype, activation: str, porta
         x, gate, scale = operands
         return _rms_backward_call(x, scale, gate, mean_square, dy, None, norm)
 
-    local = generation.linear_tangent(forward, backward, _stored(portable, norm, 2))
+    local = generation.linear_tangent(forward, backward, _stored(portable, norm, 2), kind=KernelGlue())
     return _per_shard(local, axes, (x, gate, _widened(scale)), (False, False, True))
 
 
@@ -1031,7 +1032,7 @@ def swiglu(gate, up, portable, *, axes=None):
     interpret = not generation.triton_runs()
     local = generation.linear_tangent(lambda gate, up: (_swiglu(gate, up, interpret), ()),
                                       lambda saved, operands, dy: _swiglu_bwd(interpret, operands, dy),
-                                      portable)
+                                      portable, kind=KernelGlue())
     return _per_shard(local, axes, (gate, up), (False, False))
 
 
@@ -1043,7 +1044,7 @@ def packed_swiglu(gate_up, portable, *, axes=None):
     interpret = not generation.triton_runs()
     local = generation.linear_tangent(lambda gate_up: (_packed(gate_up, interpret), ()),
                                       lambda saved, operands, dy: _packed_bwd(interpret, operands[0], dy),
-                                      portable)
+                                      portable, kind=KernelGlue())
 
     if not automatic_axes():
         return local(gate_up)

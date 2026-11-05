@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh, PartitionSpec
 
+from dew.nn.derivatives import KernelGlue
 from dew.nn.kernels import generation
 
 
@@ -19,7 +20,7 @@ def tripled(x, index):
     return generation.linear_tangent(
         lambda x, index: (jax.lax.stop_gradient(3 * x), ()),
         lambda saved, operands, cotangent: (4 * cotangent, np.zeros(operands[1].shape, jax.dtypes.float0)),
-        lambda x, index: 3 * x)(x, index)
+        lambda x, index: 3 * x, kind=KernelGlue())(x, index)
 
 
 def summed(x, index):
@@ -56,15 +57,19 @@ def reversed_through(staging):
         return lambda x, index: jax.vmap(jax.grad(summed))(x.reshape(2, -1), index.reshape(2, -1)).reshape(-1)
     if staging == "gradient of a vmap":
         return jax.grad(lambda x, index: jax.vmap(tripled)(x.reshape(2, -1), index.reshape(2, -1)).sum())
-    # An operand two rows share: its cotangent sums the rows'.
+    # An operand two rows share: its cotangent sums the rows'; a call between the vmap and the map (a jit,
+    # a marked call) leaves its tangent unbatched inside.
+    called = jax.jit(tripled) if staging == "a call shared across a vmap" else tripled
+
     def shared(x, index):
-        return jax.vmap(tripled, in_axes=(None, 0))(x, jnp.stack([index, index])).sum() / 2
+        return jax.vmap(called, in_axes=(None, 0))(x, jnp.stack([index, index])).sum() / 2
 
     return jax.jit(jax.grad(shared))
 
 
 @pytest.mark.parametrize("staging", ["vjp", "jit", "shard_map", "scan", "remat", "linearize",
-                                     "vmap of a gradient", "gradient of a vmap", "shared across a vmap"])
+                                     "vmap of a gradient", "gradient of a vmap", "shared across a vmap",
+                                     "a call shared across a vmap"])
 def test_reverse_mode_runs_the_backward_kernel_however_the_call_is_staged(staging):
     """A vjp, or a jvp that a shard_map, a scan or `jax.linear_transpose` then transposes, of the call or of
     a batch of it: each runs the backward kernel (`generation.linear_map`)."""
@@ -73,10 +78,10 @@ def test_reverse_mode_runs_the_backward_kernel_however_the_call_is_staged(stagin
     np.testing.assert_array_equal(np.asarray(reversed_through(staging)(x, index)), np.full(x.shape, 4.0))
 
 
-@pytest.mark.parametrize("staging", ["jvp", "jit", "linearize", "vmap"])
+@pytest.mark.parametrize("staging", ["jvp", "jit", "linearize", "vmap", "a call shared across a vmap"])
 def test_forward_mode_takes_the_portable_tangent_however_the_call_is_staged(staging):
     """`jax.jvp` and `jax.linearize`, of the call or of a batch of it, staged by a jit or not, evaluate the
-    portable arithmetic's tangent."""
+    portable arithmetic's tangent, a row of a batch whose rows share the operand its own."""
     x, index = jnp.arange(8.0), jnp.arange(8)
     direction = jnp.ones_like(x)
 
@@ -86,6 +91,10 @@ def test_forward_mode_takes_the_portable_tangent_however_the_call_is_staged(stag
         if staging == "vmap":
             return jax.jvp(lambda x: jax.vmap(tripled)(x.reshape(2, -1), index.reshape(2, -1)), (x,),
                            (direction,))[1].reshape(-1)
+        if staging == "a call shared across a vmap":
+            rows = jnp.stack([index, index])
+            return jax.jvp(lambda x: jax.vmap(jax.jit(tripled), in_axes=(None, 0))(x, rows), (x,),
+                           (direction,))[1][0]
         return jax.jvp(lambda x: tripled(x, index), (x,), (direction,))[1]
 
     run = jax.jit(tangent) if staging == "jit" else tangent

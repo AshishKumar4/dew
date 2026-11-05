@@ -37,6 +37,7 @@ from dew.nn.precision import (
     stochastic_bf16,
 )
 
+from ..derivatives import KernelGlue
 from ..sharding import explicit_spec
 from . import chunked_launch, short_conv, tuning
 from .generation import linear_tangent, triton_runs
@@ -365,7 +366,7 @@ def _skip_backward(saved, operands, grad):
     return summed.astype(skip.dtype), (grad * skip[:, None]).astype(value.dtype)
 
 
-_skip = linear_tangent(_skip_forward, _skip_backward, _skip_product)
+_skip = linear_tangent(_skip_forward, _skip_backward, _skip_product, kind=KernelGlue())
 """`D v` (`_skip_product`) differentiated at every order (`generation.linear_tangent`): forward mode the
 product's own tangent, reverse mode its gradient in `D` summing every token's and value's product as a
 product (at JAX's configured precision) rather than one reduction over them all: XLA:CPU's reduction,
@@ -744,7 +745,8 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
         return jax.vjp(portable, *operands)[1](cotangent)
 
     launched = functools.partial(_launched, hooks, dtype=dtype)
-    return linear_tangent(lambda operands: (launched(operands), ()), pulled, portable)(operands)
+    return linear_tangent(lambda operands: (launched(operands), ()), pulled, portable,
+                          kind=KernelGlue())(operands)
 
 
 def _launched(hooks: Hooks, operands: Step, *, dtype):
