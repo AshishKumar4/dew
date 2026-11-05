@@ -224,7 +224,9 @@ class BitForm:
         """Output register `output` of the form as one PTX block over its stored word `$1` into `$0`, the
         steps it reads each on the pipe its step names (`_PTX`), for a kernel's inline assembly (Pallas's
         `elementwise_inline_asm`, constraints `=r,r`, which takes one result a block): a register's block
-        apiece, whose shared steps ptxas computes once, as it optimizes the kernel's PTX whole."""
+        apiece, each holding the steps it reads, so a step two registers share is written twice and ptxas,
+        which optimizes the kernel's PTX whole, may compute it once (the consumer's compile report shows
+        whether it does)."""
         needed: set[int] = set()
         pending = [self.outputs[output]]
         while pending:
@@ -264,9 +266,10 @@ _PTX = {
         f"lop3.b32 {out}, {ins[0]}, {ins[1]}, {mask:#010x}, {_MASKED_XOR:#04x};" if len(ins) == 2
         else f"lop3.b32 {out}, {ins[0]}, {ins[0]}, {mask:#010x}, {_MASKED:#04x};"),
 }
-"""Each instruction on its pipe as PTX: ptxas keeps a shift or rotation on the ALU as SHF and a multiply by a
-power of two on the FMA pipe as IMAD (PTX ISA, "Integer Arithmetic Instructions"; Nsight Compute's
-pipelines)."""
+"""Each instruction as the PTX written for its pipe: a shift or rotation as `shr`/`shl`/`shf`, which ptxas
+issues as SHF on the ALU, and a multiply by a power of two as `mul`, which it issues as IMAD on the FMA pipe
+(PTX ISA, "Integer Arithmetic Instructions"; Nsight Compute's pipelines). PTX fixes the arithmetic, not the
+SASS: ptxas chooses the final instructions, which the consumer's compile report shows."""
 
 
 class Unproven(ValueError):
