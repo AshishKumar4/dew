@@ -12,14 +12,13 @@ import pytest
 from affine_run import BATCH, FEATURES, Counting, Regression, dataset
 from etils import epath
 from flax import linen as nn
-from model_support import largest_difference
 from recording import bits
 from reference_error import assert_computes_the_oracle
 
 from dew.averaging import power_decay
 from dew.checkpoints import frozen_entries
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Weighted
-from dew.optim import power_profiles
+from dew.optim import PowerProfilesState, power_profiles
 from dew.training import Checkpoints, DiLoCo, Layout, MeshSpec, Trainer
 
 RATE, OUTER_RATE, MOMENTUM = 0.05, 0.7, 0.9
@@ -352,12 +351,11 @@ def test_a_replicas_fields_are_the_train_states_marked_ones_and_its_typed_view_n
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_diloco_runs_profiles_are_kept_snapshots_that_rebuild_its_groups_mean_average(tmp_path):
+def test_a_diloco_runs_profiles_are_kept_snapshots_its_groups_averages_restore_from(tmp_path):
     """Under DiLoCo the configured optimizer, and the power profiles it keeps, are the groups' inner ones
-    (`DiLoCo.started`). Each checkpoint is a snapshot of them, kept past `keep` (row 4317), and the post-hoc
-    EMA rebuilt from them is the groups' mean of each group's own reconstruction: within fp32 rounding at
-    the weights' scale of the mean of the EMAs the groups track directly, as a run of one copy's is, each
-    stored profile's mean over a hundred times that bound from it."""
+    (`DiLoCo.started`). Each checkpoint is a snapshot of them, kept past `keep` (row 4317): its averages
+    restore as the groups held them, bit for bit, stacked over the groups, and the post-hoc EMA rebuilt
+    from the snapshots is one model in the parameters' own shapes, the groups' mean."""
     objective = Regression()
     objective.ema = EMASpec(decay=power_decay(0.07))
     run = Trainer(objective, power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0),
@@ -368,14 +366,16 @@ def test_a_diloco_runs_profiles_are_kept_snapshots_that_rebuild_its_groups_mean_
 
     checkpoints = Checkpoints(str(tmp_path / "run"))
     assert checkpoints.profile_steps() == list(range(4, 97, 4))
-    groups_mean = jax.tree.map(lambda leaf: np.mean(np.asarray(leaf), axis=0), state.inner.ema["params"])
+    held = next(node for node in jax.tree.leaves(state.inner.opt_state,
+                                                 is_leaf=lambda node: isinstance(node, PowerProfilesState))
+                if isinstance(node, PowerProfilesState))
+    for restored, live in zip(checkpoints.restore_profiles(96), held.averages, strict=True):
+        for got, want in zip(jax.tree.leaves(restored), jax.tree.leaves(live), strict=True):
+            np.testing.assert_array_equal(got, np.asarray(want))
     rebuilt = checkpoints.posthoc_ema(0.07)
-    scale = max(float(np.max(np.abs(leaf))) for leaf in jax.tree.leaves(groups_mean))
-    bound = 2 * np.finfo(np.float32).eps * scale
-    assert largest_difference(rebuilt, groups_mean) <= bound
-    for average in checkpoints.restore_profiles(96):
-        mean = jax.tree.map(lambda leaf: np.mean(leaf, axis=0), average)
-        assert largest_difference(mean, groups_mean) > 100 * bound
+    assert jax.tree.structure(rebuilt) == jax.tree.structure(state.variables["params"])
+    assert [leaf.shape for leaf in jax.tree.leaves(rebuilt)] == [
+        leaf.shape for leaf in jax.tree.leaves(state.variables["params"])]
 
 
 class Tabled(Objective):

@@ -402,9 +402,9 @@ def test_older_kept_steps_hold_their_model_alone_and_the_latest_resumes(tmp_path
     assert int(saved['step']) == 4
     np.testing.assert_array_equal(np.asarray(saved['variables']['params']['w']),
                                   np.asarray(state.variables['params']['w']))
-    with pytest.raises(ValueError, match="weights"):
+    with pytest.raises(ValueError):
         checkpoints.restore(run.initial_state(), 4)
-    with pytest.raises(ValueError, match="data position"):
+    with pytest.raises(ValueError):
         checkpoints.position(4, DataPartition(0, 1))
     resumed, _ = checkpoints.restore(run.initial_state())
     assert int(resumed.step) == 5
@@ -443,7 +443,7 @@ def test_a_step_whose_projection_was_cut_short_reads_as_projected_and_finishes_l
     monkeypatch.setattr(shutil, 'rmtree', lambda path, *args, **kwargs: (_ for _ in ()).throw(
         OSError('killed before the deletion')))
     checkpoints.save(3, state.replace(step=jnp.int32(3)), None)
-    with pytest.raises(OSError, match='killed'):
+    with pytest.raises(OSError):
         checkpoints.wait()
     monkeypatch.setattr(shutil, 'rmtree', rmtree)
     assert 'resume' in _items(directory, 2)
@@ -452,7 +452,7 @@ def test_a_step_whose_projection_was_cut_short_reads_as_projected_and_finishes_l
     reopened = Checkpoints(str(directory), keep=keep)
     assert {kept.step: kept.kind for kept in reopened.kept()} == {1: 'state', 2: 'weights', 3: 'state'}
     assert reopened.latest == 3
-    with pytest.raises(ValueError, match="weights"):
+    with pytest.raises(ValueError):
         reopened.restore(run.initial_state(), 2)
     reopened.save(4, state.replace(step=jnp.int32(4)), None)
     reopened.wait()

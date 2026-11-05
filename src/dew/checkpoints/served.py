@@ -4,7 +4,7 @@ read and translated at the restore (`Checkpoints.restore`). Carried to 1.0, when
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import jax
@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from dew.nn.protocols import ProjectionGroup
 
 
-def unpacked(read: Callable[[object, object], dict], metadata, restored: dict,
+def unpacked(read: Callable[[Mapping[str, object], Mapping[str, object]], dict], metadata, restored: dict,
              served: Sequence[ProjectionGroup]) -> dict:
     """`restored` with each leaf the step lacks under a member of a `served` group, where it holds the
     group's packed leaf in its place (`<path>/<packed>/<field>` for `<path>/<member>/<field>`), read
