@@ -18,9 +18,9 @@ import jax
 import pytest
 
 from dew import communicators
-from dew.cache import package_digest
+from dew._cache import package_digest
+from dew._devices import POOL_NAMES, pool_bound
 from dew.communicators import Collectives, CommunicatorRoom, Needs
-from dew.devices import POOL_NAMES, pool_bound
 
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 GIB = 2**30
@@ -53,7 +53,7 @@ a permute's over four 1 GiB on each member, a quarter for each send and an eight
 
 
 def test_the_pool_takes_at_most_the_runs_share_and_leaves_the_communicators_room():
-    """The pool's share of each GPU is the run's (`dew.devices.pool_bound`) as an upper bound: it leaves the
+    """The pool's share of each GPU is the run's (`dew._devices.pool_bound`) as an upper bound: it leaves the
     room its communicators and the runtime take outside the pool at NCCL's full speed, the tightest GPU
     deciding, to a thousandth below, and NCCL is never slowed to fit. A pool the communicators leave no room
     for at all is refused, naming each side's bytes."""
@@ -189,7 +189,7 @@ def test_a_programs_code_is_held_to_what_is_free_beside_its_new_communicators():
 
 
 def test_a_programs_communicators_are_kept_under_the_digest_of_dews_code(tmp_path, monkeypatch):
-    """A program's communicators are kept under the digest of Dew's own code (`dew.cache.package_digest`),
+    """A program's communicators are kept under the digest of Dew's own code (`dew._cache.package_digest`),
     the key every cache of what Dew's code computed reads: those kept under this Dew's digest are taken as
     they are kept, its text unread, and those kept by another Dew's code, under its digest or none, are read
     again from the program's text."""
@@ -457,7 +457,7 @@ def test_a_hosts_gpus_are_counted_by_its_cuda_driver_without_nvidia_smi(tmp_path
         subprocess.run([compiler, "-shared", "-fPIC", "-o", str(directory / "libcuda.so.1"),
                         str(directory / "libcuda.c")], check=True)
         environment = {name: value for name, value in os.environ.items() if name != "CUDA_VISIBLE_DEVICES"}
-        counted = "from dew.pool import local_gpu_count; print(local_gpu_count())"
+        counted = "from dew._pool import local_gpu_count; print(local_gpu_count())"
         done = subprocess.run([sys.executable, "-c", counted], capture_output=True, text=True, check=True,
                               env={**environment, "PATH": str(directory), "PYTHONPATH": str(SOURCE),
                                    "LD_LIBRARY_PATH": str(directory)})

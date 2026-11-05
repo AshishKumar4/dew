@@ -20,6 +20,8 @@ import tokamax
 from flax.linen.dtypes import promote_dtype
 from jax.ad_checkpoint import checkpoint_name
 
+from dew.nn.derivatives import KernelGlue, declared_tangent
+
 from .attention_kernels import ATTENTION, DECODE, TPU_BACKEND, AttentionCase, decodes
 from .attention_masks import (
     combined_attention_mask,
@@ -754,8 +756,7 @@ def forward_differentiable(value, tangent, *arrays, precision: str | None = None
     CPU) takes its moving operands alone."""
     from jax.custom_derivatives import SymbolicZero
 
-    @jax.custom_jvp
-    def attend(*arrays):
+    def attending(*arrays):
         return value(*arrays)
 
     def rule(primals, tangents):
@@ -775,7 +776,7 @@ def forward_differentiable(value, tangent, *arrays, precision: str | None = None
                                      tuple(tangents[index] for index in live))[1]
         return output, differentiated
 
-    attend.defjvp(rule, symbolic_zeros=True)
+    attend = declared_tangent(KernelGlue(), attending, rule, symbolic_zeros=True)
     return attend(*arrays)
 
 

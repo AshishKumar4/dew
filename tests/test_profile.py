@@ -370,7 +370,7 @@ def a_gpu_window_past_cuptis_cap_reports_no_device_figure_its_kernels_cannot_est
     pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
     import autoencoder_experiment
 
-    from dew.cli.main import main
+    from dew._cli.main import main
 
     # A cap of one event: a step's few launches (XLA runs its kernels as command buffers) pass it.
     for cap, partial in ((1, True), (-1, False)):

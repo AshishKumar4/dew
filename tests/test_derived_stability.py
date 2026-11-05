@@ -37,11 +37,16 @@ from dew.nn.kernels.templates import attention as template, attention_portable
 
 
 @contextlib.contextmanager
-def derived():
-    """Within the block, the run's fast forms with the template's walks the derived ones."""
-    fast = dataclasses.replace(generation.numerics(), forms="fast")
-    with generation.run_precision(fast), algebra_forms.derived():
+def derived(forms: str = "fast"):
+    """Within the block, the run's `forms` (the fast ones, or the accurate ones: natural logits, the anchor's
+    split, the keyed sums) with the template's walks the derived ones."""
+    numerics = dataclasses.replace(generation.numerics(), forms=forms)
+    with generation.run_precision(numerics), algebra_forms.derived():
         yield
+
+
+FORMS = ["fast", "accurate"]
+"""The forms each derived walk is held under."""
 
 
 ATTENTION_FAMILIES = [(name, dtype) for name in attention_suite.TEMPLATE_FAMILIES
@@ -49,17 +54,19 @@ ATTENTION_FAMILIES = [(name, dtype) for name in attention_suite.TEMPLATE_FAMILIE
 """Each template family as drawn (None) and in fp16, the dtype the derived forward walks."""
 
 
+@pytest.mark.parametrize("forms", FORMS)
 @pytest.mark.parametrize(("name", "dtype"), ATTENTION_FAMILIES,
                          ids=[f"{name}-{dtype or 'as drawn'}" for name, dtype in ATTENTION_FAMILIES])
-def test_the_derived_attention_is_finite_where_the_truth_is_on_every_family(name, dtype):
-    """The plain-JAX mainloop's derived forms, forward and backward, finite wherever the float64 truth
-    rounded to their dtype is (`assert_finite`) over the family's draws, a row that sees nothing zero."""
+def test_the_derived_attention_is_finite_where_the_truth_is_on_every_family(name, dtype, forms):
+    """The plain-JAX mainloop's derived forms under each of its `forms`, forward and backward, finite
+    wherever the float64 truth rounded to their dtype is (`assert_finite`) over the family's draws (an
+    anchor's, one key's and a masked query's among them), a row that sees nothing zero."""
     family = attention_suite.FAMILIES[name]
     family = family if dtype is None else dataclasses.replace(family, dtype=dtype)
     draw = attention_suite._cast(family, family.draw)
     truth = with_gradients(attention_suite._reference(family, anchored=True))
-    label = f"portable derived {family.dtype} {name}"
-    with derived():
+    label = f"portable derived {forms} {family.dtype} {name}"
+    with derived(forms):
         differentiated = jax.jit(with_gradients(attention_suite._mainloops(family, {})["portable"]))
         attention_suite.assert_finite(differentiated, truth, draw, label, seeds=attention_suite.SEEDS[name])
         attention_suite._held_empty(family, differentiated(*draw(0)), label)
@@ -119,10 +126,11 @@ def _edges(dtype) -> dict:
 EDGES = [(name, dtype) for dtype in ("float16", "bfloat16", "float32") for name in _edges(jnp.float32)]
 
 
+@pytest.mark.parametrize("forms", FORMS)
 @pytest.mark.parametrize(("name", "dtype"), EDGES, ids=[f"{name}-{dtype}" for name, dtype in EDGES])
-def test_the_derived_attention_is_finite_where_the_reference_is_at_each_edge(name, dtype):
-    """The plain-JAX mainloop's derived forms at the edge `name` in `dtype`: its output and gradients finite
-    wherever the reference's are."""
+def test_the_derived_attention_is_finite_where_the_reference_is_at_each_edge(name, dtype, forms):
+    """The plain-JAX mainloop's derived forms under each of its `forms` at the edge `name` in `dtype`: its
+    output and gradients finite wherever the reference's are."""
     query, key, value, dout, spans, hooks = _edges(jnp.dtype(dtype))[name]
     tiles = {"block_q": 8, "block_k": 8, "pad": 8}
 
@@ -131,7 +139,7 @@ def test_the_derived_attention_is_finite_where_the_reference_is_at_each_edge(nam
 
     out, pull = jax.vjp(reference, query, key, value)
     theirs = (out, *pull(dout))
-    with derived():
+    with derived(forms):
         made = attention_portable.backward(query, key, value, spans, hooks, dout, **tiles)
         mine = (attention_portable.attend(query, key, value, spans, hooks, **tiles), made.query, made.key,
                 made.value)

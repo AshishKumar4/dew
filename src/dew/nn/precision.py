@@ -338,8 +338,8 @@ def products_dtype(*operands) -> jnp.dtype | None:
 
 def _intercepted() -> bool:
     """Whether this thread traces a quantized model's method, whose products Qwix owns
-    (`dew.cache.QUANTIZED_TRACE`, which jit's cache keys on)."""
-    from dew.cache import QUANTIZED_TRACE
+    (`dew._cache.QUANTIZED_TRACE`, which jit's cache keys on)."""
+    from dew._cache import QUANTIZED_TRACE
 
     return QUANTIZED_TRACE.value is not None
 
@@ -545,7 +545,8 @@ def _summed_wide(product: Callable, preferred_element_type, *operands) -> jax.Ar
             return tuple(transposed(index) for index in live)
 
     # Forward mode differentiates `summed` as it traces, inside its scope; reverse mode runs `pulled`.
-    wide = linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True)
+    wide = linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True,
+                          kind=Protected())
     return jax.lax.platform_dependent(*operands, cpu=wide, default=narrow)
 
 
@@ -1302,7 +1303,8 @@ def bf16_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers) -> jax.A
     def forward(lhs, rhs):
         return typed(lhs, rhs, numbers)
 
-    return linear_tangent(lambda lhs, rhs: (forward(lhs, rhs), ()), pulled, forward)(lhs, rhs)
+    return linear_tangent(lambda lhs, rhs: (forward(lhs, rhs), ()), pulled, forward,
+                          kind=Protected())(lhs, rhs)
 
 
 def _transposed(cotangent, operands, numbers, side: int, product) -> jax.Array:

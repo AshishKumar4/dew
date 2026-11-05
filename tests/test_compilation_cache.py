@@ -1,5 +1,5 @@
 """A process Dew readies for training keeps JAX's persistent compilation cache under the user's
-cache directory, unless JAX's own switch turns it off (`dew.cache.persist_compilations`)."""
+cache directory, unless JAX's own switch turns it off (`dew._cache.persist_compilations`)."""
 
 import json
 import os
@@ -77,7 +77,7 @@ LATE = """
 import json
 import sys
 
-from dew.cache import enable_compilation_cache
+from dew._cache import enable_compilation_cache
 
 import jax
 

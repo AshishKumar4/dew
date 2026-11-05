@@ -538,7 +538,7 @@ class SafetensorsReload:
     `source.save` writes the weights, the derived config and the tokenizer
     files into `directory`, the directory every replica was launched on (a
     shared one when replicas span hosts). Floating-point leaves are cast to
-    `dtype` first. The source's writers replace each file whole (`dew.files.replacing`) and
+    `dtype` first. The source's writers replace each file whole (`dew._files.replacing`) and
     publish a sharded index last, so no engine reads a half-written file. `engines` are the
     replicas' root URLs, not their `/v1` API URLs, and `timeout` bounds each
     HTTP call in seconds. The push fails if a call answers with any status

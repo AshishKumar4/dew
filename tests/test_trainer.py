@@ -48,7 +48,7 @@ from reference_error import as_given, assert_as_exact
 from steady_state import steady_state
 from token_support import write_token_corpus
 
-from dew import position
+from dew import _position
 from dew.artifacts import Representations
 from dew.batch import merge, under
 from dew.checkpoints import Ranking
@@ -873,7 +873,7 @@ def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_pat
     prefix = trainer(tmp_path / "split").fit(dataset(prefix_seen), steps=2, checkpoint_every=1)
     fresh = trainer(tmp_path / "split")
     restored, _, place = fresh.place()
-    assert position.read(place).records == 2 * BATCH
+    assert _position.read(place).records == 2 * BATCH
     assert jax.tree.structure(restored) == jax.tree.structure(prefix)
     for left, right in zip(jax.tree.leaves(restored), jax.tree.leaves(prefix), strict=True):
         actual, expected = np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right))
@@ -895,7 +895,7 @@ def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_pat
     _, resumed_place = Checkpoints(str(tmp_path / "split/run")).restore(share=DataPartition())
     _, whole_place = Checkpoints(str(tmp_path / "whole/run")).restore(share=DataPartition())
     assert resumed_place == whole_place
-    assert position.read(resumed_place).records == 4 * BATCH
+    assert _position.read(resumed_place).records == 4 * BATCH
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
@@ -940,7 +940,7 @@ import jax
 import numpy as np
 import optax
 
-from dew.cache import enable_compilation_cache
+from dew._cache import enable_compilation_cache
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
 from dew.objectives.diffusion import DiffusionObjective
@@ -1012,7 +1012,7 @@ import numpy as np
 from affine_run import Regression, dataset
 from recording import RecordingTracker
 
-from dew.cache import enable_compilation_cache
+from dew._cache import enable_compilation_cache
 from dew.optim import OptimConfig
 from dew.telemetry.instrumentation import compilation_cache_counts
 from dew.training import Checkpoints, Layout, Trainer
@@ -1189,7 +1189,7 @@ def test_a_global_position_is_read_by_any_process_count(tmp_path):
     count that wrote it."""
     trainer = make_trainer(tmp_path)
     trainer.fit(dataset(), steps=1, log_every=1)
-    global_position = position.encode(position.Global(records=16, order="Counting"))
+    global_position = _position.encode(_position.Global(records=16, order="Counting"))
     _rewrite_position(trainer, 2, [global_position, global_position], shares=[[0, 2], [1, 2]])
 
     assert Checkpoints(str(tmp_path / "run")).restore(step=2, share=DataPartition())[1] == global_position

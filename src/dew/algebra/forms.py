@@ -16,16 +16,18 @@ from egglog import get_callable_args
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
+from dew._cache import DERIVED
 from dew.algebra import program, terms
-from dew.cache import DERIVED
 from dew.nn.precision import float32_dot_general
 
 
 class Accumulated(NamedTuple):
     """A reduction's step a mainloop's accumulator takes (`Derived.step`'s `stepped`): its state rescaled by
-    the row `factor` plus the tile's `weights @ values`, each value as the step evaluates it."""
+    the row `factor` (None for a sum that takes no rescale) plus the tile's product of `weights` and
+    `values`, under the declaration's own dimension numbers (`a @ b`, or `aᵀ @ b` for a sum over the
+    weights' rows), each value as the step evaluates it."""
 
-    factor: jax.Array
+    factor: jax.Array | None
     weights: jax.Array
     values: jax.Array
 
@@ -215,7 +217,7 @@ def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
 def derived(on: bool = True) -> Iterator[None]:
     """Within the block, the templates take their algebra's derived forms (`derive`, `scan`) where they hold
     them in place of their hand-written ones (`on`), or the hand-written ones: a context of JAX's trace
-    (`dew.cache.DERIVED`), so a program held across the switch traces afresh. The one switch the derived and
+    (`dew._cache.DERIVED`), so a program held across the switch traces afresh. The one switch the derived and
     hand-written forms swap behind, which check 1 drives both ways (docs/design/algebra.md §6.9)."""
     with DERIVED(on):
         yield
@@ -262,13 +264,15 @@ def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping
               product: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
               chosen: Mapping[Hashable, terms.Term] | None = None,
               exponential: tuple[str, Callable[..., jax.Array]] | None = None,
+              named: Callable[[terms.Term], str] | None = None,
               rescale: Callable[[jax.Array, jax.Array], jax.Array] | None = None
               ) -> Callable[[terms.Term], jax.Array]:
     """The values of a region's forms, each term once however many forms read it: its leaves the given
     values (`leaves`, by index; None for one no form reads) and the outputs of the region's equations
     outside the language over them, their inputs in the forms `chosen` names for them (by `terms.key`)
     where given, each term `known` names (by `terms.key`) its value there, each matrix product
-    `product(a, b)` where a caller holds its own (a mainloop's issuer) and every other product Dew's
+    `product(a, b)` where a caller holds its own (a mainloop's issuer; `product(name, a, b)` where `named`
+    names each product's role, an issuer staging each role apart) and every other product Dew's
     (`float32_dot_general`), each exponential a declaration implements by its own (`exponential`: the
     language's name of its base and its function, `exponential(x, scale=1.0)`, `derive.Reduction.exponential`;
     a product with a literal its `scale`, `_scaled`) and each rescale of two
@@ -300,7 +304,8 @@ def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping
             _, params = region.params[terms.integer(index)]
             numbers = jax.tree.map(int, params["dimension_numbers"])
             if product is not None and numbers == PLAIN_PRODUCT:
-                made = product(value(left), value(right))
+                made = (product(value(left), value(right)) if named is None
+                        else product(named(term), value(left), value(right)))
             else:
                 made = float32_dot_general(value(left), value(right), params["dimension_numbers"],
                                            precision=params.get("precision"),

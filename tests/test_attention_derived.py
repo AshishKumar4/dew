@@ -237,7 +237,7 @@ def forward_rows(form: str):
     return run
 
 
-def derived_backward(form: str, along: str):
+def derived_backward(form: str, along: str, accurate: bool = False, how=algebra.PLAIN):
     """The backward declaration's derived forms walked `along` key tiles (queries first) or query tiles (keys
     first), from the template forward's residual rows (`forward_rows`): its logits the tile's, -inf where
     unseen, and D about no anchor (its whole `delta`), each step's products the template's CPU mainloop's
@@ -245,13 +245,16 @@ def derived_backward(form: str, along: str):
     and dV the walk's over the query tiles; queries first, each query tile walking the key tiles, its dQ the
     walk's and each key tile's dK and dV its share, summed over the query tiles in order (row 3310: one
     contraction over a key tile's every query at once, no mainloop's schedule, erred 1.63 times the
-    template's in dV)."""
-    forms = derive.derive(attention_backward_algebra.backward_declaration(scale=SCALE, walked=along),
-                          accurate=False, saturation=SATURATION)
+    template's in dV). The `accurate` form's under the accurate numerics, no key its query's anchor; its
+    weights recomputed in `how`'s units (raw products scaled after their difference, their maximum the raw
+    one, or an exact largest weight)."""
+    forms = derive.derive(attention_backward_algebra.backward_declaration(scale=SCALE, walked=along, how=how,
+                                                                          accurate=accurate),
+                          accurate=accurate, saturation=SATURATION)
     seen = seen_of(form)
     rows_of = forward_rows(form)
     tiles = LENGTH // BLOCK
-    by_row = ("q", "dout", "peak", "total", "anchor", "delta", "logits", "seen")
+    by_row = ("q", "dout", "peak", "total", "anchor", "delta", "logits", "seen", "at_anchor")
 
     def tile(values: dict, index: int) -> dict:
         part = slice(index * BLOCK, (index + 1) * BLOCK)
@@ -259,7 +262,7 @@ def derived_backward(form: str, along: str):
         def part_of(name, value):
             if along == "rows":
                 return value[part] if name in by_row else value
-            if name in ("logits", "seen"):
+            if name in ("logits", "seen", "at_anchor"):
                 return value[:, part]
             return value[part] if name in ("k", "values") else value
 
@@ -273,9 +276,13 @@ def derived_backward(form: str, along: str):
 
     def run(q, k, v, d):
         _, peak, total, delta = rows_of(q, k, v, d)
-        logits = jnp.where(seen, float32_einsum("qd,kd->qk", q, k) * SCALE, -jnp.inf)
+        products = float32_einsum("qd,kd->qk", q, k)
+        logits = jnp.where(seen, products if how.factor is not None else products * SCALE, -jnp.inf)
+        if how.factor is not None:
+            peak = jnp.max(logits, axis=-1)
         values = {"logits": logits, "q": q, "k": k, "values": v, "dout": d, "peak": peak, "total": total,
-                  "anchor": jnp.zeros_like(delta), "delta": delta, "seen": seen}
+                  "anchor": jnp.zeros_like(delta), "delta": delta, "seen": seen,
+                  **({"at_anchor": jnp.zeros_like(seen)} if accurate else {})}
         if along == "rows":
             (_, dk, dv, *_), mapped = walk(values)
             return jnp.concatenate([parts[0] for parts in mapped]), dk, dv
@@ -319,6 +326,20 @@ def test_the_derived_backward_is_on_par_in_every_cell(form, walked):
     served, reference = derived_backward(form, walked), oracle_backward(form)
     assert_as_exact(jax.jit(served), jax.jit(reference), backward_draw,
                     f"attention backward {form} {walked}", seeds=16, truth_fn=xla_backward(form))
+
+
+@pytest.mark.parametrize("how", [algebra.PLAIN, algebra.Recompute(factor=SCALE),
+                                 algebra.Recompute(exact=True)], ids=["scaled", "raw", "exact"])
+@pytest.mark.parametrize("walked", ["keys", "rows"], ids=["queries-first", "keys-first"])
+def test_the_accurate_backward_declaration_derives_on_par(walked, how):
+    """The backward's accurate declaration (its maximum as given, the anchor's own term held to 0) derives
+    under the accurate numerics, whose rewrites are exact alone, in each recomputation's units (scaled
+    logits, raw products scaled after their difference, an exact largest weight), and walks on par with the
+    template's own backward against the float64 gradients (check 1) where no key is its query's anchor,
+    every query seeing a key."""
+    served = derived_backward("causal", walked, accurate=True, how=how)
+    assert_as_exact(jax.jit(served), jax.jit(oracle_backward("causal")), backward_draw,
+                    f"accurate attention backward {walked}", seeds=16, truth_fn=xla_backward("causal"))
 
 
 @contextlib.contextmanager

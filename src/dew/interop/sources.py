@@ -25,7 +25,7 @@ import jax
 import numpy as np
 
 from dew import _records
-from dew.cache import hub_answer, hub_commit, hub_storage, recorded_hub_answer
+from dew._cache import hub_answer, hub_commit, hub_storage, recorded_hub_answer
 from dew.interop import pickles
 from dew.interop.safetensors_io import (
     LazyTensors,

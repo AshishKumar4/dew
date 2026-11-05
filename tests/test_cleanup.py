@@ -1,8 +1,8 @@
-"""dew.cleanup's teardown: every step runs, and each failure says which step it was."""
+"""dew._cleanup's teardown: every step runs, and each failure says which step it was."""
 
 import pytest
 
-from dew.cleanup import attempted
+from dew._cleanup import attempted
 
 
 def test_every_step_runs_and_each_failure_carries_its_own_step():

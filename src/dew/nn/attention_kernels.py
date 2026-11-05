@@ -10,7 +10,7 @@ import importlib.util
 import jax.numpy as jnp
 import numpy as np
 
-from dew.devices import deterministic_ops_requested
+from dew._devices import deterministic_ops_requested
 
 from .kernels import decode_attention, generation
 from .kernels.generation import (

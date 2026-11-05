@@ -8,7 +8,7 @@ Cloud TPU VM and a Kubernetes job leave those where jax's own cluster
 detection reads them, and this command then only runs the program. A plain
 set of machines leaves nothing, and this command fills the gap: it starts the
 processes over ssh, or directly for the machine it runs on, with the three
-values in the variables `dew.pool` names. A Cloud TPU named with `--tpu` is
+values in the variables `dew._pool` names. A Cloud TPU named with `--tpu` is
 reached through gcloud, one process per worker, and jax reads its metadata.
 
 The launcher imports jax only to ask its cluster detection, and only when no
@@ -36,11 +36,11 @@ from typing import Annotated, TextIO
 
 import tyro
 
-from dew.cleanup import exit_code, groups_ended, signal_group
-from dew.cli import tpu_setup
-from dew.cli.gcloud import emit
-from dew.cli.tpu import reach
-from dew.pool import (
+from dew._cleanup import exit_code, groups_ended, signal_group
+from dew._cli import tpu_setup
+from dew._cli.gcloud import emit
+from dew._cli.tpu import reach
+from dew._pool import (
     COORDINATOR,
     LOCAL_DEVICES,
     PREEMPTED_EXIT,

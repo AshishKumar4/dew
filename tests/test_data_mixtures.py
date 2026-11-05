@@ -31,7 +31,7 @@ from affine_run import FEATURES, Affine
 from recording import RecordingTracker
 from token_support import write_token_corpus
 
-from dew import position
+from dew import _position
 from dew.batch import VALID_ROWS, freeze, thaw
 from dew.data import Files, Loading, Memory, from_grain, phases, presets, schedule
 from dew.data.compile import compile, held, iterate, publish, validation
@@ -885,7 +885,7 @@ def test_a_schedule_reads_a_stage_until_the_run_ends_it_then_reads_as_its_phases
     assert all(corpus_of(row) == 0 for step in packed_rows(stream, 2) for row in step)
 
     ended = open_stream(DataPartition()).ending(state)
-    assert position.read(ended).completed[0][1] == 12
+    assert _position.read(ended).completed[0][1] == 12
     for processes in (1, 2):
         assert pooled(open_stream, processes, 4, ended, rows=windows_of) == whole[3:7]
     resumed = open_stream(DataPartition())
@@ -909,7 +909,7 @@ def test_a_schedules_position_holds_the_tokens_its_finished_stages_ended_at(tmp_
     opened = scheduled_packed((first, 1000), (both, None)).train(DataPartition())
     assert isinstance(opened, PhasedStream)
     ended = opened.ending(stream.get_state())
-    assert position.read(ended).tokens == (1000,)
+    assert _position.read(ended).tokens == (1000,)
     read = []
     for entries in (((first, 1000), (both, None)), ((first, 1000), (both, 500), (second, None))):
         resumed = scheduled_packed(*entries).train(DataPartition())
@@ -938,9 +938,9 @@ def test_a_schedules_position_saved_before_it_held_stage_tokens_resumes_only_in_
     opened = scheduled_packed((first, 1000), (both, None)).train(DataPartition())
     assert isinstance(opened, PhasedStream)
     past = unrecorded(opened.ending(stream.get_state()))
-    assert position.read(early).tokens is None and position.read(past).tokens is None
+    assert _position.read(early).tokens is None and _position.read(past).tokens is None
     # Saved again as it was read, it still records none.
-    assert position.read(position.encode(position.read(past))).tokens is None
+    assert _position.read(_position.encode(_position.read(past))).tokens is None
     scheduled_packed((first, 1000), (both, None)).train(DataPartition()).set_state(early)
     with pytest.raises(ValueError):
         scheduled_packed((first, 1000), (both, None)).train(DataPartition()).set_state(past)
@@ -1464,7 +1464,7 @@ def test_a_schedule_ends_its_stage_at_the_step_whose_commit_reaches_its_tokens(t
     assert_same(whole, parameters(switched), "the schedule against phases switching where its commits did")
     assert scheduled.checkpoints is not None
     _, saved = scheduled.checkpoints.restore(share=DataPartition())
-    assert saved is not None and position.read(saved).completed[0][1] == step * 8
+    assert saved is not None and _position.read(saved).completed[0][1] == step * 8
     for stopped in (2, step):
         token_trainer(tmp_path / f"stopped-{stopped}", accumulation=accumulation).fit(data, steps=stopped)
         resumed = token_trainer(tmp_path / f"stopped-{stopped}", accumulation=accumulation).fit(data, steps=8)

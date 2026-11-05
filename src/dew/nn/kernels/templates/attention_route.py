@@ -20,6 +20,7 @@ from typing import Literal, overload
 import jax
 import jax.numpy as jnp
 
+from dew.nn.derivatives import KernelGlue, declared_derivative
 from dew.nn.kernels import generation, selection
 from dew.nn.kernels.templates import attention_decode, attention_mosaic, attention_portable, attention_triton
 from dew.nn.kernels.templates.attention import (
@@ -120,9 +121,8 @@ def drops() -> bool:
     return not _on_gpu()
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(0,))
-def _attend(config: _Config, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
-            hooks: Hooks) -> jax.Array:
+def _attending(config: _Config, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
+               hooks: Hooks) -> jax.Array:
     """The forward of a call that is not differentiated, which keeps no training state."""
     return _forward(*config.narrowed(query, key, value), spans, hooks, config, residuals=False)
 
@@ -221,7 +221,9 @@ def _attend_backward(config: _Config, saved: tuple, dout: jax.Array) -> tuple:
             None, _hooks_cotangent(hooks, grads))
 
 
-_attend.defvjp(_attend_forward, _attend_backward)
+_attend = declared_derivative(KernelGlue(), _attending, _attend_forward, _attend_backward,
+                              nondiff_argnums=(0,))
+"""A template call, differentiated by its own backward: one declared derivative of a kernel's glue."""
 
 
 def _backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
