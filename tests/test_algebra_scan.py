@@ -74,9 +74,11 @@ def chunk_of(values: dict, index: int, axes: dict = OPERANDS) -> dict:
 
 def walk(forms, values, chunks: range, state, axes: dict = OPERANDS):
     outputs = []
+    # A walk that carries its transfer composes each chunk's transition.
+    transition = isinstance(state, scan.Walk) and state.transfer is not None
     for index in chunks:
         chunk = chunk_of(values, index, axes)
-        prepared = forms.prepare(chunk)
+        prepared = forms.prepare(chunk, transition=transition)
         outputs.append(forms.mapped(prepared, state))
         state = forms.step(state, prepared)
     return outputs, state
@@ -323,7 +325,8 @@ def test_two_delta_rule_walks_merged_through_an_issuer_give_the_final_state(upda
         for chunks in (range(half), range(half, 2 * half)):
             state = forms.init(chunk_of(values, 0, operands))
             for index in chunks:
-                state = forms.step(state, forms.prepare(chunk_of(values, index, operands), issue), issue)
+                prepared = forms.prepare(chunk_of(values, index, operands), issue, transition=True)
+                state = forms.step(state, prepared, issue)
             states.append(state)
         return forms.finish(forms.merge(*states, values, issue), values)
 
@@ -369,12 +372,14 @@ def test_a_scans_carry_derived_for_one_target_serves_no_other():
     assert splits[2] is splits[0]
 
 
-def test_a_derived_scans_products_are_its_issuers_each_by_its_role():
+@pytest.mark.parametrize(("update_fn", "operands", "draw_fn"), [
+    (gated_delta, GATED, gated_draw), (kimi_delta, KIMI, kimi_draw)], ids=["gated_delta", "kimi_delta"])
+def test_a_derived_scans_products_are_its_issuers_each_by_its_role(update_fn, operands, draw_fn):
     """A derived scan's chunk walked through a mainloop's issuer (`issue(role, lhs, rhs)`) at prepare, step
     and mapped: every product of its forms is the issuer's, under the roles a chunk's form makes (its gram,
-    its inverse's doubling, its correction, write and readouts), and the walk computes what Dew's own
-    products do, bit for bit."""
-    forms = scan.derive_scan(scan.Scan(gated_delta, gated_readout, GATED, walked="time",
+    a per-key decay's factored around each sub-chunk's reference among them, its inverse's doubling, its
+    correction, write and readouts), and the walk computes what Dew's own products do, bit for bit."""
+    forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
                                        state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
     roles = []
 
@@ -382,7 +387,7 @@ def test_a_derived_scans_products_are_its_issuers_each_by_its_role():
         roles.append(role)
         return float32_matmul(left, right)
 
-    chunk = chunk_of(dict(zip(GATED, gated_draw(0), strict=True)), 0, GATED)
+    chunk = chunk_of(dict(zip(operands, draw_fn(0), strict=True)), 0, operands)
     state = forms.init(())
     plain = forms.prepare(chunk)
     expected = forms.mapped(plain, state), forms.step(state, plain)
@@ -625,20 +630,24 @@ def _primitives(jaxpr):
             yield from _primitives(held)
 
 
-def adjoint(forms, chunk_of_values, count: int):
+def adjoint(forms, chunk_of_values, count: int, issue=None, kept: bool = False):
     """A loss's gradient through the derived forms: the chunks walked forward from a zero state (each
     entering state kept), then back through each chunk's `backward`, the cotangents of the outputs and the
-    final state the loss's (`COTANGENT`, a fixed draw)."""
+    final state the loss's (`COTANGENT`, a fixed draw), every product a mainloop's `issue`'s where given,
+    each chunk's solve the forward's inverse where `kept`, as a training forward keeps it."""
     def run(values, cotangents):
         d_outputs, d_final = cotangents
-        states = [forms.init({})]
+        states, inverses = [forms.init({})], []
         for index in range(count):
-            states.append(forms.step(states[-1], forms.prepare(chunk_of_values(values, index))))
+            prepared = forms.prepare(chunk_of_values(values, index))
+            inverses.append(prepared.inverse if kept else None)
+            states.append(forms.step(states[-1], prepared))
         d_state, grads = d_final, []
         for index in reversed(range(count)):
             chunk = chunk_of_values(values, index)
             d_state, d_chunk = forms.backward(chunk, states[index], d_state,
-                                              d_outputs[index * CHUNK:(index + 1) * CHUNK])
+                                              d_outputs[index * CHUNK:(index + 1) * CHUNK], issue,
+                                              inverse=inverses[index])
             grads.append(d_chunk)
         # A token operand's gradient each chunk's; a constant's (a rate, a skip) summed over them.
         return {name: jnp.concatenate([grad[name] for grad in reversed(grads)]) if grads[0][name].ndim
@@ -687,7 +696,8 @@ def test_the_ssd_chunks_adjoint_is_the_token_scans_gradient():
     assert_as_exact(jax.jit(as_derived), jax.jit(as_tokens), draw_with_cotangents, "ssd adjoint", seeds=16)
 
 
-def assert_delta_adjoint(forms, update_fn, draw_fn, label: str, seeds: int = 16) -> None:
+def assert_delta_adjoint(forms, update_fn, draw_fn, label: str, seeds: int = 16, issue=None,
+                         kept: bool = False) -> None:
     """`forms`' chunk adjoint of the delta rule `update_fn`, walked back from each chunk's entering state:
     each token operand's gradient on par with the token-by-token scan's against the float64 truth (check
     1), over `draw_fn`'s draws and a fixed cotangent's."""
@@ -696,7 +706,7 @@ def assert_delta_adjoint(forms, update_fn, draw_fn, label: str, seeds: int = 16)
     def chunked(values, index):
         return {name: value[index * CHUNK:(index + 1) * CHUNK] for name, value in values.items()}
 
-    derived = adjoint(forms, chunked, TOKENS // CHUNK)
+    derived = adjoint(forms, chunked, TOKENS // CHUNK, issue, kept)
 
     def draw_with_cotangents(seed):
         return (*draw_fn(seed), *cotangents_of(seed, (TOKENS, VALUE), (KEY, VALUE)))
@@ -721,6 +731,44 @@ def test_the_delta_rules_chunk_adjoint_is_the_token_scans_gradient(update_fn, op
     forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
                                        state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
     assert_delta_adjoint(forms, update_fn, draw_fn, f"{update_fn.__name__} adjoint")
+
+
+@pytest.mark.parametrize(("update_fn", "operands", "draw_fn"), [
+    (gated_delta, GATED, gated_draw), (kimi_delta, KIMI, kimi_draw)], ids=["gated_delta", "kimi_delta"])
+def test_the_delta_rules_chunk_adjoint_through_an_issuer_is_the_token_scans_gradient(update_fn, operands,
+                                                                                      draw_fn):
+    """The delta rules' chunk adjoints walked back through a mainloop's issuer: each product of the forward
+    the issuer's, each of its adjoint's the issuer's under the product's role (`_dlhs`, `_drhs`), and each
+    token operand's gradient on par with the token-by-token scan's against the float64 truth (check 1)."""
+    forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    roles = set()
+
+    def issue(role, left, right):
+        roles.add(role)
+        return float32_matmul(left, right)
+
+    assert_delta_adjoint(forms, update_fn, draw_fn, f"{update_fn.__name__} adjoint through an issuer",
+                         issue=issue)
+    assert {"correct_dlhs", "correct_drhs", "gram_dlhs", "readout_memory_drhs"} <= roles, sorted(roles)
+
+
+def test_the_delta_rules_adjoint_from_the_kept_inverse_solves_nothing():
+    """The gated delta rule's chunk adjoint reading each chunk's solve's inverse as its training forward kept
+    it (`Prepared.inverse`, `backward`'s `inverse`): each token operand's gradient on par with the
+    token-by-token scan's against the float64 truth (check 1), and no product of the solve's doubling issued
+    again."""
+    forms = scan.derive_scan(scan.Scan(gated_delta, gated_readout, GATED, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    roles = set()
+
+    def issue(role, left, right):
+        roles.add(role)
+        return float32_matmul(left, right)
+
+    assert_delta_adjoint(forms, gated_delta, gated_draw, "gated_delta adjoint from its kept inverse",
+                         issue=issue, kept=True)
+    assert "correct_dlhs" in roles and not any(role.startswith("inverse_merge") for role in roles), roles
 
 
 def kimi_draw_float16(seed):

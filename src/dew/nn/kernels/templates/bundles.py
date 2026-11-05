@@ -5,16 +5,17 @@ an execution policy: Hopper's warpgroup MMA's (`mosaic_sm90.WGMMA`, and its layo
 TMA rings (`MmaFed`); a launch names its bundle by the bundle's `name` (`named`). Blackwell's tcgen05, whose
 products accumulate in tensor memory, composes its issuer with the TMA rings (`mosaic_sm100.RINGS`), which a
 launch names; `of` gives it to sm100 and sm103 once the templates' persistent launches state their
-accumulators (`Transport.persist`'s `accumulators`). A device of a family with no bundle here (a TPU's) runs
-no Mosaic GPU mainloop: every template's Mosaic launch is ineligible there, and its call takes the next route
-by legality."""
+accumulators (`Transport.persist`'s `accumulators`). A TPU core's bundle composes the MXU's issuer with VMEM
+rings (`mosaic_tpu.MXU`), which runs the toolkit's persistent walk; `of` gives it to a TPU once the templates'
+launches run on it. Until then a TPU runs no shared mainloop: every template's Mosaic launch is ineligible
+there, and its call takes the next route by legality."""
 
 import dataclasses
 
 import jax.numpy as jnp
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import mosaic, mosaic_sm80, mosaic_sm90, mosaic_sm100
+from dew.nn.kernels.templates import mosaic, mosaic_sm80, mosaic_sm90, mosaic_sm100, mosaic_tpu
 
 INTERPRETED = mosaic_sm90.WGMMA
 """The bundle Mosaic GPU's interpreter runs a template's mainloop by off a GPU of a family a bundle claims (a
@@ -88,7 +89,7 @@ def named(name: str, dtype) -> mosaic.Family:
     for composed in (mosaic_sm80.Mma, MmaFed):
         if composed.name == name:
             return composed(jnp.dtype(dtype))
-    for bundle in (mosaic_sm90.WGMMA, mosaic_sm90.FED, mosaic_sm100.RINGS):
+    for bundle in (mosaic_sm90.WGMMA, mosaic_sm90.FED, mosaic_sm100.RINGS, mosaic_tpu.MXU):
         if bundle.name == name:
             return bundle
     raise ValueError(f"no Mosaic GPU bundle is named {name!r}")

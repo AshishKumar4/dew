@@ -60,7 +60,10 @@ def statistics(counts: np.ndarray, chances: np.ndarray) -> np.ndarray:
     the null's."""
     counts = np.asarray(counts, np.float64)
     expected = chances * counts.sum(axis=-1, keepdims=True)
-    return np.sum((counts - expected) ** 2 / expected, axis=tuple(range(-chances.ndim, 0)))
+    # An outcome merged into another (`_admitted`) holds a chance of zero, and adds nothing.
+    departures = np.divide((counts - expected) ** 2, expected, out=np.zeros(np.broadcast_shapes(
+        counts.shape, expected.shape)), where=expected > 0)
+    return np.sum(departures, axis=tuple(range(-chances.ndim, 0)))
 
 
 def _rows(totals, chances) -> tuple[np.ndarray, np.ndarray]:
@@ -92,6 +95,31 @@ def p_value(statistic: float, totals, chances) -> float:
     return (1 + int(exceedances)) / (NULL_DRAWS + 1)
 
 
+def _admitted(pooled: np.ndarray, rows: np.ndarray, totals: np.ndarray, label: str):
+    """Each row's outcomes as the gate tests them: those expected fewer than FEWEST_EXPECTED times over
+    the row's draws merged into one, its count and chance their sums, with the next rarest joining until
+    it expects FEWEST_EXPECTED (a categorical of many rare tokens, MDLM's reverse step's), the merged
+    ones' places zero. A fair sampler draws the merged outcome at the merged chance, so the test stays
+    exact; a row left with fewer than two outcomes to tell apart is refused."""
+    pooled, rows = pooled.copy(), rows.copy()
+    for row, total in enumerate(totals.tolist()):
+        order = np.argsort(rows[row], kind="stable")
+        rare = [int(at) for at in order if rows[row, at] * total < FEWEST_EXPECTED]
+        if not rare:
+            continue
+        merged = list(rare)
+        while rows[row, merged].sum() * total < FEWEST_EXPECTED and len(merged) < len(order):
+            merged.append(int(order[len(merged)]))
+        kept = merged[0]
+        pooled[row, kept], rows[row, kept] = pooled[row, merged].sum(), rows[row, merged].sum()
+        pooled[row, merged[1:]], rows[row, merged[1:]] = 0, 0.0
+        if np.count_nonzero(rows[row]) < 2 or rows[row, kept] * total < FEWEST_EXPECTED:
+            raise AssertionError(f"{label}: row {row}'s {total} draws expect fewer than {FEWEST_EXPECTED} "
+                                 f"of its outcomes merged, which leaves nothing to test; give the site more "
+                                 f"seeds")
+    return pooled, rows
+
+
 def assert_draws_as_declared(counts_of, chances, label: str, *, seeds: int) -> None:
     """`counts_of(seed)`, the count of each outcome over one seed's draws (a part's records, a member's
     rows), drawn at `chances` (probabilities summing to one) as a fair sampler would, over `seeds` seeds:
@@ -100,8 +128,9 @@ def assert_draws_as_declared(counts_of, chances, label: str, *, seeds: int) -> N
     each position's draw), and `counts_of` returns their counts in the same shape: one verdict over all of
     them, their statistics summed and their null drawn row by row.
 
-    Raises SamplingFailure naming each outcome's share against its chance; refuses a site whose
-    expected counts fall below FEWEST_EXPECTED or whose seeds draw nothing."""
+    Outcomes expected fewer than FEWEST_EXPECTED times are tested merged (`_admitted`). Raises
+    SamplingFailure naming each outcome's share against its chance; refuses a site whose seeds draw
+    nothing in a row, or leave a row nothing to test once its rare outcomes are merged."""
     chances = np.asarray(chances, np.float64)
     if chances.ndim not in (1, 2) or not np.all(np.isfinite(chances)) or np.any(chances <= 0):
         raise ValueError(f"{label}: chances must be finite and positive, a row of outcomes or rows of them, "
@@ -121,10 +150,9 @@ def assert_draws_as_declared(counts_of, chances, label: str, *, seeds: int) -> N
                              f"{chances.shape}, not {counts.tolist()}")
         pooled += counts.reshape(rows.shape)
     totals = pooled.sum(axis=-1)
-    rarest = float(np.min(rows * totals[:, None]))
-    if np.any(totals == 0) or rarest < FEWEST_EXPECTED:
-        raise AssertionError(f"{label}: {totals.tolist()} draws over {seeds} seeds expect {rarest:.1f} of "
-                             f"the rarest outcome, fewer than {FEWEST_EXPECTED}; give the site more seeds")
+    if np.any(totals == 0):
+        raise AssertionError(f"{label}: a row draws nothing over {seeds} seeds; give the site more seeds")
+    pooled, rows = _admitted(pooled, rows, totals, label)
     statistic = float(statistics(pooled[None], rows)[0])
     rarity = p_value(statistic, tuple(totals.tolist()), tuple(map(tuple, rows.tolist())))
     if rarity < LEVEL:

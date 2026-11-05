@@ -138,9 +138,10 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
       where it took 64 x 256, whose four warps, splitting its rows, each read the columns' block whole:
       1.7x the shared memory a FLOP (SHAPE1-a100: 0.887 of its time). A tile its registers or a block
       cannot stage busy (`holds`, `resources.tile_registers`) gives way to the next narrower or shorter one.
-    - Consumers: as many roles as the family has (`Family.consumers`), a warpgroup each, or one where
-      rows a tile must divide (not grouped) take no whole role for each, where a group averages fewer rows
-      than one role (grouped), or where no tile of them holds.
+    - Consumers: of the counts the family takes (`Family.consumers`), a warpgroup each, the one whose tile
+      reads its operands least (`_reads`: a share's fragment loads where the products read registers, then
+      the tile's reads a FLOP), the most on a tie; one where rows a tile must divide (not grouped) take no
+      whole role for each, or where a group averages fewer rows than one role (grouped).
     - Programs: the most a multiprocessor runs at once that the family's registers hold at those
       consumers (`Family.programs`) and whose share of its shared memory (`resources.program_shared`) holds
       a tile, one at least; a wave is all of them.
@@ -199,9 +200,28 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     # past it keep the further consumers' rows real. Row 3622, H100 (FS-3622-AB1/AB2-h100): one consumer ran
     # 0.73 to 0.999 of the cooperative tile's time at 1 to 32 rows a group, and 1.13 to 1.26 of it at 64.
     whole = rows >= family.role_rows if grouped else rows % (family.role_rows * family.consumers) == 0
-    return next((tile for consumers in dict.fromkeys((family.consumers if whole else 1, 1))
-                 for programs in range(family.programs(consumers), 0, -1)
-                 if (tile := tiled(consumers, programs)) is not None), None)
+    # Each consumer count's tile at the most programs that hold one, the count the objective prices least
+    # (`_reads`), the most consumers on a tie.
+    counted = [next((tile for programs in range(family.programs(consumers), 0, -1)
+                     if (tile := tiled(consumers, programs)) is not None), None)
+               for consumers in range(family.consumers if whole else 1, 0, -1)]
+    return min((tile for tile in counted if tile is not None), key=functools.partial(_reads, family),
+               default=None)
+
+
+def _reads(family: mosaic.Family, tile: "Tiles") -> tuple[float, float]:
+    """Dew: `derived`'s objective over its consumer counts' tiles: the operand reads a FLOP each consumer's
+    share issues from shared memory (1/rows + 1/columns of its share), where its products read registers
+    its warps load (`mosaic.Issuer.operands_in_registers`: mma.sync's fragments, each an instruction its
+    warps issue beside their products), then the tile's own reads a FLOP (1/rows + 1/columns), which a
+    wider tile lowers. On an A100, two consumers' 64-row shares of a 128 x 128 tile issued 1.5x one
+    consumer's fragment loads (176M against 118M LDSM, 0.0234 against 0.0156 reads a FLOP) and ran 2.78x
+    its input gradient's time (NS-P2-NCU2-a100); their 128 x 256 tiles 1.355x one consumer's 128 x 128
+    over 19 rows (NS-P2-CONSUMERS-a100). Warpgroup MMA reads both operands from shared memory itself, no
+    instruction its warps issue: there the cooperative tile's fewer reads lead (CUTLASS's split, 2-7% faster
+    on every H100 scoreboard row)."""
+    share = 1 / (tile.block_m // tile.warpgroups) + 1 / tile.block_n
+    return share if family.operands_in_registers else 0.0, 1 / tile.block_m + 1 / tile.block_n
 
 
 def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], busy: int, shaped: Callable,
@@ -342,8 +362,9 @@ TMA_ROWS = 8
 class Allocations:
     """Dew: a GEMM launch's shared memory at its tile, as its kernel scopes it (`gmm_allocations`,
     `tgmm_allocations`): its streams' blocks `(shape, dtype)` by name (`mosaic.Family.streams`), what it
-    scopes beside them in the kernel's order (`staged`: side operands' staging, `mosaic.staging`, a meeting's
-    barriers), and its outputs' tiles `(shape, dtype)`, which the family stages (`mosaic.Family.persist`)."""
+    scopes beside them in the kernel's order (`staged`: side operands' staging, `mosaic.Transport.staging`,
+    a meeting's barriers, `mosaic.Transport.meeting`), and its outputs' tiles `(shape, dtype)`, which the
+    family stages (`mosaic.Family.persist`)."""
     blocks: dict
     staged: tuple
     outputs: tuple
@@ -365,7 +386,7 @@ class Allocations:
 
 
 def _typed(dtype) -> jax.ShapeDtypeStruct:
-    """A stand-in for an operand of `dtype`, as `mosaic.staging` reads an operand's dtype."""
+    """A stand-in for an operand of `dtype`, as `mosaic.Transport.staging` reads an operand's dtype."""
     return jax.ShapeDtypeStruct((), dtype)
 
 
@@ -387,10 +408,10 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
     blocks = {'rows': (lhs_block, dtype), 'matrix': (rhs_block, rhs_dtype),
               **({'paired': (rhs_block, rhs_dtype)} if paired else {}),
               **{f'side_{i}': (axes.named(prologue_axes[i], extent), prologue_dtypes[i]) for i in stepped}}
-    sides = mosaic.staging('side', [(axes.named(axes.held(side_axes), {'rows': part[0], 'columns': part[1]}),
+    sides = family.staging('side', [(axes.named(axes.held(side_axes), {'rows': part[0], 'columns': part[1]}),
                                      _typed(side))
                                     for side_axes, side in zip(epilogue_axes, epilogue_dtypes, strict=True)])
-    held = mosaic.staging('fixed', [(axes.named(prologue_axes[i], extent), _typed(prologue_dtypes[i]))
+    held = family.staging('fixed', [(axes.named(prologue_axes[i], extent), _typed(prologue_dtypes[i]))
                                     for i in fixed])
     return Allocations(blocks, (sides['side_smems'], sides['side_barriers'], held['fixed_smems'],
                                 held['fixed_barriers']), tuple((part, jnp.dtype(out)) for out in dtypes))
@@ -407,10 +428,10 @@ def tgmm_allocations(tiles: "Tiles", family: mosaic.Family, *, lhs_dtype, rhs_dt
     blocks = {'ring_0': ((block_k, block_m), lhs_dtype), 'ring_1': ((block_k, block_n), rhs_dtype),
               **{f'ring_{2 + position}': (axes.named(prologue_axes[i], extent), prologue_dtypes[i])
                  for position, i in enumerate(stepped)}}
-    held = mosaic.staging('fixed', [(axes.named(prologue_axes[i], extent), _typed(prologue_dtypes[i]))
+    held = family.staging('fixed', [(axes.named(prologue_axes[i], extent), _typed(prologue_dtypes[i]))
                                     for i in fixed])
     return Allocations(blocks, (held['fixed_smems'], held['fixed_barriers'],
-                                mosaic.meeting(tiles.warpgroups)),
+                                family.meeting(tiles.warpgroups)),
                        (((block_m // tiles.warpgroups, block_n), jnp.dtype(out_dtype)),))
 
 
@@ -507,13 +528,30 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
             and not exact_sums):
         tail = tail_of.balanced(-(-m // tiles.block_m) * (n // block_n), k // block_k, multiprocessors,
                                 handoff_steps=handoff_steps(tiles, generation.gpu_target()))
+    walked = (-(-m // row_tile) + (0 if dense else g)) * (n // block_n) * tiles.cluster
+    programs = launched(family_of(tiles, lhs.dtype), multiprocessors, walked, tail)
     outs = _gmm_mainloop(lhs, rhs, table, (m, n, k, g), tiles=tiles, transpose_rhs=transpose_rhs,
-                         dtypes=dtypes, multiprocessors=multiprocessors, interpret=interpret,
+                         dtypes=dtypes, multiprocessors=programs, interpret=interpret,
                          hooks=(prologue, prologue_axes, epilogue, epilogue_axes),
                          sides=(prologue_operands, epilogue_operands), dense=dense, paired=paired, tail=tail,
                          exact_sums=exact_sums, transpose_lhs=transpose_lhs)
     outs = tuple(out[:rows] for out in outs)
     return outs if out_dtypes else outs[0]
+
+
+def launched(family: mosaic.Family, multiprocessors: int, walked: int, tail: tail_of.Tail | None) -> int:
+    """Dew: the programs a launch walking `walked` tiles runs: the `multiprocessors` its residency holds at
+    once, persistent, where its family streams across a program's tiles (a producer's ring loading the next
+    tile's steps under the last one's stores) or a balanced tail splits its last wave (`tail`); a program a
+    tile where each walk scopes its streams apart (`mosaic.Family.walks_scoped`: cp.async's pipeline,
+    filled and drained a tile), which the block scheduler starts in the walk's order as multiprocessors free
+    up. A static persistent walk's programs drift apart over many rounds, where the scheduler keeps the
+    running tiles a window of the walk's order: on an A100, a program a tile ran 0.37x and 0.43x the
+    persistent walk's time on Mixtral-8x7B's down and DeepSeek-V3's gate input gradients, 0.80x and 0.90x
+    on Mixtral's and Qwen3-30B-A3B's gate forwards, 0.88-0.95x on four grouped kernel gradients and 0.63x on
+    Qwen3-32B's gate_up input gradient (a 51200-deep walk), and 0.99-1.03x on three shorter dense rows, the
+    outputs bitwise equal (NS-P8-WALK-a100, NS-P8-WALK2-a100)."""
+    return multiprocessors if tail is not None or not family.walks_scoped else max(walked, 1)
 
 
 @tuning.lowered_once(('shape', 'tiles', 'transpose_rhs', 'dtypes', 'multiprocessors', 'interpret', 'hooks',
@@ -626,7 +664,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     kernel = family.kernel(body, out_type=(*out_type, *workspace),
                            grid=(multiprocessors // pair,), grid_names=("programs",), consumers=consumers,
                            interpret=interpret, approx_math=False, name="dew_gmm", cluster=pair,
-                           resident=tiles.programs,
+                           resident=tiles.programs, scalars=0 if dense else 1,
                            cost=unit_cost.estimate(2 * m * n * k * len(matrices), *operands,
                                                    *prologue_operands, *epilogue_operands, *out_type))
     outs = kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands)
@@ -866,9 +904,11 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     if dense and family_of(tiles, lhs.dtype).fixes_up and not exact_sums:
         tail = tail_of.balanced(m // block_m * (n // block_n), -(-k // block_k), multiprocessors,
                                 handoff_steps=handoff_steps(tiles, generation.gpu_target()))
+    walked = g * (m // block_m) * (n // block_n)
+    programs = launched(family_of(tiles, lhs.dtype), multiprocessors, walked, tail)
     return _tgmm_streamed(
         (lhs, rhs), (group_sizes, group_starts, group_ends, group_num_blocks, group_block_starts, order),
-        (k, m, n, g), tiles=tiles, out_dtype=out_dtype, multiprocessors=multiprocessors,
+        (k, m, n, g), tiles=tiles, out_dtype=out_dtype, multiprocessors=programs,
         interpret=interpret, prologue=prologue, prologue_operands=prologue_operands,
         prologue_axes=prologue_axes, exact_sums=exact_sums, tail=tail)
 
@@ -983,7 +1023,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                            grid=(1 if interpret else multiprocessors,), grid_names=("programs",),
                            consumers=consumers,
                            interpret=interpret, approx_math=False, name="dew_tgmm",
-                           resident=tiles.programs,
+                           resident=tiles.programs, scalars=len(groups),
                            cost=unit_cost.estimate(2 * lhs.shape[0] * m * n, lhs, rhs, *prologue_operands,
                                                    out_type))
     return kernel(*groups, lhs, rhs, *prologue_operands)[0]
@@ -1069,7 +1109,7 @@ def _staged_halves(family: mosaic.Family, stages: list, group: tuple, mine: tupl
     boundary = _zero_neighbours_of(family, shares, *group, aligned_skip=halves is None)
     family.published()
     if halves is not None:
-        pl.when(boundary)(lambda: mosaic.meet(halves))
+        pl.when(boundary)(lambda: family.meet(halves))
     return rows_stage.at[:, mine_depth].transpose((1, 0)), cotangent_stage
 
 

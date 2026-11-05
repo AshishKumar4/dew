@@ -38,7 +38,7 @@ from flax.typing import PrecisionLike
 from jax.custom_derivatives import zero_from_primal
 from jax.extend import core as jax_core
 
-from dew.nn.derivatives import KernelGlue, declared_tangent
+from dew.nn.derivatives import KernelGlue, declared_derivative, declared_tangent
 from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.templates import mosaic
 from dew.nn.kernels.templates.axes import GROUPS
@@ -254,8 +254,7 @@ def _extended(lhs, kernel, a, b, scale, out_dtype, precision, interpret_on_cpu):
     return out, t
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7))
-def _low_rank(lhs, kernel, a, b, scale, out_dtype, precision, interpret_on_cpu):
+def _low_rank_value(lhs, kernel, a, b, scale, out_dtype, precision, interpret_on_cpu):
     return _extended(lhs, kernel, a, b, scale, out_dtype, precision, interpret_on_cpu)[0]
 
 
@@ -299,7 +298,10 @@ def _low_rank_backward(out_dtype, precision, interpret_on_cpu, residuals, cotang
     return d_lhs, d_kernel, d_a, d_b, d_scale
 
 
-_low_rank.defvjp(_low_rank_forward, _low_rank_backward, symbolic_zeros=True)
+# The launches' derivative glue (`derivatives.KernelGlue`): an operand no reverse pass reaches is a symbolic
+# zero, whose gradient is never formed.
+_low_rank = declared_derivative(KernelGlue(), _low_rank_value, _low_rank_forward, _low_rank_backward,
+                                nondiff_argnums=(5, 6, 7), symbolic_zeros=True)
 
 
 def dot_general(xla):

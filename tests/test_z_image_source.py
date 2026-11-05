@@ -171,6 +171,7 @@ def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, nam
                    for caption, gradient in zip(captions, grad_prompts, strict=True)},
                 "grad_params": grad_params}
 
+    @as_given
     def truth(inputs):
         with float64():
             return reference_walk(wide_model, inputs)
@@ -293,8 +294,8 @@ def test_prompt_encoding_matches_the_source_pipeline(pipeline, source, record):
     assert_as_exact(as_given(lambda seed: encoded(prompts_of(seed))[0]),
                     as_given(lambda seed: source_encoded(narrow, prompts_of(seed))), draw, "Z-Image prompts",
                     seeds=PIPELINE_SEEDS["prompts"],
-                    truth_fn=lambda seed: widened_call(
-                        wide, lambda pipe: source_encoded(pipe, prompts_of(seed))))
+                    truth_fn=as_given(lambda seed: widened_call(
+                        wide, lambda pipe: source_encoded(pipe, prompts_of(seed)))))
 
 
 @pytest.mark.parametrize("load", ["pipeline", "streamed"])
@@ -336,7 +337,7 @@ def test_pipeline_walk_matches_the_source(load, source, record, request):
 
     assert_as_exact(native, as_given(lambda x_T: source_walk(narrow, x_T)), draw, f"Z-Image {load} walk",
                     seeds=PIPELINE_SEEDS["walk"],
-                    truth_fn=lambda x_T: widened_call(wide, lambda pipe: source_walk(pipe, x_T)))
+                    truth_fn=as_given(lambda x_T: widened_call(wide, lambda pipe: source_walk(pipe, x_T))))
 
 
 @pytest.mark.parametrize(("latent", "real", "lengths"), [((6, 2), 8, (256, 2, 2)), ((4, 4), 32, (33, 8, 8))],

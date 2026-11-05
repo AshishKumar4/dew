@@ -235,13 +235,14 @@ def request(seed, *, questions, short_words, long_words):
 
 
 def make_pool(args):
-    from reference_error import REDRAW, SIZING_FROM
+    from check1_wire import staged_units
+    from reference_error import SIZING_FROM
 
     if args.count < 8 or args.short_words < 1 or args.long_words < args.short_words:
         raise ValueError("the pool needs at least eight verdict draws and positive ordered state lengths")
     if args.questions < 1 or args.questions % len(OPTIONS):
         raise ValueError(f"a request asks a positive multiple of {len(OPTIONS)} questions")
-    verdict = list(range(args.count * (1 + REDRAW)))
+    verdict = list(range(staged_units(args.count)))
     pilot = list(range(SIZING_FROM, SIZING_FROM + 2 * args.count))
     pool = {"commit": recorded_commit(), "count": args.count,
             "questions": args.questions, "short_words": args.short_words, "long_words": args.long_words,
@@ -659,7 +660,7 @@ def verdict(args, pool):
             log_softmax(np.asarray(loaded[phase][name], np.float64)) for name in names])}
 
     original = functools.partial(log_probabilities, "author")
-    exact = functools.partial(log_probabilities, "truth")
+    exact = as_given(functools.partial(log_probabilities, "truth"))
 
     def recorded(index):
         return {"log_probabilities": leaf_summary(original(index)["log_probabilities"],

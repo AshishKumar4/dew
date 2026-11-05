@@ -218,6 +218,8 @@ LAYERS: dict[str, tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = {
     "reinforcement learning imports no trainer": (("dew.rl",), (), ("dew.training",)),
     "only the reinforcement-learning packages import dew.rl": (
         ("dew",), ("dew.rl", "dew.objectives.rl"), ("dew.rl",)),
+    "the kernels import nothing above the network layer": (
+        ("dew.nn.kernels",), (), tuple(name for name in FEATURES if name not in ("dew.nn", "dew.telemetry"))),
 }
 """The layering contracts (docs/design/architecture.md; row 1557): each one's modules, those among them it
 leaves out, and the packages none of them imports directly (absolute, relative, function-local or under

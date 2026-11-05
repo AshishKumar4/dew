@@ -38,8 +38,12 @@ def softmax_cotangents(logits, products, peak, total, anchor, delta, keep=None, 
     about = dropped - per_query(anchor)
     if at_anchor is not None:
         about = jnp.where(at_anchor, 0.0, about)
-    cotangents = e * ((about - per_query(delta)) * over)
-    return e, e * over, gradient.where_seen(seen, cotangents, 0.0)
+    weights = e * over
+    # The fast form's cotangents from the weights it forms anyway (FlashAttention's order, 16 multiplies a
+    # tile fewer on the fused dK/dV launch, ET-CONFLICTS-h100); the accurate form's normalized last.
+    cotangents = (e * ((about - per_query(delta)) * over) if accurate
+                  else weights * (about - per_query(delta)))
+    return e, weights, gradient.where_seen(seen, cotangents, 0.0)
 
 
 @functools.cache
@@ -96,12 +100,12 @@ def derived_backward(scale: float, walked: str, hooked: bool = False, dropped: b
                          accurate=accurate, saturation=SATURATION)
 
 
-def backward_derived(how: algebra.Recompute, *, accurate: bool) -> bool:
-    """Whether the backward's derived forms walk a call (behind the switch, `dew.algebra.forms.derived`):
-    where its declaration states the walk. Its accurate form (the anchor test, the keyed sums, raw logits'
-    recomputation) is a rounding choice the fast class's derivation does not make (§1.5's compensation rules,
-    the next build): there the template's own forms run, under the replacement rule."""
-    return algebra.derived_on() and not accurate and how == algebra.PLAIN
+def backward_derived() -> bool:
+    """Whether the backward's derived forms walk a call (behind the switch, `dew.algebra.forms.derived`), in
+    every form: its recomputation's units (`how`) and its accurate form's anchor test are declared
+    (`softmax_cotangents`), and the accurate form's keyed sums and its cotangents' parts' products are each
+    mainloop's own, through the derived step's `stepped` (`attention_portable._accurate_sums`)."""
+    return algebra.derived_on()
 
 
 def backward_declaration(*, scale: float, walked: str, hooked: bool = False, dropped: bool = False,

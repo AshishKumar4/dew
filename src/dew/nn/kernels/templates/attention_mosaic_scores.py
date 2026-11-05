@@ -11,7 +11,7 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels.templates import attention_algebra as algebra, attention_gradient as gradient, mosaic
 from dew.nn.kernels.templates.attention import DQ_GRADS, Kind, by_power
-from dew.nn.kernels.templates.attention_backward_algebra import backward_derived, derived_cotangents
+from dew.nn.kernels.templates.attention_backward_algebra import derived_cotangents
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     _param,
@@ -140,17 +140,25 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
         return coords.queries(read(x), s) if coords.keys_first else read(x)
 
     multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
-    if backward_derived(how, accurate=walk.accurate):
-        # Behind the switch, the tile's weights and cotangents the derived forms'
-        # (`derived_cotangents`).
+    # The anchor key's `dP - c` taken as 0 in the accurate form alone; the fast form's is its product's
+    # rounding, FlashAttention 3's math (a query of one key's cotangents a rounding where its float64
+    # gradient is 0, a cancelling row the gate sizes by its terms; the select 10.8% of the fused dK/dV
+    # launch's instructions, ET-CONFLICTS-h100).
+    at_anchor = coords.k_pos == coords.queries(read(chosen), coords.k_pos) if walk.accurate else None
+    if algebra.derived_on():
+        # Behind the switch, the tile's weights and cotangents the derived forms' (`derived_cotangents`), in
+        # its forward's units (`how`) and form (`accurate`, its anchor keys an operand).
         tiles = {"logits": logits, "products": dp, "peak": read(peak), "total": read(total),
                  "anchor": read(anchor), "delta": read(delta)}
         if multiplier is not None:
             tiles["keep"] = multiplier
         if seen is not None:
             tiles["seen"] = seen
-        exponentials, weights, cotangents = derived_cotangents(
-            bool(coords.keys_first), multiplier is not None, seen is not None).mapped(tiles)
+        if at_anchor is not None:
+            tiles["at_anchor"] = at_anchor
+        forms = derived_cotangents(bool(coords.keys_first), multiplier is not None, seen is not None, how,
+                                   walk.accurate)
+        exponentials, weights, cotangents = forms.mapped(tiles)
         return exponentials, weights, cotangents, slopes, seen
     inverse_total = per_query(algebra.inverse(read(total)))
     # The fast form's exponent unclamped, its maximum safe where a query saw no key (`gradient.safe_peak`, a
@@ -158,11 +166,6 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
     fast = not walk.accurate
     peaks = per_query(gradient.safe_peak(read(peak)) if fast else peak)
     exponentials, weights = gradient.normalized(logits, peaks, inverse_total, how, safe=fast)
-    # The anchor key's `dP - c` taken as 0 in the accurate form alone; the fast form's is its product's
-    # rounding, FlashAttention 3's math (a query of one key's cotangents a rounding where its float64
-    # gradient is 0, a cancelling row the gate sizes by its terms; the select 10.8% of the fused dK/dV
-    # launch's instructions, ET-CONFLICTS-h100).
-    at_anchor = coords.k_pos == coords.queries(read(chosen), coords.k_pos) if walk.accurate else None
     cotangents = gradient.grad_scores(exponentials, dp, per_query(anchor), per_query(delta), seen, at_anchor,
                                      inverse_total, multiplier=multiplier, weights=weights if fast else None)
     return exponentials, weights, cotangents, slopes, seen
