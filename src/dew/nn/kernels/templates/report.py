@@ -642,8 +642,8 @@ def _binary(function: str, elf: bytes, decoded: bool = False) -> Binary:
 
 def disassembler() -> Path | None:
     """NVIDIA's nvdisasm, which the SASS rules read a kernel's machine code through (`sass_findings`): the
-    nvdisasm wheel's (`nvidia/cu13/bin`, the kernel-compile and CUDA extras', beside the nvcc wheel's
-    ptxas) or the PATH's; None where neither is installed, a user's install among them."""
+    nvdisasm wheel's (`nvidia/cu13/bin`), which the `ci` extra installs in every lock the suite runs on, or
+    the PATH's; None where neither is installed, a user's install among them."""
     spec = importlib.util.find_spec("nvidia")
     for root in (spec.submodule_search_locations or ()) if spec else ():
         if (found := Path(root) / "cu13" / "bin" / "nvdisasm").is_file():
