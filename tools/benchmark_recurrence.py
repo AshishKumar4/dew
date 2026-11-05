@@ -6,6 +6,8 @@ Arms, each on the same operands:
 
 - `template`: `recurrence_chunk.chunk`, its route as the GPU's row picks it (the conv is not in the
   template yet: it has no template arm);
+- `mosaic`: the same call with the recurrence template named (`generation.chosen`), on the cells whose route
+  takes a port (`recurrence_chunk.PORT_CELLS`, `SCAN_CELLS`) as on the rest;
 - `hand`: the kernel the template replaces, called directly: the delta rule's port (`fla_rule`,
   `fla_gdn` or `fla_kda`), mamba_ssm's port (`mamba_ssd.ssd_scan`, a refusal where it does not take
   the shape), the short conv's kernel (`linear.causal_conv1d`);
@@ -78,8 +80,13 @@ SHAPES = {
 }
 """The real shapes. Dory 1.0 4B has none: its layers are attention and MLP (its config.json)."""
 
-ARMS = {'gdn': ('template', 'hand', 'xla', 'fla', 'flashqla'), 'kda': ('template', 'hand', 'xla', 'fla'),
-        'ssd': ('template', 'hand', 'xla', 'mamba_ssm'), 'conv': ('hand', 'xla', 'fla')}
+KDA_FLOOR = -5.0
+"""Kimi Linear's declared lower bound of a token's log decay (`dew.nn.kda`'s `lower_bound`), its draws'
+decays above it (`operands`: at least -0.75 a token)."""
+
+ARMS = {'gdn': ('template', 'mosaic', 'hand', 'xla', 'fla', 'flashqla'),
+        'kda': ('template', 'mosaic', 'hand', 'xla', 'fla'),
+        'ssd': ('template', 'mosaic', 'hand', 'xla', 'mamba_ssm'), 'conv': ('hand', 'xla', 'fla')}
 
 
 def flops(shape: Shape) -> float:
@@ -170,9 +177,11 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
             refusals['hand'] = '; '.join(refusal.detail for refusal in SCAN.kernel('pallas').failed(case))
             cotangents = (given['dy'], given['dfinal'])
         else:
-            # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.
+            # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare,
+            # and Kimi delta attention's declared floor (`dew.nn.kda`'s `lower_bound`), which its draws keep.
             hooks = recurrence.Hooks(decay='vector' if shape.kind == 'kda' else 'scalar',
-                                     scale=shape.key_width ** -0.5, write_bound=1.0)
+                                     scale=shape.key_width ** -0.5, write_bound=1.0,
+                                     floor=KDA_FLOOR if shape.kind == 'kda' else None)
             inputs = (*(given[key].astype(bf16) for key in ('q', 'k', 'v')), given['g'],
                       given['beta'].astype(bf16))
 
@@ -188,7 +197,12 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
             with generation.chosen(gated_delta_rule='xla', ssd='xla'):
                 return template(*args)
 
-        arms = {'template': template, 'hand': hand, 'xla': xla}
+        def mosaic(*args):
+            # The template named, on the cells its route gives a port (`recurrence_chunk.PORT_CELLS`).
+            with generation.chosen(gated_delta_rule='mosaic_gpu', ssd='mosaic_gpu'):
+                return template(*args)
+
+        arms = {'template': template, 'mosaic': mosaic, 'hand': hand, 'xla': xla}
 
     # The cotangents are an argument: `program` keeps each function it compiled, and a closure over them
     # would keep every shape's until the sweep ended.
