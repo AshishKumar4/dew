@@ -1545,9 +1545,12 @@ class Transport[Allocated, Opened](abc.ABC):
         if not after_walks:
             return self.program_scoped(body, *allocations, streams=streams)
         if self.walks_scoped:
-            return self.program_scoped(
-                functools.partial(body, after=lambda fn: pl.run_scoped(fn, *after_walks)), *allocations,
-                streams=streams)
+            # The after-walks scope is the program's own kind (`program_scoped`: collective where its
+            # consumers share one).
+            def after(fn):
+                return self.program_scoped(lambda *refs, streams: fn(*refs), *after_walks, streams=streams)
+
+            return self.program_scoped(functools.partial(body, after=after), *allocations, streams=streams)
         held = len(allocations)
 
         def program(*refs, streams):
@@ -1682,6 +1685,12 @@ class Transport[Allocated, Opened](abc.ABC):
         each copy's launch axes as its tile holds them (`templates.axes.held`), say which of the
         accumulator's axes a vector follows, where a family stages its loads through registers in the
         accumulator's layouts (`mosaic_sm80.Mma`); a vector whose axes go unstated follows its columns."""
+
+    def shares_rows(self, rows: int, consumers: int) -> bool:
+        """Whether a step's block of `rows` rows splits into the copies `consumers` consumers each make of it:
+        always where a producer loads it whole (TMA's rings)."""
+        del rows, consumers
+        return True
 
     def load_barriers(self, count: int) -> pallas_core.ScratchShape:
         """The scoped allocation of `count` whole loads' completions (`loaded`'s barriers), which a program's
