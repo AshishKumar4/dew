@@ -439,8 +439,7 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
 
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  force_fp32_for_softmax=True, implementation: AttentionImpl = 'auto',
-                                 wide_logits: bool = False,
-                                 causal=False, sliding_window=None, mask=None, bias=None,
+                                 causal=False, sliding_window=None, mask=None, bias=None, wide_logits=False,
                                  sinks=None, softcap=None, segment_ids=None, max_segments=None,
                                  key_value_seq_lengths=None, dropout_rate=0.0,
                                  dropout_rng=None, deterministic=True, key_segment_ids=None,
@@ -460,10 +459,8 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     the row index, so a decode step against a cache passes `mask` instead.
     `bias` is additive and broadcasts to [B, H, Q, K] (T5's position table).
     `sinks` is one learned value-free logit per query head in the denominator.
-    `softcap` is Gemma 2's tanh on the scaled logits. `wide_logits` forms the
-    logits from queries and keys widened to at least fp32, scaled after the
-    product (`reference_attention`'s): the reference takes it and every other
-    kernel refuses it. `segment_ids` `[B, S]`
+    `softcap` is Gemma 2's tanh on the scaled logits. `wide_logits` forms them
+    wide, which the reference alone does (`reference_only`). `segment_ids` `[B, S]`
     keeps each packed document to itself, 0 as padding (`document_mask`), and
     `max_segments`, static, bounds the documents a row holds
     (`Coordinates.max_segments`), which flash's packed sequences need.
@@ -518,7 +515,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         key_value_seq_lengths = key_value_seq_starts = key_valid = key_runs = places = None
         implementation = kernel_for_materialized_mask(
             implementation, query, key, dtype=dtype, precision=precision,
-            force_fp32_for_softmax=force_fp32_for_softmax)
+            force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits)
     if (isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None)
             and shards > 1):
         # Only a single device's kernels read documents aligned to their last keys; elsewhere they
@@ -540,7 +537,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         causal, sliding_window, segment_ids = False, None, None
         implementation = kernel_for_materialized_mask(
             implementation, query, key, dtype=dtype, precision=precision,
-            force_fp32_for_softmax=force_fp32_for_softmax)
+            force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits)
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
@@ -720,7 +717,8 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         causal=causal, sliding_window=sliding_window, mask=mask, bias=bias,
         segment_ids=segment_ids, max_segments=max_segments, key_value_seq_lengths=lengths,
         key_value_seq_starts=starts, block_groups=block_groups, image_groups=image_groups,
-        key_valid=key_valid, key_runs=key_runs, places=places, dropout=dropout_seed is not None).ran
+        key_valid=key_valid, key_runs=key_runs, places=places, dropout=dropout_seed is not None,
+        wide_logits=wide_logits).ran
     call = functools.partial(
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
@@ -834,9 +832,6 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
                                    force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits,
                                    dropout_rate=dropout_rate, dropout_seed=dropout_seed,
                                    dropout_places=dropout_places)
-    if wide_logits:
-        raise ValueError(f"attention kernel {implementation!r} forms its logits in its inputs' dtype; wide "
-                         "logits (`wide_logits`) are the reference attention's")
 
     # The decode kernel and the template read key starts as their own spans; elsewhere they are the mask.
     if implementation not in ('decode', 'template'):
@@ -852,17 +847,19 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
                             dropout_places=dropout_places)
 
 
-def reference_only(query, dtype, precision, force_fp32_for_softmax) -> bool:
+def reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits: bool = False) -> bool:
     """Whether a call asks for arithmetic only the reference path performs.
 
-    The three are what every fused kernel's requirements refuse
+    The four are what every fused kernel's requirements refuse
     (`attention_kernels`' arithmetic requirement): a matmul precision other
     than DEFAULT (a higher one, a dot algorithm or a preset of one), a
-    softmax outside fp32, and a compute dtype other than the inputs'.
+    softmax outside fp32, a compute dtype other than the inputs', and logits
+    formed from queries and keys widened to at least fp32 (`wide_logits`).
     """
     return (not asks_default_precision(precision)
             or not force_fp32_for_softmax
-            or (dtype is not None and jnp.dtype(dtype) != query.dtype))
+            or (dtype is not None and jnp.dtype(dtype) != query.dtype)
+            or wide_logits)
 
 
 def _xla_kernel_narrows(query) -> bool:
@@ -882,7 +879,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
                    sinks=None, causal=False, sliding_window=None, mask=None, bias=None, segment_ids=None,
                    max_segments=None, key_value_seq_lengths=None, key_value_seq_starts=None,
                    block_groups=None, image_groups=None, key_valid=None, key_runs=None, places=None,
-                   dropout: bool = False, named: str = 'auto') -> AttentionCase:
+                   dropout: bool = False, wide_logits: bool = False, named: str = 'auto') -> AttentionCase:
     """The `AttentionCase` of a call `scaled_dot_product_attention` takes under the `named`
     `AttentionImpl`, which decides whether splash might run it."""
     cross = isinstance(segment_ids, CrossDocuments)
@@ -906,7 +903,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         row_bias=(bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] > 1
                   and jnp.shape(bias)[0] > 1),
         sinks=sinks is not None, softcap=softcap,
-        arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
+        arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits),
         narrows=_xla_kernel_narrows(query),
         folds=folds(query, key, bias, mask, causal, sliding_window),
         splash_mask=False, shards=sequence_shards(), dropout=dropout,
@@ -925,7 +922,7 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
                            sliding_window=None, mask=None, bias=None, segment_ids=None, max_segments=None,
                            key_value_seq_lengths=None, key_value_seq_starts=None, block_groups=None,
                            image_groups=None, key_valid=None, key_runs=None, places=None,
-                           dropout: bool = False) -> Route:
+                           dropout: bool = False, wide_logits: bool = False) -> Route:
     """The route an `AttentionImpl` takes for this call on this host (`Route.ran` its kernel,
     `Route.forced` what forced it), as the attention selector
     reports it (`select`, over `attention_case`): 'auto' takes the kernel the target's row measured
@@ -944,7 +941,7 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
                           key_value_seq_lengths=key_value_seq_lengths,
                           key_value_seq_starts=key_value_seq_starts, block_groups=block_groups,
                           image_groups=image_groups, key_valid=key_valid, key_runs=key_runs, places=places,
-                          dropout=dropout, named=implementation)
+                          dropout=dropout, wide_logits=wide_logits, named=implementation)
     if not (decodes(case) and implementation in ('auto', 'cudnn', 'xla')):
         return select(ATTENTION, case, None if implementation == 'auto' else implementation)
     if implementation == 'xla':
@@ -955,7 +952,7 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
 
 
 def kernel_for_materialized_mask(implementation: AttentionImpl, query, key, *, dtype=None, precision=None,
-                                 force_fp32_for_softmax=True) -> AttentionImpl:
+                                 force_fp32_for_softmax=True, wide_logits: bool = False) -> AttentionImpl:
     """The kernel a call that built an explicit mask runs: a kernel the call names, cuDNN aside, which runs
     the mask as xla does; else the attention selector's (`_masked_kernel`): one a run's context forces
     (`generation.chosen`), else the xla kernel, the reference path where xla hands the call on.
@@ -972,11 +969,12 @@ def kernel_for_materialized_mask(implementation: AttentionImpl, query, key, *, d
         return implementation
     return _masked_kernel(implementation, 'xla' if implementation == 'xla' else None, query, key,
                           ('xla', 'reference'), dtype=dtype, precision=precision,
-                          force_fp32_for_softmax=force_fp32_for_softmax)
+                          force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits)
 
 
 def mask_kernel(implementation: AttentionImpl, query, key, *, as_bias: bool, dtype=None, precision=None,
-                force_fp32_for_softmax=True, softcap=None, sinks: bool = False) -> AttentionImpl:
+                force_fp32_for_softmax=True, softcap=None, sinks: bool = False,
+                wide_logits: bool = False) -> AttentionImpl:
     """The kernel a call that built its mask runs, decided where the call builds it: where the mask suits
     cuDNN's dense bias (`as_bias`: a window's band, a forward-only cache call over several queries) and the
     call chooses ('auto') or names cudnn, cuDNN where it takes the call, then xla (a call cuDNN cannot
@@ -985,16 +983,17 @@ def mask_kernel(implementation: AttentionImpl, query, key, *, as_bias: bool, dty
     (`generation.chosen`) is taken as forced."""
     if not (as_bias and implementation in ('auto', 'cudnn')):
         return kernel_for_materialized_mask(implementation, query, key, dtype=dtype, precision=precision,
-                                            force_fp32_for_softmax=force_fp32_for_softmax)
+                                            force_fp32_for_softmax=force_fp32_for_softmax,
+                                            wide_logits=wide_logits)
     return _masked_kernel(implementation, None if implementation == 'auto' else implementation, query, key,
                           ('cudnn', 'xla', 'reference'), dtype=dtype, precision=precision,
                           force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
-                          as_bias=True)
+                          as_bias=True, wide_logits=wide_logits)
 
 
 def _masked_kernel(implementation: AttentionImpl, named: str | None, query, key,
                    preference: tuple[str, ...], *, dtype, precision, force_fp32_for_softmax, softcap=None,
-                   sinks: bool = False, as_bias: bool = False) -> AttentionImpl:
+                   sinks: bool = False, as_bias: bool = False, wide_logits: bool = False) -> AttentionImpl:
     """The attention selector's kernel for a call of `implementation` with a mask (`selection.selected`,
     reporting nothing: the dispatch that runs it reports its route): `named` where it takes the call, else
     one a run's context forces, else `preference`'s first that takes it, the reference path where xla hands
@@ -1005,7 +1004,7 @@ def _masked_kernel(implementation: AttentionImpl, named: str | None, query, key,
     case = dataclasses.replace(
         attention_case(query, key, dtype=dtype, precision=precision,
                        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap,
-                       sinks=True if sinks else None, named=implementation),
+                       sinks=True if sinks else None, wide_logits=wide_logits, named=implementation),
         folds=False, **form)
     return attention_implementation(ATTENTION.hosted(selected(ATTENTION, case, named,
                                                               preference=preference).name))

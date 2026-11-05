@@ -142,9 +142,9 @@ class MixerContext:
     force_fp32_for_softmax: bool = True
     wide_logits: bool = False
     """The logits from the query and keys widened to at least fp32 and scaled after the product, as
-    `reference_attention`'s `wide_logits`: only the reference attention takes it, so a layer setting it
-    trades every fused route ('auto' among them, which refuses it by name) for the reference's
-    exactness."""
+    `reference_attention`'s `wide_logits`: arithmetic only the reference attention performs
+    (`dew.nn.attention.reference_only`), so a layer asking it trades every fused route for the
+    reference's exactness ('auto' takes the reference; a fused kernel the layer names refuses it)."""
     kv_cache: KVCache = dataclasses.field(default_factory=KVCache)
     """The decode cache's storage layout (`dew.nn.kv_cache`)."""
     ngpt: NGPT | None = None

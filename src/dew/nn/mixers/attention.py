@@ -1082,7 +1082,8 @@ class CausalSelfAttention(nn.Module):
         return mask_kernel(self.ctx.attention_impl, query, key, as_bias=decode and query.shape[1] > 1,
                            dtype=self.ctx.dtype, precision=self.ctx.precision,
                            force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
-                           softcap=self.ctx.attn_logit_softcap, sinks=bool(self.ctx.attention_sinks))
+                           softcap=self.ctx.attn_logit_softcap, sinks=bool(self.ctx.attention_sinks),
+                           wide_logits=self.ctx.wide_logits)
 
     def _masking(
         self,
