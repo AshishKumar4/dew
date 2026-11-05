@@ -935,18 +935,27 @@ def test_refusals_cross_processes_only_through_an_explicit_handoff(tmp_path):
 
 
 def test_programs_compiled_at_once_are_the_ones_compiled_in_turn():
-    """Programs compiled at once (`report.compiled_at_once`) make their first compiles each in a thread of
-    its own and keep, in turn, the executables compiling them one after another keeps, in the order given."""
+    """Programs compiled at once (`report.compiled_at_once`) keep, in turn, the executables compiling them
+    one after another keeps, in the order given; those lowered in distinct MLIR contexts (here, each on a
+    thread of its own, as JAX lowers a thread's programs in one) make their first compiles each in a
+    thread of its own, and those sharing a context compile in turn in the caller's (`report.attempts`)."""
+    import concurrent.futures
+
     from dew.nn.kernels.templates import report
     from dew.telemetry.compiles import Compiles
 
     square = jax.ShapeDtypeStruct((256, 256), jnp.float32)
-    lowerings = [jax.jit(function).lower(square, square) for function in (
-        lambda x, y: x @ y, lambda x, y: jnp.tanh(x) + y, lambda x, y: jnp.sum(x * y, axis=0))]
-    with Compiles(None) as compiles:
-        together = report.compiled_at_once([(lowered, None, lambda lowered=lowered: lowered)
-                                            for lowered in lowerings])
-    threads = [program.thread for program in compiles.programs if program.kind == "compiled"]
-    assert len(threads) == 3 and all(thread.startswith("dew-compile") for thread in threads), threads
-    alone = [report.compiled(lowered, relower=lambda lowered=lowered: lowered) for lowered in lowerings]
-    assert [executable.as_text() for executable in together] == [executable.as_text() for executable in alone]
+    functions = (lambda x, y: x @ y, lambda x, y: jnp.tanh(x) + y, lambda x, y: jnp.sum(x * y, axis=0))
+    with concurrent.futures.ThreadPoolExecutor(3) as pool:
+        apart = list(pool.map(lambda function: jax.jit(function).lower(square, square), functions))
+    shared = [jax.jit(function).lower(square, square) for function in functions]
+    for lowerings, threaded in ((apart, True), (shared, False)):
+        with Compiles(None) as compiles:
+            together = report.compiled_at_once([(lowered, None, lambda lowered=lowered: lowered)
+                                                for lowered in lowerings])
+        threads = [program.thread for program in compiles.programs if program.kind == "compiled"]
+        assert len(threads) == 3, threads
+        assert all(thread.startswith("dew-compile") == threaded for thread in threads), (threaded, threads)
+        alone = [report.compiled(lowered, relower=lambda lowered=lowered: lowered) for lowered in lowerings]
+        assert [executable.as_text() for executable in together] == [
+            executable.as_text() for executable in alone]
