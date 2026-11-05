@@ -222,3 +222,87 @@ def test_a_mixtures_rejection_merges_its_members_counts_only_where_a_log_or_refu
     for at in range(300):
         counter(Rejected("short", member=f"member-{at % SOURCES}"))
     assert Merged.merges == 0
+
+
+class Documents:
+    """A source's token documents, each 3 to 12 tokens of its own, saying which source, document and
+    token it is: a packer of 16 tokens a row lays some whole and leaves others to the next row."""
+
+    def __init__(self, tag: int, records: int = RECORDS):
+        self.tag, self.records = tag, records
+
+    def __repr__(self) -> str:
+        return f"Documents(tag={self.tag}, records={self.records})"
+
+    def __len__(self) -> int:
+        return self.records
+
+    def __getitem__(self, index: int) -> dict:
+        if not 0 <= index < self.records:
+            raise IndexError(index)
+        length = 3 + (self.tag * 7 + index * 5) % 10
+        return {"text": np.arange(length, dtype=np.int32) + self.tag * 1000 + index * 20}
+
+
+def packed(count: int, *, examples: int | None = 10**6):
+    """A seeded mix of `count` sources of documents, packed first-fit into rows of 16 tokens, read as a
+    stream bounded in examples, which counts each member's examples where its rows are delivered
+    (`MEMBERS`): the read a packer asks the mix's position of before every document."""
+    chains = [Pipeline(Memory(Documents(tag)), name=f"source-{tag}").repeat() for tag in range(count)]
+    return compile(mix(chains, seed=0).pack(16, fields=("text",)).batch(BATCH), read="streamed",
+                   loading=READ, examples=examples)
+
+
+def texts(stream, batches: int) -> list[list[int]]:
+    return [np.asarray(batch["text"]).tolist() for batch in itertools.islice(stream, batches)]
+
+
+def test_a_packed_thousand_source_mixture_asks_its_position_at_no_cost_per_source(record_property):
+    """A packer asks its read's position before every document, to resume at the one that did not fit,
+    and the position of a mix counting its members' examples holds every member's counts and position:
+    captured copy-on-write, each capture copies what the document moved, so a thousand sources allocate
+    a step what ten do, give or take the two levels of a thousand's trie against one (`Shared`), where
+    copying every member's counts at each document made a step allocate a thousand sources' worth
+    (row 4079)."""
+    allocated = {}
+    for count in (10, SOURCES):
+        stream = packed(count).train(DataPartition())
+        try:
+            texts(stream, 4)
+            gc.collect()
+            tracemalloc.start()
+            began = tracemalloc.take_snapshot()
+            texts(stream, 16)
+            after = tracemalloc.take_snapshot()
+            tracemalloc.stop()
+        finally:
+            stream.close()
+        made = sum(stat.count_diff for stat in after.compare_to(began, "filename") if stat.count_diff > 0)
+        allocated[count] = made / 16
+        record_property(f"allocations_per_step_{count}", allocated[count])
+        print(f"sources={count} allocations_per_step={allocated[count]:.0f}")
+    assert allocated[SOURCES] < 2 * allocated[10], allocated
+
+
+@pytest.mark.parametrize("stop", [1, 3, 7])
+def test_a_packed_mixture_resumes_at_the_document_that_did_not_fit(stop):
+    """A packed mix's rows leave documents that do not fit to the next row, which its position begins at,
+    the mix's and its counters' positions as they stood before that document: a run stopped after `stop`
+    steps and resumed reads what the run that never stopped reads next, row for row, and counts what it
+    counts (row 4079: positions captured copy-on-write, never the live counts)."""
+    data = packed(SOURCES)
+    whole = data.train(DataPartition())
+    try:
+        texts(whole, stop)
+        state = whole.get_state()
+        expected = texts(whole, 6)
+        counted = data.statistics()
+    finally:
+        whole.close()
+    resumed = data.train(DataPartition())
+    try:
+        resumed.set_state(state)
+        assert texts(resumed, 6) == expected
+        assert data.statistics() == counted
+    finally:
+        resumed.close()
