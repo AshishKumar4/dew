@@ -12,9 +12,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   GPU (an H100, an H200 or a GH200) a mixture of experts' projection now runs CUTLASS on the two grouped cells
   declared for it, the forward and the input gradient, where Dew's Mosaic GPU template ran them: on an H100
   the template took 1.019x CUTLASS's time on the forward and 1.018x on the input gradient (geomean of seven
-  MoE rows). The kernel gradient, every other GPU and every other cell stay on the template, and so does a
-  call CUTLASS cannot run (operands that are not bf16, a width that is not a multiple of 8, a fused hook,
-  exact sums).
+  MoE rows). Hopper's grouped kernel gradient stays on the template, every other cell keeps the route it had,
+  and a call CUTLASS cannot run (operands that are not bf16, a width that is not a multiple of 8, a fused hook,
+  exact sums) takes the selector's next route, as before.
 - `dew.algebra.extract` adds exact DAG extraction, an integer program over the e-graph's nodes with each shared
   node priced once. egglog's greedy DAG extraction stays the default: the exact one priced no template's forms
   lower and took twice as long. A template declaration can ask for exact extraction
