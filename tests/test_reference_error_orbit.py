@@ -181,6 +181,26 @@ def test_narrow_rows_take_their_narrow_factor_and_wider_rows_row_factor():
             assert bool(over) == fails, (width, worst)
 
 
+def test_a_worst_row_one_element_rules_takes_one_values_factor():
+    """A wide leaf's worst row whose largest element carries past RULED_SHARE of the reference's worst row's
+    squared error is judged at a row of one value's factor (row 3684), at three and sixteen values a row: a
+    worst row twenty times the reference's passes there, and fails where the reference's worst row is spread
+    over its values, or its shares unknown (a recording's summary)."""
+    from check1_statistics import RULED_SHARE
+    from reference_error import NARROW_FACTORS, NO_ZERO_ROWS, _Draws, _judgement
+
+    worst = 20.0
+    assert NARROW_FACTORS[1] > worst > NARROW_FACTORS[2]
+    for width in (3, 16):
+        for shares, fails in ((np.full((8, 1), (1 + RULED_SHARE) / 2), False),
+                              (np.full((8, 1), RULED_SHARE / 2), True), (None, True)):
+            draws = _Draws(["leaf"], np.ones((8, 1)), np.ones((8, 1)),
+                           np.tile([[[np.log(worst), 0.0]]], (8, 1, 1)), [[NO_ZERO_ROWS]] * 8,
+                           np.ones((8, 1), bool), (width,), shares=shares)
+            over, _ = _judgement(draws, "leaf")
+            assert bool(over) == fails, (width, shares)
+
+
 def test_a_narrow_rows_factor_holds_through_check_one():
     """Through `assert_as_exact`: a first row of one value ten times the reference's relative error, too
     small a value for the pooled ratio to see, passes at one value a row and fails at eight."""
