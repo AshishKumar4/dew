@@ -203,41 +203,45 @@ def test_a_live_cell_takes_dews_arguments_and_is_refused_only_what_the_service_d
 
 def test_a_guest_whose_request_outlasts_its_connection_stays_admitted_until_the_engine_settles_it(
         service, tmp_path, monkeypatch):
-    """A guest's request the engine still holds when its connection's wait runs out keeps the guest's one
-    admission: a second request is refused while the first runs, and admitted once the engine settles
-    it, so a slow pass never lets one guest queue a second job past the service's bounds."""
+    """A guest's image request the engine still runs when its connection's wait runs out keeps the guest's
+    one admission: its connection hears the timeout and nothing after it, a second request is refused
+    while the first runs, and the guest is admitted again once the engine has settled it, so a slow pass
+    never lets one guest queue a second job past the service's bounds. The service's real models run
+    the request (`live_kernel`), its 40-step walk compiling past the shortened wait."""
     import json
     import os
     import socket
-    from concurrent.futures import Future
 
-    held = []
+    _, _, native = live_kernel(service, tmp_path)
+    monkeypatch.setattr(service, "REQUEST_SECONDS", 0.05)
+    request = {"op": "sample", "repo": "model", "revision": "pinned", "prompt": "a lake", "negative": None,
+               "prepare_key": 3, "prepare_steps": 40, "key": 5, "steps": 40, "solver": None}
 
-    class Models:
-        def describe(self, request):
-            return {}
+    def connected(payload):
+        client = socket.socket(socket.AF_UNIX)
+        client.connect(str(tmp_path / "model.sock"))
+        client.sendall(json.dumps(payload).encode() + b"\n")
+        return client, client.makefile()
 
-        def submitted(self, request, emit):
-            future = Future()
-            held.append(future)
-            return future, lambda result: {"text": result}
+    def reply(lines):
+        """The connection's reply, after the progress before it."""
+        return next(message for message in map(json.loads, lines)
+                    if "result" in message or "error" in message)
 
-    monkeypatch.setattr(service, "REQUEST_SECONDS", 0.2)
-    request = {"op": "text", "model": "m", "prompt": "hi", "tokens": 1, "key": 0}
-
-    def asked():
-        with socket.socket(socket.AF_UNIX) as client:
-            client.connect(str(tmp_path / "model.sock"))
-            client.sendall(json.dumps(request).encode() + b"\n")
-            return json.loads(client.makefile().readline())
-
-    shared = service.ModelService(tmp_path / "model.sock", Models(), uids=(os.getuid(),))
+    shared = service.ModelService(tmp_path / "model.sock", native, uids=(os.getuid(),))
     try:
-        assert asked()["error"]["name"] == "TimeoutError"
-        # Refused while the first still runs: the engine is handed nothing more.
-        assert "error" in asked() and len(held) == 1
-        held[0].set_result("done")
-        assert asked()["error"]["name"] == "TimeoutError" and len(held) == 2
+        first, lines = connected(request)
+        with first:
+            assert reply(lines)["error"]["name"] == "TimeoutError"
+            # The reply ends the connection's output: no progress of the running walk follows it.
+            assert lines.read() == ""
+        second, lines = connected(request)
+        with second:
+            assert reply(lines)["error"]["name"] == "ValueError"
+        # The engine answers requests in order: once this one is answered, the first has been settled.
+        native.sample(service.validate({**request, "key": 6}), lambda _: None)
+        third, lines = connected({"op": "describe", "repo": "model", "revision": "pinned"})
+        with third:
+            assert "result" in reply(lines)
     finally:
-        held[-1].set_result("done")
         shared.server_close()
