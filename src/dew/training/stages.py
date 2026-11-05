@@ -784,8 +784,9 @@ def _row_form(equation, held: int, stacked: set[int], shapes: Sequence) -> Mappi
         return None
     if entrywise(equation) and name != "broadcast_in_dim":
         # Each operand of its result's shape, a scalar, or of one entry along an axis it broadcasts.
-        return params if all(tuple(shape) == () or (len(shape) == len(out) and all(
-            size in (whole, 1) for size, whole in zip(shape, out, strict=True))) for shape in shapes) else None
+        fits = all(tuple(shape) == () or (len(shape) == len(out) and all(
+            size in (whole, 1) for size, whole in zip(shape, out, strict=True))) for shape in shapes)
+        return params if fits else None
     if name == "broadcast_in_dim":
         dims = tuple(params["broadcast_dimensions"])
         if dims[:held] != tuple(range(held)):
