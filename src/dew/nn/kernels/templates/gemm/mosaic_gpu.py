@@ -584,10 +584,8 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                     return  # past its program's range: another program walks the tile
                 fixed_refs = [smem.at[wg] for smem in fixed_smems]
                 if active:
-                    family.loaded([(prologue_gmems[i].at[pl.ds(row_start, block_m)], ref, barrier.at[wg])
-                                   for i, ref, barrier in zip(fixed, fixed_refs, fixed_barriers,
-                                                              strict=True)],
-                                  axes=tuple(axes.held(prologue_axes[i]) for i in fixed))
+                    _fixed_loaded(family, prologue_gmems, prologue_axes, fixed, fixed_refs, fixed_barriers,
+                                  wg=wg, rows=pl.ds(row_start, block_m))
                 step = functools.partial(_gmm_step, family=family, prologue=prologue,
                                          prologue_axes=prologue_axes,
                                          fixed_tiles=dict(zip(fixed, fixed_refs, strict=True)),
@@ -650,6 +648,15 @@ def _stored_rows(group, part_row, rows: int, m: int, *, dense: bool, row_tile: i
         return 0, (rows if m % row_tile == 0 else jnp.clip(m - part_row, 0, rows))
     first = jnp.clip(group.actual_start - part_row, 0, rows)
     return first, jnp.clip(group.actual_end - part_row, 0, rows) - first
+
+
+def _fixed_loaded(family: mosaic.Family, prologue_gmems, prologue_axes: tuple, fixed, refs, barriers, *, wg,
+                  rows) -> None:
+    """Dew: a consumer's prologue side tiles without depth (`fixed`: loaded once a tile, at its `rows`) into
+    its `refs`, each in the layout of its own axes (`Family.loaded`)."""
+    family.loaded([(prologue_gmems[i].at[rows], ref, barrier.at[wg])
+                   for i, ref, barrier in zip(fixed, refs, barriers, strict=True)],
+                  axes=tuple(axes.held(prologue_axes[i]) for i in fixed))
 
 
 def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store, sides: tuple, origins: dict,
