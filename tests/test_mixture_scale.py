@@ -146,14 +146,19 @@ def test_a_thousand_sources_compile_and_step_without_a_cost_per_source(by, recor
         stream = data.train(DataPartition())
         try:
             drawn(stream, count)
-            gc.collect()
-            Documents.reads, blocks = 0, sys.getallocatedblocks()
+            Documents.reads = 0
             began = time.perf_counter()
             asks = asked(stream, 64)
             stepped = (time.perf_counter() - began) / 64
             reads = Documents.reads
-            gc.collect()
-            kept = (sys.getallocatedblocks() - blocks) / 64
+            # What steps keep, counted between two counts past the first window: a buffer it sized once
+            # is in both, and whatever a step keeps grows with the steps between them.
+            blocks = []
+            for _ in range(2):
+                texts(stream, 64)
+                gc.collect()
+                blocks.append(sys.getallocatedblocks())
+            kept = (blocks[1] - blocks[0]) / 64
             threads = threading.active_count()
         finally:
             stream.close()
