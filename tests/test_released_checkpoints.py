@@ -28,9 +28,8 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from float64_terms import float64_forward
 from model_support import flat_tree
-from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact
 
 from dew.interop import Pretrained
 from dew.objectives.base import Step
@@ -196,51 +195,91 @@ def test_the_load_hands_back_the_checkpoints_own_tokenizer(bundle, batch):
     assert lengths[1] < lengths[0], "both prompts tokenize to the same length; nothing is padded"
 
 
-def test_the_released_logits_match_transformers_on_the_same_ids(
-        bundle, batch, reference, checkpoint):
-    """The parity claim on real weights: dew's fp32 forward over the released
-    checkpoint as exact as transformers' over the same directory, the same
-    ids, the same mask and the same positions (`assert_as_exact_as_the_reference`),
-    the truth transformers' float64 twin of the same weights."""
+SEEDS = 8
+"""Each released checkpoint's declared check-1 seeds, sized by `seeds_for` paired on armada."""
+
+
+def drawn_ids(batch, vocab: int, salt: int, avoid: int | None = None):
+    """Check 1's draw of the batch's ids: each real position a token below `vocab` (never `avoid`, the
+    fill), the padding, mask and positions the batch's own."""
+    inputs, _, _ = batch
+    ids = np.asarray(inputs.tokens)
+    valid = np.asarray(inputs.token_fields["attention_mask"]).astype(bool)
+
+    def draw(seed):
+        tokens = np.random.default_rng([salt, seed]).integers(0, vocab - (avoid is not None), ids.shape)
+        if avoid is not None:
+            tokens += tokens >= avoid
+        return (np.where(valid, tokens, ids).astype(ids.dtype),)
+    return draw
+
+
+def assert_logits_as_exact(model, variables, reference, batch, label, salt):
+    """Dew's fp32 logits of `model` over `variables` as exact as transformers' `reference` (check 1) over
+    drawn ids (`drawn_ids`) at the batch's mask and positions, real positions alone, the truth the
+    reference's float64 twin."""
     inputs, _, _ = batch
     valid = np.asarray(inputs.token_fields["attention_mask"]).astype(bool)
     positions = inputs.token_fields["positions"]
-    ours = np.asarray(bundle.model.apply(bundle.variables, inputs.tokens, **inputs.kwargs()),
-                      np.float32)
-    theirs = reference_logits(reference, inputs.tokens, valid, positions)
-    wide = wide_logits(reference, inputs.tokens, valid, positions)
-    _, terms = float64_forward(bundle.model, bundle.variables, inputs.tokens, **inputs.kwargs())
-    assert_as_exact_as_the_reference(ours[valid], theirs[valid], wide[valid], f"{checkpoint} logits",
-                                     terms=np.asarray(terms)[valid])
+    forward = jax.jit(model.apply)
+    assert_as_exact(
+        as_given(lambda ids: np.asarray(forward(variables, ids, **inputs.kwargs()), np.float64)[valid]),
+        as_given(lambda ids: reference_logits(reference, ids, valid, positions).astype(np.float64)[valid]),
+        drawn_ids(batch, reference.config.vocab_size, salt), label, seeds=SEEDS,
+        truth_fn=as_given(lambda ids: wide_logits(reference, ids, valid, positions)[valid]))
+
+
+def test_the_released_logits_match_transformers_on_the_same_ids(
+        bundle, batch, reference, checkpoint):
+    """The parity claim on real weights: dew's fp32 forward over the released
+    checkpoint as exact as transformers' over the same directory, drawn ids at
+    the same mask and positions (check 1), the truth transformers' float64
+    twin of the same weights."""
+    assert_logits_as_exact(bundle.model, bundle.variables, reference, batch, f"{checkpoint} logits", 0x5E1)
 
 
 def test_the_objectives_token_scores_are_the_references_cross_entropy(
         batch, reference, scoring, checkpoint):
     """`LMObjective.evaluate` is the shifted cross entropy of the reference's
-    own logits, position by position, as exact as the reference's
-    (`assert_as_exact_as_the_reference`, the truth the cross entropy of its
+    own logits, position by position, as exact as the reference's over drawn
+    ids at the rows' padding (check 1, the truth the cross entropy of its
     float64 twin's logits), and the fill it is handed counts for nothing."""
     import torch
 
-    inputs, _, _ = batch
+    inputs, _, fill = batch
     objective, variables, rows = scoring
     valid = np.asarray(inputs.token_fields["attention_mask"])
-    scores = objective.evaluate(variables, {"text": jnp.asarray(rows)},
-                                Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None))
-    losses, weights = np.asarray(scores.losses), np.asarray(scores.weights)
-    targets = torch.from_numpy(rows[:, 1:].astype(np.int64))
+    width = valid.shape[1]
+    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
+    real = np.zeros(rows.shape, bool)
+    real[:, :width] = valid.astype(bool)
 
-    def cross_entropy(logits):
-        return torch.nn.functional.cross_entropy(torch.from_numpy(logits).transpose(1, 2), targets,
-                                                 reduction="none").numpy()
+    def draw(seed):
+        (ids,) = drawn_ids(batch, reference.config.vocab_size, 0x5E2, avoid=fill)(seed)
+        drawn = rows.copy()
+        drawn[:, :width] = ids
+        return (np.where(real, drawn, rows),)
 
-    expected = cross_entropy(reference_logits(reference, rows[:, :-1]))
-    truth = cross_entropy(wide_logits(reference, rows[:, :-1]))
-    counted = weights > 0
+    def counted(rows):
+        return np.asarray(objective.evaluate(variables, {"text": jnp.asarray(rows)}, step).weights) > 0
+
     # Every real token but each row's first is a target; the fill is not.
-    assert int(counted.sum()) == int(valid.sum()) - rows.shape[0]
-    assert_as_exact_as_the_reference(losses[counted], expected[counted], truth[counted],
-                                     f"{checkpoint} token losses")
+    assert int(counted(draw(0)[0]).sum()) == int(valid.sum()) - rows.shape[0]
+
+    def cross_entropy(logits, rows):
+        targets = torch.from_numpy(rows[:, 1:].astype(np.int64))
+        return torch.nn.functional.cross_entropy(torch.from_numpy(logits).transpose(1, 2), targets,
+                                                 reduction="none").numpy()[counted(rows)]
+
+    @as_given
+    def losses(rows):
+        scores = objective.evaluate(variables, {"text": jnp.asarray(rows)}, step)
+        return np.asarray(scores.losses, np.float64)[np.asarray(scores.weights) > 0]
+
+    assert_as_exact(losses, as_given(lambda rows: cross_entropy(reference_logits(reference, rows[:, :-1]),
+                                                                rows).astype(np.float64)),
+                    draw, f"{checkpoint} token losses", seeds=SEEDS,
+                    truth_fn=as_given(lambda rows: cross_entropy(wide_logits(reference, rows[:, :-1]), rows)))
 
 
 def test_greedy_generation_draws_the_references_greedy_continuation(bundle, batch, reference):
@@ -276,8 +315,8 @@ def test_the_trained_export_reloads_and_transformers_reads_it(
     layout: `Pretrained.load` reads them back leaf for leaf, rebuilds the
     same model and still carries a tokenizer, and transformers loads the
     same directory, consuming every tensor and wanting none, and computes
-    logits Dew's are as exact as (`assert_as_exact_as_the_reference`), the
-    truth its float64 twin of the exported weights."""
+    logits Dew's are as exact as over drawn ids (check 1), the truth its
+    float64 twin of the exported weights."""
     import torch
     from transformers import AutoModelForCausalLM
 
@@ -312,10 +351,4 @@ def test_the_trained_export_reloads_and_transformers_reads_it(
 
     read_back.eval()
     read_back.set_attn_implementation("eager")
-    positions = inputs.token_fields["positions"]
-    theirs = reference_logits(read_back, inputs.tokens, valid, positions)
-    wide = wide_logits(read_back, inputs.tokens, valid, positions)
-    del read_back
-    _, terms = float64_forward(bundle.model, state.variables, inputs.tokens, **inputs.kwargs())
-    assert_as_exact_as_the_reference(ours[valid], theirs[valid], wide[valid], f"{checkpoint} export",
-                                     terms=np.asarray(terms)[valid])
+    assert_logits_as_exact(bundle.model, state.variables, read_back, batch, f"{checkpoint} export", 0x5E3)
