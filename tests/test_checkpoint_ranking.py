@@ -700,8 +700,14 @@ def test_a_runs_persistent_and_local_checkpoints_hold_one_envelope(tmp_path):
     assert local <= set(persistent) and local <= set(saved)
     for field in local - {"state"}:
         assert persistent[field] == saved[field], field
+    def held(leaf):
+        """A state leaf's values, a key's by its data."""
+        leaf = jnp.asarray(leaf)
+        return np.asarray(jax.random.key_data(leaf) if jax.dtypes.issubdtype(leaf.dtype,
+                                                                             jax.dtypes.prng_key) else leaf)
+
     assert jax.tree.structure(persistent["state"]) == jax.tree.structure(saved["state"])
-    assert all(jax.tree.leaves(jax.tree.map(lambda a, b: bool(np.array_equal(np.asarray(a), np.asarray(b))),
+    assert all(jax.tree.leaves(jax.tree.map(lambda a, b: bool(np.array_equal(held(a), held(b))),
                                             persistent["state"], saved["state"])))
 
 
