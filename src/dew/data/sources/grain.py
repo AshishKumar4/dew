@@ -12,7 +12,6 @@ from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
 
 from .base import Read, Shard, ShardManifest, unnamed
-from .rows import streamed_rows
 
 
 @dataclass(frozen=True, eq=False)
@@ -58,7 +57,7 @@ class Grain(Dataset):
 
     def _read_shard(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
         if isinstance(self.dataset, grain.MapDataset):
-            return streamed_rows(self.dataset, options)
+            return self.dataset.to_iter_dataset(options)
         return self.dataset
 
     def metadata(self) -> Mapping[str, object]:

@@ -48,7 +48,6 @@ from dew.data.storage import (
 
 from .base import Read, Shard, ShardManifest, preparing, url_label
 from .index import ArrayIndex
-from .rows import streamed_rows
 
 type Format = Literal["jsonl", "text", "csv", "parquet", "arrow", "array_record", "files", "webdataset"]
 
@@ -891,7 +890,7 @@ class Files(Dataset):
 
     def _read_shard(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
         if self.kind in ("parquet", "arrow"):
-            return streamed_rows(grain.MapDataset.source(_ArrowFragment(self, shard.start)), options)
+            return grain.MapDataset.source(_ArrowFragment(self, shard.start)).to_iter_dataset(options)
         rows = self._shard_rows(shard, options)
         return rows if self.columns is None else rows.map(_Columns(self.columns, self.describe())).map(
             Fields(self.columns))
@@ -900,20 +899,20 @@ class Files(Dataset):
         if self.kind == "array_record":
             from .records import ArrayRecords
 
-            return streamed_rows(grain.MapDataset.source(
+            return grain.MapDataset.source(
                 ArrayRecords(
                     (shard.uri,),
                     self.storage_options,
                     record_codec=self.committed is not None and self.committed.get("codec") == 1,
                     declared=(self._declared_objects.get(shard.uri),),
                 )
-            ), options)
+            ).to_iter_dataset(options)
         if self.kind == "webdataset":
             from .webdataset import TarRows
 
             return TarRows(shard.uri, self.storage_options, self._declared_objects.get(shard.uri))
         if self.kind == "files":
-            return streamed_rows(grain.MapDataset.source(_Paths((shard.uri,))), options)
+            return grain.MapDataset.source(_Paths((shard.uri,))).to_iter_dataset(options)
         return _Lines(self, shard)
 
     def locality(self) -> tuple[tuple[int, ...], bool]:
