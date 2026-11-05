@@ -77,7 +77,7 @@ from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, Logi
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
-from dew.nn.kernels.options import owned_program
+from dew.nn.kernels.options import held_objects, owned_program
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import Link, Schedule, boxed, measured_links, pipeline_microbatches
 from dew.objectives.base import (
@@ -998,7 +998,7 @@ class Trainer(Generic[Loss, Effects]):
         links = self._links(mesh)
         shaped = self._at_base_rung(batch)
         resumed, self._resumed_rung = self._resumed_rung if shaped is None else shaped, None
-        with self._traced_on(mesh, links) as schedule:
+        with self._traced_on(mesh, links) as schedule, held_objects():
             planned, flops = self._planned(state, batch, mesh, schedule, resumed, trials, capacity, frontier)
             split, candidate, self.executable = planned.split, planned.candidate, planned.executable
             self._split = split
