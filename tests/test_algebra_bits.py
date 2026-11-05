@@ -164,23 +164,26 @@ def test_a_forms_traced_decode_is_its_decode():
 
 
 def _inline_decode(form: bits.BitForm):
-    """A Triton kernel decoding a block of stored words through the form's PTX (`BitForm.ptx`), a register's
-    block apiece."""
+    """A Triton kernel decoding a block of stored words (uint32) through the form's PTX (`BitForm.ptx`), a
+    register's block apiece, its words int32 inside, as Triton's inline assembly types a 32-bit register (a
+    signless integer)."""
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import triton as plgpu
 
     count = len(form.outputs)
 
     def body(words_ref, *out_refs):
-        shape = jax.ShapeDtypeStruct(words_ref.shape, jnp.uint32)
+        shape = jax.ShapeDtypeStruct(words_ref.shape, jnp.int32)
         words = words_ref[...]
         for output, ref in enumerate(out_refs):
             ref[...] = plgpu.elementwise_inline_asm(form.ptx(output), args=(words,), constraints="=r,r",
                                                     pack=1, result_shape_dtypes=(shape,))[0]
 
     def decode(words):
-        shape = jax.ShapeDtypeStruct(words.shape, jnp.uint32)
-        return pl.pallas_call(body, out_shape=(shape,) * count)(words)
+        shape = jax.ShapeDtypeStruct(words.shape, jnp.int32)
+        signed = jax.lax.bitcast_convert_type(words, jnp.int32)
+        return tuple(jax.lax.bitcast_convert_type(value, jnp.uint32)
+                     for value in pl.pallas_call(body, out_shape=(shape,) * count)(signed))
 
     return decode
 
