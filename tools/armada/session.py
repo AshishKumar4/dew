@@ -1,14 +1,17 @@
 """A CI task's pytest session, as the plan (ci.py) and the plugins a task loads into it (split.py,
-executed.py) share it: how pytest runs and what it sees (`pytest_run`, `pytest_environment`), how long it runs
-(`DEADLINE`, `GRACE`), which tests take another path on a GPU (`MARKS`), and how a split file's tests are cut
-(`cut`, `groups`), those of one shared setup together (`SHARED_SETUP`). What it decides changes a task's
-outcome, so the test cache keys every file's record on it (ci.py's `SHARED`); the plan's own code does not,
-and a change to it reruns nothing. The standard library alone: the plan imports it where pytest is not
-installed."""
+executed.py) share it: the one contract of how pytest is run and what it sees (`pytest_run`, `selected`,
+`pytest_command`, `pytest_environment`), the part of the environment a test's results
+depend on (`keyed_environment`), how long it runs (`DEADLINE`, `GRACE`), which tests take another path on a
+GPU (`MARKS`), and how a split file's tests are cut (`cut`, `groups`), those of one shared setup together
+(`SHARED_SETUP`). What it decides changes a task's outcome, so the test cache keys every file's record on it
+(ci.py's `SHARED`), a CPU task's and a GPU lane's alike; the plan's own code does not, and a change to it
+reruns nothing. The standard library alone: the plan imports it where pytest is not installed."""
 
 import ast
 import functools
+import json
 import os
+import re
 from collections.abc import Container, Iterator, Mapping
 from pathlib import Path
 
@@ -54,11 +57,104 @@ def pytest_run(python: str, report: Path, *measured: str) -> list[str]:
             "--tb=short", "--continue-on-collection-errors", "-p", "no:cacheprovider", f"--junitxml={report}"]
 
 
-def pytest_environment(environ: Mapping[str, str]) -> dict[str, str]:
-    """What CI's pytest runs under: this process's environment, `environ` over it, the Hub closed, and
-    tools/armada on the path, where the plugins a task loads (split.py, executed.py) import from."""
+STEERING = ("PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTEST_DISABLE_PLUGIN_AUTOLOAD")
+"""The variables pytest reads to change which tests it runs and which plugins it loads: extra options, extra
+plugins, the entry-point plugins left out. CI's command names its selection and plugins (`selected`,
+`pytest_command`), so none of them reaches a task's pytest (`pytest_environment`): a green row is the run the
+key says it is."""
+
+SEMANTIC = ("XLA_FLAGS", "LIBTPU_INIT_ARGS", "NVIDIA_TF32_OVERRIDE")
+"""The variables beside every `JAX_` one that change what a test computes, which a test process inherits, so
+its record is keyed by them (`keyed_environment`): XLA's and the TPU runtime's flags, and the GPU's TF32
+policy. dew-ops records the same variables as those that change a job's programs (dewops/node/session.py's
+`FLAGS`)."""
+UNKEYED = ("JAX_PLATFORMS", "JAX_COMPILATION_CACHE_DIR", "JAX_ENABLE_COMPILATION_CACHE",
+           "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS",
+           "JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES")
+"""The `JAX_` variables no key holds: the platforms, which the record's class names (ci.py's `device_class`),
+and where and whether JAX keeps its compiled programs, which a program's bits do not depend on."""
+PLUMBING = ("--xla_gpu_per_fusion_autotune_cache_dir", "--xla_dump_")
+"""The XLA flags (by their name's start) that say where it writes what it compiled or measured, which no
+result depends on, and which a GPU node sets to a directory of its own."""
+
+
+def keyed_environment(environ: Mapping[str, str]) -> str:
+    """The part of `environ` a test's results depend on, as one text: each variable of `SEMANTIC` and each
+    `JAX_` one but `UNKEYED`, by name and value, XLA's flags with the `PLUMBING` ones left out and the rest in
+    their order (a later flag overrides an earlier one). The record's key holds it (ci.py's `shared`), on a
+    GPU lane as on a CPU task: a green row of one setting is no row of another."""
+    values = {name: value for name, value in environ.items()
+              if name in SEMANTIC or (name.startswith("JAX_") and name not in UNKEYED)}
+    if "XLA_FLAGS" in values:
+        values["XLA_FLAGS"] = " ".join(flag for flag in values["XLA_FLAGS"].split()
+                                       if not flag.startswith(PLUMBING))
+    return json.dumps(values, sort_keys=True)
+
+
+def pytest_environment(environ: Mapping[str, str], hub_open: bool = False) -> dict[str, str]:
+    """What CI's pytest runs under: this process's environment but `STEERING`, `environ` over it, the Hub
+    closed (`CLOSED_HUB`) unless `hub_open`, the network lane's, which sets none of it, and tools/armada on
+    the path, where the plugins a task loads (split.py, executed.py) import from."""
     path = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH")]))
-    return {**os.environ, **environ, **CLOSED_HUB, "PYTHONPATH": path}
+    held = {**os.environ, **environ, **({} if hub_open else CLOSED_HUB), "PYTHONPATH": path}
+    return {name: value for name, value in held.items()
+            if name not in STEERING and not (hub_open and name in CLOSED_HUB)}
+
+
+SHARDS = {"check1_shards": "seeds", "shards": "units"}
+"""The marks of a site too long for one task (pyproject.toml's markers), each by the count it declares:
+`check1_shards(seeds=S, per_task=P)` on a test whose `assert_as_exact` sites (tests/reference_error.py)
+declare S seeds, which check 1's two stages draw (1 + REDRAW) times over; and `shards(units=N,
+per_task=P)` on a test whose work is N units of its own, split the same way (a witness's items). CI runs
+either as armada's map and judge (ci.py's `site_entries`): map tasks of P units each over the units its stages
+or its work take, and one judge."""
+
+SITE = re.compile(r"(?P<test>(?:\w+\.)*test\w*)(?:\.draws-(?P<start>\d+)-(?P<stop>\d+))?")
+"""A check-1 site's group in its rows' names (ci.py's `row`), which its tasks' split carries: its test's name
+in its file (ci.py's `sites`), its judge's, whose row is the site's verdict; or that and the seeds one of its
+map tasks draws, `<test>.draws-<start>-<stop>`."""
+
+
+def selected(command: list[str], network: bool, whole: bool = False, release: bool = False,
+             site: bool = False) -> list[str]:
+    """CI's pytest `command` (`pytest_run`), or with `network` the same selecting the network-marked
+    tests alone, every one the rest of CI sets aside. It sets aside the tests marked whole_suite too, but on
+    the daily run (`whole`: DEW_WHOLE_SUITE, CI's schedule), whatever
+    the cache's policy: a policy-off train runs every file, never a whole-suite cell (the maintainer,
+    2026-10-28: train 250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline). The
+    release checks run in their own tasks alone (`release`), every one whatever else marks it, under a
+    requirement the suite's environment lacks (ci.py's `release_plan`), and on no other run, the network
+    lane's among them. A site marked one of `SHARDS` runs in its own tasks alone (`site`: its map tasks and
+    its judge, ci.py's `site_entries`), and every other run sets it aside."""
+    at = command.index(SELECTION[1])
+    if release:
+        chosen = "release_env"
+    elif network:
+        chosen = "network and not release_env"
+    else:
+        chosen = (SELECTION[1] + " and not release_env" + ("" if whole else " and not whole_suite")
+                  + ("" if site else "".join(f" and not {kind}" for kind in SHARDS)))
+    return [*command[:at], chosen, *command[at + 1:]]
+
+
+def selection(tests: list[str], split: str, release: str = "") -> list[str]:
+    """pytest's arguments that select `tests` as a CI task does: one group of a split file (`split`,
+    split.py), a release check's tests (`release`, release.py), or a check-1 site's test alone (`split` its
+    group, `SITE`)."""
+    site = SITE.fullmatch(split)
+    grouping = (["-p", "split", f"--ci-group={split}"] if split and not site else []) + (
+        ["-p", "release", f"--ci-release={release}"] if release else [])
+    named = [f"{name}::{site['test'].replace('.', '::')}" for name in tests] if site else tests
+    return [*named, *grouping]
+
+
+def pytest_command(run: list[str], tests: list[str], split: str, release: str) -> list[str]:
+    """CI's pytest `run` over `tests`, with the plugin that records what ran (executed.py), as `selection`
+    selects them. A release check's pytest runs with its requirement over the suite's environment, whose
+    torch and jax it keeps: uv's overlay."""
+    command = [*run, "-p", "executed", *selection(tests, split, release)]
+    return ["uv", "run", "--no-project", "--python", command[0], "--with", release, "--", "python",
+            *command[1:]] if release else command
 
 
 MARKS = ("gpu",)
