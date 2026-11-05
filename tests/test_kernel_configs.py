@@ -966,7 +966,7 @@ def test_refusals_cross_processes_only_through_an_explicit_handoff(tmp_path):
     import subprocess
     import sys
 
-    tile = "mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2)"
+    tile = "mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, family='wgmma')"
     preamble = ("import json, sys\n"
                 "from dew.nn.kernels import tuning\n"
                 "from dew.nn.kernels.templates import report\n"
