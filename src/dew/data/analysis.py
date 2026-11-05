@@ -34,7 +34,7 @@ import grain.python as pygrain
 
 from dew._records import json_value, record
 from dew.data.completion import cuts
-from dew.data.dataset import Records, SourceSlice
+from dew.data.dataset import Records
 from dew.data.pipeline import (
     TOKEN_FIELDS,
     Artifact,
@@ -179,9 +179,7 @@ def _stated(source: Source, read: Read, measuring: Sequence[Measuring] = (),
     store = _store(source)
     if isinstance(store, SelectedGeneration):
         store = store.whole
-    # A records holdout reads its part of the whole store's records, which it keeps.
-    rows = (held if store is source else held.source if isinstance(held, SourceSlice)
-            else whole(store) if whole is not None else store.records(read))
+    rows = held if store is source else whole(store) if whole is not None else store.records(read)
     return held, {**metadata, **{each.measure.fact: each.measure(prepared_rows(rows, each.before))
                                  for each in measuring}}
 

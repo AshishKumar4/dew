@@ -1032,33 +1032,6 @@ class _CheckpointableMapping(_Mapping):
         source.set_state(state)
 
 
-class SourceSlice:
-    """Reads `source[start:stop]` by index.
-
-    It gives the train and validation loaders disjoint index ranges while
-    Grain still handles the shuffle, the epochs and the sharding. The
-    attributes stay plain because Grain pickles the source to its workers.
-    """
-
-    def __init__(self, source: Indexed, start: int, stop: int):
-        self.source = source
-        self.start = start
-        self.length = stop - start
-
-    def __repr__(self) -> str:
-        # The description a saved position compares against, so it carries
-        # the wrapped corpus's own (`describe`).
-        return f"SourceSlice({describe(self.source)}, start={self.start}, length={self.length})"
-
-    def __len__(self) -> int:
-        return self.length
-
-    def __getitem__(self, index: int):
-        if not 0 <= index < self.length:
-            raise IndexError(index)
-        return self.source[self.start + index]
-
-
 def describe(source: Indexed | pygrain.MapDataset[Batch]) -> str:
     """`source`'s own description, or its type when it has none.
 
@@ -1826,7 +1799,6 @@ __all__ = [
     "Reader",
     "Records",
     "Resumable",
-    "SourceSlice",
     "Stage",
     "Stoppable",
     "mapped",

@@ -66,10 +66,12 @@ class RecordSlice(View[Source]):
         return _selected(self.source, "slice", {"slice": [self.start, self.stop]})
 
     def records(self, read: Read):
-        from dew.data.dataset import SourceSlice
+        """Its part of the source's records, a Grain slice of them (row 4145)."""
+        import grain.python as grain
 
         records = self.source.records(read)
-        return SourceSlice(records, *self.bounds(len(records)))
+        start, stop = self.bounds(len(records))
+        return grain.MapDataset.source(records)[start:stop]
 
     def admits(self, position: int, row: Batch | bytes | None) -> bool:
         """Whether the record at `position` among its source's is in this slice."""
