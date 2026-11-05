@@ -30,13 +30,18 @@ from dew.registry import from_record
 from .precision import at_least_fp32
 
 
-def sinusoid_frequencies(count: int, divisor: float, *, dtype: DTypeLike, exponential: bool = False
-                         ) -> np.ndarray:
+def sinusoid_frequencies(count: int, divisor: float, *, dtype: DTypeLike, exponential: bool = False,
+                         powered: bool = False) -> np.ndarray:
     """`10000 ** (-i / divisor)` for i below `count`, an absolute sinusoidal table's frequencies, on the
     host in `dtype`: rounded once from float64 (`_base_powers`), or, `exponential`, as the published
     timestep embeddings form them, the whole exponent `i * -ln(10000)` in `dtype` before it is divided
     (the other order moves a sine by 1e-5 near timestep 1000) and its exp taken in float64 and rounded
-    once."""
+    once; or, `powered`, in `dtype` throughout, as MAE's `get_1d_sincos_pos_embed_from_grid` forms them
+    in float32 (MoonViT's time table)."""
+    if powered:
+        exponents = np.arange(count, dtype=dtype)
+        exponents /= divisor
+        return 1.0 / 10000**exponents
     if not exponential:
         return (1.0 / _base_powers(10000.0, np.arange(count, dtype=np.float64) / divisor)).astype(dtype)
     width = np.dtype(dtype).type
