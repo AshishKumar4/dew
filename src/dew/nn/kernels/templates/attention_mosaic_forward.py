@@ -618,17 +618,18 @@ class _Residuals(NamedTuple):
 
 def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, spans: _Spans | None,
             hooked: _Hooked, place: tuple, whole, turn, *, hooks: Hooks, drawn: bool,
-            held: tuple | None = None) -> tuple:
+            held: tuple | None = None, product: Callable[[], jax.Array] | None = None) -> tuple:
     """A key tile's first key, coordinates and logits under the score hook (batch row and head `place`, its
     queries from `first`), and their products where the logits are a factor of them (`algebra.logits_of`),
     every walk's (`_consumer`'s, `_peak_consumer`'s), so a peak walk's logits are the training walk's to the
     bit; its places read by the walk's dropout where it draws it (`drawn`). A tile every query sees whole
     takes no mask: one walk, the choice a tile's (a walk of each, these rings' waits and arrivals in two
-    loops, faulted on an H100 under jax 0.11.2's lowering)."""
+    loops, faulted on an H100 under jax 0.11.2's lowering). The tile's `Q Kᵀ` its own fresh product, or
+    `product()`'s where the walk issues it (`_deferred`'s, beside the step before's P·V)."""
     row, head = place
     family, tiles = program.family, program.tiles
     shape = (tiles.block_q, tiles.block_k)
-    s = family.product(q, slots["keys"].transpose((1, 0)), shape, turn)
+    s = family.product(q, slots["keys"].transpose((1, 0)), shape, turn) if product is None else product()
     slots.release("keys")
     k_first = index * tiles.block_k
     # The tile's places formed a step, not held across the walk beside its sums (`_coords`).
@@ -740,7 +741,70 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
                             initial=(start.acc,))
         return algebra.Partial(acc, *rows), None
 
+    dtype = views["values"][0].dtype
+    deferred = tiles.deferred and guard is None and residuals is None
+
+    def deferred_step(index, slots, carry, accumulators, *, issues_before: bool):
+        # FlashAttention 3's step (`values_deferred`): the tile's `Q Kᵀ` issued fresh into the walk's own
+        # accumulator, then the step before's P·V, its weights carried and its value slot held past it
+        # (`Family.walk`'s `held_past`); the tensor cores the partner's once both are issued; the logits read
+        # once their product is done, the P·V running on under the softmax; the sums taken to the tile's
+        # maximum once it is done, this tile's weights carried to the next step. The sums' operations and
+        # their order are the plain step's: the step before's product added, then the factor.
+        m, total, weights = carry
+        acc, logits_acc = accumulators
+
+        def product():
+            nonlocal acc, logits_acc
+            logits_acc = family.products(logits_acc, q, slots["keys"].transpose((1, 0)), interpret,
+                                         accumulate=False)
+            if issues_before:
+                acc = issued_into(family, acc, (weights,), slots.previous("values"), interpret)
+            turn()
+            return family.read(logits_acc, pending=1 if issues_before else 0)
+
+        _, coords, logits, products = _scored(program, spec, q, index, slots, first, spans, hooked,
+                                              (row, head), whole, turn, hooks=hooks, drawn=False, held=held,
+                                              product=product)
+        taken = {}
+
+        def accumulate(sums, scale, parts, value):
+            # The tile's weights taken for the next step's product, the sums rescaled
+            # (`Family.rescaled_products` of no parts).
+            del value
+            (taken["weights"],) = parts
+            return family.rescaled_products(sums, scale, (), None, interpret)
+
+        def value_slot():
+            # The step before's P·V done where the step first reads its values, past its softmax and before
+            # its weights are narrowed (FlashAttention 3's `warpgroup_wait<0>` before `convert_type_out`): a
+            # register the P·V reads is never written while it runs, which ptxas would serialize.
+            family.settled()
+            return slots["values"]
+
+        tile = algebra.Operand((tiles.block_k, value_width), dtype, value_slot)
+        keys = algebra.Keys(coords, logits, tile, dot, accumulate, products)
+        state = algebra.plain_step(spec, algebra.Partial(acc, m, total), keys)
+        return (state.m, state.total, taken["weights"]), (state.acc, logits_acc)
+
+    def deferred_walk(streams, lo, hi, counted):
+        # Its first step issues no P·V before it; `finish` issues the last one's (`Family.walk`).
+        def finish(carry, accumulators, kept):
+            acc, logits_acc = accumulators
+            return carry, (issued_into(family, acc, (carry[2],), kept["values"], interpret), logits_acc)
+
+        segments = ((functools.partial(deferred_step, issues_before=False), lo, lo + 1),
+                    (functools.partial(deferred_step, issues_before=True), lo + 1, hi))
+        none = family.zeros((tiles.block_q, tiles.block_k)).astype(dtype)
+        (m, total, _), (acc, _) = family.walk(
+            streams, segments, (start.m, start.total, none),
+            ((tiles.block_q, value_width), (tiles.block_q, tiles.block_k)), interpret, first=counted,
+            initial=(start.acc, None), held_past=("values",), finish=finish)
+        return algebra.Partial(acc, m, total), None
+
     def walked(streams, lo, hi, counted):
+        if deferred:
+            return deferred_walk(streams, lo, hi, counted)
         if residuals is None:
             return inference(_walk_of(family, streams, lo, hi, counted, interpret=interpret))
         assert anchors is not None
@@ -749,9 +813,10 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         return _trained(spec, family, start, known, scored, values, (lo, hi), streams, counted,
                         interpret=interpret)
 
-    # The slots its partner reads around its own, the turns it would have taken (`Family.walk_own`).
+    # The slots its partner reads around its own, the turns it would have taken (`Family.walk_own`): a
+    # deferred step takes one, a plain step two.
     state, trained = family.walk_own(streams, views, (lo, hi), streamed, consumer, walked,
-                                     between=lambda: (turn(), turn()))
+                                     between=turn if deferred else lambda: (turn(), turn()))
     if merged:
         state = algebra.merge(spec, _initial(family, spec, hooked, state_rows, live), state)
     if residuals is not None:

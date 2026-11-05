@@ -483,8 +483,8 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
             return tuple(initial)
         return tuple(Accumulator(None, shape) for shape in shapes)
 
-    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool, initial: tuple | None = None
-                       ) -> tuple[C, tuple]:
+    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool, initial: tuple | None = None,
+                       finish=None) -> tuple[C, tuple]:
         # The accumulators stay in tensor memory, out of the loops' carries: a step's products add onto them
         # but at the walk's first step.
         del interpret
@@ -501,14 +501,15 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
             carry = lax.fori_loop(loop.lo, loop.hi, stepped, carry)
             if loop.then is not None:
                 loop.then()
-        return carry, accumulators
+        return (carry, accumulators) if finish is None else finish(carry, accumulators)
 
-    def products(self, acc: Accumulator, lhs, rhs, interpret: bool) -> Accumulator:
+    def products(self, acc: Accumulator, lhs, rhs, interpret: bool, *, accumulate: bool = True
+                 ) -> Accumulator:
         # The left operand from shared memory, or from tensor memory (an `Accumulator` a role wrote,
         # tcgen05's TS form: FlashAttention 4's P·V); the right from shared memory.
         del interpret  # Mosaic GPU's interpreter models tensor memory and tcgen05's products
         left = _tensor_memory(lhs) if isinstance(lhs, Accumulator) else lhs
-        plgpu.tcgen05_mma(_tensor_memory(acc), left, rhs, accumulate=acc.accumulate)
+        plgpu.tcgen05_mma(_tensor_memory(acc), left, rhs, accumulate=acc.accumulate if accumulate else False)
         return dataclasses.replace(acc, accumulate=True)
 
     def settled(self, pending: int = 0) -> None:

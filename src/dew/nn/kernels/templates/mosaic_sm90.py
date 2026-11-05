@@ -95,12 +95,22 @@ class WgmmaIssuer(mosaic.Issuer):
             return jnp.dot(lhs, rhs[...], preferred_element_type=jnp.float32)
         return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
 
-    def products(self, acc, lhs, rhs, interpret: bool):
+    def products(self, acc, lhs, rhs, interpret: bool, *, accumulate: bool = True):
         mosaic.committed()
         if interpret:
-            return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
+            fresh = jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
+            return acc + fresh if accumulate else fresh
+        if not accumulate:
+            # A fresh product into a walk's accumulator: zeroed in its registers, then issued, no wait.
+            acc[...] = jnp.zeros(acc.shape, jnp.float32)
         plgpu.wgmma(acc, lhs, rhs)
         return acc
+
+    def read(self, acc, *, first: int = 0, columns: int | None = None, pending: int = 0) -> jax.Array:
+        # A scoped warpgroup accumulator read once at most `pending` of the warpgroup's product groups are in
+        # flight (`wgmma_accumulator_load`'s wait), the later ones running on; interpreted, its value.
+        value = acc if isinstance(acc, jax.Array) else plgpu.wgmma_accumulator_load(acc, wait_n=pending)
+        return super().read(value, first=first, columns=columns)
 
     def register_products(self, acc, parts, rhs, interpret: bool):
         for formed in parts:
@@ -144,12 +154,12 @@ class WgmmaIssuer(mosaic.Issuer):
     def settled(self, pending: int = 0) -> None:
         plgpu.wgmma_wait(pending)
 
-    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool, initial: tuple | None = None
-                       ) -> tuple[C, tuple[jax.Array, ...]]:
+    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool, initial: tuple | None = None,
+                       finish=None) -> tuple[C, tuple[jax.Array, ...]]:
         # Warpgroup accumulators scoped across the walk, read once its MMAs are done; interpreted, arrays
         # the walk carries.
         if interpret:
-            return super().accumulated(segments, start, shapes, interpret, initial)
+            return super().accumulated(segments, start, shapes, interpret, initial, finish)
         initial = (None,) * len(shapes) if initial is None else initial
 
         def run(*accumulators):
@@ -164,6 +174,8 @@ class WgmmaIssuer(mosaic.Issuer):
                 carry = lax.fori_loop(loop.lo, loop.hi, stepped, carry)
                 if loop.then is not None:
                     loop.then()
+            if finish is not None:
+                carry = finish(carry, accumulators)[0]
             plgpu.wgmma_wait(0)
             return carry, tuple(acc[...] for acc in accumulators)
 
