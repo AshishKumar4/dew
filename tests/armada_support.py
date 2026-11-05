@@ -2,22 +2,35 @@
 (tools/armada/ci.py) run on small test files written into a checkout of their own."""
 
 import json
+import shutil
 import sys
 from collections.abc import Callable
 from pathlib import Path
 
-from tool_support import git, load
+from tool_support import REPO_ROOT, git, load
 
 
-def loaded(tmp_path: Path, monkeypatch):
-    """tools/armada/ci.py, run from the checkout at `tmp_path`, with no test cache named: CI's own environment
-    names the shared test cache, and these runs of the tools must not read or write it."""
-    module = load("ci", "tools/armada")
+def loaded(tmp_path: Path, monkeypatch, root: Path = REPO_ROOT):
+    """tools/armada/ci.py of the repository (or of the checkout at `root`), run from the checkout at
+    `tmp_path`, with no test cache named: CI's own environment names the shared test cache, and these runs of
+    the tools must not read or write it."""
+    module = load("ci", "tools/armada", root)
     monkeypatch.chdir(tmp_path)
     for name in ("DEW_XLA_CACHE_URL", "DEW_XLA_CACHE_TOKEN", "DEW_XLA_CACHE_READ_TOKEN", "DEW_TEST_CACHE"):
         monkeypatch.delenv(name, raising=False)
-    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests").mkdir(exist_ok=True)
     return module
+
+
+def copied_tools(tmp_path: Path, monkeypatch):
+    """`loaded`, with the tools as a checkout carries them: this repository's tools/armada and pyproject.toml
+    copied into the checkout at `tmp_path`, and ci.py loaded from the copy. What a task there records of the
+    harness it runs (its PYTHONPATH is the copy's directory) and what `shared` hashes are the copy's files,
+    which a test edits."""
+    shutil.copytree(REPO_ROOT / "tools/armada", tmp_path / "tools/armada",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copy(REPO_ROOT / "pyproject.toml", tmp_path / "pyproject.toml")
+    return loaded(tmp_path, monkeypatch, tmp_path)
 
 
 def interpreter(root: Path, version: str) -> None:

@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -16,7 +17,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from armada_support import cached, commit, interpreter, loaded, written
+from armada_support import cached, commit, copied_tools, interpreter, loaded, written
 from tool_support import git, load
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -2495,3 +2496,47 @@ def test_a_release_check_runs_in_the_whole_suites_second_job_under_its_requireme
     assert ci.main() == 0
     assert [(found["name"], found["exitCode"]) for found in json.loads(out.read_text())["rows"]] == [
         (f"3.12:tests/test_release.py#release:{pinned}", 0)]
+
+
+def install_inputs(root: Path, script: str) -> set[str]:
+    """The files of the checkout at `root` that `script` (its path there) names among its commands' words, and
+    those the shell scripts among them name in turn: a limited check of what an install runs or reads (shlex,
+    comments set aside), not a shell interpreter, so a path a variable builds (`locks/$name.txt`) is none
+    of them."""
+    found, pending = set(), [script]
+    while pending:
+        name = pending.pop()
+        if name in found:
+            continue
+        found.add(name)
+        words = [word for line in (root / name).read_text().splitlines()
+                 for word in shlex.split(line, comments=True)]
+        pending.extend(word for word in words if not word.startswith(("/", "..")) and (root / word).is_file())
+    return found
+
+
+def test_the_environments_key_names_every_file_its_install_script_runs_or_reads(tmp_path, monkeypatch):
+    """armada rebuilds the environment where the files its key names change (.armada.json), so each file
+    tools/armada/install.sh runs or reads is among them (row 3303: tools/fetched_fixtures.py, whose fetch
+    placed release files elsewhere, the classifiers of pyproject.toml that set which Pythons get an
+    environment, and the .python-version the repository's own is linked to), but ci.py, which install.sh runs
+    for those classifiers (`pythons`): its code is the plan's, which no environment is rebuilt for."""
+    environment = json.loads((ROOT / ".armada.json").read_text())["environment"]
+    # What armada hashes: the files its globs match in the commit, and the recipe's setup and install scripts.
+    keyed = {path.relative_to(ROOT).as_posix() for glob in environment["key"] for path in ROOT.glob(glob)}
+    keyed |= {environment["setup"], environment["install"]}
+    runs = install_inputs(ROOT, environment["install"])
+    reader = "tools/armada/ci.py"
+    assert reader in runs
+    assert sorted(runs - keyed - {reader}) == []
+    # The classifiers are what it prints: a version added to them is one more environment, so pyproject.toml,
+    # which holds them, is keyed.
+    before = copied_tools(tmp_path, monkeypatch).PYTHONS
+    pyproject = tmp_path / "pyproject.toml"
+    classifier = '"Programming Language :: Python :: 3.14",'
+    assert classifier in pyproject.read_text()
+    pyproject.write_text(pyproject.read_text().replace(
+        classifier, classifier + '\n    "Programming Language :: Python :: 3.15",'))
+    after = load("ci", "tools/armada", tmp_path).PYTHONS
+    assert after == (*before, "3.15")
+    assert "pyproject.toml" in keyed

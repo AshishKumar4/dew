@@ -980,8 +980,7 @@ def policy(base: str) -> str:
         if armada_seen(before.stdout if before.returncode == 0 else None) == armada_seen(
                 armada.read_text() if armada.is_file() else None):
             changed.remove(".armada.json")  # where and when tasks run, never what a test sees
-    whole = {*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), ".armada.json",
-             ".python-version"}
+    whole = {*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), ".armada.json"}
     if any(name in whole or not (name.startswith(PLACED) or name in PLACED_FILES) for name in changed):
         return "off"
     return "on"
