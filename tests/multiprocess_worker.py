@@ -2387,8 +2387,8 @@ def mode_decision_publish(args) -> dict:
                              layout=Layout(min_shard=1, tolerance=1.0))
     written = rollouts.SafetensorsReload(placed, Path(args.run_dir), (), "vllm", dtype="float32")
     written.write(placed.variables)
-    exported = rollouts._published(placed, placed.variables, jnp.dtype("float32")).export()
     with reading_home("push export", writes=jax.process_index() == 0):
+        exported = rollouts._published(placed, placed.variables, jnp.dtype("float32")).export()
         tensors = {name: exported[name] for name in sorted(exported)}
     if jax.process_index() == 0:
         np.savez(args.out.with_suffix(".npz"), **tensors)

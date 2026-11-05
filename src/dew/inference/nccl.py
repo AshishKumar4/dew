@@ -300,24 +300,27 @@ class NCCLPush:
         # Process 0 holds the gathered policy, so it sends, from its first device of the mesh.
         sender = jax.local_devices()[0] if mesh is None else next(
             device for device in mesh.devices.flat if device.process_index == 0)
-        # Every tree the source exports, a decision release's readout beside the trained backbone, a
-        # table read as it is sent (`Pretrained.export`): its names, dtypes and shapes before any tensor.
-        exported = _published(self.source, variables, jnp.dtype(self.dtype)).export()
-        names = sorted(exported)
-        specs = tensor_specs(exported)
-        # Named before any replica pauses for the update, which a dtype the collectives cannot carry
-        # would leave paused.
-        uncarried = sorted({str(specs[name].dtype) for name in names} - _DTYPES.keys())
-        if uncarried:
-            raise ValueError(f"an NCCL push carries {sorted(_DTYPES)}; the publication exports {uncarried}")
-        chunks = [[names[index] for index in group] for group in byte_groups(
-            [specs[name] for name in names], self.chunk,
-            nbytes=lambda spec: int(np.prod(spec.shape)) * np.dtype(spec.dtype).itemsize)] or [[]]
-        self.timings["export"] = time.perf_counter() - began
         # Each chunk's tensors read home by the pool together (`reading_home`), in the same order on every
-        # process, as process 0 sends them; the others read along and send none.
+        # process, as process 0 sends them; the others read along and send none. A tree a release reads
+        # whole as it exports (a decision release's readout) reads there too.
         sending = jax.process_index() == 0
         with reading_home("weight push", writes=sending):
+            # Every tree the source exports, a decision release's readout beside the trained backbone, a
+            # table read as it is sent (`Pretrained.export`): its names, dtypes and shapes before any
+            # tensor.
+            exported = _published(self.source, variables, jnp.dtype(self.dtype)).export()
+            names = sorted(exported)
+            specs = tensor_specs(exported)
+            # Named before any replica pauses for the update, which a dtype the collectives cannot carry
+            # would leave paused.
+            uncarried = sorted({str(specs[name].dtype) for name in names} - _DTYPES.keys())
+            if uncarried:
+                raise ValueError(f"an NCCL push carries {sorted(_DTYPES)}; the publication exports "
+                                 f"{uncarried}")
+            chunks = [[names[index] for index in group] for group in byte_groups(
+                [specs[name] for name in names], self.chunk,
+                nbytes=lambda spec: int(np.prod(spec.shape)) * np.dtype(spec.dtype).itemsize)] or [[]]
+            self.timings["export"] = time.perf_counter() - began
             agreed("weight push", lambda: self._push(
                 exported, specs, chunks, SingleDeviceSharding(sender), sender.local_hardware_id, version)
                 if sending else _read_along(exported, chunks))

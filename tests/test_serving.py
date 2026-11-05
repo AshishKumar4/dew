@@ -822,8 +822,8 @@ one-entry-booked-twice's at 512."""
     ((Served(12), Served(12, flipped=(6,))), {"prefix_state_every": 1}, (0, 4), None, NARROW_HYBRID),
     ((Served(12), Served(12), Served(12)), {"admission": 1}, (0, 16), (1, 2), NARROW_HYBRID),
     ((Served(12), Served(12, flipped=(0,)), Served(12)),
-     {"slots": 1, "kv_cache": KVCache(page_size=4, pages=6), "host_pages": 8}, (0, 0, 8), None,
-     NARROW_HYBRID)],
+     {"slots": 1, "kv_cache": KVCache(page_size=4, pages=6), "host_pages": 8, "prefix_states": 4},
+     (0, 0, 8), None, NARROW_HYBRID)],
     ids=["by-default", "in-pieces", "every-page", "restores-past-admission", "from-the-host"])
 @pytest.mark.check1_shards(seeds=256, per_task=64)
 def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(requests, options, hits, rounds,
@@ -861,7 +861,8 @@ def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
     prompts admitted together into a store of one entry keep one state, the later booking's, which the
     next round's repeat of it reads; two repeats seated together each restore their state, past the
     one prompt piece a call admits. A pool of six pages with a host tier spills the first prompt's pages
-    and the state kept with them while another prompt runs, and its repeat reads both back. Each request
+    while another prompt runs, its state kept in a store of four entries, and its repeat reads its pages
+    back (a pool without the tier reads none: its other prompt takes the pages). Each request
     draws what it draws alone and scores it as a full
     forward does (check 1)."""
     # A vocabulary of 256 at least and eight draws a request, so each request's scores spread enough to
