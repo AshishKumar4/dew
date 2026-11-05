@@ -1191,8 +1191,7 @@ class Trainer(Generic[Loss, Effects]):
         (`transaction.consumed_where_made`), over the state its commit reads: under DiLoCo a group's own
         (`group_of`), not the outer optimizer's."""
         with group_of(prepared, micro) as (view, _):
-            return consumed_where_made(self.objective, self.optimizer, view, window,
-                                       shared=pooled_by_mean(shapes[0]),
+            return consumed_where_made(self.optimizer, view, window, shared=pooled_by_mean(shapes[0]),
                                        progressed=self._examples is not None)
 
     def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, split: int,

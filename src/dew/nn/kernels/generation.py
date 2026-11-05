@@ -294,6 +294,11 @@ class GpuTarget:
     """Whether a training step keeps XLA's Triton GEMM fusions on this GPU (`dew.training.memory`): off
     where a step measured cuBLAS's GEMMs faster with them off, an A100's (26a01bc18), an L4's
     (71966bcea) and an H100's (0fb7f065e), unless a module the step runs keeps them (`TritonGemm`)."""
+    late_weight_gradients: bool = False
+    """Whether XLA's schedule of a training step for this GPU runs every layer's weight gradient after the
+    whole backward where the step's head takes its gradient a tile at a time, unfused, holding the
+    products' operands to then (`dew.training.footprint.sunk`): an H100's, compiled for one at 80 GiB
+    (row 3341's calibration, `TARGETS`' comments)."""
     step_seconds: float | None = None
     """One dependent step's latency on XLA's path: an iteration of a loop XLA lowers, its launches and its
     predicate, each reading the last (the work-span model's step, `templates.cost.Work.span`), measured per
@@ -468,6 +473,14 @@ TARGETS = {target.generation: target for target in (
               # A loop iteration on XLA's path, 4.93 us (FS-STEP-SECONDS1-h100's second round, 0.3% from the
               # line; its first's 4.80 us lay 17% from it).
               clock_hz=1830e6, memory_bandwidth=3350e9, triton_gemm_fusions=False, step_seconds=4.93e-6,
+              # A step whose head takes its gradient in the backward a tile at a time, unfused, compiled for
+              # an H100: Qwen3.5-4B's at 2 x 4096 tokens under 'full' holds 36.6 GiB of temporaries, 29
+              # layers' four [8192, 9216] product operands at its peak and no layer's gradient, its weight
+              # gradients run after the backward; Qwen3.5-0.8B's at 8 x 3072, 32.1. For an A100 they hold
+              # 10.8 and 8.5, each layer's weight gradient run in its backward, and the 0.8B's 8.6 for an
+              # RTX PRO 6000 (row 3341's calibration, compile-only; an L4's attention kernel compiles
+              # for none).
+              late_weight_gradients=True,
               # tools/device_facts.py on an H100 SXM and a GH200: their streams FS-DEVICEFACTS2-h100's and
               # -gh200's, their launches and hand-offs FS-DEVICEFACTS4's; the H200's stream the same line
               # through the kernel challenge's best read at each size, 16.8 MB to 805 MB, cold L2 under graph
@@ -481,7 +494,11 @@ TARGETS = {target.generation: target for target in (
     # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,
               dense_peaks={'NVIDIA B200': {'bf16': 2.25e15, 'fp8': 4.5e15}}, multiprocessors=148,
-              clock_hz=1965e6, memory_bandwidth=8e12),
+              clock_hz=1965e6, memory_bandwidth=8e12,
+              # Qwen3.5-0.8B's step at 8 x 3072 tokens under 'full', its head tiled and unfused, compiled for
+              # a B200 holds 22.9 GiB of temporaries, its weight gradients run after the backward, against
+              # 5.6 with the head fused (row 3341's calibration, compile-only).
+              late_weight_gradients=True),
     # Blackwell Ultra, datasheet alone and unmeasured, a compile-only sm103 device's facts: 160 SMs and
     # 8 TB/s (NVIDIA, "Inside NVIDIA Blackwell Ultra"), HGX B300's 2.25/4.5 PF dense bf16/fp8 a GPU (the
     # HGX table's sparse figures halved over 8 GPUs). No source states its clock: B200's, which steers
