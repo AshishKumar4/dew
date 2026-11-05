@@ -40,13 +40,19 @@ def swizzled(shape: tuple[int, ...], dtype) -> tuple:
     return mosaic.swizzle_transforms(dtype, mosaic.copied_swizzle(shape, dtype))
 
 
-def _depth_granule(ref, axis: int, instruction: int) -> int:
-    """The depth slice a ref's staging allows: one MMA, or a whole swizzle along its tiled columns."""
-    if not isinstance(ref, state_types.TransformedRef):
-        return instruction
-    transposed = sum(isinstance(transform, state_types.TransposeTransform)
-                     and transform.permutation == (1, 0) for transform in ref.transforms) % 2
-    if axis != (0 if transposed else 1):
+def _transposed(ref) -> bool:
+    """Whether a shared-memory operand is read as the transpose of its stored tile."""
+    return isinstance(ref, state_types.TransformedRef) and bool(sum(
+        isinstance(transform, state_types.TransposeTransform) and transform.permutation == (1, 0)
+        for transform in ref.transforms) % 2)
+
+
+def _rhs_granule(ref, instruction: int) -> int:
+    """The depth slice a right operand's staging allows: one MMA, or, read transposed (its depth its stored
+    tile's swizzled columns), a whole swizzle tile, no narrower slice of which lowers (FS-4324-NARROW2-all:
+    "slice size 16 divisible by the tile size 64"). An untransposed left operand slices inside its swizzle
+    tile (FS-4324-NARROW1)."""
+    if not _transposed(ref):
         return instruction
     swizzle = max((transform.swizzle for transform in ref.transforms
                    if isinstance(transform, plgpu_core.UnswizzleRef)), default=0)
@@ -159,12 +165,17 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # its rows' 8-row tiles.
         return self._staged_depth(depth, swizzle) if transposed else self.fragment_depth(depth)
 
-    def lhs_fragment_depth(self, depth: int) -> int:
-        return self._staged_depth(depth)
+    def lhs_fragment_depth(self, depth: int, *, transposed: bool = False) -> int:
+        # A transposed left operand loads a whole swizzle tile of its depth at a time, as one loaded in
+        # instruction slices took the A100's kernel gradient 7% slower (FS-DENSE-AB1); an untransposed one
+        # only the fragments the next instruction consumes, CUTLASS's and FlashAttention 2's warp-level
+        # k-groups: a D128 attention forward's queries held 64 deep took 16 registers its 128 x 64 tile
+        # spilled (FS-4324-NARROW1).
+        return self._staged_depth(depth) if transposed else self.fragment_depth(depth)
 
     def _staged_depth(self, depth: int, swizzle: int | None = None) -> int:
         """The depth a load of a stage whose rows are `depth` deep takes: one tile of its `swizzle` (bytes;
-        the widest its row bytes allow where None, `swizzled`, `_depth_granule`), the whole depth where it
+        the widest its row bytes allow where None, `swizzled`, `_rhs_granule`), the whole depth where it
         is narrower."""
         swizzle = resources.widest_swizzle(self.dtype, depth) if swizzle is None else swizzle
         return max(self.fragment_depth(depth), min(depth, mosaic.swizzle_columns(self.dtype, swizzle)))
@@ -251,14 +262,13 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         if interpret:
             # mma has no rule on a CPU: its sum, in fp32.
             return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
-        # The left operand loads a whole swizzle tile of its depth at a time (`lhs_fragment_depth`), as a
-        # transposed left operand loaded in instruction slices took the A100's kernel gradient 7% slower
-        # (FS-DENSE-AB1); the right loads only the fragments the next instructions consume, as narrow as
-        # its staging allows (`_depth_granule`), which took its input gradient 12% faster. A register operand
-        # (an accumulator's value) is cast once and sliced.
+        # The left operand loads at its depth (`lhs_fragment_depth`: an untransposed one an instruction's,
+        # a transposed one a whole swizzle tile); the right only the fragments the next instructions
+        # consume, as narrow as its staging allows (`_rhs_granule`), which took the input gradient 12%
+        # faster. A register operand (an accumulator's value) is cast once and sliced.
         instruction = self.fragment_depth(int(rhs.shape[0]))
-        lhs_depth = max(_depth_granule(lhs, 1, instruction), self.lhs_fragment_depth(int(lhs.shape[1])))
-        rhs_depth = _depth_granule(rhs, 0, instruction)
+        lhs_depth = self.lhs_fragment_depth(int(lhs.shape[1]), transposed=_transposed(lhs))
+        rhs_depth = _rhs_granule(rhs, instruction)
         held = self._left(lhs) if isinstance(lhs, jax.Array) else None
         lefts: dict[int, jax.Array] = {}
         rights: dict[int, jax.Array] = {}

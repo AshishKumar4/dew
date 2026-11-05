@@ -96,34 +96,35 @@ def live_registers(family: "Family", carried, *phases, addressed=()) -> int:
 
 
 def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs, rhs, *, lhs_parts: int = 1,
-                      rhs_parts: int = 1, rhs_transposed: bool = False,
+                      rhs_parts: int = 1, lhs_transposed: bool = False, rhs_transposed: bool = False,
                       rhs_swizzle: int | None = None) -> list:
     """The operand fragments a product `[rows, depth] @ [depth, columns]` holds at once where its family's
     products read registers (`Family.operands_in_registers`), none where they read shared memory: its left
-    operand's loaded depth (`Family.lhs_fragment_depth`), its right one's at its stage's swizzle
-    (`Family.rhs_fragment_depth`; `rhs_swizzle` bytes, the family's default where None), each in the warps
-    replicating it (`lhs_copies`, `rhs_copies`) and its dtype (`lhs`, `rhs`), repeated for its parts (an
-    fp32 operand split into 16-bit parts): GEMM's, recurrence's and attention's products'."""
+    operand's loaded depth by its orientation (`Family.lhs_fragment_depth`), its right one's at its stage's
+    swizzle (`Family.rhs_fragment_depth`; `rhs_swizzle` bytes, the family's default where None), each in the
+    warps replicating it (`lhs_copies`, `rhs_copies`) and its dtype (`lhs`, `rhs`), repeated for its parts
+    (an fp32 operand split into 16-bit parts): GEMM's, recurrence's and attention's products'."""
     if not family.operands_in_registers:
         return []
-    return ([(rows * family.lhs_copies, family.lhs_fragment_depth(depth), lhs)] * lhs_parts
+    return ([(rows * family.lhs_copies, family.lhs_fragment_depth(depth, transposed=lhs_transposed), lhs)]
+            * lhs_parts
             + [(family.rhs_fragment_depth(depth, transposed=rhs_transposed, swizzle=rhs_swizzle),
                 columns * family.rhs_copies, rhs)] * rhs_parts)
 
 
 def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int], dtype, *,
-                   stored=(), rhs_transposed: bool = False) -> int:
+                   stored=(), lhs_transposed: bool = False, rhs_transposed: bool = False) -> int:
     """The registers a consumer thread holds at a `(rows, columns, depth)` GEMM tile of `consumers` roles
     of `family` (`live_registers`): its share of the fp32 accumulator carried, and a step's operand
     fragments where its products read registers (`Family.operands_in_registers`; the right operand's in
-    each of its replicating warps: `lhs_copies`, `rhs_copies`), the right one's a sub-step deep where
-    it loads it so (`Family.rhs_fragment_depth`), or held whole when its transposed storage requires it.
+    each of its replicating warps: `lhs_copies`, `rhs_copies`), each at the depth its orientation loads
+    (`Family.lhs_fragment_depth`, `Family.rhs_fragment_depth`: a transposed one a swizzle tile deep).
     Where the family copies its outputs out through its registers (`Family.stores_through_registers`),
     its epilogue holds one copy's rows (`copied_rows`) in the widest `stored` dtype beside the accumulator."""
     rows, columns, depth = block
     share = rows // consumers
     fragments = operand_fragments(family, share, depth, columns, dtype, dtype,
-                                 rhs_transposed=rhs_transposed)
+                                 lhs_transposed=lhs_transposed, rhs_transposed=rhs_transposed)
     accumulator = (share, columns, jnp.float32)
     walk = live_registers(family, [accumulator], fragments)
     if not (family.stores_through_registers and stored):
