@@ -20,8 +20,9 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
-from dew.batch import coordinates
-from dew.interop.weights import translate_parameters
+from dew.batch import Variables, coordinates
+from dew.interop.unread import Stored, held
+from dew.interop.weights import Tree, checkpoint_dtype, insert, placed
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
 from dew.nn.precision import float32_dot_general
@@ -37,7 +38,7 @@ from .mixers.attention import CausalSelfAttention
 from .mlp import GatedMLP
 from .norms import LayerNorm, RMSNorm
 from .quantizers import residual_quantize
-from .vision import TowerBase, TowerGeometry
+from .vision import TowerBase, TowerGeometry, TowerLayout
 
 if TYPE_CHECKING:
     from dew.data.processors import LogMel
@@ -111,6 +112,23 @@ class MiMoAudio(TowerBase):
 
     def geometry(self) -> TowerGeometry:
         return TowerGeometry(mel_features=self.tokenizer.n_mels)
+
+    def encoded(self, mask: np.ndarray) -> np.ndarray:
+        """Which of each clip's encoded tokens `MiMoAudioTower` gives hold one, `[clips, capacity]`, from
+        its valid frames `mask` `[clips, frames]`: the frames cut into segments of `audio_segment_size`,
+        each convolved and pooled to its codes (`AudioTokenizerEncoder`), a clip's codes in groups of
+        `group_size`, as many places as a clip of every frame valid fills."""
+        cfg, size = self.tokenizer, self.audio_segment_size
+
+        def codes(frames):
+            convolved = (frames + 3 - cfg.kernel_size + 2 - cfg.kernel_size) // cfg.stride_size + 1
+            return np.where(frames > 0, -(-convolved // cfg.avg_pooler), 0)
+
+        valid = np.sum(mask, axis=1)
+        counts = valid // size * codes(np.asarray(size)) + codes(valid % size)
+        groups = -(-counts // self.group_size)
+        capacity = -(-(-(-mask.shape[1] // size) * codes(np.asarray(size))) // self.group_size)
+        return np.arange(capacity)[None, :] < groups[:, None]
 
 
 class AudioTokenizerEncoder(nn.Module):
@@ -432,17 +450,53 @@ def mimo_audio_encoder_path(name: str) -> tuple[str, ...]:
     return path
 
 
+AUDIO_TOKENIZER = "audio_tokenizer"
+"""The folder a MiMo-V2.6 release keeps its audio tokenizer in, its own config and weights, which the
+release's code loads beside the model (`MiMoV2ForCausalLM.load_audio_tokenizer`); a bundle's names hold
+its tensors under it (`dew.interop.decoder_parts.folder_name`)."""
+
+_TOKENIZER_ENCODER = f"{AUDIO_TOKENIZER}/encoder."
+"""The tokenizer's encoder in a bundle's names: the half its MiMoAudioTokenizer holds."""
+
+_STATISTICS = ("inited", "cluster_size", "embed_avg")
+"""The quantizer's running statistics beside its codebooks, which no code it gives reads."""
+
+
+def mimo_audio_path(name: str) -> tuple[str, ...] | None:
+    """One tensor of a MiMo-V2.6 bundle's audio tower, by its name in the bundle, into its path under
+    `params`: the encoder's (`audio_encoder.`, `speech_embeddings.`) and the tokenizer folder's encoder's;
+    None for the quantizer's running statistics, which the tower does not compute with."""
+    if name.startswith(_TOKENIZER_ENCODER):
+        rest = name.removeprefix(_TOKENIZER_ENCODER)
+        return None if rest.split(".")[-1] in _STATISTICS else ("params", *mimo_audio_tokenizer_path(rest))
+    return ("params", *mimo_audio_encoder_path(name.removeprefix("audio_encoder.")))
+
+
+def _read_mimo_audio(tensors: Mapping[str, Stored], path_of, param_dtype: str
+                     ) -> tuple[Tree[Stored], tuple]:
+    """The tower's variables and the layouts that write its tensors back (`placed`), each of the
+    tokenizer's key maps, which carry no bias, beside a zero one."""
+    variables, layouts = placed(tensors, path_of, param_dtype)
+    for name, tensor in tensors.items():
+        bias = name.removesuffix("weight") + "bias"
+        path = path_of(name) if name.endswith("k_proj.weight") and bias not in tensors else None
+        if path is not None:
+            insert(variables, (*path[:-1], "bias"),
+                   held(np.zeros(tensor.shape[0], checkpoint_dtype(held(tensor).dtype, param_dtype))), bias)
+    return variables, layouts
+
+
+_LAYOUT = TowerLayout("", mimo_audio_path, read=_read_mimo_audio,
+                      roots=("audio_encoder.", "speech_embeddings.", _TOKENIZER_ENCODER))
+MiMoAudio.checkpoint = _LAYOUT
+
+
 def translate_mimo_audio_weights(tokenizer: Mapping[str, np.ndarray], encoder: Mapping[str, np.ndarray], *,
-                                 param_dtype: str = "float32") -> dict:
-    """The tower's parameters from the tokenizer's tensors (`encoder.` prefix off) and the audio
-    encoder's. The codebooks are the quantizer's frozen `embed` buffers, its running statistics
-    left behind; the tokenizer's key maps carry no bias, so theirs is zero."""
-    statistics = ("inited", "cluster_size", "embed_avg")
-    tensors = {name: tensor for name, tensor in tokenizer.items() if name.split(".")[-1] not in statistics}
-    for name, tensor in list(tensors.items()):
-        if name.endswith("k_proj.weight"):
-            bias = name.removesuffix("weight") + "bias"
-            tensors.setdefault(bias, np.zeros(np.shape(tensor)[0], np.asarray(tensor).dtype))
-    params = translate_parameters(tensors, mimo_audio_tokenizer_path, param_dtype)
-    params.update(translate_parameters(encoder, mimo_audio_encoder_path, param_dtype))
-    return {"params": params}
+                                 param_dtype: str = "float32") -> Variables:
+    """The tower's variables from the tokenizer's tensors (`encoder.` prefix off) and the audio
+    encoder's (`audio_encoder.` off, `speech_embeddings.` kept), as a bundle's names read them
+    (`MiMoAudio.checkpoint`)."""
+    named = {**{f"{_TOKENIZER_ENCODER}{name}": tensor for name, tensor in tokenizer.items()},
+             **{name if name.startswith("speech_embeddings.") else f"audio_encoder.{name}": tensor
+                for name, tensor in encoder.items()}}
+    return _LAYOUT.variables(named, param_dtype)[0]
