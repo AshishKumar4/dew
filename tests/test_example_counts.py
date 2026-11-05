@@ -321,6 +321,21 @@ def test_a_corpus_states_the_share_of_its_rows_cut_short_in_rows(bounded):
     assert counted(loader, "data/cut_removed/") == [2 * 24]
 
 
+def test_a_step_after_a_mix_that_makes_bytes_of_its_rows_is_refused_for_the_counts_it_drops():
+    """A step after a mix that makes raw bytes of its members' rows, under a bound in examples, is refused
+    for the counts its bytes cannot carry (`consumed_by`, ValueError), not as a member that gave bytes,
+    which none did (row 3746)."""
+    from test_pipeline_core import Encoded
+
+    from dew.data.pipeline import mix
+
+    members = [Pipeline(Memory({"id": np.arange(at * 16, at * 16 + 16, dtype=np.int32)}), name=f"member-{at}")
+               for at in range(2)]
+    with pytest.raises(ValueError):
+        loader = compile(mix(members).map(Encoded()).batch(BATCH), read="streamed", examples=12)
+        read_whole(loader, "id")
+
+
 def test_a_streamed_mixture_of_byte_records_counted_by_member_is_refused_not_credited_to_none():
     """A streamed run bounded in examples counts each mixture member's examples under the member its rows
     carry (`MEMBER`), which a record of raw bytes cannot: a mix of members that give byte records, decoded

@@ -34,13 +34,15 @@ def keeping_picks() -> str:
 
 
 def fresh(script: str | Path, *arguments: str, cache_dir=None, flags: str | None = None,
-          source: Path = REPO_ROOT / "src", cwd: Path | None = None):
+          source: Path = REPO_ROOT / "src", cwd: Path | None = None, platforms: str | None = None):
     """`script`'s last printed JSON, run by a fresh interpreter on the package at `source` (this
     checkout's) and these tests: its text, or the file at its path, in `cwd` where given, compiling into
-    `cache_dir` under XLA `flags` where given, else into this process's cache under its flags."""
+    `cache_dir` under XLA `flags` where given, else into this process's cache under its flags, and seeing
+    the platforms `platforms` names where given (`JAX_PLATFORMS`), else this process's."""
     environment = {**os.environ, "PYTHONPATH": os.pathsep.join((str(source), str(REPO_ROOT / "tests"))),
                    **({} if cache_dir is None else {"JAX_COMPILATION_CACHE_DIR": str(cache_dir)}),
-                   **({} if flags is None else {"XLA_FLAGS": flags})}
+                   **({} if flags is None else {"XLA_FLAGS": flags}),
+                   **({} if platforms is None else {"JAX_PLATFORMS": platforms})}
     command = [str(script)] if isinstance(script, Path) else ["-c", script]
     run = subprocess.run([sys.executable, *command, *arguments], env=environment, check=False,
                          capture_output=True, text=True, cwd=cwd)

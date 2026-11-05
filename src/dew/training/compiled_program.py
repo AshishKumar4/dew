@@ -14,14 +14,13 @@ import functools
 import itertools
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import TypeGuard
 
 import jax
 import jax.extend.core as jcore
 import numpy as np
 from jax.core import ShapedArray
 
-from dew.nn.programs import CALLS, bodies, opaque, platform_branch
+from dew.nn.programs import CALLS, bodies, computed, inlined, opaque, platform_branch
 
 VIEWS = frozenset({"reshape", "squeeze", "expand_dims"})
 """Primitives a row-major value's layout keeps as a bitcast of their operand (XLA's `ReshapeIsBitcast`
@@ -38,11 +37,6 @@ xla/service/gpu/gpu_constants.h), which a slice fused into a matmul's call must 
 xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2.cc)."""
 
 
-def computed(value) -> TypeGuard[jcore.Var]:
-    """Whether `value` is a program's variable, not a literal it reads."""
-    return isinstance(value, jcore.Var) and not isinstance(value, jcore.Literal)
-
-
 def lowering_platform(device) -> str:
     """The platform JAX lowers a program on `device` for, its lowering rules' name: a GPU's `cuda` or
     `rocm`, as its client's platform version states (`PjRtClient::platform_version`, a compile-only
@@ -56,26 +50,6 @@ def deviceless(device) -> bool:
     """Whether `device` is a compile-only target, no device of a running backend: one of a topology JAX
     compiles for without a device (`compile_only_runtime`, `jax.experimental.topologies`)."""
     return device.client.runtime_type == "compile_only_runtime"
-
-
-def inlined(body: jcore.Jaxpr, operands: Sequence[jcore.Var | jcore.Literal],
-            consts: Sequence = ()) -> tuple[list[jcore.JaxprEqn], list[jcore.Var | jcore.Literal]]:
-    """`body`'s equations, each value its own fresh variable, read over `operands` (and its constants
-    over `consts`, as literals), and its results: a program run in its caller as one of its own, as one
-    body traced once may be run more than once."""
-    local: dict[jcore.Var, jcore.Var | jcore.Literal] = dict(zip(body.invars, operands, strict=True))
-    local.update({var: jcore.Literal(value, var.aval)
-                  for var, value in zip(body.constvars, consts, strict=True)})
-
-    def read(value):
-        return local.get(value, value) if computed(value) else value
-
-    equations = []
-    for equation in body.eqns:
-        fresh = [out if isinstance(out, jcore.DropVar) else jcore.Var(out.aval) for out in equation.outvars]
-        equations.append(equation.replace(invars=[read(value) for value in equation.invars], outvars=fresh))
-        local.update(zip(equation.outvars, fresh, strict=True))
-    return equations, [read(value) for value in body.outvars]
 
 
 def compiled(program: jcore.Jaxpr, lowering: str) -> jcore.Jaxpr:

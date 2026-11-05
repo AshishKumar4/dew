@@ -36,14 +36,6 @@ A product or quotient of a sum by a value that is none carries them too,
 scaled element by element (`_applied`), as `s_i sum_k x_ik` sums the terms
 `s_i x_ik`; a product of two sums ends them."""
 
-CALLS = programs.CALLS | {"remat", "custom_vjp_call_jaxpr"}
-"""The calls whose bodies are evaluated op by op, as the computation's own:
-a jit, a remat (`jax.checkpoint` binds 'remat2'), a custom rule's primal, a
-marked span (`dew.nn.derivatives.marked`, lowered as its body). A
-shard_map's per-device program is too, on each device's blocks (`_mapped`).
-A body that runs elsewhere, a Pallas kernel, is one operation, its outputs
-their own size."""
-
 
 def float32_values(jaxpr) -> int:
     """How many values of float32 `jaxpr`, and every jaxpr it holds, makes: none in a float64 program
@@ -420,8 +412,11 @@ def _carried(equation) -> list[int]:
 
 
 def _body(equation):
-    """The jaxpr and constants a call runs (`CALLS`), or None."""
-    if equation.primitive.name not in CALLS:
+    """The jaxpr and constants a call runs (`dew.nn.programs.CALLS`: a jit, a remat, a custom rule's primal, a
+    marked span, each evaluated op by op as the computation's own), or None. A shard_map's per-device program
+    is evaluated too, on each device's blocks (`_mapped`); a body that runs elsewhere, a Pallas kernel, is
+    one operation, its outputs their own size."""
+    if equation.primitive.name not in programs.CALLS:
         return None
     for name in ("jaxpr", "call_jaxpr", "fun_jaxpr"):
         body = equation.params.get(name)
