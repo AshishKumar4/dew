@@ -22,7 +22,6 @@ from dew.nn.moe import (
     expert_compute_dtype,
     expert_dispatch,
     expert_projection,
-    gather_expert_bias,
     renormalized_softmax,
 )
 from dew.nn.precision import float32_dot_general
@@ -87,21 +86,22 @@ class GptOssExperts(nn.Module):
             capacity_factor=self.capacity_factor)
         return jnp.sum(slots * weights[..., None], axis=-2)
 
-    def _project(self, tokens: jax.Array, sizes: jax.Array, expert_ids: jax.Array,
+    def _project(self, tokens: jax.Array, sizes: jax.Array, _expert_ids: jax.Array,
                  parameters: tuple[jax.Array, jax.Array, jax.Array, jax.Array], *,
                  dtype: Dtype) -> jax.Array:
+        # Each bias is added to its expert's rows' sums before their one rounding (`expert_projection`);
+        # a slot of no expert, past the routed rows, comes back zero from the dispatch.
         gate_up, gate_bias, down, down_bias = parameters
         projected = jnp.asarray(expert_projection(
-            tokens, gate_up, sizes, dtype, self.implementation, self.precision))
+            tokens, gate_up, sizes, dtype, self.implementation, self.precision, bias=gate_bias))
         # The dense MLP's residual names, the interleaved gate and up one product as a packed MLP's
         # (mlp.py), so one remat policy covers every MLP (mixer_base.RESIDUALS).
-        projected = checkpoint_name(checkpoint_name(
-            projected + gather_expert_bias(gate_bias, expert_ids, dtype), 'gate_proj'), 'up_proj')
+        projected = checkpoint_name(checkpoint_name(projected, 'gate_proj'), 'up_proj')
         gate, up = swiglu_clamped(projected[..., ::2], projected[..., 1::2], 7.0)
         activated = (up + 1) * quick_gelu(gate)
         output = jnp.asarray(expert_projection(
-            activated, down, sizes, dtype, self.implementation, self.precision))
-        return checkpoint_name(output + gather_expert_bias(down_bias, expert_ids, dtype), 'down_proj')
+            activated, down, sizes, dtype, self.implementation, self.precision, bias=down_bias))
+        return checkpoint_name(output, 'down_proj')
 
 
 class GptOssMLP(nn.Module):

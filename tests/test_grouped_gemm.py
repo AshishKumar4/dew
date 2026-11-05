@@ -16,8 +16,8 @@ from jax.sharding import Mesh
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import assert_as_exact, with_gradients
 
-from dew.nn.kernels import generation, grouped_matmul, tuning
-from dew.nn.kernels.templates.gemm import mosaic_gpu, template
+from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
+from dew.nn.kernels.templates.gemm import mosaic_gpu
 from dew.nn.moe import expert_projection
 from tools import grouped_oracle as oracle
 
@@ -278,13 +278,13 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     def products(rows, depth, width, groups):
         # The forward, and its input and kernel gradients as the reverse pass launches them, each alone.
         sizes = jnp.full((groups,), rows // groups, jnp.int32)
-        forward = functools.partial(template.gemm, group_sizes=sizes, out_dtype=jnp.bfloat16,
+        forward = functools.partial(gemm.gemm, group_sizes=sizes, out_dtype=jnp.bfloat16,
                                     precision="default", interpret_on_cpu=True)
         bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
         x, w, dy = bf16((rows, depth)), bf16((groups, depth, width)), bf16((rows, width))
         named = [(forward, (x, w)), (functools.partial(forward, transpose_rhs=True), (dy, w))]
         if target.wgmma:
-            named.append((functools.partial(template.gemm_t, group_sizes=sizes, out_dtype=jnp.bfloat16,
+            named.append((functools.partial(gemm.gemm_t, group_sizes=sizes, out_dtype=jnp.bfloat16,
                                             interpret_on_cpu=True), (x, dy)))
         return named
 
@@ -316,7 +316,7 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
 
     def through_mosaic(x, w, dy):
         with generation.assumed(target), generation.chosen(grouped_matmul="mosaic_gpu"):
-            return with_gradients(lambda x, w: template.gemm(x, held(w), group_sizes, out_dtype=jnp.bfloat16,
+            return with_gradients(lambda x, w: gemm.gemm(x, held(w), group_sizes, out_dtype=jnp.bfloat16,
                                                              precision="default",
                                                              interpret_on_cpu=True))(x, w, dy)
 
@@ -346,7 +346,7 @@ def test_a_frozen_matrix_forms_no_kernel_gradient():
 
     def through_mosaic(x, w, dy):
         with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
-            return with_gradients(frozen(lambda x, w: template.gemm(x, w, group_sizes, out_dtype=jnp.bfloat16,
+            return with_gradients(frozen(lambda x, w: gemm.gemm(x, w, group_sizes, out_dtype=jnp.bfloat16,
                                                                     interpret_on_cpu=True)))(x, w, dy)
 
     # Eagerly: the Mosaic interpreter's ordered callbacks are not a jitted `linear_call`'s to carry.
@@ -454,7 +454,7 @@ def test_an_ampere_gpus_mosaic_and_triton_launches_are_each_as_exact_as_xla(size
     def forward(x, w):
         # The default precision: the suite's highest asks each step's sum apart, which mma.sync's tiles do
         # not add.
-        return template.gemm(x, w, group_sizes, out_dtype=out_dtype, precision="default",
+        return gemm.gemm(x, w, group_sizes, out_dtype=out_dtype, precision="default",
                              interpret_on_cpu=True)
 
     for named in ("triton", "mosaic_gpu"):
@@ -470,7 +470,7 @@ def test_an_mma_sync_forward_of_no_depth_is_zero():
     and no launch runs."""
     lhs, rhs = jnp.zeros((128, 0), jnp.bfloat16), jnp.zeros((1, 0, 256), jnp.bfloat16)
     with ampere(), generation.chosen(grouped_matmul="mosaic_gpu"):
-        got = jax.jit(lambda x, w: template.gemm(x, w, jnp.asarray([128], jnp.int32), out_dtype=jnp.float32,
+        got = jax.jit(lambda x, w: gemm.gemm(x, w, jnp.asarray([128], jnp.int32), out_dtype=jnp.float32,
                                                  precision="default", interpret_on_cpu=True))(lhs, rhs)
     assert not np.any(np.asarray(got))
 

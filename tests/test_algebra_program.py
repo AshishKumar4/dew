@@ -718,6 +718,18 @@ def _marked_kinds(closed) -> list:
     return [equation.params["kind"] for equation in equations(closed) if equation.primitive is marked_call_p]
 
 
+@pytest.mark.parametrize(("generation_name", "measured"), [("sm80", 225.3e-9), ("sm90", 142.7e-9),
+                                                         ("sm120", 137.7e-9)])
+def test_a_template_walks_span_is_priced_at_its_gpus_kernel_step(generation_name, measured):
+    """A template's tile walk prices its span, a chain of dependent steps each reading the last, at its GPU's
+    in-kernel step: one dependent reduction of a tile within a program, measured as the slope over 1,024 to
+    16,384 steps (FS-STEP-SECONDS1's kernel path: an A100's 225.3 ns, an H100's 142.7, an RTX PRO 6000
+    Server's 137.7), so a walk of 10,000 such steps and little work is that span's time (row 4080)."""
+    target = generation.gpu_target(generation_name)
+    work = kernel_cost.Work(flops=1.0, span=10_000)
+    assert kernel_cost.walked(work, target) == 10_000 * measured
+
+
 def test_a_protected_span_is_kept_as_traced_however_often_the_pass_runs():
     """A protected span (`dew.nn.derivatives.Protected`: an error-free transform's) is a boundary no region
     crosses and whose inside no rule touches (docs/design/algebra.md §1.2): two sums the pass joins unmarked
@@ -990,7 +1002,7 @@ def test_a_fused_gemms_producer_passes_the_algebra_pass_before_the_fuser_places_
     """A fused GEMM's producer is rewritten by the algebra pass before the fuser stages it (algebra.md §2):
     a producer of two scales of one operand summed is staged as its cheaper form, its window's rewrite
     spliced (the fused products' values against their references: tests/test_gemm_template.py)."""
-    from dew.nn.kernels.templates.gemm import fused
+    from dew.nn.kernels import fused_gemm
 
     def producer(values):
         x, a, b = values
@@ -998,7 +1010,7 @@ def test_a_fused_gemms_producer_passes_the_algebra_pass_before_the_fuser_places_
         return capped * jnp.tanh(a) + capped * jnp.tanh(b)
 
     with report.refusals():
-        fused._split(producer, _scaled_operands(1, (64, 128)))
+        fused_gemm._split(producer, _scaled_operands(1, (64, 128)))
         assert any(made.spliced for made in report.rewrites())
 
 

@@ -37,7 +37,7 @@ import pytest
 import qualification_worker as worker
 import torch
 from map_judge import sharded
-from process_support import ProcessGroup
+from process_support import ProcessGroup, owned, terminate
 from remote_cache import HOST
 from token_support import encoded_token_fixture
 from transformers import (
@@ -55,20 +55,19 @@ TOKENIZER = FIXTURES / "tokenizers" / "tiny-tools"
 
 
 def spawn(directory: Path, mode: str) -> subprocess.Popen:
-    """One run of the worker in its own session, so a kill takes its children
-    too. It inherits the session's platform and the lane's flags
-    (tests/lane_environment.py), which on CUDA make the reductions repeatable."""
-    environment = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
-    return subprocess.Popen([sys.executable, str(Path(worker.__file__)), str(directory), mode],
-                            cwd=ROOT, env=environment, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    """One run of the worker as a group its owner holds (`process_support.owned`), so a kill takes its
+    children too, and a test killed while the run blocks takes the run with it. It inherits the session's
+    platform and the lane's flags (tests/lane_environment.py), which on CUDA make the reductions
+    repeatable."""
+    return owned([sys.executable, str(Path(worker.__file__)), str(directory), mode],
+                 {**os.environ, "PYTHONPATH": str(ROOT / "src")})
 
 
 def finish(process: subprocess.Popen, mode: str) -> None:
     try:
         log = process.communicate(timeout=900)[0]
     except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
+        terminate(process)
         pytest.fail(f"the {mode} run did not finish within 900s\n{process.communicate()[0]}")
     assert process.returncode == 0, f"the {mode} run exited {process.returncode}\n{log}"
 
@@ -78,7 +77,7 @@ def kill_when_ready(process: subprocess.Popen, marker: Path) -> None:
     deadline = time.monotonic() + 900
     while not marker.exists():
         if process.poll() is not None or time.monotonic() >= deadline:
-            os.killpg(process.pid, signal.SIGKILL)
+            terminate(process)
             pytest.fail(f"the interrupted run never blocked\n{process.communicate()[0]}")
         time.sleep(0.05)
     assert int(marker.read_text()) == process.pid

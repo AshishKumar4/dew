@@ -76,6 +76,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     stated,
     transposed_swizzles,
 )
+from dew.nn.kernels.templates.cost import estimate
 
 
 def _out_types(batch: int, queries: int, heads: int, value_width: int, out_dtype, *, splits: int, peaks: bool,
@@ -1100,7 +1101,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     cost = (stated(spec, batch, heads, columns, query, key, value,
                    tile_walk=TileWalk((queries, keys_count), (block_q, block_k), consumers,
                                       common=family.feeds_itself)) if counted
-            else pl.CostEstimate(flops=0, transcendentals=0, bytes_accessed=0))
+            else estimate(0))
     query_share = modelled(spec, batch, heads, spec.queries or queries, owned_query)
     value_share = modelled(spec, batch, heads, spec.queries or queries, owned_value)
     model = (0 if not counted else None if query_share is None or value_share is None

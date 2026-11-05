@@ -19,9 +19,9 @@ from flax.core import meta
 from dew.nn.dense import _plain_dense, intercepted
 from dew.nn.precision import biased, float32_dot_general
 
+from .kernels import gemm
 from .kernels.generation import INHERENT, device_generation
 from .kernels.selection import Kernel, Op, Requirement, select
-from .kernels.templates.gemm import template
 
 
 @dataclasses.dataclass(frozen=True)
@@ -130,8 +130,8 @@ def joined_dense(x: jax.Array, projections: Sequence[nn.Module], *, axis: int) -
     biases = (jnp.stack([bias for _, _, bias in promoted], axis=axis + 2) if projections[0].use_bias
               else None)
     dimensions = (((inputs.ndim - 1,), (0,)), ((), ()))
-    # One matrix product of the kernels side by side, as a Dense takes its own (`template.dot_general`).
-    y = template.dot_general(float32_dot_general)(inputs, kernel.reshape(kernel.shape[0], -1), dimensions,
+    # One matrix product of the kernels side by side, as a Dense takes its own (`gemm.dot_general`).
+    y = gemm.dot_general(float32_dot_general)(inputs, kernel.reshape(kernel.shape[0], -1), dimensions,
                                                   precision=projections[0].precision)
     y = y.reshape(*y.shape[:-1], *kernel.shape[1:])
     if biases is None:

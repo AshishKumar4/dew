@@ -16,8 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental.mosaic.gpu import profiler
 
-from dew.nn.kernels import generation
-from dew.nn.kernels.templates.gemm import template
+from dew.nn.kernels import gemm, generation
 
 MODELS = {
     "qwen3-30b-a3b": {"hidden": 2048, "intermediate": 768, "experts": 128, "top_k": 8},
@@ -86,7 +85,7 @@ def main() -> None:
                                "projection": projection, "route": route}
                         try:
                             with generation.chosen(grouped_matmul=route):
-                                fn = jax.jit(lambda x, w, s: template.gemm(x, w, s, out_dtype=jnp.bfloat16))
+                                fn = jax.jit(lambda x, w, s: gemm.gemm(x, w, s, out_dtype=jnp.bfloat16))
                                 seconds = timed(fn, [(x, w, s) for s in sizes])
                             # Each call's weights read: its routing's active experts' matrices.
                             matrix = w.shape[1] * w.shape[2] * 2

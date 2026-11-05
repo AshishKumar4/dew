@@ -56,7 +56,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import axes, bundles, cost as unit_cost, mosaic, resources, tail as tail_of
-from dew.nn.kernels.templates.gemm import cost, rows_padded
+from dew.nn.kernels.templates.gemm import rows_padded
 
 
 def family_of(tiles: "Tiles", dtype) -> mosaic.Family:
@@ -381,7 +381,7 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
     blocks = {'rows': ((block_m, block_k), dtype), 'matrix': (rhs_block, rhs_dtype),
               **({'paired': (rhs_block, rhs_dtype)} if paired else {}),
               **{f'side_{i}': (axes.named(prologue_axes[i], extent), prologue_dtypes[i]) for i in stepped}}
-    sides = mosaic.staging('side', [(axes.named(side_axes, {'rows': part[0], 'columns': part[1]}),
+    sides = mosaic.staging('side', [(axes.named(axes.held(side_axes), {'rows': part[0], 'columns': part[1]}),
                                      _typed(side))
                                     for side_axes, side in zip(epilogue_axes, epilogue_dtypes, strict=True)])
     held = mosaic.staging('fixed', [(axes.named(prologue_axes[i], extent), _typed(prologue_dtypes[i]))
@@ -590,6 +590,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                     _finished, family=family, wg=wg, epilogue=epilogue, o_gmems=o_gmems, store=store,
                     sides=tuple(zip(side_gmems, epilogue_axes, side_smems, side_barriers, strict=True)),
                     origins={'rows': pl.ds(part_row, part[0]), 'columns': pl.ds(column, part[1])},
+                    group=jnp.minimum(group.group_id, g - 1),
                     place=(part_row, first, stored, column, min(part[0], m), TMA_ROWS if dense else 1))
                 if tail is None or workspace is None:
                     finished(*accs)
@@ -621,8 +622,8 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                            grid=(multiprocessors // pair,), grid_names=("programs",), consumers=consumers,
                            interpret=interpret, approx_math=False, name="dew_gmm", cluster=pair,
                            resident=tiles.programs,
-                           cost=cost(2 * m * n * k * len(matrices), *operands, *prologue_operands,
-                                      *epilogue_operands, *out_type))
+                           cost=unit_cost.estimate(2 * m * n * k * len(matrices), *operands,
+                                                   *prologue_operands, *epilogue_operands, *out_type))
     outs = kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands)
     return outs[:len(out_type)] if tail is not None else outs
 
@@ -637,13 +638,18 @@ def _stored_rows(group, part_row, rows: int, m: int, *, dense: bool, row_tile: i
 
 
 def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store, sides: tuple, origins: dict,
-              place: tuple) -> None:
+              group, place: tuple) -> None:
     """Dew: a consumer's share of a `gmm` tile, its accumulators whole (`accs`): its epilogue on its side
-    tiles (`sides`, each its global ref, axes, staging and barrier), loaded at `origins`, then each output
-    stored at `place` (`mosaic.Family.persist`'s `store`)."""
-    family.loaded([(gmem.at[axes.named(side_axes, origins)], smem.at[wg], barrier.at[wg])
+    tiles (`sides`, each its global ref, axes, staging and barrier), loaded at `origins`, a side operand by
+    group at the tile's `group` (the unrouted rows' the last's, as XLA's program reads them) and handed
+    the epilogue at each of the share's rows, then each output stored at `place` (`mosaic.Family.persist`'s
+    `store`)."""
+    family.loaded([(gmem.at[axes.named(side_axes, origins | axes.at_group(side_axes, gmem.shape, group))],
+                    smem.at[wg], barrier.at[wg])
                    for gmem, side_axes, smem, barrier in sides])
-    values = accs if epilogue is None else epilogue(*accs, *(smem[wg] for _, _, smem, _ in sides))
+    rows = origins['rows'].size
+    values = accs if epilogue is None else epilogue(*accs, *(axes.by_rows(smem[wg], side_axes, rows)
+                                                           for _, side_axes, smem, _ in sides))
     values = values if isinstance(values, tuple) else (values,)
     for output, (o_gmem, value) in enumerate(zip(o_gmems, values, strict=True)):
         store(output, value, o_gmem, place)
@@ -714,32 +720,44 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
               fixed_tiles: dict, read_tiles: dict, mine_rows, transpose_rhs: bool, matrices: tuple,
               interpret: bool, first=0, apart: tuple | None = None):
     """Dew: a consumer's step of the cooperative `gmm` (`mosaic.Family.walk`): its half of the rows' slot,
-    rewritten by the prologue on its side tiles (the streamed ones' slots, the fixed ones' `fixed_tiles`,
+    transformed by the prologue on its side tiles (the streamed ones' slots, the fixed ones' `fixed_tiles`,
     a depth vector the family does not copy read at step `index` from global memory: `read_tiles`),
     times each of `matrices`' slot into its accumulator (a paired product's two); with `apart`, each
-    product taken apart as an fp32 tile of that shape (`_walked_products`' exact sums)."""
+    product taken apart as an fp32 tile of that shape (`_walked_products`' exact sums). The prologue's
+    value stays in registers, where the products take it as their left operand (warpgroup MMA's register
+    operand A, mma.sync's fragments): rewritten into the stage and read back, the gated prologue of a
+    Llama-3-8B gate_up ran at 8.3x its plain product on an H100 (row 1336)."""
     stage = slots['rows']
+    oriented = {name: slots[name].transpose((1, 0)) if transpose_rhs else slots[name] for name in matrices}
     if prologue is not None:
         # This warpgroup's half of the rows, the only half its MMA reads.
         depth = stage.shape[1]
         tiles_of = {i: fixed_tiles[i] if i in fixed_tiles
                     else read_tiles[i].at[pl.ds((first + index) * depth, depth)] if i in read_tiles
                     else slots[f'side_{i}'] for i in range(len(prologue_axes))}
-        _rewritten(prologue, prologue_axes, stage.at[mine_rows], tiles_of, 'rows', mine_rows)
-        family.published()
-    oriented = {name: slots[name].transpose((1, 0)) if transpose_rhs else slots[name] for name in matrices}
+        left = _transformed(prologue, prologue_axes, stage.at[mine_rows], tiles_of, 'rows', mine_rows)
+        if apart is not None:
+            return nothing, tuple(family.registers_product(left, oriented[name], interpret)
+                                  for name in matrices)
+        return nothing, tuple(family.register_products(acc, (left,), oriented[name], interpret)
+                              for acc, name in zip(accumulators, matrices, strict=True))
     if apart is not None:
         return nothing, tuple(family.product(stage.at[mine_rows], oriented[name], apart) for name in matrices)
     return nothing, tuple(family.products(acc, stage.at[mine_rows], oriented[name], interpret)
                           for acc, name in zip(accumulators, matrices, strict=True))
 
 
-def _rewritten(prologue, axes_of: tuple, mine, tiles_of: dict, halved: str, half) -> None:
-    """Dew: `mine`, this warpgroup's half of a stage, rewritten by the prologue on its side tiles
-    (`tiles_of`, by operand) cut to the same half along the `halved` launch axis; its reader publishes
-    the writes (`mosaic.Family.published`)."""
+def _transformed(prologue, axes_of: tuple, mine, tiles_of: dict, halved: str, half) -> jax.Array:
+    """Dew: `mine`, this warpgroup's half of a stage, transformed by the prologue on its side tiles
+    (`tiles_of`, by operand) cut to the same half along the `halved` launch axis, in the stage's dtype."""
     cut = [tiles_of[i].at[axes.placed(side_axes, {halved: half})][...] for i, side_axes in enumerate(axes_of)]
-    mine[...] = prologue(mine[...], *cut).astype(mine.dtype)
+    return prologue(mine[...], *cut).astype(mine.dtype)
+
+
+def _rewritten(prologue, axes_of: tuple, mine, tiles_of: dict, halved: str, half) -> None:
+    """Dew: `mine` rewritten in place by the prologue (`_transformed`); its reader publishes the writes
+    (`mosaic.Family.published`)."""
+    mine[...] = _transformed(prologue, axes_of, mine, tiles_of, halved, half)
 
 
 def _split(refs: tuple, prologue: int, epilogue: int) -> tuple:
@@ -918,7 +936,8 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                            consumers=consumers,
                            interpret=interpret, approx_math=False, name="dew_tgmm",
                            resident=tiles.programs,
-                           cost=cost(2 * lhs.shape[0] * m * n, lhs, rhs, *prologue_operands, out_type))
+                           cost=unit_cost.estimate(2 * lhs.shape[0] * m * n, lhs, rhs, *prologue_operands,
+                                                   out_type))
     return kernel(*groups, lhs, rhs, *prologue_operands)[0]
 
 

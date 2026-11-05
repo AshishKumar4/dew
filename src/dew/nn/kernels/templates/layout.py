@@ -9,7 +9,7 @@ from typing import Any
 import jax
 import jax.extend.core as jax_core
 
-from dew.nn.programs import CALLS, jax_name
+from dew.nn.programs import CALLS, CUMULATIVE, ENTRYWISE, REDUCTIONS, jax_name
 
 
 class Untransposable(NotImplementedError):
@@ -219,30 +219,14 @@ def _axis_free(jaxpr: jax_core.Jaxpr, shape: tuple[int, ...] = ()) -> bool:
 
 RULES: dict[str, Callable] = {
     "broadcast_in_dim": _broadcast, "reshape": _reshape, "squeeze": _squeeze, "iota": _iota,
-    "reduce_sum": _reduced("reduce_sum"), "reduce_max": _reduced("reduce_max"),
-    "reduce_min": _reduced("reduce_min"), "reduce_prod": _reduced("reduce_prod"),
-    "reduce_and": _reduced("reduce_and"), "reduce_or": _reduced("reduce_or"),
-    "argmax": _reduced("argmax"), "argmin": _reduced("argmin"),
-    "cumsum": _along("axis"), "cumprod": _along("axis"), "cummax": _along("axis"), "cummin": _along("axis"),
-    "cumlogsumexp": _along("axis"), "concatenate": _along("dimension"),
-    "slice": _reversed("start_indices", "limit_indices", "strides"), "pad": _reversed("padding_config"),
-    "dynamic_slice": _dynamic_slice, "transpose": _transpose,
+    **{name: _reduced(name) for name in REDUCTIONS}, **dict.fromkeys(CUMULATIVE, _along("axis")),
+    "concatenate": _along("dimension"), "slice": _reversed("start_indices", "limit_indices", "strides"),
+    "pad": _reversed("padding_config"), "dynamic_slice": _dynamic_slice, "transpose": _transpose,
     "jit": _call, "pjit": _call, "closed_call": _call, "custom_jvp_call": _custom, "custom_vjp_call": _custom,
 }
 """Each operation `transposed` takes that names an axis, by its primitive's name: its rule binds it on the
-held operands with each axis it names swapped."""
-
-ENTRYWISE = frozenset({
-    "abs", "acos", "acosh", "add", "add_any", "and", "asin", "asinh", "atan", "atan2", "atanh", "cbrt",
-    "ceil", "clamp", "convert_element_type", "copy", "copy_p", "cos", "cosh", "digamma", "div", "eq", "erf",
-    "erf_inv", "erfc", "exp", "exp2", "expm1", "floor", "ge", "gt", "integer_pow", "is_finite", "le",
-    "lgamma", "log", "log1p", "logistic", "lt", "max", "min", "mul", "ne", "neg", "nextafter", "not", "or",
-    "population_count", "pow", "rem", "round", "rsqrt", "select_n", "shift_left", "shift_right_arithmetic",
-    "shift_right_logical", "sign", "sin", "sinh", "sqrt", "square", "stop_gradient", "sub", "tan", "tanh",
-    "xor",
-})
-"""The operations of one entry at a time, whose operands are each a scalar or a value of their output's
-shape: bound on held tiles unchanged. An operation neither these nor `RULES` take is refused."""
+held operands with each axis it names swapped. An operation of `dew.nn.programs.ENTRYWISE` is bound on
+held tiles unchanged; one neither those nor these take is refused."""
 
 
 def _run(jaxpr: jax_core.Jaxpr, consts, operands) -> list:
