@@ -151,6 +151,24 @@ def test_a_split_the_derivation_leaves_no_byte_to_spare_is_one_it_fits(monkeypat
     assert headroom[4] == 0 and headroom[2] < 0 and asked(trainer)[0][0] == 4
 
 
+def test_past_a_miss_the_derivation_orders_the_next_compile_where_it_judges():
+    """Past a miss, the next split compiled is the first the derivation judges to fit, its judgment
+    corrected by the most a compile at the rung needed beyond it (`under`); the compiles' forecast orders
+    only splits the derivation cannot judge. A forecast scales the missed compile's temporaries down by
+    the split and holds its arguments, so it takes a split to fit whose accumulated gradient the
+    derivation counts and it does not: Qwen3.5-4B at 4 x 2048 on a compile-only H100 missed at one
+    microbatch by 0.32 GiB, then compiled two, which the derivation judged 3.83 GiB short (18.6 GiB of
+    accumulator), before four (row 3341's walk, 6b7c3be6d8)."""
+    from dew.training.planning import judged_likely
+
+    gib = 2**30
+    assert not judged_likely(int(-3.83 * gib), int(0.48 * gib), forecast=True)
+    assert judged_likely(int(2.18 * gib), int(0.48 * gib), forecast=False)
+    assert not judged_likely(int(0.3 * gib), int(0.48 * gib), forecast=True)
+    assert judged_likely(None, int(0.48 * gib), forecast=True)
+    assert not judged_likely(None, 0, forecast=False)
+
+
 def test_a_run_that_sets_its_remat_derives_its_own_rung_alone_and_compiles_there_once(monkeypatch, tmp_path):
     """A run that sets its remat compiles at it alone (row 2111), once, its split derived there; no rung
     below its own is traced for it, which cost a run every lighter rung's trace before its first step to
