@@ -1047,7 +1047,12 @@ def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(t
         tickets = [server.submit(np.asarray([prompt]), 6, key=int(key), adapter=name)
                    for prompt, name, key in zip(prompts, names, keys, strict=True)]
         server.run()
-        return tuple(ticket.result().host().tokens for ticket in tickets)
+        return tuple(drawn_of(ticket.result()) for ticket in tickets)
+
+    def drawn_of(generation):
+        """A draw's tokens and the likelihoods its adapter gave them, which a wrong adapter moves."""
+        held = generation.host()
+        return held.tokens, held.raw_log_probs
 
     def by_itself(dtype):
         @as_given
@@ -1059,7 +1064,7 @@ def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(t
                     task = dataclasses.replace(task, model=task.model.clone(dtype=jnp.float64),
                                                variables=widened(task.variables))
                 with jax.enable_x64(new_val=dtype == "float64"):
-                    out.append(task(np.asarray([prompt]), 6, key=int(key)).host().tokens)
+                    out.append(drawn_of(task(np.asarray([prompt]), 6, key=int(key))))
             return tuple(out)
 
         return drawn_alone
