@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, indexed_recording, recording
 from token_support import byte_level_tokenizer
 from transformers.generation.logits_process import (
     EncoderNoRepeatNGramLogitsProcessor,
@@ -338,7 +338,7 @@ def test_exponential_decay_grows_the_eos_score_after_its_start():
     assert got[0, 6] > logits[0, 6] and got[1, 6] == logits[1, 6]
 
 
-PENALTIES = np.load(Path(__file__).resolve().parent / "fixtures" / "decoding" / "penalties.npz")
+PENALTIES = recording(Path(__file__).resolve().parent / "fixtures" / "decoding" / "penalties.npz")
 
 
 @pytest.mark.parametrize("case", range(len(PENALTIES["penalties"])))
@@ -347,15 +347,19 @@ def test_frequency_and_presence_penalties_are_vllms(case):
     on four histories: the frequency penalty times each token's count among
     the generated tokens and the presence penalty times whether it was
     generated, the prompt counting for neither, both signs. Dew's two
-    transforms, chained in vLLM's order, held to its float64 run by the
-    float64 rule."""
+    transforms, chained in vLLM's order, on par with vLLM's float32 run over
+    recorded logits (check 1), the truth vLLM's float64 run."""
     frequency, presence = (float(value) for value in PENALTIES["penalties"][case])
     prompts, drawn = ([[int(token) for token in row if token != VOCAB] for row in PENALTIES[name]]
                       for name in ("prompt", "output"))
-    native = decoding.chain((decoding.FrequencyPenalty(frequency), decoding.PresencePenalty(presence)))
-    got = np.asarray(jax.jit(native)(rows(prompts, drawn), jnp.asarray(PENALTIES["logits"])))
-    assert_as_exact_as_the_reference(got, PENALTIES[f"case_{case}"], PENALTIES[f"case_{case}_f64"],
-                                     f"penalties {frequency}, {presence}")
+    native = jax.jit(decoding.chain((decoding.FrequencyPenalty(frequency),
+                                     decoding.PresencePenalty(presence))))
+    site = f"case_{case}"
+    draw, reference, truth = indexed_recording(PENALTIES, site, int(PENALTIES[f"{site}.seeds"]))
+    state = rows(prompts, drawn)
+    assert_as_exact(as_given(lambda index, inputs: {"logits": np.asarray(native(state, inputs["logits"]))}),
+                    reference, draw, f"penalties {frequency}, {presence}",
+                    seeds=int(PENALTIES[f"{site}.seeds"]), truth_fn=truth)
 
 
 def stop_string_tokenizer(tmp_path):
