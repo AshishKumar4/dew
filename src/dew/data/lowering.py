@@ -140,7 +140,6 @@ from dew.data.shards import bounded as shards_bounded, bounded_places, streamed
 from dew.data.sources.base import Read, Shard, ShardManifest, ShardOpener, Source, materialized
 from dew.data.sources.urls import Fetch
 from dew.data.steps.text import LayoutRule, ValidTargets, counted_window, recounted
-from dew.data.storage import Mirrored
 from dew.data.text import Chunks
 from dew.data.tokens import _WrappingDataset
 
@@ -1933,7 +1932,7 @@ class _Build:
         elif isinstance(stage, Workers):
             # A column too small for a shared segment of its own crosses pickled (`SHARED_BYTES`).
             options = gx.DatasetOptions(min_shm_size=SHARED_BYTES)
-            rows = gx.WithOptionsIterDataset(Mirrored(_as_iter(rows, self.loading)), options).mp_prefetch(
+            rows = gx.WithOptionsIterDataset(_as_iter(rows, self.loading), options).mp_prefetch(
                 pygrain.MultiprocessingOptions(
                     num_workers=stage.count, per_worker_buffer_size=stage.buffer
                 ),

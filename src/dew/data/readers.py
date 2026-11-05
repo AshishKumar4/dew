@@ -286,9 +286,8 @@ class _Statistics:
         read = {name: counts for published in self._published for name, counts in published.counts.items()}
         merged = {name: counts.followed(read.pop(name)) if name in read else counts
                   for name, counts in self._counts.items()}
-        # What the reading processes' mirrors did beside them (`mirror_metrics`, row 4299).
-        latest = self._published[-1].published.state if self._published else None
-        return {**data_metrics([*merged.values(), *read.values()]), **mirror_metrics(latest)}
+        # What this process's mirrors did beside them (`mirror_metrics`, row 4299).
+        return {**data_metrics([*merged.values(), *read.values()]), **mirror_metrics()}
 
 
 @dataclasses.dataclass(frozen=True)
