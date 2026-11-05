@@ -96,7 +96,7 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
     def lane_columns(self) -> int:
         raise NotImplementedError(self._VALUES)
 
-    def zeros(self, shape: tuple[int, int]) -> jax.Array:
+    def zeros(self, shape: tuple[int, ...]) -> jax.Array:
         return jnp.zeros(shape, jnp.float32)
 
     def written(self, smem, value: jax.Array) -> None:

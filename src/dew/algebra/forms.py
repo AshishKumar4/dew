@@ -261,22 +261,22 @@ def _scaled(operand: terms.Term, value: Callable[[terms.Term], jax.Array]) -> tu
 
 
 def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping[Hashable, jax.Array], *,
-              product: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
+              product: Callable[..., jax.Array] | None = None,
               chosen: Mapping[Hashable, terms.Term] | None = None,
               exponential: tuple[str, Callable[..., jax.Array]] | None = None,
-              named: Callable[[terms.Term], str] | None = None,
+              named: Callable[[terms.Term, terms.Term], str] | None = None,
               rescale: Callable[[jax.Array, jax.Array], jax.Array] | None = None
               ) -> Callable[[terms.Term], jax.Array]:
-    """The values of a region's forms, each term once however many forms read it: its leaves the given
-    values (`leaves`, by index; None for one no form reads) and the outputs of the region's equations
-    outside the language over them, their inputs in the forms `chosen` names for them (by `terms.key`)
-    where given, each term `known` names (by `terms.key`) its value there, each matrix product
-    `product(a, b)` where a caller holds its own (a mainloop's issuer; `product(name, a, b)` where `named`
-    names each product's role, an issuer staging each role apart) and every other product Dew's
+    """The values of a region's forms, each term once however many forms read it: its leaves the given values
+    (`leaves`, by index; None for one no form reads) and the outputs of the region's equations outside the
+    language over them, their inputs in the forms `chosen` names for them (by `terms.key`) where given,
+    each term `known` names (by `terms.key`) its value there, each matrix product `product(a, b)` where a
+    caller holds its own (a mainloop's issuer; `product(name, a, b)` where `named` names each product's
+    role from its operands' terms, an issuer staging each role apart) and every other product Dew's
     (`float32_dot_general`), each exponential a declaration implements by its own (`exponential`: the
-    language's name of its base and its function, `exponential(x, scale=1.0)`, `derive.Reduction.exponential`;
-    a product with a literal its `scale`, `_scaled`) and each rescale of two
-    anchors by the declaration's (`rescale`, `terms.RESCALE`), every other term the engine's
+    language's name of its base and its function, `exponential(x, scale=1.0)`,
+    `derive.Reduction.exponential`; a product with a literal its `scale`, `_scaled`) and each rescale of
+    two anchors by the declaration's (`rescale`, `terms.RESCALE`), every other term the engine's
     (`terms.value_of`)."""
     values = dict(known)
     outside = {leaf: opaque for opaque in region.opaque for leaf in opaque.outputs}
@@ -305,7 +305,7 @@ def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping
             numbers = jax.tree.map(int, params["dimension_numbers"])
             if product is not None and numbers == PLAIN_PRODUCT:
                 made = (product(value(left), value(right)) if named is None
-                        else product(named(term), value(left), value(right)))
+                        else product(named(left, right), value(left), value(right)))
             else:
                 made = float32_dot_general(value(left), value(right), params["dimension_numbers"],
                                            precision=params.get("precision"),

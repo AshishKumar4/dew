@@ -138,9 +138,10 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
       where it took 64 x 256, whose four warps, splitting its rows, each read the columns' block whole:
       1.7x the shared memory a FLOP (SHAPE1-a100: 0.887 of its time). A tile its registers or a block
       cannot stage busy (`holds`, `resources.tile_registers`) gives way to the next narrower or shorter one.
-    - Consumers: as many roles as the family has (`Family.consumers`), a warpgroup each, or one where
-      rows a tile must divide (not grouped) take no whole role for each, where a group averages fewer rows
-      than one role (grouped), or where no tile of them holds.
+    - Consumers: of the counts the family takes (`Family.consumers`), a warpgroup each, the one whose tile
+      reads its operands least (`_reads`: a share's fragment loads where the products read registers, then
+      the tile's reads a FLOP), the most on a tie; one where rows a tile must divide (not grouped) take no
+      whole role for each, or where a group averages fewer rows than one role (grouped).
     - Programs: the most a multiprocessor runs at once that the family's registers hold at those
       consumers (`Family.programs`) and whose share of its shared memory (`resources.program_shared`) holds
       a tile, one at least; a wave is all of them.
@@ -199,9 +200,28 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     # past it keep the further consumers' rows real. Row 3622, H100 (FS-3622-AB1/AB2-h100): one consumer ran
     # 0.73 to 0.999 of the cooperative tile's time at 1 to 32 rows a group, and 1.13 to 1.26 of it at 64.
     whole = rows >= family.role_rows if grouped else rows % (family.role_rows * family.consumers) == 0
-    return next((tile for consumers in dict.fromkeys((family.consumers if whole else 1, 1))
-                 for programs in range(family.programs(consumers), 0, -1)
-                 if (tile := tiled(consumers, programs)) is not None), None)
+    # Each consumer count's tile at the most programs that hold one, the count the objective prices least
+    # (`_reads`), the most consumers on a tie.
+    counted = [next((tile for programs in range(family.programs(consumers), 0, -1)
+                     if (tile := tiled(consumers, programs)) is not None), None)
+               for consumers in range(family.consumers if whole else 1, 0, -1)]
+    return min((tile for tile in counted if tile is not None), key=functools.partial(_reads, family),
+               default=None)
+
+
+def _reads(family: mosaic.Family, tile: "Tiles") -> tuple[float, float]:
+    """Dew: `derived`'s objective over its consumer counts' tiles: the operand reads a FLOP each consumer's
+    share issues from shared memory (1/rows + 1/columns of its share), where its products read registers
+    its warps load (`mosaic.Issuer.operands_in_registers`: mma.sync's fragments, each an instruction its
+    warps issue beside their products), then the tile's own reads a FLOP (1/rows + 1/columns), which a
+    wider tile lowers. On an A100, two consumers' 64-row shares of a 128 x 128 tile issued 1.5x one
+    consumer's fragment loads (176M against 118M LDSM, 0.0234 against 0.0156 reads a FLOP) and ran 2.78x
+    its input gradient's time (NS-P2-NCU2-a100); their 128 x 256 tiles 1.355x one consumer's 128 x 128
+    over 19 rows (NS-P2-CONSUMERS-a100). Warpgroup MMA reads both operands from shared memory itself, no
+    instruction its warps issue: there the cooperative tile's fewer reads lead (CUTLASS's split, 2-7% faster
+    on every H100 scoreboard row)."""
+    share = 1 / (tile.block_m // tile.warpgroups) + 1 / tile.block_n
+    return share if family.operands_in_registers else 0.0, 1 / tile.block_m + 1 / tile.block_n
 
 
 def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], busy: int, shaped: Callable,
