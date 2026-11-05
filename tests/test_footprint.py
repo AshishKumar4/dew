@@ -323,6 +323,26 @@ def test_a_loops_carry_read_and_written_through_an_axis_of_one_holds_one_buffer(
     assert each[0] == each[1], each
 
 
+def test_a_scatter_into_zeros_holds_its_result_alone():
+    """A scatter fuses the operands it reads, as XLA fuses a scatter's producers into it (an input fusion,
+    `IsInputFusibleScatter`, xla/service/gpu/gpu_fusible.cc), its base computed into its result: an
+    embedding's gradient, a scatter-add of its rows' cotangents into zeros, holds the gradient alone, where
+    the derivation held the zeros beside it (Qwen3.5-4B's tied embedding under 'full', 2.37 GiB over XLA's
+    4.76 at its step's peak: row 4089)."""
+    from dew.training.footprint import peak_bytes
+
+    vocab, width, tokens = 4096, 256, 512
+    ids = jax.ShapeDtypeStruct((tokens,), jnp.int32)
+    cotangents = jax.ShapeDtypeStruct((tokens, width), jnp.float32)
+
+    def gradient(ids, cotangents):
+        return jnp.zeros((vocab, width), jnp.float32).at[ids].add(2.0 * cotangents)
+
+    program = jax.make_jaxpr(gradient)(ids, cotangents).jaxpr
+    assert "scatter-add" in {equation.primitive.name for equation in program.eqns}
+    assert peak_bytes(program, "gpu", Workspace(0, 0)) == vocab * width * 4
+
+
 def test_a_transposed_input_returned_flat_is_a_copy():
     """A transpose of an input whose layout is fixed reorders its elements into a buffer of their own,
     which a flattening of it returned holds, where a transpose of a value the program computes is laid
