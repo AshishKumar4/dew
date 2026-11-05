@@ -6,8 +6,8 @@ A function of a carried state and a chunk's operands, traced at one chunk, enter
 are marked (`reads`), and the products' linear algebra saturates over them (`CARRIED`): a product of a
 transposed operand as a plain product of its transpose, a product distributed over a sum or a difference that
 reads the state, two products associated so the state is the last operand, two products of one right operand
-factored, each where the region's range facts bound the operands its new intermediates read (`rules.tame`): no
-form is infinite where the function is finite. Extraction prices the carried outputs' forms by the work that
+factored, each where the region's range facts bound the operands its new intermediates read
+(`rules.reorderable`): no form is infinite where the function is finite. Extraction prices the carried outputs' forms by the work that
 reads the state first and the rest second (`Priced`), so the carry reads the state through the fewest products
 its facts allow. The other outputs, emitted from each chunk's entering state once the carry has run, take the
 program's cost (`cost.model`). The forms' largest terms that read no state are the walk's prepared values,
