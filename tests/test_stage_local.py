@@ -464,6 +464,40 @@ def scaled_by_progress() -> optax.GradientTransformationExtraArgs:
 
 
 @pytest.mark.mesh(devices=8)
+def doubled_gains() -> optax.GradientTransformation:
+    """Each leaf's update scaled by a sum of squares doubled 64 times: of the leaf's own entries where it
+    is of rank one, of each entry plus one at any other rank, so a stacked leaf's rows' gains are other
+    sums than its layers'. A sum named modulo 2**64 names both alike, doubling empties it."""
+    def update(updates, state, params=None):
+        def scaled(gradient):
+            read = gradient if gradient.ndim == 1 else gradient + 1
+            gain = jnp.sum(read * read, axis=-1)
+            for _ in range(64):
+                gain = gain + gain
+            return gradient * (0.0 * gain[..., None])
+        return jax.tree.map(scaled, updates), state
+    return optax.GradientTransformation(lambda params: optax.EmptyState(), update)
+
+
+def spread_sums() -> optax.GradientTransformation:
+    """Each leaf's update from a primitive of its own named `copy`, JAX's entrywise copy's name, that
+    broadcasts its operand's sum over it: no operation one entry at a time, whatever its name."""
+    from jax.extend.core import Primitive
+    from jax.interpreters import mlir
+
+    def spread(value):
+        return jnp.broadcast_to(jnp.sum(value), value.shape)
+
+    copy = Primitive("copy")
+    copy.def_impl(spread)
+    copy.def_abstract_eval(lambda value: value)
+    mlir.register_lowering(copy, mlir.lower_fun(spread, multiple_results=False))
+
+    def update(updates, state, params=None):
+        return jax.tree.map(lambda gradient: -1e-3 * jnp.tanh(copy.bind(gradient)), updates), state
+    return optax.GradientTransformation(lambda params: optax.EmptyState(), update)
+
+
 def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trains():
     """Over two stages, a transformation given built whose update reads each stored layer of a stacked leaf
     by the same expression of that layer's entries as over the stored layers keeps each run stage-local
@@ -472,7 +506,9 @@ def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trai
     clip by the global norm, its layers' sum (rows 3995, 4015, 4036). One whose update reads a leaf whole,
     optax's LAMB, whose trust ratio would take one ratio over both stages, and Adafactor, whose factored
     moments and block clip read the leaf, given built or named by its import path in an `OptimConfig`, one
-    whose build reads its tree's shapes (a decay masked by rank), keep every layer whole on every stage,
+    whose build reads its tree's shapes (a decay masked by rank), one whose sums of squares differ by row
+    and are doubled 64 times (`doubled_gains`), and one through a primitive that takes an entrywise
+    operation's name and reads its operand whole (`spread_sums`), keep every layer whole on every stage,
     and the run's plan names what kept them whole. No per-layer view of a transform whose reductions only
     its own code knows is exact short of each layer a leaf of its own, so the run trains as
     `Layout(stage_local=False)` trains it, and steps."""
@@ -492,7 +528,7 @@ def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trai
     # A decay masked by rank decides otherwise over a stacked leaf, whose bias is rank three.
     by_rank = optax.adamw(1e-3, mask=lambda params: jax.tree.map(lambda leaf: leaf.ndim > 1, params))
     for given in (optax.lamb(1e-3), optax.adafactor(1e-3), by_rank,
-                  OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3)):
+                  OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3), doubled_gains(), spread_sums()):
         # An OptimConfig's transformation is built over the run's length, which fit gives.
         assert saving(functools.partial(trainer, model, given, STAGED, 8, ema=None)) == 0
         run = trainer(model, given, STAGED, 8, ema=None)
