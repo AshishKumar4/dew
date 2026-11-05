@@ -102,10 +102,10 @@ def test_apg_keeps_diffusers_projection_precision_on_raw_predictions(name):
 
 
 @pytest.mark.parametrize("guidance, conditional, unconditional, guided", [
-    (CFG(0.5), 40000.0, -40000.0, 0.0), (CFG(0.0), 40000.0, -40000.0, -40000.0), (APG(2.0), 1000.0, 0.0, 30.0),
+    (CFG(0.5), 40000.0, -40000.0, 0.0), (CFG(0.0), 40000.0, -40000.0, -40000.0),
+    (APG(2.0), 1000.0, 0.0, 30.0),
 ], ids=["cfg-half", "cfg-zero", "apg-clipped"])
-def test_finite_half_precision_predictions_guide_to_their_finite_combination(guidance, conditional, unconditional,
-                                                                            guided):
+def test_finite_half_precision_predictions_guide_finitely(guidance, conditional, unconditional, guided):
     """CFG and APG combine finite fp16 predictions whose guided result is finite without overflowing on
     the way, each eager operation rounding as it goes (ledger 3944, 3945): CFG's 40000 and -40000, whose
     difference passes fp16's largest, guide to 0 at a scale of one half and to the unconditional exactly
