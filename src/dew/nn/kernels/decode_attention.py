@@ -133,14 +133,15 @@ def _spec(scale: float, power: float, softcap: float | None, natural: bool | Non
     natural for fp32 operands, whose edge logit's base-2 conversion rounded before exp2 moves its normal
     weight by several ppm, which a large value carries into the output, ledger 2151), and in either form
     whether a row's sums of `dtype` values need a guard (`algebra.headroom`) and keep their additions'
-    rounding (`algebra.compensates`). A decode
-    block's rows are a key head's query heads and positions (`grouped_query`), so the hook takes no query
-    positions."""
+    rounding (`algebra.compensates`), folded logits a difference of raw products scaled after it is taken
+    (`algebra.Forward.subtracted`: no fold's divergence past its reach, row 1955, on a walk the memory
+    bounds). A decode block's rows are a key head's query heads and positions (`grouped_query`), so the hook
+    takes no query positions."""
     return algebra.Forward("spans", 0, ids=False, scale=scale,
                            score_mod=None if softcap is None else Capped(softcap),
                            natural=jnp.dtype(dtype) == jnp.float32 if natural is None else natural,
                            headroom=algebra.headroom(dtype), initial=sinks,
-                           compensated=algebra.compensates(dtype), prescale=power)
+                           compensated=algebra.compensates(dtype), prescale=power, subtracted=True)
 
 
 def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forward, steps,
