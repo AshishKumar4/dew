@@ -4,6 +4,6 @@
  "path": "recordings/cf0bfdf4df3ab3ab884591b679f2da027f0190c2dbc309a4eb09affdeeead8f0.npz",
  "reference": "huggingface/diffusers 6256aa7666cedd47443adc8f82da9a10e110b09c",
  "repo": "dewml/fixtures",
- "revision": null,
+ "revision": "5d7c89bc5b600e07676efbd9a6c45b1d40c28570",
  "sha256": "cf0bfdf4df3ab3ab884591b679f2da027f0190c2dbc309a4eb09affdeeead8f0"
 }
