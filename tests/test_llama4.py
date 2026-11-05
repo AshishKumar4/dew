@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from interop_support import fixture_arrays
-from model_support import as_stepped
+from model_support import as_stepped, decode_through
 from reference_error import assert_as_exact, widened
 
 from dew.batch import coordinates
@@ -90,24 +90,13 @@ def test_decode_matches_prefill_on_both_rules(rule):
     settings = {"local": {"use_rope": True, "attention_chunk_size": 4}, "global": {"use_rope": False}}[rule]
     module, wide = attention(**settings), attention(**settings, dtype=jnp.float64)
     variables = attention_variables(tensors)
-    # The first decode call allocates the cache without writing it.
-    cache = nn.unbox(module.init(jax.random.key(0), jnp.asarray(recorded)[:, :1], MixerCall(decode=True)))
-
-    def cached(hidden):
-        state = {**cache, **variables}
-        steps = []
-        for start, stop in [(0, 7)] + [(position, position + 1) for position in range(7, hidden.shape[1])]:
-            step, mutated = module.apply(state, hidden[:, start:stop], MixerCall(decode=True),
-                                         mutable=["cache"])
-            state = {**state, "cache": mutated["cache"]}
-            steps.append(step)
-        return jnp.concatenate(steps, axis=1)
 
     def draw(seed):
         rng = np.random.default_rng([0x2739, seed])
         return (jnp.asarray(rng.standard_normal(recorded.shape) * recorded.std(), jnp.float32),)
 
-    assert_as_exact(cached, lambda hidden: as_stepped(lambda held: module.apply(variables, held), hidden, 7),
+    assert_as_exact(lambda hidden: decode_through(module, variables, hidden, prefill=7)[0],
+                    lambda hidden: as_stepped(lambda held: module.apply(variables, held), hidden, 7),
                     draw, f"llama4 {rule} decode", seeds=DECODE_SEEDS[rule],
                     truth_fn=lambda hidden: wide.apply(widened(variables), hidden))
 

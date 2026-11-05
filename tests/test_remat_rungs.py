@@ -21,8 +21,7 @@ from architecture_cases import CASES as ARCHITECTURES, LM, SEQ_LEN, TEXT_FEATURE
 from arm_arithmetic import float64_held
 from checkpoint_cases import LENGTH, PATHS, ROWS, loaded, tokens
 from flax import linen as nn
-from flax.traverse_util import flatten_dict, unflatten_dict
-from model_support import float64_twin, stepped_outputs
+from model_support import float64_twin, floating_gradient, stepped_outputs
 from reference_error import assert_as_exact
 from tool_support import load
 
@@ -55,15 +54,7 @@ def _stepped(model, variables, inputs, **apply) -> dict:
     """A step's gradient in every floating parameter, along a cotangent drawn at its output's shape."""
     output = jax.eval_shape(lambda: _call(model, variables, inputs, **apply))
     cotangent = jax.random.normal(jax.random.key(1), output.shape, jnp.float32).astype(output.dtype)
-    flat = flatten_dict(variables["params"])
-    floats = {path: leaf for path, leaf in flat.items() if jnp.issubdtype(leaf.dtype, jnp.inexact)}
-    held = {path: leaf for path, leaf in flat.items() if path not in floats}
-
-    def loss(trained):
-        params = unflatten_dict({**held, **trained})
-        return jnp.sum(_call(model, {**variables, "params": params}, inputs, **apply) * cotangent)
-
-    return jax.grad(loss)(floats)
+    return floating_gradient(lambda held: _call(model, held, inputs, **apply), variables, cotangent)
 
 
 def _rungs(model) -> list:

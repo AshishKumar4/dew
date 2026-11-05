@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 from lane_environment import outside_suite
 from flax import linen as nn
+from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.inference import RunProcessor, TextGeneration
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -94,6 +95,42 @@ def two_documents(rng: np.random.Generator, rows: int, length: int):
         positions[row, boundary:] = np.arange(length - boundary)
     segments[-1, -3:] = 0
     return coordinates(segments=segments, positions=positions, max_segments=length, right_padded=True, xp=np)
+
+
+def rows_prefill_pause_and_resume(step: Callable, state, alone: Callable, hidden, prefill_valid, schedule):
+    """A cached call's per-row prefill, pause and resume: rows prefilled with unequal real histories
+    (`prefill_valid` over `hidden`'s first tokens, an invalid token overwritten with a value no row may
+    read), then each of `schedule`'s `(index, active)` steps token `index` of the rows `active` marks.
+    `step(state, tokens, valid)` returns the call's outputs and its state after them. Yields each active
+    row's output at its last token beside `alone(history)`, the call over that row's real tokens alone;
+    a paused row's history waits."""
+    width = prefill_valid.shape[1]
+    held = prefill_valid.reshape(prefill_valid.shape + (1,) * (hidden.ndim - 2))
+    actual, state = step(state, jnp.where(held, hidden[:, :width], 50.0), prefill_valid)
+    histories = [hidden[row:row + 1, :width][:, np.asarray(prefill_valid[row])]
+                 for row in range(hidden.shape[0])]
+    for row, history in enumerate(histories):
+        yield actual[row, -1], alone(history)
+    for index, active in schedule:
+        actual, state = step(state, hidden[:, index:index + 1], jnp.asarray(active)[:, None])
+        for row, live in enumerate(active):
+            if live:
+                token = hidden[row:row + 1, index:index + 1]
+                histories[row] = jnp.concatenate([histories[row], token], axis=1)
+                yield actual[row, -1], alone(histories[row])
+
+
+def floating_gradient(call: Callable, variables, cotangent) -> dict:
+    """The gradient of `<call(variables), cotangent>` in every floating parameter of `variables`, by
+    path; integer parameters are held as they are."""
+    flat = flatten_dict(variables["params"])
+    floats = {path: leaf for path, leaf in flat.items() if jnp.issubdtype(leaf.dtype, jnp.inexact)}
+    held = {path: leaf for path, leaf in flat.items() if path not in floats}
+
+    def loss(trained):
+        return jnp.sum(call({**variables, "params": unflatten_dict({**held, **trained})}) * cotangent)
+
+    return jax.grad(loss)(floats)
 
 
 def decode_through(module: nn.Module, variables, hidden, prefill: int):

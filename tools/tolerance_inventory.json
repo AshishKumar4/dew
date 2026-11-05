@@ -162,7 +162,7 @@
    "lane": "Kernels"
   },
   "tests/test_decode_cache.py": {
-   "comparisons": 4,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_decoder_export.py": {
@@ -742,7 +742,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_vision.py": {
-   "comparisons": 25,
+   "comparisons": 21,
    "lane": "Models, Serving & RL"
   },
   "tests/test_vllm_interop.py": {
