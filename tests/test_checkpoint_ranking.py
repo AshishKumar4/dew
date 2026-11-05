@@ -664,6 +664,56 @@ def test_local_resume_keeps_plateau_patience(tmp_path):
     assert int(result.step) == 4
 
 
+def test_a_runs_persistent_and_local_checkpoints_hold_one_envelope(tmp_path):
+    """A run's persistent checkpoint and its local one are submitted with the same envelope, every field a
+    local save takes the persistent save takes alike, each tier adding its own: two runs alike, one saving
+    its second step persistently and one locally, hand their tiers the same state, data position,
+    partition, stop control, rung, artifact, axes and rollout, value for value (row 4126: two submissions
+    each built field by field, a field added to one missed by the other)."""
+    import inspect
+    from typing import ClassVar
+
+    local = set(inspect.signature(Checkpoints.save_local).parameters) - {"self", "step"}
+
+    class Recorded(Checkpoints):
+        """Checkpoints that keep what each tier's save of each step was handed."""
+
+        submitted: ClassVar[dict[tuple[str, int], dict]] = {}
+
+        def kept(self, tier: str, step, args, fields):
+            """What `tier`'s save of `step` was handed, by its parameters' names, saved as it was asked."""
+            written = getattr(Checkpoints, tier)
+            self.submitted.setdefault((tier, step), inspect.signature(written).bind(
+                self, step, *args, **fields).arguments)
+            return written(self, step, *args, **fields)
+
+        def save(self, step, *args, **fields):
+            return self.kept("save", step, args, fields)
+
+        def save_local(self, step, *args, **fields):
+            return self.kept("save_local", step, args, fields)
+
+    for name, tiers in (("persistent", {}), ("local", {"local_directory": str(tmp_path / "local"),
+                                                     "local_every": 2})):
+        run = Trainer(Overfit(), optax.sgd(.1), key=jax.random.key(0),
+                      checkpoints=Recorded(str(tmp_path / name), **tiers))
+        run.fit(data(), steps=2, log_every=1, checkpoint_every=2 if name == "persistent" else None)
+        run.checkpoints.wait()
+    persistent, saved = Recorded.submitted[("save", 2)], Recorded.submitted[("save_local", 2)]
+    assert local <= set(persistent) and local <= set(saved)
+    for field in local - {"state"}:
+        assert persistent[field] == saved[field], field
+    def held(leaf):
+        """A state leaf's values, a key's by its data."""
+        leaf = jnp.asarray(leaf)
+        return np.asarray(jax.random.key_data(leaf) if jax.dtypes.issubdtype(leaf.dtype,
+                                                                             jax.dtypes.prng_key) else leaf)
+
+    assert jax.tree.structure(persistent["state"]) == jax.tree.structure(saved["state"])
+    assert all(jax.tree.leaves(jax.tree.map(lambda a, b: bool(np.array_equal(held(a), held(b))),
+                                            persistent["state"], saved["state"])))
+
+
 def test_tile_head_invalidates_validation_trace_for_the_same_batch_shape():
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
