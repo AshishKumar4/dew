@@ -102,3 +102,44 @@ def test_locate_the_first_changed_states(tmp_path):
             right = np.asarray(outputs[second][0])[0, :single.tokens.shape[1]]
             print("FIXED_LENGTH", first, second, int(np.count_nonzero(left != right)),
                   float(np.max(np.abs(left.astype(float) - right.astype(float)))), flush=True)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_mixed_joint_probabilities_against_float64(tmp_path, dtype):
+    from reference_error import as_given, assert_as_exact, widened
+
+    from dew.decision.model import DecisionModel
+
+    source = tmp_path / "release"
+    source.mkdir()
+    backbone = FIXTURES / "hf" / "qwen38-dense-tiny"
+    joint = FIXTURES / "joint_checkpoint" / "tiny"
+    for item in [*backbone.iterdir(), joint / "joint_head_config.json",
+                 joint / "joint_head.safetensors"]:
+        (source / item.name).symlink_to(item.resolve())
+    task = Decide.from_pretrained(source, attention_impl="xla", dtype=dtype)
+    task = replace(task, layout=replace(task.layout, max_len=512))
+    short = ("refund", {"q": Choice("team", ["pay", "tech", "sales"])})
+    long = ("invoice " * 20, {"q": Choice("which department", ["billing", "technical", "sales",
+                                                             "support", "account", "other"])})
+    rows = [own[0] for own in task.rows([short, long])]
+    wide_model = DecisionModel(task.model.backbone.clone(dtype=jnp.float64),
+                               task.model.head.clone(dtype=jnp.float64))
+    wide = replace(task, model=wide_model)
+
+    def probabilities(held, variables, together):
+        scores = held.scored(rows if together else rows[:1], variables)[0][0, :3]
+        return np.asarray(held.calibration.probabilities(short[1]["q"], scores))
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jax.tree.map(lambda leaf: np.asarray(
+            leaf * (1 + rng.normal(0, 0.05, np.shape(leaf))), np.asarray(leaf).dtype), task.variables),)
+
+    def truth(variables):
+        with jax.enable_x64(new_val=True), algebra.passes(False):
+            return probabilities(wide, widened(variables), False)
+
+    assert_as_exact(as_given(lambda variables: probabilities(task, variables, True)),
+                    as_given(lambda variables: probabilities(task, variables, False)), draw,
+                    "mixed joint probabilities", seeds=16, truth_fn=truth)
