@@ -498,11 +498,11 @@ def _expressions(layered, stacked, inputs: Sequence, outputs: Sequence) -> list[
         return readers[row]
 
     refusals = []
-    for (output, result) in zip(outputs, stack_results, strict=True):
+    for output, returned in zip(outputs, stack_results, strict=True):
         rows = enumerate(output.places) if isinstance(output, _Rows) else [(None, output)]
         for row, place in rows:
             stack = stack_reader(row)
-            if stack(result) is None or stack(result) != lay(lay_results[place]):
+            if stack(returned) is None or stack(returned) != lay(lay_results[place]):
                 refusals.append(f"its output {place} computes its layer otherwise over the stack, or by no "
                                 "elementwise expression of its layer")
                 break
