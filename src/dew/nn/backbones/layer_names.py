@@ -64,10 +64,12 @@ def stored_layers(model, variables: Variables) -> Variables:
     each whole, as a reader by layer name reads them: an export, an adapter's merge or save. The runs are
     those `model` declares (`StagedStacks.stage_sites`), each cut back by the view it was stacked under
     (`StackView.layer_form`); variables that hold no such run are returned as they are. A model run
-    reads the store as it is (`off_stages`)."""
-    stages = stage_count(variables)
-    if stages == 1 or not isinstance(model, StagedStacks):
+    reads the store as it is (`off_stages`). A store on one stage holds its runs so too where its decoder
+    scans them (`StagedStacks.stage_sites` at one stage)."""
+    if not isinstance(model, StagedStacks) or not any(
+            isinstance(tree, Mapping) and _staged(tree) for tree in variables.values()):
         return variables
+    stages = stage_count(variables)
     stored = dict(variables)
     for site in model.stage_sites(variables, stages):
         def layered(node, view=site.view):
@@ -75,6 +77,11 @@ def stored_layers(model, variables: Variables) -> Variables:
             return view.layer_form(node, array_rows) if held else node
         stored = {name: _at(tree, site.namespace, layered) for name, tree in stored.items()}
     return stored
+
+
+def _staged(tree: Mapping) -> bool:
+    """Whether `tree` holds a run stacked by stage (`StackView.stage_form`) anywhere in it."""
+    return 'stages' in tree or any(isinstance(child, Mapping) and _staged(child) for child in tree.values())
 
 
 def _at(tree, namespace: tuple[str, ...], convert):
