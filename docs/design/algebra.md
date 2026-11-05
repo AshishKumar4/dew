@@ -110,9 +110,10 @@ JVP's forward and backward bodies, by the site's declared class:
 Each site declares its class where it defines its derivative (`dew.nn.derivatives`: `declared_derivative` or
 `declared_tangent` with its kind, or `surrogate`; §6.10), so the class is read from the site, never inferred. A
 bare custom derivative in `src/dew` is to fail a slop check, not take a default. Each declaring function wraps
-`jax.custom_vjp` or `jax.custom_jvp` and returns the derivative as one marked call of its kind, its primal,
-forward and backward one span (`dew.nn.derivatives.bound_span`: its arrays the operands, its other arguments
-and its `nondiff_argnums` bound in), so the check (SLOP026, row 4012) refuses `jax.custom_vjp` and
+`jax.custom_vjp` or `jax.custom_jvp` around its primal and its rules, each one marked call of its kind
+(`dew.nn.derivatives.bound_span`: its arrays the operands, its other arguments and its `nondiff_argnums` bound
+in), the custom rule outermost, so a differentiated call traces its rules alone, each where it runs, and the
+check (SLOP026, row 4012) refuses `jax.custom_vjp` and
 `jax.custom_jvp` anywhere in `src/dew` but `dew/nn/derivatives.py` (a reference to JAX's `custom_vjp_call_p` is
 no application). Rows 4026 to 4030 declare each lane's sites; the check lands after them. Until a site is
 declared, its custom call's bodies are rewritten as any glue is (§6.2), reorderings over its values held by
@@ -550,7 +551,7 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   every node it prices, and the chosen DAG is extracted by egglog with every chosen node free. Over the
   algebra's and the templates' test derivations it priced no template's form below greedy's and took twice its
   time, so greedy stays the default. The test suite holds each derivation's greedy choice to the exact optimum
-  (`dew.cache.Passes.checked`); a declaration greedy prices dearer is refused there until it is extracted
+  (`dew._cache.Passes.checked`); a declaration greedy prices dearer is refused there until it is extracted
   exactly (`derive.Reduction.exact`).
 - A price states itself as levels compared in order (`extract.Linear`). Each level is the larger of its
   pieces, each a sum over the chosen nodes, and its nodes' largest peak (a span), plus what the nodes add
@@ -654,12 +655,12 @@ def rewritten(fn: Callable, *, saturation: Saturation, static_argnums=(), static
     # `dew.algebra.rewritten_program` bind `SATURATION`
 
 @dataclass(frozen=True)
-class Passes:                         # dew.cache
+class Passes:                         # dew._cache
     on: bool = True                   # the pass runs
     target: str | None = None         # the GpuTarget whose facts it prices for; None: the process's own
     checked: bool = False             # each derivation's greedy extraction held to the exact optimum
 
-ALGEBRA = jax.make_user_context(default_value=Passes())   # dew.cache, in JAX's trace context
+ALGEBRA = jax.make_user_context(default_value=Passes())   # dew._cache, in JAX's trace context
 
 @contextlib.contextmanager
 def passes(on: bool = True, target: str | None = None) -> Iterator[None]: ...   # sets ALGEBRA
@@ -884,9 +885,10 @@ def derive_scan(declaration: Scan, *, saturation: Saturation, splits_held: int =
   - `linear_scan`: a token's algebra over its state and its affine forms; the chunk's identities, compact
     WY, the state-space dual, a solve's inverse by doubling or its substitution, and a solve's linearity.
     A scan's adjoint is its forms' derivative;
-  - `error_free`: the compensated sum, the natural exponent through `two_product` and `2**k`, and an argmax
-    anchor's split identity. Under accurate numerics, extraction keeps these wherever the hand-written form's
-    error bound requires them.
+  - no `error_free` set: the accurate numerics admit only exact rewrites, so a compensated form is the
+    declaration's own numerics (`Reduction.exponential`, `rescale`: the natural exponent through
+    `two_product` and `2**k`) or the mainloop's own step over the derived parts (`Derived.step`'s `stepped`:
+    the compensated and the guarded sums, an argmax anchor's split), never a rewrite extraction chooses.
 
 ### 6.10 Marked regions and custom derivatives
 

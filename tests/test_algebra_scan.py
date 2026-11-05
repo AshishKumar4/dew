@@ -17,6 +17,7 @@ from reference_error import assert_as_exact
 
 from dew.algebra import SATURATION, cost, linear_scan, scan
 from dew.nn.kernels import generation
+from dew.nn.precision import float32_matmul
 
 TOKENS, STATE, WIDTH, CHUNK = 128, 16, 32, 32
 
@@ -292,6 +293,45 @@ def test_two_delta_rule_walks_merged_give_the_final_state(update_fn, operands, d
                     f"{update_fn.__name__} merged", seeds=16)
 
 
+@pytest.mark.parametrize(("update_fn", "operands", "draw_fn"), [
+    (gated_delta, GATED, gated_draw), (kimi_delta, KIMI, kimi_draw)], ids=["gated_delta", "kimi_delta"])
+def test_two_delta_rule_walks_merged_through_an_issuer_give_the_final_state(update_fn, operands, draw_fn):
+    """The two halves' walks of the delta rules stepped, their transfers composed from each chunk's prepared
+    transition and joined, every product a mainloop's issuer's by its role (`issue`, Dew's own products
+    here): the final state on par with the token-by-token scan's against the float64 truth (check 1), the
+    transfer held as the issuer's own value, which no operation but the issuer's reads."""
+    forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    half = TOKENS // CHUNK // 2
+    roles = set()
+
+    class Held:
+        """A transfer as a mainloop's issuer holds it (its own tiles), which only the issuer reads."""
+
+        def __init__(self, value):
+            self.value = value
+
+    def issue(role, left, right):
+        roles.add(role)
+        left, right = (x.value if isinstance(x, Held) else x for x in (left, right))
+        made = right * left[None, :] if role == "transfer_decay" else float32_matmul(left, right)
+        return Held(made) if role in ("transfer_compose", "transfer_decay") else made
+
+    def merged(q, k, v, g, beta):
+        values = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
+        states = []
+        for chunks in (range(half), range(half, 2 * half)):
+            state = forms.init(chunk_of(values, 0, operands))
+            for index in chunks:
+                state = forms.step(state, forms.prepare(chunk_of(values, index, operands), issue), issue)
+            states.append(state)
+        return forms.finish(forms.merge(*states, values, issue), values)
+
+    assert_as_exact(jax.jit(merged), jax.jit(lambda *xs: gated_tokenwise(update_fn)(*xs)[1]), draw_fn,
+                    f"{update_fn.__name__} merged through an issuer", seeds=16)
+    assert {"transfer_compose", "transfer_apply"} <= roles, roles
+
+
 @pytest.mark.parametrize("target", ["sm86", "sm90"])
 def test_a_chunk_form_any_target_extracts_computes_the_token_scan(target):
     """The gated delta rule's chunks derived under an A10 (its step's latency unstated, so the token loop is
@@ -327,6 +367,30 @@ def test_a_scans_carry_derived_for_one_target_serves_no_other():
             splits.append(forms.prepare(chunk).split)
     assert splits[1] is not splits[0]
     assert splits[2] is splits[0]
+
+
+def test_a_derived_scans_products_are_its_issuers_each_by_its_role():
+    """A derived scan's chunk walked through a mainloop's issuer (`issue(role, lhs, rhs)`) at prepare, step
+    and mapped: every product of its forms is the issuer's, under the roles a chunk's form makes (its gram,
+    its inverse's doubling, its correction, write and readouts), and the walk computes what Dew's own
+    products do, bit for bit."""
+    forms = scan.derive_scan(scan.Scan(gated_delta, gated_readout, GATED, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    roles = []
+
+    def issue(role, left, right):
+        roles.append(role)
+        return float32_matmul(left, right)
+
+    chunk = chunk_of(dict(zip(GATED, gated_draw(0), strict=True)), 0, GATED)
+    state = forms.init(())
+    plain = forms.prepare(chunk)
+    expected = forms.mapped(plain, state), forms.step(state, plain)
+    issued = forms.prepare(chunk, issue)
+    made = forms.mapped(issued, state, issue), forms.step(state, issued, issue)
+    np.testing.assert_array_equal(np.asarray(made[0]), np.asarray(expected[0]))
+    np.testing.assert_array_equal(np.asarray(made[1][1]), np.asarray(expected[1][1]))
+    assert {"gram", "inverse_merge", "correct", "carry", "readout_memory"} <= set(roles), roles
 
 
 def test_a_derived_scan_holds_its_latest_splits_alone():

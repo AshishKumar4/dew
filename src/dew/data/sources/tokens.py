@@ -11,14 +11,14 @@ from pathlib import Path
 
 import numpy as np
 
+from dew._cache import dew_cache_dir
+from dew._files import write_atomically
 from dew._records import boolean, json_value, record
 from dew.batch import Batch
-from dew.cache import dew_cache_dir
 from dew.data.dataset import Ranges, Records
 from dew.data.declared import Declared
 from dew.data.pipeline import Dataset
 from dew.data.storage import Store, local
-from dew.files import write_atomically
 
 from .base import Read, ShardManifest, _indexed_manifest, url_label
 from .files import Files, export_content

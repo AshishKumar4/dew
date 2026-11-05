@@ -1206,7 +1206,7 @@ def _write(path: Path, drawn: Drawn, meta: dict[str, Any]) -> None:
     """`drawn` and `meta` in one file, written whole or not at all, every array at its own dtype."""
     import numpy as np
 
-    from dew.files import replacing
+    from dew._files import replacing
 
     arrays = {f"gradient/{name}": value for name, value in drawn.gradient.items()}
     arrays |= {f"record/{name}/{place}": value for name, examples in drawn.record.items()

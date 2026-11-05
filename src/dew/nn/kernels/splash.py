@@ -54,6 +54,7 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 )
 
 from dew.nn.attention_kernels import SPLASH_BLOCK, SPLASH_LANES
+from dew.nn.derivatives import KernelGlue, declared_derivative
 from dew.nn.kernels import generation, launches
 from dew.nn.kernels.options import program
 
@@ -1100,8 +1101,7 @@ def _dkv(
 _NONDIFF = ("blocks", "call")
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnames=_NONDIFF)
-def _attention(
+def _attending(
     fwd_mask_info: mask_info_lib.MaskInfo,
     dq_mask_info: mask_info_lib.MaskInfo,
     dkv_mask_info: mask_info_lib.MaskInfo,
@@ -1149,7 +1149,9 @@ def _attention_bwd(blocks: BlockSizes, call: _Call, residuals: tuple, do: jax.Ar
     return None, None, None, dq, dk, dv, None, dsinks
 
 
-_attention.defvjp(_attention_fwd, _attention_bwd)
+# Dew: one declared derivative of a kernel's glue (`dew.nn.derivatives`), its `blocks` and `call` static.
+_attention = declared_derivative(KernelGlue(), _attending, _attention_fwd, _attention_bwd,
+                                 nondiff_argnums=(8, 9))
 
 
 def _collapsed(mask_info: mask_info_lib.MaskInfo) -> mask_info_lib.MaskInfo:

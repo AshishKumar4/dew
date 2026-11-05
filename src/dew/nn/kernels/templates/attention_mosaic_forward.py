@@ -162,7 +162,8 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
         carried = [(rows, columns, jnp.float32)] * 2 + [(rows, 4 * GUARD_ROWS, jnp.float32)]
         logits, sums = [(rows, block, jnp.float32)] * 2, [(rows, columns, jnp.float32)] * 2
         fragments = _products(family, dtype, (rows, width, block, logits, False, True),
-                              (rows, block, columns, logits[:1] + sums, True, False), narrow=candidate.narrow)
+                              (rows, block, columns, logits[:1] + sums, True, False), narrow=candidate.narrow,
+                              lhs_swizzle=query_swizzle(family))
         # Its keys' magnitudes read from the value tile (`Family.key_magnitudes`) beside the logits, a phase
         # of their own: ptxas holds the tile's load apart from the step's sums (counted beside them as well,
         # every A100 guarded tile was refused, gate80 46 of 96 against 70; the A100's guarded launch at width

@@ -1,7 +1,7 @@
 """A shared layer under JAX's persistent compilation cache, for CI on armada and the GPU queue.
 
 Each armada task and GPU pass starts on a cold machine, so the on-disk cache conftest turns on
-(`dew.cache.enable_compilation_cache`) is always empty there, and the suite spends most of its time
+(`dew._cache.enable_compilation_cache`) is always empty there, and the suite spends most of its time
 in XLA: on the Colab A100 tier, compiling took 55% of every file's wall time. With
 DEW_XLA_CACHE_URL and DEW_XLA_CACHE_TOKEN set (.armada.json), `install` keeps each test file's
 programs in that file's bundle on the dew-xla-cache Worker (deployed from the private dew-ops
@@ -378,7 +378,7 @@ def prefix() -> str:
     (jax/_src/cache_key.py), so a release of jax alone that lowers a program differently keys it
     anew, and one that does not (a post-release of Dew's patch stack) keeps every file's programs.
     The Python minor is among them because jax 0.11.2 names 3.14's stdlib zstd codec "zlib" in its
-    key (`dew.cache.default_compilation_cache_dir`); and the host's CPU class (`HOST.cpu_class`),
+    key (`dew._cache.default_compilation_cache_dir`); and the host's CPU class (`HOST.cpu_class`),
     on every backend, as XLA:CPU compiles for the features of the host that compiles and a GPU lane's
     bundles hold CPU executables too (its host-side computations): armada's hosts span classes, and a
     program from another class need not link here, after which the process compiles nothing more."""

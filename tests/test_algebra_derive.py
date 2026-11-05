@@ -199,6 +199,36 @@ def test_a_walks_sums_added_by_its_mainloop_take_each_tiles_factor_and_sum():
                     "attention, its sums added twice", seeds=16)
 
 
+def unscaled(q, k, v, rows, keys):
+    """A walked sum of local products that takes no rescale: each key's score times its value, summed."""
+    del rows, keys
+    return (q @ k.T) @ v
+
+
+def test_a_walks_plain_sums_of_products_are_the_mainloops_to_take():
+    """A walked sum of local products that takes no rescale (a backward's dQ over its key tiles) states its
+    tile's weights and values to a mainloop that takes its step (`Derived.step`'s `stepped`, `Accumulated`,
+    no factor): accumulated twice over, the walk's sum is the declared function's doubled, on par against the
+    float64 truth (check 1)."""
+    forms = derive.derive(declared(unscaled), accurate=False, saturation=SATURATION)
+
+    def doubled(states, parts):
+        return tuple(state + 2 * (part.weights @ part.values)
+                     if isinstance(part, algebra_forms.Accumulated) and part.factor is None else None
+                     for state, part in zip(states, parts, strict=True))
+
+    def run(q, k, v):
+        values = operands(q, k, v)
+        tiles = [tile_of(values, tile) for tile in range(KEYS // TILE)]
+        state = forms.init(shaped(tiles[0]))
+        for tile in tiles:
+            state = forms.step(state, tile, stepped=doubled)
+        return forms.finish(state, values, shapes=shaped(tiles[0]))
+
+    assert_as_exact(jax.jit(run), jax.jit(lambda q, k, v: 2 * whole(unscaled)(q, k, v)), draw,
+                    "a plain sum of products, accumulated twice", seeds=16)
+
+
 def test_a_walks_merge_by_its_mainloop_takes_each_sums_two_factors():
     """A mainloop that merges two walks' sums itself (`Derived.merge`'s `merged`, a guarded walk's join of
     shifts) takes each rescaled sum's two factors (`Merged`), the maximum left to the forms: the denominator's

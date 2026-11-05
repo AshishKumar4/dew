@@ -67,6 +67,11 @@ Scope is per rule, because the rules are not all about the same thing:
   takes the options its models and the run's seam hold, admits its
   communicators and takes the algebra pass, and a trace that compiles nothing
   traces (`jax.make_jaxpr`, `jax.eval_shape`).
+- SLOP026 is about `src/<package>`: no module applies `jax.custom_vjp` or
+  `jax.custom_jvp`, by any name it is imported as, but `nn/derivatives.py`,
+  whose functions declare a custom derivative of its kind, its primal and
+  rules each a marked call the algebra pass reads (docs/design/algebra.md
+  §6.10).
 - SLOP027 is about `src/<package>`: no kernel is launched by Pallas's own
   `pallas_call` or Mosaic GPU's `kernel`, by any name it is imported as, but the
   launch point's (`nn/kernels/launches.py`), which holds each launch to the
@@ -635,7 +640,7 @@ def _patched(node: ast.Call, table: dict[str, str]) -> str:
 
 def _seam(target: str) -> bool:
     """Does `target` leave the process: does it hold one of `SEAMS` as whole parts
-    between its dots and underscores, so `dew.cli.tpu.time.sleep` and
+    between its dots and underscores, so `dew._cli.tpu.time.sleep` and
     `dew.interop.sources.snapshot` do and `dew.training.narrow.narrowed_paths` does not?
     A private attribute is its owner's: of a seam's owner it leaves the process as
     the owner does (`dew._coordination.os._exit`), and of a first-party object it
@@ -1507,12 +1512,12 @@ EXTERNAL = ("subprocess.", "socket.", "ssl.", "select.", "urllib.", "http.", "re
             "aiohttp.", "grpc.", "huggingface_hub.", "fsspec.", "gcsfs.", "google.", "boto3.", "botocore.",
             "filelock.", "multiprocessing.", "concurrent.futures.ProcessPoolExecutor.", "os.kill.",
             "os.killpg.", "os.waitpid.", "os.waitid.", "os.fork.", "os.posix_spawn.", "jax.distributed.",
-            "dew.cleanup.signal_group.", "dew.cleanup.exit_code.", "dew.cleanup.groups_ended.",
-            "dew.cleanup.end_group.", "dew.cleanup.process_group.",
+            "dew._cleanup.signal_group.", "dew._cleanup.exit_code.", "dew._cleanup.groups_ended.",
+            "dew._cleanup.end_group.", "dew._cleanup.process_group.",
             "IPython.display.display.", "IPython.display.update_display.", "IPython.display.clear_output.")
 """What leaves the process: a subprocess, the network, a remote service, another process (a
 notebook's frontend, which IPython's display functions publish to over the kernel's socket; its
-representations, such as `HTML`, are built in the process; a process group `dew.cleanup` signals)."""
+representations, such as `HTML`, are built in the process; a process group `dew._cleanup` signals)."""
 
 
 WAITS = {"wait", "wait_for", "join", "get", "put", "acquire"}
@@ -1997,6 +2002,31 @@ def pallas_launches(module: Module) -> Iterator[Finding]:
                           f"`dew.nn.kernels.launches.{launch}`, which holds the launch per shard")
 
 
+DERIVATIVE_OWNER = "nn/derivatives.py"
+"""The module of `src/<package>` that applies JAX's custom derivatives (SLOP026); every other declares one
+through its functions (`declared_derivative`, `declared_tangent`, each with its kind, and `surrogate`), each
+one marked call of its kind."""
+
+CUSTOM_DERIVATIVES = frozenset({"jax.custom_vjp", "jax.custom_jvp", "jax.custom_derivatives.custom_vjp",
+                                "jax.custom_derivatives.custom_jvp"})
+"""JAX's custom derivatives, by their public paths, which SLOP026 reports outside `DERIVATIVE_OWNER`."""
+
+
+def custom_derivatives(module: Module) -> Iterator[Finding]:
+    """SLOP026: a custom derivative of JAX's (`CUSTOM_DERIVATIVES`), its name read through the imports of its
+    scope, anywhere in `src/<package>` but `DERIVATIVE_OWNER`: applied by a site, its derivative is a call
+    the algebra pass cannot tell a kernel's glue from a rule its numerics need as written."""
+    prefix = f"src/{module.package}/"
+    if not module.relative.startswith(prefix) or module.relative.removeprefix(prefix) == DERIVATIVE_OWNER:
+        return
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
+        named = isinstance(node, (ast.Name, ast.Attribute)) and scopes.resolved(node, table)
+        if named in CUSTOM_DERIVATIVES:
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP026",
+                          f"applies {named} itself; declare it with its kind through `dew.nn.derivatives` "
+                          "(`declared_derivative`, `declared_tangent` or `surrogate`)")
+
+
 GATE = frozenset({"tests/reference_error.py", "tests/check1_statistics.py", "tests/op_certificates.py",
                   "tests/certified.py",
                   "tests/reference_graph.py", "tests/reference_trees.py", "tests/residual_orders.py",
@@ -2282,7 +2312,7 @@ def tolerances(module: Module) -> Iterator[Finding]:
 
 
 CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections, compile_points,
-                  pallas_launches)
+                  pallas_launches, custom_derivatives)
 UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private)
 
 

@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Protocol, TextIO
 import jax
 import numpy as np
 
+from dew._cleanup import attempted
 from dew._records import integer, record
 from dew.artifacts import (
     Artifact,
@@ -40,7 +41,6 @@ from dew.artifacts import (
     VideoGrid,
     uint8_pixels,
 )
-from dew.cleanup import attempted
 from dew.telemetry.records import RECORD_TYPES, FitEnded, Record, RunRecord, reported_number, tracker_json
 
 if TYPE_CHECKING:

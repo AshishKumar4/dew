@@ -10,7 +10,7 @@ from pathlib import Path, PurePosixPath
 
 import numpy as np
 
-from dew.cache import HubAnswer, hub_answer, hub_commit, recorded_hub_answer
+from dew._cache import HubAnswer, hub_answer, hub_commit, recorded_hub_answer
 from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
 
@@ -106,7 +106,7 @@ class Hub(Dataset):
 
     @cached_property
     def commit(self) -> str:
-        """The commit `revision` names, the default branch's where None (`dew.cache.hub_commit`):
+        """The commit `revision` names, the default branch's where None (`dew._cache.hub_commit`):
         online the Hub's answer, recorded; offline (`HF_HUB_OFFLINE`) the cache's ref, else the
         answer recorded online."""
         return self._pinned.value
@@ -219,7 +219,7 @@ class Hub(Dataset):
                format: Format) -> Mapping[str, Mapping[str, object]]:
         """Each shard's size, and the sha256 of its content where the Hub states one (an LFS
         file's), else its git blob id, at `revision`, as the Hub last answered
-        (`dew.cache.hub_answer`), and so of each JSON lines shard's offset index the commit holds.
+        (`dew._cache.hub_answer`), and so of each JSON lines shard's offset index the commit holds.
         `Files` takes them as the files' own facts, so they keep their identity offline."""
         from huggingface_hub import HfFileSystem
 
@@ -241,7 +241,7 @@ class Hub(Dataset):
                 for url in (*urls, *indexes)}
 
     def _listed(self, revision: str) -> list[str]:
-        """Every file of the repo at `revision`, as the Hub last answered (`dew.cache.hub_answer`),
+        """Every file of the repo at `revision`, as the Hub last answered (`dew._cache.hub_answer`),
         asked once per source: a commit's files never change, so its answer stands for it."""
         from huggingface_hub import HfApi
 
@@ -260,7 +260,7 @@ class Hub(Dataset):
         """The configurations the repo's card states at `revision` (its `configs`, as `datasets` reads
         them: `datasets.utils.metadata.MetadataConfigs`), each by its name with the fields that choose
         its files and its default (`data_files`, `data_dir`, `default`), as the Hub last answered
-        (`dew.cache.hub_answer`); none where the commit holds no card or its card states none."""
+        (`dew._cache.hub_answer`); none where the commit holds no card or its card states none."""
         if "README.md" not in self._listed(revision):
             return {}
 

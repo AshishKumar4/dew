@@ -7,6 +7,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- Dew's support modules are private: `dew.accuracy`, `dew.builds`, `dew.cache`, `dew.cleanup`, `dew.devices`,
+  `dew.files`, `dew.logging`, `dew.pool`, `dew.position` and `dew.cli` are now `dew._accuracy` and so on, with
+  no alias left, and the API reference no longer lists `dew.cache`. `CPUOnlyJax`, which a run raises where JAX
+  opened on the CPU of a GPU machine, is `dew.training.CPUOnlyJax`. The `dew` command is unchanged.
 - `dew.algebra.extract` adds exact DAG extraction, an integer program over the e-graph's nodes with each shared
   node priced once. egglog's greedy DAG extraction stays the default: the exact one priced no template's forms
   lower and took twice as long. A template declaration can ask for exact extraction

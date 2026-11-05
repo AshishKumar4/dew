@@ -72,6 +72,28 @@ def test_nvfp4_words_stored_in_the_forms_layout_decode_to_their_codes_in_order()
     np.testing.assert_array_equal(got, expected)
 
 
+def test_an_nvfp4_tile_decodes_to_its_codes_times_their_block_scales():
+    """An NVFP4 tile (`nvfp4_decoded`): every code in every place of a word, under E4M3 block scales from the
+    least subnormal to the largest, decodes to the code times its block's scale over `NVFP4_OWED`, exactly,
+    under a jit."""
+    rng = np.random.default_rng(3621)
+    depth, columns = 64, 32
+    codes = rng.integers(0, 16, size=(depth, columns))
+    codes[:16, :16] = np.arange(16)[:, None]
+    scale_bits = rng.integers(0, 0x7F, size=(depth // 16, columns), dtype=np.uint8)
+    scale_bits[0, :3] = (0x01, 0x7E, 0x08)
+    scales = jnp.asarray(scale_bits).view(jnp.float8_e4m3fn)
+    packed = codes.reshape(depth // 8, 8, columns).astype(np.uint64) << (
+        4 * np.arange(8, dtype=np.uint64))[None, :, None]
+    natural = jnp.asarray(packed.sum(axis=1).astype(np.uint32))
+    stored = bits.NVFP4_BFLOAT16_FORM.prepared(natural)
+    decoded = jax.jit(bits.nvfp4_decoded)(stored, scales)
+    values = np.where(codes >= 8, -1.0, 1.0) * np.asarray(E2M1)[codes & 7]
+    block = np.repeat(np.asarray(scales.astype(jnp.float32), np.float64), 16, axis=0)
+    np.testing.assert_array_equal(np.asarray(decoded.astype(jnp.float32), np.float64) * bits.NVFP4_OWED,
+                                  values * block)
+
+
 def test_an_fp8_decode_reads_back_every_finite_code_in_every_place():
     """Four E4M3 codes of a 32-bit word decoded into two registers of two float16s (sm80's FP8, which its
     tensor cores do not multiply), code `2i` the low half of register `i` and `2i + 1` the high, its layout

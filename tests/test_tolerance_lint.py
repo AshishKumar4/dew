@@ -14,7 +14,7 @@ COMPARISONS = {
     "math's isclose by its default": ("import math as m\nassert m.isclose(a, b)", 1),
     "torch's assert_close": ("import torch\ntorch.testing.assert_close(a, b)", 1),
     "unittest's assertAlmostEqual": ("self.assertAlmostEqual(a, b)", 1),
-    "dew.accuracy's within, qualified": ("import dew.accuracy\nassert dew.accuracy.within(e, b)", 1),
+    "dew._accuracy's within, qualified": ("import dew._accuracy\nassert dew._accuracy.within(e, b)", 1),
     "a wrapper given a tolerance": ("close(a, b, atol=1e-6)", 1),
     "a hand-written tolerance": ("import numpy as np\nassert np.max(np.abs(a - b)) <= 1e-6", 1),
     "an error bound to a name first": ("import numpy as np\ngap = np.abs(a - b)\nworst = gap.max()\n"

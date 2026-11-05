@@ -17,8 +17,8 @@ import shutil
 import sys
 from collections.abc import Callable, Mapping, Sequence
 
-from dew.builds import CUDA_BUILDS, PACKAGE_INDEX, QUERY, listed_gpus, newest_build, runs_on
-from dew.pool import answered, cuda_driver, runs_on_gpu
+from dew._builds import CUDA_BUILDS, PACKAGE_INDEX, QUERY, listed_gpus, newest_build, runs_on
+from dew._pool import answered, cuda_driver, runs_on_gpu
 
 _log = logging.getLogger(__name__)
 _late_policy_warned = False
@@ -277,7 +277,7 @@ def cuda_plugin() -> bool:
 
 def nvidia_gpus() -> tuple[str, tuple[int, int]] | None:
     """The driver version and the least SM of the GPUs nvidia-smi lists, or
-    None where none answers (`dew.pool.answered`, `listed_gpus`)."""
+    None where none answers (`dew._pool.answered`, `listed_gpus`)."""
     if shutil.which("nvidia-smi") is None:
         return None
     return listed_gpus(answered(QUERY, 10))
@@ -302,7 +302,7 @@ kHz, the device memory bus's width in bits, and the L2 cache's size in bytes."""
 
 
 def device_handle(ordinal: int) -> tuple[ctypes.CDLL, ctypes.c_int] | None:
-    """The CUDA driver (`dew.pool.cuda_driver`) started, and its handle of the visible GPU `ordinal`: the one
+    """The CUDA driver (`dew._pool.cuda_driver`) started, and its handle of the visible GPU `ordinal`: the one
     way every driver read here reaches a device. None where no driver library loads (a CPU host); a driver
     error raises."""
     cuda = cuda_driver()
@@ -397,7 +397,7 @@ def deterministic_ops_requested() -> bool:
     turns XLA's kernel measurements off, so every compilation picks the same
     kernels (docs/guides/checkpoints.md). Kernel selection reads this flag:
     `dew.nn.attention` keeps cudnn's fused attention away from a run that set
-    it, and `dew.cache.enable_compilation_cache` gives it no stored picks.
+    it, and `dew._cache.enable_compilation_cache` gives it no stored picks.
     """
     return (xla_flag('xla_gpu_deterministic_ops') or '').lower() in ('true', '1')
 
