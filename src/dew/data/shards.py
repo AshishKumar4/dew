@@ -196,18 +196,15 @@ class _Sequential(grain.IterDataset):
 
 class _SequentialIterator(grain.DatasetIterator):
     """`_Sequential`'s reads: the place it reads (`place`) and its rows' position there, None before it
-    opens; a position an earlier Dew saved, its interleave's of one place at a time, read on by that
-    interleave (`earlier`)."""
+    opens; a position an earlier Dew saved, its interleave's of one place at a time, read as the place it
+    read and its rows' position there (`_sequential_position`)."""
 
     def __init__(self, places: grain.MapDataset, reader: Callable[..., grain.IterDataset], loading: Loading):
         super().__init__()
         self.places, self.reader, self.loading = places, reader, loading
         self.place, self.rows = 0, None
-        self.earlier: grain.DatasetIterator | None = None
 
     def __next__(self):
-        if self.earlier is not None:
-            return next(self.earlier)
         while self.place < len(self.places):
             if self.rows is None:
                 self.rows = iter(self.reader(self.places[self.place]))
@@ -219,30 +216,38 @@ class _SequentialIterator(grain.DatasetIterator):
         raise StopIteration
 
     def get_state(self) -> Mapping[str, object]:
-        if self.earlier is not None:
-            return self.earlier.get_state()
         return {"place": self.place, "rows": None if self.rows is None else self.rows.get_state()}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         self.close()
-        if "place" not in state:
-            # A position an earlier Dew saved, its interleave's of one place at a time, handed back to that
-            # interleave as it is: the one translation of it (CONTRIBUTING's), deleted at 1.0.
-            self.earlier = interleaved(self.places, self.reader, 1, self.loading).__iter__()
-            self.earlier.set_state(state)
-            return
-        self.place = integer(state["place"], "sequential shard pass's place")
-        rows = state["rows"]
+        position = _sequential_position(state)
+        self.place = integer(position["place"], "sequential shard pass's place")
+        rows = position["rows"]
         if rows is not None:
             self.rows = iter(self.reader(self.places[self.place]))
             self.rows.set_state(record(rows, "sequential shard pass's rows"))
 
     def close(self) -> None:
-        if self.earlier is not None:
-            self.earlier.close()
         if self.rows is not None:
             self.rows.close()
-        self.earlier, self.rows = None, None
+        self.rows = None
+
+
+def _sequential_position(state: Mapping[str, object]) -> Mapping[str, object]:
+    """`state`, a sequential pass's position (`_SequentialIterator`), or one an earlier Dew saved of the
+    same rows in the same order, Grain's interleave of one place at a time, read as the sequential one: the
+    place its iterator in use read and that iterator's position there (each place read by the same reader,
+    so its rows' position is the one the sequential reader keeps), or, its iterator exhausted or none open,
+    the next place it opens from its start. The one translation of it, at the restore, the run reading on
+    by the sequential reader (row 4079); deleted at 1.0."""
+    if "place" in state:
+        return state
+    (index,) = state["iterators_in_use_indices"]
+    (rows,) = state["iterators_in_use_states"]
+    (exhausted,) = state["exhausted"]
+    if rows is None or exhausted:
+        return {"place": state["next_index_in_datasets"], "rows": None}
+    return {"place": index, "rows": rows}
 
 
 NOTHING: Mapping[str, object] = {"rows": None}
