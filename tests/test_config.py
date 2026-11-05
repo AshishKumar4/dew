@@ -109,7 +109,8 @@ def test_a_run_trained_on_a_compiled_loader_records_the_version_the_loader_reads
     import numpy as np
     from affine_run import FEATURES
 
-    from dew.data import Memory, compile
+    from dew.data import Memory
+    from dew.data.compile import compile
     from dew.data.plan import PLAN_VERSIONS
 
     rows = np.random.default_rng(0).normal(size=(16, FEATURES)).astype(np.float32)
