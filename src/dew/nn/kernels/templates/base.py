@@ -34,8 +34,8 @@ def _derived_once(derive: Callable) -> Callable:
     s of a Qwen3.5-4B step's compile_ahead)."""
     @functools.wraps(derive)
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget):
-        key = (derive, report.derivation_inputs(self, ba, target), _cache.NUMERICS.value, _cache.ALGEBRA.value,
-               _cache.DERIVED.value, _cache.KERNEL_CHOICES.value)
+        key = (derive, report.derivation_inputs(self, ba, target), _cache.NUMERICS.value,
+               _cache.ALGEBRA.value, _cache.DERIVED.value, _cache.KERNEL_CHOICES.value)
         with _DERIVED_GUARD:
             if key in _DERIVED:
                 return _DERIVED[key]
