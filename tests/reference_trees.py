@@ -21,13 +21,14 @@ classes takes its members' trees from `assignments`. Zeros padding a sum to whol
 add exactly.
 """
 
+import dataclasses
 import itertools
 from collections.abc import Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.extend.core import ClosedJaxpr, Literal
+from float64_terms import evaluated_on, walked
 
 
 def _pairwise(x):
@@ -123,79 +124,44 @@ def evaluated(function, tree: str):
     and ran out of memory in its log-softmax)."""
     def run(*args):
         closed, shapes = jax.make_jaxpr(function, return_shape=True)(*args)
-        found = _evaluate(closed.jaxpr, closed.consts, jax.tree.leaves(args), tree)
+        leaves = jax.tree.leaves(args)
+        with evaluated_on(leaves):
+            found = walked(closed.jaxpr, closed.consts, leaves, Summed(tree))
         return jax.tree.unflatten(jax.tree.structure(shapes), found)
 
     return run
 
 
-def _evaluate(jaxpr, consts, args, tree):
-    """`jaxpr` on `consts` and `args` under `tree`, its outputs."""
-    env = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, args, strict=True))
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class Summed:
+    """The walk's rule of a reference under a summation tree (`float64_terms.Rule`, `evaluated`): each
+    `dot_general` a `tree_contract` and each `reduce_sum` a `tree_sum` under `tree`, a primitive of an order
+    the tree does not set refused (`ORDERED`), every other one as it is."""
 
-    def read(var):
-        return var.val if isinstance(var, Literal) else env[var]
+    tree: str = dataclasses.field(metadata={"static": True})
 
-    for equation in jaxpr.eqns:
-        found = _apply(equation, [read(var) for var in equation.invars], tree)
-        env.update(zip(equation.outvars, found if equation.primitive.multiple_results else [found],
-                       strict=True))
-    return [read(var) for var in jaxpr.outvars]
+    def at(self, index: int) -> "Summed":
+        return self
 
-
-def _closed(closed, values, tree):
-    """A closed jaxpr's outputs on `values` under `tree`."""
-    return _evaluate(closed.jaxpr, closed.consts, list(values), tree)
-
-
-def _apply(equation, values, tree):
-    """One equation under `tree`: a reduction as the tree sums it, a jaxpr-holding one evaluated
-    within, any other bound as it is."""
-    name, params = equation.primitive.name, equation.params
-    # Integers and booleans sum exactly in any order: a position's cumulative count binds as it is.
-    exact = not any(jnp.issubdtype(value.dtype, jnp.inexact) for value in values if hasattr(value, "dtype"))
-    if name in ORDERED and not exact:
-        raise NotImplementedError(f"{name} sums or calls in an order the tree does not set; evaluate a "
-                                  "reference without it (an XLA attention, no fused kernel)")
-    if exact and name in (*ORDERED, "dot_general", "reduce_sum"):
-        return equation.primitive.bind(*values, **params)
-    if name == "dot_general":
-        return _contract(*values, params["dimension_numbers"], params.get("preferred_element_type"), tree)
-    if name == "reduce_sum":
-        (operand,), axes = values, tuple(params["axes"])
-        kept = [axis for axis in range(operand.ndim) if axis not in axes]
-        moved = jnp.transpose(operand, (*kept, *axes))
-        flat = moved.reshape(*moved.shape[:len(kept)], -1)
-        return tree_sum(flat, -1, tree)
-    if name in ("pjit", "jit", "closed_call", "core_call", "remat", "checkpoint", "custom_jvp_call",
-                "custom_vjp_call", "custom_vjp_call_jaxpr", "custom_lin"):
-        held = next(params[key] for key in ("jaxpr", "call_jaxpr", "fun_jaxpr") if key in params)
-        if not hasattr(held, "consts"):
-            held = ClosedJaxpr(held, ())
-        return _closed(held, values, tree)
-    if name == "scan":
-        consts, carry, xs = (list(part) for part in params["ft_in"].update(values).unpack())
-
-        def step(carried, sliced):
-            found = _closed(params["jaxpr"], (*consts, *carried, *sliced), tree)
-            return tuple(list(part) for part in params["ft_out"].update(found).unpack())
-
-        carried, ys = jax.lax.scan(step, carry, xs, length=params["length"], reverse=params["reverse"])
-        return [*carried, *ys]
-    if name == "while":
-        cond, body = params["cond_jaxpr"], params["body_jaxpr"]
-        cond_consts = values[:params["cond_nconsts"]]
-        body_consts = values[params["cond_nconsts"]:params["cond_nconsts"] + params["body_nconsts"]]
-        init = values[params["cond_nconsts"] + params["body_nconsts"]:]
-        return jax.lax.while_loop(lambda carried: _closed(cond, (*cond_consts, *carried), tree)[0],
-                                  lambda carried: _closed(body, (*body_consts, *carried), tree),
-                                  list(init))
-    if name == "cond":
-        index, *operands = values
-        branches = [lambda *ops, branch=branch: _closed(branch, ops, tree)
-                    for branch in params["branches"]]
-        return jax.lax.switch(index, branches, *operands)
-    return equation.primitive.bind(*values, **params)
+    def primitive(self, equation, values: list) -> list:
+        name, params = equation.primitive.name, equation.params
+        # Integers and booleans sum exactly in any order: a position's cumulative count binds as it is.
+        exact = not any(jnp.issubdtype(value.dtype, jnp.inexact)
+                        for value in values if hasattr(value, "dtype"))
+        if name in ORDERED and not exact:
+            raise NotImplementedError(f"{name} sums or calls in an order the tree does not set; evaluate a "
+                                      "reference without it (an XLA attention, no fused kernel)")
+        if not exact and name == "dot_general":
+            return [_contract(*values, params["dimension_numbers"], params.get("preferred_element_type"),
+                              self.tree)]
+        if not exact and name == "reduce_sum":
+            (operand,), axes = values, tuple(params["axes"])
+            kept = [axis for axis in range(operand.ndim) if axis not in axes]
+            moved = jnp.transpose(operand, (*kept, *axes))
+            return [tree_sum(moved.reshape(*moved.shape[:len(kept)], -1), -1, self.tree)]
+        found = equation.primitive.bind(*values, **equation.primitive.get_bind_params(params))
+        return list(found) if equation.primitive.multiple_results else [found]
 
 
 def _contract(lhs, rhs, dimension_numbers, preferred, tree):

@@ -226,6 +226,17 @@ class Rule(Protocol):
     def primitive(self, equation, inputs: list) -> list: ...
 
 
+def walked(jaxpr, consts, args, rule: Rule, *, compiling: bool = False) -> list:
+    """`jaxpr`'s outputs on `consts` and `args`, each primitive evaluated by `rule` (`Rule`) and the walk's
+    structure the gate's one: a call's body (`dew.nn.programs.called`), a scan, a loop, a branch and a
+    shard_map walked inside, only the equations its outputs read, a static run compiled where `compiling`
+    (`_evaluated`). Every program evaluator of the gate walks here: float64's replay
+    (tests/float64_replay.py), a reference under a summation tree (tests/reference_trees.py), a tapped
+    evaluation (tests/rounding_bound.py). Within `evaluated_on`, whose device a branch its platform picks
+    reads."""
+    return _evaluated(jaxpr, consts, args, compiling=compiling, rule=rule)[0]
+
+
 def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False, rule=None):
     """`jaxpr`'s outputs and their terms' energies, the sums of their squares
     (`float64_terms`), from `args` and the energies `given` for them (none for
@@ -240,7 +251,7 @@ def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False, rule=No
     passed in as its values are (`_span`)."""
     from jax.extend.core import Literal
 
-    wanted, last, runs = _layout(jaxpr)
+    wanted, last, runs, live = _layout(jaxpr)
     values, energies = {}, {}
     for var, value, energy in zip(jaxpr.constvars + jaxpr.invars, [*consts, *args],
                                   [None] * len(consts) + list(given or [None] * len(args)), strict=True):
@@ -254,6 +265,9 @@ def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False, rule=No
 
     spans = runs if compiling else [(index, index + 1) for index in range(len(jaxpr.eqns))]
     for start, stop in spans:
+        if not any(live[start:stop]):
+            # Read by no output: an initializer's forward pass, whose outputs its init drops.
+            continue
         run = jaxpr.eqns[start:stop]
         if stop - start > 1:
             # A static run of the walk's steps, compiled once (`_span`), the values it reads in.
@@ -285,7 +299,8 @@ every draw, its bodies' too."""
 def _layout(jaxpr):
     """What the walk reads of `jaxpr`'s structure alone, once a jaxpr: the variables whose terms reach an
     output (`_carrying`), the step that reads each variable last, after which it goes as an execution
-    frees it (a chunked scan's float64 intermediates would otherwise all stay), and its spans (`_runs`)."""
+    frees it (a chunked scan's float64 intermediates would otherwise all stay), its spans (`_runs`), and
+    whether each equation's outputs reach an output (`_live`)."""
     from jax.extend.core import Literal
 
     if jaxpr not in LAYOUTS:
@@ -294,8 +309,22 @@ def _layout(jaxpr):
         for var in jaxpr.outvars:
             if not isinstance(var, Literal):
                 last.pop(var, None)
-        LAYOUTS[jaxpr] = (_carrying(jaxpr), last, _runs(jaxpr))
+        LAYOUTS[jaxpr] = (_carrying(jaxpr), last, _runs(jaxpr), _live(jaxpr))
     return LAYOUTS[jaxpr]
+
+
+def _live(jaxpr) -> list[bool]:
+    """Whether each equation of `jaxpr` makes a value an output reads, directly or through later equations."""
+    from jax.extend.core import Var
+
+    read = {var for var in jaxpr.outvars if isinstance(var, Var)}
+    live = [False] * len(jaxpr.eqns)
+    for index in reversed(range(len(jaxpr.eqns))):
+        equation = jaxpr.eqns[index]
+        if any(var in read for var in equation.outvars):
+            live[index] = True
+            read.update(var for var in equation.invars if isinstance(var, Var))
+    return live
 
 
 def _static_equation(equation, picked: frozenset = frozenset()) -> bool:
@@ -342,7 +371,7 @@ def _span(jaxpr, start: int, stop: int):
 
     key = (jaxpr, start, stop, _target())
     if key not in RUNS:
-        wanted, last, _ = _layout(jaxpr)
+        wanted, last, _, _ = _layout(jaxpr)
         run = jaxpr.eqns[start:stop]
         # A platform's index the run reads is read again inside it (`_platform`), never passed in: the
         # branch it picks is then one static step of the compiled run.
@@ -436,6 +465,10 @@ def _applied(equation, inputs, given, wanted: bool, compiling: bool = False, rul
     walked = wanted or rule is not None
     if walked and body is not None:
         return _evaluated(*body, inputs, given, compiling, rule)
+    if rule is not None and name in ("scan", "while", "cond") and _traced_values(inputs):
+        # Traced, its values pick no branch and bound no Python loop: the primitive itself over walked bodies.
+        outputs = _bound_walk(name, params, inputs, rule)
+        return outputs, [None] * len(outputs)
     if walked and name == "scan":
         return _scanned(params, inputs, given, compiling, rule)
     if walked and name == "while":
@@ -512,6 +545,51 @@ def scanned_steps(params, inputs: list[tuple], body, lanes: int) -> list[tuple]:
     return [*carry, *(tuple(None if any(entry is None for entry in lane) else jnp.stack(lane)
                             for lane in zip(*column, strict=True))
                       for column in zip(*ys, strict=True))]
+
+
+def _traced_values(values) -> bool:
+    """Whether any of `values` is a tracer: a walk inside a trace (a compiled span, a jit of the walk)."""
+    return any(isinstance(value, jax.core.Tracer) for value in values)
+
+
+def _bound_walk(name: str, params, inputs: list, rule) -> list:
+    """A traced scan, while loop or branch of a rule's walk, bound as its own primitive (`jax.lax.scan`,
+    `while_loop`, `switch`) whose bodies the walk evaluates, each step's or iteration's rule its own
+    (`Rule.at`) as when it steps them concretely: a scan's at its step's index, a loop's at its iteration
+    and its test at `-1 - iteration`, a branch's the walk's own."""
+    if name == "cond":
+        index, *operands = inputs
+        branches = [lambda *values, branch=branch: walked(branch.jaxpr, branch.consts, list(values), rule)
+                    for branch in params["branches"]]
+        return list(jax.lax.switch(index, branches, *operands))
+    if name == "while":
+        condition, body = params["cond_jaxpr"], params["body_jaxpr"]
+        tested, run = params["cond_nconsts"], params["body_nconsts"]
+        condition_consts, body_consts = inputs[:tested], inputs[tested:tested + run]
+
+        def test(state):
+            iteration, carry = state
+            return walked(condition.jaxpr, condition.consts, [*condition_consts, *carry],
+                          rule.at(-1 - iteration))[0]
+
+        def step(state):
+            iteration, carry = state
+            return iteration + 1, walked(body.jaxpr, body.consts, [*body_consts, *carry], rule.at(iteration))
+
+        return list(jax.lax.while_loop(test, step, (0, list(inputs[tested + run:])))[1])
+    body, length, reverse = params["jaxpr"], params["length"], params["reverse"]
+    constants, carries = scan_groups(params, len(inputs))
+    consts = inputs[:constants]
+
+    def step(state, sliced):
+        counter, carry = state
+        index = length - 1 - counter if reverse else counter
+        outputs = walked(body.jaxpr, body.consts, [*consts, *carry, *sliced], rule.at(index))
+        return (counter + 1, outputs[:carries]), outputs[carries:]
+
+    (_, carry), ys = jax.lax.scan(step, (0, list(inputs[constants:constants + carries])),
+                                  list(inputs[constants + carries:]), length=length, reverse=reverse)
+    return [*carry, *ys]
 
 
 def _scanned(params, inputs, given, compiling: bool = False, rule=None):
