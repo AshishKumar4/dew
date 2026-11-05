@@ -745,12 +745,15 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                 walked = tile(at)
                 return live(at, arrays), walked.steps, walked.views, at
 
-            def consumer(_, at, walk, store, *, active):
-                del store
+            def issue(_, at, walk, *, active):
+                # A tile's steps store what they compute: nothing is left to finish.
                 if active:
                     tile(at).persisted(walk)
 
-            family.persist(streams["walked"], (tiles,), schedule, consumer, consumers=1, axis="programs",
+            def finish(*_, **__):
+                pass
+
+            family.persist(streams["walked"], (tiles,), schedule, issue, finish, consumers=1, axis="programs",
                            outputs=(), interpret=call.interpret)
 
         if persistent:
