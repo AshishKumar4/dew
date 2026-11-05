@@ -59,6 +59,10 @@ class DecoderState:
     """The rows whose last step crossed that change and rebuilt every cache from the history, the
     prediction depths' reseeded as a prefill seeds them (`text.decode_ops`); None where no row can
     cross."""
+    adapters: jax.Array | None = None
+    """Each row's adapter of an adapter set's model (`dew.lora.AdapterSet`), its place in the set's names,
+    -1 for the base model alone, which every forward of the row names as its call's `adapters` field
+    (`text.prefill_state`); None for a model of no set."""
 
 
 
