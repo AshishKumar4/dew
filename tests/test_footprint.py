@@ -449,6 +449,36 @@ def test_a_scatter_whose_updates_read_its_base_holds_them_apart():
     assert peak(into_view, jax.ShapeDtypeStruct((size // 256, 256), jnp.float32)) >= (10 + 1) * size * 4
 
 
+def test_a_loops_carry_summed_with_a_product_holds_no_product_beside_it():
+    """A sum of a cuBLAS product and a value of its type is the product's own, as XLA's GEMM rewriter folds
+    the sum into the GEMM as its bias (`FuseMatrixBiasAdd`, its beta 1), in a loop's body too: a tiled
+    head's weight gradient adding each tile's product to its loop's carry holds what a loop writing each
+    product into its carry holds, where the derivation held each tile's product beside the carry
+    (Qwen3.5-4B's step under 'full' at two microbatches, 2.37 GiB a tile: row 4089)."""
+    from dew.training.footprint import peak_bytes, simplified
+
+    width, vocab, tokens, tiles = 256, 4096, 512, 4
+    shapes = (jax.ShapeDtypeStruct((tiles, tokens, width), jnp.float32),
+              jax.ShapeDtypeStruct((tiles, tokens, vocab), jnp.float32))
+
+    def product(tile):
+        hidden, cotangents = tile
+        return jax.lax.dot_general(hidden, cotangents, (((0,), (0,)), ((), ())))
+
+    def summed(hidden, cotangents):
+        return jax.lax.scan(lambda carried, tile: (carried + product(tile), None),
+                            jnp.zeros((width, vocab), jnp.float32), (hidden, cotangents))[0]
+
+    def written(hidden, cotangents):
+        return jax.lax.scan(lambda carried, tile: (product(tile), None),
+                            jnp.zeros((width, vocab), jnp.float32), (hidden, cotangents))[0]
+
+    def peak(function):
+        return peak_bytes(simplified(jax.make_jaxpr(function)(*shapes).jaxpr, "gpu"), "gpu", Workspace(0, 0))
+
+    assert peak(summed) == peak(written)
+
+
 def test_a_transposed_input_returned_flat_is_a_copy():
     """A transpose of an input whose layout is fixed reorders its elements into a buffer of their own,
     which a flattening of it returned holds, where a transpose of a value the program computes is laid
