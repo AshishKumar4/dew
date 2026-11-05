@@ -803,7 +803,8 @@ UNROLLED = 256
 numbered once a step; a longer one keeps every layer whole."""
 
 
-def _keeps_sign(equation, name: str, params: Mapping, operands: Sequence, nonnegative: set[int]) -> bool:
+def _keeps_sign(equation, name: str | None, params: Mapping, operands: Sequence,
+                nonnegative: set[int]) -> bool:
     """Whether an equation `name` under `params` over `operands` makes no negative entry, its operands and
     results all real floating point (an integer's magnitude or square can overflow negative, a
     complex square is no ordering at all): a square (`x * x`, `square`, an even integer power), a
