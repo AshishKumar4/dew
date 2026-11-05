@@ -1156,23 +1156,30 @@ EARLIER_CAPTURE = ("host_tracer_level", "python_tracer_level", "activity_cap")
 
 def earlier_profile(record: Mapping[str, object]) -> Mapping[str, object]:
     """A saved run's record whose trainer's profile window states its capture's options as its own fields
-    (`EARLIER_CAPTURE`), with them its capture's, as it captured with them; and one a Dew saved while a
-    run's own window was its `profile` naming no directory (train 607 to 610's), with no window of its
-    own named, as the run's own window is its `run_profile` (row 4255). A window that states its capture
-    beside them is as it was, its fields refused by name. Carried to 1.0 (ledger 1552)."""
+    (`EARLIER_CAPTURE`), with them its capture's, as it captured with them; and one saved before a run's
+    own window was its `run_profile` (row 4255): its window naming no directory (PF01 to train 610's) as
+    its `run_profile`, its steps, warmup and capture kept, and no window at all as none of its own, as it
+    traced none. A window that states its capture beside them is as it was, its fields refused by name.
+    Carried to 1.0 (ledger 1552)."""
     fields = record.get("fields")
     trainer = fields.get("trainer") if isinstance(fields, Mapping) else None
     inner = trainer.get("fields", trainer) if isinstance(trainer, Mapping) else None
     window = inner.get("profile") if isinstance(inner, Mapping) else None
     stated = window.get("fields", window) if isinstance(window, Mapping) else None
-    if (not isinstance(fields, Mapping) or not isinstance(trainer, Mapping) or not isinstance(inner, Mapping)
-            or not isinstance(window, Mapping) or not isinstance(stated, Mapping)):
+    if not isinstance(fields, Mapping) or not isinstance(trainer, Mapping) or not isinstance(inner, Mapping):
         return record
-    if "directory" in stated and stated["directory"] is None:
-        inner = {**inner, "profile": None}
+    if "run_profile" not in inner and "profile" in inner and (
+            window is None or (isinstance(stated, Mapping) and stated.get("directory", "") is None)):
+        # Saved before a run's own window was its `run_profile`: no window traced none, and a window
+        # naming no directory was the run's own, its steps, warmup and capture its own's (its reports
+        # none, a run's own window's trace and manifest alone).
+        own = None if window is None else {name: stated[name] for name in ("steps", "warmup", "capture")
+                                           if name in stated}
+        inner = {**inner, "profile": None, "run_profile": own}
         trainer = {**trainer, "fields": inner} if "fields" in trainer else inner
         return {**record, "fields": {**fields, "trainer": trainer}}
-    if "capture" in stated or not set(EARLIER_CAPTURE) & set(stated):
+    if (not isinstance(window, Mapping) or not isinstance(stated, Mapping) or "capture" in stated
+            or not set(EARLIER_CAPTURE) & set(stated)):
         return record
     capture = {name: stated[name] for name in EARLIER_CAPTURE if name in stated}
     stated = {**{name: value for name, value in stated.items() if name not in EARLIER_CAPTURE},

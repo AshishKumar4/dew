@@ -90,10 +90,12 @@ class RunProfile:
 
     steps: int = 2
     warmup: int = 10
+    capture: telemetry_profile.CaptureOptions = dataclasses.field(
+        default_factory=telemetry_profile.CaptureOptions)
 
     def window(self, directory: str) -> ProfileWindow:
         """This window as a trainer traces it, into `directory`."""
-        return ProfileWindow(directory, self.steps, warmup=self.warmup, reports=False)
+        return ProfileWindow(directory, self.steps, warmup=self.warmup, capture=self.capture, reports=False)
 
 
 def capturable() -> bool:
