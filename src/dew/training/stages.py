@@ -446,29 +446,36 @@ def whole_reading(optimizer: optax.GradientTransformation | None, shapes, local:
             return ["a transformation built against the layer tree, which builds over no stacked one"]
         if _schema(built) != _schema(state):
             return ["a transformation whose build reads its tree's shapes, deciding otherwise when stacked"]
+        held_leaves = len(jax.tree.leaves((layer_params, layer_state, layer_params)))
         places = jax.tree.unflatten(jax.tree.structure((layer_params, layer_state, layer_params)),
-                                    range(len(jax.tree.leaves((layer_params, layer_state, layer_params)))))
+                                    range(held_leaves))
         inputs = jax.tree.leaves((local.staged({"params": places[0]}, _row_places)["params"],
                                   local.staged(places[1], _row_places),
                                   local.staged({"params": places[2]}, _row_places)["params"]))
         refusals: list[str] = []
-        clocks = (None, jax.ShapeDtypeStruct((), jnp.float32))
-        for progress in clocks[:2 if isinstance(optimizer, optax.GradientTransformationExtraArgs) else 1]:
-            def update(gradient, opt_state, held, progress=progress):
+        # A run's progress, where it has one, an input of both programs, handed as a commit hands it.
+        clocks: list[tuple] = [()]
+        if isinstance(optimizer, optax.GradientTransformationExtraArgs):
+            clocks.append((jax.ShapeDtypeStruct((), jnp.float32),))
+        for clock in clocks:
+            def update(gradient, opt_state, held, *progress):
                 # As a commit calls it, handed no attention maxima (no QK-Clip, above).
-                return optimizer_update(optimizer, gradient, opt_state, held, progress=progress)
+                return optimizer_update(optimizer, gradient, opt_state, held,
+                                        progress=progress[0] if progress else None)
 
-            returned = jax.eval_shape(update, layer_params, layer_state, layer_params)
+            returned = jax.eval_shape(update, layer_params, layer_state, layer_params, *clock)
             made = jax.tree.unflatten(jax.tree.structure(returned), range(len(jax.tree.leaves(returned))))
             outputs = jax.tree.leaves((local.staged({"params": made[0]}, _row_places)["params"],
                                        local.staged(made[1], _row_places)))
             staged = (local.staged_shapes({"params": returned[0]})["params"],
                       local.staged_shapes(returned[1]))
-            if _schema(jax.eval_shape(update, params, state, params)) != _schema(staged):
+            if _schema(jax.eval_shape(update, params, state, params, *clock)) != _schema(staged):
                 refusals.append("an update whose results over the stack are not the stacked layers' shapes")
                 continue
-            refusals += _expressions(jax.make_jaxpr(update)(layer_params, layer_state, layer_params),
-                                     jax.make_jaxpr(update)(params, state, params), inputs, outputs)
+            # The progress, the layer program's last input, is the same input of the stacked one.
+            given = [*inputs, *range(held_leaves, held_leaves + len(clock))]
+            refusals += _expressions(jax.make_jaxpr(update)(layer_params, layer_state, layer_params, *clock),
+                                     jax.make_jaxpr(update)(params, state, params, *clock), given, outputs)
     return refusals
 
 
