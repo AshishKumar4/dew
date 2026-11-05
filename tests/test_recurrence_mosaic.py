@@ -903,7 +903,7 @@ def test_a_refusal_under_the_remat_rung_reaches_the_route():
     launch, the rung's flag resolved alike (`recurrence_chunk.recomputed_memory`); bound as kept, it judged
     another launch than the run's (row 4133)."""
     from dew.nn.kernels import recurrence_chunk
-    from dew.training._lowering import kernel_calls
+    from dew.nn.kernels.lowered import kernel_calls
 
     operands = [jnp.zeros(shape, dtype) for shape, dtype in (
         ((1, 64, 1, 64), jnp.bfloat16), ((1, 64, 1, 64), jnp.bfloat16), ((1, 64, 2, 64), jnp.bfloat16),
