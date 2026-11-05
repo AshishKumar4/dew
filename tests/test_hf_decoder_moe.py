@@ -530,8 +530,9 @@ def test_kimi_k25_reads_raw_images_through_its_releases_own_processor(tmp_path):
     load that trusts the source's code reads raw images through it (`Processor.media`), over a row of one
     image and a row of two of other sizes, as the release lays them out: each row's tokens the release's,
     each placeholder expanded to as many as the release's own count of its image's tokens
-    (`media_tokens_calculator`), and the images' patches and grids its own, in order. The model reads
-    them: its logits are finite and another image changes them."""
+    (`media_tokens_calculator`), and the images' patches and grids its own, in order. A chat over an image
+    part, under the release's own template, reads it as the call over the text the template writes does.
+    The model reads them: its logits are finite and another image changes them."""
     import json
     import shutil
 
@@ -582,6 +583,18 @@ def test_kimi_k25_reads_raw_images_through_its_releases_own_processor(tmp_path):
                                   np.concatenate(pixels).reshape(-1))
     np.testing.assert_array_equal(np.asarray(called.conditioning["image_grid_thw"]).reshape(-1, 3),
                                   np.concatenate(grids))
+
+    messages = [{"role": "user", "content": [{"type": "image", "image": images[1]},
+                                             {"type": "text", "text": "w5"}]}]
+    chatted = loaded.processor.chat(messages)
+    written = loaded.processor.reference.apply_chat_template(messages, tokenize=False,
+                                                             add_generation_prompt=True)
+    direct = loaded.processor(written, images=[images[1]])
+    np.testing.assert_array_equal(np.asarray(chatted.tokens), np.asarray(direct.tokens))
+    np.testing.assert_array_equal(np.asarray(chatted.conditioning["pixel_values"]),
+                                  np.asarray(direct.conditioning["pixel_values"]))
+    assert np.count_nonzero(np.asarray(chatted.tokens) == image_id) == \
+        release.media_processor.media_tokens_calculator({"type": "image", "image": images[1]})
 
     def logits(images):
         inputs = loaded.processor(rows, images=images)

@@ -293,14 +293,20 @@ class Processor:
         """Return the source's media fields before Dew aligns them to model rows: its processor's own,
         or, for a processor whose public call takes its media as `medias` (Kimi K2.5's release's), the
         fields that call gives as the other processors give them (`_medias_fields`)."""
-        if "medias" in inspect.signature(type(self._media_reference).__call__).parameters:
+        if self._takes_medias:
             return self._medias_fields(images, **kwargs)
         # An audio-only processor takes no images keyword at all.
         if images is None:
             return self._media_reference(**kwargs)
         return self._media_reference(images=images, **kwargs)
 
-    def _medias_fields(self, images: Media | None, **kwargs: Unpack[ProcessorCall]) -> dict[str, np.ndarray]:
+    @property
+    def _takes_medias(self) -> bool:
+        """Whether the source's processor takes its media as `medias` beside its text (`_medias_fields`)."""
+        return "medias" in inspect.signature(type(self._media_reference).__call__).parameters
+
+    def _medias_fields(self, images: Media | Sequence[object] | None,
+                       **kwargs: Unpack[ProcessorCall]) -> dict[str, np.ndarray]:
         """The fields of a processor whose public call takes `medias` and `text` (Kimi K2.5's release's
         KimiK25Processor at 4d01dfe, kimi_k25_processor.py:72-119), as Dew reads every other's: each row
         asked alone with its own images, its one placeholder an image expanded to the image's merge blocks
@@ -317,8 +323,8 @@ class Processor:
             raise ValueError(f"{type(self._media_reference).__name__} takes its media with their text")
         rows = [text] if isinstance(text, str) else list(text)
         # One image (an array, a PIL image) or a sequence of them.
-        given: list[Media] = ([] if images is None else list(images) if isinstance(images, Sequence)
-                              else [images])
+        given: list[object] = ([] if images is None else list(images) if isinstance(images, Sequence)
+                               else [images])
         per_row = len(rows) > 1 and len(given) == len(rows) and all(
             isinstance(entry, Sequence) for entry in given)
         image_id, _ = _media_token_ids(self.record)
@@ -326,7 +332,8 @@ class Processor:
         tokens, pixels, grids = [], [], []
         for index, row in enumerate(rows):
             if per_row:
-                taken = list(given[index])
+                entry = given[index]
+                taken = list(entry) if isinstance(entry, Sequence) else [entry]
             else:
                 count = int(np.count_nonzero(np.asarray(self.reference(text=row)["input_ids"]) == image_id))
                 taken, given = given[:count], given[count:]
@@ -406,6 +413,24 @@ class Processor:
                     for message in messages for content in (message.get("content"),)
                     if isinstance(content, Sequence) and not isinstance(content, str)
                     for part in content)
+        if media and self._takes_medias:
+            # Its template writes each image part's placeholder, and its call reads the images beside the
+            # text (`_medias_fields`), as its own call over the messages does (kimi_k25_processor.py:103-119).
+            text = self.reference.apply_chat_template(messages, tokenize=False,
+                                                      add_generation_prompt=add_generation_prompt,
+                                                      **template_options)
+            if not isinstance(text, str):
+                raise TypeError("the source's chat template must render text")
+            parts = [ContentPart.parse(part, "chat") for message in messages
+                     for content in (message.get("content"),)
+                     if isinstance(content, Sequence) and not isinstance(content, str) for part in content
+                     if isinstance(part, Mapping)]
+            kinds = sorted({part.type for part in parts if part.needs_processor} - {"image"})
+            if kinds:
+                raise ValueError(f"{type(self._media_reference).__name__} reads images alone from a chat, "
+                                 f"not {kinds}: hand the model its processed fields (`from_hf`)")
+            images = [part.fields["image"] for part in parts if part.type == "image"]
+            return self._from_arrays(self._medias_fields(images, text=text))
         reference = self._media_reference if media else self.reference
         values = reference.apply_chat_template(
             messages, tokenize=True, return_dict=True, return_tensors=self._media_tensors if media else "np",

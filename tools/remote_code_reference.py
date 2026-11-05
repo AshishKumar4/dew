@@ -115,10 +115,11 @@ RELEASES = {
                                                "video_processing_lfm3_vl.py"),
                      "AutoModelForImageTextToText"),
     # Kimi K2.5's processor (KimiK25Processor and its vision processor), its release's own code, whose
-    # public call takes `medias` and returns `grid_thws` (`dew.interop.processors.Processor.media`).
+    # public call takes `medias` and returns `grid_thws` (`dew.interop.processors.Processor.media`), and
+    # the chat template that writes an image part's placeholder.
     "kimi-k25-tiny": ("moonshotai/Kimi-K2.5", "4d01dfe0332d63057c186e0b262165819efb6611",
                       ("kimi_k25_processor.py", "kimi_k25_vision_processing.py", "media_utils.py",
-                       "preprocessor_config.json"), "AutoModelForCausalLM"),
+                       "preprocessor_config.json", "chat_template.jinja"), "AutoModelForCausalLM"),
 }
 LICENSES = {"lfm3-tiny": "lfm1.0", "lfm3-biased-tiny": "lfm1.0", "lfm3-vl-tiny": "lfm1.0",
             "kimi-k25-tiny": "modified-mit",
