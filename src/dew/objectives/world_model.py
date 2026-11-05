@@ -291,35 +291,52 @@ def diffusion_forcing_loss(f: Predictor, clean: jax.Array, noise: jax.Array, tau
     return ramp(tau) * jnp.sum(jnp.square(predicted - clean), tuple(range(tau.ndim, clean.ndim)))
 
 
+TOKENIZER = "tokenizer"
+"""The collection of a world model's tree holding its frozen tokenizer's weights (`WorldModelObjective`)."""
+
+
 class WorldModelObjective(Objective[Ratio]):
     """Trains `Dynamics` over a frozen tokenizer's latents of a batch's `video` (and `actions`, where
-    the model reads them) by shortcut forcing, or with `shortcut` False by diffusion forcing."""
+    the model reads them) by shortcut forcing, or with `shortcut` False by diffusion forcing. The
+    tokenizer's weights are state, under `TOKENIZER` beside the dynamics' (`held_variables`), as a
+    diffusion objective's frozen towers are: they reach the compiled step as arguments, placed and
+    checkpointed with the rest, and the optimizer never sees them."""
 
     shown: Mapping[str, Shown] = {"loss": Shown()}
+
+    # The held tree is the starting tree or the tokenizer a draw goes beside.
+    _held_parts = True
 
     def __init__(self, model: Dynamics, tokenizer: CausalTokenizer, tokenizer_variables: Variables, *,
                  shortcut: bool = True):
         self.model = model
         # A held tree enters plain: a draw's boxes (`nn.with_logical_partitioning`) are its table's.
-        self.tokenizer, self.tokenizer_variables = tokenizer, unboxed(tokenizer_variables)
+        self.tokenizer, self._tokenizer = tokenizer, unboxed(tokenizer_variables)
         self.shortcut = shortcut
 
+    def held_variables(self) -> Variables:
+        """The starting tree, or none, with the tokenizer's weights it starts from under `TOKENIZER`."""
+        return {TOKENIZER: self._tokenizer, **(self.variables or {})}
+
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
+        held = self.held_variables() if held is None else held
         frames = jnp.zeros((1, 2, self.model.latents, self.model.bottleneck))
         # A labeled model's action projection drawn with the rest, so labeled and unlabeled batches
         # read one tree.
         actions = jnp.zeros((1, 2, self.model.action_size)) if self.model.action_size else None
-        return self.model.init(key, frames, jnp.ones((1, 2)), jnp.ones((1, 2)), actions)
+        drawn = self.model.init(key, frames, jnp.ones((1, 2)), jnp.ones((1, 2)), actions)
+        return {**drawn, TOKENIZER: held[TOKENIZER]}
 
     @property
     def validation_loss_refusal(self) -> str | None:
         return None
 
-    def latents(self, video: jax.Array) -> jax.Array:
-        return jax.lax.stop_gradient(self.tokenizer.bind(self.tokenizer_variables).encode(video))
+    def latents(self, variables: Variables, video: jax.Array) -> jax.Array:
+        """`video`'s latents, each frame encoded by the tokenizer `variables` hold (`TOKENIZER`)."""
+        return jax.lax.stop_gradient(self.tokenizer.bind(variables[TOKENIZER]).encode(video))
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
-        clean = self.latents(unit_frames(batch["video"]))
+        clean = self.latents(variables, unit_frames(batch["video"]))
         actions = batch.get("actions")
         rows, frames = clean.shape[:2]
         d_min = 1.0 / self.model.k_max
@@ -330,7 +347,7 @@ class WorldModelObjective(Objective[Ratio]):
         tau, d = step.boundary("signal level", tau), step.boundary("step size", d)
         noise = step.boundary("noise", step.sample("noise", jax.random.normal, clean.shape[1:], rows=rows))
 
-        dynamics = self.model.bind(variables)
+        dynamics = self.model.bind(_dynamics(variables))
 
         def f(noisy: jax.Array, tau: jax.Array, d: jax.Array) -> jax.Array:
             return dynamics(noisy, tau, d, actions)
@@ -360,11 +377,16 @@ class WorldModelObjective(Objective[Ratio]):
                                        jnp.full((context.shape[0], 1), level)], 1)
                 d = jnp.full(tau.shape, d_model)
                 given = None if actions is None else actions[:, :sequence.shape[1]]
-                predicted = self.model.bind(variables)(sequence, tau, d, given)[:, -1]
+                predicted = self.model.bind(_dynamics(variables))(sequence, tau, d, given)[:, -1]
                 current = current + (predicted - current) / (1 - level) / steps
             produced = jnp.concatenate([produced, current[:, None]], 1)
         return produced[:, context.shape[1]:]
 
 
-__all__ = ["CausalTokenizer", "Dynamics", "TokenizerObjective", "WorldModelObjective",
+def _dynamics(variables: Variables) -> Variables:
+    """A world model's tree without its tokenizer: the dynamics model's own collections."""
+    return {name: tree for name, tree in variables.items() if name != TOKENIZER}
+
+
+__all__ = ["TOKENIZER", "CausalTokenizer", "Dynamics", "TokenizerObjective", "WorldModelObjective",
            "diffusion_forcing_loss", "ramp", "sampled_steps", "shortcut_forcing_loss", "unit_frames"]
