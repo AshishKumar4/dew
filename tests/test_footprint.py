@@ -277,17 +277,18 @@ def test_a_tied_weights_cast_twice_and_held_by_a_barrier_holds_one_cast():
     from dew.training.compiled_program import compiled
     from dew.training.footprint import deduplicated, peak_bytes
 
-    weights = jax.ShapeDtypeStruct((4096, 1024), jnp.float32)
+    # Weights read untransposed, so no layout of theirs is a product's to fold.
+    weights = jax.ShapeDtypeStruct((1024, 4096), jnp.float32)
     rows = jax.ShapeDtypeStruct((64, 1024), jnp.bfloat16)
 
     def tied(weights, rows):
         embedded = jax.lax.optimization_barrier(weights.astype(jnp.bfloat16))
         head = weights.astype(jnp.bfloat16)
-        return (rows @ embedded.T) + (rows @ head.T)
+        return (rows @ embedded) + ((2 * rows) @ head)
 
     def once(weights, rows):
         cast = jax.lax.optimization_barrier(weights.astype(jnp.bfloat16))
-        return (rows @ cast.T) + (rows @ cast.T)
+        return (rows @ cast) + ((2 * rows) @ cast)
 
     peaks = [peak_bytes(deduplicated(compiled(jax.make_jaxpr(function)(weights, rows).jaxpr, "cuda")), "gpu",
                         Workspace(0, 0)) for function in (tied, once)]
