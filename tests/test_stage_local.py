@@ -456,21 +456,27 @@ expression of a layer's, so a run of it keeps every layer whole (`whole_reading`
 @pytest.mark.mesh(devices=8)
 def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trains():
     """Over two stages, a transformation given built whose update reads each stored layer of a stacked leaf
-    from that layer alone keeps each run stage-local, its dataflow traced over the stacked leaves
-    (`whole_reading`): optax's Adam at a constant rate, its moments and its scale a number at a time
-    (rows 3995, 4015). One whose update reads a leaf whole, optax's LAMB, whose trust ratio would take one
-    ratio over both stages, and Adafactor, whose factored moments and block clip read the leaf, given built
-    or named by its import path in an `OptimConfig`, one whose build reads its tree's shapes (a decay
-    masked by rank), and M3's batched products given built (`RAW_M3`), keep every layer whole on every
-    stage, and the run's plan names what kept them whole.
-    No per-layer view of a transform whose reductions only its own code knows is exact short of each layer a
-    leaf of its own, so the run trains as `Layout(stage_local=False)` trains it, and steps."""
+    by the same expression of that layer's entries as over the stored layers keeps each run stage-local
+    (`whole_reading`): optax's Adam and SGD with momentum at a constant rate and AdamW's decay on a
+    schedule, their moments, decay and scale a number at a time (rows 3995, 4015). One whose update reads
+    a leaf whole, optax's LAMB, whose trust ratio would take one ratio over both stages, and Adafactor,
+    whose factored moments and block clip read the leaf, given built or named by its import path in an
+    `OptimConfig`, one whose build reads its tree's shapes (a decay masked by rank), and M3's batched
+    products given built (`RAW_M3`), keep every layer whole on every stage, and the run's plan names what
+    kept them whole. No per-layer view of a transform whose reductions only its own code knows is exact
+    short of each layer a leaf of its own, so the run trains as `Layout(stage_local=False)` trains it, and
+    steps."""
     model = decoder()
-    for local in (optax.adam(1e-3), optax.adam(1e-3)):
+    for local in (optax.adam(1e-3), optax.sgd(1e-3, momentum=0.9),
+                  optax.adamw(optax.cosine_decay_schedule(1e-3, 8), weight_decay=0.1)):
         assert saving(functools.partial(trainer, model, local, STAGED, 8, ema=None)) > 0
         run = trainer(model, local, STAGED, 8, ema=None)
         assert int(run.fit(stream(), steps=1, log_every=1).step) == 1
         assert "layers_whole_for" not in run.plan
+    # Two runs of unequal depth, four layers and two that share their keys and values, each output read
+    # against its own run's rows.
+    uneven = decoder(num_layers=6, kv_shared_layers=(4, 5))
+    assert saving(functools.partial(trainer, uneven, optax.adam(1e-3), STAGED, 8, ema=None)) > 0
     # A decay masked by rank decides otherwise over a stacked leaf, whose bias is rank three.
     by_rank = optax.adamw(1e-3, mask=lambda params: jax.tree.map(lambda leaf: leaf.ndim > 1, params))
     for given in (optax.lamb(1e-3), optax.adafactor(1e-3), by_rank, RAW_M3,
