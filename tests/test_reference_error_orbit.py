@@ -208,7 +208,7 @@ def test_a_worst_row_one_element_rules_takes_one_values_factor():
         ruled_chunk = _Draws(["leaf"], np.ones((4, 1)), np.ones((4, 1)),
                              np.tile([[[np.log(worst), 0.0]]], (4, 1, 1)), [[NO_ZERO_ROWS]] * 4,
                              np.ones((4, 1), bool), (width,), shares=np.tile([[[ruled, ruled]]], (4, 1, 1)))
-        unknown = _Draws(["leaf"], np.ones((4, 1)), np.ones((4, 1)), np.zeros((4, 1, 2)),
+        unknown = _Draws(["leaf"], np.ones((4, 1)), np.ones((4, 1)), np.full((4, 1, 2), -1.0),
                          [[NO_ZERO_ROWS]] * 4, np.ones((4, 1), bool), (width,))
         for joined in (unknown.joined(ruled_chunk), ruled_chunk.joined(unknown)):
             assert joined.factor(0) == ruled_chunk.factor(0) == NARROW_FACTORS[1]
