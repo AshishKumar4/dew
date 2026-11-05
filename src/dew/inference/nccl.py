@@ -372,7 +372,7 @@ class NCCLPush:
         names = [name for chunk in chunks for name in chunk]
         listing: JSON = {
             "update_info": {
-                "names": names,
+                "names": list(names),
                 "dtype_names": [str(specs[name].dtype) for name in names],
                 "shapes": [[int(size) for size in specs[name].shape] for name in names],
             }

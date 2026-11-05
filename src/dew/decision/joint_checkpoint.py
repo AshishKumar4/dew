@@ -114,8 +114,12 @@ def _name(path: tuple[str, ...]) -> str:
     return f"{_STEMS.get(tuple(module), module[0])}.{torch_leaf}"
 
 
-def _stored(path: tuple[str, ...], leaf: np.ndarray) -> np.ndarray:
-    """`leaf` with the attention heads `_shaped` holds apart joined again, as the release stores it."""
+def _stored(path: tuple[str, ...], leaf: object) -> np.ndarray | jax.Array:
+    """`leaf` with the attention heads `_shaped` holds apart joined again, as the release stores it, where it
+    is (a host array, or an array on devices, read home only as a tensor of it is read)."""
+    if not isinstance(leaf, (np.ndarray, jax.Array)):
+        raise TypeError(f"the joint head's parameter at {'/'.join(path)} is a {type(leaf).__name__}, not an "
+                        "array")
     *module, name = path
     if module and module[-1] in ("to_q", "to_k", "to_v"):
         return leaf.reshape(leaf.shape[0], -1) if name == "kernel" else leaf.reshape(-1)

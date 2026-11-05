@@ -381,8 +381,10 @@ def test_a_decision_releases_export_reads_its_readout_home_only_as_each_tensor_i
             reads.append(value.shape)
         return _coordination.read_home(value)
 
+    # Every reader of an array home through its module's name for it (`raising=False`: a release whose
+    # codec reads none so holds its tensors read before, which the counts below find).
     for module in (streaming, slot_source):
-        monkeypatch.setattr(module, "read_home", counted)
+        monkeypatch.setattr(module, "read_home", counted, raising=False)
     bundle = Pretrained.load(released(kind, tmp_path / "release"), dtype="float32", attention_impl="xla")
     exported = bundle.export()
     names = list(exported)
