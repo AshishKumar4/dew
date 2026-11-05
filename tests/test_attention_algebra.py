@@ -284,7 +284,7 @@ def test_an_extreme_fp32_backward_is_as_exact_as_the_reference(peak0, scale, key
 
     for name, run in (("triton", triton_dq), ("portable", portable_dq)):
         assert np.isfinite(np.asarray(run(*draw(0)))).all(), name
-        assert_as_exact(run, reference, draw, f"dq at fp32's edges, {name}", seeds=EDGE_SEEDS)
+        assert_as_exact(run, reference, draw, f"dq at fp32's edges, {name}", seeds=GPU_EDGE_SEEDS)
 
 
 def test_a_logit_past_the_forwards_rounded_maximum_weighs_one_in_the_backward():
@@ -664,8 +664,10 @@ def test_the_accurate_forms_rescale_is_as_exact_as_its_exponent_rounded_once(raw
                     f"the accurate form's rescale, {'raw' if raw else 'scaled'}", seeds=8, truth_fn=exact)
 
 
-EDGE_SEEDS = 32
-"""An edge case's declared check-1 seeds (`_scaled_draw`), sized by `seeds_for` paired."""
+EDGE_SEEDS = {"a small denominator": 256, "a tiny weight over a large state": 8}
+"""An edge case's declared check-1 seeds (`_scaled_draw`), sized by `seeds_for` paired on armada; a case
+the reference holds exactly (`_accurate_dq`) or a GPU runs takes `GPU_EDGE_SEEDS`."""
+GPU_EDGE_SEEDS = 32
 
 
 def _scaled_draw(query, key, value, dout):
@@ -716,7 +718,8 @@ def _accurate_dq(query, key, value, spans, hooks, dout, scale, name):
         np.testing.assert_array_equal(found, want, err_msg=name)
     else:
         for arm, run in (("triton", triton), ("portable", portable)):
-            assert_as_exact(run, reference, draw, f"{name}, {arm}", seeds=EDGE_SEEDS)
+            assert_as_exact(run, reference, draw, f"{name}, {arm}",
+                            seeds=EDGE_SEEDS.get(name, GPU_EDGE_SEEDS))
     return found, want
 
 

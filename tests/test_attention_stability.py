@@ -1176,8 +1176,8 @@ def test_decodes_default_is_finite_where_its_sums_pass_fp32s_largest(family):
                   f"decode default {family.dtype}", seeds=seeds)
 
 
-SUBNORMAL_SHARE_SEEDS = 8
-"""The subnormal share's declared check-1 seeds, sized by `seeds_for` paired."""
+SUBNORMAL_SHARE_SEEDS = {"float32": 8, "bfloat16": 16}
+"""The subnormal share's declared check-1 seeds, sized by `seeds_for` paired on armada."""
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
@@ -1229,6 +1229,6 @@ def test_a_guarded_rows_split_sums_keep_a_subnormal_share_element_wise(dtype):
         def found(*drawn, attend=attend):
             return np.asarray(attend(*drawn)[4].others[..., 1], np.float64)[..., None]
 
-        assert_as_exact(found, fp32, draw, f"{name} {dtype} subnormal share", seeds=SUBNORMAL_SHARE_SEEDS,
-                        truth_fn=exact)
+        assert_as_exact(found, fp32, draw, f"{name} {dtype} subnormal share",
+                        seeds=SUBNORMAL_SHARE_SEEDS[dtype], truth_fn=exact)
 
