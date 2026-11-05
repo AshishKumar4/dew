@@ -660,7 +660,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     # Measured peaks of 4 GiB: each file then holds 6 GiB of the 40, and four run at once. Records without
     # a key, as a run on these inputs leaves to be run again, under the last run's and these inputs'.
     # The spawner's child took its fraction, so it holds two shares: 12 GiB beside the others' 24.
-    common = ci.lane_inputs("3.12")
+    common = ci.shared("3.12")
     for name, inputs in itertools.product([*names, "tests/test_spawner.py"], (None, common)):
         at = "/" + ci.record_key("3.12", ci.row("3.12", name, ""), ci.device_class(), inputs)
         stored[at] = json.dumps({"key": None, "depends": [name], "row": {}, "reads": [], "peak": 4 * 2 ** 30,
@@ -2667,3 +2667,60 @@ def test_a_whole_runs_rows_of_a_file_with_cells_are_no_trains(ci, tmp_path, monk
     assert counts() == [2, 1, 2, 2], "a train's own groups run, each of its tests once, the cell set aside"
     armada_task(ci, monkeypatch, verdict, "on")
     assert counts() == [2, 1, 2, 2], "a train's rows serve the next"
+
+
+def lane_run_counts(ci, root: Path, names: list[str], processes: int = 1) -> list[int]:
+    """One GPU lane of `names` at `root` (`gpu_lane_at`'s machine), every row green: how many times each
+    file has run so far."""
+    out = root / "verdict.json"
+    assert ci.gpu_lane("3.12", names, out, cache="on", processes=processes, deadline=600.0) == 0
+    assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [0] * len(names)
+    return [len(lane_runs(root, Path(name).stem)) for name in names]
+
+
+def test_a_gpu_lane_is_keyed_by_the_session_it_runs_and_nothing_else_of_the_plans_code(
+        tmp_path, monkeypatch, cache_worker):
+    """A lane's file runs the command, selection and environment session.py holds, which every key covers
+    (`SHARED`), and nothing else of ci.py decides what it runs or sees: an edit to the plan, a report field or
+    a docstring reruns no recorded GPU file and puts none in the GPU tier as changed, where any edit of ci.py
+    reran the whole recorded tier (row 2596; train 330's review). An edit to session.py reruns them."""
+    ci = copied_tools(tmp_path, monkeypatch)
+    url, _, _ = cache_worker
+    names = gpu_lane_at(tmp_path, monkeypatch, url, 2)
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    assert lane_run_counts(ci, tmp_path, names) == [1, 1]
+    assert lane_run_counts(ci, tmp_path, names) == [1, 1], "the second lane reuses the first's rows"
+    plan = tmp_path / "tools/armada/ci.py"
+    plan.write_text(plan.read_text().replace('"""', '"""A note on the plan. ', 1)
+                    + "\n\ndef report_field() -> str:\n    return 'a field of the report'\n")
+    edited = load("ci", "tools/armada", tmp_path)
+    assert lane_run_counts(edited, tmp_path, names) == [1, 1], "an edit of the plan reruns no file"
+    assert not set(names) & set(edited.gpu_tier("3.12")), "and no file is in the tier as changed"
+    session = tmp_path / "tools/armada/session.py"
+    session.write_text(session.read_text().replace("GRACE = 60.0", "GRACE = 61.0"))
+    changed = load("ci", "tools/armada", tmp_path)
+    assert {name: found for name, found in changed.gpu_tier("3.12").items() if name in names} == {
+        name: ["changed"] for name in names}
+    assert lane_run_counts(changed, tmp_path, names) == [2, 2], "an edit of the session reruns them"
+
+
+def test_a_gpu_lane_keys_the_xla_and_jax_settings_its_node_gives_it(ci, tmp_path, monkeypatch, cache_worker):
+    """A lane on a CUDA node inherits the node's settings, which change what its files compute, so one file
+    green under one is no row under another on the same GPU class (row 2558); a flag that only says where
+    XLA keeps its picks changes no result, and the row is reused."""
+    url, _, _ = cache_worker
+    names = gpu_lane_at(tmp_path, monkeypatch, url, 1)
+    monkeypatch.setenv("JAX_PLATFORMS", "cuda,cpu")
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    picks = "--xla_gpu_per_fusion_autotune_cache_dir"
+    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_autotune_level=4")
+    assert lane_run_counts(ci, tmp_path, names) == [1]
+    assert lane_run_counts(ci, tmp_path, names) == [1]
+    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_autotune_level=0")
+    assert lane_run_counts(ci, tmp_path, names) == [2]
+    monkeypatch.setenv("XLA_FLAGS", f"--xla_gpu_autotune_level=0 {picks}=/node/picks")
+    assert lane_run_counts(ci, tmp_path, names) == [2]
+    monkeypatch.setenv("JAX_ENABLE_X64", "1")
+    assert lane_run_counts(ci, tmp_path, names) == [3]
