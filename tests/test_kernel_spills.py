@@ -671,9 +671,10 @@ def test_the_sass_rules_find_an_elect_waterfall_around_a_conversion():
 
 
 def test_the_compile_gate_reads_machine_code_or_fails_a_kernel_it_could_not_read():
-    """The SASS rules' disassembler comes with the compile gate (nvdisasm, the kernel-compile extra's), and a
-    kernel whose machine code went unread (no disassembler) is no kernel the gate passes: its report names
-    the machine code unread, which fails it as an unread register count does (row 4071; train 591)."""
+    """The SASS rules' disassembler comes with the compile gate (nvdisasm, the ci extra's, in every lock the
+    suite runs on), and a kernel whose machine code went unread (no disassembler) is no kernel the gate
+    passes: its report names the machine code unread, which fails it as an unread register count does (row
+    4071; train 591)."""
     import kernel_compile as kc
 
     assert report.disassembler() is not None

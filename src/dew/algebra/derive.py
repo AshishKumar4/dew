@@ -59,7 +59,7 @@ from egglog.bindings import EggSmolError
 
 from dew.algebra import cost, extract, program, rules, terms
 from dew.algebra.cost import Work
-from dew.algebra.forms import Derived, Refused, evaluated, evaluator, inlined
+from dew.algebra.forms import Accumulated, Added, Derived, Merged, Refused, evaluated, evaluator, inlined
 from dew.algebra.terms import Term
 from dew.cache import ALGEBRA
 from dew.nn.kernels import generation
@@ -85,14 +85,19 @@ class Reduction:
     exact: bool = False
     """Whether its forms are extracted exactly (`extract.cheapest`): a declaration whose greedy extraction the
     test suite's oracle finds dearer than the optimum (`dew.cache.Passes.checked`)."""
-    exponential: Callable[[jax.Array], jax.Array] | None = None
-    """The implementation of its exponential (`exponent`'s base), which its walk's every exponential of that
-    base evaluates by: a numerics choice of the declaration's (attention's accurate form's `natural_exp`, as
-    exact as the reference's on every backend), equal to the plain one in the reals; None for JAX's."""
+    exponential: Callable[..., jax.Array] | None = None
+    """The implementation of its exponential (`exponent`'s base), `exponential(x, scale=1.0)`, `exp(x scale)`
+    in the reals, which its walk's every exponential of that base evaluates by, an exponential of a
+    difference times a literal taking the literal as its `scale` (raw logits', `forms._scaled`): a numerics
+    choice of the declaration's (attention's accurate form's `natural_exp`, as exact as the reference's on
+    every backend), equal to the plain one in the reals; None for JAX's."""
     rescale: Callable[[jax.Array, jax.Array], jax.Array] | None = None
-    """The factor a carried state takes from its anchor `carried` to the walk's new one `now`, `exp(carried -
-    now)` in the reals, which the walk's rescale evaluates by where given (attention's accurate form's
-    `carried`, its exponent's rounding compensated); None for the plain exponential of the difference."""
+    """The factor a carried state takes from its anchor `carried` to the walk's new one `now`, the walk's
+    weights' exponential of their difference: `exp(carried - now)` in the reals, or `exp((carried - now) c)`
+    where the weights are `exp((x - b) c)` (raw logits, `c` the declaration's literal, which the rescale
+    carries itself: only a declaration that states its rescale walks scaled weights, `WALKING_SCALED`),
+    which the walk's rescale evaluates by where given (attention's accurate form's `carried`, its exponent's
+    rounding compensated); None for the plain exponential of the difference."""
 
 
 # The facts the derivation reads (§6.3), each registered from a parameter's own values or saturated by
@@ -223,6 +228,23 @@ def weighted(step: Term) -> Term: ...
 def summand(step: Term) -> Term: ...
 """The tile's sum a reduction's step adds to its rescaled state (`state * lift(factor) + sum`, `rescaled_by`'s
 factor): a mainloop's own addition takes it, as its accumulator takes a product's parts."""
+
+
+@function(merge=lambda old, new: old)
+def merge_factors(merge: Term) -> Term: ...
+"""The factor a merge of two rescaled sums takes its first state by (its maximum to the joined one), as the
+rule writes the merge: a mainloop's own merge takes it (`Merged`)."""
+
+
+@function(merge=lambda old, new: old)
+def merge_second(merge: Term) -> Term: ...
+"""The factor the same merge takes its second state by."""
+
+
+@function(merge=lambda old, new: old)
+def summed_terms(step: Term) -> Term: ...
+"""The tile's terms `summand` sums, before their reduction: a mainloop's addition that takes them apart (a
+guard's shift on each) reads them."""
 
 
 @function(merge=lambda old, new: old)
@@ -472,7 +494,7 @@ def _decoupled(rescaling: bool = False):
               eq(lift).to(lifts(given, to, along)),
               eq(added).to(stock("add")), eq(multiplied).to(stock("mul")), eq(largest).to(stock("max")),
               eq(floor).to(least(k)), eq(typed).to(retype(i)), slotted)
-    stepped = var("stepped", Term)
+    stepped, merged = vars_("stepped merged", Term)
     for summed_term, tile in ((x.reduce(String("sum"), axes, p), x.stepped().reduce(String("sum"), axes, p)),
                               (x.dot(y, p), x.stepped().dot(y.stepped(), p)),
                               (y.dot(x, p), y.stepped().dot(x.stepped(), p))):
@@ -482,13 +504,17 @@ def _decoupled(rescaling: bool = False):
         # reduction's tile sum its own addition takes (`summand`).
         product = get_callable_args(tile, Term.dot)
         parts = (set_(rescaled_by(stepped)).to(correction(0, k.stepped())),
-                 *((set_(summand(stepped)).to(tile),) if product is None else
+                 *((set_(summand(stepped)).to(tile), set_(summed_terms(stepped)).to(x.stepped()))
+                   if product is None else
                    (set_(weighed(stepped)).to(product[0]), set_(weighted(stepped)).to(product[1]))))
         derived += [
             rule(eq(stepped).to(t.stepped()), *conditions).then(
                 union(stepped).with_(rescaled(0, k.stepped()).binary(String("add"), tile, added)), *parts),
-            rewrite(t.merged()).to(rescaled(0, k.merged()).binary(String("add"), rescaled(1, k.merged()),
-                                                                  added), *conditions),
+            rule(eq(merged).to(t.merged()), *conditions).then(
+                union(merged).with_(rescaled(0, k.merged()).binary(String("add"), rescaled(1, k.merged()),
+                                                                   added)),
+                set_(merge_factors(merged)).to(correction(0, k.merged())),
+                set_(merge_second(merged)).to(correction(1, k.merged()))),
             rewrite(t.finished()).to(Term.state(i, 0), *conditions),
         ]
     return ruleset(*derived, name="decoupled rescaled" if rescaling else "decoupled")
@@ -562,9 +588,12 @@ class _Forms:
     accumulated: tuple[tuple[Term, Term, Term] | None, ...] = ()
     """Each reduction's step as a mainloop's accumulator takes it (`rescaled_by`): its row factor, the tile
     product's weights and values, extracted with the forms; None for a step of no such rule."""
-    added: tuple[tuple[Term, Term] | None, ...] = ()
-    """Each reduction's step as a mainloop's own addition takes it (`summand`): its row factor and the tile's
-    sum, extracted with the forms; None for a step of no such rule."""
+    added: tuple[tuple[Term, Term, Term] | None, ...] = ()
+    """Each reduction's step as a mainloop's own addition takes it (`summand`): its row factor, the tile's sum
+    and the terms it sums (`summed_terms`), extracted with the forms; None for a step of no such rule."""
+    merged: tuple[tuple[Term, Term] | None, ...] = ()
+    """Each reduction's merge as a mainloop's own merge takes it (`merge_factors`): the factors its first and
+    second states take, extracted with the forms; None for a merge of no such rule."""
 
 
 def context() -> tuple:
@@ -624,20 +653,19 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
                 for side, state in enumerate(states)
                 for index in range(len(made.reductions))}
 
-    def step(state, tiles, *, product=None, accumulate=None, add=None, outputs: Sequence[int] = ()):
+    def step(state, tiles, *, product=None, stepped=None, outputs: Sequence[int] = ()):
         made = forms(shaped(tiles))
         value = evaluator(made.region, [*made.consts, *(tiles[name] for name in names)],
                           carried(made, state), product=product, **declared)
-        stepped = []
-        for index, form in enumerate(made.steps):
-            if accumulate is not None and (parts := made.accumulated[index]) is not None:
-                factor, weights, values = parts
-                stepped.append(accumulate(state[index], value(factor), value(weights), value(values)))
-            elif add is not None and (summed := made.added[index]) is not None:
-                factor, tile = summed
-                stepped.append(add(state[index], value(factor), value(tile)))
-            else:
-                stepped.append(value(form))
+        # The mainloop's own step where it gives one, once, over each reduction's parts as the rules state
+        # them (each value evaluated once), every reduction it leaves (None) by its form.
+        taken = (None,) * len(made.steps)
+        if stepped is not None:
+            parts = tuple(Accumulated(*map(value, accumulated)) if accumulated is not None
+                          else Added(*map(value, added)) if added is not None else None
+                          for accumulated, added in zip(made.accumulated, made.added, strict=True))
+            taken = tuple(stepped(tuple(state), parts))
+        stepped = [value(form) if own is None else own for own, form in zip(taken, made.steps, strict=True)]
         if not outputs:
             return tuple(stepped)
         # The tile's outputs along the walked axis `outputs` names (by place), by the same evaluation: a
@@ -649,13 +677,20 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
             along.append(value(output))
         return tuple(stepped), tuple(along)
 
-    def merge(a, b, operands=None, *, shapes: Mapping):
+    def merge(a, b, operands=None, *, shapes: Mapping, merged=None):
         made = forms(shapes)
         # A merge reads no walked operand (`_derived`), its unwalked ones whole.
         leaves = [*made.consts, *(None if operands is None or name in walked_axes else operands[name]
                                   for name in names)]
         value = evaluator(made.region, leaves, carried(made, a, b), **declared)
-        return tuple(value(form) for form in made.merges)
+        # The mainloop's own merge where it gives one, once, over each rescaled sum's two factors (`step`'s).
+        taken = (None,) * len(made.merges)
+        if merged is not None:
+            parts = tuple(None if factors is None else Merged(*map(value, factors))
+                          for factors in made.merged)
+            taken = tuple(merged(tuple(a), tuple(b), parts))
+        return tuple(value(form) if own is None else own
+                     for own, form in zip(taken, made.merges, strict=True))
 
     def finish(state, operands=None, *, shapes: Mapping):
         made = forms(shapes)
@@ -755,7 +790,10 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     adding = [index for index, reduction in enumerate(reductions) if stated(summand, reduction)]
     parts = [part(reductions[index].stepped()) for index in range(len(reductions))
              for part in ((rescaled_by, weighed, weighted) if index in accumulating
-                          else (rescaled_by, summand) if index in adding else ())]
+                          else (rescaled_by, summand, summed_terms) if index in adding else ())]
+    merging = [index for index, reduction in enumerate(reductions)
+               if graph.lookup_function_value(merge_factors(reduction.merged())) is not None]
+    parts += [part(reductions[index].merged()) for index in merging for part in (merge_factors, merge_second)]
     if parts:
         bundle = Term.bundle(Vec[Term](*roots, *parts))
         graph.register(bundle)
@@ -765,7 +803,8 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     accumulated, added = [], []
     for index in range(len(reductions)):
         accumulated.append((next(held), next(held), next(held)) if index in accumulating else None)
-        added.append((next(held), next(held)) if index in adding else None)
+        added.append((next(held), next(held), next(held)) if index in adding else None)
+    merged = [(next(held), next(held)) if index in merging else None for index in range(len(reductions))]
     chosen = chosen[:len(roots)]
     if not math.isfinite(after.value):
         unwritten = next(root for root, form in zip(roots, chosen, strict=True) if not _written(form))
@@ -787,7 +826,8 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
         if _reads_leaves(form) & walked_leaves:
             raise Refused("a merge reads a walked operand: no tile is there to read")
     return _Forms(region, reductions, tuple(steps), tuple(merges), finishes, tuple(along), tuple(outputs),
-                  walked_leaves, tuple(closed.consts), report, tuple(accumulated), tuple(added))
+                  walked_leaves, tuple(closed.consts), report, tuple(accumulated), tuple(added),
+                  tuple(merged))
 
 
 def _decoupled_through(graph: EGraph, region: terms.Region, facts: Schedule, decoupled: rules.Rules) -> None:

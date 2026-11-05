@@ -179,6 +179,38 @@ class Unpriced(Doubling):
         raise ValueError("no cost facts")
 
 
+DERIVATIONS: list[int] = []
+"""Each derivation `Deriving` ran, by the rows of its call."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Deriving(Doubling):
+    """`Doubling`, generating its config: the most rows of a block the device holds, at most the call's."""
+
+    GENERATES: ClassVar[bool] = True
+
+    def derived(self, ba, target):
+        DERIVATIONS.append(ba.arguments["x"].shape[0])
+        return max(config for config in Doubling.space(self, ba) if self.legal(ba, config, target))
+
+
+def test_a_launch_derives_once_for_what_its_derivation_reads():
+    """A launch's derivation (`Template.derived`) runs once for what it reads: the call (its arguments'
+    shapes and dtypes, its hooks) and the target, every eligibility check and planner candidate after
+    reading that once; a call or a target of other facts derives again (row 4259: the GEMM tile derived at
+    every check took 36 s of a Qwen3.5-4B step's compile_ahead)."""
+    DERIVATIONS.clear()
+    op = Deriving()
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        for rows in (2048, 2048, 4096, 2048):
+            op.derived(op.bind(jax.ShapeDtypeStruct((rows, 512), jnp.float32)), target)
+        halved = dataclasses.replace(target, multiprocessors=target.multiprocessors // 2)
+        with generation.assumed(halved):
+            op.derived(op.bind(jax.ShapeDtypeStruct((2048, 512), jnp.float32)), halved)
+    assert DERIVATIONS == [2048, 4096, 2048]
+
+
 def test_a_selector_serves_a_choice_chosen_may_name_and_no_other():
     """A selector (`selection.Op`) is built for a choice `generation.chosen` may name, and one built for a
     name it may not is refused as it is built: no selector serves a choice no call can name. A choice no

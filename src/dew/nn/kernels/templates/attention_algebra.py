@@ -33,7 +33,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.algebra import derive, rewritten
-from dew.algebra.forms import Operand, derived_on
+from dew.algebra.forms import Accumulated, Added, Merged, Operand, derived_on
 from dew.nn.kernels.templates import layout, product
 from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Draw, within
 from dew.nn.precision import float32_einsum, two_product, two_sum
@@ -1143,7 +1143,9 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     forms' (`dew.algebra.forms.derived`, `_derived_step`), but for a dropping call's: the derivation narrows a
     dropped weight unnormalized, past fp16's largest at a rate near 1 (a multiplier of 2^16), where this
     step's scaled parts (`weights_parts`) keep it, a representation the declaration states none of."""
-    if states_derived(spec, state) and keys.coords.drop is None:
+    # A compensated or guarded walk's step takes its dropped roundings and its shifts through the derived
+    # step's own hook (`_derived_step`).
+    if derived_on() and keys.coords.drop is None:
         return _derived_step(spec, state, keys)
     m, factor, p, value, held = _softmax(spec, state, keys)
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
@@ -1483,18 +1485,27 @@ def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     """Two states over disjoint keys as one, `first`'s keys before `second`'s: each taken to the larger
     maximum and summed, in that order. Either may hold no key whatever the call (a slice past a row's
     keys), so `empty` is its identity under every spec. Behind the switch, the derived forms'
-    (`dew.algebra.forms.derived`, `_derived_merge`)."""
-    if states_derived(spec, first, second):
+    (`dew.algebra.forms.derived`, `_derived_merge`), a guarded state's join of its sums the template's
+    (`_guarded_merge`) over the factors they evaluate."""
+    if derived_on():
         return _derived_merge(spec, first, second)
     m = jnp.maximum(first.m, second.m)
     safe = jnp.where(m == -jnp.inf, 0.0, m)
+    factors = carried(spec, first.m, safe), carried(spec, second.m, safe)
     if first.guard is None and second.guard is None:
-        a, b = carried(spec, first.m, safe), carried(spec, second.m, safe)
+        a, b = factors
         acc = expand(a, first.acc) * first.acc + expand(b, second.acc) * second.acc
         return Partial(acc, m, a * first.total + b * second.total)
+    return _guarded_merge(first, second, m, factors)
+
+
+def _guarded_merge(first: Partial, second: Partial, m: jax.Array, factors: tuple[jax.Array, jax.Array]
+                   ) -> Partial:
+    """`merge`'s join of two states one of which is guarded (`Guard`), each taken to the joined maximum `m` by
+    its factor of `factors`, its shifted sums at the larger shift, or more where the join overflows, and its
+    unshifted ones beside them."""
     ones, others = headroom_of(first), headroom_of(second)
     reach = jnp.maximum(ones.reach, others.reach)
-    factors = carried(spec, first.m, safe), carried(spec, second.m, safe)
     natural = (power2(factors[0] * first.total, ones.shift)
                + power2(factors[1] * second.total, others.shift))
 
@@ -1529,7 +1540,7 @@ def merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     another order, no less accurately. A slice of no key (a maximum of -inf) adds nothing. On the guarded
     path the sums join at the largest shift, and a row whose join overflows shifts as its natural sums
     need, as `merge` shifts them. Behind the switch, the derived forms' (`_derived_merged`)."""
-    if states_derived(spec, stacked):
+    if derived_on():
         return _derived_merged(spec, stacked, axis)
     m = jnp.max(stacked.m, axis=axis)
     factors = carried(spec, stacked.m, jnp.expand_dims(jnp.where(m == -jnp.inf, 0.0, m), axis))
@@ -1584,13 +1595,14 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
            output_params: tuple[jax.Array, ...] = ()) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The block's output `[bq, Dv]` fp32 (its weighted values over its denominator, zero for a query
     that saw nothing and started from no state, then the output hook) and its residual rows
-    (`finished_rows`); the output is the shifted sums' ratio, which the shift leaves. Behind the switch, the
-    output the derived forms' (`dew.algebra.forms.derived`, `_derived_output`)."""
+    (`finished_rows`); the output is the shifted sums' ratio, which the shift leaves. Behind the switch, that
+    ratio the derived forms' (`dew.algebra.forms.derived`, `_derived_output`), a guarded state's live rows
+    taken from its unshifted sums as ever."""
     m, denominator = finished_rows(spec, state, initial=initial)
-    if states_derived(spec, state):
+    if derived_on():
         out = _derived_output(spec, state)
-        return (out if output_mod is None else output_mod(out, *output_params)), m, denominator
-    out = output_of(state.acc, state.total, guarded=spec.guarded or initial)
+    else:
+        out = output_of(state.acc, state.total, guarded=spec.guarded or initial)
     fields = state.guard
     if fields is not None:
         bounded = finite(fields.plain_total)
@@ -1842,19 +1854,6 @@ def _form_key(spec: Forward) -> tuple:
     return (True, spec.scale if spec.raw else None) if spec.natural else ()
 
 
-def states_derived(spec: Forward, *states: Partial) -> bool:
-    """Whether the derived forms walk a state of `spec` (behind the switch, `dew.algebra.forms.derived`):
-    where the declaration states its walk, the accurate form's among them (`Forward.natural`: its exponential
-    and its compensated rescale declared, its largest weight held to 1 or its raw products scaled after their
-    difference, `declaration`). Its compensated running sums (`Forward.compensated`) and the headroom guard's
-    shifted sums (`Forward.headroom`, a state's `Guard`) are representation choices the derivation does not
-    make yet (error-aware extraction's compensation rules, docs/design/algebra.md §6.9): there the template's
-    own forms run, under the replacement rule (a derived form replaces a hand-written one only where it states
-    the walk)."""
-    return derived_on() and not (spec.compensated or spec.headroom) and all(
-        state.guard is None and state.low is None for state in states)
-
-
 def _slotted(key: tuple, shapes: Mapping) -> tuple[str, ...]:
     """The `Partial` field each of the derived forms' (`derived_forms(*key)`) carried states is
     (`Derived.slots`) at a walk of tiles of `shapes`, by its role: its maximum `m`, its sum `total`, its
@@ -1880,47 +1879,87 @@ def _stated(spec: Forward, state: Partial) -> tuple[tuple, dict]:
 
 def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     """`plain_step` by the derived forms: the tile's logits (-inf where a query does not see a key, as
-    `modify` writes them) and values; the weighted values' sums the mainloop's own where it holds them
-    (`Keys.accumulate`), every product the mainloop's (`Keys.dot`)."""
+    `modify` writes them) and values, its maximum, rescale and weights the forms'; the weighted values' sums
+    the mainloop's own where it holds them (`Keys.accumulate`), every product the mainloop's (`Keys.dot`). A
+    compensated walk's (the state's `Low`) and a guarded one's (its `Guard`) take their sums as the template's
+    step takes them (`stepped`, the one owner of both): the tile's products a chunk of keys each, each
+    addition's rounding kept, and on the guarded walk each live row's shift (`room`, from the forms' weights
+    and the tile's values) with the unshifted sums beside them."""
     # Over the raw products where the mainloop gives them (`logits_of`), their factor the declaration's own.
     raw = keys.products is not None
     key = (spec.base2, bool(keys.coords.keys_first), spec.factor if raw else None, *_form_key(spec))
     forms = derived_forms(*key)
     tiles = {"logits": keys.products if raw else keys.logits, "values": keys.values}
     fields = _slotted(key, {name: (value.shape, value.dtype) for name, value in tiles.items()})
-    held_by = keys.accumulate
+    held_by, plain = keys.accumulate, state.low is None and state.guard is None
+    after: list[Partial] = []
 
-    def accumulate(acc, factor, weights, values):
-        def scale(held):
-            return keys.coords.queries(factor, held) * held
+    def own(states, parts):
+        taken = dict(zip(fields, parts, strict=True))
+        accumulated, added = taken["acc"], taken["total"]
+        assert isinstance(accumulated, Accumulated)
+        if plain:
+            # The weighted values' sums the mainloop's accumulators hold; every other state the forms'.
+            def scale(held):
+                return keys.coords.queries(accumulated.factor, held) * held
 
-        assert held_by is not None
-        return held_by(acc, scale, (weights,), values)
+            assert held_by is not None
+            acc = held_by(states[fields.index("acc")], scale, (accumulated.weights,), accumulated.values)
+            return tuple(acc if field == "acc" else None for field in fields)
+        assert isinstance(added, Added)
+        # The template's step over the forms' weights (the denominator's terms, before their narrowing for
+        # the product) and rescale.
+        value, p, factor = accumulated.values, added.terms, added.factor
+        held = None
+        if state.guard is not None:
+            largest = keys.largest if keys.largest is not None else functools.partial(magnitudes, value)
+            held = room(state.guard, state.total, factor, p, largest())
+        weights = p if held is None else held.weights
+        times = functools.partial(_times, keys.dot, value, multiplier=None, chunk=chunk_of(spec))
+        after.append(stepped(state, state.m, factor, weights, times(weights), held, times))
+        return tuple(getattr(after[0], field) if field in ("acc", "total") else None for field in fields)
 
-    stepped = forms.step(tuple(getattr(state, field) for field in fields), tiles, product=keys.dot,
-                         accumulate=None if held_by is None else accumulate)
-    return Partial(**dict(zip(fields, stepped, strict=True)))
+    derived = forms.step(tuple(getattr(state, field) for field in fields), tiles, product=keys.dot,
+                         stepped=None if held_by is None and plain else own)
+    found = Partial(**dict(zip(fields, derived, strict=True)))
+    return found if not after else found._replace(guard=after[0].guard, low=after[0].low)
 
 
 def _rows(state: Partial) -> Partial:
     """`state` with its leading axes and its rows one axis of rows (`acc` `[rows, Dv]`, `m` and `total`
-    `[rows]`): each row's softmax is its own, so a merge or a finish of a split decode's states
-    (`[..., splits, ..., bq]`, `decode_attention._combined`) is the declaration's over all their rows."""
-    return state._replace(acc=state.acc.reshape(-1, state.acc.shape[-1]), m=state.m.reshape(-1),
-                          total=state.total.reshape(-1))
+    `[rows]`, a guard's alike): each row's softmax is its own, so a merge or a finish of a split decode's
+    states (`[..., splits, ..., bq]`, `decode_attention._combined`) is the declaration's over all their
+    rows."""
+    leading = state.m.ndim
+    return jax.tree.map(lambda part: part.reshape(-1, *part.shape[leading:]), state)
 
 
 def _derived_merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     """`merge` by the derived forms (`_stated`'s), over the states' rows whatever their leading axes
-    (`_rows`)."""
-    flat = _rows(first)
+    (`_rows`): a guarded state's sums joined as the template joins them (`_guarded_merge`) over the
+    factors the forms evaluate, through the forms' merge hook."""
+    flat, other = _rows(first), _rows(second)
     key, shapes = _stated(spec, flat)
     fields = _slotted(key, shapes)
-    other = _rows(second)
+    joined: list[Partial] = []
+
+    def own(firsts, seconds, parts):
+        del firsts, seconds
+        factor = dict(zip(fields, parts, strict=True))["total"]
+        assert isinstance(factor, Merged)
+        m = jnp.maximum(flat.m, other.m)
+        joined.append(_guarded_merge(flat, other, m, (factor.first, factor.second)))
+        return tuple(getattr(joined[0], field) if field in ("acc", "total") else None for field in fields)
+
+    guarded = first.guard is not None or second.guard is not None
     merged = derived_forms(*key).merge(tuple(getattr(flat, field) for field in fields),
-                                       tuple(getattr(other, field) for field in fields), shapes=shapes)
-    return Partial(**{field: value.reshape(getattr(first, field).shape)
-                      for field, value in zip(fields, merged, strict=True)})
+                                       tuple(getattr(other, field) for field in fields), shapes=shapes,
+                                       merged=own if guarded else None)
+    found = Partial(**dict(zip(fields, merged, strict=True)))
+    if joined:
+        found = found._replace(guard=joined[0].guard)
+    leading = first.m.shape
+    return jax.tree.map(lambda part: part.reshape(*leading, *part.shape[1:]), found)
 
 
 def _derived_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
