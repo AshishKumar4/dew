@@ -20,6 +20,7 @@ from pathlib import Path
 
 import jax
 import pytest
+from process_support import assert_exits_cleanly
 from reference_error import recording
 from saved_run_kinds import SAVED_KINDS, answered, computed
 from saved_run_products import unpacked
@@ -202,6 +203,50 @@ def test_a_run_an_earlier_main_saved_resumes_when_its_command_runs_again(tmp_pat
     records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
     started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
     assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
+
+
+@pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
+def test_a_run_an_earlier_main_saved_resumes_through_its_python_train(tmp_path, monkeypatch, recorded, kind):
+    """A kind's run saved at an earlier main resumes from its last checkpoint as a Python experiment trains
+    it: its objective and data built, then handed to `RunConfig.train` with the run naming no data plan
+    version, as one written in Python does. The train resolves it itself, the saved run's (`resumed`, which
+    `readied` asks), so the resume compares alike and fits the one step past its checkpoint, and the record
+    it writes names the version it read by (train 589's review: a run trained so read by this Dew's version
+    and recorded none, so a saved run's resume was refused)."""
+    run, last, built = rebuilt(tmp_path, monkeypatch, recorded, kind)
+    prepared = built.prepare()
+    python = dataclasses.replace(prepared, run=dataclasses.replace(prepared.run, data_plan_version=None))
+    python.train(kind)
+    records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
+    started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
+    assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
+    assert RunConfig.load(str(run)).data_plan_version == 8
+
+
+def test_reading_a_saved_run_opens_no_device_before_its_process_is_prepared(tmp_path):
+    """`dew train run.json` reads the run before it prepares its process (`RunConfig.run`'s
+    `prepare_process`, which joins a pool of processes before any device is opened), so reading a saved
+    decision run's record opens none, whatever its record leaves to its checkpoints: the writing a run saved
+    before row 3867 left to its layout is read where the run resumes (`resumed`, `check_resumed`), after
+    the process is prepared, in a fresh interpreter (train 589's review)."""
+    # A saved decision run's record as main before row 3867 wrote it, its writing left to its layout.
+    run = extracted(tmp_path, *next((recorded, kind) for recorded, kind in SAVED if kind == "decision"))
+    record = json.loads((run / "run.json").read_text())
+    (run / "run.json").write_text(json.dumps({**record, "fields": {**record["fields"], "option_text": None}}))
+    assert_exits_cleanly(f"""
+import socket
+
+import jax
+from dew.config import RunConfig
+
+RunConfig.load({str(run)!r})
+# A pool of one process joined after the read, as `prepare_process` joins one: refused once a device is open.
+with socket.socket() as free:
+    free.bind(("localhost", 0))
+    port = free.getsockname()[1]
+jax.distributed.initialize(f"localhost:{{port}}", num_processes=1, process_id=0)
+jax.distributed.shutdown()
+""")
 
 
 def test_a_run_that_sets_another_option_text_than_its_saved_run_trained_is_refused(tmp_path, monkeypatch):
