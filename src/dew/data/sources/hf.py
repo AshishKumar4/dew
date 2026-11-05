@@ -19,6 +19,7 @@ from .base import Read, Shard, ShardManifest
 from .codec import Value
 from .iterator import _StreamIterator
 from .memory import _record
+from .rows import streamed_rows
 
 if TYPE_CHECKING:
     import datasets
@@ -118,7 +119,7 @@ class HF(Dataset):
         from datasets import Dataset as Arrow
 
         if isinstance(self.dataset, Arrow):
-            return arrow_rows(self.dataset).to_iter_dataset(options)
+            return streamed_rows(arrow_rows(self.dataset), options)
         if not isinstance(shard, _HFShard):
             raise ValueError("a Hugging Face stream needs its own shard descriptor")
         return _Streamed(_undecoded(self.dataset), shard)
