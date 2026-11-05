@@ -49,7 +49,8 @@ class Lane:
     `reach`: by rounding primitive and format, the largest level (`LEVELS`) of the lane's own results
     over its probes (`_probes`): 0 where every one was its exact value rounded to nearest, 1 where each
     was one of the two neighbours of its exact value on the lane's grid (faithful), n where each was
-    within n - 1 steps of the grid past them."""
+    within n - 1 steps of the grid past them; a division by a size-1 broadcast divisor its own form's
+    (`BROADCAST`)."""
     flushes: bool
     reach: dict[tuple[str, str], int]
 
@@ -411,8 +412,16 @@ def _rounding(name: str, integral):
         if fmt is None:
             return _bits(result) == _bits(integral(result, *operands))
         measured = lane()
-        return LEVELS[name](operands, result, fmt, measured.flushes) <= measured.reach[name, fmt.name]
+        # A division by a divisor broadcast along a size-1 axis is held at that form's own reach
+        # (`BROADCAST`), which XLA may compute as a multiply by the divisor's reciprocal.
+        form = BROADCAST if np.shape(operands[-1]) != np.shape(result) else ""
+        reach = measured.reach.get((name + form, fmt.name), measured.reach[name, fmt.name])
+        return LEVELS[name](operands, result, fmt, measured.flushes) <= reach
     return contract
+
+
+BROADCAST = " broadcast"
+"""A division's form whose divisor is broadcast along a size-1 axis, its reach measured apart (`lane`)."""
 
 
 def _product(a, b):
@@ -862,6 +871,16 @@ def lane() -> Lane:
                 raise ArithmeticError(f"the lane's {name} in {fmt.name} breaks an exact case at "
                                       f"{[operand[at] for operand in operands]}")
             reach[name, fmt.name] = int(np.max(found))
+    for fmt in FORMATS.values():
+        # A division whose divisor is broadcast along a size-1 axis, a row's scale's, which XLA on the CPU
+        # computes as a multiply by the divisor's reciprocal, two roundings: measured as a form of its own.
+        dividend, divisor = _probes("div", fmt)
+        rows = PROBES // 32
+        operands = [dividend[:rows * 32].reshape(rows, 32), divisor[:rows].reshape(rows, 1)]
+        found = LEVELS["div"](operands, np.asarray(jax.lax.div(*operands)), fmt, flushes)
+        if np.any(found == UNREACHED):
+            raise ArithmeticError(f"the lane's broadcast div in {fmt.name} breaks an exact case")
+        reach["div" + BROADCAST, fmt.name] = int(np.max(found))
     return Lane(flushes, reach)
 
 
