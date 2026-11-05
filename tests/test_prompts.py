@@ -9,6 +9,7 @@ byte, and the refusals for rows without a prompt, unknown fields and empty
 files.
 """
 
+import dataclasses
 import json
 
 import numpy as np
@@ -230,28 +231,28 @@ def test_a_prompt_that_starts_with_its_bos_keeps_one(tmp_path, inserted):
     assert list(batch[PROMPT_KEY][0, WINDOW - length:]) == [1, 3]
 
 
-def test_a_records_holdout_measures_its_reward_width_over_the_one_read_of_its_store(tmp_path, monkeypatch):
+@dataclasses.dataclass(frozen=True)
+class Counted(Memory):
+    """Records in memory that note each read a compile takes of them."""
+
+    reads: list = dataclasses.field(default_factory=list, compare=False)
+
+    def records(self, read):
+        self.reads.append(read)
+        return super().records(read)
+
+
+def test_a_records_holdout_measures_its_reward_width_over_the_one_read_of_its_store():
     """A records holdout's part rendered with its reward width measured reads its store once in a memory
     read: the part's rows and the whole store the width is measured over are one read's, the width the
     whole store's widest, wider than any row of the part (row 4145)."""
-
-    path = tmp_path / "prompts.jsonl"
-    rows = [{"prompt": IDS, "ground_truth": "x" * (40 if index == 0 else 3)} for index in range(6)]
-    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
-    reads = []
-    whole = Files.records
-
-    def counted(self, read):
-        reads.append(read)
-        return whole(self, read)
-
-    monkeypatch.setattr(Files, "records", counted)
-    train, _ = Files(str(path)).holdout(records=2)
+    store = Counted([{"prompt": IDS, "ground_truth": "x" * (40 if index == 0 else 3)} for index in range(6)])
+    train, _ = store.holdout(records=2)
     data = trained(train, 2)
     reader = data.train(DataPartition())
     try:
         batch = next(reader)
     finally:
         reader.close()
-    assert reads.count("memory") == 1
+    assert store.reads.count("memory") == 1
     assert batch[TRUTH_KEY].shape == (2, 40)

@@ -1302,7 +1302,7 @@ class _Lines(grain.IterDataset):
 
     def __iter__(self) -> grain.DatasetIterator:
         if self.source.kind == "json":
-            return _JsonIterator(self.source, self.shard)
+            return _json_records(self.source, self.shard)
         return _LineIterator(self.source, self.shard)
 
 
@@ -1353,37 +1353,33 @@ class _LineIterator(grain.DatasetIterator):
             self.file.close()
 
 
-class _JsonIterator(grain.DatasetIterator):
-    """A JSON file's records, as `datasets` reads a JSON file: the items of the array it holds, read whole,
-    or else each line's object (`_LineIterator`), as JSON lines (row 2402)."""
+def _json_records(source: Files, shard: Shard) -> grain.DatasetIterator:
+    """A JSON file's records, as `datasets` reads a JSON file: the items of the array it holds, read whole
+    (`_JsonArray`), or else each line's object, as JSON lines (`_LineIterator`) (row 2402)."""
+    with _open_lines(source._opened(shard.uri), shard.uri) as file:
+        # The first byte of the value the file holds, past the whitespace before it.
+        while (head := file.read(1)) and head.isspace():
+            pass
+        if head == b"[":
+            return _JsonArray(json.loads(head + file.read()))
+    return _LineIterator(source, shard, "jsonl")
 
-    def __init__(self, source: Files, shard: Shard):
+
+class _JsonArray(grain.DatasetIterator):
+    """The items of a JSON file's array, its position the items read."""
+
+    def __init__(self, array: list[Batch]):
         super().__init__()
-        with _open_lines(source._opened(shard.uri), shard.uri) as file:
-            # The first byte of the value the file holds, past the whitespace before it.
-            while (head := file.read(1)) and head.isspace():
-                pass
-            self.array = json.loads(head + file.read()) if head == b"[" else None
-        self.lines = _LineIterator(source, shard, "jsonl") if self.array is None else None
-        self.read = 0
+        self.array, self.read = array, 0
 
     def __next__(self) -> Batch:
-        if self.lines is not None:
-            return next(self.lines)
         if self.read >= len(self.array):
             raise StopIteration
         self.read += 1
         return self.array[self.read - 1]
 
     def get_state(self) -> dict[str, int]:
-        return self.lines.get_state() if self.lines is not None else {"read": self.read}
+        return {"read": self.read}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        if self.lines is not None:
-            self.lines.set_state(state)
-            return
         self.read = integer(state["read"], "JSON array items read")
-
-    def close(self) -> None:
-        if self.lines is not None:
-            self.lines.close()

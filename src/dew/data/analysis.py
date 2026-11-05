@@ -182,22 +182,24 @@ def _stated(source: Source, read: Read, measuring: Sequence[Measuring] = (),
     from dew.data.holdout import SelectedGeneration
     from dew.data.lowering import prepared_rows
 
-    metadata = source.metadata()
     if read != "memory":
-        return None, metadata
+        return None, source.metadata()
     store = _store(source)
     views = list(beneath(source, SAME_ROWS))[:-1]
-    if measuring and whole is not None and views and all(isinstance(view, Selection) for view in views):
+    parted = measuring and whole is not None and views and all(isinstance(view, Selection) for view in views)
+    if parted:
         # Parts of one store measured over it whole take their parts of the one read of it (`whole`).
         rows = whole(store)
         held = functools.reduce(lambda records, view: view.part(records), reversed(views), rows)
     else:
         held = source.records(read)
-        if not measuring:
-            return held, metadata
         measured = store.whole if isinstance(store, SelectedGeneration) else store
-        rows = (held if measured is source else whole(measured) if whole is not None
+        rows = (held if measured is source or not measuring else whole(measured) if whole is not None
                 else measured.records(read))
+    # Its metadata after its read, which states what a read infers (a decision table's options).
+    metadata = source.metadata()
+    if not measuring:
+        return held, metadata
     return held, {**metadata, **{each.measure.fact: each.measure(prepared_rows(rows, each.before))
                                  for each in measuring}}
 

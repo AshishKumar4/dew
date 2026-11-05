@@ -112,10 +112,10 @@ class CorpusCounts:
         if not isinstance(element, Mapping):
             return
         self.truncated += int(bool(element.get("_dew_truncated", False)))
-        for kind, (rows, tokens) in element.get("_dew_cut", {}).items():
+        for kind, (rows, removed) in element.get("_dew_cut", {}).items():
             self.cut_examples[kind] += 1
             self.cut_rows[kind] += int(rows)
-            self.cut_removed[kind] += int(tokens)
+            self.cut_removed[kind] += int(removed)
         for reason, count in element.get("_dew_rejected", {}).items():
             self.left_out[reason] += int(count)
         self.left_out_cut.update(element.get("_dew_left_out_cut", {}))

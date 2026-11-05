@@ -322,11 +322,12 @@ class Hub(Dataset):
         # conversion, or is prepared.
         # An archive's module is what it holds, which only reading it says: such a split streams no files of
         # its own, as datasets' inference would open each archive to learn it.
+        from datasets.data_files import DataFilesList
         from datasets.load import infer_module_for_data_files_list
 
         if any(PurePosixPath(path).suffix.lower() == ".zip" for path in paths):
             return [], "parquet"
-        module, _ = infer_module_for_data_files_list(paths)
+        module, _ = infer_module_for_data_files_list(DataFilesList(paths, [() for _ in paths]))
         kinds: Mapping[str, tuple[Format, ...]] = {"parquet": ("parquet",), "json": ("jsonl", "json")}
         matches = [path for path in paths if inferred_format(path) in kinds.get(module or "", ())]
         if not matches:

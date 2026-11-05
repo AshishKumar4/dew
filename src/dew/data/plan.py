@@ -550,8 +550,8 @@ def _tokens_counted(iterator: JSON) -> JSON:
     from the resume. Carried to 1.0 (ledger 1552)."""
     from dew.data.mixing import COUNTER
 
-    def counted(counts: JSON) -> JSON:
-        return {**counts, "tokens": 0} if isinstance(counts, dict) and "tokens" not in counts else counts
+    def counted(counts: dict[str, JSON]) -> dict[str, JSON]:
+        return counts if "tokens" in counts else {**counts, "tokens": 0}
 
     def filled(branch: JSON) -> JSON:
         match branch:
@@ -562,11 +562,16 @@ def _tokens_counted(iterator: JSON) -> JSON:
             case _:
                 return branch
         match node.get(COUNTER):
-            case {"counts": counts, "members": {**members}} as counter:
-                node[COUNTER] = {**counter, "counts": counted(counts), "members": {
-                    key: {**member, "counts": counted(member.get("counts"))} if isinstance(member, dict)
-                    else member for key, member in members.items()}}
-            case {"counts": counts} as counter:
+            case {"counts": {**counts}, "members": {**members}} as counter:
+                held: dict[str, JSON] = {}
+                for key, member in members.items():
+                    match member:
+                        case {"counts": {**counted_member}}:
+                            held[key] = {**member, "counts": counted(counted_member)}
+                        case _:
+                            held[key] = member
+                node[COUNTER] = {**counter, "counts": counted(counts), "members": held}
+            case {"counts": {**counts}} as counter:
                 node[COUNTER] = {**counter, "counts": counted(counts)}
         return node
 
