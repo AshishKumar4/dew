@@ -194,6 +194,10 @@ class _Sequential(grain.IterDataset):
         return _SequentialIterator(self.places, self.reader, self.loading)
 
 
+_ENDED = object()
+"""A place's rows read to their end (`_SequentialIterator`)."""
+
+
 class _SequentialIterator(grain.DatasetIterator):
     """`_Sequential`'s reads: the place it reads (`place`) and its rows' position there, None before it
     opens; a position an earlier Dew saved, its interleave's of one place at a time, read as the place it
@@ -205,14 +209,15 @@ class _SequentialIterator(grain.DatasetIterator):
         self.place, self.rows = 0, None
 
     def __next__(self):
+        # Each place read to its end, then the next opened, until the last ends.
         while self.place < len(self.places):
             if self.rows is None:
                 self.rows = iter(self.reader(self.places[self.place]))
-            try:
-                return next(self.rows)
-            except StopIteration:
-                self.rows.close()
-                self.rows, self.place = None, self.place + 1
+            row = next(self.rows, _ENDED)
+            if row is not _ENDED:
+                return row
+            self.rows.close()
+            self.rows, self.place = None, self.place + 1
         raise StopIteration
 
     def get_state(self) -> Mapping[str, object]:
