@@ -13,7 +13,14 @@ import numpy as np
 from dew.devices import deterministic_ops_requested
 
 from .kernels import decode_attention, generation
-from .kernels.generation import INHERENT, bf16_dot_runs, capability, device_generation, gpu_placed
+from .kernels.generation import (
+    INHERENT,
+    bf16_dot_runs,
+    capability,
+    cuda_lowered,
+    device_generation,
+    gpu_placed,
+)
 from .kernels.selection import Kernel, Op, Requirement
 from .kernels.templates import attention_route
 from .kernels.templates.attention_triton import DTYPES as TEMPLATE_DTYPES
@@ -493,11 +500,16 @@ def _attention_preferred(case: AttentionCase) -> str:
 
 
 def _hosted(kernel: str) -> str:
-    """What this host runs for the target's `kernel`: cuDNN's, FlashAttention's or tokamax's Triton
-    kernel where this process places the call on its own GPU, else jax.nn's xla attention, as a step
-    traced for an assumed GPU on a CPU lowers (`gpu_placed`); Dew's own Pallas kernels lower for the
-    target on any host."""
-    return 'xla' if kernel in ('cudnn', 'flash', 'triton') and not gpu_placed() else kernel
+    """What this host runs for the target's `kernel`: FlashAttention's where its call lowers for the target
+    (`cuda_lowered`: on its own GPU, or a compile ahead's on a host of the target's GPU, whose FFI targets
+    lower for its compile-only devices: a step compiled ahead for an H100 on an H100 ran XLA's attention, its
+    fp32 scores 4.3 GB the run's step never holds, row 3792), cuDNN's or tokamax's Triton kernel where this
+    process places the call on its own GPU (`gpu_placed`), else jax.nn's xla attention, as a step traced for
+    an assumed GPU on a CPU lowers; Dew's own Pallas kernels lower for the target on any host. The route
+    reports a substitution (`Route.ran`), which a compile ahead names (`dew.training.ahead.substituted`)."""
+    if kernel == 'flash':
+        return kernel if cuda_lowered() else 'xla'
+    return 'xla' if kernel in ('cudnn', 'triton') and not gpu_placed() else kernel
 
 
 ATTENTION = Op[AttentionCase]('attention', (

@@ -43,6 +43,7 @@ from dew.decision.layout import (
     RowSegment,
     Schema,
     default_layout,
+    layout_writing,
 )
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
@@ -142,9 +143,11 @@ class DecisionRunConfig(DecoderRunConfig):
     option_text: Literal["named", "described"] | None = None
     """How a question row writes a choice's option (`QuestionLayout.option_text`): its key and
     description (`named`, as Laya's release reads its rows), or its description alone (`described`).
-    None keeps the layout's own, a release's named and a fresh head's described, as its record keeps
-    None; a run that leaves it None and resumes takes the saved run's (`BUILT`, `RunConfig.resumed`). A
-    run saved before this field reads `named`, as it ran (`dew.config.earlier_option_text`). A joint row
+    None keeps the layout's own, a release's named and a fresh head's described, which its record holds
+    as the build resolved it (`layout_writing`); a run that leaves it None and resumes takes the saved
+    run's (`BUILT`, `RunConfig.resumed`). A run saved before this field reads `named`, as it ran, and one
+    whose record holds None the writing its checkpoint's layout states (`dew.config.earlier_option_text`,
+    `earlier_option_writing`). A joint row
     names each option by its key beside its description in its schema, the named writing, and has no
     other."""
     segments: Annotated[tuple[RowSegment, ...], record_argument(tuple[RowSegment, ...])] | None = None
@@ -343,7 +346,11 @@ class DecisionRunConfig(DecoderRunConfig):
 
         metrics = self.validation_metrics(validates=bool(held))
         after = calibrate if self.calibrate and held else None
-        return Prepared(self, objective, dataset, metrics=metrics, summary=summary, after=after,
+        # The writing the layout resolved, recorded as a pinned source's step is, so a resume writes its
+        # rows as the run did whatever a later Dew's layout leaves (`BUILT`, row 3867).
+        run = self if self.option_text is not None else dataclasses.replace(
+            self, option_text=layout_writing(objective.layout))
+        return Prepared(run, objective, dataset, metrics=metrics, summary=summary, after=after,
                         validation=held)
 
     def _row_fields(self) -> Budgets:

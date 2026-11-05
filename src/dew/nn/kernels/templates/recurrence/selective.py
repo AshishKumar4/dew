@@ -22,6 +22,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn import derivatives
 from dew.nn.kernels import generation, recurrence_algebra as algebra, tuning
 from dew.nn.kernels.templates import base, cost, mosaic, report, resources, scan as block_scan
 from dew.nn.kernels.templates.recurrence import mainloop
@@ -38,7 +39,8 @@ class Scan:
     mainloop (interpreted where `interpret`); `packed` where tokens reset their state (a document's first),
     `entered` where the entering state of each chunk opening a backward block (`block_positions`) is kept
     for the backward, which starts its blocks from them; the backward's tokens a thread and programs a
-    multiprocessor (`backward_plan`)."""
+    multiprocessor (`backward_plan`); the launch tracing the forward (`report.launch_digest`), whose name the
+    backward's kernel carries too (`report.relaunched`)."""
 
     rows: int
     length: int
@@ -52,6 +54,7 @@ class Scan:
     interpret: bool = False
     packed: bool = False
     entered: bool = False
+    launch: str | None = None
 
     @property
     def chunks(self) -> int:
@@ -86,6 +89,33 @@ PARAMETER_ROWS = 8
 rows come in."""
 
 
+def forward_scope(family: mosaic.Family, chunk: int, states: int, dtypes: tuple,
+                  packed: bool) -> resources.Scope:
+    """`forward`'s shared memory by lifetime at `chunk` tokens (`forward_allocations`), its streams where the
+    family states they live (`mainloop.allocation_scope`, `Family.lifetimes`), no reduction across warps."""
+    streams, allocations = forward_allocations(family, chunk, block_scan.THREADS, states, dtypes, packed)
+    return mainloop.allocation_scope(family, streams, allocations, reduces=False)
+
+
+def forward_allocations(family: mosaic.Family, chunk: int, block: int, states: int, dtypes: tuple,
+                        packed: bool) -> tuple[dict, tuple]:
+    """`forward`'s shared memory at `chunk` tokens and `block` channels a program: its streams (a ring of two
+    chunks of `x`, `dt`, `B`, `C` and, `packed`, the resets, in `dtypes`' x, dt, B and C dtypes; the
+    parameters and the entering state once) and its output chunk and state row, which `Selective` sizes its
+    chunk by (`resources.shared_bytes`)."""
+    x_dtype, dt_dtype, b_dtype, c_dtype = dtypes
+    blocks = {"x": ((chunk, block), x_dtype), "dt": ((chunk, block), dt_dtype),
+              "b": ((chunk, states), b_dtype), "c": ((chunk, states), c_dtype)}
+    if packed:
+        blocks["resets"] = ((chunk, RESET_WIDTH), jnp.int8)
+    once = {"parameters": ((states + PARAMETER_ROWS, block), jnp.float32),
+            "entering": ((states, block), jnp.float32)}
+    # Each tile read a row at a time, at a traced row: staged plain (`mosaic.UNSWIZZLED`).
+    streams = {"walked": family.streams(blocks, 2, 1, swizzles=dict.fromkeys(blocks, mosaic.UNSWIZZLED)),
+               "once": family.streams(once, 1, 1, swizzles=dict.fromkeys(once, mosaic.UNSWIZZLED))}
+    return streams, (plgpu.SMEM((chunk, block), x_dtype), plgpu.SMEM((block,), jnp.float32))
+
+
 @tuning.lowered_once(("scan",))
 def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
     """The scan's outputs from padded operands: `x`, `dt` `[R, T, D]`, `b`, `c` `[R, T, N]`, `parameters`
@@ -96,15 +126,8 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
     fp32 (`Scan.opening`; None without): every chunk's kept 64 times what 2048-token blocks of 32-token
     chunks read (4.3 GB at Falcon 7B's step, 2970)."""
     family, chunk, block, states = scan.family, scan.chunk, scan.block, scan.states
-    blocks = {"x": ((chunk, block), x.dtype), "dt": ((chunk, block), dt.dtype),
-              "b": ((chunk, states), b.dtype), "c": ((chunk, states), c.dtype)}
-    if scan.packed:
-        blocks["resets"] = ((chunk, RESET_WIDTH), jnp.int8)
-    once = {"parameters": ((states + PARAMETER_ROWS, block), jnp.float32),
-            "entering": ((states, block), jnp.float32)}
-    # Each tile read a row at a time, at a traced row: staged plain (`mosaic.UNSWIZZLED`).
-    streams = {"walked": family.streams(blocks, 2, 1, swizzles=dict.fromkeys(blocks, mosaic.UNSWIZZLED)),
-               "once": family.streams(once, 1, 1, swizzles=dict.fromkeys(once, mosaic.UNSWIZZLED))}
+    streams, allocations = forward_allocations(family, chunk, block, states, (x.dtype, dt.dtype, b.dtype,
+                                                                              c.dtype), scan.packed)
     out_type = [jax.ShapeDtypeStruct(x.shape, x.dtype),
                 jax.ShapeDtypeStruct((scan.rows, states, scan.channels), jnp.float32)]
     if scan.entered:
@@ -180,7 +203,6 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
 
             family.roles(1, consumer, producer)
 
-        allocations = (plgpu.SMEM((chunk, block), x.dtype), plgpu.SMEM((block,), jnp.float32))
         family.scoped(body, allocations, streams=streams)
 
     entry.__name__ = "selective_scan"
@@ -373,7 +395,13 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
     return dx, ddt, dbc[0].sum(0), dbc[1].sum(0), da, dd, dstate
 
 
-def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic.Family, chunk: int = 32,
+CHUNK = 32
+"""The fewest tokens a forward chunk takes, a ring stage of its operands whose entering state the forward
+keeps for each backward block it opens (`Scan.opening`), and the fewest a call takes (a decode step's are
+the portable math's, `recurrence_chunk.SELECTIVE_SUPPORTS`)."""
+
+
+def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic.Family, chunk: int = CHUNK,
                    block: int = block_scan.THREADS, interpret: bool = False,
                    plan: tuple[int, int] | None = None):
     """`dew.nn.mixers.mamba.selective_scan` on the template: `x`, `dt` `[B, S, D]` (after the softplus),
@@ -398,7 +426,7 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
     entering = (jnp.zeros((rows, states, channels), jnp.float32) if state is None
                 else jnp.swapaxes(jnp.asarray(state, jnp.float32), 1, 2))
     scan = Scan(rows, padded, channels, states, chunk, block, family, positions, resident, interpret,
-                packed=starts is not None)
+                packed=starts is not None, launch=report.launch_digest())
     y, final = _scan(pad(x), pad(dt), jnp.asarray(A, jnp.float32), pad(B), pad(C),
                      jnp.asarray(D, jnp.float32), entering, resets, scan)
     return y[:, :length], jnp.swapaxes(final, 1, 2).astype(x.dtype)
@@ -411,8 +439,7 @@ def _parameters(A, D, channels: int):
     return jnp.concatenate([(A * algebra.LOG2_E).T, D[None], padding])
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(8,))
-def _scan(x, dt, A, B, C, D, entering, resets, scan: Scan):
+def _scan_primal(x, dt, A, B, C, D, entering, resets, scan: Scan):
     """`forward` over padded operands, its gradient `backward`'s: `(y, final [R, N, D] fp32)`."""
     y, final, _ = forward(x, dt, B, C, _parameters(A, D, scan.channels), entering, resets, scan)
     return y, final
@@ -435,9 +462,12 @@ def _scan_backward(scan: Scan, residuals, grads):
         writes nothing and reads nothing."""
         return mainloop.zero_padded(jnp.moveaxis(t, 1, -1), axis=t.ndim - 1, size=padded)
 
-    dx, ddt, db, dc, da, dd, dstate = backward(
-        leading(x), leading(dt), leading(B), leading(C), _parameters(A, D, scan.channels), entered,
-        leading(resets[..., 0]), leading(dy.astype(x.dtype)), dfinal.astype(jnp.float32), scan)
+    # Its kernel named for the launch that traced the forward (`report.relaunched`), as JAX traces it after
+    # that launch's scope ended: a spill of it refuses the launch and steps its tokens down (`Selective`).
+    with report.relaunched(scan.launch):
+        dx, ddt, db, dc, da, dd, dstate = backward(
+            leading(x), leading(dt), leading(B), leading(C), _parameters(A, D, scan.channels), entered,
+            leading(resets[..., 0]), leading(dy.astype(x.dtype)), dfinal.astype(jnp.float32), scan)
 
     def trailing(t):
         """A gradient `[R, ..., T]` back as `[R, T, ...]`, the padding's tokens dropped."""
@@ -448,7 +478,8 @@ def _scan_backward(scan: Scan, residuals, grads):
             None)
 
 
-_scan.defvjp(_scan_forward, _scan_backward)
+_scan = derivatives.declared_derivative(derivatives.KernelGlue(), _scan_primal, _scan_forward, _scan_backward,
+                                        nondiff_argnums=(8,))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -459,12 +490,6 @@ class Tiles:
     chunk: int
     positions: int
     resident: int
-
-
-CHUNK = 32
-"""The fewest tokens a forward chunk takes, a ring stage of its operands whose entering state the forward
-keeps for each backward block it opens (`Scan.opening`), and the fewest a call takes (a decode step's are
-the portable math's, `recurrence_chunk.SELECTIVE_SUPPORTS`)."""
 
 
 class Selective(base.Template[Tiles]):
@@ -492,21 +517,29 @@ class Selective(base.Template[Tiles]):
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Tiles | None:
         """The call's config on `target`: the backward's tokens a thread and residency from its register model
         (`backward_plan`), past the token counts a compile found spilling (`report.spilled`), each a step down
-        to half its tokens; and the forward's chunk, from `CHUNK` the longest whose ring a block's shared
-        memory holds (`staged_bytes`), up to a warpgroup's tokens (a chunk dividing every backward block) and
-        the call's tokens: on an H100 Mamba-1's bf16 forward at 8x2048x5120 took 1.21 ms at 16 tokens a
-        chunk, 1.14 at 32 and 1.12 to 1.14 at 64 and 128, its training step 6.51, 6.39 to 6.43 and 6.34
-        to 6.40 (sel-chunk-sxm at 5bf70d36b)."""
+        to half its tokens (None where a spill no token count clears); and the forward's chunk, from `CHUNK`
+        the longest whose ring a block's shared memory holds (`staged_bytes`), up to a warpgroup's tokens (a
+        chunk dividing every backward block), dividing the call's tokens padded to `CHUNK`'s (a longer chunk
+        walks no more padding): on an H100 Mamba-1's bf16 forward at 8x2048x5120 took 1.21 ms at 16 tokens a
+        chunk, 1.14 at 32 and 1.12 to 1.14 at 64 and 128, its training step 6.51, 6.39 to 6.43 and 6.34 to
+        6.40 (sel-chunk-sxm at 5bf70d36b)."""
         facts = self._facts(ba, target)
         positions, resident = backward_plan(facts)
         chunk, length = CHUNK, ba.arguments["x"].shape[1]
-        while (2 * chunk <= min(block_scan.THREADS, length) and self.staged_bytes(
+        padded = -(-length // CHUNK) * CHUNK
+        while (2 * chunk <= block_scan.THREADS and padded % (2 * chunk) == 0 and self.staged_bytes(
                 ba, Tiles(2 * chunk, positions, resident), facts) <= generation.shared_budget(facts)):
             chunk *= 2
         tiles = Tiles(chunk, positions, resident)
-        while report.spilled(self, ba, tiles) and tiles.positions > 1:
+        # A launch whose compile found a kernel spilling steps the tile that sets that kernel's registers: the
+        # backward's tokens. The forward's registers no tile sets (its chunk's loop is rolled, `UNROLLED`), so
+        # a forward spill, or a backward's at one token, leaves no config.
+        while spilled := report.spilled(self, ba, tiles):
+            backward = all(name.startswith("selective_scan_backward") for name in spilled)
+            if not backward or tiles.positions == 1:
+                return None
             fewer = tiles.positions // 2
-            tiles = Tiles(chunk, fewer, backward_programs(backward_registers(fewer), facts))
+            tiles = Tiles(tiles.chunk, fewer, backward_programs(backward_registers(fewer), facts))
         return tiles
 
     @staticmethod
@@ -528,12 +561,25 @@ class Selective(base.Template[Tiles]):
         return resources.entry_registers(1, config.resident)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
-        """The forward's ring of two chunks of its operands, a program's channel block's `x` and `dt` and the
-        chunk's `B` and `C` rows, and its chunk of outputs."""
-        x, b = ba.arguments["x"], ba.arguments["B"]
-        block, states = block_scan.THREADS, b.shape[-1]
-        ring = 2 * config.chunk * (2 * block * x.dtype.itemsize + 2 * states * b.dtype.itemsize)
-        return ring + config.chunk * block * x.dtype.itemsize
+        """The forward's shared memory at the config's chunk (`forward_allocations`), as the toolkit counts a
+        program's (`resources.shared_bytes`)."""
+        from dew.nn.kernels.templates import bundles
+
+        arguments = ba.arguments
+        x, dt, b, c = (arguments[name] for name in ("x", "dt", "B", "C"))
+        family = bundles.INTERPRETED if arguments.get("interpret", False) else bundles.of(target.generation,
+                                                                                            x.dtype)
+        assert family is not None, f"no bundle of the template claims {target.generation} (`eligible`)"
+        return resources.shared_bytes(family, forward_scope(family, config.chunk, b.shape[-1],
+                                                            (x.dtype, dt.dtype, b.dtype, c.dtype),
+                                                            arguments.get("starts") is not None))
+
+    def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
+        """Whether a bundle of the template claims the call's GPU (interpreted, the interpreted bundle)."""
+        from dew.nn.kernels.templates import bundles
+
+        return (ba.arguments.get("interpret", False)
+                or bundles.of(target.generation, ba.arguments["x"].dtype) is not None)
 
 
 SELECTIVE = Selective()

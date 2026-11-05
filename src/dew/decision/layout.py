@@ -1918,6 +1918,12 @@ class JointLayout(Layout):
         return list(range(len(keys)))
 
 
+def layout_writing(layout: Layout) -> Literal["named", "described"]:
+    """How `layout`'s rows write a choice's option (`QuestionLayout.option_text`): a question layout's own
+    writing, and a joint row's `named`, its schema naming each option by its key beside its description."""
+    return layout.option_text if isinstance(layout, QuestionLayout) else "named"
+
+
 def default_layout(causal: bool, one_question: bool) -> Layout:
     """The layout a head reads where none is given: every question of a
     request in one row (`JointLayout`) for a head that reads several a row

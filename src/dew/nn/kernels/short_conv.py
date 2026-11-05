@@ -49,6 +49,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import pallas as pl
 
+from dew.nn.kernels import launches
+
 from . import generation, tuning
 from .generation import INHERENT
 from .selection import Kernel, Op, Requirement
@@ -459,7 +461,7 @@ def _forward_launch(x, taps, bias, valid, documents, *, parts: tuple[tuple[int, 
         has_bias=bias is not None, has_valid=valid is not None, has_documents=documents is not None,
         activation=activation, eps=eps, interpret=interpret)
     widths = [width for width, _ in parts]
-    return tuple(pl.pallas_call(
+    return tuple(launches.pallas_call(
         kernel, grid=(programs, pl.cdiv(length, config.rows), batch), in_specs=specs,
         out_specs=[pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0)) for width in widths],
         out_shape=[jax.ShapeDtypeStruct((batch, length, width), jnp.dtype(dtype)) for width in widths],
@@ -490,7 +492,7 @@ def _backward_launch(x, taps, bias, valid, documents, before, dy, *, first: int,
         out_specs.append(pl.BlockSpec((None, None, width), lambda c, t, b: (b, t, 0)))
         out_shape.append(jax.ShapeDtypeStruct((batch, tiles, width), jnp.float32))
     held = [] if before is None else [before]
-    return tuple(pl.pallas_call(
+    return tuple(launches.pallas_call(
         kernel, grid=grid,
         in_specs=[*specs, *([whole] if held else []),
                   pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0))],

@@ -452,7 +452,10 @@ TARGETS = {target.generation: target for target in (
               # its clocks), its launch FS-DEVICEFACTS4-a100's.
               measured={'NVIDIA A100-SXM4-40GB': Measured(6.04e-6, 1.486e12, launch=2.11e-6)}),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024,
-              {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}, multiprocessors=72,
+              # The RTX A6000's 154.8 TF dense (its datasheet's 309.7 with sparsity; the RTX PRO Blackwell
+              # architecture whitepaper's Table 4), a real one's other facts its driver's (`runtime_facts`).
+              {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12},
+               'NVIDIA RTX A6000': {'bf16': 154.8e12}}, multiprocessors=72,
               clock_hz=1695e6, memory_bandwidth=600e9),
     GpuTarget('sm89', 'NVIDIA L4', 99 * 1024,
               {'NVIDIA L4': {'bf16': 121e12, 'fp8': 242.5e12},
@@ -472,9 +475,10 @@ TARGETS = {target.generation: target for target in (
               # -gh200's, their launches and hand-offs FS-DEVICEFACTS4's; the H200's stream the same line
               # through the kernel challenge's best read at each size, 16.8 MB to 805 MB, cold L2 under graph
               # replay (judge-facts.md:3-18).
-              # The H100 PCIe's two rounds of tools/device_facts.py agreed to 1% (ET-DEVICEFACTS-h100pcie).
+              # The H100 PCIe's two rounds of tools/device_facts.py agreed to 1% (ET-DEVICEFACTS-h100pcie),
+              # its hand-off 0.695 us in both; its launch fit no line (negative slopes).
               measured={'NVIDIA H100 80GB HBM3': Measured(1.87e-6, 3.190e12, launch=1.02e-6, handoff=0.78e-6),
-                        'NVIDIA H100 PCIe': Measured(2.11e-6, 1.980e12),
+                        'NVIDIA H100 PCIe': Measured(2.11e-6, 1.980e12, handoff=0.695e-6),
                         'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6),
                         'NVIDIA H200': Measured(2.81e-6, 4.617e12)}),
     # Datasheet facts alone, no routes: what a compile-only sm100 device needs (`tests/kernel_compile.py`),
@@ -491,7 +495,10 @@ TARGETS = {target.generation: target for target in (
               clock_hz=1965e6, memory_bandwidth=8e12),
     GpuTarget('sm120', 'NVIDIA RTX PRO 6000 Blackwell Server Edition', 99 * 1024,
               dense_peaks={'NVIDIA RTX PRO 6000 Blackwell': {'bf16': 500e12, 'fp8': 1000e12}},
-              aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1792e9,
+              # The Server Edition's 1.597 TB/s (NVIDIA's RTX PRO 6000 Blackwell Server Edition page and
+              # datasheet); 1.792 TB/s is the Workstation part's (the RTX PRO Blackwell architecture
+              # whitepaper, p.12).
+              aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1597e9,
               step_seconds=3.68e-6),
     GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}),
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
@@ -1046,6 +1053,19 @@ def gpu_placed() -> bool:
     GPU host, so it makes none."""
     import jax
     return assumption() is None and jax.default_backend() == 'gpu' and placed_platform() == 'gpu'
+
+
+def cuda_lowered() -> bool:
+    """Whether a library's CUDA call lowers here for the call's target: on this process's own GPU
+    (`gpu_placed`), or within `assumed` on a GPU host whose own GPU is the assumed generation's, where a
+    compile ahead's program for that GPU's compile-only devices lowers it as for its own (an FFI target
+    the library registered, and the facts it reads of the GPU: FlashAttention's, dew_flash_attn)."""
+    import jax
+    if gpu_placed():
+        return True
+    found = assumption()
+    return (found is not None and jax.default_backend() == 'gpu'
+            and _generation(jax.local_devices()[0]) == found.generation)
 
 
 def backend() -> str:
