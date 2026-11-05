@@ -727,7 +727,7 @@ def test_a_template_walks_span_is_priced_at_its_gpus_kernel_step(generation_name
     Server's 137.7), so a walk of 10,000 such steps and little work is that span's time (row 4080)."""
     target = generation.gpu_target(generation_name)
     work = kernel_cost.Work(flops=1.0, span=10_000)
-    assert kernel_cost.walked(work, target) == pytest.approx(10_000 * measured, rel=0.01)
+    assert kernel_cost.walked(work, target) == 10_000 * measured
 
 
 def test_a_protected_span_is_kept_as_traced_however_often_the_pass_runs():
