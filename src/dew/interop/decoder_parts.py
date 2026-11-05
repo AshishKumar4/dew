@@ -2128,7 +2128,7 @@ class DecoderFamily:
         counts = {*self.prediction_counts,
                   *(alias for alias, name in self.aliases.items() if name in self.prediction_counts)}
         changed = {name: kept for name in counts
-                   if type(stated.get(name)) is int and stated[name] > kept}
+                   if type(count := stated.get(name)) is int and count > kept}
         return changed if self.whole_drafter is None else {**changed, **self.whole_drafter(stated, kept)}
 
     def readings(self, tensors: Mapping[str, Stored],

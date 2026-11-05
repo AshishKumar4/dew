@@ -2249,14 +2249,20 @@ def _scopes(config: dict) -> list[dict]:
 def _kept_depths(config: Mapping[str, object], kept: int) -> dict:
     """`config` as the config of a checkpoint holding its first `kept` prediction depths alone: each of
     its scopes (its top, its `text_config`) as its family keeps them (`DecoderFamily.kept_depths`: its
-    own count fields at most `kept`, a DSpark drafter whole or not at all); a scope no decoder family
-    reads holds no depths a load builds. A load reads, builds and saves the source this config states
-    (`Pretrained.load(prediction_depths=)`)."""
+    own count fields at most `kept`, a DSpark drafter whole or not at all), a wrapper's text read by the
+    wrapper's family where its own type names none (DeepSeek V4.1's `deepseek_v41_text`); a scope no
+    decoder family reads holds no depths a load builds. A load reads, builds and saves the source this
+    config states (`Pretrained.load(prediction_depths=)`)."""
     written = copy.deepcopy(dict(config))
     families = decoders.families()
-    for scope in _scopes(written):
+
+    def family_of(scope: Mapping[str, object]):
         model_type = scope.get("model_type")
-        family = families.get(model_type) if isinstance(model_type, str) else None
+        return families.get(model_type) if isinstance(model_type, str) else None
+
+    top = family_of(written)
+    for scope in _scopes(written):
+        family = family_of(scope) or top
         if family is not None:
             scope.update(family.kept_depths(scope, kept))
     return written

@@ -22,6 +22,7 @@ from jax.typing import ArrayLike
 
 from dew.diffusion.process import Denoiser, Process
 from dew.diffusion.schedules import RectifiedFlow, expand
+from dew.nn.derivatives import Protected, declared_tangent
 from dew.nn.kernels.generation import linear_map
 from dew.nn.precision import at_least_fp32, divided
 
@@ -229,45 +230,44 @@ def _divergence(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> j
     return _scaled(quotient, power)
 
 
-@jax.custom_jvp
-def _half_mahalanobis(value: jax.Array, mean: jax.Array, variance: jax.Array) -> jax.Array:
+def _half_mahalanobis_term(value: jax.Array, mean: jax.Array, variance: jax.Array) -> jax.Array:
     """`|value - mean|**2 / (2 variance)` per row, the density's quadratic term, as the KL forms it
     (`_divergence`): the plain float32 formula bit for bit wherever it stays in range, and finite
     wherever the term is (a residual of 2**64 under a variance of 2**126; a value of 2**127 beside a
-    mean of -2**127). Its derivatives are the plain formula's at every order (`_half_mahalanobis_jvp`)."""
+    mean of -2**127). Its derivatives are the plain formula's at every order (`_half_mahalanobis_jvp`), a
+    protected span (`_half_mahalanobis`, `dew.nn.derivatives.declared_tangent`)."""
     return _divergence(value, mean, variance)
 
 
-@_half_mahalanobis.defjvp
+def _residual_over(value: jax.Array, mean: jax.Array, variance: jax.Array) -> jax.Array:
+    """`(value - mean) / variance` each entry, its row's variance: the plain formula wherever the
+    residual is in range, and where an operand reaches float32's top binades, both taken down by a power
+    of two the primals choose and the quotient restored by it (`_scaled`), exact where it is a normal
+    number: the coefficient the quadratic term's tangent multiplies a direction by."""
+    limits = jnp.finfo(value.dtype)
+    down = jax.lax.stop_gradient(jnp.maximum(jnp.maximum(_exponent(value), _exponent(mean))
+                                             - (limits.maxexp - 3), 0))
+    residual = _scaled(value, -down) - _scaled(mean, -down)
+    return _scaled(divided(residual, expand(variance, residual)), down)
+
+
 def _half_mahalanobis_jvp(primals, tangents):
-    """The plain formula's tangent, `sum((value - mean) * (t_value - t_mean)) / variance - term * t_variance
-    / variance`, formed from the residual and the term as they are held, shifted to range
-    (`_divergence_parts`), and restored once: finite wherever the derivative is. It is linear in the
-    tangents, so reverse mode transposes it, and its coefficients are functions of the primals, so it
-    differentiates again."""
+    """The plain formula's tangent, `sum((value - mean) / variance * (t_value - t_mean)) - term / variance *
+    t_variance`, each coefficient restored into its own value before the direction's product
+    (`_residual_over`, the term over the variance): a direction of any scale meets the coefficients the
+    plain formula's does, so it is finite wherever the derivative is (a zero residual under a direction
+    of 2**10, a residual of 2**100 under a variance and a direction of 2**100), and the coefficients'
+    own derivatives, a second order's, are the plain formula's. It is linear in the tangents, so reverse
+    mode transposes it, and its coefficients are functions of the primals, so it differentiates again."""
     value, mean, variance = primals
     along_value, along_mean, along_variance = tangents
-    difference, shift, (quotient, power) = _divergence_parts(value, mean, variance)
-    # Each term's power of two restored half before the tangent's product and half after, so neither a
-    # tangent of zero meets a coefficient past float32's largest (inf * 0) nor reverse mode a cotangent
-    # taken below its least normal: `sum(residual * tangent) / variance` and `-term * t_variance /
-    # variance`, the plain formula's in range, bit for bit, the powers of two exact.
-    level, spread = _split(variance)
-    axes = tuple(range(1, value.ndim))
-    widest = jnp.max(shift, axis=axes)
-    residual_power = widest - spread
-    before = _half(residual_power)
-    products = _scaled(difference, shift - expand(widest - before, shift)) * (along_value - along_mean)
-    moved = _scaled(products.sum(axis=axes) / level, residual_power - before)
-    stretch_power = power - spread
-    stretched = _scaled(-quotient, _half(stretch_power)) * along_variance / level
-    return (_half_mahalanobis(value, mean, variance),
-            moved + _scaled(stretched, stretch_power - _half(stretch_power)))
+    term = _half_mahalanobis(value, mean, variance)
+    moved = jnp.sum(_residual_over(value, mean, variance) * (along_value - along_mean),
+                    axis=tuple(range(1, value.ndim)))
+    return term, moved - divided(term, variance) * along_variance
 
 
-def _half(power: jax.Array) -> jax.Array:
-    """Half an integer power of two's exponent, rounded toward zero, the rest restored apart."""
-    return (power.astype(jnp.float32) * 0.5).astype(jnp.int32)
+_half_mahalanobis = declared_tangent(Protected(), _half_mahalanobis_term, _half_mahalanobis_jvp)
 
 
 @jax.custom_jvp

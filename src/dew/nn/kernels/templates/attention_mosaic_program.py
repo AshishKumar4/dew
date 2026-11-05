@@ -493,14 +493,32 @@ def _varying_slopes(score_mod, params: tuple, graded: tuple[Kind, ...]) -> int:
         return jax.jvp(along, (inputs[place],), (jnp.ones_like(inputs[place]),))[1]
 
     count = int(_varies(score_mod, logits, positions, positions, *values))
+    traced = jax.make_jaxpr(score_mod)(logits, positions, positions, *values).jaxpr
     formed = [index for index in floating_params(values) if params[index][0] in graded]
     for place in (0, *(1 + index for index in formed)):
-        try:
-            count += _varies(functools.partial(slope, place), logits, positions, positions, *values)
-        except TypeError:
-            # A `jax.custom_vjp` hook takes no forward derivative: its slope counted.
-            count += 1
+        # A `jax.custom_vjp` the input reaches takes no forward derivative: that slope is counted untraced.
+        reached = _reaches_custom_vjp(traced, traced.invars[0 if place == 0 else place + 2])
+        count += reached or _varies(functools.partial(slope, place), logits, positions, positions, *values)
     return count
+
+
+def _holds_custom_vjp(jaxpr: jax_core.Jaxpr) -> bool:
+    """Whether `jaxpr` calls a `jax.custom_vjp`, itself or within a call it makes."""
+    return any(equation.primitive is jax_core.primitives.custom_vjp_call_p
+               or any(_holds_custom_vjp(inner) for inner in jax_core.jaxprs_in_params(equation.params))
+               for equation in jaxpr.eqns)
+
+
+def _reaches_custom_vjp(jaxpr: jax_core.Jaxpr, start: jax_core.Var) -> bool:
+    """Whether `start`, one of `jaxpr`'s inputs, reaches a `jax.custom_vjp` call (`_holds_custom_vjp`)."""
+    reached = {start}
+    for equation in jaxpr.eqns:
+        if any(not isinstance(var, jax_core.Literal) and var in reached for var in equation.invars):
+            if equation.primitive is jax_core.primitives.custom_vjp_call_p or any(
+                    _holds_custom_vjp(inner) for inner in jax_core.jaxprs_in_params(equation.params)):
+                return True
+            reached.update(equation.outvars)
+    return False
 
 
 def _varies(function: Callable, *arguments: jax.ShapeDtypeStruct) -> bool:

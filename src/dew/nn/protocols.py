@@ -890,7 +890,8 @@ def partitioned_routes(routed: Mapping[str, tuple[str, ...]], records, covered: 
     one routed site, or records keyed by site path (`dew.nn.inputs.LayerInputs.experts`); a record for
     several sites, or one that names not every routed site, raises `ValueError`. The one partition a
     decoder's layer (its mixer and its feed-forward) and a parallel mixer (its branches) make."""
-    if records is None:
+    if records is None or not routed:
+        # A layer whose sites route over no experts reads none of the record (a dense layer's slice).
         return {}
     sites = [site for paths in routed.values() for site in paths]
     if not isinstance(records, Mapping):

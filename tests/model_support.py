@@ -175,12 +175,6 @@ def as_stepped(forward: Callable[[jax.Array], jax.Array], sequence: jax.Array, p
     return stepped_outputs(lambda length: forward(sequence[:, :length]), sequence.shape[1], prefill)
 
 
-def stepped_logits(forward: Callable[[jax.Array], jax.Array], ids: jax.Array, prompt: int) -> jax.Array:
-    """`forward`'s logits over `ids` at the widths a cached decode of a `prompt`-token prefill computes
-    them (`as_stepped`), from position `prompt - 1`: `decode_logits`'s positions."""
-    return as_stepped(forward, ids, prompt)[:, prompt - 1:]
-
-
 def float64_twin(model: nn.Module) -> nn.Module:
     """`model` computing in float64, its own `dtype` and every module it
     holds: the truth a float32 run's rounding is measured from."""
@@ -422,9 +416,10 @@ def remote_code_site(source, site: str, *, wide: bool = False) -> Callable[[dict
 
 def prediction_logits(model, variables, tokens):
     """A causal transformer's multi-token prediction logits for `tokens`: its prediction depth's first, read
-    from its hidden states (`CausalTransformer.mtp_logits`)."""
-    hidden = model.apply(variables, tokens, method=CausalTransformer.hidden_states)
-    return model.apply(variables, hidden, tokens, method=CausalTransformer.mtp_logits)[0]
+    from the depth's own input (`CausalTransformer.hidden_and_mtp_inputs`: the final states, or DeepSeek
+    V4's uncollapsed streams) by `CausalTransformer.mtp_logits`."""
+    _, inputs = model.apply(variables, tokens, method=CausalTransformer.hidden_and_mtp_inputs)
+    return model.apply(variables, inputs, tokens, method=CausalTransformer.mtp_logits)[0]
 
 
 def stepped_decode(model, variables, ids):

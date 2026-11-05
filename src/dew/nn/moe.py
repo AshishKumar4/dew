@@ -568,8 +568,6 @@ def expert_projection(x: jax.Array, kernel: jax.Array | Layered, group_sizes: ja
     measures it against float64 sums and three Adam steps on every expert/fsdp
     layout.
     """
-    if implementation not in GROUPED_MATMULS:
-        raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     stack, layer = (kernel.stack, kernel.layer) if isinstance(kernel, Layered) else (kernel, None)
     compute = canonicalize_dtype(x, stack, dtype=dtype)
     with _named(implementation):
@@ -593,8 +591,6 @@ def paired_projections(x: jax.Array, first: jax.Array | Layered, second: jax.Arr
     if isinstance(first, Layered) or isinstance(second, Layered):
         return (expert_projection(x, first, group_sizes, compute, implementation, precision),
                 expert_projection(x, second, group_sizes, compute, implementation, precision))
-    if implementation not in GROUPED_MATMULS:
-        raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     with _named(implementation):
         return template.gemm(x, first, group_sizes, compute=compute, out_dtype=compute,
                              out_dtypes=(compute, compute), precision=precision, paired=second)
@@ -602,7 +598,9 @@ def paired_projections(x: jax.Array, first: jax.Array | Layered, second: jax.Arr
 
 def _named(implementation: str) -> contextlib.AbstractContextManager:
     """The launch choice an expert projection's `implementation` names: XLA's ragged dot for 'xla', the
-    template's own for 'auto' and 'pallas' (`expert_projection`)."""
+    template's own for 'auto' and 'pallas' (`expert_projection`); any other name is refused."""
+    if implementation not in GROUPED_MATMULS:
+        raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     return generation.chosen(grouped_matmul='xla') if implementation == 'xla' else contextlib.nullcontext()
 
 
