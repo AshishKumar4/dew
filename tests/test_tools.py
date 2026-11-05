@@ -1910,6 +1910,25 @@ def test_a_pallas_call_outside_the_launch_point_is_reported(tmp_path):
     assert _linted(tmp_path / "suite", {"tests/test_kernel.py": kernel, "tools/kernel.py": kernel}) == []
 
 
+def test_a_mosaic_gpu_kernel_outside_the_launch_point_is_reported(tmp_path):
+    """SLOP027: Pallas Mosaic GPU's own `kernel`, by any name it is imported as, built or passed on, is
+    reported outside the launch point (`nn/kernels/launches.py`), as its `pallas_call` is; the launch
+    point's `kernel` is not, nor a Mosaic GPU kernel in the tests or the tools."""
+    bundle = ("import functools\n"
+              "from jax.experimental.pallas import mosaic_gpu as plgpu\n"
+              "from jax.experimental.pallas.mosaic_gpu import kernel\n"
+              "from sparx.nn.kernels import launches\n"
+              "built = plgpu.kernel(lambda r: None, out_type=None, grid=(1,))\n"
+              "named = kernel(lambda r: None, out_type=None)\n"
+              "partial = functools.partial(plgpu.kernel, grid=(1,))\n"
+              "launched = launches.kernel(lambda r: None, name='k', out_type=None)\n")
+    assert_reported(tmp_path / "bundle", "src/sparx/nn/kernels/templates/bundle.py", bundle, "SLOP027",
+                    (5, 6, 7))
+    point = "from jax.experimental.pallas import mosaic_gpu as plgpu\nbuild = plgpu.kernel\n"
+    assert _linted(tmp_path / "point", {"src/sparx/nn/kernels/launches.py": point}) == []
+    assert _linted(tmp_path / "suite", {"tests/test_bundle.py": bundle, "tools/bundle.py": bundle}) == []
+
+
 def test_an_outer_program_built_outside_the_compile_point_is_reported(tmp_path):
     """SLOP025: a program built as an `OuterProgram` of its own, by a call, a `functools.partial` over it, a
     decorator or an alias of its name, takes no compiler option, so it is reported in any package of
