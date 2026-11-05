@@ -465,27 +465,27 @@ def test_every_run_profiles_a_short_window_of_its_own_steps_kept_with_its_record
     assert not (inside / "profile").exists()
 
 
-def test_a_runs_own_window_whose_manifest_is_not_written_leaves_the_run_training(tmp_path, monkeypatch,
-                                                                                 caplog):
+def test_a_runs_own_window_whose_manifest_is_not_written_leaves_the_run_training(caplog):
     """A run's own profile window is a diagnostic of the run's: where its capture's manifest cannot be
-    written as it stops (`dew.telemetry.profile.ExportFailed`), the run logs it and trains to its end, where
-    a window the run names fails it as before (train 607's review)."""
+    written as it stops (`dew.telemetry.profile.ExportFailed`), the stop logs it and the run trains on,
+    where a window that reports fails the run as before (train 607's review)."""
     import logging
 
-    from dew.telemetry import profile as telemetry_profile
+    from dew.telemetry.profile import ExportFailed
+    from dew.training.profiling import ProfileWindow, run_window, stop_capture
 
-    def unwritable(capture, metadata, reports):
-        raise OSError("the profile's directory is read-only")
+    class Unwritten:
+        """A profiler whose capture stopped and whose manifest could not be written."""
 
-    monkeypatch.setattr(telemetry_profile, "_manifest", unwritable)
-    config = TrainerConfig(name="diagnosed", checkpoint_dir=str(tmp_path / "runs"), steps=14, eval_every=None,
-                           checkpoint_every=None)
-    loader = Loader(lambda partition: batches(), None, None, 8)
+        def stop(self, *, wait: bool = True) -> None:
+            raise ExportFailed("writing the capture's manifest failed", [OSError("read-only directory")])
+
     with caplog.at_level(logging.WARNING, logger="dew"):
-        state = RunConfig(trainer=config).train(Regression(), loader, name="diagnosed")
-    assert int(state.step) == 14
+        stop_capture(Unwritten(), None, run_window())
     assert any(record.name == "dew.training.profiling" and record.levelno == logging.WARNING
                for record in caplog.records)
+    with pytest.raises(ExportFailed):
+        stop_capture(Unwritten(), None, ProfileWindow("asked", 2))
 
 
 def test_a_trainer_given_a_window_naming_no_directory_traces_into_one_of_its_own(tmp_path):

@@ -518,7 +518,7 @@ def exported(directory: str | os.PathLike[str] | None = None) -> None:
         raise RuntimeError("Profile export failed for " + ", ".join(failed))
 
 
-class ExportFailed(RuntimeError):
+class ExportFailed(ExceptionGroup):
     """A capture stopped as it should and its reports or manifest could not be written: what it traced is
     in its directory, what reads it lacks."""
 
@@ -540,9 +540,11 @@ def _export(capture: Path, converter: _Converter | None, metadata: dict[str, JSO
             _manifest(capture, metadata, [])
         else:
             _reports(capture, converter, metadata)
-    except BaseException as error:
+    except Exception as error:
         if not stopped:
-            raise ExportFailed(f"writing {capture}'s reports or manifest failed") from error
+            raise ExportFailed(f"writing {capture}'s reports or manifest failed", [error]) from None
+        failures.append(error)
+    except BaseException as error:
         failures.append(error)
     if failures:
         raise BaseExceptionGroup("Profile cleanup or export failed", failures)

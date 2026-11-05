@@ -176,7 +176,7 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None", window: Profile
                 if window.reports:
                     raise
                 _log.warning("the run's profile window traced, and its manifest was not written: %s (%s)",
-                             failure, failure.__cause__)
+                             failure, failure.exceptions)
             except BaseException as failure:
                 if primary is None:
                     raise
