@@ -747,9 +747,10 @@ def _external(stage: Stage) -> bool:
 def _volatile(stage: Stage) -> bool:
     """Whether `stage` reads what may change between reads (a step that says it is `Volatile`, as a
     live fetch does), so neither a cache nor a second reader may stand for it: the one test the
-    cache prefix and the plan read."""
-    return (isinstance(stage, (Map, MapWithIndex)) and isinstance(stage.step, Volatile)
-            and stage.step.volatile)
+    cache prefix and the plan read, of whatever step the stage runs (`runs`), a predicate, an
+    expansion or a random step's as a map's (row 4120)."""
+    ran = runs(stage)
+    return ran is not None and isinstance(ran.step, Volatile) and ran.step.volatile
 
 
 def _drops(stage: Stage) -> bool:
