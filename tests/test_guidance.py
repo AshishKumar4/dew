@@ -101,6 +101,30 @@ def test_apg_keeps_diffusers_projection_precision_on_raw_predictions(name):
     assert_as_exact(dew, recorded, draw, f"APG projection {name}", seeds=seeds, truth_fn=truth)
 
 
+def test_finite_half_precision_predictions_guide_to_their_finite_combination():
+    """CFG and APG combine finite fp16 predictions whose guided result is finite without overflowing on
+    the way, each eager operation rounding as it goes (ledger 3944, 3945): CFG's 40000 and -40000, whose
+    difference passes fp16's largest, guide to 0 at a scale of one half and to the unconditional exactly
+    at zero; APG clips a direction of 1000, whose square passes it, to its threshold of 15, guiding 0 to
+    30 at a scale of 2, as the reference's norm, accumulated in float32, clips it."""
+    process = Process(FlowMatchingScheduler(), DirectPredictionTransform())
+
+    def guided(guidance, conditional: float, unconditional: float) -> np.ndarray:
+        def half(value):
+            return jnp.full((1, 1), value, jnp.float16)
+
+        denoise = process.denoiser(RawPrediction(), {}, {"prediction": half(conditional)},
+                                   {"prediction": half(unconditional)})
+        walk = guidance.walk(denoise, 1)
+        x = jnp.zeros((1, 1), jnp.float16)
+        # At alpha=0 and sigma=1 DirectPredictionTransform's clean prediction is the raw one.
+        return np.asarray(walk.step(x, jnp.ones(1), 0, walk.init(x))[0][0])
+
+    np.testing.assert_array_equal(guided(CFG(0.5), 40000.0, -40000.0), [[0.0]])
+    np.testing.assert_array_equal(guided(CFG(0.0), 40000.0, -40000.0), [[-40000.0]])
+    np.testing.assert_array_equal(guided(APG(2.0), 1000.0, 0.0), [[30.0]])
+
+
 class Strength(nn.Module):
     """EDM's closed-form D(x; sigma) at a strength, as the reference's main
     network and its weaker guide."""

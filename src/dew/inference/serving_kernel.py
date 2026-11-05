@@ -205,13 +205,17 @@ class Dense:
     With `continuing` a prompt can prefill in pieces, which the mixed step
     alone serves, each reading its row's earlier keys. `plan` draws each row's
     tokens a speculative block a step (`Speculative`), its prefill seeding the
-    row's drafting state; None, a token a step.
+    row's drafting state; None, a token a step. `prng` is the PRNG
+    implementation of the rows' keys, the default as the rows were made: a
+    step reads their key data as keys of it, and its program is keyed by it,
+    as JAX's trace cache does not key on the default.
     """
 
     groups: int = 1
     mixed: bool = False
     continuing: bool = False
     plan: Speculative | None = None
+    prng: str = dataclasses.field(default_factory=lambda: str(jax.config.jax_default_prng_impl))
 
     def prefilled(self, model: nn.Module, params: Variables, pad_id: int, state: Slots,
                   admission: Admission, progress: Progress = END) -> tuple[DecoderState, jax.Array]:
@@ -227,7 +231,8 @@ class Dense:
         fresh, real = prefill_state(narrow, params, admission.prompts,
                                     decode_ops(narrow, params, pad_id, drafting_depths(model, self.plan),
                                                progress),
-                                    rounding=rounding_keys(jax.random.wrap_key_data(admission.keys)),
+                                    rounding=rounding_keys(jax.random.wrap_key_data(admission.keys,
+                                                                                    impl=self.prng)),
                                     progress=progress)
         def place(resident: jax.Array, incoming: jax.Array) -> jax.Array:
             return _placed(resident, incoming, admission.slots, self.groups)
@@ -241,13 +246,14 @@ class Paged:
 
     `mixed` runs the admitting step as one forward, as `Dense.mixed` does;
     `continuing` pieces (chunks, or a shared prefix's pages) read their
-    row's earlier keys; `plan` is `Dense.plan`.
+    row's earlier keys; `plan` and `prng` are `Dense`'s.
     """
 
     groups: int = 1
     mixed: bool = False
     continuing: bool = False
     plan: Speculative | None = None
+    prng: str = dataclasses.field(default_factory=lambda: str(jax.config.jax_default_prng_impl))
 
     def prefilled(self, model: nn.Module, params: Variables, pad_id: int, state: Slots,
                   admission: Admission, progress: Progress = END) -> tuple[DecoderState, jax.Array]:
@@ -265,7 +271,7 @@ class Paged:
         rows = admission.cursors.shape[0]
         allocated = with_rounding_keys(
             model.apply(params, rows, method="init_cache", mutable=["cache"])[1]["cache"],
-            rounding_keys(jax.random.wrap_key_data(admission.keys)))
+            rounding_keys(jax.random.wrap_key_data(admission.keys, impl=self.prng)))
         continues = admission.cursors > 0
 
         def view(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.Array, fresh: jax.Array) -> jax.Array:
@@ -342,7 +348,8 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
         decoder = dataclasses.replace(decoder, logits=jnp.where(fed[:, None], decoder.logits,
                                                                 state.decoder.logits))
     view = StepState(state.tokens, state.valid, state.step, state.active,
-                     jax.random.wrap_key_data(state.keys), prompt_width=capacity, budget=state.budget)
+                     jax.random.wrap_key_data(state.keys, impl=placement.prng), prompt_width=capacity,
+                     budget=state.budget)
     drew = row_step(view, decoder.logits, decoding.chain(transforms), decoding.finish(stopping),
                     None if grammar is None else (grammar, state.automaton))
     drawn = state.active
@@ -372,7 +379,8 @@ def _speculated(model: nn.Module, params: Variables, pad_id: int, placement: Pla
     capacity = state.tokens.shape[1] // 2
     ops = decode_ops(model, params, pad_id, drafting_depths(model, plan), progress)
     view = StepState(state.tokens, state.valid, state.step, state.active,
-                     jax.random.wrap_key_data(state.keys), prompt_width=capacity, budget=state.budget)
+                     jax.random.wrap_key_data(state.keys, impl=placement.prng), prompt_width=capacity,
+                     budget=state.budget)
     block = block_step(state.decoder, view, jnp.zeros_like(view.active), plan, ops,
                        decoding.chain(transforms), decoding.finish(stopping), state.budget)
     drawn, kept = state.active, block.kept
