@@ -46,9 +46,10 @@ def _overwritten_mma_operands(module: str) -> tuple[list[str], int, int]:
 
 
 def test_hopper_attention_backward_preserves_its_multiuse_query_tile(tmp_path):
-    """At the first derived config (two stages) the raw query tile dK's product reads stays its own until
+    """At 64 by 64, each launch two stages deep, the raw query tile dK's product reads stays its own until
     that product completes, after its prescaled copy fed the scores."""
-    config = attention_triton.BACKWARD_STEPS[0]
+    config = attention_triton.BackwardTiles(64, 64, attention_triton.WARPS, attention_triton.STAGES,
+                                            attention_triton.WARPS, attention_triton.STAGES)
     power, scale = template.prescale(jnp.bfloat16, 128, None)
     op = attention_triton._backward_op(score_mod=None, score_kinds=(), score_dtypes=(), scale=scale,
                                        prescale=power, split=True, natural=False, accurate=template.ACCURATE,
