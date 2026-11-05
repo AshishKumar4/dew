@@ -170,7 +170,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_decoding_components.py": {
-   "comparisons": 6,
+   "comparisons": 5,
    "lane": "Training"
   },
   "tests/test_decoding_strategies.py": {
@@ -293,17 +293,9 @@
    "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_gguf.py": {
-   "comparisons": 2,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_gpt_oss.py": {
    "comparisons": 3,
    "lane": "Models, Serving & RL"
-  },
-  "tests/test_grouped_gemm.py": {
-   "comparisons": 3,
-   "lane": "Kernels"
   },
   "tests/test_grpo.py": {
    "comparisons": 2,
@@ -350,7 +342,7 @@
    "lane": "Training"
   },
   "tests/test_inference.py": {
-   "comparisons": 11,
+   "comparisons": 10,
    "lane": "Models, Serving & RL"
   },
   "tests/test_inference_media.py": {
@@ -514,7 +506,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_norm_swiglu.py": {
-   "comparisons": 8,
+   "comparisons": 6,
    "lane": "Kernels"
   },
   "tests/test_ollama_interop.py": {
@@ -577,10 +569,6 @@
    "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_quantization_sites.py": {
-   "comparisons": 4,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_quantized.py": {
    "comparisons": 4,
    "lane": "Models, Serving & RL"
@@ -607,14 +595,6 @@
   },
   "tests/test_reference_runs.py": {
    "comparisons": 4,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_reference_trees.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_released_checkpoints.py": {
-   "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
   "tests/test_reporting.py": {
@@ -739,10 +719,6 @@
   },
   "tests/test_vision.py": {
    "comparisons": 21,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_vllm_interop.py": {
-   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_wan_source.py": {
