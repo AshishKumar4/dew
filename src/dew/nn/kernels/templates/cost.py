@@ -50,11 +50,12 @@ class Work:
     at the default precision, and FP8's, `GpuTarget.tensor_rate`; CUDA-core fp32 operations, a product at
     `Precision.HIGHEST`'s FLOPs among them; special-function exponentials; conversions, which run on the
     CUDA cores at their rate until a target states one of their own) and its bytes by level (device memory,
-    shared memory), and its span, the dependent steps on its critical path (a loop's iterations, each reading
-    the last). The algebra's terms and a template's instructions both price through it; a schedule turns it
-    into seconds by the work-span model (Brent's): the larger of its work at its units' rates and its span
-    at a dependent step's latency, XLA's fusion's (`dew.algebra.cost.fused`) or a template's tile walk
-    (`walked`)."""
+    shared memory), its span, the dependent steps on its critical path (a loop's iterations, each reading
+    the last), and the kernels XLA's fusion makes of it (`kernels`: a reduction's and a product's, each a
+    fusion's root), each paying the part's fixed latency in XLA's schedule (`dew.algebra.cost.Fused`). The
+    algebra's terms and a template's instructions both price through it; a schedule turns it into seconds by
+    the work-span model (Brent's): the larger of its work at its units' rates and its span at a dependent
+    step's latency, XLA's fusion's (`dew.algebra.cost.fused`) or a template's tile walk (`walked`)."""
 
     flops: float = 0.0
     operations: float = 0.0
@@ -65,6 +66,7 @@ class Work:
     tf32_flops: float = 0.0
     span: float = 0.0
     fp8_flops: float = 0.0
+    kernels: float = 0.0
 
     def __add__(self, other: "Work") -> "Work":
         # Works summed side by side: their span the longer one's; a chain of works' span is its path's sum,
@@ -73,7 +75,7 @@ class Work:
                     self.exponentials + other.exponentials, self.conversions + other.conversions,
                     self.device_bytes + other.device_bytes, self.shared_bytes + other.shared_bytes,
                     self.tf32_flops + other.tf32_flops, max(self.span, other.span),
-                    self.fp8_flops + other.fp8_flops)
+                    self.fp8_flops + other.fp8_flops, self.kernels + other.kernels)
 
 
 @functools.cache
