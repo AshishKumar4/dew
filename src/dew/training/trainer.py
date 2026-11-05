@@ -94,7 +94,7 @@ from dew.optim import STACKED_OPTIMIZERS, declaring, held_rates, scaled_rates, s
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
-from dew.telemetry.profile import exported as telemetry_exported, region
+from dew.telemetry.profile import region
 from dew.telemetry.records import AxisLink, CheckpointRequested, FitEnded, FitStarted, Record, StepCompiled
 from dew.training import staging
 from dew.training._fit import (
@@ -190,7 +190,7 @@ from dew.training.planning import (
     splits,
     whole_step,
 )
-from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window
+from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, waited_export
 from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics, rolled_out
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
@@ -1585,10 +1585,7 @@ class Trainer(Generic[Loss, Effects]):
         # A run's last log is written at its cleanup, a failed run's only where no write waits on a step
         # its peers may never finish (`LogWriter.raise_failure`).
         unread = functools.partial(self._read_taken, run, agree=False)
-        # This rank's window's export alone: a failed one fails every rank at `_reported_outcome`'s agreement.
-        # A window that reports nothing wrote its manifest as it stopped, and waits on no export.
-        exported = (None if profile is None or not profile.reports
-                    else functools.partial(telemetry_exported, profile.directory))
+        exported = waited_export(profile)
         cleanups = (("Training log", unread), ("Log writer", run.writer.close), ("Training iterator", close),
                     ("Profiler", stop_trace), ("Profile export", exported),
                     ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),

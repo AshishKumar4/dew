@@ -7,6 +7,7 @@ proceeds alone to deadlock its peers at the next collective. The trainer reports
 """
 
 import dataclasses
+import functools
 import gzip
 import json
 import sys
@@ -53,9 +54,9 @@ class ProfileWindow:
     directory: str | None
     steps: int
     warmup: int = 2
-    reports: bool = True
     capture: telemetry_profile.CaptureOptions = dataclasses.field(
         default_factory=telemetry_profile.CaptureOptions)
+    reports: bool = True
 
 
 def pgle_runs() -> int:
@@ -170,6 +171,15 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
                 primary.add_note(f"Profiler stop failed: {failure!r}")
 
     agreed("profile stop", stop)
+
+
+def waited_export(window: ProfileWindow | None) -> Callable[[], None] | None:
+    """What a fit's cleanup waits for of its `window`'s capture: this rank's export of the reports it
+    converts (`dew.telemetry.profile.exported`), a failed one failing every rank at the run's outcome's
+    agreement; none for a window that reports nothing, whose manifest its stop wrote."""
+    if window is None or not window.reports:
+        return None
+    return functools.partial(telemetry_profile.exported, window.directory)
 
 
 def reported_window(report: Callable[[Record, int], None], note: Callable[[str], None],
