@@ -136,6 +136,18 @@ def _beside(name: str):
     return module
 
 
+def _gate(name: str):
+    """tests/`name`.py, a standard-library module of the gate's the plan shares (`check1_wire`), loaded by its
+    path as `_beside` loads this file's neighbours."""
+    path = Path(__file__).resolve().parents[2] / "tests" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"armada_{name}", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+check1_wire = _gate("check1_wire")
 child_groups = _beside("child_groups")
 session = _beside("session")
 coverage_report = _beside("coverage_report")
@@ -1019,20 +1031,11 @@ either as armada's map and judge (`site_entries`): map tasks of P units each ove
 its work take, and one judge."""
 SITE_MARK = re.compile(r"\bmark\.(?:" + "|".join(SHARDS) + r")\b")
 """A site's mark as a test file's source spells it (`sites`), which a file that holds none never parses."""
-REDRAW = 4
-"""Check 1's REDRAW (tests/check1_statistics.py, which the plan cannot import: it has no JAX): a site its
-first stage leaves undecided draws REDRAW times its declared seeds further, so its map tasks together draw
-seeds 0 to (1 + REDRAW) times the declared count."""
-DRAWS, RECORDS, POOL, LATER = "DEW_CHECK1_DRAWS", "DEW_CHECK1_RECORDS", "DEW_CHECK1_POOL", "DEW_CHECK1_LATER"
-"""What runs a site's test as a map task, which takes the units DRAWS names (`start:stop`) and writes what
-they give into the directory RECORDS names, judging nothing, or as their judge, which pools the records
-under POOL and judges them as a test that took every unit itself would (tests/map_judge.py's
-`record_units` and `pooled_units`): a check-1 site its seeds' draws (tests/reference_error.py), and a test
-marked `shards` the units of its own work, given alike. A judge whose judgement needs units its later map
-tasks draw writes the file LATER names (`ask_later`), and its row asks for them (armada's `more`)."""
-STAGES = "DEW_CHECK1_STAGES"
-"""Check 1's stages log (tests/reference_error.py's STAGES_LOG, which the plan cannot import: it has no
-JAX): the file a judge appends each judgement it completes to, its stage among it (`later_judged`)."""
+DRAWS, RECORDS, POOL, LATER, STAGES = (check1_wire.DRAWS, check1_wire.RECORDS, check1_wire.POOL,
+                                       check1_wire.LATER, check1_wire.STAGES)
+"""Check 1's map and judge contract (tests/check1_wire.py, its one owner, `staged_units` the units a site's
+stages draw): what runs a site's test as a map task (DRAWS, RECORDS), as their judge (POOL), a judge's ask
+for its later map tasks (LATER), and its stages log (STAGES)."""
 LATER_JUDGED = "check1_later"
 """A check-1 site judge's row's word that its judgement needed its later map tasks (`later_judged`), which the
 next plan reads to draw them in the first wave (`eager_sites`)."""
@@ -1111,8 +1114,8 @@ def marked_sites(name: str, text: str) -> dict[str, Mark]:
         if (not mark.args and len(counts) == len(mark.keywords) and set(counts) in allowed
                 and all(type(count) is int and count > 0 for count in counts.values()) and test not in found):
             declared = counts[SHARDS[kind]]
-            units = (1 + REDRAW) * declared if kind == "check1_shards" else declared
-            weighed = (1 + REDRAW) * counts.get("conditioning", 0)
+            units = check1_wire.staged_units(declared) if kind == "check1_shards" else declared
+            weighed = check1_wire.staged_units(counts.get("conditioning", 0))
             found[test] = Mark(units, counts["per_task"], mark.lineno, declared, weighed,
                                counts.get("conditioning_per_task", 0))
             read.add(id(mark.func))

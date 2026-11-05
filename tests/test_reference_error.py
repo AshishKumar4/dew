@@ -389,7 +389,7 @@ def sharded_site(monkeypatch, root, shards, site):
     """`site()` run as armada runs a sharded site: a map task for each range of `shards` (DRAWS), its
     records under `root` (RECORDS), then their judge (POOL over `root`); what each map task's run
     returned and what the judge's did."""
-    from map_judge import DRAWS, POOL, RECORDS
+    from check1_wire import DRAWS, POOL, RECORDS
 
     drawn = []
     for index, (start, stop) in enumerate(shards):

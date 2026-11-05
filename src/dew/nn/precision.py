@@ -237,26 +237,26 @@ def broadcast_summed(value: jax.Array, shape: tuple[int, ...], dimensions: tuple
 def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
     """`value` broadcast to `shape`, whose transpose, the sum of a cotangent over every position the
     value spread over (a bias's gradient), a CPU running wide arithmetic (`WIDE_CPU_ARITHMETIC`, Dew's
-    tests) takes in float64 and rounds once: there the broadcast is the outer product of ones and the
-    value, taken in float64 (`float64_sum`), whose transpose is a product too. A float32 reduction's sum
-    (`widened_reduction`), it is wide in a scope that states fp32 sums for products (`FP32_SUMS`) as
-    well. A library process, an accelerator, a value not float32 and a quantized model's trace broadcast
-    it, whose transpose JAX sums in the value's dtype. A value an Explicit axis places along an axis it
-    spreads over (never a bias, whose leading axes `biased` adds) is broadcast: the outer product does
-    not keep that placement on a dropped size-one axis."""
+    tests) takes in float64 and rounds once, as it sums a float32 product (`accumulated`): there the
+    broadcast is the outer product of ones and the value, whose transpose is a product. Everywhere
+    else, and where `accumulated` leaves a product its own sum (`FP32_SUMS`, a quantized model's
+    trace), it is the broadcast, whose transpose JAX sums in the value's dtype, as a user's process
+    sums it on every platform (ledger 3197). A value an Explicit axis places along an axis it spreads
+    over (never a bias, whose leading axes `biased` adds) is broadcast: the outer product does not keep
+    that placement on a dropped size-one axis."""
     axes = tuple(axis for axis, (size, total) in enumerate(zip(value.shape, shape, strict=True))
                  if size == 1 and total != 1)
     placed = explicit_spec(value)
     if (not axes or (placed is not None and any(placed.spec[axis] is not None for axis in axes))
-            or not wide_cpu_arithmetic() or _intercepted() or value.dtype != jnp.float32):
+            or not _sums_in_float64(value)):
         return jnp.broadcast_to(value, shape)
     kept = tuple(axis for axis in range(len(shape)) if axis not in axes)
 
     def outer(value: jax.Array) -> jax.Array:
         # Only the size-one axes are dropped, so a sharded kept axis keeps its own sharding.
         ones = jnp.ones(tuple(shape[axis] for axis in axes), value.dtype)
-        product = float64_sum(functools.partial(jax.lax.dot_general, dimension_numbers=(((), ()), ((), ()))),
-                              ones, jnp.squeeze(value, axes), dtype=value.dtype)
+        product = accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((), ()), ((), ()))),
+                              ones, jnp.squeeze(value, axes))
         return jnp.transpose(product, tuple(np.argsort((*axes, *kept))))
 
     return jax.lax.platform_dependent(value, cpu=outer, default=lambda value: jnp.broadcast_to(value, shape))

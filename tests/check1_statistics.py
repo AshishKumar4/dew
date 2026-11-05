@@ -52,8 +52,6 @@ FEWEST_SEEDS = 8
 seeds a bootstrap has so few distinct resamples that its interval can sit wholly to one side of PARITY by
 the draws' luck, so fewer is Inconclusive whatever their ratio reads; above it the measured interval
 decides. `seeds_for` never declares fewer."""
-REDRAW = 4
-"""A failing site's pooled ratio is drawn again over REDRAW times its seeds before it fails."""
 
 
 @dataclasses.dataclass(frozen=True)

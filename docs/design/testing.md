@@ -111,7 +111,7 @@ A mainloop that composes the guards (the plain-JAX one today; a Mosaic mainloop 
 
 The module's older assertions hold the comparisons not yet converted to check 1, and go once their last site moves.
 
-The accurate form, measured the same way, ties at keys an ulp apart alone: dV in fp32, 48 groups of at most 16 ulps; the output in bf16, 3 groups of at most 8 ulps, each within check 1's 1.5× of the reference's error.
+The accurate form, measured the same way, tied at keys an ulp apart: dV in fp32, 48 groups of at most 16 ulps; the output in bf16, 3 groups of at most 8 ulps, each within check 1's 1.5× of the reference's error. Those ties break its no-merging contract above, which parity does not relax: they are an open defect of the accurate form, not permitted behavior, and the stability suite holds the accurate form to check 1 and its exact zeros, not yet to no merging (ledger 4205).
 
 Investigate a failure in Dew, the reference arm or the gate. Do not change the reference to match Dew, exclude failing positions or gradients, or compare only argmax when logits disagree. The library-arm rule above is the only permitted bound exception.
 

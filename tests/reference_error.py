@@ -84,7 +84,6 @@ from check1_statistics import (
     NARROW_FACTORS,
     PARITY,
     PREVIOUS_TAILS,
-    REDRAW,
     ROW_FACTOR,
     UPPER_TAIL,
     Finding,
@@ -108,9 +107,10 @@ from check1_statistics import (
     root_mean,
     shown,
 )
+from check1_wire import DRAWS, REDRAW, STAGES, staged_units
 from conditioning import Conditioning, conditioned
 from float64_terms import float64_terms
-from map_judge import DRAWS, PoolRefused, ask_later, drawing, judging, pooled_units, record_units
+from map_judge import PoolRefused, ask_later, drawing, judging, pooled_units, record_units
 from site_draws import _Draws
 
 from dew.accuracy import distance, reduction_bound, within
@@ -1441,16 +1441,16 @@ def _staged(drawn, seeds: int, label: str, *,
         further = any(np.sum(draws.theirs[:, index]) > 0 and _judged(draws, index, tails)[0] > PARITY
                       for index in range(len(draws.names)))
     if further:
-        draws = draws.joined(drawn(seeds, (1 + REDRAW) * seeds))
+        draws = draws.joined(drawn(seeds, staged_units(seeds)))
     # The stage drawn by the pooled ratio alone; the final verdict's leaves it leaves inconclusive asked of
     # their typical draw (`_judgement`'s `typical`).
     return (*_judgement(draws, label, tails, contained=two_stage, typical=two_stage), 2 if further else 1)
 
 
-STAGES_LOG = "DEW_CHECK1_STAGES"
-"""The environment variable naming a file each check-1 judgement appends its stage, its verdict and its
-leaves of narrow rows (NARROW_FACTORS) to, one JSON line (`_logged`): what a train reads every site's
-stage-two rate from, every attempt counted, and which sites' local errors rest on check 2."""
+STAGES_LOG = STAGES
+"""The environment variable (`check1_wire.STAGES`) naming a file each check-1 judgement appends its stage, its
+verdict and its leaves of narrow rows (NARROW_FACTORS) to, one JSON line (`_logged`): what a train reads every
+site's stage-two rate from, every attempt counted, and which sites' local errors rest on check 2."""
 
 
 def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str], ynn: str | None = None) -> None:
@@ -1694,7 +1694,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     # own, the shards cut at the most of them, and a recording holds no more.
     _site_judged(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
                  library_fn=library_fn, library_row=library_row, library_leaves=library_leaves, also=also,
-                 terms=terms, examples=examples, weighing=None, upto=(1 + REDRAW) * seeds)
+                 terms=terms, examples=examples, weighing=None, upto=staged_units(seeds))
 
 
 def _deferred(dew_fn, reference_fn, draw, label: str, *, seeds: int, conditioning: int, truth_fn, orders,
@@ -1704,7 +1704,7 @@ def _deferred(dew_fn, reference_fn, draw, label: str, *, seeds: int, conditionin
     elements classed over the draws it takes, alike in every process that runs it. A sharded site's map
     tasks draw each check's units apart, the weighed check's past the unweighted one's in the plan's units
     (tools/armada/ci.py `draws_of`), and its judge pools the weighed check's where it defers."""
-    plain, span = (1 + REDRAW) * seeds, (1 + REDRAW) * conditioning
+    plain, span = staged_units(seeds), staged_units(conditioning)
 
     def weighed():
         _site_judged(dew_fn, reference_fn, draw, f"{label}, conditioned", seeds=conditioning,
@@ -1860,7 +1860,7 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
     draws = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn, label=label)
     moved, kept, unresolved = _moved(draws, 1)
     if not moved:
-        further = range(seeds, (1 + REDRAW) * seeds)
+        further = range(seeds, staged_units(seeds))
         draws = draws.joined(_drawn(changed_fn, original_fn, draw, further, truth_fn, label=label))
         moved, kept, unresolved = _moved(draws, 2)
     if not moved:
@@ -1944,7 +1944,7 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     _refuse_numpy_arms(draw, *([dew_fn] if paired else []), reference_fn)
     # A weighed site (`assert_as_exact`'s `conditioning`) is sized as it is judged, weighed, its heavy
     # elements classed over its first stages' draws.
-    weighing = (_conditioning(reference_fn, truth_fn, draw, range((1 + REDRAW) * max(start, FEWEST_SEEDS)))
+    weighing = (_conditioning(reference_fn, truth_fn, draw, range(staged_units(max(start, FEWEST_SEEDS))))
                 if conditioning else None)
     dew_fn, reference_fn = _arms(dew_fn if paired else reference_fn, reference_fn)
     dew_fn = dew_fn if paired else None
@@ -2077,7 +2077,7 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
     verdicts = []
     # Each run's draws: both budgets whole, the unweighted check's and the weighed one's, and the
     # reference's own beside them where unpaired, so no two runs share a draw.
-    span = (1 + REDRAW) * max(seeds, conditioning or 0)
+    span = staged_units(max(seeds, conditioning or 0))
     for run in range(first, first + runs):
         base = run * 2 * span
 
@@ -2094,7 +2094,7 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
         verdict = _verdict(over, unresolved)
         if conditioning is not None and verdict == "inconclusive":
             weighing = _conditioning(reference_fn, truth_fn, draw,
-                                     range(base, base + (1 + REDRAW) * conditioning))
+                                     range(base, base + staged_units(conditioning)))
             over, unresolved, stage = judged(weighing, conditioning)
             verdict = f"{_verdict(over, unresolved)}, conditioned"
         verdicts.append((verdict, stage, [str(finding) for finding in over + unresolved]))
@@ -2223,9 +2223,9 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
     recorded = [*reference.values(), *truth.values(),
                 *(inputs.values() if inputs_of is None else [digests])]
     count = min(len(value) for value in recorded)
-    if count < (1 + REDRAW) * seeds:
+    if count < staged_units(seeds):
         raise AssertionError(f"{site}: {count} recorded seeds, and check 1 over {seeds} may draw "
-                             f"{(1 + REDRAW) * seeds}; record (1 + REDRAW) times the declared seeds")
+                             f"{staged_units(seeds)}; record (1 + REDRAW) times the declared seeds")
 
     def draw(seed):
         if inputs_of is None:
@@ -2269,9 +2269,9 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
     pilots = len(stored.get(f"{site}.pilot.input_digest", ()))
     count = min([len(value) for part in (mse, worst, finite, sketch) for value in part.values()]
                 + [len(value) - 1 for value in zero_offsets.values()])
-    if min(count, len(digests)) < (1 + REDRAW) * seeds:
+    if min(count, len(digests)) < staged_units(seeds):
         raise AssertionError(f"{site}: {min(count, len(digests))} recorded seeds, and check 1 over {seeds} "
-                             f"may draw {(1 + REDRAW) * seeds}")
+                             f"may draw {staged_units(seeds)}")
     roundings = {}
 
     def held(seed):
