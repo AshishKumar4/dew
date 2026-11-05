@@ -44,7 +44,7 @@ import dataclasses
 import functools
 import logging
 import math
-from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence, Sized
 from typing import TYPE_CHECKING, overload
 
 import jax
@@ -714,8 +714,9 @@ def _scan_counts(params: Mapping) -> tuple[int, int] | None:
     if "num_consts" in params:
         return params["num_consts"], params["num_carry"]
     trees = params.get("ft_in")
-    if isinstance(trees, tuple) and len(trees) == 3 and all(isinstance(tree, tuple) for tree in trees):
-        return len(trees[0]), len(trees[1])
+    if isinstance(trees, Sized) and len(trees) == 3 and all(isinstance(tree, Sized) for tree in trees):
+        consts, carries, _ = trees
+        return len(consts), len(carries)
     return None
 
 
