@@ -369,12 +369,14 @@ def test_a_scans_carry_derived_for_one_target_serves_no_other():
     assert splits[2] is splits[0]
 
 
-def test_a_derived_scans_products_are_its_issuers_each_by_its_role():
+@pytest.mark.parametrize(("update_fn", "operands", "draw_fn"), [
+    (gated_delta, GATED, gated_draw), (kimi_delta, KIMI, kimi_draw)], ids=["gated_delta", "kimi_delta"])
+def test_a_derived_scans_products_are_its_issuers_each_by_its_role(update_fn, operands, draw_fn):
     """A derived scan's chunk walked through a mainloop's issuer (`issue(role, lhs, rhs)`) at prepare, step
     and mapped: every product of its forms is the issuer's, under the roles a chunk's form makes (its gram,
-    its inverse's doubling, its correction, write and readouts), and the walk computes what Dew's own
-    products do, bit for bit."""
-    forms = scan.derive_scan(scan.Scan(gated_delta, gated_readout, GATED, walked="time",
+    a per-key decay's factored around each sub-chunk's reference among them, its inverse's doubling, its
+    correction, write and readouts), and the walk computes what Dew's own products do, bit for bit."""
+    forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
                                        state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
     roles = []
 
@@ -382,7 +384,7 @@ def test_a_derived_scans_products_are_its_issuers_each_by_its_role():
         roles.append(role)
         return float32_matmul(left, right)
 
-    chunk = chunk_of(dict(zip(GATED, gated_draw(0), strict=True)), 0, GATED)
+    chunk = chunk_of(dict(zip(operands, draw_fn(0), strict=True)), 0, operands)
     state = forms.init(())
     plain = forms.prepare(chunk)
     expected = forms.mapped(plain, state), forms.step(state, plain)

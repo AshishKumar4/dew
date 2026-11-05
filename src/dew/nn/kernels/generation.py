@@ -760,27 +760,18 @@ def _shared_memory(device) -> int | None:
 
 
 @functools.cache
-def _clocks(ordinal: int) -> tuple[tuple[str, float], ...]:
-    """The visible GPU `ordinal`'s multiprocessor clock and device-memory bandwidth (twice the memory
-    clock times the bus's bytes, as CUDA's deviceQuery derives it), which jax's Device does not carry,
-    from the CUDA driver (`dew._devices.gpu_attribute`), read once a process; none where no
-    driver loads."""
-    from dew._devices import CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH, MEMORY_CLOCK_RATE, gpu_attribute
+def _driver_facts(ordinal: int, read: Callable[[int, int], int | None]) -> tuple[tuple[str, float], ...]:
+    """The visible GPU `ordinal`'s facts jax's Device does not carry, as the CUDA driver reports them
+    (`read`: an attribute of a GPU, `dew._devices.gpu_attribute`), read once a process: its
+    multiprocessor clock, its device-memory bandwidth (twice the memory clock times the bus's bytes, as
+    CUDA's deviceQuery derives it) and its L2 cache's bytes; none where no driver loads."""
+    from dew._devices import CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH, L2_CACHE_SIZE, MEMORY_CLOCK_RATE
 
-    clock, memory_clock, bus = (gpu_attribute(ordinal, attribute)
-                                for attribute in (CLOCK_RATE, MEMORY_CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH))
-    if clock is None or memory_clock is None or bus is None:
-        return ()
-    return ('clock_hz', clock * 1e3), ('memory_bandwidth', 2 * memory_clock * 1e3 * bus / 8)
-
-
-@functools.cache
-def _l2_bytes(ordinal: int) -> int | None:
-    """The visible GPU `ordinal`'s L2 cache in bytes, from the CUDA driver (`dew.devices.gpu_attribute`),
-    read once a process; None where no driver loads."""
-    from dew.devices import L2_CACHE_SIZE, gpu_attribute
-
-    return gpu_attribute(ordinal, L2_CACHE_SIZE)
+    clock, memory_clock, bus, l2 = (read(ordinal, attribute) for attribute in (
+        CLOCK_RATE, MEMORY_CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH, L2_CACHE_SIZE))
+    clocks = (() if clock is None or memory_clock is None or bus is None else
+              (('clock_hz', clock * 1e3), ('memory_bandwidth', 2 * memory_clock * 1e3 * bus / 8)))
+    return (*clocks, *(() if l2 is None else (('l2_bytes', l2),)))
 
 
 def _one_kind(devices) -> None:
@@ -797,13 +788,18 @@ def _one_kind(devices) -> None:
                          "be of one kind")
 
 
-def runtime_facts(target: GpuTarget, device) -> GpuTarget:
+def runtime_facts(target: GpuTarget, device, *, read: Callable[[int, int], int | None] | None = None
+                  ) -> GpuTarget:
     """`target` with the facts a real CUDA `device` reports of itself in place of the table's: its
-    multiprocessors, its block's shared memory, its clock and memory bandwidth (`_clocks`), read free at
+    multiprocessors, its block's shared memory, its clock, memory bandwidth and L2 cache from the CUDA
+    driver (`_driver_facts`, read by `read`, `dew._devices.gpu_attribute` by default), read free at
     runtime, its family's facts its capability's (`architecture`). A GPU the table does not name so
     keeps every resource a kernel's requirements and cost read."""
+    if read is None:
+        from dew._devices import gpu_attribute
+        read = gpu_attribute
     facts = {'multiprocessors': _multiprocessors(device), 'shared_limit': _shared_memory(device),
-             **dict(_clocks(device.local_hardware_id)), 'l2_bytes': _l2_bytes(device.local_hardware_id)}
+             **dict(_driver_facts(device.local_hardware_id, read))}
     return dataclasses.replace(target, **{name: value for name, value in facts.items() if value is not None})
 
 
