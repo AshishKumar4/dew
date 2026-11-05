@@ -1154,6 +1154,12 @@ def _cutlass_registered() -> None:
         jax.ffi.register_ffi_target(target, capsule, platform="CUDA")
 
 
+def _cutlass_call(target: str, out: jax.ShapeDtypeStruct) -> Callable:
+    """dew_cutlass's FFI call `target` giving `out`, a mapped call running its maps in turn, one launch
+    each (row 4389: JAX's FFI batching refuses a call that states no rule)."""
+    return jax.ffi.ffi_call(target, out, vmap_method='sequential')
+
+
 CUTLASS_TILE = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2, family='wgmma')
 """The dew-cutlass wheel's one instantiated kernel, as Dew's records name a launch (row 4323): a fact of
 that binary, not a derivation. kernels/cutlass/grouped_sm90.cu's `Kernel`, which every one of its targets
@@ -1217,8 +1223,8 @@ class CutlassGmm(_Cutlass):
         _cutlass_registered()
         width = kernel.shape[1] if trans_rhs else kernel.shape[2]
         out = jax.ShapeDtypeStruct((tokens.shape[0], width), jnp.dtype(out_dtype))
-        return jax.ffi.ffi_call('dew_cutlass_grouped_gemm', out)(tokens, kernel, sizes,
-                                                                 transpose_w=trans_rhs), None
+        call = _cutlass_call('dew_cutlass_grouped_gemm', out)
+        return call(tokens, kernel, sizes, transpose_w=trans_rhs), None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1240,7 +1246,7 @@ class CutlassTgmm(_Cutlass):
         _cutlass_registered()
         out = jax.ShapeDtypeStruct((sizes.shape[0], tokens.shape[1], cotangent.shape[1]),
                                    jnp.dtype(out_dtype))
-        return jax.ffi.ffi_call('dew_cutlass_grouped_gemm_k', out)(tokens, cotangent, sizes), None
+        return _cutlass_call('dew_cutlass_grouped_gemm_k', out)(tokens, cotangent, sizes), None
 
 
 class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
