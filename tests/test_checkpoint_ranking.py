@@ -666,8 +666,9 @@ def test_local_resume_keeps_plateau_patience(tmp_path):
 
 def test_a_runs_persistent_and_local_checkpoints_hold_one_envelope(tmp_path):
     """A run's persistent checkpoint and its local one are submitted with the same envelope, every field a
-    local save takes the persistent save takes alike (the state as saved, its data position, partition,
-    stop control, rung, artifact, axes and rollout), each tier adding its own (row 4126: two submissions
+    local save takes the persistent save takes alike, each tier adding its own: two runs alike, one saving
+    its second step persistently and one locally, hand their tiers the same state, data position,
+    partition, stop control, rung, artifact, axes and rollout, value for value (row 4126: two submissions
     each built field by field, a field added to one missed by the other)."""
     import inspect
     from typing import ClassVar
@@ -675,34 +676,33 @@ def test_a_runs_persistent_and_local_checkpoints_hold_one_envelope(tmp_path):
     local = set(inspect.signature(Checkpoints.save_local).parameters) - {"self", "step"}
 
     class Recorded(Checkpoints):
-        """Checkpoints that keep what each tier's first save was handed."""
+        """Checkpoints that keep what each tier's save of each step was handed."""
 
-        submitted: ClassVar[dict[str, tuple[tuple, dict]]] = {}
+        submitted: ClassVar[dict[tuple[str, int], dict]] = {}
 
         def save(self, step, *args, **fields):
-            self.submitted.setdefault("save", (args, fields))
+            bound = inspect.signature(Checkpoints.save).bind(self, step, *args, **fields).arguments
+            self.submitted.setdefault(("save", step), bound)
             return super().save(step, *args, **fields)
 
         def save_local(self, step, *args, **fields):
-            self.submitted.setdefault("save_local", (args, fields))
+            bound = inspect.signature(Checkpoints.save_local).bind(self, step, *args, **fields).arguments
+            self.submitted.setdefault(("save_local", step), bound)
             return super().save_local(step, *args, **fields)
 
-    run = Trainer(Overfit(), optax.sgd(.1), key=jax.random.key(0),
-                  checkpoints=Recorded(str(tmp_path / "run"), local_directory=str(tmp_path / "local"),
-                                       local_every=1))
-    run.fit(data(), steps=2, log_every=1, checkpoint_every=2)
-    run.checkpoints.wait()
-    (persistent_args, persistent), (local_args, local_fields) = (Recorded.submitted["save"],
-                                                                 Recorded.submitted["save_local"])
-    assert not persistent_args and not local_args and set(local_fields) == local <= set(persistent)
-    # What a step does not move, each tier holds alike: the partition, the rung, the artifact, the axes; the
-    # state, its position and the rollout as trees of one structure.
-    for name in ("share", "rung", "artifact", "boxed"):
-        assert persistent[name] == local_fields[name], name
-    for name in ("state", "rollout"):
-        assert jax.tree.structure(persistent[name]) == jax.tree.structure(local_fields[name]), name
-    assert isinstance(persistent["saved"], bytes) and isinstance(local_fields["saved"], bytes)
-    assert persistent["control"].keys() == local_fields["control"].keys()
+    for name, tiers in (("persistent", {}), ("local", {"local_directory": str(tmp_path / "local"),
+                                                     "local_every": 2})):
+        run = Trainer(Overfit(), optax.sgd(.1), key=jax.random.key(0),
+                      checkpoints=Recorded(str(tmp_path / name), **tiers))
+        run.fit(data(), steps=2, log_every=1, checkpoint_every=2 if name == "persistent" else None)
+        run.checkpoints.wait()
+    persistent, saved = Recorded.submitted[("save", 2)], Recorded.submitted[("save_local", 2)]
+    assert local <= set(persistent) and local <= set(saved)
+    for field in local - {"state"}:
+        assert persistent[field] == saved[field], field
+    assert jax.tree.structure(persistent["state"]) == jax.tree.structure(saved["state"])
+    assert all(jax.tree.leaves(jax.tree.map(lambda a, b: bool(np.array_equal(np.asarray(a), np.asarray(b))),
+                                            persistent["state"], saved["state"])))
 
 
 def test_tile_head_invalidates_validation_trace_for_the_same_batch_shape():
