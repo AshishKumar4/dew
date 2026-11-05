@@ -20,7 +20,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
-from dew.batch import coordinates
+from dew.batch import Variables, coordinates
 from dew.interop.unread import Stored, held
 from dew.interop.weights import Tree, checkpoint_dtype, insert, placed
 from dew.nn.conv import Conv
@@ -486,16 +486,17 @@ def _read_mimo_audio(tensors: Mapping[str, Stored], path_of, param_dtype: str
     return variables, layouts
 
 
-MiMoAudio.checkpoint = TowerLayout("", mimo_audio_path, read=_read_mimo_audio,
-                                   roots=("audio_encoder.", "speech_embeddings.", _TOKENIZER_ENCODER))
+_LAYOUT = TowerLayout("", mimo_audio_path, read=_read_mimo_audio,
+                      roots=("audio_encoder.", "speech_embeddings.", _TOKENIZER_ENCODER))
+MiMoAudio.checkpoint = _LAYOUT
 
 
 def translate_mimo_audio_weights(tokenizer: Mapping[str, np.ndarray], encoder: Mapping[str, np.ndarray], *,
-                                 param_dtype: str = "float32") -> Tree[Stored]:
+                                 param_dtype: str = "float32") -> Variables:
     """The tower's variables from the tokenizer's tensors (`encoder.` prefix off) and the audio
     encoder's (`audio_encoder.` off, `speech_embeddings.` kept), as a bundle's names read them
     (`MiMoAudio.checkpoint`)."""
     named = {**{f"{_TOKENIZER_ENCODER}{name}": tensor for name, tensor in tokenizer.items()},
              **{name if name.startswith("speech_embeddings.") else f"audio_encoder.{name}": tensor
                 for name, tensor in encoder.items()}}
-    return MiMoAudio.checkpoint.variables(named, param_dtype)[0]
+    return _LAYOUT.variables(named, param_dtype)[0]

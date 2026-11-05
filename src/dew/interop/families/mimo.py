@@ -468,23 +468,7 @@ def _mimo_v2_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
     used.update(hf_config)
     width = record_int(text, 'emb_features')
     vision = hf_config.get('vision_config') is not None
-    audio = dict(NO_AUDIO)
-    unported: dict[str, str] = {}
-    stated = hf_config.get('audio_config')
-    tokenizer = hf_config.get(folder_config(_AUDIO_TOKENIZER))
-    if stated is not None and tokenizer is None:
-        # The language model alone loads (`text_only`); a whole load is refused by the encoder's name.
-        unported = dict.fromkeys(('audio_encoder.', 'speech_embeddings.'),
-                                 f"the audio encoder reads the codes of the tokenizer in the release's "
-                                 f"{_AUDIO_TOKENIZER} folder, which this source lacks")
-    elif stated is not None:
-        record = translate_mimo_audio_config(_records.record(stated, 'audio_config'),
-                                             _records.record(tokenizer, folder_config(_AUDIO_TOKENIZER)))
-        projected = record_int(_records.record(record['fields'], 'audio fields'), 'out_hidden_size')
-        if projected != width:
-            refuse(f'audio_config.out_hidden_size {projected}', f'the decoder embeds {width} wide')
-        audio.update(audio=record, audio_token_id=record_int(hf_config, 'audio_token_id'))
-    return {
+    fields: WrapperFields = {
         'model_type': 'mimo_v2', 'text_model_type': 'mimo_v2', 'text': text,
         'tower': translate_mimo_vision_config(hf_config) if vision else None,
         'projector': translate_mimo_projector_config(hf_config, width) if vision else None,
@@ -492,7 +476,23 @@ def _mimo_v2_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
         'video_token_id': (None if hf_config.get('video_token_id') is None
                            else record_int(hf_config, 'video_token_id')),
         'extra_placeholder_ids': (), 'text_unprefixed': ('embed_tokens.', 'layers.', 'norm.', 'mtp.'),
-        **({'unported': unported} if unported else {}), **audio}
+        **NO_AUDIO}
+    stated = hf_config.get('audio_config')
+    tokenizer = hf_config.get(folder_config(_AUDIO_TOKENIZER))
+    if stated is not None and tokenizer is None:
+        # The language model alone loads (`text_only`); a whole load is refused by the encoder's name.
+        fields['unported'] = dict.fromkeys(('audio_encoder.', 'speech_embeddings.'),
+                                           f"the audio encoder reads the codes of the tokenizer in the "
+                                           f"release's {_AUDIO_TOKENIZER} folder, which this source lacks")
+    elif stated is not None:
+        record = translate_mimo_audio_config(_records.record(stated, 'audio_config'),
+                                             _records.record(tokenizer, folder_config(_AUDIO_TOKENIZER)))
+        projected = record_int(_records.record(record['fields'], 'audio fields'), 'out_hidden_size')
+        if projected != width:
+            refuse(f'audio_config.out_hidden_size {projected}', f'the decoder embeds {width} wide')
+        fields['audio'] = record
+        fields['audio_token_id'] = record_int(hf_config, 'audio_token_id')
+    return fields
 
 
 def _mimo_v2_export(model: CausalTransformer) -> Mapping[str, object]:

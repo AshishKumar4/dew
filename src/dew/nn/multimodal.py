@@ -390,7 +390,8 @@ class MultimodalTransformer(DecoderWrapper):
         embeddings = self.language_model.scaled_embeddings(
             self.language_model.token_embeddings(decoder_tokens))
         if self.family == "gemma3n":
-            embedders = [self.conditioner.projector]
+            # Each must be a hard-vocabulary embedder, which an absent audio projector is not.
+            embedders: list[ProjectorBase | None] = [self.conditioner.projector]
             if self.audio is not None:
                 embedders.append(self.audio_conditioner.audio_projector)
             for embedder in embedders:
