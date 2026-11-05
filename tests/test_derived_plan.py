@@ -198,6 +198,22 @@ def bare_search(objective):
     return search
 
 
+def test_a_step_lowered_afresh_past_a_spilled_kernel_traces_its_footprint_again():
+    """The search's first lowering of a candidate the derivation read keeps the footprint it traced; one
+    lowered afresh past a kernel that spilled traces its own (`FitSearch.relowering`), as the kernel's next
+    config can change the buffers its first held (review of row 4261)."""
+    from dew.training.footprint import Footprint
+
+    handed = []
+    search = bare_search(deep(split=None).objective)
+    search.lower = lambda split, narrow, footprint: handed.append(footprint)
+    derived = Footprint(residuals=1, gradients=2, held=3)
+    search.footprints[search.candidate_key(1, narrow=False)] = derived
+    search.lowering(1)
+    search.relowering(1)
+    assert handed == [derived, None]
+
+
 class Asked(Exception):
     """A compile `bare_search` was asked for, at the remat rung its argument names."""
 
