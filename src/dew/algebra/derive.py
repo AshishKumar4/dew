@@ -597,9 +597,9 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
                                                   made.finishes, strict=True)]
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
-    def mapped(tiles):
+    def mapped(tiles, *, product=None):
         made = forms(shaped(tiles))
-        value = evaluator(made.region, [*made.consts, *(tiles[name] for name in names)], {})
+        value = evaluator(made.region, [*made.consts, *(tiles[name] for name in names)], {}, product=product)
         outputs = [value(form) if along and form is not None else None
                    for form, along in zip(made.outputs, made.mapped, strict=True)]
         return outputs[0] if len(outputs) == 1 else tuple(outputs)

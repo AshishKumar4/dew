@@ -265,7 +265,7 @@ def derived_backward(form: str, along: str):
         values = {"logits": logits, "q": q, "k": k, "values": v, "dout": d, "peak": peak, "total": total,
                   "anchor": jnp.zeros_like(delta), "delta": delta, "seen": seen}
         parts = [tile(values, index) for index in range(LENGTH // BLOCK)]
-        mapped = [forms.mapped(part) for part in parts]
+        mapped = [forms.mapped(part, product=template.interpreted_dot) for part in parts]
         dq, dk, dv, *_ = forms.finish(walked(forms, parts, template.interpreted_dot), values,
                                       shapes=shaped(parts[0]))
         if along == "rows":
