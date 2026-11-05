@@ -185,9 +185,9 @@ def _mainloop(declined: selection.Refusal | None, spans: KeySpans, hooks: Hooks,
 
 def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
              config: _Config, *, residuals: bool):
-    """The forward on its mainloop (`_mainloop`): the Mosaic one's training forward keeping its output for the
-    backward's D where the call takes that (`takes_output_residuals`), whichever mainloop runs the backward
-    (the residuals are every mainloop's, `output_split`)."""
+    """The forward on its mainloop (`_mainloop`): a training forward keeping its output for the backward's D
+    where the call takes that (`takes_output_residuals`), the Mosaic and the Pallas-Triton one alike,
+    whichever mainloop runs the backward (the residuals are every mainloop's, `output_split`)."""
     form = {"scale": config.scale, "natural": config.natural}
     if not residuals:
         kept = Kept.NONE
@@ -198,7 +198,7 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, residuals=kept,
                                                  **form) if _on_gpu() else None
     mainloop = _mainloop(declined, spans, hooks, functools.partial(
-        attention_triton.unfitted, query, key, value, spans, hooks, residuals=residuals, **form))
+        attention_triton.unfitted, query, key, value, spans, hooks, residuals=kept, **form))
     if mainloop == 'mosaic':
         if not residuals and attention_decode.serves(query, key, hooks, natural=config.natural,
                                                      target=generation.gpu_target()):
@@ -206,7 +206,7 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
             return attention_decode.attend(query, key, value, spans, hooks, scale=config.scale)
         return attention_mosaic.forward(query, key, value, spans, hooks, residuals=kept, **form)
     if mainloop == 'triton':
-        return attention_triton.forward(query, key, value, spans, _spread(hooks, query), residuals=residuals,
+        return attention_triton.forward(query, key, value, spans, _spread(hooks, query), residuals=kept,
                                         **form)
     return attention_portable.attend(query, key, value, spans, hooks, block_q=PLAIN_TILE, block_k=PLAIN_TILE,
                                      pad=PLAIN_TILE, residuals=residuals, **form)

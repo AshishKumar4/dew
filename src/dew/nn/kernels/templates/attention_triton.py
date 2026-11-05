@@ -32,6 +32,7 @@ from dew.nn.kernels.templates.attention import (
     AttentionLaunch,
     Gradients,
     Hooks,
+    Kept,
     KeySpans,
     Kind,
     Split,
@@ -41,6 +42,7 @@ from dew.nn.kernels.templates.attention import (
     kept_dtype,
     kernel_dot,
     launch_arguments,
+    output_split,
     padded_call,
     prescaled,
     within,
@@ -102,13 +104,14 @@ def refused(spans: KeySpans, hooks: Hooks | None = None) -> Refusal | None:
 
 def unfitted(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
              *, scale: float | None = None, natural: bool = NATURAL,
-             residuals: bool = False) -> Refusal | None:
+             residuals: bool | Kept = False) -> Refusal | None:
     """Why no config of `forward`'s launch, bound as it binds this call (`_forward_call`), fits the GPU: its
     own fitting (`Template.fits`: its padding, the configs dividing it, the registers they hold and the
     shared memory they stage), or None. The route then takes another mainloop rather than a launch that
     cannot run (`attention_route._mainloop`); the backward's own launches hold the same tiles' operands."""
     op, args, _ = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
-    if op.fits(op.bind(*args, residuals=residuals, interpret=False), generation.gpu_target()):
+    kept = {False: Kept.NONE, True: Kept.SPLIT}.get(residuals, residuals)
+    if op.fits(op.bind(*args, residuals=kept, interpret=False), generation.gpu_target()):
         return None
     return Refusal('resources',
                    "no config of the Triton mainloop's forward fits the GPU's block and registers")
@@ -131,7 +134,7 @@ def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: pl.Slice | None
 
 
 def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
-                    output_kinds: tuple[Kind, ...], initial: bool, residuals: bool, output_mod, block_k: int,
+                    output_kinds: tuple[Kind, ...], initial: bool, residuals: Kept, output_mod, block_k: int,
                     interpret: bool, guard: str):
     """The forward's Triton mainloop: one program a query block and head walks the key tiles its form
     gives it (every tile, the causal diagonal's, or the spans' block map), issuing the tile's two
@@ -196,7 +199,7 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         # The plain walk where `live` is None, else the guarded one, those rows shifting.
         resumed = (initial_refs[0][...], initial_refs[1][...], initial_refs[2][...]) if initial else None
         start = algebra.started(spec, resumed, block_q, value_ref.shape[-1], live)
-        if residuals:
+        if residuals is Kept.SPLIT:
             return algebra.training_walk(spec, lo, hi, keys_at, rows, start)
         return algebra.plain_walk(spec, lo, hi, keys_at, start)
 
@@ -225,15 +228,17 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         written(walk(live))
 
 
-def _written(spec, walked, *, rows, out_ref, residual_refs, flag_ref, residuals: bool, initial: bool,
+def _written(spec, walked, *, rows, out_ref, residual_refs, flag_ref, residuals: Kept, initial: bool,
              output_mod, output_params, normalized: Callable):
     """A forward walk's output and residuals written: which rows overflowed where the launch flags them,
-    the anchors and split sums of a training walk (`algebra.split_written`, a guarded one's live rows'
-    from the `normalized` pass), and the normalized output with its maximum and denominator."""
+    the anchors and split sums of a training walk (`Kept.SPLIT`: `algebra.split_written`, a guarded one's
+    live rows' from the `normalized` pass), and the normalized output with its maximum and denominator
+    (`Kept.OUTPUT` these alone, the plain walk's)."""
+    split = residuals is Kept.SPLIT
     if flag_ref is not None:
-        weighted = algebra.joined(walked, rows).acc if residuals else walked.acc
+        weighted = algebra.joined(walked, rows).acc if split else walked.acc
         flag_ref[...] = algebra.overflowed(weighted).astype(jnp.float32)
-    if residuals:
+    if split:
         walked, anchors, sums = algebra.split_written(walked, rows, functools.partial(normalized, walked))
         residual_refs[2][...] = anchors
         for ref, part in zip(residual_refs[3:7], sums, strict=True):
@@ -241,7 +246,7 @@ def _written(spec, walked, *, rows, out_ref, residual_refs, flag_ref, residuals:
     out, m, denominator = algebra.finish(spec, walked, initial=initial, output_mod=output_mod,
                                          output_params=output_params)
     out_ref[...] = out.astype(out_ref.dtype)
-    if residuals:
+    if residuals is not Kept.NONE:
         residual_refs[0][...] = m
         residual_refs[1][...] = denominator
 
@@ -273,7 +278,7 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
     natural: bool = NATURAL
 
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, m0, total0,
-             acc0, *, residuals: bool, interpret: bool, config: Tiles, return_residuals: bool = False):
+             acc0, *, residuals: Kept, interpret: bool, config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         # The query taken by its scale's power of two before its products (`prescale`).
@@ -311,14 +316,16 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
             arrays += [m0, total0, acc0]
         out_shape = [jax.ShapeDtypeStruct((batch, queries, heads, value_width), query.dtype)]
         out_specs = [pl.BlockSpec((None, block_q, None, value_width), lambda i, b, h: (b, i, h, 0))]
-        if residuals:
+        if residuals is not Kept.NONE:
             per_row = pl.BlockSpec((None, None, block_q), lambda i, b, h: (b, h, i))
-            out_shape += [*[jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)] * 2,
-                          jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32),
+            out_shape += [jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)] * 2
+            out_specs += [per_row, per_row]
+        if residuals is Kept.SPLIT:
+            out_shape += [jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32),
                           jax.ShapeDtypeStruct((batch, heads, queries, value_width), jnp.float32),
                           *[jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)] * 3]
             per_value = pl.BlockSpec((None, None, block_q, value_width), lambda i, b, h: (b, h, i, 0))
-            out_specs += [per_row, per_row, per_row, per_value, per_row, per_row, per_row]
+            out_specs += [per_row, per_value, per_row, per_row, per_row]
         # A call's own key count, none included; an op built without one counts its launch's keys.
         # Every form guards its sums where its values can overflow them (`algebra.Forward.headroom`), as the
         # plain-JAX and Mosaic mainloops do: the template's production route runs this one on a GPU.
@@ -335,7 +342,7 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         if not spec.headroom:
             out = launch(functools.partial(kernel, guard="none"), in_specs=in_specs, out_specs=out_specs,
                          out_shape=out_shape, name=report.named("attention_forward"))(*arrays)
-            return (tuple(out) if residuals else out[0]), None
+            return (tuple(out) if residuals is not Kept.NONE else out[0]), None
         # The plain launch writes which rows overflowed; the second, issued only where one did, walks again
         # only the programs with one, its outputs the plain launch's (`_forward_kernel`): ordinary inputs
         # take the one launch and a check.
@@ -354,7 +361,7 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
                                 )(*arrays, flags, *out))
 
         out = jax.lax.cond(jnp.max(flags) > 0, rewalked, lambda out: out, tuple(out))
-        return (tuple(out) if residuals else out[0]), None
+        return (tuple(out) if residuals is not Kept.NONE else out[0]), None
 
     GENERATES = True
 
@@ -386,7 +393,7 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         query_tile, weights = config.block_q * width * size, config.block_q * config.block_k * size
         shared = config.block_q >= 128 and width <= 128
         plain = streamed + (max(query_tile, weights) if shared else query_tile + weights)
-        if not (ba.arguments.get("residuals") and algebra.headroom(value.dtype)):
+        if not (ba.arguments.get("residuals") is Kept.SPLIT and algebra.headroom(value.dtype)):
             return plain
         key_stages = (config.stages - 1) * config.block_k * width * size
         normalized = config.block_k * (width + value_width) * size
@@ -403,7 +410,7 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         rows, value = config.block_q, ba.arguments["value"]
         sums = 2 if algebra.compensates(value.dtype) else 1
         words = sums * rows * value.shape[-1] + rows * config.block_k
-        if ba.arguments.get("residuals"):
+        if ba.arguments.get("residuals") is Kept.SPLIT:
             words += rows * value.shape[-1]
         return words // (32 * config.warps)
 
@@ -445,28 +452,35 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
 
 @overload
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
-            *, scale: float | None = None, residuals: Literal[True], natural: bool = NATURAL,
+            *, scale: float | None = None, residuals: Literal[True] | Kept, natural: bool = NATURAL,
             interpret: bool = False) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
     ...
 
 
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
-            *, scale: float | None = None, residuals: bool = False, natural: bool = NATURAL,
+            *, scale: float | None = None, residuals: bool | Kept = False, natural: bool = NATURAL,
             interpret: bool = False):
     """The template's forward (`TritonForward`) on `query` `[B, Q, H, D]` over `key` and `value`
     `[B, K, Hk, D]` and `[B, K, Hk, Dv]` and the keys `spans` leaves each query: as
     `dew.nn.kernels.templates.attention.reference` computes it, with `residuals` its running maxima and
     denominators `[B, H, Q]` too, and each query's anchor key `[B, H, Q]` int32 (`backward` reads them
-    all). The operands pad to whole blocks of the largest tile and to power-of-two
-    head widths (`padded_call`). `natural` keeps the logits natural (`algebra.Forward.base2`).
+    all): `True` or `Kept.SPLIT` the training walk's anchor and split sums, `Kept.OUTPUT` the plain walk's
+    output in their place (`output_split`, `takes_output_residuals`: no anchor key, as the Mosaic training
+    forward keeps where the call takes it). The operands pad to whole blocks of the largest tile and to
+    power-of-two head widths (`padded_call`). `natural` keeps the logits natural (`algebra.Forward.base2`).
     `interpret` runs it on the CPU. A call over runs or under dropout is refused (`refused`)."""
     if reason := refused(spans, hooks):
         raise NotImplementedError(reason)
     op, args, queries = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
     value_width = value.shape[-1]
-    out = op(*args, residuals=residuals, interpret=interpret)
-    if not residuals:
+    kept = {False: Kept.NONE, True: Kept.SPLIT}.get(residuals, residuals)
+    out = op(*args, residuals=kept, interpret=interpret)
+    if kept is Kept.NONE:
         return out[:, :queries, :, :value_width]
+    if kept is Kept.OUTPUT:
+        out, peak, total = out
+        out, peak, total = out[:, :queries, :, :value_width], peak[:, :, :queries], total[:, :, :queries]
+        return out, peak, total, jnp.full(peak.shape, -1, jnp.int32), output_split(out)
     out, peak, total, anchors, others, own, others_total, shift = out
     return (out[:, :queries, :, :value_width], peak[:, :, :queries], total[:, :, :queries],
             anchors[:, :, :queries],
@@ -1000,7 +1014,7 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     if residuals is None:
         plain = Hooks() if hooks is None else Hooks(hooks.score_mod, hooks.score_params, hooks.initial)
         _, maxima, totals, anchors, sums = forward(query, key, value, spans, plain, scale=scale,
-                                                   residuals=True, natural=natural, interpret=interpret)
+                                                   residuals=Kept.SPLIT, natural=natural, interpret=interpret)
         residuals = maxima, totals, anchors, sums
     initial = hooks is not None and hooks.initial is not None
     # A guarded forward's live rows carry normalized split sums (`algebra.split_residuals`), which the first
