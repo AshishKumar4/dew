@@ -108,3 +108,62 @@ def test_a_cache_directory_named_after_the_first_compile_holds_the_programs_comp
 
     assert len(programs(first)) == 1 and len(programs(later)) == 1
 
+
+
+PICKS = """
+import json
+import os
+import sys
+
+from dew.cache import enable_compilation_cache, kernel_picks_path
+
+enable_compilation_cache(sys.argv[1])
+named = [flag for flag in os.environ["XLA_FLAGS"].split()
+         if flag.startswith("--xla_gpu_per_fusion_autotune_cache_dir=")]
+print(json.dumps({"xla": named[0].partition("=")[2], "kernels": kernel_picks_path("NVIDIA H100")}))
+"""
+
+
+def installed_plugin(site: pathlib.Path, build: str, version: str) -> None:
+    """The CUDA `build`'s PJRT plugin at `version` as an install leaves it under `site`: its `jax_plugins`
+    package, which `dew.devices.cuda_builds` finds the build by (JAX calls its `initialize`), and its
+    distribution's metadata."""
+    package = site / "jax_plugins" / f"xla_{build}"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("def initialize():\n    pass\n")
+    info = site / f"jax_{build}_pjrt-{version}.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: jax-{build}-pjrt\nVersion: {version}\n")
+
+
+def test_a_changed_pjrt_plugin_build_reads_no_earlier_pick(tmp_path):
+    """XLA's picks and Dew's kernel picks are measured by the PJRT plugin's compile (XLA, Triton and Mosaic
+    GPU live there), which post42 to post45 rebuild under one jaxlib (row 3560): a process names the directory
+    of its jaxlib and its plugin's build, so a pick measured under post45 is read by post45 again and by no
+    other build, in a process that finds the plugin as an install leaves it."""
+    cache = tmp_path / "cache"
+    base = {key: value for key, value in os.environ.items() if key != "XLA_FLAGS"}
+    root = pathlib.Path(__file__).resolve().parent.parent
+    sites, named = {}, {}
+    for process, version in (("first", "0.12.0.1.post45"), ("other build", "0.12.0.1.post46"),
+                             ("again", "0.12.0.1.post45")):
+        site = sites[process] = tmp_path / process.replace(" ", "-")
+        installed_plugin(site, "cuda12", version)
+        env = {**base, "JAX_PLATFORMS": "cpu", "PYTHONPATH": os.pathsep.join(
+            filter(None, (str(site), str(root / "src"), os.environ.get("PYTHONPATH"))))}
+        done = subprocess.run([sys.executable, "-c", PICKS, str(cache)], capture_output=True, text=True,
+                              env=env, timeout=300, cwd=root)
+        assert done.returncode == 0, done.stderr[-2000:]
+        named[process] = json.loads(done.stdout.strip().splitlines()[-1])
+        if process == "first":
+            pathlib.Path(named[process]["xla"], "pick").write_text("measured under post45")
+            pathlib.Path(named[process]["kernels"]).parent.mkdir(parents=True)
+            pathlib.Path(named[process]["kernels"]).write_text("{}")
+    assert named["again"] == named["first"]
+    assert pathlib.Path(named["again"]["xla"], "pick").read_text() == "measured under post45"
+    other = named["other build"]
+    for kind in ("xla", "kernels"):
+        assert not pathlib.Path(other[kind]).is_relative_to(named["first"]["xla"]), kind
+        assert not pathlib.Path(named["first"][kind]).is_relative_to(other["xla"]), kind
+    assert not pathlib.Path(other["xla"], "pick").exists()
+    assert not pathlib.Path(other["kernels"]).exists()
