@@ -204,13 +204,15 @@ class CorpusCounts:
     def followed(self, reader: CorpusCounts) -> CorpusCounts:
         """These counts of the prefix a memory read ran, followed by `reader`'s of the stages it
         read after them: the reader delivered the rows and counted those cut short, and its examples
-        where it counts them (`rows`), else the prefix did, and the two dropped and chunked apart."""
+        where it counts them (`rows`), else the prefix did, and the two dropped and chunked apart; the
+        tokens are the first weighing's, whichever weighed."""
         examples = {} if reader.rows else {
             "rows": self.rows, "examples": self.examples, "accepted": self.accepted}
         return dataclasses.replace(
             reader, **examples, attempted=max(self.attempted, reader.attempted),
             chunks=self.chunks + reader.chunks, chunk_records=self.chunk_records + reader.chunk_records,
-            rejected=self.rejected + reader.rejected, rejected_cut=self.rejected_cut + reader.rejected_cut)
+            rejected=self.rejected + reader.rejected, rejected_cut=self.rejected_cut + reader.rejected_cut,
+            tokens=max(self.tokens, reader.tokens))
 
     def expanded(self, outputs: Sequence[Record]) -> None:
         """Count one chunked document and its fan-out before later stages can reject chunks."""
@@ -1131,7 +1133,7 @@ def _past(counted: dict[str, CorpusCounts], outer: CorpusCounts) -> None:
         outer, rows=inner.rows, examples=inner.examples, accepted=inner.accepted,
         attempted=max(inner.attempted, outer.attempted), chunks=max(inner.chunks, outer.chunks),
         chunk_records=max(inner.chunk_records, outer.chunk_records), rejected=inner.rejected + outer.rejected,
-        rejected_cut=inner.rejected_cut + outer.rejected_cut)
+        rejected_cut=inner.rejected_cut + outer.rejected_cut, tokens=max(inner.tokens, outer.tokens))
 
 
 def _added(counted: dict[str, CorpusCounts], counts: CorpusCounts) -> None:
