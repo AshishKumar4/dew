@@ -342,8 +342,9 @@ TMA_ROWS = 8
 class Allocations:
     """Dew: a GEMM launch's shared memory at its tile, as its kernel scopes it (`gmm_allocations`,
     `tgmm_allocations`): its streams' blocks `(shape, dtype)` by name (`mosaic.Family.streams`), what it
-    scopes beside them in the kernel's order (`staged`: side operands' staging, `mosaic.staging`, a meeting's
-    barriers), and its outputs' tiles `(shape, dtype)`, which the family stages (`mosaic.Family.persist`)."""
+    scopes beside them in the kernel's order (`staged`: side operands' staging, `mosaic.Transport.staging`,
+    a meeting's barriers, `mosaic.Transport.meeting`), and its outputs' tiles `(shape, dtype)`, which the
+    family stages (`mosaic.Family.persist`)."""
     blocks: dict
     staged: tuple
     outputs: tuple
@@ -365,7 +366,7 @@ class Allocations:
 
 
 def _typed(dtype) -> jax.ShapeDtypeStruct:
-    """A stand-in for an operand of `dtype`, as `mosaic.staging` reads an operand's dtype."""
+    """A stand-in for an operand of `dtype`, as `mosaic.Transport.staging` reads an operand's dtype."""
     return jax.ShapeDtypeStruct((), dtype)
 
 
@@ -387,10 +388,10 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
     blocks = {'rows': (lhs_block, dtype), 'matrix': (rhs_block, rhs_dtype),
               **({'paired': (rhs_block, rhs_dtype)} if paired else {}),
               **{f'side_{i}': (axes.named(prologue_axes[i], extent), prologue_dtypes[i]) for i in stepped}}
-    sides = mosaic.staging('side', [(axes.named(axes.held(side_axes), {'rows': part[0], 'columns': part[1]}),
+    sides = family.staging('side', [(axes.named(axes.held(side_axes), {'rows': part[0], 'columns': part[1]}),
                                      _typed(side))
                                     for side_axes, side in zip(epilogue_axes, epilogue_dtypes, strict=True)])
-    held = mosaic.staging('fixed', [(axes.named(prologue_axes[i], extent), _typed(prologue_dtypes[i]))
+    held = family.staging('fixed', [(axes.named(prologue_axes[i], extent), _typed(prologue_dtypes[i]))
                                     for i in fixed])
     return Allocations(blocks, (sides['side_smems'], sides['side_barriers'], held['fixed_smems'],
                                 held['fixed_barriers']), tuple((part, jnp.dtype(out)) for out in dtypes))
@@ -407,10 +408,10 @@ def tgmm_allocations(tiles: "Tiles", family: mosaic.Family, *, lhs_dtype, rhs_dt
     blocks = {'ring_0': ((block_k, block_m), lhs_dtype), 'ring_1': ((block_k, block_n), rhs_dtype),
               **{f'ring_{2 + position}': (axes.named(prologue_axes[i], extent), prologue_dtypes[i])
                  for position, i in enumerate(stepped)}}
-    held = mosaic.staging('fixed', [(axes.named(prologue_axes[i], extent), _typed(prologue_dtypes[i]))
+    held = family.staging('fixed', [(axes.named(prologue_axes[i], extent), _typed(prologue_dtypes[i]))
                                     for i in fixed])
     return Allocations(blocks, (held['fixed_smems'], held['fixed_barriers'],
-                                mosaic.meeting(tiles.warpgroups)),
+                                family.meeting(tiles.warpgroups)),
                        (((block_m // tiles.warpgroups, block_n), jnp.dtype(out_dtype)),))
 
 
@@ -1069,7 +1070,7 @@ def _staged_halves(family: mosaic.Family, stages: list, group: tuple, mine: tupl
     boundary = _zero_neighbours_of(family, shares, *group, aligned_skip=halves is None)
     family.published()
     if halves is not None:
-        pl.when(boundary)(lambda: mosaic.meet(halves))
+        pl.when(boundary)(lambda: family.meet(halves))
     return rows_stage.at[:, mine_depth].transpose((1, 0)), cotangent_stage
 
 
