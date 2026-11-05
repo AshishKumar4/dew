@@ -1071,6 +1071,28 @@ def earlier_option_text(record: Mapping[str, object]) -> Mapping[str, object]:
     return {**record, "fields": {**named[1], "option_text": "named"}}
 
 
+def earlier_option_writing(record: Mapping[str, object], directory: str) -> Mapping[str, object]:
+    """A saved decision run's record (`earlier_run`'s) whose option text is None, which a Dew before row
+    3867 recorded where the run left it to its layout: the writing the layout its last checkpoint in
+    `directory` records wrote (`dew.decision.layout.layout_writing`), so a resume writes its rows as it
+    did, whatever a later Dew's layout leaves; as it is where no checkpoint records one (a run that
+    trained no step). Carried to 1.0 (ledger 1552)."""
+    named = registry.class_record(record)
+    if named is None or "option_text" not in named[1] or named[1]["option_text"] is not None:
+        return record
+    from dew.decision.layout import Layout, layout_writing
+    from dew.inference.tasks import earlier_shapes
+
+    with Checkpoints(directory) as checkpoints:
+        step = checkpoints.latest
+        artifact = None if step is None else checkpoints.artifact(step)
+    laid = earlier_shapes(artifact).get("layout") if isinstance(artifact, Mapping) else None
+    if not isinstance(laid, Mapping):
+        return record
+    writing = layout_writing(registry.from_record(Layout, laid))
+    return {**record, "fields": {**named[1], "option_text": writing}}
+
+
 def earlier_trainer(record: Mapping[str, object]) -> Mapping[str, object]:
     """A saved run's record with its decision segments and its trainer's numerics in today's shapes
     (`earlier_run`), its optimizer's as it was."""
@@ -1639,7 +1661,9 @@ class RunConfig:
         """The record of the saved run in its checkpoints' `directory`, read as every earlier shape of a
         saved run is (`earlier_run`); None where none was saved."""
         saved = epath.Path(directory) / RUN_FILE
-        return earlier_run(json.loads(saved.read_text())) if saved.exists() else None
+        if not saved.exists():
+            return None
+        return earlier_option_writing(earlier_run(json.loads(saved.read_text())), directory)
 
     @classmethod
     def cli(cls, args: Sequence[str] | None = None, *, default: Self | None = None) -> Self:
@@ -1721,10 +1745,12 @@ class RunConfig:
         as the class it names, which must be this one or derive from it.
         `trust` names the packages outside Dew the record may import."""
         path = epath.Path(directory)
-        record = json.loads((path if str(directory).endswith(".json") else path / RUN_FILE).read_text())
+        named_file = str(directory).endswith(".json")
+        record = json.loads((path if named_file else path / RUN_FILE).read_text())
         # The packages trusted first, so the record's earlier shapes are read with its classes imported.
         registry.import_trusted(record, trust)
-        return cls.read(earlier_run(record), trust=trust)
+        held = earlier_option_writing(earlier_run(record), str(path.parent if named_file else path))
+        return cls.read(held, trust=trust)
 
     @classmethod
     def read(cls, record: Mapping[str, object], *, trust: Sequence[str] = ()) -> Self:
