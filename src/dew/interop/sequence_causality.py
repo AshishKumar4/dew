@@ -125,19 +125,31 @@ def causality_refusal(closed: core.Jaxpr, tokens: int, length: int,
     positions on axis 1: a forward's logits and states) reads at a position that position and earlier
     ones alone. It holds for this program alone: another length's, or another call's, may compute
     otherwise, so a caller proves each program it runs (`torchax_fallback.TorchGraph`)."""
+    return positional_refusal(closed, {tokens: 1}, length, dict.fromkeys(positional, 1))
+
+
+def positional_refusal(closed: core.Jaxpr, inputs: Mapping[int, int], length: int,
+                       outputs: Mapping[int, int]) -> str | None:
+    """Why the program `closed` is not provably causal along an axis of `length` positions, or None where
+    each of its `outputs` (by index, to the axis its positions lie on) reads at a position that position
+    and earlier ones alone of its `inputs` (by index, to the axis their positions lie on): a forward's
+    tokens (`causality_refusal`), or the stored layers of an update's stacked leaves
+    (`dew.training.stages.whole_reading`). Over the program with the positions reversed it says whether
+    each reads that position and later ones alone; together, that position alone."""
     held: list[Held] = [None] * len(closed.jaxpr.invars)
-    held[tokens] = Reads(1, np.arange(length, dtype=np.int64))
+    for index, axis in inputs.items():
+        held[index] = Reads(axis, np.arange(length, dtype=np.int64))
     walk = _Walk(length)
     consts = [np.asarray(const) if _small_integer(const) else None for const in closed.consts]
     # The values it evaluates (indices, their tests) computed now, also where a trace encloses the walk
     # (a program proven as it is traced, `torchax_fallback.TorchGraph`).
     with jax.ensure_compile_time_eval():
-        outputs, _ = walk.run(closed.jaxpr, held, [None] * len(closed.jaxpr.invars), consts)
-    for index in positional:
-        output = outputs[index]
-        if output is not None and _later(output, length):
+        read, _ = walk.run(closed.jaxpr, held, [None] * len(closed.jaxpr.invars), consts)
+    for index, axis in outputs.items():
+        output = read[index]
+        if output is not None and _later(output, length, axis):
             where = f"; first at {walk.first}" if walk.first else ""
-            return f"its output {index}'s entry reads a later position at {length} tokens{where}"
+            return f"its output {index}'s entry reads a later position at {length} positions{where}"
     return None
 
 
@@ -148,11 +160,11 @@ def _ahead(value: Reads, length: int) -> bool:
     return bool(np.any(value.latest > np.arange(length)))
 
 
-def _later(value: Reads, length: int) -> bool:
-    """Whether an entry of `value`, an output holding its positions on axis 1, reads a position later than
+def _later(value: Reads, length: int, axis: int = 1) -> bool:
+    """Whether an entry of `value`, an output holding its positions on `axis`, reads a position later than
     its own: along that axis, entry i reads one past i; read along any other axis, or along none, every
     entry reads the latest of all, which is past position 0 where it is any later one."""
-    if value.axis != 1 or len(value.latest) != length:
+    if value.axis != axis or len(value.latest) != length:
         return value.last > 0
     return _ahead(value, length)
 

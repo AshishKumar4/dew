@@ -55,7 +55,6 @@ from dew.batch import unboxed
 from dew.mesh import STAGE_AXIS, LayoutRefused
 from dew.nn.kernels.options import owned_program, program
 from dew.nn.sharding import abstract, held_by_stage
-from dew.optim import STACKED_STATES
 
 if TYPE_CHECKING:
     from dew.checkpoints import Checkpoints
@@ -150,13 +149,6 @@ class StageLocal:
             return cls((), mesh)
         # The draw's shapes, its tree plain as a run holds it (`dew.batch.unboxed`).
         shapes = unboxed(abstract(objective.initializer, jax.random.key(0)))
-        whole = whole_reading(optimizer, shapes.get("params", {}))
-        if whole:
-            _log.warning("the optimizer given built holds %s, transforms that may read a parameter whole, so "
-                         "each pipelined run keeps every layer whole on every stage, without stage-local "
-                         "storage's 1/%d of the run a device; a named optimizer (OptimConfig(optimizer=...)) "
-                         "reads each stored layer and keeps them stage-local", whole, stages)
-            return cls((), mesh, tuple(whole))
         declared = objective.stage_sites(shapes, stages)
         if not declared:
             _log.info("%s declares no run a pipeline over %d stages stacks (Objective.stage_sites), so its "
@@ -165,8 +157,17 @@ class StageLocal:
         # every collection, which the pipeline restacks as it would any stored layers.
         from dew.inference.banks import in_namespace
 
-        return cls(tuple(site for site in declared if not any(
+        staged = cls(tuple(site for site in declared if not any(
             site.view.splits(tree) for tree in in_namespace(shapes, site.namespace).values())), mesh)
+        whole = whole_reading(optimizer, shapes, staged)
+        if whole:
+            _log.warning("the optimizer given built may read a stacked leaf otherwise than layer by layer "
+                         "(%s), so each pipelined run keeps every layer whole on every stage, without "
+                         "stage-local storage's 1/%d of the run a device; a named optimizer "
+                         "(OptimConfig(optimizer=...)) reads each stored layer and keeps them stage-local",
+                         "; ".join(whole), stages)
+            return cls((), mesh, tuple(whole))
+        return staged
 
     @property
     def stages(self) -> int:
@@ -405,23 +406,52 @@ def _layered_arrays(local: StageLocal, tree):
     return local.layered(tree)
 
 
-def whole_reading(optimizer: optax.GradientTransformation | None, params) -> list[str]:
-    """The kinds of transform `optimizer`'s state over `params` (their shapes) holds outside
-    `dew.optim.STACKED_STATES`, each of which may read a parameter whole; none for Dew's own (None)."""
-    if optimizer is None or not params:
-        return []
-    kinds = {type(node) for node in _states(jax.eval_shape(optimizer.init, params))}
-    return sorted(kind.__name__ for kind in kinds - STACKED_STATES)
+def whole_reading(optimizer: optax.GradientTransformation | None, shapes, local: StageLocal) -> list[str]:
+    """Why `optimizer`'s update may read a stacked run's leaf otherwise than layer by layer: none where,
+    traced over `shapes`' parameters stacked as `local` stacks them (`StageLocal.staged`), each stored
+    layer of every stacked leaf it returns, its update's and its state's, reads that layer alone of every
+    stacked leaf it reads, the gradient's, the state's and the parameters' (row 3995): along the stacked
+    layers none later and, the program over them reversed, none earlier
+    (`dew.interop.sequence_causality.positional_refusal`), as optax's constant rate, its moments and its
+    decay read; a trust ratio or a clip over a leaf's norm reads every layer, and is named. None for Dew's
+    own optimizers (None), which read a stacked leaf as its layers, and for a run with no stacked site."""
+    from dew.interop.sequence_causality import positional_refusal
+    from dew.nn.sharding import layers_of
 
+    if optimizer is None or not local.sites:
+        return []
+    with local.held():
+        params = local.staged(shapes)["params"]
+        arguments = (params, jax.eval_shape(optimizer.init, params), params)
+        given, structure = jax.tree_util.tree_flatten_with_path(arguments)
+        stacked = [layers_of(path)[1] for path, _ in given]
+        merged = [jax.ShapeDtypeStruct((math.prod(leaf.shape[:held]), *leaf.shape[held:]), leaf.dtype)
+                  if held else leaf for (_, leaf), held in zip(given, stacked, strict=True)]
+        returned, _ = jax.tree_util.tree_flatten_with_path(jax.eval_shape(optimizer.update, *arguments))
+        made = [layers_of(path)[1] for path, _ in returned]
 
-def _states(node) -> list:
-    """Every optimizer-state node `node` nests, its own included: each container of a type of its own
-    (a transform's state, a NamedTuple), past the tuples, lists and dicts that hold them."""
-    if node is None:
-        return []
-    children, structure = jax.tree_util.tree_flatten(node, is_leaf=lambda child: child is not node)
-    # A leaf is one value; an empty node (a transform's state of no fields, Gauss-Newton's) is a state.
-    if jax.tree_util.treedef_is_leaf(structure) and structure.num_leaves == 1:
-        return []
-    own = [] if type(node) in (tuple, list, dict) else [node]
-    return own + [state for child in children for state in _states(child)]
+        def update(*leaves, flipped: frozenset[int] = frozenset(), flipping: frozenset[int] = frozenset()):
+            # The stacked leaves' layers on one axis each, reversed where the walk reads them reversed.
+            layered = [jax.numpy.flip(leaf, 0) if index in flipped else leaf
+                       for index, leaf in enumerate(leaves)]
+            whole = [leaf.reshape(shape.shape) if held else leaf for leaf, (_, shape), held in
+                     zip(layered, given, stacked, strict=True)]
+            out = jax.tree.leaves(optimizer.update(*jax.tree.unflatten(structure, whole)))
+            out = [leaf.reshape((-1, *leaf.shape[held:])) if held else leaf
+                   for leaf, held in zip(out, made, strict=True)]
+            return [jax.numpy.flip(leaf, 0) if index in flipping else leaf for index, leaf in enumerate(out)]
+
+        refusals = []
+        for length in sorted({leaf.shape[0] for leaf, held in zip(merged, stacked, strict=True) if held}):
+            inputs = {index: 0 for index, (leaf, held) in enumerate(zip(merged, stacked, strict=True))
+                      if held and leaf.shape[0] == length}
+            outputs = {index: 0 for index, ((_, leaf), held) in enumerate(zip(returned, made, strict=True))
+                       if held and math.prod(leaf.shape[:held]) == length}
+            for flips in ((frozenset(), frozenset()), (frozenset(inputs), frozenset(outputs))):
+                traced = functools.partial(update, flipped=flips[0], flipping=flips[1])
+                closed = jax.make_jaxpr(traced)(*merged)
+                refused = positional_refusal(closed, inputs, length, outputs)
+                if refused is not None:
+                    way = " reversed" if flips[0] else ""
+                    refusals.append(f"over {length} stored layers{way}, {refused}")
+    return refusals
