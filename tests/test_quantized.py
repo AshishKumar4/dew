@@ -24,6 +24,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 from interop_support import fetch, respelled
+from model_support import encoded_form
 
 from dew.interop import Pretrained
 from dew.interop.codecs import (
@@ -396,7 +397,7 @@ def reexport(request, tmp_path_factory):
     loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
     values = one_training_step(loaded.variables)
     dense = source_tensors(loaded, values)
-    written = fp8_blocks(REEXPORT_BLOCK, ue8m0=ue8m0).requantize(dense, names)
+    written = encoded_form(fp8_blocks(REEXPORT_BLOCK, ue8m0=ue8m0), dense, names)
     shutil.copytree(directory, destination)
     write_safetensors(destination / "model.safetensors", written)
     reloaded = Pretrained.load(str(destination), dtype="float32", attention_impl="reference")

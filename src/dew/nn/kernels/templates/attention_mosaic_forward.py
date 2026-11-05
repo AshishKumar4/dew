@@ -69,6 +69,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     extents,
     issued_into,
     modelled,
+    query_swizzle,
     reducing,
     refused,
     score_places,
@@ -108,9 +109,11 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     is), a training forward's its split sums' fp32 (`_Residuals`); a training forward's or a peak walk's
     anchor keys' stage; the query loads' barriers and
     the consumers' turns' barrier; and its key and value streams in `stages` slots (`Family.streams`), a
-    peak walk's keys alone, each slot loaded in `pieces` copies (a paged call's tile of several pages)."""
+    peak walk's keys alone, each slot loaded in `pieces` copies (a paged call's tile of several pages); the
+    query's stage at its swizzle (`query_swizzle`)."""
     consumers, block_q, block_k = tiles.consumers, tiles.block_q, tiles.block_k
-    scoped = [plgpu.SMEM((consumers, block_q, width), dtype), plgpu.SMEM((consumers, block_q), jnp.float32)]
+    scoped = [mosaic.staged((consumers, block_q, width), dtype, query_swizzle(family)),
+              plgpu.SMEM((consumers, block_q), jnp.float32)]
     if residuals:
         scoped.append(plgpu.SMEM((consumers, block_q, value_width), jnp.float32))
     elif not peaks and (value_width != width or out_dtype not in (None, dtype)):

@@ -28,19 +28,23 @@ from dew.nn.kernels.templates.attention_mosaic_scores import _Backward, _dq_adde
 
 
 def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int
-                       ) -> tuple[list, dict]:
+                       ) -> tuple[list, dict, list]:
     """The fused launch's allocations as `Family.scoped` takes them, in `_fused_launch`'s order: its
     consumers' resident keys and values; a tile's weights and score cotangents staged for the transposed
-    products' left operands and dQ's; dK's and dV's output stage, which a tile's dQ adds take too (fp32, the
-    head widths equal, `MosaicBackward.legal`); the two loads' barriers; and its query and output-cotangent
-    streams in `stages` slots (`Family.streams`)."""
+    products' left operands and dQ's; dK's and dV's output stage (fp32, the head widths equal,
+    `MosaicBackward.legal`), held across the walks where a tile's dQ adds read it
+    (`Transport.adds_through_shared`); the two loads' barriers; its query and output-cotangent streams in
+    `stages` slots (`Family.streams`); and the output stage scoped after the walks where no add reads it,
+    the walks' slots its memory (`Family.scoped`'s `after_walks`: two mma.sync consumers' 64 x 64 launch
+    then fits an A100, FS-4324-TWO2's 229,424 bytes held whole against its 166,912)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
+    stage = plgpu.SMEM((consumers, max(block_q, block_k), width), jnp.float32)
+    held = family.adds_through_shared
     scoped = [plgpu.SMEM((consumers, block_k, width), dtype), plgpu.SMEM((consumers, block_k, width), dtype),
-              plgpu.SMEM((consumers, 2, block_q, block_k), dtype),
-              plgpu.SMEM((consumers, max(block_q, block_k), width), jnp.float32),
+              plgpu.SMEM((consumers, 2, block_q, block_k), dtype), *([stage] if held else []),
               family.load_barriers(consumers), family.load_barriers(consumers)]
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype)}
-    return scoped, family.streams(blocks, stages, consumers)
+    return scoped, family.streams(blocks, stages, consumers), [] if held else [stage]
 
 def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, whole, add_dq, index, slots,
                 carry, accumulators, *, masked: bool | None = None):
@@ -99,7 +103,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     shapes = [(batch, keys_padded, kv_heads, width)] * 2
     groups = mosaic.stacked_groups(shapes)
 
-    def body(*refs, streams):
+    def body(*refs, streams, after=None):
         (q_ref, k_ref, v_ref, do_ref, *stat_refs), refs = refs[:9], refs[9:]
         spans_of, refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
         if grouped:
@@ -107,7 +111,9 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
             dk_ref, dv_ref = mosaic.stacked_views([dkv_ref], groups)
         else:
             dq_ref, dk_ref, dv_ref, *refs = refs
-        k_smem, v_smem, staged, out_smem, k_loaded, v_loaded = refs
+        # The output stage where the walks' adds read it; else the epilogue's own, scoped after the walks.
+        k_smem, v_smem, staged, *out_smem, k_loaded, v_loaded = refs
+        out_smem = out_smem[0] if out_smem else None
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         key_head = lax.div(head, heads // kv_heads)
         views = _views_of({"queries": q_ref, "douts": do_ref}, row, head)
@@ -143,23 +149,29 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                 streams, views, (lo, hi), streamed, index,
                 lambda streams, lo, hi, counted: family.walk(streams, segments(lo, hi), (), shapes,
                                                              walk.interpret, first=counted))
-            smem = out_smem.at[index, pl.ds(0, block_k)]
-            if grouped:
-                for value, ref in ((dk, dk_ref), (dv, dv_ref)):
-                    family.added(value, ref.at[keys_view], walk.interpret, smem=smem)
+            def finished(stage):
+                smem = stage.at[index, pl.ds(0, block_k)]
+                if grouped:
+                    for value, ref in ((dk, dk_ref), (dv, dv_ref)):
+                        family.added(value, ref.at[keys_view], walk.interpret, smem=smem)
+                else:
+                    family.stored((dk, dv), (dk_ref.at[keys_view], dv_ref.at[keys_view]), smem=smem)
+
+            if after is None:
+                finished(out_smem)
             else:
-                family.stored((dk, dv), (dk_ref.at[keys_view], dv_ref.at[keys_view]), smem=smem)
+                after(finished)
 
         def producer():
             family.stream(streams, views, *streamed)
 
         family.roles(consumers, consumer, producer)
 
-    scoped, rings = _fused_allocations(family, program.tiles, width, query.dtype,
-                                       min(program.tiles.stages, q_steps))
+    scoped, rings, after = _fused_allocations(family, program.tiles, width, query.dtype,
+                                              min(program.tiles.stages, q_steps))
 
     def entry(*refs):
-        family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
+        family.scoped(functools.partial(body, *refs), *scoped, streams=rings, after_walks=tuple(after))
 
     gradient = jax.ShapeDtypeStruct((batch, keys_padded, kv_heads, width), jnp.float32)
     launch = family.kernel(
