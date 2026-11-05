@@ -83,6 +83,7 @@ def load_settings(directory: Path, numerics: Numerics | None, dtype: DTypeLike |
         return LoadSettings(settings, numerics, dtype_name(numerics.dtypes.compute),
                             dtype_name(numerics.dtypes.params))
     compute = dtype_name(dtype) if dtype is not None else run_compute or "bfloat16"
-    params = (param_dtype if param_dtype == AUTO else dtype_name(param_dtype) if param_dtype is not None
-              else AUTO if run_compute is not None else "float32")
+    params: DtypeName | Literal["auto"] = (
+        AUTO if param_dtype == AUTO or (param_dtype is None and run_compute is not None)
+        else "float32" if param_dtype is None else dtype_name(param_dtype))
     return LoadSettings(settings, run_numerics, compute, params)
