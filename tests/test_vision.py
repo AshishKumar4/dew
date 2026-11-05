@@ -453,3 +453,25 @@ def test_a_grid_convolution_convolves_each_frames_patch_grid_whatever_the_token_
     np.testing.assert_array_equal(in_order[0, :frames * height * width], expected)
     shuffled = rng.permutation(length)
     np.testing.assert_array_equal(mixed(shuffled), in_order[:, shuffled])
+
+
+def test_a_moonvit_pools_frames_finitely_beside_a_padded_item():
+    """MoonViT's packed rows beside the padding a processor gives a row of fewer items (a grid of no frame,
+    `Processor._images`): a clip's pooled tokens its frames' mean at its first frame's places, the padded
+    row zero, and the gradient of the clip's tokens finite everywhere, the padded row's division included
+    (row 855's review)."""
+    from dew.nn.vision.moonvit import MoonViT
+
+    tower = MoonViT(vt_hidden_size=16, vt_intermediate_size=24, vt_num_attention_heads=2,
+                    vt_num_hidden_layers=1, patch_size=2, init_pos_emb_height=4, init_pos_emb_time=2)
+    module = tower.build()
+    grid = jnp.asarray([[2, 4, 4], [0, 2, 2]], jnp.int32)
+    pixels = jax.random.normal(jax.random.key(0), (2, 32, 12))
+    variables = module.init(jax.random.key(1), pixels, grid)
+    out = np.asarray(module.apply(variables, pixels, grid))
+    assert np.isfinite(out).all()
+    # The clip's 16 places of its first frame hold its tokens; the rest of its row and the padded row none.
+    assert np.abs(out[0, :16]).sum(axis=-1).min() > 0
+    assert not out[0, 16:].any() and not out[1].any()
+    gradient = jax.grad(lambda held: module.apply(held, pixels, grid)[0, :16].sum())(variables)
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(gradient))
