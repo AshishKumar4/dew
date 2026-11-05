@@ -20,6 +20,7 @@ from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
 from dew.nn.kernels.templates import (
     attention_algebra as algebra,
+    axes,
     bundles,
     layout,
     mosaic,
@@ -633,25 +634,21 @@ def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_fir
     never silently; a pointwise hook is the same function of either. A score tile whose rows are its keys
     (`keys_first`, `[bk, bq]`) reads a tile parameter's entries from its keys-first copy `[B, H, Kp, Qp]`."""
     queries, keys = like.shape[::-1] if keys_first else like.shape
-    rows, columns = pl.ds(first, queries), pl.ds(k_first, keys)
-    if kind in (Kind.QUERY, Kind.KEY, Kind.TILE):
+    if kind is Kind.HEAD:
+        return ref[head]
+    if kind is not Kind.OUTPUT:
         row, head = shared_place(ref.shape, row, head)
-    match kind:
-        case Kind.HEAD:
-            return ref[head]
-        case Kind.QUERY:
-            if keys_first:
-                return algebra.across(family.columns_of(ref.at[row, head, rows]), like)
-            return algebra.expand(family.rows_of(ref.at[row, head, rows]), like)
-        case Kind.KEY:
-            if keys_first:
-                return algebra.expand(family.rows_of(ref.at[row, head, columns]), like)
-            return algebra.across(family.columns_of(ref.at[row, head, columns]), like)
-        case Kind.TILE:
-            tile = (row, head, columns, rows) if keys_first else (row, head, rows, columns)
-            return family.tile_of(ref.at[tile])
-        case Kind.OUTPUT:
-            return family.tile_of(ref.at[row, rows, head])
+    # Its block at the tile's place along each of its axes (`Kind.axes`), a tile parameter's keys-first
+    # copy's keys before its queries.
+    laid = kind.axes[:2] + kind.axes[2:][::-1] if keys_first and kind is Kind.TILE else kind.axes
+    places = {"batch": row, "heads": head, "queries": pl.ds(first, queries), "keys": pl.ds(k_first, keys)}
+    block = ref.at[axes.placed(laid, places)]
+    if kind in (Kind.TILE, Kind.OUTPUT):
+        return family.tile_of(block)
+    # A query's or a key's along the tile's rows or its columns, as the tile lays its queries.
+    along_rows = (kind is Kind.QUERY) != keys_first
+    return (algebra.expand(family.rows_of(block), like) if along_rows
+            else algebra.across(family.columns_of(block), like))
 
 
 class _Spans(NamedTuple):
