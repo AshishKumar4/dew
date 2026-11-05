@@ -296,9 +296,9 @@ def cuda_driver_version() -> int | None:
     return None if cuda.cuDriverGetVersion(ctypes.byref(version)) else version.value
 
 
-CLOCK_RATE, MEMORY_CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH = 13, 36, 37
+CLOCK_RATE, MEMORY_CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH, L2_CACHE_SIZE = 13, 36, 37, 38
 """`CUdevice_attribute`s (cuda.h): the multiprocessors' peak clock and the device memory's peak clock, in
-kHz, and the device memory bus's width in bits."""
+kHz, the device memory bus's width in bits, and the L2 cache's size in bytes."""
 
 
 def device_handle(ordinal: int) -> tuple[ctypes.CDLL, ctypes.c_int] | None:
