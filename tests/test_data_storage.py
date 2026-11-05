@@ -443,10 +443,20 @@ def test_distinct_transport_misses_download_concurrently_within_the_shared_budge
     with ThreadPoolExecutor(2) as pool:
         assert list(pool.map(read, paths)) == [path.encode() for path in paths]
     assert cache.metrics()["downloaded_bytes"] == sum(len(path) for path in paths)
-    # A run's data metrics report its process's mirrors (row 4299).
-    from dew.data.storage import mirror_metrics
+    # A run's data metrics report its process's mirrors beside its corpora's (row 4299).
+    from dew.data import Loading, Memory
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+    from dew.data.pipeline import Pipeline
 
-    assert mirror_metrics()["data/mirror/downloaded_bytes"] >= sum(len(path) for path in paths)
+    loader = compile(Pipeline(Memory([{"id": 0}])).repeat(1).batch(1), read="indexed",
+                     loading=Loading(workers=0, threads=1, read_buffer=1))
+    reader = loader.train(DataPartition())
+    try:
+        list(reader)
+    finally:
+        reader.close()
+    assert loader.statistics()["data/mirror/downloaded_bytes"] >= sum(len(path) for path in paths)
 
 
 def test_url_chain_reads_and_writes_memory(tmp_path):

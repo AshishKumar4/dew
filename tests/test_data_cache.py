@@ -1472,17 +1472,19 @@ def test_a_local_fill_leaves_its_disks_headroom_free_whatever_its_budget(tmp_pat
     assert not list(tmp_path.rglob("*.array_record"))
 
 
-def test_an_optional_streamed_fill_with_no_room_stops_once_for_its_key(tmp_path, caplog):
-    """A stream's optional fill that runs out of room stops once: its later shards' records are computed
-    and their writers write nothing, so a store of four shards reports the stop as a store of one does,
-    not once a shard (row 4296)."""
+@pytest.mark.parametrize("full", ["spool", "root"])
+def test_an_optional_streamed_fill_with_no_room_stops_once_for_its_key(tmp_path, caplog, full):
+    """A stream's optional fill that runs out of room, in its spool or in a root that evicts nothing, stops
+    once: its later shards' records are computed and their writers write nothing, so a store of four
+    shards reports the stop as a store of one does, not once a shard (row 4296)."""
     import logging
     from uuid import uuid4
 
     def warned(records: int) -> int:
         source = Memory([{"id": index} for index in range(records)], shard_rows=1)
-        cache = Cache(str(tmp_path / str(records)), keep_local_bytes=1, shard_bytes=1, spool_bytes=1,
-                      optional=True)
+        budgets = ({"spool_bytes": 1, "keep_local_bytes": 1} if full == "spool"
+                   else {"keep_local_bytes": 1, "evicts": False})
+        cache = Cache(str(tmp_path / str(records)), shard_bytes=1, optional=True, **budgets)
         manifest = source.manifest()
         reader = cache.streamed(manifest.reader, _key(f"halted-{uuid4().hex}"), source=source)
         caplog.clear()
