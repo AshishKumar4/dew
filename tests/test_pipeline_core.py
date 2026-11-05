@@ -2464,8 +2464,9 @@ def test_a_version_7_position_of_a_two_share_streamed_read_resumes_where_8_reads
     batches by a version 7 main (tests/fixtures/version7_positions.json, written at its commit): read
     plainly, or taking 18 rows, version 8 reads the order as 7 did, so the position resumes onto the
     rows 7 read next; bounded to 10 examples, which version 8 deals to the shares otherwise, it is refused
-    before a row is read (row 3364). Shuffled, it is read by version 8 (`plan_version`), as a run config's
-    resume reads a run saved under it, where 9 keys a named chain's shuffle by its name (row 3840)."""
+    before a row is read (row 3364). Its order shuffles, which version 9 keys by a chain's name where it has
+    one and a saved order does not say, so it is read by version 8 (`plan_version`, row 3840), as a run
+    config's resume reads a run saved under it."""
     import json
     from pathlib import Path
 
