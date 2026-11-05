@@ -195,9 +195,58 @@ def derived_terms(loss: Callable, params, arguments: Sequence, *, platform: str,
     alike: an equation's lowering reads no output), as each derives it from its own (row 4261: lowered
     for each, the two lowerings were 16 of a Qwen3.5-4B candidate's 28 seconds)."""
     program, count, shapes = traced_gradient(loss, params, arguments)
-    lowered = deduplicated(compiled(program, lowering or LOWERED.get(platform, platform)))
+    lowered = simplified(program, platform, lowering)
     return (_kept(lowered, count, shapes, platform),
             _peak(lowered, count, platform, workspace, consumed, deferred))
+
+
+def simplified(program: jcore.Jaxpr, platform: str, lowering: str | None = None) -> jcore.Jaxpr:
+    """`program` as XLA compiles it for `platform`, as JAX lowers it for `lowering` (`compiled`;
+    `platform`'s own name where none is given, a GPU's CUDA's), each equation that repeats another one
+    (`deduplicated`) and each sum into a scatter (`folded`) as XLA's simplifiers make them."""
+    return folded(deduplicated(compiled(program, lowering or LOWERED.get(platform, platform))))
+
+
+def folded(program: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`program` with each sum of a value and a scatter-add read by that sum alone a scatter-add into the
+    sum of that value and the scatter's base, the base dropped where it is a zero, as XLA's simplifier
+    folds them (`A + scatter(B, I, U) => scatter(A + B, I, U)` and `A + 0 => A`,
+    `AlgebraicSimplifierVisitor::HandleAdd`, xla/hlo/transforms/simplifiers/algebraic_simplifier.cc):
+    a tied embedding's gradient, its head's product and the scatter of its rows' cotangents, is one
+    buffer, which the scatter writes in place (`in_place`). Qwen3.5-4B's step under 'full' was derived
+    holding the product, the scatter and their sum at its end, 7.1 GiB against XLA's 4.4 (row 4089)."""
+    producers = {out: equation for equation in program.eqns for out in equation.outvars}
+    readers = collections.Counter(value for equation in program.eqns
+                                  for value in equation.invars if computed(value))
+    readers.update(value for value in program.outvars if computed(value))
+    folding: dict[int, jcore.JaxprEqn] = {}
+    for equation in program.eqns:
+        if equation.primitive.name not in ("add", "add_any") or len(equation.invars) != 2:
+            continue
+        for scattered, other in (equation.invars, reversed(equation.invars)):
+            scatter = producers.get(scattered) if computed(scattered) else None
+            if (scatter is None or scatter.primitive.name != "scatter-add" or readers[scattered] != 1
+                    or scattered.aval != equation.outvars[0].aval or id(scatter) in folding):
+                continue
+            base, *rest = scatter.invars
+            zero = producers.get(base) if computed(base) else None
+            if zero is not None and zero.primitive.name == "broadcast_in_dim" and not computed(
+                    zero.invars[0]) and not np.any(np.asarray(zero.invars[0].val)):
+                summed = [other]
+            else:
+                total = jcore.Var(equation.outvars[0].aval)
+                summed = [equation.replace(invars=[other, base], outvars=[total]), total]
+            folding[id(scatter)] = None
+            folding[id(equation)] = [*summed[:-1], scatter.replace(invars=[summed[-1], *rest],
+                                                                    outvars=equation.outvars)]
+            break
+    if not folding:
+        return program
+    equations = []
+    for equation in program.eqns:
+        replaced = folding.get(id(equation), [equation])
+        equations.extend(replaced or ())
+    return program.replace(eqns=equations)
 
 
 def operand_key(value: jcore.Var | jcore.Literal) -> Hashable:
@@ -250,8 +299,7 @@ def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str
     every other value, count whole. Matching an axis's size to the batch size cannot identify its
     sharding: a weight or a scan's layer axis can have that size too."""
     program, count, shapes = traced_gradient(loss, params, arguments)
-    return _kept(deduplicated(compiled(program, lowering or LOWERED.get(platform, platform))), count, shapes,
-                 platform)
+    return _kept(simplified(program, platform, lowering), count, shapes, platform)
 
 
 def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
@@ -272,8 +320,7 @@ def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
     xla/service/gpu/gpu_hlo_schedule.cc). With `deferred`, the gradient's own equations run after the rest
     of the backward (`sunk`)."""
     program, count, _ = traced_gradient(loss, params, arguments)
-    lowered = deduplicated(compiled(program, lowering or LOWERED.get(platform, platform)))
-    return _peak(lowered, count, platform, workspace, consumed, deferred)
+    return _peak(simplified(program, platform, lowering), count, platform, workspace, consumed, deferred)
 
 
 def _kept(lowered: jcore.Jaxpr, count: int, shapes: Sequence, platform: str) -> int:
@@ -418,6 +465,8 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
         made = [out for out in equation.outvars
                 if out in last and frontier.buffered(out) and out not in carried]
         made_bytes = sum(map(device_share, made))
+        # A scatter writes its result in the buffer of the base it reads last (`in_place`).
+        taken = in_place(equation, held, last, index)
         if made or not frontier.fusing(equation):
             inner = max((peak_bytes(body, platform, workspace, Slicing.entering(equation, body),
                                     returned_carry(equation, body)) for body in bodies(equation)), default=0)
@@ -432,7 +481,7 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
             # A loop's results (its stacked outputs, its carry) are held beside each turn's own; a call's
             # results are what its body returns.
             running = (looped(frontier, last, index, equation, made, carried) + inner
-                       if equation.primitive.name in LOOPS else max(inner, made_bytes))
+                       if equation.primitive.name in LOOPS else max(inner, made_bytes - taken))
             most = max(most, live + running + operands + products)
         held.update(made)
         live += made_bytes
@@ -440,6 +489,22 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
             held.discard(done)
             live -= device_share(done)
     return most
+
+
+def in_place(equation: jcore.JaxprEqn, held: set, last: Mapping, index: int) -> int:
+    """The bytes of the buffer the scatter `equation`, the program's `index`th, writes its result in: its
+    base's, where the program holds that buffer (`held`) and reads it last there, its result's size, as
+    XLA shares a scatter's first operand's buffer with its result
+    (`HloDataflowAnalysis::CanShareOperandBufferWithUser`, xla/hlo/analysis/hlo_dataflow_analysis.cc);
+    none for any other equation."""
+    if not equation.primitive.name.startswith("scatter") or not equation.invars:
+        return 0
+    base = equation.invars[0]
+    if not computed(base) or base not in held or last.get(base) != index:
+        return 0
+    if device_share(base) != device_share(equation.outvars[0]) or equation.invars.count(base) != 1:
+        return 0
+    return device_share(base)
 
 
 def carry(equation: jcore.JaxprEqn) -> list[tuple]:
