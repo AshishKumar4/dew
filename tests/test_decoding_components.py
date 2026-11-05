@@ -22,6 +22,7 @@ import pytest
 import torch
 from reference_error import as_given, assert_as_exact, indexed_recording, recording
 from token_support import byte_level_tokenizer
+from tool_support import run_from
 from transformers.generation.logits_process import (
     EncoderNoRepeatNGramLogitsProcessor,
     EncoderRepetitionPenaltyLogitsProcessor,
@@ -348,15 +349,22 @@ def test_frequency_and_presence_penalties_are_vllms(case):
     the generated tokens and the presence penalty times whether it was
     generated, the prompt counting for neither, both signs. Dew's two
     transforms, chained in vLLM's order, on par with vLLM's float32 run over
-    recorded logits (check 1), the truth vLLM's float64 run."""
+    drawn logits (check 1, the recording's summary of vLLM's evidence), the
+    truth Dew's float64 run held to the sketch of vLLM's."""
     frequency, presence = (float(value) for value in PENALTIES["penalties"][case])
     prompts, drawn = ([[int(token) for token in row if token != VOCAB] for row in PENALTIES[name]]
                       for name in ("prompt", "output"))
-    native = jax.jit(decoding.chain((decoding.FrequencyPenalty(frequency),
-                                     decoding.PresencePenalty(presence))))
-    site = f"case_{case}"
-    draw, reference, truth = indexed_recording(PENALTIES, site, int(PENALTIES[f"{site}.seeds"]))
-    state = rows(prompts, drawn)
+    native = decoding.chain((decoding.FrequencyPenalty(frequency), decoding.PresencePenalty(presence)))
+    site, state = f"case_{case}", rows(prompts, drawn)
+    with run_from("vllm_penalty_reference", "tools") as generator:
+        redraw = generator.draw
+
+    def wide(inputs):
+        with jax.enable_x64(new_val=True):
+            return {"logits": np.asarray(native(state, jnp.asarray(inputs["logits"], jnp.float64)))}
+
+    draw, reference, truth = indexed_recording(PENALTIES, site, int(PENALTIES[f"{site}.seeds"]),
+                                               inputs_of=redraw, truth_fn=as_given(wide))
     assert_as_exact(as_given(lambda index, inputs: {"logits": np.asarray(native(state, inputs["logits"]))}),
                     reference, draw, f"penalties {frequency}, {presence}",
                     seeds=int(PENALTIES[f"{site}.seeds"]), truth_fn=truth)

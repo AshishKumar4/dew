@@ -17,9 +17,10 @@ The rows: four histories over a 17-token vocabulary, prompts of up to five
 tokens and outputs of up to four, with tokens that appear in the prompt
 alone, in the output alone, in both and several times, padded with the
 vocabulary size as vLLM pads them. Each penalty pair is a site of its own,
-`case_<index>`, recorded over its seeds (`recorded_references.record_case`):
-a seed's float32 logits, standard normal, vLLM's run on them in float32 the
-reference and in float64 the truth.
+`case_<index>`, recorded over its seeds (`recorded_references.record_case`,
+summarized): a seed's float32 logits, standard normal (`draw`, which the
+test draws again), vLLM's run on them in float32 the reference and in float64
+the truth, whose sketch the test's float64 run is held to.
 
     python tools/vllm_penalty_reference.py
 """
@@ -32,7 +33,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from recorded_references import record_case
 from reference_source import definitions
 
 VLLM = "https://raw.githubusercontent.com/vllm-project/vllm/ced6857afa0ea7b2e3f0846a62e1394e90f15607/"
@@ -44,12 +44,20 @@ PENALTIES = ((0.7, 0.0), (0.0, 0.7), (0.45, -0.3), (-1.2, 1.6))
 """(frequency, presence) pairs; OpenAI's range is -2 to 2."""
 
 
+def draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's float32 logits, standard normal, one row a history (the test draws them again)."""
+    return {"logits": np.random.default_rng([0x9E7, seed]).standard_normal((len(PROMPTS), VOCAB)).astype(
+        np.float32)}
+
+
 def padded(rows: tuple[list[int], ...]) -> torch.Tensor:
     width = max(1, max(len(row) for row in rows))
     return torch.tensor([row + [VOCAB] * (width - len(row)) for row in rows], dtype=torch.long)
 
 
 def main() -> None:
+    from recorded_references import record_case
+
     ops = definitions(VLLM + "vllm/_custom_ops.py",
                       ("apply_repetition_penalties_torch", "apply_repetition_penalties"), {"torch": torch})
     # apply_repetition_penalties dispatches on logits.is_cuda; its CUDA
@@ -62,10 +70,6 @@ def main() -> None:
     arrays = {"penalties": np.asarray(PENALTIES), "prompt": padded(PROMPTS).numpy(),
               "output": padded(OUTPUTS).numpy()}
 
-    def draw(seed):
-        rng = np.random.default_rng([0x9E7, seed])
-        return {"logits": rng.standard_normal((len(PROMPTS), VOCAB)).astype(np.float32)}
-
     for index, (frequency, presence) in enumerate(PENALTIES):
         def scored(logits, dtype, frequency=frequency, presence=presence):
             def column(value):
@@ -76,8 +80,10 @@ def main() -> None:
                                                       column(1.0))
             return {"logits": penalized.numpy()}
 
+        # The reference's evidence alone (`summary`), the test's own float64 run held to its truth's sketch.
         arrays.update(record_case(f"case_{index}", draw, lambda inputs, scored=scored: (
-            scored(inputs["logits"], torch.float32), scored(inputs["logits"], torch.float64))))
+            scored(inputs["logits"], torch.float32), scored(inputs["logits"], torch.float64)),
+            store_inputs=False, summary=True))
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
     np.savez(FIXTURE, **arrays)
     print(f"{FIXTURE}: {len(PENALTIES)} penalty pairs over {len(PROMPTS)} rows")
