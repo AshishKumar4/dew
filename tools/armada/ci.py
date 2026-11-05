@@ -60,6 +60,8 @@ itself and what every file shares (`shared`: the environment's locks, the
 CI tools, the names of the non-Python files under tests/ but its fixtures and
 under src/, of the Python files under tests/ but the test modules, and src/'s
 entries). A fixture is the input of the runs that opened, listed or probed it.
+A row whose inputs its task wrote (every file of the checkout is watched while a task runs,
+`watched`) keeps no key: the bytes its key would hash are not the ones its run read.
 A test module, or a module in a package a file never imported, is no input
 of that file's: a train that loses a head reruns only the files the head's
 modules reached (the land queue's recompose after a pull). A task
@@ -1826,24 +1828,24 @@ def site_inputs(python: str, row_name: str, depends: list[str] | None) -> list[s
     return sorted({*depends, *(path for each in drawn for path in each)})
 
 
-def rewritten(depends: list[str], written: Container[str]) -> list[str]:
-    """The inputs among `depends` that a task wrote (`written`, the task's watch): a file its processes read
+def rewritten(depends: list[str], wrote: Container[str]) -> list[str]:
+    """The inputs among `depends` that a task wrote (`wrote`, the task's watch): a file its processes read
     and changed, or a directory they listed and changed, whose bytes where the key is made are no longer the
     ones read (row 2559: a test that read a fixture and wrote it left a key over what it wrote, which a later
     checkout holding those bytes reused). A probe or a unit of a module is its file's."""
     return sorted({path for each in depends
-                   if (path := each.removeprefix(followed.PROBED).partition(followed.CODE)[0]) in written})
+                   if (path := each.removeprefix(followed.PROBED).partition(followed.CODE)[0]) in wrote})
 
 
 def record(python: str, rows: list[dict], log: Path, common: str, network: bool = False,
            opened: set[str] | None = None, unkeyed: Container[str] = (), whole: bool = False,
-           written: Container[str] = ()) -> None:
+           wrote: Container[str] = ()) -> None:
     """Keep each row a task ran with the files its tests executed and read, every data file the task's
     processes opened (`opened`, the task's watch: None where it was blind, and no row keeps a key), where
     they read the backend and its peak memory on a GPU and its children's pools: `gpu_tier` reads the
     reads, `gpu_needs` the memory. A green row keeps its key too, which `reused` reads it back by; a red
     row has none, so a later run never reuses an earlier green row of its file, nor does one whose inputs
-    the task wrote (`written`, `rewritten`), which are not the bytes it read. A check-1 site's judge keeps
+    the task wrote (`wrote`, `rewritten`), which are not the bytes it read. A check-1 site's judge keeps
     its map tasks' inputs with its own (`site_inputs`)."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
@@ -1859,7 +1861,7 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         ran = executed.get(name, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
         if ran["depends"] is not None:
             ran = {**ran, "depends": None if opened is None else sorted({*ran["depends"], *opened})}
-        if ran["depends"] is not None and (touched := rewritten(ran["depends"], written)):
+        if ran["depends"] is not None and (touched := rewritten(ran["depends"], wrote)):
             print(f"{name} keeps no key: its task wrote {', '.join(touched[:5])}"
                   f"{' and more' if len(touched) > 5 else ''}, which its run read", flush=True)
             ran = {**ran, "depends": None}
