@@ -34,7 +34,7 @@ class Unit(enum.Enum):
     FMA = "fma"
 
 
-class Op(enum.Enum):
+class BitOp(enum.Enum):
     """An instruction of the vocabulary, each a GF(2)-linear map of its operands' words, as SASS names it, and
     the pipes that can issue it (`units`). A shift's amount and a mask are immediates."""
 
@@ -45,28 +45,28 @@ class Op(enum.Enum):
 
     @property
     def units(self) -> tuple[Unit, ...]:
-        return (Unit.ALU,) if self in (Op.ROTR, Op.LOP3) else (Unit.ALU, Unit.FMA)
+        return (Unit.ALU,) if self in (BitOp.ROTR, BitOp.LOP3) else (Unit.ALU, Unit.FMA)
 
 
-class Step(NamedTuple):
+class BitStep(NamedTuple):
     """One instruction of a form: `op` over the values at `args` (0 the stored word, `i + 1` step `i`'s), its
     immediate (a shift's amount, a mask), and the unit it issues on."""
 
-    op: Op
+    op: BitOp
     args: tuple[int, ...]
     immediate: int
     unit: Unit
 
 
-def _applied(step: Step, values: Sequence[np.ndarray]) -> np.ndarray:
+def _applied(step: BitStep, values: Sequence[np.ndarray]) -> np.ndarray:
     """`step` over `values` (uint64 arrays of 32-bit words), as the instruction computes it."""
     first = values[step.args[0]]
-    if step.op is Op.SHR:
+    if step.op is BitOp.SHR:
         return first >> np.uint64(step.immediate)
-    if step.op is Op.ROTR:
+    if step.op is BitOp.ROTR:
         count = np.uint64(step.immediate)
         return ((first >> count) | (first << np.uint64(WORD - step.immediate))) & np.uint64(MASK)
-    if step.op is Op.SHL:
+    if step.op is BitOp.SHL:
         return (first << np.uint64(step.immediate)) & np.uint64(MASK)
     xor = first if len(step.args) == 1 else first ^ values[step.args[1]]
     return xor & np.uint64(step.immediate)
@@ -166,12 +166,12 @@ class BitTransform:
 
 
 @dataclasses.dataclass(frozen=True)
-class Form:
+class BitForm:
     """A transform's instruction form: its `steps`, the value each output register is (`outputs`, 0 the stored
     word, `i + 1` step `i`'s), and the stored word's encoder (`encoder`: its bit `j` the parity of the input's
     bits in `encoder[j]`; the identity for a fixed layout)."""
 
-    steps: tuple[Step, ...]
+    steps: tuple[BitStep, ...]
     outputs: tuple[int, ...]
     encoder: tuple[int, ...]
 
@@ -210,11 +210,12 @@ class Unproven(ValueError):
     """A form that does not compute its transform on some word."""
 
 
-def proven(transform: BitTransform, form: Form) -> None:
+def proven(transform: BitTransform, form: BitForm) -> None:
     """Prove `form` computes `transform` on every input, or raise `Unproven`: every instruction of the
-    vocabulary is GF(2)-linear (`Op`), so the form and its encoder are linear maps, and two linear maps that
-    agree on each basis word agree on all 2^width; the input's every word is checked besides where it has 16
-    bits or fewer. Bits outside a register's mask are proven zero by the same argument."""
+    vocabulary is GF(2)-linear (`BitOp`), so the form and its encoder are linear maps, and two linear maps
+    that agree on each basis word agree on all 2^width; the input's every word is checked besides where it
+    has 16 bits or fewer. Bits outside a register's mask are proven zero by the same argument. A fixed
+    layout's encoder must be the identity: its form reads the input as stored."""
     identity = tuple(1 << bit for bit in range(transform.width))
     if len(form.encoder) != transform.width or (not transform.free and form.encoder != identity):
         raise Unproven(f"{transform.name}: its form reads a stored word its layout does not store")
@@ -233,7 +234,7 @@ class _Shift(NamedTuple):
     shift of it or of the right one (`base`: 0 the stored word, 1 the right shift), by `amount`; and the input
     bit each of its bits is (`bits`, -1 a zero)."""
 
-    op: Op
+    op: BitOp
     base: int
     amount: int
     bits: tuple[int, ...]
@@ -247,24 +248,24 @@ def _stored(width: int) -> tuple[int, ...]:
 class _Shape(NamedTuple):
     """A form's shifts: its right-moving source's (`right`, None for none) and its count of left shifts."""
 
-    right: Op | None
+    right: BitOp | None
     lefts: int
 
 
-def _shifted(bits: Sequence[int], op: Op, amount: int) -> tuple[int, ...]:
+def _shifted(bits: Sequence[int], op: BitOp, amount: int) -> tuple[int, ...]:
     """The input bit each bit of a value is, the value `bits` shifted by `op`."""
-    if op is Op.SHR:
+    if op is BitOp.SHR:
         return tuple(bits[t + amount] if t + amount < WORD else -1 for t in range(WORD))
-    if op is Op.ROTR:
+    if op is BitOp.ROTR:
         return tuple(bits[(t + amount) % WORD] for t in range(WORD))
     return tuple(bits[t - amount] if t >= amount else -1 for t in range(WORD))
 
 
 def _priced(shape: _Shape, registers: int, units: frozenset[Unit]) -> tuple[tuple[int, int], int]:
-    """A shape's price (`Form.price`) with one LOP3 a register, and its shifts on the ALU: a rotation there
+    """A shape's price (`BitForm.price`) with one LOP3 a register, and its shifts on the ALU: a rotation there
     (the ALU's alone), the rest split so the two pipes balance, or all of them where `units` holds no FMA."""
     shifts = (shape.right is not None) + shape.lefts
-    rotations = int(shape.right is Op.ROTR)
+    rotations = int(shape.right is BitOp.ROTR)
     on_alu = (shifts if Unit.FMA not in units
               else min(shifts, max(rotations, -(-(shifts - registers) // 2))))
     return (max(registers + on_alu, shifts - on_alu), registers + shifts), on_alu
@@ -279,7 +280,7 @@ def _configs(shape: _Shape, reach: int, width: int) -> Iterator[list[_Shift]]:
                     for amount in range(1, WORD)])
     for right in rights:
         bases = [stored] if right is None else [stored, right.bits]
-        lefted = [_Shift(Op.SHL, index, amount, _shifted(bits, Op.SHL, amount))
+        lefted = [_Shift(BitOp.SHL, index, amount, _shifted(bits, BitOp.SHL, amount))
                   for index, bits in enumerate(bases) for amount in range(1, reach + 1)]
         for chosen in itertools.combinations(lefted, shape.lefts):
             yield [*([] if right is None else [right]), *chosen]
@@ -329,7 +330,7 @@ def _registers(transform: BitTransform, shifts: Sequence[_Shift]) -> Iterator[li
     wanted = _wanted(transform)
     sources = [_stored(transform.width), *(shift.bits for shift in shifts)]
     count = len(sources)
-    bases = {shift.base for shift in shifts if shift.op is Op.SHL and shift.base}
+    bases = {shift.base for shift in shifts if shift.op is BitOp.SHL and shift.base}
     needed = frozenset(range(1, count)) - bases
 
     def search(index: int, built: list[list[int]], chosen: list[tuple[int, int]], basis: dict[int, int],
@@ -383,20 +384,20 @@ def _narrowed(transform: BitTransform, register: int) -> int:
 
 
 def _form(transform: BitTransform, shifts: Sequence[_Shift], on_alu: int,
-          registers: Sequence[tuple[int, int]]) -> Form:
+          registers: Sequence[tuple[int, int]]) -> BitForm:
     """The form of `shifts` (each a step, `on_alu` of them on the ALU, a rotation first) and `registers`, its
     encoder solved from its map (a free layout's) or the identity."""
-    alu = set(sorted(range(len(shifts)), key=lambda index: shifts[index].op is not Op.ROTR)[:on_alu])
-    steps = [Step(shift.op, (shift.base,), shift.amount, Unit.ALU if index in alu else Unit.FMA)
+    alu = set(sorted(range(len(shifts)), key=lambda index: shifts[index].op is not BitOp.ROTR)[:on_alu])
+    steps = [BitStep(shift.op, (shift.base,), shift.amount, Unit.ALU if index in alu else Unit.FMA)
              for index, shift in enumerate(shifts)]
     sources = len(shifts) + 1
     outputs: list[int] = []
     for register, (first, second) in enumerate(registers):
         ids = tuple(arg if arg < sources else outputs[arg - sources]
                     for arg in ((first,) if first == second else (first, second)))
-        steps.append(Step(Op.LOP3, ids, _narrowed(transform, register), Unit.ALU))
+        steps.append(BitStep(BitOp.LOP3, ids, _narrowed(transform, register), Unit.ALU))
         outputs.append(len(steps))
-    plain = Form(tuple(steps), tuple(outputs), tuple(1 << bit for bit in range(transform.width)))
+    plain = BitForm(tuple(steps), tuple(outputs), tuple(1 << bit for bit in range(transform.width)))
     if not transform.free:
         return plain
     # The form's map from the stored word to the bits the registers hold, inverted: the encoder is that
@@ -412,14 +413,14 @@ def _form(transform: BitTransform, shifts: Sequence[_Shift], on_alu: int,
 
 
 def synthesized(transform: BitTransform, *, right: bool = True, lefts: int = 3,
-                reach: int = WORD - 1) -> Form:
-    """The cheapest proven form of `transform` (`Form.price`) of one LOP3 a register over the stored word, at
-    most one right shift or rotation of it by any amount (`right`) and `lefts` left shifts of it or of that,
-    each by at most `reach` places, each shift on the pipe that balances the two among the transform's
+                reach: int = WORD - 1) -> BitForm:
+    """The cheapest proven form of `transform` (`BitForm.price`) of one LOP3 a register over the stored word,
+    at most one right shift or rotation of it by any amount (`right`) and `lefts` left shifts of it or of
+    that, each by at most `reach` places, each shift on the pipe that balances the two among the transform's
     `units`: the search walks shapes in increasing price and returns the first form found, proven (`proven`).
     Raises LookupError where no form within the bounds computes it."""
     registers, units = len(transform.outputs), transform.units
-    shapes = [_Shape(op, count) for op in (None, *((Op.SHR, Op.ROTR) if right else ()))
+    shapes = [_Shape(op, count) for op in (None, *((BitOp.SHR, BitOp.ROTR) if right else ()))
               for count in range(lefts + 1)]
     for shape in sorted(shapes, key=lambda shape: _priced(shape, registers, units)[0]):
         on_alu = _priced(shape, registers, units)[1]

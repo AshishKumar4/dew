@@ -35,7 +35,7 @@ def _nvfp4():
 
 
 @functools.cache
-def _nvfp4_form() -> bits.Form:
+def _nvfp4_form() -> bits.BitForm:
     """The NVFP4 decode's form over shifts of at most 6 places, found once for the tests that read it."""
     return bits.synthesized(_nvfp4(), reach=6)
 
@@ -110,7 +110,7 @@ def test_a_form_wrong_on_one_bit_is_unproven(fault):
     transform, form = _nvfp4(), _nvfp4_form()
     steps = list(form.steps)
     index = (form.outputs[0] - 1 if fault == "mask"
-             else next(i for i, step in enumerate(steps) if step.op is not bits.Op.LOP3))
+             else next(i for i, step in enumerate(steps) if step.op is not bits.BitOp.LOP3))
     step = steps[index]
     moved = step.immediate & ~(1 << 6) if fault == "mask" else step.immediate + 1
     steps[index] = step._replace(immediate=moved)
@@ -135,8 +135,8 @@ def test_a_fixed_layouts_form_reads_the_input_as_stored():
     encoder that moves bit 0 there computes the transform end to end, but not on the stored input, and is
     refused."""
     transform = bits.BitTransform.placed("bit-0", 2, (1,), {0: (0, 0)}, free=False)
-    swapped = bits.Form((bits.Step(bits.Op.SHR, (0,), 1, bits.Unit.ALU),
-                         bits.Step(bits.Op.LOP3, (1,), 1, bits.Unit.ALU)), (2,), (2, 1))
+    swapped = bits.BitForm((bits.BitStep(bits.BitOp.SHR, (0,), 1, bits.Unit.ALU),
+                         bits.BitStep(bits.BitOp.LOP3, (1,), 1, bits.Unit.ALU)), (2,), (2, 1))
     with pytest.raises(bits.Unproven):
         bits.proven(transform, swapped)
 
