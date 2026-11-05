@@ -3,6 +3,7 @@
 import functools
 from collections.abc import Callable
 from functools import partial
+from typing import overload
 
 import jax
 import jax.numpy as jnp
@@ -266,6 +267,30 @@ def torch_nearest_resize(x, height: int, width: int):
     return jnp.take(jnp.take(x, rows, axis=1), columns, axis=2)
 
 
+@overload
+def torch_cubic_weights(t: np.ndarray) -> np.ndarray: ...
+
+
+@overload
+def torch_cubic_weights(t: jax.Array) -> jax.Array: ...
+
+
+def torch_cubic_weights(t: np.ndarray | jax.Array) -> np.ndarray | jax.Array:
+    """The weights of torch's bicubic interpolation (a = -0.75, `upsample_bicubic2d`) on the four taps
+    around a source coordinate whose distance past its floor is `t` (NumPy or JAX, its dtype kept): the
+    taps at floor - 1, floor, floor + 1 and floor + 2, in that order, on a new last axis."""
+    a = -0.75
+
+    def near(x):
+        return ((a + 2) * x - (a + 3)) * x * x + 1
+
+    def far(x):
+        return ((a * x - 5 * a) * x + 8 * a) * x - 4 * a
+
+    taps = [far(t + 1), near(t), near(1 - t), far(2 - t)]
+    return np.stack(taps, axis=-1) if isinstance(t, np.ndarray) else jnp.stack(taps, axis=-1)
+
+
 def _torch_bicubic_weights(size_in: int, size_out: int, antialias: bool) -> np.ndarray:
     """The `[size_out, size_in]` matrix of torch's bicubic interpolation along
     one axis, `align_corners=False`.
@@ -288,21 +313,11 @@ def _torch_bicubic_weights(size_in: int, size_out: int, antialias: bool) -> np.n
             )
             matrix[i, low:high] = weights / weights.sum()
         return matrix.astype(np.float32)
-    a, one = np.float32(-0.75), np.float32(1)
-
-    def near(x):
-        return ((a + 2) * x - (a + 3)) * x * x + one
-
-    def far(x):
-        return ((a * x - 5 * a) * x + 8 * a) * x - 4 * a
-
     for i in range(size_out):
         source = scale * (np.float32(i) + np.float32(0.5)) - np.float32(0.5)
         index = int(np.floor(source))
         t = np.float32(source - np.float32(index))
-        for tap, weight in zip(
-            range(index - 1, index + 3), (far(t + one), near(t), near(one - t), far(2 * one - t)), strict=True
-        ):
+        for tap, weight in zip(range(index - 1, index + 3), torch_cubic_weights(np.asarray(t)), strict=True):
             matrix[i, min(max(tap, 0), size_in - 1)] += weight
     return matrix.astype(np.float32)
 

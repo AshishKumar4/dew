@@ -90,8 +90,9 @@ def tower_activation(hidden_act: str) -> str:
 def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: bool = False,
                activation: str | Callable[[jax.Array], jax.Array] = "quick_gelu", eps: float = 1e-5,
                rotary_axes: tuple[int, ...] | None = None,
-               rotary_pairs: Literal["half", "adjacent"] = "half", rope_theta: float = 10000.0,
-               packed: bool = False, kv_heads: int | None = None, head_dim: int | None = None,
+               rotary_pairs: Literal["half", "adjacent"] = "half", rotary_interleaved: bool = False,
+               rope_theta: float = 10000.0, packed: bool = False, kv_heads: int | None = None,
+               head_dim: int | None = None,
                norm_type: Literal["rms", "layer", "fast_layer"] = "fast_layer", norm_bias: bool = True,
                mlp_bias: bool = True, mlp_packed: bool = False, window: int | None = None,
                branch_scale: float | None = None, attention_bias: bool = True, qk_norm: bool = False,
@@ -109,7 +110,8 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
     biased maps around `activation` (a feed-forward activation; `tower_activation` reads a
     checkpoint's `hidden_act`). The attention is causal in CLIP's text tower and full elsewhere,
     over `window` places either side where given; the vision towers rotate it by their patch grid
-    (`rotary_axes`, Llama 4's in adjacent pairs). A layout sets the rest: grouped `kv_heads`, a
+    (`rotary_axes`, Llama 4's in adjacent pairs, MoonViT's axes in turn: `rotary_interleaved`). A
+    layout sets the rest: grouped `kv_heads`, a
     `head_dim` beside `width // heads`, RMS norms or no norm bias, an unbiased or gated
     feed-forward whose gate and up maps are one (`mlp_packed`), queries, keys and values in
     one map (`packed`), unbiased attention maps (`attention_bias`), an RMS norm on each head's
@@ -128,7 +130,8 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
             # A window keeps the keys within `window` places: |q - k| < window + 1 (`window_sides`).
             sliding_window=None if window is None else window + 1, bidirectional_window=window is not None,
             dtype=dtype, precision=precision),
-        nope=rotary_axes is None, rotary_axes=rotary_axes, rotary_pairs=rotary_pairs, packed=packed)
+        nope=rotary_axes is None, rotary_axes=rotary_axes, rotary_pairs=rotary_pairs,
+        rotary_interleaved=rotary_interleaved, packed=packed)
     mlp = functools.partial(GatedMLP, hidden_features=hidden, out_features=width, activation=activation,
                             use_bias=mlp_bias, packed=mlp_packed, dtype=dtype, precision=precision)
     return DecoderBlock(attention if mixer is None else mixer, mlp, width,
