@@ -7,6 +7,19 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- Every requirement Dew installs states a lower bound, and the lowest and the highest set its ranges admit are
+  each installed with the built wheel into a clean environment and run through a small real workflow (import,
+  a decoder forward, a training run, a checkpoint saved and resumed bit for bit, a decoder directory saved and
+  loaded, records read, and each extra's own feature) on every whole-suite run and every release
+  (`tools/check_bounds.py`, CI's `bounds` job). The requirements that stated no floor take the release the
+  suite's lock holds: `numpy>=2.5.4`, `pillow>=11.3.0`, `opencv-python-headless>=5.0.0.93`, `einops>=0.8.2`,
+  `sympy>=1.14.0`, `scipy>=1.18.1`, `tyro>=1.0.16`, `jinja2>=3.1.6`, `filelock>=4.1.1`,
+  `huggingface_hub>=1.33.0` and `protobuf>=6.33.6`, and the extras' `torch>=2.14.1`, `moviepy>=2.2.1`,
+  `wandb>=0.30.0`, `mlflow>=3.17.0`, `tensorboard>=2.21.0`, `optuna>=5.0.0`, `ftfy>=6.3.1`,
+  `importlib_resources>=7.1.0` and, for `tpu`, `requests>=2.34.2`.
+- `safetensors>=0.8.0` is a base requirement: Dew reads and writes every checkpoint's tensors with it, and
+  transformers installed it already. The `interop` extra, which named it alone, is gone, and so is the
+  `metrics` extra, whose `requests` no library module imports (the test suite and the `tpu` extra keep it).
 - The `cuda12` and `cuda13` extras install `dew-cutlass` 0.1.0 (`dew-cutlass-cu12` or `dew-cutlass-cu13`, on
   Linux x86_64 and aarch64), Dew's build of CUTLASS's grouped GEMMs, whose kernels are Hopper's. On an sm90
   GPU (an H100, an H200 or a GH200) a mixture of experts' projection now runs CUTLASS on the two grouped cells
