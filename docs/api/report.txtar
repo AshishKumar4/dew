@@ -295,7 +295,7 @@ class Trackers(*trackers: Tracker)  [dew.training.tracker]
   .artifact(self, value: Reported, step: int) -> None
   .close(self) -> None
   .log(self, scalars: Mapping[str, float], step: int) -> None
-class TrainState(step: jax.Array, microstep: jax.Array, updates: jax.Array, variables: Variables, opt_state: optax.OptState, ema: Variables | None, key: jax.Array, scale: DynamicScale | None, window_size: jax.Array, accumulation: Accumulation | None = None, consumed: jax.Array | None = None, deferred: jax.Array | None = None, inner: Replicas | None = None, compute: Variables | None = None) -> None  [dew.state]
+class TrainState(step: jax.Array, microstep: jax.Array, updates: jax.Array, variables: Variables, opt_state: optax.OptState, ema: Variables | None, key: jax.Array, scale: DynamicScale | None, window_size: jax.Array, accumulation: Accumulation | None = None, consumed: jax.Array | None = None, deferred: jax.Array | None = None, inner: ReplicaState | None = None, compute: Variables | None = None) -> None  [dew.state]
   .averaged: property -> Variables
   .pending_tokens: property -> jax.Array | None
   .replace(self, **updates)
