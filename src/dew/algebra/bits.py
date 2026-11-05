@@ -200,10 +200,45 @@ class BitForm:
         return max(depths[index] for index in self.outputs)
 
     @property
+    def ptx(self) -> str:
+        """The form as one PTX block over its stored word `$N` (N the outputs' count) into its outputs `$0` to
+        `$N-1`, each instruction on the pipe its step names (`_PTX`), for a kernel's inline assembly (Pallas's
+        `elementwise_inline_asm`, constraints `=r` an output and `r` the word)."""
+        count = len(self.outputs)
+        names = [f"${count}", *(f"v{index}" for index in range(1, len(self.steps) + 1))]
+        lines = [f".reg .b32 {', '.join(names[1:])};"] if self.steps else []
+        for index, step in enumerate(self.steps, start=1):
+            operands = [names[arg] for arg in step.args]
+            lines.append(_PTX[step.op, step.unit](names[index], operands, step.immediate))
+        lines += [f"mov.b32 ${position}, {names[value]};" for position, value in enumerate(self.outputs)]
+        return "{\n" + "\n".join(lines) + "\n}"
+
+    @property
     def price(self) -> tuple[int, int]:
         """Its busiest unit's issues, then its instructions (`Unit`: one rate): a decoder's words are many
         and independent, so its pipes' throughput prices it, not its chain's latency."""
         return max(self.issues.values()), len(self.steps)
+
+
+# LOP3's truth table of `c & (a ^ b)` and of `c & a`, over its operands' tables 0xF0, 0xCC and 0xAA (PTX ISA,
+# "Logic and Shift Instructions: lop3").
+_MASKED_XOR, _MASKED = (0xF0 ^ 0xCC) & 0xAA, 0xF0 & 0xAA
+
+_PTX = {
+    (BitOp.SHR, Unit.ALU): lambda out, ins, amount: f"shr.b32 {out}, {ins[0]}, {amount};",
+    # IMAD.HI.U32: the high word of a multiply by 2^(32-c) is the logical shift right by c.
+    (BitOp.SHR, Unit.FMA): lambda out, ins, amount: f"mul.hi.u32 {out}, {ins[0]}, {1 << (WORD - amount):#x};",
+    (BitOp.ROTR, Unit.ALU): lambda out, ins, amount: f"shf.r.wrap.b32 {out}, {ins[0]}, {ins[0]}, {amount};",
+    (BitOp.SHL, Unit.ALU): lambda out, ins, amount: f"shl.b32 {out}, {ins[0]}, {amount};",
+    # IMAD.SHL: a multiply by 2^k, the FMA pipe's left shift.
+    (BitOp.SHL, Unit.FMA): lambda out, ins, amount: f"mul.lo.u32 {out}, {ins[0]}, {1 << amount:#x};",
+    (BitOp.LOP3, Unit.ALU): lambda out, ins, mask: (
+        f"lop3.b32 {out}, {ins[0]}, {ins[1]}, {mask:#010x}, {_MASKED_XOR:#04x};" if len(ins) == 2
+        else f"lop3.b32 {out}, {ins[0]}, {ins[0]}, {mask:#010x}, {_MASKED:#04x};"),
+}
+"""Each instruction on its pipe as PTX: ptxas keeps a shift or rotation on the ALU as SHF and a multiply by a
+power of two on the FMA pipe as IMAD (PTX ISA, "Integer Arithmetic Instructions"; Nsight Compute's
+pipelines)."""
 
 
 class Unproven(ValueError):
