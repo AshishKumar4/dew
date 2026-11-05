@@ -19,7 +19,6 @@ import numpy as np
 import optax
 import pytest
 from interop_support import gemma_features
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file
 
@@ -55,6 +54,47 @@ def _audio(kind):
 def audio(request):
     return _audio(request.param)
 
+BF16_TOWER_SEEDS = 8
+"""Gemma 4's bf16 audio tower's declared check-1 seeds, sized by `seeds_for` paired."""
+
+
+def assert_bf16_tower_on_par(path, model, variables, features, real):
+    """Dew's bf16 Gemma 4 audio tower on par with transformers' own bf16 tower over drawn input features at
+    the fixture's mask (check 1), real frames alone, the truth the reference's float64 twin."""
+    import torch
+    from safetensors.torch import load_file as load_torch
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel
+
+    from tools.audio_reference import audio_config as reference_config
+    from tools.torch_precision import float64_twin, widened
+
+    config = reference_config("gemma4")
+    config._attn_implementation = "sdpa"
+    tower = Gemma4AudioModel(config).eval()
+    tower.load_state_dict(load_torch(str(path / "encoder.safetensors")))
+    wide = float64_twin(tower, lambda: Gemma4AudioModel(config).eval())
+    narrow = tower.to(torch.bfloat16)
+    mask = torch.from_numpy(np.asarray(features["input_features_mask"]))
+    lowered = jax.jit(lambda drawn: model.clone(dtype=jnp.bfloat16).apply(
+        variables, drawn, features["input_features_mask"]).features)
+    shape = np.asarray(features["input_features"]).shape
+
+    def draw(seed):
+        return (np.random.default_rng([0xA0D, seed]).standard_normal(shape).astype(np.float32),)
+
+    def reference(tower, dtype, context):
+        @as_given
+        def run(drawn):
+            with context(), torch.no_grad():
+                found = tower(torch.from_numpy(drawn).to(dtype), mask).last_hidden_state
+            return np.asarray(found.double().numpy())[real]
+        return run
+
+    assert_as_exact(as_given(lambda drawn: np.asarray(lowered(jnp.asarray(drawn)), np.float64)[real]),
+                    reference(narrow, torch.bfloat16, contextlib.nullcontext), draw, "bf16 encoded",
+                    seeds=BF16_TOWER_SEEDS, truth_fn=reference(wide, torch.float64, widened))
+
+
 def test_waveform_preprocessing_encoder_and_projection_match_reference(audio):
     path, config, variables, model, projector, projector_variables = audio
     data = np.load(path / "reference.npz")
@@ -80,15 +120,13 @@ def test_waveform_preprocessing_encoder_and_projection_match_reference(audio):
         assert np.max(np.abs(np.asarray(changed.features) - data["encoded"])) > 1e-3
         # The loaded FP32 bounds clamp in the operand's dtype, as torch.clamp
         # does, so a bf16 tower stays bf16 through every clipped map, and its
-        # output is as near the float32 tower's as the reference's bf16 tower.
-        lowered, state = jax.jit(lambda variables: model.clone(dtype=jnp.bfloat16).apply(
+        # output is on par with the reference's bf16 tower over drawn features
+        # (check 1, the truth the reference's float64 twin).
+        _, state = jax.jit(lambda variables: model.clone(dtype=jnp.bfloat16).apply(
             variables, **features, capture_intermediates=lambda module, _: isinstance(module, AudioLinear)))(
             variables)
         assert {leaf.dtype for leaf in jax.tree.leaves(state["intermediates"])} == {jnp.dtype(jnp.bfloat16)}
-        real = np.asarray(data["valid"], bool)
-        truth = np.asarray(data["encoded"], np.float64)[real]
-        assert_as_exact_as_the_reference(np.asarray(lowered.features, np.float32)[real],
-                                         data["encoded_bf16"][real], truth, "bf16 encoded")
+        assert_bf16_tower_on_par(path, model, variables, features, np.asarray(data["valid"], bool))
 
 
 BLOCK_SEEDS = 8
