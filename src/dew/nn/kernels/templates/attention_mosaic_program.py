@@ -85,6 +85,19 @@ family without one (mma.sync's, until its thin mainloop) takes another mainloop 
 `MosaicBackward.eligible`)."""
 
 
+def values_deferred(family: mosaic.Family, form: str, splits: int, dtype, dropped: bool) -> bool:
+    """Whether a forward's plain walk issues each tile's P·V a step late
+    (`attention_mosaic_forward._consumer`): FlashAttention 3's overlap within a consumer, its next `Q Kᵀ`
+    and the step before's P·V in flight together and its softmax under the P·V
+    (hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp's `fwd_step`), the weights carried a step in registers.
+    Where its family's products run asynchronously (`Issuer.products_overlap`) over a producer's loads (a
+    loading consumer would wait on its own late release, `Transport.feeds_itself`), every program walks a key
+    tile (a full or causal call's whole launch: no spans, no splits), and a tile's weights are one bf16
+    operand (no dropout's parts)."""
+    return (family.products_overlap and not family.feeds_itself and form in ("full", "causal") and splits == 1
+            and jnp.dtype(dtype) == jnp.dtype(jnp.bfloat16) and not dropped)
+
+
 def query_swizzle(family: mosaic.Family) -> int | None:
     """The swizzle a forward stages its query block at, the left operand of its logits' product: the
     narrowest where its family loads operands into registers (`Family.operands_in_registers`), 8-row tiles
@@ -127,6 +140,9 @@ class Tiles:
     (`transposed_swizzles`), where its family reads operands from registers: a load one instruction's depth
     of them (`Family.rhs_fragment_depth`), not a wide swizzle tile's, a wide stage's bandwidth traded for
     registers (ET-CENSUS80: a 64 x 192 forward's keys at the widest 162 of its 291 registers)."""
+    deferred: bool = False
+    """Whether its plain inference walk issues each tile's P·V a step late (`values_deferred`), where that
+    walk's registers hold the carried weights at these tiles (`MosaicForward.derived`)."""
 
     def __post_init__(self):
         if self.stages < 2:
@@ -134,11 +150,12 @@ class Tiles:
 
     @property
     def relaunch(self) -> "Tiles":
-        """The natural form's rewalk's tiles (`algebra.walked_launches`)."""
+        """The natural form's rewalk's tiles (`algebra.walked_launches`), its P·V in its step (its own tiles'
+        deferral not derived)."""
         return dataclasses.replace(self, block_k=self.relaunch_k or self.block_k,
                                    consumers=self.relaunch_consumers or self.consumers, relaunch_k=None,
                                    relaunch_consumers=None, relaunch_columns=None, natural_form=True,
-                                   columns=self.relaunch_columns)
+                                   columns=self.relaunch_columns, deferred=False)
 
 
 @dataclasses.dataclass(frozen=True, order=True)
