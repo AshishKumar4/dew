@@ -637,12 +637,12 @@ class _Numbering:
         if len({(len(operands[index]), leads[index]) for index in stacked}) != 1:
             return None
         count, held = len(operands[stacked[0]]), leads[stacked[0]]
-        rows = tuple(shapes[stacked[0]][:held])
+        whole = tuple(shapes[stacked[0]])
         for index, operand in enumerate(operands):
-            if index in stacked or len(shapes[index]) < held or tuple(shapes[index][:held]) != rows:
+            if index in stacked or not entrywise(equation) or tuple(shapes[index]) != whole:
                 continue
-            # A value of no stack of the stack's shape: each row's the same where it is a scalar's
-            # broadcast, any other's rows its own, which no row's expression names.
+            # An entrywise equation's operand of no stack of a stack's shape: each row's the same where it
+            # is a scalar's broadcast, any other's rows its own, which no row's expression names.
             if operand not in self.uniform:
                 return None
             operands[index] = (operand,) * count
