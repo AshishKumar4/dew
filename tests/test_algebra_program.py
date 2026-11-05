@@ -481,6 +481,30 @@ def test_an_fp8_product_is_priced_in_the_tensor_mode_its_gpu_runs_it_in(generati
     assert seconds(jnp.float8_e4m3fn) == seconds(jnp.bfloat16) / speedup
 
 
+def test_xlas_schedule_prices_each_kernel_its_parts_fixed_latency():
+    """XLA's schedule (`cost.fused`) prices each kernel of a form, a product's or a reduction's (a root of
+    XLA's fusion), at its part's measured fixed latency (`GpuTarget.fixed_seconds`, its launch and first
+    byte) beside its work: a traced product and a chunk form's products (`cost.product_work`, one a product)
+    alike, row 4081's receipts finding a small fusion's time that latency. On a part no one measured, the
+    kernels are work no rate prices (`Schedule.unpriced`)."""
+    hopper = generation.gpu_target("NVIDIA H100 80GB HBM3")
+    schedule = cost.fused(hopper)
+
+    def priced(fn, *shapes):
+        region = terms.region(jax.make_jaxpr(fn)(*(jnp.ones(shape, jnp.bfloat16) for shape in shapes)))
+        graph, bundle, _ = program.graphed(region)
+        return graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                             cost_model=cost.model(region, schedule))[1].work
+
+    traced = priced(lambda a, b: jnp.sum(jnp.dot(a, b), axis=-1), (64, 64), (64, 64))
+    assert traced.kernels == 2
+    one, two = cost.product_work(64, 64, 64), cost.product_work(64, 64, 64, count=2)
+    throughput = sum(kernel_cost.units(one, kernel_cost.rates(hopper, device=True))[0])
+    assert schedule(one) == pytest.approx(throughput + hopper.fixed_seconds)
+    assert schedule(two) == pytest.approx(2 * (throughput + hopper.fixed_seconds))
+    assert cost.fused(generation.gpu_target("sm86")).unpriced(two)[-1] == 2
+
+
 def test_device_memory_is_priced_at_the_parts_measured_stream():
     """A GPU's device-memory bytes are priced at its part's measured stream (`GpuTarget.part`,
     tools/device_facts.py's plateau), whatever bandwidth its memory clock and bus state, which no transfer
