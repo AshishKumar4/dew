@@ -277,17 +277,35 @@ def test_a_guest_whose_request_outlasts_its_connection_stays_admitted_until_the_
     admission: its connection hears the timeout and nothing after it, a second request is refused while
     the first runs, and the guest is admitted again once the engine has settled it, so a slow pass never
     lets one guest queue a second job past the service's bounds. The service's real models run it
-    (`live_kernel`), held inside its walk while the test looks (`held_in_its_walk`)."""
+    (`live_kernel`), held inside its walk while the test looks (`held_in_its_walk`), and the connection's
+    wait runs out once the walk runs, not by a clock."""
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
     _, _, native = live_kernel(service, tmp_path)
-    monkeypatch.setattr(service, "REQUEST_SECONDS", 0.05)
     submitted = spied_submissions(native, monkeypatch)
     path = tmp_path / "model.sock"
     with serving(service, native, path):
         with held_in_its_walk(native, monkeypatch) as running:
+            engine = native.submitted
+
+            def outlasted(request, emit):
+                """The engine's future, whose wait runs out once its walk runs."""
+                future, answered = engine(request, emit)
+
+                class Waited:
+                    def __getattr__(self, name):
+                        return getattr(future, name)
+
+                    def result(self, timeout=None):
+                        running.wait()
+                        raise FuturesTimeout
+
+                return Waited(), answered
+
+            monkeypatch.setattr(native, "submitted", outlasted)
             first, lines = connected(path, SLOW)
             with first:
                 assert reply(lines)["error"]["name"] == "TimeoutError"
-                assert running.is_set()
                 second, refused = connected(path, SLOW)
                 with second:
                     assert reply(refused)["error"]["name"] == "ValueError"
