@@ -146,22 +146,25 @@ def test_blocks_and_context_follow_the_documented_distribution(mask):
                                  seeds=MASK_SEEDS)
     # Of each mask leaving the free count seed 0 draws most often, one free position drawn apart from the
     # mask (its own stream): kept at the rate num_context / free wherever the blocks fell, each mask one
-    # independent trial, counted by the position drawn (the context's positions in a mask are a subset of
-    # fixed size, not independent of each other).
+    # independent trial, counted by the grid row and the grid column of the position drawn (the context's
+    # positions in a mask are a subset of fixed size, not independent of each other).
     size = int(np.bincount((~drawn(0)[3]).sum(axis=1)).argmax())
     chance = mask.num_context / size
 
-    def kept_or_dropped(seed):
+    def kept_or_dropped(seed, axis):
+        """Each grid row's (`axis` 0) or column's (1) kept and dropped counts of its probed positions."""
         *_, covered, kept = drawn(seed)
         probes = np.random.default_rng([0x7E9A, seed])
-        counts = np.zeros((mask.num_patches, 2), np.int64)
+        counts = np.zeros((GRID[axis], 2), np.int64)
         for row in np.flatnonzero((~covered).sum(axis=1) == size):
             position = probes.choice(np.flatnonzero(~covered[row]))
-            counts[position, 0 if kept[row, position] else 1] += 1
+            counts[np.divmod(position, GRID[1])[axis], 0 if kept[row, position] else 1] += 1
         return counts
 
-    assert_draws_as_declared(kept_or_dropped, np.tile([chance, 1 - chance], (mask.num_patches, 1)),
-                             "the context's free positions", seeds=MASK_SEEDS)
+    for axis, name in enumerate(("row", "column")):
+        assert_draws_as_declared(functools.partial(kept_or_dropped, axis=axis),
+                                 np.tile([chance, 1 - chance], (GRID[axis], 1)),
+                                 f"the context's free positions by grid {name}", seeds=MASK_SEEDS)
 
 
 @pytest.mark.parametrize("scan_order", ["raster", "hilbert", "zigzag"])
