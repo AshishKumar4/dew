@@ -16,6 +16,7 @@ from collections.abc import Callable, Hashable, Mapping
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn, struct
 from jax._src import config as jax_config
 from jax.experimental import checkify
@@ -696,8 +697,11 @@ def host_pages(resident: Slots, carried: Slots, slots: int) -> Variables:
     def held(leaf):
         if leaf is None:
             return None
+        # Each shard made on the host and put where it lives: the tier never passes through device memory.
+        shape = (leaf.shape[0], slots, *leaf.shape[2:])
         sharding = leaf.sharding.with_memory_kind("pinned_host")
-        return jax.device_put(jnp.zeros((leaf.shape[0], slots, *leaf.shape[2:]), leaf.dtype), sharding)
+        return jax.make_array_from_callback(
+            shape, sharding, lambda index: np.zeros(sharding.shard_shape(shape), leaf.dtype))
 
     pool = _pooled(joined(resident, carried).decoder.cache)
     return jax.tree.map(held, pool, is_leaf=lambda x: x is None)

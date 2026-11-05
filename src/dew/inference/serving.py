@@ -1113,6 +1113,8 @@ class Server:
         """Make the page copies every process's seating owes before the step's program writes any page: each
         reclaimed prefix page out to its host slot, then each shared one back from its slot into its fresh
         page, a fixed number a call so one program of each serves every step."""
+        if self._host is None:
+            return
         width = self.admission * self.rows.width
         for start in range(0, len(spills), width):
             pages, slots = _padded(spills[start:start + width], width, 1)
