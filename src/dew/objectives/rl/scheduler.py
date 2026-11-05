@@ -143,6 +143,7 @@ from dataclasses import dataclass, field
 from typing import ClassVar, Protocol
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 from dew._coordination import agreed, agreed_count, from_every_process
@@ -645,6 +646,43 @@ class RolloutScheduler:
                    truncation=truncation, log=log, varied=varied, overlong=overlong, admit=admit,
                    reference=objective if isinstance(objective, GRPOObjective) and objective.reward_kl > 0
                    else None, generation_batches=generation_batches)
+
+    @classmethod
+    def served(cls, objective: GRPOObjective, reward: Reward, *, tasks: int, slots: int,
+               decode: Callable[[Sequence[int]], str] = lambda ids: " ".join(str(token) for token in ids),
+               groups: int = 4, max_new_tokens: int = 32, estimator: str = "group", truncation: str = "score",
+               sampling: Sampling | None = None, ahead: int = 1, max_lag: int = 1, sync_every: int = 1,
+               log: Callable[[SchedulerRecord], None] | None = None, varied: bool = False,
+               overlong: tuple[int, int] | None = None, admit: int | None = None,
+               generation_batches: int = 1) -> RolloutScheduler:
+        """Draw `groups` completions of each of a batch's `tasks` prompt rows ahead of the trainer from
+        Dew's own server over `objective`'s policy, `slots` rows decoding at once, and train on them
+        (`Asynchronous` over a `PromptSource` of a `NativeRolloutServer`, its first weights the run's
+        first snapshot's): `ahead` batches submitted before the trainer reads them, a rollout at most
+        `max_lag` updates behind it, the weights pushed every `sync_every` updates, each version drawn
+        at the run's progress at its updates (`LMObjective.policy`). The proximal policy is rescored
+        under the trainer's weights, so a `max_lag` above 0 needs `objective.behavior_importance`. A
+        reward-side reference penalty (`GRPOObjective.reward_kl`) is `objective`'s own, as `sampled`'s."""
+        from dew.inference.rollouts import NativeRolloutServer
+        from dew.inference.serving import Server
+
+        from .sources import PromptSource
+
+        drawing = objective.sampled(Sampling() if sampling is None else sampling)
+        width = objective.seq_len + 1
+
+        def built(variables: Variables, version: int) -> Server:
+            policy = objective.policy(variables, drawing, Progress(jnp.asarray(version, jnp.int32)))
+            return Server.from_task(policy, slots=slots, capacity=width)
+
+        server = NativeRolloutServer.deferred(built, drawing)
+        source = PromptSource(server, reward, decode=decode, max_new_tokens=max_new_tokens)
+        acquisition = Asynchronous(source, server, objective, width=width, rows=tasks * groups, ahead=ahead,
+                                   max_lag=max_lag, sync_every=sync_every)
+        return cls(acquisition, tasks=prompt_tasks, groups=groups, estimator=estimator, truncation=truncation,
+                   log=log, varied=varied, overlong=overlong, admit=admit,
+                   reference=objective if objective.reward_kl > 0 else None,
+                   generation_batches=generation_batches)
 
     @classmethod
     def episodes(cls, policy: EpisodeInference, environment: EnvironmentFactory, verifier: Verifier, *,
