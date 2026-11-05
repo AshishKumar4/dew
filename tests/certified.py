@@ -413,17 +413,20 @@ def _rounding(name: str, integral):
             return _bits(result) == _bits(integral(result, *operands))
         measured = lane()
         # A division by a divisor broadcast along a size-1 axis of its own rank is held at that form's own
-        # reach (`BROADCAST`), which XLA may compute as a multiply by the divisor's reciprocal; a scalar
-        # divisor's (a literal's, ledger 1402) is the division's.
+        # reach (`BROADCAST`); a scalar divisor's (a literal's, ledger 1402) is the division's.
         divisor = np.shape(operands[-1])
-        form = BROADCAST if len(divisor) == np.ndim(result) and divisor != np.shape(result) else ""
-        reach = measured.reach.get((name + form, fmt.name), measured.reach[name, fmt.name])
+        broadcast = name == "div" and len(divisor) == np.ndim(result) and divisor != np.shape(result)
+        reach = measured.reach[name + BROADCAST if broadcast else name, fmt.name]
         return LEVELS[name](operands, result, fmt, measured.flushes) <= reach
     return contract
 
 
 BROADCAST = " broadcast"
-"""A division's form whose divisor is broadcast along a size-1 axis, its reach measured apart (`lane`)."""
+"""A division's form whose divisor is broadcast along a size-1 axis within the one equation (lax's implicit
+broadcast), its reach measured apart (`lane`): XLA on the CPU computes it as a multiply by the divisor's
+reciprocal, two roundings. A divisor broadcast by an equation of its own (`broadcast_in_dim`) reaches its
+division materialized, which check 2 runs alone and the lane rounds correctly (row 4011: none of 2048
+such quotients off, though the same jitted whole was off at 545)."""
 
 
 def _product(a, b):
