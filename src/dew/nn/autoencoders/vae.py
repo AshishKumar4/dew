@@ -231,17 +231,20 @@ Candidate = tuple[str, str | None, str | None]
 def _candidates(revision: str) -> list[Candidate]:
     """Every place a load looks, in the order it looks.
 
-    First the SD1-era flax msgpack: the revision the caller named and the
-    `flax` branch, each with and without the `vae` subfolder. Then the torch
-    safetensors: a revision outside `FLAX_REVISIONS` is a pin, so only that
-    revision, and otherwise the repo's default branch.
+    A revision outside `FLAX_REVISIONS` is a pin: both layouts at that
+    revision alone, the flax msgpack first, each with and without the `vae`
+    subfolder. A layout name (`FLAX_REVISIONS`) looks first for the SD1-era
+    flax msgpack at that revision and the `flax` branch, each with and
+    without the subfolder, then for the torch safetensors on the repo's
+    default branch.
     """
-    torch = ([(revision, "vae"), (revision, None)] if revision not in FLAX_REVISIONS
-             else [(None, "vae"), (None, None)])
+    if revision not in FLAX_REVISIONS:
+        return [(weights, revision, subfolder) for weights in (FLAX_WEIGHTS, TORCH_WEIGHTS)
+                for subfolder in ("vae", None)]
     return [
         (FLAX_WEIGHTS, *place)
         for place in [(revision, "vae"), ("flax", "vae"), (revision, None), (None, None)]
-    ] + [(TORCH_WEIGHTS, *place) for place in torch]
+    ] + [(TORCH_WEIGHTS, *place) for place in [(None, "vae"), (None, None)]]
 
 
 def _check_weights(modelname: str, candidates: list[Candidate], index: int) -> None:
@@ -344,7 +347,7 @@ def located_vae(modelname: str, revision: str = "bf16", *, params=None) -> tuple
 
     `revision` names the flax layout when it is one of `FLAX_REVISIONS`, and
     the torch path then reads the repo's default branch. Any other revision
-    is a pin: the torch path reads only that revision, and raises
+    is a pin: both layouts are read at that revision alone, and a load raises
     FileNotFoundError when the repo has no weights at it.
     """
     if os.path.isdir(modelname):
