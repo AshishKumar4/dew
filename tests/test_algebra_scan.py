@@ -17,6 +17,7 @@ from reference_error import assert_as_exact
 
 from dew.algebra import SATURATION, cost, linear_scan, scan
 from dew.nn.kernels import generation
+from dew.nn.precision import float32_matmul
 
 TOKENS, STATE, WIDTH, CHUNK = 128, 16, 32, 32
 
@@ -327,6 +328,30 @@ def test_a_scans_carry_derived_for_one_target_serves_no_other():
             splits.append(forms.prepare(chunk).split)
     assert splits[1] is not splits[0]
     assert splits[2] is splits[0]
+
+
+def test_a_derived_scans_products_are_its_issuers_each_by_its_role():
+    """A derived scan's chunk walked through a mainloop's issuer (`issue(role, lhs, rhs)`) at prepare, step
+    and mapped: every product of its forms is the issuer's, under the roles a chunk's form makes (its gram,
+    its inverse's doubling, its correction, write and readouts), and the walk computes what Dew's own
+    products do, bit for bit."""
+    forms = scan.derive_scan(scan.Scan(gated_delta, gated_readout, GATED, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    roles = []
+
+    def issue(role, left, right):
+        roles.append(role)
+        return float32_matmul(left, right)
+
+    chunk = chunk_of(dict(zip(GATED, gated_draw(0), strict=True)), 0, GATED)
+    state = forms.init(())
+    plain = forms.prepare(chunk)
+    expected = forms.mapped(plain, state), forms.step(state, plain)
+    issued = forms.prepare(chunk, issue)
+    made = forms.mapped(issued, state, issue), forms.step(state, issued, issue)
+    np.testing.assert_array_equal(np.asarray(made[0]), np.asarray(expected[0]))
+    np.testing.assert_array_equal(np.asarray(made[1][1]), np.asarray(expected[1][1]))
+    assert {"gram", "inverse_merge", "correct", "carry", "readout_memory"} <= set(roles), roles
 
 
 def test_a_derived_scan_holds_its_latest_splits_alone():
