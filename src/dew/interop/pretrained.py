@@ -557,10 +557,11 @@ class Pretrained:
             modeling_overrides)
         # An export of a run carries the run's declaration, numerics and dtypes (`released`), read from the
         # folder the load selects; a load that states its own takes their place.
-        settings, run_numerics, run_dtypes = released(reference.directory(directory))
-        if numerics is None and run_dtypes is not None and (dtype, param_dtype) == ("bfloat16", "float32"):
-            # The load's own dtypes are its defaults (`load`'s, `_load_settings`'s), so it states none.
-            dtype, param_dtype = run_dtypes
+        settings, run_numerics, run_compute = released(reference.directory(directory))
+        if numerics is None and run_compute is not None and (dtype, param_dtype) == ("bfloat16", "float32"):
+            # The load's own dtypes are its defaults (`load`'s, `_load_settings`'s), so it states none: the
+            # run's compute dtype, and its parameters as the export stored them.
+            dtype, param_dtype = run_compute, AUTO
         loaded, extracted = _loaded_kind(
             reference, directory, composite, fallback=fallback, gguf_file=gguf_file,
             single_file=single_file, dduf_file=dduf_file, placed=placed, streaming=streaming or not weights,
@@ -775,10 +776,10 @@ class Pretrained:
 
     def _release(self) -> dict[str, object] | None:
         """The release metadata `save` writes beside the config (`decoders.RELEASE_FILE`) where the bundle
-        holds a run's own declaration (`settings`): its task settings' record, its numerics and the dtypes
+        holds a run's own declaration (`settings`): its task settings' record, its numerics and the dtype
         its model computes in (its own `dtype`, else its parameters', which a module without one computes
-        in) and keeps its parameters in (as the export stores them, `auto`), under the release record's
-        `task` (`dew.config.Release`), which `load` reads back (`released`)."""
+        in; the parameters' own are the export's), under the release record's `task`
+        (`dew.config.Release`), which `load` reads back (`released`)."""
         if self.settings is None:
             return None
         from dew.inference.tasks import TaskSettings as Settings
@@ -791,7 +792,7 @@ class Pretrained:
         stated = model.dtype if isinstance(model, CausalTransformer | DiffusionGemma) else None
         compute = held if stated is None else stated
         return {"task": {"settings": to_record(self.settings, Settings), "numerics": numerics,
-                         "dtypes": {"compute": dtype_name(compute), "params": AUTO}}}
+                         "dtypes": {"compute": dtype_name(compute)}}}
 
     def push_to_hub(self, repo_id: str, *, variables: Mapping[str, object] | None = None,
                     private: bool = False, commit_message: str = "Upload dew export",
@@ -1624,13 +1625,11 @@ def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
     return config, None
 
 
-def released(directory: Path) -> tuple[TaskSettings | None, Numerics | None,
-                                       tuple[DtypeName, DtypeName | Literal["auto"]] | None]:
-    """The run's own task settings, numerics and model dtypes an export of it wrote
+def released(directory: Path) -> tuple[TaskSettings | None, Numerics | None, DtypeName | None]:
+    """The run's own task settings, numerics and compute dtype an export of it wrote
     (`decoders.RELEASE_FILE`, `Pretrained.save`): its tasks' declaration, the numerics they trace under,
-    and the dtypes its model computed in and kept its parameters in (`auto`, as the export stores
-    them), or None for each where the directory holds none: a source with no run behind it builds its
-    tasks from its own files, in the load's dtypes."""
+    and the dtype its model computed in, or None for each where the directory holds none: a source with
+    no run behind it builds its tasks from its own files, in the load's dtypes."""
     from dew.inference.tasks import TaskSettings as Settings
 
     path = directory / decoders.RELEASE_FILE
@@ -1639,10 +1638,9 @@ def released(directory: Path) -> tuple[TaskSettings | None, Numerics | None,
     record = _records.record(json.loads(path.read_text()), decoders.RELEASE_FILE)
     task = _records.record(record["task"], "task")
     numerics, dtypes = task.get("numerics"), _records.record(task["dtypes"], "dtypes")
-    compute, params = _records.text(dtypes["compute"], "compute"), _records.text(dtypes["params"], "params")
     return (from_record(Settings, task["settings"], dtypes=False),
             None if numerics is None else from_record(Numerics, numerics, dtypes=False),
-            (dtype_name(compute), AUTO if params == AUTO else dtype_name(params)))
+            dtype_name(_records.text(dtypes["compute"], "compute")))
 
 
 def _decoded(tensors: Mapping[str, unread.Stored], config: Mapping[str, object], param_dtype: str, *,
