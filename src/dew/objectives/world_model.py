@@ -17,6 +17,7 @@ and context frames at signal level 1 - `tau_ctx` when generating.
 
 from __future__ import annotations
 
+import functools
 import math
 from collections.abc import Callable, Mapping
 
@@ -104,15 +105,16 @@ class CausalTokenizer(nn.Module):
     def __call__(self, frames: jax.Array) -> jax.Array:
         return self.decode(self.encode(frames))
 
-    def encode(self, frames: jax.Array, mask_rate: jax.Array | None = None,
-               key: jax.Array | None = None) -> jax.Array:
-        """Each frame's latents; with `mask_rate` `[...]`, each patch replaced by the mask token with
-        that frame's probability, drawn from `key`."""
+    def encode(self, frames: jax.Array, mask_rate: jax.Array | None = None, key: jax.Array | None = None,
+               *, masked: jax.Array | None = None) -> jax.Array:
+        """Each frame's latents; each patch `masked` `[..., patches]` replaced by the mask token, or with
+        `mask_rate` `[...]` each with that frame's probability, drawn from `key`."""
         x = self.embed(self._patchify(frames)) + self.patch_positions
         if mask_rate is not None:
             if key is None:
                 raise ValueError("masking a tokenizer's patches draws from a key")
             masked = jax.random.uniform(key, x.shape[:-1]) < mask_rate[..., None]
+        if masked is not None:
             x = jnp.where(masked[..., None], self.mask_token, x)
         lead = x.shape[:-2]
         latent = jnp.broadcast_to(self.latent_tokens, (*lead, *self.latent_tokens.shape))
@@ -165,12 +167,19 @@ class TokenizerObjective(Objective[Ratio]):
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         video = unit_frames(batch["video"])
-        rate_key, mask_key = jax.random.split(step.key)
-        rate = jax.random.uniform(rate_key, video.shape[:2], maxval=self.max_mask) if step.training else None
+        rows, frames = video.shape[:2]
+        masked = None
+        if step.training:
+            # Each clip's own draws (`Step.sample`): a frame's mask rate, and each patch's uniform.
+            rate = step.sample("mask rate", functools.partial(jax.random.uniform, maxval=self.max_mask),
+                               (frames,), rows=rows)
+            uniform = step.sample("patch mask", jax.random.uniform, (frames, self.model.patches), rows=rows)
+            masked = step.boundary("patch mask", uniform < rate[..., None])
 
         tokenizer = self.model.bind(variables)
-        error = jnp.mean(jnp.square(tokenizer.decode(tokenizer.encode(video, rate, mask_key)) - video))
-        return Ratio(error, jnp.ones(())), Aux({"mse": error})
+        stats = self.row_mean(jnp.square(tokenizer.decode(tokenizer.encode(video, masked=masked)) - video),
+                              batch)
+        return stats, Aux({"mse": stats.mean()[0]})
 
 
 class Dynamics(nn.Module):
@@ -230,12 +239,17 @@ class Dynamics(nn.Module):
 
 def sampled_steps(key: jax.Array, shape: tuple[int, ...], k_max: int) -> tuple[jax.Array, jax.Array]:
     """Eq. 4: each frame's step size d, the reciprocal of a power of two up to `k_max` drawn uniformly,
-    and its signal level tau drawn uniformly from {0, d, ..., 1 - d}."""
+    and its signal level tau drawn uniformly from {0, d, ..., 1 - d} (`_gridded`)."""
     size_key, level_key = jax.random.split(key)
-    levels = int(math.log2(k_max)) + 1
-    d = 1.0 / 2.0 ** jax.random.randint(size_key, shape, 0, levels).astype(jnp.float32)
-    tau = jnp.floor(jax.random.uniform(level_key, shape) / d) * d
-    return tau, d
+    return _gridded(jax.random.randint(size_key, shape, 0, int(math.log2(k_max)) + 1),
+                   jax.random.uniform(level_key, shape))
+
+
+def _gridded(exponent: jax.Array, uniform: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Eq. 4 from its draws: the signal level tau and the step size d = 2^-`exponent`, tau `uniform` in
+    [0, 1) floored to d's grid."""
+    d = 1.0 / 2.0 ** exponent.astype(jnp.float32)
+    return jnp.floor(uniform / d) * d, d
 
 
 def ramp(tau: jax.Array) -> jax.Array:
@@ -308,10 +322,14 @@ class WorldModelObjective(Objective[Ratio]):
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         clean = self.latents(unit_frames(batch["video"]))
         actions = batch.get("actions")
-        steps_key, noise_key = jax.random.split(step.key)
+        rows, frames = clean.shape[:2]
         d_min = 1.0 / self.model.k_max
-        tau, d = sampled_steps(steps_key, clean.shape[:2], self.model.k_max)
-        noise = jax.random.normal(noise_key, clean.shape)
+        # Each clip's own draws (`Step.sample`): Eq. 4's step size and signal level a frame, and its noise.
+        exponent = step.sample("step size", functools.partial(jax.random.randint, minval=0,
+                                                              maxval=self.model.levels), (frames,), rows=rows)
+        tau, d = _gridded(exponent, step.sample("signal level", jax.random.uniform, (frames,), rows=rows))
+        tau, d = step.boundary("signal level", tau), step.boundary("step size", d)
+        noise = step.boundary("noise", step.sample("noise", jax.random.normal, clean.shape[1:], rows=rows))
 
         dynamics = self.model.bind(variables)
 
@@ -322,8 +340,8 @@ class WorldModelObjective(Objective[Ratio]):
             per_frame = shortcut_forcing_loss(f, clean, noise, tau, d, d_min)
         else:
             per_frame = diffusion_forcing_loss(f, clean, noise, jnp.floor(tau / d_min) * d_min, d_min)
-        stats = Ratio(per_frame.sum(), jnp.asarray(per_frame.size, per_frame.dtype))
-        return stats, Aux({"frame_loss": per_frame.mean()})
+        stats = self.row_mean(per_frame, batch)
+        return stats, Aux({"frame_loss": stats.mean()[0]})
 
     def generate(self, variables: Variables, context: jax.Array, frames: int, key: jax.Array, *,
                  steps: int = 4, tau_ctx: float = 0.1, actions: jax.Array | None = None) -> jax.Array:
