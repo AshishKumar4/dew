@@ -273,8 +273,10 @@ def test_a_decision_run_this_dew_saves_resumes_when_its_command_runs_again_or_fr
     """A decision run saved by this Dew, its option text left to its layout (a release's named, a fresh
     lettered head's described), records the writing its build resolved, as a pinned source's step is, so
     a later Dew's default writes none of its rows otherwise (row 3867); it resumes when its command runs
-    again and when read back from its record. A record a Dew before that wrote holds None, which a resume
-    reads off its checkpoint's layout (`dew.config.earlier_option_writing`), and it resumes either way."""
+    again and when read back from its record. A record a Dew before that wrote holds None, which reading
+    it leaves (no checkpoint is read before its process is prepared, train 589's review) and its resume
+    reads off its checkpoint's layout (`resumed`, `dew.config.earlier_option_writing`), and it resumes
+    either way."""
     from run_kinds import trained
 
     from dew.decision.config import DecisionRunConfig
@@ -290,7 +292,7 @@ def test_a_decision_run_this_dew_saves_resumes_when_its_command_runs_again_or_fr
     for steps in (2, 3):
         (directory / "run.json").write_text(unresolved)
         loaded = DecisionRunConfig.load(str(directory))
-        assert loaded.option_text == written
+        assert loaded.option_text is None and loaded.resumed().option_text == written
         run = first if steps == 2 else loaded
         trained(run, tmp_path, kind, trainer={"name": kind, "steps": steps, "checkpoint_final": True})
         assert str(steps) in {path.name for path in directory.iterdir()}
