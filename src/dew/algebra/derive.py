@@ -85,14 +85,19 @@ class Reduction:
     exact: bool = False
     """Whether its forms are extracted exactly (`extract.cheapest`): a declaration whose greedy extraction the
     test suite's oracle finds dearer than the optimum (`dew.cache.Passes.checked`)."""
-    exponential: Callable[[jax.Array], jax.Array] | None = None
-    """The implementation of its exponential (`exponent`'s base), which its walk's every exponential of that
-    base evaluates by: a numerics choice of the declaration's (attention's accurate form's `natural_exp`, as
-    exact as the reference's on every backend), equal to the plain one in the reals; None for JAX's."""
+    exponential: Callable[..., jax.Array] | None = None
+    """The implementation of its exponential (`exponent`'s base), `exponential(x, scale=1.0)`, `exp(x scale)`
+    in the reals, which its walk's every exponential of that base evaluates by, an exponential of a
+    difference times a literal taking the literal as its `scale` (raw logits', `forms._scaled`): a numerics
+    choice of the declaration's (attention's accurate form's `natural_exp`, as exact as the reference's on
+    every backend), equal to the plain one in the reals; None for JAX's."""
     rescale: Callable[[jax.Array, jax.Array], jax.Array] | None = None
-    """The factor a carried state takes from its anchor `carried` to the walk's new one `now`, `exp(carried -
-    now)` in the reals, which the walk's rescale evaluates by where given (attention's accurate form's
-    `carried`, its exponent's rounding compensated); None for the plain exponential of the difference."""
+    """The factor a carried state takes from its anchor `carried` to the walk's new one `now`, the walk's
+    weights' exponential of their difference: `exp(carried - now)` in the reals, or `exp((carried - now) c)`
+    where the weights are `exp((x - b) c)` (raw logits, `c` the declaration's literal, which the rescale
+    carries itself: only a declaration that states its rescale walks scaled weights, `WALKING_SCALED`),
+    which the walk's rescale evaluates by where given (attention's accurate form's `carried`, its exponent's
+    rounding compensated); None for the plain exponential of the difference."""
 
 
 # The facts the derivation reads (§6.3), each registered from a parameter's own values or saturated by

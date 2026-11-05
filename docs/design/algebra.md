@@ -843,8 +843,8 @@ class Reduction:                     # attention, and any walk whose state is a 
     exponent: Literal[2, "e"]        # stated by each template per call (a scale folded with log2(e)), never found
     ranges: Mapping[str, float] = {} # operands' magnitude bounds by name (§6.3)
     exact: bool = False              # extracted exactly where greedy prices dearer (§6.5)
-    exponential: Callable | None = None   # its exponential's implementation, which its forms evaluate by
-    rescale: Callable | None = None  # (carried, now) -> the factor a carried state takes; None: exp(carried - now)
+    exponential: Callable | None = None   # (x, scale=1.0) -> exp(x scale), its exponential's implementation
+    rescale: Callable | None = None  # (carried, now) -> exp((carried - now) c), c its weights' literal or 1
 
 @dataclass(frozen=True)
 class Scan:                          # a recurrence
