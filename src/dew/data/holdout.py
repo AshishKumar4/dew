@@ -66,10 +66,12 @@ class RecordSlice(View[Source]):
         return _selected(self.source, "slice", {"slice": [self.start, self.stop]})
 
     def records(self, read: Read):
-        """Its part of the source's records, a Grain slice of them (row 4145)."""
+        return self.part(self.source.records(read))
+
+    def part(self, records: Records) -> Records:
+        """Its part of `records`, its source's: a Grain slice of them (row 4145)."""
         import grain.python as grain
 
-        records = self.source.records(read)
         start, stop = self.bounds(len(records))
         return grain.MapDataset.source(records)[start:stop]
 
@@ -147,11 +149,14 @@ class HashPart(View[Source]):
         return _selected(self.source, "hash", part)
 
     def records(self, read: Read):
+        return self.part(self.source.records(read))
+
+    def part(self, records: Records) -> Records:
+        """Its part of `records`, its source's: those whose identity it holds."""
         import grain.python as grain
 
-        rows = self.source.records(read)
-        keys = tuple(index for index in range(len(rows)) if self.keeps(rows[index]))
-        return grain.MapDataset.source(keys).map(_SelectedRow(rows))
+        keys = tuple(index for index in range(len(records)) if self.keeps(records[index]))
+        return grain.MapDataset.source(keys).map(_SelectedRow(records))
 
     def keeps(self, row: Batch | bytes | None) -> bool:
         """Whether this part holds `row`: one that is there, its identity in the part."""

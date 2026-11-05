@@ -299,17 +299,15 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
     for branch in pipelines:
         for key, measuring in _measured(branch).items():
             measured.setdefault(key, {}).update({each.measure.fact: each for each in measuring})
-    # Each store held beside its pinned read, so no store made later takes a freed one's address and read.
-    stores: dict[int, tuple[Source, Source]] = {}
+    # Each store held beside its records, so no store made later takes a freed one's address and records.
+    stores: dict[int, tuple[Source, Records]] = {}
     reading = threading.Lock()
 
-    def whole(store: Source) -> Source:
-        # A store several holdout parts measure over is read once for them all, each part's rows its share
-        # of that one read.
+    def whole(store: Source) -> Records:
+        # A store several holdout parts measure over is read once for them all.
         with reading:
             if id(store) not in stores:
-                stores[id(store)] = (store, _Facts(store, read, store.fingerprint(), store.metadata(),
-                                                   _PinnedRead(store.records(read)), store.label()))
+                stores[id(store)] = (store, store.records(read))
             return stores[id(store)][1]
 
     def pin(source: Source) -> _Facts:
