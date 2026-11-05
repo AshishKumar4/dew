@@ -232,12 +232,15 @@ def test_a_zero_gradient_is_held_from_the_programs_start_where_its_gradients_are
     """The gradient of a parameter the loss reads none of is a broadcast zero JAX writes at the backward's
     end, which XLA makes ahead of the work, held to its reader: where the step holds every gradient to its
     end (`consumed` false, a global clip's), it is held through the backward's peak, one buffer of the
-    parameter's size more than where the parameter is read (row 4089: Qwen3.5-4B's multi-token head's 25
-    zero gradients, 0.48 GiB, at its step's peak)."""
+    parameter's size more than where the parameter is read, one for every parameter of its shape, as
+    XLA computes equal constants once (row 4089: Qwen3.5-4B's multi-token head's and vision tower's zero
+    gradients, 312 of 25 shapes, held as 0.48 GiB at its step's peak)."""
     # Activations of 8 MiB a layer make the backward's peak, past which the gradients alone are held.
     rows = jax.ShapeDtypeStruct((4096, 512), jnp.float32)
+    # Two unread parameters of one shape: their zero gradients are one constant, which XLA computes once.
     params = {"used": jax.ShapeDtypeStruct((512, 512), jnp.float32),
-              "unread": jax.ShapeDtypeStruct((128, 128), jnp.float32)}
+              "unread": jax.ShapeDtypeStruct((128, 128), jnp.float32),
+              "also_unread": jax.ShapeDtypeStruct((128, 128), jnp.float32)}
 
     def loss(params, rows):
         return jnp.sum(jnp.tanh(jnp.tanh(rows @ params["used"]) @ params["used"])), ()
