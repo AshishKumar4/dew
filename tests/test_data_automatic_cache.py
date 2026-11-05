@@ -65,6 +65,11 @@ def records(offset: int = 0) -> Memory:
     return Memory([{"id": np.int32(offset + index)} for index in range(RECORDS)])
 
 
+def sharded() -> Memory:
+    """The records in shards of three, which a stream reads one after another."""
+    return Memory([{"id": np.int32(index)} for index in range(RECORDS)], shard_rows=3)
+
+
 def mapped(step: Counted, source: Memory | None = None) -> Pipeline:
     """`step` over `source` as a chain's leading map, its records shuffled after it: globally, or in a
     window where it rejects some, as a read by index shuffles no order a step can drop from."""
@@ -130,21 +135,22 @@ def test_a_chain_reads_the_same_records_and_plan_with_or_without_its_automatic_c
     assert plan(cache=True) == plan(cache=False)
 
 
+@pytest.mark.parametrize("how", ["indexed", "streamed"])
 @pytest.mark.parametrize("workers", [0, 2])
 @pytest.mark.parametrize("saved_with", [True, False], ids=["saved-cached", "saved-uncached"])
-def test_a_rejecting_chain_resumes_across_its_automatic_cache_turned_on_or_off(saved_with, workers):
-    """A read by index of a leading map that rejects saves a position with its automatic cache that a
-    run without it resumes, and the reverse, in the reading process or its loading workers: each reads
-    what the run nobody stopped reads (row 803)."""
+def test_a_rejecting_chain_resumes_across_its_automatic_cache_turned_on_or_off(saved_with, workers, how):
+    """A read by index or a stream of a leading map that rejects saves a position with its automatic
+    cache that a run without it resumes, and the reverse, in the reading process or its loading
+    workers: each reads what the run nobody stopped reads (rows 803, 4217)."""
     def loader(cache: bool):
-        chain = mapped(Counted(rejects=frozenset({1, 4}))).repeat(2).batch(2, drop_remainder=False)
+        chain = mapped(Counted(rejects=frozenset({1, 4})), sharded()).repeat(2).batch(2, drop_remainder=False)
         loading = Loading(workers=workers, threads=1, read_buffer=1, cache=cache)
-        return compile(chain, read="indexed", loading=loading)
+        return compile(chain, read=how, loading=loading)
 
     def ids(stream) -> list[list[int]]:
         return [[int(row) for row in batch["id"]] for batch in stream]
 
-    read(mapped(Counted(rejects=frozenset({1, 4}))), "indexed")
+    read(mapped(Counted(rejects=frozenset({1, 4})), sharded()), how)
     assert generations()
     whole = loader(saved_with).train(DataPartition())
     try:
@@ -304,14 +310,14 @@ def unnamed():
 
 
 @pytest.mark.parametrize("chain", ["cheap step", "unkeyed step", "volatile step", "volatile indexed step",
-                                   "unnamed store", "streamed", "image decode"])
+                                   "unnamed store", "image decode"])
 def test_a_chain_no_cache_could_serve_or_speed_reads_as_written(chain):
     """A chain whose leading steps no cache could stand for, or none would speed, reads as it is
     written, never refused: a step that costs less than reading its records back, one with no
-    identity, one that may make other records on each call, a store that names no content, and a
-    streamed read write no automatic cache, and their steps run on every pass."""
+    identity, one that may make other records on each call, and a store that names no content write no
+    automatic cache, and their steps run on every pass."""
     step = Counted(volatile=chain == "volatile step", costly=chain != "cheap step")
-    how = "streamed" if chain == "streamed" else "indexed"
+    how = "indexed"
     if chain == "image decode":
         # A decode reads an image a record names by path from storage its content does not key.
         from dew.data import presets
@@ -444,3 +450,14 @@ def test_a_required_cache_refuses_a_record_its_codec_cannot_write_after_its_admi
                                                         if key != "tag"}, identity="untag@1"))
     with pytest.raises(TypeError):
         read(chain, "indexed")
+
+
+def test_a_stream_reads_its_leading_maps_back_once_a_pass_has_read_them_whole():
+    """A stream's leading costly map is cached as a read by index's is: once a pass has read every
+    shard, the next run reads the same records back, calling the map on none (row 4217)."""
+    def chain(step: Counted) -> Pipeline:
+        return Pipeline(sharded()).map(step, identity="counted@1").shuffle(0, window=4)
+
+    first, again = Counted(), Counted()
+    assert sorted(read(chain(first), "streamed")) == sorted(read(chain(again), "streamed"))
+    assert sorted(first.calls) == list(range(RECORDS)) and generations() and again.calls == []
