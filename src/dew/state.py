@@ -199,6 +199,8 @@ CHECKPOINTED = tuple(field.name for field in dataclasses.fields(TrainState)
 declaration marks `checkpointed=False` is rebuilt on resume."""
 
 OPTIONAL = tuple(field.name for field in dataclasses.fields(TrainState) if field.metadata.get('optional'))
+"""The checkpointed train-state fields a run may hold none of, as a run on another clock holds no
+examples consumed: a checkpoint that holds none restores None (`dew.checkpoints`), whichever Dew wrote it."""
 
 REPLICA_FIELDS = tuple(field.name for field in dataclasses.fields(TrainState)
                        if all(field.metadata.get(key) == value for key, value in REPLICA.items()))
@@ -212,8 +214,6 @@ Replicas = struct.dataclass(type("Replicas", (), {
                         if field.name in REPLICA_FIELDS}}))
 """DiLoCo's inner copies (`ReplicaState`), made as `TrainState` declares the `REPLICA_FIELDS`: a class of
 their annotations alone, which `struct.dataclass` makes the pytree."""
-"""The checkpointed train-state fields a run may hold none of, as a run on another clock holds no
-examples consumed: a checkpoint that holds none restores None (`dew.checkpoints`), whichever Dew wrote it."""
 
 MODEL_STATE = ("step", "microstep", "updates", "variables", "ema")
 """The train-state fields that say which model a step holds, its counters, variables and EMA:
