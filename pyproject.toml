@@ -30,7 +30,9 @@ dependencies = [
     # checks docs/installation.md lists under "Bumping JAX" first: CI is
     # CPU-only.
     "jax>=0.12.0.1.post52,<0.12.1",
-    "optax>=0.2.2",
+    # dew.newton_schulz reads optax.contrib.MuonDimensionNumbers, which 0.2.6 introduced: 0.2.5 lacks it, and
+    # the lowest set (tools/check_bounds.py) found the old floor, 0.2.2, could not import Dew.
+    "optax>=0.2.6",
     "orbax-checkpoint>=0.12.4",
     "numpy>=2.5.4",
     "pillow>=11.3.0",
