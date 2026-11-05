@@ -771,7 +771,7 @@ def _full_sum(equation, held: int) -> Mapping | None:
 def _row_form(equation, held: int, stacked: set[int], shapes: Sequence) -> Mapping | None:
     """`equation`'s parameters as one of its rows reads them, its stacked operands' (`stacked`) rows on
     their `held` leading axes and its results' too: an entrywise one over operands of its result's
-    shape or scalars; a broadcast, a reshape or a transpose that keeps the rows' axes leading; a reduction,
+    shape or scalars; a broadcast, a reshape, a transpose or a pad that keeps the rows' axes leading; a reduction,
     a cumulative one, a squeeze, an expansion or a concatenation along a row's own axes; and a product of
     rows batched on their leading axes, or of a stack's rows and one operand of no stack. None where a
     row reads another, or the rows leave their leading axes."""
@@ -807,6 +807,11 @@ def _row_form(equation, held: int, stacked: set[int], shapes: Sequence) -> Mappi
         if key in params and name in _ALONG:
             moved = _shifted((params[key],), held)
             return None if moved is None else {**params, key: moved[0]}
+    if name == "pad":
+        config = tuple(params["padding_config"])
+        if stacked != {0} or any(tuple(int(edge) for edge in axis) != (0, 0, 0) for axis in config[:held]):
+            return None
+        return {**params, "padding_config": config[held:]}
     if name == "dot_general":
         (lhs_c, rhs_c), (lhs_b, rhs_b) = params["dimension_numbers"]
         if stacked == {0, 1}:
