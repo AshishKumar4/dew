@@ -15,6 +15,8 @@ import itertools
 from collections.abc import Iterator, Mapping, Sequence
 from typing import NamedTuple
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
 WORD = 32
@@ -198,6 +200,25 @@ class BitForm:
         for step in self.steps:
             depths.append(1 + max(depths[arg] for arg in step.args))
         return max(depths[index] for index in self.outputs)
+
+    def traced(self, words: jax.Array) -> tuple[jax.Array, ...]:
+        """Each output register of each stored word of `words` (uint32), as JAX computes it: the form's
+        steps in `jax.numpy`'s integer operations, for a kernel's portable path and its interpreter, where no
+        inline assembly runs."""
+        values = [words.astype(jnp.uint32)]
+        for step in self.steps:
+            first = values[step.args[0]]
+            if step.op is BitOp.SHR:
+                value = first >> step.immediate
+            elif step.op is BitOp.ROTR:
+                value = (first >> step.immediate) | (first << (WORD - step.immediate))
+            elif step.op is BitOp.SHL:
+                value = first << step.immediate
+            else:
+                xor = first if len(step.args) == 1 else first ^ values[step.args[1]]
+                value = xor & jnp.uint32(step.immediate)
+            values.append(value)
+        return tuple(values[index] for index in self.outputs)
 
     @property
     def ptx(self) -> str:
