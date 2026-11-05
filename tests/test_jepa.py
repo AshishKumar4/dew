@@ -1,6 +1,8 @@
 """I-JEPA and V-JEPA: masking, shapes, the objective, collapse telemetry, and
 the objective through the general trainer."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -10,6 +12,7 @@ from affine_run import dataset
 from learning_gate import assert_learns
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, widened
+from sampling_gate import assert_draws_as_declared
 from steady_state import steady_state
 
 from dew.artifacts import Representations
@@ -101,52 +104,58 @@ def gathered(module, params, index, axis, dtype=None):
 
 # --- masking ---------------------------------------------------------------
 
+MASK_SEEDS = 4
+"""The sampling gate's seeds for the multi-block draw, 1024 rows each."""
+
+
 def test_blocks_and_context_follow_the_documented_distribution(mask):
     """The static-shape multi-block draw: each block's shape uniform over
     `block_shapes`, its corner uniform over the corners where that shape
-    fits, and the context a uniform subset of the targets' complement. Over
-    4096 rows, Pearson's chi-square of the shapes and of each shape's
-    corners, and of the context's inclusion rate per complement size, at a
-    one-in-a-million false alarm."""
-    from scipy import stats
+    fits, and the context a uniform subset of the targets' complement: among
+    rows leaving the same number of tokens free, every free position kept at
+    the rate num_context / free, wherever the blocks fell. Each held by the
+    sampling gate over 4096 rows, 1024 a seed."""
+    rows = 1024
 
-    rows = 4096
-    context, targets = (np.asarray(part) for part in mask.sample(jax.random.PRNGKey(5), rows))
-    blocks = targets.reshape(-1, mask.block_area)
-    top, left = np.divmod(blocks.min(axis=1), GRID[1])
-    height = blocks.max(axis=1) // GRID[1] - top + 1
-    shapes = [mask.block_shapes.index((int(h), mask.block_area // int(h))) for h in height]
+    @functools.cache
+    def drawn(seed):
+        context, targets = (np.asarray(part) for part in mask.sample(jax.random.PRNGKey(seed), rows))
+        blocks = targets.reshape(-1, mask.block_area)
+        top, left = np.divmod(blocks.min(axis=1), GRID[1])
+        height = blocks.max(axis=1) // GRID[1] - top + 1
+        shapes = np.asarray([mask.block_shapes.index((int(h), mask.block_area // int(h))) for h in height])
+        covered = np.zeros((rows, mask.num_patches), bool)
+        covered[np.arange(rows)[:, None], targets.reshape(rows, -1)] = True
+        kept = np.zeros_like(covered)
+        kept[np.arange(rows)[:, None], context] = True
+        assert not (kept & covered).any()
+        return shapes, top, left, covered, kept
 
-    def assert_uniform(counts, what):
-        p = stats.chisquare(counts).pvalue
-        assert p > 1e-6, f"{what} is not uniform (p = {p:.1e})"
-
-    assert_uniform(np.bincount(shapes, minlength=len(mask.block_shapes)), "the block shape")
+    kinds = len(mask.block_shapes)
+    assert_draws_as_declared(lambda seed: np.bincount(drawn(seed)[0], minlength=kinds),
+                             np.full(kinds, 1 / kinds), "the block shape", seeds=MASK_SEEDS)
     for index, (h, w) in enumerate(mask.block_shapes):
-        chosen = np.asarray(shapes) == index
-        corners = top[chosen] * (GRID[1] - w + 1) + left[chosen]
-        assert_uniform(np.bincount(corners, minlength=(GRID[0] - h + 1) * (GRID[1] - w + 1)),
-                       f"the {h}x{w} block's corner")
-    covered = np.zeros((rows, mask.num_patches), bool)
-    covered[np.arange(rows)[:, None], targets.reshape(rows, -1)] = True
-    kept = np.zeros_like(covered)
-    kept[np.arange(rows)[:, None], context] = True
-    assert not (kept & covered).any()
-    # Among rows leaving the same number of tokens free, every free position
-    # is kept at the rate num_context / free, wherever the blocks fell.
-    free = (~covered).sum(axis=1)
-    size = np.bincount(free).argmax()
-    same = free == size
+        places = (GRID[0] - h + 1) * (GRID[1] - w + 1)
+
+        def corners(seed, index=index, w=w, places=places):
+            shapes, top, left, *_ = drawn(seed)
+            chosen = shapes == index
+            return np.bincount(top[chosen] * (GRID[1] - w + 1) + left[chosen], minlength=places)
+
+        assert_draws_as_declared(corners, np.full(places, 1 / places), f"the {h}x{w} block's corner",
+                                 seeds=MASK_SEEDS)
+    # The rows of the free count seed 0 draws most often, each free position kept or dropped at the rate.
+    size = int(np.bincount((~drawn(0)[3]).sum(axis=1)).argmax())
     chance = mask.num_context / size
-    offered, taken = (~covered[same]).sum(axis=0), kept[same].sum(axis=0)
-    seen = offered > 0
-    # Each offered position's kept and dropped counts against the rate's: Pearson's statistic over both
-    # cells is the binomial one, sum (taken - offered chance)^2 / (offered chance (1 - chance)), on
-    # one degree of freedom less than the positions.
-    observed = np.concatenate([taken[seen], (offered - taken)[seen]])
-    expected = np.concatenate([offered[seen] * chance, offered[seen] * (1 - chance)])
-    p = stats.chisquare(observed, expected, ddof=int(seen.sum())).pvalue
-    assert p > 1e-6, f"the context favours some free positions (p = {p:.1e})"
+
+    def kept_or_dropped(seed):
+        *_, covered, kept = drawn(seed)
+        same = (~covered).sum(axis=1) == size
+        offered, taken = (~covered[same]).sum(axis=0), kept[same].sum(axis=0)
+        return np.stack([taken, offered - taken], axis=-1)
+
+    assert_draws_as_declared(kept_or_dropped, np.tile([chance, 1 - chance], (mask.num_patches, 1)),
+                             "the context's free positions", seeds=MASK_SEEDS)
 
 
 @pytest.mark.parametrize("scan_order", ["raster", "hilbert", "zigzag"])

@@ -64,12 +64,23 @@ def float64_replay(fn, *, compiled: bool = False):
                   for value, aval in zip(jax.tree.leaves(arguments), graph.in_avals, strict=True)]
         with jax.enable_x64(new_val=True), evaluated_on(native):
             if compiled and not program:
-                program.append(jax.jit(lambda *given: walked(graph.jaxpr, graph.consts, list(given), REPLAY)))
+                program.append(jax.jit(lambda *given: _walked(graph, given)))
                 traced[signature] = (graph, shapes, *program)
-            outputs = (program[0](*native) if compiled
-                       else walked(graph.jaxpr, graph.consts, native, REPLAY))
-        return jax.tree.unflatten(jax.tree.structure(shapes), [_widened(value) for value in outputs])
+            outputs = program[0](*native) if compiled else _walked(graph, native)
+            return jax.tree.unflatten(jax.tree.structure(shapes), [_widened(value) for value in outputs])
     return as_given(run)
+
+
+def _walked(graph, native) -> list:
+    """`graph`'s replay (`Replay`) on `native`, its arguments at their traced dtypes: every value held widened
+    from the start (`Replay.held`), the program's constants and arguments too."""
+    return walked(graph.jaxpr, [_widened(value) for value in graph.consts],
+                  [_widened(value) for value in native], REPLAY)
+
+
+def _wide(dtype):
+    """`dtype`, a float widened to float64."""
+    return jnp.float64 if _floating(dtype) else dtype
 
 
 def _widened(value):
@@ -87,6 +98,9 @@ class Replay:
 
     def at(self, index: int) -> "Replay":
         return self
+
+    def held(self, dtype):
+        return _wide(dtype)
 
     def primitive(self, equation, inputs: list) -> list:
         name, params = equation.primitive.name, equation.params

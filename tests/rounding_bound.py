@@ -94,6 +94,9 @@ class TapRule:
         return TapRule(_mixed(self.key + _GOLDEN * (jnp.asarray(index, jnp.int64).astype(jnp.uint64) + 1)),
                        self.scale)
 
+    def held(self, dtype):
+        return _wide(dtype)
+
     def primitive(self, equation, inputs: list) -> list:
         name, params = equation.primitive.name, dict(equation.params)
         for key in ("new_dtype", "preferred_element_type", "dtype"):

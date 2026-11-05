@@ -144,6 +144,9 @@ class Summed:
     def at(self, index: int) -> "Summed":
         return self
 
+    def held(self, dtype):
+        return dtype
+
     def primitive(self, equation, values: list) -> list:
         name, params = equation.primitive.name, equation.params
         # Integers and booleans sum exactly in any order: a position's cumulative count binds as it is.
