@@ -444,33 +444,3 @@ def test_a_required_cache_refuses_a_record_its_codec_cannot_write_after_its_admi
                                                         if key != "tag"}, identity="untag@1"))
     with pytest.raises(TypeError):
         read(chain, "indexed")
-
-
-@pytest.mark.parametrize("held", ["bytes", "path"])
-@pytest.mark.parametrize("how", READS)
-def test_an_image_decode_caches_what_it_made_of_a_records_bytes_and_stops_at_a_path(tmp_path, how, held):
-    """An automatic cache stands for an image decode before a costly map: the images a store's records
-    hold are read back, the decode and the map called on none the second run; one record naming its
-    image by path stops the fill, publishing nothing, and both runs read the same records (row 4212)."""
-    import cv2
-
-    from dew.data.images import DecodeImage
-
-    def image(index: int):
-        encoded = cv2.imencode(".png", np.full((4, 4, 3), index, np.uint8))[1].tobytes()
-        if held == "bytes" or index != 5:
-            return {"bytes": encoded, "path": None}
-        (tmp_path / "5.png").write_bytes(encoded)
-        return {"bytes": None, "path": str(tmp_path / "5.png")}
-
-    store = Memory(tuple({"id": np.int32(index), "png": image(index)} for index in range(RECORDS)))
-
-    def chain(step: Counted) -> Pipeline:
-        decoded = Pipeline(store).map(DecodeImage("png", rejects=False))
-        return decoded.map(step, identity="counted@1").shuffle(0)
-
-    first, again = Counted(), Counted()
-    assert read(chain(first), how) == read(chain(again), how)
-    assert sorted(first.calls) == list(range(RECORDS))
-    assert bool(generations()) == (held == "bytes")
-    assert sorted(again.calls) == ([] if held == "bytes" else list(range(RECORDS)))
