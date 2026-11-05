@@ -41,7 +41,8 @@ class MoonViT(TowerBase):
     rotated in adjacent pairs by the patch grid, a column's pair then a row's (`Rope2DPosEmbRepeated`),
     and an ungated tanh-GELU feed-forward (`MLP2`); a norm after the blocks; then each merge block's
     patches averaged over the item's frames (`tpool_patch_merger`, `sd2_tpool`). K2.5's norms are layer
-    norms and its maps biased; K3 states RMS norms, unbiased maps and a wider attention
+    norms and its maps biased; K3 states RMS norms (`norm_type`), each at the epsilon of the dtype the
+    tower computes in, as torch's RMSNorm(eps=None) takes its input's, unbiased maps and a wider attention
     (`qkv_hidden_size`).
     """
 
@@ -58,27 +59,35 @@ class MoonViT(TowerBase):
     attn_bias: bool = True
     linear_bias: bool = True
     patch_embed_proj_bias: bool = True
+    norm_type: Literal["layernorm", "rmsnorm"] = "layernorm"
 
     def __post_init__(self):
         if self.pos_emb_interpolation_mode not in ("bicubic", "bilinear"):
             raise ValueError(f"pos_emb_interpolation_mode {self.pos_emb_interpolation_mode!r} is neither "
                              "bicubic nor bilinear")
+        if self.norm_type not in ("layernorm", "rmsnorm"):
+            raise ValueError(f"norm_type {self.norm_type!r} is neither layernorm nor rmsnorm")
 
     def layout(self) -> ViTLayout:
         depth, heads = self.vt_num_hidden_layers, self.vt_num_attention_heads
         width = self.vt_hidden_size if self.qkv_hidden_size is None else self.qkv_hidden_size
+        rms = self.norm_type == "rmsnorm"
+        # torch's LayerNorm at its default epsilon (K2.5), or its RMSNorm at the computing dtype's (K3).
+        eps = None if rms else 1e-5
         return ViTLayout(
             depth=depth, hidden_size=self.vt_hidden_size, num_heads=heads, num_kv_heads=heads,
             head_dim=head_width(width, heads), intermediate_size=self.vt_intermediate_size,
             activation="gelu", in_channels=3, patch_size=self.patch_size, temporal_patch_size=1,
-            spatial_merge_size=self.merge_kernel_size, norm_type="layer", norm_eps=1e-5, norm_bias=True,
+            spatial_merge_size=self.merge_kernel_size, norm_type="rms" if rms else "layer", norm_eps=eps,
+            norm_bias=not rms,
             mlp_bias=self.linear_bias, packed=True, patch_bias=self.patch_embed_proj_bias,
             attention=("item",) * depth, order=("patches",) * depth, sinks=(False,) * depth,
             positions=LearnedPositions(self.init_pos_emb_height, mode=self.pos_emb_interpolation_mode,
                                        align_corners=False, border=True,
                                        initializer=nn.initializers.normal(1.0)),
-            rotary="adjacent", rotary_interleaved=True, rotary_columns_first=True, post_norm="layer",
-            outer_norm_eps=1e-5, attention_bias=self.attn_bias, merge_blocks=False,
+            rotary="adjacent", rotary_interleaved=True, rotary_columns_first=True,
+            post_norm="rms" if rms else "layer", outer_norm_eps=eps, attention_bias=self.attn_bias,
+            merge_blocks=False,
             frame_positions=self.init_pos_emb_time, pool_frames=True)
 
     def build(self) -> nn.Module:
@@ -93,6 +102,12 @@ class MoonViTProjector(MergeProjector, ProjectorBase):
     """MoonViT's projector (`PatchMergerMLP`): a layer norm of each trunk token at `projector_ln_eps`,
     each merge block's tokens joined unit by unit, and two biased maps around an exact GELU, the first
     as wide as the block, the second to the decoder width."""
+
+
+class MoonViTProjectorV2(MergeProjector, ProjectorBase):
+    """Kimi K3's projector (`PatchMergerMLPV2`): each merge block's trunk tokens joined unit by unit, two
+    unbiased maps around an exact GELU, the first as wide as the block, the second to the decoder width,
+    and an RMS norm after them at `projector_ln_eps`; no norm before."""
 
 
 _POSITIONS = "patch_embed.pos_emb.weight"
@@ -163,11 +178,11 @@ def _spelled(vision: Mapping[str, object], name: str) -> str:
 def translate_moonvit_config(hf_config: Mapping[str, object]) -> Record:
     """A Kimi K2.5 or K3 vision_config, the release's or transformers' (`_SPELLINGS`), into a MoonViT
     value's fields: a square position table, the 2x2 temporally pooled merge (`sd2_tpool`), divided
-    fixed positions and spatio-temporal attention, the tanh-GELU feed-forward (`mlp2`), layer norms and
-    the rotary's base of 10000, as the releases state them; any other is refused."""
+    fixed positions and spatio-temporal attention, the tanh-GELU feed-forward (`mlp2`), layer or RMS
+    norms and the rotary's base of 10000, as the releases state them; any other is refused."""
     vision = _vision_section(hf_config)
     stated = {"merge_type": "sd2_tpool", "pos_emb_type": "divided_fixed",
-              "video_attn_type": "spatial_temporal", "mlp_type": "mlp2", "norm_type": "layernorm"}
+              "video_attn_type": "spatial_temporal", "mlp_type": "mlp2"}
     for field, value in stated.items():
         if vision.get(field, value) != value:
             raise ValueError(f"vision_config {field} {vision[field]!r} is not MoonViT's {value!r} here")
@@ -187,6 +202,9 @@ def translate_moonvit_config(hf_config: Mapping[str, object]) -> Record:
     if len(merge) != 2 or merge[0] != merge[1]:
         raise ValueError(f"merge_kernel_size {merge} is no square merge block")
     qkv = vision.get("qkv_hidden_size")
+    norm = _records.text(vision.get("norm_type", "layernorm"), "norm_type")
+    if norm not in ("layernorm", "rmsnorm"):
+        raise ValueError(f"vision_config norm_type {norm!r} is neither of MoonViT's, layernorm or rmsnorm")
     return {"class": "moonvit", "fields": {
         **{name: _records.integer(vision.get(_spelled(vision, name)), name)
            for name in ("vt_hidden_size", "vt_intermediate_size", "vt_num_attention_heads",
@@ -203,27 +221,32 @@ def translate_moonvit_config(hf_config: Mapping[str, object]) -> Record:
         "linear_bias": _records.boolean(vision.get("linear_bias", True), "linear_bias"),
         "patch_embed_proj_bias": _records.boolean(vision.get("patch_embed_proj_bias", True),
                                                   "patch_embed_proj_bias"),
+        "norm_type": norm,
     }}
 
 
 def translate_moonvit_projector_config(hf_config: Mapping[str, object], text_width: int) -> Record:
-    """A Kimi K2.5 wrapper's projector fields (`PatchMergerMLP`, `mm_projector_type` 'patchmerger'): the
-    merge block's width in and out of its first map, the decoder's out of its second, as the release's
-    vision_config states them (`mm_hidden_size`, `projector_ln_eps`) or transformers' wrapper config
-    (`projection_hidden_size`, `projection_layer_norm_eps`)."""
+    """A Kimi K2.5 or K3 wrapper's projector fields (`mm_projector_type` 'patchmerger', K2.5's
+    `PatchMergerMLP`, or 'patchmergerv2', K3's `PatchMergerMLPV2`): the merge block's width in and out of
+    its first map, the decoder's out of its second, as the release's vision_config states them
+    (`mm_hidden_size`, `projector_ln_eps`) or transformers' wrapper config (`projection_hidden_size`,
+    `projection_layer_norm_eps`)."""
     vision = _vision_section(hf_config)
     kind = vision.get("mm_projector_type", "patchmerger")
-    if kind != "patchmerger":
-        raise ValueError(f"mm_projector_type {kind!r} is not the patch merger read here")
+    if kind not in ("patchmerger", "patchmergerv2"):
+        raise ValueError(f"mm_projector_type {kind!r} is neither patch merger read here")
     width = _records.integer(vision.get("mm_hidden_size", hf_config.get("projection_hidden_size")),
                              "mm_hidden_size")
     merge = _records.integers(vision.get("merge_kernel_size", [2, 2]), "merge_kernel_size")[0]
     if _records.integer(vision.get("text_hidden_size", text_width), "text_hidden_size") != text_width:
         raise ValueError(f"vision_config text_hidden_size is not the decoder's width {text_width}")
     eps = vision.get("projector_ln_eps", hf_config.get("projection_layer_norm_eps", 1e-5))
-    return {"class": "moonvit", "fields": {
+    # K3's merger norms after its unbiased maps, and not before them (`MoonViTProjectorV2`).
+    after = {"norm": False, "bias": False, "post_norm": True} if kind == "patchmergerv2" else {}
+    return {"class": "moonvit_v2" if after else "moonvit", "fields": {
         "hidden_size": width, "spatial_merge_size": merge, "width": width * merge ** 2,
-        "out_width": text_width, "norm_eps": _records.number(eps, "projector_ln_eps"), "activation": "gelu"}}
+        "out_width": text_width, "norm_eps": _records.number(eps, "projector_ln_eps"), "activation": "gelu",
+        **after}}
 
 
 MoonViT.checkpoint = TowerLayout("vision_tower.", moonvit_path, read=_read_moonvit)
@@ -231,4 +254,8 @@ MoonViTProjector.checkpoint = ProjectorLayout("mm_projector.", {
     "pre_norm.weight": ("norm", "scale"), "pre_norm.bias": ("norm", "bias"),
     "proj.0.weight": ("fc1", "kernel"), "proj.0.bias": ("fc1", "bias"),
     "proj.2.weight": ("fc2", "kernel"), "proj.2.bias": ("fc2", "bias"),
+})
+MoonViTProjectorV2.checkpoint = ProjectorLayout("mm_projector.", {
+    "proj.0.weight": ("fc1", "kernel"), "proj.2.weight": ("fc2", "kernel"),
+    "post_norm.weight": ("post_norm", "scale"),
 })

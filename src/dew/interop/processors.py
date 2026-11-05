@@ -22,11 +22,12 @@ from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.nn.mimo_audio import MiMoAudio
 from dew.registry import towers
 
-PACKED_MEDIA = (*QWEN35_TYPES, 'muse_glimmer', 'lfm3_vl', 'mimo_v2', 'kimi_k25')
+PACKED_MEDIA = (*QWEN35_TYPES, 'muse_glimmer', 'lfm3_vl', 'mimo_v2', 'kimi_k25', 'kimi_k3')
 """The wrappers whose processors pack images and videos alike, as runs of patch vectors beside their
 `(t, h, w)` grids, a video's frames each a run of its own (`Processor._qwen_frames`): Qwen 3.5's, Muse
-Glimmer's, LFM3-VL's and MiMo-V2.6's, whose towers attend and convolve within a frame; and Kimi K2.5's,
-each item whole, whose tower attends over an item's frames and pools them (`TowerGeometry.pools_frames`)."""
+Glimmer's, LFM3-VL's and MiMo-V2.6's, whose towers attend and convolve within a frame; and Kimi K2.5's
+and K3's, each item whole, whose tower attends over an item's frames and pools them
+(`TowerGeometry.pools_frames`)."""
 
 VIDEO_MEDIA = (*PACKED_MEDIA, *GEMMA4_TYPES)
 """The wrappers whose processors carry videos (`pixel_values_videos`): the packed ones and Gemma 4's,

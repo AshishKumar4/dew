@@ -943,13 +943,22 @@ def source_depths(record: DecoderFields, model_type: str | DecoderFamily | None 
 def wrapper_source_depths(record: WrapperFields) -> Callable[[str], int | None]:
     """`source_depths` of a wrapper's tensors: its language model's, each routed as `wrapper_route`
     routes it, of the family `read_wrapper` reads it by; None for a tower's or a projector's."""
-    language = source_depths(record["text"])
+    language = source_depths(record["text"], language_family(record))
 
     def depth(name: str) -> int | None:
         component, local = wrapper_route(name, record)
         return language(local) if component == "language_model" else None
 
     return depth
+
+
+def language_family(record: WrapperFields) -> DecoderFamily | None:
+    """The family a wrapper's language model reads by: a family that reads its media bundle whole and
+    names itself its text type reads its decoder too (Kimi K3's, a decoder no family's fields match);
+    else None, the family the text record's fields match (`read_decoder`), DeepSeek V3's for Kimi
+    K2.5's."""
+    bundled = _bundled(record["model_type"])
+    return bundled if bundled is not None and record["text_model_type"] == record["model_type"] else None
 
 
 def read_wrapper(
@@ -974,8 +983,9 @@ def read_wrapper(
     sources, aliases = _wrapper_sources(hf_tensors, hf_tensors.__getitem__, record, checked)
     tables = {group: {local: hf_tensors[name] for local, name in held.items()}
               for group, held in sources.items()}
-    language, readings = read_decoder(tables["language_model"], record["text"], param_dtype=param_dtype,
-                                      lazy=lazy, checked=_renamed(checked, sources["language_model"]))
+    language, readings = read_decoder(tables["language_model"], record["text"], language_family(record),
+                                      param_dtype=param_dtype, lazy=lazy,
+                                      checked=_renamed(checked, sources["language_model"]))
     variables = {"language_model": language}
     placed = {}
     if record["tower"] is not None:

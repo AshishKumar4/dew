@@ -137,7 +137,9 @@ class ViTLayout:
     sequence. `pre_norm` names the norm after the patch map, as `post_norm` does. `attention_bias` biases
     the attention's maps, and `qk_norm` norms each head's queries and keys (an RMS norm at the layers'
     epsilon) before the rotary; under `scale_after_cast` every RMS norm weighs its normalized input after
-    its cast back, as Llama's does.
+    its cast back, as Llama's does. An RMS norm's epsilon None (`norm_eps`, `outer_norm_eps`) is the
+    machine epsilon of the dtype the tower computes in (`compute_epsilon`), as torch's RMSNorm(eps=None)
+    takes its input's (Kimi K3's MoonViT).
     """
 
     depth: int
@@ -152,7 +154,7 @@ class ViTLayout:
     temporal_patch_size: int
     spatial_merge_size: int
     norm_type: Literal["rms", "layer", "fast_layer"]
-    norm_eps: float
+    norm_eps: float | None
     norm_bias: bool
     mlp_bias: bool
     packed: bool
@@ -169,7 +171,7 @@ class ViTLayout:
     post_norm: Literal["layer", "rms"] | None = None
     post_norm_scope: Literal["sequence", "class"] = "sequence"
     post_norm_affine: bool = True
-    outer_norm_eps: float = 1e-5
+    outer_norm_eps: float | None = 1e-5
     mlp_packed: bool = False
     output: Literal["sequence", "patches", "patch_grid"] = "sequence"
     frame_positions: int | None = None
@@ -196,6 +198,11 @@ class ViTLayout:
     def __post_init__(self):
         if not len(self.attention) == len(self.order) == len(self.sinks) == self.depth:
             raise ValueError(f"{self.depth} layers need an attention, an order and a sinks flag each")
+        if (self.norm_eps is None and (self.norm_type != "rms" or self.qk_norm)) or (
+                self.outer_norm_eps is None and "layer" in (self.pre_norm, self.post_norm)):
+            raise ValueError("an epsilon of the computing dtype's (None) is an RMS norm's, as torch's "
+                             "RMSNorm(eps=None) takes it; a layer norm or a query and key norm states its "
+                             "own")
         if self.rotary is not None and self.head_dim % 4:
             raise ValueError(f"head_dim {self.head_dim} splits into no height and width rotary pairs")
         if self.special_tokens.registers and self.special_tokens.cls != "first":
@@ -249,6 +256,12 @@ def resampled_positions(table, rows, columns, heights, widths, *, align_corners:
     return (gathered * weights[..., None]).sum(axis=-2)
 
 
+def compute_epsilon(epsilon: float | None, dtype: Dtype | None) -> float:
+    """A norm's `epsilon`, or for None the machine epsilon of `dtype`, the dtype a tower computes in
+    (float32 without one), as torch's RMSNorm(eps=None) takes its input's (`ViTLayout`)."""
+    return float(jnp.finfo(jnp.float32 if dtype is None else dtype).eps) if epsilon is None else epsilon
+
+
 def vit_block(layout: ViTLayout, index: int, *, dtype: Dtype | None,
               precision: PrecisionLike) -> DecoderBlock:
     """Layer `index`'s block (`clip_layer`): a pre-norm attention over the 2D rotary, over a band of
@@ -261,7 +274,8 @@ def vit_block(layout: ViTLayout, index: int, *, dtype: Dtype | None,
                                   dtype=dtype, precision=precision)
     return clip_layer(layout.hidden_size, layout.num_heads, layout.intermediate_size, 1,
                       kv_heads=layout.num_kv_heads, head_dim=layout.head_dim, activation=layout.activation,
-                      eps=layout.norm_eps, norm_type=layout.norm_type, norm_bias=layout.norm_bias,
+                      eps=compute_epsilon(layout.norm_eps, dtype), norm_type=layout.norm_type,
+                      norm_bias=layout.norm_bias,
                       mlp_bias=layout.mlp_bias, mlp_packed=layout.mlp_packed,
                       rotary_axes=None if layout.rotary is None else (layout.head_dim // 2,) * 2,
                       rotary_pairs=layout.rotary or "half", rotary_interleaved=layout.rotary_interleaved,
@@ -302,11 +316,12 @@ class VisionTransformer(nn.Module):
                 lay.positions.side ** 2 + int(lay.special_tokens.cls is not None), lay.hidden_size,
                 lay.positions, dtype=self.dtype if lay.positions.compute_dtype else None,
                 name="position_table")
+        outer = compute_epsilon(lay.outer_norm_eps, self.dtype)
         if lay.post_norm == "layer":
-            self.post_norm = LayerNorm(epsilon=lay.outer_norm_eps, use_scale=lay.post_norm_affine,
+            self.post_norm = LayerNorm(epsilon=outer, use_scale=lay.post_norm_affine,
                                        use_bias=lay.post_norm_affine, dtype=self.dtype, name="post_norm")
         elif lay.post_norm == "rms":
-            self.post_norm = RMSNorm(epsilon=lay.outer_norm_eps, with_scale=lay.post_norm_affine,
+            self.post_norm = RMSNorm(epsilon=outer, with_scale=lay.post_norm_affine,
                                      scale_after_cast=lay.scale_after_cast, dtype=self.dtype,
                                      name="post_norm")
 
@@ -360,9 +375,11 @@ class VisionTransformer(nn.Module):
                                 frame=frame, times=grid[:, 0:1])
         tokens = lay.special_tokens
         if lay.pre_norm == "layer":
-            hidden = LayerNorm(epsilon=lay.outer_norm_eps, dtype=self.dtype, name="pre_norm")(hidden)
+            hidden = LayerNorm(epsilon=compute_epsilon(lay.outer_norm_eps, self.dtype), dtype=self.dtype,
+                               name="pre_norm")(hidden)
         elif lay.pre_norm == "rms":
-            hidden = RMSNorm(epsilon=lay.outer_norm_eps, scale_after_cast=lay.scale_after_cast,
+            hidden = RMSNorm(epsilon=compute_epsilon(lay.outer_norm_eps, self.dtype),
+                             scale_after_cast=lay.scale_after_cast,
                              dtype=self.dtype, name="pre_norm")(hidden)
 
         rotary = None
@@ -581,7 +598,8 @@ class MergeProjector(nn.Module):
     `merge**2` features join unit by unit, or channel by channel where `channel_major` (Muse
     Glimmer's `pixel_shuffle`), and pass two maps with the checkpoint's `activation` (its
     `hidden_act` name) between them, and after the second too where `activation_after` (Muse
-    Glimmer's adapter).
+    Glimmer's adapter); with `post_norm`, an RMS norm at `norm_eps` after them (Kimi K3's
+    PatchMergerMLPV2).
     """
 
     hidden_size: int
@@ -595,6 +613,7 @@ class MergeProjector(nn.Module):
     bias: bool = True
     activation: str = "gelu"
     activation_after: bool = False
+    post_norm: bool = False
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -618,7 +637,10 @@ class MergeProjector(nn.Module):
                         activation_after=self.activation_after, use_bias=self.bias, names=("fc1", "fc2"),
                         dtype=self.dtype, precision=self.precision)
         nn.share_scope(self, mlp)
-        return mlp(grouped)
+        projected = mlp(grouped)
+        if self.post_norm:
+            projected = RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name="post_norm")(projected)
+        return projected
 
 
 PATCH_CONVOLUTION = "patch_embed.proj.weight"

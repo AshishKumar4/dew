@@ -1535,6 +1535,7 @@ projectors: Aliases[type[ProjectorBase], ProjectorBase] = Aliases("projector", {
     "llama4": "dew.nn.vision.llama4:Llama4Projector",
     "mimo": "dew.nn.vision.mimo:MiMoProjector",
     "moonvit": "dew.nn.vision.moonvit:MoonViTProjector",
+    "moonvit_v2": "dew.nn.vision.moonvit:MoonViTProjectorV2",
     "muse_glimmer": "dew.nn.vision.muse_glimmer:MuseGlimmerProjector",
     "qwen3_5": "dew.nn.vision.qwen35:Qwen35Projector",
 }, base="dew.nn.vision.common:ProjectorBase")
