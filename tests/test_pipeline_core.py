@@ -16,7 +16,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from data_support import WideDraw, listed
+from data_support import Logged, WideDraw, listed
 from reader_support import assert_resumes_where_it_stopped
 from token_support import write_token_corpus
 
@@ -83,17 +83,6 @@ class Counted:
 
 def source(count=24):
     return Memory(tuple({"id": np.int32(index)} for index in range(count)))
-
-
-@dataclasses.dataclass(frozen=True)
-class Logged(Memory):
-    """Records in memory that log each read a run takes of them."""
-
-    reads: list = dataclasses.field(default_factory=list, compare=False)
-
-    def records(self, read):
-        self.reads.append(read)
-        return super().records(read)
 
 
 def test_a_memory_compile_reads_each_source_once():

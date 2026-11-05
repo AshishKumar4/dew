@@ -9,11 +9,11 @@ byte, and the refusals for rows without a prompt, unknown fields and empty
 files.
 """
 
-import dataclasses
 import json
 
 import numpy as np
 import pytest
+from data_support import Logged
 
 from dew.data import Files, Loading, Memory, presets
 from dew.data.compile import compile, iterate
@@ -231,22 +231,11 @@ def test_a_prompt_that_starts_with_its_bos_keeps_one(tmp_path, inserted):
     assert list(batch[PROMPT_KEY][0, WINDOW - length:]) == [1, 3]
 
 
-@dataclasses.dataclass(frozen=True)
-class Counted(Memory):
-    """Records in memory that note each read a compile takes of them."""
-
-    reads: list = dataclasses.field(default_factory=list, compare=False)
-
-    def records(self, read):
-        self.reads.append(read)
-        return super().records(read)
-
-
 def test_a_records_holdout_measures_its_reward_width_over_the_one_read_of_its_store():
     """A records holdout's part rendered with its reward width measured reads its store once in a memory
     read: the part's rows and the whole store the width is measured over are one read's, the width the
     whole store's widest, wider than any row of the part (row 4145)."""
-    store = Counted([{"prompt": IDS, "ground_truth": "x" * (40 if index == 0 else 3)} for index in range(6)])
+    store = Logged([{"prompt": IDS, "ground_truth": "x" * (40 if index == 0 else 3)} for index in range(6)])
     train, _ = store.holdout(records=2)
     data = trained(train, 2)
     reader = data.train(DataPartition())

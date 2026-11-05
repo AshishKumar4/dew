@@ -70,13 +70,21 @@ def automatic_root(loading: Loading) -> str | None:
     return named or os.path.join(dew_cache_dir(), "data")
 
 
+_HALTED: set[str] = set()
+"""The keys whose optional fill stopped in this process (no room, a record the codec cannot write): a
+later shard's writer of one computes its records and writes none, so a fill that cannot complete stops
+once, not at each shard (row 4296)."""
+
+
 def _opened_writer(cache: Cache, key: DependencyManifest, *, expected: int | None = None,
-                   source: Source | None = None) -> _Writer | _Computed:
-    """A writer of `key`'s fill, of `expected` rows from `source` where an indexed fill knows them, or,
-    where an optional cache's storage cannot hold one, none: its records are computed
-    (`Cache.read_on`)."""
+                   source: Source | None = None, shards: int | None = None) -> _Writer | _Computed:
+    """A writer of `key`'s fill, of `expected` rows from `source` where an indexed fill knows them, or of
+    one of a stream's `shards`, or, where an optional cache's storage cannot hold one or its fill stopped
+    in this process (`_HALTED`), none: its records are computed (`Cache.read_on`)."""
+    if cache.optional and key.key in _HALTED:
+        return _Computed()
     try:
-        return _Writer(cache, key, expected=expected, source=source)
+        return _Writer(cache, key, expected=expected, source=source, shards=shards)
     except (OSError, sqlite3.Error) as error:
         if not cache.read_on(error, "writes nothing"):
             raise
@@ -268,10 +276,12 @@ class Cache:
                 return computed
             # A transparent read computes its records in the form it saves with the cache read.
             return _CachedReader(reader, self, key, transform, _Computed(), source, transparent=True)
+        # The store's shards, counted once for every shard's writer (`_Writer._published`).
+        shards = None if source is None else len(source.manifest().shards)
         return _CachedReader(reader, self, key, transform,
                              None if published is None
                              else _Published(published, transform, self if self.optional else None), source,
-                             transparent)
+                             transparent, shards)
 
     def generation(self, key: DependencyManifest) -> Generation | None:
         root = self._root(key)
@@ -374,9 +384,9 @@ _READING: CacheStats = {"admitting": False, "spool_bytes": 0, "uploaded_bytes": 
 
 class _Writer:
     def __init__(self, cache: Cache, key: DependencyManifest, *, expected: int | None = None,
-                 source: Source | None = None):
+                 source: Source | None = None, shards: int | None = None):
         self.cache, self.root = cache, cache._root(key)
-        self.key, self.source = key, source
+        self.key, self.source, self.shards = key, source, shards
         self.writer = uuid.uuid4().hex
         _, root_path, scheme = self.root._backend()
         self.pin = LocalRetention.pin(Path(root_path) / "shards" / self.writer) if scheme == "file" else None
@@ -484,7 +494,10 @@ class _Writer:
 
     def _stopped(self) -> None:
         """Stop admitting for good, under the lock: what the writer held unwritten is dropped, and the
-        fill is neither sealed nor published (`dropped`), what it wrote left for collection."""
+        fill is neither sealed nor published (`dropped`), what it wrote left for collection; an optional
+        cache's later writers of the key in this process write nothing (`_HALTED`)."""
+        if self.cache.optional:
+            _HALTED.add(self.key.key)
         self.admitting, self.dropped = False, True
         self.pending.clear()
         self.pending_bytes = 0
@@ -664,9 +677,9 @@ class _Writer:
         """Publish the stream's generation once as many writers have sealed as its store has shards: each
         shard's writer seals as it reads the shard whole, so the publication's check of every sealed
         record runs once a stream ends, not at each of its shards' ends (row 4211)."""
-        assert self.source is not None
+        assert self.source is not None and self.shards is not None
         fs, path = self.root.child("segments").resolve()
-        if len(fs.glob(f"{path}/*/seal.json")) < len(self.source.manifest().shards):
+        if len(fs.glob(f"{path}/*/seal.json")) < self.shards:
             return
         try:
             with ExitStack() as pins:
@@ -695,7 +708,7 @@ class _Writer:
             self._settled(self.seal)
             if self.seal_future is not None:
                 self._settled(self.seal_future.result)
-            if self.expected is None and self.source is not None and not self.dropped:
+            if self.shards is not None and not self.dropped:
                 # A stream's shard read whole: its source's generation published once every shard's
                 # fill has sealed, by whichever seals last (row 4211).
                 self._settled(self._published)
@@ -884,10 +897,11 @@ class _CachedReader:
     published: _Published | _Computed | None
     source: Source | None = None
     transparent: bool = False
+    shards: int | None = None
 
     def __call__(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
         return _CachedIter(self.reader(shard, options), self.cache, self.key, shard, self.transform,
-                           self.published, self.source, self.transparent)
+                           self.published, self.source, self.transparent, self.shards)
 
 
 class _CachedIter(grain.IterDataset):
@@ -901,11 +915,12 @@ class _CachedIter(grain.IterDataset):
         published: _Published | _Computed | None,
         source: Source | None,
         transparent: bool,
+        shards: int | None,
     ):
         super().__init__(parent)
         self.cache, self.key, self.shard, self.transform = cache, key, shard, transform
         self.published, self.input_parent, self.source = published, parent, source
-        self.transparent = transparent
+        self.transparent, self.shards = transparent, shards
 
     def __iter__(self) -> grain.DatasetIterator:
         return _CachedIterator(self.input_parent.__iter__(), self.writer, self.shard, self.transform,
@@ -918,7 +933,7 @@ class _CachedIter(grain.IterDataset):
         writes nothing, so the key holds no rows under its IDs."""
         published = self.published
         if published is None:
-            return _opened_writer(self.cache, self.key, source=self.source)
+            return _opened_writer(self.cache, self.key, source=self.source, shards=self.shards)
         if isinstance(published, _Computed) or published.generation.holds((self.shard.id, 0)):
             return published
         return _Computed()
