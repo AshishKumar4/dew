@@ -9,13 +9,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def named(path: str | Path, parts: int = 1) -> str:
-    """`path` as a receipt records it: a URI (`scheme://...`, a bucket's) as given; a local path relative
-    to the checkout inside it, outside it by its last `parts` parts (a TFDS directory's dataset and
-    version, 2)."""
-    if "://" in str(path):
+    """`path` as a receipt records it: a remote URI (a bucket's) as given; a local path, or a `file://`
+    URI's, relative to the checkout inside it, outside it by its last `parts` parts (a TFDS directory's
+    dataset and version, 2), its root never among them."""
+    scheme, remote, rest = str(path).partition("://")
+    if remote and scheme != "file":
         return str(path)
-    whole = Path(path).resolve()
-    return str(whole.relative_to(ROOT)) if whole.is_relative_to(ROOT) else "/".join(Path(path).parts[-parts:])
+    local = Path(rest) if remote else Path(path)
+    whole = local.resolve()
+    if whole.is_relative_to(ROOT):
+        return str(whole.relative_to(ROOT))
+    return "/".join([part for part in local.parts if part != local.anchor][-parts:])
 
 
 def recorded(config: object, paths: tuple[str, ...] = ()) -> dict:
