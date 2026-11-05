@@ -342,6 +342,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     adds_vectors = False  # its atomic adds take no layout replicating a vector's entries (a [bk] key sum's)
 
+    adds_through_shared = False  # `added`'s atomic adds go from registers (`red.global`), its `smem` unread
+
     @property
     @abc.abstractmethod
     def lhs(self) -> plgpu_core.SomeLayout:
@@ -376,7 +378,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                                 kernel_name=report.named(name), cost_estimate=cost)
         return mosaic.checked(built, name or self.name, resident, model_flops)
 
-    def scoped(self, body, *allocations, streams):
+    def program_scoped(self, body, *allocations, streams):
         return pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)
 
     def roles(self, consumers: int, consumer, producer) -> None:
