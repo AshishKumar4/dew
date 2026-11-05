@@ -1286,9 +1286,9 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
         ci, tmp_path, monkeypatch, cache_worker):
     """A file's green row is kept across a change its tests never meet, the plan's own code (ci.py, which
     runs outside every test process), another test module, or a change to a fixture it never opens (its
-    openers' input alone); it runs again once what its test process runs or reads changes: a plugin loaded
-    into it, a Python file added that can change what an import finds (a conftest.py, a top-level package
-    under src/), or the process group it runs as."""
+    openers' input alone), or a comment in the harness (row 2730); it runs again once what its test process
+    runs or reads changes: a plugin loaded into it, a Python file added that can change what an import finds
+    (a conftest.py, a top-level package under src/), or the process group it runs as."""
     (tmp_path / "tests/test_kept.py").write_text(
         "from pathlib import Path\n"
         "def test_kept():\n"
@@ -1301,10 +1301,11 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
     (tmp_path / "tests/fixtures/data.json").write_text("{}\n")
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     changes = [(None, "", 1), ("tools/armada/ci.py", "# the plan's own code\n", 1),
-               ("tools/armada/executed.py", "# a plugin loaded into it\n", 2),
+               ("tools/armada/executed.py", "# a comment in a plugin\n", 1),
+               ("tools/armada/executed.py", "PLUGIN = 1\n", 2),
                ("tests/fixtures/data.json", "{}\n", 2), ("tests/conftest.py", "VALUE = 1\n", 3),
                ("src/package/__init__.py", "", 4), ("tests/more/test_added.py", "VALUE = 2\n", 4),
-               ("tools/armada/child_groups.py", "# its process group\n", 5)]
+               ("tools/armada/child_groups.py", "GROUP = 1\n", 5)]
     for path, text, runs in changes:
         if path:
             (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)

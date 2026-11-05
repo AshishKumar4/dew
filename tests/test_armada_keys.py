@@ -7,7 +7,7 @@ import json
 import re
 from pathlib import Path
 
-from armada_support import copied_tools
+from armada_support import cached_checkout, commit, copied_tools, green_runs
 from tool_support import load
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,3 +54,51 @@ def test_the_environments_key_names_every_file_its_install_script_runs_or_reads(
     after = load("ci", "tools/armada", tmp_path).PYTHONS
     assert after == (*before, "3.15")
     assert "pyproject.toml" in keyed
+
+
+def test_a_harness_edit_of_comments_and_docstrings_reruns_only_what_observed_the_edited_text(
+        tmp_path, monkeypatch, cache_worker):
+    """The recorder, session and plugins under tools/armada are in every key by their code, not their bytes,
+    and the cache stays on for a change of them that is no code (row 2730: train 350's docstring edits to
+    followed.py and child_groups.py turned the cache off and re-keyed every row). What a test observes of the
+    harness is its own input all the same: a text it reads is its bytes, a function's `__code__` it takes its
+    unit with its docstring. A change to code reruns every row and turns the cache off."""
+    ci = copied_tools(tmp_path, monkeypatch)
+    observers = {
+        "plain": "",
+        "reads": "    assert 'def read(' in Path('tools/armada/followed.py').read_text()\n",
+        "code": "    import followed\n    assert followed.read.__code__.co_argcount == 3\n"}
+    for name, body in observers.items():
+        (tmp_path / f"tests/test_{name}.py").write_text(
+            f"from pathlib import Path\ndef test_{name}():\n"
+            f"    with Path('runs-{name}').open('a') as runs: runs.write('x')\n{body}")
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+    base = commit(tmp_path, "base")
+    names = tuple(observers)
+
+    def runs(*more: str) -> list[int]:
+        return green_runs(ci, monkeypatch, tmp_path, verdict, ci.policy(base), names)
+
+    assert runs() == [1, 1, 1]
+    assert runs() == [1, 1, 1]
+    followed = tmp_path / "tools/armada/followed.py"
+    # A comment, and a module's docstring in the recorder, the plugin, the session and the process group's.
+    followed.write_text(followed.read_text() + "\n# a note on the recorder\n")
+    for name in ("session", "child_groups", "lifetime", "executed"):
+        path = tmp_path / f"tools/armada/{name}.py"
+        path.write_text(path.read_text().replace('"""', '"""A note on it. ', 1))
+    commit(tmp_path, "comments and docstrings")
+    assert ci.policy(base) == "on"
+    assert runs() == [1, 2, 1], "what read the text reruns, nothing else"
+    # A docstring of the function whose code one file took.
+    signature = "def read(event: str, args: tuple, root: str) -> str | None:\n    \"\"\""
+    assert signature in followed.read_text()
+    followed.write_text(followed.read_text().replace(signature, signature + "A note on reading. ", 1))
+    commit(tmp_path, "a function's docstring")
+    assert ci.policy(base) == "on"
+    assert runs() == [1, 3, 2], "the text, and the code that took the function's"
+    session = tmp_path / "tools/armada/session.py"
+    session.write_text(session.read_text().replace("GRACE = 60.0", "GRACE = 61.0"))
+    commit(tmp_path, "code")
+    assert ci.policy(base) == "off"
+    assert runs() == [2, 4, 3]
