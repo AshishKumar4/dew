@@ -13,11 +13,11 @@ reads its kind (`dew.algebra.program`): a protected span (`Protected`, an error-
 it is, a surrogate's bodies (`Surrogate`) and a kernel derivative's glue (`KernelGlue`) are rewritten within
 their call, and a derivative written to restructure algebra (`Algebra`) opens into the region around it.
 
-A custom derivative is declared through its class's function, which makes it one marked call of its kind:
-`kernel_derivative` and `kernel_tangent` (a kernel's glue), `numerics_derivative` and `numerics_tangent` (a
-rule its numerics need as written), `surrogate` (a value and its declared derivative). Each lane moves its
-sites onto them (rows 4026 to 4030); then the slop check refuses `jax.custom_vjp` and `jax.custom_jvp`
-outside this module.
+A custom derivative is declared with its kind, which makes it one marked call of that kind:
+`declared_derivative` (a reverse-mode rule, as `jax.custom_vjp` takes one) and `declared_tangent` (a tangent
+rule, as `jax.custom_jvp` takes one), each of any kind, and `surrogate` (a value and its declared derivative).
+Each lane moves its sites onto them (rows 4026 to 4030); then the slop check refuses `jax.custom_vjp` and
+`jax.custom_jvp` outside this module.
 """
 
 from __future__ import annotations
@@ -37,12 +37,10 @@ __all__ = [
     "Protected",
     "Surrogate",
     "bound_span",
-    "kernel_derivative",
-    "kernel_tangent",
+    "declared_derivative",
+    "declared_tangent",
     "marked",
     "marked_call_p",
-    "numerics_derivative",
-    "numerics_tangent",
     "surrogate",
 ]
 
@@ -74,21 +72,24 @@ def surrogate[Value](forward: Callable[..., Value], derivative: Callable[..., Va
     return bound_span(Surrogate(), rule, static=declared)
 
 
-def _derivative[Value](kind: Kind, primal: Callable[..., Value], forward: Callable, backward: Callable, *,
-                      nondiff_argnums: Sequence[int] = ()) -> Callable[..., Value]:
+def declared_derivative[Value](kind: Kind, primal: Callable[..., Value], forward: Callable,
+                               backward: Callable, *,
+                               nondiff_argnums: Sequence[int] = ()) -> Callable[..., Value]:
     """`primal` with a declared reverse-mode rule (`forward` saving its residuals, `backward` taking them and
-    the cotangent, as `jax.custom_vjp.defvjp` takes them), one marked call of `kind` (`bound_span`). Forward
-    mode refuses it as a bare `jax.custom_vjp` does."""
+    the cotangent, as `jax.custom_vjp.defvjp` takes them), one marked call of `kind` (`bound_span`): a
+    kernel's glue (`KernelGlue`), a rule its numerics need as written (`Protected`), a derivative of Dew's
+    choosing (`Surrogate`) or one written to restructure algebra (`Algebra`). Forward mode refuses it as a
+    bare `jax.custom_vjp` does."""
     rule = jax.custom_vjp(primal, nondiff_argnums=tuple(nondiff_argnums))
     rule.defvjp(forward, backward)
     return bound_span(kind, rule, static=nondiff_argnums)
 
 
-def _tangent[Value](kind: Kind, primal: Callable[..., Value], tangent: Callable, *,
-                    nondiff_argnums: Sequence[int] = ()) -> Callable[..., Value]:
+def declared_tangent[Value](kind: Kind, primal: Callable[..., Value], tangent: Callable, *,
+                            nondiff_argnums: Sequence[int] = ()) -> Callable[..., Value]:
     """`primal` with a declared tangent rule (`tangent(primals, tangents)` returning the primal's value and
     its tangent, as `jax.custom_jvp.defjvp` takes it, which reverse mode transposes), one marked call of
-    `kind` (`bound_span`)."""
+    `kind` (`bound_span`), as `declared_derivative` takes it."""
     rule = jax.custom_jvp(primal, nondiff_argnums=tuple(nondiff_argnums))
     rule.defjvp(tangent)
     return bound_span(kind, rule, static=nondiff_argnums)
@@ -170,15 +171,3 @@ def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[...,
         return jax.tree.unflatten(jax.tree.structure(shaped), outputs)
     return call
 
-
-kernel_derivative = functools.partial(_derivative, KernelGlue())
-"""A kernel's reverse-mode derivative (`_derivative`): its glue the pass rewrites within its call."""
-
-kernel_tangent = functools.partial(_tangent, KernelGlue())
-"""A kernel's tangent (`_tangent`), a GEMM prologue's: its glue the pass rewrites within its call."""
-
-numerics_derivative = functools.partial(_derivative, Protected())
-"""A reverse-mode rule its numerics need as written (`_derivative`): one call the pass keeps as it is."""
-
-numerics_tangent = functools.partial(_tangent, Protected())
-"""A tangent rule its numerics need as written (`_tangent`): one call the pass keeps as it is."""
