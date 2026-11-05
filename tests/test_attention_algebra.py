@@ -12,8 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from one_draw import assert_as_exact_as_the_reference
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 from test_attention_template import CASES, ROWS, arguments
 from test_attention_triton import (
     BACKWARD_FORMS,
@@ -259,9 +258,9 @@ def test_an_extreme_fp32_backward_is_as_exact_as_the_reference(peak0, scale, key
     2**25, under an output cotangent of 2**100: a weight exp(-87) / 2**25 below fp32's least subnormal,
     a scale of 2**-126 over that denominator, or a key of 2**30 beside the cotangent. Both mainloops
     form each score cotangent as the reference does, its weight over the denominator first, so every
-    intermediate stays within the reference's, and dQ is as exact as fp32's reference against
-    float64's (check 1): a weight the reference loses below fp32 they lose alike, and no product
-    overflows that the reference keeps."""
+    intermediate stays within the reference's, and dQ is finite and on par with fp32's reference over the
+    case's draws (check 1, `_scaled_draw`): a weight the reference loses below fp32 they lose alike, and no
+    product overflows that the reference keeps."""
     spans = template.spans(1, 1, 1)
     query = jnp.zeros((1, 1, 1, 1), jnp.float32)
     key = jnp.full((1, 1, 1, 1), key_size, jnp.float32)
@@ -272,27 +271,23 @@ def test_an_extreme_fp32_backward_is_as_exact_as_the_reference(peak0, scale, key
     hooks = template.Hooks(initial=state)
     pins = {attention_triton.TritonBackward: attention_triton.BackwardTiles(32, 32, 4, 2, 4, 2),
             attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2)}
-    with tuning.pinned(pins):
-        triton = attention_triton.backward(query, key, value, spans, hooks, dout, scale=scale,
-                                           interpret=True)
-    portable = attention_portable.backward(query, key, value, spans, hooks, dout, block_q=32, block_k=32,
-                                           pad=attention_triton.BLOCK, scale=scale)
+    draw, reference = _scaled_draw(query, key, value, dout), _reference_dq(spans, hooks, scale)
 
-    def reference_dq(dtype):
-        def attend(q, k, v):
-            given = template.Hooks(initial=jax.tree.map(lambda x: x.astype(dtype), state))
-            return template.reference(q, k, v, spans, given, scale=scale)
+    @as_given
+    def triton_dq(query, key, value, dout):
+        with tuning.pinned(pins):
+            return np.asarray(attention_triton.backward(query, key, value, spans, hooks, dout, scale=scale,
+                                                        interpret=True).query)
 
-        operands = (query.astype(dtype), key.astype(dtype), value.astype(dtype))
-        return np.asarray(jax.vjp(attend, *operands)[1](dout.astype(dtype))[0])
+    @as_given
+    def portable_dq(query, key, value, dout):
+        return np.asarray(attention_portable.backward(query, key, value, spans, hooks, dout, block_q=32,
+                                                      block_k=32, pad=attention_triton.BLOCK,
+                                                      scale=scale).query)
 
-    theirs = reference_dq(jnp.float32)
-    with jax.enable_x64(new_val=True):
-        want = reference_dq(jnp.float64)
-    for found in (triton, portable):
-        got = np.asarray(found.query)
-        assert np.isfinite(got).all()
-        assert_as_exact_as_the_reference(got, theirs, want, "dq at fp32's edges")
+    for name, run in (("triton", triton_dq), ("portable", portable_dq)):
+        assert np.isfinite(run(*draw(0))).all(), name
+        assert_as_exact(run, reference, draw, f"dq at fp32's edges, {name}", seeds=EDGE_SEEDS)
 
 
 def test_a_logit_past_the_forwards_rounded_maximum_weighs_one_in_the_backward():
@@ -672,35 +667,62 @@ def test_the_accurate_forms_rescale_is_as_exact_as_its_exponent_rounded_once(raw
                     f"the accurate form's rescale, {'raw' if raw else 'scaled'}", seeds=8, truth_fn=exact)
 
 
+EDGE_SEEDS = 32
+"""An edge case's declared check-1 seeds (`_scaled_draw`), sized by `seeds_for` paired."""
+
+
+def _scaled_draw(query, key, value, dout):
+    """Check 1's draws of an edge case: its operands with the values and the output cotangent each scaled by
+    one factor drawn in [1, 2), which every quantity linear in them follows and no equality among a value's
+    entries, logit or weight moves, so the case stays at its edge at every seed."""
+    def draw(seed):
+        factors = np.random.default_rng([0xED6E, seed]).uniform(1.0, 2.0, 2)
+        return query, key, (value * factors[0]).astype(value.dtype), (dout * factors[1]).astype(dout.dtype)
+    return draw
+
+
+def _reference_dq(spans, hooks, scale):
+    """The reference's dQ of a draw (`template.reference`), the state's hooks in the operands' dtype."""
+    def dq(query, key, value, dout):
+        def attend(q, k, v):
+            given = jax.tree.map(lambda x: x.astype(q.dtype) if isinstance(x, jax.Array) else x, hooks)
+            return template.reference(q, k, v, spans, given, scale=scale)
+        return jax.vjp(attend, query, key, value)[1](dout)[0]
+    return dq
+
+
 def _accurate_dq(query, key, value, spans, hooks, dout, scale, name):
     """The accurate form's dQ (`natural=True, accurate=True`: the keyed sums, each factor's mantissa and
     exponent apart, `gradient.dq_finish`) on the Triton mainloop interpreted and the plain-JAX one: finite,
-    the two equal to the bit, and on par with the reference's own fp32 dQ against float64's (check 1); where
-    the reference's is float64's exactly, which check 1 cannot weigh, float64's exactly too."""
+    the two equal to the bit, and on par with the reference's own fp32 dQ over the case's draws
+    (`_scaled_draw`, check 1, the truth its float64 run); where the reference's is float64's exactly, which
+    check 1 cannot weigh, float64's exactly too. The first draw's dQ and float64's."""
     tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
     form = {"scale": scale, "natural": True, "accurate": True}
-    with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
-        triton = attention_triton.backward(query, key, value, spans, hooks, dout, interpret=True, **form)
-    portable = attention_portable.backward(query, key, value, spans, hooks, dout, **tiles, **form)
-    found = np.asarray(triton.query)
+
+    @as_given
+    def triton(query, key, value, dout):
+        with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
+            return np.asarray(attention_triton.backward(query, key, value, spans, hooks, dout, interpret=True,
+                                                        **form).query)
+
+    @as_given
+    def portable(query, key, value, dout):
+        return np.asarray(attention_portable.backward(query, key, value, spans, hooks, dout, **tiles,
+                                                      **form).query)
+
+    draw, reference = _scaled_draw(query, key, value, dout), _reference_dq(spans, hooks, scale)
+    found = triton(*draw(0))
     assert np.isfinite(found).all(), name
-    np.testing.assert_array_equal(found, np.asarray(portable.query), err_msg=name)
-
-    def reference_dq(dtype):
-        def attend(q, k, v):
-            given = jax.tree.map(lambda x: x.astype(dtype) if isinstance(x, jax.Array) else x, hooks)
-            return template.reference(q, k, v, spans, given, scale=scale)
-
-        operands = (query.astype(dtype), key.astype(dtype), value.astype(dtype))
-        return np.asarray(jax.vjp(attend, *operands)[1](dout.astype(dtype))[0])
-
-    theirs = reference_dq(jnp.float32)
+    np.testing.assert_array_equal(found, portable(*draw(0)), err_msg=name)
+    theirs = np.asarray(jax.jit(reference)(*draw(0)))
     with jax.enable_x64(new_val=True):
-        want = reference_dq(jnp.float64)
+        want = np.asarray(reference(*(jnp.asarray(x, jnp.float64) for x in draw(0))))
     if np.array_equal(theirs, want):
         np.testing.assert_array_equal(found, want, err_msg=name)
     else:
-        assert_as_exact_as_the_reference(found, theirs, want, name)
+        for arm, run in (("triton", triton), ("portable", portable)):
+            assert_as_exact(run, reference, draw, f"{name}, {arm}", seeds=EDGE_SEEDS)
     return found, want
 
 
