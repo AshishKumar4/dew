@@ -38,8 +38,12 @@ def softmax_cotangents(logits, products, peak, total, anchor, delta, keep=None, 
     about = dropped - per_query(anchor)
     if at_anchor is not None:
         about = jnp.where(at_anchor, 0.0, about)
-    cotangents = e * ((about - per_query(delta)) * over)
-    return e, e * over, gradient.where_seen(seen, cotangents, 0.0)
+    weights = e * over
+    # The fast form's cotangents from the weights it forms anyway (FlashAttention's order, 16 multiplies a
+    # tile fewer on the fused dK/dV launch, ET-CONFLICTS-h100); the accurate form's normalized last.
+    cotangents = (e * ((about - per_query(delta)) * over) if accurate
+                  else weights * (about - per_query(delta)))
+    return e, weights, gradient.where_seen(seen, cotangents, 0.0)
 
 
 @functools.cache
