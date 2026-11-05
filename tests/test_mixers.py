@@ -282,7 +282,7 @@ attention's 64 are sized paired (`seeds_for` with the packed row as its Dew arm,
 compared with themselves its documents alone take 512."""
 
 
-SHARDED = {"kimi_delta_attention", "mamba2", "memory"}
+SHARDED = {"gated_delta_net", "kimi_delta_attention", "mamba2", "memory"}
 """The kinds whose packed rows' draws run as armada's map tasks (`check1_shards`), each a test of its own."""
 
 
@@ -290,6 +290,13 @@ SHARDED = {"kimi_delta_attention", "mamba2", "memory"}
 def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     """`assert_packs_as_alone` over every mixer in the registry but the sharded ones (`SHARDED`)."""
     assert_packs_as_alone(kind)
+
+
+@pytest.mark.check1_shards(seeds=512, per_task=128)
+def test_a_packed_row_of_gated_delta_net_computes_what_its_documents_compute_alone():
+    """`assert_packs_as_alone` over the gated delta net, whose 512 seeds took 39 s of 96 on armada's CI
+    CPU and 128 s in train 580's CI: CI draws them in map tasks of 128 (ledger 4039)."""
+    assert_packs_as_alone("gated_delta_net")
 
 
 @pytest.mark.check1_shards(seeds=64, per_task=8)
