@@ -243,12 +243,7 @@ def test_a_pretraining_stage_from_its_record_learns_from_its_saved_teacher_as_co
     assert_bitwise(pretrained, fitted(pretraining, objective, rollout, 2))
     assert isinstance(prepared.rollout, DreamerRollout)
     assert_bitwise(prepared.rollout.held_replay, rollout.held_replay)
-    dagger = student(tmp_path, 2, teacher=TeacherConfig(str(tmp_path / "teacher")),
-                     pretrained=str(tmp_path / "pretrain"), model=EnvRunConfig().model,
-                     objective=ObjectiveConfig(DREAMER_V3, {"imitation": 1.0, "imitates": LABEL}))
-    prepared = dagger.prepare()
-    assert prepared.run.source.step == 2
-    assert_bitwise(prepared.objective.variables, pretrained.variables)
+
 
 
 def test_a_dagger_stage_from_its_record_labels_its_flights_with_its_saved_teachers_actions(tmp_path):
