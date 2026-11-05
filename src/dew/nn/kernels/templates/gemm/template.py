@@ -37,6 +37,7 @@ from flax.typing import PrecisionLike
 from jax.custom_derivatives import zero_from_primal
 from jax.extend import core as jax_core
 
+from dew.nn.derivatives import KernelGlue, marked
 from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.templates.product import declared
 from dew.nn.precision import at_least_fp32
@@ -409,7 +410,9 @@ def _prologued(prologue, prologue_jvp):
     def _(primals, tangents):
         return prologued(*primals), prologue_jvp(*primals)(*tangents)
 
-    return prologued
+    # The fused kernel's derivative glue (`derivatives.KernelGlue`): the producer's own derivative, true and
+    # rewritten as any other math, written once for the prologue the kernel applies to its tiles.
+    return marked(KernelGlue(), prologued)
 
 
 def _prologue_cotangents(prologue, lhs, arrays, axes_of, group_sizes, d_operand):

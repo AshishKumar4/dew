@@ -44,6 +44,7 @@ from jax.custom_derivatives import SymbolicZero
 from jax.experimental.pallas import mosaic_gpu as plgpu, tpu as pltpu
 from jax.extend import core as jax_core
 
+from ..derivatives import marked_call_p
 from ..precision import at_least_fp32, rounded_operand
 from . import generation, selection, tuning
 from .generation import INHERENT
@@ -157,10 +158,10 @@ def _equations(jaxpr):
 def _lowers(hook, tiles: tuple, sides, rules) -> bool:
     """Whether a Pallas lowering's `rules` hold a rule for every primitive of `hook` on its `tiles` and its
     side tiles: Mosaic GPU's, at warpgroup semantics, have none for a transpose, which Triton's lowering
-    takes."""
+    takes. A marked span (`derivatives.marked_call_p`) lowers as its body, whose primitives are read."""
     if hook is None:
         return True
-    return all(equation.primitive in rules
+    return all(equation.primitive in rules or equation.primitive is marked_call_p
                for equation in _equations(jax.make_jaxpr(hook)(*tiles, *sides).jaxpr))
 
 
