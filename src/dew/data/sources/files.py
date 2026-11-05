@@ -1080,10 +1080,14 @@ class Files(Dataset):
             with self._versions_held(self.paths):
                 return self.arrow.to_table(columns=["length"])["length"].to_numpy()
         if self.index:
-            with io.BytesIO(Store(self.index, self.storage_options).read()) as file:
-                index = np.load(file, allow_pickle=False)
-                if index.dtype.names and "length" in index.dtype.names:
-                    return index["length"]
+            # The index as the offset reader reads it (`ArrayIndex`), held to its producer's declaration;
+            # its length column copied out before the index lets its file go (row 4144).
+            index = ArrayIndex(self.index, self.storage_options, self._declared_index(self.index))
+            try:
+                names = index.values.dtype.names
+                return np.array(index.values["length"]) if names and "length" in names else None
+            finally:
+                index.close()
         return None
 
 
