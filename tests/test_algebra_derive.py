@@ -204,6 +204,15 @@ def held(q, k, v, rows, keys):
     return (p @ v) / jnp.sum(p, axis=-1)[:, None]
 
 
+def held_floored(q, k, v, rows, keys):
+    """The held form over each query's keys up to its own place, its maximum floored at fp32's least finite
+    value (`attention_algebra.softmax_of`'s), so a query that sees no key weighs every key 0."""
+    s = jnp.where(keys[None, :] <= rows[:, None], (q @ k.T) * WIDTH ** -0.5, -jnp.inf)
+    safe = jnp.maximum(jnp.max(s, axis=-1), jnp.finfo(s.dtype).min)[:, None]
+    p = jnp.exp(jnp.where(s < safe, s - safe, 0.0))
+    return (p @ v) / jnp.where(jnp.sum(p, axis=-1) == 0, 1.0, jnp.sum(p, axis=-1))[:, None]
+
+
 def natural_exp(x):
     """An exponential of the declaration's own: `exp` by way of `exp2` (a launch's lowering of it)."""
     return jnp.exp2(x * np.float32(np.log2(np.e)))
@@ -217,16 +226,17 @@ def compensated_rescale(carried, now):
     return jnp.where(jnp.isfinite(error), factor * (1.0 + error), factor)
 
 
-@pytest.mark.parametrize("stated", ["held", "declared numerics"])
+@pytest.mark.parametrize("stated", ["held", "held floored", "declared numerics"])
 def test_an_accurate_declarations_own_forms_walk_as_its_function(stated):
-    """A declaration under the accurate numerics whose weights hold the largest to 1 by a select, or which
+    """A declaration under the accurate numerics whose weights hold the largest to 1 by a select (against its
+    maximum, or that maximum floored where a query may see no key), or which
     states its own exponential and rescale (`Reduction.exponential`, `rescale`: attention's accurate
     forward's), walked over every key tile by its derived step and finished: on par with the whole-operand
     function against the float64 truth (check 1)."""
-    function = held if stated == "held" else attention
+    function = {"held": held, "held floored": held_floored, "declared numerics": attention}[stated]
     declaration = derive.Reduction(function, AXES, walked="keys", exponent="e",
-                                   **({} if stated == "held" else {"exponential": natural_exp,
-                                                                   "rescale": compensated_rescale}))
+                                   **({} if stated != "declared numerics" else
+                                      {"exponential": natural_exp, "rescale": compensated_rescale}))
     forms = derive.derive(declaration, accurate=True, saturation=SATURATION)
     assert_as_exact(jax.jit(walked_whole(forms)), jax.jit(whole(function)), draw, f"{stated} walked",
                     seeds=16)
