@@ -462,8 +462,8 @@ def kimi_k25_media_case(site):
         dtype = next(network.parameters()).dtype
         if site == "image":
             return network(input_ids=ids, **{pixels: patches.to(dtype), grids: torch.tensor([grid])}).logits
-        # transformers 5.17 splits a video's projected tokens by t·h·w/4 where its tower pools the frames
-        # to h·w/4 (`get_image_features`), so its forward refuses a clip of more than one frame: its own
+        # transformers 5.17 splits a video's projected tokens by t·h·w/4 where its tower pools the frames (row
+        # 4368) to h·w/4 (`get_image_features`), so its forward refuses a clip of more than one frame: its own
         # tower, projector and decoder, placed as its forward places them (`Kimi_K25Model.forward`: the
         # placeholders read token 0, then the projected tokens scattered over them).
         inner, placed = network.model, ids == token

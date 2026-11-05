@@ -432,7 +432,9 @@ class VisionTransformer(nn.Module):
             # the merge blocks then gather as one frame's.
             summed = jax.vmap(lambda row, at: jnp.zeros_like(row).at[at].add(row))(
                 jnp.where(valid[..., None], hidden, 0), jnp.where(valid, within, 0))
-            hidden = jnp.where((place < area)[..., None], summed / grid[:, 0:1, None].astype(summed.dtype), 0)
+            # A padded row's grid holds no frame: it divides by one, its places kept zero.
+            frames = jnp.maximum(grid[:, 0:1, None], 1).astype(summed.dtype)
+            hidden = jnp.where((valid & (place < area))[..., None], summed / frames, 0)
         if not lay.merge_blocks and merge > 1:
             # Raster patches into merge blocks, each block's patches consecutive (pixel_shuffle's gather).
             block = frame * area + (rows // merge) * merge * widths + (columns // merge) * merge * merge
