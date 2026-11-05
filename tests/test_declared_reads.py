@@ -284,17 +284,19 @@ def test_a_declared_index_with_lengths_replaced_under_its_facts_is_refused_where
         index.write(written.getvalue())
         return rows, index
 
-    root, index = published([3, 5, 7])
-    facts = {store.url: {"bytes": len(store.read()), "sha256": hashlib.sha256(store.read()).hexdigest()}
-             for store in (root, index)}
-    def lengths():
-        return Files((root.url,), format="jsonl", index=index.url, file_info=facts).lengths()
+    def declared(lengths: list[int]):
+        root, index = published(lengths)
+        facts = {store.url: {"bytes": len(store.read()), "sha256": hashlib.sha256(store.read()).hexdigest()}
+                 for store in (root, index)}
+        return Files((root.url,), format="jsonl", index=index.url, file_info=facts), index
 
-    assert lengths().tolist() == [3, 5, 7]
+    files, _ = declared([3, 5, 7])
+    assert files.lengths().tolist() == [3, 5, 7]
+    replaced, index = declared([3, 5, 7])
     _, other = published([4, 4, 4])
     index.write(other.read())
     with pytest.raises(Replaced):
-        lengths()
+        replaced.lengths()
 
 
 def test_an_indexed_reader_holds_the_declared_file_it_checked(tmp_path):
