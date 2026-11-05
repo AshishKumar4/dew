@@ -42,7 +42,7 @@ import numpy as np
 from jax import lax
 from jax.extend import core as jcore
 
-from dew.algebra import carry, cost, linear_scan, program, terms
+from dew.algebra import carry, cost, derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate, read_by
 from dew.cache import ALGEBRA
 from dew.nn.precision import at_least_fp32, float32_einsum, float32_matmul, two_sum, vanishing
@@ -166,7 +166,10 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
         # operands of its function, whose state the carry reads (`carry.split`).
         held = _prepared(form, tokens, decays)
         given = (*decays, *(tokens[name] for name in TOKENS), *held.values())
-        key = (affine.base2, corrected, *((value.shape, str(value.dtype)) for value in given))
+        # A split is priced and traced where it is derived (`derive.context`): one derived under another
+        # target, precision, numerics or mesh is none of this one's.
+        key = (derive.context(), affine.base2, corrected,
+               *((value.shape, str(value.dtype)) for value in given))
         if key not in splits:
             h = jax.ShapeDtypeStruct(shape, carried)
             avals = [jax.ShapeDtypeStruct(value.shape, value.dtype) for value in given]
