@@ -63,6 +63,7 @@ from dew.interop.pipeline_assembly import (
     text_components,
 )
 from dew.interop.processors import Processor, hosts
+from dew.interop.release import load_settings, release_record
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, tensor_specs
 from dew.interop.saved_sources import RunPipeline, pinned_run, pipeline_of_run, released_run
 from dew.interop.streaming import WeightLayout
@@ -79,9 +80,7 @@ from dew.nn.precision import Numerics, numerics_of
 from dew.nn.sharding import boxed, current_boxes, drawn_axes
 from dew.objectives.base import SavedTask
 from dew.registry import (
-    DtypeName,
     ModelConfig,
-    dtype_name,
     from_record,
     projectors,
     record_fields,
@@ -301,7 +300,7 @@ class Pretrained:
     loader builds them (`TextGeneration.from_settings`: its prefix, policy and budget), where a source
     read from its files builds them from its generation config, which an export writes as the
     representation its format's readers read (ledger 3007). An export writes it beside its config and a
-    load reads it back (`released`, ledger 4314)."""
+    load reads it back (`dew.interop.release`, ledger 4314)."""
     names_tokenizer: ClassVar[bool] = True
     """Whether generation_config.json may record the tokenizer's name.
 
@@ -468,11 +467,9 @@ class Pretrained:
         the source has them.
 
         `dtype` sets the compute dtype, and `param_dtype` separately sets the storage
-        dtype of floating parameters. They default to BF16 compute over FP32 master
-        weights, or for an export of a run to the run's compute dtype over the weights
-        as the export stores them (`released`); 'auto' keeps each tensor in the dtype
-        the checkpoint stores it in; a quantized
-        source's packed weights decode to the dtype it declares (`declared_dtype`).
+        dtype of floating parameters: BF16 over FP32 master weights unless stated, or an exported
+        run's own (`load_settings`); 'auto' keeps each tensor's stored dtype; a quantized source's
+        packed weights decode to the dtype it declares (`declared_dtype`).
         `precision`, a run's numerics or their name (`dew.nn.precision.numerics_of`), sets both
         from its dtypes, and the bundle's tasks trace under its precision and forms (`formed`).
         Each is a dtype (`jnp.bfloat16`) or its name, and the model's record keeps
@@ -550,21 +547,17 @@ class Pretrained:
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
         streaming, placed = _placement(mesh, layout, on_host=on_host, weights=weights)
-
         numerics = _load_settings(precision, dtype, param_dtype, prediction_depths)
         # The reference refuses a folder outside the source before anything is fetched.
         directory, reference, composite = _source_metadata(
             sources.SourceReference(str(name_or_dir), revision, subfolder, remote_code=trust_remote_code),
             selected, fallback,
             modeling_overrides)
-        # An export of a run carries the run's declaration, numerics and compute dtype (`released`), read
-        # from the folder the load selects; a load that states its own takes their place.
-        settings, run_numerics, run_compute = released(reference.directory(directory))
-        dtype, param_dtype = _load_dtypes(numerics, dtype, param_dtype, run_compute)
+        loading = load_settings(reference.directory(directory), numerics, dtype, param_dtype)
         loaded, extracted = _loaded_kind(
-            reference, directory, composite, fallback=fallback, gguf_file=gguf_file,
-            single_file=single_file, dduf_file=dduf_file, placed=placed, streaming=streaming or not weights,
-            weights=weights, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl,
+            reference, directory, composite, fallback=fallback, gguf_file=gguf_file, single_file=single_file,
+            dduf_file=dduf_file, placed=placed, streaming=streaming or not weights, weights=weights,
+            dtype=loading.dtype, param_dtype=loading.param_dtype, attention_impl=attention_impl,
             max_seq_len=max_seq_len, overrides=modeling_overrides, trust_remote_code=trust_remote_code,
             text_only=text_only, prediction_depths=prediction_depths)
         if not isinstance(loaded, cls):
@@ -573,7 +566,7 @@ class Pretrained:
         extended = _extended(_published(loaded, name_or_dir, selected=bool(selected) or extracted
                                         or reference.subfolder is not None), dex, placed, scan_layers)
         return replace(_resident(extended, weights=weights, streaming=streaming, on_host=on_host),
-                       settings=settings, numerics=run_numerics if precision is None else numerics)
+                       settings=loading.settings, numerics=loading.numerics)
 
     @property
     def layouts(self) -> Mapping[str, WeightLayout]:
@@ -758,7 +751,9 @@ class Pretrained:
         decoders.save_export_assets(destination,
                                     tokenizer=self.processor if self.tokenizer is None else self.tokenizer,
                                     generation_config=dict(self.generation_config),
-                                    named=self.names_tokenizer, release=self._release())
+                                    named=self.names_tokenizer,
+                                    release=None if self.settings is None else release_record(
+                                        self.settings, self.numerics, self.model_config, values))
         for name, module in sorted(modules.items()):
             written = destination / name
             written.parent.mkdir(parents=True, exist_ok=True)
@@ -772,26 +767,6 @@ class Pretrained:
         save_hf_layout(_folder_part(tensors, "") if folders else tensors,
                        {key: value for key, value in self.config.items() if key not in folders},
                        destination, max_shard_size)
-
-    def _release(self) -> dict[str, object] | None:
-        """The release metadata `save` writes beside the config (`decoders.RELEASE_FILE`) where the bundle
-        holds a run's own declaration (`settings`): its task settings' record, its numerics and the dtype
-        its model computes in (its own `dtype`, else its parameters', which a module without one computes
-        in; the parameters' own are the export's), under the release record's `task`
-        (`dew.config.Release`), which `load` reads back (`released`)."""
-        if self.settings is None:
-            return None
-        from dew.inference.tasks import TaskSettings as Settings
-        from dew.registry import to_record
-
-        numerics = None if self.numerics is None else to_record(self.numerics, Numerics)
-        held = jnp.result_type(*(leaf.dtype for leaf in jax.tree.leaves(unboxed(self.variables))
-                                 if jnp.issubdtype(leaf.dtype, jnp.floating)))
-        model = self.model
-        stated = model.dtype if isinstance(model, CausalTransformer | DiffusionGemma) else None
-        compute = held if stated is None else stated
-        return {"task": {"settings": to_record(self.settings, Settings), "numerics": numerics,
-                         "dtypes": {"compute": dtype_name(compute)}}}
 
     def push_to_hub(self, repo_id: str, *, variables: Mapping[str, object] | None = None,
                     private: bool = False, commit_message: str = "Upload dew export",
@@ -1624,24 +1599,6 @@ def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
     return config, None
 
 
-def released(directory: Path) -> tuple[TaskSettings | None, Numerics | None, DtypeName | None]:
-    """The run's own task settings, numerics and compute dtype an export of it wrote
-    (`decoders.RELEASE_FILE`, `Pretrained.save`): its tasks' declaration, the numerics they trace under,
-    and the dtype its model computed in, or None for each where the directory holds none: a source with
-    no run behind it builds its tasks from its own files, in the load's dtypes."""
-    from dew.inference.tasks import TaskSettings as Settings
-
-    path = directory / decoders.RELEASE_FILE
-    if not path.is_file():
-        return None, None, None
-    record = _records.record(json.loads(path.read_text()), decoders.RELEASE_FILE)
-    task = _records.record(record["task"], "task")
-    numerics, dtypes = task.get("numerics"), _records.record(task["dtypes"], "dtypes")
-    return (from_record(Settings, task["settings"], dtypes=False),
-            None if numerics is None else from_record(Numerics, numerics, dtypes=False),
-            dtype_name(_records.text(dtypes["compute"], "compute")))
-
-
 def _decoded(tensors: Mapping[str, unread.Stored], config: Mapping[str, object], param_dtype: str, *,
              media: bool) -> tuple[Mapping[str, unread.Stored], tuple[str, ...], str | None,
                                    dict[str, unread.Stored], decoders.Checked,
@@ -2095,20 +2052,6 @@ def _load_settings(precision: Numerics | str | None, dtype: DTypeLike | None,
         raise ValueError("precision sets a load's dtype and param_dtype; pass the numerics or the dtypes, "
                          "not both")
     return numerics
-
-
-def _load_dtypes(numerics: Numerics | None, dtype: DTypeLike | None,
-                 param_dtype: DTypeLike | Literal["auto"] | None, released: DtypeName | None
-                 ) -> tuple[DtypeName, DtypeName | Literal["auto"]]:
-    """The compute and storage dtypes a load loads in, by name: its numerics' dtypes, else each one it
-    states, and each it leaves unstated (None) its source's: an export of a run's compute dtype
-    (`released`) over its weights as stored, or BF16 compute over FP32 master weights."""
-    if numerics is not None:
-        return dtype_name(numerics.dtypes.compute), dtype_name(numerics.dtypes.params)
-    compute = dtype_name(dtype) if dtype is not None else released or "bfloat16"
-    params = (param_dtype if param_dtype == AUTO else dtype_name(param_dtype) if param_dtype is not None
-              else AUTO if released is not None else "float32")
-    return compute, params
 
 
 def _source_metadata(requested: sources.SourceReference, selected: list, fallback: str | None,

@@ -732,17 +732,17 @@ def test_a_quantized_source_of_a_preparing_family_exports_updated_weights_in_its
     assert_restores(decoded.model, decoded.variables, reloaded, np.load(FIXTURES / fixture / "input_ids.npy"))
 
 
-def test_a_quantized_export_encodes_each_weight_as_it_is_read_against_its_stored_tensors(tmp_path,
-                                                                                          monkeypatch):
-    """A quantized source's export is a table built as it is read (row 4316): no weight is encoded and
-    no dense tensor of the family's encoder built before a writer reads it, each weight's group once
-    however its tensors are read (the weight twice before its scale, from several threads), the table's
-    specs its source's stored tensors before any is built. A weight whose geometry no longer fits what
-    its source stored is refused as it is read, and one whose stored tensors are unknown at once; a
-    composite of two tables refuses a name both hold."""
+def test_a_quantized_export_encodes_each_weight_as_it_is_read_against_its_stored_tensors(tmp_path):
+    """A quantized source's export is a table built as it is read (row 4316): building it over the model's
+    shapes alone reads no weight, the family's spelled encoder included, its specs its source's stored
+    tensors. The format's table (`SourceQuantization.requantize`) reads and encodes no weight before a
+    writer reads one of its tensors, each weight's group once however its tensors are read (the weight
+    twice before its scale, from several threads); a weight whose geometry no longer fits what its source
+    stored is refused as it is read, and one whose stored tensors are unknown at once; a composite of two
+    tables refuses a name both hold."""
     from concurrent.futures import ThreadPoolExecutor
 
-    from dew.interop import codecs, decoder_parts, pretrained
+    from dew.interop import codecs
     from dew.interop.safetensors_io import LazyTensors, joined_tensors, tensor_specs
 
     fixture, name, bare = PREPARED["gpt-neox"]
@@ -754,42 +754,39 @@ def test_a_quantized_export_encodes_each_weight_as_it_is_read_against_its_stored
     assert quantization is not None
     save_hf_layout(encoded_form(quantization, tensors, (name,)), config, tmp_path / "fp8")
     loaded = Pretrained.load(tmp_path / "fp8", dtype="float32", attention_impl="reference")
-    encoded = []
-
-    def counted(config, **options):
-        found = codecs.source_quantization(config, **options)
-        assert found is not None
-        return dataclasses.replace(found, encode=lambda weight, value: encoded.append(weight) or found.encode(
-            weight, value))
-
-    monkeypatch.setattr(pretrained, "source_quantization", counted)
-    built = []
-    leaf = decoder_parts.WeightLayout.export
-    monkeypatch.setattr(decoder_parts.WeightLayout, "export",
-                        lambda layout, *arguments: built.append(layout.name) or leaf(layout, *arguments))
-    table = loaded.export()
-    assert isinstance(table, LazyTensors) and encoded == [] and built == []
-    headers = tensor_specs(load_shards(tmp_path / "fp8"))
     stored = loaded.quantized_specs
     assert set(stored) == {name, f"{name}_scale_inv"}
+    headers = tensor_specs(load_shards(tmp_path / "fp8"))
+    shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), loaded.variables)
+    table = loaded.export(shapes)
+    assert isinstance(table, LazyTensors)
     assert {part: tensor_specs(table)[part] for part in stored} == {part: headers[part] for part in stored}
-    first, again, scale = table[name], table[name], table[f"{name}_scale_inv"]
-    np.testing.assert_array_equal(first, again)
-    assert encoded == [name]
-    with ThreadPoolExecutor(4) as pool:
-        written = dict(zip(table, pool.map(table.__getitem__, list(table)), strict=True))
-    assert encoded == [name, name]
-    np.testing.assert_array_equal(written[f"{name}_scale_inv"], scale)
+    written = loaded.export()
     for part, spec in stored.items():
         assert (written[part].shape, written[part].dtype) == (spec.shape, spec.dtype), part
     with pytest.raises(ValueError):
         dataclasses.replace(loaded, quantized_specs={}).export()
 
-    resized = dataclasses.replace(loaded, quantized_specs={
-        part: jax.ShapeDtypeStruct((spec.shape[0] + 1, *spec.shape[1:]), spec.dtype)
-        for part, spec in stored.items()})
+    dense = {**tensors, name: quantization.decode(written, name)}
+    reads, encoded = [], []
+    lazy = LazyTensors(tensor_specs(dense), lambda part: reads.append(part) or dense[part])
+    counted = dataclasses.replace(quantization, encode=lambda weight, value: encoded.append(weight)
+                                  or quantization.encode(weight, value))
+    table = counted.requantize(lazy, (name,), stored)
+    assert reads == encoded == []
+    first, again, scale = table[name], table[name], table[f"{name}_scale_inv"]
+    np.testing.assert_array_equal(first, again)
+    assert encoded == [name] and reads == [name]
+    with ThreadPoolExecutor(4) as pool:
+        every = dict(zip(table, pool.map(table.__getitem__, list(table)), strict=True))
+    assert encoded == [name, name]
+    np.testing.assert_array_equal(every[f"{name}_scale_inv"], scale)
+    resized = {part: jax.ShapeDtypeStruct((spec.shape[0] + 1, *spec.shape[1:]), spec.dtype)
+               for part, spec in stored.items()}
     with pytest.raises(ValueError):
-        resized.export()[name]
+        quantization.requantize(dense, (name,), resized)[name]
+    with pytest.raises(ValueError):
+        quantization.requantize(dense, (name,), {})
     with pytest.raises(ValueError):
         joined_tensors({"backbone": {"w": np.zeros(2)}, "readout": {"w": np.ones(2)}})
     joined = joined_tensors({"backbone": table, "readout": {"head.weight": np.ones(2, np.float32)}})

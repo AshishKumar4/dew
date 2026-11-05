@@ -133,8 +133,11 @@ def test_a_release_test_outside_its_overlay_fails_naming_the_overlay(tmp_path, p
                          capture_output=True, text=True, cwd=tmp_path, check=False,
                          env={**os.environ, "PYTHONPATH": os.pathsep.join(
                              filter(None, (str(tests), os.environ.get("PYTHONPATH"))))})
-    if pinned.startswith("held"):
-        assert run.returncode == 0, run.stdout[-2000:]
-    else:
-        assert run.returncode == 1, run.stdout[-2000:]
-        assert "tools/armada/ci.py release" in run.stdout and "test_marked.py" in run.stdout
+    from conftest import release_unheld
+
+    unheld = release_unheld(requirement, "test_marked.py::test_marked")
+    assert run.returncode == (0 if unheld is None else 1), run.stdout[-2000:]
+    assert (unheld is None) == pinned.startswith("held")
+    if unheld is not None:
+        assert unheld.command[:3] == ("python", "tools/armada/ci.py", "release")
+        assert {f"--requirement={requirement}", "--tests=test_marked.py"} <= set(unheld.command)

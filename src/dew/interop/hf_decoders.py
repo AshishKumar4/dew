@@ -64,6 +64,7 @@ from dew.interop.decoder_parts import (
     refuse_drafter,
     translated,
 )
+from dew.interop.release import RELEASE_FILE
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
 from dew.interop.unread import Stored, equal, held
 from dew.interop.weights import checkpoint_dtype, insert, nested
@@ -85,11 +86,6 @@ from dew.nn.vision.siglip import translate_gemma_projector_config, translate_sig
 from dew.registry import from_record, towers
 
 GENERATION_CONFIG_FILE = "generation_config.json"
-
-RELEASE_FILE = "dew_release.json"
-"""The release metadata an export of a run writes beside its config (`save_export_assets`): the run's
-own task declaration and the numerics its tasks build under, which `Pretrained.load` reads back in
-place of the family's defaults; generation_config.json is derived from it for every other reader."""
 
 
 def _kind_name(record: Mapping[str, object], section: str) -> str:
@@ -1220,7 +1216,7 @@ def save_export_assets(
     release: Mapping[str, object] | None = None,
 ) -> None:
     """Write the tokenizer files and generation_config.json beside exported weights, and the run's
-    release metadata where the export has one (`release`, `RELEASE_FILE`).
+    release metadata where the export has one (`release`, `dew.interop.release.RELEASE_FILE`).
 
     Readers of the HF layout (transformers, llama.cpp and the runtimes on it) locate the
     vocabulary through tokenizer_config.json, so the tokenizer writes its own files here
