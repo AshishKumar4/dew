@@ -1335,7 +1335,8 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     # A bundle may state its processing in its own config instead (MiMo-V2.6's `processor_config`).
     processor_files = config.get("processor_config") is not None or any(
         (directory / name).exists() for name in ("processor_config.json", "preprocessor_config.json"))
-    media = _media_wrapper(config) and processor_files
+    # A bundle's language model alone (`text_only`) translates to a decoder's record, which reads no media.
+    media = _media_wrapper(config) and processor_files and "tower" in record
     if media or (directory / "tokenizer_config.json").exists() or gguf_path is not None:
         from dew.data.text import load_tokenizer
         # A GGUF repo ships none; the file carries its tokenizer.
@@ -2222,10 +2223,14 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: source
         config = _kept_depths(config, prediction_depths)
     route = source_route(config, remote=remote, pinned=pinned)
     language = route.wrapper if text_only and isinstance(route, WrapperRoute) else None
-    if language is not None:
+    if language is not None and decoders.bundles(config):
+        # A bundle its own family reads whole: its family's decoder over the source's own config and
+        # tensors, the towers' retained by name and written back with the config that names them (Kimi
+        # K2.5's under `language_model.`, MiMo-V2.6's at the root).
+        route, language = DecoderRoute(decoders.translate_config(config)), None
+    elif language is not None:
         # The language model's config as its decoder reads it (`decoders.decoder_config`), a quantized
-        # wrapper's module selection renamed with its tensors; a bundle its own family reads whole keeps
-        # its decoder's names and their codec.
+        # wrapper's module selection renamed with its tensors.
         config = decoders.decoder_config(config, inventory)
         route = source_route(config, remote=remote, pinned=pinned)
     elif isinstance(route, WrapperRoute):
