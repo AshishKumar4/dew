@@ -30,6 +30,7 @@ from collections.abc import Callable, Sequence
 
 import jax
 from jax.core import eval_context
+from jax.custom_derivatives import CustomVJPPrimal, SymbolicZero
 from jax.extend import core as jax_core
 from jax.extend.core import create_call_primitive
 
@@ -121,23 +122,31 @@ def bound_span[Result](kind: Kind, function: Callable[..., Result], *,
     def call(*args, **kwargs):
         bound = signature.bind(*args, **kwargs)
         operands = [arg for position, arg in enumerate(bound.args) if position not in fixed]
-        leaves, structure = jax.tree.flatten((operands, bound.kwargs))
-        traced = [index for index, leaf in enumerate(leaves) if isinstance(leaf, jax.Array)]
+        # A forward's primal under `symbolic_zeros` (`CustomVJPPrimal`) is its array, its flag bound in.
+        leaves, structure = jax.tree.flatten((operands, bound.kwargs),
+                                             is_leaf=lambda leaf: isinstance(leaf, CustomVJPPrimal))
+        traced = [index for index, leaf in enumerate(leaves) if isinstance(_array(leaf), jax.Array)]
         if not traced:
             return function(*args, **kwargs)
 
         def span(*arrays):
             filled = list(leaves)
             for index, array in zip(traced, arrays, strict=True):
-                filled[index] = array
+                filled[index] = (CustomVJPPrimal(array, leaves[index].perturbed)
+                                 if isinstance(leaves[index], CustomVJPPrimal) else array)
             given, named = jax.tree.unflatten(structure, filled)
             positional, rest = [], iter(given)
             for position, arg in enumerate(bound.args):
                 positional.append(arg if position in fixed else next(rest))
             return function(*positional, **named)
 
-        return marked(kind, span)(*(leaves[index] for index in traced))
+        return marked(kind, span)(*(_array(leaves[index]) for index in traced))
     return call
+
+
+def _array(leaf):
+    """A span's operand of `leaf`: a forward's primal's array (`CustomVJPPrimal.value`), else the leaf."""
+    return leaf.value if isinstance(leaf, CustomVJPPrimal) else leaf
 
 
 @dataclasses.dataclass(frozen=True)
@@ -195,8 +204,19 @@ def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[...,
         if _evaluating():
             return function(*arguments)
         flat, structure = jax.tree.flatten(arguments)
-        closed, shaped = jax.make_jaxpr(lambda *leaves: function(*jax.tree.unflatten(structure, leaves)),
-                                        return_shape=True)(*flat)
+        # A tangent rule's known zero (`SymbolicZero`) among its outputs is no value of the span: it is
+        # returned beside the span's outputs, in its place.
+        returned = {}
+
+        def span(*leaves):
+            produced, returned["structure"] = jax.tree.flatten(
+                function(*jax.tree.unflatten(structure, leaves)),
+                is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
+            returned["zeros"] = {index: leaf for index, leaf in enumerate(produced)
+                                 if isinstance(leaf, SymbolicZero)}
+            return [leaf for leaf in produced if not isinstance(leaf, SymbolicZero)]
+
+        closed = jax.make_jaxpr(span)(*flat)
         # A value of the enclosing trace the function closes over (a kernel's mask, a reference's operand) is
         # one of the call's operands, leading its arguments, as a closed-over value is no constant there.
         held = [isinstance(const, jax.core.Tracer) for const in closed.consts]
@@ -208,7 +228,10 @@ def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[...,
                         *closed.invars],
                 consts=[const for const, is_held in zip(closed.consts, held, strict=True) if not is_held])
             flat = [*lifted, *flat]
-        outputs = marked_call_p.bind(*flat, call_jaxpr=closed, kind=kind)
-        return jax.tree.unflatten(jax.tree.structure(shaped), outputs)
+        outputs = iter(marked_call_p.bind(*flat, call_jaxpr=closed, kind=kind))
+        zeros = returned["zeros"]
+        return jax.tree.unflatten(returned["structure"], [
+            zeros[index] if index in zeros else next(outputs)
+            for index in range(returned["structure"].num_leaves)])
     return call
 
