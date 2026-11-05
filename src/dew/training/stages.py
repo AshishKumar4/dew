@@ -698,12 +698,16 @@ class _Numbering:
                 chosen.append(outs[0])
             elif all(not isinstance(number, tuple) for number, _ in outs):
                 chosen.append((self.number(("branch", index, tuple(number for number, _ in outs))), None))
-            elif len({(len(number), lead) if isinstance(number, tuple) else None
-                      for number, lead in outs}) == 1:
-                rows = zip(*(number for number, _ in outs), strict=True)
-                chosen.append((tuple(self.number(("branch", index, row)) for row in rows), outs[0][1]))
             else:
-                return None
+                # A branch's stack against another's value of no stack, the same each row (a scalar's
+                # broadcast), row by row; stacks of other rows than each other's are no branch's choice.
+                shapes = {(len(number), lead) for number, lead in outs if isinstance(number, tuple)}
+                if len(shapes) != 1:
+                    return None
+                count, lead = shapes.pop()
+                rows = zip(*(number if isinstance(number, tuple) else (number,) * count for number, _ in outs),
+                           strict=True)
+                chosen.append((tuple(self.number(("branch", index, row)) for row in rows), lead))
         return chosen
 
 
