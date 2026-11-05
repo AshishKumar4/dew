@@ -2134,3 +2134,28 @@ def test_a_mix_of_hundreds_of_corpora_reads_with_one_read_budget_and_only_the_co
         assert touched == {0, 1}
     finally:
         reader.close()
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_token_mixture_logs_the_tokens_each_member_delivered_through_a_resume(read):
+    """A mixture measured in tokens logs each member's valid target tokens (`data/tokens/<member>`): the
+    targets of the rows of it the run read, one a short row and nine a long one, across a saved position
+    and its resume (row 4119)."""
+    chain = mix([_token_rows("short", 1, 2).repeat(), _token_rows("long", 2, 10).repeat()],
+                by="tokens").batch(2)
+    data = compile(chain, read=read, loading=READ)
+    stopped = data.train(DataPartition())
+    try:
+        read_ids = [int(identity) for batch in itertools.islice(stopped, 5) for identity in batch["id"]]
+        state = stopped.get_state()
+    finally:
+        stopped.close()
+    resumed = data.train(DataPartition())
+    try:
+        resumed.set_state(state)
+        read_ids += [int(identity) for batch in itertools.islice(resumed, 5) for identity in batch["id"]]
+        statistics = data.statistics()
+    finally:
+        resumed.close()
+    for name, tag, targets in (("short", 1, 1), ("long", 2, 9)):
+        assert statistics[f"data/tokens/{name}"] == targets * sum(value // 1000 == tag for value in read_ids)
