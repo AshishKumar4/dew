@@ -501,12 +501,11 @@ class TextToImage(SavedRunTask, InItsForm):
         with region("inference.image"):
             initial = program(_initials, static_argnums=(0, 1, 2))(walking.solver, walking.process, grid,
                                                                    noise, walks)
-            solver = walking.solver if streams is None else _Streaming(walking.solver, streams)
             models = sampling_modules(self.model, walking.guidance, self.autoencoder)
             generated = program(_walks, *models, static_argnums=(0, 1, 2, 3, 4, 5))(
                 self.model, walking.process, self.autoencoder, self.finish, self.final_denoise,
-                walking.decode, solver, walking.guidance, np.asarray(grid, np.float32), initial,
-                self.variables, conditions, unconditional, noise, walks)
+                walking.decode, walking.solver, walking.guidance, np.asarray(grid, np.float32), initial,
+                self.variables, conditions, unconditional, noise, walks, streams)
         return [replace(jax.tree.map(lambda leaf, index=index: leaf[index], generated), rows=inputs.rows)
                 for index, inputs in enumerate(prepared)]
 
@@ -834,7 +833,7 @@ class ImageRequest:
     on_step: Callable[[int, np.ndarray], None] | None = None
 
 
-_STREAMS: dict[int, Callable[[int, np.ndarray], None]] = {}
+_STREAMS: dict[int, Callable[[np.ndarray], None]] = {}
 """Each served request's step stream that a walk running now feeds (`_streams`), by its number."""
 _STREAMING = threading.Lock()
 _STREAMED = itertools.count()
@@ -882,8 +881,8 @@ def _streamed(numbers: np.ndarray, denoised: np.ndarray) -> None:
 @struct.dataclass
 class _Streaming:
     """`inner`, sending each step's clean prediction to its request's stream (`ImageRequest.on_step`):
-    the walk's solver where a request in it streams, `number` its stream (`_streams`), data, so the
-    program serves every stream, mapped over a pass's requests with them (`_walks`)."""
+    the walk's solver where a request in it streams, `number` its stream (`_streams`), data, so one
+    program serves every stream, each request's own where a pass maps the walk over them (`_walks`)."""
 
     inner: Solver
     number: jax.Array
@@ -1152,16 +1151,16 @@ def _initials(solver, process, grid, x_T, keys):
 
 
 def _walks(model, process, autoencoder, finish, final_denoise, decode,
-           solver, guidance, times, initial, params, given, null, x_T, keys):
+           solver, guidance, times, initial, params, given, null, x_T, keys, streams):
     """`_walk` of each request's rows, mapped over the requests, the weights and the grid shared, so a
-    served pass runs each request's walk as its lone call does under one program."""
-    def walked(solver, initial, given, null, x_T, key):
-        return _walk(model, process, autoencoder, finish, final_denoise, decode, solver, guidance, times,
+    served pass runs each request's walk as its lone call does under one program, each request's steps
+    sent to its own of `streams` where they stream (`_Streaming`)."""
+    def walked(initial, given, null, x_T, key, stream):
+        stepping = solver if stream is None else _Streaming(solver, stream)
+        return _walk(model, process, autoencoder, finish, final_denoise, decode, stepping, guidance, times,
                      initial, params, given, null, x_T, key)
 
-    # A streaming solver's stream is each request's own; its inner solver is the pass's.
-    streams = _Streaming(None, 0) if isinstance(solver, _Streaming) else None
-    return jax.vmap(walked, in_axes=(streams, 0, 0, 0, 0, 0))(solver, initial, given, null, x_T, keys)
+    return jax.vmap(walked)(initial, given, null, x_T, keys, streams)
 
 
 def _walk(model, process, autoencoder, finish, final_denoise, decode,
