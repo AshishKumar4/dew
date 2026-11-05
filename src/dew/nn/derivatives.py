@@ -12,25 +12,29 @@ keeps a call of that kind, its tangent and cotangent too (docs/design/algebra.md
 reads its kind (`dew.algebra.program`): a protected span (`Protected`, an error-free transform's) is kept as
 it is, a surrogate's bodies (`Surrogate`) and a kernel derivative's glue (`KernelGlue`) are rewritten within
 their call, and a derivative written to restructure algebra (`Algebra`) opens into the region around it.
+
+A custom derivative is declared through its class's function, which makes it one marked call of its kind:
+`kernel_derivative` (a kernel's reverse-mode glue), `numerics_derivative` and `numerics_tangent` (a rule its
+numerics need as written), `surrogate` (a value and its declared derivative). No module of Dew applies
+`jax.custom_vjp` or `jax.custom_jvp` itself.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import functools
+import inspect
 from collections.abc import Callable, Sequence
-from typing import TypeVar
 
 import jax
 from jax.extend.core import create_call_primitive
 
-__all__ = ["Algebra", "KernelGlue", "Kind", "Protected", "Surrogate", "marked", "marked_call_p", "surrogate"]
-
-Value = TypeVar("Value")
-"""A surrogate's value, a tree of arrays, and its tangent's type."""
+__all__ = ["Algebra", "KernelGlue", "Kind", "Protected", "Surrogate", "kernel_derivative", "marked",
+           "marked_call_p", "numerics_derivative", "numerics_tangent", "spanned", "surrogate"]
 
 
-def surrogate(forward: Callable[..., Value], derivative: Callable[..., Value], *,
-              nondiff_argnums: Sequence[int] = ()) -> Callable[..., Value]:
+def surrogate[Value](forward: Callable[..., Value], derivative: Callable[..., Value], *,
+                     nondiff_argnums: Sequence[int] = ()) -> Callable[..., Value]:
     """The function whose value is `forward(*operands)`, exactly, and whose derivative is the declared rule
     `derivative(primals, tangents, value)`: the output's tangent from the differentiable operands, their
     tangents and the value, linear in the tangents, so reverse mode transposes it and a higher order
@@ -53,7 +57,62 @@ def surrogate(forward: Callable[..., Value], derivative: Callable[..., Value], *
         return value, derivative(*fixed, primals, tangents, value)
 
     rule.defjvp(tangent)
-    return rule
+    return spanned(Surrogate(), rule)
+
+
+def kernel_derivative[Value](primal: Callable[..., Value], forward: Callable, backward: Callable, *,
+                      nondiff_argnums: Sequence[int] = ()) -> Callable[..., Value]:
+    """`primal` with the reverse-mode rule a kernel's derivative states (`forward` saving its residuals,
+    `backward` taking them and the cotangent, as `jax.custom_vjp.defvjp` takes them), one marked call of
+    `KernelGlue` (`spanned`): the pass rewrites its glue within the call, and every transform keeps it a
+    call of its kind. Forward mode refuses it as a bare `jax.custom_vjp` does."""
+    rule = jax.custom_vjp(primal, nondiff_argnums=tuple(nondiff_argnums))
+    rule.defvjp(forward, backward)
+    return spanned(KernelGlue(), rule)
+
+
+def numerics_derivative[Value](primal: Callable[..., Value], forward: Callable, backward: Callable, *,
+                        nondiff_argnums: Sequence[int] = ()) -> Callable[..., Value]:
+    """`primal` with a reverse-mode rule its numerics need as written (`forward`, `backward`, as
+    `kernel_derivative`'s), one `Protected` call the pass keeps as it is."""
+    rule = jax.custom_vjp(primal, nondiff_argnums=tuple(nondiff_argnums))
+    rule.defvjp(forward, backward)
+    return spanned(Protected(), rule)
+
+
+def numerics_tangent[Value](primal: Callable[..., Value], tangent: Callable, *,
+                     nondiff_argnums: Sequence[int] = ()) -> Callable[..., Value]:
+    """`primal` with a tangent rule its numerics need as written (`tangent(primals, tangents)` returning the
+    primal's value and its tangent, as `jax.custom_jvp.defjvp` takes it), one `Protected` call the pass keeps
+    as it is, which reverse mode transposes."""
+    rule = jax.custom_jvp(primal, nondiff_argnums=tuple(nondiff_argnums))
+    rule.defjvp(tangent)
+    return spanned(Protected(), rule)
+
+
+def spanned[Result](kind: Kind, function: Callable[..., Result]) -> Callable[..., Result]:
+    """`function` as one marked call of `kind` (`marked`) over its arrays, passed by position or by name: its
+    other arguments (a static factor, a dtype, a Python number, an option) bound in, so a constant still
+    splits where it is known; a call of no array, `function` itself."""
+    signature = inspect.signature(function)
+
+    @functools.wraps(function)
+    def call(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        leaves, structure = jax.tree.flatten((bound.args, bound.kwargs))
+        traced = [index for index, leaf in enumerate(leaves) if isinstance(leaf, jax.Array)]
+        if not traced:
+            return function(*args, **kwargs)
+
+        def span(*operands):
+            filled = list(leaves)
+            for index, operand in zip(traced, operands, strict=True):
+                filled[index] = operand
+            positional, named = jax.tree.unflatten(structure, filled)
+            return function(*positional, **named)
+
+        return marked(kind, span)(*(leaves[index] for index in traced))
+    return call
 
 
 @dataclasses.dataclass(frozen=True)
