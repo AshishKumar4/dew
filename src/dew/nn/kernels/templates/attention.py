@@ -533,6 +533,27 @@ class Kind(enum.Enum):
     OUTPUT = "output"
     """`[B, Q, H, Dv]`: one value an output entry, the output tile's `[block_q, Dv]` (a gate)."""
 
+    @property
+    def axes(self) -> tuple[str, ...]:
+        """The parameter's logical axes by name, in its layout's order (`templates/axes.py`'s vocabulary):
+        'batch', 'heads', 'queries', 'keys' and 'width'. Each backend composes its blocks, its loads and
+        its broadcasts from them (`axes.named`, `axes.placed`, `scored`), so none restates a kind's
+        layout."""
+        return _KIND_AXES[self]
+
+
+_KIND_AXES = {Kind.HEAD: ("heads",), Kind.QUERY: ("batch", "heads", "queries"),
+              Kind.KEY: ("batch", "heads", "keys"), Kind.TILE: ("batch", "heads", "queries", "keys"),
+              Kind.OUTPUT: ("batch", "queries", "heads", "width")}
+
+
+def scored(tile: jax.Array, kind: Kind) -> jax.Array:
+    """A score parameter's values over its own tile axes (`Kind.axes`' queries and keys, as a launch loads
+    them) as the score tile's `[queries, keys]`: a singleton along the axis it does not vary on."""
+    if "queries" not in kind.axes:
+        return tile[None, :]
+    return tile if "keys" in kind.axes else tile[:, None]
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
