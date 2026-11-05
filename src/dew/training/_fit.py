@@ -767,7 +767,7 @@ def read_batch(run: FitRun, interval: Interval, state: TrainState, rollout: Roll
     return batch, closes_window(device, examples) if branch else device, ahead
 
 
-def counted_step(interval: Interval, run: FitRun, row_tokens: Callable[[Batch], object], batch: Batch,
+def counted_step(interval: Interval, run: FitRun, row_tokens: Callable[[Batch], int | None], batch: Batch,
                  device: Batch, flops, loss, finite, committed, aux) -> None:
     """A step's batch and results counted in `interval`, its tokens (`row_tokens`) on `run`'s clock: the
     run's step and a cooldown branch's alike (row 4125)."""

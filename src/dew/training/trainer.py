@@ -35,7 +35,7 @@ from typing_extensions import TypeVar as DefaultTypeVar
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON, boolean, json_value, record
 from dew.batch import CLOSES_WINDOW, FROZEN, Batch, owned_dicts, select, unboxed
-from dew.checkpoints import Checkpoints, Ranking, Resume
+from dew.checkpoints import Checkpoints, Envelope, Ranking, Resume
 from dew.cleanup import attempted
 from dew.data.compile import Handed
 from dew.data.dataset import (
@@ -2305,7 +2305,7 @@ class Trainer(Generic[Loss, Effects]):
         return time.perf_counter() - paused
 
     def _checkpoint_envelope(self, state: TrainState, position: bytes | None, interval: Interval, run: FitRun,
-                             *, weights_only: bool = False) -> dict[str, object]:
+                             *, weights_only: bool = False) -> Envelope:
         """What a checkpoint of `state` holds on every tier, each tier's save adding its own metadata: one
         envelope a persistent and a local save submit (row 4126)."""
         control, share = {**run.stop_control, **interval.token_control}, DataPartition.of(self.device_mesh)
