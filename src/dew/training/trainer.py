@@ -998,7 +998,7 @@ class Trainer(Generic[Loss, Effects]):
         links = self._links(mesh)
         shaped = self._at_base_rung(batch)
         resumed, self._resumed_rung = self._resumed_rung if shaped is None else shaped, None
-        with self._traced_on(mesh, links) as schedule:
+        with self._traced_on(mesh, links) as schedule, held_objects():
             planned, flops = self._planned(state, batch, mesh, schedule, resumed, trials, capacity, frontier)
             split, candidate, self.executable = planned.split, planned.candidate, planned.executable
             self._split = split
@@ -1058,9 +1058,6 @@ class Trainer(Generic[Loss, Effects]):
                 return (together(moving, frozen), *(outputs[0] if split == 1 else whole_step(outputs)))
         return run
 
-    # The search's own Python and every compile it makes hold the run's objects out of Python's collector
-    # (`held_objects`), whose full collections walked them (row 2440).
-    @held_objects()
     def _planned(self, state: TrainState, batch: Batch, mesh: Mesh, schedule: Schedule, resumed: JSON,
                  trials: Trials | None, capacity: int | None,
                  frontier: bool) -> tuple[Planned, StepFlops | None]:
