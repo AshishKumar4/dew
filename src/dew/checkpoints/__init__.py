@@ -786,9 +786,10 @@ class _MetadataTree(Protocol):
     def tree(self) -> Variables: ...
 
 
-def _item_metadata(metadata: _StepFacts) -> Variables:
-    """The named state tree a step's metadata holds (`_StepFacts.item_metadata`)."""
-    tree = metadata.item_metadata
+def _item_metadata(metadata: _StepFacts | ocp.metadata.StepMetadata) -> Variables:
+    """The named state tree a step's metadata holds (`_StepFacts.item_metadata`), or one item's in Orbax's
+    metadata of it (a stored collection's, `FROZEN_STORE`)."""
+    tree = _tree_of(metadata.item_metadata)
     if not isinstance(tree, Mapping) or any(not isinstance(key, str) for key in tree):
         raise ValueError("the checkpoint holds no named state metadata")
     return dict(tree)
@@ -810,8 +811,9 @@ def _in_items(tree: Mapping, profiles: TreePath | None) -> dict[str, dict]:
     held = None if profiles is None else _at(rest, profiles)
     found = None if held is None else _power_profiles(held)
     if found is not None:
-        items[PROFILES] = {'averages': tuple(_averages_of(found))}
-        rest = _with(rest, profiles, _with_averages(held, ()))
+        # Their place in the optimizer state holds no leaf, which every reader of a step's trees keeps.
+        items[PROFILES] = {'averages': _averages_of(found)}
+        rest = _with(rest, profiles, _with_averages(held, None))
     for name, value in rest.items():
         items[MODEL if name in MODEL_STATE else RESUME][name] = value
     return {item: fields for item, fields in items.items() if fields}
@@ -825,7 +827,7 @@ def _from_items(items: Mapping[str, Mapping], profiles: TreePath | None) -> dict
     averages = items.get(PROFILES)
     held = None if profiles is None else _at(tree, profiles)
     if averages is not None and held is not None:
-        tree = _with(tree, profiles, _with_averages(held, tuple(averages['averages'])))
+        tree = _with(tree, profiles, _with_averages(held, averages['averages']))
     return tree
 
 
@@ -1253,7 +1255,8 @@ class _RankedSteps(preservation.PreservationPolicy):
     def roles(self, checkpoints: Sequence[preservation.PolicyCheckpointInfo],
               context: preservation.PreservationContext) -> dict[int, frozenset[str]]:
         """The readers each step is kept for (`ROLES`), as the union of the run's rules: the latest steps a
-        resume reads, whole; every `every`-th, wall-time-spaced and predicate step, whole or, under
+        resume reads, whole, and the latest a model's reader reads, their models; every `every`-th,
+        wall-time-spaced and predicate step, whole or, under
         `Keep.weights_only`, its model; each ranking's best, whole or, ranked `weights_only`, its model;
         and each post-hoc EMA snapshot, its profiles (row 4311)."""
         owner, keep = self.checkpoints, self.checkpoints.keep
@@ -1266,11 +1269,13 @@ class _RankedSteps(preservation.PreservationPolicy):
                     roles[checkpoint.step].add(role)
 
         kept_whole = MODEL if keep.weights_only else RESUME
-        # Orbax's selectors over the steps in order: the latest among those a resume reads and every
-        # `every`-th step.
-        resumable = [checkpoint for checkpoint in ordered if RESUME in owner._roles_held(checkpoint.step)]
-        if keep.latest:
-            chosen(resumable, preservation.LatestN(n=keep.latest), RESUME)
+        # Orbax's selectors over the steps in order: the latest among those a resume reads, and among those
+        # a model's reader reads, a weights-only snapshot's or average's (`Decide.save`), their models;
+        # and every `every`-th step.
+        for role in (RESUME, MODEL):
+            held_by = [checkpoint for checkpoint in ordered if role in owner._roles_held(checkpoint.step)]
+            if keep.latest:
+                chosen(held_by, preservation.LatestN(n=keep.latest), role)
         if keep.every:
             chosen(ordered, preservation.EveryNSteps(interval_steps=keep.every), kept_whole)
         ranks = {key for checkpoint in checkpoints for key in checkpoint.metrics or {}
@@ -1424,11 +1429,11 @@ class Checkpoints:
     def _roles_held(self, step: int) -> frozenset[str]:
         """The readers `step`'s items serve (`ROLES`): its items, or for a step of one item (`ONE_ITEM`),
         every reader of its whole state but where it was saved as its model alone, and its profiles where
-        it records them."""
+        it records them; a step another writer is saving, whose items Dew has not read, as a whole one."""
         items = self._items(step)
-        if ONE_ITEM not in items:
+        if items and ONE_ITEM not in items:
             return frozenset(items)
-        custom = self._custom(step)
+        custom = self._custom(step) if items else {}
         if custom.get('weights_only'):
             return frozenset({MODEL})
         return frozenset({MODEL, RESUME, *((PROFILES,) if custom.get('profiles') is not None else ())})
