@@ -203,8 +203,9 @@ def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources
             model = _model(launch, ba, tiles)
         return support.KernelCase(f"gmm {tiles}", lambda: launch.lowering(ba, tiles), {"dew_gmm": model})
 
-    found = compile_mosaic_kernels([case(mosaic_gpu.Tiles(128, 128, 64, 3, 1)),
-                                    case(mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2))], "sm90")
+    found = compile_mosaic_kernels([case(mosaic_gpu.Tiles(128, 128, 64, 3, 1, family='wgmma')),
+                                    case(mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2,
+                                                          family='wgmma'))], "sm90")
     assert len(found) == 2 and all(record.get("kernels") for record in found), found
     failed = mosaic_failures(found) + model_failures(found)
     assert not failed, "\n".join(failed)
@@ -224,7 +225,7 @@ def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
     def call():
         def gmm(lhs, rhs, sizes):
             return mosaic_gpu.gmm(lhs, rhs, sizes, tiles=mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2,
-                                                                          cluster=2),
+                                                                          cluster=2, family='wgmma'),
                                   transpose_rhs=False, out_dtype=jnp.bfloat16, dense=True,
                                   multiprocessors=generation.gpu_target("sm90").multiprocessors)
 
