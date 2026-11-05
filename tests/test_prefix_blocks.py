@@ -226,7 +226,8 @@ def test_a_saved_prefix_runs_bundle_serves_as_the_runs_own_task(tmp_path):
     declaration (ledger 3007), as the run's own loader does (`TextGeneration.from_run`): its prefix and the
     numerics its step trained in, where the bundle had built a task from the generation config its
     export writes, which states neither. Their greedy rollouts agree bit for bit, and a bundle loaded from
-    that export, which holds no run's declaration, builds its task from the export's files."""
+    the export, which writes the run's declaration beside its config, builds the run's own task again
+    (row 4314), where it had built a causal one from the generation config alone."""
     import json
 
     from affine_run import Replaying
@@ -269,7 +270,13 @@ def test_a_saved_prefix_runs_bundle_serves_as_the_runs_own_task(tmp_path):
     assert given.temperature == 0.5
     assert (given.eos_token_ids, given.pad_token_id) == ((VOCAB - 1,), VOCAB - 2)
     bundle.save(tmp_path / "export")
-    assert Pretrained.load(tmp_path / "export", dtype="float32").settings is None
+    exported = Pretrained.load(tmp_path / "export", dtype="float32").pipeline()
+    assert (exported.prefix, exported.precision) == (PREFIX, trained_in)
+    # The run's own task over the same weights on the host, where the export's loads them: one program.
+    home = dataclasses.replace(bundle, variables=jax.device_get(bundle.variables)).pipeline()
+    again, run = exported(prompt, NEW, key=0), home(prompt, NEW, key=0)
+    np.testing.assert_array_equal(again.tokens, run.tokens)
+    np.testing.assert_array_equal(again.raw_log_probs, run.raw_log_probs)
 
 
 def test_with_no_prefix_the_loss_is_the_causal_one_bitwise():

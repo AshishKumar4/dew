@@ -107,15 +107,34 @@ def test_an_export_opens_through_its_releases_own_code_as_the_release_does(name,
     assert all(checks.values()), checks
 
 
-def test_a_release_test_outside_its_overlay_fails_naming_the_overlay():
-    """A release_env test run by an interpreter without the package its mark pins fails before it runs,
-    naming the overlay that holds it (`uv run --with <requirement>`), where the release's own loader failed
-    opaquely in its subprocess (row 3576); an interpreter that holds it runs the test."""
+@pytest.mark.parametrize("pinned", ["held", "other", "absent", "held wheel", "other wheel"])
+def test_a_release_test_outside_its_overlay_fails_naming_the_overlay(tmp_path, pinned):
+    """A release_env test run by an interpreter without the package its mark pins, a requirement or the
+    wheel's path CI's release task overlays (tools/armada/ci.py `pytest_command`), fails before it runs,
+    naming CI's release operation over its file, where the release's own loader failed opaquely in its
+    subprocess (row 3576); an interpreter that holds it runs the test. Run as pytest runs a marked test,
+    through the suite's own hooks (tests/conftest.py, loaded as the run's plugin) and its markers
+    (pyproject.toml)."""
+    import os
+    import subprocess
+    import sys
     from importlib.metadata import version
 
-    from conftest import release_unheld
-
-    unheld = release_unheld("transformers==0.0.1")
-    assert unheld is not None and "uv run --with 'transformers==0.0.1'" in unheld
-    assert release_unheld("dew-absent-package==1.0") is not None
-    assert release_unheld(f"transformers=={version('transformers')}") is None
+    held = version("packaging")
+    requirement = {"held": f"packaging=={held}", "other": "packaging==0.0.1", "absent": "dew-absent==1.0",
+                   "held wheel": str(tmp_path / f"packaging-{held}-py3-none-any.whl"),
+                   "other wheel": str(tmp_path / "packaging-0.0.1-py3-none-any.whl")}[pinned]
+    test = tmp_path / "test_marked.py"
+    test.write_text(f"import pytest\n\n\n@pytest.mark.release_env({requirement!r})\ndef test_marked():\n"
+                    "    pass\n")
+    tests = Path(__file__).resolve().parent
+    run = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "conftest",
+                          "-c", str(tests.parent / "pyproject.toml"), "--rootdir", str(tmp_path), str(test)],
+                         capture_output=True, text=True, cwd=tmp_path, check=False,
+                         env={**os.environ, "PYTHONPATH": os.pathsep.join(
+                             filter(None, (str(tests), os.environ.get("PYTHONPATH"))))})
+    if pinned.startswith("held"):
+        assert run.returncode == 0, run.stdout[-2000:]
+    else:
+        assert run.returncode == 1, run.stdout[-2000:]
+        assert "tools/armada/ci.py release" in run.stdout and "test_marked.py" in run.stdout

@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from interop_support import respelled
+from model_support import encoded_form
 from safetensors.numpy import load_file, save_file
 
 from dew.interop import Pretrained, codecs
@@ -312,7 +313,7 @@ def test_a_store_dtype_mxfp4_source_loads_its_decoded_weights_and_saves_its_code
     store = codecs.mxfp4_store(128, config['num_key_value_heads'])
     quantized = [name for name in tensors if name.endswith(('qkv_proj.weight', 'mlp.gate_proj.weight',
                                                             'mlp.up_proj.weight', 'mlp.down_proj.weight'))]
-    stored = store.requantize(tensors, quantized)
+    stored = encoded_form(store, tensors, quantized)
     ignored = sorted(name.removesuffix('.weight') for name in tensors if name.endswith('o_proj.weight'))
     source, dense = tmp_path / 'stored', tmp_path / 'decoded'
     for directory, quantization, weights in ((source, {**STORED, 'ignored_layers': ignored}, stored),
