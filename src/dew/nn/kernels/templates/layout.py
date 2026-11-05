@@ -155,6 +155,14 @@ def _tiles_in(closed) -> bool:
             or literal_tiles(closed.jaxpr))
 
 
+def entrywise(eqn) -> bool:
+    """Whether `eqn` acts one entry at a time: one of `ENTRYWISE`, or a scalar's broadcast. The one test of
+    an equation's kind its readers share, each with its own of the shapes it reads (`_axis_free`, the
+    Mosaic program's `_entrywise`, `dew.training.stages`)."""
+    name = eqn.primitive.name
+    return name in ENTRYWISE or (name == "broadcast_in_dim" and _rank(eqn.invars[0]) == 0)
+
+
 def _axis_free(jaxpr: jax_core.Jaxpr, shape: tuple[int, ...] = ()) -> bool:
     """Whether `jaxpr` acts one entry at a time: every value a scalar or of `shape`, every operation one of
     `ENTRYWISE`, a scalar's broadcast or a call of a program so."""
@@ -168,7 +176,7 @@ def _axis_free(jaxpr: jax_core.Jaxpr, shape: tuple[int, ...] = ()) -> bool:
             if name not in CALLS or not all(
                     _axis_free(inner, shape) for inner in nested):
                 return False
-        elif name not in ENTRYWISE and not (name == "broadcast_in_dim" and _rank(eqn.invars[0]) == 0):
+        elif not entrywise(eqn):
             return False
     return True
 

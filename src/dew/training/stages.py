@@ -26,9 +26,10 @@ Invariants:
   LAMB's trust ratio, LaProp's adaptive clip and QK-Clip's per-layer maxima each give what they give
   unstacked. An optax transformation given as it is runs over the stacked leaf, so the run keeps its runs
   stage-local where its update over the stacked leaves computes each layer as its update over the stored
-  layers does, entry by entry the same expression of that layer's entries (`whole_reading`), and keeps
-  every layer whole on every stage otherwise, the replicated layout's memory, which trains it exactly: a
-  trust ratio or a clip over a norm, or a build that decides by its leaves' shapes (rows 3934, 3995).
+  layers does, row by row the same expression of that layer's entries, a sum over every layer the sum of
+  its layers' (`whole_reading`), and keeps every layer whole on every stage otherwise, the replicated
+  layout's memory, which trains it exactly: a trust ratio over a leaf, or a build that decides by its
+  leaves' shapes (rows 3934, 3995).
 
 Rejected: the stage axis as one more axis the state splits over, as fsdp splits it, which keeps each
 leaf one layer but moves the run's parameters to their stage and its gradients back every step, the
@@ -53,11 +54,11 @@ import numpy as np
 import optax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from dew.algebra.terms import parameter_key, parameters_key
 from dew.batch import unboxed
 from dew.mesh import STAGE_AXIS, LayoutRefused
 from dew.nn.kernels.options import owned_program, program
-from dew.nn.kernels.templates.layout import ENTRYWISE
-from dew.nn.programs import computed
+from dew.nn.kernels.templates.layout import ENTRYWISE, entrywise
 from dew.nn.sharding import abstract, held_by_stage
 
 if TYPE_CHECKING:
@@ -416,11 +417,12 @@ def whole_reading(optimizer: optax.GradientTransformation | None, shapes, local:
     called as a commit calls it (`dew.training.transaction.optimizer_update`, a run's progress handed it
     or not), every leaf it returns, its update's and its state's, is of the stacked layers' shapes and, row
     by row, the same expression of its row's leaves over the stack as over each layer (`_expressions`), as
-    optax's moments, decay, rates and schedules are (row 3995). A reduction, a contraction or a reshape of
-    a stacked leaf, a call it cannot see into, a QK-Clip's read of the forward's maxima, or a choice its
-    build makes otherwise over a stacked tree (a mask by rank, a tree of the layers' paths) is named, and
-    keeps every layer whole: LAMB's trust ratio, a clip by a norm. None for Dew's own optimizers (None),
-    which read a stacked leaf as its layers, and for a run with no stacked site."""
+    optax's moments, decay, rates and schedules are, M3's products batched on the rows, and a clip by the
+    global norm, its layers' sum (rows 3995, 4035, 4036). A reduction or a product across a stacked leaf's
+    layers, a call it cannot see into, a QK-Clip's read of the forward's maxima, or a choice its build
+    makes otherwise over a stacked tree (a mask by rank, a tree of the layers' paths) is named, and keeps
+    every layer whole: LAMB's trust ratio, Adafactor's factored moments. None for Dew's own optimizers
+    (None), which read a stacked leaf as its layers, and for a run with no stacked site."""
     from dew.gauss_newton import solves_equations
     from dew.optim import clips_qk
     from dew.training.transaction import optimizer_update
@@ -486,13 +488,15 @@ def _schema(tree) -> tuple:
 
 @dataclasses.dataclass(frozen=True)
 class _Rows:
-    """A stacked leaf's rows, by their places among the layer tree's leaves, stage-major (`staged`)."""
+    """A stacked leaf's rows, by their places among the layer tree's leaves, stage-major (`staged`), over
+    its `lead` leading axes."""
 
     places: tuple[int, ...]
+    lead: int
 
 
 def _row_places(rows, shape) -> _Rows:
-    return _Rows(tuple(rows))
+    return _Rows(tuple(rows), len(shape))
 
 
 def _expressions(layered, stacked, inputs: Sequence, outputs: Sequence) -> list[str]:
@@ -500,123 +504,209 @@ def _expressions(layered, stacked, inputs: Sequence, outputs: Sequence) -> list[
     `_Rows` it stacks), computes any of its `outputs` (each likewise) otherwise than `layered` computes
     each row: an output is the same expression of the inputs, row by row, where both programs, their
     calls inlined (`dew.training.staging.flattened`), compute it by the same equations of the same
-    primitives, parameters and constants over the same inputs' rows, each equation that reads a stacked
-    leaf elementwise (`_elementwise`), so each entry of a stacked leaf is its row's entry's expression,
-    and any equation of leaves no stack holds as the layer program has it. Row r of a stack of n rows is
-    read against row r of every stacked input of n rows; a stacked input of another count is no row's.
-    Equal expressions share one number (`_Numbering`)."""
+    primitives, parameters and constants over the same inputs' rows (`_Numbering`). An equation of the
+    stack reads each row as its layer's does where it holds the rows on its leading axes and its
+    parameters are the layer's over them (`_row_form`): an entrywise one, a product, a reduction, a
+    transpose, a reshape or a broadcast of each row. A sum over every axis of a stack is the sum of its
+    rows', and a scalar's sums are one sum whatever their order (`_Numbering.summed`), as a clip by the
+    global norm forms it. Row r of a stack of n rows is read against row r of every stacked input of n
+    rows; a stack of another count is no row's."""
     from dew.training.staging import flattened
 
     numbering = _Numbering()
     lay_equations, lay_results = flattened(layered.jaxpr, layered.jaxpr.invars, layered.consts)
     stack_equations, stack_results = flattened(stacked.jaxpr, stacked.jaxpr.invars, stacked.consts)
-    lay = numbering.program(lay_equations, {var: ("input", place)
-                                            for place, var in enumerate(layered.jaxpr.invars)})
-    rows_held = frozenset(var for var, given in zip(stacked.jaxpr.invars, inputs, strict=True)
-                          if isinstance(given, _Rows))
-    readers: dict[tuple[int, int] | None, dict] = {}
-
-    def stack_numbers(row: tuple[int, int] | None) -> dict:
-        # Each value's number with row r of every stacked input of n rows named as its layer's, every other
-        # stacked input as itself, so an output that reads one matches no layer's.
-        if row not in readers:
-            named = {var: ("input", given.places[row[1]])
-                     if isinstance(given, _Rows) and row is not None and len(given.places) == row[0]
-                     else ("stacked", given.places) if isinstance(given, _Rows) else ("input", given)
-                     for var, given in zip(stacked.jaxpr.invars, inputs, strict=True)}
-            readers[row] = numbering.program(stack_equations, named, rows_held)
-        return readers[row]
-
+    lay = numbering.program(lay_equations, {var: numbering.number(("input", place))
+                                            for place, var in enumerate(layered.jaxpr.invars)}, {})
+    named = {var: tuple(numbering.number(("input", place)) for place in given.places)
+             if isinstance(given, _Rows) else numbering.number(("input", given))
+             for var, given in zip(stacked.jaxpr.invars, inputs, strict=True)}
+    leads = {var: given.lead for var, given in zip(stacked.jaxpr.invars, inputs, strict=True)
+             if isinstance(given, _Rows)}
+    stack = numbering.program(stack_equations, named, leads)
     refusals = []
     for output, returned in zip(outputs, stack_results, strict=True):
-        rows = ([((len(output.places), index), place) for index, place in enumerate(output.places)]
-                if isinstance(output, _Rows) else [(None, output)])
-        for row, place in rows:
-            number = numbering.read(stack_numbers(row), returned)
-            if number is None or number != numbering.read(lay, lay_results[place]):
-                refusals.append(f"its output {place} computes its layer otherwise over the stack, or by no "
-                                "elementwise expression of its layer")
-                break
+        places = output.places if isinstance(output, _Rows) else (output,)
+        rows = _rows_of(numbering.read(stack, returned), output, leads.get(returned))
+        if rows is None or any(row != numbering.read(lay, lay_results[place])
+                               for row, place in zip(rows, places, strict=True)):
+            refusals.append(f"its output {places[0]} computes its layer otherwise over the stack, or by no "
+                            "expression of its layer")
     return refusals
+
+
+def _rows_of(number, output, lead: int | None) -> tuple | None:
+    """Each row's number of a result the stacked program numbered `number`, returned as `output`: a
+    stack's rows on the leading axes `output` holds them on; one number of no stack, the same each row's
+    (a scalar's broadcast); None where the two disagree."""
+    if not isinstance(output, _Rows):
+        return None if isinstance(number, tuple) or number is None else (number,)
+    if not isinstance(number, tuple):
+        return None if number is None else (number,) * len(output.places)
+    if len(number) != len(output.places) or lead != output.lead:
+        return None
+    return number
 
 
 class _Numbering:
     """Numbers for expressions, one an expression however often it is formed: an input, a constant, or an
-    equation's result over numbered operands (`_expressions`), keyed by the primitive itself and its
-    parameters as JAX compares them."""
+    equation's result over numbered operands (`_expressions`), keyed by the primitive and its parameters
+    as the algebra pass keys them (`dew.algebra.terms.parameters_key`); a stack's value numbered row by
+    row, a tuple of its rows' numbers."""
 
     def __init__(self):
-        self.numbers: dict[tuple, int] = {}
+        self.numbers: dict[Hashable, int] = {}
+        self.sums: dict[int, tuple[int, ...]] = {}
 
-    def number(self, key: tuple) -> int:
+    def number(self, key: Hashable) -> int:
         return self.numbers.setdefault(key, len(self.numbers))
 
-    def read(self, numbers: dict, value) -> int | None:
+    def summed(self, terms: Sequence[int]) -> int:
+        """The number of the sum of `terms`, each sum among them read as its own terms, in any order."""
+        parts = tuple(sorted(part for term in terms for part in self.sums.get(term, (term,))))
+        total = self.number(("sum", parts))
+        self.sums[total] = parts
+        return total
+
+    def read(self, numbers: dict, value) -> int | tuple[int, ...] | None:
         """`value`'s number among a program's `numbers` (`program`): a literal's of its own."""
         if isinstance(value, jcore.Literal):
-            literal = np.asarray(value.val)
-            return self.number(("literal", str(value.aval), literal.tobytes()))
+            return self.number(("literal", str(value.aval), parameter_key(value.val)))
         return numbers.get(value)
 
-    def program(self, equations, named: dict, stacked: frozenset = frozenset()) -> dict:
-        """Each value of `equations` over the inputs `named` to its expression's number, in program order;
-        a value that reads a `stacked` input otherwise than elementwise (`_elementwise`), as no layer's
-        expression reads its own, has none."""
-        numbers = {var: self.number(key) for var, key in named.items()}
-        reaching = set(stacked)
+    def equation(self, equation, params: Mapping, operands: Sequence[int], shapes: Sequence) -> list[int]:
+        """The numbers of `equation`'s results over `operands` of `shapes` under `params`: an entry of a
+        scalar's broadcast is the scalar, whatever shape it fills; an entrywise result's entry is its
+        operands' entries'; any other's reads its operands' shapes too. A scalar's sum of scalars is one
+        sum of their terms (`summed`)."""
+        name = equation.primitive.name
+        spread = name == "broadcast_in_dim" and tuple(shapes[0]) == ()
+        if name == "add" and all(tuple(shape) == () for shape in shapes):
+            return [self.summed(operands)]
+        held = {key: setting for key, setting in params.items() if not (spread and key in _SHAPED)}
+        _, keyed = parameters_key(equation.primitive, held)
+        free = spread or name in ENTRYWISE
+        read = () if free else tuple(map(tuple, shapes))
+        return [self.number((equation.primitive, keyed, tuple(operands), read, index))
+                for index in range(len(equation.outvars))]
+
+    def program(self, equations, named: dict, leads: dict) -> dict:
+        """Each value of `equations` over the inputs `named` to its expression's number, in program order, a
+        stack's its rows' numbers, its leading axes of rows in `leads`, which this extends by each stack it
+        makes; a value that reads a stack otherwise than row by row (`_row_form`, `_full_sum`) has none."""
+        numbers = dict(named)
         for equation in equations:
             operands = [self.read(numbers, operand) for operand in equation.invars]
-            stacks = any(computed(operand) and operand in reaching for operand in equation.invars)
-            if None in operands or (stacks and not _elementwise(equation)):
+            if any(operand is None for operand in operands):
                 continue
-            if stacks:
-                reaching.update(equation.outvars)
-            # An entry of a scalar's broadcast is the scalar, whatever shape it fills; an entrywise result's
-            # entry is its operands' entries'; any other's reads its operands' shapes too.
-            spread = equation.primitive is jax.lax.broadcast_in_dim_p and equation.invars[0].aval.shape == ()
-            params = tuple(sorted((key, _hashable(setting)) for key, setting in equation.params.items()
-                                  if not (spread and key in _SHAPED)))
-            if any(setting is _UNKEYED for _, setting in params):
+            stacked = [index for index, operand in enumerate(operands) if isinstance(operand, tuple)]
+            shapes = [operand.aval.shape for operand in equation.invars]
+            if not stacked:
+                made = self.equation(equation, equation.params, operands, shapes)
+                numbers.update(zip(equation.outvars, made, strict=True))
                 continue
-            shapes = () if spread or _elementwise(equation) else tuple(
-                getattr(operand.aval, "shape", None) for operand in equation.invars)
+            rows = {len(operands[index]) for index in stacked}
+            lead = {leads[equation.invars[index]] for index in stacked}
+            if len(rows) != 1 or len(lead) != 1:
+                continue
+            count, held = rows.pop(), lead.pop()
+            row_shapes = [shape[held:] if index in stacked else shape for index, shape in enumerate(shapes)]
+            every = _full_sum(equation, held)
+            if every is not None:
+                # A sum over every axis of a stack: the sum of each row's sum over its own axes.
+                terms = [self.equation(equation, every, [operands[0][row]], row_shapes)[0]
+                         for row in range(count)]
+                numbers[equation.outvars[0]] = self.summed(terms)
+                continue
+            form = _row_form(equation, held, set(stacked), shapes)
+            if form is None:
+                continue
+            by_row = [self.equation(equation, form, [operand[row] if isinstance(operand, tuple) else operand
+                                                     for operand in operands], row_shapes)
+                      for row in range(count)]
             for index, out in enumerate(equation.outvars):
-                numbers[out] = self.number((equation.primitive, params, tuple(operands), shapes, index))
+                numbers[out] = tuple(made[index] for made in by_row)
+                leads[out] = held
         return numbers
-
-
-_UNKEYED = object()
-"""A parameter no key compares: its equation's results take no number, as no layer's expression."""
-
-
-def _hashable(setting):
-    """An equation's parameter as a key: itself where it hashes, as JAX's own caches compare parameters;
-    an array by its dtype, shape and bytes, a sequence by its items; `_UNKEYED` for any other."""
-    if isinstance(setting, np.ndarray):
-        return ("array", str(setting.dtype), setting.shape, setting.tobytes())
-    if isinstance(setting, tuple | list):
-        entries = tuple(_hashable(entry) for entry in setting)
-        return _UNKEYED if any(entry is _UNKEYED for entry in entries) else (type(setting).__name__, entries)
-    return setting if isinstance(setting, Hashable) else _UNKEYED
 
 
 _SHAPED = frozenset({"shape", "broadcast_dimensions", "sharding"})
 """A scalar's broadcast's parameters that name the shape it fills, which a stacked leaf's holds more of."""
 
 
-def _elementwise(equation) -> bool:
-    """Whether `equation` computes each entry of its results from the same entry of each operand, or a
-    scalar: one of JAX's entrywise primitives (`ENTRYWISE`, each `jax.lax`'s own) whose every operand is of
-    its result's shape or a scalar, or a scalar's broadcast."""
-    shapes = {out.aval.shape for out in equation.outvars}
-    operands = [operand.aval.shape for operand in equation.invars]
-    if equation.primitive is jax.lax.broadcast_in_dim_p:
-        return operands == [()]
-    return (equation.primitive in _ENTRYWISE_PRIMITIVES and len(shapes) == 1
-            and all(shape in shapes or shape == () for shape in operands))
+def _shifted(axes, held: int) -> tuple[int, ...] | None:
+    """`axes` of a stack held on `held` leading axes as a row's, None where one is a row's own."""
+    if any(axis < held for axis in axes):
+        return None
+    return tuple(int(axis) - held for axis in axes)
 
 
-_ENTRYWISE_PRIMITIVES = frozenset(
-    primitive for name in ENTRYWISE if (primitive := getattr(jax.lax, f"{name}_p", None)) is not None)
-"""JAX's entrywise primitives themselves (`dew.nn.kernels.templates.layout.ENTRYWISE`, each by its
-`jax.lax` object), so a primitive of another library that shares a name is none of them."""
+def _full_sum(equation, held: int) -> Mapping | None:
+    """A sum of a stack over every axis (`reduce_sum`), as each row's sum over its own axes's parameters;
+    None for any other equation."""
+    if equation.primitive.name != "reduce_sum":
+        return None
+    rank = len(equation.invars[0].aval.shape)
+    if tuple(sorted(equation.params["axes"])) != tuple(range(rank)):
+        return None
+    return {**equation.params, "axes": tuple(range(rank - held))}
+
+
+def _row_form(equation, held: int, stacked: set[int], shapes: Sequence) -> Mapping | None:
+    """`equation`'s parameters as one of its rows reads them, its stacked operands' (`stacked`) rows on
+    their `held` leading axes and its results' too: an entrywise one over operands of its result's
+    shape or scalars; a broadcast, a reshape or a transpose that keeps the rows' axes leading; a reduction,
+    a cumulative one, a squeeze, an expansion or a concatenation along a row's own axes; and a product of
+    rows batched on their leading axes, or of a stack's rows and one operand of no stack. None where a
+    row reads another, or the rows leave their leading axes."""
+    name, params = equation.primitive.name, dict(equation.params)
+    out = equation.outvars[0].aval.shape
+    rows = shapes[next(iter(stacked))][:held]
+    if tuple(out[:held]) != tuple(rows):
+        return None
+    if entrywise(equation) and name != "broadcast_in_dim":
+        return params if all(tuple(shape) in (tuple(out), ()) for shape in shapes) else None
+    if name == "broadcast_in_dim":
+        dims = tuple(params["broadcast_dimensions"])
+        if dims[:held] != tuple(range(held)):
+            return None
+        return {**params, "shape": tuple(params["shape"])[held:],
+                "broadcast_dimensions": _shifted(dims[held:], held)}
+    if name == "reshape":
+        if params.get("dimensions") is not None:
+            return None
+        return {**params, "new_sizes": tuple(params["new_sizes"])[held:]}
+    if name == "transpose":
+        order = tuple(params["permutation"])
+        if order[:held] != tuple(range(held)):
+            return None
+        return {**params, "permutation": _shifted(order[held:], held)}
+    for key in ("axes", "dimensions"):
+        if key in params and name in _ALONG:
+            moved = _shifted(tuple(params[key]), held)
+            return None if moved is None else {**params, key: moved}
+    if name == "concatenate" and stacked != set(range(len(shapes))):
+        return None
+    for key in ("axis", "dimension"):
+        if key in params and name in _ALONG:
+            moved = _shifted((params[key],), held)
+            return None if moved is None else {**params, key: moved[0]}
+    if name == "dot_general":
+        (lhs_c, rhs_c), (lhs_b, rhs_b) = params["dimension_numbers"]
+        if stacked == {0, 1}:
+            if tuple(lhs_b[:held]) != tuple(range(held)) or tuple(rhs_b[:held]) != tuple(range(held)):
+                return None
+            numbers = ((_shifted(lhs_c, held), _shifted(rhs_c, held)),
+                       (_shifted(lhs_b[held:], held), _shifted(rhs_b[held:], held)))
+        elif stacked == {0} and not lhs_b and not rhs_b and _shifted(lhs_c, held) is not None:
+            numbers = ((_shifted(lhs_c, held), tuple(rhs_c)), ((), ()))
+        else:
+            return None
+        return {**params, "dimension_numbers": numbers}
+    return None
+
+
+_ALONG = frozenset({"reduce_sum", "reduce_max", "reduce_min", "reduce_prod", "reduce_and", "reduce_or",
+                    "argmax", "argmin", "squeeze", "expand_dims", "cumsum", "cumprod", "cummax", "cummin",
+                    "cumlogsumexp", "concatenate"})
+"""The equations along axes their parameters name, which a row reads where none is a row's own."""
