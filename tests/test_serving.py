@@ -1001,12 +1001,14 @@ def test_a_server_drafts_speculative_blocks_as_a_lone_call_does(temperature, dec
         server.reload(params)
 
 
-def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(tmp_path):
+@pytest.mark.parametrize("cache", [None, KVCache(page_size=2, pages=64)], ids=["dense", "paged"])
+def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(tmp_path, cache):
     """One server over an adapter set (`dew.lora.AdapterSet`) of a published decoder: the fixture's PEFT
     adapter (rank 8 over q and v, with an alpha pattern) and one of rank 2 over q alone, saved side by side
     and loaded by directory. Requests naming either adapter, or none, share the server's steps and its
     one copy of the base, and each draws what a task over its adapter alone (or the base) draws, on par
-    with that task against its float64 twin (check 1) (ledger 870)."""
+    with that task against its float64 twin (check 1), over a dense cache and over a paged one sharing
+    prompt pages, where one prompt under two adapters shares none (ledger 870)."""
     from pathlib import Path
 
     from arm_arithmetic import widened
@@ -1038,9 +1040,10 @@ def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(t
                                        ).text_generation(sampling=sampling)
              for name, adapter in (("fixture", fixture), ("second", second))} | {
                  None: decoder.text_generation(sampling=sampling)}
-    prompts = ([1, 5, 9, 13], [2, 4], [7, 7, 7, 3, 1], [11, 6, 2])
-    names = ("fixture", "second", None, "fixture")
-    server = Server.from_task(served, slots=4, capacity=64, admission=2)
+    prompts = ([1, 5, 9, 13, 2], [2, 4], [7, 7, 7, 3, 1], [1, 5, 9, 13, 2], [1, 5, 9, 13, 2])
+    names = ("fixture", "second", None, "second", "fixture")
+    server = Server.from_task(served, slots=4, capacity=64, admission=2, kv_cache=cache,
+                              prefix_cache=cache is not None)
 
     def draw(seed):
         return (np.arange(len(prompts)) + len(prompts) * seed,)
@@ -1077,6 +1080,61 @@ def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(t
                       dew_fn=through_the_server)
     assert_as_exact(through_the_server, by_itself("float32"), draw, label, seeds=count,
                     truth_fn=by_itself("float64"))
+
+
+def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own():
+    """An adapter set of two adapters over different layers of a decoder that scans its like layers, one
+    over layer 0's q and one over layer 1's: the two layers, which the set adapts alike in shape, scan
+    apart where the adapters' scales differ, and each row's logits are those of its adapter alone, on par
+    with that adapter against its float64 twin (check 1)."""
+    from pathlib import Path
+
+    from arm_arithmetic import widened
+    from reference_error import as_given, assert_as_exact, seeds_for
+
+    from dew.interop.pretrained import Pretrained
+    from dew.lora import AdapterSet, LoRA, selected
+
+    decoder = Pretrained.load(Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny",
+                              dtype="float32", attention_impl="reference", scan_layers=True)
+
+    def drawn(layer: int, key: int):
+        adapter = LoRA(rank=2, modules=(f"layers.{layer}.self_attn.q_proj",)).apply(
+            decoder.model, decoder.variables, key=key, layouts=decoder.layouts)
+        factors = jax.tree_util.tree_map_with_path(
+            lambda path, leaf: (jax.random.normal(jax.random.key(key), leaf.shape, leaf.dtype)
+                                if jax.tree_util.keystr(path).endswith("'lora_B']") else leaf),
+            adapter.variables["params"])
+        return dataclasses.replace(adapter, variables={**adapter.variables, "params": factors})
+
+    first, second = drawn(0, 1), drawn(1, 2)
+    adapters = AdapterSet.of({"first": first, "second": second})
+
+    def draw(seed):
+        return (jax.random.randint(jax.random.key(seed), (2, 5), 1, 30),)
+
+    @as_given
+    def served(tokens):
+        with selected(jnp.asarray([0, 1], jnp.int32)):
+            return np.asarray(adapters.model.apply(adapters.variables, jnp.asarray(tokens)))
+
+    def alone(dtype):
+        @as_given
+        def logits(tokens):
+            rows = []
+            for row, adapter in enumerate((first, second)):
+                model, variables = adapter.model, adapter.variables
+                if dtype == "float64":
+                    model, variables = model.clone(dtype=jnp.float64), widened(variables)
+                with jax.enable_x64(new_val=dtype == "float64"):
+                    rows.append(np.asarray(model.apply(variables, jnp.asarray(tokens)))[row])
+            return np.stack(rows)
+
+        return logits
+
+    label = "adapter set over different layers"
+    count = seeds_for(alone("float32"), draw, label, truth_fn=alone("float64"), dew_fn=served)
+    assert_as_exact(served, alone("float32"), draw, label, seeds=count, truth_fn=alone("float64"))
 
 
 def test_a_row_of_an_adapter_sets_base_computes_the_base_bit_for_bit():
