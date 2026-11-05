@@ -30,6 +30,32 @@ call. A result that is the program's own parameter is its operand's buffer, and 
 cheap value of another is recomputed where it is read, as it would be without the call."""
 
 
+ENTRYWISE = frozenset({
+    "abs", "acos", "acosh", "add", "add_any", "and", "asin", "asinh", "atan", "atan2", "atanh", "bessel_i0e",
+    "bessel_i1e", "cbrt", "ceil", "clamp", "clz", "complex", "conj", "convert_element_type", "copy", "copy_p",
+    "cos", "cosh", "digamma", "div", "eq", "erf", "erf_inv", "erfc", "exp", "exp2", "expm1", "floor", "ge",
+    "gt", "igamma", "igammac", "imag", "integer_pow", "is_finite", "le", "lgamma", "log", "log1p", "log2",
+    "logistic", "lt", "max", "min", "mul", "ne", "neg", "nextafter", "not", "or", "polygamma",
+    "population_count", "pow", "real", "reduce_precision", "rem", "round", "rsqrt", "select_n", "shift_left",
+    "shift_right_arithmetic", "shift_right_logical", "sign", "sin", "sinh", "sqrt", "square", "stop_gradient",
+    "sub", "tan", "tanh", "threefry2x32", "xor", "zeta",
+})
+"""The operations whose every output entry reads its operands' entries at its own index (each operand of
+the output's shape, or a scalar) and nothing else, by JAX's name (`jax_name`): the one vocabulary the
+analyses of a program's entries read (`templates.layout`, `dew.interop.sequence_causality`)."""
+
+KEYS = frozenset({"random_bits", "random_fold_in", "random_split", "random_unwrap", "random_wrap"})
+"""The operations on PRNG keys, each output entry its own key's: entrywise over a key array's positions,
+but not over a value's (a key's data extends its shape, and `random_bits` takes the shape it fills), so an
+analysis of positions takes them beside `ENTRYWISE` and one of values' entries does not."""
+
+REDUCTIONS = frozenset({"argmax", "argmin", "reduce_and", "reduce_max", "reduce_min", "reduce_or",
+                        "reduce_prod", "reduce_sum", "reduce_xor"})
+"""The operations that reduce the axes their `axes` parameter names."""
+
+CUMULATIVE = frozenset({"cumlogsumexp", "cummax", "cummin", "cumprod", "cumsum"})
+"""The operations that scan along the axis their `axis` parameter names."""
+
 def platform_branch(platforms: Sequence[Sequence[str] | None], lowering: str) -> int:
     """The index of the branch of a platform choice that a program lowered for `lowering` runs: of a
     `cond` whose `branches_platforms` name each branch's platforms (None for its default), the first

@@ -39,8 +39,7 @@ from dew.nn.dense import Dense
 from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
-from .kernels import generation
-from .kernels.templates.gemm import template
+from .kernels import gemm, generation
 from .precision import (
     at_least_fp32,
     capped_logits,
@@ -464,18 +463,6 @@ class Router(nn.Module):
         return flat.reshape(selection.shape)
 
 
-def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> jax.Array:
-    """Expert-major biases in compute dtype, with master-precision cotangent sums.
-
-    Out-of-range IDs are transport padding, contributing neither a value
-    nor a gradient. Promotion before gathering prevents a bf16 scatter-add
-    or scan carry from rounding partial bias gradients.
-    """
-    work = jnp.result_type(bias.dtype, dtype, jnp.float32)
-    values = jnp.asarray(rounded_operand(bias, dtype)).astype(work)
-    return values.at[expert_ids].get(mode='fill', fill_value=0).astype(dtype)
-
-
 BANKED_EXPERTS = 'banked_experts'
 """The collection a run over a bank in device memory hands its experts' kernels in: each `ExpertLinear`'s
 kernel the bank's whole `[layers, experts, in, out]` and the layer read (`experts_apart`, `at_iteration`),
@@ -484,7 +471,7 @@ read where it lies (`Layered`)."""
 
 class Layered(struct.PyTreeNode):
     """An expert kernel read in place from a bank: the run's stack `[layers, experts, in, out]` and the
-    layer read, which the GEMM template reads where it lies (`template.gemm`'s `layer`) rather than as a
+    layer read, which the GEMM template reads where it lies (`gemm.gemm`'s `layer`) rather than as a
     slice copied out a layer at a time (1.2 GB a layer at Qwen3-30B-A3B's experts, half a decode step on
     an H100)."""
 
@@ -537,7 +524,7 @@ def at_iteration(variables: Mapping[str, Mapping], layer: jax.Array) -> dict:
 
 def expert_projection(x: jax.Array, kernel: jax.Array | Layered, group_sizes: jax.Array,
                       dtype: Dtype | None, implementation: str,
-                      precision: PrecisionLike) -> jax.Array:
+                      precision: PrecisionLike, bias: jax.Array | None = None) -> jax.Array:
     """The grouped matmul of `x`'s expert-sorted rows, `[rows, in]`, through
     each expert's matrix in `kernel`, `[experts, in, out]`, `group_sizes`
     counting each expert's leading rows, under one precision contract for both
@@ -548,16 +535,21 @@ def expert_projection(x: jax.Array, kernel: jax.Array | Layered, group_sizes: ja
     split width rounds no partial sum. The tangent is `dx @ Q(kernel) + Q(x) @
     dkernel` with `Q` the rounded operands: a kernel gradient keeps the master
     dtype, an input gradient its input's, both accumulating over the widest of
-    the compute, input and kernel dtypes, whatever the placement.
+    the compute, input and kernel dtypes, whatever the placement. `bias`, each
+    expert's `[experts, out]` where given, is added to its rows' fp32 sums
+    before their one rounding (the template's epilogue, which reads it at each
+    row's expert: row 3963), rounded to the compute dtype as an operand is, its
+    gradient summed over each expert's rows in at least fp32 before it meets
+    the bias's own dtype.
 
     Every implementation runs the GEMM template
-    (`dew.nn.kernels.templates.gemm.template.gemm`), which selects each of its
+    (`dew.nn.kernels.gemm.gemm`), which selects each of its
     launches where it runs (`grouped_matmul.GROUPED`: the template's kernels on
     a GPU, an old route on a declared cell, XLA's program off a GPU and on a
     call no launch takes, each route reported with its reason) and holds the
     law in every differentiation mode; 'xla' names XLA's ragged dot for every
     launch (`generation.chosen`), and 'auto' and 'pallas' alike leave the
-    choice to the template. `generation.chosen(grouped_matmul=...)` names a
+    choice to the gemm. `generation.chosen(grouped_matmul=...)` names a
     kernel, a launch's name raising where it cannot run the call
     (`selection.KernelRefused`). A CPU process runs XLA's program: a test
     interprets the kernels by calling the template's interpreter itself. XLA's
@@ -570,17 +562,33 @@ def expert_projection(x: jax.Array, kernel: jax.Array | Layered, group_sizes: ja
     if implementation not in GROUPED_MATMULS:
         raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     stack, layer = (kernel.stack, kernel.layer) if isinstance(kernel, Layered) else (kernel, None)
-    compute = canonicalize_dtype(x, stack, dtype=dtype)
+    compute = canonicalize_dtype(x, stack, *(() if bias is None else (bias,)), dtype=dtype)
     with _named(implementation):
-        return template.gemm(x, stack, group_sizes, compute=compute, out_dtype=compute, precision=precision,
-                             layer=layer)
+        return gemm.gemm(x, stack, group_sizes, compute=compute, out_dtype=compute, precision=precision,
+                         layer=layer, **_biased(bias, compute))
+
+
+def _biased(bias: jax.Array | None, compute) -> dict:
+    """The template's epilogue adding each expert's bias to its rows' sums (`expert_projection`): the bias
+    rounded to `compute` as an operand is, held in at least fp32, so its gradient sums each expert's rows so
+    before it meets the bias's dtype (`rounded_operand`)."""
+    if bias is None:
+        return {}
+    work = jnp.result_type(bias.dtype, compute, jnp.float32)
+    held = jnp.asarray(rounded_operand(bias, compute)).astype(work)
+    return {'epilogue': _plus_bias, 'epilogue_operands': ((held, ('groups', 'columns')),)}
+
+
+def _plus_bias(acc: jax.Array, bias: jax.Array) -> jax.Array:
+    """An expert's rows' sums plus its bias, before their one rounding (`_biased`)."""
+    return acc + bias
 
 
 def paired_projections(x: jax.Array, first: jax.Array | Layered, second: jax.Array | Layered,
                        group_sizes: jax.Array, dtype: Dtype | None, implementation: str,
                        precision: PrecisionLike) -> tuple[jax.Array, jax.Array]:
     """`expert_projection` of the same rows through two expert matrices of one shape (a gate's and an up
-    projection's), as one paired product (`template.gemm`'s `paired`): a launch that takes the pair reads
+    projection's), as one paired product (`gemm.gemm`'s `paired`): a launch that takes the pair reads
     the rows once for both, and the call hands the two products on apart where its launch takes none
     (`grouped_matmul._takes_pair`), each under `expert_projection`'s law. On an H100 the pair took 0.79
     to 1.0 of the two products' time at the routings of DeepSeek-V3, Qwen3-30B-A3B and GPT-OSS-20B, its
@@ -595,7 +603,7 @@ def paired_projections(x: jax.Array, first: jax.Array | Layered, second: jax.Arr
     if implementation not in GROUPED_MATMULS:
         raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     with _named(implementation):
-        return template.gemm(x, first, group_sizes, compute=compute, out_dtype=compute,
+        return gemm.gemm(x, first, group_sizes, compute=compute, out_dtype=compute,
                              out_dtypes=(compute, compute), precision=precision, paired=second)
 
 

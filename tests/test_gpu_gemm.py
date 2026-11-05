@@ -27,8 +27,7 @@ from gpu_flow import Cell, cells_of, run_cells, when
 from jax.experimental.pallas import fuser
 from reference_error import assert_as_exact
 
-from dew.nn.kernels import generation
-from dew.nn.kernels.templates.gemm import fused
+from dew.nn.kernels import fused_gemm, generation
 from dew.nn.norms import rms_normalized
 
 pytestmark = pytest.mark.gpu(reason="the GEMM template's and the Mosaic toolkit's kernels, compiled")
@@ -46,7 +45,7 @@ def _fused_projection_training():
     def native(x, params):
         normalized = rms_normalized(x, params["norm"], 1e-6, x.dtype, scale_offset=False,
                                     scale_after_cast=False, fp32_statistics=True, implementation="xla")
-        projected = fused.fusible_gemm(normalized, params["weight"].astype(x.dtype), groups)
+        projected = fused_gemm.fusible_gemm(normalized, params["weight"].astype(x.dtype), groups)
         return jax.nn.silu(projected + params["bias"]) + x[:, :width].astype(jnp.float32)
 
     def reference(x, params):

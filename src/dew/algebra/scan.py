@@ -30,6 +30,7 @@ Every other update or readout is refused, named.
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import functools
 import math
@@ -102,16 +103,19 @@ def _traced(declaration: Scan, function: Callable, names: tuple[str, ...], chunk
         return jax.make_jaxpr(named)(jax.ShapeDtypeStruct(shape, dtype), *tokens)
 
 
-def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived:
+def derive_scan(declaration: Scan, *, saturation: program.Saturation,
+                splits_held: int = derive.FORMS_HELD) -> Derived:
     """`declaration`'s chunk forms (the module's account), split into what every chunk computes at once and
-    what its carry computes in sequence (`carry.split`, under `saturation`'s limits): `init(shapes)` a zero
-    state and no decay, `prepare(chunk)` a chunk's values that read no state (`Prepared`), `step(state,
-    prepared)` the state after the chunk, `mapped(prepared, state)` the chunk's outputs from the state
-    entering it, `merge(a, b)` two consecutive walks' states joined (the later walk's from zero),
-    `finish(state, operands)` the final state; `backward` a chunk's adjoint, a cotangent for each operand
-    but the reset's. Refused (`Refused`) where the update or the readout is not of the module's form.
-    `init(shapes)` given a chunk's operands (or their shapes and dtypes) starts a walk that merges (`Walk`),
-    its transfer carried where its tokens correct the state; given none, one that steps alone."""
+    what its carry computes in sequence (`carry.split`, under `saturation`'s limits, the latest
+    `splits_held` contexts' and shapes' splits kept, as a declaration's forms are, `derive.FORMS_HELD`):
+    `init(shapes)` a zero state and no decay, `prepare(chunk)` a chunk's values that read no state
+    (`Prepared`), `step(state, prepared)` the state after the chunk, `mapped(prepared, state)` the chunk's
+    outputs from the state entering it, `merge(a, b)` two consecutive walks' states joined (the later walk's
+    from zero), `finish(state, operands)` the final state; `backward` a chunk's adjoint, a cotangent for
+    each operand but the reset's. Refused (`Refused`) where the update or the readout is not of the
+    module's form. `init(shapes)` given a chunk's operands (or their shapes and dtypes) starts a walk that
+    merges (`Walk`), its transfer carried where its tokens correct the state; given none, one that steps
+    alone."""
     names = tuple(name for name in declaration.operands if name != declaration.reset)
     shape, dtype = declaration.state
     if len(shape) != 2:
@@ -152,7 +156,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
         corrected = affine_of(shapes).correction is not None
         return Walk(*empty, jnp.eye(shape[0], dtype=carried) if corrected else None)
 
-    splits: dict = {}
+    splits: collections.OrderedDict = collections.OrderedDict()  # the least recently prepared first
 
     def prepare(chunk):
         affine, (exponent, *values) = parts(chunk)
@@ -170,17 +174,14 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
         # target, precision, numerics or mesh is none of this one's.
         key = (derive.context(), affine.base2, corrected,
                *((value.shape, str(value.dtype)) for value in given))
-        if key not in splits:
-            h = jax.ShapeDtypeStruct(shape, carried)
-            avals = [jax.ShapeDtypeStruct(value.shape, value.dtype) for value in given]
-            ranges = _ranges(declaration, names, chunk, affine, extents.tokens)
-            bound = ranges.pop("inverse", None)
-            ranges.update({DECAYS + len(TOKENS) + place: bound for place, node in enumerate(held)
-                           if bound is not None and linear_scan.inverse(node)})
-            splits[key] = carry.split(functools.partial(_chunk, form, tuple(held)), h, avals, (1,),
-                                      saturation=saturation, ranges=ranges,
-                                      state_range=_magnitude(declaration.ranges.get("state")))
-        return Prepared((natural, splits[key].prepare(*given)), splits[key], corrected)
+        split = splits.get(key)
+        if split is None:
+            split = splits[key] = _split(declaration, names, chunk, affine, form, tuple(held), given,
+                                         jax.ShapeDtypeStruct(shape, carried), extents.tokens, saturation)
+            if len(splits) > splits_held:
+                splits.popitem(last=False)
+        splits.move_to_end(key)
+        return Prepared((natural, split.prepare(*given)), split, corrected)
 
     def step(state, prepared):
         decay, h = state[:2]
@@ -302,6 +303,21 @@ def _derived_form(extents: linear_scan.Extents, corrected: bool, target, precisi
 def _magnitude(bound: float | tuple[float, float] | None) -> float | None:
     """A declared range's magnitude (`Scan.ranges`): a magnitude itself, an interval its endpoints' larger."""
     return None if bound is None else max(map(abs, bound)) if isinstance(bound, tuple) else bound
+
+
+def _split(declaration: Scan, names: Sequence[str], chunk: Mapping, affine, form: linear_scan.Form,
+           held: tuple, given: tuple, state: jax.ShapeDtypeStruct, chunk_size: int,
+           saturation: program.Saturation) -> carry.Split:
+    """The chunk function's split (`carry.split`) at the shapes of `given`, its decays, tokens and the form's
+    values that read no state (`held`, prepared), its operands bounded as the declaration ranges them
+    (`_ranges`), a solve's inverse by its bound."""
+    ranges = _ranges(declaration, names, chunk, affine, chunk_size)
+    bound = ranges.pop("inverse", None)
+    ranges.update({DECAYS + len(TOKENS) + place: bound for place, node in enumerate(held)
+                   if bound is not None and linear_scan.inverse(node)})
+    avals = [jax.ShapeDtypeStruct(value.shape, value.dtype) for value in given]
+    return carry.split(functools.partial(_chunk, form, held), state, avals, (1,), saturation=saturation,
+                       ranges=ranges, state_range=_magnitude(declaration.ranges.get("state")))
 
 
 def _ranges(declaration: Scan, names: Sequence[str], chunk: Mapping, affine,

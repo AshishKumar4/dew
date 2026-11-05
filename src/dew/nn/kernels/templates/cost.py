@@ -14,7 +14,18 @@ import dataclasses
 import functools
 import math
 
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+
 from dew.nn.kernels import generation
+
+
+def estimate(flops: float, *arrays, transcendentals: float = 0) -> pl.CostEstimate:
+    """A launch's cost as it states it to XLA and to Dew's FLOP count (the custom call's cost estimate,
+    `dew.telemetry.instrumentation.sizes`): its `flops`, its `transcendentals`, and the bytes of each of
+    `arrays`, its operands and outputs, once."""
+    return pl.CostEstimate(flops=int(flops), transcendentals=int(transcendentals), bytes_accessed=int(sum(
+        math.prod(array.shape) * jnp.dtype(array.dtype).itemsize for array in arrays)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -108,9 +119,9 @@ def spanned(work: Work, latency: float | None) -> tuple[float, float]:
 
 def step_latency(target: generation.GpuTarget, *, device: bool) -> float | None:
     """A dependent step's latency on a schedule's path: XLA's loop iteration (`GpuTarget.step_seconds`) for
-    the whole device's; a template's in-kernel step from its instructions' latencies, which no fact states
-    yet, so none."""
-    return target.step_seconds if device else None
+    the whole device's; a template's in-kernel step, a tile's dependent reduction within a program
+    (`GpuTarget.kernel_step_seconds`), for a tile walk's. None where the GPU's was not measured."""
+    return target.step_seconds if device else target.kernel_step_seconds
 
 
 def walked(work: Work, target: generation.GpuTarget) -> float:

@@ -92,18 +92,22 @@ def test_biased_exchange_preserves_all_gradients_and_idle_experts(dtype, expert,
     (jnp.bfloat16, [1., 2**-8, 2**-8, -1., 8.], 2**-7),
     (jnp.float64, [1. + 2**-30, -1., 0., 0., 8.], 2**-30)])
 def test_expert_bias_gradients_sum_before_returning_to_master_dtype(compute, cotangents, residue):
-    from dew.nn.moe import gather_expert_bias
+    from dew.nn.moe import expert_projection
 
     with jax.enable_x64():
         bias = jnp.asarray([[.2], [.4]], jnp.float32)
-        ids = jnp.asarray([0, 0, 0, 0, 2], jnp.int32)
+        rows, kernel = jnp.zeros((5, 1), compute), jnp.zeros((2, 1, 1), jnp.float32)
+        sizes = jnp.asarray([4, 0], jnp.int32)
         cotangent = jnp.asarray(cotangents, compute)[:, None]
 
         def loss(bias):
-            return jnp.sum(gather_expert_bias(bias, ids, compute).astype(jnp.float64) * cotangent)
+            out = expert_projection(rows, kernel, sizes, compute, "xla", None, bias=bias)
+            # The dispatch zeroes a slot of no expert, past the routed rows.
+            out = jnp.where(jnp.arange(5)[:, None] < jnp.sum(sizes), out, 0)
+            return jnp.sum(out.astype(jnp.float64) * cotangent)
 
         gradient = jax.jit(jax.grad(loss))(bias)
-        # The final ID is padding, and expert 1 is idle. Neither takes any
+        # The final row is padding, and expert 1 is idle. Neither takes any
         # cotangent. The exact residue rules out per-shard/per-round rounding.
         np.testing.assert_array_equal(gradient, np.asarray([[residue], [0]], np.float32))
         assert gradient.dtype == jnp.float32
