@@ -586,7 +586,8 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                 if active:
                     family.loaded([(prologue_gmems[i].at[pl.ds(row_start, block_m)], ref, barrier.at[wg])
                                    for i, ref, barrier in zip(fixed, fixed_refs, fixed_barriers,
-                                                              strict=True)])
+                                                              strict=True)],
+                                  axes=tuple(axes.held(prologue_axes[i]) for i in fixed))
                 step = functools.partial(_gmm_step, family=family, prologue=prologue,
                                          prologue_axes=prologue_axes,
                                          fixed_tiles=dict(zip(fixed, fixed_refs, strict=True)),
@@ -660,7 +661,8 @@ def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store,
     `store`)."""
     family.loaded([(gmem.at[axes.named(side_axes, origins | axes.at_group(side_axes, gmem.shape, group))],
                     smem.at[wg], barrier.at[wg])
-                   for gmem, side_axes, smem, barrier in sides])
+                   for gmem, side_axes, smem, barrier in sides],
+                  axes=tuple(axes.held(side_axes) for _, side_axes, _, _ in sides))
     rows = origins['rows'].size
     values = accs if epilogue is None else epilogue(*accs, *(axes.by_rows(smem[wg], side_axes, rows)
                                                            for _, side_axes, smem, _ in sides))

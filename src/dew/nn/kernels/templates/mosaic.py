@@ -1530,10 +1530,13 @@ class Transport[Allocated, Opened](abc.ABC):
         consumer's (counted from `first`); `between()` after each step."""
 
     @abc.abstractmethod
-    def loaded(self, copies, *, issued: jax.Array | bool = True) -> None:
+    def loaded(self, copies, *, issued: jax.Array | bool = True, axes: tuple | None = None) -> None:
         """Each `(view, ref, barrier)` copied whole into its shared-memory `ref` (its barrier one of
         `load_barriers`'): where `issued` is a role's own (a traced predicate), that role loads `ref` for
-        every role that shares it and each caller awaits it; by default each caller loads its own."""
+        every role that shares it and each caller awaits it; by default each caller loads its own. `axes`,
+        each copy's launch axes as its tile holds them (`templates.axes.held`), say which of the
+        accumulator's axes a vector follows, where a family stages its loads through registers in the
+        accumulator's layouts (`mosaic_sm80.Mma`); a vector whose axes go unstated follows its columns."""
 
     def load_barriers(self, count: int):
         """The scoped allocation of `count` whole loads' completions (`loaded`'s barriers), which a program's
@@ -1899,7 +1902,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         passed(tuple(streams.values()), lo, hi, first=first, between=between)
 
-    def loaded(self, copies, *, issued: jax.Array | bool = True) -> None:
+    def loaded(self, copies, *, issued: jax.Array | bool = True, axes: tuple | None = None) -> None:
+        del axes  # copied by TMA, bytes whatever their layout
         loaded(copies, issued)
 
     def stored(self, parts, views, *, smem, wait: bool = True) -> None:
