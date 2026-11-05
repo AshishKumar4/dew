@@ -78,14 +78,15 @@ def _facts(value: Hashable | Mapping | list) -> Hashable:
     return value
 
 
-CHOICES = frozenset({'attention', 'attention_mainloop', 'decode', 'delta_decode',
-                      'delta_gates', 'gate_up', 'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue',
-                      'grouped_matmul', 'local_attention', 'mla', 'narrow_copies', 'paged_decode', 'rms_norm',
-                      'selective_scan', 'short_conv', 'ssd', 'ssd_decode', 'swiglu'})
-"""The choices a dispatch reports (`route`), and so the ones `chosen` may name (`chosen_kernel`)."""
+CHOICES = frozenset({'attention', 'attention_mainloop', 'decode', 'delta_decode', 'delta_gates', 'gate_up',
+                     'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue', 'grouped_matmul', 'narrow_copies',
+                     'paged_decode', 'rms_norm', 'selective_scan', 'short_conv', 'ssd', 'swiglu'})
+"""The choices a dispatch reports (`route`), and so the ones `chosen` may name (`chosen_kernel`): every one a
+selector serves (`selection.Op`, which refuses a choice this does not hold as it is built) or a site reads
+(`chosen_kernel`, likewise)."""
 
 
-def _named(choices: Iterable[str]) -> None:
+def known_choices(choices: Iterable[str]) -> None:
     """Refuse any of `choices` that `CHOICES` does not hold, naming every one it holds."""
     if unknown := set(choices) - CHOICES:
         raise ValueError(f"no kernel choice is named {', '.join(sorted(unknown))}; "
@@ -101,7 +102,7 @@ def chosen(**kernels: str) -> Iterator[None]:
     outside the block traces again within it."""
     from dew import cache
 
-    _named(kernels)
+    known_choices(kernels)
     with cache.KERNEL_CHOICES(tuple(sorted({**dict(cache.KERNEL_CHOICES.value), **kernels}.items()))):
         yield
 
@@ -834,7 +835,7 @@ def chosen_kernel(choice: str, default: str) -> str:
     without a selector (the attention template's form, a step's narrow copies)."""
     from dew import cache
 
-    _named((choice,))
+    known_choices((choice,))
     return dict(cache.KERNEL_CHOICES.value).get(choice, default)
 
 
@@ -905,7 +906,7 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
     both and the refusal's reason; one that runs the preferred kernel logs nothing."""
     from dew import cache
 
-    _named((choice,))
+    known_choices((choice,))
     generation = device_generation()
     preferred = preferred or dict(cache.KERNEL_CHOICES.value).get(choice) or kernel
     found = Route(choice, kernel, preferred, refusal, ran or kernel, generation, _site(), forced)
