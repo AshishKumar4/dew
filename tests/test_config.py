@@ -122,6 +122,24 @@ def test_a_run_trained_on_a_compiled_loader_records_the_version_the_loader_reads
     assert RunConfig.load(str(tmp_path / "runs" / "loaded")).data_plan_version == 8
 
 
+def test_a_run_naming_another_version_than_its_compiled_loader_is_refused(tmp_path):
+    """A run that names its data plan version and is handed a loader compiled at another would train the
+    loader's order under a record naming its own, so it is refused, naming both, before it trains (train
+    593's review)."""
+    import numpy as np
+    from affine_run import FEATURES
+
+    from dew.data import Memory
+    from dew.data.compile import compile
+
+    rows = np.random.default_rng(0).normal(size=(16, FEATURES)).astype(np.float32)
+    loader = compile(Memory([{"x": row, "y": 2 * row[:2]} for row in rows]).batch(8).repeat(), plan_version=9)
+    config = TrainerConfig(name="named", checkpoint_dir=str(tmp_path / "runs"), steps=1, eval_every=None,
+                           checkpoint_every=None)
+    with pytest.raises(ValueError):
+        RunConfig(trainer=config, data_plan_version=8).train(Regression(), loader, name="named")
+
+
 def test_a_record_with_an_unknown_field_or_without_a_required_one_is_refused():
     record = RunConfig().to_dict()
     with pytest.raises(ValueError):
