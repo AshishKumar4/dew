@@ -74,7 +74,7 @@ class MoonViT(TowerBase):
             mlp_bias=self.linear_bias, packed=True, patch_bias=self.patch_embed_proj_bias,
             attention=("item",) * depth, order=("patches",) * depth, sinks=(False,) * depth,
             positions=LearnedPositions(self.init_pos_emb_height, mode=self.pos_emb_interpolation_mode,
-                                       align_corners=False, clamped=True,
+                                       align_corners=False, border=True,
                                        initializer=nn.initializers.normal(1.0)),
             rotary="adjacent", rotary_interleaved=True, rotary_columns_first=True, post_norm="layer",
             outer_norm_eps=1e-5, attention_bias=self.attn_bias, merge_blocks=False,
@@ -144,36 +144,54 @@ def _read_moonvit(tensors: Mapping[str, Stored], path_of: Callable[[str], tuple[
     return variables, layouts
 
 
+_SPELLINGS = {"vt_hidden_size": "hidden_size", "vt_intermediate_size": "intermediate_size",
+              "vt_num_attention_heads": "num_attention_heads", "vt_num_hidden_layers": "num_hidden_layers",
+              "init_pos_emb_height": "pos_emb_height", "init_pos_emb_width": "pos_emb_width",
+              "init_pos_emb_time": "pos_emb_time", "activation_func": "hidden_act"}
+"""MoonViT's vision_config fields under the release's names and, where transformers' port
+(`Kimi_K25VisionConfig`) spells one otherwise, under its; either reads the same checkpoint."""
+
+
+def _spelled(vision: Mapping[str, object], name: str, default: object = None) -> object:
+    """A vision_config field under the release's name, else transformers' (`_SPELLINGS`), else
+    `default`."""
+    return vision.get(name, vision.get(_SPELLINGS.get(name, name), default))
+
+
 def translate_moonvit_config(hf_config: Mapping[str, object]) -> Record:
-    """A Kimi K2.5 or K3 vision_config into a MoonViT value's fields: a square position table, the 2x2
-    temporally pooled merge (`sd2_tpool`), divided fixed positions and spatio-temporal attention, the
-    tanh-GELU feed-forward (`mlp2`) and layer norms, as the releases state them; any other is refused."""
+    """A Kimi K2.5 or K3 vision_config, the release's or transformers' (`_SPELLINGS`), into a MoonViT
+    value's fields: a square position table, the 2x2 temporally pooled merge (`sd2_tpool`), divided
+    fixed positions and spatio-temporal attention, the tanh-GELU feed-forward (`mlp2`), layer norms and
+    the rotary's base of 10000, as the releases state them; any other is refused."""
     vision = _vision_section(hf_config)
     stated = {"merge_type": "sd2_tpool", "pos_emb_type": "divided_fixed",
               "video_attn_type": "spatial_temporal", "mlp_type": "mlp2", "norm_type": "layernorm"}
     for field, value in stated.items():
         if vision.get(field, value) != value:
             raise ValueError(f"vision_config {field} {vision[field]!r} is not MoonViT's {value!r} here")
-    activation = vision.get("activation_func", "gelu_pytorch_tanh")
+    activation = _spelled(vision, "activation_func", "gelu_pytorch_tanh")
     if activation != "gelu_pytorch_tanh":
         raise ValueError(f"vision_config activation_func {activation!r} is not MoonViT's tanh GELU")
-    height = _records.integer(vision.get("init_pos_emb_height", 64), "init_pos_emb_height")
-    if _records.integer(vision.get("init_pos_emb_width", height), "init_pos_emb_width") != height:
+    rope = vision.get("rope_parameters")
+    theta = 10000.0 if rope is None else _records.number(_records.record(rope, "rope_parameters").get(
+        "rope_theta", 10000.0), "rope_theta")
+    if theta != 10000.0:
+        raise ValueError(f"vision_config rope_theta {theta} is not MoonViT's 10000")
+    height = _records.integer(_spelled(vision, "init_pos_emb_height", 64), "init_pos_emb_height")
+    if _records.integer(_spelled(vision, "init_pos_emb_width", height), "init_pos_emb_width") != height:
         raise ValueError("MoonViT's position table resamples here as a square only")
     merge = _records.integers(vision.get("merge_kernel_size", [2, 2]), "merge_kernel_size")
     if len(merge) != 2 or merge[0] != merge[1]:
         raise ValueError(f"merge_kernel_size {merge} is no square merge block")
     qkv = vision.get("qkv_hidden_size")
     return {"class": "moonvit", "fields": {
-        "vt_hidden_size": _records.integer(vision["vt_hidden_size"], "vt_hidden_size"),
-        "vt_intermediate_size": _records.integer(vision["vt_intermediate_size"], "vt_intermediate_size"),
-        "vt_num_attention_heads": _records.integer(vision["vt_num_attention_heads"],
-                                                   "vt_num_attention_heads"),
-        "vt_num_hidden_layers": _records.integer(vision["vt_num_hidden_layers"], "vt_num_hidden_layers"),
+        **{name: _records.integer(_spelled(vision, name), name)
+           for name in ("vt_hidden_size", "vt_intermediate_size", "vt_num_attention_heads",
+                        "vt_num_hidden_layers")},
         "patch_size": _records.integer(vision.get("patch_size", 14), "patch_size"),
         "merge_kernel_size": merge[0],
         "init_pos_emb_height": height,
-        "init_pos_emb_time": _records.integer(vision.get("init_pos_emb_time", 4), "init_pos_emb_time"),
+        "init_pos_emb_time": _records.integer(_spelled(vision, "init_pos_emb_time", 4), "init_pos_emb_time"),
         "pos_emb_interpolation_mode": _records.text(vision.get("pos_emb_interpolation_mode", "bicubic"),
                                                     "pos_emb_interpolation_mode"),
         "qkv_hidden_size": None if qkv is None else _records.integer(qkv, "qkv_hidden_size"),
@@ -186,20 +204,22 @@ def translate_moonvit_config(hf_config: Mapping[str, object]) -> Record:
 
 def translate_moonvit_projector_config(hf_config: Mapping[str, object], text_width: int) -> Record:
     """A Kimi K2.5 wrapper's projector fields (`PatchMergerMLP`, `mm_projector_type` 'patchmerger'): the
-    merge block's width in and out of its first map, the decoder's out of its second."""
+    merge block's width in and out of its first map, the decoder's out of its second, as the release's
+    vision_config states them (`mm_hidden_size`, `projector_ln_eps`) or transformers' wrapper config
+    (`projection_hidden_size`, `projection_layer_norm_eps`)."""
     vision = _vision_section(hf_config)
     kind = vision.get("mm_projector_type", "patchmerger")
     if kind != "patchmerger":
         raise ValueError(f"mm_projector_type {kind!r} is not the patch merger read here")
-    width = _records.integer(vision["mm_hidden_size"], "mm_hidden_size")
+    width = _records.integer(vision.get("mm_hidden_size", hf_config.get("projection_hidden_size")),
+                             "mm_hidden_size")
     merge = _records.integers(vision.get("merge_kernel_size", [2, 2]), "merge_kernel_size")[0]
     if _records.integer(vision.get("text_hidden_size", text_width), "text_hidden_size") != text_width:
         raise ValueError(f"vision_config text_hidden_size is not the decoder's width {text_width}")
+    eps = vision.get("projector_ln_eps", hf_config.get("projection_layer_norm_eps", 1e-5))
     return {"class": "moonvit", "fields": {
         "hidden_size": width, "spatial_merge_size": merge, "width": width * merge ** 2,
-        "out_width": text_width, "norm_eps": _records.number(vision.get("projector_ln_eps", 1e-5),
-                                                             "projector_ln_eps"),
-        "activation": "gelu"}}
+        "out_width": text_width, "norm_eps": _records.number(eps, "projector_ln_eps"), "activation": "gelu"}}
 
 
 MoonViT.checkpoint = TowerLayout("vision_tower.", moonvit_path, read=_read_moonvit)

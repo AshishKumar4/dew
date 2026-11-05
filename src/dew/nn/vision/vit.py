@@ -79,9 +79,9 @@ class LearnedPositions:
     compute_dtype: bool = True
     align_corners: bool = True
     antialias: bool = False
-    clamped: bool = False
-    """Bilinear sampling as `F.interpolate` does it, the source coordinate held at 0 and the taps at the
-    table's edge (MoonViT's), where `F.grid_sample`'s zero padding weighs out-of-range taps zero."""
+    border: bool = False
+    """Out-of-range bilinear taps held at the table's edge, as `F.interpolate` holds them (MoonViT's),
+    where `F.grid_sample`'s zero padding weighs them zero; bicubic taps are held there always."""
     initializer: Initializer = nn.Embed.embedding_init
 
 
@@ -209,21 +209,16 @@ class ViTLayout:
                              "from another origin or holding special tokens does not state")
 
 
-def _interp_taps(index, size, side: int, align_corners: bool, dtype, *, clamped: bool = False,
+def _interp_taps(index, size, side: int, align_corners: bool, dtype, *, border: bool = False,
                  cubic: bool = False):
     """Bilinear taps into a `side`-long table for positions along one axis, and their weights in
     `at_least_fp32(dtype)`: transformers' `_interpolation_axis_taps_weights` (vision_utils.py) with
-    aligned corners, or with half-pixel centres and out-of-range taps weighing zero; or `F.interpolate`'s
-    at half-pixel centres, the taps held at the table's edge: bilinear from a coordinate held at 0
-    (`clamped`), or `cubic`'s four (`dew.nn.blocks.torch_cubic_weights`)."""
+    aligned corners, or with half-pixel centres and out-of-range taps weighing zero, or under `border`
+    held at the table's edge (`F.interpolate`'s); `cubic`'s four taps by the Keys kernel
+    (`dew.nn.blocks.torch_cubic_weights`), held at the edge."""
     index = index.astype(at_least_fp32(dtype))
     if align_corners:
         source = index * (side - 1) / jnp.maximum(size - 1, 1)
-    elif clamped or cubic:
-        # `F.interpolate`'s source coordinate: the scale first, then the half-pixel centre
-        # (`area_pixel_compute_source_index`), held at 0 for bilinear.
-        source = (side / size).astype(index.dtype) * (index + 0.5) - 0.5
-        source = source if cubic else jnp.maximum(source, 0)
     else:
         source = (index + 0.5) * side / size - 0.5
     floor = jnp.floor(source)
@@ -233,20 +228,19 @@ def _interp_taps(index, size, side: int, align_corners: bool, dtype, *, clamped:
         return jnp.clip(raw, 0, side - 1), torch_cubic_weights(distance)
     raw = floor.astype(jnp.int32)[..., None] + jnp.arange(2)
     weights = jnp.concatenate([1 - distance[..., None], distance[..., None]], axis=-1).clip(min=0)
-    if not (align_corners or clamped):
+    if not (align_corners or border):
         weights = weights * ((raw >= 0) & (raw <= side - 1))
     return jnp.clip(raw, 0, side - 1), weights
 
 
 def resampled_positions(table, rows, columns, heights, widths, *, align_corners: bool, dtype=None,
-                        clamped: bool = False, cubic: bool = False):
-    """The learned square table resampled to each patch's grid place: bilinear over its rows and
-    columns separately, the outer product of the taps (vision_utils.py,
-    get_vision_interpolation_indices_and_weights), or as `F.interpolate` resamples it, bilinear or
-    bicubic, at each place's taps (`_interp_taps`'s `clamped`, `cubic`)."""
+                        border: bool = False, cubic: bool = False):
+    """The learned square table resampled to each patch's grid place: bilinear or bicubic over its rows
+    and columns separately, the outer product of the taps (vision_utils.py,
+    get_vision_interpolation_indices_and_weights; `_interp_taps`)."""
     side, dtype = round(len(table) ** 0.5), table.dtype if dtype is None else dtype
     taps = functools.partial(_interp_taps, side=side, align_corners=align_corners, dtype=dtype,
-                             clamped=clamped, cubic=cubic)
+                             border=border, cubic=cubic)
     (row_taps, row_weights), (column_taps, column_weights) = taps(rows, heights), taps(columns, widths)
     taps = row_taps.shape[-1] * column_taps.shape[-1]
     indices = (row_taps[..., :, None] * side + column_taps[..., None, :]).reshape(*rows.shape, taps)
@@ -433,16 +427,17 @@ class VisionTransformer(nn.Module):
             hidden = _gather(hidden, jnp.argsort(leaving, axis=1))
         if lay.post_norm is not None and lay.post_norm_scope == "sequence":
             hidden = self.post_norm(hidden)
+        if lay.pool_frames:
+            # Each place's mean over the row's frames, at the place's own index in its first frame, which
+            # the merge blocks then gather as one frame's.
+            summed = jax.vmap(lambda row, at: jnp.zeros_like(row).at[at].add(row))(
+                jnp.where(valid[..., None], hidden, 0), jnp.where(valid, within, 0))
+            hidden = jnp.where((place < area)[..., None], summed / grid[:, 0:1, None].astype(summed.dtype), 0)
         if not lay.merge_blocks and merge > 1:
             # Raster patches into merge blocks, each block's patches consecutive (pixel_shuffle's gather).
             block = frame * area + (rows // merge) * merge * widths + (columns // merge) * merge * merge
             key = block + (rows % merge) * merge + columns % merge
             hidden = _gather(hidden, jnp.argsort(jnp.where(valid, key, last), axis=1, stable=True))
-        if lay.pool_frames:
-            # Each place's mean over the row's frames, at the place's own index in its first frame.
-            summed = jax.vmap(lambda row, at: jnp.zeros_like(row).at[at].add(row))(
-                jnp.where(valid[..., None], hidden, 0), jnp.where(valid, within, 0))
-            hidden = jnp.where((place < area)[..., None], summed / grid[:, 0:1, None].astype(summed.dtype), 0)
         return hidden
 
     def _embedded(self, pixel_values, pixels, rows, columns, heights, widths, images, *, frame, times):
@@ -476,7 +471,7 @@ class VisionTransformer(nn.Module):
                 # A packed row's grid is its own: bicubic positions resample per place (`F.interpolate`'s).
                 position = resampled_positions(table, rows, columns, heights, widths,
                                                 align_corners=spec.align_corners, dtype=compute,
-                                                clamped=spec.clamped, cubic=spec.mode == "bicubic")
+                                                border=spec.border, cubic=spec.mode == "bicubic")
             elif spec.mode == "bicubic":
                 if not images:
                     raise ValueError("bicubic positions take an image's rectangular patch grid")
