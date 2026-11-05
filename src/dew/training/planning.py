@@ -803,10 +803,12 @@ class FitSearch[LossT, EffectsT]:
 
     def likely(self, split: int) -> bool:
         """Whether the step at `split` at the objective's rung is likely to fit, which orders the compiles
-        past a miss (`planned`): as the derivation judged it, corrected by what the compiles measured,
-        where it judged it, else as the compiles' forecast guesses (`judged_likely`)."""
-        return judged_likely(self.judged_at.get(self.candidate_key(split, self.narrow)),
-                             self.under.get(self.remat_rung(), 0),
+        past a miss (`planned`): as the derivation judges it, traced where the search has not judged it
+        yet (a trace, where a compile it saves is a minute and more), corrected by what the compiles
+        measured; as the compiles' forecast guesses where the derivation cannot judge (`judged_likely`)."""
+        derived = (self.judged(split, self.narrow) if self.derive is not None and self.judging()
+                   else self.judged_at.get(self.candidate_key(split, self.narrow)))
+        return judged_likely(derived, self.under.get(self.remat_rung(), 0),
                              forecast=self.forecast.likely(self.rung(), split))
 
     def judging(self) -> bool:
