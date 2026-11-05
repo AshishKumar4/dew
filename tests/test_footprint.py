@@ -217,13 +217,21 @@ def test_a_zero_gradient_is_held_from_the_programs_start_where_its_gradients_are
     def loss(params, rows):
         return jnp.sum(jnp.tanh(jnp.tanh(rows @ params["used"]) @ params["used"])), ()
 
-    # However the weight gradients run, after the backward too (`sunk`, `late_weight_gradients`).
-    for deferred in (False, True):
-        held = gradient_peak(loss, params, (rows,), platform="gpu", workspace=Workspace(0, 0),
-                             deferred=deferred).bytes
-        read = gradient_peak(loss, {"used": params["used"]}, (rows,), platform="gpu",
-                             workspace=Workspace(0, 0), deferred=deferred).bytes
-        assert held == read + 128 * 128 * 4, (deferred, held, read)
+    held = gradient_peak(loss, params, (rows,), platform="gpu", workspace=Workspace(0, 0)).bytes
+    read = gradient_peak(loss, {"used": params["used"]}, (rows,), platform="gpu",
+                         workspace=Workspace(0, 0)).bytes
+    assert held == read + 128 * 128 * 4, (held, read)
+
+    # So where the weight gradients run after the backward (`sunk`, `late_weight_gradients`), its peak at a
+    # cotangent of 64 MiB no weight gradient reads, which the zero is held through as well.
+    def widened(params, rows):
+        return jnp.sum(jnp.tanh(jnp.tile(rows @ params["used"], (1, 8)))), ()
+
+    held = gradient_peak(widened, params, (rows,), platform="gpu", workspace=Workspace(0, 0),
+                         deferred=True).bytes
+    read = gradient_peak(widened, {"used": params["used"]}, (rows,), platform="gpu",
+                         workspace=Workspace(0, 0), deferred=True).bytes
+    assert held == read + 128 * 128 * 4, (held, read)
 
 
 def test_a_loops_zero_carry_is_made_where_the_loop_needs_it():
