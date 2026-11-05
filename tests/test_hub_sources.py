@@ -92,11 +92,13 @@ def moving_hub_conversion(monkeypatch, tmp_path, request):
     return converted
 
 
-def test_a_split_saved_as_arrow_streams_its_parquet_conversion(monkeypatch):
+@pytest.mark.parametrize("native", ["arrow", "zip"])
+def test_a_split_saved_as_arrow_streams_its_parquet_conversion(monkeypatch, native):
     """A dataset repo's `.arrow` files are what `save_to_disk` and `push_to_hub` write, Arrow's
-    stream format, which no file reader opens; a split that holds only those streams its Parquet
-    conversion, and a pinned revision without one is prepared rather than streamed. The read's
-    metrics go by the repository's name, not the conversion's files it reads."""
+    stream format, which no file reader opens, and a ZIP archive holds files only reading it names
+    (row 2402); a split that holds only those streams its Parquet conversion, and a pinned revision
+    without one is prepared rather than streamed. The read's metrics go by the repository's name, not
+    the conversion's files it reads."""
     from types import SimpleNamespace
 
     import pyarrow.parquet as pq
@@ -125,7 +127,8 @@ def test_a_split_saved_as_arrow_streams_its_parquet_conversion(monkeypatch):
 
     def listing(self, repo, *, repo_type, revision):
         return (["default/train/0000.parquet"] if revision == "converted"
-                else ["train/data-00000-of-00001.arrow", "train/state.json"])
+                else ["train/data-00000-of-00001.arrow", "train/state.json"] if native == "arrow"
+                else ["data/train.zip"])
 
     conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit="converted")
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, **kwargs: SimpleNamespace(sha="original"))
@@ -138,7 +141,9 @@ def test_a_split_saved_as_arrow_streams_its_parquet_conversion(monkeypatch):
     reader = data.train(DataPartition())
     try:
         assert [int(value) for _ in range(3) for value in next(reader)["id"]] == list(range(12))
-        assert {name.split("/")[2] for name in data.statistics()} == {"data"}
+        # Each corpus's metrics go by its repository's name, beside the run's mirrors' (`data/mirror/...`).
+        corpora = {name.split("/")[2] for name in data.statistics() if not name.startswith("data/mirror/")}
+        assert corpora == {"data"}
     finally:
         reader.close()
     assert Hub("owner/data", revision="original").streamed is None
@@ -443,13 +448,13 @@ def test_snapshot_reads_a_prepared_hub_without_physical_shards(tmp_path, monkeyp
 def test_a_hub_split_prepared_online_reads_its_own_commits_rows_with_the_hub_offline(tmp_path, monkeypatch):
     """A Hub split prepared online at two commits reads, with the Hub offline (HF_HUB_OFFLINE),
     the rows of the commit each source pins: the commit is the answer the Hub gave online
-    (`dew.cache.hub_answer`), the default branch's the last given, even where another tool has since
+    (`dew._cache.hub_answer`), the default branch's the last given, even where another tool has since
     moved the Hub cache's ref of the branch, and the Arrow is the cache `datasets` prepared at that
     commit, which `datasets` itself does not find offline."""
     import datasets
     from hub_support import native_hub, offline
 
-    from dew.cache import hub_ref
+    from dew._cache import hub_ref
     from dew.data import Hub
     from dew.data.compile import compile
     from dew.data.pipeline import Pipeline
@@ -560,6 +565,47 @@ def test_a_downloaded_hub_split_streams_offline_as_it_streamed_online(tmp_path, 
     shutil.copytree(repository.parent, cache / "datasets--owner--rows" / "snapshots" / commit)
     offline(monkeypatch)
     assert streamed(split()) == online
+
+
+@pytest.mark.parametrize("held", ["lines", "array"])
+def test_a_hub_split_of_compressed_json_files_streams_them_natively(tmp_path, monkeypatch, held):
+    """A repository of gzipped JSON files at its root, laid out as codeparrot-clean's (`file-*.json.gz`),
+    streams its own files, the records `datasets` reads of them, not its Parquet conversion (row 2402)."""
+    import gzip
+    from types import SimpleNamespace
+
+    from huggingface_hub import HfApi, HfFileSystem
+    from huggingface_hub.hf_api import GitRefInfo, GitRefs
+
+    from dew.data.compile import iterate
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources import Hub
+
+    commit = "0123456789abcdef0123456789abcdef01234567"
+    rows = [{"id": index, "content": f"def f{index}():\n    return {index}"} for index in range(9)]
+    names = ["README.md", *(f"file-00000000000{number}.json.gz" for number in (1, 2, 3))]
+    for number, name in enumerate(names[1:]):
+        part = rows[3 * number:3 * number + 3]
+        body = json.dumps(part) if held == "array" else "".join(json.dumps(row) + "\n" for row in part)
+        (tmp_path / name).write_bytes(gzip.compress(body.encode()))
+    (tmp_path / "README.md").write_text("# code\n")
+    conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit="converted")
+    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, revision=None, **options: SimpleNamespace(
+        sha=commit))
+    monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo, *, repo_type, revision: (
+        names if revision == commit else ["default/train/0000.parquet"]))
+    monkeypatch.setattr(HfApi, "list_repo_refs",
+                        lambda self, repo, **options: GitRefs(branches=[], converts=[conversion], tags=[]))
+    monkeypatch.setattr(HfFileSystem, "info", lambda self, path, **options: {
+        "name": path, "type": "file", "size": (tmp_path / Path(path).name).stat().st_size,
+        "blob_id": f"blob:{Path(path).name}"})
+    monkeypatch.setattr(HfFileSystem, "_open", lambda self, path, mode="rb", **options: io.BytesIO(
+        (tmp_path / Path(path).name).read_bytes()))
+    source = Hub("owner/code")
+    assert source.streamed == commit
+    assert source.files.url == tuple(f"hf://datasets/owner/code@{commit}/{name}" for name in names[1:])
+    read = sorted((int(row["id"]), row["content"]) for row in iterate(Pipeline(source), read="streamed"))
+    assert read == [(row["id"], row["content"]) for row in rows]
 
 
 def test_a_hub_jsonl_shard_keeps_its_offset_index_in_its_identity_with_the_hub_offline(monkeypatch):

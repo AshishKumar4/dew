@@ -66,10 +66,14 @@ class RecordSlice(View[Source]):
         return _selected(self.source, "slice", {"slice": [self.start, self.stop]})
 
     def records(self, read: Read):
-        from dew.data.dataset import SourceSlice
+        return self.part(self.source.records(read))
 
-        records = self.source.records(read)
-        return SourceSlice(records, *self.bounds(len(records)))
+    def part(self, records: Records) -> Records:
+        """Its part of `records`, its source's: a Grain slice of them (row 4145)."""
+        import grain.python as grain
+
+        start, stop = self.bounds(len(records))
+        return grain.MapDataset.source(records)[start:stop]
 
     def admits(self, position: int, row: Batch | bytes | None) -> bool:
         """Whether the record at `position` among its source's is in this slice."""
@@ -145,11 +149,14 @@ class HashPart(View[Source]):
         return _selected(self.source, "hash", part)
 
     def records(self, read: Read):
+        return self.part(self.source.records(read))
+
+    def part(self, records: Records) -> Records:
+        """Its part of `records`, its source's: those whose identity it holds."""
         import grain.python as grain
 
-        rows = self.source.records(read)
-        keys = tuple(index for index in range(len(rows)) if self.keeps(rows[index]))
-        return grain.MapDataset.source(keys).map(_SelectedRow(rows))
+        keys = tuple(index for index in range(len(records)) if self.keeps(records[index]))
+        return grain.MapDataset.source(keys).map(_SelectedRow(records))
 
     def keeps(self, row: Batch | bytes | None) -> bool:
         """Whether this part holds `row`: one that is there, its identity in the part."""
@@ -270,6 +277,12 @@ class SelectedGeneration(View[Source]):
         from dew.data.analysis import _provisioner
 
         return _provisioner(self.source, self.placing) is not None
+
+    def preparation_bytes(self) -> int | None:
+        from dew.data.analysis import _provisioner
+
+        preparer = _provisioner(self.source, self.placing)
+        return None if preparer is None else preparer.preparation_bytes()
 
     def provision(self) -> SelectedGeneration:
         from dew.data.analysis import _provisioner

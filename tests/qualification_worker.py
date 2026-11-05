@@ -26,12 +26,12 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
+from dew._files import write_atomically
 from dew.checkpoints import Checkpoints
 from dew.data import Loading, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, GlobalStream
 from dew.data.sources.tokens import TokenFiles
-from dew.files import write_atomically
 from dew.interop import Pretrained
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective

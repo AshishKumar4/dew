@@ -17,6 +17,7 @@ import pytest
 import tokamax
 from reference_error import assert_computes_the_oracle
 
+from dew import _cache
 from dew.nn.kernels import generation, norm_swiglu, tuning
 from dew.nn.kernels.templates import attention, report
 from dew.nn.precision import Numerics
@@ -73,17 +74,17 @@ def test_a_pick_measured_under_another_jax_is_not_read(tmp_path, monkeypatch):
     kept in its own jax's store for its own checkout, and measured anew here into this jax's, which holds
     no copy of the other's (row 3837: one store for every jax kept each fork's copy, parsed by every read)."""
     # The store's own path (its jax's file), moved under `tmp_path`, not the suite's cache.
-    cache, picks_path = tuning.cache, tuning.cache.kernel_picks_path
+    cache, picks_path = _cache, _cache.kernel_picks_path
     monkeypatch.setattr(cache, "kernel_picks_path", lambda kind: str(
         tmp_path / Path(picks_path(kind)).relative_to(cache.default_compilation_cache_dir())))
     ba, derived, other = _norm_launch_and_two_configs()
     with monkeypatch.context() as patched:
         patched.setattr(jax, "__version__", "0.0.0.other")
         tuning._store("gpu", [(ba, tuning.Timings({derived: _timed(2.0), other: _timed(1.0)}))])
-        theirs = tuning.cache.kernel_picks_path("gpu")
-    assert tuning._read(tuning.cache.kernel_picks_path("gpu")) == ({}, [])
+        theirs = _cache.kernel_picks_path("gpu")
+    assert tuning._read(_cache.kernel_picks_path("gpu")) == ({}, [])
     tuning._store("gpu", [(ba, tuning.Timings({derived: _timed(2.0), other: _timed(1.0)}))])
-    read, foreign = tuning._read(tuning.cache.kernel_picks_path("gpu"))
+    read, foreign = tuning._read(_cache.kernel_picks_path("gpu"))
     assert len(read) == 1 and foreign == []
     with monkeypatch.context() as patched:
         patched.setattr(jax, "__version__", "0.0.0.other")
@@ -94,7 +95,7 @@ def test_a_launch_whose_derived_config_lost_names_its_gap(tmp_path, monkeypatch)
     """The tuner's picks feed a maintainer report (bible §6): each stored launch whose fastest config is
     not its derived one names the launch, its derived config and the pick, and their times; a launch
     whose derived config won names none."""
-    monkeypatch.setattr(tuning.cache, "kernel_picks_path", lambda kind: str(tmp_path / f"{kind}.json"))
+    monkeypatch.setattr(_cache, "kernel_picks_path", lambda kind: str(tmp_path / f"{kind}.json"))
     ba, derived, other = _norm_launch_and_two_configs()
     tuning._store("gpu", [(ba, tuning.Timings({derived: _timed(3.0), other: _timed(2.0)}))])
     [gap] = tuning.gaps("gpu")

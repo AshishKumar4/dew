@@ -190,7 +190,7 @@ def main(argv: list[str] | None = None) -> None:
     run.add_argument("--state-dtype", choices=("float32", "bfloat16", "int8"), default="float32")
     run.add_argument("--steps", type=int, default=30)
     run.add_argument("--trace", default=None,
-                     help="a directory for a jax.profiler trace of three steady-state steps")
+                     help="a directory for a dew.Profiler trace of three steady-state steps")
     args = parser.parse_args(argv)
     result = {"projection": projection, "adam": adam, "step": step}[args.mode](args)
     result.update(device_kind=jax.devices()[0].device_kind, jax=jax.__version__,

@@ -6,7 +6,7 @@ state, the EMA, the key, the loss scaler and a partial accumulation window,
 and, when the data iterator can report one, `position`. The narrow compute
 copies derive from the variables and are rebuilt on resume. A position
 is either global, which any partition of the data can read, or one share's own
-offset, which only a reader of that same share can read; `dew.position` marks
+offset, which only a reader of that same share can read; `dew._position` marks
 the difference and `read_position` acts on it. A state that is not a training
 run's, such as a simulation's, is saved as a mapping of arrays and restored
 through a mapping template, with the same asynchronous writes, retention and
@@ -70,7 +70,7 @@ import math
 import os
 from collections.abc import Callable, Mapping, Sequence
 from types import TracebackType
-from typing import TYPE_CHECKING, Literal, Protocol, overload, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, overload, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -81,14 +81,14 @@ from orbax.checkpoint.checkpoint_manager import AsyncOptions, MultiprocessingOpt
 from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation
 
 from dew import _records
+from dew._cleanup import attempted
 from dew._coordination import broadcast_from_process_zero, from_every_process, seen_by_every_process
+from dew._files import write_atomically
 from dew._hashing import fmix32
 from dew._records import JSON, duration, json_value, record, share, text
 from dew.batch import PARAMETER_ROOTS, Variables
 from dew.checkpoints._step_records import counted_processes, gather_positions, read_position, step_record
 from dew.checkpoints.served import unpacked
-from dew.cleanup import attempted
-from dew.files import write_atomically
 from dew.mesh import LogicalAxes, mesh_axes
 from dew.nn import sharding
 from dew.nn.kernels.options import owned_program, program
@@ -221,6 +221,22 @@ def location(directory: str) -> epath.Path:
     """
     path = epath.Path(directory)
     return path if is_uri(directory) else path.resolve()
+
+
+class Envelope(TypedDict):
+    """What a checkpoint of a run's state holds on every tier, as `Checkpoints.save` and `save_local` each
+    take it, their own metadata beside it: the state as saved, its data position (`saved`), the partition
+    it was read by, the stop control, the rung, the artifact, the boxed axes and the rollout's tree
+    (`dew.training.Trainer`'s one envelope, row 4126)."""
+
+    state: TrainState
+    saved: bytes | None
+    share: DataPartition | None
+    control: dict | None
+    rung: JSON
+    artifact: JSON
+    boxed: Mapping[tuple[str, ...], LogicalAxes] | None
+    rollout: Mapping[str, object] | None
 
 
 @dataclasses.dataclass(frozen=True)

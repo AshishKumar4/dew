@@ -40,8 +40,8 @@ class Blocks(grain.MapTransform):
             raise ValueError(f"Blocks' prefix is a positive number of tokens, got {self.prefix!r}")
 
     def map(self, element: Batch) -> Batch:
+        from dew.batch import prefix_groups
         from dew.data.chat import Role
-        from dew.nn.visibility import prefix_groups
 
         if self.fills and f"{self.field}_block_groups" in element:
             return element

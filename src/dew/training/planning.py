@@ -11,13 +11,16 @@ many a step takes.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
+import gc
 import json
 import logging
 import tempfile
+import threading
 import time
-from collections.abc import Callable, Hashable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 import jax
@@ -53,6 +56,7 @@ from dew.training.memory import (
     judged,
     local_devices,
     offloads,
+    pooled_headroom,
     recompute_more,
     recompute_record,
     remat_half,
@@ -188,6 +192,43 @@ def whole_step(outputs):
               for name, value in metrics[-1].items()}
     return (losses[-1], report, jnp.all(jnp.stack(finite)), jnp.all(jnp.stack(accepted)),
             jax.tree.map(lambda *values: sum(values), *committed))
+
+
+TRACING_COLLECTIONS = 50_000
+"""The allocations between collections of Python's youngest generation while a plan search runs
+(`held_objects`), past CPython's 700: its traces allocate millions of short-lived objects."""
+
+_HELD = 0
+"""The blocks of `held_objects` open, across nesting and threads."""
+
+_HELD_GUARD = threading.Lock()
+
+_THRESHOLDS: list[int] = []
+"""Python's collection thresholds as the first open block of `held_objects` found them."""
+
+@contextlib.contextmanager
+def held_objects() -> Iterator[None]:
+    """Within the block, the youngest generation of Python's collector collects every
+    `TRACING_COLLECTIONS` allocations: a plan search's traces, compiles and bookkeeping make millions of
+    short-lived objects, and each full collection their collections led to walked the long-lived ones
+    beside them (row 2440: 59 full collections paused a Qwen3.5-4B step's compile_ahead 73 s of 342,
+    FS2440-GC-PLAIN). The process's permanent generation is no part of it: a freeze is the process's own
+    to make and undo (one made before Dew was imported reads as CPython 3.12's own immortal objects do, which
+    each collection returns to it), so the block never freezes nor unfreezes. Nested and concurrent blocks
+    share one threshold; the last to leave restores the process's."""
+    global _HELD
+    with _HELD_GUARD:
+        if not _HELD:
+            _THRESHOLDS[:] = gc.get_threshold()
+            gc.set_threshold(TRACING_COLLECTIONS, *_THRESHOLDS[1:])
+        _HELD += 1
+    try:
+        yield
+    finally:
+        with _HELD_GUARD:
+            _HELD -= 1
+            if not _HELD:
+                gc.set_threshold(*_THRESHOLDS)
 
 
 def judged_likely(headroom: int | None, under: int, *, forecast: bool) -> bool:
@@ -557,13 +598,6 @@ def spill_record(miss: report.Miss) -> dict[str, JSON]:
             "frame": miss.frame, "shared": miss.shared, "stepped": miss.stepped}
 
 
-def agreed(headroom: int | None) -> int | None:
-    """`headroom` as every process reads it: the tightest any process states, None where one states none
-    (it judges nothing), so each process takes the same decision on it (`from_every_process`)."""
-    stated = from_every_process(headroom)
-    return None if any(value is None for value in stated) else min(stated)
-
-
 @dataclasses.dataclass
 class FitSearch[LossT, EffectsT]:
     """A step's search over the fit ladder (`planned`): the first of the run's split candidates (`splits`)
@@ -762,13 +796,13 @@ class FitSearch[LossT, EffectsT]:
         """The derived headroom of the step at `split` and `narrow` at the objective's rung, traced once a
         candidate (`judged_at`), and recorded beside the rungs `walked` reads; None where the derivation
         cannot judge it or no device states memory to judge it against. Every process reads it alike
-        (`agreed`), so each compiles the plan the others do."""
+        (`memory.pooled_headroom`), so each compiles the plan the others do."""
         key = self.candidate_key(split, narrow)
         if key not in self.judged_at:
             assert self.derive is not None
             candidate = self.derive(split, narrow)
             footprint = candidate.footprint
-            headroom = agreed(None if footprint is None else derived_headroom(
+            headroom = pooled_headroom(None if footprint is None else derived_headroom(
                 footprint, local_devices(self.mesh), self.capacity, candidate.built))
             label = "unknown" if headroom is None else "fits" if headroom >= 0 else "refuses"
             self.derived.append({**self.current(), "narrow": narrow, "split": split, "headroom": headroom,
@@ -934,10 +968,10 @@ class FitSearch[LossT, EffectsT]:
             fit, headroom = step_fits(compiled, self.mesh, candidate.held, self.capacity, candidate.built)
         seconds = time.perf_counter() - began
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
-        foreseen = agreed(None if candidate.footprint is None else derived_headroom(
+        foreseen = pooled_headroom(None if candidate.footprint is None else derived_headroom(
             candidate.footprint, local_devices(self.mesh), self.capacity, candidate.built))
         probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, derived_headroom=foreseen)
-        self.learned(foreseen, agreed(headroom), fit)
+        self.learned(foreseen, pooled_headroom(headroom), fit)
         if foreseen is not None and (foreseen >= 0) != fit:
             # A derived peak bounded from below (`Footprint.exact`) admits provisionally: its miss names
             # the need the compile found, which a sourced rule is to reach.

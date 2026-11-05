@@ -31,7 +31,7 @@ from affine_run import FEATURES, Affine
 from recording import RecordingTracker
 from token_support import write_token_corpus
 
-from dew import position
+from dew import _position
 from dew.batch import VALID_ROWS, freeze, thaw
 from dew.data import Files, Loading, Memory, from_grain, phases, presets, schedule
 from dew.data.compile import compile, held, iterate, publish, validation
@@ -885,7 +885,7 @@ def test_a_schedule_reads_a_stage_until_the_run_ends_it_then_reads_as_its_phases
     assert all(corpus_of(row) == 0 for step in packed_rows(stream, 2) for row in step)
 
     ended = open_stream(DataPartition()).ending(state)
-    assert position.read(ended).completed[0][1] == 12
+    assert _position.read(ended).completed[0][1] == 12
     for processes in (1, 2):
         assert pooled(open_stream, processes, 4, ended, rows=windows_of) == whole[3:7]
     resumed = open_stream(DataPartition())
@@ -909,7 +909,7 @@ def test_a_schedules_position_holds_the_tokens_its_finished_stages_ended_at(tmp_
     opened = scheduled_packed((first, 1000), (both, None)).train(DataPartition())
     assert isinstance(opened, PhasedStream)
     ended = opened.ending(stream.get_state())
-    assert position.read(ended).tokens == (1000,)
+    assert _position.read(ended).tokens == (1000,)
     read = []
     for entries in (((first, 1000), (both, None)), ((first, 1000), (both, 500), (second, None))):
         resumed = scheduled_packed(*entries).train(DataPartition())
@@ -938,9 +938,9 @@ def test_a_schedules_position_saved_before_it_held_stage_tokens_resumes_only_in_
     opened = scheduled_packed((first, 1000), (both, None)).train(DataPartition())
     assert isinstance(opened, PhasedStream)
     past = unrecorded(opened.ending(stream.get_state()))
-    assert position.read(early).tokens is None and position.read(past).tokens is None
+    assert _position.read(early).tokens is None and _position.read(past).tokens is None
     # Saved again as it was read, it still records none.
-    assert position.read(position.encode(position.read(past))).tokens is None
+    assert _position.read(_position.encode(_position.read(past))).tokens is None
     scheduled_packed((first, 1000), (both, None)).train(DataPartition()).set_state(early)
     with pytest.raises(ValueError):
         scheduled_packed((first, 1000), (both, None)).train(DataPartition()).set_state(past)
@@ -1464,7 +1464,7 @@ def test_a_schedule_ends_its_stage_at_the_step_whose_commit_reaches_its_tokens(t
     assert_same(whole, parameters(switched), "the schedule against phases switching where its commits did")
     assert scheduled.checkpoints is not None
     _, saved = scheduled.checkpoints.restore(share=DataPartition())
-    assert saved is not None and position.read(saved).completed[0][1] == step * 8
+    assert saved is not None and _position.read(saved).completed[0][1] == step * 8
     for stopped in (2, step):
         token_trainer(tmp_path / f"stopped-{stopped}", accumulation=accumulation).fit(data, steps=stopped)
         resumed = token_trainer(tmp_path / f"stopped-{stopped}", accumulation=accumulation).fit(data, steps=8)
@@ -2134,3 +2134,37 @@ def test_a_mix_of_hundreds_of_corpora_reads_with_one_read_budget_and_only_the_co
         assert touched == {0, 1}
     finally:
         reader.close()
+
+
+def _unless_third(row) -> bool:
+    """Whether a row is not every third long one, which a step after a mixture refuses."""
+    return int(row["id"]) // 1000 != 2 or int(row["id"]) % 3 != 2
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_token_mixture_logs_the_tokens_it_drew_of_each_member_through_a_resume(read):
+    """A mixture measured in tokens logs the valid target tokens it drew of each member
+    (`data/weighed_tokens/<member>`), the shares it balances: one a short row and nine a long one, of
+    the rows the run read and of those a step after the mix refused, across a saved position and its
+    resume (row 4119)."""
+    chain = mix([_token_rows("short", 1, 2).repeat(), _token_rows("long", 2, 10).repeat()],
+                by="tokens").filter(_unless_third, reason="third").batch(1)
+    data = compile(chain, read=read, loading=READ)
+    stopped = data.train(DataPartition())
+    try:
+        read_ids = [int(identity) for batch in itertools.islice(stopped, 10) for identity in batch["id"]]
+        state = stopped.get_state()
+    finally:
+        stopped.close()
+    resumed = data.train(DataPartition())
+    try:
+        resumed.set_state(state)
+        read_ids += [int(identity) for batch in itertools.islice(resumed, 10) for identity in batch["id"]]
+        statistics = data.statistics()
+    finally:
+        resumed.close()
+    refused = sum(count for name, count in statistics.items() if name.endswith("/third"))
+    assert refused > 0
+    for name, tag, targets, after in (("short", 1, 1, 0), ("long", 2, 9, refused)):
+        drawn = sum(value // 1000 == tag for value in read_ids) + after
+        assert statistics[f"data/weighed_tokens/{name}"] == targets * drawn

@@ -31,10 +31,10 @@ from huggingface_hub.file_download import REGEX_COMMIT_HASH
 from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 from s3fs import S3FileSystem
 
+from dew._cache import dew_cache_dir
+from dew._files import write_atomically
 from dew._records import JSON, json_value, record, text
-from dew.cache import dew_cache_dir
 from dew.data.retention import LocalRetention, evictable, read_pin
-from dew.files import write_atomically
 
 
 class PreconditionFailed(FileExistsError):
@@ -343,6 +343,15 @@ class BoundedFileCache(WholeFileCacheFileSystem):
             "downloaded_bytes": self._dew_downloaded,
             "wait_seconds": self._dew_wait,
         }
+
+
+def mirror_metrics() -> dict[str, float]:
+    """What this process's mirrors (`dewcache::`) did, summed over every one it opened, as a run logs it
+    beside its data metrics (`data/mirror/...`, row 4299): none where it opened none."""
+    held = [mirror.metrics() for mirror in BoundedFileCache._cache.values()]
+    if not held:
+        return {}
+    return {f"data/mirror/{name}": float(sum(stats[name] for stats in held)) for name in held[0]}
 
 
 # Registered as this module loads, which reads no configuration, so `dewcache::` URLs open through
@@ -792,10 +801,10 @@ def _hub_commit(fs: HfFileSystem, path: str) -> tuple[str, str]:
 @functools.cache
 def _registered() -> None:
     """Register the profiles the storage config names (DEW_STORAGE_CONFIG, else storage.toml in Dew's
-    configuration directory, `dew.cache.dew_config_dir`) with fsspec, once, as the first store
+    configuration directory, `dew._cache.dew_config_dir`) with fsspec, once, as the first store
     resolves: the configuration is read where it is first used, so a broken one fails that store,
     not the import."""
-    from dew.cache import dew_config_dir
+    from dew._cache import dew_config_dir
 
     named = os.environ.get("DEW_STORAGE_CONFIG")
     config = Path(named).expanduser() if named else dew_config_dir() / "storage.toml"

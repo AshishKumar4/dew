@@ -17,7 +17,7 @@
 #   --pip           use pip instead of uv
 #
 # The CUDA build is the newest of cuda_builds below, each build:least driver:least SM, generated from
-# dew.builds.CUDA_BUILDS, that the driver and every GPU's SM run. Dew needs Python python_min or
+# dew._builds.CUDA_BUILDS, that the driver and every GPU's SM run. Dew needs Python python_min or
 # newer.
 set -eu
 

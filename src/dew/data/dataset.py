@@ -32,9 +32,10 @@ import jax
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from dew import position
+from dew import _position
 from dew._records import record
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS, Batch, padded_rows
+from dew.data import cgroups
 from dew.mesh import LayoutRefused, batch_axes
 
 _log = logging.getLogger(__name__)
@@ -330,7 +331,7 @@ class Host:
     memory: int
 
     @classmethod
-    def current(cls, cgroup: Path | None = None, root: Path = Path("/sys/fs/cgroup")) -> Host:
+    def current(cls, cgroup: Path | None = None, root: Path = cgroups.ROOT) -> Host:
         """This process's host, read through `cgroup`, its own cgroup (v2) directory, which
         /proc/self/cgroup names under `root` by default, and every ancestor of it up to `root`:
         a container's limit on a parent binds an unlimited child, so each level's CPU quota and
@@ -340,32 +341,15 @@ class Host:
         cgroup, and counting that as taken left room for no worker beside it."""
         import psutil
 
-        group = _own_cgroup() if cgroup is None else cgroup
+        group = cgroups.own(root) if cgroup is None else cgroup
         cpus, memory = len(os.sched_getaffinity(0)), psutil.virtual_memory().available
-        for level in (group, *group.parents):
-            quota = level / "cpu.max"
-            if quota.is_file():
-                limit, period = quota.read_text().split()
-                if limit != "max":
-                    cpus = min(cpus, math.ceil(int(limit) / int(period)))
-            maximum, current, stat = level / "memory.max", level / "memory.current", level / "memory.stat"
-            if maximum.is_file() and current.is_file() and (limit := maximum.read_text().strip()) != "max":
-                stated = [line.split() for line in stat.read_text().splitlines()] if stat.is_file() else []
-                reclaimed = next((int(value) for name, value in stated if name == "inactive_file"), 0)
-                memory = min(memory, max(0, int(limit) - (int(current.read_text()) - reclaimed)))
-            if level == root:
-                break
+        for level in cgroups.levels(group, root):
+            if (quota := cgroups.cpus(level)) is not None:
+                cpus = min(cpus, quota)
+            limit, held = cgroups.memory(level), cgroups.memory_held(level)
+            if limit is not None and held is not None:
+                memory = min(memory, max(0, limit - held))
         return cls(cpus, memory)
-
-
-def _own_cgroup() -> Path:
-    """This process's cgroup (v2) directory: the path /proc/self/cgroup names (`0::/path`) under
-    /sys/fs/cgroup, which is the root itself inside a container's own cgroup namespace."""
-    root, membership = Path("/sys/fs/cgroup"), Path("/proc/self/cgroup")
-    lines = membership.read_text().splitlines() if membership.is_file() else []
-    named = next((line[3:] for line in lines if line.startswith("0::")), None)
-    own = root / named.strip().lstrip("/") if named else root
-    return own if own.is_dir() else root
 
 
 def batch_bytes(batch: Batch) -> int:
@@ -825,7 +809,7 @@ type Position = bytes | Mapping[str, object]
 
 Dew's own envelope is bytes, and Grain reports a JSON object, which
 `dew.distributed.batches` encodes before a checkpoint stores it.
-`dew.position` tells which of the two kinds a saved position is."""
+`dew._position` tells which of the two kinds a saved position is."""
 
 
 @runtime_checkable
@@ -834,7 +818,7 @@ class Checkpointable(Protocol):
 
     Grain's iterators satisfy this, and so does `GlobalStream`, and so does
     a stream a reader declares to replay (`replayed`). The state itself is
-    opaque here; `dew.position` tells which of its two kinds a checkpoint
+    opaque here; `dew._position` tells which of its two kinds a checkpoint
     holds.
     """
 
@@ -1032,33 +1016,6 @@ class _CheckpointableMapping(_Mapping):
         source.set_state(state)
 
 
-class SourceSlice:
-    """Reads `source[start:stop]` by index.
-
-    It gives the train and validation loaders disjoint index ranges while
-    Grain still handles the shuffle, the epochs and the sharding. The
-    attributes stay plain because Grain pickles the source to its workers.
-    """
-
-    def __init__(self, source: Indexed, start: int, stop: int):
-        self.source = source
-        self.start = start
-        self.length = stop - start
-
-    def __repr__(self) -> str:
-        # The description a saved position compares against, so it carries
-        # the wrapped corpus's own (`describe`).
-        return f"SourceSlice({describe(self.source)}, start={self.start}, length={self.length})"
-
-    def __len__(self) -> int:
-        return self.length
-
-    def __getitem__(self, index: int):
-        if not 0 <= index < self.length:
-            raise IndexError(index)
-        return self.source[self.start + index]
-
-
 def describe(source: Indexed | pygrain.MapDataset[Batch]) -> str:
     """`source`'s own description, or its type when it has none.
 
@@ -1237,7 +1194,7 @@ class GlobalStream:
     The offset alone would resume that many records into whatever order the
     run now has, so the plan's order (`order`) and the plan are saved with
     it and a restore whose plan disagrees is refused (`Plan.check`).
-    `dew.position` defines the format that both this class and
+    `dew._position` defines the format that both this class and
     `dew.checkpoints` read.
 
     Every share steps as many batches of the order, its whole batches where
@@ -1281,8 +1238,8 @@ class GlobalStream:
         return batch
 
     def get_state(self) -> bytes:
-        return position.encode(
-            position.Global(
+        return _position.encode(
+            _position.Global(
                 records=self._records,
                 order=self._order,
                 plan=self._plan.record(),
@@ -1306,7 +1263,7 @@ class GlobalStream:
         return self._plan.identity()
 
     def set_state(self, state: bytes) -> None:
-        saved = position.read(state)
+        saved = _position.read(state)
         if saved.plan is not None:
             from dew.data.plan import earlier_plan
 
@@ -1499,8 +1456,8 @@ class PhasedStream:
                 self._streams[self._current].close()
             stream = self._stream(phase)
             stream.set_state(
-                position.encode(
-                    position.Global(records=self._records - self._start(phase), order=stream.order)
+                _position.encode(
+                    _position.Global(records=self._records - self._start(phase), order=stream.order)
                 )
             )
             self._current = phase
@@ -1530,12 +1487,12 @@ class PhasedStream:
         else:
             phase = self._phase(self._records - 1) if self._records else 0
         plans = [
-            position.read(_global_position(self._stream(index).get_state())).plan
+            _position.read(_global_position(self._stream(index).get_state())).plan
             for index in range(phase + 1)
         ]
         completed = tuple((self._stream(index).order, self._start(index + 1)) for index in range(phase))
-        return position.encode(
-            position.Global(
+        return _position.encode(
+            _position.Global(
                 records=self._records,
                 order=self._stream(phase).order,
                 completed=completed,
@@ -1546,7 +1503,7 @@ class PhasedStream:
         )
 
     def set_state(self, state: bytes) -> None:
-        saved = position.read(state)
+        saved = _position.read(state)
         from dew.data.plan import same_order
 
         if self._tokens is not None:
@@ -1578,8 +1535,8 @@ class PhasedStream:
                 end = saved.completed[index][1] if index < len(saved.completed) else saved.records
                 stream = self._stream(index)
                 stream.set_state(
-                    position.encode(
-                        position.Global(records=end - self._start(index), order=stream.order, plan=plan)
+                    _position.encode(
+                        _position.Global(records=end - self._start(index), order=stream.order, plan=plan)
                     )
                 )
 
@@ -1747,13 +1704,13 @@ class RampedStream(Forwarding):
         return step
 
     def get_state(self) -> bytes:
-        place = position.read(_global_position(self._source.get_state()))
-        return position.encode(dataclasses.replace(place, records=self._records))
+        place = _position.read(_global_position(self._source.get_state()))
+        return _position.encode(dataclasses.replace(place, records=self._records))
 
     def set_state(self, state: bytes) -> None:
         self._source.set_state(state)
         self._held = None
-        self._records = position.read(state).records
+        self._records = _position.read(state).records
         stage = self._stage()
         if (self._records - stage.records) % stage.batch:
             raise ValueError(
@@ -1796,7 +1753,7 @@ def ramped(dataset: Loader, ramp: Ramp) -> Loader:
             state = stream.get_state()
             # A global record count alone: an elastic read's position is the order's, which the
             # ramp's steps, cut from a global order, do not save or restore (`RampedStream`).
-            if isinstance(state, bytes) and position.decode(state) is not None:
+            if isinstance(state, bytes) and _position.decode(state) is not None:
                 return RampedStream(stream, ramp.stages(dataset.batch, partition.window), partition,
                                     tail=dataset.tail, order_records=dataset.order_records)
         if isinstance(stream, Closeable):
@@ -1826,7 +1783,6 @@ __all__ = [
     "Reader",
     "Records",
     "Resumable",
-    "SourceSlice",
     "Stage",
     "Stoppable",
     "mapped",

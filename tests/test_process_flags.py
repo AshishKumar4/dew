@@ -1,5 +1,5 @@
 """A run's XLA flags hold where XLA_FLAGS carried them before the process loaded jaxlib
-(`dew.devices.flags_hold`): one holds where XLA would read its value; a process prepared with flags after
+(`dew._devices.flags_hold`): one holds where XLA would read its value; a process prepared with flags after
 its backend opened is refused (`dew.training.prepare_process`), not appended to no effect, one prepared
 with them before is warned they are unproven where jaxlib had loaded, and one whose flags already hold is
 prepared again as often as its run asks (row 1901)."""
@@ -22,7 +22,7 @@ STATED = "--xla_dump_hlo_pass_re=fusion=all --xla_dump_hlo_as_text"
 
 HOLDS = """
 import json, sys
-from dew.devices import flags_hold
+from dew._devices import flags_hold
 
 print(json.dumps([flags_hold(flags) for flags in sys.argv[1:]]))
 """
@@ -58,7 +58,7 @@ def test_flags_that_do_not_hold_after_the_backend_opened_are_refused_where_the_p
 PREPARED = """
 import json, sys
 import jax
-from dew.devices import xla_flag
+from dew._devices import xla_flag
 from dew.training import prepare_process
 
 flags, cache = sys.argv[1], sys.argv[2]
@@ -151,7 +151,7 @@ OPENED_ON = """
 import json, os, sys
 import dew
 import jax
-from dew.devices import flags_hold
+from dew._devices import flags_hold
 from dew.training import prepare_process
 
 imported, opened = sys.argv[1], sys.argv[2]
@@ -189,7 +189,7 @@ import json, sys
 if sys.argv[1] == "jax first":
     import jax
 import dew
-from dew.devices import flags_hold
+from dew._devices import flags_hold
 
 print(json.dumps(flags_hold("--xla_allow_excess_precision=false")))
 """
@@ -211,7 +211,7 @@ def test_dews_own_flags_hold_where_dew_is_imported_before_jax(order, held):
 LATE = """
 import json, logging, sys
 import dew
-from dew.devices import flags_hold, xla_flag
+from dew._devices import flags_hold, xla_flag
 from dew.training import prepare_process
 
 logging.basicConfig(level=logging.WARNING)
@@ -239,7 +239,7 @@ def test_a_library_caller_preparing_with_flags_after_jaxlib_loaded_is_told_they_
 HELD = """
 import json, sys
 import dew
-from dew.devices import flags_hold, hold_xla_flags
+from dew._devices import flags_hold, hold_xla_flags
 
 hold_xla_flags(sys.argv[1])
 print(json.dumps(flags_hold(sys.argv[1])))

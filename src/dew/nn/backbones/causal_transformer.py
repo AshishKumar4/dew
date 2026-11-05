@@ -662,7 +662,10 @@ class CausalTransformer(LinearProducts):
             "qk_norm": kind.qk_norm, "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
             "precision": self.precision, "dex": dex, "dex_start": dex_start,
             "value_experts": self.value_experts if routed else None,
-            "mixture": self.mixture if routed else None}
+            "mixture": self.mixture if routed else None,
+            # A decoder forms its logits as its kernels do; a block needing them wide asks so itself
+            # (`MixerContext.wide_logits`, the world model's).
+            "wide_logits": False}
         return MixerContext(**resolved, **{field.name: getattr(self, field.name)
                                            for field in dataclasses.fields(MixerContext)
                                            if field.name not in resolved})

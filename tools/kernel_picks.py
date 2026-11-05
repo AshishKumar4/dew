@@ -4,7 +4,7 @@ model's training step at its real shapes.
 The step is lowered from abstract state (`Trainer(lower_for=...)` on this
 GPU's generation), so a model this GPU cannot hold still lowers, and each
 Pallas launch the step holds is measured here and stored beside the
-compilation cache (`dew.cache.kernel_picks_path`), where every later run on
+compilation cache (`dew._cache.kernel_picks_path`), where every later run on
 a GPU of this model and jax reads it. Each stored launch whose derived config
 lost is printed last as a gap in the derivation (`tuning.gaps`), a row for its
 family's maintainers. FSDP splits the parameters, not the rows a norm
@@ -30,7 +30,7 @@ import optax
 import tokamax
 from benchmark_cases import checkpoint_fields
 
-from dew import cache
+from dew import _cache
 from dew.interop import sources
 from dew.nn.backbones import CausalTransformer
 from dew.nn.kernels import generation, tuning
@@ -56,7 +56,7 @@ def main() -> None:
     parser.add_argument("--seq", type=int, required=True)
     parser.add_argument("--dtype", default="bfloat16")
     arguments = parser.parse_args()
-    if not cache.measures_picks():
+    if not _cache.measures_picks():
         raise SystemExit("this process shares its GPU, where no pick is measured: "
                          "run it under gpu-run without -n")
     model = model_of(arguments)
@@ -79,7 +79,7 @@ def main() -> None:
     _, launches = tuning.tune(step, measure=True)
     print(json.dumps({"kernels": reports[-1].record()}))
     launches = json.loads(launches)
-    path = Path(cache.kernel_picks_path(jax.devices()[0].device_kind))
+    path = Path(_cache.kernel_picks_path(jax.devices()[0].device_kind))
     # A store exists once a launch has been measured on this GPU model: a step with no Pallas launch
     # there (the dense 1.1B on an RTX PRO 6000 Blackwell) leaves none.
     stored = [] if not path.is_file() else list(tuning._read(str(path))[0].values())

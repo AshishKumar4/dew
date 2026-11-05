@@ -304,8 +304,8 @@ def test_a_pretrained_runs_record_trains_again(tmp_path, lora):
     through the command's `--set trainer.steps=2`. The restored parameters
     move again, so the replay reaches training rather than only parsing.
     """
+    from dew._cli.main import main
     from dew.checkpoints import Checkpoints
-    from dew.cli.main import main
 
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
@@ -377,7 +377,7 @@ def test_fresh_processes_train_a_runs_record_and_export_it(tmp_path):
     def dew(*arguments: str) -> None:
         """The command line on this checkout's source, as a fresh interpreter imports it."""
         environment = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")}
-        done = subprocess.run([sys.executable, "-m", "dew.cli.main", *arguments], capture_output=True,
+        done = subprocess.run([sys.executable, "-m", "dew._cli.main", *arguments], capture_output=True,
                               text=True, check=False, env=environment)
         assert done.returncode == 0, done.stdout + done.stderr
 

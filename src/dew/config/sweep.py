@@ -20,7 +20,7 @@ from typing import Protocol
 
 import numpy as np
 
-from dew.files import write_atomically
+from dew._files import write_atomically
 from dew.telemetry.records import TrialFinished, tracker_json
 
 type Choice = None | bool | int | float | str

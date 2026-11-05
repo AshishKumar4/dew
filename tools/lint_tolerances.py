@@ -37,7 +37,7 @@ TOLERANT: dict[str, dict[str, tuple[int | None, float]] | None] = {
     "pytest.approx": {"rel": (1, 1e-6), "abs": (2, 1e-12)},
     "numpy.testing.assert_almost_equal": None, "numpy.testing.assert_array_almost_equal": None,
     "numpy.testing.assert_approx_equal": None, "numpy.testing.assert_array_max_ulp": None,
-    "numpy.testing.assert_array_almost_equal_nulp": None, "dew.accuracy.within": None,
+    "numpy.testing.assert_array_almost_equal_nulp": None, "dew._accuracy.within": None,
     "chex.assert_trees_all_close": None, "chex.assert_trees_all_equal_comparator": None,
 }
 """The APIs that compare floats within a tolerance, as their imports resolve them (lint_scopes), however
@@ -50,13 +50,12 @@ BOUNDED = frozenset({"numpy.testing.assert_array_less"})
 """An ordering assertion, a tolerance when what it orders is an error (`_erring`)."""
 MAGNITUDES = frozenset({"abs", "numpy.abs", "numpy.absolute", "numpy.fabs", "jax.numpy.abs",
                         "jax.numpy.absolute", "torch.abs", "math.fabs", "numpy.linalg.norm",
-                        "jax.numpy.linalg.norm", "torch.linalg.norm", "dew.accuracy.distance",
+                        "jax.numpy.linalg.norm", "torch.linalg.norm", "dew._accuracy.distance",
                         "reference_error.distance", "numpy.square", "jax.numpy.square", "torch.square"})
 """What a hand-written tolerance takes of an error before comparing it with a bound."""
-DISTANCES = frozenset({"dew.accuracy.distance", "reference_error.distance"})
+DISTANCES = frozenset({"dew._accuracy.distance", "reference_error.distance"})
 """Distances between two values: an error, whatever the values are."""
-ONE_DRAW = frozenset({"one_draw.assert_as_exact_as_the_reference", "one_draw.assert_leaves_as_exact",
-                      "one_draw.assert_no_less_exact"})
+ONE_DRAW = frozenset({"one_draw.assert_as_exact_as_the_reference", "one_draw.assert_no_less_exact"})
 """The gate's one-draw rules, a comparison each call until it judges through check 1's drawn seeds
 (`assert_as_exact`), under the inventory's ratchet (the maintainer's ruling, row 2089)."""
 

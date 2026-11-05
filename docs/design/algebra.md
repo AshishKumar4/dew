@@ -550,7 +550,7 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   every node it prices, and the chosen DAG is extracted by egglog with every chosen node free. Over the
   algebra's and the templates' test derivations it priced no template's form below greedy's and took twice its
   time, so greedy stays the default. The test suite holds each derivation's greedy choice to the exact optimum
-  (`dew.cache.Passes.checked`); a declaration greedy prices dearer is refused there until it is extracted
+  (`dew._cache.Passes.checked`); a declaration greedy prices dearer is refused there until it is extracted
   exactly (`derive.Reduction.exact`).
 - A price states itself as levels compared in order (`extract.Linear`). Each level is the larger of its
   pieces, each a sum over the chosen nodes, and its nodes' largest peak (a span), plus what the nodes add
@@ -654,12 +654,12 @@ def rewritten(fn: Callable, *, saturation: Saturation, static_argnums=(), static
     # `dew.algebra.rewritten_program` bind `SATURATION`
 
 @dataclass(frozen=True)
-class Passes:                         # dew.cache
+class Passes:                         # dew._cache
     on: bool = True                   # the pass runs
     target: str | None = None         # the GpuTarget whose facts it prices for; None: the process's own
     checked: bool = False             # each derivation's greedy extraction held to the exact optimum
 
-ALGEBRA = jax.make_user_context(default_value=Passes())   # dew.cache, in JAX's trace context
+ALGEBRA = jax.make_user_context(default_value=Passes())   # dew._cache, in JAX's trace context
 
 @contextlib.contextmanager
 def passes(on: bool = True, target: str | None = None) -> Iterator[None]: ...   # sets ALGEBRA
@@ -818,7 +818,7 @@ a derived form replaces a hand-written one only where it states the walk, passes
   (`Reduction.rescale`, the language's binary `rescale`, `terms.RESCALE`, which no rule rewrites), and may
   hold its largest weight to 1 by a select (`exp(where(x < b, x - b, 0))`, `b` the broadcast of `x`'s own
   maximum). A compensated walk's running sums are the mainloop's own additions over the derived forms
-  (`Derived.step`'s `add`, beside the accumulator's `accumulate`). The template's hand forms run until it
+  (`Derived.step`'s `stepped`, the mainloop's one step over each sum's parts, `Accumulated` and `Added`). The template's hand forms run until it
   takes these (row 4228); the guard's shifted sums follow, its control flow the template's. Error-aware
   extraction (§1.5) waits for a cell whose cheapest form fails check 1 where an equal one passes: row 3310's
   was the test's schedule, not a form.
@@ -843,8 +843,8 @@ class Reduction:                     # attention, and any walk whose state is a 
     exponent: Literal[2, "e"]        # stated by each template per call (a scale folded with log2(e)), never found
     ranges: Mapping[str, float] = {} # operands' magnitude bounds by name (§6.3)
     exact: bool = False              # extracted exactly where greedy prices dearer (§6.5)
-    exponential: Callable | None = None   # its exponential's implementation, which its forms evaluate by
-    rescale: Callable | None = None  # (carried, now) -> the factor a carried state takes; None: exp(carried - now)
+    exponential: Callable | None = None   # (x, scale=1.0) -> exp(x scale), its exponential's implementation
+    rescale: Callable | None = None  # (carried, now) -> exp((carried - now) c), c its weights' literal or 1
 
 @dataclass(frozen=True)
 class Scan:                          # a recurrence

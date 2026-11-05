@@ -13,14 +13,14 @@ MESH_DEVICES = 8
 
 
 DETERMINISTIC_OPS = "--xla_gpu_deterministic_ops=true"
-"""Under it a process keeps no picks (`dew.cache.keeps_picks`) and XLA refuses cudnn attention
+"""Under it a process keeps no picks (`dew._cache.keeps_picks`) and XLA refuses cudnn attention
 (openxla/xla#46500)."""
 
 REPEATABLE_GPU_FLAGS = (DETERMINISTIC_OPS, "--xla_gpu_autotune_level=0", "--xla_gpu_enable_triton_gemm=false")
 """The cuda lane's flags for steps repeatable across processes. Deterministic
 ops order the reductions; autotuning off leaves every cuBLAS and cuDNN call
 the configuration it was emitted with, so no process chooses one; and such
-a run keeps no stored picks (`dew.cache.keeps_picks`), which XLA and Dew's
+a run keeps no stored picks (`dew._cache.keeps_picks`), which XLA and Dew's
 kernels would take instead. Deterministic ops take Triton out of the GEMM
 configurations (`GetEnabledBackends` in
 xla/service/gpu/autotuning/config_assigner_pass.cc) while XLA still fuses
@@ -67,7 +67,7 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     flags = [environ.get("XLA_FLAGS", "")]
     if "--xla_allow_excess_precision" not in flags[0]:
         # Every rounding the program states, as a run keeps them
-        # (`dew.devices.keep_roundings`).
+        # (`dew._devices.keep_roundings`).
         flags.append("--xla_allow_excess_precision=false")
     local = {"cuda": _local_gpus, "tpu": _local_tpus}
     accelerator = next((name for name in platforms if name in local), None)
@@ -188,8 +188,8 @@ def per_test_settings(patch, directory, *, network: bool = False) -> None:
     runs a cell (tests/gpu_flow.py's `isolated`): its own rung records (`dew.training.rungs`: the suite shares
     one compilation cache, beside which a run records its step's rung, and a rung one test forces would be
     another's floor), its own automatic data cache (`dew.data.cache.automatic_root`), its own recorded Hub
-    answers (`dew.cache.hub_answer`), and, where it reaches no network, its own Hub cache, whose refs its
-    stand-ins' answers write (`dew.cache.hub_commit`), never the runner's. Each is `directory(name)`, set
+    answers (`dew._cache.hub_answer`), and, where it reaches no network, its own Hub cache, whose refs its
+    stand-ins' answers write (`dew._cache.hub_commit`), never the runner's. Each is `directory(name)`, set
     through `patch` (a pytest MonkeyPatch, undone after the test)."""
     patch.setenv("DEW_RUNG_RECORDS", str(directory("rungs")))
     patch.setenv("DEW_DATA_CACHE", str(directory("data-cache")))

@@ -23,7 +23,7 @@ import numpy as np
 from flax import linen as nn
 
 import dew.nn.conv as conv
-from dew.accuracy import reduction_bound, within
+from dew._accuracy import reduction_bound, within
 from dew.telemetry.benchmark import samples
 
 

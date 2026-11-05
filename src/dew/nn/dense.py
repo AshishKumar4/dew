@@ -29,7 +29,7 @@ from flax import linen as nn
 from flax.linen.module import InterceptorContext
 from flax.typing import Array
 
-from dew.cache import INTERCEPTED
+from dew._cache import INTERCEPTED
 
 from .kernels import gemm
 from .precision import accumulated, biased, float32_dot_general
@@ -41,7 +41,7 @@ QWIX = importlib.util.find_spec("qwix") is not None
 
 def intercepted() -> bool:
     """Whether a wrapper owns the layer's product, which reaches it as a `jax.lax.dot_general` call: a Dew
-    interception scope (`dew.quantization`, `dew.lora`: `dew.cache.INTERCEPTED`), or a Qwix rule matching
+    interception scope (`dew.quantization`, `dew.lora`: `dew._cache.INTERCEPTED`), or a Qwix rule matching
     the op at this module under a direct `qwix.quantize_model` call (`qwix.pallas.get_current_rule`, Qwix's
     public query for code that runs its own kernels, which every active provider answers)."""
     if INTERCEPTED.value:

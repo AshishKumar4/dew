@@ -338,8 +338,8 @@ def products_dtype(*operands) -> jnp.dtype | None:
 
 def _intercepted() -> bool:
     """Whether this thread traces a quantized model's method, whose products Qwix owns
-    (`dew.cache.QUANTIZED_TRACE`, which jit's cache keys on)."""
-    from dew.cache import QUANTIZED_TRACE
+    (`dew._cache.QUANTIZED_TRACE`, which jit's cache keys on)."""
+    from dew._cache import QUANTIZED_TRACE
 
     return QUANTIZED_TRACE.value is not None
 

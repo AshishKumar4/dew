@@ -221,10 +221,8 @@ def _takes_backward(spans: template.KeySpans, query, key, hooks: template.Hooks 
     target in effect, checked against `declined`, the call one it declines for its registers
     (`MosaicBackward.declined`'s resources, the route's next implementation's: `ACCURATE_DECLINED`)."""
     query, key = (jnp.zeros(array.shape, array.dtype) for array in (query, key))
-    residuals = _residuals(query.shape)
-    op, args = attention_mosaic._backward_call(query, key, key, spans, hooks, query, residuals, scale=None,
-                                               natural=attention_mosaic.NATURAL, accurate=accurate)
-    reason = op.declined(op.bind(*args, interpret=False), generation.gpu_target())
+    reason = attention_mosaic.backward_declined(query, key, key, spans, hooks, query,
+                                                residuals=_residuals(query.shape), accurate=accurate)
     assert (reason is not None) == declined and (reason is None or reason.code == "resources"), reason
     return reason is None
 

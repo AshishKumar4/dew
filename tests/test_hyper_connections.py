@@ -127,6 +127,7 @@ def test_the_mean_head_is_the_mean_and_expansion_repeats_a_stream():
     assert_as_exact(lambda streams: collapse_streams(jnp.asarray(streams, jnp.float32), None),
                     as_given(lambda streams: np.asarray(streams, np.float32).mean(2)), draw,
                     "mean hyper head",
-                    seeds=SEEDS["mean"], truth_fn=lambda streams: np.asarray(streams, np.float64).mean(2))
+                    seeds=SEEDS["mean"],
+                    truth_fn=as_given(lambda streams: np.asarray(streams, np.float64).mean(2)))
     first = jnp.asarray(draw(0)[0][:, :, 0], jnp.float32)
     assert np.array_equal(expand_streams(first, H), np.repeat(np.asarray(first)[:, :, None], H, axis=2))

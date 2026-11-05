@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import tokamax
 
-from dew.devices import deterministic_ops_requested
+from dew._devices import deterministic_ops_requested
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
 from dew.nn.kernels.templates import attention_algebra as algebra, cost, mosaic, resources

@@ -28,7 +28,7 @@ from reference_error import as_given, assert_as_exact, seeds_for
 from sharded import collectives
 from token_support import write_token_corpus
 
-from dew import cache
+from dew import _cache
 from dew.checkpoints import Checkpoints
 from dew.data import Loading, presets
 from dew.data.compile import compile
@@ -353,14 +353,14 @@ def a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_for_th
             lowered.append(seconds)
 
     counts = []
-    settled = cache.KERNEL_TUNES.get_global()
+    settled = _cache.KERNEL_TUNES.get_global()
     jax.monitoring.register_event_duration_secs_listener(lowering)
     try:
         for _ in range(2):
             trained(lm(), steps=0)
             counts.append(len(lowered))
             lowered.clear()
-            changed, settled = cache.KERNEL_TUNES.get_global() != settled, cache.KERNEL_TUNES.get_global()
+            changed, settled = _cache.KERNEL_TUNES.get_global() != settled, _cache.KERNEL_TUNES.get_global()
             assert counts[-1] == 1 + changed
     finally:
         jax.monitoring.unregister_event_duration_listener(lowering)
@@ -428,7 +428,7 @@ trainer = lm()
 state, _, _ = trainer.place()
 trainer.compile(state, BATCH)
 assert not touched and gc.get_threshold() == thresholds, (touched, gc.get_threshold())
-from dew.nn.kernels.options import held_objects
+from dew.training.planning import held_objects
 with held_objects():
     assert gc.get_threshold()[0] > thresholds[0]
 assert not touched and gc.get_threshold() == thresholds
@@ -448,7 +448,7 @@ def stepped(trainer, steps: int = 3, trials: Callable[[TrainState], Trials] | No
     state, _, _ = trainer.place()
     held = None if trials is None else trials(state)
     # The garbage of the steps before collected, which the plan search would hold frozen while it runs
-    # (`dew.nn.kernels.options.held_objects`) where an executable counted inside it is part of it.
+    # (`dew.training.planning.held_objects`) where an executable counted inside it is part of it.
     gc.collect()
     step = trainer.compile(state, BATCH, held)
     state = state if held is None else held.state

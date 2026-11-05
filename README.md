@@ -772,9 +772,11 @@ print(np.asarray(result.tokens))
 `layer_types` names each layer's kind, and `kinds` says what that kind does:
 `sliding_attention` attends to 8 keys including its own, and `full_attention`
 attends to all of them. A Grain `to_iter_dataset()` iterator has
-`get_state` and `set_state`, which `checkpoint_every` needs to record the data
-position. A plain generator has neither, so `Trainer` raises an error if you
-use one with `checkpoint_every`. `objective.pipeline` returns a
+`get_state` and `set_state`, with which `checkpoint_every` records the data
+position, so a resume continues the data exactly. A plain generator has
+neither: it trains and checkpoints its weights and training state, and `fit`
+refuses to resume from such a checkpoint unless the reader is declared to
+replay its batches ([Data position](https://github.com/AshishKumar4/dew/blob/main/docs/guides/checkpoints.md#data-position)). `objective.pipeline` returns a
 `TextGeneration` task that uses the state's weights.
 
 ### Custom Flax models
@@ -1022,9 +1024,10 @@ trajectories; they are not quality benchmarks of the released models.
 
 A task in `dew.inference` pairs a model with its weights for generation.
 `TextGeneration` decodes tokens, `BlockGeneration` decodes Diffusion Gemma
-canvases, `MaskedGeneration` samples a whole response from a masked-diffusion
-decoder with Dew's MDLM sampler, and `TextToImage` denoises images.
-`MaskedGeneration` does not implement LLaDA's or Dream's own remasking recipes.
+canvases, `MaskedGeneration` samples a response from a masked-diffusion
+decoder, walking as the release does where its family declares the walk
+(Dream's and DiffuCoder's sampling, LLaDA2's blocks) and by Dew's MDLM sampler
+otherwise, and `TextToImage` denoises images.
 A task is immutable and keeps the weights it was built with; `bind` returns a
 new task with other weights.
 
@@ -1275,7 +1278,7 @@ accept them.
 
 The mesh also has expert, tensor, sequence and stage axes. Sequence-parallel attention chooses how to exchange data on each call. It uses Ulysses all-to-alls, which trade sequence rows for heads so that no device holds a whole key or value, when the heads and lengths divide evenly and the all-to-all moves fewer bytes, as it does for causal attention. Otherwise it gathers keys and values. The GPipe stage axis splits execution into stages, and each stage's devices hold only that stage's layers with their optimizer state and EMA, so stages save parameter memory as well as activation memory; the state `fit` returns is that state, which the model reads off the mesh as its stored layers. `MeshSpec(fsdp=8, replicas=2)` is hybrid sharding over two nodes: FSDP inside each node and replicas across them.
 
-Compute dtypes are configurable, and the attention kernel depends on the hardware: cuDNN for supported shapes on NVIDIA GPUs, a Pallas kernel on TPU, and XLA otherwise. Qwix provides optional int8 and fp8 compute, and MuonClip adds per-head QK clipping to Muon. Loading quantized weights is separate from quantized training.
+Compute dtypes are configurable, and the attention selector chooses each call's kernel, reporting why: the attention template on a GPU, the Pallas splash kernel on a TPU where a call qualifies, XLA or the reference path otherwise ([kernels and precision](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/distributed.md#kernels-and-precision)). Qwix provides optional int8 and fp8 compute, and MuonClip adds per-head QK clipping to Muon. Loading quantized weights is separate from quantized training.
 
 Set `remat` on a decoder to a policy name such as `"full"`, `"minimal"` or `"save_qkv_proj"` to recompute block activations in the backward pass. A policy such as `"save_qkv_proj"` keeps the projections it names. Offloaded policies such as `"minimal_offloaded"` keep those residuals in pinned host memory, and `Layout(host=("opt_state", "ema"))` keeps the optimizer state and the EMA copy there between steps. Both save device memory at the cost of extra compute or transfers, and both work with layer scanning.
 

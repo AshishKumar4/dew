@@ -303,7 +303,7 @@ def _export_cli(input_path, destination):
 
     chain = destination.parent / "corpus_chain.py"
     chain.write_text(f"from dew.data import Files\n\ndata = Files({str(input_path)!r}, format='text')\n")
-    return subprocess.run([sys.executable, "-m", "dew.cli.main", "data", "export", str(chain),
+    return subprocess.run([sys.executable, "-m", "dew._cli.main", "data", "export", str(chain),
                            str(destination), "--format", "array_record", "--tokenizer", "byte",
                            "--read", "memory"], cwd=destination.parent,
                           capture_output=True, text=True,

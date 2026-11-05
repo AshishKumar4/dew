@@ -195,7 +195,7 @@ def released(args) -> dict:
     import jax
     from safetensors.numpy import load_file
 
-    from dew.cli.main import main
+    from dew._cli.main import main
     from dew.interop import saved_sources
     from dew.interop.pretrained import PretrainedDecoder
 

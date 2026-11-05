@@ -31,7 +31,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from arm_arithmetic import unrewritten
-from float64_terms import SUMS, _evaluated, _static, _target, evaluated_on
+from float64_terms import SUMS, _static, _target, evaluated_on, walked
 
 EXACT = frozenset({
     "neg", "abs", "max", "min", "select_n", "reshape", "broadcast_in_dim", "transpose", "squeeze",
@@ -89,10 +89,14 @@ class TapRule:
 
     key: jax.Array
     scale: float
+    pruned = True
 
-    def at(self, index: int) -> TapRule:
+    def at(self, index: int, name: str | None = None) -> TapRule:
         return TapRule(_mixed(self.key + _GOLDEN * (jnp.asarray(index, jnp.int64).astype(jnp.uint64) + 1)),
                        self.scale)
+
+    def held(self, dtype):
+        return _wide(dtype)
 
     def primitive(self, equation, inputs: list) -> list:
         name, params = equation.primitive.name, dict(equation.params)
@@ -175,13 +179,13 @@ def rounding_scale(fn, *args, seed: int = 0):
                 jaxpr = closed.jaxpr
                 # One tapped evaluation compiled, which every draw runs with its own key: a program of
                 # one copy of `fn`, not one of each draw's.
-                held[signature] = jax.jit(lambda consts, leaves, key, scale: _evaluated(
-                    jaxpr, consts, leaves, rule=TapRule(key, scale))[0])
+                held[signature] = jax.jit(lambda consts, leaves, key, scale: walked(
+                    jaxpr, consts, leaves, TapRule(key, scale)))
             outputs, scales = _scaled(closed.jaxpr, functools.partial(held[signature], consts, leaves), key)
         else:
             # Its runs of static steps between a branch and a loop compiled, the rule passed in (`_span`).
-            outputs, scales = _scaled(closed.jaxpr, lambda key, scale: _evaluated(
-                closed.jaxpr, consts, leaves, rule=TapRule(key, jnp.float64(scale)), compiling=True)[0], key)
+            outputs, scales = _scaled(closed.jaxpr, lambda key, scale: walked(
+                closed.jaxpr, consts, leaves, TapRule(key, jnp.float64(scale)), compiling=True), key)
     return (tree.unflatten([np.asarray(value) for value in outputs]),
             tree.unflatten([None if scale is None else np.asarray(scale) for scale in scales]))
 

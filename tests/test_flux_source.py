@@ -144,6 +144,7 @@ def test_native_flux_matches_the_source_forward_and_every_gradient(name, source)
         return torch_with_gradients(forward)(drawn["packed"], drawn["context"], drawn["pooled"],
                                              weights[model], drawn["probe"])
 
+    @as_given
     def truth(inputs):
         with float64():
             return reference_walk(wide_model, inputs)

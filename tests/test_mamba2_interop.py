@@ -48,6 +48,7 @@ def assert_logits_of_the_fixture(path: Path, label: str) -> None:
         with torch.no_grad():
             return port(torch.from_numpy(np.asarray(ids).astype(np.int64))).logits.numpy()
 
+    @as_given
     def truth(ids):
         with jax.enable_x64(new_val=True):
             return np.asarray(wide.model.apply(wide.variables, jnp.asarray(ids)))

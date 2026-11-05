@@ -45,7 +45,7 @@ from reference_error import as_given, assert_as_exact, torch_with_gradients, wid
 from selection_margins import indexer_margins
 from tool_support import load
 
-from dew.batch import coordinates
+from dew.batch import coordinates, prefix_groups
 from dew.data.dataset import Loader
 from dew.interop.decoder_parts import yarn_record
 from dew.interop.hf_decoders import translate_weights
@@ -68,7 +68,6 @@ from dew.nn.rope import (
     yarn_query_scale,
 )
 from dew.nn.sharding import down_projection
-from dew.nn.visibility import prefix_groups
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 from dew.training import Layout, MeshSpec, Trainer
@@ -309,7 +308,7 @@ def test_yarn_matches_the_reference_derivation():
         return (np.random.default_rng(seed).integers(0, 4096 * 40, 64).astype(np.int32),)
 
     assert_as_exact(ours, reference, draw, "yarn rotary", seeds=SEEDS["yarn"],
-                    truth_fn=lambda positions: reference(positions, wide_run=True))
+                    truth_fn=as_given(lambda positions: reference(positions, wide_run=True)))
 
 
 def test_yarn_over_a_partial_rotary_ramps_the_rotated_width_and_refuses_a_proportional_one():

@@ -120,7 +120,7 @@ def wordpiece_tokenizer(directory: Path):
 def export_byte_tokens(root: Path, documents: Iterable[str], *flags: str) -> Path:
     """`documents` written as records under `root` and exported by `dew data export` as byte tokens,
     each document ended by its EOS, into `root/tokens`, with the export's further `flags`."""
-    from dew.cli.main import main
+    from dew._cli.main import main
 
     records = root / "documents.jsonl"
     records.write_text("".join(json.dumps({"text": text}) + "\n" for text in documents))

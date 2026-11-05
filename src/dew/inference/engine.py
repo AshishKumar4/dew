@@ -3,7 +3,8 @@
 A serving kind (`Kind`) admits the requests waiting for it within its own bounds, runs them with one
 device call a `step`, and settles their futures: `dew.inference.serving.Server` is autoregressive
 generation's kind, a slot scheduler over a resident cache, and `dew.inference.scoring.ScoringServer`
-scoring's, one forward a batch. A kind of block or masked generation joins as one more. Each holds its
+scoring's, one forward a batch, which a text-to-image task's walks are served by too
+(`TextToImage.scoring`). A kind of block or masked generation joins as one more. Each holds its
 weights resident on its mesh (`dew.inference.tasks.resident`), reloads new weights through
 `normalized` and `reloaded`, and answers each request through a `Timed` future that `settled`
 completes. `Engine` serves kinds from one thread, a bounded step of each busy kind a turn, so none
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future
 from typing import Protocol
@@ -89,11 +91,49 @@ def reloaded(incoming: Variables, served: Variables) -> Variables:
     return jax.tree.unflatten(structure, leaves)
 
 
+class Waiting[T]:
+    """A kind's waiting requests, oldest first, and the failure that stopped it: a submission appends
+    unless the kind failed, and a failure sweeps what waits, under one lock, so no request queues past
+    the sweep unsettled. A step takes from the left while a submission appends on the right, so a
+    submitting thread never waits for a step (a deque's append and popleft are atomic)."""
+
+    def __init__(self, stopped: str) -> None:
+        self.queue: deque[T] = deque()
+        self.failure: BaseException | None = None
+        self._stopped = stopped
+        self._lock = threading.Lock()
+
+    def append(self, request: T) -> None:
+        """Queue `request`; refused once the kind failed."""
+        with self._lock:
+            self.check()
+            self.queue.append(request)
+
+    def check(self) -> None:
+        """Refuse a submission or a step once the kind failed, naming the failure."""
+        if self.failure is not None:
+            raise RuntimeError(self._stopped) from self.failure
+
+    def failed(self, failure: BaseException, *held: T) -> list[T]:
+        """Record `failure` and return every request it settles, `held` (those a step took) and those
+        waiting, each once, the queue left empty."""
+        with self._lock:
+            self.failure = failure
+            # Each once by identity: a request taken into a step may wait for the rest of its rows too.
+            waiting = list({id(request): request for request in (*held, *self.queue)}.values())
+            self.queue.clear()
+        return waiting
+
+
 class Kind(Protocol):
     """One serving kind, as `Engine` drives it."""
 
     arrived: Callable[[], None]
     """Called after each submission, so an engine waiting for work wakes to it."""
+
+    pooled: bool
+    """Whether its steps span several processes, which step it together (`dew.inference.Server.run`); an
+    engine steps a kind of one process, as only that process's submissions wake it."""
 
     @property
     def busy(self) -> bool:
@@ -122,6 +162,9 @@ class Engine:
     def __init__(self, *kinds: Kind, name: str = "serving-engine") -> None:
         if not kinds:
             raise ValueError("an engine serves one kind or more")
+        if any(kind.pooled for kind in kinds):
+            raise ValueError("an engine steps kinds of one process; a server whose mesh spans several is "
+                             "stepped on each of them together, by its own run")
         self.kinds = kinds
         self.name = name
         self._arrived = threading.Event()

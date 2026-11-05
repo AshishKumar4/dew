@@ -245,7 +245,7 @@ LINES = [f"line {i}: the quick brown fox jumps over the lazy dog" for i in range
 def token_directory(tmp_path: Path) -> Path:
     """A byte-tokenized corpus, as the curve's documented producer writes it: `dew data export` over
     a text file's lines, each a document closed by EOS."""
-    from dew.cli.main import DataExport
+    from dew._cli.main import DataExport
 
     corpus = tmp_path / "corpus.txt"
     corpus.write_text("".join(f"{line}\n" for line in LINES))
@@ -550,6 +550,29 @@ def test_layout_parity_reads_the_first_step_as_the_trainer_does():
     assert int(step.committed) == 5 and step.example_count == 4
 
 
+def test_layout_parity_reads_every_first_step_through_the_trainers(monkeypatch):
+    """The reference's audit, its float64 anchor and the anchor's loss each read the trainer's first step
+    (`first_step`, ledger 3057, 3092) over the state they judge, which the test above holds to the
+    trainer's: a site that built its Step by hand would pass by it, and is caught here."""
+    tool = load("layout_parity")
+    read = []
+    first_step = tool.first_step
+
+    def spied(state, variables, ema, batch):
+        read.append(int(state.updates))
+        return first_step(state, variables, ema, batch)
+
+    monkeypatch.setattr(tool, "first_step", spied)
+    _, reference = tool.model_case("jepa", "float32", {}, {})
+    with jax.enable_x64(new_val=True), tempfile.TemporaryDirectory() as directory:
+        tool.Judge(reference, tool.References(Path(directory)), "jepa").audit()
+        tool.Anchor(reference, "jepa")
+        state, _, _ = tool._trainer(reference, {}, one_device=True).place()
+        tool.anchor_loss(reference, tool.drawn_batch(reference, 0), state.replace(
+            updates=jnp.asarray(5, jnp.int32)))
+    assert read == [0, 0, 5]
+
+
 def test_layout_parity_holds_every_arm_to_the_references_sample():
     """An arm that drew and started from the reference's values, at every example, is coupled to it; one
     whose draw is transformed for one example, or that records a name the reference does not, is
@@ -642,11 +665,11 @@ def test_prepared_windows_hold_every_draw_a_windowed_run_reads():
     """A prepare run with a window of two draws keeps both draws of every check-1 seed and of its
     redraw's (`REDRAW`): a run reading those references finds the reference and the float64 anchor of
     the last draw a windowed check reads, and none past it."""
-    from reference_error import REDRAW
+    from check1_wire import staged_units
 
     tool = load("layout_parity")
     _, reference = tool.model_case("jepa", "float32", {}, {})
-    last = (1 + REDRAW) * 2 * 2 - 1
+    last = staged_units(2) * 2 - 1
     with jax.enable_x64(new_val=True), tempfile.TemporaryDirectory() as directory:
         prepare = tool.References(Path(directory), prepare=True)
         assert tool.prepared(["jepa"], dtype="float32", seeds=2, windows=2, mixture={}, objective={},

@@ -279,6 +279,7 @@ class ScanCase:
 
     def arms(self):
         """The scanned stack's measured run and the plain loop's, and the plain loop's float64 truth."""
+        @as_given
         def truth(ids, cotangent):
             with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
                 if "truth" not in self.runs:
@@ -564,6 +565,7 @@ def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_t
 
     draw = drawn_ids(0x1342, 8)
 
+    @as_given
     def truth(ids):
         with jax.enable_x64(new_val=True):
             wide = tiny(num_layers=4, max_seq_len=16, mixture=routed, dtype=jnp.float64)
@@ -718,6 +720,7 @@ def float64_layer_states(model, variables):
     every lane keeps for float64, as a function of token rows: the truth."""
     wide, held = model.clone(dtype=jnp.float64), widened(variables)
 
+    @as_given
     def states(ids):
         with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
             return [np.asarray(state) for state in layer_states(wide, held, np.asarray(ids))]

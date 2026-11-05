@@ -12,7 +12,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.devices import deterministic_ops_requested
+from dew._devices import deterministic_ops_requested
 from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import attention_algebra as algebra, attention_gradient as gradient, mosaic
 from dew.nn.kernels.templates.attention import DKV_GRADS, Dropout, Kind, by_power, shared_place

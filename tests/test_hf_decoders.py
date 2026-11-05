@@ -58,9 +58,10 @@ Tolerances and the differences actually observed, fp32 on CPU:
   magnitude 6.8. Three gated delta net layers and one gated attention layer
   with a sliced quarter-head rope; the delta net's own numbers are in
   tests/test_linear_attention.py.
-- qwen3-next-tiny: max |logit difference| 2.3e-05 on the trunk and 1.8e-05
-  on the MTP layer, on logits of magnitude 6.6, tolerance 1e-4 scaled by
-  that magnitude. The Qwen3.5 hybrid with the delta net's projections fused
+- qwen3-next-tiny: max |logit difference| 2.3e-05 on the trunk, on logits of
+  magnitude 6.6, tolerance 1e-4 scaled by that magnitude; its MTP layer is
+  check 1's against the published composition live
+  (tests/test_hf_decoder_hybrids.py). The Qwen3.5 hybrid with the delta net's projections fused
   and grouped by key head, and every layer routing softmax top-2 over eight
   experts beside a sigmoid-gated shared expert.
 - gpt-oss-tiny: max |logit difference| 2.5e-06, tolerance 1e-4. Sink
@@ -1307,7 +1308,7 @@ def test_llada_moe_trained_exports_reload_and_run(llada_moe_source, tmp_path, de
     assert_as_exact(as_given(lambda seed: actual(draws[int(seed)])),
                     as_given(lambda seed: expected(draws[int(seed)])),
                     lambda seed: (np.asarray(seed, np.int32),), name + ' trained export', seeds=8,
-                    truth_fn=lambda seed: np.asarray(expected(draws[int(seed)]), np.float64))
+                    truth_fn=as_given(lambda seed: np.asarray(expected(draws[int(seed)]), np.float64)))
     prompt = ids[:1, :4]
     generated = reloaded.text_generation()(prompt, 4, key=7, steps=3).host().tokens
     np.testing.assert_array_equal(generated[:, :4], prompt)

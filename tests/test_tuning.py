@@ -75,9 +75,9 @@ def launched(program) -> list[list]:
 
 STORED = """
 import json, os, sys
-from dew import cache
-from dew.files import write_atomically
-path = cache.kernel_picks_path(json.loads(sys.argv[1])["device_kind"])
+from dew import _cache
+from dew._files import write_atomically
+path = _cache.kernel_picks_path(json.loads(sys.argv[1])["device_kind"])
 os.makedirs(os.path.dirname(path), exist_ok=True)
 write_atomically(path, sys.argv[1])
 print(json.dumps([path]))
@@ -315,7 +315,7 @@ TRAINED = """
 import json, os, sys
 import jax, numpy as np, optax
 import dew.nn.backbones
-from dew import cache
+from dew import _cache
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.distributed.batches import shard_batch
@@ -328,7 +328,7 @@ trainer = Trainer(LMObjective(model, seq), optax.adam(1e-3), key=jax.random.key(
 state, _, _ = trainer.place()
 tokens = np.random.default_rng(0).integers(0, 4096, size=(4, seq + 1)).astype(np.int32)
 trainer.compile(state, shard_batch(trainer.device_mesh, {"text": tokens}))
-path = cache.kernel_picks_path(jax.devices()[0].device_kind)
+path = _cache.kernel_picks_path(jax.devices()[0].device_kind)
 print(json.dumps([path, os.stat(path).st_mtime_ns if os.path.exists(path) else None]))
 """
 
@@ -337,7 +337,7 @@ MEASURED = """
 import json, os, sys
 import jax
 from test_tuning import operands, step
-from dew import cache
+from dew import _cache
 from dew.nn.kernels import tuning
 lowerings = []
 
@@ -348,7 +348,7 @@ def lower():
 
 
 _, launches = tuning.tune(lower, measure=True)
-path = cache.kernel_picks_path(jax.devices()[0].device_kind)
+path = _cache.kernel_picks_path(jax.devices()[0].device_kind)
 stamp = os.stat(path).st_mtime_ns if os.path.exists(path) else None
 print(json.dumps([path, stamp, tuning.settled(launches), len(lowerings)]))
 """
@@ -445,7 +445,7 @@ import json, sys
 import jax
 import tokamax
 from test_tuning import operands, step
-from dew import cache
+from dew import _cache
 from dew.nn.kernels import norm_swiglu, tuning
 with tuning.launches():
     found = tokamax.autotuning.get_bound_args(step(), *operands(15))
@@ -455,7 +455,7 @@ timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluatio
 config = norm_swiglu.RowsConfig(*json.loads(sys.argv[1]))
 pick = tuning.Timings({config: timing})
 tuning._store(jax.devices()[0].device_kind, ((norm, pick),))
-path = cache.kernel_picks_path(jax.devices()[0].device_kind)
+path = _cache.kernel_picks_path(jax.devices()[0].device_kind)
 read, foreign = tuning._read(path)
 picks = {json.dumps(sorted(ba.arguments)): [timings.fastest_config.rows, timings.fastest_config.warps]
          for ba, timings in read.values() if type(ba.op) is norm_swiglu.RmsForward}

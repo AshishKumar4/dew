@@ -10,7 +10,18 @@ import grain.python as grain
 import numpy as np
 from absl import flags
 
-from dew.data import images
+from dew.data import Memory, images
+
+
+@dataclasses.dataclass(frozen=True)
+class Logged(Memory):
+    """Records in memory that log each read a run takes of them."""
+
+    reads: list = dataclasses.field(default_factory=list, compare=False)
+
+    def records(self, read):
+        self.reads.append(read)
+        return super().records(read)
 
 
 def parse_grain_flags() -> None:

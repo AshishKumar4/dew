@@ -2,7 +2,7 @@
 dynamics over the frozen tokenizer's latents.
 
 Both stages read a clip's `video` from the run's data, so both are runs over data, not over an environment
-(`dew.objectives.rl.config`). The tokenizer's stage (`TokenizerObjective`) trains `CausalTokenizer`. The
+(`dew.config.env`). The tokenizer's stage (`TokenizerObjective`) trains `CausalTokenizer`. The
 dynamics' stage (`WorldModelObjective`) trains `Dynamics` over a tokenizer that no field of the record can
 hold as a value: its weights are the saved tokenizer run's, read at the step the record pins
 (`TokenizerConfig`), as an environment run reads its teacher's.
@@ -26,7 +26,7 @@ import tyro
 from flax import linen as nn
 
 from dew._records import record
-from dew.batch import Variables
+from dew.batch import Variables, unboxed
 from dew.checkpoints import Checkpoints
 from dew.config import ObjectiveConfig, Prepared, RunConfig
 from dew.config.media import media_field
@@ -160,7 +160,10 @@ class WorldModelRunConfig(RunConfig):
         tokenizer = saved.model.build(**saved.numerics_fields(), **saved.derived({"frame": frame}))
         with Checkpoints(held.run) as checkpoints:
             variables = checkpoints.variables(step=held.step, ema=False)
-        fresh = jax.eval_shape(lambda key: tokenizer.init(key, jnp.zeros((1, *frame))), jax.random.key(0))
+        # Drawn plain, as a checkpoint holds it: a draw's boxes (`nn.with_logical_partitioning`) are its
+        # table's.
+        fresh = unboxed(jax.eval_shape(lambda key: tokenizer.init(key, jnp.zeros((1, *frame))),
+                                       jax.random.key(0)))
         try:
             fitting = jax.tree.map(lambda drawn, read: np.shape(drawn) == np.shape(read), fresh, variables)
         except ValueError:

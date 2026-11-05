@@ -251,8 +251,8 @@ def test_a_reference_exactly_zero_on_a_residue_row_does_not_measure_it():
     reference = np.where(np.arange(len(truth))[:, None] == 0, truth, 0.0)
     dew = np.where(np.arange(len(truth))[:, None] == 0, truth, 1e-15)
     mine = leaf_summary(dew, truth)
-    _, _, worst, _, (rows, _, _), _ = _paired("leaf", mine, leaf_summary(reference, truth))
+    _, _, worst, _, (rows, _, _), _, _ = _paired("leaf", mine, leaf_summary(reference, truth))
     assert rows.tolist() == list(range(1, len(truth))) and worst < 0
     close = np.where(np.arange(len(truth))[:, None] == 1, [1.6e-40, -1.6e-40, 1.5e-40], reference)
-    _, _, worst, _, (rows, _, _), _ = _paired("leaf", mine, leaf_summary(close, truth))
+    _, _, worst, _, (rows, _, _), _, _ = _paired("leaf", mine, leaf_summary(close, truth))
     assert 1 not in rows.tolist() and worst > 50

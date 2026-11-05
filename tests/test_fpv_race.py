@@ -11,7 +11,7 @@ from tool_support import load
 
 from dew.checkpoints import Checkpoints
 from dew.config import RunConfig
-from dew.objectives.rl.config import EnvRunConfig
+from dew.config.env import EnvRunConfig
 
 fpv_race = load("fpv_race")
 

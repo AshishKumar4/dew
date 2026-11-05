@@ -55,6 +55,7 @@ from dew.batch import (
     freeze,
     leaves_by_path,
     merge,
+    prefix_groups,
     real_slots,
     scored_targets,
     shifted_span,
@@ -95,7 +96,6 @@ from dew.nn.protocols import (
     refuse_prefix,
 )
 from dew.nn.sharding import LOGITS, abstract, constrain
-from dew.nn.visibility import prefix_groups
 from dew.objectives.base import (
     OMITTED,
     Aux,

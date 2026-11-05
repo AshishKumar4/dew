@@ -116,7 +116,7 @@ def test_a_yarn_phi_trains_as_transformers_computes_it_and_writes_it_back(tmp_pa
         return (np.random.default_rng([0xA2, seed]).integers(0, 64, (4, 32)).astype(np.int32),)
 
     assert_as_exact(ours, reference, draw, 'phi under a partial YaRN', seeds=YARN_SEEDS,
-                    truth_fn=lambda ids: reference(ids, wide=True))
+                    truth_fn=as_given(lambda ids: reference(ids, wide=True)))
 
     export = tmp_path / 'export'
     PretrainedDecoder.from_model(loaded.model, loaded.variables).save(export)

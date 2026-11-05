@@ -93,7 +93,7 @@ def test_processes_converting_one_pickle_at_once_each_read_its_weights():
     overlay in CI, where a listing of the folder another process was replacing a file in found no weights
     (eight processes, forty rounds: some forty misses before the conversion was published whole, none
     under a tmpfs). Each conversion is published whole, so every read finds its weights."""
-    from dew.cache import dew_cache_dir
+    from dew._cache import dew_cache_dir
 
     rounds, workers = 8, 8
     # Beside Dew's own cache, on its filesystem: the home directory's unless XDG_CACHE_HOME moves it.

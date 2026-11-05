@@ -21,10 +21,10 @@ from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding
 
 from dew import communicators
+from dew._devices import gpu_free_bytes, xla_flag
 from dew._records import JSON, integer, integers, json_value, listed, record
 from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
-from dew.devices import gpu_free_bytes, xla_flag
 from dew.distributed.placement import parameter_axes
 from dew.mesh import batch_axes, mesh_axes
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
@@ -510,15 +510,20 @@ def temporaries_factor(mesh: Mesh, capacity: int | None = None) -> int:
                for device in local)
 
 
-def fits_everywhere(headroom: int | None) -> bool:
-    """Whether every process's headroom is non-negative, with the same answer on every process.
-
-    A process reads only its own devices' memory, so the pool takes the minimum;
-    a process that reports none does not affect the result.
-    """
+def pooled_headroom(headroom: int | None) -> int | None:
+    """The pool's headroom, the same on every process: the tightest any process states of its own devices
+    (`headroom`, a compile's measure or a derivation's judgment), which reads only its own devices' memory;
+    a process that states none does not affect it, and None where none states one."""
     from dew._coordination import from_every_process
 
-    return min((value for value in from_every_process(headroom) if value is not None), default=0) >= 0
+    return min((value for value in from_every_process(headroom) if value is not None), default=None)
+
+
+def fits_everywhere(headroom: int | None) -> bool:
+    """Whether every process's headroom is non-negative, with the same answer on every process
+    (`pooled_headroom`): a pool where no process states one fits."""
+    pooled = pooled_headroom(headroom)
+    return pooled is None or pooled >= 0
 
 
 def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0,

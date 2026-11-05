@@ -227,7 +227,7 @@ def test_a_packages_own_run_artifact_metric_and_axis_train_from_its_record_in_a_
     assert 0.0 < scalars(tmp_path / "first", "val/mean_rate")[-1] < 1.0
 
     record = str(tmp_path / "first" / "activity" / "run.json")
-    again = ("-m", "dew.cli.main", "train", record, "--set", f"trainer.checkpoint_dir={tmp_path / 'again'}")
+    again = ("-m", "dew._cli.main", "train", record, "--set", f"trainer.checkpoint_dir={tmp_path / 'again'}")
     refused = run(*again)
     # Refused before anything trains: the run writes nothing of its own.
     assert refused.returncode != 0 and not (tmp_path / "again").exists()

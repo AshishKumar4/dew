@@ -46,8 +46,8 @@ from process_support import (
 from test_whole_validation import POOLED
 from token_support import Corpus, write_token_corpus
 
+from dew._position import ENVELOPE
 from dew.checkpoints import FROZEN_STORE
-from dew.position import ENVELOPE
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -676,10 +676,10 @@ def pool_checkpoint(tmp_path_factory):
 @pytest.mark.distributed
 def test_every_process_plans_from_the_tightest_room_any_of_their_devices_leaves(tmp_path):
     """The derivation's judgments decide which plan compiles first, so every process reads each alike, the
-    tightest any process's devices leave (`planning.agreed`, row 3341's review): over two processes whose
-    devices leave four microbatches room to the byte on one and a byte less on the other, each judges four
-    to refuse and compiles eight first, the plan the other compiles, where judged apart one would have
-    compiled four and the other eight."""
+    tightest any process's devices leave (`memory.pooled_headroom`, row 3341's review): over two processes
+    whose devices leave four microbatches room to the byte on one and a byte less on the other, each judges
+    four to refuse and compiles eight first, the plan the other compiles, where judged apart one would
+    have compiled four and the other eight."""
     reports = run_pool("agreement", tmp_path, 2, script=Path(__file__).with_name("plan_worker.py"), devices=1)
     first, second = reports
     assert first["need"] == second["need"]
@@ -924,7 +924,7 @@ def replicated_flags(run_dir: Path, steps: int) -> dict:
 @pytest.fixture(scope="module")
 def replicated_checkpoint(tmp_path_factory):
     """Two processes' elastic fit over a filtered stream, saved after `POOL_STEPS` steps."""
-    from dew.position import REPLICATED
+    from dew._position import REPLICATED
 
     directory = tmp_path_factory.mktemp("replicated-checkpoint")
     reports = run_pool("fit", directory / "out", 2, **replicated_flags(directory / "run", POOL_STEPS))

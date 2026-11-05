@@ -35,7 +35,7 @@ def stat_identity(path: str | os.PathLike) -> tuple[str, int, int]:
     key. A local file relies on its mtime: rewriting it in place at the
     same size within one mtime tick, or `cp -p` of another file of the
     same size over it, reuses the stale conversion; deleting the cache's
-    directory under `dew.cache.dew_cache_dir()` clears it."""
+    directory under `dew._cache.dew_cache_dir()` clears it."""
     status = os.stat(path)
     return str(Path(path).resolve()), status.st_size, status.st_mtime_ns
 

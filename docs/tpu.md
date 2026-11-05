@@ -48,7 +48,7 @@ For a real configuration, run `dew tpu init` without `--dry-run` and it writes t
 
 `zones` is the order in which `dew tpu` searches for an existing TPU. Creation uses `--zone` if you give it, and otherwise the first zone in the list. It does not retry in the next zone when one has no capacity. Dew caches the zone it finds for each TPU in `zones.json`.
 
-Dry runs still write local files. Creation can update the zone cache, and setup writes its generated shell script into the configuration directory, so the separate directory keeps these files out of your normal configuration. No cloud resources are created.
+Dry runs write no local files: creation leaves the zone cache as it is, and setup does not write its generated shell script. No cloud resources are created. The separate `DEW_CONFIG_DIR` keeps the example configuration you save for the previews out of your real one.
 
 ## Creation and setup
 

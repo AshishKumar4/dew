@@ -313,7 +313,7 @@ def _chunk_delta_residual(query, key, value, g, beta, state, chunk_size, starts,
     """`_kept_residual`'s, or where the block's remat rung recomputes the delta rule's memory (`RECOMPUTED`,
     'delta_memory') the operands alone, the backward computing the memory and what it derives again, as the
     port and the template drop theirs: `(out, (kept, operands))`, one of them None."""
-    if "delta_memory" in RECOMPUTED.get():
+    if recomputed_memory():
         out = _chunk_delta_rule(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
         return out, (None, (query, key, value, g, beta, state, starts))
     out, kept = _kept_residual(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
@@ -861,7 +861,8 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
 
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
                      max_segments=max_segments, scale=scale, delta=delta, wide=wide, floor=floor, bound=bound,
-                     rounded=chunk_rounding(delta, jnp.result_type(query, key, value)))
+                     rounded=chunk_rounding(delta, jnp.result_type(query, key, value)),
+                     recomputed=recomputed_memory())
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1], call=call,
@@ -1028,8 +1029,8 @@ def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=No
     its gradient on each device's own rows. Called on the whole batch, every device of a 2xH100 FSDP run ran
     its launches on the global batch, layer 0's solve over 4 rows for its 2, beside 40 GB of gathers a
     microbatch (row 1897). `options` are the op's (`max_segments`, `scale`, `delta`, `wide`, `floor`,
-    `bound`, `rounded`); whether the block's remat rung recomputes the delta rule's memory (`RECOMPUTED`)
-    is resolved here, as its route traces."""
+    `bound`, `rounded`); whether the block's remat rung recomputes the delta rule's memory is resolved as
+    the selectors' binds resolve it (`recomputed_memory`)."""
     from .templates.recurrence import template
 
     four, three, memory, decays, resets = _shard_specs(value.shape, key.shape[2], g.ndim)
@@ -1042,7 +1043,7 @@ def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=No
         given = iter(given)
         state, starts, firsts, skip = (None if x is None else next(given) for x, _ in optional)
         return template.MOSAIC(query, key, value, g, beta, state, starts, firsts=firsts, skip=skip,
-                               recomputed="delta_memory" in RECOMPUTED.get(), **options)
+                               recomputed=recomputed_memory(), **options)
 
     return manual_map(local, specs, (four, memory))(*operands)
 
@@ -1052,6 +1053,14 @@ RECOMPUTED: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("re
 keeping every other (`dew.nn.backbones.decoder_block.RematPolicy.recompute`): a delta rule traced
 inside recomputes its memory in its backward where this names 'delta_memory' (`_blocked_rule`),
 and keeps it otherwise. A block sets it as it traces its layers (`recomputing`)."""
+
+
+def recomputed_memory() -> bool:
+    """Whether the layers traced here recompute the delta rule's memory in their backward (`RECOMPUTED`): the
+    template's call takes it as an argument (`template.mosaic_rule`'s `recomputed`), so the selectors' binds
+    (`port_kernel`, `scan_kernel`) and the run's (`template_rule`) read it alike, and a launch a compile
+    refused under the rung is the one the route judges (row 4133)."""
+    return "delta_memory" in RECOMPUTED.get()
 
 
 @contextlib.contextmanager
@@ -1099,7 +1108,7 @@ def _blocked_rule(query, key, value, g, beta, state, starts, firsts=None, *, doc
     spans = None if documents is None else cu_seqlens(starts, B * (documents + 1), firsts)
     port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
     out, final = port(query, key, value, g, beta, state, spans, scale, CHUNK_SIZE,
-                      not generation.triton_runs(), "delta_memory" not in RECOMPUTED.get(), wide)
+                      not generation.triton_runs(), not recomputed_memory(), wide)
     out = out[..., :width].reshape(B, S, Hv, split * width)[..., :Dv]
     final = final[:, :, :Dk, :width]
     final = jnp.moveaxis(final.reshape(B, Hv, split, Dk, width), 2, 3).reshape(B, Hv, Dk, split * width)
@@ -1358,7 +1367,7 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
 
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
                      max_segments=max_segments, scale=1.0, delta=False, wide=wide, rounded=fast_rounding(),
-                     skip=skip)
+                     skip=skip, recomputed=recomputed_memory())
     case = scan_case(value, key, chunk_size, padded=True, call=call, product=product)
     return select(SCAN, case).kernel
 

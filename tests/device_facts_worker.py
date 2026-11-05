@@ -12,7 +12,7 @@ def main() -> None:
     rank, coordinator, output = int(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
     jax.distributed.initialize(coordinator_address=coordinator, num_processes=2, process_id=rank,
                                initialization_timeout=60)
-    from dew.devices import CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH, MEMORY_CLOCK_RATE, gpu_attribute
+    from dew._devices import CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH, MEMORY_CLOCK_RATE, gpu_attribute
     from dew.nn.kernels.generation import gpu_target
 
     device = jax.local_devices()[0]

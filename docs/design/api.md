@@ -330,7 +330,10 @@ reads a request's answer off its rows' outputs (`answer`). The server runs one p
 waiting rows oldest first, so a request whose rows outrun a pass carries the rest to the next turn.
 It binds each request to the (task, weights) pair that admitted it, so a reload swaps both at once
 for what is submitted after. `Decide.scoring()` gives a decision task as such a task, and
-`Decide.systemone` over a list of bodies is served by the same server.
+`Decide.systemone` over a list of bodies is served by the same server. `TextToImage.scoring()` gives
+a text-to-image task as one too: an `ImageRequest` (prompts, key and its own steps, guidance, solver
+and negatives) is one row, a pass walks requests alike as one program mapped over them, and each
+request draws what its lone call draws under its key.
 
 ## 4. The three examples in this API
 

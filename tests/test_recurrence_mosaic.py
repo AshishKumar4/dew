@@ -33,7 +33,7 @@ from test_recurrence_chunk import (
 )
 
 from dew.nn.kernels import generation, recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk, chunk_rounding, fast_rounding
+from dew.nn.kernels.recurrence_chunk import Chunk, chunk_rounding, fast_rounding, recomputed_memory
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import bundles, mosaic, product, report, resources
 from dew.nn.kernels.templates.base import Unfitted
@@ -258,7 +258,8 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fas
     def rule(given: Chunk, max_segments: int | None = None):
         return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
                            tiles=narrowest, starts=given.starts, max_segments=max_segments, scale=hooks.scale,
-                           floor=hooks.floor, bound=hooks.inverse_bound, rounded=forms == 'fast')
+                           floor=hooks.floor, bound=hooks.inverse_bound, rounded=forms == 'fast',
+                           recomputed=recomputed_memory())
 
     return rule
 
@@ -893,6 +894,46 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
     assert stepped.block_v < first.block_v
     narrower = (stepped.forward or stepped).block_v < first.forward.block_v
     assert narrower == (kernel == 'recurrence_states')
+
+
+def test_a_refusal_under_the_remat_rung_reaches_the_route():
+    """Under the remat rung recomputing the delta rule's memory (`recurrence_chunk.recomputing`), a refusal of
+    every tile of the run's training call's launch (its identity as its lowering for an H100 names it,
+    `report.traced`) reaches the selector, which takes another kernel for the call: its bind is the run's
+    launch, the rung's flag resolved alike (`recurrence_chunk.recomputed_memory`); bound as kept, it judged
+    another launch than the run's (row 4133)."""
+    from dew.nn.kernels import recurrence_chunk
+    from dew.training._lowering import kernel_calls
+
+    operands = [jnp.zeros(shape, dtype) for shape, dtype in (
+        ((1, 64, 1, 64), jnp.bfloat16), ((1, 64, 1, 64), jnp.bfloat16), ((1, 64, 2, 64), jnp.bfloat16),
+        ((1, 64, 2), jnp.float32), ((1, 64, 2), jnp.bfloat16))]
+    # The run's call as the chunked op's route makes it (`recurrence_chunk.chunk`'s options).
+    options = {'max_segments': None, 'scale': None, 'delta': True, 'wide': False, 'floor': None, 'bound': 1.0,
+               'rounded': True}
+
+    def loss(*given):
+        out, final = recurrence_chunk.template_rule(*given, **options)
+        return out.astype(jnp.float32).sum() + final.sum()
+
+    def selected() -> str:
+        return recurrence_chunk.port_kernel(*operands, bound=1.0, product='training', report=False)
+
+    with report.refusals(), generation.assumed('sm90'), recurrence_chunk.recomputing(('delta_memory',)):
+        target = template.Mosaic.launched()
+        assert selected() == 'mosaic_gpu'
+        training = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
+        lowered = training.trace(*operands).lower(lowering_platforms=('cuda',))
+        (identity,) = {report.traced(call.launch).identity for call in kernel_calls(lowered)
+                       if call.kind == 'mosaic_gpu' and call.launch is not None}
+        # The run's launch bound as the run binds it, its identity the lowering's.
+        bound = template.MOSAIC.bind(*operands, None, None, firsts=None, skip=None, recomputed=True,
+                                     **options)
+        assert report._identity(template.MOSAIC, bound) == identity
+        while (tiles := template.MOSAIC.derived(bound, target)) is not None:
+            names = {launch.name for launch in template.MOSAIC._launches(bound, tiles, target, backward=True)}
+            report.refuse([(identity, tiles, names)])
+        assert selected() != 'mosaic_gpu'
 
 
 def _model(launch: mainloop.Launch, family: mosaic.Family) -> resources.RegisterModel:

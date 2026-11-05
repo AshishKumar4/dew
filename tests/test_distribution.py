@@ -53,7 +53,7 @@ def start(*arguments: str, devices: int) -> subprocess.Popen:
         env["JAX_PLATFORMS"] = "cpu"
         placement = ["--env", f"XLA_FLAGS=--xla_force_host_platform_device_count={devices}"]
     return subprocess.Popen(
-        [sys.executable, "-m", "dew.cli.main", "launch", *placement, *arguments],
+        [sys.executable, "-m", "dew._cli.main", "launch", *placement, *arguments],
         cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
@@ -328,7 +328,7 @@ def a_launched_process_keeps_every_device_inside_a_slurm_step():
                "import jax\n"
                "print('local devices', jax.local_device_count())\n")
     done = finished(subprocess.Popen(
-        [sys.executable, "-m", "dew.cli.main", "launch", "--processes-per-host", "1", "--",
+        [sys.executable, "-m", "dew._cli.main", "launch", "--processes-per-host", "1", "--",
          sys.executable, "-c", program],
         cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), timeout=300)
     assert done.returncode == 0, done.stdout + done.stderr

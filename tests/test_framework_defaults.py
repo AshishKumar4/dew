@@ -39,7 +39,7 @@ def test_a_decay_spares_biases_unless_told_not_to_and_a_group_decays_what_it_cla
 def test_a_users_persistent_cache_thresholds_stay_theirs(tmp_path, monkeypatch):
     """A cache Dew enables caches every program, unless the user named JAX's thresholds
     (JAX_PERSISTENT_CACHE_MIN_*), which it leaves as they are."""
-    from dew.cache import enable_compilation_cache
+    from dew._cache import enable_compilation_cache
 
     sizes = jax.config.jax_persistent_cache_min_entry_size_bytes
     seconds = jax.config.jax_persistent_cache_min_compile_time_secs

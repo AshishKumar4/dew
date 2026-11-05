@@ -17,7 +17,7 @@ from objective_cases import cases
 from reference_error import assert_computes_the_oracle, assert_fp32_reduction_bound
 from run_kinds import KINDS, lm, scalars
 
-from dew.cli.main import main
+from dew._cli.main import main
 from dew.data.dataset import Loader
 from dew.nn.inspection import HISTOGRAM_EDGES, statistics
 from dew.telemetry.compiles import Compiles

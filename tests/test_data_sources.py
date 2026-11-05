@@ -163,6 +163,39 @@ def test_jsonl_ranges_cover_rows_once_even_at_line_boundaries():
     assert list(resumed) == expected
 
 
+@pytest.mark.parametrize("held, suffix", [
+    ("array", ".json"), ("array", ".json.gz"), ("array", ".json.bz2"),
+    ("lines", ".json"), ("lines", ".json.gz"), ("lines", ".jsonl.xz"),
+])
+def test_a_json_file_reads_and_resumes_as_datasets_reads_it(tmp_path, held, suffix):
+    """A JSON file, compressed or not, reads the records `datasets`' JSON loader reads of it: the items of
+    the array it holds, or each line's object, and a stream of it resumes where it stopped (row 2402)."""
+    import bz2
+    import gzip
+    import lzma
+
+    import datasets
+
+    rows = [{"id": index, "text": f"row {index}\nof {held}"} for index in range(12)]
+    body = (json.dumps(rows, indent=1) if held == "array"
+            else "\n" + "\n".join(json.dumps(row) for row in rows) + "\n").encode()
+    compress = {".gz": gzip.compress, ".bz2": bz2.compress, ".xz": lzma.compress}.get(Path(suffix).suffix)
+    path = tmp_path / f"rows{suffix}"
+    path.write_bytes(body if compress is None else compress(body))
+    expected = datasets.load_dataset("json", data_files=str(path), split="train",
+                                     cache_dir=str(tmp_path / "datasets")).to_list()
+    files = Files(str(path))
+    assert list(files.records("memory")) == expected
+    manifest = files.manifest()
+    (shard,) = manifest.shards
+    reader = iter(manifest.reader(shard))
+    assert [next(reader) for _ in range(5)] == expected[:5]
+    saved = reader.get_state()
+    resumed = iter(manifest.reader(shard))
+    resumed.set_state(saved)
+    assert list(resumed) == list(reader) == expected[5:]
+
+
 @pytest.mark.parametrize("extension", ["gz", "zst"])
 @pytest.mark.parametrize("transport", ["local", "memory"])
 @pytest.mark.parametrize("discovery", ["inferred", "explicit", "directory"])
@@ -1025,7 +1058,7 @@ def test_a_token_export_reads_through_the_storage_options_it_is_given(tmp_path):
 
 
 def test_cli_refuses_an_unsupported_token_export_format_before_writing(tmp_path):
-    from dew.cli.main import main
+    from dew._cli.main import main
 
     input = tmp_path / "documents.jsonl"
     input.write_text('{"text":"a document"}\n')
@@ -1036,7 +1069,7 @@ def test_cli_refuses_an_unsupported_token_export_format_before_writing(tmp_path)
 
 
 def test_cli_record_exports_still_default_to_parquet(tmp_path):
-    from dew.cli.main import main
+    from dew._cli.main import main
     from dew.data.sources import source
 
     input = tmp_path / "documents.jsonl"
@@ -1054,7 +1087,7 @@ def test_cli_exports_the_chain_of_the_file_it_names_and_no_other(tmp_path, monke
     module the process holds elsewhere (the standard library's `json`), or as a package's module
     (`email.utils`), is refused, not read as it, and leaves the process as it was: its directory off the
     path, so no later import, a loading worker's included, reads it in the module's place."""
-    from dew.cli.main import main
+    from dew._cli.main import main
     from dew.data.sources import source
 
     # The exports accepted put their directories first on the path, as a run of the CLI does; the test's

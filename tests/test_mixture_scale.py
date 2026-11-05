@@ -22,8 +22,10 @@ from dew.data.pipeline import Pipeline, mix
 SOURCES = 1000
 RECORDS = 8
 BATCH = 16
-DOCUMENTS = 1024
-"""Each packed source's documents (`packed`)."""
+DOCUMENTS = 128
+"""Each packed source's documents (`packed`): more than five times the most the packed tests read of one
+source (24, a thousand sources mixed by records), so no step reopens a source, and few enough that hashing
+every source's records to name it costs compiling a thousand of them 8 s, not 61 (row 4247)."""
 SOURCE_TOKENS = 100_000
 """The tokens each packed source's documents count from, past any of another's (`Documents`)."""
 READ = Loading(workers=0, threads=1, read_buffer=8, worker_buffer=1)

@@ -104,6 +104,6 @@ This is what `fit` prints when stdout is not a terminal, as in a pipe, a log fil
 
 - For more input features, give the batch shape `(batch_size, features)` and the `init` sample shape `(1, features)`.
 - For a nonlinear model, replace `nn.Dense` with your own Linen module. The batch fields and the objective must still agree on names, shapes and dtypes.
-- To change the data, change a Records recipe's source or validation and compile it with load. For data larger than memory, choose an indexed or streamed source explicitly; see [Training data](concepts/data.md) and [Checkpoints](guides/checkpoints.md).
+- To change the data, build another `Dataset` chain from a reader in place of `Memory`, and pass it to `fit`, its held-out records as `validation=`. For data larger than memory, choose an indexed or streamed source explicitly; see [Training data](concepts/data.md) and [Checkpoints](guides/checkpoints.md).
 
 [Custom objectives](concepts/objectives.md) adds evaluation and state to an objective. [Language models](concepts/language_models.md) uses a built-in objective on tokenized text.

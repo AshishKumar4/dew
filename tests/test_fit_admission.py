@@ -55,7 +55,7 @@ def test_a_jepa_predictor_takes_the_width_its_encoder_was_built_at(tmp_path):
 KEYED = """
 import json
 import optax
-from dew.devices import backend_open
+from dew._devices import backend_open
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import Trainer

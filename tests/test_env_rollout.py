@@ -205,7 +205,7 @@ def test_ppo_raises_the_greedy_policys_return_on_the_walk(simulated):
     """A few PPO updates of a fresh actor-critic on walks cut at 8 steps, a JAX environment or a simulator
     stepped from the host, raise its greedy policy's mean return above the fresh one's, the collection
     served as two passes of two minibatches."""
-    from dew.objectives.rl.config import idle
+    from dew.config.env import idle
     from dew.training import Trainer
 
     walks = Batched(TimeLimit(Walk(limit=50.0), episode_length=8), 64)
@@ -474,7 +474,7 @@ def test_a_control_run_resumed_from_its_checkpoint_ends_as_the_run_that_never_st
     for bit, the key's as its raw bits; a run whose checkpoints were written without the rollout's state
     resumes to another state, its walks begun again."""
     from dew.checkpoints import Checkpoints, Keep
-    from dew.objectives.rl.config import idle
+    from dew.config.env import idle
     from dew.training import Trainer
 
     def walks():
@@ -540,7 +540,7 @@ def test_a_control_run_accumulating_two_minibatches_an_update_serves_each_collec
     every sequence of each collection served once. The cursor is the rollout's own, apart from the updates
     the optimizer commits, where reading it off them collected afresh on every call of an update and
     served the first minibatch of each (row 3932)."""
-    from dew.objectives.rl.config import idle
+    from dew.config.env import idle
     from dew.training import Trainer
 
     objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9)
@@ -562,7 +562,7 @@ def test_a_control_runs_cooldowns_leave_its_rollout_as_the_run_left_it(tmp_path)
     from recording import preempting
 
     from dew.checkpoints import Checkpoints, Keep
-    from dew.objectives.rl.config import idle
+    from dew.config.env import idle
     from dew.rl.evaluation import episodes
     from dew.training import Episodes, EvalSuite, Preempted, Trainer
     from dew.training.cooldown import Cooldowns
@@ -600,7 +600,7 @@ def test_a_control_runs_cooldown_over_a_simulator_leaves_it_as_the_run_left_it()
     steps of its own, ends, every leaf bit for bit, where the run with no cooldown does: the rollout keeps
     its state and the simulator its own walks (their `branch()`, `dew.rl.simulator.branched`). A simulator
     with no `branch()` is refused the cooldown."""
-    from dew.objectives.rl.config import idle
+    from dew.config.env import idle
     from dew.rl.evaluation import episodes
     from dew.training import Episodes, EvalSuite, Trainer
     from dew.training.cooldown import Cooldowns
@@ -682,8 +682,8 @@ def test_a_split_scored_by_its_episodes_reports_its_averaged_weights_first_episo
     `flight/steps` and `flight/distance`: what its averaged weights earn flown, from the key the run's key
     gives at its last step, over the walks' first episodes scored by hand; its live weights' flight is
     another. A warming flight before the first step reports nothing."""
+    from dew.config.env import idle
     from dew.objectives.base import EMASpec
-    from dew.objectives.rl.config import idle
     from dew.rl.evaluation import episodes
     from dew.training import Episodes, EvalSuite, Trainer
     from dew.training.tracker import LocalTracker
@@ -717,7 +717,7 @@ def test_a_run_ranks_its_checkpoints_by_a_score_its_episodes_report(tmp_path, se
     very one the run declares), or by that metric where the suite asks for it alone, which logs it alone
     though the episodes report every score they declare."""
     from dew.checkpoints import Checkpoints, Keep
-    from dew.objectives.rl.config import idle
+    from dew.config.env import idle
     from dew.rl.evaluation import episodes
     from dew.training import Best, Episodes, EvalSuite, Trainer
     from dew.training.tracker import LocalTracker

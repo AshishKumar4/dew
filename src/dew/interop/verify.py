@@ -48,7 +48,7 @@ import numpy as np
 from flax import traverse_util as flax_traverse
 
 from dew import _records
-from dew.cache import package_digest
+from dew._cache import package_digest
 from dew.interop import decoder_parts, hf_decoders as decoders, parts, sources
 from dew.interop.decoder_families import ENTRIES
 from dew.nn import precision
@@ -990,7 +990,7 @@ def _record_key(hf_config: Mapping[str, object], source: ModelSource) -> str:
 
 
 def _recorded(key: str) -> VerifiedMapping | None:
-    from dew.cache import dew_cache_dir
+    from dew._cache import dew_cache_dir
 
     path = Path(dew_cache_dir()) / _VERIFIED / key / 'mapping.json'
     if not path.is_file():
@@ -1003,11 +1003,11 @@ def _recorded(key: str) -> VerifiedMapping | None:
 
 
 def _record(key: str, verified: VerifiedMapping) -> None:
-    from dew import files
-    from dew.cache import dew_cache_dir
+    from dew import _files
+    from dew._cache import dew_cache_dir
 
     directory = Path(dew_cache_dir()) / _VERIFIED / key
-    with files.staged(directory) as staging:
+    with _files.staged(directory) as staging:
         (staging / 'mapping.json').write_text(json.dumps({
             'model_type': verified.model_type, 'family': verified.family, 'reference': verified.reference,
             'error': verified.error, 'bound': verified.bound, 'inert': list(verified.inert)}))

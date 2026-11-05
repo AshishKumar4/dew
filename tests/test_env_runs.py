@@ -1,4 +1,4 @@
-"""Environment runs built from their records (`dew.objectives.rl.config.EnvRunConfig`): an agent trained in
+"""Environment runs built from their records (`dew.config.env.EnvRunConfig`): an agent trained in
 the gate race as the same run composed in Python trains, its record read back training it again, a teacher
 saved as a run labelling and demonstrating the steps its own policy would, stages chained from the run before
 them, a resume ending where the run that never stopped ends, and each setup the kind refuses."""
@@ -16,8 +16,8 @@ from recording import bits
 from test_env_rollout import evaluation_key
 
 from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
+from dew.config.env import EnvConfig, EnvRunConfig, EpisodesConfig, RolloutConfig, TeacherConfig
 from dew.nn.kernels import generation
-from dew.objectives.rl.config import EnvConfig, EnvRunConfig, EpisodesConfig, RolloutConfig, TeacherConfig
 from dew.objectives.rl.control import ActorCritic, ControlPPOObjective, ControlRollout
 from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, WorldModel
 from dew.objectives.rl.tssm import TSSM
@@ -221,19 +221,30 @@ def test_a_student_resumed_by_its_command_keeps_the_teacher_step_it_pinned(tmp_p
     assert untaught.resumed().teacher is None
 
 
-def test_stages_from_their_records_learn_from_their_saved_teacher_as_composed_in_python(tmp_path):
-    """A teacher trained as an environment run (PPO over the race's privileged view), then two stages of a
-    student, each built from its record: pretraining, whose prefill the teacher demonstrates with its
-    policy's draws and which trains on that prefill alone (`train_ratio` inf), and DAgger from it, the
-    student flying and the teacher labelling each step with its greedy action, which the student imitates.
-    Each trains, every leaf of its state and of its replay bit for bit, as the stage composed in Python does
-    with the teacher's own policy and weights; the DAgger stage starts from the pretraining stage's last
-    weights, and each names the steps it read of the runs before it."""
-    teacher = teacher_run(tmp_path).prepare().train("teacher")
-    taught = teacher_policy()
+@pytest.fixture(scope="module")
+def trained_teacher(tmp_path_factory):
+    """A teacher trained as an environment run once for the module's tests, its saved run and its state."""
+    root = tmp_path_factory.mktemp("teacher")
+    return root / "teacher", teacher_run(root).prepare().train("teacher")
+
+
+@pytest.fixture(scope="module")
+def saved_teacher(trained_teacher) -> Path:
+    return trained_teacher[0]
+
+
+def test_a_pretraining_stage_from_its_record_learns_from_its_saved_teacher_as_composed_in_python(
+        tmp_path, trained_teacher):
+    """A teacher trained as an environment run (PPO over the race's privileged view), then a student's
+    pretraining stage built from its record, whose prefill the teacher demonstrates with its policy's draws
+    and which trains on that prefill alone (`train_ratio` inf): it trains, every leaf of its state and of its
+    replay bit for bit, as the stage composed in Python does with the teacher's own policy and weights, and
+    names the teacher step it read; a DAgger stage from it starts from its last weights."""
+    saved, teacher = trained_teacher
+    # A step of the stage: one update reads, writes and records all a run of more does.
     scales = {"policy": 0.0, "value": 0.0, "replay_value": 0.0}
     pretrains = {"batch": 8, "length": 8, "train_ratio": float("inf"), "prefill": 16, "capacity": 64}
-    pretraining = student(tmp_path, 2, teacher=TeacherConfig(str(tmp_path / "teacher"), demonstrates=True),
+    pretraining = student(tmp_path, 1, teacher=TeacherConfig(str(saved), demonstrates=True),
                           objective=ObjectiveConfig(DREAMER_V3, {"imitation": 1.0, "scales": scales}),
                           rollout=RolloutConfig("dreamer", pretrains))
     prepared = pretraining.prepare()
@@ -242,29 +253,39 @@ def test_stages_from_their_records_learn_from_their_saved_teacher_as_composed_in
     objective = DreamerV3Objective(world_model(), imitation=1.0, scales=scales)
     race = Batched(FlightEnv(racing(), VIEWS), 8)
     rollout = DreamerRollout(objective, race, capacity=64, batch=8, length=8, train_ratio=float("inf"),
-                             prefill=16, demonstrator=Teacher(taught.act, teacher.variables))
-    assert_bitwise(pretrained, fitted(pretraining, objective, rollout, 2))
+                             prefill=16, demonstrator=Teacher(teacher_policy().act, teacher.variables))
+    assert_bitwise(pretrained, fitted(pretraining, objective, rollout, 1))
     assert isinstance(prepared.rollout, DreamerRollout)
     assert_bitwise(prepared.rollout.held_replay, rollout.held_replay)
-
-    dagger = student(tmp_path, 2, teacher=TeacherConfig(str(tmp_path / "teacher")),
+    dagger = student(tmp_path, 1, teacher=TeacherConfig(str(saved)),
                      pretrained=str(tmp_path / "pretrain"), model=EnvRunConfig().model,
                      objective=ObjectiveConfig(DREAMER_V3, {"imitation": 1.0, "imitates": LABEL}))
     prepared = dagger.prepare()
-    assert prepared.run.source.step == 2
+    assert prepared.run.source.step == 1
     assert_bitwise(prepared.objective.variables, pretrained.variables)
-    state = prepared.train("dagger")
-    objective = DreamerV3Objective(world_model(), imitation=1.0, imitates=LABEL,
-                                   variables=pretrained.variables)
-    rollout = DreamerRollout(objective, Batched(FlightEnv(racing(), VIEWS), 8), capacity=64, batch=8,
-                             length=8, train_ratio=16.0, prefill=8,
-                             teacher=Teacher(taught.greedy, teacher.variables))
-    assert_bitwise(state, fitted(dagger, objective, rollout, 2))
+
+
+def test_a_dagger_stage_from_its_record_labels_its_flights_with_its_saved_teachers_actions(tmp_path,
+                                                                                         trained_teacher):
+    """A teacher trained as an environment run, then a student's DAgger stage built from its record: the
+    student flies, the teacher read from its saved run labels each step with its greedy action, and the
+    stage's replay holds those labels beside the actions flown, which they differ from, its labeller the
+    saved teacher's weights bit for bit. The labelling composed in Python is test_aggregation's; this
+    stage's record wires it to the saved teacher."""
+    saved, teacher = trained_teacher
+    dagger = student(tmp_path, 1, teacher=TeacherConfig(str(saved)),
+                     objective=ObjectiveConfig(DREAMER_V3, {"imitation": 1.0, "imitates": LABEL}))
+    prepared = dagger.prepare()
+    assert prepared.run.teacher is not None and prepared.run.teacher.step == 2
+    assert int(prepared.train("dagger").step) == 1
     assert isinstance(prepared.rollout, DreamerRollout)
     labelled = jax.device_get(prepared.rollout.held_replay)
-    assert_bitwise(labelled, rollout.held_replay)
     filled = int(labelled.filled)
-    assert not np.array_equal(labelled.held[LABEL][:filled], labelled.held["action"][:filled])
+    assert filled and not np.array_equal(labelled.held[LABEL][:filled], labelled.held["action"][:filled])
+    # The labeller is the saved teacher: its weights, bit for bit.
+    labeller = prepared.rollout.teacher
+    assert labeller is not None
+    assert_bitwise(labeller.variables, teacher.variables)
 
 
 @pytest.mark.parametrize("agent", ["ppo", "dreamer"])
@@ -316,11 +337,6 @@ def test_a_dreamer_run_resumed_in_a_later_phase_trains_on_and_at_another_horizon
         later.override({"trainer.steps": 6, "objective.horizon": 100.0}).prepare().train("phased")
 
 
-@pytest.fixture(scope="module")
-def saved_teacher(tmp_path_factory) -> Path:
-    root = tmp_path_factory.mktemp("teacher")
-    teacher_run(root).prepare().train("teacher")
-    return root / "teacher"
 
 
 REFUSED = {

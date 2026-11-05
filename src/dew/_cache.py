@@ -18,9 +18,7 @@ from pathlib import Path
 
 import jax
 
-from dew.devices import deterministic_ops_requested, xla_flag
-
-__all__ = ["enable_compilation_cache"]
+from dew._devices import deterministic_ops_requested, xla_flag
 
 
 def dew_cache_dir() -> str:
@@ -77,7 +75,7 @@ def hub_answer[Answer](question: tuple[str, ...], ask: Callable[[], Answer]) -> 
 
     from huggingface_hub.errors import OfflineModeIsEnabled
 
-    from dew.files import write_atomically
+    from dew._files import write_atomically
 
     try:
         value = ask()
@@ -416,7 +414,7 @@ def hub_commit(repo: str, revision: str | None, *, repo_type: str = "model") -> 
     from huggingface_hub import HfApi, constants
     from huggingface_hub.errors import OfflineModeIsEnabled
 
-    from dew.files import write_atomically
+    from dew._files import write_atomically
 
     branch = revision or constants.DEFAULT_REVISION
     # The keys earlier runs recorded: a model's default branch as main, a dataset's as HEAD.

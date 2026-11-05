@@ -30,7 +30,7 @@ from run_kinds import (
 )
 
 from dew import registry
-from dew.cli.main import main
+from dew._cli.main import main
 from dew.config import RunConfig
 from dew.decision.layout import QuestionSegment, Reads, built_in
 from dew.registry import objectives

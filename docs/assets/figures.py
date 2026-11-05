@@ -1399,7 +1399,7 @@ def architecture_derived_figure():
     label = ("The derivation of a Reduction: the declaration is traced at one tile into terms, facts mark "
              "the walked sums and maxima, the step, merge and finish readings saturate under the decoupled "
              "rules, and extraction priced by the tile walk yields init, step, merge and finish, or "
-             "refuses. The switch dew.cache.DERIVED, off by default, chooses the derived forms or the "
+             "refuses. The switch dew._cache.DERIVED, off by default, chooses the derived forms or the "
              "hand-written ones for the template's plain_step, merge and finish.")
     parts = [
         ("declaration", ["a Reduction:", "softmax(s)·v by keys"], "plain", (16, 16, 172, 81), 0),
@@ -1407,7 +1407,7 @@ def architecture_derived_figure():
         ("saturate", ["step, merge, finish;", "decoupled rules"], "dew", (384, 16, 172, 81), 2),
         ("extract", ["priced by the tile", "walk, or refused"], "dew", (568, 16, 176, 81), 3),
         ("Derived", ["init, step, merge,", "finish"], "dew", (568, 143, 176, 81), 4),
-        ("dew.cache.DERIVED", ["one switch,", "off by default"], "elsewhere", (272, 143, 240, 81), 5),
+        ("dew._cache.DERIVED", ["one switch,", "off by default"], "elsewhere", (272, 143, 240, 81), 5),
         ("hand-written forms", ["attention_algebra,", "recurrence_algebra"], "plain", (16, 143, 220, 81), 4),
         ("plain_step, merge, finish", [], "plain", (196, 252, 392, 40), 6),
     ]

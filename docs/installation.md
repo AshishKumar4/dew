@@ -94,7 +94,7 @@ The driver and the GPU decide the build, newest first:
 
 `nvidia-smi --query-gpu=driver_version,compute_cap --format=csv,noheader` prints both; with several GPUs the oldest SM counts. These are the minimums in the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) and in Table 3 of NVIDIA's [CUDA release notes](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html). The CUDA version is the one the driver library a process loads supports: a driver's own, or a newer one under NVIDIA's [forward-compatibility package](https://docs.nvidia.com/deploy/cuda-compatibility/forward-compatibility.html) (`cuda-compat`), which runs the `cuda13` build on a 570 driver; Dew reads it from the library (`cuDriverGetVersion`). Neither build runs on an older GPU. The [dewml.dev install script](https://dewml.dev/install.sh) chooses by the driver alone.
 
-A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the first `Trainer.fit` of a program that never called it, raises `dew.devices.CPUOnlyJax` when JAX opened on the CPU, naming the install that fixes it where no CUDA build is installed or the installed one can't run on this driver. `import dew` asks nothing of the hardware, so the check runs once the process's XLA flags are set. `JAX_PLATFORMS` selects the backend before JAX is imported. `JAX_PLATFORMS=cpu python train.py` runs on the CPU on a GPU machine, and the check leaves it alone. On Colab the tutorials install `dewml[cuda13]`. [Cloud TPUs](tpu.md) covers TPU provisioning.
+A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the first `Trainer.fit` of a program that never called it, raises `dew.training.CPUOnlyJax` when JAX opened on the CPU, naming the install that fixes it where no CUDA build is installed or the installed one can't run on this driver. `import dew` asks nothing of the hardware, so the check runs once the process's XLA flags are set. `JAX_PLATFORMS` selects the backend before JAX is imported. `JAX_PLATFORMS=cpu python train.py` runs on the CPU on a GPU machine, and the check leaves it alone. On Colab the tutorials install `dewml[cuda13]`. [Cloud TPUs](tpu.md) covers TPU provisioning.
 
 ### Dew's JAX build
 
@@ -213,7 +213,7 @@ FlashAttention comes as Dew's own wheel, `dew-flash-attn-cu12` or `dew-flash-att
 
 CUTLASS's grouped GEMMs come as Dew's own wheel too, `dew-cutlass-cu12` or `dew-cutlass-cu13` (kernels/cutlass), from Dew's package index, with the `cuda12` and `cuda13` extras on Linux x86_64 and aarch64: a mixture of experts' projection placed on CUTLASS runs it on the GPUs whose grouped kernels the installed build holds (`dew_cutlass.ARCHITECTURES`, Hopper's today).
 
-tokamax comes with Dew: Dew's Pallas kernels take the config they derive from the GPU's facts, which is fast without tuning. The opt-in tuner (`dew.nn.kernels.tuning`), `python tools/kernel_picks.py` or `Trainer(tune_kernels=True)`, times a few tested variants of each kernel's config on a GPU it has to itself and stores the fastest for the GPU model; a later compile takes those picks, else the nearest measured shape's, else the derived config, and measures nothing. And `"auto"` runs its Pallas-Triton attention on sm80 and later for heads up to 64 wide (`dew.nn.attention.triton_runs`). Earlier releases pin `typeguard==2.13.3`, which tyro excludes, so installing one by hand breaks every recipe's command line.
+tokamax comes with Dew: Dew's Pallas kernels take the config they derive from the GPU's facts, which is fast without tuning. The opt-in tuner (`dew.nn.kernels.tuning`), `python tools/kernel_picks.py` or `Trainer(tune_kernels=True)`, times a few tested variants of each kernel's config on a GPU it has to itself and stores the fastest for the GPU model; a later compile takes those picks, else the nearest measured shape's, else the derived config, and measures nothing. Which kernel `"auto"` runs for a call is the selectors' ([kernels and precision](concepts/distributed.md#kernels-and-precision)). Earlier releases pin `typeguard==2.13.3`, which tyro excludes, so installing one by hand breaks every recipe's command line.
 
 ## Development install
 
@@ -229,10 +229,10 @@ The `ci` extra is the test suite's environment, every package a test file import
 
 ## Bumping JAX
 
-CI runs on CPUs, so a JAX bump first runs these on a GPU, on Colab, in one session:
+CI runs on CPUs. Two diagnostics read a new JAX release on a GPU when you want them, Colab's among them:
 
 - `tests/test_gpu_recurrence.py`'s cell "a gated delta net decodes on its step kernel" and `tests/test_decode_attention.py::test_the_decode_kernel_reads_each_row_to_its_length_at_every_config`: the gated delta net's and the decode attention's kernels are on the Pallas Triton backend JAX 0.11 deprecates, and each one's `fits` is its off switch;
-- `python tools/gpu_profile_check.py --out out/profile-check`, about a minute: a warmed step captured under `dew.Profiler` with command buffers on and off. It fails unless the capture with them off attributes device time to HLO ops and every capture's device time a step is positive and within its wall time. It records whether the default capture attributes ops (none on 0.11.2) and whether XLA ran its command buffers op by op for the session, so a release that changes either shows. While the cause of the default capture's missing attribution is open, every Colab GPU session runs it first too.
+- `python tools/gpu_profile_check.py --out out/profile-check`, about a minute: a warmed step captured under `dew.Profiler` with command buffers on and off. It fails unless the capture with them off attributes device time to HLO ops and every capture's device time a step is positive and within its wall time. It records whether the default capture attributes ops (none on 0.11.2) and whether XLA ran its command buffers op by op for the session, so a release that changes either shows.
 
 ## Compilation cache
 

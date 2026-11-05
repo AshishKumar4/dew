@@ -404,6 +404,7 @@ def test_clip_image_transform_matches_the_reference_processor(config, height, wi
     def draw(seed):
         return (np.random.RandomState(seed).randint(0, 256, (1, height, width, 3), dtype=np.uint8),)
 
+    @as_given
     def normalized(pixels):
         """The processor's resized and cropped integers, rescaled and normalized in float64."""
         crop = np.asarray(resized(list(np.asarray(pixels, np.uint8)), return_tensors="np")["pixel_values"],
@@ -556,3 +557,20 @@ def test_public_text_encoder_storage_is_separate_from_compute(kind, tmp_path):
         expected = reference(directory)
         np.testing.assert_array_equal(hidden(rebound, expected["input_ids"], expected["attention_mask"]),
                                       hidden(native, expected["input_ids"], expected["attention_mask"]))
+
+
+def test_a_tower_layer_asking_wide_logits_attends_with_them():
+    """`clip_layer`'s `wide_logits` reaches its attention (`MixerContext.wide_logits`): from the same
+    weights and bf16 inputs, a layer asking them answers otherwise than the layer that does not, which is
+    CLIP's own (row 4149's review, train 608: the world model's blocks build on `clip_layer`, attending
+    so)."""
+    import jax.numpy as jnp
+
+    from dew.nn.text_encoders import clip_layer
+
+    x = jnp.asarray(np.random.default_rng(23).normal(scale=4.0, size=(2, 8, 32)), jnp.bfloat16)
+    wide, narrow = (clip_layer(32, 2, 64, 8, norm_type="rms", qk_norm=True, wide_logits=flag,
+                               dtype=jnp.bfloat16) for flag in (True, False))
+    variables = narrow.init(jax.random.key(24), x)
+    assert not np.array_equal(np.asarray(wide.apply(variables, x), np.float32),
+                              np.asarray(narrow.apply(variables, x), np.float32))

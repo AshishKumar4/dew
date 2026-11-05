@@ -14,8 +14,8 @@ import jax
 from process_support import serve_mode, worker_parser
 from test_tuning import launched, operands, step
 
-from dew import cache
-from dew.files import write_atomically
+from dew import _cache
+from dew._files import write_atomically
 from dew.nn.kernels import generation, tuning
 
 
@@ -23,7 +23,7 @@ def mode_settle(args) -> list:
     jax.config.update("jax_compilation_cache_dir", str(args.cache / f"process{args.process_id}"))
     held = args.picks / f"process{args.process_id}.json"
     if held.exists():
-        path = cache.kernel_picks_path(jax.devices()[0].device_kind)
+        path = _cache.kernel_picks_path(jax.devices()[0].device_kind)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         write_atomically(path, held.read_text())
     rows = [int(count) for count in args.rows.split(",")]

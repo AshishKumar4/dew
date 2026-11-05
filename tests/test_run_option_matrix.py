@@ -16,8 +16,8 @@ from pathlib import Path
 import pytest
 from run_kinds import KINDS, scalars
 
+from dew._cli.main import main
 from dew.checkpoints import Checkpoints
-from dew.cli.main import main
 from dew.config import RunConfig, TrainerConfig
 from dew.quantization import Quantization
 from dew.registry import to_record
@@ -315,10 +315,10 @@ def an_lm_run_measures_its_kernel_launches_as_set(tmp_path):
     """An LM run whose attention takes Dew's attention template (`model.attention_impl="template"`,
     `AttentionLaunch`), a launch of configs to measure, that measures its step's launches on this GPU
     (`tune_kernels`) adds what it picked to the picks of this GPU's kind beside the compilation cache
-    (`dew.cache.kernel_picks_path`), where a later run reads them: the tuner measures Dew's own launches
+    (`dew._cache.kernel_picks_path`), where a later run reads them: the tuner measures Dew's own launches
     (`tuning.KernelOp`), not tokamax's ops, which keep their heuristic (row 2661). Every kind's trainer is
     built through the one `RunConfig.built`, which hands it the option. The suite's GPUs run
-    deterministic ops, under which no process keeps picks (`dew.cache.keeps_picks`); the run here does
+    deterministic ops, under which no process keeps picks (`dew._cache.keeps_picks`); the run here does
     not. It runs as `dew train` in a process of its own, whose compilation cache is its own
     (JAX_COMPILATION_CACHE_DIR): no run before it measured into that cache, and no picks this process holds
     reach it."""
@@ -326,7 +326,7 @@ def an_lm_run_measures_its_kernel_launches_as_set(tmp_path):
     from lane_environment import without_deterministic_ops
     from process_support import REPO_ROOT, dew_train
 
-    from dew.cache import kernel_picks_path
+    from dew._cache import kernel_picks_path
 
     compiled = tmp_path / "compiled"
     cached = jax.config.jax_compilation_cache_dir
@@ -336,7 +336,7 @@ def an_lm_run_measures_its_kernel_launches_as_set(tmp_path):
     finally:
         jax.config.update("jax_compilation_cache_dir", cached)
     # This process holds its share of the GPU; the run takes memory as it needs it, not the 95% a
-    # training process preallocates (`dew.devices`), which a 40 GB card cannot give beside it.
+    # training process preallocates (`dew._devices`), which a 40 GB card cannot give beside it.
     environment = {**os.environ, "JAX_COMPILATION_CACHE_DIR": str(compiled),
                    "PYTHONPATH": str(REPO_ROOT / "src"), "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
                    "XLA_FLAGS": without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))}

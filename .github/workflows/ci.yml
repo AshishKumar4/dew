@@ -3,6 +3,9 @@
 # https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
 
 name: CI
+# A whole dispatch says so in its title, by which the land queue reads it beside the daily runs; every other run keeps
+# GitHub's own.
+run-name: "${{ inputs.whole && format('CI: the whole suite at {0}', github.sha) || '' }}"
 
 on:
   push:
@@ -13,9 +16,16 @@ on:
     branches: [ "main", "ci/**", "base/kernels" ]
   pull_request:
     branches: [ "main" ]
+  # A dispatch runs its ref as a push would; with `whole`, it is the daily run's whole suite, which the land queue
+  # dispatches on main after every fifth publish (bible: the whole suite every fifth publish).
   workflow_dispatch:
+    inputs:
+      whole:
+        description: "the whole suite, as the daily run's: every file on every Python, the whole_suite cells and the release checks, the test cache off"
+        type: boolean
+        default: false
   # Daily, main's every test file runs on every Python, the whole_suite cells and the release checks among them,
-  # the test cache aside (tools/armada/ci.py), so nothing it skipped can hide: the one whole suite, which the land
+  # the test cache aside (tools/armada/ci.py), so nothing it skipped can hide: the whole suite, which the land
   # queue reads (its daily runs), each red a P1 of its file's owner.
   schedule:
     - cron: "17 9 * * *"
@@ -29,12 +39,13 @@ permissions:
 # A newer push to the same ref makes the older run's verdict moot, but on base/kernels, whose lanes push more
 # often than a run takes (about 47 minutes), a running run finishes: GitHub keeps the newest push pending behind it,
 # cancelling an older pending one, so each run that finishes grades the newest tip it could and its reds page
-# (2026-11-02: seven base runs in a row cancelled by the next push, 2 to 26 minutes in, none finished). The daily
-# run takes a group of its own: a push to main, a train's publish, makes no whole suite moot (the daily of 10-28,
-# 10-29 and 11-02 was cancelled so, its verdict never written).
+# (2026-11-02: seven base runs in a row cancelled by the next push, 2 to 26 minutes in, none finished). The whole
+# suite, daily or dispatched, takes a group of its own: a push to main, a train's publish, makes no whole suite moot
+# (the daily of 10-28, 10-29 and 11-02 was cancelled so, its verdict never written); and a running one finishes, as
+# on base/kernels, so a dispatch never cancels the daily run, nor the daily run a dispatch.
 concurrency:
-  group: ci-${{ github.event_name == 'schedule' && 'daily' || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/base/kernels' }}
+  group: ci-${{ (github.event_name == 'schedule' || inputs.whole) && 'daily' || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/base/kernels' && !(github.event_name == 'schedule' || inputs.whole) }}
 
 env:
   # The armada runner every armada job uses.
@@ -138,7 +149,7 @@ jobs:
         grep -q "No matching distribution found for jax" plain.txt || { cat plain.txt; exit 1; }
     - name: Resolve the accelerator extras
       run: |
-        index=$(python -c "import runpy; print(runpy.run_path('src/dew/builds.py')['PACKAGE_INDEX'])")
+        index=$(python -c "import runpy; print(runpy.run_path('src/dew/_builds.py')['PACKAGE_INDEX'])")
         for extras in cuda12,quantization,profile cuda13,quantization,profile tpu,quantization,profile; do
           echo "dewml[$extras] @ file://$(realpath dist/*.whl)" \
             | uv pip compile - --extra-index-url "$index" \
@@ -146,7 +157,7 @@ jobs:
         done
 
   # What the run's suite covers (tools/armada/ci.py policy), read before the test job starts, as its armada
-  # group depends on it: the daily run runs every file with the cache off; any other
+  # group depends on it: the whole suite, daily or dispatched, runs every file with the cache off; any other
   # run reruns what its change reaches, and the whole suite where it cannot place it: from main, for a fix on a
   # train (ci/fix-*) from the train's tip it fixes, its first parent, for a base/<producer> promote
   # (ci/base-<sha>-*) from the producer branch's tip it merges onto, <sha>, and for a push to base/kernels from
@@ -171,7 +182,7 @@ jobs:
     - uses: astral-sh/setup-uv@v6
     - id: policy
       env:
-        DEW_TEST_CACHE: ${{ github.event_name == 'schedule' && 'off' || '' }}
+        DEW_TEST_CACHE: ${{ (github.event_name == 'schedule' || inputs.whole) && 'off' || '' }}
         BEFORE: ${{ github.event.before }}
         GH_TOKEN: ${{ github.token }}
       run: |
@@ -234,11 +245,11 @@ jobs:
     # promote (ci/base-*), and a push to base/kernels, take a group of their own, whether it reruns what its
     # change reaches or the whole suite: they run no gangs, which every train runs, and take a bounded share of
     # the fleet (`BACKGROUND_POOL`), so a train never waits on them and its gangs find their containers; on fewer
-    # containers a whole suite takes longer, so they have a longer deadline. The daily run, the one whole suite,
+    # containers a whole suite takes longer, so they have a longer deadline. The whole suite, daily or dispatched,
     # takes a group of its own, so a direct push to main never waits on it.
     concurrency:
       group: >-
-        ${{ (github.event_name == 'schedule' && 'armada-daily')
+        ${{ ((github.event_name == 'schedule' || inputs.whole) && 'armada-daily')
         || ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels') && 'armada-base')
         || (startsWith(github.ref_name, 'ci/stage-') && 'armada-stage')
         || ((startsWith(github.ref_name, 'ci/batch-') || startsWith(github.ref_name, 'ci/fix-'))
@@ -274,9 +285,9 @@ jobs:
         # It reads records and never writes them; a fork's pull request receives no repository secret.
         DEW_XLA_CACHE_READ_TOKEN: ${{ secrets.DEW_XLA_CACHE_READ_TOKEN }}
         DEW_TEST_CACHE: ${{ needs.scope.outputs.policy }}
-        # The daily run alone runs the whole_suite cells, every file on the newest Python and the release checks
-        # (tools/armada/ci.py `selected`, `plan`, `release-plan`).
-        DEW_WHOLE_SUITE: ${{ github.event_name == 'schedule' && '1' || '' }}
+        # The whole suite alone, daily or dispatched, runs the whole_suite cells, every file on the newest Python and the
+        # release checks (tools/armada/ci.py `selected`, `plan`, `release-plan`).
+        DEW_WHOLE_SUITE: ${{ (github.event_name == 'schedule' || inputs.whole) && '1' || '' }}
         PROVEN: ${{ needs.proven.outputs.run }}
         BACKGROUND_POOL: >-
           ${{ ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels') && '48') || '' }}
@@ -337,8 +348,8 @@ jobs:
         case "$GITHUB_REF_NAME" in ci/stage-*-p[0-9]*) bound="$bound --pool=${GITHUB_REF_NAME##*-p}" ;; esac
         # A commit the proven job found proved (a run that passed, or, on main, the land queue's proof of the tip it
         # graded green, red rows its regrade passed included) runs no suite again, whatever its stored verdict or the
-        # cache's policy; the daily run reads no proof (the proven job runs on a push alone), so it proves main's
-        # tip anew.
+        # cache's policy; the whole suite, daily or dispatched, reads no proof (the proven job runs on a push alone), so
+        # it proves main's tip anew.
         if [ -z "$PROVEN" ] && { [ "$DEW_TEST_CACHE" = off ] || ! $armada verdict ${{ github.sha }}; }; then
           setsid $armada run ${{ github.sha }} $bound $priority --label="$GITHUB_REF_NAME" \
             > >(tee "$RUNNER_TEMP/suite.log") 2> >(tee "$RUNNER_TEMP/suite.err" >&2) &

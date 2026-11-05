@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 
-from dew.accuracy import distance
+from dew._accuracy import distance
 from dew.interop import Pretrained
 from dew.sampling.text import Sampling
 

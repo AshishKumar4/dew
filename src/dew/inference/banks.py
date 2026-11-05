@@ -20,13 +20,13 @@ instead, and the prefetch loop reads them during execution.
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
+import functools
 import itertools
 import math
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from types import MappingProxyType
@@ -95,14 +95,20 @@ class LayerBanks(Protocol):
         differently is refused as well, because a bank is one array with one
         sharding. Both checks raise ValueError before anything is read.
         """
-        sites, shapes, _device_mesh, placement, entries = _bank_plan(model, self, mesh, layout)
+        return _stored(self, model, mesh, layout, self.entry, self.bank)
 
-        entry_values = jax.block_until_ready(self.entry(entries)) if entries else {}
-        return merge(entry_values, assembled(sites, lambda site, first, count, _: self.bank(
-            range(first, first + count),
-            _bank_placement(one_layer(placement, first, namespace=site.namespace),
-                            one_layer(shapes, first, namespace=site.namespace), stacked=count > 1),
-            namespace=site.namespace)))
+
+def _stored(source: LayerBanks, model: BankedModel, mesh: MeshSpec | Mesh | None, layout: Layout | None,
+            entry: Callable[[Placement], Variables], bank: Callable[..., Variables]) -> Variables:
+    """`LayerBanks.place` of `source`, its entries read by `entry` and each bank by `bank`."""
+    sites, shapes, _device_mesh, placement, entries = _bank_plan(model, source, mesh, layout)
+
+    entry_values = jax.block_until_ready(entry(entries)) if entries else {}
+    return merge(entry_values, assembled(sites, lambda site, first, count, _: bank(
+        range(first, first + count),
+        _bank_placement(one_layer(placement, first, namespace=site.namespace),
+                        one_layer(shapes, first, namespace=site.namespace), stacked=count > 1),
+        namespace=site.namespace)))
 
 
 def one_layer(variables: Variables, index: int, *, namespace: tuple[str, ...] = ()) -> Variables:
@@ -201,8 +207,7 @@ class CheckpointBanks(LayerBanks):
     """The shape and dtype trees the checkpoint at `step` holds, read once when the source is built."""
 
     def __post_init__(self):
-        from dew.checkpoints import Checkpoints
-        with Checkpoints(self.directory) as checkpoints:
+        with self._reader() as checkpoints:
             step = checkpoints.latest if self.step is None else self.step
             if step is None:
                 raise FileNotFoundError(f"{self.directory} holds no checkpoint")
@@ -215,64 +220,49 @@ class CheckpointBanks(LayerBanks):
         return self.stored["variables"]
 
     def entry(self, placement: Placement) -> Variables:
-        with self._opened() as restoring:
-            return restoring.entry(placement)
+        with self._reader() as checkpoints:
+            return self._restored(checkpoints, placement)
 
     def bank(self, layers: Sequence[int], placement: Placement, *,
              namespace: tuple[str, ...] = ()) -> Variables:
-        with self._opened() as restoring:
-            return restoring.bank(layers, placement, namespace=namespace)
+        with self._reader() as checkpoints:
+            return self._bank(checkpoints, layers, placement, namespace=namespace)
 
     def place(self, model: BankedModel, *, mesh: MeshSpec | Mesh | None = None,
               layout: Layout | None = None) -> Variables:
         """`LayerBanks.place`, every entry and bank of the load read through one reader of the run, so the
         checkpoint's metadata is read once a load, not once a layer."""
-        with self._opened() as restoring:
-            return restoring.place(model, mesh=mesh, layout=layout)
+        with self._reader() as checkpoints:
+            return _stored(self, model, mesh, layout, functools.partial(self._restored, checkpoints),
+                           functools.partial(self._bank, checkpoints))
 
-    @contextlib.contextmanager
-    def _opened(self) -> Iterator[_Restoring]:
+    def _reader(self) -> Checkpoints:
         from dew.checkpoints import Checkpoints
 
-        with Checkpoints(self.directory) as checkpoints:
-            yield _Restoring(self, checkpoints)
+        return Checkpoints(self.directory)
 
-
-@dataclasses.dataclass(frozen=True)
-class _Restoring(LayerBanks):
-    """A `CheckpointBanks` source's banks, restored through `checkpoints`, one reader of its run held open
-    for as many reads as its caller makes."""
-
-    source: CheckpointBanks
-    checkpoints: Checkpoints
-
-    def shapes(self) -> Variables:
-        return self.source.shapes()
-
-    def entry(self, placement: Placement) -> Variables:
-        return self._restored(placement)
-
-    def bank(self, layers: Sequence[int], placement: Placement, *,
-             namespace: tuple[str, ...] = ()) -> Variables:
+    def _bank(self, checkpoints: Checkpoints, layers: Sequence[int], placement: Placement, *,
+              namespace: tuple[str, ...] = ()) -> Variables:
+        """`bank`, read through `checkpoints`."""
         if len(layers) == 1:
-            return one_layer(self._restored(at_layer(placement, layers[0], namespace=namespace)),
+            return one_layer(self._restored(checkpoints, at_layer(placement, layers[0], namespace=namespace)),
                              layers[0], namespace=namespace)
-        rows = [one_layer(self._restored(at_layer(_row_placement(placement), index, namespace=namespace)),
+        rows = [one_layer(self._restored(checkpoints, at_layer(_row_placement(placement), index,
+                                                               namespace=namespace)),
                           index, namespace=namespace) for index in layers]
         return program(stack_layers, out_shardings=placement)(*rows)
 
-    def _restored(self, placement: Placement) -> Variables:
-        """Restore the variables `placement` names onto its shardings, as every load of a run's
-        variables restores them (`Checkpoints.materialized`)."""
-        source = self.source
+    def _restored(self, checkpoints: Checkpoints, placement: Placement) -> Variables:
+        """Restore the variables `placement` names onto its shardings through `checkpoints`, as every load
+        of a run's variables restores them (`Checkpoints.materialized`)."""
         shapes = narrowed(self.shapes(), placement)
         template, placements = {"variables": shapes}, {"variables": narrowed(placement, shapes)}
-        if source.ema:
-            averaged = narrowed(source.stored["ema"], placement)
+        if self.ema:
+            averaged = narrowed(self.stored["ema"], placement)
             if averaged:
                 template["ema"], placements["ema"] = averaged, narrowed(placement, averaged)
-        assert source.step is not None
-        return self.checkpoints.materialized(template, placements, step=source.step)
+        assert self.step is not None
+        return checkpoints.materialized(template, placements, step=self.step)
 
 
 @dataclasses.dataclass(frozen=True)

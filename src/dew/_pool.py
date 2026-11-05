@@ -3,7 +3,7 @@
 `jax.distributed.initialize` needs the coordinator's address, the process
 count and this process's rank. A TPU VM, a Slurm step and an Open MPI launch
 leave those in variables jax reads by itself. A plain set of machines leaves
-nothing, so `dew.cli.launch` sets the four variables below on every process
+nothing, so `dew._cli.launch` sets the four variables below on every process
 and `dew.training.runtime.prepare_process` reads them back. This module is
 the contract between the two. It imports only the standard library, so
 neither side pulls in the other's dependencies; `detected_cluster` imports
@@ -142,7 +142,7 @@ def selected_gpus(selected: str) -> tuple[int, ...] | None:
 
 def local_gpus(selected: str = ALL_GPUS) -> tuple[int, ...] | None:
     """The GPUs a process of JAX's selection `selected` opens, by the CUDA driver's ordinals, which its
-    memory and placement reads take (`dew.devices.gpu_memory`): those `selected` names, else every one the
+    memory and placement reads take (`dew._devices.gpu_memory`): those `selected` names, else every one the
     process may use (`local_gpu_count`); None where they could not be counted."""
     named = selected_gpus(selected)
     if named is not None:
