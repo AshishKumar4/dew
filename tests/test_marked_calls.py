@@ -209,6 +209,39 @@ def test_a_declared_rule_with_symbolic_zeros_meets_one_where_no_tangent_reaches(
         np.testing.assert_array_equal(np.asarray(jax.grad(lambda x, f=declared: jnp.sum(f(x, y)))(x)),
                                       np.asarray(jax.grad(lambda x, f=bare: jnp.sum(f(x, y)))(x)))
         assert seen and set(seen) == {unreached}, seen
+        # Its rules keep their kind: the gradient computes no sine outside a span of it.
+        gradient = jax.make_jaxpr(jax.grad(lambda x, f=declared: jnp.sum(f(x, y))))(x)
+        assert "sin" not in unmarked(gradient.jaxpr), gradient
+
+
+def unmarked(jaxpr) -> list[str]:
+    """The primitives `jaxpr` runs outside every marked call, its other bodies' included."""
+    names = []
+    for equation in jaxpr.eqns:
+        if equation.primitive is marked_call_p:
+            continue
+        names.append(equation.primitive.name)
+        for value in equation.params.values():
+            for inner in (value if isinstance(value, (tuple, list)) else (value,)):
+                if isinstance(inner, jax.extend.core.Jaxpr):
+                    names += unmarked(inner)
+    return names
+
+
+def test_a_declared_rule_may_return_a_known_zero_tangent():
+    """A declared tangent rule with `symbolic_zeros` may return a known zero (`SymbolicZero`) as an output's
+    tangent, as a bare `jax.custom_jvp`'s may: differentiated along an operand it ignores, its tangent is
+    zero, as the bare rule's is."""
+    def tangent(primals, tangents):
+        return primals[0], tangents[0]
+
+    declared = derivatives.declared_tangent(Protected(), lambda x, y: x, tangent, symbolic_zeros=True)
+    bare = jax.custom_jvp(lambda x, y: x)
+    bare.defjvp(tangent, symbolic_zeros=True)
+    x, y = jnp.linspace(0.1, 1.0, 8), jnp.full(8, 2.0)
+    for rule in (declared, bare):
+        _, along = jax.jit(lambda y, f=rule: jax.jvp(lambda y: f(x, y), (y,), (jnp.ones_like(y),)))(y)
+        np.testing.assert_array_equal(np.asarray(along), np.zeros(8))
 
 
 def test_a_surrogate_is_one_surrogate_call():
