@@ -16,14 +16,25 @@ import optax
 import pytest
 from flax import linen as nn
 from learning_gate import assert_learns, within
-from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact
 from scipy import stats
+from tool_support import run_from
 
 from dew.diffusion import broadcast_rates, expand, presets
 from dew.diffusion.schedules import FlowMatchingScheduler
 from dew.sampling import Euler, sample
 
-DENSITIES = dict(np.load(Path(__file__).parent / "fixtures" / "flow" / "densities.npz"))
+DENSITY_DRAWS = 4096
+DENSITY_SEEDS = 8
+"""Each training-time density's declared check-1 seeds, sized by `seeds_for` paired."""
+DIFFUSERS_DENSITY = {"logit_normal": {"weighting_scheme": "logit_normal", "logit_mean": 0.0,
+                                      "logit_std": 1.0},
+                     "logit_normal_shifted": {"weighting_scheme": "logit_normal", "logit_mean": 0.5,
+                                              "logit_std": 0.8},
+                     "mode": {"weighting_scheme": "mode", "mode_scale": 1.29},
+                     "mode_negative": {"weighting_scheme": "mode", "mode_scale": -0.5}}
+"""Each case's arguments, Diffusers' names for FlowMatchingScheduler's density, logit_mean, logit_std and
+mode_scale."""
 
 
 @pytest.mark.parametrize("case,fields", [
@@ -35,11 +46,32 @@ DENSITIES = dict(np.load(Path(__file__).parent / "fixtures" / "flow" / "densitie
 def test_training_times_are_diffusers_sd3_densities(case, fields):
     """SD3's training-time densities (Esser et al. 2024, section 3.1) as
     Diffusers 0.34.0's `compute_density_for_timestep_sampling` computes them
-    (tools/flow_density_reference.py), on the draw `sample_t` makes from the
-    same key, held to the float64 rule: logit-normal at its default and
-    shifted, and the mode density on both sides of uniform."""
-    drawn = FlowMatchingScheduler(**fields).sample_t(jax.random.key(0), DENSITIES[case].shape[0])
-    assert_as_exact_as_the_reference(drawn, DENSITIES[case], DENSITIES[f"{case}_f64"], case)
+    in the test, on the draw `sample_t` makes from the
+    same key, on par over drawn keys (check 1): logit-normal at its default
+    and shifted, and the mode density on both sides of uniform. Diffusers' one
+    random draw is the one `sample_t` makes (`recorded_draws.fixed_draws`): a
+    standard normal for `logit_normal`, which `torch.normal(mean, std)`
+    returns as mean + std * normal, and a uniform for the others."""
+    import torch
+    from diffusers.training_utils import compute_density_for_timestep_sampling
+
+    arguments = DIFFUSERS_DENSITY[case]
+    sampler = jax.random.normal if arguments["weighting_scheme"] == "logit_normal" else jax.random.uniform
+
+    def diffusers(dtype):
+        @as_given
+        def run(seed):
+            base = np.asarray(sampler(jax.random.key(int(seed)), (DENSITY_DRAWS,), dtype=jnp.float32))
+            fixed = torch.tensor(base, dtype=dtype)
+            with run_from("recorded_draws", "tools") as draws, draws.fixed_draws(fixed):
+                return compute_density_for_timestep_sampling(batch_size=DENSITY_DRAWS, **arguments).numpy()
+        return run
+
+    def dew(seed):
+        return FlowMatchingScheduler(**fields).sample_t(jax.random.key(seed), DENSITY_DRAWS)
+
+    assert_as_exact(dew, diffusers(torch.float32), lambda seed: (np.int32(seed),), case, seeds=DENSITY_SEEDS,
+                    truth_fn=diffusers(torch.float64))
 
 
 COSMAP_DRAWS = 4_000_000
@@ -171,6 +203,8 @@ def test_flow_matching_learns_a_two_mode_mixture():
 
 
 LOSS = np.load(Path(__file__).resolve().parent / "fixtures" / "flow" / "loss.npz")
+FLOW_LOSS_SEEDS = 8
+"""The flow loss's declared check-1 seeds, sized by `seeds_for` paired."""
 
 
 class Velocity(nn.Module):
@@ -196,10 +230,10 @@ def test_the_static_shift_is_diffusers_schedulers():
 def test_the_flow_loss_and_its_gradient_are_diffusers_flux_trainings(case):
     """DiffusionObjective's flow loss on its own draws against Diffusers'
     Flux DreamBooth loss statements run as published on the same sigmas and
-    noise (its "logit_normal" weighting, ones): Dew's is half of it, as
-    Dew's L2 halves the squared error, within 1e-6 of the float64 run, and
-    twice its gradient in the network's 192 weights is held to the float64
-    run by the float64 rule. At shift 3 the drawn times move to the
+    noise (its "logit_normal" weighting, ones): twice Dew's loss, as Dew's L2
+    halves the squared error, and twice its gradient in the network's 192
+    weights, on par with Diffusers' over the objective's own draws from drawn
+    keys (check 1, the truth Diffusers' float64 run). At shift 3 the drawn times move to the
     shifted sigmas the static shift gives."""
     from dew.inputs import Field, InputSpec
     from dew.objectives.base import Step
@@ -210,20 +244,55 @@ def test_the_flow_loss_and_its_gradient_are_diffusers_flux_trainings(case):
     objective = DiffusionObjective(Velocity(), presets.Flow(shift=shift)(),
                                    InputSpec(Field("image", pixels.shape[1:])), guidance=None, solver=Euler(),
                                    steps=2, unconditional_prob=0.0, ema_decay=None)
+    import types
+
+    import torch
+    from diffusers.training_utils import compute_loss_weighting_for_sd3
+
+    from tools.flow_loss_reference import velocity
+    from tools.torch_precision import float_as, replaced
+
     variables = objective.init(jax.random.PRNGKey(0))
-    # The step reads the reference's times and noise (`Step.tape`), drawn as tools/flow_loss_reference.py
-    # draws them.
-    keys = jax.random.split(jax.random.key(int(LOSS["key"])), 5)
-    times = objective.process.schedule.sample_t(keys[2], pixels.shape[0])
-    step = Step(step=jnp.asarray(0), key=keys[0], ema=None,
-                tape={"times": times, "noise": jax.random.normal(keys[3], pixels.shape)})
-    np.testing.assert_array_equal(np.asarray(objective.process.schedule.rates(times)[1]),
-                                  LOSS[f"sigmas_{case}"])
+    schedule = objective.process.schedule
 
-    def loss(weights):
-        tree = {**variables, "params": {"weights": weights}}
-        return objective.scalar_loss(tree, {"image": pixels}, step)[0]
+    def draw(seed):
+        # The training times and noise as the objective draws them from a key's split, handed to the step
+        # by name (`Step.tape`), and the schedule's sigmas at those times, the reference's.
+        keys = jax.random.split(jax.random.key(seed), 5)
+        times = schedule.sample_t(keys[2], pixels.shape[0])
+        return times, jax.random.normal(keys[3], pixels.shape), schedule.rates(times)[1]
 
-    value, gradient = jax.value_and_grad(loss)(jnp.asarray(LOSS["weights"]))
-    np.testing.assert_allclose(2 * float(value), float(LOSS[f"loss_{case}_f64"]), rtol=1e-6)
-    assert_as_exact_as_the_reference(2 * gradient, LOSS[f"grad_{case}"], LOSS[f"grad_{case}_f64"], "gradient")
+    def dew(times, noise, sigmas):
+        step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None,
+                    tape={"times": times, "noise": noise})
+
+        def loss(weights):
+            tree = {**variables, "params": {"weights": weights}}
+            return objective.scalar_loss(tree, {"image": pixels}, step)[0]
+
+        value, gradient = jax.value_and_grad(loss)(jnp.asarray(LOSS["weights"]))
+        return {"loss": 2 * value, "gradient": 2 * gradient}
+
+    def diffusers(dtype):
+        @as_given
+        def run(times, noise, sigmas):
+            # Diffusers' loss statements as published (the fixture's, read from the script).
+            x = (pixels.astype(np.float32) - np.float32(127.5)) / np.float32(127.5)
+            parameters = torch.tensor(LOSS["weights"], dtype=dtype, requires_grad=True)
+            scope = {"torch": torch, "compute_loss_weighting_for_sd3": compute_loss_weighting_for_sd3,
+                     "args": types.SimpleNamespace(weighting_scheme="logit_normal"),
+                     "model_input": torch.tensor(x, dtype=dtype),
+                     "noise": torch.tensor(np.asarray(noise), dtype=dtype),
+                     "sigmas": torch.tensor(np.asarray(sigmas), dtype=dtype).reshape(-1, 1, 1, 1)}
+            with replaced(float_as(dtype)):
+                exec(str(LOSS["noising"]), scope)
+                scope["model_pred"] = velocity(parameters, scope["noisy_model_input"],
+                                               scope["sigmas"].flatten() * 1000)
+                exec(str(LOSS["loss_lines"]), scope)
+                scope["loss"].backward()
+            return {"loss": scope["loss"].detach().numpy(), "gradient": parameters.grad.numpy()}
+        return run
+
+    np.testing.assert_array_equal(np.asarray(draw(0)[2]), np.asarray(schedule.rates(draw(0)[0])[1]))
+    assert_as_exact(dew, diffusers(torch.float32), draw, f"flow loss at shift {shift}",
+                    seeds=FLOW_LOSS_SEEDS, truth_fn=diffusers(torch.float64))
