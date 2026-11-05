@@ -713,7 +713,8 @@ def test_a_denoiser_reads_the_text_interval_and_time_it_declares(architecture, r
     does. MeanFlow and sCM slow a `TimeScaled` denoiser's time features
     through `time_scale`, which is the time's unit: at 16 on t and d it
     computes bit for bit what it computes at 2 on 8t and 8d, powers of two
-    keeping both sides exact.
+    keeping both sides exact. Each claim's calls run as one compiled program, where op by op they took
+    most of the test (ledger 3908).
     """
     model, sample, time, rest, conditions = denoiser(architecture, rng)
     if isinstance(model, RequiresText):
@@ -723,30 +724,41 @@ def test_a_denoiser_reads_the_text_interval_and_time_it_declares(architecture, r
         text = conditions.get(model.text_keyword, rest[0] if rest else None)
         denoised = model.apply(variables, sample, time, **{model.text_keyword: text})
     else:
-        denoised = model.apply(model.init(rng, sample, time), sample, time)
+        denoised = jax.jit(lambda sample, time: model.apply(model.init(rng, sample, time), sample, time))(
+            sample, time)
     assert denoised.shape == sample.shape and bool(jnp.all(jnp.isfinite(denoised)))
 
     def built(model, scale=None):
+        """`model` (at `scale`), its variables drawn, and its call of them at a time and its keywords."""
         model = model if scale is None else model.clone(time_scale=scale)
         # Noise on every parameter, so a zero-initialized head hides nothing a change of input does.
-        initialized = model.init(rng, sample, time, *rest, **conditions)
+        initialized = jax.jit(lambda: model.init(rng, sample, time, *rest, **conditions))()
         variables = {**initialized, "params": moved(initialized["params"], rng, 0.1)}
-        return lambda at, **duration: model.apply(variables, sample, at, *rest, **duration, **conditions)
+        return variables, lambda variables, at, **duration: model.apply(variables, sample, at, *rest,
+                                                                         **duration, **conditions)
 
     duration = jnp.full_like(time, 0.25)
     if isinstance(model, IntervalModel):
         with pytest.raises(ValueError):
-            built(model.clone(interval=False))(time, duration=duration)
+            variables, call = built(model.clone(interval=False))
+            call(variables, time, duration=duration)
         model = model.clone(interval=True)
-        call = built(model)
-        np.testing.assert_array_equal(call(time), call(time, duration=jnp.zeros_like(time)))
-        assert not np.array_equal(call(time), call(time, duration=duration))
+        variables, call = built(model)
+        missing, zero, spanning = jax.jit(lambda variables, time, duration: (
+            call(variables, time), call(variables, time, duration=jnp.zeros_like(time)),
+            call(variables, time, duration=duration)))(variables, time, duration)
+        np.testing.assert_array_equal(missing, zero)
+        assert not np.array_equal(missing, spanning)
     else:
         with pytest.raises(TypeError):
-            built(model)(time, duration=duration)
+            variables, call = built(model)
+            call(variables, time, duration=duration)
     if isinstance(model, TimeScaled):
         spanned = isinstance(model, IntervalModel)
-        fast, slow = (built(model, scale)(unit * time, **({"duration": unit * duration} if spanned else {}))
-                      for scale, unit in ((16.0, 1.0), (2.0, 8.0)))
+        pairs = [(*built(model, scale), unit) for scale, unit in ((16.0, 1.0), (2.0, 8.0))]
+        fast, slow = jax.jit(lambda held, time, duration: [
+            call(variables, unit * time, **({"duration": unit * duration} if spanned else {}))
+            for (_, call, unit), variables in zip(pairs, held, strict=True)])(
+                [variables for variables, _, _ in pairs], time, duration)
         assert not np.array_equal(fast, jnp.zeros_like(fast))
         np.testing.assert_array_equal(fast, slow)
