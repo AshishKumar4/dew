@@ -8,7 +8,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from one_draw import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, indexed_recording, recording
+from tool_support import run_from
 
 from dew.diffusion import expand, presets
 from dew.inputs import Field, InputSpec, unit_range
@@ -17,7 +18,7 @@ from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
 from dew.sampling import Euler
 
-EMBED = np.load(Path(__file__).resolve().parent / "fixtures" / "jit" / "bottleneck.npz")
+EMBED = recording(Path(__file__).resolve().parent / "fixtures" / "jit" / "bottleneck.npz")
 
 
 class Clean(nn.Module):
@@ -71,9 +72,18 @@ def test_the_training_times_are_the_references_logit_normal_mirrored():
 
 
 def test_the_bottleneck_embedding_is_jits():
+    """Dew's bottleneck embedding with JiT's own weights on par with JiT's `BottleneckPatchEmbed` over the
+    recorded seeds' pixels (check 1, the recording's summary of its float32 run's evidence), the truth Dew's
+    float64 run held to the sketch of JiT's own."""
     embed = PatchEmbedding(patch_size=8, embedding_dim=12, bottleneck=5)
-    variables = {"params": {"Conv_0": {"kernel": jnp.asarray(EMBED["Conv_0.kernel"], jnp.float32)},
-                            "Dense_0": {"kernel": jnp.asarray(EMBED["Dense_0.kernel"], jnp.float32),
-                                        "bias": jnp.asarray(EMBED["Dense_0.bias"], jnp.float32)}}}
-    tokens = embed.apply(variables, jnp.asarray(EMBED["pixels"]))
-    assert_as_exact_as_the_reference(tokens, EMBED["tokens32"], EMBED["tokens"], "bottleneck")
+    weights = {"params": {"Conv_0": {"kernel": EMBED["Conv_0.kernel"]},
+                          "Dense_0": {"kernel": EMBED["Dense_0.kernel"], "bias": EMBED["Dense_0.bias"]}}}
+    narrow = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), weights)
+    with run_from("jit_reference", "tools") as generator:
+        redraw = generator.draw
+    seeds = int(EMBED["bottleneck.seeds"])
+    draw, reference, truth = indexed_recording(
+        EMBED, "bottleneck", seeds, inputs_of=redraw,
+        truth_fn=lambda inputs: {"tokens": embed.apply(weights, jnp.asarray(inputs["pixels"], jnp.float64))})
+    assert_as_exact(lambda index, inputs: {"tokens": embed.apply(narrow, inputs["pixels"])}, reference, draw,
+                    "bottleneck", seeds=seeds, truth_fn=truth)
