@@ -15,7 +15,7 @@ PROGRAM = """
 import json, sys
 import jax, jax.numpy as jnp, numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
-from dew.cache import enable_compilation_cache
+from dew._cache import enable_compilation_cache
 from dew.nn.attention import scaled_dot_product_attention
 from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
 from dew.nn.kernels.lowered import custom_calls

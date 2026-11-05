@@ -21,7 +21,7 @@ from reference_error import assert_fp32_reduction_bound
 from run_kinds import scalars
 
 import dew
-from dew.cli.main import main
+from dew._cli.main import main
 from dew.config import ObjectiveConfig
 from dew.data import Files
 from dew.data.dataset import Loading

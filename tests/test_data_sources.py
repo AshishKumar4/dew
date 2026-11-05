@@ -1058,7 +1058,7 @@ def test_a_token_export_reads_through_the_storage_options_it_is_given(tmp_path):
 
 
 def test_cli_refuses_an_unsupported_token_export_format_before_writing(tmp_path):
-    from dew.cli.main import main
+    from dew._cli.main import main
 
     input = tmp_path / "documents.jsonl"
     input.write_text('{"text":"a document"}\n')
@@ -1069,7 +1069,7 @@ def test_cli_refuses_an_unsupported_token_export_format_before_writing(tmp_path)
 
 
 def test_cli_record_exports_still_default_to_parquet(tmp_path):
-    from dew.cli.main import main
+    from dew._cli.main import main
     from dew.data.sources import source
 
     input = tmp_path / "documents.jsonl"
@@ -1087,7 +1087,7 @@ def test_cli_exports_the_chain_of_the_file_it_names_and_no_other(tmp_path, monke
     module the process holds elsewhere (the standard library's `json`), or as a package's module
     (`email.utils`), is refused, not read as it, and leaves the process as it was: its directory off the
     path, so no later import, a loading worker's included, reads it in the module's place."""
-    from dew.cli.main import main
+    from dew._cli.main import main
     from dew.data.sources import source
 
     # The exports accepted put their directories first on the path, as a run of the CLI does; the test's

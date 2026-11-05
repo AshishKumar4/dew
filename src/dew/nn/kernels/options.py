@@ -27,7 +27,7 @@ from jax.experimental.layout import Format
 from jax.sharding import Sharding
 
 from dew import algebra
-from dew.devices import xla_flag
+from dew._devices import xla_flag
 from dew.nn.kernels.generation import backend, gpu_target
 from dew.nn.nested import staged
 

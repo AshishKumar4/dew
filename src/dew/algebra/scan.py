@@ -43,9 +43,9 @@ import numpy as np
 from jax import lax
 from jax.extend import core as jcore
 
+from dew._cache import ALGEBRA
 from dew.algebra import carry, cost, derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate, read_by
-from dew.cache import ALGEBRA
 from dew.nn.precision import at_least_fp32, float32_einsum, float32_matmul, two_sum, vanishing
 
 Axes = tuple[str, ...]

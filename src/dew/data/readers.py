@@ -11,7 +11,7 @@ from typing import Literal
 import grain.python as pygrain
 import numpy as np
 
-from dew import position
+from dew import _position
 from dew._records import json_value, record
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS, Batch
 from dew.data.dataset import (
@@ -234,11 +234,11 @@ class _PerShare(Forwarding):
         saved = {"dew_data_plan": self._plan.record(), "counters": COUNTERS, "iterator": state}
         # A mix's captured positions are shared mappings (`SharedMapping`), written as the records they
         # read as.
-        return json.dumps(json_value({position.REPLICATED: saved} if self._replicated else saved,
+        return json.dumps(json_value({_position.REPLICATED: saved} if self._replicated else saved,
                                      "data position")).encode()
 
     def set_state(self, state: bytes) -> None:
-        held = position.replicated(state)
+        held = _position.replicated(state)
         if self._replicated != (held is not None):
             raise ValueError(
                 "this read is elastic, and the saved position is one share's own offset; resume it with the "
@@ -261,9 +261,8 @@ class _PerShare(Forwarding):
         return self._plan.identity()
 
     def statistics(self) -> Mapping[str, float]:
-        """The metrics of the counters last published by the reading thread, and what this process's
-        mirrors did (`mirror_metrics`)."""
-        return {**data_metrics(self._statistics.counts.values()), **mirror_metrics()}
+        """The metrics of the counters last published by the reading thread."""
+        return data_metrics(self._statistics.counts.values())
 
     def close(self) -> None:
         if self._read is not None:
@@ -287,7 +286,8 @@ class _Statistics:
         read = {name: counts for published in self._published for name, counts in published.counts.items()}
         merged = {name: counts.followed(read.pop(name)) if name in read else counts
                   for name, counts in self._counts.items()}
-        return data_metrics([*merged.values(), *read.values()])
+        # What this process's mirrors did beside them (`mirror_metrics`, row 4299).
+        return {**data_metrics([*merged.values(), *read.values()]), **mirror_metrics()}
 
 
 @dataclasses.dataclass(frozen=True)
