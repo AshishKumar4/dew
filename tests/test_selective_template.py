@@ -264,16 +264,16 @@ run (tests/test_gpu_recurrence.py), each held there to recorded mamba_ssm."""
 def test_the_selective_scan_through_its_dispatch_is_as_exact_as_the_portable_scan(forms, c_dtype):
     """The selective scan through its dispatch with the template named, its placement and operand dtypes as
     a call hands them over: its output and every input's gradient on par from float64 with the portable
-    scan's over drawn fp32 operands (check 1), one row of a ragged chunk over two channel blocks (KT5: no
-    route held, the scan's behaviour)."""
+    scan's over drawn fp32 operands, `C` drawn in `c_dtype` (check 1), one row of a ragged chunk over two
+    channel blocks (KT5: no route held, the scan's behaviour)."""
     shape = SHAPES["interpreted"]
 
     def draws(seed):
-        inputs, _, dy = draw(jnp.float32, seed, *shape, packed=False)
-        return (*inputs, dy)
+        (x, dt, a, b, c, skip), _, dy = draw(jnp.float32, seed, *shape, packed=False)
+        return x, dt, a, b, c.astype(c_dtype), skip, dy
 
     def reference(x, dt, a, b, c, skip):
-        return portable(x, dt, a, b, c.astype(c_dtype).astype(jnp.float32), skip, None, None)[0]
+        return portable(x, dt, a, b, c.astype(jnp.float32), skip, None, None)[0]
 
     assert_as_exact(jax.jit(with_gradients(dispatched(forms, named=True, c_dtype=c_dtype))),
                     jax.jit(with_gradients(reference)), draws,
