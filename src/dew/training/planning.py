@@ -12,6 +12,7 @@ many a step takes.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 import logging
 import tempfile
@@ -203,7 +204,7 @@ def judged_likely(headroom: int | None, under: int, *, forecast: bool) -> bool:
 
 def planned(candidates: Sequence[int], first: int, fits: Callable[[int], bool],
             climb: Callable[[], bool], likely: Callable[[int], bool] = lambda split: False,
-            refused: Callable[[int], bool] = lambda split: False) -> int | None:
+            halved: Callable[[int], bool] | None = None) -> int | None:
     """The split a step reads its batch in, at the rung `climb` leaves the
     objective on, or None where no candidate fits.
 
@@ -232,11 +233,10 @@ def planned(candidates: Sequence[int], first: int, fits: Callable[[int], bool],
     Past a miss, the first split `likely` to fit by what the compiles
     measured (`Forecast`) or the derivation judged is asked in place of the
     largest, and where it misses, the next above it; the halving below a
-    split that fits compiles no split `refused`, one the derivation judges
-    short, corrected by what a compile at the rung needed beyond it
-    (Qwen3.5-4B at 4 x 2048 on an H100: two microbatches, judged 3.83 GiB
-    short for their accumulated gradient, compiled a third time on main,
-    row 3341). Replayed through it, the six compiles an A100-40 asked for
+    split that fits asks `halved`, which may rule a compile out
+    (`FitSearch.refused`: Qwen3.5-4B at 4 x 2048 on an H100, two
+    microbatches, judged 3.83 GiB short for their accumulated gradient,
+    compiled a third time on main, row 3341). Replayed through it, the six compiles an A100-40 asked for
     Qwen3.5-0.8B's packed 8 x 3072 step are five (no largest split), the
     plan the same.
     """
@@ -250,9 +250,7 @@ def planned(candidates: Sequence[int], first: int, fits: Callable[[int], bool],
                 high = index
                 while high - low > 1:
                     middle = (low + high) // 2
-                    # A split the derivation refuses past a miss is not compiled (`refused`).
-                    fitted = not refused(candidates[middle]) and fits(candidates[middle])
-                    low, high = (low, middle) if fitted else (middle, high)
+                    low, high = (low, middle) if (halved or fits)(candidates[middle]) else (middle, high)
                 return candidates[high]
             low = index
         if not climb():
@@ -658,7 +656,8 @@ class FitSearch[LossT, EffectsT]:
         self.derived_start(candidates[-1])
         first = self.derived_split(candidates, first)
         seen, held, traced = len(report.misses()), set(report.refused_launches()), len(report.rewrites())
-        split = planned(candidates, first, self.fits, self.climb, self.likely, self.refused)
+        split = planned(candidates, first, self.fits, self.climb, self.likely,
+                        functools.partial(self.fits, pruned=True))
         spills: list[JSON] = [spill_record(miss) for miss in report.misses()[seen:]]
         refused: list[JSON] = [refusal_record(*refusal) for refusal in report.refused_launches()
                                if refusal not in held]
@@ -827,6 +826,16 @@ class FitSearch[LossT, EffectsT]:
         return judged_likely(self.judgment(split), self.under.get(self.remat_rung(), 0),
                              forecast=self.forecast.likely(self.rung(), split))
 
+    def learned(self, foreseen: int | None, measured: int | None, fit: bool) -> None:
+        """What a compile at the objective's remat teaches the derivation's next judgments there: the
+        headroom it `measured` short of the one `foreseen` corrects them (`under`), and a compile that fit
+        where the derivation, so corrected, judged it short rules its refusals out (`overstated`)."""
+        rung = self.remat_rung()
+        if foreseen is not None and fit and foreseen - self.under.get(rung, 0) < 0:
+            self.overstated.add(rung)
+        if foreseen is not None and measured is not None and foreseen > measured:
+            self.under[rung] = max(self.under.get(rung, 0), foreseen - measured)
+
     def refused(self, split: int) -> bool:
         """Whether the derivation judges the step at `split` short past a miss, corrected by what a compile
         at the rung needed beyond it (`under`), which the halving below a split that fits does not compile
@@ -861,15 +870,18 @@ class FitSearch[LossT, EffectsT]:
             moved = step()
         return moved
 
-    def fits(self, split: int) -> bool:
-        if self.fits_here(split):
+    def fits(self, split: int, *, pruned: bool = False) -> bool:
+        """Whether the step at `split` fits, at the objective's rung or its half rung (`remat_half`), a
+        compile asked at each; `pruned`, a rung the derivation judges short asks none (`refused`), the
+        half rung judged on its own."""
+        if self.fits_here(split, pruned):
             return True
         missed, held = self.rung(), remat_half(self.objective)
         self.forecast.half_of[missed] = None if held is None else self.rung()
         if held is None:
             return False
         self.halves.add(self.remat_rung())
-        if self.fits_here(split):
+        if self.fits_here(split, pruned):
             return True
         self.objective.substitute(held)
         return False
@@ -925,16 +937,7 @@ class FitSearch[LossT, EffectsT]:
         foreseen = agreed(None if candidate.footprint is None else derived_headroom(
             candidate.footprint, local_devices(self.mesh), self.capacity, candidate.built))
         probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, derived_headroom=foreseen)
-        measured = agreed(headroom)
-        if foreseen is not None and measured is not None and foreseen > measured:
-            # What this compile needed past its derivation corrects the derivation's next judgments at its
-            # remat (`likely`).
-            rung = self.remat_rung()
-            self.under[rung] = max(self.under.get(rung, 0), foreseen - measured)
-        if foreseen is not None and foreseen < 0 and fit:
-            # A compile the derivation judged short that fits: its refusals at this remat order no compile
-            # out (`refused`), the compiles deciding.
-            self.overstated.add(self.remat_rung())
+        self.learned(foreseen, agreed(headroom), fit)
         if foreseen is not None and (foreseen >= 0) != fit:
             # A derived peak bounded from below (`Footprint.exact`) admits provisionally: its miss names
             # the need the compile found, which a sourced rule is to reach.
@@ -954,7 +957,9 @@ class FitSearch[LossT, EffectsT]:
                          None if probe.derived is None else probe.derived.record())
         return options, candidate, executable, probe
 
-    def fits_here(self, split: int) -> bool:
+    def fits_here(self, split: int, pruned: bool = False) -> bool:
+        if pruned and self.refused(split):
+            return False
         key = (split, self.rung())
         if key not in self.lowered:
             # A step compiled ahead, its first compile, is lowered as its own compile lowered it (`handed`):
