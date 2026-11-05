@@ -1569,11 +1569,31 @@ def the_backward_is_on_par_under_every_score_hook_on_an_h100(hooks, form):
     _check_hooked_backward(hooks, form=form, interpret=False)
 
 
+def _counted(fn, *arrays) -> tuple[float, float]:
+    """The model's share of the Mosaic launches' work `fn` lowers for an H100 each declares
+    (`instrumentation.MODEL_FLOPS`) and the hardware's work each states (`_stated_flops`: none unsized)."""
+    import re
+
+    from dew.telemetry.instrumentation import _MODEL_FLOPS, _stated_flops
+
+    # Lowered deviceless for an H100 whatever the host, so a GPU host of another generation lowers no TMA
+    # of its own.
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        text = jax.jit(fn).trace(*arrays).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
+    launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
+    assert launches and all(_stated_flops(line) is not None for line in launches)
+    declared = [_MODEL_FLOPS.search(line) for line in launches]
+    assert all(declared)
+    return (sum(float(found.group(1)) for found in declared if found),
+            sum(_stated_flops(line) or 0.0 for line in launches))
+
+
 @pytest.mark.parametrize("causal, queries, keys, pairs", [
     (True, 256, 256, 256 * 257 // 2), (True, 128, 256, 128 * 129 // 2),
     (True, 256, 128, 128 * 129 // 2 + 128 * 128), (True, 64, 192, 64 * 65 // 2),
-    (False, 256, 256, 256 * 256)],
-    ids=["causal", "causal-fewer-queries", "causal-more-queries", "causal-padded", "full"])
+    (False, 256, 256, 256 * 256), (False, 64, 192, 64 * 192)],
+    ids=["causal", "causal-fewer-queries", "causal-more-queries", "causal-padded", "full", "full-padded"])
 def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, keys, pairs):
     """A bf16 call's plain forward, training forward and backward through the Mosaic mainloop, each lowered
     for an H100: every launch states its hardware work (`attention_mosaic_program.stated`), which Dew's FLOP
@@ -1588,9 +1608,7 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
     training forward and in the backward; a rerun (the guarded launch, the fold's natural walk) adds none. The
     launches' own statements are read: the training forward's overflowed rows rerun the plain-JAX walk in a
     conditional, whose products the count bounds apart."""
-    import re
-
-    from dew.telemetry.instrumentation import _MODEL_FLOPS, _stated_flops, hlo_flops
+    from dew.telemetry.instrumentation import hlo_flops
 
     rows, heads, kv_heads, width = 1, 4, 2, 64
     query = jax.ShapeDtypeStruct((rows, queries, heads, width), jnp.bfloat16)
@@ -1598,29 +1616,16 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
     spans = template.spans(queries, keys, rows, causal=causal)
     forward = 2 * rows * heads * pairs * (width + width)
     # The 64 by 64 tiles the pinned launches walk that hold a pair a causal call reaches (a key at or before
-    # its query), each computed whole, over the queries padded to a program's two consumers' rows: a padded
-    # consumer walks its keys as a real one does.
+    # its query), each computed whole, over the queries padded to a program's two consumers' rows (a padded
+    # consumer walks its keys as a real one does) and the call's keys: the keys pad to two tiles too, a tile
+    # wholly past them walked by none.
     block, consumers = 64, 2
     padded = -(-queries // (consumers * block)) * consumers * block
     walked = sum(block * block for first_q in range(0, padded, block) for first_k in range(0, keys, block)
                  if not causal or first_k < first_q + block)
     issued = 2 * rows * heads * walked * (width + width)
 
-    # Lowered deviceless for an H100 whatever the host, so a GPU host of another generation lowers no TMA
-    # of its own.
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
-
-    def counted(fn, *arrays):
-        """The model's share of the launches' work each declares (`instrumentation.MODEL_FLOPS`) and the
-        hardware's work each states."""
-        with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-            text = jax.jit(fn).trace(*arrays).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
-        launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
-        assert launches and all(_stated_flops(line) is not None for line in launches)
-        declared = [_MODEL_FLOPS.search(line) for line in launches]
-        assert all(declared)
-        return (sum(float(found.group(1)) for found in declared if found),
-                sum(_stated_flops(line) or 0.0 for line in launches))
 
     def trained(query, key, value):
         return attention_mosaic.forward(query, key, value, spans, residuals=template.Kept.SPLIT)
@@ -1633,10 +1638,10 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
 
     # The training forward recomputes its walk's `Q K^T`; the fast backward its `S` beside its four.
     product = issued // 2
-    pins = (attention_mosaic.Tiles(block, block, 2, 1), attention_mosaic.BackwardTiles(block, block, 2, 1,
-                                                                                         fused=True))
+    pins = (attention_mosaic.Tiles(block, block, 2, consumers),
+            attention_mosaic.BackwardTiles(block, block, 2, consumers, fused=True))
     with _pinned(*pins):
-        plain = counted(lambda q, k, v: attention_mosaic.forward(q, k, v, spans), query, key, key)
+        plain = _counted(lambda q, k, v: attention_mosaic.forward(q, k, v, spans), query, key, key)
     assert plain == (forward, issued)
     # A forward whose launches walk its value columns a block apiece: each recomputes `Q K^T`, which the
     # model owns once. The blocks' launches are one kernel called once a block, as the step's FLOP count
@@ -1650,12 +1655,38 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
 
     with _pinned(*pins):
         whole = weighed(lambda q, k, v: attention_mosaic.forward(q, k, v, spans))
-    with _pinned(attention_mosaic.Tiles(block, block, 2, 1, columns=width // 2)):
+    with _pinned(attention_mosaic.Tiles(block, block, 2, consumers, columns=width // 2)):
         blocked = weighed(lambda q, k, v: attention_mosaic.forward(q, k, v, spans))
     assert blocked == (whole[0], whole[1] + product)
     with _pinned(*pins):
-        assert counted(trained, query, key, key) == (forward, issued + product)
-        assert counted(backward, query, key, key, query, residuals) == (2 * forward, 2 * issued + product)
+        assert _counted(trained, query, key, key) == (forward, issued + product)
+        assert _counted(backward, query, key, key, query, residuals) == (2 * forward, 2 * issued + product)
+
+
+def test_a_common_walk_states_every_tile_each_holder_walks():
+    """The fast backward's one launch fed by its consumers (`wgmma.fed`, a program two key blocks, each
+    consumer walking every query tile either block is read by, `Family.walk_own`) over a causal call of 128
+    queries and 192 keys, its keys padded to 256, lowered for an H100: the launch states the tiles each
+    consumer walks (`attention_mosaic_program.issued`), one its own keys are not seen by too. The first
+    program's consumers walk both 64-row query tiles each, the second keys' tile read by the second alone;
+    the second program's none, its first keys past every query's and its second past the keys."""
+    rows, heads, width, block = 1, 2, 64, 64
+    query = jax.ShapeDtypeStruct((rows, 128, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, 192, heads, width), jnp.bfloat16)
+    spans = template.spans(128, 192, rows, causal=True)
+    with generation.assumed("sm90"):
+        residuals = jax.eval_shape(lambda q, k, v: attention_mosaic.forward(
+            q, k, v, spans, residuals=template.Kept.SPLIT), query, key, key)[1:]
+
+    def backward(query, key, value, dout, residuals):
+        return attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals)
+
+    # The backward's five products (`S` recomputed, dP's, dV's, dK's and dQ's) over four tiles where each
+    # consumer walked its own keys' readers alone: three.
+    walked, pairs = 4 * block * block, 128 * 129 // 2
+    with _pinned(backward=attention_mosaic.BackwardTiles(block, block, 2, 2, fused=True, family="wgmma.fed")):
+        assert _counted(backward, query, key, key, query, residuals) == (
+            2 * rows * heads * pairs * 4 * width, 2 * rows * heads * walked * 5 * width)
 
 
 @pytest.mark.parametrize("axis", [0, 1])
