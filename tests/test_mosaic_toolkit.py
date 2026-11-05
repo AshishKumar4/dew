@@ -744,3 +744,30 @@ def test_the_relay_through_tensor_memory_lowers_for_a_b200():
     with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(mesh):
         jax.jit(functools.partial(_relayed_products, interpret=False)).trace(q, k, v).lower(
             lowering_platforms=("cuda",))
+
+
+def test_a_tpu_core_walks_the_persistent_tiles_interpreted():
+    """Interpreted on any host: the persistent walk on a TPU core's bundle (`mosaic_tpu.MXU`), each step's
+    blocks DMA'd into its VMEM ring a step ahead and multiplied by the MXU, each tile's rows stored from
+    VMEM, over three tiles with the middle one multiplying nothing: each tile's rows exactly its product,
+    the middle's zeros."""
+    from dew.nn.kernels.templates import mosaic_tpu
+    family = mosaic_tpu.MXU
+    x, w = _persisted_operands(family.rows)
+    got = np.asarray(_persisted_products(x, w, family=family, interpret=True))
+    expected = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
+    expected[family.rows:2 * family.rows] = 0
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_the_tpu_persistent_walk_lowers_for_a_v5e():
+    """The persistent walk on a TPU core's bundle lowers for a TPU v5e on any host, its devices abstract."""
+    from jax.sharding import AbstractDevice, AbstractMesh
+
+    from dew.nn.kernels.templates import mosaic_tpu
+    family = mosaic_tpu.MXU
+    x, w = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _persisted_operands(family.rows))
+    device = AbstractDevice(device_kind=generation.TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
+    with jax.sharding.use_abstract_mesh(AbstractMesh((1,), ("data",), abstract_device=device)):
+        jax.jit(functools.partial(_persisted_products, family=family, interpret=False)).trace(x, w).lower(
+            lowering_platforms=("tpu",))

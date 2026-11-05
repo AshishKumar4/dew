@@ -128,21 +128,23 @@ def shaped(tile: dict) -> dict:
     return {name: (value.shape, value.dtype) for name, value in tile.items()}
 
 
-def walked(forms: derive.Derived, tiles: list[dict], product=None):
+def walked(forms: derive.Derived, tiles: list[dict], product=None, stepped=None):
     """The state after stepping each of `tiles` (its operands' tiles) in order, from the empty state, each
-    product `product`'s where given (a mainloop's issuer)."""
+    product `product`'s where given (a mainloop's issuer), each step's sums `stepped`'s where given (a
+    mainloop's own step, `Derived.step`'s)."""
     state = forms.init(shaped(tiles[0]))
     for tile in tiles:
-        state = forms.step(state, tile, product=product)
+        state = forms.step(state, tile, product=product, stepped=stepped)
     return state
 
 
-def walked_whole(forms: derive.Derived):
-    """The declaration's derived step over every key tile in order, finished: a function of (q, k, v)."""
+def walked_whole(forms: derive.Derived, stepped=None):
+    """The declaration's derived step over every key tile in order (each step's sums `stepped`'s where
+    given), finished: a function of (q, k, v)."""
     def run(q, k, v):
         values = operands(q, k, v)
-        return forms.finish(walked(forms, [tile_of(values, tile) for tile in range(KEYS // TILE)]), values,
-                            shapes=shaped(tile_of(values, 0)))
+        tiles = [tile_of(values, tile) for tile in range(KEYS // TILE)]
+        return forms.finish(walked(forms, tiles, stepped=stepped), values, shapes=shaped(tiles[0]))
 
     return run
 
@@ -187,16 +189,9 @@ def test_a_walks_sums_added_by_its_mainloop_take_each_tiles_factor_and_sum():
                      if isinstance(part, algebra_forms.Added) else None
                      for state, part in zip(states, parts, strict=True))
 
-    def run(q, k, v):
-        values = operands(q, k, v)
-        tiles = [tile_of(values, tile) for tile in range(KEYS // TILE)]
-        state = forms.init(shaped(tiles[0]))
-        for tile in tiles:
-            state = forms.step(state, tile, stepped=doubled)
-        return forms.finish(state, values, shapes=shaped(tiles[0]))
-
-    assert_as_exact(jax.jit(run), jax.jit(lambda q, k, v: whole(attention)(q, k, v) / 2), draw,
-                    "attention, its sums added twice", seeds=16)
+    halved = jax.jit(lambda q, k, v: whole(attention)(q, k, v) / 2)
+    assert_as_exact(jax.jit(walked_whole(forms, doubled)), halved, draw, "attention, its sums added twice",
+                    seeds=16)
 
 
 def unscaled(q, k, v, rows, keys):
@@ -217,15 +212,8 @@ def test_a_walks_plain_sums_of_products_are_the_mainloops_to_take():
                      if isinstance(part, algebra_forms.Accumulated) and part.factor is None else None
                      for state, part in zip(states, parts, strict=True))
 
-    def run(q, k, v):
-        values = operands(q, k, v)
-        tiles = [tile_of(values, tile) for tile in range(KEYS // TILE)]
-        state = forms.init(shaped(tiles[0]))
-        for tile in tiles:
-            state = forms.step(state, tile, stepped=doubled)
-        return forms.finish(state, values, shapes=shaped(tiles[0]))
-
-    assert_as_exact(jax.jit(run), jax.jit(lambda q, k, v: 2 * whole(unscaled)(q, k, v)), draw,
+    twice = jax.jit(lambda q, k, v: 2 * whole(unscaled)(q, k, v))
+    assert_as_exact(jax.jit(walked_whole(forms, doubled)), twice, draw,
                     "a plain sum of products, accumulated twice", seeds=16)
 
 
