@@ -5,7 +5,7 @@ A txtar archive of four sections, each a contract consumers outside the reposito
 - `exports`: each name of `dew.__all__`, its kind and signature; an exported class's public methods, each
   with its signature, and its properties, each with its getter's type and whether it is set or deleted.
 - `config`: each dataclass of `dew.config` and of the modules of the run kinds, and each dataclass of Dew
-  their fields' types reach, wherever it is defined: its fields with their types and defaults, and a field
+  the run kinds' fields reach, wherever it is defined: its fields with their types and defaults, and a field
   that is keyword-only or no constructor argument marked so.
 - `cli`: each command of `dew` (`dew.cli.main.COMMANDS`, `DATA_COMMANDS` under `dew data`,
   `dew.cli.tpu.COMMANDS` under `dew tpu`), each argument as the command declares it to tyro: its field's
@@ -220,7 +220,7 @@ def reaches(hint) -> Iterator[type]:
 def config() -> list[str]:
     """Every record dataclass a run's `run.json` holds: those of `dew.config` and its modules, and of the
     module of each run kind the registry names (`dew.registry.runs`), wherever it lives, and every dataclass
-    of Dew their fields' types reach (`reaches`), each once under its qualified name."""
+    of Dew a run kind's fields reach (`reaches`), each once under its qualified name."""
     import dew.config
     from dew.registry import runs
 
@@ -228,18 +228,18 @@ def config() -> list[str]:
     modules = {dew.config, *(importlib.import_module(f"dew.config.{info.name}")
                              for info in pkgutil.iter_modules(dew.config.__path__)),
                *(importlib.import_module(module) for module in kinds)}
-    pending = [cls for module in modules for cls in vars(module).values()
-               if inspect.isclass(cls) and dataclasses.is_dataclass(cls)
-               and cls.__module__ == module.__name__]
-    listed: dict[type, None] = {}
+    listed = {cls for module in modules for cls in vars(module).values()
+              if inspect.isclass(cls) and dataclasses.is_dataclass(cls) and cls.__module__ == module.__name__}
+    pending = [runs[name] for name in runs]
+    reached: set[type] = set()
     while pending:
         cls = pending.pop()
-        if cls not in listed:
-            listed[cls] = None
+        if cls not in reached:
+            reached.add(cls)
             hints = typing.get_type_hints(cls, include_extras=True)
             pending.extend(found for field in dataclasses.fields(cls) for found in reaches(hints[field.name]))
     lines = []
-    for cls in sorted(listed, key=lambda cls: (cls.__module__, cls.__qualname__)):
+    for cls in sorted(listed | reached, key=lambda cls: (cls.__module__, cls.__qualname__)):
         lines.append(f"{cls.__module__}.{cls.__qualname__}")
         lines.extend(f"  {line}" for line in fields(cls))
     return lines
