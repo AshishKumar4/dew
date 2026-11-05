@@ -28,7 +28,15 @@ from jax.extend import core as jaxpr_core
 
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic
-from dew.nn.kernels.templates.attention import Hooks, Initial, Kept, KeySpans, prescale
+from dew.nn.kernels.templates.attention import (
+    Hooks,
+    Initial,
+    Kept,
+    KeySpans,
+    grouped_rows,
+    prescale,
+    ungrouped_rows,
+)
 from dew.nn.kernels.templates.attention_mosaic_program import bundle_of
 
 
@@ -71,13 +79,12 @@ def _reads_places(score_mod) -> bool:
 
 def packed(query: jax.Array, spans: KeySpans, kv_heads: int, initial: Initial | None = None
            ) -> tuple[jax.Array, KeySpans, Initial | None]:
-    """`query` `[B, T, H, D]` as `[B, T·G, KV, D]` over its `kv_heads` key heads, `G = H // KV`, row `t·G + g`
-    query head `k·G + g` of position `t`, and `spans` `[B, T]` and `initial` `[B, H, T]` alike: each packed
-    row sees its query's keys and starts from its head's state."""
-    batch, positions, heads, width = query.shape
+    """`query` `[B, T, H, D]` as `[B, T·G, KV, D]` over its `kv_heads` key heads (`grouped_rows`), and `spans`
+    `[B, T]` and `initial` `[B, H, T]` alike: each packed row sees its query's keys and starts from its head's
+    state; `ungrouped_rows` takes an output back."""
+    batch, positions, heads, _ = query.shape
     group = heads // kv_heads
-    rows = query.reshape(batch, positions, kv_heads, group, width).transpose(0, 1, 3, 2, 4)
-    rows = rows.reshape(batch, positions * group, kv_heads, width)
+    rows = grouped_rows(query, kv_heads)
 
     def repeated(x):
         return None if x is None else jnp.repeat(x, group, axis=1)
@@ -93,14 +100,6 @@ def packed(query: jax.Array, spans: KeySpans, kv_heads: int, initial: Initial | 
 
         initial = Initial(heads_rows(initial.m), heads_rows(initial.total), heads_rows(initial.acc))
     return rows, spans, initial
-
-
-def unpacked(out: jax.Array, heads: int) -> jax.Array:
-    """`packed`'s inverse on an output `[B, T·G, KV, Dv]`: `[B, T, H, Dv]`."""
-    batch, rows, kv_heads, width = out.shape
-    group = heads // kv_heads
-    shaped = out.reshape(batch, rows // group, group, kv_heads, width).transpose(0, 1, 3, 2, 4)
-    return shaped.reshape(batch, rows // group, heads, width)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -220,11 +219,11 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
             out = attention_mosaic.forward(rows, key, value, row_spans, whole, scale=scale, natural=False,
                                            residuals=Kept.NONE, interpret=interpret, masked=True, table=table,
                                            sources=sources)
-        return unpacked(out, heads)
+        return ungrouped_rows(out, heads)
     with tuning.pinned({attention_mosaic.MosaicForward: work.config}):
         out, maximum, total = attention_mosaic.forward(
             rows, key, value, row_spans, walked, scale=scale, natural=False, residuals=Kept.OUTPUT,
             interpret=interpret, out_dtype=jnp.float32, masked=True, splits=work.slices, table=table,
             sources=sources)[:3]
     merged_rows = merged(_spec(rows, row_spans, walked, scale=scale), out, maximum, total, initial)
-    return unpacked(merged_rows, heads).astype(query.dtype)
+    return ungrouped_rows(merged_rows, heads).astype(query.dtype)

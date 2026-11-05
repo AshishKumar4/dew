@@ -56,7 +56,7 @@ from . import tuning
 from .generation import INHERENT, gpu_target, triton_runs
 from .selection import Requirement
 from .templates import attention_algebra as algebra
-from .templates.attention import Capped, kernel_dot, prescaled
+from .templates.attention import Capped, grouped_rows, kernel_dot, prescaled, ungrouped_rows
 
 if TYPE_CHECKING:
     # Named in quotes: tokamax reads its ops' `_fwd` annotations as types, which postponed ones are not.
@@ -484,15 +484,10 @@ def grouped_query(attend, query, key, value):
     positions and ran each query head on its own, 4.7% slower a layer at 64 rows for the same bits
     (docs/performance.md), and the decode kernel takes as many query heads as key heads
     (`decode_attention.SUPPORTS`)."""
-    batch, positions, heads, width = query.shape
-    kv_heads = key.shape[-2]
-    group = heads // kv_heads
-    if group == 1:
+    heads, kv_heads = query.shape[2], key.shape[-2]
+    if heads == kv_heads:
         return attend(query, key, value)
-    grouped = query.reshape(batch, positions, kv_heads, group, width).transpose(0, 1, 3, 2, 4)
-    out = attend(grouped.reshape(batch, positions * group, kv_heads, width), key, value)
-    out = out.reshape(batch, positions, group, kv_heads, out.shape[-1]).transpose(0, 1, 3, 2, 4)
-    return out.reshape(batch, positions, heads, out.shape[-1])
+    return ungrouped_rows(attend(grouped_rows(query, kv_heads), key, value), heads)
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Array, starts=None, *,
