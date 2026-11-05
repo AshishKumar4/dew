@@ -280,11 +280,11 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
 
         starts = range(0, rhs.shape[0], instruction)
         fragments = loaded(starts[0])
-        for following in (*starts[1:], None):
-            ahead = None if following is None else loaded(following)
+        for following in starts[1:]:
+            ahead = loaded(following)
             acc = self._mma(acc, *fragments)
             fragments = ahead
-        return acc
+        return self._mma(acc, *fragments)
 
     def _mma(self, acc, left, right):
         """`acc + left @ right` by one mma.sync product of its operands' fragments: fp32's as TF32 through
