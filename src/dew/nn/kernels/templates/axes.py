@@ -11,9 +11,9 @@ WHOLE = slice(None)
 """An axis taken whole (a view's slice along an axis it does not cut)."""
 
 GROUPS = 'groups'
-"""A side operand's axis of one value a group (`dew.nn.kernels.gemm`'s, row 3963): a launch reads the operand at its
-tile's group (`at_group`), the axis indexed away (`held`), and hands its hook the value at each of the tile's
-rows (`by_rows`), as the portable program reads it repeated at each row."""
+"""A side operand's axis of one value a group (`dew.nn.kernels.gemm`'s, row 3963): a launch reads the operand
+at its tile's group (`at_group`), the axis indexed away (`held`), and hands its hook the value at each of the
+tile's rows (`by_rows`), as the portable program reads it repeated at each row."""
 
 
 def named[T](axes: Sequence[str], by_axis: Mapping[str, T]) -> tuple[T, ...]:
