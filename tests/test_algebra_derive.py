@@ -3,6 +3,7 @@ softmax over keys stated on whole operands, walked in key tiles through its deri
 two and merged, each held to the float64 truth (check 1) against the whole-operand function; and the
 declarations no monoid along the walk holds, refused."""
 
+import functools
 from collections.abc import Callable
 from typing import Literal
 
@@ -213,30 +214,47 @@ def held_floored(q, k, v, rows, keys):
     return (p @ v) / jnp.where(jnp.sum(p, axis=-1) == 0, 1.0, jnp.sum(p, axis=-1))[:, None]
 
 
-def natural_exp(x):
-    """An exponential of the declaration's own: `exp` by way of `exp2` (a launch's lowering of it)."""
-    return jnp.exp2(x * np.float32(np.log2(np.e)))
+def raw(q, k, v, rows, keys):
+    """Attention over its raw products, the scale taken after the subtraction (the accurate form's raw
+    logits: the largest's exponent exactly 0, whatever the scale)."""
+    del rows, keys
+    s = q @ k.T
+    m = jnp.max(s, axis=-1)
+    p = jnp.exp((s - m[:, None]) * SCALE)
+    return (p @ v) / jnp.sum(p, axis=-1)[:, None]
 
 
-def compensated_rescale(carried, now):
-    """`exp(carried - now)` with the subtraction's rounding carried to first order (TwoSum), as attention's
-    accurate form rescales a state."""
+SCALE = WIDTH ** -0.5
+
+
+def natural_exp(x, scale=1.0):
+    """An exponential of the declaration's own, of `x` times `scale`: `exp` by way of `exp2` (a launch's
+    lowering of it)."""
+    return jnp.exp2(x * np.float32(scale * np.log2(np.e)))
+
+
+def compensated_rescale(carried, now, scale=1.0):
+    """`exp((carried - now) scale)` with the subtraction's rounding carried to first order (TwoSum), as
+    attention's accurate form rescales a state."""
     difference, error = precision.two_sum(carried, -now)
-    factor = natural_exp(difference)
-    return jnp.where(jnp.isfinite(error), factor * (1.0 + error), factor)
+    factor = natural_exp(difference, scale)
+    return jnp.where(jnp.isfinite(error), factor * (1.0 + error * scale), factor)
 
 
-@pytest.mark.parametrize("stated", ["held", "held floored", "declared numerics"])
+@pytest.mark.parametrize("stated", ["held", "held floored", "declared numerics", "raw"])
 def test_an_accurate_declarations_own_forms_walk_as_its_function(stated):
     """A declaration under the accurate numerics whose weights hold the largest to 1 by a select (against its
-    maximum, or that maximum floored where a query may see no key), or which
+    maximum, or that maximum floored where a query may see no key), or over raw products scaled after their
+    subtraction, its exponential carrying the scale, or which
     states its own exponential and rescale (`Reduction.exponential`, `rescale`: attention's accurate
     forward's), walked over every key tile by its derived step and finished: on par with the whole-operand
     function against the float64 truth (check 1)."""
-    function = {"held": held, "held floored": held_floored, "declared numerics": attention}[stated]
-    declaration = derive.Reduction(function, AXES, walked="keys", exponent="e",
-                                   **({} if stated != "declared numerics" else
-                                      {"exponential": natural_exp, "rescale": compensated_rescale}))
+    function = {"held": held, "held floored": held_floored, "declared numerics": attention,
+                "raw": raw}[stated]
+    numerics = {"declared numerics": {"exponential": natural_exp, "rescale": compensated_rescale},
+                "raw": {"exponential": natural_exp,
+                        "rescale": functools.partial(compensated_rescale, scale=SCALE)}}
+    declaration = derive.Reduction(function, AXES, walked="keys", exponent="e", **numerics.get(stated, {}))
     forms = derive.derive(declaration, accurate=True, saturation=SATURATION)
     assert_as_exact(jax.jit(walked_whole(forms)), jax.jit(whole(function)), draw, f"{stated} walked",
                     seeds=16)
