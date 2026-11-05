@@ -62,7 +62,7 @@
    "lane": "Training"
   },
   "tests/test_autoencoder.py": {
-   "comparisons": 6,
+   "comparisons": 4,
    "lane": "Training"
   },
   "tests/test_beam_search.py": {
