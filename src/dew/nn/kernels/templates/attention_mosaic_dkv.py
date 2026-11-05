@@ -18,6 +18,7 @@ from dew.nn.kernels.templates import attention_algebra as algebra, attention_gra
 from dew.nn.kernels.templates.attention import DKV_GRADS, Dropout, Kind, by_power, shared_place
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
+    Tiling,
     _coords,
     _Spans,
     _streamed,
@@ -480,12 +481,12 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
     key block a consumer, or one its consumers share (`holders`)."""
     batch, queries, heads, width = query.shape
     keys_padded, value_width = key.shape[1], value.shape[-1]
-    family, consumers = walk.program.family, walk.consumers
+    family, consumers, tiles = walk.program.family, walk.consumers, walk.program.tiles
     del graded
     dk, dv = (jax.ShapeDtypeStruct((batch, keys_padded, heads, share), jnp.float32) for _, share in shares)
     return family.kernel(
         entry, out_type=(dk, dv),
-        grid=(heads, keys_padded // (holders(family, consumers) * walk.program.tiles.block_k), batch),
+        grid=(heads, keys_padded // (holders(family, consumers) * tiles.block_k), batch),
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math,
         name=name,
@@ -498,8 +499,9 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
                     + part_count(query.dtype, walk.accurate)
                     * (shares[0][1] + (width if walk.fused else 0)),
                     query, key, value, dout,
-                    extents=(queries, keys_padded),
-                    blocks=(walk.program.tiles.block_q, walk.program.tiles.block_k)),
+                    tiling=Tiling((queries, keys_padded), (tiles.block_q, tiles.block_k),
+                                  holders(family, consumers), keyed=True,
+                                  common=family.feeds_itself or tiles.shared_dq or tiles.staged_logits)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              (width if walk.fused else 0) + shares[0][1] + shares[1][1]
                              + (value_width if shares[0][0] == 0 else 0)))

@@ -17,6 +17,7 @@ from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import mosaic
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
+    Tiling,
     _coords,
     _rows,
     _Spans,
@@ -175,7 +176,7 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         cost=stated(walk.spec, batch, heads,
                     width + 2 * value.shape[-1] + 2 * part_count(query.dtype, walk.accurate) * width,
                     query, key, value, dout,
-                    extents=(queries, keys_padded), blocks=(program.tiles.block_q, program.tiles.block_k)),
+                    tiling=Tiling((queries, keys_padded), (block_q, block_k), keyed=True)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              2 * width + 2 * value.shape[-1]))
     dq = jax.new_ref(jnp.zeros((batch, queries, heads, width), jnp.float32))
