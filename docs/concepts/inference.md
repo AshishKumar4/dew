@@ -311,6 +311,7 @@ Calling the server with a batch submits every prompt, steps until they all finis
 | `kv_cache` | A `KVCache` layout replacing the model's own. |
 | `chunk` | Prefill a long prompt in pieces of at most this many tokens, one piece a step. Needs a paged cache. |
 | `prefix_cache` | Share the full prompt pages of an earlier request that began with the same tokens. Needs a paged cache. |
+| `prefill_mesh` | Prefill the admitted prompts on a mesh of their own, as disaggregated serving does: the server keeps a copy of its weights there and moves each admission's prefilled rows to the decoding mesh, where they decode. Each prompt prefills whole over a dense cache. |
 | `host_pages` | Keep that many more prefix pages in host memory: a cached page the pool reclaims is copied to the host first, and a request that shares it reads it back into a fresh page before its prefill. Needs `prefix_cache`; a model whose rows keep a state beside their pages keeps its prefixes on the device. |
 | `decode_steps` | Decode iterations per device call (default 1). |
 
