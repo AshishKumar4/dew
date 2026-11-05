@@ -1031,6 +1031,59 @@ def test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images(tmp_path):
                                atol=2e-5, rtol=2e-5)
 
 
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("spec", [{"tensor": 2}, {"sequence": 2}, {"fsdp": 2, "stage": 2}],
+                         ids=["tensor", "sequence", "fsdp-stage"])
+def test_a_run_draws_images_on_every_trainer_layout_as_one_device_does(tmp_path, spec):
+    """A trained text-to-image run placed on each layout the trainer runs, a tensor axis, a sequence axis
+    and a pipeline's stage axis with FSDP, draws the images it draws on one device, called and served
+    (`TextToImage.scoring`), on par with one device against its float64 twin over the same prepared noise
+    and conditions (check 1) (ledger 1817)."""
+    from arm_arithmetic import widened
+    from reference_error import as_given, assert_as_exact, seeds_for
+
+    from dew.inference import ImageRequest, ScoringServer
+    from dew.training import Layout, MeshSpec
+
+    make_run(tmp_path)
+    devices = jax.devices()[:4]
+    layout = Layout(min_shard=1, tolerance=1.0)
+    alone = TextToImage.from_run(str(tmp_path))
+    placed = dew.pipeline(str(tmp_path), mesh=MeshSpec(**spec).build(devices), layout=layout)
+    server = ScoringServer.from_task(*placed.scoring(steps=3, images=2))
+    wide = dataclasses.replace(alone, model=alone.model.clone(dtype=jnp.float64),
+                               variables=widened(alone.variables))
+    prompts = ["a", "b"]
+
+    def draw(seed):
+        return (np.asarray([seed]),)
+
+    def drawn(task):
+        @as_given
+        def images(keys):
+            return task(prompts, steps=3, key=int(keys[0])).host().images
+
+        return images
+
+    @as_given
+    def served(keys):
+        answer = server.submit(ImageRequest(prompts, int(keys[0]), steps=3))
+        server.run()
+        return answer.result().host().images
+
+    @as_given
+    def truth(keys):
+        prepared = alone.prepare(prompts, key=int(keys[0]), steps=3)
+        held = widened(jax.tree.map(np.asarray, prepared))
+        with jax.enable_x64(new_val=True):
+            return wide(held, steps=3, key=int(keys[0])).host().images
+
+    label = f"images on {spec}"
+    count = seeds_for(drawn(alone), draw, label, truth_fn=truth, dew_fn=drawn(placed))
+    assert_as_exact(drawn(placed), drawn(alone), draw, label, seeds=count, truth_fn=truth)
+    assert_as_exact(served, drawn(alone), draw, label, seeds=count, truth_fn=truth)
+
+
 def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajectory(tmp_path):
     """A source whose sampler pairs its own tables hands the task a `grid`:
     for a step count it answers the process and the explicit time grid the
