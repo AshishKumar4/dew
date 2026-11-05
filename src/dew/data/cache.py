@@ -669,7 +669,10 @@ class _Writer:
         except OSError as error:
             if self.cache.on_full == "block":
                 raise
-            _log.warning("cache %s remains filling after upload failure: %s", self.root.url, error)
+            # A root that refused room refuses the next shard too: the fill stops once (row 4296).
+            with self.lock:
+                self._halt()
+            _log.warning("cache %s stops filling after upload failure: %s", self.root.url, error)
         except sqlite3.Error as error:
             if not self.cache.read_on(error, "remains filling"):
                 raise

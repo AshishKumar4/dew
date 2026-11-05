@@ -141,7 +141,9 @@ def test_a_split_saved_as_arrow_streams_its_parquet_conversion(monkeypatch, nati
     reader = data.train(DataPartition())
     try:
         assert [int(value) for _ in range(3) for value in next(reader)["id"]] == list(range(12))
-        assert {name.split("/")[2] for name in data.statistics()} == {"data"}
+        # Each corpus's metrics go by its repository's name, beside the run's mirrors' (`data/mirror/...`).
+        corpora = {name.split("/")[2] for name in data.statistics() if not name.startswith("data/mirror/")}
+        assert corpora == {"data"}
     finally:
         reader.close()
     assert Hub("owner/data", revision="original").streamed is None
