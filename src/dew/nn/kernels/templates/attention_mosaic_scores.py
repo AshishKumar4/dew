@@ -170,12 +170,14 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
 def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, dq, columns=None) -> None:
     """A fused dK/dV consumer's tile `dq` added into dQ at its queries from `q_first` (`place` its row and
     head), its `columns` where it is a share of them (`pl.ds`), through its output stage, free until its dK
-    and dV are stored; interpreted, into a copy of the consumer's own (`Family.added`)."""
+    and dV are stored (None where the family's adds read no stage, `Transport.adds_through_shared`);
+    interpreted, into a copy of the consumer's own (`Family.added`)."""
     row, head = place
     rows = dq.shape[0]
     view = dq_ref.at[index if walk.interpret else 0, row, pl.ds(q_first, rows), head]
     view = view if columns is None else view.at[:, columns]
-    walk.program.family.added(dq, view, walk.interpret, smem=out_smem.at[index, pl.ds(0, rows)])
+    smem = None if out_smem is None else out_smem.at[index, pl.ds(0, rows)]
+    walk.program.family.added(dq, view, walk.interpret, smem=smem)
 
 
 def _query_program(program: _Program, streams, k_ref, v_ref, spans, *, heads: int, kv_heads: int,

@@ -648,14 +648,17 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                 table, sources)
 
 
-def _scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int) -> resources.Scope:
-    """A launch's `allocations` (`(scoped, streams)`, `Family.scoped`'s) by lifetime (`Family.lifetimes`),
-    with the algebra's reductions' scratch and its `reducing_warpgroups`' scratch (`resources.Scope`):
-    every attention launch reduces its scores, weights or cotangents."""
-    scoped, streams = allocations
+def _scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int, *, reduces: bool = True
+           ) -> resources.Scope:
+    """A launch's `allocations` (`(scoped, streams)`, `Family.scoped`'s, and those it scopes after its
+    walks where it has them, `after_walks`) by lifetime (`Family.lifetimes`), with the algebra's
+    reductions' scratch where it `reduces` (a launch reducing its scores, weights or cotangents across
+    warps) and its `reducing_warpgroups`' scratch (`resources.Scope`)."""
+    scoped, streams, *after = allocations
     held, walks = family.lifetimes(streams)
-    return resources.Scope(program=(scoped, *held), walks=walks, reduces=True,
-                           reducing_warpgroups=reducing_warpgroups)
+    return resources.Scope(program=(scoped, *held), walks=walks,
+                           after=tuple((tile.shape, tile.dtype) for tile in (after[0] if after else ())),
+                           reduces=reduces, reducing_warpgroups=reducing_warpgroups)
 
 
 DQ_ROWS = 7
@@ -1001,16 +1004,22 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         q_stages = min(config.stages, padded_q // config.block_q)
         if config.queries_first:
             allocations = _coop_allocations if config.shared_keys else _fused_allocations
-            launches = [(family, config, allocations(family, config, width, dtype, q_stages))]
+            # The fused launch reduces across no warps, its statistics and D its operands and its sums its
+            # products' (an A100's at 64 x 64 reserves no reduction scratch, its lowering's 114,688 bytes the
+            # model's without it, et-fused80).
+            launches = [(family, config, allocations(family, config, width, dtype, q_stages),
+                         config.shared_keys)]
         else:
             launches = [(dkv_family, config.dkv, _dkv_allocations(
                 dkv_family, config.dkv, width, value_width, dtype, stages=q_stages, columns=config.columns,
-                tiled=Kind.TILE in self.score_kinds))]
+                tiled=Kind.TILE in self.score_kinds), True)]
         if not config.fused:
             launches.append((family, config, _dq_allocations(family, config, width, value_width, dtype,
-                                                             min(config.stages, padded_k // config.block_k))))
+                                                             min(config.stages, padded_k // config.block_k)),
+                             True))
         return max(resources.shared_bytes(layout, _scope(layout, allocations, reducing(
-            layout, tiles.consumers, self.score_mod))) for layout, tiles, allocations in launches)
+            layout, tiles.consumers, self.score_mod), reduces=reduces))
+            for layout, tiles, allocations, reduces in launches)
 
     def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int:
         dq, dkv = self._launch_registers(ba, config)

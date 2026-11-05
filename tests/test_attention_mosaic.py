@@ -1841,6 +1841,24 @@ def test_an_a100_forward_counts_the_shared_memory_its_lowering_asks_for(dtype, k
         assert shared > target.shared_limit
 
 
+@COMPILES_ON_CPU
+def test_an_a100_fused_backward_counts_the_shared_memory_its_lowering_asks_for():
+    """An A100's fused backward at 64 by 64 two stages deep on mma.sync, whose adds read no stage
+    (`Transport.adds_through_shared`), so its dK/dV output stage is scoped after its walks: the model counts
+    exactly the shared bytes its binary takes, the stage within the walks' slots, not beside them, and no
+    reduction scratch (the launch reduces across no warps)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels
+
+    op, ba, _ = _gated_backward("sm80", 128, accurate=False)
+    config = attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True, family="mma.sync")
+    with generation.assumed("sm80"):
+        shared = op.staged_bytes(ba, config, generation.gpu_target())
+        (found,) = compile_mosaic_kernels([KernelCase("backward", lambda: op.lowering(ba, config))], "sm80")
+    (binary,) = found["binaries"]
+    assert binary["shared"] == shared
+
+
 def _forward_kernels(op, ba, config) -> dict:
     """The forward's register model by each name a launch of it takes (`attention_mosaic_forward._launch`:
     `attention_{forward, training, peaks}`, then `_natural`, `_kept`, `_guarded`, `_columns{width}` and
