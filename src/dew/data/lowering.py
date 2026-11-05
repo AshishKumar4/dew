@@ -774,6 +774,15 @@ class _CachedOutputs:
         return held if held else (Rejected("empty_expansion"),)
 
 
+class _CachedOne:
+    """What a cache of steps that keep or reject each input holds for one, as the uncached steps make
+    it: its record, or the marker of its rejection; a missing one rejected (`_CachedOutputs`)."""
+
+    def __call__(self, outputs: Record | tuple[Record, ...]) -> Record:
+        (value,) = outputs if isinstance(outputs, tuple) else (outputs,)
+        return Rejected("missing") if value is None else value
+
+
 def _filled(stage: Artifact) -> Cache:
     """The cache an artifact stage fills. A generation is read as a source,
     which `_promoted` puts in its place before anything opens."""
@@ -1597,6 +1606,13 @@ class _Build:
         view = self.viewed(self.shared(placed, pipeline, partition), pipeline, partition, cache)
         if self.lowering.one_to_one:
             return view, cache + 1, self.dealt(partition, lambda: len(inputs))
+        if not any(isinstance(stage, (FlatMap, Batched)) for stage in prefix.stages):
+            # Steps that keep or reject each input give one output an input, a record or its marker, read
+            # as the uncached run's rows are read and dropped (`record_stage`), so a position either saves
+            # resumes in the other, the cache on or off (row 803).
+            single = _as_iter(view.map(_CachedOne()), self.loading)
+            kept = single if marked else Accepted(single, _name(pipeline), _label(pipeline))
+            return kept, cache + 1, None
         # A fetch with a pool of its own among the cached steps reads that many inputs at once.
         threads = max(self.loading.threads, prefix.threads or 0)
         read = dataclasses.replace(self.loading, threads=threads,

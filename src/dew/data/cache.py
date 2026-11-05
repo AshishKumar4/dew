@@ -676,9 +676,11 @@ class _Writer:
         held = self.metrics()
         seconds = held["upload_seconds"]
         rate = held["uploaded_bytes"] / seconds / 2**20 if seconds else 0.0
-        _log.info("data/cache %s: admitting=%s spool_bytes=%d uploaded_bytes=%d (%.1f MiB/s) abandoned=%d",
-                  self.root.url, held["admitting"], held["spool_bytes"], held["uploaded_bytes"], rate,
-                  held["abandoned"])
+        # A fill that abandoned uploads warns, which a run's default logging shows.
+        _log.log(logging.WARNING if held["abandoned"] else logging.INFO,
+                 "data/cache %s: admitting=%s spool_bytes=%d uploaded_bytes=%d (%.1f MiB/s) abandoned=%d",
+                 self.root.url, held["admitting"], held["spool_bytes"], held["uploaded_bytes"], rate,
+                 held["abandoned"])
 
     def _release(self) -> None:
         """The writer's local spool and its pin let go, once no upload reads them: the one release
@@ -705,8 +707,6 @@ class _Writer:
             future.cancel()
         self.pool.shutdown(wait=False, cancel_futures=True)
         self.index.close()
-        if self.abandoned:
-            _log.warning("data/cache/abandoned=%d at %s", self.abandoned, self.root.url)
         self._reported()
         if unfinished:
             remaining = set(unfinished)
