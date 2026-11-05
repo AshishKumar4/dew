@@ -510,7 +510,7 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
 
 
 def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int,
-                 amplified: bool = False) -> tuple[list, list[float]]:
+                 amplified: bool = False, shared: bool = False, steepest: int = 24) -> tuple[list, list[float]]:
     """Check 1's verdicts (`_staged`) on its worst-row rule alone for equally exact pairs as sites run it,
     `runs` runs from `chunk`'s own stream: both arms on one truth, so each row's size is shared; `rows`
     rows a draw of `width` values, truths and errors standard normal, the arms' errors independent; the
@@ -527,11 +527,12 @@ def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int,
     verdicts, statistics = [], []
     for _ in range(runs):
         truth = np.sqrt(np.mean(np.square(rng.standard_normal((span, rows, width))), axis=2))
+        scale = 2.0 ** rng.integers(0, steepest + 1, (span, rows)) if shared else None
         arms = []
         for _ in range(2):
             errors = rng.standard_normal((span, rows, width))
             if amplified:
-                errors[..., 0] *= 2.0 ** rng.integers(0, 25, (span, rows))
+                errors[..., 0] *= scale if shared else 2.0 ** rng.integers(0, steepest + 1, (span, rows))
             arms.append((np.sqrt(np.mean(np.square(errors), axis=2)) / truth).max(axis=1))
         worst = np.stack(arms, axis=-1)[:, None, :]
 
