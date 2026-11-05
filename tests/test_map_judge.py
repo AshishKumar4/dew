@@ -2,7 +2,8 @@
 check 1's draws are tested beside the gate (tests/test_reference_error.py)."""
 
 import pytest
-from map_judge import DRAWS, POOL, RECORDS, PoolRefused, drawing, pooled_units, record_units
+from check1_wire import DRAWS, POOL, RECORDS
+from map_judge import PoolRefused, drawing, pooled_units, record_units
 
 
 def recorded(monkeypatch, tmp_path, ranges, label="units"):

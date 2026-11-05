@@ -259,7 +259,7 @@ def test_sites_past_one_judges_jobs_inputs_together_are_planned_and_one_past_it_
         return f"import pytest\n\n@pytest.mark.{mark}\ndef test_site():\n    pass\n"
 
     # Two sites a Python, each within one job's inputs and past them together on every Python.
-    seeds = ci.MAX_INPUTS // (2 * (1 + ci.REDRAW))
+    seeds = ci.MAX_INPUTS // (2 * ci.check1_wire().staged_units(1))
     units = ci.MAX_INPUTS - 1
     written(tmp_path, {"test_a.py": marked(f"check1_shards(seeds={seeds}, per_task=1)"),
                        "test_b.py": marked(f"shards(units={units}, per_task=1)")})
@@ -299,10 +299,6 @@ def test_a_judge_judges_its_map_tasks_pooled_draws_from_its_inputs_and_refuses_a
     and a judge that pools whatever its inputs hold (ARMADA_INPUTS) and passes, the site's row green; the
     file's own row runs the rest of the file alone. A judge whose inputs miss a map task's seeds is refused
     (the gate's PoolRefused), never judged."""
-    from check1_statistics import REDRAW
-    from map_judge import DRAWS, POOL, RECORDS
-
-    assert (ci.DRAWS, ci.RECORDS, ci.POOL, ci.REDRAW) == (DRAWS, RECORDS, POOL, REDRAW)
     out = site_checkout(tmp_path, f"""import sys
 from pathlib import Path
 

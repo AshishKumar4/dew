@@ -248,6 +248,7 @@ def test_a_block_across_a_longrope_change_answers_each_token_as_the_walk_does(dr
     with jax.enable_x64(new_val=True):
         wide = walk(model.clone(dtype=jnp.float64), widened(params))
 
+    @as_given
     def truth(prompts, stretch):
         with jax.enable_x64(new_val=True):
             return wide(prompts, stretch)
@@ -308,6 +309,7 @@ def test_a_longrope_crossing_reseeds_the_drafter_as_a_prefill_of_its_history_doe
     with jax.enable_x64(new_val=True):
         wide = prefill(model.clone(dtype=jnp.float64), widened(params))
 
+    @as_given
     def truth(prompts, stretch):
         with jax.enable_x64(new_val=True):
             return wide(prompts, stretch)

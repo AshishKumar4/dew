@@ -164,7 +164,7 @@ def test_altup_trains_past_its_coefficient_clip_as_the_reference_does():
 
     assert_as_exact(stepped, as_given(lambda *inputs: reference(torch.float32, *inputs)), draw,
                     "an AltUp step past its clip", seeds=ALTUP_SEEDS,
-                    truth_fn=lambda *inputs: reference(torch.float64, *inputs))
+                    truth_fn=as_given(lambda *inputs: reference(torch.float64, *inputs)))
 
 
 STEP_ROWS, STEP_LENGTH = 4, 32
@@ -318,7 +318,8 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
 
     label = f"a clamped AltUp update, decay {decay}"
     assert_as_exact(stepped, as_given(lambda *inputs: reference(torch.float32, *inputs)), draw, label,
-                    seeds=UPDATE_SEEDS[decay], truth_fn=lambda *inputs: reference(torch.float64, *inputs))
+                    seeds=UPDATE_SEEDS[decay],
+                    truth_fn=as_given(lambda *inputs: reference(torch.float64, *inputs)))
 
 
 @pytest.mark.check1_shards(seeds=512, per_task=128)
@@ -413,7 +414,7 @@ def test_the_dense_decoders_gradient_is_the_references():
     try:
         assert_as_exact(differentiated, as_given(lambda *inputs: reference(torch.float32, *inputs)), draw,
                         "the dense decoder's gradient", seeds=DENSE_SEEDS,
-                        truth_fn=lambda *inputs: reference(torch.float64, *inputs), orders=orders)
+                        truth_fn=as_given(lambda *inputs: reference(torch.float64, *inputs)), orders=orders)
     finally:
         torch.set_num_threads(threads)
 
@@ -565,7 +566,7 @@ def test_the_sparse_mlp_trains_on_padded_rows_as_the_reference_does():
 
     assert_as_exact(stepped, as_given(lambda *inputs: reference(torch.float32, *inputs)), draw,
                     "a sparse MLP step over padded rows", seeds=PADDED_SEEDS,
-                    truth_fn=lambda *inputs: reference(torch.float64, *inputs))
+                    truth_fn=as_given(lambda *inputs: reference(torch.float64, *inputs)))
 
 
 def pulled(mlp, names, rows, cotangent) -> dict:
@@ -651,7 +652,7 @@ def test_the_sparse_mlp_is_as_exact_as_the_reference_at_each_sparsity(sparsity):
 
     assert_as_exact(stepped, as_given(lambda rows, cotangent: reference(torch.float32, cotangent, rows)),
                     draw, f"a sparse MLP step at sparsity {sparsity}", seeds=SPARSITY_SEEDS[sparsity],
-                    truth_fn=lambda rows, cotangent: reference(torch.float64, cotangent, rows))
+                    truth_fn=as_given(lambda rows, cotangent: reference(torch.float64, cotangent, rows)))
 
 
 @pytest.mark.parametrize("sparsity", [1e-9, 1 - 1e-9])

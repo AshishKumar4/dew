@@ -27,6 +27,7 @@ def _summed(order):
     return summed
 
 
+@as_given
 def _truth(x):
     return {"sum": np.sum(np.asarray(x, np.float64), axis=1)}
 

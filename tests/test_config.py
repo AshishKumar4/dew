@@ -82,7 +82,7 @@ def test_named_validation_splits_read_back_in_their_order(tmp_path):
 
 
 def test_a_run_records_the_data_plan_it_reads_by_and_one_saved_before_reads_by_eight(tmp_path):
-    """A run leaves its data plan version to its build, which records this Dew's (`RunConfig.pinned`), so
+    """A run leaves its data plan version to its build, which records this Dew's (`RunConfig.resumed`), so
     a resume reads its order as it did whatever version a later Dew reads by; a saved run whose record
     names none was written under version 8, which it reads by (`earlier_data_plan`, row 3840); its command
     run again resumes there (tests/test_saved_runs.py, each saved run of an earlier main)."""
@@ -92,15 +92,53 @@ def test_a_run_records_the_data_plan_it_reads_by_and_one_saved_before_reads_by_e
 
     config = RunConfig(data=TokenFiles("tokens/train").pipe(presets.token_windows, seq_len=8, batch=2),
                        trainer=TrainerConfig(steps=1))
-    assert config.data_plan is None and config.pinned().data_plan == PLAN_VERSIONS[-1] == 9
-    saved = config.pinned().record()
-    assert RunConfig.read(saved).data_plan == 9
+    assert config.data_plan_version is None and config.resumed().data_plan_version == PLAN_VERSIONS[-1] == 9
+    saved = config.resumed().record()
+    assert RunConfig.read(saved).data_plan_version == 9
     earlier = {**saved, "fields": {name: value for name, value in saved["fields"].items()
-                                   if name != "data_plan"}}
+                                   if name != "data_plan_version"}}
     directory = tmp_path / "planned"
     directory.mkdir()
     (directory / "run.json").write_text(json.dumps(earlier))
-    assert RunConfig.load(str(directory)).data_plan == 8
+    assert RunConfig.load(str(directory)).data_plan_version == 8
+
+
+def test_a_run_trained_on_a_compiled_loader_records_the_version_the_loader_reads_by(tmp_path):
+    """A run handed a loader already compiled (`RunConfig.train` of a `Loader`) reads the order the loader
+    was compiled in, so its record names the loader's data plan version, which rebuilding the run reads by,
+    not this Dew's (train 589's review: a loader compiled at 8 trained under a record naming 9)."""
+    import numpy as np
+    from affine_run import FEATURES
+
+    from dew.data import Memory
+    from dew.data.compile import compile
+    from dew.data.plan import PLAN_VERSIONS
+
+    rows = np.random.default_rng(0).normal(size=(16, FEATURES)).astype(np.float32)
+    loader = compile(Memory([{"x": row, "y": 2 * row[:2]} for row in rows]).batch(8).repeat(), plan_version=8)
+    assert loader.plan.version == 8 != PLAN_VERSIONS[-1]
+    config = TrainerConfig(name="loaded", checkpoint_dir=str(tmp_path / "runs"), steps=1, eval_every=None,
+                           checkpoint_every=None)
+    RunConfig(trainer=config).train(Regression(), loader, name="loaded")
+    assert RunConfig.load(str(tmp_path / "runs" / "loaded")).data_plan_version == 8
+
+
+def test_a_run_naming_another_version_than_its_compiled_loader_is_refused(tmp_path):
+    """A run that names its data plan version and is handed a loader compiled at another would train the
+    loader's order under a record naming its own, so it is refused, naming both, before it trains (train
+    593's review)."""
+    import numpy as np
+    from affine_run import FEATURES
+
+    from dew.data import Memory
+    from dew.data.compile import compile
+
+    rows = np.random.default_rng(0).normal(size=(16, FEATURES)).astype(np.float32)
+    loader = compile(Memory([{"x": row, "y": 2 * row[:2]} for row in rows]).batch(8).repeat(), plan_version=9)
+    config = TrainerConfig(name="named", checkpoint_dir=str(tmp_path / "runs"), steps=1, eval_every=None,
+                           checkpoint_every=None)
+    with pytest.raises(ValueError):
+        RunConfig(trainer=config, data_plan_version=8).train(Regression(), loader, name="named")
 
 
 def test_a_record_with_an_unknown_field_or_without_a_required_one_is_refused():

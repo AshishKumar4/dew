@@ -1209,8 +1209,8 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
     assert_as_exact(as_given(lambda *inputs: {"loss": piped(*inputs)[0]}),
                     as_given(lambda *inputs: {"loss": loop(*inputs)[0]}),
                     draw, "quantized pipeline loss", seeds=PIPELINE_SEEDS,
-                    truth_fn=lambda variables, rows, cotangent: {"loss": np.asarray(unquantized(
-                        variables["params"], variables, {"text": rows}, cotangent)[0])})
+                    truth_fn=as_given(lambda variables, rows, cotangent: {"loss": np.asarray(unquantized(
+                        variables["params"], variables, {"text": rows}, cotangent)[0])}))
 
 
 def test_stochastic_rounding_draws_from_its_own_stream():

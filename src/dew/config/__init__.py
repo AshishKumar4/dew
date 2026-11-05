@@ -1078,13 +1078,17 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def earlier_data_plan(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A saved run's record that states no data plan version (`RunConfig.data_plan`): it was written
-    before the field, under version 8, which read a mixture's corpora shuffled by one seed in one
-    permutation, so it reads by 8 (row 3840). Carried to 1.0 (ledger 1552)."""
+    """A saved run's record that states no data plan version (`RunConfig.data_plan_version`): one a Dew
+    wrote while the field was `data_plan` states it there, None where the run was trained in Python,
+    which that Dew compiled at version 9; one written before either, under version 8, which read a
+    mixture's corpora shuffled by one seed in one permutation, reads by 8 (row 3840). Carried to 1.0
+    (ledger 1552)."""
     named = registry.class_record(record)
-    if named is None or named[0] not in registry.runs or "data_plan" in named[1]:
+    if named is None or named[0] not in registry.runs or "data_plan_version" in named[1]:
         return record
-    return {**record, "fields": {**named[1], "data_plan": 8}}
+    fields = {name: value for name, value in named[1].items() if name != "data_plan"}
+    landed = named[1].get("data_plan", 8)
+    return {**record, "fields": {**fields, "data_plan_version": 9 if landed is None else landed}}
 
 
 def earlier_option_text(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -1431,12 +1435,12 @@ class RunConfig:
     it trains, which the resume must keep (`check_resume`), and so does `trainer.quantization`, which
     changes the forward pass the weights train through."""
 
-    BUILT: ClassVar[tuple[str, ...]] = ("source.param_dtype", "source.step", "data_plan")
+    BUILT: ClassVar[tuple[str, ...]] = ("source.param_dtype", "source.step", "data_plan_version")
     """The fields, by their dotted paths, a run may leave None for its build or its pinning to resolve,
     whose resolution a later Dew, or a later state of what it reads, may change: the storage of the
     source it reads (`SourceOptions.param_dtype`), the step of a saved Dew run it starts from, which
     that run's later checkpoints move (`with_pinned_run`), the data plan version its order is read by
-    (`data_plan`), and in a kind of run that adds them its own
+    (`data_plan_version`), and in a kind of run that adds them its own
     (a decision run's option text). A run that leaves one None and resumes a saved run under its name
     takes the saved run's value (`resumed`), so running the same command again resumes what it trained;
     one it sets is its own, and a resume refuses it where it differs (`check_resume`). A saved run whose
@@ -1460,7 +1464,7 @@ class RunConfig:
     stage or the training batch."""
     data_seed: int = 0
     """The seed of the data's order and of its random steps."""
-    data_plan: int | None = None
+    data_plan_version: int | None = None
     """The data plan version the run reads its order by (`dew.data.plan.PLAN_VERSIONS`): None for this
     Dew's, which its record holds resolved (`pinned`), so a resume reads the order it read whatever a
     later Dew's is (`BUILT`); a saved run that recorded none read by version 8 (`earlier_data_plan`)."""
@@ -1801,14 +1805,10 @@ class RunConfig:
         record = json.loads((path if named_file else path / RUN_FILE).read_text())
         # The packages trusted first, so the record's earlier shapes are read with its classes imported.
         registry.import_trusted(record, trust)
-        held = earlier_run(record)
-        run = cls.read(held, trust=trust)
-        # Its checkpoints' tiers as the run kept them, under the directory it was saved in.
-        saved = str(path.parent if named_file else path)
-        name = run.trainer.name or os.path.basename(saved.rstrip("/"))
-        with run.trainer.checkpoints(name, directory=saved) as checkpoints:
-            settled = earlier_option_writing(held, checkpoints)
-        return run if settled is held else cls.read(settled, trust=trust)
+        # A field its record left to its checkpoints (`earlier_option_writing`) is read where the run resumes
+        # (`resumed`, `check_resumed`), its process prepared: `dew train run.json` reads the run first, before
+        # a pool of processes is joined, which no device opened before may be (train 589's review).
+        return cls.read(earlier_run(record), trust=trust)
 
     @classmethod
     def read(cls, record: Mapping[str, object], *, trust: Sequence[str] = ()) -> Self:
@@ -1837,22 +1837,29 @@ class RunConfig:
         names what it started from and is what it loads."""
         return self.resumed().pinned().build_run()
 
-    def resumed(self) -> Self:
-        """This run with each field it leaves None for its build to resolve (`BUILT`) at the value the
-        saved run it resumes under its name recorded, read as every earlier shape of a saved run is
-        (`earlier_run`); itself where it resumes none (`TrainerConfig.resumes`) or leaves none to its
-        build."""
+    def resumed(self, paths: Sequence[str] | None = None) -> Self:
+        """This run with each field it leaves None for its build to resolve (`BUILT`, or those of them
+        `paths` names) at the value the saved run it resumes under its name recorded, read as every
+        earlier shape of a saved run is (`earlier_run`), and its data plan version, where it resumes no
+        run that recorded one, this Dew's (`PLAN_VERSIONS`): the one place a run's version is resolved,
+        on each path a run trains by (`prepare`, and `readied`, which a run trained in Python reaches
+        alone), before its data compiles or its record is written. Itself where it resumes none
+        (`TrainerConfig.resumes`) or leaves none to its build."""
         trainer = self.trainer
-        unset = [path for path in self.BUILT if _holds(self, path) and _recorded_at(self, path) is None]
-        if not unset or trainer.name is None or trainer.resume == "never" or not trainer.resumes():
-            return self
-        with trainer.checkpoints(trainer.name) as checkpoints:
-            saved = self._saved_record(trainer.directory(trainer.name), checkpoints)
-        recorded = None if saved is None else self._saved_as(saved)
-        if recorded is None:
-            return self
-        # A field of a record the saved run held none of (a teacher it had not) takes nothing.
-        return self.override({path: _recorded_at(recorded, path) for path in unset if _holds(recorded, path)})
+        built = self.BUILT if paths is None else paths
+        unset = [path for path in built if _holds(self, path) and _recorded_at(self, path) is None]
+        run = self
+        if unset and trainer.name is not None and trainer.resume != "never" and trainer.resumes():
+            with trainer.checkpoints(trainer.name) as checkpoints:
+                saved = self._saved_record(trainer.directory(trainer.name), checkpoints)
+            recorded = None if saved is None else self._saved_as(saved)
+            # A field of a record the saved run held none of (a teacher it had not) takes nothing.
+            if recorded is not None:
+                run = self.override({path: _recorded_at(recorded, path) for path in unset
+                                     if _holds(recorded, path)})
+        if "data_plan_version" in built and run.data_plan_version is None:
+            run = dataclasses.replace(run, data_plan_version=PLAN_VERSIONS[-1])
+        return run
 
     def build_run(self) -> Prepared:
         """Build what this run trains, the run as it stands, its sources already pinned (`prepare`
@@ -1915,12 +1922,15 @@ class RunConfig:
                                validation: Dataset | Mapping[str, Dataset | Entry] | None,
                                ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
         """`dataset` and `validation` as the run trains on them (`fitted`): compiled with `objective`'s
-        stages, `data_seed` and `data_plan`, the training read bounded to `trainer.examples` where the run
-        counts them, or to `trainer.epochs` passes over its source examples where its read has no record
-        count, so its length is read off the loader this returns."""
+        stages, `data_seed` and `data_plan_version`, the training read bounded to `trainer.examples` where
+        the run counts them, or to `trainer.epochs` passes over its source examples where its read has no
+        record count, so its length is read off the loader this returns."""
+        # At the version `resumed` resolves (itself where `prepare` or `readied` resolved it; a run built
+        # alone, `build_run`, resolves it here), which it always states.
+        planned = self.resumed(("data_plan_version",)).data_plan_version
+        assert planned is not None
         return fitted(dataset, validation, objective=objective, seed=self.data_seed,
-                      examples=self.trainer.examples, epochs=self.trainer.epochs,
-                      plan_version=PLAN_VERSIONS[-1] if self.data_plan is None else self.data_plan)
+                      examples=self.trainer.examples, epochs=self.trainer.epochs, plan_version=planned)
 
     def run(self) -> TrainState:
         """Prepare the process, build what this run trains (`prepare`) and train it.
@@ -1939,13 +1949,9 @@ class RunConfig:
     def pinned(self) -> Self:
         """This run with its Hub sources named at the commits they resolve to now, as its record names
         them and `prepare` loads them: here an imported adapter's (`LoRA.resolved`); a kind of run pins
-        its own sources beside it. Its data plan version is this Dew's where it names none
-        (`data_plan`). Itself where nothing is left to pin."""
+        its own sources beside it. Itself where nothing is left to pin."""
         lora = None if self.lora is None else self.lora.resolved()
-        plan = PLAN_VERSIONS[-1] if self.data_plan is None else self.data_plan
-        if lora == self.lora and plan == self.data_plan:
-            return self
-        return dataclasses.replace(self, lora=lora, data_plan=plan)
+        return self if lora == self.lora else dataclasses.replace(self, lora=lora)
 
     def with_pinned_run(self, pretrained: str | None) -> Self:
         """This run with the checkpoint it reads of the saved Dew run it starts from (`pretrained`, a
@@ -2054,11 +2060,22 @@ class RunConfig:
         its steps; its trunk quantized where it asks; its record naming the run's directory and its
         optimizer's groups (`grouped`)."""
         self.check_process()
-        dataset, held = self.compiled(objective.data(), dataset, validation)
+        # Its data plan version resolved before its data compiles and its record is written, a run trained
+        # in Python reaching `readied` alone, as the run it trains under `name` reads it (train 589's
+        # review): a loader compiled already reads by its own plan's version, which it records.
+        named = dataclasses.replace(self, trainer=dataclasses.replace(self.trainer, name=name))
+        plan = dataset.plan if isinstance(dataset, Loader) else None
+        if plan is not None and self.data_plan_version not in (None, plan.version):
+            raise ValueError(f"the run reads by data plan version {self.data_plan_version}, and the loader "
+                             f"it is given was compiled at {plan.version}; compile the loader at the run's "
+                             "version (`compile(..., plan_version=...)`), or leave the run's to the loader")
+        planned = (named.resumed(("data_plan_version",)) if plan is None
+                   else dataclasses.replace(named, data_plan_version=plan.version))
+        dataset, held = planned.compiled(objective.data(), dataset, validation)
         # Each split scores the metrics `val_metrics` names for it, or else `metrics`, the kind's.
-        suites = self.suites(dataset, held, metrics)
-        sized, dataset, steps = self.trainer.resolved(dataset)
-        run = dataclasses.replace(self, trainer=sized)
+        suites = planned.suites(dataset, held, metrics)
+        sized, dataset, steps = planned.trainer.resolved(dataset)
+        run = dataclasses.replace(planned, trainer=sized)
         if run.trainer.quantization is not None:
             quantize_trunk(objective, run.trainer.quantization)
         # The record names the run's directory, so its run.json trains the same run again.

@@ -192,7 +192,7 @@ def test_a_bias_sums_its_gradient_over_every_position_at_fp32(layer, shape):
         return {"bias": np.asarray(jnp.asarray(summed(cotangent, np.float32), jnp.bfloat16), np.float64)}
 
     assert_as_exact(dew, reference, draw, f"{layer.__class__.__name__} bias gradient", seeds=BIAS_SEEDS,
-                    truth_fn=lambda x, cotangent: {"bias": summed(cotangent, np.float64)})
+                    truth_fn=as_given(lambda x, cotangent: {"bias": summed(cotangent, np.float64)}))
 
 
 SPLIT = {"conv": (Conv(3, (3, 3)), (8, 32, 32, 4), 256), "dense": (Dense(3), (8, 32, 32, 4), 256)}
@@ -227,6 +227,7 @@ def test_a_bias_gradient_is_as_exact_however_its_positions_are_split(site):
     split = jax.jit(gradient, in_shardings=(rows, rows), out_shardings=whole)
     alone = jax.jit(gradient)
 
+    @as_given
     def truth(x, cotangent):
         return {"bias": np.asarray(cotangent, np.float64).reshape(-1, out[-1]).sum(0)}
 

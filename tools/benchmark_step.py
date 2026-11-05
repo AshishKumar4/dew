@@ -195,7 +195,7 @@ class BenchmarkConfig:
     alone. This is the packed loader's batch, which reroutes attention off the
     fused kernel."""
     profile_dir: str | None = None
-    """Trace `profile_steps` more steps into this directory with jax.profiler
+    """Trace `profile_steps` more steps under this directory with `dew.Profiler`
     after the timed windows, and read the device timeline back into the row:
     the fraction of the window the device was busy, kernels per step and
     kernel milliseconds per step by category. The trace itself stays on disk

@@ -1089,6 +1089,7 @@ def test_ernies_router_divides_by_its_clamped_sum_where_its_bias_picks_a_faint_e
             return weights.detach().numpy(), held.grad.numpy()
         return run
 
+    @as_given
     def truth(tokens, cotangent):
         with float64():
             return torch_arm(wide, torch.float64)(tokens, cotangent)
