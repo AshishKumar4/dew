@@ -119,7 +119,8 @@ class Waiting[T]:
         waiting, each once, the queue left empty."""
         with self._lock:
             self.failure = failure
-            waiting = list(dict.fromkeys([*held, *self.queue]))
+            # Each once by identity: a request taken into a step may wait for the rest of its rows too.
+            waiting = list({id(request): request for request in (*held, *self.queue)}.values())
             self.queue.clear()
         return waiting
 

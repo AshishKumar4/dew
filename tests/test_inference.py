@@ -867,9 +867,10 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
 @pytest.mark.mesh
 def test_a_scoring_server_answers_image_requests_as_each_draws_alone(tmp_path):
     """A text-to-image task served by a `ScoringServer` (`TextToImage.scoring`), as an `Engine` serves it
-    beside other kinds: requests of two prompts share a pass up to its four images, a request of one walks
-    in a pass of its own, and each request's images are those its lone call draws under its key, on par
-    with that call against the float64 pipeline over the same prepared noise and conditions (check 1)."""
+    beside other kinds: requests alike share a pass up to its four images, a request of another prompt
+    count or other settings (its steps, its negative prompt) walks in a pass of its own, and each
+    request's images are those its lone call draws under its key and settings, on par with that call
+    against the float64 pipeline over the same prepared noise and conditions (check 1)."""
     from arm_arithmetic import widened
     from reference_error import as_given, assert_as_exact, seeds_for
 
@@ -877,40 +878,50 @@ def test_a_scoring_server_answers_image_requests_as_each_draws_alone(tmp_path):
 
     make_run(tmp_path)
     pipe = TextToImage.from_run(str(tmp_path))
-    prompts = (("a water lily", "a sunflower"), ("a rose", "a tulip"), ("a daisy",), ("an iris", "a lotus"))
-    settings = {"steps": 3, "guidance": 2.0}
-    server = ScoringServer.from_task(*pipe.scoring(**settings, images=4))
+    requests = ({"prompts": ("a water lily", "a sunflower")}, {"prompts": ("a rose", "a tulip")},
+                {"prompts": ("a daisy",)},
+                {"prompts": ("an iris", "a lotus"), "steps": 4, "negative": "blurry"})
+    server = ScoringServer.from_task(*pipe.scoring(steps=3, guidance=2.0, images=4))
     wide = dataclasses.replace(pipe, model=pipe.model.clone(dtype=jnp.float64),
                                variables=widened(pipe.variables))
 
     def draw(seed):
-        return (np.arange(len(prompts)) + len(prompts) * seed,)
+        return (np.arange(len(requests)) + len(requests) * seed,)
+
+    def prepared(request, key):
+        """The request's lone call's inputs and its settings."""
+        steps = request.get("steps", 3)
+        return pipe.prepare(list(request["prompts"]), key=key, steps=steps,
+                            unconditional=request.get("negative")), {"steps": steps, "guidance": 2.0}
 
     @as_given
     def served(keys):
-        futures = [server.submit(ImageRequest(rows, key=int(key)))
-                   for rows, key in zip(prompts, keys, strict=True)]
+        futures = [server.submit(ImageRequest(**request, key=int(key)))
+                   for request, key in zip(requests, keys, strict=True)]
         server.run()
         admitted = [future.admitted for future in futures]
-        assert admitted[0] == admitted[1] != admitted[2] != admitted[3]
+        assert admitted[0] == admitted[1] and len(set(admitted[1:])) == 3
         return tuple(future.result().host().images for future in futures)
 
     @as_given
     def alone(keys):
-        return tuple(pipe(rows, **settings, key=int(key)).host().images for rows, key in zip(prompts, keys,
-                                                                                           strict=True))
+        images = []
+        for request, key in zip(requests, keys, strict=True):
+            inputs, settings = prepared(request, int(key))
+            images.append(pipe(inputs, **settings, key=int(key)).host().images)
+        return tuple(images)
 
     @as_given
     def truth(keys):
         images = []
-        for rows, key in zip(prompts, keys, strict=True):
-            prepared = pipe.prepare(list(rows), key=int(key), steps=3)
+        for request, key in zip(requests, keys, strict=True):
+            inputs, settings = prepared(request, int(key))
 
-            def real(leaf, count=prepared.rows):
+            def real(leaf, count=inputs.rows):
                 """A prepared leaf's real rows, on the host: the mesh pads them to its devices."""
                 return np.asarray(leaf) if leaf.shape[0] == 1 else np.asarray(leaf)[:count]
 
-            held = widened(jax.tree.map(real, prepared))
+            held = widened(jax.tree.map(real, inputs))
             with jax.enable_x64(new_val=True):
                 images.append(wide(held, **settings, key=int(key)).host().images)
         return tuple(images)

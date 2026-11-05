@@ -433,32 +433,35 @@ class TextToImage(SavedRunTask, InItsForm):
                 solver: Solver | None = None, decode: bool = True, images: int = 8
                 ) -> tuple[ImageScoring, Variables]:
         """This task as a scoring task of `ImageRequest`s (`dew.inference.scoring.Scoring`), which a
-        `ScoringServer` serves beside the other kinds of an `Engine`, and the weights it samples with. A
-        request is answered with the `Images` a lone call `task(request.prompts, key=request.key)` with
-        these settings draws: its noise and its walk's draws are its key's, whatever requests share its
-        pass. A pass holds requests of as many prompts as the first it takes, up to `images` images,
-        and walks them as one batch, each request's walk its own. The scoring task holds no weights: a
-        server holds them resident and swaps both whole on a reload (`ScoringServer.reload`)."""
-        count = self.steps if steps is None else steps
-        process, times = self.prepared_process(count)
+        `ScoringServer` serves beside the other kinds of an `Engine`, and the weights it samples with.
+        `steps`, `guidance` and `solver` are a request's where it names none, the task's where these are
+        omitted. A request is answered with the `Images` its lone call `task(prompts, key=key, ...)` draws
+        with its settings: its noise and its walk's draws are its key's, whatever requests share its pass.
+        A pass holds requests alike (as many prompts and negatives, the same settings) up to `images`
+        images, and walks them as one program mapped over the requests, each request's walk its own. The
+        scoring task holds no weights: a server holds them resident and swaps both whole on a reload
+        (`ScoringServer.reload`)."""
         if type(decode) is not bool:
             raise ValueError("decode must be a boolean")
         if type(images) is not int or images < 1:
             raise ValueError(f"a pass holds an image or more, not {images}")
         self._text_encoder("a served request's prompts are encoded with it")
-        held = ImageScoring(replace(self, variables={}), count, process, times, self._guidance(guidance),
-                            self.solver if solver is None else solver, decode, images)
+        held = ImageScoring(replace(self, variables={}), self.steps if steps is None else steps,
+                            self._guidance(guidance), self.solver if solver is None else solver, decode,
+                            images)
         return held, self.variables
 
     @traced_in_its_form
-    def _served(self, requests: Sequence[_Drawn], scoring: ImageScoring) -> list[Images]:
-        """One served pass of `scoring` over `requests`, each of as many prompts: each request's conditions
-        and noise prepared as its lone call prepares them, and the walks run as one program mapped over
-        the requests, each with its own key (`ImageScoring`)."""
+    def _served(self, requests: Sequence[_Drawn]) -> list[Images]:
+        """One served pass over `requests`, alike (`_Drawn.alike`): each request's conditions and noise
+        prepared as its lone call prepares them, and the walks run as one program mapped over the
+        requests, each with its own key (`TextToImage.scoring`)."""
         mesh = mesh_of(self.variables)
+        walking = requests[0].walking
         prepared = [self._inputs(self._resolved(
-            mesh, list(request.prompts), None, request=request.key, count=scoring.count,
-            process=scoring.process, selected=scoring.times, unconditional=None, image=None,
+            mesh, list(request.prompts), None, request=request.key, count=walking.count,
+            process=walking.process, selected=walking.times,
+            unconditional=None if request.negative is None else list(request.negative), image=None,
             image_latents=None, mask=None, noise=None, initial=None, encode_key=None),
             owns_grid=self.grid is not None)
             for request in requests]
@@ -467,14 +470,14 @@ class TextToImage(SavedRunTask, InItsForm):
                                                                  dict(inputs.unconditional))
                                                                 for inputs in prepared), strict=True))
         walks = jnp.stack([jax.random.fold_in(request.key, 1) for request in requests])
-        grid = _default_grid(scoring.process, scoring.count) if scoring.times is None else scoring.times
+        grid = _default_grid(walking.process, walking.count) if walking.times is None else walking.times
         with region("inference.image"):
             initial = program(_initials, static_argnums=(0, 1, 2))(
-                scoring.solver, scoring.process, grid, noise, walks)
-            models = sampling_modules(self.model, scoring.guidance, self.autoencoder)
+                walking.solver, walking.process, grid, noise, walks)
+            models = sampling_modules(self.model, walking.guidance, self.autoencoder)
             generated = program(_walks, *models, static_argnums=(0, 1, 2, 3, 4, 5))(
-                self.model, scoring.process, self.autoencoder, self.finish, self.final_denoise,
-                scoring.decode, scoring.solver, scoring.guidance, np.asarray(grid, np.float32), initial,
+                self.model, walking.process, self.autoencoder, self.finish, self.final_denoise,
+                walking.decode, walking.solver, walking.guidance, np.asarray(grid, np.float32), initial,
                 self.variables, conditions, unconditional, noise, walks)
         return [replace(jax.tree.map(lambda leaf, index=index: leaf[index], generated), rows=inputs.rows)
                 for index, inputs in enumerate(prepared)]
@@ -774,65 +777,105 @@ class TextToImage(SavedRunTask, InItsForm):
 @dataclass(frozen=True)
 class ImageRequest:
     """One request a served text-to-image task answers (`TextToImage.scoring`): its prompts, an image
-    each, and the key its draws come from, as a lone call `task(prompts, key=key)` draws them."""
+    each, the key its draws come from, and the settings of its lone call `task(prompts, key=key, ...)`:
+    `steps`, `guidance` and `solver` (the scoring task's where omitted), and `negative`, its negative
+    prompts, one or one a prompt, in place of the task's blank."""
 
     prompts: str | Sequence[str]
     key: int | jax.Array
+    steps: int | None = None
+    guidance: Guidance | float | None | Omitted = OMITTED
+    solver: Solver | None = None
+    negative: str | Sequence[str] | None = None
 
 
-@dataclass(frozen=True, eq=False)
-class _Drawn:
-    """An admitted request: its prompts and its typed key."""
+@dataclass(frozen=True)
+class _Walking:
+    """What one served pass walks with, which every request in it shares."""
 
-    prompts: tuple[str, ...]
-    key: jax.Array
-
-
-@dataclass
-class _ImagePass:
-    """A served pass of requests of as many prompts as its first, up to `images` images (`PassPlan`)."""
-
-    images: int
-    prompts: int = 0
-    held: int = 0
-
-    def add(self, request: _Drawn) -> bool:
-        count = len(request.prompts)
-        if self.held and (count != self.prompts or self.held + count > self.images):
-            return False
-        self.prompts, self.held = count, self.held + count
-        return True
-
-
-@dataclass(frozen=True, eq=False)
-class ImageScoring:
-    """A text-to-image task served by a `ScoringServer` (`TextToImage.scoring`): each `ImageRequest` one
-    row, answered with its `Images`, every pass over the weights its server hands it."""
-
-    task: TextToImage
     count: int
     process: Process
     times: tuple[float, ...] | None
     guidance: Guidance | None
     solver: Solver
     decode: bool
+
+
+@dataclass(frozen=True, eq=False)
+class _Drawn:
+    """An admitted request: its prompts, negatives, typed key and settings."""
+
+    prompts: tuple[str, ...]
+    negative: tuple[str, ...] | None
+    key: jax.Array
+    walking: _Walking
+
+    def alike(self, other: _Drawn) -> bool:
+        """Whether `other` walks in one program beside this one: as many prompts and negatives, and the
+        same settings."""
+        return (len(self.prompts) == len(other.prompts) and self.walking == other.walking
+                and (self.negative is None) == (other.negative is None)
+                and (self.negative is None or len(self.negative) == len(other.negative or ())))
+
+
+@dataclass
+class _ImagePass:
+    """A served pass of requests alike its first, up to `images` images (`PassPlan`)."""
+
+    images: int
+    first: _Drawn | None = None
+    held: int = 0
+
+    def add(self, request: _Drawn) -> bool:
+        if self.first is not None and (not self.first.alike(request)
+                                       or self.held + len(request.prompts) > self.images):
+            return False
+        self.first = self.first or request
+        self.held += len(request.prompts)
+        return True
+
+
+@dataclass(frozen=True, eq=False)
+class ImageScoring:
+    """A text-to-image task served by a `ScoringServer` (`TextToImage.scoring`): each `ImageRequest` one
+    row, answered with its `Images`, every pass over the weights its server hands it, with the settings
+    a request names none of."""
+
+    task: TextToImage
+    steps: int
+    guidance: Guidance | None
+    solver: Solver
+    decode: bool
     images: int
 
     def admit(self, request: ImageRequest) -> ScoringRequest[_Drawn, None]:
+        task = self.task
         prompts = (request.prompts,) if isinstance(request.prompts, str) else tuple(request.prompts)
-        if not prompts or not all(isinstance(prompt, str) for prompt in prompts):
-            raise ValueError("an image request holds a prompt or more, each a string")
-        return ScoringRequest((_Drawn(prompts, request_key(request.key)),), None)
+        negative = (None if request.negative is None else (request.negative,)
+                    if isinstance(request.negative, str) else tuple(request.negative))
+        if not prompts or not all(isinstance(prompt, str) for prompt in (*prompts, *(negative or ()))):
+            raise ValueError("an image request holds a prompt or more, each a string, and its negatives too")
+        if negative is not None and len(negative) not in (1, len(prompts)):
+            raise ValueError("an image request's negatives are one or one a prompt")
+        count = self.steps if request.steps is None else request.steps
+        process, times = task.prepared_process(count)
+        walking = _Walking(count, process, times,
+                           self.guidance if request.guidance is OMITTED else task._guidance(request.guidance),
+                           self.solver if request.solver is None else request.solver, self.decode)
+        return ScoringRequest((_Drawn(prompts, negative, request_key(request.key), walking),), None)
 
     def planned(self) -> _ImagePass:
         return _ImagePass(self.images)
 
     def forward(self, variables: Variables, rows: Sequence[_Drawn]) -> list[Images]:
-        return self.task.bind(variables)._served(rows, self)
+        # A walk places its rows over the weights' mesh itself, as a lone call does, outside the server's
+        # mesh context, under which its eager key folds would take the whole mesh for a key's one device.
+        with jax.set_mesh(None):
+            return self.task.bind(variables)._served(rows)
 
     def compile(self, variables: Variables) -> Sequence[object]:
-        """Nothing up front: a pass's programs compile at its first count of requests and prompts, as a
-        lone call's do at its first count of prompts."""
+        """Nothing up front: a pass's programs compile at its first settings and count of requests and
+        prompts, as a lone call's do at its first settings and count of prompts."""
         return ()
 
     def answer(self, payload: None, outputs: Sequence[Images]) -> Images:
