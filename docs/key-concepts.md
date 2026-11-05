@@ -91,7 +91,7 @@ A package can bring a whole kind of run the same way. Its own `RunConfig` subcla
 
 A model defined where no import path reaches it, in `__main__` or inside a function, trains, checkpoints and resumes the same way. The first checkpoint warns, and loading the run says, that its model has no import path.
 
-A model written in Flax NNX trains through Flax's own bridge, `flax.nnx.bridge.ToLinen`, which turns an NNX module into a Linen one with its parameters, its other state (a `BatchNorm`'s `batch_stats`) and its random streams (the `dropout` stream an objective passes to `apply`). The bridge runs the module's `__call__`, which is all `DiffusionObjective` calls on a denoiser: `bridge.ToLinen(MyDenoiser, args=(channels,))` is the model. An objective that reads another method, such as `hidden_states` and `logits` for `LMObjective`, needs a Linen class that names it, a few lines of your own:
+A model written in Flax NNX trains through Flax's own bridge, `flax.nnx.bridge.ToLinen`, which turns an NNX module into a Linen one with its parameters, its other state (a `BatchNorm`'s `batch_stats`) and its random streams (the `dropout` stream an objective passes to `apply`). The bridge runs the module's `__call__`, which is all `DiffusionObjective` calls on a denoiser: `bridge.ToLinen(MyDenoiser, args=(channels,))` is the model. `LMObjective` reads a model's logits by its `logits` method where it has one and by its own forward otherwise (`dew.nn.protocols.forward_method`), so an NNX language model whose `__call__` returns its logits trains through the bridge too; a Linen class over the bridge only states what `LMObjective` asks of a token model beside them, such as `causal`:
 
 <!-- not run: a fragment; MyNNXLanguageModel and vocab_size are your NNX model's -->
 ```python
@@ -100,12 +100,6 @@ from flax.nnx import bridge
 
 class MyTokens(bridge.ToLinen):
     causal: bool = True
-
-    def hidden_states(self, tokens, *, train=False, **fields):
-        return self(tokens, nnx_method="hidden_states", train=train, **fields)
-
-    def logits(self, tokens, *, train=False, **fields):
-        return self(tokens, nnx_method="logits", train=train, **fields)
 
 
 model = MyTokens(MyNNXLanguageModel, args=(vocab_size,))
