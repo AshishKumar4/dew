@@ -41,10 +41,6 @@
    "comparisons": 5,
    "lane": "Training"
   },
-  "tests/test_attention_algebra.py": {
-   "comparisons": 2,
-   "lane": "Kernels"
-  },
   "tests/test_attention_masked_rows.py": {
    "comparisons": 1,
    "lane": "Kernels"
@@ -55,10 +51,6 @@
   },
   "tests/test_attention_splash.py": {
    "comparisons": 3,
-   "lane": "Kernels"
-  },
-  "tests/test_attention_stability.py": {
-   "comparisons": 1,
    "lane": "Kernels"
   },
   "tests/test_audio.py": {
@@ -158,7 +150,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_decode_attention.py": {
-   "comparisons": 9,
+   "comparisons": 1,
    "lane": "Kernels"
   },
   "tests/test_decode_cache.py": {
@@ -322,11 +314,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoders.py": {
-   "comparisons": 18,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_hf_modernbert.py": {
-   "comparisons": 1,
+   "comparisons": 17,
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_qwen35_moe_wrapper.py": {
@@ -374,7 +362,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_kernels.py": {
-   "comparisons": 24,
+   "comparisons": 8,
    "lane": "Kernels"
   },
   "tests/test_kimi_k3.py": {
