@@ -734,6 +734,27 @@ def _v4_mixture(hf_config: Mapping[str, object], layers: int,
 type DSparkFields = NativeFields[DSpark]
 
 
+def dspark_stages(ratios: Sequence[object], layers: int) -> int:
+    """The DSpark drafter's stage count: `compress_ratios`' entries past the trunk's `layers`, as the
+    release builds stage `s`'s attention from entry `layers + s` (0731 model.py:459, :901-902)."""
+    return len(ratios) - layers
+
+
+def dspark_kept(config: Mapping[str, object], kept: int) -> dict:
+    """The fields a V4.1 or V4-Flash-0731 config keeping `kept` prediction depths states differently
+    (`DecoderFamily.whole_drafter`): its DSpark stages draft as one, their heads on the last, so the
+    drafter is kept whole or, at 0, dropped (its stages' ratios and its block); a count between is
+    refused. A config that names no block keeps its fields."""
+    ratios, layers = config.get('compress_ratios'), config.get('num_hidden_layers')
+    if not (config.get('dspark_block_size') and isinstance(ratios, list) and type(layers) is int):
+        return {}
+    stages = dspark_stages(ratios, layers)
+    if 0 < kept < stages:
+        raise ValueError(f"a DSpark drafter's {stages} stages draft as one, its heads on the last: "
+                         f"prediction_depths keeps all of them or none (0), not {kept}")
+    return {} if kept else {'compress_ratios': ratios[:layers], 'dspark_block_size': 0}
+
+
 def dspark_fields(text: Mapping[str, object], layers: int, ratios: Sequence[object], seen: set[str], *,
             reads: Literal['input', 'output']) -> DSparkFields | None:
     """The DSpark drafter record of a V4.1 or V4-Flash-0731 config (section
@@ -756,7 +777,7 @@ def dspark_fields(text: Mapping[str, object], layers: int, ratios: Sequence[obje
     block = record_int(text, 'dspark_block_size', 0)
     if not block:
         return None
-    stages = len(ratios) - layers
+    stages = dspark_stages(ratios, layers)
     if stages < 1 or tuple(ratios[layers:]) != (0,) * stages:
         refuse('compress_ratios', "the DSpark stages are sliding layers, one trailing 0 each")
     stated = record_int(text, 'num_nextn_predict_layers', stages)
@@ -1145,6 +1166,7 @@ DEEPSEEK_V4 = DecoderFamily(
     preserve_source_layout=True,
     tied_head_names=('head.weight', 'embed.weight'),
     padding_idx=True,
+    prediction_counts=('num_nextn_predict_layers', 'n_mtp_layers'), whole_drafter=dspark_kept,
 )
 
 DEEPSEEK_V32 = DecoderFamily(

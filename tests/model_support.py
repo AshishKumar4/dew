@@ -175,12 +175,6 @@ def as_stepped(forward: Callable[[jax.Array], jax.Array], sequence: jax.Array, p
     return stepped_outputs(lambda length: forward(sequence[:, :length]), sequence.shape[1], prefill)
 
 
-def stepped_logits(forward: Callable[[jax.Array], jax.Array], ids: jax.Array, prompt: int) -> jax.Array:
-    """`forward`'s logits over `ids` at the widths a cached decode of a `prompt`-token prefill computes
-    them (`as_stepped`), from position `prompt - 1`: `decode_logits`'s positions."""
-    return as_stepped(forward, ids, prompt)[:, prompt - 1:]
-
-
 def float64_twin(model: nn.Module) -> nn.Module:
     """`model` computing in float64, its own `dtype` and every module it
     holds: the truth a float32 run's rounding is measured from."""

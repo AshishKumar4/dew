@@ -17,7 +17,14 @@ from dew.nn.flops import counted_flops, parameter_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, PredictionPhase
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import scaled
-from dew.nn.protocols import ProjectionGroup, ReadsTrain, Routes, RoutesBySite, RoutesExperts, declared_groups
+from dew.nn.protocols import (
+    ProjectionGroup,
+    ReadsTrain,
+    Routes,
+    declared_groups,
+    partitioned_routes,
+    routed_children,
+)
 
 if TYPE_CHECKING:
     from dew.nn.mla import MLAMixer
@@ -75,14 +82,9 @@ class ParallelMixers(nn.Module):
 
     @nn.nowrap
     def _routed(self) -> dict[str, tuple[str, ...]]:
-        """The branches that route over experts, by name, each with its sites' paths below this mixer."""
-        routed = {}
-        for name, factory, *_ in self.branches:
-            built = factory(parent=None)
-            if isinstance(built, RoutesExperts) and built.routes_experts:
-                routed[name] = (tuple(f'{name}/{site}' for site in sorted(built.routed_sites))
-                                if isinstance(built, RoutesBySite) else (name,))
-        return routed
+        """The branches that route over experts, by name, each with its sites' paths below this mixer
+        (`dew.nn.protocols.routed_children`)."""
+        return routed_children({name: factory(parent=None) for name, factory, *_ in self.branches})
 
     @property
     def reads_train(self) -> bool:
@@ -111,26 +113,15 @@ class ParallelMixers(nn.Module):
     def __call__(self, x, call: MixerCall = PLAIN_CALL, *, train: bool = False,
                  prediction_phase: PredictionPhase = 'ordinary',
                  routes: Routes | tuple[Mapping[str, jax.Array], jax.Array | None] | None = None):
-        routed = self._routed()
         records, covered = (None, None) if routes is None else routes
-        if records is not None and not isinstance(records, Mapping):
-            # A layer's one record, for its one routed site.
-            sites = self.routed_sites
-            if len(sites) != 1:
-                raise ValueError(f"a layer's one routing record replays one routed site, and sites "
-                                 f"{sorted(sites)} route; key the record by site path")
-            records = {next(iter(sites)): records}
-        if records is not None and (missing := sorted(self.routed_sites - set(records))):
-            raise ValueError(f"the routing record names {sorted(records)}, not the routed sites {missing}")
+        parts = partitioned_routes(self._routed(), records, covered)
         total = None
         for mixer, (name, _, into, out, phased) in zip(self.mixers, self.branches, strict=True):
             options = {
                 **({'train': train} if isinstance(mixer, ReadsTrain) and mixer.reads_train else {}),
                 **({'prediction_phase': prediction_phase} if phased and prediction_phase != 'ordinary'
                    else {}),
-                **({} if records is None or name not in routed else {'routes': (
-                    records[name] if routed[name] == (name,)
-                    else {site[len(name) + 1:]: records[site] for site in routed[name]}, covered)})}
+                **({'routes': parts[name]} if name in parts else {})}
             output = scaled(mixer(scaled(x, into), call, **options), out)
             total = output if total is None else total + output
         return total
