@@ -94,7 +94,7 @@ CONTRACTED = {
         ("test_the_decode_step_holds_every_order", KERNEL),
     "src/dew/nn/kernels/recurrence_chunk.py::_per_product.linear_tangent":
         ("test_the_chunked_op_holds_every_order", KERNEL),
-    "src/dew/nn/kernels/recurrence_chunk.py::mosaic_rule.rule":
+    "src/dew/nn/kernels/templates/recurrence/template.py::mosaic_rule.rule":
         ("test_the_template_rule_holds_its_orders", KERNEL),
     "src/dew/nn/kernels/short_conv.py::conv.linear_tangent":
         ("test_the_short_conv_holds_every_order", KERNEL),

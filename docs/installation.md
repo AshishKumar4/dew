@@ -209,6 +209,8 @@ The `profile` extra installs XProf, never 2.23.2. XProf 2.23.2 declares `setupto
 
 FlashAttention comes as Dew's own wheel, `dew-flash-attn-cu12` or `dew-flash-attn-cu13` (kernels/flash_attn), for the CUDA major of your jax: FlashAttention-2 for sm8x and sm120, and FlashAttention-3 for Hopper (sm90). The `cuda12` and `cuda13` extras install it on Linux x86_64 and aarch64 (a GH200). With it installed, `"auto"` runs it on the GPUs whose measured kernel it is, for the calls its requirements admit (`FLASH_SUPPORTS` in `dew.nn.attention_kernels`); a call it turns down on such a GPU is logged once, with why.
 
+CUTLASS's grouped GEMMs come as Dew's own wheel too, `dew-cutlass-cu12` or `dew-cutlass-cu13` (kernels/cutlass), from Dew's package index, with the `cuda12` and `cuda13` extras on Linux x86_64 and aarch64: a mixture of experts' projection placed on CUTLASS runs it on the GPUs whose grouped kernels the installed build holds (`dew_cutlass.ARCHITECTURES`, Hopper's today).
+
 tokamax comes with Dew: Dew's Pallas kernels take the config they derive from the GPU's facts, which is fast without tuning. The opt-in tuner (`dew.nn.kernels.tuning`), `python tools/kernel_picks.py` or `Trainer(tune_kernels=True)`, times a few tested variants of each kernel's config on a GPU it has to itself and stores the fastest for the GPU model; a later compile takes those picks, else the nearest measured shape's, else the derived config, and measures nothing. And `"auto"` runs its Pallas-Triton attention on sm80 and later for heads up to 64 wide (`dew.nn.attention.triton_runs`). Earlier releases pin `typeguard==2.13.3`, which tyro excludes, so installing one by hand breaks every recipe's command line.
 
 ## Development install
