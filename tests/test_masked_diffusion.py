@@ -247,9 +247,9 @@ def test_a_masked_family_unmasks_each_position_from_the_logits_its_reference_rea
     """LLaDA predicts each position's token from its own logits; Dream-v0, continued from an
     autoregressive model, from the position before (its reference shifts the logits right, the first
     repeated). One unmasking step's distribution at every position is the softmax of those logits of
-    the model, the mask's column left out, on par with a plain softmax of the same logits over drawn
-    ids (check 1, the truth the float64 forward's); the logits themselves are the release's
-    (tests/test_remote_code_releases.py)."""
+    the model, the mask's column left out, on par in log space with a plain log-softmax of the same
+    logits over drawn ids (check 1, the truth the float64 forward's), the distribution unmasking draws
+    from; the logits themselves are the release's (tests/test_remote_code_releases.py)."""
     from dew.diffusion.discrete import DiscreteProcess, LogLinear
 
     model, variables = loaded(name)
@@ -261,13 +261,14 @@ def test_a_masked_family_unmasks_each_position_from_the_logits_its_reference_rea
             logits = model.apply(variables, ids)
             if name == "dream-tiny":
                 logits = jnp.concatenate([logits[:, :1], logits[:, :-1]], axis=1)
-            return jax.nn.softmax(logits.at[..., 120].set(-jnp.inf), axis=-1)
+            # The mask's own column, which no unmasking draws, left out (its log probability is -inf).
+            return jax.nn.log_softmax(logits.at[..., 120].set(-jnp.inf), axis=-1)[..., :120]
         return run
 
     def draw(seed):
         return (np.random.default_rng([0x0D, seed]).integers(0, 120, shape).astype(np.int32),)
 
-    assert_as_exact(lambda ids: jnp.exp(denoise(ids, jnp.ones((1,)))[1]), unmasking(model, variables), draw,
+    assert_as_exact(lambda ids: denoise(ids, jnp.ones((1,)))[1][..., :120], unmasking(model, variables), draw,
                     f"{name} unmasking", seeds=UNMASKING_SEEDS,
                     truth_fn=unmasking(model.clone(dtype=jnp.float64), widened(variables)))
 

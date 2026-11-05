@@ -11,6 +11,7 @@ import pytest
 from diffusion_support import TanhLayer
 from flax import linen as nn
 from reference_error import (
+    as_given,
     assert_as_exact,
     assert_as_exact_over_orders,
     distance,
@@ -234,13 +235,15 @@ def test_the_encoders_input_is_repas_and_irepas_dinov2_preprocessing(spatial_nor
 
     alignment = Alignment("block", encoder=Unchanged(), resolution=224, spatial_norm=spatial_norm)
     name = "dinov2" if spatial_norm is None else "zscore"
+    import torch
+
     with run_from("repa_reference", "tools") as generator:
-        redraw = generator.preprocessed_draw
+        redraw, preprocess = generator.preprocessed_draw, generator.preprocess
     seeds = int(PREPROCESSED["preprocessed.seeds"])
+    # The truth the published preprocessing in float64 (Dew's targets resize in its compute dtype).
     draw, reference, truth = indexed_recording(
         PREPROCESSED, "preprocessed", seeds, inputs_of=redraw, leaves=(name,),
-        truth_fn=lambda inputs: {name: alignment.targets({}, (2 * jnp.asarray(inputs["pixels"], jnp.float64)
-                                                              - 255) / 255)})
+        truth_fn=as_given(lambda inputs: {name: preprocess(inputs["pixels"], torch.float64)[name]}))
     assert_as_exact(lambda index, inputs: {name: alignment.targets({}, unit_range(inputs["pixels"]))},
                     reference, draw, name, seeds=seeds, truth_fn=truth)
 
