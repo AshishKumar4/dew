@@ -70,21 +70,16 @@ def automatic_root(loading: Loading) -> str | None:
     return named or os.path.join(dew_cache_dir(), "data")
 
 
-_HALTED: set[str] = set()
-"""The keys whose optional fill stopped in this process (no room, a record the codec cannot write): a
-later shard's writer of one computes its records and writes none, so a fill that cannot complete stops
-once, not at each shard (row 4296)."""
-
-
 def _opened_writer(cache: Cache, key: DependencyManifest, *, expected: int | None = None,
-                   source: Source | None = None, shards: int | None = None) -> _Writer | _Computed:
+                   source: Source | None = None, shards: int | None = None,
+                   halted: set[str] | None = None) -> _Writer | _Computed:
     """A writer of `key`'s fill, of `expected` rows from `source` where an indexed fill knows them, or of
     one of a stream's `shards`, or, where an optional cache's storage cannot hold one or its fill stopped
-    in this process (`_HALTED`), none: its records are computed (`Cache.read_on`)."""
-    if cache.optional and key.key in _HALTED:
+    on this reader already (`halted`), none: its records are computed (`Cache.read_on`)."""
+    if cache.optional and halted is not None and key.key in halted:
         return _Computed()
     try:
-        return _Writer(cache, key, expected=expected, source=source, shards=shards)
+        return _Writer(cache, key, expected=expected, source=source, shards=shards, halted=halted)
     except (OSError, sqlite3.Error) as error:
         if not cache.read_on(error, "writes nothing"):
             raise
@@ -384,9 +379,9 @@ _READING: CacheStats = {"admitting": False, "spool_bytes": 0, "uploaded_bytes": 
 
 class _Writer:
     def __init__(self, cache: Cache, key: DependencyManifest, *, expected: int | None = None,
-                 source: Source | None = None, shards: int | None = None):
+                 source: Source | None = None, shards: int | None = None, halted: set[str] | None = None):
         self.cache, self.root = cache, cache._root(key)
-        self.key, self.source, self.shards = key, source, shards
+        self.key, self.source, self.shards, self.halted = key, source, shards, halted
         self.writer = uuid.uuid4().hex
         _, root_path, scheme = self.root._backend()
         self.pin = LocalRetention.pin(Path(root_path) / "shards" / self.writer) if scheme == "file" else None
@@ -495,27 +490,33 @@ class _Writer:
     def _stopped(self) -> None:
         """Stop admitting for good, under the lock: what the writer held unwritten is dropped, and the
         fill is neither sealed nor published (`dropped`), what it wrote left for collection; an optional
-        cache's later writers of the key in this process write nothing (`_HALTED`)."""
-        if self.cache.optional:
-            _HALTED.add(self.key.key)
-        self.admitting, self.dropped = False, True
+        cache's later writers of the key on its reader write nothing (`_halt`)."""
+        self._halt()
+        self.dropped = True
         self.pending.clear()
         self.pending_bytes = 0
+
+    def _halt(self) -> None:
+        """Stop admitting; an optional cache's later shard writers on this reader write nothing, so a fill
+        that cannot complete stops once, not at each shard (row 4296)."""
+        self.admitting = False
+        if self.cache.optional and self.halted is not None:
+            self.halted.add(self.key.key)
 
     def _admit(self, row_key: str, payload: bytes) -> None:
         pages = self.index.execute("PRAGMA page_count").fetchone()[0]
         page_size = self.index.execute("PRAGMA page_size").fetchone()[0]
         if (pages + 2) * page_size > self.cache.local_limit:
-            self.admitting = False
+            self._halt()
             _log.warning("cache %s stopped admission at its local index budget", self.root.url)
         if len(payload) > self.cache.spool_limit:
             if self.cache.on_full == "block":
                 raise ValueError(f"cache row {row_key} exceeds spool_bytes={self.cache.spool_bytes}")
-            self.admitting = False
+            self._halt()
         while self.admitting and self.spool_bytes + len(payload) > self.cache.spool_limit:
             self._flush()
             if self.cache.on_full == "stop":
-                self.admitting = False
+                self._halt()
                 break
             self.lock.wait_for(lambda: self._room(len(payload)))
         if self.admitting:
@@ -564,14 +565,14 @@ class _Writer:
                     f"closed cache shard requires {actual} bytes, exceeding "
                     f"spool_bytes={self.cache.spool_limit}"
                 )
-            self.admitting = False
+            self._halt()
             _log.warning("cache %s stopped admission: one shard exceeds its spool budget", self.root.url)
             return False
         while self.spool_bytes - provisional + actual > self.cache.spool_limit:
             if self.cache.on_full == "stop":
                 path.unlink()
                 self.spool_bytes -= provisional
-                self.admitting = False
+                self._halt()
                 _log.warning("cache %s stopped admission at its spool budget", self.root.url)
                 return False
             self.lock.wait_for(lambda: self._room(actual - provisional))
@@ -898,10 +899,12 @@ class _CachedReader:
     source: Source | None = None
     transparent: bool = False
     shards: int | None = None
+    halted: set[str] = field(default_factory=set, compare=False)
+    """The keys whose fill stopped on this reader in this process (`_Writer._halt`)."""
 
     def __call__(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
         return _CachedIter(self.reader(shard, options), self.cache, self.key, shard, self.transform,
-                           self.published, self.source, self.transparent, self.shards)
+                           self.published, self.source, self.transparent, self.shards, self.halted)
 
 
 class _CachedIter(grain.IterDataset):
@@ -916,11 +919,12 @@ class _CachedIter(grain.IterDataset):
         source: Source | None,
         transparent: bool,
         shards: int | None,
+        halted: set[str],
     ):
         super().__init__(parent)
         self.cache, self.key, self.shard, self.transform = cache, key, shard, transform
         self.published, self.input_parent, self.source = published, parent, source
-        self.transparent, self.shards = transparent, shards
+        self.transparent, self.shards, self.halted = transparent, shards, halted
 
     def __iter__(self) -> grain.DatasetIterator:
         return _CachedIterator(self.input_parent.__iter__(), self.writer, self.shard, self.transform,
@@ -933,7 +937,8 @@ class _CachedIter(grain.IterDataset):
         writes nothing, so the key holds no rows under its IDs."""
         published = self.published
         if published is None:
-            return _opened_writer(self.cache, self.key, source=self.source, shards=self.shards)
+            return _opened_writer(self.cache, self.key, source=self.source, shards=self.shards,
+                                  halted=self.halted)
         if isinstance(published, _Computed) or published.generation.holds((self.shard.id, 0)):
             return published
         return _Computed()
