@@ -457,8 +457,9 @@ class CausalTransformer(LinearProducts):
     the checkpoint's logits line up, which `dew.diffusion.discrete.aligned` applies for the
     masked loss and the sampler alike."""
     scan_layers: bool = False
-    """Runs of like layers under flax's scan; a decode step over resident weights scans a period's repeats as
-    one body too (`scan_groups(periodic=True)`), so its program grows with the period, not the depth."""
+    """Runs of like layers under flax's scan; a step over resident weights, training's or a decode step's,
+    scans a period's repeats as one body too (`scan_groups(periodic=True)`), so its program grows with the
+    period, not the depth."""
     bank_layers: int | None = None
     """The most layers one scanned run holds, which is also how many layers its
     parameter bank stacks. A longer run of like layers is split into
@@ -1811,11 +1812,12 @@ class CausalTransformer(LinearProducts):
                 raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
                                     f"by run holds whole runs; {list(banked)} arrived banked")
             groups = self.groups if span is None else spanned
-            # A decode step over resident weights scans by period; weights a step reads a layer at
-            # a time (banked, streamed from disk or in host memory) keep the runs their banks hold,
-            # and a layer that leaves what a later one reads (`_provides`) runs alone.
-            if decode and not (banked or self._provides or 'streaming' in self.variables
-                               or on_host(self.variables.get('params', {}))):
+            # A step over resident weights, training's or a decode step's, scans by period, its program
+            # one period's body however deep the stack; weights a step reads a layer at a time (banked,
+            # streamed from disk or in host memory) keep the runs their banks hold, and a layer that
+            # leaves what a later one reads (`_provides`) runs alone.
+            if not (banked or self._provides or 'streaming' in self.variables
+                    or on_host(self.variables.get('params', {}))):
                 keys = self.scan_keys[first:end]
                 groups = tuple((first + start, count) for start, count in scan_groups(keys, periodic=True))
             periods = tuple(run_period(self.scan_keys, start, count) for start, count in groups)
