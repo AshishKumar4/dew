@@ -733,13 +733,14 @@ def test_a_quantized_source_of_a_preparing_family_exports_updated_weights_in_its
 
 
 def test_a_quantized_export_encodes_each_weight_as_it_is_read_against_its_stored_tensors(tmp_path):
-    """A quantized source's export is a table built as it is read (row 4316): building it for a load
-    without its weights reads no weight, the family's spelled encoder included, its specs its source's
-    stored tensors. The format's table (`SourceQuantization.requantize`) reads and encodes no weight before a
-    writer reads one of its tensors, each weight's group once however its tensors are read (the weight
-    twice before its scale, from several threads); a weight whose geometry no longer fits what its source
-    stored is refused as it is read, and one whose stored tensors are unknown at once; a composite of two
-    tables refuses a name both hold."""
+    """A quantized source's export is a table built as it is read (row 4316): building it over parameters
+    whose values are gone reads none of them, the family's spelled encoder included, its specs its
+    source's stored tensors, and only a read finds them gone. The format's table
+    (`SourceQuantization.requantize`) reads and encodes no weight before a writer reads one of its
+    tensors, each weight's group once however its tensors are read (the weight twice before its scale,
+    from several threads); a weight whose geometry no longer fits what its source stored is refused as it
+    is read, and one whose stored tensors are unknown at once; a composite of two tables refuses a name
+    both hold."""
     from concurrent.futures import ThreadPoolExecutor
 
     from dew.interop import codecs
@@ -757,9 +758,13 @@ def test_a_quantized_export_encodes_each_weight_as_it_is_read_against_its_stored
     stored = loaded.quantized_specs
     assert set(stored) == {name, f"{name}_scale_inv"}
     headers = tensor_specs(load_shards(tmp_path / "fp8"))
-    unweighted = Pretrained.load(tmp_path / "fp8", dtype="float32", attention_impl="reference", weights=False)
-    table = unweighted.export()
+    gone = jax.tree.map(jax.numpy.array, loaded.variables)
+    for leaf in jax.tree.leaves(gone):
+        leaf.delete()
+    table = loaded.export(gone)
     assert isinstance(table, LazyTensors)
+    with pytest.raises(RuntimeError):
+        table[name]
     assert {part: tensor_specs(table)[part] for part in stored} == {part: headers[part] for part in stored}
     written = loaded.export()
     for part, spec in stored.items():
