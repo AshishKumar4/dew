@@ -33,7 +33,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.algebra import derive, rewritten
-from dew.algebra.forms import Operand, derived_on
+from dew.algebra.forms import Accumulated, Added, Operand, derived_on
 from dew.nn.kernels.templates import layout, product
 from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Draw, within
 from dew.nn.precision import float32_einsum, two_product, two_sum
@@ -1906,15 +1906,20 @@ def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
         assert held_by is not None
         return held_by(acc, scale, (weights,), values)
 
-    def add(total, factor, summed, terms):
-        del terms
-        assert low is not None
+    def add(total, factor, summed):
         total, dropped["total"] = kept_in_turn(total * factor, low.total * factor, (summed,))
         return total
 
+    def own(states, parts):
+        # The weighted values' sums the mainloop's or a compensated walk's, its denominator a compensated
+        # walk's; every other state the forms'.
+        return tuple(accumulate(current, *part) if isinstance(part, Accumulated)
+                     else add(current, part.factor, part.sum)
+                     if isinstance(part, Added) and low is not None else None
+                     for current, part in zip(states, parts, strict=True))
+
     stepped = forms.step(tuple(getattr(state, field) for field in fields), tiles, product=keys.dot,
-                         accumulate=None if held_by is None and low is None else accumulate,
-                         add=None if low is None else add)
+                         stepped=None if held_by is None and low is None else own)
     kept = None if low is None else Low(dropped["acc"], dropped["total"])
     return Partial(**dict(zip(fields, stepped, strict=True)), low=kept)
 

@@ -818,7 +818,7 @@ a derived form replaces a hand-written one only where it states the walk, passes
   (`Reduction.rescale`, the language's binary `rescale`, `terms.RESCALE`, which no rule rewrites), and may
   hold its largest weight to 1 by a select (`exp(where(x < b, x - b, 0))`, `b` the broadcast of `x`'s own
   maximum). A compensated walk's running sums are the mainloop's own additions over the derived forms
-  (`Derived.step`'s `add`, beside the accumulator's `accumulate`). The template's hand forms run until it
+  (`Derived.step`'s `stepped`, the mainloop's one step over each sum's parts, `Accumulated` and `Added`). The template's hand forms run until it
   takes these (row 4228); the guard's shifted sums follow, its control flow the template's. Error-aware
   extraction (§1.5) waits for a cell whose cheapest form fails check 1 where an equal one passes: row 3310's
   was the test's schedule, not a form.

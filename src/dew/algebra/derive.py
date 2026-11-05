@@ -59,7 +59,7 @@ from egglog.bindings import EggSmolError
 
 from dew.algebra import cost, extract, program, rules, terms
 from dew.algebra.cost import Work
-from dew.algebra.forms import Derived, Refused, evaluated, evaluator, inlined
+from dew.algebra.forms import Accumulated, Added, Derived, Refused, evaluated, evaluator, inlined
 from dew.algebra.terms import Term
 from dew.cache import ALGEBRA
 from dew.nn.kernels import generation
@@ -631,20 +631,19 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
                 for side, state in enumerate(states)
                 for index in range(len(made.reductions))}
 
-    def step(state, tiles, *, product=None, accumulate=None, add=None, outputs: Sequence[int] = ()):
+    def step(state, tiles, *, product=None, stepped=None, outputs: Sequence[int] = ()):
         made = forms(shaped(tiles))
         value = evaluator(made.region, [*made.consts, *(tiles[name] for name in names)],
                           carried(made, state), product=product, **declared)
-        stepped = []
-        for index, form in enumerate(made.steps):
-            if accumulate is not None and (parts := made.accumulated[index]) is not None:
-                factor, weights, values = parts
-                stepped.append(accumulate(state[index], value(factor), value(weights), value(values)))
-            elif add is not None and (summed := made.added[index]) is not None:
-                factor, tile, summed_by = summed
-                stepped.append(add(state[index], value(factor), value(tile), value(summed_by)))
-            else:
-                stepped.append(value(form))
+        # The mainloop's own step where it gives one, once, over each reduction's parts as the rules state
+        # them (each value evaluated once), every reduction it leaves (None) by its form.
+        taken = (None,) * len(made.steps)
+        if stepped is not None:
+            parts = tuple(Accumulated(*map(value, accumulated)) if accumulated is not None
+                          else Added(*map(value, added)) if added is not None else None
+                          for accumulated, added in zip(made.accumulated, made.added, strict=True))
+            taken = tuple(stepped(tuple(state), parts))
+        stepped = [value(form) if own is None else own for own, form in zip(taken, made.steps, strict=True)]
         if not outputs:
             return tuple(stepped)
         # The tile's outputs along the walked axis `outputs` names (by place), by the same evaluation: a

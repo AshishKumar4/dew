@@ -21,6 +21,24 @@ from dew.cache import DERIVED
 from dew.nn.precision import float32_dot_general
 
 
+class Accumulated(NamedTuple):
+    """A reduction's step a mainloop's accumulator takes (`Derived.step`'s `stepped`): its state rescaled by
+    the row `factor` plus the tile's `weights @ values`, each value as the step evaluates it."""
+
+    factor: jax.Array
+    weights: jax.Array
+    values: jax.Array
+
+
+class Added(NamedTuple):
+    """A reduction's step a mainloop's own addition takes (`Derived.step`'s `stepped`): its state rescaled by
+    the row `factor` plus the tile's `sum` of its `terms`."""
+
+    factor: jax.Array
+    sum: jax.Array
+    terms: jax.Array
+
+
 class Derived(NamedTuple):
     """A declaration's forms (`derive`): `init(shapes)` the empty state for operands of `shapes` (by name,
     their walked axis a tile's), `step(state, tiles)` the state after one tile of each walked operand (and the
@@ -36,18 +54,18 @@ class Derived(NamedTuple):
     the state entering it and the cotangents of the state leaving it and of its outputs (a reduction's
     backward is a declaration of its own, None here). A reduction's `slots(shapes)` names each carried state's
     role (`max`, `sum`, `contraction`: the reduction that made it) and shape in the state's order, so a
-    template holds each where its mainloop holds that value; its `step(state, tiles, product=, accumulate=,
-    add=, outputs=)` takes a mainloop's own matrix product (`evaluator`), its own accumulator for a sum a rule
-    stepped as `state * factor + weights @ values` (`accumulate(state, factor, weights, values)`, the factor a
-    row's, the parts the rule states, `derive.rescaled_by`) and its own addition for a reduction a rule
-    stepped as `state * factor + sum` (`add(state, factor, sum, terms)`, `derive.summand`, the terms it sums
-    beside it: a compensated walk's running sums, a guard's shifted ones), each called once a step in the
-    carried states' order (`slots`'), so a mainloop's policy over several of them (a guard's shift) is found
-    in the first and read by the rest, and with `outputs` (places) returns those of the tile's outputs
-    along the walked axis beside the state, by the same evaluation; its `merge(a, b, operands=None,
-    shapes=)` and `finish(state, operands=None, shapes=)` read the state (and the unwalked operands given)
-    by the forms of the walk whose tiles were of `shapes` (`init`'s), named, as a state's values alone name
-    no walk (a bfloat16 walk's float32 sums are a float32 walk's too)."""
+    template holds each where its mainloop holds that value; its `step(state, tiles, product=, stepped=,
+    outputs=)` takes a mainloop's own matrix product (`evaluator`) and its own step (`stepped(states,
+    parts)`, called once a step with each carried state's parts in the slots' order: `Accumulated` for a sum
+    a rule stepped as `state * factor + weights @ values`, `Added` for one stepped as `state * factor +
+    sum(terms)`, None for any other; it returns each new state it takes, None for one it leaves to the
+    forms: a mainloop's accumulator, a compensated walk's running sums, a guard's shifted ones), the factor a
+    row's, the parts the rules state (`derive.rescaled_by`, `summand`), each evaluated once), and with
+    `outputs` (places) returns those of the tile's outputs along the walked axis beside the state, by the
+    same evaluation; its `merge(a, b, operands=None, shapes=)` and `finish(state, operands=None, shapes=)`
+    read the state (and the unwalked operands given) by the forms of the walk whose tiles were of `shapes`
+    (`init`'s), named, as a state's values alone name no walk (a bfloat16 walk's float32 sums are a float32
+    walk's too)."""
 
     init: Callable
     step: Callable
