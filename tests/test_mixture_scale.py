@@ -22,6 +22,10 @@ from dew.data.pipeline import Pipeline, mix
 SOURCES = 1000
 RECORDS = 8
 BATCH = 16
+DOCUMENTS = 1024
+"""Each packed source's documents (`packed`)."""
+SOURCE_TOKENS = 100_000
+"""The tokens each packed source's documents count from, past any of another's (`Documents`)."""
 READ = Loading(workers=0, threads=1, read_buffer=8, worker_buffer=1)
 
 
@@ -80,7 +84,7 @@ class Documents:
             raise IndexError(index)
         Documents.reads += 1
         length = 3 + (self.tag * 7 + index * 5) % 10
-        return {"text": np.arange(length, dtype=np.int32) + self.tag * 1000 + index * 20}
+        return {"text": np.arange(length, dtype=np.int32) + self.tag * SOURCE_TOKENS + index * 20}
 
 
 def packed(count: int, *, by: str = "records", examples: int | None = 10**6):
@@ -89,7 +93,11 @@ def packed(count: int, *, by: str = "records", examples: int | None = 10**6):
     stream under the default loading and bounded in examples, which counts each member's examples where its
     rows are delivered (`MEMBERS`): a user's packed mixture, whose packer asks the mix's position before
     every document."""
-    chains = [Pipeline(Memory(Documents(tag)), name=f"source-{tag}").repeat() for tag in range(count)]
+    # Each source a shard of more documents than the steps a test reads take of it, as a corpus's are: a
+    # shard opened again costs its open once (Grain registers each dataset it reads for its statistics,
+    # a few blocks it keeps), which the steps between opens do not.
+    chains = [Pipeline(Memory(Documents(tag, DOCUMENTS)), name=f"source-{tag}").repeat()
+              for tag in range(count)]
     mixed = mix(chains, seed=0) if by == "records" else mix(chains, by="tokens")
     return compile(mixed.pack(16, fields=("text",)).batch(BATCH), read="streamed", examples=examples)
 
@@ -121,7 +129,7 @@ def drawn(stream, count: int) -> None:
     left = set(range(count))
     while left:
         for batch in texts(stream, 8):
-            left -= {value // 1000 for row in batch for value in row if value}
+            left -= {value // SOURCE_TOKENS for row in batch for value in row if value}
 
 
 @pytest.mark.parametrize("by", ["records", "tokens"])
