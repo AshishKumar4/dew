@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from jax.sharding import AbstractMesh, Mesh
 
+    from dew.nn.derivatives import TangentKind
     from dew.nn.precision import Numerics
 
     from .selection import Refusal
@@ -967,7 +968,7 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
     return found
 
 
-def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
+def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *, kind: TangentKind,
                    live_cotangents: bool = False, primal: Callable | None = None,
                    nested: bool = True) -> Callable:
     """A fused kernel as one function of its operands, differentiated at every order through
@@ -984,7 +985,10 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     `portable`'s and its pullback's, so a higher order (`jax.jvp` of `jax.grad`, `jax.grad` of
     `jax.jvp`) differentiates through XLA while each level's value comes from the kernels; what
     `saved` holds is a function of the operands, whose tangents carry it. This composes with
-    `jax.vmap` of a gradient, the gradient of a `jax.vmap` and forward over reverse.
+    `jax.vmap` of a gradient, the gradient of a `jax.vmap` and forward over reverse. Each of the three is
+    declared as the caller's `kind` (`dew.nn.derivatives.declared_tangent`): a kernel's glue (`KernelGlue`),
+    a rule its numerics need as written (`Protected`), or one written to restructure algebra (`Algebra`),
+    which is what the algebra pass reads of it.
 
     With `live_cotangents`, `backward(saved, operands, cotangent, live)` gives the cotangents of the
     operands at the indices `live` alone, those a reverse pass differentiates, so a frozen operand's
@@ -995,23 +999,23 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     import jax
     from jax.custom_derivatives import SymbolicZero, zero_from_primal
 
-    @jax.custom_jvp
-    def produced(*operands):
-        return forward(*operands)
+    from dew.nn.derivatives import declared_tangent
 
-    @produced.defjvp
-    def _(primals, tangents):
+    def produced_jvp(primals, tangents):
         output, saved = produced(*primals)
         # `saved` reaches only `pulled`, whose tangent reads the operands' instead.
         return (output, saved), (jax.jvp(portable, primals, tangents)[1], zero_from_primal(saved))
 
-    @functools.partial(jax.custom_jvp, nondiff_argnums=(3,))
-    def pulled(saved, operands, cotangent, live):
+    def producing(*operands):
+        return forward(*operands)
+
+    produced = declared_tangent(kind, producing, produced_jvp)
+
+    def pulled_by(saved, operands, cotangent, live):
         arguments = (saved, operands, cotangent) if live is None else (saved, operands, cotangent, live)
         return backward(*arguments)
 
-    @pulled.defjvp
-    def _(live, primals, tangents):
+    def pulled_jvp(live, primals, tangents):
         _, operands, cotangent = primals
         _, doperands, dcotangent = tangents
 
@@ -1022,9 +1026,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
         return pulled(*primals, live), jax.jvp(pullback, (operands, cotangent), (doperands, dcotangent))[1]
 
-    @jax.custom_jvp
-    def bounded(*operands):
-        return forward(*operands)[0] if primal is None else primal(*operands)
+    pulled = declared_tangent(kind, pulled_by, pulled_jvp, nondiff_argnums=(3,))
 
     def bounded_jvp(primals, tangents):
         output, saved = (produced if nested else forward)(*primals)
@@ -1056,8 +1058,10 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
         typed = jax.tree.map(lambda leaf: jax.typeof(leaf).to_tangent_aval(), output)
         return output, linear_map(tangent, transposed, (primals, saved), moving, out_aval=typed)
 
-    bounded.defjvp(bounded_jvp, symbolic_zeros=True)
-    return bounded
+    def bounding(*operands):
+        return forward(*operands)[0] if primal is None else primal(*operands)
+
+    return declared_tangent(kind, bounding, bounded_jvp, symbolic_zeros=True)
 
 
 def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_aval=None):

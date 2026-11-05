@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
 
+from dew.nn.derivatives import Algebra
 from dew.nn.kernels.generation import linear_tangent
 from dew.nn.precision import L2NORM_EPS, at_least_fp32
 
@@ -86,7 +87,7 @@ def stepped(residual: jax.Array, branch: jax.Array, alpha: jax.Array, scale: flo
     (`linear_tangent`)."""
     return linear_tangent(functools.partial(_stepped_forward, scale),
                           functools.partial(_stepped_backward, scale),
-                          functools.partial(_stepped, scale))(residual, branch, alpha)
+                          functools.partial(_stepped, scale), kind=Algebra())(residual, branch, alpha)
 
 
 def _squares(x: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -169,7 +170,8 @@ def normed_hidden(gate: jax.Array, up: jax.Array, gate_gain: jax.Array, up_gain:
     gains'; forward mode differentiates the formula (`linear_tangent`)."""
     return linear_tangent(functools.partial(_hidden_forward, factor, product),
                           functools.partial(_hidden_backward, factor, product),
-                          functools.partial(_hidden, factor, product))(gate, up, gate_gain, up_gain)
+                          functools.partial(_hidden, factor, product),
+                          kind=Algebra())(gate, up, gate_gain, up_gain)
 
 
 def _gated(factor: float, gate, up, gate_gain, up_gain):

@@ -12,6 +12,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.typing import DTypeLike
 
 from dew.nn.dense import Dense, DenseGeneral
+from dew.nn.derivatives import Protected
 from dew.nn.dropout import Dropout
 
 from . import activations
@@ -58,7 +59,8 @@ def _rows(dtype: jnp.dtype) -> Callable:
     def forward(table, ids):
         return _table_rows(table, ids, dtype), (table, ids)
 
-    return linear_tangent(forward, _table_rows_backward, lambda table, ids: _table_rows(table, ids, dtype))
+    return linear_tangent(forward, _table_rows_backward, lambda table, ids: _table_rows(table, ids, dtype),
+                          kind=Protected())
 
 
 def _table_rows_backward(saved: tuple[jax.Array, jax.Array], operands: tuple, cotangent: jax.Array
