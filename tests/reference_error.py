@@ -1690,9 +1690,11 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                   truth_fn=truth_fn, orders=orders, library_fn=library_fn, library_row=library_row,
                   library_leaves=library_leaves, also=also, terms=terms, examples=examples)
         return
+    # A map task draws no seed past the site's stages (`REDRAW`): a sharded test's cases each declare their
+    # own, the shards cut at the most of them, and a recording holds no more.
     _site_judged(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
                  library_fn=library_fn, library_row=library_row, library_leaves=library_leaves, also=also,
-                 terms=terms, examples=examples, weighing=None)
+                 terms=terms, examples=examples, weighing=None, upto=(1 + REDRAW) * seeds)
 
 
 def _deferred(dew_fn, reference_fn, draw, label: str, *, seeds: int, conditioning: int, truth_fn, orders,
