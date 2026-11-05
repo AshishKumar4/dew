@@ -688,15 +688,57 @@ def reached(spec: algebra.Forward, queries: int) -> int | None:
     return None
 
 
-def stated(spec: algebra.Forward, batch: int, heads: int, queries: int, widths: int, *arrays
-           ) -> pl.CostEstimate | None:
+class TileWalk(NamedTuple):
+    """A launch's walk of its tiles as the work it issues reads it (`issued`): its padded `extents` (its
+    arrays' query rows and keys, whole programs of both), its tiles' `blocks` (a consumer's query block and
+    the key block), the tiles a program holds on its walk's axis (`holders`: its consumers' query blocks, or
+    the key blocks of a walk over query tiles, `keyed`), and whether each of them walks every tile any of its
+    program's holders reads (`common`: `Family.walk_own` on a layout whose consumers feed their rings, a
+    shared dQ's or staged logits' dK/dV walk), a tile its own does not see masked whole."""
+
+    extents: tuple[int, int]
+    blocks: tuple[int, int]
+    holders: int = 1
+    keyed: bool = False
+    common: bool = False
+
+
+def issued(spec: algebra.Forward, tile_walk: TileWalk) -> int | None:
+    """The query and key pairs a launch walking `tile_walk` computes: each tile holding a pair its call's form
+    reaches, whole, the first key aligned to the first query, as its program reads them (a query block's key
+    tiles up to its diagonal, `_Program.walked`, or a key block's query tiles from it, `_Program.readers`):
+    every padded row's (a padded consumer walks its keys as a real one does), a causal diagonal tile's
+    masked part computed with the rest (on an H100, the tensor pipes' counts of a causal call at 2048
+    queries and 128-row tiles: 6.25% past its reached pairs, row 3948), and a common walk's every tile for
+    each holder, one wholly past the keys too (`algebra.Forward.walked_keys`); None for a spans call."""
+    if spec.form == "spans":
+        return None
+    (queries, keys), (block_q, block_k) = tile_walk.extents, tile_walk.blocks
+    query_tiles, causal = queries // block_q, spec.form == "causal"
+    seen = min(-(-spec.keys // block_k), keys // block_k)
+    if tile_walk.keyed:
+        # A key block's readers, from its diagonal where causal; a block wholly past the keys has none.
+        firsts = [min(tile * block_k // block_q, query_tiles) if causal else 0 for tile in range(seen)]
+        walks = [query_tiles - first for first in firsts] + [0] * (keys // block_k - seen)
+    else:
+        walks = [min(-(-(tile + 1) * block_q // block_k), seen) if causal else seen
+                 for tile in range(query_tiles)]
+    if tile_walk.common:
+        holders = tile_walk.holders
+        programs = (walks[first:first + holders] for first in range(0, len(walks), holders))
+        walks = [len(program) * max(program) for program in programs]
+    return block_q * block_k * sum(walks)
+
+
+def stated(spec: algebra.Forward, batch: int, heads: int, widths: int, *arrays,
+           tile_walk: TileWalk) -> pl.CostEstimate | None:
     """A launch's cost as it states it to XLA and to Dew's FLOP count (`dew.telemetry.instrumentation`), the
-    hardware's work: a multiply-add a reached pair (`reached`), head and row for each of `widths` product
-    columns the launch issues, its recomputed ones (a backward's `S`) and each part a cotangent's product
-    takes (`part_count`) among them, a transcendental a reached pair, and the bytes of each of `arrays` once;
-    None for a spans call, whose pairs no launch knows (`reached`): its FLOPs count as unsized, never as
-    0. The model's share of it the launch declares apart (`modelled`)."""
-    pairs = reached(spec, queries)
+    hardware's work: a multiply-add a pair its walk (`tile_walk`) issues (`issued`), head and row for each of
+    `widths` product columns the launch issues, its recomputed ones (a backward's `S`) and each part a
+    cotangent's product takes (`part_count`) among them, a transcendental an issued pair, and the bytes of
+    each of `arrays` once; None for a spans call, whose pairs no launch knows (`reached`): its FLOPs count as
+    unsized, never as 0. The model's share of it the launch declares apart (`modelled`)."""
+    pairs = issued(spec, tile_walk)
     if pairs is None:
         return None
     return pl.CostEstimate(flops=2 * batch * heads * pairs * widths, transcendentals=batch * heads * pairs,
