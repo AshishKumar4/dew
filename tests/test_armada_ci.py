@@ -642,7 +642,8 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     def ran(stem: str) -> list[list[str]]:
         return lane_runs(tmp_path, stem)
 
-    out = tmp_path / "verdict.json"
+    (tmp_path / ".verdict").mkdir()
+    out = tmp_path / ".verdict/verdict.json"
     assert ci.gpu_lane("3.12", every, out, cache="on", processes=4, deadline=600.0) == 0
     rows = json.loads(out.read_text())["rows"]
     assert [(row["name"], row["exitCode"]) for row in rows] == [
@@ -729,7 +730,8 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
     def ran(stem: str) -> list[list[str]]:
         return lane_runs(tmp_path, stem)
 
-    out = tmp_path / "verdict.json"
+    (tmp_path / ".verdict").mkdir()
+    out = tmp_path / ".verdict/verdict.json"
     assert ci.gpu_lane("3.12", every, out, cache="on", processes=4, deadline=600.0) == 0
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
     borrowed = str(6 * 2 ** 30 / (81920 * 2 ** 20))
