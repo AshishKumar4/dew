@@ -533,9 +533,9 @@ def unfused(frontier: Frontier, equation: jcore.JaxprEqn) -> set[jcore.Var]:
     if name == "optimization_barrier" or not equation.invars:
         return set()
     if name.startswith("scatter"):
-        base = frontier.reading(equation.invars[:1])
+        base = frontier.roots(equation.invars[:1])
         return {value for value in equation.invars[1:] if computed(value) and value is not equation.invars[0]
-                and frontier.made_for(value) and frontier.reading([value]) & base}
+                and frontier.made_for(value) and frontier.roots([value]) & base}
     if frontier.fusing(equation):
         return set()
     return {value for value in equation.invars if computed(value) and frontier.made_for(value)}
@@ -716,6 +716,24 @@ class Frontier:
         name = equation.primitive.name
         return (recomputed(equation, self.platform) or name == "reduce"
                 or name.startswith(("reduce_", "arg", "scatter")))
+
+    def roots(self, values: Iterable) -> set[jcore.Var]:
+        """The buffers reading `values` holds (`reading`) and the inputs they are computed from or view: what
+        they depend on, the program's inputs among it."""
+        found: set[jcore.Var] = set()
+        pending = [value for value in values if computed(value)]
+        seen: set[jcore.Var] = set()
+        while pending:
+            value = pending.pop()
+            if value in seen:
+                continue
+            seen.add(value)
+            if value in self.inputs or not self.fused(value):
+                found.add(value)
+                continue
+            read = [self.forwards[value]] if value in self.forwards else self.producers[value].invars
+            pending.extend(each for each in read if computed(each))
+        return found
 
     def reading(self, values: Iterable) -> set[jcore.Var]:
         """The buffers reading `values` holds: each value's own, or for one fused, those it is
