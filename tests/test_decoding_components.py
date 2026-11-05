@@ -359,12 +359,9 @@ def test_frequency_and_presence_penalties_are_vllms(case):
     with run_from("vllm_penalty_reference", "tools") as generator:
         redraw = generator.draw
 
-    def wide(inputs):
-        with jax.enable_x64(new_val=True):
-            return {"logits": np.asarray(native(state, jnp.asarray(inputs["logits"], jnp.float64)))}
-
-    draw, reference, truth = indexed_recording(PENALTIES, site, int(PENALTIES[f"{site}.seeds"]),
-                                               inputs_of=redraw, truth_fn=as_given(wide))
+    draw, reference, truth = indexed_recording(
+        PENALTIES, site, int(PENALTIES[f"{site}.seeds"]), inputs_of=redraw,
+        truth_fn=lambda inputs: {"logits": native(state, jnp.asarray(inputs["logits"], jnp.float64))})
     assert_as_exact(as_given(lambda index, inputs: {"logits": np.asarray(native(state, inputs["logits"]))}),
                     reference, draw, f"penalties {frequency}, {presence}",
                     seeds=int(PENALTIES[f"{site}.seeds"]), truth_fn=truth)
