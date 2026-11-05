@@ -87,6 +87,8 @@ ADMITTED = {
         embedded(tokens)[0])[None],
     "layers scanned": lambda tokens: jax.lax.scan(lambda h, w: (jnp.cumsum(h @ w, axis=1), None),
                                                   embedded(tokens), jnp.ones((3, D, D)))[0],
+    "a token's own random bits": lambda tokens: jax.vmap(jax.vmap(lambda token: jax.random.bits(
+        jax.random.fold_in(jax.random.key(0), token), ())))(tokens)[..., None],
 }
 
 REFUSED = {
