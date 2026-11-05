@@ -585,7 +585,9 @@ class _Numbering:
             return [self.summed(operands)]
         held = {key: setting for key, setting in params.items() if not (spread and key in _SHAPED)}
         _, keyed = parameters_key(equation.primitive, held)
-        free = spread or name in ENTRYWISE
+        # An entrywise result over operands of one shape, or scalars, reads no shape; one that broadcasts
+        # an operand's axes of one entry reads which.
+        free = spread or (name in ENTRYWISE and len({tuple(shape) for shape in shapes} - {()}) <= 1)
         read = () if free else tuple(map(tuple, shapes))
         return [self.number((equation.primitive, keyed, tuple(operands), read, index))
                 for index in range(len(equation.outvars))]
@@ -781,7 +783,9 @@ def _row_form(equation, held: int, stacked: set[int], shapes: Sequence) -> Mappi
     if tuple(out[:held]) != tuple(rows):
         return None
     if entrywise(equation) and name != "broadcast_in_dim":
-        return params if all(tuple(shape) in (tuple(out), ()) for shape in shapes) else None
+        # Each operand of its result's shape, a scalar, or of one entry along an axis it broadcasts.
+        return params if all(tuple(shape) == () or (len(shape) == len(out) and all(
+            size in (whole, 1) for size, whole in zip(shape, out, strict=True))) for shape in shapes) else None
     if name == "broadcast_in_dim":
         dims = tuple(params["broadcast_dimensions"])
         if dims[:held] != tuple(range(held)):
