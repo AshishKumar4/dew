@@ -5,6 +5,8 @@ the decoded registers read as the consumer reads them, values its format defines
 import dataclasses
 import functools
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -148,3 +150,59 @@ def test_a_transform_kept_off_the_fma_pipe_takes_its_shifts_on_the_alu():
     form = bits.synthesized(transform, reach=6)
     assert form.issues[bits.Unit.FMA] == 0
     assert form.price == (len(form.steps), len(form.steps))
+
+
+def test_a_forms_traced_decode_is_its_decode():
+    """The NVFP4 decode's form traced in JAX's integer operations (`BitForm.traced`, a kernel's portable
+    path and its interpreter's) gives every register of every drawn stored word as the form's own decode
+    does, under a jit."""
+    form = _nvfp4_form()
+    words = np.random.default_rng(3733).integers(0, 1 << 32, size=4096, dtype=np.uint64)
+    traced = jax.jit(form.traced)(jnp.asarray(words.astype(np.uint32)))
+    for got, expected in zip(traced, form.decoded(words), strict=True):
+        np.testing.assert_array_equal(np.asarray(got).astype(np.uint64), expected)
+
+
+def _inline_decode(form: bits.BitForm):
+    """A Triton kernel decoding a block of stored words through the form's PTX (`BitForm.ptx`), one
+    instruction stream a word."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as plgpu
+
+    count = len(form.outputs)
+
+    def body(words_ref, *out_refs):
+        shape = jax.ShapeDtypeStruct(words_ref.shape, jnp.uint32)
+        decoded = plgpu.elementwise_inline_asm(form.ptx, args=(words_ref[...],),
+                                               constraints=",".join(["=r"] * count + ["r"]),
+                                               pack=1, result_shape_dtypes=(shape,) * count)
+        for ref, value in zip(out_refs, decoded, strict=True):
+            ref[...] = value
+
+    def decode(words):
+        shape = jax.ShapeDtypeStruct(words.shape, jnp.uint32)
+        return pl.pallas_call(body, out_shape=(shape,) * count)(words)
+
+    return decode
+
+
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_forms_ptx_compiles_for_the_gpu(generation):
+    """The NVFP4 decode's PTX in a Triton kernel's inline assembly, lowered and compiled by XLA for a
+    compile-only GPU of `generation` (`tests/kernel_compile.py`): ptxas takes every instruction of it, each
+    shift on its pipe's (SHF, or IMAD by a power of two) and each register a LOP3."""
+    from kernel_compile import lowered_for
+
+    words = jax.ShapeDtypeStruct((1024,), jnp.uint32)
+    lowered_for(_inline_decode(_nvfp4_form()), (words,), generation).compile()
+
+
+@pytest.mark.gpu(reason="runs a form's PTX on this host's GPU")
+def test_a_forms_ptx_decodes_on_the_gpu_as_its_form_does():
+    """The NVFP4 decode's PTX run on the GPU (`BitForm.ptx` in a Triton kernel's inline assembly) gives
+    every register of every drawn stored word as the form's own decode does."""
+    form = _nvfp4_form()
+    words = np.random.default_rng(3734).integers(0, 1 << 32, size=1 << 16, dtype=np.uint64)
+    decoded = jax.jit(_inline_decode(form))(jnp.asarray(words.astype(np.uint32)))
+    for got, expected in zip(decoded, form.decoded(words), strict=True):
+        np.testing.assert_array_equal(np.asarray(got).astype(np.uint64), expected)
