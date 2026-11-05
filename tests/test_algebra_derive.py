@@ -126,11 +126,12 @@ def shaped(tile: dict) -> dict:
     return {name: (value.shape, value.dtype) for name, value in tile.items()}
 
 
-def walked(forms: derive.Derived, tiles: list[dict]):
-    """The state after stepping each of `tiles` (its operands' tiles) in order, from the empty state."""
+def walked(forms: derive.Derived, tiles: list[dict], product=None):
+    """The state after stepping each of `tiles` (its operands' tiles) in order, from the empty state, each
+    product `product`'s where given (a mainloop's issuer)."""
     state = forms.init(shaped(tiles[0]))
     for tile in tiles:
-        state = forms.step(state, tile)
+        state = forms.step(state, tile, product=product)
     return state
 
 
@@ -169,6 +170,28 @@ def test_the_derived_walk_computes_the_declared_function(name, walk):
     forms = derive.derive(declared(function, exponent), accurate=False, saturation=SATURATION)
     run = walked_whole(forms) if walk == "walked" else merged_whole(forms)
     assert_as_exact(jax.jit(run), jax.jit(whole(function)), draw, f"{name} {walk}", seeds=16)
+
+
+def test_a_walks_sums_added_by_its_mainloop_take_each_tiles_factor_and_sum():
+    """A mainloop that makes a walked sum's additions itself (`Derived.step`'s `add`, a compensated walk's
+    running sums) takes each tile's rescale factor and its tile's sum: added twice over, the softmax's
+    denominator doubles on every tile, and the walk's attention is the declared function's halved, on par
+    against the float64 truth (check 1)."""
+    forms = derive.derive(declared(attention), accurate=False, saturation=SATURATION)
+
+    def doubled(state, factor, summed):
+        return state * factor + 2 * summed
+
+    def run(q, k, v):
+        values = operands(q, k, v)
+        tiles = [tile_of(values, tile) for tile in range(KEYS // TILE)]
+        state = forms.init(shaped(tiles[0]))
+        for tile in tiles:
+            state = forms.step(state, tile, add=doubled)
+        return forms.finish(state, values, shapes=shaped(tiles[0]))
+
+    assert_as_exact(jax.jit(run), jax.jit(lambda q, k, v: whole(attention)(q, k, v) / 2), draw,
+                    "attention, its sums added twice", seeds=16)
 
 
 def unshifted(q, k, v, rows, keys):
