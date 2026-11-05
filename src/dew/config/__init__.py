@@ -571,14 +571,16 @@ class TrainerConfig:
     """Microbatches a pipelined step feeds through the mesh's stages, a
     multiple of `mesh.stage`; unset feeds one a stage."""
     layout: Layout = dataclasses.field(default_factory=Layout)
-    profile: ProfileWindow | RunProfile | None = dataclasses.field(default_factory=RunProfile)
-    """One profiler window: the steps to trace, the warmup before them and the output directory.
-
-    By default every run traces two of its steps once ten have run past its first compile, through Dew's
-    own profiler, kept with its records under its directory (`profile`, a window naming no directory),
-    where the process can take a capture (`dew.training.profiling.capturable`): a capture's fixed cost,
-    about a second on a CPU host whatever its steps (row 4112), a run of minutes does not see, and a run
-    shorter than its warmup takes none. None traces nothing.
+    profile: ProfileWindow | None = None
+    """One profiler window: the steps to trace, the warmup before them and the output directory, in place
+    of the run's own (`run_profile`). Unset traces the run's own window alone.
+    """
+    run_profile: RunProfile | None = dataclasses.field(default_factory=RunProfile)
+    """The run's own profile window, every run's by default: two of its steps traced once ten have run
+    past its first compile, kept with its records (`window`), its trace and manifest alone, where the
+    process can take a capture (`dew.training.profiling.capturable`): a capture's fixed cost, about a
+    second on a CPU host whatever its steps (row 4112), a run of minutes does not see, and a run shorter
+    than its warmup takes none. A `profile` the run names replaces it; None traces none of its own.
     """
     compilation_cache_dir: str | None = None
     """The directory of JAX's persistent compilation cache, so a restart skips recompiling the step.
@@ -755,17 +757,16 @@ class TrainerConfig:
         return os.path.join(self.checkpoint_dir, name)
 
     def window(self, directory: str, name: str) -> ProfileWindow | None:
-        """The profile window the run `name` under `directory` traces: `profile` as it names it, or a run's
-        own (`RunProfile`) kept with the run's local records (`local_records`: its directory's `profile`,
+        """The profile window the run `name` under `directory` traces: `profile` as it names it, or else its
+        own (`run_profile`) kept with the run's local records (`local_records`: its directory's `profile`,
         or Dew's cache for a run in a bucket) where the process can take a capture (`capturable`), none
         where it cannot; none where the run traces none. A trainer is given a window naming its directory
         alone (row 4246)."""
         from dew.training.profiling import capturable
 
-        window = self.profile
-        if not isinstance(window, RunProfile):
-            return window
-        return window.window(local_records(directory, name, "profile")) if capturable() else None
+        if self.profile is not None or self.run_profile is None:
+            return self.profile
+        return self.run_profile.window(local_records(directory, name, "profile")) if capturable() else None
 
     def checkpoints(self, name: str, directory: str | None = None) -> Checkpoints:
         """The checkpoints of the run `name` in `checkpoint_dir` (`directory`), or in `directory` where
@@ -1155,16 +1156,23 @@ EARLIER_CAPTURE = ("host_tracer_level", "python_tracer_level", "activity_cap")
 
 def earlier_profile(record: Mapping[str, object]) -> Mapping[str, object]:
     """A saved run's record whose trainer's profile window states its capture's options as its own fields
-    (`EARLIER_CAPTURE`), with them its capture's, as it captured with them. A window that states its
-    capture beside them is as it was, its fields refused by name. Carried to 1.0 (ledger 1552)."""
+    (`EARLIER_CAPTURE`), with them its capture's, as it captured with them; and one a Dew saved while a
+    run's own window was its `profile` naming no directory (train 607 to 610's), with no window of its
+    own named, as the run's own window is its `run_profile` (row 4255). A window that states its capture
+    beside them is as it was, its fields refused by name. Carried to 1.0 (ledger 1552)."""
     fields = record.get("fields")
     trainer = fields.get("trainer") if isinstance(fields, Mapping) else None
     inner = trainer.get("fields", trainer) if isinstance(trainer, Mapping) else None
     window = inner.get("profile") if isinstance(inner, Mapping) else None
     stated = window.get("fields", window) if isinstance(window, Mapping) else None
     if (not isinstance(fields, Mapping) or not isinstance(trainer, Mapping) or not isinstance(inner, Mapping)
-            or not isinstance(window, Mapping) or not isinstance(stated, Mapping) or "capture" in stated
-            or not set(EARLIER_CAPTURE) & set(stated)):
+            or not isinstance(window, Mapping) or not isinstance(stated, Mapping)):
+        return record
+    if "directory" in stated and stated["directory"] is None:
+        inner = {**inner, "profile": None}
+        trainer = {**trainer, "fields": inner} if "fields" in trainer else inner
+        return {**record, "fields": {**fields, "trainer": trainer}}
+    if "capture" in stated or not set(EARLIER_CAPTURE) & set(stated):
         return record
     capture = {name: stated[name] for name in EARLIER_CAPTURE if name in stated}
     stated = {**{name: value for name, value in stated.items() if name not in EARLIER_CAPTURE},

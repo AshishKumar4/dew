@@ -46,7 +46,7 @@ class ProfileWindow:
     A window that `reports` nothing keeps its trace and manifest alone, which needs no XProf and its stop
     writes at once; one that reports converts its capture's reports as its stop is waited for at the
     fit's end, minutes for a training window. A run's own window (`RunProfile`, every run's by default) is
-    resolved into one by its config, kept with its records.
+    resolved into one by its config (`dew.config.TrainerConfig.window`), kept with its records.
 
     `dew.Profiler` is the other way to capture a trace, as a context manager
     around any code; a fit refuses to schedule a window inside one. The loop
@@ -82,7 +82,7 @@ PGLE_CAPTURE = (
 
 @dataclasses.dataclass(frozen=True)
 class RunProfile:
-    """A run's own profile window, every run's by default (`dew.config.TrainerConfig.profile`): `steps`
+    """A run's own profile window, every run's by default (`dew.config.TrainerConfig.run_profile`): `steps`
     traced once `warmup` have run past its first compile, kept with the run's records, its trace and
     manifest alone (no reports: no XProf asked, no conversion the run's end waits for), and taken where the
     process can take one (`capturable`), none where it cannot, where a `ProfileWindow` a run names refuses.
