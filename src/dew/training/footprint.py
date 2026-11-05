@@ -585,9 +585,13 @@ class Frontier:
         chains as it reads them: an elementwise one's (`recomputed`) or a reduction's, a variadic
         `reduce` among them, which XLA fuses into its own kernel whatever its operands' number
         (`PriorityFusion::ChooseKind`, `CanFuseWithNativeEmitter`,
-        xla/backends/gpu/transforms/priority_fusion.cc)."""
+        xla/backends/gpu/transforms/priority_fusion.cc), or a scatter's, an input fusion as a reduction's
+        is (`IsInputFusibleScatter`, xla/service/gpu/gpu_fusible.cc), its base computed into its result:
+        Qwen3.5-4B's tied embedding's gradient, a scatter-add into zeros, was derived holding the zeros
+        beside it, 2.37 GiB over XLA's 4.76 at its step's peak under 'full' (row 4089)."""
         name = equation.primitive.name
-        return recomputed(equation, self.platform) or name == "reduce" or name.startswith(("reduce_", "arg"))
+        return (recomputed(equation, self.platform) or name == "reduce"
+                or name.startswith(("reduce_", "arg", "scatter")))
 
     def reading(self, values: Iterable) -> set[jcore.Var]:
         """The buffers reading `values` holds: each value's own, or for one fused, those it is
