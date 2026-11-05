@@ -6,6 +6,7 @@ attention, PatchMergerMLPV2).
 
 import dataclasses
 from collections.abc import Callable, Mapping
+from typing import Literal
 
 import numpy as np
 from flax import linen as nn
@@ -52,7 +53,7 @@ class MoonViT(TowerBase):
     merge_kernel_size: int = 2
     init_pos_emb_height: int = 64
     init_pos_emb_time: int = 4
-    pos_emb_interpolation_mode: str = "bicubic"
+    pos_emb_interpolation_mode: Literal["bicubic", "bilinear"] = "bicubic"
     qkv_hidden_size: int | None = None
     attn_bias: bool = True
     linear_bias: bool = True
@@ -152,10 +153,11 @@ _SPELLINGS = {"vt_hidden_size": "hidden_size", "vt_intermediate_size": "intermed
 (`Kimi_K25VisionConfig`) spells one otherwise, under its; either reads the same checkpoint."""
 
 
-def _spelled(vision: Mapping[str, object], name: str, default: object = None) -> object:
-    """A vision_config field under the release's name, else transformers' (`_SPELLINGS`), else
-    `default`."""
-    return vision.get(name, vision.get(_SPELLINGS.get(name, name), default))
+def _spelled(vision: Mapping[str, object], name: str) -> str:
+    """The name a vision_config states a field under: the release's, else transformers' where it states
+    that (`_SPELLINGS`), else the release's, which reads the field's default."""
+    other = _SPELLINGS.get(name, name)
+    return other if name not in vision and other in vision else name
 
 
 def translate_moonvit_config(hf_config: Mapping[str, object]) -> Record:
@@ -169,7 +171,7 @@ def translate_moonvit_config(hf_config: Mapping[str, object]) -> Record:
     for field, value in stated.items():
         if vision.get(field, value) != value:
             raise ValueError(f"vision_config {field} {vision[field]!r} is not MoonViT's {value!r} here")
-    activation = _spelled(vision, "activation_func", "gelu_pytorch_tanh")
+    activation = vision.get(_spelled(vision, "activation_func"), "gelu_pytorch_tanh")
     if activation != "gelu_pytorch_tanh":
         raise ValueError(f"vision_config activation_func {activation!r} is not MoonViT's tanh GELU")
     rope = vision.get("rope_parameters")
@@ -177,21 +179,23 @@ def translate_moonvit_config(hf_config: Mapping[str, object]) -> Record:
         "rope_theta", 10000.0), "rope_theta")
     if theta != 10000.0:
         raise ValueError(f"vision_config rope_theta {theta} is not MoonViT's 10000")
-    height = _records.integer(_spelled(vision, "init_pos_emb_height", 64), "init_pos_emb_height")
-    if _records.integer(_spelled(vision, "init_pos_emb_width", height), "init_pos_emb_width") != height:
+    height = _records.integer(vision.get(_spelled(vision, "init_pos_emb_height"), 64), "init_pos_emb_height")
+    width = vision.get(_spelled(vision, "init_pos_emb_width"), height)
+    if _records.integer(width, "init_pos_emb_width") != height:
         raise ValueError("MoonViT's position table resamples here as a square only")
     merge = _records.integers(vision.get("merge_kernel_size", [2, 2]), "merge_kernel_size")
     if len(merge) != 2 or merge[0] != merge[1]:
         raise ValueError(f"merge_kernel_size {merge} is no square merge block")
     qkv = vision.get("qkv_hidden_size")
     return {"class": "moonvit", "fields": {
-        **{name: _records.integer(_spelled(vision, name), name)
+        **{name: _records.integer(vision.get(_spelled(vision, name)), name)
            for name in ("vt_hidden_size", "vt_intermediate_size", "vt_num_attention_heads",
                         "vt_num_hidden_layers")},
         "patch_size": _records.integer(vision.get("patch_size", 14), "patch_size"),
         "merge_kernel_size": merge[0],
         "init_pos_emb_height": height,
-        "init_pos_emb_time": _records.integer(_spelled(vision, "init_pos_emb_time", 4), "init_pos_emb_time"),
+        "init_pos_emb_time": _records.integer(vision.get(_spelled(vision, "init_pos_emb_time"), 4),
+                                              "init_pos_emb_time"),
         "pos_emb_interpolation_mode": _records.text(vision.get("pos_emb_interpolation_mode", "bicubic"),
                                                     "pos_emb_interpolation_mode"),
         "qkv_hidden_size": None if qkv is None else _records.integer(qkv, "qkv_hidden_size"),

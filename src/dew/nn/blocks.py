@@ -266,7 +266,7 @@ def torch_nearest_resize(x, height: int, width: int):
     return jnp.take(jnp.take(x, rows, axis=1), columns, axis=2)
 
 
-def torch_cubic_weights(t):
+def torch_cubic_weights[T: (np.ndarray, jax.Array)](t: T) -> T:
     """The weights of torch's bicubic interpolation (a = -0.75, `upsample_bicubic2d`) on the four taps
     around a source coordinate whose distance past its floor is `t` (NumPy or JAX, its dtype kept): the
     taps at floor - 1, floor, floor + 1 and floor + 2, in that order, on a new last axis."""
@@ -278,8 +278,8 @@ def torch_cubic_weights(t):
     def far(x):
         return ((a * x - 5 * a) * x + 8 * a) * x - 4 * a
 
-    stack = np.stack if isinstance(t, np.ndarray | np.generic) else jnp.stack
-    return stack([far(t + 1), near(t), near(1 - t), far(2 - t)], axis=-1)
+    taps = [far(t + 1), near(t), near(1 - t), far(2 - t)]
+    return np.stack(taps, axis=-1) if isinstance(t, np.ndarray) else jnp.stack(taps, axis=-1)
 
 
 def _torch_bicubic_weights(size_in: int, size_out: int, antialias: bool) -> np.ndarray:
