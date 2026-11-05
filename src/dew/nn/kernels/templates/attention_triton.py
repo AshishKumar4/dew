@@ -12,6 +12,7 @@ and the call's queries and keys pad to whole blocks, which their spans leave unr
 
 import dataclasses
 import functools
+import math
 from collections.abc import Callable
 from typing import Literal, overload
 
@@ -26,6 +27,7 @@ from dew.nn.kernels.templates import (
     attention_algebra as algebra,
     attention_gradient as gradient,
     axes,
+    cost,
     report,
 )
 from dew.nn.kernels.templates.attention import (
@@ -71,17 +73,93 @@ class Tiles:
     stages: int
 
 
-FORWARD_STEPS = tuple(Tiles(block_q, block_k, 4, 2) for block_q in (128, 64, 32) for block_k in (64, 32))
-"""The forward's tiles in the order its derivation steps down (`TritonForward.derived`): the first, 128 by
-64 in four warps two stages deep, within 6% of the fastest at Qwen3-8B, causal and full, on an A100 and
-an H100 (ATT-ZERO3-a100 and ATT-ZERO4-h100, 2026-10-21); then fewer queries, a block's registers living
-in its rows (a training walk's 128 by 64 holds 320 a thread, 10x the plain forward's time on an A100,
-where 64 by 64 holds 160 at 2.1x: TRAINTILES3-a100), then fewer keys, a stage's shared memory living in
-its keys."""
+WARPS = 4
+"""A program's warps: one warpgroup, its tile's rows over its four warps, FlashAttention 2's."""
 
-BLOCK = max(max(tiles.block_q, tiles.block_k) for tiles in FORWARD_STEPS)
-"""The forward's largest tile, the block a call pads to (`padded_call`); the backward's tiles are within
-it (`BACKWARD_STEPS`)."""
+STAGES = 2
+"""A launch's pipeline stages: one tile loading beside the one consumed (`resources.Launch.floor`)."""
+
+ROWS = 32
+"""The fewest rows, and keys, a tile takes: two mma.sync instructions' sixteen, the extents the algebra's
+laws hold at (tests/test_algebra_laws.py's `ROWS` and `KEYS`)."""
+
+BLOCK = WARPS * ROWS
+"""The most rows or keys a tile takes, the block a call pads to (`padded_call`): its fewest a warp
+(FlashAttention 2's 128 a program)."""
+
+
+def _extents() -> tuple[int, ...]:
+    """The extents a tile takes along its queries or its keys: powers of two from `ROWS` to `BLOCK`."""
+    return tuple(ROWS << power for power in range((BLOCK // ROWS).bit_length()))
+
+
+FORWARD_TILES = tuple(Tiles(block_q, block_k, WARPS, STAGES)
+                      for block_q in _extents() for block_k in _extents())
+"""The forward's tiles, each of the extents by each, its derivation's space (`TritonForward.derived`), which
+the call's modelled time orders (`_forward_seconds`). The measured order it replaces, 128 by 64 first,
+within 6% of the fastest at Qwen3-8B causal and full on an A100 and an H100 (ATT-ZERO3-a100,
+ATT-ZERO4-h100, 2026-10-21; a training walk's 64 by 64 at 2.1x where 128 by 64 took 10x, TRAINTILES3-a100),
+is the oracle the measurement batch compares it against."""
+
+
+def _walk_seconds(ba: tokamax.BoundArguments, target: generation.GpuTarget, *, programs: int, steps: float,
+                  step: cost.Work, held: cost.Work, resident: int, streamed: float) -> float:
+    """A launch's modelled time (`cost.Work`'s work-span model, `cost.walked`'s rates): `programs` programs,
+    `resident` a multiprocessor at once, each walking `steps` steps of `step`'s work beside `held`'s (its
+    own tiles' loads and stores), the steps' span its dependent reductions at an in-kernel step's latency;
+    a wave of resident programs the longer of their units' work at the multiprocessor's rates and one's
+    span, waves in turn, and the launch at least its `streamed` device bytes at the device's bandwidth."""
+    del ba
+    work = cost.Work(flops=step.flops * steps + held.flops, exponentials=step.exponentials * steps,
+                     shared_bytes=step.shared_bytes * steps + held.shared_bytes, span=step.span * steps)
+    units, _ = cost.units(work, cost.rates(target, device=False))
+    span, _ = cost.spanned(work, cost.step_latency(target, device=False))
+    waves = math.ceil(programs / ((target.multiprocessors or 1) * resident))
+    seconds = waves * max(resident * max(units), span)
+    return max(seconds, streamed / target.memory_rate) if target.memory_rate else seconds
+
+
+def _resident(launch: Template, ba: tokamax.BoundArguments, config, target: generation.GpuTarget,
+              warps: int) -> int:
+    """The programs of `launch` at `config` a multiprocessor holds at once: its threads' registers
+    (`registers`, a whole multiple of the register step a thread), its shared memory and its threads."""
+    facts = target.multiprocessor
+    held = -(-max(launch.registers(ba, config) or 1, 1) // facts.register_step) * facts.register_step
+    threads = 32 * warps
+    by_registers = facts.registers // (held * threads)
+    by_shared = generation.shared_budget(target) // max(launch.staged_bytes(ba, config, target), 1)
+    return max(1, min(by_registers, by_shared, facts.resident_threads // threads, facts.resident_blocks))
+
+
+def _key_steps(queries: int, keys: int, block_q: int, block_k: int, *, causal: bool) -> float:
+    """A query block's key tiles, on average over a call's blocks: every one, or under a causal mask the
+    tiles at or below its last query's."""
+    if not causal:
+        return keys / block_k
+    blocks = queries // block_q
+    return sum(min(keys, (block + 1) * block_q) / block_k for block in range(blocks)) / blocks
+
+
+def _forward_seconds(launch: "TritonForward", ba: tokamax.BoundArguments, config: Tiles,
+                     target: generation.GpuTarget) -> float:
+    """The forward's modelled time at `config` (`_walk_seconds`): a program a query block and head, each step
+    its logits' and weighted values' products, its weights' exponentials and its key and value tiles read
+    from shared memory, one reduction each of its maximum and its denominator; its keys and values streamed
+    from device memory once a program."""
+    query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
+    batch, queries, heads, width = query.shape
+    keys, value_width = key.shape[1], value.shape[-1]
+    size = jnp.dtype(query.dtype).itemsize
+    block_q, block_k = config.block_q, config.block_k
+    padded_q, padded_k = -(-queries // BLOCK) * BLOCK, -(-keys // BLOCK) * BLOCK
+    steps = _key_steps(padded_q, padded_k, block_q, block_k, causal=launch.form == "causal")
+    step = cost.Work(flops=2 * block_q * block_k * (width + value_width), exponentials=block_q * block_k,
+                     shared_bytes=block_k * (width + value_width) * size, span=2)
+    held = cost.Work(shared_bytes=block_q * (width + value_width) * size)
+    programs = batch * heads * (padded_q // block_q)
+    streamed = programs * (steps * block_k * (width + value_width) + block_q * (width + value_width)) * size
+    return _walk_seconds(ba, target, programs=programs, steps=steps, step=step, held=held,
+                         resident=_resident(launch, ba, config, target, config.warps), streamed=streamed)
 
 
 def _eligible(ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
@@ -368,10 +446,9 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
     GENERATES = True
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Tiles | None:
-        """The first of `FORWARD_STEPS` dividing the call's padded queries and keys that a program of the
-        device holds (`legal`: its shared memory and its threads' registers), stepping down from the
-        measured tile one budget at a time; None where none does."""
-        return _derived(self, FORWARD_STEPS, ba, target)
+        """The tile of `FORWARD_TILES` a program of the device holds (`legal`: its shared memory and its
+        threads' registers) whose call the model times least (`_forward_seconds`); None where none does."""
+        return _derived(self, FORWARD_TILES, ba, target, _forward_seconds)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         """The shared memory Triton gives a program, in the operands' dtype: the key and value tiles of
@@ -434,13 +511,16 @@ def _split(ba: tokamax.BoundArguments) -> bool:
     return _kept(ba.arguments.get("residuals")) is Kept.SPLIT
 
 
-def _derived[T: (Tiles, BackwardTiles)](launch: Template[T], steps: tuple[T, ...], ba: tokamax.BoundArguments,
-                                       target: generation.GpuTarget) -> T | None:
-    """The first of `steps` whose tiles divide the launch's padded queries and keys and which `launch`
-    holds on `target` (`legal`), None where none does."""
-    fitting = dividing(steps, (ba.arguments["query"].shape[1], ba.arguments["key"].shape[1]),
+def _derived[T: (Tiles, BackwardTiles)](launch: Template[T], space: tuple[T, ...], ba: tokamax.BoundArguments,
+                                       target: generation.GpuTarget, seconds: Callable) -> T | None:
+    """Of `space`'s tiles dividing the launch's padded queries and keys that `launch` holds on `target`
+    (`legal`), the one the call's modelled time (`seconds(launch, ba, tiles, target)`) is least at, the
+    larger tile where two tie; None where none holds."""
+    fitting = dividing(space, (ba.arguments["query"].shape[1], ba.arguments["key"].shape[1]),
                        lambda tiles: (tiles.block_q, tiles.block_k))
-    return next((config for config in fitting if launch.legal(ba, config, target)), None)
+    held = [config for config in fitting if launch.legal(ba, config, target)]
+    return min(held, key=lambda config: (seconds(launch, ba, config, target), -config.block_q,
+                                         -config.block_k), default=None)
 
 
 def _param_spec(kind: Kind, param: jax.Array, block_q: int, keys: int) -> pl.BlockSpec:
@@ -721,12 +801,45 @@ class BackwardTiles:
     dkv_stages: int
 
 
-BACKWARD_STEPS = tuple(BackwardTiles(block_q, block_k, 4, 2, 4, 2)
-                       for block_q in (64, 32) for block_k in (64, 32))
-"""The backward's tiles in the order its derivation steps down (`TritonBackward.derived`): the first, 64 by
-64 with each launch in four warps two stages deep, within 7% of the fastest joint config of both launches
-at a llama shape and at head width 64, causal, on an A100 and an H100 (DPROF3-a100 and DPROF3-h100,
-2026-10-21); then fewer queries, then fewer keys."""
+BACKWARD_TILES = tuple(BackwardTiles(block_q, block_k, WARPS, STAGES, WARPS, STAGES)
+                       for block_q in _extents() for block_k in _extents())
+"""The backward's tiles, each of the extents by each, both launches at each (`TritonBackward.derived`),
+which the call's modelled time orders (`_backward_seconds`). The measured order it replaces, 64 by 64
+first, within 7% of the fastest joint config of both launches at a llama shape and at head width 64,
+causal, on an A100 and an H100 (DPROF3-a100 and DPROF3-h100, 2026-10-21), is the oracle the measurement
+batch compares it against."""
+
+
+def _backward_seconds(launch: "TritonBackward", ba: tokamax.BoundArguments, config: "BackwardTiles",
+                      target: generation.GpuTarget) -> float:
+    """The backward's modelled time at `config` (`_walk_seconds`), its two launches': the dQ launch a query
+    block and head a program, each key step the logits' and their cotangents' products and dQ's, its keys
+    and values streamed; the dK/dV launch a key block and head, each query step the same two and dK's and
+    dV's, its queries and output gradients streamed; each step its weights' exponentials and its tiles read
+    from shared memory, one reduction of its cotangents' row sums; every step walked (the op states no form:
+    its spans are arrays)."""
+    query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
+    batch, queries, heads, width = query.shape
+    keys, value_width = key.shape[1], value.shape[-1]
+    size = jnp.dtype(query.dtype).itemsize
+    block_q, block_k = config.block_q, config.block_k
+    padded_q, padded_k = -(-queries // BLOCK) * BLOCK, -(-keys // BLOCK) * BLOCK
+    tile = block_q * block_k
+    seconds = 0.0
+    for dq in (True, False):
+        rows, walked = (block_q, block_k) if dq else (block_k, block_q)
+        own, steps_of = (padded_q, padded_k) if dq else (padded_k, padded_q)
+        steps = _key_steps(own, steps_of, rows, walked, causal=False)
+        products = (2 * width + value_width) if dq else (2 * width + 2 * value_width)
+        step = cost.Work(flops=2 * tile * products, exponentials=tile,
+                         shared_bytes=walked * (width + value_width) * size, span=1)
+        held = cost.Work(shared_bytes=rows * (width + value_width) * size)
+        programs = batch * heads * (own // rows)
+        streamed = programs * (steps + 1) * walked * (width + value_width) * size
+        resident = _resident(launch, ba, config, target, config.dq_warps if dq else config.dkv_warps)
+        seconds += _walk_seconds(ba, target, programs=programs, steps=steps, step=step, held=held,
+                                 resident=resident, streamed=streamed)
+    return seconds
 
 
 @dataclasses.dataclass(frozen=True)
@@ -773,9 +886,9 @@ class TritonBackward(AttentionLaunch, Template[BackwardTiles]):
     GENERATES = True
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> BackwardTiles | None:
-        """The first of `BACKWARD_STEPS` dividing the call's padded queries and keys that a program of
-        either launch holds on the device (`legal`); None where none does."""
-        return _derived(self, BACKWARD_STEPS, ba, target)
+        """The tile of `BACKWARD_TILES` a program of either launch holds on the device (`legal`) whose call
+        the model times least (`_backward_seconds`); None where none does."""
+        return _derived(self, BACKWARD_TILES, ba, target, _backward_seconds)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
                      target: generation.GpuTarget) -> int:
