@@ -816,7 +816,7 @@ def _training_measure(train: Pipeline, validation: Pipeline | None, *, objective
         training=True,
         objective=objective,
         counts=(counts,) if validation is None else (counts, validation_counts),
-        automatic=automatic_root(loading) if read != "streamed" else None,
+        automatic=automatic_root(loading),
         examples=examples if written is None else None,
         epochs=epochs,
     )
