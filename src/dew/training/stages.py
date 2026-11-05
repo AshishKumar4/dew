@@ -557,6 +557,9 @@ class _Numbering:
     def __init__(self):
         self.numbers: dict[Hashable, int] = {}
         self.sums: dict[int, tuple[int, ...]] = {}
+        self.uniform: set[int] = set()
+        """The numbers of a scalar's broadcasts, a value the same at every entry, so the same in each row of
+        a stack of its shape."""
 
     def number(self, key: Hashable) -> int:
         return self.numbers.setdefault(key, len(self.numbers))
@@ -589,8 +592,11 @@ class _Numbering:
         # an operand's axes of one entry reads which.
         free = spread or (name in ENTRYWISE and len({tuple(shape) for shape in shapes} - {()}) <= 1)
         read = () if free else tuple(map(tuple, shapes))
-        return [self.number((equation.primitive, keyed, tuple(operands), read, index))
+        made = [self.number((equation.primitive, keyed, tuple(operands), read, index))
                 for index in range(len(equation.outvars))]
+        if spread:
+            self.uniform.update(made)
+        return made
 
     def program(self, equations, named: dict, leads: dict) -> dict:
         """Each value of `equations` over the inputs `named` to its expression's number, in program order, a
@@ -631,6 +637,16 @@ class _Numbering:
         if len({(len(operands[index]), leads[index]) for index in stacked}) != 1:
             return None
         count, held = len(operands[stacked[0]]), leads[stacked[0]]
+        rows = tuple(shapes[stacked[0]][:held])
+        for index, operand in enumerate(operands):
+            if index in stacked or len(shapes[index]) < held or tuple(shapes[index][:held]) != rows:
+                continue
+            # A value of no stack of the stack's shape: each row's the same where it is a scalar's
+            # broadcast, any other's rows its own, which no row's expression names.
+            if operand not in self.uniform:
+                return None
+            operands[index] = (operand,) * count
+            stacked.append(index)
         row_shapes = [shape[held:] if index in stacked else shape for index, shape in enumerate(shapes)]
         every = _full_sum(equation, held)
         if every is not None:
@@ -653,15 +669,15 @@ class _Numbering:
         from dew.training.staging import flattened
 
         def run(closed, values: list, held: list) -> list[tuple] | None:
-            body, results = flattened(closed.jaxpr, closed.jaxpr.invars, closed.consts)
+            body, returned = flattened(closed.jaxpr, closed.jaxpr.invars, closed.consts)
             inner = {var: lead for var, lead in zip(closed.jaxpr.invars, held, strict=True)
                      if lead is not None}
             numbers = self.program(body, dict(zip(closed.jaxpr.invars, values, strict=True)), inner)
-            out = [self.read(numbers, value) for value in results]
+            out = [self.read(numbers, value) for value in returned]
             if any(number is None for number in out):
                 return None
             return [(number, inner.get(value) if isinstance(number, tuple) else None)
-                    for number, value in zip(out, results, strict=True)]
+                    for number, value in zip(out, returned, strict=True)]
 
         params = equation.params
         if equation.primitive.name == "scan":
