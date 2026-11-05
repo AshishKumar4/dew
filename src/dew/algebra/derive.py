@@ -231,24 +231,28 @@ def slot(term: Term) -> i64: ...
 
 def _exponentials() -> list:
     """The rules that find what scales as `exp(-k)` of an anchor `k` (`scales`), from its exponential."""
-    x, y, k, t, base = vars_("x y k t base", Term)
+    x, y, z, k, t, base = vars_("x y z k t base", Term)
     name = var("name", String)
-    p, q, c, d, e, s = vars_("p q c d e s", i64)
+    p, q, c, d, e, s, f = vars_("p q c d e s f", i64)
     axes = var("axes", Vec[i64])
     found = []
     # An exponential of a local value less an anchor's broadcast, with the axis along which the anchor's own
     # lies (`at`, -1 for a scalar anchor's), as its broadcast placed it. The same where the largest value's
-    # exponent is held to 0 by a select, `exp(where(x < b, x - b, 0))`, `b` the broadcast of `x`'s own
-    # maximum (so the two are equal in the reals): attention's accurate form's weights over scaled logits,
-    # its largest weighing exactly 1 against a compiler's contraction.
+    # exponent is held to 0 by a select, `exp(where(x < b, x - b, 0))`, `b` the broadcast of a bound of every
+    # `x` (so the two are equal in the reals): attention's accurate form's weights over scaled logits, its
+    # largest weighing exactly 1 against a compiler's contraction.
     for power in ("exp", "exp2"):
         difference = x.binary(String("sub"), base, s)
         held = x.compare(String("lt"), base, d).select(y, difference)
         broadcast = (local(x), eq(base).to(k.shaped(String("broadcast_in_dim"), q)), anchor(k),
                      eq(name).to(String(power)))
-        own_maximum = eq(k).to(x.reduce(String("max"), axes, p))
+        # `b` at least every `x` (its own maximum, or that maximum floored, `max(max(x), z)`), so that where
+        # `x < b` fails the difference is 0 too.
+        bounds = (eq(k).to(x.reduce(String("max"), axes, p)),
+                  eq(k).to(x.reduce(String("max"), axes, p).binary(String("max"), z, f)),
+                  eq(k).to(z.binary(String("max"), x.reduce(String("max"), axes, p), f)))
         for exponential, conditions in ((difference.unary(name, e), ()),
-                                        (held.unary(name, e), (zero(y), own_maximum))):
+                                        *((held.unary(name, e), (zero(y), bound)) for bound in bounds)):
             found += [
                 rule(eq(t).to(exponential), *broadcast, *conditions, lays(q, i64(0), c)).then(
                     scales(t, k, name, e, s, c)),
