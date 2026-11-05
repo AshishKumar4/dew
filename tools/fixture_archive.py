@@ -9,6 +9,7 @@ import re
 import tarfile
 from collections.abc import Callable, Iterable
 from pathlib import Path
+from typing import BinaryIO
 
 PRESET = 9
 """xz's preset for a fixture archive."""
@@ -30,20 +31,27 @@ def cleaned(name: str, data: bytes) -> bytes:
     return NAME_OR_PATH.sub(rb'\1""', data) if name.endswith(".json") else data
 
 
-def write(destination: str | Path, entries: Iterable[tuple[Path, str]],
-          kept: Callable[[str], bool] = lambda name: True) -> None:
-    """The xz archive `destination` of `entries`, each a file or directory and its name in the archive,
-    a directory's members beneath it in name order, but those `kept` refuses: every member `anonymous`
-    and `cleaned`, packed at `PRESET`."""
-    with tarfile.open(destination, "w:xz", preset=PRESET) as archive:
+def write(destination: str | Path | BinaryIO, entries: Iterable[tuple[Path, str]],
+          kept: Callable[[str], bool] = lambda name: True, *,
+          cleaning: Callable[[str, bytes], bytes] = cleaned, modes: tuple[int, int] | None = None) -> None:
+    """The xz archive `destination` (a path, or a binary file it is written into) of `entries`, each a file
+    or directory and its name in the archive, a directory's members beneath it in name order, but those
+    `kept` refuses: every member `anonymous`, each file's bytes as `cleaning` gives them (`cleaned`: a saved
+    config's writer's directory emptied), of one mode a kind where `modes` (a directory's, a file's) states
+    them, packed at `PRESET`."""
+    named = isinstance(destination, str | Path)
+    with tarfile.open(name=destination if named else None, fileobj=None if named else destination,
+                      mode="w:xz", preset=PRESET) as archive:
         for root, name in entries:
             for path in [root, *sorted(root.rglob("*"))] if root.is_dir() else [root]:
                 member = (Path(name) / path.relative_to(root)).as_posix() if path != root else name
                 if not kept(member):
                     continue
                 info = anonymous(archive.gettarinfo(path, arcname=member))
+                if modes is not None:
+                    info.mode = modes[0] if path.is_dir() else modes[1]
                 if path.is_file():
-                    data = cleaned(member, path.read_bytes())
+                    data = cleaning(member, path.read_bytes())
                     info.size = len(data)
                     archive.addfile(info, io.BytesIO(data))
                 else:
