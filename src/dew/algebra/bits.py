@@ -60,18 +60,24 @@ class BitStep(NamedTuple):
     unit: Unit
 
 
-def _applied(step: BitStep, values: Sequence[np.ndarray]) -> np.ndarray:
-    """`step` over `values` (uint64 arrays of 32-bit words), as the instruction computes it."""
-    first = values[step.args[0]]
-    if step.op is BitOp.SHR:
-        return first >> np.uint64(step.immediate)
-    if step.op is BitOp.ROTR:
-        count = np.uint64(step.immediate)
-        return ((first >> count) | (first << np.uint64(WORD - step.immediate))) & np.uint64(MASK)
-    if step.op is BitOp.SHL:
-        return (first << np.uint64(step.immediate)) & np.uint64(MASK)
-    xor = first if len(step.args) == 1 else first ^ values[step.args[1]]
-    return xor & np.uint64(step.immediate)
+def _run[Words: (np.ndarray, jax.Array)](steps: Sequence[BitStep], outputs: Sequence[int], words: Words,
+                                          xp) -> tuple[Words, ...]:
+    """Each output (`outputs`, 0 the stored word, `i + 1` step `i`'s) of `steps` over `words`, uint32 arrays
+    of `xp` (NumPy, or `jax.numpy` for a kernel's portable path): the one evaluation of a form's steps, as
+    each instruction computes it, its shifts in 32 bits."""
+    values = [words]
+    for step in steps:
+        first, amount = values[step.args[0]], xp.uint32(step.immediate)
+        if step.op is BitOp.SHR:
+            value = first >> amount
+        elif step.op is BitOp.ROTR:
+            value = (first >> amount) | (first << xp.uint32(WORD - step.immediate))
+        elif step.op is BitOp.SHL:
+            value = first << amount
+        else:
+            value = (first if len(step.args) == 1 else first ^ values[step.args[1]]) & amount
+        values.append(value)
+    return tuple(values[index] for index in outputs)
 
 
 def _bits(mask: int) -> list[int]:
@@ -178,11 +184,9 @@ class BitForm:
     encoder: tuple[int, ...]
 
     def decoded(self, words: np.ndarray) -> tuple[np.ndarray, ...]:
-        """Each output register of each stored word of `words`."""
-        values = [words.astype(np.uint64)]
-        for step in self.steps:
-            values.append(_applied(step, values))
-        return tuple(values[index] for index in self.outputs)
+        """Each output register of each stored word of `words` (`_run`'s, in NumPy), as uint64."""
+        return tuple(value.astype(np.uint64)
+                     for value in _run(self.steps, self.outputs, words.astype(np.uint32), np))
 
     def encoded(self, inputs: np.ndarray) -> np.ndarray:
         """The stored word of each of `inputs`."""
@@ -202,23 +206,9 @@ class BitForm:
         return max(depths[index] for index in self.outputs)
 
     def traced(self, words: jax.Array) -> tuple[jax.Array, ...]:
-        """Each output register of each stored word of `words` (uint32), as JAX computes it: the form's
-        steps in `jax.numpy`'s integer operations, for a kernel's portable path and its interpreter, where no
-        inline assembly runs."""
-        values = [words.astype(jnp.uint32)]
-        for step in self.steps:
-            first = values[step.args[0]]
-            if step.op is BitOp.SHR:
-                value = first >> step.immediate
-            elif step.op is BitOp.ROTR:
-                value = (first >> step.immediate) | (first << (WORD - step.immediate))
-            elif step.op is BitOp.SHL:
-                value = first << step.immediate
-            else:
-                xor = first if len(step.args) == 1 else first ^ values[step.args[1]]
-                value = xor & jnp.uint32(step.immediate)
-            values.append(value)
-        return tuple(values[index] for index in self.outputs)
+        """Each output register of each stored word of `words` (uint32), as JAX computes it (`_run`'s, in
+        `jax.numpy`): a kernel's portable path and its interpreter's, where no inline assembly runs."""
+        return _run(self.steps, self.outputs, words.astype(jnp.uint32), jnp)
 
     def ptx(self, output: int) -> str:
         """Output register `output` of the form as one PTX block over its stored word `$1` into `$0`, the

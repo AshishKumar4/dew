@@ -597,8 +597,8 @@ class Server:
         # The run's progress a model that reads one draws at (`dew.nn.progress`), an input of every step
         # like the weights, which `reload` moves to each version it serves without a compile.
         self.progress = progress
-        # The PRNG implementation its rows' keys are of: the default one as it was built.
-        self.decode_steps, self.steps, self.prng = decode_steps, 0, str(jax.config.jax_default_prng_impl)
+        # The PRNG implementation its rows' keys are of: the default one as its rows were made.
+        self.decode_steps, self.steps, self.prng = decode_steps, 0, rows.placement.prng
         self._queue: deque[_Row] = deque()
         """The requests waiting for a slot, oldest first. `submit` appends on
         the right while a step seats from the left, so a submitting thread
@@ -687,10 +687,13 @@ class Server:
     @contextlib.contextmanager
     def _context(self) -> Iterator[None]:
         """The mesh the model traces under, so a layer that reads it, such as an expert exchange, finds it,
-        under the numerics its task's run trained in."""
+        under the numerics its task's run trained in, with its rows' PRNG implementation the default, so a
+        key a layer draws (a stochastic rounding stream) is of the implementation its cache was opened
+        with, whatever thread serves it."""
         with (contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh),
               contextlib.nullcontext() if self.precision is None
-              else generation.run_precision(self.precision)):
+              else generation.run_precision(self.precision),
+              jax.default_prng_impl(self.prng)):
             yield
 
     @classmethod
