@@ -942,13 +942,18 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     return Timings({**timings, **_benchmarks(read, flushes)})
 
 
-def _benchmarks(read: Mapping, flushes: set[str]) -> dict[Hashable, tokamax.BenchmarkData]:
-    """The configs `_measured` timed, each run's time the sum of its own kernels', the flush's left out."""
-    benchmarks = {}
+def _benchmarks(read: Mapping, flushes: set[str]) -> dict[Hashable, tokamax.BenchmarkData | Exception]:
+    """The configs `_measured` timed, each run's time the sum of its own kernels', the flush's left out;
+    a config a run of which CUPTI read none of its own kernels in is no pick, as its time would read as
+    zero."""
+    benchmarks: dict[Hashable, tokamax.BenchmarkData | Exception] = {}
     for config, (runs, lowering, compiling) in read.items():
-        times = tuple(sum(milliseconds for name, milliseconds in run if name not in flushes) for run in runs)
+        own = [[ms for name, ms in run if name not in flushes] for run in runs]
+        if not all(own):
+            benchmarks[config] = ValueError(f"CUPTI read none of config {config}'s own kernels")
+            continue
         benchmarks[config] = tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering,
-                                                   metadata={}, evaluation_times_ms=times)
+                                                   metadata={}, evaluation_times_ms=tuple(map(sum, own)))
     return benchmarks
 
 
