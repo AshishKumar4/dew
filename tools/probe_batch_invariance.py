@@ -2,10 +2,13 @@
 
 import hashlib
 import json
+import sys
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 from dew.decision import Choice, Decide, DecisionInputs
@@ -31,7 +34,11 @@ def main():
         padded = jax.tree.map(lambda leaf: leaf[:1], mixed)
         forward = jax.jit(task.model.logits)
         found = {}
-        for name, inputs in (("alone", single), ("padded", padded), ("mixed", mixed)):
+        passes = [("alone", single), ("padded", padded), ("mixed", mixed)]
+        if "--one-pad" in sys.argv:
+            passes.append(("one-pad", replace(single, tokens=jnp.pad(single.tokens, ((0, 0), (0, 1))),
+                                               segments=jnp.pad(single.segments, ((0, 0), (0, 1))))))
+        for name, inputs in passes:
             logits = np.asarray(forward(task.variables, inputs))[0, 0, :3]
             p = task.calibration.probabilities(short[1]["q"], logits)
             found[name] = {"logits": logits.tolist(), "probabilities": p.tolist()}
