@@ -311,10 +311,14 @@ def folded(program: jcore.Jaxpr) -> jcore.Jaxpr:
 
 
 def zero(value: jcore.Var | jcore.Literal, producers: Mapping) -> bool:
-    """Whether `value` is a zero: a literal zero, or one broadcast."""
+    """Whether `value` is a zero: a literal zero, or one broadcast, cast or laid out otherwise (`bitcast`):
+    a scanned head's zero carry, which its loop of one turn, run inline (`compiled_program.once`), reads
+    unstacked."""
     producer = producers.get(value) if isinstance(value, jcore.Var) else None
-    if producer is not None and producer.primitive.name == "broadcast_in_dim":
+    while producer is not None and producer.invars and (
+            producer.primitive.name in ("broadcast_in_dim", "convert_element_type") or bitcast(producer)):
         value = producer.invars[0]
+        producer = producers.get(value) if isinstance(value, jcore.Var) else None
     return isinstance(value, jcore.Literal) and not np.any(np.asarray(value.val))
 
 
