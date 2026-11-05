@@ -1,4 +1,4 @@
-"""The grouped matmul's kernel launches, which the GEMM template (`templates.gemm.template`) runs and
+"""The grouped matmul's kernel launches, which the GEMM template (`kernels.gemm`) runs and
 differentiates (`dew.nn.moe.expert_projection` through it), and XLA's portable projection.
 
 Three products, in MaxText's megablox shape: the forward `gmm`, the input gradient `gmm` against the
@@ -93,7 +93,7 @@ class Hooks:
     then each side tile's: `prologue_dtypes`, `epilogue_dtypes`). The side operands themselves are the
     launch's `prologue_operands` and `epilogue_operands`. A launch's picks key each hook by what it
     computes (`_GroupedLaunch.traced`), never by the function object. A `paired` product's epilogue takes its
-    two accumulators before its side tiles (`templates.gemm.template.gemm`'s `paired`)."""
+    two accumulators before its side tiles (`gemm.gemm`'s `paired`)."""
     prologue: object = None
     prologue_axes: tuple = ()
     epilogue: object = None
@@ -310,7 +310,7 @@ class _Triton(_GroupedLaunch[Tile]):
     GENERATES: ClassVar[bool] = True
 
     def eligible(self, ba, target) -> bool:
-        # Every CUDA GPU the template sends the kernels to (`templates.gemm.template`), and
+        # Every CUDA GPU the template sends the kernels to (`kernels.gemm`), and
         # a CPU, which interprets them, or traces the CUDA branch a GPU's lowering takes; never a TPU (a
         # paired product the selector hands on apart: `_takes_pair`).
         return generation.capability(target.generation) is not None and self.derived(ba, target) is not None
@@ -1509,7 +1509,7 @@ def _takes_pair(name: str, target) -> bool:
 
 class Apart:
     """`launched`'s answer for a paired product no launch takes whole: its two products run apart
-    (`templates.gemm.template._apart`), each through the launches that take it, as the unfused program runs
+    (`gemm._apart`), each through the launches that take it, as the unfused program runs
     them."""
 
     name = 'apart'
@@ -1569,7 +1569,7 @@ def gmm_call(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_oper
              paired: jax.Array | None = None, *, out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS,
              interpret: bool, promoted: bool = False, dense: bool = False) -> tuple:
     """The launches, arguments and options of each group's rows of `tokens` times its matrix of `kernel`,
-    both of one dtype, with the template's hooks (`templates.gemm.template.gemm`). `promoted`,
+    both of one dtype, with the template's hooks (`gemm.gemm`). `promoted`,
     the declared product's (`templates.product.Product`), adds each depth step's partial apart
     (`exact_sums`); `dense`, one group of every row (a dense product), the plain tiled kernel where Triton
     runs it; `paired`, a second matrix of `kernel`'s shape multiplied by the same rows (Mosaic GPU's
@@ -1585,7 +1585,7 @@ def tgmm_call(tokens, cotangent, sizes, prologue_operands: tuple = (), *, out_dt
               hooks: Hooks = NO_HOOKS, interpret: bool, promoted: bool = False, dense: bool = False) -> tuple:
     """The launches, arguments and options of each group's rows of `tokens` transposed times its rows of
     `cotangent`, both of one dtype, with the template's prologue
-    (`templates.gemm.template.gemm_t`); `promoted` and `dense` as `gmm_call`'s."""
+    (`gemm.gemm_t`); `promoted` and `dense` as `gmm_call`'s."""
     arguments = (tokens, cotangent, sizes, tuple(prologue_operands))
     options = {'out_dtype': jnp.dtype(out_dtype).name, 'hooks': hooks, 'interpret': interpret,
                'exact_sums': promoted, 'dense': dense}

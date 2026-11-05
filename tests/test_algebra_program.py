@@ -965,7 +965,7 @@ def test_a_fused_gemms_producer_passes_the_algebra_pass_before_the_fuser_places_
     """A fused GEMM's producer is rewritten by the algebra pass before the fuser stages it (algebra.md §2):
     a producer of two scales of one operand summed is staged as its cheaper form, its window's rewrite
     spliced (the fused products' values against their references: tests/test_gemm_template.py)."""
-    from dew.nn.kernels.templates.gemm import fused
+    from dew.nn.kernels import fused_gemm
 
     def producer(values):
         x, a, b = values
@@ -973,7 +973,7 @@ def test_a_fused_gemms_producer_passes_the_algebra_pass_before_the_fuser_places_
         return capped * jnp.tanh(a) + capped * jnp.tanh(b)
 
     with report.refusals():
-        fused._split(producer, _scaled_operands(1, (64, 128)))
+        fused_gemm._split(producer, _scaled_operands(1, (64, 128)))
         assert any(made.spliced for made in report.rewrites())
 
 

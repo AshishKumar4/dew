@@ -33,14 +33,14 @@ def test_a_dependent_named_choice_holds_unless_the_child_names_its_own():
 
 
 def test_a_gemm_pullback_keeps_its_named_choice_and_restores_the_callers_scope():
-    from dew.nn.kernels.templates.gemm import template
+    from dew.nn.kernels import gemm
 
     with jax.enable_x64(new_val=True):
         x = jnp.arange(8, dtype=jnp.float64).reshape(2, 4) / 8
         weight = jnp.arange(12, dtype=jnp.float64).reshape(4, 3) / 16
 
         def projected(x, weight):
-            return template.gemm(x, weight, None, out_dtype=jnp.float64)
+            return gemm.gemm(x, weight, None, out_dtype=jnp.float64)
 
         with generation.chosen(grouped_matmul="xla"):
             value, pullback = jax.vjp(projected, x, weight)

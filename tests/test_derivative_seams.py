@@ -34,7 +34,7 @@ CONTRACTED = {
         ("test_a_bf16_dot_holds_every_order", NUMERICS),
     "src/dew/nn/precision.py::_summed_wide.linear_tangent":
         ("test_a_wide_cpu_sum_of_products_holds_every_order", NUMERICS),
-    "src/dew/nn/kernels/templates/gemm/template.py::gemm.linear_tangent":
+    "src/dew/nn/kernels/gemm.py::gemm.linear_tangent":
         ("test_a_grouped_gemm_holds_every_order", KERNEL),
     "src/dew/nn/kernels/templates/recurrence/selective.py::_scan":
         ("test_the_selective_scan_holds_its_orders", KERNEL),
@@ -124,7 +124,7 @@ CONTRACTED = {
         ("test_a_node_perturbation_estimate_holds_every_order", SURROGATE),
     "src/dew/nn/kernels/grouped_matmul.py::portable_projection":
         ("test_a_portable_grouped_projection_holds_every_order", NUMERICS),
-    "src/dew/nn/kernels/templates/gemm/template.py::_prologued.prologued":
+    "src/dew/nn/kernels/gemm.py::_prologued.prologued":
         ("test_a_gemm_prologue_holds_every_order", KERNEL),
     "src/dew/nn/kernels/templates/layout.py::_custom.held":
         ("test_a_transposed_hooks_custom_vjp_holds_every_reverse_order", KERNEL),

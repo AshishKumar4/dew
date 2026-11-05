@@ -108,11 +108,11 @@ def _reported(generation: str, layers: int = 1, *, scanned: bool = False):
     each call it, its kernels lowered once, `tuning.lowered_once`), unrolled or under a scan (`scanned`, as
     `scan_layers=True` runs a stack of like layers), beside a Triton kernel, lowered on this CPU for
     `generation`'s GPU, with the routes its dispatches reported (`routes`)."""
-    from dew.nn.kernels.templates.gemm import template
+    from dew.nn.kernels import gemm
 
     def step(x, w, sizes):
         def layer(x, w, scale):
-            return template.gemm(x * scale, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
+            return gemm.gemm(x * scale, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
 
         def loss(x, w):
             if scanned:
@@ -173,14 +173,14 @@ def test_a_kernel_behind_a_loop_of_no_trips_is_compiled_and_launches_none(genera
     and compiles, so the compile gate's inventory holds them (`kernel_calls(..., unrun=True)`), and which
     launch none, so the kernel report and the FLOP count leave them out alike, the step's Triton kernel its
     one launch (2958's review: a kernel of no runs once turned a live kernel's stated FLOPs unknown)."""
-    from dew.nn.kernels.templates.gemm import template
+    from dew.nn.kernels import gemm
     from dew.telemetry.instrumentation import hlo_flops
     from dew.training._lowering import kernel_calls
 
     def step(x, w, sizes):
         def body(carry):
             trip, total = carry
-            product = template.gemm(x, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
+            product = gemm.gemm(x, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
             return trip + 1, total + product
 
         _, total = jax.lax.while_loop(lambda carry: carry[0] < 0, body, (jnp.int32(0), jnp.float32(0)))
