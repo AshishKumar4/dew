@@ -998,6 +998,79 @@ def test_a_server_drafts_speculative_blocks_as_a_lone_call_does(temperature, dec
         server.reload(params)
 
 
+def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(tmp_path):
+    """One server over an adapter set (`dew.lora.AdapterSet`) of a published decoder: the fixture's PEFT
+    adapter (rank 8 over q and v, with an alpha pattern) and one of rank 2 over q alone, saved side by side
+    and loaded by directory. Requests naming either adapter, or none, share the server's steps and its
+    one copy of the base, and each draws what a task over its adapter alone (or the base) draws, on par
+    with that task against its float64 twin (check 1) (ledger 870)."""
+    from pathlib import Path
+
+    from arm_arithmetic import widened
+    from reference_error import as_given, assert_as_exact, seeds_for
+
+    from dew.interop.pretrained import Pretrained
+    from dew.lora import AdapterSet, LoRA
+
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    decoder = Pretrained.load(fixtures / "hf" / "llama-tiny", dtype="float32", attention_impl="reference")
+    fixture = LoRA.load(decoder.model, decoder.variables, fixtures / "lora" / "llama-tiny" / "adapter",
+                        layouts=decoder.layouts)
+    drawn = LoRA(rank=2, modules=("q_proj",)).apply(decoder.model, decoder.variables, key=0,
+                                                       layouts=decoder.layouts)
+    # Its B starts at zero; a draw of its own moves the model.
+    factors = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: (jax.random.normal(jax.random.key(len(path)), leaf.shape, leaf.dtype) * 0.5
+                            if jax.tree_util.keystr(path).endswith("'lora_B']") else leaf),
+        drawn.variables["params"])
+    second = dataclasses.replace(drawn, variables={**drawn.variables, "params": factors})
+    fixture.save(fixture.variables, tmp_path / "set" / "fixture")
+    second.save(second.variables, tmp_path / "set" / "second")
+    adapters = AdapterSet.load(decoder.model, decoder.variables, tmp_path / "set", layouts=decoder.layouts)
+    assert adapters.names == ("fixture", "second")
+    sampling = Sampling(temperature=1.0)
+    served = dataclasses.replace(decoder, model=adapters.model, variables=adapters.variables
+                                 ).text_generation(sampling=sampling)
+    alone = {name: dataclasses.replace(decoder, model=adapter.model, variables=adapter.variables
+                                       ).text_generation(sampling=sampling)
+             for name, adapter in (("fixture", fixture), ("second", second))} | {
+                 None: decoder.text_generation(sampling=sampling)}
+    prompts = ([1, 5, 9, 13], [2, 4], [7, 7, 7, 3, 1], [11, 6, 2])
+    names = ("fixture", "second", None, "fixture")
+    server = Server.from_task(served, slots=4, capacity=64, admission=2)
+
+    def draw(seed):
+        return (np.arange(len(prompts)) + len(prompts) * seed,)
+
+    @as_given
+    def through_the_server(keys):
+        tickets = [server.submit(np.asarray([prompt]), 6, key=int(key), adapter=name)
+                   for prompt, name, key in zip(prompts, names, keys, strict=True)]
+        server.run()
+        return tuple(ticket.result().host().tokens for ticket in tickets)
+
+    def by_itself(dtype):
+        @as_given
+        def drawn_alone(keys):
+            out = []
+            for prompt, name, key in zip(prompts, names, keys, strict=True):
+                task = alone[name]
+                if dtype == "float64":
+                    task = dataclasses.replace(task, model=task.model.clone(dtype=jnp.float64),
+                                               variables=widened(task.variables))
+                with jax.enable_x64(new_val=dtype == "float64"):
+                    out.append(task(np.asarray([prompt]), 6, key=int(key)).host().tokens)
+            return tuple(out)
+
+        return drawn_alone
+
+    label = "served adapter set"
+    count = seeds_for(by_itself("float32"), draw, label, truth_fn=by_itself("float64"),
+                      dew_fn=through_the_server)
+    assert_as_exact(through_the_server, by_itself("float32"), draw, label, seeds=count,
+                    truth_fn=by_itself("float64"))
+
+
 @pytest.mark.distributed
 def test_a_server_over_a_pool_draws_what_each_request_draws_alone(tmp_path):
     """One server over a mesh that spans two processes, each seating and reading its own groups of rows and
