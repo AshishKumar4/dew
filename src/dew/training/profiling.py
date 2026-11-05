@@ -43,19 +43,17 @@ class ProfileWindow:
     host events at level 2, no Python calls (the Python tracer slows Python-heavy host work several
     times over), and on GPU at most its `activity_cap` CUDA activity events.
 
-    A window that names no `directory` traces into one of its own (`dew.Profiler`'s), a run's own
-    (`run_window`, every run's by default, `dew.config.TrainerConfig.profile`) kept with the run's
-    records and taken where the process can take one (`capturable`): none under JAX's AutoPGLE or inside
-    another capture, where a window a run names refuses to run. A window that `reports` nothing keeps its
-    trace and manifest alone, which needs no XProf and its stop writes at once; one that reports converts
-    its capture's reports as its stop is waited for at the fit's end, minutes for a training window.
+    A window that `reports` nothing keeps its trace and manifest alone, which needs no XProf and its stop
+    writes at once; one that reports converts its capture's reports as its stop is waited for at the
+    fit's end, minutes for a training window. A run's own window (`RunProfile`, every run's by default) is
+    resolved into one by its config (`dew.config.TrainerConfig.window`), kept with its records.
 
     `dew.Profiler` is the other way to capture a trace, as a context manager
     around any code; a fit refuses to schedule a window inside one. The loop
     reports the window it wrote as the `ProfileTraced` record of
     `dew.telemetry.records`.
     """
-    directory: str | None
+    directory: str
     steps: int
     warmup: int = 2
     capture: telemetry_profile.CaptureOptions = dataclasses.field(
@@ -82,16 +80,27 @@ PGLE_CAPTURE = (
 """Why a capture refuses to run where JAX's AutoPGLE profiles programs, and JAX's own way round it."""
 
 
-def run_window() -> ProfileWindow:
-    """A run's own window, every run's by default (`dew.config.TrainerConfig.profile`): two steps traced
-    once ten have run past its first compile, kept with the run's records, its trace and manifest alone
-    (no `reports`: no XProf asked, no conversion the run's end waits for)."""
-    return ProfileWindow(None, 2, warmup=10, reports=False)
+@dataclasses.dataclass(frozen=True)
+class RunProfile:
+    """A run's own profile window, every run's by default (`dew.config.TrainerConfig.run_profile`): `steps`
+    traced once `warmup` have run past its first compile, kept with the run's records, its trace and
+    manifest alone (no reports: no XProf asked, no conversion the run's end waits for), and taken where the
+    process can take one (`capturable`), none where it cannot, where a `ProfileWindow` a run names refuses.
+    Its config resolves it into its window (`dew.config.TrainerConfig.window`); a trainer is given that."""
+
+    steps: int = 2
+    warmup: int = 10
+    capture: telemetry_profile.CaptureOptions = dataclasses.field(
+        default_factory=telemetry_profile.CaptureOptions)
+
+    def window(self, directory: str) -> ProfileWindow:
+        """This window as a trainer traces it, into `directory`."""
+        return ProfileWindow(directory, self.steps, warmup=self.warmup, capture=self.capture, reports=False)
 
 
 def capturable() -> bool:
     """Whether every process can take a capture: none holds another (`dew.Profiler`) and none runs under
-    JAX's AutoPGLE (`pgle_runs`); a run's own window (`run_window`), which reports nothing and so asks no
+    JAX's AutoPGLE (`pgle_runs`); a run's own window (`RunProfile`), which reports nothing and so asks no
     XProf, is taken where they can, a window a run names refuses where they cannot (`owned_capture`)."""
     local = telemetry_profile.active_profile() is None and not pgle_runs()
     return all(from_every_process(local))
@@ -153,8 +162,8 @@ def start_capture(profiler: "Profiler") -> None:
         raise
 
 
-def stop_capture(profiler: "Profiler", loss: "jax.Array | None", window: ProfileWindow) -> None:
-    """Stop `window`'s owned capture on every rank.
+def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
+    """Stop the window's owned capture on every rank.
 
     The core Profiler drains the backend and stops the trace here, and
     exports its native reports in a process of its own while the run
@@ -163,7 +172,8 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None", window: Profile
     on only to order the primary's failure ahead of the profiler's own drain.
     A window that reports nothing writes its manifest as it stops, a
     diagnostic of the run's: its write failing is logged, and the run trains
-    on (`dew.telemetry.profile.ExportFailed`)."""
+    on (`dew.telemetry.profile.ExportFailed`, which only such a window's stop
+    raises, a reporting window's export running in a process of its own)."""
     def stop() -> None:
         try:
             if loss is not None:
@@ -173,8 +183,6 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None", window: Profile
             try:
                 profiler.stop(wait=False)
             except telemetry_profile.ExportFailed as failure:
-                if window.reports:
-                    raise
                 _log.warning("the run's profile window traced, and its manifest was not written: %s (%s)",
                              failure, failure.exceptions)
             except BaseException as failure:

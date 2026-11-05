@@ -456,7 +456,7 @@ def test_every_run_profiles_a_short_window_of_its_own_steps_kept_with_its_record
     assert remote is not None and remote.directory == local_records("gs://bucket/runs/remote", "remote",
                                                                     "profile")
     assert "://" not in remote.directory
-    plain = trained("plain", profile=None)
+    plain = trained("plain", run_profile=None)
     assert not (plain / "profile").exists()
     with dew.Profiler(tmp_path / "outer"):
         inside = trained("inside")
@@ -465,14 +465,14 @@ def test_every_run_profiles_a_short_window_of_its_own_steps_kept_with_its_record
     assert not (inside / "profile").exists()
 
 
-def test_a_runs_own_window_whose_manifest_is_not_written_leaves_the_run_training(caplog):
-    """A run's own profile window is a diagnostic of the run's: where its capture's manifest cannot be
-    written as it stops (`dew.telemetry.profile.ExportFailed`), the stop logs it and the run trains on,
-    where a window that reports fails the run as before (train 607's review)."""
+def test_a_window_whose_manifest_is_not_written_leaves_the_run_training(caplog):
+    """A profile window that reports nothing writes its manifest as it stops, a diagnostic of the run's:
+    where it cannot be written (`dew.telemetry.profile.ExportFailed`, which only such a window's stop
+    raises), the stop logs it and the run trains on (train 607's and 610's reviews)."""
     import logging
 
     from dew.telemetry.profile import ExportFailed
-    from dew.training.profiling import ProfileWindow, run_window, stop_capture
+    from dew.training.profiling import stop_capture
 
     class Unwritten:
         """A profiler whose capture stopped and whose manifest could not be written."""
@@ -481,28 +481,54 @@ def test_a_runs_own_window_whose_manifest_is_not_written_leaves_the_run_training
             raise ExportFailed("writing the capture's manifest failed", [OSError("read-only directory")])
 
     with caplog.at_level(logging.WARNING, logger="dew"):
-        stop_capture(Unwritten(), None, run_window())
+        stop_capture(Unwritten(), None)
     assert any(record.name == "dew.training.profiling" and record.levelno == logging.WARNING
                for record in caplog.records)
-    with pytest.raises(ExportFailed):
-        stop_capture(Unwritten(), None, ProfileWindow("asked", 2))
 
 
-def test_a_trainer_given_a_window_naming_no_directory_traces_into_one_of_its_own(tmp_path):
-    """A trainer given a profile window that names no directory traces it into a directory of the
-    profiler's own (`dew.Profiler`'s), which its `ProfileTraced` record names, where it refused to run
-    (train 607's review)."""
-    from dew.training import LocalTracker, ProfileWindow
+@pytest.mark.parametrize(("saved", "expected"), [
+    ({"directory": None, "steps": 2, "warmup": 10}, "default"),
+    ({"directory": None, "steps": 25, "warmup": 50, "capture": {"host_tracer_level": 1}}, "customized"),
+    (None, "none"),
+])
+def test_a_run_saved_before_its_own_window_was_a_field_traces_as_it_was_configured(tmp_path, saved, expected):
+    """A run a Dew saved before a run's own window was its `run_profile` (row 4255) loads as it traced: a
+    window naming no directory, the run's own, as its `run_profile` with its steps, warmup and capture,
+    trace-only, so it resumes on a plain install asking no XProf; no window at all as none of its own."""
+    from dew.telemetry.profile import CaptureOptions
+    from dew.training.profiling import RunProfile
 
-    tracking = tmp_path / "tracking"
-    config = TrainerConfig(steps=4, eval_every=None, checkpoint_every=None)
-    trainer = RunConfig(trainer=config).built(Regression(), config.mesh, None,
-                                              tracker=LocalTracker(str(tracking)),
-                                              profile=ProfileWindow(None, 1, warmup=1, reports=False))
-    trainer.fit(Loader(lambda partition: batches(), None, None, 8), steps=4)
-    records = [json.loads(line) for line in (tracking / "records.jsonl").read_text().splitlines()]
-    (traced,) = [row["value"] for row in records if row["type"] == "ProfileTraced"]
-    assert traced["steps"] == 1 and any(path.is_file() for path in Path(traced["directory"]).rglob("*"))
+    record = RunConfig(trainer=TrainerConfig(name="saved", checkpoint_dir=str(tmp_path))).record()
+    trainer = record["fields"]["trainer"]
+    held = trainer.get("fields", trainer)
+    held.pop("run_profile", None)
+    held["profile"] = saved
+    (tmp_path / "run.json").write_text(json.dumps(record))
+    loaded = RunConfig.load(str(tmp_path / "run.json")).trainer
+    window = loaded.window(str(tmp_path / "saved"), "saved")
+    assert loaded.profile is None
+    if expected == "none":
+        assert loaded.run_profile is None and window is None
+        return
+    own = RunProfile() if expected == "default" else RunProfile(25, 50, CaptureOptions(host_tracer_level=1))
+    assert loaded.run_profile == own
+    assert window is not None and (window.steps, window.warmup, window.capture) == (own.steps, own.warmup,
+                                                                                  own.capture)
+    assert not window.reports
+
+
+def test_a_runs_own_window_and_a_named_one_round_trip_through_its_record(tmp_path):
+    """A run's own window, customized, and a window the run names each read back from the run's record as
+    they were saved (row 4255's review)."""
+    from dew.telemetry.profile import CaptureOptions
+    from dew.training import ProfileWindow
+    from dew.training.profiling import RunProfile
+
+    for trainer in (TrainerConfig(run_profile=RunProfile(3, 4, CaptureOptions(host_tracer_level=1))),
+                    TrainerConfig(profile=ProfileWindow(str(tmp_path / "named"), 5, warmup=6)),
+                    TrainerConfig(run_profile=None)):
+        saved = RunConfig(trainer=trainer).save(str(tmp_path / "saved"))
+        assert RunConfig.load(saved).trainer == trainer
 
 
 def test_a_saved_runs_profile_window_reads_its_capture_options_as_its_captures(tmp_path):
