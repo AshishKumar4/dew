@@ -916,10 +916,13 @@ class Caching:
     pixels decoded and resized to 128), a learned tokenizer (`bpe`: a 4,000-token byte-level BPE
     trained here over the documents of 700 words) or a field selection (`fields`). Every pass must read
     each record once, and every arm the records the computed pass read, each its id and a digest of
-    what the map made (`Digest`). It qualifies which steps are `Costly` (`dew.data.pipeline`)."""
+    what the map made (`Digest`). It qualifies which steps are `Costly` (`dew.data.pipeline`). `rejecting`
+    makes the image decode one that drops what does not decode (`filter_map`), which a cache reads back
+    as each input's outputs (row 803)."""
 
     workload: Literal["images", "bpe", "fields"] = "bpe"
-    read: Literal["memory", "indexed"] = "indexed"
+    read: Literal["memory", "indexed", "streamed"] = "indexed"
+    rejecting: bool = False
     records: int = 2000
     batch: int = 32
     output: Path = Path("data-caching.json")
@@ -957,7 +960,7 @@ def caching_chain(config: Caching, directory: Path) -> "tuple[list[dict], Callab
         rows = [{"id": np.int32(index), "image": cv2.imencode(".png", rng.integers(0, 255, (256, 256, 3),
                                                                                 np.uint8))[1].tobytes()}
                 for index in range(config.records)]
-        steps = (images.DecodeImage("image", rejects=False), images.Resize(128))
+        steps = (images.DecodeImage("image", rejects=config.rejecting), images.Resize(128))
     else:
         words = np.asarray(["the", "of", "and", "to", "in", "is", "that", "for", "it", "as", "with",
                             "was", "on", "be", "by", "this", "are", "from", "at", "or", "an", "have",
@@ -982,7 +985,7 @@ def caching_chain(config: Caching, directory: Path) -> "tuple[list[dict], Callab
         record's id and the digest of what they made (`Digest`)."""
         mapped = Pipeline(Memory(rows))
         for step in steps:
-            mapped = mapped.map(step)
+            mapped = mapped.filter_map(step) if step is steps[0] and config.rejecting else mapped.map(step)
         cached = mapped if cache is None else mapped.cache(cache)
         return cached.map(Digest(), identity="digest@1").repeat(1).batch(config.batch, drop_remainder=False)
 
