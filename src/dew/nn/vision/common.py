@@ -40,6 +40,9 @@ class TowerLayout:
     prefix: str
     path: Callable[[str], tuple[str, ...] | None]
     read: Reader = placed
+    roots: tuple[str, ...] = ()
+    """The leading names of a tower stored under several roots, an empty `prefix` beside them, whose
+    names `path` reads whole: MiMo-V2.6's audio tower, its encoder's and its tokenizer folder's."""
 
     def variables(self, hf_tensors: Mapping[str, Stored], param_dtype: str
                   ) -> tuple[Variables, tuple[WeightLayout, ...]]:

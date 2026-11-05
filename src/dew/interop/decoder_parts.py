@@ -307,7 +307,8 @@ class WrapperFields(AudioFields):
     text: DecoderFields
     tower: Mapping[str, object] | None
     projector: Mapping[str, object] | None
-    image_token_id: int
+    image_token_id: int | None
+    """None for a bundle without a vision tower, whose config may state none (MiMo-V2.6 with audio alone)."""
     tokens_per_image: int | None
     video_token_id: int | None
     extra_placeholder_ids: tuple[int, ...]
@@ -318,6 +319,17 @@ class WrapperFields(AudioFields):
     text_unprefixed: NotRequired[tuple[str, ...]]
     """The prefixes (past `model.`) under which a release saved before transformers nested its language
     model keeps that model's modules at the top (Qwen2.5-VL-7B's `model.layers.*`), routed into it."""
+
+
+def folder_config(folder: str) -> str:
+    """The key a bundle's source config holds `folder`'s config.json under
+    (`DecoderFamily.wrapper_folders`)."""
+    return f"{folder}/config.json"
+
+
+def folder_name(folder: str, name: str) -> str:
+    """The name a bundle's tensors hold `folder`'s tensor `name` under (`DecoderFamily.wrapper_folders`)."""
+    return f"{folder}/{name}"
 
 
 def kinds_of(config: DecoderFields) -> dict[str, KindFields]:
@@ -2064,6 +2076,11 @@ class DecoderFamily:
     """Reads a media bundle released under the family's own model_type, which
     keeps the decoder's tensors unprefixed and `wrapper_projector_names` beside them."""
     wrapper_projector_names: tuple[str, ...] = ()
+    wrapper_folders: tuple[str, ...] = ()
+    """Folders of a bundle that each hold a media component of its own, its config.json and its weights,
+    which the release's code loads beside the model (MiMo-V2.6's `audio_tokenizer`): a load reads each
+    folder's config into the source's under `<folder>/config.json` and its tensors as `<folder>/<name>`
+    (`folder_config`, `folder_name`), and a save writes them back into the folder."""
     wrapper_media_suffixes: tuple[str, ...] = ()
     """Suffixes of a bundle's decoder tensors that serve its media alone, which its language model read
     as its text checkpoint drops (`hf_decoders.language_model_names`): V4.1's routers' image-span bias."""
