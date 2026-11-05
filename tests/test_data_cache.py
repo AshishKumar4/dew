@@ -1455,6 +1455,28 @@ def test_a_fill_that_evicts_nothing_stops_at_its_roots_free_room_and_keeps_its_g
     assert published.generation(first_key)[0] == {"id": 0}
 
 
+@pytest.mark.parametrize("optional", [True, False], ids=["automatic", "named"])
+def test_a_local_fill_leaves_its_disks_headroom_free_whatever_its_budget(tmp_path, monkeypatch, optional):
+    """A local cache's writes leave `DISK_HEADROOM` free on their disk under any budget (row 4263): on a
+    disk with less spare, a fill writes nothing there, its records are read as computed and no
+    generation is published."""
+    import shutil
+    from collections import namedtuple
+
+    from dew.data.retention import DISK_HEADROOM
+
+    usage = namedtuple("usage", "total used free")
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: usage(2**40, 2**40, DISK_HEADROOM + 1024))
+    source = Memory([{"id": index} for index in range(4)])
+    cache = Cache(str(tmp_path), shard_bytes=1, optional=optional)
+    filled = cache.mapped(grain.MapDataset.source(source.records("indexed")), _key("full"))
+    assert [filled[index] for index in range(4)] == [{"id": index} for index in range(4)]
+    filled.finish()
+    filled.close()
+    assert cache.generation(_key("full")) is None
+    assert not list(tmp_path.rglob("*.array_record"))
+
+
 def test_local_retention_counts_what_its_root_holds_once_its_record_passes_the_limit(tmp_path):
     """A local root records the bytes its writes reserve, so a write under the limit counts nothing
     again. Bytes removed outside a reservation leave the record above what the root holds: the next
