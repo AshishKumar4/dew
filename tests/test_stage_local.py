@@ -453,18 +453,22 @@ def test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one(tmp_path):
 
 @pytest.mark.mesh(devices=8)
 def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trains():
-    """Over two stages, a transformation given built whose every state names a transform that acts a
-    number at a time (Adam's moments, a schedule's rate) keeps each run stage-local; optax's Adam, whose
-    constant rate is a stateless transform (`optax.EmptyState`, which names none: optax's LAMB trust ratio
-    holds one too, row 3934), and Adafactor, whose factored moments and block clip read a leaf whole, keep
-    every layer whole on every stage, given built or named by its import path in an `OptimConfig`, and the
-    run's plan names what kept them whole. No per-layer view of a transform whose reductions only its own
-    code knows is exact short of each layer a leaf of its own, which one program can hold on every stage
-    alone, so the run trains as `Layout(stage_local=False)` trains it, and steps: optax's LAMB, whose trust
-    ratio over a stacked leaf would take one ratio over both stages, among them."""
+    """Over two stages, a transformation given built whose update reads each stored layer of a stacked leaf
+    from that layer alone keeps each run stage-local, its dataflow traced over the stacked leaves
+    (`whole_reading`): optax's Adam at a constant rate, its moments and its scale a number at a time
+    (rows 3995, 4015). One whose update reads a leaf whole, optax's LAMB, whose trust ratio would take one
+    ratio over both stages, and Adafactor, whose factored moments and block clip read the leaf, given built
+    or named by its import path in an `OptimConfig`, keeps every layer whole on every stage, and the run's
+    plan names what kept them whole. No per-layer view of a transform whose reductions only its own code
+    knows is exact short of each layer a leaf of its own, so the run trains as `Layout(stage_local=False)`
+    trains it, and steps."""
     model = decoder()
-    assert saving(functools.partial(trainer, model, stage_local_adam(1e-3), STAGED, 8, ema=None)) > 0
-    for given in (optax.adam(1e-3), optax.lamb(1e-3), optax.adafactor(1e-3),
+    for local in (stage_local_adam(1e-3), optax.adam(1e-3)):
+        assert saving(functools.partial(trainer, model, local, STAGED, 8, ema=None)) > 0
+        run = trainer(model, local, STAGED, 8, ema=None)
+        assert int(run.fit(stream(), steps=1, log_every=1).step) == 1
+        assert "layers_whole_for" not in run.plan
+    for given in (optax.lamb(1e-3), optax.adafactor(1e-3),
                   OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3)):
         # An OptimConfig's transformation is built over the run's length, which fit gives.
         assert saving(functools.partial(trainer, model, given, STAGED, 8, ema=None)) == 0
