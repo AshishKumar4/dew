@@ -29,7 +29,7 @@ import inspect
 from collections.abc import Callable, Sequence
 
 import jax
-from jax.core import eval_context
+from jax.core import Tracer, eval_context
 from jax.custom_derivatives import CustomVJPPrimal, SymbolicZero
 from jax.extend import core as jax_core
 from jax.extend.core import create_call_primitive
@@ -219,7 +219,7 @@ def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[...,
         closed = jax.make_jaxpr(span)(*flat)
         # A value of the enclosing trace the function closes over (a kernel's mask, a reference's operand) is
         # one of the call's operands, leading its arguments, as a closed-over value is no constant there.
-        held = [isinstance(const, jax.core.Tracer) for const in closed.consts]
+        held = [isinstance(const, Tracer) for const in closed.consts]
         if any(held):
             lifted = [const for const, is_held in zip(closed.consts, held, strict=True) if is_held]
             closed = closed.replace(
