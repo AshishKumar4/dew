@@ -2215,9 +2215,12 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: source
     if language is not None:
         # The language model's config as its decoder reads it (`decoders.decoder_config`), a quantized
         # wrapper's module selection renamed with its tensors; a bundle its own family reads whole keeps
-        # its decoder's names and their codec.
+        # its decoder's names and their codec, its family's decoder reading the source's own tensors, the
+        # towers' retained by name (Kimi K2.5's under `language_model.`, MiMo-V2.6's at the root).
+        bundled = decoders.bundles(config)
         config = decoders.decoder_config(config, inventory)
         route = source_route(config, remote=remote, pinned=pinned)
+        language = None if bundled else language
     elif isinstance(route, WrapperRoute):
         # Before any weight downloads, as the routing of the wrapper's names would (`_wrapper_sources`).
         decoders.refuse_unported(route.wrapper)
