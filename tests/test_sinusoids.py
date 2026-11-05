@@ -67,6 +67,7 @@ def test_gemma3n_audio_positions_are_on_par_with_the_reference(width):
     def draw(seed):
         return (np.random.default_rng(seed).integers(-64, 64, 48).astype(np.int32),)
 
+    @as_given
     def truth(positions):
         angles = np.asarray(positions, np.float64)[:, None] * inverse[None, :]
         return np.concatenate([np.sin(angles), np.cos(angles)], axis=-1)

@@ -202,7 +202,7 @@ def _traced(fn, args):
 def released() -> None:
     """Forget every trace and compiled evaluation the walk keeps, and the arrays they hold: where the
     suite releases its compiled programs (tests/conftest.py's `release`)."""
-    for cache in (TRACES, FORWARDS, COMPILED, STATIC, LAYOUTS, RUNS):
+    for cache in (TRACES, FORWARDS, COMPILED, STATIC, LAYOUTS, RUNS, READING):
         cache.clear()
 
 
@@ -217,16 +217,38 @@ def _compiled(jaxpr):
 
 class Rule(Protocol):
     """How a walk other than the terms' evaluates each primitive (`_evaluated`'s `rule`): its outputs from
-    its inputs (`primitive`), and the rule of a walk's equation, step or iteration `index` within it
-    (`at`), so a rule that draws reads a draw of its own at every equation it meets
-    (tests/rounding_bound.py's taps)."""
+    its inputs (`primitive`), and the rule of a walk's equation, step or iteration `index` within it, an
+    equation's primitive `name` given (`at`), so a rule that draws reads a draw of its own at every
+    equation it meets (tests/rounding_bound.py's taps) and check 2 names each equation by its path
+    (tests/certified.py), and the dtype its values hold each traced type in (`held`)."""
 
-    def at(self, index: int) -> Rule: ...
+    def at(self, index: int, name: str | None = None) -> Rule: ...
 
     def primitive(self, equation, inputs: list) -> list: ...
 
+    def held(self, dtype) -> np.dtype:
+        """The dtype the walk's values of traced type `dtype` take under this rule (a float64 walk's
+        floats float64): a traced loop's carries and a branch's outputs are cast to it, exactly."""
+        ...
 
-def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False, rule=None):
+    pruned: bool
+    """Whether the walk runs only what the outputs read (`_reading`), as an evaluation does; false where
+    every equation is the rule's to hold, check 2's (tests/certified.py), whose contract is every equation
+    executed."""
+
+
+def walked(jaxpr, consts, args, rule: Rule, *, compiling: bool = False) -> list:
+    """`jaxpr`'s outputs on `consts` and `args`, each primitive evaluated by `rule` (`Rule`) and the walk's
+    structure the gate's one: a call's body (`dew.nn.programs.called`), a scan, a loop, a branch and a
+    shard_map walked inside, only the equations its outputs read, a static run compiled where `compiling`
+    (`_evaluated`). Every program evaluator of the gate walks here: float64's replay
+    (tests/float64_replay.py), a reference under a summation tree (tests/reference_trees.py), a tapped
+    evaluation (tests/rounding_bound.py). Within `evaluated_on`, whose device a branch its platform picks
+    reads."""
+    return _evaluated(jaxpr, consts, args, compiling=compiling, rule=rule)[0]
+
+
+def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False, rule=None, used=None):
     """`jaxpr`'s outputs and their terms' energies, the sums of their squares
     (`float64_terms`), from `args` and the energies `given` for them (none for
     a computation's own inputs). A value no sum made has none. `compiling`
@@ -237,7 +259,11 @@ def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False, rule=No
     arithmetic (`Rule`): the walk, its calls' bodies, scans, loops, branches
     and maps, is the same, each equation's rule its own (`Rule.at`), and no
     value carries an energy. A rule a compiled run takes is a pytree of JAX's,
-    passed in as its values are (`_span`)."""
+    passed in as its values are (`_span`).
+
+    Only the steps `jaxpr`'s `used` outputs read run (every output where None), each call, scan,
+    branch and map told which of its own outputs are read (`_reading`), and an output not read is
+    None: an initializer's forward pass, whose outputs its init drops, never runs."""
     from jax.extend.core import Literal
 
     wanted, last, runs = _layout(jaxpr)
@@ -247,13 +273,20 @@ def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False, rule=No
         values[var], energies[var] = value, energy
 
     def read(var):
-        return var.val if isinstance(var, Literal) else values[var]
+        # A literal at its traced type, as the program reads it: its Python value may be wider (a float64
+        # scalar for a float32), which a call's body would take in as it is.
+        return np.asarray(var.val, var.aval.dtype) if isinstance(var, Literal) else values.get(var)
 
     def energy(var):
         return None if isinstance(var, Literal) else energies.get(var)
 
-    spans = runs if compiling else [(index, index + 1) for index in range(len(jaxpr.eqns))]
-    for start, stop in spans:
+    spans = runs if compiling else tuple((index, index + 1) for index in range(len(jaxpr.eqns)))
+    pruned = rule is None or rule.pruned
+    used = tuple([True] * len(jaxpr.outvars) if used is None or not pruned else used)
+    readings = _reading(jaxpr, spans, used) if pruned else [None] * len(spans)
+    for (start, stop), reading in zip(spans, readings, strict=True):
+        if pruned and reading is None:
+            continue
         run = jaxpr.eqns[start:stop]
         if stop - start > 1:
             # A static run of the walk's steps, compiled once (`_span`), the values it reads in.
@@ -265,7 +298,8 @@ def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False, rule=No
             with equation.ctx.manager:
                 outputs, made = _applied(equation, inputs, [energy(var) for var in equation.invars],
                                          any(var in wanted for var in equation.outvars), compiling,
-                                         None if rule is None else rule.at(start))
+                                         None if rule is None else rule.at(start, equation.primitive.name),
+                                         reading)
             written = equation.outvars
             freed = [var for var in equation.invars
                      if not isinstance(var, Literal) and last.get(var) == start]
@@ -274,7 +308,34 @@ def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False, rule=No
             energies.pop(var, None)
         for var, value, made_energy in zip(written, outputs, made, strict=True):
             values[var], energies[var] = value, made_energy
-    return [read(var) for var in jaxpr.outvars], [energy(var) for var in jaxpr.outvars]
+    return ([read(var) if kept else None for var, kept in zip(jaxpr.outvars, used, strict=True)],
+            [energy(var) for var in jaxpr.outvars])
+
+
+READING: dict = {}
+"""Each walked jaxpr's reads (`_reading`), by the jaxpr, its spans and the outputs read."""
+
+
+def _reading(jaxpr, spans, used) -> list:
+    """For each span of `jaxpr`, which of its outputs a later span or a `used` output reads, or None where it
+    makes nothing read: a span runs whole once any of it is read (a compiled span reads all it reads), so a
+    read span's every input is read."""
+    from jax.extend.core import Var
+
+    key = (jaxpr, spans, used)
+    if key not in READING:
+        read = {var for var, kept in zip(jaxpr.outvars, used, strict=True) if kept and isinstance(var, Var)}
+        found = []
+        for start, stop in reversed(spans):
+            outvars = [var for equation in jaxpr.eqns[start:stop] for var in equation.outvars]
+            if not any(var in read for var in outvars):
+                found.append(None)
+                continue
+            found.append(tuple(var in read for var in outvars))
+            read.update(var for equation in jaxpr.eqns[start:stop] for var in equation.invars
+                        if isinstance(var, Var))
+        READING[key] = found[::-1]
+    return READING[key]
 
 
 LAYOUTS: dict = {}
@@ -294,7 +355,7 @@ def _layout(jaxpr):
         for var in jaxpr.outvars:
             if not isinstance(var, Literal):
                 last.pop(var, None)
-        LAYOUTS[jaxpr] = (_carrying(jaxpr), last, _runs(jaxpr))
+        LAYOUTS[jaxpr] = (_carrying(jaxpr), last, tuple(_runs(jaxpr)))
     return LAYOUTS[jaxpr]
 
 
@@ -370,8 +431,8 @@ def _span(jaxpr, start: int, stop: int):
                 inputs = [var.val if isinstance(var, Literal) else values[var] for var in equation.invars]
                 given = [None if isinstance(var, Literal) else energies.get(var) for var in equation.invars]
                 with equation.ctx.manager:
-                    outputs, made = _applied(equation, inputs, given, mark,
-                                             rule=None if rule is None else rule.at(index))
+                    at = None if rule is None else rule.at(index, equation.primitive.name)
+                    outputs, made = _applied(equation, inputs, given, mark, rule=at)
                 values.update(zip(equation.outvars, outputs, strict=True))
                 energies.update(zip(equation.outvars, made, strict=True))
             return [values[var] for var in kept], [energies[var] for var in kept]
@@ -426,25 +487,30 @@ def _squared(value):
     return jnp.square(jnp.abs(value)) if jnp.issubdtype(jnp.result_type(value), jnp.inexact) else None
 
 
-def _applied(equation, inputs, given, wanted: bool, compiling: bool = False, rule=None):
+def _applied(equation, inputs, given, wanted: bool, compiling: bool = False, rule=None, used=None):
     """`equation`'s outputs from `inputs`, and their energies where `wanted`, a body's runs of static
-    steps compiled where `compiling` (`_evaluated`); a primitive's by `rule` where one is given."""
+    steps compiled where `compiling` (`_evaluated`); a primitive's by `rule` where one is given; a body's
+    `used` outputs alone (`_evaluated`'s)."""
     name, params = equation.primitive.name, equation.params
     if name == "platform_index":
         return [_platform(equation)], [None]
     body = _body(equation)
     walked = wanted or rule is not None
     if walked and body is not None:
-        return _evaluated(*body, inputs, given, compiling, rule)
+        return _evaluated(*body, inputs, given, compiling, rule, used)
+    if rule is not None and name in ("scan", "while", "cond") and _traced_values(inputs):
+        # Traced, its values pick no branch and bound no Python loop: the primitive itself over walked bodies.
+        outputs = _bound_walk(name, params, inputs, rule, used)
+        return outputs, [None] * len(outputs)
     if walked and name == "scan":
-        return _scanned(params, inputs, given, compiling, rule)
+        return _scanned(params, inputs, given, compiling, rule, used)
     if walked and name == "while":
         return _looped(params, inputs, given, compiling, rule)
     if walked and name == "shard_map":
         return _mapped(params, inputs, given, rule)
     if walked and name == "cond":
         branch = params["branches"][int(inputs[0])]
-        return _evaluated(branch.jaxpr, branch.consts, inputs[1:], given[1:], compiling, rule)
+        return _evaluated(branch.jaxpr, branch.consts, inputs[1:], given[1:], compiling, rule, used)
     if rule is not None:
         outputs = rule.primitive(equation, inputs)
         return outputs, [None] * len(outputs)
@@ -514,15 +580,105 @@ def scanned_steps(params, inputs: list[tuple], body, lanes: int) -> list[tuple]:
                       for column in zip(*ys, strict=True))]
 
 
-def _scanned(params, inputs, given, compiling: bool = False, rule=None):
+def _traced_values(values) -> bool:
+    """Whether any of `values` is a tracer: a walk inside a trace (a compiled span, a jit of the walk)."""
+    return any(isinstance(value, jax.core.Tracer) for value in values)
+
+
+def _bound_walk(name: str, params, inputs: list, rule, used=None) -> list:
+    """A traced scan, while loop or branch of a rule's walk, bound as its own primitive (`jax.lax.scan`,
+    `while_loop`, `switch`) whose bodies the walk evaluates, each step's or iteration's rule its own
+    (`Rule.at`) as when it steps them concretely: a scan's at its step's index, a loop's at its iteration
+    and its test at `-1 - iteration`, a branch's the walk's own. Of a branch's and a scan's outputs its
+    `used` ones alone are walked, zeros of their types the rest, so each body keeps its signature."""
+    if name == "cond":
+        index, *operands = inputs
+        branches = [lambda *values, branch=branch: _filled(branch.jaxpr, branch.consts, list(values), rule,
+                                                           used)
+                    for branch in params["branches"]]
+        return list(jax.lax.switch(index, branches, *operands))
+    if name == "while":
+        condition, body = params["cond_jaxpr"], params["body_jaxpr"]
+        tested, run = params["cond_nconsts"], params["body_nconsts"]
+        condition_consts, body_consts = inputs[:tested], inputs[tested:tested + run]
+
+        def test(state):
+            iteration, carry = state
+            return walked(condition.jaxpr, condition.consts, [*condition_consts, *carry],
+                          rule.at(-1 - iteration))[0]
+
+        def step(state):
+            iteration, carry = state
+            return iteration + 1, _filled(body.jaxpr, body.consts, [*body_consts, *carry], rule.at(iteration),
+                                          None)
+
+        carry = [_held(value, var, rule)
+                 for value, var in zip(inputs[tested + run:], body.jaxpr.invars[run:], strict=True)]
+        return list(jax.lax.while_loop(test, step, (0, carry))[1])
+    body, length, reverse = params["jaxpr"], params["length"], params["reverse"]
+    constants, carries = scan_groups(params, len(inputs))
+    consts, reading = inputs[:constants], _scan_reads(params, len(inputs), used)
+
+    def step(state, sliced):
+        counter, carry = state
+        index = length - 1 - counter if reverse else counter
+        outputs = _filled(body.jaxpr, body.consts, [*consts, *carry, *sliced], rule.at(index), reading)
+        return (counter + 1, outputs[:carries]), outputs[carries:]
+
+    carry = [_held(value, var, rule) for value, var in
+             zip(inputs[constants:constants + carries], body.jaxpr.invars[constants:constants + carries],
+                 strict=True)]
+    (_, carry), ys = jax.lax.scan(step, (0, carry), list(inputs[constants + carries:]), length=length,
+                                  reverse=reverse)
+    return [*carry, *ys]
+
+
+def _scan_reads(params, operands: int, used) -> tuple:
+    """Which of a scan body's outputs its `used` outputs read (`_evaluated`'s `used`, every one where None):
+    a used carry or output, and every carry a read output reads back in through the next step, until none
+    is added."""
+    from jax.extend.core import Var
+
+    body = params["jaxpr"].jaxpr
+    constants, carries = scan_groups(params, operands)
+    reading = tuple([True] * len(body.outvars) if used is None else used)
+    spans = tuple((index, index + 1) for index in range(len(body.eqns)))
+    while True:
+        read = {body.outvars[index] for index, kept in enumerate(reading)
+                if kept and isinstance(body.outvars[index], Var)}
+        for (start, _), found in zip(spans, _reading(body, spans, reading), strict=True):
+            if found is not None:
+                read.update(var for var in body.eqns[start].invars if isinstance(var, Var))
+        added = [index for index in range(carries)
+                 if not reading[index] and body.invars[constants + index] in read]
+        if not added:
+            return reading
+        reading = tuple(kept or index in added for index, kept in enumerate(reading))
+
+
+def _filled(jaxpr, consts, values: list, rule, used) -> list:
+    """`jaxpr`'s `used` outputs walked by `rule` (`_evaluated`), the rest zeros, each in the dtype the rule
+    holds its type in (`Rule.held`): a traced body's outputs keep one signature at every step and branch."""
+    outputs = _evaluated(jaxpr, consts, values, rule=rule, used=used)[0]
+    return [_held(output, var, rule) for output, var in zip(outputs, jaxpr.outvars, strict=True)]
+
+
+def _held(value, var, rule):
+    """`value`, of `var`'s type (zeros of it where None), in the dtype `rule` holds that type in."""
+    dtype = rule.held(var.aval.dtype)
+    return jnp.zeros(var.aval.shape, dtype) if value is None else jnp.asarray(value).astype(dtype)
+
+
+def _scanned(params, inputs, given, compiling: bool = False, rule=None, used=None):
     """A scan's outputs and energies (`float64_terms`), its body evaluated a step at a time, each step's
-    rule its own (`Rule.at`)."""
+    rule its own (`Rule.at`), its `used` outputs alone (`_scan_reads`)."""
     body = params["jaxpr"]
+    reading = _scan_reads(params, len(inputs), used)
 
     def step(index, pairs):
         outputs, made = _evaluated(body.jaxpr, body.consts, [value for value, _ in pairs],
                                    [energy for _, energy in pairs], compiling,
-                                   None if rule is None else rule.at(index))
+                                   None if rule is None else rule.at(index), reading)
         return list(zip(outputs, made, strict=True))
 
     walked = scanned_steps(params, list(zip(inputs, given, strict=True)), step, lanes=2)

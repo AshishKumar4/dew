@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from one_draw import assert_as_exact_as_the_reference
+from sampling_gate import assert_draws_as_declared
 
 from dew.diffusion.discrete import MDLM, DiscreteDenoiser, Unmask
 from dew.nn.protocols import OutputTable
@@ -102,15 +103,18 @@ def test_the_nelbo_and_its_gradient_are_mdlms():
                                   np.float32(masked.sum()) / np.float32(masked.size))
 
 
+REVERSE_SEEDS = 20
+"""The sampling gate's seeds for MDLM's reverse step, 1000 steps each."""
+
+
 def test_the_reverse_step_draws_from_mdlms_categorical():
     """MDLM's `_ddpm_update` from t = 0.6 to s = 0.35 draws each masked
     position from one categorical: a token with the model's probability
     times the share revealed, the mask with the share that stays. `Unmask`
     draws the reveal and the token separately; over 20000 steps, each masked
-    position's outcomes follow MDLM's categorical, by Pearson's chi-square
-    over every masked position's categories pooled (32 positions, 11 free
-    categories each), at a one-in-a-billion false alarm. Visible positions
-    keep their tokens."""
+    position's outcomes follow MDLM's categorical, held by the sampling gate
+    with a row a masked position (32 positions, 12 categories each). Visible
+    positions keep their tokens."""
     process = MDLM(mask_id=MASK)()
     row = jnp.asarray(REFERENCE["reverse_row"], jnp.int32)
     t = jnp.full((row.shape[0],), float(REFERENCE["reverse_t"]), jnp.float32)
@@ -119,21 +123,21 @@ def test_the_reverse_step_draws_from_mdlms_categorical():
                             "head": jnp.asarray(REFERENCE["head"])}}
     denoise = DiscreteDenoiser(process, Fixed(), variables)
     denoised, log_probs = denoise(row, t)
-    draws = 20000
-
-    def step(key):
-        return Unmask().step(row, t, s, denoised, log_probs, (), key, process, denoise)[0]
-
-    outcomes = jax.vmap(step)(jax.random.split(jax.random.key(3), draws))
     masked = np.asarray(row == MASK)
-    counts = np.asarray(jax.nn.one_hot(outcomes, MASK + 1).sum(axis=0))[masked]
-    expected = draws * REFERENCE["reverse_categorical"][masked]
-    visible = np.asarray(outcomes)[:, ~masked]
-    np.testing.assert_array_equal(visible, np.broadcast_to(np.asarray(row)[~masked], visible.shape))
-    statistic = float(np.sum(np.square(counts - expected) / expected))
-    assert counts.size - counts.shape[0] == 352
-    # scipy.stats.chi2.isf(1e-9, 352): the statistic a correct sampler exceeds once in a billion runs.
-    assert statistic < 535.1, statistic
+
+    @jax.jit
+    def steps(key):
+        return jax.vmap(lambda key: Unmask().step(row, t, s, denoised, log_probs, (), key, process,
+                                                  denoise)[0])(jax.random.split(key, 1000))
+
+    def counts(seed):
+        outcomes = np.asarray(steps(jax.random.key(seed)))
+        visible = outcomes[:, ~masked]
+        np.testing.assert_array_equal(visible, np.broadcast_to(np.asarray(row)[~masked], visible.shape))
+        return np.asarray(jax.nn.one_hot(outcomes, MASK + 1).sum(axis=0), np.int64)[masked]
+
+    assert_draws_as_declared(counts, REFERENCE["reverse_categorical"][masked], "MDLM's reverse step",
+                             seeds=REVERSE_SEEDS)
 
 
 CONTINUATION = dict(np.load(Path(__file__).parent / "fixtures" / "mdlm" / "continuation.npz"))

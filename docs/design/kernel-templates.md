@@ -396,7 +396,7 @@ Two measures decide whether a mainloop lands and whether it replaces a route: th
 
 ## 9. One owner per math, and the deletions
 
-- **The portable CPU and TPU path is the algebra, run by a plain-JAX reference mainloop,** not a second implementation. Each template exposes it as one public `xla_mainloop(config)`, held to check 1 as every mainloop is (§6). Check 2's certificate interprets this mainloop and witnesses each kernel's native output against it, so the algebra is certified once. Tests hold every template to independent oracles:
+- **The portable CPU and TPU path is the algebra, run by a plain-JAX reference mainloop,** not a second implementation. Each template exposes it as one public `xla_mainloop(config)`, held to check 1 as every mainloop is (§6). Check 2 holds the native kernels as built: a GEMM's output element by element within its exact products, summed as the tensor cores sum them and rounded once into the output (`tests/native_certificates.py`), and the recurrence template's launches record by record against its step (`tests/recurrence_witness.py`); attention's native kernels have no certificate yet (ledger 2084), and no certificate interprets a plain-JAX mainloop while none exists. Tests hold every template to independent oracles:
   - naive softmax attention;
   - the token-by-token recurrence update;
   - `jnp.dot` at float64;

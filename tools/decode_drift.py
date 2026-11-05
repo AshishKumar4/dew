@@ -196,7 +196,7 @@ def main() -> int:
         # Both arms read the decode's scores on the host, as given.
         assert_as_exact(as_given(lambda rows, tokens, scores: blocks(scores)), as_given(replay), draw,
                         f"{args.model}'s decode", seeds=args.seeds,
-                        truth_fn=lambda rows, tokens, scores: blocks(true(rows[0], tokens)))
+                        truth_fn=as_given(lambda rows, tokens, scores: blocks(true(rows[0], tokens))))
     except AssertionError as failed:
         finding = str(failed)
 

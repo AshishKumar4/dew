@@ -880,6 +880,7 @@ def test_the_decode_kernel_keeps_the_kernel_contract_on_a_mesh(axis, split):
         query, key, value, g, beta, state = decode_operands(rng, rows, H, D)
         return query, key, value, g, beta, state, active
 
+    @as_given
     def exact(*operands):
         """The recurrence in float64, an idle row's output zero and its state as it was."""
         out, final = recurrent_gated_delta_rule(*operands[:6])
@@ -944,6 +945,7 @@ def test_the_decode_step_keeps_the_kernel_contract_on_a_mesh_for_each_decay(form
         return stepped_per_shard(hooks, state, query, key, value, None, beta, active, rate=decay_or_rate,
                                  skip=skip)
 
+    @as_given
     def exact(query, key, value, decay_or_rate, beta, state, active, skip=None):
         with jax.enable_x64(new_val=True):
             given = {"log_decay": decay_or_rate} if keyed else {"rate": decay_or_rate, "skip": skip}

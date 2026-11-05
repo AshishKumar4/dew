@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 from interop_support import token_draw
 from model_support import stepped_decode
-from reference_error import assert_as_exact, widened
+from reference_error import as_given, assert_as_exact, widened
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.hf_decoders import translate_config
@@ -69,6 +69,7 @@ def test_a_scanned_minimax_decodes_as_its_plain_loop():
                       for scan in (False, True))
     variables = plain.init(jax.random.key(0), jnp.zeros((2, 4), jnp.int32))
 
+    @as_given
     def truth(ids):
         with jax.enable_x64(new_val=True):
             return np.asarray(stepped_decode(plain.clone(dtype=jnp.float64), widened(variables), ids)[0])

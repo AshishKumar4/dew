@@ -27,14 +27,15 @@ def recorded_runs(tool, tmp_path, options, logits, *, count=8, pool_commit=COMMI
     records over it, made on the CPU at float32 in one run of COMMIT: `count` verdict draws and their
     redraw, twice `count` pilots from SIZING_FROM, two questions of `options` options a request, and
     each question's logits `logits(phase, seed, question)`; the pool names `pool_commit`, where one."""
-    from reference_error import REDRAW, SIZING_FROM
+    from check1_wire import staged_units
+    from reference_error import SIZING_FROM
     from safetensors.numpy import save_file
 
     source = tmp_path / "source"
     source.mkdir()
     (source / "config.json").write_text('{"model_type":"qwen3_5"}')
     save_file({"model.embed_tokens.weight": np.zeros((4, 2), np.float32)}, source / "model.safetensors")
-    verdict, pilot = list(range(count * (1 + REDRAW))), list(range(SIZING_FROM, SIZING_FROM + 2 * count))
+    verdict, pilot = list(range(staged_units(count))), list(range(SIZING_FROM, SIZING_FROM + 2 * count))
     pool = {**({} if pool_commit is None else {"commit": pool_commit}), "count": count, "verdict": verdict,
             "pilot": pilot,
             "requests": {str(seed): {"questions": {
