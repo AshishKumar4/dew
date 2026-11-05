@@ -1017,3 +1017,18 @@ def test_a_value_times_its_sign_is_its_magnitude_under_either_numerics():
             np.testing.assert_array_equal(np.asarray(jax.jit(algebra.rewritten(summed))(x)),
                                           np.asarray(jax.jit(summed)(x)))
         assert not any(eq.primitive in (jax.lax.sign_p, jax.lax.mul_p) for eq in equations(rewritten)), policy
+
+
+def test_a_complex_value_times_its_sign_stays_as_written():
+    """A complex value times its sign is no magnitude (1j times sign(1j) is -1, its magnitude 1), so the
+    `signs` rule rewrites a real value's alone: a complex program computes, rewritten, what it computes as
+    written, and holds no magnitude."""
+    def summed(x):
+        return jnp.sum(jnp.sign(x) * x, axis=-1)
+
+    real, imaginary = rows(19, (4, 64), (4, 64))
+    x = jax.lax.complex(real, imaginary)
+    rewritten = jax.make_jaxpr(algebra.rewritten(summed))(x)
+    np.testing.assert_array_equal(np.asarray(jax.jit(algebra.rewritten(summed))(x)),
+                                  np.asarray(jax.jit(summed)(x)))
+    assert not any(eq.primitive is jax.lax.abs_p for eq in equations(rewritten))
