@@ -250,6 +250,18 @@ def traced(digest: str) -> Launch | None:
     return _LAUNCHES.get(digest)
 
 
+def derivation_inputs(op, arguments: tokamax.BoundArguments, target) -> Hashable:
+    """What a launch's derivation of its config for `arguments` on `target` reads of the launch and its
+    compiles: the launch's identity (`_identity`: the op, its arguments' shapes and dtypes, its hooks), the
+    whole target, whose facts price its schedules, and each config this context's compiles refused it
+    (`refused`), so a refusal recorded after a derivation derives it again."""
+    identity = _identity(op, arguments)
+    with _GUARD:
+        refusals = frozenset((config, kernels) for (launch, config), kernels in _registry().refused.items()
+                             if launch == identity)
+    return identity, target, refusals
+
+
 def refused(op, arguments: tokamax.BoundArguments, config: Hashable) -> bool:
     """Whether a compile of this process refused `op`'s launch of `arguments` at `config`: its kernel
     spilled (`compiled`). A template's legality reads it, so its derivation takes the next config."""
