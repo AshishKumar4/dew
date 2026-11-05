@@ -594,12 +594,18 @@ def stored(parts, views, *, smem, wait: bool = True) -> None:
             plgpu.wait_smem_to_gmem(0)
 
 
-def staged_rows(smem, value: jax.Array, o_gmem, row_start, first, stored, column, most: int,
-                least: int = 1) -> None:
-    """`value` written to the shared buffer `smem` in its dtype, made visible to TMA, and its rows `first` to
-    `first + stored` stored to `o_gmem` at row `row_start + first` and `column` (`store_rows`); the copies
-    stay in flight (the caller waits before `smem` is written again)."""
+def written(smem, value: jax.Array) -> None:
+    """`value` written to the shared buffer `smem` in its dtype by an optimized transfer from its layout."""
     smem[...] = value.astype(smem.dtype)
+
+
+def staged_rows(smem, value: jax.Array, o_gmem, row_start, first, stored, column, most: int,
+                least: int = 1, *, write: Callable = written) -> None:
+    """`value` written to the shared buffer `smem` in its dtype (`write`: its issuer's, `Issuer.written`),
+    made visible to TMA, and its rows `first` to `first + stored` stored to `o_gmem` at row
+    `row_start + first` and `column` (`store_rows`); the copies stay in flight (the caller waits before
+    `smem` is written again)."""
+    write(smem, value)
     plgpu.commit_smem()
     store_rows(smem, o_gmem, row_start, first, stored, column, most, least)
 
@@ -941,16 +947,29 @@ def staged(shape: tuple, dtype, swizzle: int | None = None):
 
 
 def roles(wg, consumers: int, consumer, producer) -> None:
-    """Each warpgroup's role in a cooperative block: the `consumers` first run `consumer(wg)` with their
-    register budget raised to their share at the launch's residency (`resources.raised_registers`,
-    `_RESIDENT`), the last runs `producer()` with its lowered to `resources.producer_floor`, where the
-    GPU's compile honors them (`resources.RAISES_HONORED`)."""
-    @pl.when(wg < consumers)
-    def _():
-        plgpu.set_max_registers(resources.raised_registers(consumers, _RESIDENT.get()), action="increase")
-        consumer(wg)
+    """Each warpgroup's role in a cooperative block: the `consumers` first run `consumer(wg)`, the last
+    `producer()` (`tabled`'s one row)."""
+    tabled(wg, ((consumers, consumer),), producer)
 
-    @pl.when(wg == consumers)
+
+def tabled(wg, table: tuple, producer) -> None:
+    """Each warpgroup's role in a cooperative block from a role table: each of `table`'s rows, `(count,
+    body)` in turn, its `count` warpgroups running `body(index)` (`index` the warpgroup's own among
+    them), every one with its register budget raised to its share at the launch's residency
+    (`resources.raised_registers`, `_RESIDENT`); the warpgroup after them runs `producer()` with its
+    lowered to `resources.producer_floor`, where the GPU's compile honors them
+    (`resources.RAISES_HONORED`)."""
+    total = sum(count for count, _ in table)
+    first = 0
+    for count, body in table:
+        @pl.when((wg >= first) & (wg < first + count))
+        def _(body=body, first=first):
+            plgpu.set_max_registers(resources.raised_registers(total, _RESIDENT.get()), action="increase")
+            body(wg - first)
+
+        first += count
+
+    @pl.when(wg == total)
     def _():
         plgpu.set_max_registers(resources.producer_floor(), action="decrease")
         producer()
@@ -1201,6 +1220,11 @@ class Issuer[Accumulator](abc.ABC):
     def added_into(self, acc: Accumulator, value: jax.Array, interpret: bool) -> Accumulator:
         """The accumulator `acc` a walk carries with `value` (fp32, its shape, a scaled product restored,
         `operands.Issuer.summed`) added in."""
+
+    def written(self, smem, value: jax.Array) -> None:
+        """`value`, a tile in the issuer's register layout, written to the shared buffer `smem` in its dtype
+        (an output's staging): by an optimized transfer where the layout takes one."""
+        written(smem, value)
 
     def chunk_columns(self, columns: int) -> int:
         """The columns of a tile's accumulator a consumer holds in registers at once (`chunks`): all of them,
@@ -1873,11 +1897,11 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
         return run
 
-    @staticmethod
-    def _stores(smems, index) -> Callable:
+    def _stores(self, smems, index) -> Callable:
         """Consumer `index`'s `store(output, value, ref, place)` (`persist`'s): its share of each output
-        staged in chunks (`output_staging`: two buffers of `staged_columns`, `smems`) and stored by TMA,
-        waiting only for a buffer's last store to read it before it writes it again."""
+        staged in chunks (`output_staging`: two buffers of `staged_columns`, `smems`), written from its
+        issuer's layout (`Issuer.written`), and stored by TMA, waiting only for a buffer's last store to read
+        it before it writes it again."""
         def store(output, value, ref, place):
             smem = smems[output].at[index]
             buffers, width = smem.shape[0], smem.shape[-1]
@@ -1887,7 +1911,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                     # The buffer's last store (the last tile's, at its first chunk) has read it.
                     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
                 buffer = smem.at[chunk % buffers]
-                staged_rows(buffer, piece, ref, row_start, first, stored, column + start, *ladder)
+                staged_rows(buffer, piece, ref, row_start, first, stored, column + start, *ladder,
+                            write=self.written)
 
         return store
 

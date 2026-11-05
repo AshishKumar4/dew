@@ -458,3 +458,15 @@ def moved(tree, key: jax.Array, scale: float):
         (leaf + scale * jax.random.normal(each, leaf.shape)).astype(leaf.dtype)
         if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
         for leaf, each in zip(leaves, keys, strict=True)])
+
+
+def encoded_form(quantization, tensors, names):
+    """Dense `tensors` with each of `names` written in `quantization`'s stored form, as a checkpoint of
+    that format holds them and a test builds one: each weight's stored tensors (`encode`) in its place,
+    every other tensor as it is. A loaded source's export writes them back by `requantize`, which reads
+    the stored tensors' specs from the source."""
+    names = set(names)
+    out = {name: tensor for name, tensor in tensors.items() if name not in names}
+    for name in sorted(names):
+        out.update(quantization.encode(name, np.asarray(tensors[name])))
+    return out

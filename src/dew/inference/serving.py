@@ -85,7 +85,7 @@ from jax.experimental import checkify
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
-from dew._coordination import agreed_reads
+from dew._coordination import agreed_reads, collective_host, pinned_get
 from dew._hashing import array_fingerprint
 from dew._records import JSON
 from dew.batch import (
@@ -112,6 +112,9 @@ from dew.inference.serving_kernel import (
     mixed_refusal,
     opened,
     opened_in,
+    page_programs,
+    page_shapes,
+    prefill_program,
     resident_formats,
     row_state,
     split_donated,
@@ -136,6 +139,7 @@ from dew.nn.inputs import (
     CONTEXT_LENGTHS,
     CrossContext,
     ModelInputs,
+    default_placement,
     host_token_rows,
     mesh_of,
     request_key,
@@ -551,7 +555,7 @@ class Server:
                  grammar: Grammar | None, rows: Rows, slots: int, capacity: int, admission: int,
                  default_budget: int | None, max_length: int | None, decode_steps: int,
                  prefix: int | Literal["prompt"] | None = None, precision: Numerics | None = None,
-                 progress: Progress = END) -> None:
+                 progress: Progress = END, prefill_mesh: Mesh | None = None) -> None:
         if type(slots) is not int or slots < 1:
             raise ValueError("slots must be a positive number of resident rows")
         _refuse_unserved_modes(
@@ -584,9 +588,7 @@ class Server:
         self.sampling = dataclasses.replace(sampling, pad_token_id=self.pad_id)
         self.transforms = transforms
         self.stopping = stopping
-        self.slots = slots
-        self.capacity = capacity
-        self.admission = admission
+        self.slots, self.capacity, self.admission = slots, capacity, admission
         self.default_budget = default_budget
         self.max_length = max_length
         self.prefix: int | Literal["prompt"] | None = prefix
@@ -636,7 +638,8 @@ class Server:
             """Whether a layer's decode cache holds its rows' rounding keys (`dew.nn.kv_cache.ROUNDING_KEYS`),
             so a prompt's state follows its request's key, which then names its prefix too (`_prepared`)."""
             # None selects the one mixed forward of `_mixed_step`.
-            self.mixed_refusal = mixed_refusal(model, shapes, rows.placement)
+            self.mixed_refusal = ("its prompts prefill on a mesh of their own" if prefill_mesh is not None
+                                  else mixed_refusal(model, shapes, rows.placement))
             """Why the admitting step prefills in a separate forward, or None when it runs one mixed forward.
 
             The mixed forward covers each row's last draw and the admitted
@@ -662,6 +665,27 @@ class Server:
                 opened_in(formats)(model, self.variables, self.pad_id, slots, capacity, rows.placement.plan,
                                    self.prng))
             self._keep_states(formats)
+        self._prefill_apart(prefill_mesh)
+
+    def _prefill_apart(self, mesh: Mesh | None) -> None:
+        """Prefill the admitted prompts on `mesh`, apart from the decoding mesh (`from_task`'s
+        `prefill_mesh`): the program that runs there and a copy of the weights placed on it."""
+        self.prefill_mesh = mesh
+        if mesh is None:
+            return
+        spans = {device.process_index for device in mesh.devices.flat}
+        if spans != ({jax.process_index()} if self.mesh is None else
+                     {device.process_index for device in self.mesh.devices.flat}):
+            # Each process's requests reach the prefill mesh through the server's own steps, which the
+            # processes take together only where the server's mesh spans them all.
+            raise ValueError("a server prefills on a mesh over the processes its own mesh spans; place its "
+                             "weights over the same processes as prefill_mesh")
+        rows = self.rows
+        if not isinstance(rows, DenseRows) or rows.chunk is not None or rows.placement.plan is not None:
+            raise ValueError("a server that prefills on a mesh of its own prefills each prompt whole over a "
+                             "dense cache; serve it without page_size, chunk or a speculative plan")
+        self._prefill = prefill_program()
+        self._prefill_variables = _on_mesh(self.variables, mesh)
 
     def _keep_states(self, formats) -> None:
         """Open the store of row states a shared prefix is read with, where the rows keep state beside
@@ -684,6 +708,12 @@ class Server:
                 self.cache)
             self._states = states
             self._restored, self._captured = map(Fetched, state_programs(formats, states))
+        self._host: dict[int, list[np.ndarray]] | None = None
+        """The prefix cache's host tier: each of this process's host slots, by the slot's global index, its
+        page of each pool leaf (`dew.inference.pages.Transfers`); None without one."""
+        if isinstance(rows, PagedRows) and rows.pages[0].host:
+            self._host = {}
+            self._read_pages, self._written_pages = map(Fetched, page_programs(formats, self._admitted))
 
     @contextlib.contextmanager
     def _context(self) -> Iterator[None]:
@@ -703,7 +733,8 @@ class Server:
     def from_task(cls, task: TextGeneration, *, slots: int, capacity: int,
                   admission: int | None = None, kv_cache: KVCache | None = None,
                   chunk: int | None = None, prefix_cache: bool = False, prefix_states: int | None = None,
-                  prefix_state_every: int | None = None, decode_steps: int = 1) -> Server:
+                  prefix_state_every: int | None = None, host_pages: int = 0,
+                  decode_steps: int = 1, prefill_mesh: Mesh | None = None) -> Server:
         """Build a server over the task's model, weights, processor and policy.
 
         `capacity` is rounded up to whole 64-slot tiles and whole pages, and
@@ -727,7 +758,18 @@ class Server:
         prompt's deepest shareable page boundary and every
         `prefix_state_every` pages below it, a piece cut to end there, and a
         request reuses pages as deep as a state is kept
-        (`dew.inference.pages.States`).
+        (`dew.inference.pages.States`). `host_pages` keeps that many more
+        prefix pages in host memory, split over the groups: a cached page the
+        pool reclaims goes to the host first, and a prompt that shares it reads
+        it back into a fresh page before its prefill (`dew.inference.pages`), so
+        a prefix cache holds more than the device's pages.
+
+        `prefill_mesh` prefills the admitted prompts on a mesh of their own,
+        as MaxEngine's and vLLM's disaggregated serving does: the server keeps
+        a copy of its weights there, placed as on its own mesh, prefills each
+        admission's rows over it and moves their decoder state to the decoding
+        mesh, where the rows are seated and decode; a request draws what it
+        draws on one mesh. The rows prefill whole over a dense cache.
 
         Weights on a mesh are served on that mesh. The slots, the admission
         and the pages are split over its row axes, so the number of row
@@ -766,30 +808,10 @@ class Server:
         for name, value in (("prefix_states", prefix_states), ("prefix_state_every", prefix_state_every)):
             if value is not None and (type(value) is not int or value < 1):
                 raise ValueError(f"{name} must be a positive integer")
-        ceiling = cache_ceiling(task.model)
-        if ceiling is None:
-            raise ValueError("a server needs a model that declares max_seq_len for its cache")
-        if type(capacity) is not int or capacity < 1:
-            raise ValueError("capacity must be a positive number of cache slots per row")
-        model = task.model
-        if kv_cache is not None:
-            if not isinstance(model, Layered):
-                raise ValueError(f"{type(model).__name__} declares no kv_cache layout to replace")
-            model = model.with_kv_cache(kv_cache)
-        layout = model.kv_cache if isinstance(model, Layered) else KVCache()
-        # One program serves one capacity, so the cache holds whole tiles of it
-        # rather than a power-of-two bucket: every decode step's attention reads
-        # each slot, and a capacity of 384 bucketed to 512 read a third more.
-        # A model shorter than the tiles keeps whole pages within its max_seq_len, which no row passes.
-        unit = math.lcm(64, layout.page_size or 64)
-        page = layout.page_size or 1
-        rounded = min(-(-capacity // unit) * unit, ceiling // page * page)
-        if rounded < capacity:
-            raise ValueError(f"a capacity of {capacity} passes the model's max_seq_len of {ceiling}"
-                             + ("" if page == 1 else f" in whole pages of {page}"))
+        model, layout, rounded = _served_layout(task.model, kv_cache, capacity)
         groups = _row_groups(mesh)
         model, rows = _cache_rows(cache_sized(model, rounded), layout, slots, rounded, groups, chunk,
-                                  prefix_cache, prefix_states, prefix_state_every)
+                                  prefix_cache, prefix_states, prefix_state_every, host_pages)
         if plan is not None:
             if isinstance(rows, PagedRows):
                 raise ValueError("speculative rows rewind a block's rejected keys from the cache saved "
@@ -816,6 +838,7 @@ class Server:
             default_budget=task.max_new_tokens,
             max_length=task.max_length,
             decode_steps=decode_steps, prefix=task.prefix, precision=task.precision, progress=task.progress,
+            prefill_mesh=prefill_mesh,
         )
 
     @property
@@ -868,6 +891,8 @@ class Server:
         packed = pack_projections(normalized(stored_layers(self.model, variables), self._source_shapes),
                                   self._weight_groups)
         self.variables = reloaded(packed, self.variables)
+        if self.prefill_mesh is not None:
+            self._prefill_variables = _on_mesh(self.variables, self.prefill_mesh)
         if progress is not None:
             self.progress = progress
         self.rows.reloaded()
@@ -1052,21 +1077,26 @@ class Server:
             return
         restores = [tuple(pair) for held in said for pair in held["restores"]]
 
-        def admitted() -> tuple[Admission | None, list]:
+        def admitted() -> tuple[Admission | None, dict]:
             admission = self._admit(pending, max(held["waiting"] for held in said),
                                     max(held["widest"] for held in said),
                                     sorted({name for held in said for name in held["fields"]}))
-            return admission, [list(pair) for pair in self._captures]
+            return admission, {"captures": [list(pair) for pair in self._captures], **self._owed()}
 
         # The admission is built on every process, and a failure building it stops every one, as the
-        # seating's does; each process's captures come back with it.
+        # seating's does; each process's captures and page copies come back with it.
         (admission, _), booked = self._agreed("serving admission", admitted, lambda held: held[1])
-        captures = [tuple(pair) for held in booked for pair in held]
+        captures = [tuple(pair) for held in booked for pair in held["captures"]]
+        spills, uploads = ([tuple(pair) for held in booked for pair in held[name]]
+                           for name in ("spills", "uploads"))
         with self._context():
+            self._transferred(spills, uploads)
             if restores:
                 self._resident, self._carried = self._restored(
                     self._resident, self._carried, self._states, *_padded(restores, self.slots, 0))
                 self._restores = []
+            if admission is not None and self.prefill_mesh is not None:
+                admission = self._prefilled_elsewhere(admission)
             program = self._step if admission is None else self._admitting
             error, (self._resident, self._carried, draws) = program(
                 self.model, self.variables, self.pad_id, self.rows.placement, self.decode_steps,
@@ -1079,6 +1109,72 @@ class Server:
         self.steps += self.decode_steps
         self._settle()
         self._pending = (error, draws)
+
+    def _prefilled_elsewhere(self, admission: Admission) -> Admission:
+        """`admission` with its rows prefilled on the prefill mesh (`Dense.rows_prefilled`) and their decoder
+        state moved onto the decoding mesh's rows, which the admitting step seats."""
+        assert isinstance(self.rows.placement, Dense) and self.prefill_mesh is not None
+        mesh = self.prefill_mesh
+        # The rows split over the prefill mesh's row groups where they divide, else each device prefills all.
+        split = admission.slots.shape[0] % _row_groups(mesh) == 0
+        rows = _moved(admission, NamedSharding(mesh, P(batch_axes(mesh) or None) if split else P()),
+                      phase="an admission to the prefill mesh")
+        with jax.set_mesh(mesh), whole():
+            prefilled = self._prefill(self.model, self._prefill_variables, self.pad_id, self.rows.placement,
+                                      rows, self.progress)
+        # Onto the decoding rows: the server's mesh's, or the default device's, where an unmeshed state is.
+        return dataclasses.replace(admission, prefilled=_moved(
+            prefilled, default_placement() if self._admitted is None else self._admitted,
+            phase="prefilled rows to the decoding mesh"))
+
+    def _owed(self) -> dict[str, list[list[int]]]:
+        """The page copies this process's seating owes (`dew.inference.pages.Transfers`), by the pool's and
+        the host tier's global page and slot: its groups' pages and slots lie at their groups' offsets."""
+        if self._host is None:
+            return {"spills": [], "uploads": []}
+        assert isinstance(self.rows, PagedRows)
+        per, host = self.rows.pages[0].count, self.rows.pages[0].host
+        owed = [(group, self.rows.pages[group].drained()) for group in self._local]
+        return {"spills": [[group * per + page, group * host + slot] for group, held in owed
+                           for page, slot in held.spills],
+                "uploads": [[group * host + slot, group * per + page] for group, held in owed
+                            for slot, page in held.uploads]}
+
+    def _transferred(self, spills: Sequence[tuple[int, int]], uploads: Sequence[tuple[int, int]]) -> None:
+        """Make the page copies every process's seating owes before the step's program writes any page: each
+        reclaimed prefix page out to its host slot, then each shared one back from its slot into its fresh
+        page, a fixed number a call so one program of each serves every step. A process keeps the slots of
+        its own groups, and hands the pages written in a row per group, its groups' rows its own
+        (`_placed`), each group's at most as many as its share of an admission reads."""
+        if self._host is None:
+            return
+        assert isinstance(self.rows, PagedRows)
+        host, width = self.rows.pages[0].host, self.admission * self.rows.width
+        for start in range(0, len(spills), width):
+            batch = spills[start:start + width]
+            pages, _ = _padded(batch, width, 1)
+            read = self._read_pages(self._resident, self._carried, pages)
+            # A pool's pages come home with every process agreeing; a server of one process's alone.
+            leaves = (jax.tree.leaves(collective_host(read, phase="the prefix cache's spilled pages"))
+                      if self.pooled else pinned_get(jax.tree.leaves(read)))
+            for index, (_, slot) in enumerate(batch):
+                if slot // host in self._local:
+                    self._host[slot] = [np.asarray(leaf)[:, index].copy() for leaf in leaves]
+        share = width // self.groups
+        by_group = [[pair for pair in uploads if pair[0] // host == group] for group in range(self.groups)]
+        shapes = page_shapes(self._resident, self._carried, share)
+        for start in range(0, max(map(len, by_group)), share):
+            pages = np.full((self.groups, share), DROPPED, np.int32)
+            held = [np.zeros((len(self._local), *leaf.shape), leaf.dtype) for leaf in jax.tree.leaves(shapes)]
+            for group, pairs in enumerate(by_group):
+                for index, (slot, page) in enumerate(pairs[start:start + share]):
+                    pages[group, index] = page
+                    if group in self._local:
+                        for rows, held_page in zip(held, self._host[slot], strict=True):
+                            rows[self._local.index(group), :, index] = held_page
+            self._resident, self._carried = self._written_pages(
+                self._resident, self._carried, pages,
+                jax.tree.unflatten(jax.tree.structure(shapes), self._placed(held)))
 
     def run(self) -> None:
         """Step until every queued and running request has resolved. A step that fails stops the server:
@@ -1258,7 +1354,10 @@ class Server:
         conditioning = {} if cross is None else {CONTEXT: placed[11], CONTEXT_LENGTHS: placed[12]}
         fields = {VALIDITY_FIELD: placed[1], **dict(zip(pieces, placed[len(placed) - len(pieces):],
                                                           strict=True))}
-        return Admission(ModelInputs(placed[0], fields, conditioning), *placed[2:11])
+        names = ("slots", "budgets", "keys", "tables", "cursors", "final", "history", "history_valid",
+                 "adapters")
+        return Admission(ModelInputs(placed[0], fields, conditioning), **dict(zip(names, placed[2:11],
+                                                                                   strict=True)))
 
     def _placed(self, local: list) -> list[jax.Array]:
         """This process's rows of an admission's arrays placed as the admission is (`_admitted`): every row
@@ -1377,10 +1476,71 @@ def _served_plan(strategy: Strategy, mesh: Mesh | None, chunk: int | None,
     return strategy
 
 
+def _on_mesh(variables: Variables, mesh: Mesh) -> Variables:
+    """`variables` placed on `mesh` as they lie on their own, each leaf's partition spec kept: a copy of a
+    server's weights on its prefill mesh. A leaf on one device is replicated."""
+    return _moved(variables, lambda leaf: NamedSharding(
+        mesh, leaf.sharding.spec if isinstance(leaf.sharding, NamedSharding) else P()),
+        phase="weights to the prefill mesh")
+
+
+def _moved[T](tree: T, sharding: jax.sharding.Sharding | Callable[[jax.Array], jax.sharding.Sharding], *,
+              phase: str) -> T:
+    """`tree` placed by `sharding`, one for every leaf or each leaf's: where JAX moves it between the
+    device sets (`jax.device_put`, every array within this process's devices), as it does; between meshes
+    over several processes, each leaf gathered to every process's host (`collective_host`, every process
+    calling it) and each process's shards made of it, as JAX's transfers cannot move a sharded array to
+    another processes' device set."""
+    leaves, structure = jax.tree.flatten(tree)
+    targets = [sharding if isinstance(sharding, jax.sharding.Sharding) else sharding(leaf) for leaf in leaves]
+    if all(leaf.is_fully_addressable and target.is_fully_addressable
+           for leaf, target in zip(leaves, targets, strict=True)):
+        return jax.tree.unflatten(structure, jax.device_put(leaves, targets))
+    # Gathered under the mesh the leaves lie on, whatever mesh the caller traces under.
+    source = next(leaf.sharding.mesh for leaf in leaves if isinstance(leaf.sharding, NamedSharding))
+    assert isinstance(source, Mesh), "an array's placed sharding names a concrete mesh"
+    with jax.set_mesh(source):
+        home = collective_host(leaves, phase=phase)
+    return jax.tree.unflatten(structure, [
+        jax.make_array_from_callback(held.shape, target, lambda index, held=held: held[index])
+        for held, target in zip(home, targets, strict=True)])
+
+
+def _served_layout(model: nn.Module, kv_cache: KVCache | None,
+                   capacity: int) -> tuple[nn.Module, KVCache, int]:
+    """The served model over `kv_cache` where given, its cache layout, and its rows' `capacity` rounded to
+    whole 64-slot tiles and whole pages: one program serves one capacity, so the cache holds whole tiles of
+    it rather than a power-of-two bucket (every decode step's attention reads each slot, and a capacity of
+    384 bucketed to 512 read a third more), and a model shorter than the tiles keeps whole pages within its
+    max_seq_len, which no row passes."""
+    ceiling = cache_ceiling(model)
+    if ceiling is None:
+        raise ValueError("a server needs a model that declares max_seq_len for its cache")
+    if type(capacity) is not int or capacity < 1:
+        raise ValueError("capacity must be a positive number of cache slots per row")
+    if kv_cache is not None:
+        if not isinstance(model, Layered):
+            raise ValueError(f"{type(model).__name__} declares no kv_cache layout to replace")
+        model = model.with_kv_cache(kv_cache)
+    layout = model.kv_cache if isinstance(model, Layered) else KVCache()
+    unit = math.lcm(64, layout.page_size or 64)
+    page = layout.page_size or 1
+    rounded = min(-(-capacity // unit) * unit, ceiling // page * page)
+    if rounded < capacity:
+        raise ValueError(f"a capacity of {capacity} passes the model's max_seq_len of {ceiling}"
+                         + ("" if page == 1 else f" in whole pages of {page}"))
+    return model, layout, rounded
+
+
 def _cache_rows(model: nn.Module, layout: KVCache, slots: int, capacity: int, groups: int, chunk: int | None,
-                prefix_cache: bool, states: int | None, every: int | None) -> tuple[nn.Module, Rows]:
+                prefix_cache: bool, states: int | None, every: int | None,
+                host: int = 0) -> tuple[nn.Module, Rows]:
     """The model over its cache's layout, its pages pooled for `slots` rows of `capacity` slots in `groups`
     where it pages, and the rows' host side (`Server.from_task`'s arguments)."""
+    if host and not prefix_cache:
+        raise ValueError("a host tier keeps a prefix cache's pages; serve with prefix_cache=True")
+    if host % groups:
+        raise ValueError(f"host_pages ({host}) split over the {groups} groups the mesh splits rows into")
     if layout.page_size is None:
         if prefix_cache:
             raise ValueError("prefix caching runs over a paged cache; "
@@ -1390,7 +1550,8 @@ def _cache_rows(model: nn.Module, layout: KVCache, slots: int, capacity: int, gr
     # Only a model that declares its layout has a paged one; the default pages nothing.
     assert isinstance(model, Layered)
     model = model.with_kv_cache(dataclasses.replace(layout, pages=count, groups=groups))
-    return model, PagedRows([Pages(count // groups, layout.page_size, prefix_cache=prefix_cache)
+    return model, PagedRows([Pages(count // groups, layout.page_size, prefix_cache=prefix_cache,
+                                   host=host // groups)
                              for _ in range(groups)], chunk, capacity // layout.page_size,
                             states=slots // groups if states is None else states, every=every)
 
