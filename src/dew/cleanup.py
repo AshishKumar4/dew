@@ -144,28 +144,25 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
     return process
 
 
-def _still_owned(process: subprocess.Popen) -> bool:
-    """Whether the group `process` led was `start`ed, its lifeline still alive, and a process of it still
-    runs: the group is then still its owner's, though its leader was reaped, and its id names it."""
-    with _HELD:
-        held = _LIFELINES.get(process.pid)
-    return held is not None and held[1].poll() is None and bool(members(process.pid))
-
-
 def stop(process: subprocess.Popen, grace: float = 0.0, interrupt: int = signal.SIGTERM,
          settle: float = SETTLE_SECONDS) -> list[int]:
     """Stop the group `process` leads: with a `grace`, `interrupt` to every process in it and up to `grace`
     seconds for the leader to exit, left unreaped; then SIGKILL to the group, while its id is still the
-    leader's own or, where the leader was reaped, while the group is still its owner's (`_still_owned`);
-    then up to `settle` seconds, one budget, for every process of it to end; the leader reaped once it has
-    exited, and the group's lifeline, if it has one, told the group is stopped, which kills what is left
-    and ends it. Returns the processes still running then (none, normally; a leader the kill has not
-    reached, in uninterruptible sleep, among them), never raised, so a caller can still report what ran."""
+    leader's own, and, where the group was `start`ed, its lifeline told the group is stopped, which kills
+    what is left by the group's id: a leader reaped before is no bar, which CI's is (it reaps pytest before
+    it stops what pytest left). Then up to `settle` seconds, one budget, for every process of it to end, and
+    the leader reaped once it has exited. Returns the processes still running then (none, normally; a
+    leader the kill has not reached, in uninterruptible sleep, among them), never raised, so a caller can
+    still report what ran."""
     if grace > 0 and exit_code(process) is None and signal_group(process, interrupt):
         groups_ended((process,), grace)
     killed = signal_group(process, signal.SIGKILL)
-    if not killed and _still_owned(process):
-        killed = _killpg(process.pid, signal.SIGKILL)
+    with _HELD:
+        held = _LIFELINES.pop(process.pid, None)
+    if held:
+        os.close(held[0])
+        held[1].wait()
+        killed = True
     left: list[int] = []
     if killed:
         deadline = time.monotonic() + settle
@@ -173,11 +170,6 @@ def stop(process: subprocess.Popen, grace: float = 0.0, interrupt: int = signal.
             time.sleep(POLL_SECONDS)
     with contextlib.suppress(subprocess.TimeoutExpired):
         process.wait(0)
-    with _HELD:
-        held = _LIFELINES.pop(process.pid, None)
-    if held:
-        os.close(held[0])
-        held[1].wait()
     return left
 
 

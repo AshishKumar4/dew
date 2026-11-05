@@ -70,8 +70,8 @@ def test_a_leader_is_given_its_grace_to_end_by_its_own_hand_before_the_group_is_
 
 def test_a_group_whose_leader_was_reaped_is_signalled_only_where_its_owner_started_it():
     """CI reaps a leader before it stops the group, and the processes the leader left are its to stop,
-    since a group `start`ed holds its id; a group nothing holds is not signalled once its leader is reaped,
-    as its id may be another process's by then."""
+    gone when the stop returns, since a group `start`ed holds its id by its lifeline; a group nothing holds
+    is not signalled once its leader is reaped, as its id may be another process's by then."""
     with started(leader_with_child("")) as unowned:
         stranded = child_of(unowned)
         unowned.wait()
@@ -83,7 +83,7 @@ def test_a_group_whose_leader_was_reaped_is_signalled_only_where_its_owner_start
         held = child_of(owned)
         owned.wait()
         assert cleanup.stop(owned) == []
-        assert gone_within(held, 30)
+        assert not running(held)
     finally:
         owned.stdout.close()
 
