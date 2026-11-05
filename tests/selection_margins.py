@@ -108,11 +108,8 @@ def scale_of(ranked: np.ndarray) -> np.ndarray:
 def top_margin(values: np.ndarray, kept: int) -> np.ndarray:
     """Each row's gap between its `kept`-th largest value and the next, over its size (`scale_of`): how
     far a top-`kept` selection over the row's last axis is from flipping. Infinite where the row
-    holds no more than `kept` finite values, which decide nothing, the whole axis among them."""
+    holds no more than `kept` finite values, which decide nothing."""
     ranked = -np.sort(-values, axis=-1)
-    if ranked.shape[-1] <= kept:
-        # A selection of the whole axis (a Router taking every expert or every group) has no cutoff.
-        return np.full(ranked.shape[:-1], np.inf)
     chosen, next_best = ranked[..., kept - 1], ranked[..., kept]
     with np.errstate(invalid="ignore"):
         gap = chosen - next_best
