@@ -15,6 +15,7 @@ from reference_error import equations
 
 from dew.nn import derivatives
 from dew.nn.derivatives import KernelGlue, Protected, Surrogate, marked, marked_call_p
+from dew.nn.programs import called
 
 KINDS = [kind() for kind in typing.get_args(derivatives.Kind.__value__)]
 """Every kind a span is marked as, each through either builder (`derivatives.Kind`'s)."""
@@ -154,7 +155,7 @@ def test_an_eager_call_of_a_marked_span_traces_no_program():
     """A marked span called eagerly, outside any trace, a call no program records, is its function's own
     call: once its operations have run, it traces and compiles nothing again (a decision task's eager
     scores in a step's steady state, train 586), and computes its function's values. Inside a trace it is
-    one marked call, its arguments traced or concrete."""
+    one call of its custom rule whose primal is one marked call, its arguments traced or concrete."""
     from dew.nn.categorical import label_terms
     from dew.telemetry.compiles import Compiles
 
@@ -168,7 +169,8 @@ def test_an_eager_call_of_a_marked_span_traces_no_program():
         np.testing.assert_array_equal(np.asarray(each), np.asarray(expected))
     for traced in (jax.make_jaxpr(label_terms)(logits, labels).jaxpr,
                    jax.make_jaxpr(lambda: label_terms(logits, labels))().jaxpr):
-        assert [equation.primitive for equation in traced.eqns] == [derivatives.marked_call_p], traced
+        (rule,) = traced.eqns
+        assert [equation.primitive for equation in called(rule).eqns] == [derivatives.marked_call_p], traced
 
 
 def test_a_declared_rule_with_symbolic_zeros_meets_one_where_no_tangent_reaches():
