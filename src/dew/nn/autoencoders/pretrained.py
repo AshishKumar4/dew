@@ -10,16 +10,14 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol
 
-import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
 
 from dew.batch import Variables
-from dew.interop.components import bind_component
 from dew.registry import DtypeName
 
 from . import dc_ae, flux2, qwen_image, rae, wan
-from .api import AutoEncoder, LatentNormalization, published_source
+from .api import AutoEncoder, LatentNormalization, bound_autoencoder, published_source
 from .dc_ae import DCAutoencoder, load_dc_ae
 from .flux2 import Flux2Autoencoder, load_flux2_vae
 from .qwen_image import QwenImageAutoencoder, load_qwen_image_vae
@@ -78,14 +76,11 @@ def load_kl_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
     if weights == FLAX_WEIGHTS and params is None:
         params, shapes = flax_vae(directory / FLAX_WEIGHTS)
     model, shift, scale = published(config, compute)
-    image = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
-                                 jnp.float32)
-    return bind_component(
-        directory, "vae", config, model, _vae_path,
+    return bound_autoencoder(
+        directory, config, model, _vae_path,
         lambda bound: StableDiffusionVAE(str(name_or_dir), dtype=compute, params=bound, model=model,
                                          latent_shift=shift, latent_scale=scale),
-        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(image,),
-        shapes=shapes)
+        params=params, param_dtype=param_dtype, lazy=lazy, shapes=shapes)
 
 
 @dataclasses.dataclass(frozen=True)

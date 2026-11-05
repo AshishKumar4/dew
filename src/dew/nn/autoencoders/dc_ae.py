@@ -26,7 +26,6 @@ from flax.typing import Dtype
 
 from dew import _records
 from dew.batch import Variables
-from dew.interop.components import bind_component
 from dew.interop.weights import indexed_path
 from dew.nn.dense import Dense
 
@@ -35,7 +34,7 @@ from ..conv import Conv
 from ..norms import rms_normalized
 from ..precision import at_least_fp32, float32_dot_general, float32_einsum
 from ..scan_orders import pixel_shuffle, pixel_unshuffle
-from .api import LatentNormalization, ModuleAutoEncoder, published_source
+from .api import LatentNormalization, ModuleAutoEncoder, bound_autoencoder, published_source
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
@@ -525,11 +524,8 @@ def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | 
     placement to read (`dew.interop.weights.record_layouts`)."""
     directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED, weights=params is None)
     model = DCAE(**dc_ae_fields(config), dtype=compute)
-    frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
-                                 jnp.float32)
-    return bind_component(
-        directory, "vae", config, model, dc_ae_path,
+    return bound_autoencoder(
+        directory, config, model, dc_ae_path,
         lambda bound: DCAutoencoder(model=model, params=bound,
                                     latent_scale=config.get("scaling_factor", 1.0)),
-        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(frame,),
-        shapes=shapes)
+        params=params, param_dtype=param_dtype, lazy=lazy, shapes=shapes)
