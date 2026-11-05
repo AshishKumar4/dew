@@ -54,7 +54,7 @@ def _audio(kind):
 def audio(request):
     return _audio(request.param)
 
-BF16_TOWER_SEEDS = 8
+BF16_TOWER_SEEDS = 64
 """Gemma 4's bf16 audio tower's declared check-1 seeds, sized by `seeds_for` paired."""
 
 

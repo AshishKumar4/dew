@@ -132,8 +132,9 @@ def test_a_vae_encoder_keeps_the_host_reference_precision(batch, backward):
 
 
 VAE_ENCODER = Path(__file__).resolve().parent / "fixtures" / "vae" / "encoder.npz"
-VAE_ENCODER_SEEDS = 8
-"""Diffusers' encoder site's declared check-1 seeds, sized by `seeds_for` paired."""
+VAE_ENCODER_SEEDS = {False: 8, True: 64}
+"""Diffusers' encoder site's declared check-1 seeds, the moments' and the gradients', sized by `seeds_for`
+paired on armada."""
 
 
 @pytest.mark.parametrize("batch", [1, 4])
@@ -204,7 +205,7 @@ def test_a_vae_encoder_is_as_exact_as_diffusers(batch, backward):
         return run
 
     assert_as_exact(dew, diffusers_walk(encoder, torch.float32, contextlib.nullcontext), draw,
-                    f"batch {batch} {'gradients' if backward else 'moments'}", seeds=VAE_ENCODER_SEEDS,
+                    f"batch {batch} {'gradients' if backward else 'moments'}", seeds=VAE_ENCODER_SEEDS[backward],
                     truth_fn=diffusers_walk(wide, torch.float64, widened_torch))
 
 
