@@ -77,7 +77,8 @@ class Shard:
 
 
 def preparing(source: Source, size: int | None, into: str) -> None:
-    """Log the one line a source logs as it prepares a read: what, how large, and where."""
+    """Log the one line a source logs as it prepares a read: what, how large (its `preparation_bytes`),
+    and where."""
     stated = "size not stated" if size is None else f"{size / 2**20:.1f} MiB"
     logging.getLogger("dew.data").warning("preparing %s (%s) into %s", source.describe(), stated, into)
 
@@ -268,6 +269,14 @@ class View[S: Source]:
         if self.rows in ("selected", "described"):
             return dataclasses.replace(self, source=_consumed(self.source, read))
         return self
+
+
+@runtime_checkable
+class Selection(Protocol):
+    """A view whose records are a part of its source's alone (a holdout's), so a part is taken of records
+    its source's read gave once (`part`), as a compile shares one read of a store among its parts."""
+
+    def part(self, records: Records) -> Records: ...
 
 
 def beneath(source: Source, through: Collection[Rows]) -> Iterator[Source]:
