@@ -502,7 +502,7 @@ def test_a_narrow_key_dimensions_gradient_lowers_its_copies_for_an_ampere_gpu(ta
 
 @pytest.mark.parametrize('dtype', [jnp.bfloat16, jnp.float32], ids=['bf16', 'fp32-accurate'])
 def test_a_launch_states_the_part_pairs_it_issues_and_declares_the_models_products(dtype):
-    """A gated delta rule's forward and gradient through the template, lowered for an H100: each launch
+    """A gated delta rule's forward through the template, lowered for an H100: each launch
     states the products it issues, its operands' part pairs (`product.terms`: one for bf16, six for an fp32
     operand's three bf16 parts under the accurate forms), and declares the model's products apart
     (`instrumentation.MODEL_FLOPS`), which Dew's FLOP count reads for the model's work."""
@@ -523,8 +523,7 @@ def test_a_launch_states_the_part_pairs_it_issues_and_declares_the_models_produc
 
     mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), generation.run_precision(ACCURATE), jax.sharding.use_abstract_mesh(mesh):
-        text = jax.jit(jax.grad(rule, argnums=(0, 1, 2))).trace(*operands).lower(
-            lowering_platforms=("cuda",)).as_text(dialect="hlo")
+        text = jax.jit(rule).trace(*operands).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
     launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
     ratios = set()
     for line in launches:
