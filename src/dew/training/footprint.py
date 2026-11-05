@@ -293,11 +293,11 @@ def hoisted(program: jcore.Jaxpr) -> jcore.Jaxpr:
     schedules ahead of that work, holding it to its reader past the program, each one computed once
     where equal ones repeat (`deduplicated`, which the derivation reads it through). The gradient of a
     parameter the loss reads none of is such a constant, a broadcast zero JAX writes at the backward's
-    end, which XLA made during the forward, one a shape: Qwen3.5-4B's step at 4 x 2048 tokens under 'minimal_with_scan_and_conv',
-    compiled for an H100, held one zero gradient of each of 25 shapes of its multi-token head's and its
-    vision tower's 312, 0.48 GiB of 1.69, from step 2,480 of its schedule to the update at 15,091, its
-    peak at 4,863 among them (row 4089, its buffer dump). A constant the work reads (a loop's zero
-    carry) is made where the work needs it, as XLA makes it."""
+    end, which XLA made during the forward, one a shape: Qwen3.5-4B's step at 4 x 2048 tokens under
+    'minimal_with_scan_and_conv', compiled for an H100, held one zero gradient of each of 25 shapes of
+    its multi-token head's and its vision tower's 312, 0.48 GiB of 1.69, from step 2,480 of its schedule
+    to the update at 15,091, its peak at 4,863 among them (row 4089, its buffer dump). A constant the
+    work reads (a loop's zero carry) is made where the work needs it, as XLA makes it."""
     constant: dict[jcore.Var, int] = {}
     for index, equation in enumerate(program.eqns):
         reads = [value for value in equation.invars if computed(value)]
