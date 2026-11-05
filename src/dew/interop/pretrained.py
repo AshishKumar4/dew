@@ -755,7 +755,15 @@ class Pretrained:
             written = destination / name
             written.parent.mkdir(parents=True, exist_ok=True)
             written.write_bytes(module.read_bytes())
-        save_hf_layout(tensors, dict(self.config), destination, max_shard_size)
+        # A bundle's folders each get their own tensors and config back (`DecoderFamily.wrapper_folders`).
+        folders = {decoder_parts.folder_config(folder): folder for folder in _folders(self.config)
+                   if decoder_parts.folder_config(folder) in self.config}
+        for key, folder in folders.items():
+            save_hf_layout(_folder_part(tensors, decoder_parts.folder_name(folder, "")),
+                           dict(_records.record(self.config[key], key)), destination / folder, max_shard_size)
+        save_hf_layout(_folder_part(tensors, "") if folders else tensors,
+                       {key: value for key, value in self.config.items() if key not in folders},
+                       destination, max_shard_size)
 
     def push_to_hub(self, repo_id: str, *, variables: Mapping[str, object] | None = None,
                     private: bool = False, commit_message: str = "Upload dew export",
@@ -1256,7 +1264,7 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.Wra
     into the three mrope sections its wrapper positions rows with.
     """
     family = config.get("model_type")
-    text_config = _records.record(config["text_config"], "text_config")
+    text_config = decoders.text_scope(config)
     text_fields = record["text"].copy()
     if max_seq_len is not None:
         text_fields["max_seq_len"] = max_seq_len
@@ -1284,7 +1292,7 @@ def _wrapper_model(config: Mapping[str, object], record: decoder_parts.WrapperFi
     """Build the wrapper its record describes: the decoder above, the towers and
     projectors it names, and the placeholder ids its prompts carry."""
     family = _records.text(config["model_type"], "model_type")
-    text_config = _records.record(config["text_config"], "text_config")
+    text_config = decoders.text_scope(config)
     audio_record = record["audio"]
     audio_projector = record["audio_projector"]
     return MultimodalTransformer(
@@ -1321,8 +1329,9 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     the source's own processor code where the load ran its code
     (`SourceReference.remote_code`).
     """
-    processor_files = any((directory / name).exists()
-                          for name in ("processor_config.json", "preprocessor_config.json"))
+    # A bundle may state its processing in its own config instead (MiMo-V2.6's `processor_config`).
+    processor_files = config.get("processor_config") is not None or any(
+        (directory / name).exists() for name in ("processor_config.json", "preprocessor_config.json"))
     media = _media_wrapper(config) and processor_files
     if media or (directory / "tokenizer_config.json").exists() or gguf_path is not None:
         from dew.data.text import load_tokenizer
@@ -1383,6 +1392,8 @@ def load_processor(source: sources.SourceReference, model: nn.Module) -> Process
     component = None if description is None else description.backbone
     if component is None:
         config, _ = _source_config(source.name, directory, source.revision, None)
+        # The folders' configs beside it, which its media read (`_with_folders`).
+        config = _with_folders(config, source, sources.snapshot(source.name, source.revision, weights=False))
     else:
         config = component.config
         directory = directory / component.config_folder
@@ -1607,6 +1618,53 @@ def _decoded(tensors: Mapping[str, unread.Stored], config: Mapping[str, object],
     tensors = quantization.dequantize(tensors, param_dtype=param_dtype)
     _share_quantized_aliases(tensors, aliases, quantized_tensors)
     return tensors, quantized_tensors, scale_dtype, grid, decoders.checked_groups(aliases)
+
+
+def _folders(config: Mapping[str, object]) -> tuple[str, ...]:
+    """The folders of a bundle whose media read their own config and weights
+    (`DecoderFamily.wrapper_folders`); none for any other source."""
+    family = config.get("model_type")
+    return decoders.family_entry(family).wrapper_folders if decoders.bundles(config) and isinstance(
+        family, str) else ()
+
+
+def _with_folders(config: Mapping[str, object], source: sources.SourceReference,
+                  root: Path) -> Mapping[str, object]:
+    """`config` with each of its bundle's folders' configs beside its own (`_folders`), under
+    `decoder_parts.folder_config`, as the source keeps them; a folder the source lacks adds none, for its
+    family to refuse the media that read it."""
+    folded = dict(config)
+    for folder in _folders(config):
+        path = source.component(folder).optional_file(root, "config.json")
+        if path is not None:
+            folded[decoder_parts.folder_config(folder)] = _records.record(json.loads(path.read_text()),
+                                                                          f"{folder}/config.json")
+    return folded
+
+
+def _with_folder_tensors(tensors: Mapping[str, unread.Stored], config: Mapping[str, object],
+                         source: sources.SourceReference, root: Path, *, weights: bool
+                         ) -> Mapping[str, unread.Stored]:
+    """`tensors` with each of the bundle's folders' (`_folders`) whose config the source holds
+    (`_with_folders`) under `decoder_parts.folder_name`, read as the load reads the source's own: whole,
+    or by their headers alone without its weights."""
+    held = dict(tensors)
+    for folder in (folder for folder in _folders(config) if decoder_parts.folder_config(folder) in config):
+        part = source.component(folder)
+        stored = (sources.load_shards(part.directory(part.weights(root))) if weights
+                  else sources.stored_tensors(part, root) or {})
+        held.update({decoder_parts.folder_name(folder, name): tensor for name, tensor in stored.items()})
+    return held
+
+
+def _folder_part(tensors: Mapping[str, np.ndarray], prefix: str) -> Mapping[str, np.ndarray]:
+    """The tensors named under `prefix`, the prefix off, each built as `tensors` builds it; the empty
+    prefix with no folder's name (`_folders`) keeps the rest, the root's."""
+    specs = tensor_specs(tensors)
+    names = {name.removeprefix(prefix): name for name in specs
+             if (name.startswith(prefix) if prefix else "/" not in name)}
+    return LazyTensors({local: specs[name] for local, name in names.items()},
+                       lambda local: tensors[names[local]])
 
 
 def _language_model_tensors(tensors: Mapping[str, unread.Stored], record: decoder_parts.WrapperFields
@@ -1843,15 +1901,16 @@ def _lazy_route(config: Mapping[str, object]) -> DecoderRoute | WrapperRoute:
 
 
 def _media_wrapper(config: Mapping[str, object]) -> bool:
-    """Whether a source is a media wrapper, its decoder under text_config.
+    """Whether a source is a media wrapper: its decoder under text_config, or a bundle its decoder
+    family reads whole (`DecoderFamily.wrapper`, `decoders.bundles`), its decoder at its root or nested.
 
     Where its model_type is a registered decoder family, the text half is
-    the model unless the family reads its media bundle whole
-    (`DecoderFamily.wrapper`). DiffusionGemma nests its text config too.
+    the model unless the family reads its media bundle whole. DiffusionGemma
+    nests its text config too.
     """
     family = config.get("model_type")
-    return (family != "diffusion_gemma" and decoders.carries_text(config)
-            and (family not in decoders.families() or decoders.bundles(config)))
+    return family != "diffusion_gemma" and (decoders.bundles(config) if family in decoders.families()
+                                            else decoders.carries_text(config))
 
 
 def _spelled_source_weights(spelling: Mapping[str, str], model: CausalTransformer,
@@ -2329,6 +2388,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         directory = configured.directory(root)
     mamba_ssm = mamba2.is_mamba_ssm(config)
     config = _native_config(config, overrides)
+    # A bundle's folders' configs beside its own, which its media read (`DecoderFamily.wrapper_folders`).
+    config = _with_folders(config, configured, root)
     family = config.get("model_type")
     if routed is None:
         listed = tensors
@@ -2355,6 +2416,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         tensors = sources.load_shards(directory)
     if mamba_ssm:
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
+    if language is None and isinstance(route, WrapperRoute):
+        tensors = _with_folder_tensors(tensors, config, configured, root, weights=weights)
     if prediction_depths is not None:
         # Before a wrapper's language model is taken out of it, by the wrapper's own names: a discarded
         # depth's spellings are neither read nor compared (`_language_model_tensors`).
