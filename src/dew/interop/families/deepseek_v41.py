@@ -38,6 +38,7 @@ from dew.interop.families.deepseek import (
     V4_TRUNK,
     deepseek_v4_prepare,
     dspark_fields,
+    dspark_kept,
     dspark_path,
     v4_depth,
 )
@@ -385,6 +386,7 @@ DEEPSEEK_V41 = DecoderFamily(
     'deepseek_v41', 'DeepseekV41ForCausalLM', lambda model: {},
     weight_path=_deepseek_v41_path, prediction_depth=v4_depth, prepare=deepseek_v4_prepare,
     preserve_source_layout=True, tied_head_names=('head.weight', 'embed.weight'),
+    prediction_counts=('num_nextn_predict_layers', 'n_mtp_layers'), whole_drafter=dspark_kept,
     constants=_deepseek_v41_constants, wrapper=_deepseek_v41_wrapper,
     # The image span's learned vectors sit at the top level, beside the
     # aligner (model.py:1201-1222).

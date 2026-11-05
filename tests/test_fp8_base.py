@@ -116,7 +116,7 @@ def calls(model, variables, inputs):
     """Every Dense call of `model`'s forward: its path, the module unbound, its input and its output. The
     decoder runs the plain loop, each layer's Dense under its own path (`layers_N`): a scan runs a run's
     layers as one traced body, under the run's path, whose values no interceptor reads (row 4099)."""
-    model = model.with_scanned_layers(scanned=False)
+    model = model.clone(scan_layers=False)
     seen = {}
 
     def capture(next_fun, args, kwargs, context):

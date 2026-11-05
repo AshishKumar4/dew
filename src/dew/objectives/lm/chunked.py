@@ -75,9 +75,9 @@ from dew.nn.protocols import (
     AffineHead,
     HiddenStates,
     Lacks,
-    Logits,
     LogitsFromHidden,
     OutputTable,
+    forward_method,
     head_table,
 )
 
@@ -127,18 +127,22 @@ def reads_states(model) -> bool:
 
 def refuse_without_logits(model, objective: str) -> None:
     """Refuse a model `objective` reads no logits from: no head over its final
-    states (`reads_states`) and no logits from its tokens (`Logits`)."""
-    if not reads_states(model) and not isinstance(model, Logits):
+    states (`reads_states`), no logits from its tokens (`Logits`) and no
+    forward that gives them (`forward_method`)."""
+    if not reads_states(model) and forward_method(model, "logits") is None:
         raise Lacks("logits",
                     f"{objective} scores a model's logits, and a {type(model).__name__} gives none: no head "
-                    f"over its final states (HiddenStates with AffineHead or LogitsFromHidden) and no Logits")
+                    f"over its final states (HiddenStates with AffineHead or LogitsFromHidden), no Logits "
+                    f"and no forward")
 
 
 def final_read(model, variables, *args, **kwargs):
     """`model.apply(variables, *args, **kwargs)` reading what a loss scores:
     the final states of a model that scores them through a head
-    (`reads_states`), else the logits it gives from its tokens (`Logits`)."""
-    return model.apply(variables, *args, method="hidden_states" if reads_states(model) else "logits",
+    (`reads_states`), else the logits it gives from its tokens: its `logits`
+    (`Logits`), or a native module's own forward (`forward_method`)."""
+    return model.apply(variables, *args,
+                       method="hidden_states" if reads_states(model) else forward_method(model, "logits"),
                        **kwargs)
 
 

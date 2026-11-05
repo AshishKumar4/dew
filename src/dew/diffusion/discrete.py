@@ -62,7 +62,7 @@ from dew.nn.inputs import (
     unruled_fields,
 )
 from dew.nn.kernels.options import program
-from dew.nn.protocols import Logits, ShiftsLogits, TokenModel
+from dew.nn.protocols import Logits, ShiftsLogits, TokenModel, forward_method
 from dew.nn.sharding import explicit_spec
 
 MDLM_STEPS = 128
@@ -333,7 +333,7 @@ class DiscreteDenoiser:
             fields = {**fields, "attention_pairwise_mask": self.visible}
         logits = self.model.apply(self.params, x_t, **fields, rngs=None, mutable=False,
                                   capture_intermediates=False,
-                                  method="logits" if isinstance(self.model, Logits) else None)
+                                  method=forward_method(self.model, "logits"))
         assert not isinstance(logits, tuple)  # no mutable collections were asked for
         # Normalized in at least fp32 (`dew.nn.categorical`) over the logits each position reads
         # (`aligned`): the reveal draws its categorical from these, and a bf16 log partition would
