@@ -197,3 +197,20 @@ def test_an_updates_corruption_is_each_clips_own_however_the_update_is_split():
         assert whole and set(whole) == set(split)
         for name, tape in whole.items():
             np.testing.assert_array_equal(tape, split[name], err_msg=name)
+
+
+def test_a_tokenizers_patches_are_each_frames_row_major_pixels_whatever_its_leading_axes():
+    """The tokenizer patches each frame of a clip batch `[B, T, H, W, C]` as `nn.scan_orders.patchify` does
+    one image (row 4150: it kept its own reshape): pixel (r, c, k) at patch (r // p) * (W / p) + c // p,
+    place ((r % p) * p + c % p) * C + k, and unpatching returns the frames."""
+    from dew.objectives.world_model import CausalTokenizer
+
+    tokenizer = CausalTokenizer((8, 12, 2), patch=4)
+    frames = jnp.arange(2 * 3 * 8 * 12 * 2, dtype=jnp.float32).reshape(2, 3, 8, 12, 2)
+    patches = np.asarray(tokenizer._patchify(frames))
+    assert patches.shape == (2, 3, 6, 32)
+    r, c, k = np.meshgrid(np.arange(8), np.arange(12), np.arange(2), indexing="ij")
+    placed = np.zeros_like(patches)
+    placed[:, :, (r // 4) * 3 + c // 4, ((r % 4) * 4 + c % 4) * 2 + k] = np.asarray(frames)
+    np.testing.assert_array_equal(patches, placed)
+    np.testing.assert_array_equal(np.asarray(tokenizer._unpatchify(jnp.asarray(patches))), np.asarray(frames))
