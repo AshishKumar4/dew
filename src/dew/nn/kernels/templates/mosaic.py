@@ -353,8 +353,8 @@ def tiled(tiles: tuple[int, ...], schedule: Callable, visit: Callable, *, axis: 
     return ended
 
 
-def consumed(family: "Family", tiles: tuple[int, ...], schedule: Callable, consumer: Callable, store: Callable,
-             index, walking: Callable, *, axis: str) -> jax.Array:
+def consumed(family: "Family", tiles: tuple[int, ...], schedule: Callable, consumer: Callable,
+             store: Callable, index, walking: Callable, *, axis: str) -> jax.Array:
     """Consumer role `index`'s tiles of a persistent kernel (`tiled`'s): each tile's `consumer(index, tile,
     walk, store, active=...)`, `walk` its steps' (`walking(counter, active, steps, views)`, built where the
     tile is visited) where it streams any, a walk of none (`unwalked`) where not. Returns the counter past
