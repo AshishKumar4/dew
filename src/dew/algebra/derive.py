@@ -84,6 +84,14 @@ class Reduction:
     exact: bool = False
     """Whether its forms are extracted exactly (`extract.cheapest`): a declaration whose greedy extraction the
     test suite's oracle finds dearer than the optimum (`dew.cache.Passes.checked`)."""
+    exponential: Callable[[jax.Array], jax.Array] | None = None
+    """The implementation of its exponential (`exponent`'s base), which its walk's every exponential of that
+    base evaluates by: a numerics choice of the declaration's (attention's accurate form's `natural_exp`, as
+    exact as the reference's on every backend), equal to the plain one in the reals; None for JAX's."""
+    rescale: Callable[[jax.Array, jax.Array], jax.Array] | None = None
+    """The factor a carried state takes from its anchor `carried` to the walk's new one `now`, `exp(carried -
+    now)` in the reals, which the walk's rescale evaluates by where given (attention's accurate form's
+    `carried`, its exponent's rounding compensated); None for the plain exponential of the difference."""
 
 
 # The facts the derivation reads (§6.3), each registered from a parameter's own values or saturated by
@@ -221,9 +229,42 @@ def slot(term: Term) -> i64: ...
 """A walked reduction's index among the walk's, its carried state's (`Term.state`)."""
 
 
+def _exponentials() -> list:
+    """The rules that find what scales as `exp(-k)` of an anchor `k` (`scales`), from its exponential."""
+    x, y, z, k, t, base = vars_("x y z k t base", Term)
+    name = var("name", String)
+    p, q, c, d, e, s, f = vars_("p q c d e s f", i64)
+    axes = var("axes", Vec[i64])
+    found = []
+    # An exponential of a local value less an anchor's broadcast, with the axis along which the anchor's own
+    # lies (`at`, -1 for a scalar anchor's), as its broadcast placed it. The same where the largest value's
+    # exponent is held to 0 by a select, `exp(where(x < b, x - b, 0))`, `b` the broadcast of a bound of every
+    # `x` (so the two are equal in the reals): attention's accurate form's weights over scaled logits, its
+    # largest weighing exactly 1 against a compiler's contraction.
+    for power in ("exp", "exp2"):
+        difference = x.binary(String("sub"), base, s)
+        held = x.compare(String("lt"), base, d).select(y, difference)
+        broadcast = (local(x), eq(base).to(k.shaped(String("broadcast_in_dim"), q)), anchor(k),
+                     eq(name).to(String(power)))
+        # `b` at least every `x` (its own maximum, or that maximum floored, `max(max(x), z)`), so that where
+        # `x < b` fails the difference is 0 too.
+        bounds = (eq(k).to(x.reduce(String("max"), axes, p)),
+                  eq(k).to(x.reduce(String("max"), axes, p).binary(String("max"), z, f)),
+                  eq(k).to(z.binary(String("max"), x.reduce(String("max"), axes, p), f)))
+        for exponential, conditions in ((difference.unary(name, e), ()),
+                                        *((held.unary(name, e), (zero(y), bound)) for bound in bounds)):
+            found += [
+                rule(eq(t).to(exponential), *broadcast, *conditions, lays(q, i64(0), c)).then(
+                    scales(t, k, name, e, s, c)),
+                rule(eq(t).to(exponential), *broadcast, *conditions, eq(rules.shape(k)).to(Vec[i64]())).then(
+                    scales(t, k, name, e, s, i64(-1))),
+            ]
+    return found
+
+
 def _walking():
     """The facts' rules (the module's account)."""
-    x, y, z, k, t, base = vars_("x y z k t base", Term)
+    x, y, z, k, t = vars_("x y z k t", Term)
     name, layout = vars_("name layout", String)
     p, q, a, b, c, d, e, s = vars_("p q a b c d e s", i64)
     axes = var("axes", Vec[i64])
@@ -291,20 +332,9 @@ def _walking():
         rule(eq(t).to(x.shaped(name, p)), zero(x)).then(zero(t)),
         rule(eq(t).to(x.convert(p)), zero(x)).then(zero(t)),
     ]
-    # What scales as exp(-k): an exponential of a local value less an anchor's broadcast, and what multiplies,
-    # divides, selects against zeros, sums, casts or lays it out with local values; with the axis along which
-    # the anchor's own lies (`at`, -1 for a scalar anchor's), as its broadcast placed it and each equation
-    # moved it.
-    for power in ("exp", "exp2"):
-        exponential = x.binary(String("sub"), base, s).unary(name, e)
-        broadcast = (local(x), eq(base).to(k.shaped(String("broadcast_in_dim"), q)), anchor(k),
-                     eq(name).to(String(power)))
-        walking += [
-            rule(eq(t).to(exponential), *broadcast, lays(q, i64(0), c)).then(
-                scales(t, k, name, e, s, c)),
-            rule(eq(t).to(exponential), *broadcast, eq(rules.shape(k)).to(Vec[i64]())).then(
-                scales(t, k, name, e, s, i64(-1))),
-        ]
+    # What scales as exp(-k) (`_exponentials`), and what multiplies, divides, selects against zeros, sums,
+    # casts or lays it out with local values, each equation moving the anchor's axis.
+    walking += _exponentials()
     for side in (0, 1):
         def product(scaled, other, params, side=side):
             return scaled.binary(String("mul"), other, params) if side == 0 else other.binary(
@@ -362,9 +392,11 @@ WALKING = _walking()
 SHAPES = _shapes()
 
 
-def _decoupled():
+def _decoupled(rescaling: bool = False):
     """The derivation's rules (the module's account): each reading distributes over the language, and a walked
-    reduction's step, merge and finish are its monoid's, a sum that scales with an anchor rescaled first."""
+    reduction's step, merge and finish are its monoid's, a sum that scales with an anchor rescaled first, by
+    the plain exponential of the anchors' difference, or `rescaling` by the declaration's own rescale
+    (`Reduction.rescale`, the language's binary `rescale` of the two anchors, which no rule rewrites)."""
     x, y, z, k, t = vars_("x y z k t", Term)
     name = var("name", String)
     p, e, s, side, a, b, at, along, lift, added, multiplied, largest, i, floor, typed = vars_(
@@ -416,6 +448,8 @@ def _decoupled():
     # at least the least finite value, so a state that has seen nothing (both -inf) rescales by 0.
     def correction(carried_side, now):
         shifted = now.binary(String("max"), Term.literal(floor), largest)
+        if rescaling:
+            return k.held(carried_side).binary(String(terms.RESCALE), shifted, e).convert(typed)
         return k.held(carried_side).binary(String("sub"), shifted, s).unary(name, e).convert(typed)
 
     def rescaled(carried_side, now):
@@ -445,7 +479,7 @@ def _decoupled():
                                                                   added), *conditions),
             rewrite(t.finished()).to(Term.state(i, 0), *conditions),
         ]
-    return ruleset(*derived, name="decoupled")
+    return ruleset(*derived, name="decoupled rescaled" if rescaling else "decoupled")
 
 
 @function
@@ -465,9 +499,16 @@ def _plain():
         name="plain walked")
 
 
+EXPONENTIALS = {2: "exp2", "e": "exp"}
+"""The language's exponential of each base a declaration states (`Reduction.exponent`)."""
+
+
 DECOUPLED = rules.Rules("decoupled", "reorders", _decoupled(),
                         receipt="docs/design/algebra.md §6.9; tests/test_algebra_derive.py")
 """The derivation's rules, run beside the engine's sets (`rules.admitted`) and never among them."""
+DECOUPLED_RESCALED = rules.Rules("decoupled rescaled", "reorders", _decoupled(rescaling=True),
+                                 receipt="docs/design/algebra.md §6.9; tests/test_algebra_derive.py")
+"""`DECOUPLED` for a declaration that states its own rescale (`Reduction.rescale`)."""
 PLAIN = _plain()
 
 
@@ -538,6 +579,10 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
     names = tuple(declaration.operands)
     walked_axes = {name: axes.index(declaration.walked) for name, axes in declaration.operands.items()
                    if declaration.walked in axes}
+    # The declaration's own numerics its forms evaluate by (`Reduction.exponential`, `rescale`).
+    declared = {"exponential": None if declaration.exponential is None else
+                (EXPONENTIALS[declaration.exponent], declaration.exponential),
+                "rescale": declaration.rescale}
     @functools.lru_cache(maxsize=FORMS_HELD)
     def derived_at(contexts: tuple, keyed: tuple) -> _Forms:
         del contexts  # The key alone: the derivation reads them where it runs.
@@ -570,7 +615,7 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
     def step(state, tiles, *, product=None, accumulate=None, add=None, outputs: Sequence[int] = ()):
         made = forms(shaped(tiles))
         value = evaluator(made.region, [*made.consts, *(tiles[name] for name in names)],
-                          carried(made, state), product=product)
+                          carried(made, state), product=product, **declared)
         stepped = []
         for index, form in enumerate(made.steps):
             if accumulate is not None and (parts := made.accumulated[index]) is not None:
@@ -597,13 +642,13 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
         # A merge reads no walked operand (`_derived`), its unwalked ones whole.
         leaves = [*made.consts, *(None if operands is None or name in walked_axes else operands[name]
                                   for name in names)]
-        value = evaluator(made.region, leaves, carried(made, a, b))
+        value = evaluator(made.region, leaves, carried(made, a, b), **declared)
         return tuple(value(form) for form in made.merges)
 
     def finish(state, operands=None, *, shapes: Mapping):
         made = forms(shapes)
         leaves = [*made.consts, *(None if operands is None else operands[name] for name in names)]
-        value = evaluator(made.region, leaves, carried(made, state))
+        value = evaluator(made.region, leaves, carried(made, state), **declared)
         # A literal output is its literal; one along the walked axis, `mapped`'s.
         outputs = [jnp.asarray(literal) if term is None else None if form is None else value(form)
                    for term, literal, form in zip(made.region.outputs, made.region.literal_outputs,
@@ -612,7 +657,7 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
 
     def mapped(tiles):
         made = forms(shaped(tiles))
-        value = evaluator(made.region, [*made.consts, *(tiles[name] for name in names)], {})
+        value = evaluator(made.region, [*made.consts, *(tiles[name] for name in names)], {}, **declared)
         outputs = [value(form) if along and form is not None else None
                    for form, along in zip(made.outputs, made.mapped, strict=True)]
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
@@ -684,8 +729,9 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     schedule = cost.walk(cost.target())
     _, before = extract.cheapest(graph, declared, cost.model(region, schedule))
     facts = seq(rules.FACTS.saturate(), SHAPES.saturate(), WALKING.saturate())
-    _decoupled_through(graph, region, facts)
-    saturated = program.saturate(graph, region, (*rules.admitted(accurate), DECOUPLED),
+    decoupled = DECOUPLED if declaration.rescale is None else DECOUPLED_RESCALED
+    _decoupled_through(graph, region, facts, decoupled)
+    saturated = program.saturate(graph, region, (*rules.admitted(accurate), decoupled),
                                  saturation, facts)
     # Each step a rule wrote as a mainloop's accumulator or its own addition takes it, its parts extracted
     # with the forms.
@@ -731,13 +777,13 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
                   walked_leaves, tuple(closed.consts), report, tuple(accumulated), tuple(added))
 
 
-def _decoupled_through(graph: EGraph, region: terms.Region, facts: Schedule) -> None:
+def _decoupled_through(graph: EGraph, region: terms.Region, facts: Schedule, decoupled: rules.Rules) -> None:
     """The derivation's readings run through `region`'s terms alone first (`DECOUPLED`, its facts saturated
     after each pass): each reading meets the language at the region's depth, before the engine's sets grow
     the graph toward their limits, so a limit the engine reaches never stops a form."""
     for _ in range(4 * max(region.depth, 1) + 8):
         graph.run(facts)
-        if not graph.run(DECOUPLED.ruleset).updated:
+        if not graph.run(decoupled.ruleset).updated:
             break
     graph.run(facts)
 

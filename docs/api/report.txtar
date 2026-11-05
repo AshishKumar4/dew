@@ -200,7 +200,7 @@ class Process(schedule: NoiseScheduler, prediction: PredictionTransform, weighti
   .times(self, steps: int) -> jax.Array
   .variances(self, t, *, like: jax.Array) -> tuple[jax.Array, jax.Array]
   .weight(self, t) -> jax.Array
-class ProfileWindow(directory: str, steps: int, warmup: int = 2, capture: dew.telemetry.profile.CaptureOptions = <factory>) -> None  [dew.training.profiling]
+class ProfileWindow(directory: str | None, steps: int, warmup: int = 2, capture: dew.telemetry.profile.CaptureOptions = <factory>) -> None  [dew.training.profiling]
 class Profiler(directory: str | os.PathLike[str] | None = None, *, options: jax.profiler.ProfileOptions | None = None, reports: bool = True) -> None  [dew.telemetry.profile]
   .captures: property -> tuple[Path, ...]
   .directory: property -> Path | None
@@ -431,7 +431,7 @@ dew.config.TrainerConfig
   mesh: dew.distributed.placement.MeshSpec = dew.distributed.placement.MeshSpec()
   microbatches: int | None = None
   layout: dew.distributed.placement.Layout = dew.distributed.placement.Layout()
-  profile: dew.training.profiling.ProfileWindow | None = None
+  profile: dew.training.profiling.ProfileWindow | None = dew.training.profiling.run_window()
   compilation_cache_dir: str | None = None
   wandb: dew.training.tracker.Wandb | None = None
   publish: bool = False
