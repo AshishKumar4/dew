@@ -13,7 +13,7 @@ import grain.python as grain
 from dew._records import boolean, integer, integers, listed, record
 
 from .dataset import LONG_RUN, DataPartition, Loading, logged_run, restore_parent
-from .sources.base import Shard, ShardManifest, ShardReader
+from .sources.base import Shard, ShardManifest, ShardOpener
 
 _log = logging.getLogger(__name__)
 
@@ -307,7 +307,7 @@ class _EmptyRun:
 class _Taken:
     """A shard reader of `(shard, rows)` places (`bounded_places`): the shard's first `rows` rows."""
 
-    reader: ShardReader
+    reader: ShardOpener
 
     def __call__(self, place: tuple[Shard, int],
                  options: grain.ReadOptions | None = None) -> grain.IterDataset:

@@ -1,4 +1,4 @@
-"""A shard's indexed rows streamed under the read options its reading gives (`ShardReader`)."""
+"""A shard's indexed rows streamed under the read options its reading gives (`ShardOpener`)."""
 
 from collections.abc import Mapping
 
@@ -8,7 +8,7 @@ from dew._records import integer
 
 
 def streamed_rows(rows: grain.MapDataset, options: grain.ReadOptions | None) -> grain.IterDataset:
-    """A shard's indexed `rows` streamed under `options` (`ShardReader`): on Grain's prefetch where they
+    """A shard's indexed `rows` streamed under `options` (`ShardOpener`): on Grain's prefetch where they
     read on threads of their own or Grain's defaults (None), else read by index on the thread that draws
     them, a mix member's share of no thread (`_IndexedRows`), which Grain's prefetch of no threads read
     too but registered for its statistics each time a shard opened and never let go (its iterators'

@@ -137,7 +137,7 @@ from dew.data.pipeline import (
 from dew.data.plan import PLAN_VERSIONS, Manifest
 from dew.data.readers import _FillShare
 from dew.data.shards import bounded as shards_bounded, bounded_places, streamed
-from dew.data.sources.base import Read, Shard, ShardManifest, ShardReader, Source, materialized
+from dew.data.sources.base import Read, Shard, ShardManifest, ShardOpener, Source, materialized
 from dew.data.sources.urls import Fetch
 from dew.data.steps.text import LayoutRule, ValidTargets, counted_window, recounted
 from dew.data.text import Chunks
@@ -414,7 +414,7 @@ class _Rest:
 
 @dataclasses.dataclass(frozen=True)
 class _PlacedShards:
-    reader: ShardReader
+    reader: ShardOpener
     starts: Mapping[str, int]
 
     def __call__(self, shard: Shard, options: pygrain.ReadOptions | None = None) -> pygrain.IterDataset:
@@ -730,7 +730,7 @@ class _ShardSteps:
     flattens the shards where it stands. Rejected rows stay marked for the
     accepting reader after it."""
 
-    reader: ShardReader
+    reader: ShardOpener
     stages: tuple[Map | MapWithIndex | Filter | FlatMap, ...]
     cached: bool
     name: str

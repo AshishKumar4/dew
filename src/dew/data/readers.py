@@ -231,7 +231,8 @@ class _PerShare(Forwarding):
             state = self._reader().get_state()
             self._publish(state)
         saved = {"dew_data_plan": self._plan.record(), "counters": COUNTERS, "iterator": state}
-        # A mix's captured positions are shared mappings (`Shared`), written as the records they read as.
+        # A mix's captured positions are shared mappings (`SharedMapping`), written as the records they
+        # read as.
         return json.dumps(json_value({position.REPLICATED: saved} if self._replicated else saved,
                                      "data position")).encode()
 

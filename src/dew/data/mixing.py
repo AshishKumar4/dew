@@ -23,7 +23,7 @@ from dew._records import boolean, integer, record, text
 from dew.batch import Batch
 from dew.data.dataset import LONG_RUN, logged_run
 from dew.data.pipeline import Owed, Record, Rejected, accounts, member_of, members_of
-from dew.data.shared import Shared
+from dew.data.shared import SharedMapping
 
 _log = logging.getLogger(__name__)
 
@@ -227,7 +227,7 @@ class _KeepAccepted:
         which that next row carries on (`_AcceptedIterator`)."""
         self.rejections = 0
         """How many records it rejected, its own and its members', counted as it rejects them."""
-        self._states: Shared[Mapping[str, object]] | None = None
+        self._states: SharedMapping[Mapping[str, object]] | None = None
         self._touched: set[str] = set(self.members)
         """The members whose counts moved since `_states` was made, which alone a capture makes again."""
 
@@ -238,13 +238,13 @@ class _KeepAccepted:
         self._touched.add(member)
         return self.members[member]
 
-    def member_states(self) -> Shared[Mapping[str, object]]:
+    def member_states(self) -> SharedMapping[Mapping[str, object]]:
         """Each member's counts as they stand, by member key (`MEMBERS`): the states captured before, the
-        members' that moved since made again, the rest shared with them (`Shared`), so a capture before
+        members' that moved since made again, the rest shared with them (`SharedMapping`), so a capture before
         each record costs it the members it counted, not every member (row 4079)."""
         touched = {key: {"corpus": self.members[key].name, "label": self.members[key].label,
                          "counts": self.members[key].state()} for key in self._touched}
-        self._states = Shared.of(touched) if self._states is None else self._states.replaced(touched)
+        self._states = SharedMapping.of(touched) if self._states is None else self._states.replaced(touched)
         self._touched.clear()
         return self._states
 
@@ -509,7 +509,7 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         self._reads, self._weights, self._tokens, self._keys = tuple(reads), weights, tokens, keys
         self._delivered = [0] * len(reads)
         # The targets each corpus delivered as a position holds them, the one corpus a row read replaced.
-        self._sent: Shared[int] = Shared(keys, self._delivered)
+        self._sent: SharedMapping[int] = SharedMapping(keys, self._delivered)
         self._positions = _Captured(dict(zip(keys, self._reads, strict=True)))
 
     def __next__(self) -> Batch:
@@ -554,7 +554,7 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         total, weight = sum(restored), sum(w for w, held in zip(self._weights, kept, strict=True) if held)
         self._delivered = [delivered[key] if held else (w * total // weight if weight else 0)
                            for key, w, held in zip(self._keys, self._weights, kept, strict=True)]
-        self._sent = Shared(self._keys, self._delivered)
+        self._sent = SharedMapping(self._keys, self._delivered)
 
     def close(self) -> None:
         for read in self._reads:
@@ -911,12 +911,12 @@ class KeyedMix(pygrain.IterDataset[Batch]):
 
 class _Captured:
     """A mix's corpora's positions by key, captured before each record the mix gives: the corpus it read
-    since the last capture captured again, every other's shared with it (`Shared`), so a capture costs
+    since the last capture captured again, every other's shared with it (`SharedMapping`), so a capture costs
     a record the corpus it read, not every corpus (row 4079)."""
 
     def __init__(self, reads: Mapping[str, pygrain.DatasetIterator[Batch]]):
         self._reads = reads
-        self._held: Shared[Mapping[str, object]] | None = None
+        self._held: SharedMapping[Mapping[str, object]] | None = None
         self._moved: set[str] = set(reads)
 
     def moved(self, key: str) -> None:
@@ -927,12 +927,12 @@ class _Captured:
         """Every corpus restored, each captured again at the next capture."""
         self._moved = set(self._reads)
 
-    def captured(self) -> Shared[Mapping[str, object]]:
+    def captured(self) -> SharedMapping[Mapping[str, object]]:
         # Each moved corpus's position copied whole as it is captured, a snapshot no read of it moves on
         # (Grain's iterators may hand back what they keep), which the shared mapping holds as it is, and a
-        # copy of it with it (`Shared.__deepcopy__`).
+        # copy of it with it (`SharedMapping.__deepcopy__`).
         changed = {key: copy.deepcopy(self._reads[key].get_state()) for key in self._moved}
-        self._held = Shared.of(changed) if self._held is None else self._held.replaced(changed)
+        self._held = SharedMapping.of(changed) if self._held is None else self._held.replaced(changed)
         self._moved.clear()
         return self._held
 

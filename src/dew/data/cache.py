@@ -45,7 +45,7 @@ from dew.data.once import LOCK, locked_cached_property
 from dew.data.pipeline import Record, Rejected, Volatile
 from dew.data.retention import LocalRetention
 from dew.data.sinks import write_array_record
-from dew.data.sources.base import Shard, ShardReader, Source
+from dew.data.sources.base import Shard, ShardOpener, Source
 from dew.data.sources.codec import Unencodable, encode
 from dew.data.sources.records import ArrayRecords
 from dew.data.storage import PreconditionFailed, Store, _byte_size
@@ -236,12 +236,12 @@ class Cache:
 
     def streamed(
         self,
-        reader: ShardReader,
+        reader: ShardOpener,
         key: DependencyManifest,
         *,
         transform: Transform | None = None,
         threads: int | None = None,
-    ) -> ShardReader:
+    ) -> ShardOpener:
         computed = (reader if transform is None
                     else _PassthroughReader(reader, _Passthrough(transform), threads))
         if transform is not None and _volatile(transform):
@@ -813,7 +813,7 @@ class _Applied:
 
 @dataclass(frozen=True)
 class _PassthroughReader:
-    reader: ShardReader
+    reader: ShardOpener
     transform: _Passthrough
     threads: int | None = None
 
@@ -827,7 +827,7 @@ class _PassthroughReader:
 
 @dataclass(frozen=True)
 class _CachedReader:
-    reader: ShardReader
+    reader: ShardOpener
     cache: Cache
     key: DependencyManifest
     transform: Transform | None

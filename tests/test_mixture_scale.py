@@ -129,7 +129,7 @@ def test_a_thousand_sources_compile_and_step_without_a_cost_per_source(by, recor
     """A user's packed mixture, the default packer and loading (`packed`), steps once it has read from every
     source at no cost per source: a thousand sources' step reads the records it packs and nothing of the
     sources it does not draw, asks the positions the packer asks before each document in the calls ten
-    do (a mix's position captured copy-on-write, `Shared`, each capture asking again only what the
+    do (a mix's position captured copy-on-write, `SharedMapping`, each capture asking again only what the
     document moved), holds the threads ten do (its members read under their share of the loading, one
     after another on the thread that draws from them), and keeps no block a step, and compiling them
     costs memory linear in their count (row 4079: each document's capture asked and copied every

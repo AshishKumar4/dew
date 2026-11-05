@@ -101,7 +101,7 @@ def _uncounted(metadata: Mapping[str, object]) -> Mapping[str, object]:
     return {name: value for name, value in metadata.items() if name not in _COUNTS}
 
 
-class ShardReader(Protocol):
+class ShardOpener(Protocol):
     """Opens a shard (`ShardManifest.reader`): its records in order, read under the grain `ReadOptions` its
     reading gives (`dew.data.shards`: the run's loading, or a mix member's share of it), Grain's own where
     it gives none."""
@@ -126,7 +126,7 @@ class ShardManifest:
     (`_indexed_manifest`)."""
 
     shards: tuple[Shard, ...]
-    reader: ShardReader
+    reader: ShardOpener
     subdivide: Callable[[int], tuple[Shard, ...]] | None = None
     index_ordered: bool = False
 
@@ -294,7 +294,7 @@ def materialized(source: Source) -> TypeGuard[Materialized]:
 
 
 def _indexed_manifest(source: Source, uri: str, rows: int,
-                      reader: ShardReader | None = None) -> ShardManifest:
+                      reader: ShardOpener | None = None) -> ShardManifest:
     """The records `source` reads by index as a stream: consecutive ranges of
     at most `rows` records, each `Shard` named by the record it starts at,
     which no copy of the source names otherwise, wherever it is, and read at
