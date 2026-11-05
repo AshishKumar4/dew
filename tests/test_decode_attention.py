@@ -12,10 +12,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from arm_arithmetic import float64_held
-from attention_oracle import attention_terms, exact_attention, float64_weights
+from attention_oracle import attention_on_par, exact_attention, float64_weights
+from contract_support import normal_drawn
 from model_support import as_stepped
-from one_draw import assert_as_exact_as_the_reference
-from reference_error import FEWEST_SEEDS, assert_as_exact, assert_fp32_reduction_bound
+from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, assert_fp32_reduction_bound
 
 from dew.nn.attention import attention_case, scaled_dot_product_attention
 from dew.nn.attention_masks import with_key_lengths
@@ -27,6 +27,10 @@ from dew.nn.precision import FP32_SUMS
 pytestmark = pytest.mark.kernel
 
 
+FOLDED_SEEDS = 8
+"""Folded attention's declared check-1 seeds in bf16, sized by `seeds_for` paired."""
+
+
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("heads", [1, 2])
 def test_folded_attention_is_jax_nn_attention(dtype, heads):
@@ -36,9 +40,9 @@ def test_folded_attention_is_jax_nn_attention(dtype, heads):
     keys and the value product's over keys times heads (exact zeros between),
     so it sits within their summed chains of jax.nn's
     (`assert_fp32_reduction_bound`), the logits' rounding carried through the
-    softmax at twice the largest logit magnitude. In bf16 it is within
-    tests/reference_error.py's rule of jax.nn against float64. Rows read 1,
-    17 and all 40 keys."""
+    softmax at twice the largest logit magnitude. In bf16 it is on par with
+    jax.nn over drawn inputs (check 1, the truth jax.nn's float64 run). Rows
+    read 1, 17 and all 40 keys."""
     rng = np.random.default_rng(0)
     query = rng.normal(size=(3, 4, heads, 256))
     key, value = rng.normal(size=(2, 3, 40, heads, 256)) * np.array([0.3, 1.0])[:, None, None, None, None]
@@ -53,15 +57,27 @@ def test_folded_attention_is_jax_nn_attention(dtype, heads):
     read = np.arange(40)[None, None, None, :] < np.asarray(lengths)[:, None, None, None]
     with jax.enable_x64(new_val=True):
         probs = np.asarray(float64_weights(jnp.asarray(q), jnp.asarray(k), read, None, None)[0])
-        truth = np.asarray(exact_attention(*(jnp.asarray(x) for x in (q, k, v)), keep=read))
     if dtype == jnp.float32:
         spread = np.where(read, np.einsum('btnd,bsnd->bnts', np.abs(q), np.abs(k)) / 16.0, 0).max(-1)
         carried = 1 + 2 * spread.transpose(0, 2, 1)[..., None]
         magnitudes = np.einsum('bnts,bsnd->btnd', probs, np.abs(v)) * carried
         assert_fp32_reduction_bound(folded, plain, magnitudes, terms=256 + 40 + 40 * heads)
         return
-    assert_as_exact_as_the_reference(np.asarray(folded, np.float32), np.asarray(plain, np.float32), truth,
-                                     "folded")
+
+    def draw(seed):
+        rng = np.random.default_rng([0xF01, seed])
+        query = rng.normal(size=(3, 4, heads, 256))
+        key, value = rng.normal(size=(2, 3, 40, heads, 256)) * np.array([0.3, 1.0])[:, None, None, None, None]
+        return tuple(jnp.asarray(x, dtype) for x in (query, key, value))
+
+    # The truth attention written out over each row's keys: raw jax.nn takes its softmax in fp32 whatever
+    # its operands (src/dew/nn/attention.py).
+    reads = np.arange(40)[None, None, None, :] < np.asarray(lengths)[:, None, None, None]
+    assert_as_exact(lambda q, k, v: folded_attention(q, k, v, with_key_lengths(None, lengths, 40)),
+                    lambda q, k, v: jax.nn.dot_product_attention(q, k, v, key_value_seq_lengths=lengths,
+                                                                 implementation='xla'),
+                    draw, "folded", seeds=FOLDED_SEEDS, terms=True,
+                    truth_fn=lambda q, k, v: exact_attention(q, k, v, keep=reads))
 
 
 ON_GPU = jax.default_backend() == "gpu"
@@ -76,12 +92,13 @@ def on_the_gpu():
     return contextlib.nullcontext() if ON_GPU else assumed("sm80")
 
 
-def dense_operands(dtype, windowed=False) -> tuple:
+def dense_operands(dtype, windowed=False, seed: int = 0) -> tuple:
     """Rows reading 1 key (an idle slot), a block's worth, one past it, 77 keys and the whole capacity
     of 32 blocks, at Qwen3.5-0.8B's widths (4 query positions over 2 key heads of 256): the queries, keys,
     values and lengths, and with `windowed` the rows' starts within a block, at one, mid-row and a window of
-    300 keys before a full row's end, as a sliding window's decode reads them."""
-    rng = np.random.default_rng(0)
+    300 keys before a full row's end, as a sliding window's decode reads them; their values drawn by
+    `seed`, the rows' lengths and starts the same at every seed."""
+    rng = np.random.default_rng(seed)
     capacity = 32 * decode_attention.BLOCK
     lengths = jnp.asarray([1, decode_attention.BLOCK, decode_attention.BLOCK + 1, 77, capacity], jnp.int32)
     rows = lengths.shape[0]
@@ -92,19 +109,6 @@ def dense_operands(dtype, windowed=False) -> tuple:
     return query, key, value, lengths, *((starts,) if windowed else ())
 
 
-def dense_case(dtype, windowed=False):
-    """`dense_operands` and their float64 truth: 32 steps of the loop, a slice each at the most, so the slices
-    of each config cut short rows to empty ones."""
-    arrays = dense_operands(dtype, windowed)
-    query, key, value, lengths = arrays[:4]
-    starts = arrays[4] if windowed else jnp.zeros_like(lengths)
-    read = spanned(starts, lengths, key.shape[1])
-    with jax.enable_x64(new_val=True):
-        truth = np.asarray(exact_attention(*(jnp.asarray(x, jnp.float64) for x in (query, key, value)),
-                                           keep=read))
-    return arrays, truth
-
-
 def spanned(starts, lengths, capacity):
     """Each row's keys from its start to its length, `[rows, 1, 1, capacity]`."""
     keys = np.arange(capacity)[None, None, None, :]
@@ -112,35 +116,44 @@ def spanned(starts, lengths, capacity):
     return (keys >= first) & (keys < last)
 
 
+DECODE_KERNEL_SEEDS = 8
+"""The decode kernel's declared check-1 seeds a config, sized by `seeds_for` paired."""
+
+
 @pytest.mark.parametrize("windowed", [False, True], ids=["prefix", "window"])
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 def test_the_decode_kernel_reads_each_row_to_its_length_at_every_config(dtype, windowed):
     """`dew.nn.kernels.decode_attention` reads each row's keys up to its length, from its start where
     a window gives one, block by block, at each slice count it may take (`SPLITS`, `tuning.pinned`:
-    one slice a row, or more whose fp32 sums XLA combines), and is within tests/reference_error.py's
-    rule of jax.nn's xla attention under the same keys' mask against float64. Compiled
+    one slice a row, or more whose fp32 sums XLA combines), on par with jax.nn's xla attention under the
+    same keys' mask over drawn inputs (check 1, the truth its float64 run). Compiled
     on a GPU at the default precision, which the GPU lane otherwise sets to the highest
     (tests/lane_environment.py), its fp32 products must be fp32 ones, held to jax.nn's at fp32
     precision; Triton's default is one TF32 product. Elsewhere it runs interpreted."""
     from dew.nn.kernels import decode_attention, tuning
 
-    arrays, truth = dense_case(dtype, windowed)
+    def draw(seed):
+        return dense_operands(dtype, windowed, seed)[:3]
 
-    def attend(*arrays):
-        return decode_attention.attend(*arrays, interpret=not ON_GPU)
+    lengths = dense_operands(dtype, windowed)[3]
+    starts = dense_operands(dtype, windowed)[4] if windowed else jnp.zeros_like(lengths)
+    mask = jnp.asarray(spanned(starts, lengths, draw(0)[1].shape[1]))
+    windowing = (starts,) if windowed else ()
 
-    starts = arrays[4] if windowed else jnp.zeros_like(arrays[3])
-    with jax.default_matmul_precision("float32"):
-        plain = jax.nn.dot_product_attention(*arrays[:3], mask=jnp.asarray(spanned(starts, arrays[3],
-                                                                                   arrays[1].shape[1])),
-                                             implementation='xla')
+    def plain(query, key, value):
+        with jax.default_matmul_precision("float32"):
+            return jax.nn.dot_product_attention(query, key, value, mask=mask, implementation='xla')
+
     for config in map(decode_attention.Split, decode_attention.SPLITS):
-        pin = tuning.pinned({decode_attention.DecodeAttention: config})
-        with on_the_gpu(), pin, jax.default_matmul_precision("default"):
-            out = jax.jit(attend)(*arrays)
-        assert out.shape == plain.shape and out.dtype == plain.dtype
-        assert_as_exact_as_the_reference(np.asarray(out, np.float32), np.asarray(plain, np.float32), truth,
-                                         f"decode kernel, {config}")
+        def attend(query, key, value, config=config):
+            pin = tuning.pinned({decode_attention.DecodeAttention: config})
+            with on_the_gpu(), pin, jax.default_matmul_precision("default"):
+                return decode_attention.attend(query, key, value, lengths, *windowing, interpret=not ON_GPU)
+
+        out = jax.jit(attend)(*draw(0))
+        assert out.shape == jax.eval_shape(plain, *draw(0)).shape and out.dtype == draw(0)[0].dtype
+        assert_as_exact(attend, plain, draw, f"decode kernel, {config}", seeds=DECODE_KERNEL_SEEDS,
+                        terms=True, truth_fn=lambda q, k, v: exact_attention(q, k, v, keep=np.asarray(mask)))
 
 
 SINKS = (0.5, -1.0, 2.0, -3.0)
@@ -150,7 +163,7 @@ SOFTCAP = 0.5
 
 
 def grouped_case(dtype):
-    """`dense_case`'s keys, lengths and capacity under 2 query positions of 4 query heads, a key head's
+    """`dense_operands`' keys, lengths and capacity under 2 query positions of 4 query heads, a key head's
     pair reading it as gpt-oss's 64 read their 8."""
     _, key, value, lengths = dense_operands(dtype)
     query = jnp.asarray(np.random.default_rng(1).normal(size=(key.shape[0], 2, 4, key.shape[-1])), dtype)
@@ -360,29 +373,29 @@ def test_a_grouped_query_in_its_own_layout_reaches_the_decode_kernel(generation)
             lowering_platforms=("cuda",))
 
 
+GROUPED_SEEDS = 8
+"""A grouped lone query's declared check-1 seeds, sized by `seeds_for` paired."""
+
+
 @pytest.mark.parametrize("implementation", ["xla", "reference"])
 def test_a_grouped_query_attends_as_its_heads_do_alone(implementation):
     """Grouped in the core, a lone query of 8 heads over 2 key heads with key lengths gives each head's
-    attention over its key head's keys, within tests/reference_error.py's rule of the reference over
-    the key heads repeated, against float64."""
+    attention over its key head's keys, on par with the reference over the key heads repeated over
+    drawn inputs (check 1, the truth its float64 run)."""
     from dew.nn.attention import reference_attention
     from dew.nn.attention_masks import repeat_kv_heads
 
-    rng = np.random.default_rng(3)
     lengths = jnp.asarray([1, 9, 32], jnp.int32)
-    query, key, value = (jnp.asarray(rng.normal(size=shape), jnp.float32)
-                         for shape in ((3, 1, 8, 32), (3, 32, 2, 32), (3, 32, 2, 32)))
-    found = scaled_dot_product_attention(query, key, value, implementation=implementation,
-                                         key_value_seq_lengths=lengths)
+
+    draw = normal_drawn(3, (3, 1, 8, 32), (3, 32, 2, 32), (3, 32, 2, 32))
 
     def alone(query, key, value):
         mask = (jnp.arange(key.shape[1]) < lengths[:, None])[:, None, None, :]
         return reference_attention(query, repeat_kv_heads(key, 8), repeat_kv_heads(value, 8), mask=mask)
 
-    with jax.enable_x64(new_val=True):
-        truth = alone(*(jnp.asarray(x, jnp.float64) for x in (query, key, value)))
-    assert_as_exact_as_the_reference(np.asarray(found), np.asarray(alone(query, key, value)),
-                                     np.asarray(truth), f"grouped {implementation}")
+    assert_as_exact(lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=implementation,
+                                                                 key_value_seq_lengths=lengths),
+                    alone, draw, f"grouped {implementation}", seeds=GROUPED_SEEDS)
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
@@ -410,36 +423,45 @@ def test_a_windowed_layers_decode_step_reads_its_window_through_the_decode_kerne
         jax.jit(step).trace(variables, cache, tokens).lower(lowering_platforms=("cuda",))
 
 
+WINDOWED_DECODE_SEEDS = 8
+"""A windowed decode's declared check-1 seeds against its whole passes, sized by `seeds_for` paired."""
+
+
 def test_a_windowed_decode_step_attends_as_its_whole_pass():
     """A windowed layer's decode, its keys from each row's first under a window of 5 over a 64-slot
     cache at widths the decode kernel takes (heads 16 wide), gives what its whole passes give at each
-    token, each step's at the width it reads (`as_stepped`), within tests/reference_error.py's rule of
-    them against the float64 whole pass: the starts the decode reads are the window's keys. On a GPU
+    token, each step's at the width it reads (`as_stepped`), on par with them over drawn tokens (check 1,
+    the truth the float64 whole pass): the starts the decode reads are the window's keys. On a GPU
     the same steps run the decode kernel in every layer."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
     model = CausalTransformer(vocab_size=64, num_layers=2, emb_features=64, num_heads=4, num_kv_heads=2,
                               max_seq_len=64, layer_types=("sliding_attention",) * 2,
                               kinds={"sliding_attention": {"window": 5}}, attention_impl="xla")
-    tokens = jax.random.randint(jax.random.key(3), (2, 12), 0, 64)
-    variables = model.init(jax.random.key(0), tokens)
-    whole = as_stepped(jax.jit(lambda held: model.apply(variables, held)), tokens, 4)
-    with jax.enable_x64(new_val=True):
-        wide = float64_held(variables)
-        truth = np.asarray(model.clone(dtype=jnp.float64).apply(wide, tokens), np.float64)
+    variables = model.init(jax.random.key(0), jnp.zeros((2, 12), jnp.int32))
+    forward = jax.jit(lambda held: model.apply(variables, held))
     cache = model.apply(variables, 2, method=CausalTransformer.init_cache, mutable=["cache"])[1]["cache"]
-    _, state = model.apply({**variables, "cache": cache}, tokens[:, :4], decode=True, mutable=["cache"])
 
     @jax.jit
     def step(cache, token):
         return model.apply({**variables, **cache}, token, decode=True, mutable=["cache"])
 
-    steps = []
-    for index in range(4, 12):
-        out, state = step(state, tokens[:, index:index + 1])
-        steps.append(out)
-    decoded = np.asarray(jnp.concatenate(steps, axis=1), np.float64)
-    assert_as_exact_as_the_reference(decoded, np.asarray(whole[:, 4:], np.float64), truth[:, 4:], "decode")
+    @as_given
+    def decoded(tokens):
+        _, state = model.apply({**variables, "cache": cache}, tokens[:, :4], decode=True, mutable=["cache"])
+        steps = []
+        for index in range(4, 12):
+            out, state = step(state, tokens[:, index:index + 1])
+            steps.append(out)
+        return np.asarray(jnp.concatenate(steps, axis=1), np.float64)
+
+    def draw(seed):
+        return (np.asarray(jax.random.randint(jax.random.key(seed), (2, 12), 0, 64), np.int32),)
+
+    wide = model.clone(dtype=jnp.float64)
+    stepped = as_given(lambda tokens: np.asarray(as_stepped(forward, tokens, 4)[:, 4:], np.float64))
+    assert_as_exact(decoded, stepped, draw, "decode", seeds=WINDOWED_DECODE_SEEDS,
+                    truth_fn=lambda tokens: wide.apply(float64_held(variables), tokens)[:, 4:])
 
 
 @pytest.mark.parametrize("options", [{}, {"force_fp32_for_softmax": False},
@@ -477,31 +499,38 @@ def test_key_starts_attend_as_the_mask_they_mean(options):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 
 
+STARTS_SEEDS = 8
+"""Key starts under reference arithmetic: declared check-1 seeds, sized by `seeds_for` paired."""
+
+
 @pytest.mark.parametrize("options", [{"force_fp32_for_softmax": False},
                                      {"precision": jax.lax.Precision.HIGHEST}], ids=["softmax", "precision"])
 def test_key_starts_keep_the_arithmetic_auto_is_asked_for_where_the_decode_kernel_would_run(options):
     """A lone grouped query of decode-kernel widths over key starts and lengths alone, traced as on
     an A100, asking for arithmetic only the reference path performs: 'auto' takes the reference
-    path, not the decode kernel (which refused the options by name), and is within
-    tests/reference_error.py's rule of the one-mask form against float64; the grouped query sums
-    in another order."""
+    path, not the decode kernel (which refused the options by name), and is on par with the one-mask
+    form over drawn inputs (check 1, the truth the reference path's float64 run); the grouped query
+    sums in another order."""
     from dew.nn.kernels.generation import assumed
 
-    rng = np.random.default_rng(6)
-    query, key, value = (jnp.asarray(rng.normal(size=shape), jnp.float32)
-                         for shape in ((3, 1, 4, 16), (3, 64, 2, 16), (3, 64, 2, 16)))
     lengths, starts = jnp.asarray([2, 40, 64], jnp.int32), jnp.asarray([1, 8, 0], jnp.int32)
     keys = jnp.arange(64)
     kept = ((keys >= starts[:, None]) & (keys < lengths[:, None]))[:, None, None, :]
-    with assumed("sm80"):
-        got = scaled_dot_product_attention(query, key, value, key_value_seq_lengths=lengths,
-                                           key_value_seq_starts=starts, **options)
-        want = scaled_dot_product_attention(query, key, value, mask=kept, **options)
-    with jax.enable_x64(new_val=True):
-        truth = scaled_dot_product_attention(*(jnp.asarray(x, jnp.float64) for x in (query, key, value)),
-                                             mask=kept, implementation="reference")
-    assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), np.asarray(truth),
-                                     "starts under reference arithmetic")
+
+    draw = normal_drawn(6, (3, 1, 4, 16), (3, 64, 2, 16), (3, 64, 2, 16))
+
+    def by_starts(query, key, value):
+        with assumed("sm80"):
+            return scaled_dot_product_attention(query, key, value, key_value_seq_lengths=lengths,
+                                                key_value_seq_starts=starts, **options)
+
+    def by_mask(query, key, value):
+        with assumed("sm80"):
+            return scaled_dot_product_attention(query, key, value, mask=kept, **options)
+
+    assert_as_exact(by_starts, by_mask, draw, "starts under reference arithmetic", seeds=STARTS_SEEDS,
+                    truth_fn=lambda q, k, v: scaled_dot_product_attention(q, k, v, mask=kept,
+                                                                          implementation="reference"))
 
 
 @pytest.mark.parametrize("cross", [False, True], ids=["documents", "cross-documents"])
@@ -613,37 +642,39 @@ def test_a_grouped_query_over_one_key_head_reaches_the_decode_kernel_on_each_ten
             lowering_platforms=("cuda",))
 
 
+DECODE_DERIVATIVE_SEEDS = 8
+"""The decode kernel's derivatives' declared check-1 seeds, sized by `seeds_for` paired on a GPU."""
+
+
 def attention_the_decode_kernel_takes_differentiates_as_the_folded_attention():
     """A decode step's attention, its value the kernel's, differentiates as the folded attention it
-    stands in for, in both modes: the value, query, key and value gradients, and the tangent, within
-    tests/reference_error.py's rule of the folded attention's against float64 attention."""
-    rng = np.random.default_rng(1)
+    stands in for, in both modes: the value, query, key and value gradients, and the tangent, on par
+    with the folded attention's over drawn inputs (check 1, the truth float64 attention's)."""
     lengths = jnp.asarray([1, 20, 64], jnp.int32)
     attended, folded = decode_step(lengths)
-    query, key, value, *tangents = (jnp.asarray(rng.normal(size=shape), jnp.float32) for shape in (
-        (3, 4, 2, 64), (3, 64, 2, 64), (3, 64, 2, 64), (3, 4, 2, 64), (3, 64, 2, 64), (3, 64, 2, 64)))
-    cotangent = jnp.asarray(rng.normal(size=query.shape), jnp.float32)
 
-    def derivatives(attend, *arrays):
-        def pulled(*a):
-            return jnp.sum(attend(*a) * cotangent.astype(a[0].dtype))
+    def draw(seed):
+        rng = np.random.default_rng([1, seed])
+        return tuple(jnp.asarray(rng.normal(size=shape), jnp.float32) for shape in (
+            (3, 4, 2, 64), (3, 64, 2, 64), (3, 64, 2, 64), (3, 4, 2, 64), (3, 64, 2, 64), (3, 64, 2, 64),
+            (3, 4, 2, 64)))
 
-        out, tangent = jax.jvp(attend, arrays, tuple(t.astype(arrays[0].dtype) for t in tangents))
-        return (out, *jax.grad(pulled, argnums=(0, 1, 2))(*arrays), tangent)
+    def derivatives(attend):
+        def run(query, key, value, *rest):
+            *tangents, cotangent = rest
+            arrays = (query, key, value)
+            out, tangent = jax.jvp(attend, arrays, tuple(tangents))
+            gradients = jax.grad(lambda *a: jnp.sum(attend(*a) * cotangent), argnums=(0, 1, 2))(*arrays)
+            return {"value": out, "gradients": gradients, "tangent": tangent}
+        return run
 
-    found = jax.jit(lambda *a: derivatives(attended, *a))(query, key, value)
-    reference = jax.jit(lambda *a: derivatives(folded, *a))(query, key, value)
     def exact(query, key, value):
         # Each row over its first `lengths` keys, every step in the operands' float64.
         return exact_attention(query, key, value,
                                keep=np.arange(key.shape[1]) < np.asarray(lengths)[:, None, None, None])
 
-    with jax.enable_x64(new_val=True):
-        truth = derivatives(exact, *(jnp.asarray(x, jnp.float64) for x in (query, key, value)))
-    names = ("value", "dq", "dk", "dv", "tangent")
-    for name, got, want, exact in zip(names, found, reference, truth, strict=True):
-        assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), np.asarray(exact),
-                                         f"the decode kernel's {name}")
+    assert_as_exact(derivatives(attended), derivatives(folded), draw, "the decode kernel's derivatives",
+                    seeds=DECODE_DERIVATIVE_SEEDS, truth_fn=derivatives(exact))
 
 
 @pytest.mark.mesh(devices=2)
@@ -699,9 +730,9 @@ def test_a_decode_step_launches_the_decode_kernel_on_each_shard_of_its_mesh(axes
 def paged_case(page_size, windowed=False):
     """Rows reading 1 key, a page, one past a block and every page of 32 blocks through tables
     shuffled and shared between rows, their query heads sharing key heads as Qwen3-0.6B's do (16 over
-    8 of 128), and the gathered rows' keys and values and the float64 truth. `windowed` starts the
-    rows within a page, past a block and a window of 300 keys before a full row's end."""
-
+    8 of 128): the table, the lengths and the starts (`windowed` starts the rows within a page, past a
+    block and a window of 300 keys before a full row's end), a seed's draw of the queries and the key
+    and value pages, and the rows' keys and values gathered through the table."""
     rng = np.random.default_rng(0)
     per_row, kv_heads, heads, width = 32 * decode_attention.BLOCK // page_size, 8, 16, 128
     capacity = per_row * page_size
@@ -710,20 +741,23 @@ def paged_case(page_size, windowed=False):
     count = rows * per_row + 3
     table = jnp.asarray(rng.permutation(count)[:rows * per_row].reshape(rows, per_row), jnp.int32)
     table = table.at[1, 0].set(table[0, 0])
-    query = jnp.asarray(rng.normal(size=(rows, heads, width)), jnp.bfloat16)
-    key_pages = jnp.asarray(rng.normal(size=(kv_heads, count, page_size, width)) * 0.3, jnp.bfloat16)
-    value_pages = jnp.asarray(rng.normal(size=(kv_heads, count, page_size, width)), jnp.bfloat16)
-    key, value = (jnp.moveaxis(pages[:, table].reshape(kv_heads, rows, capacity, width), 0, 2)
-                  for pages in (key_pages, value_pages))
-    q = np.asarray(query, np.float64)[:, None]
-    k, v = np.asarray(key, np.float64), np.asarray(value, np.float64)
     starts = jnp.asarray([0, 1, decode_attention.BLOCK + 1 - 2, capacity - 300] if windowed else [0] * rows,
                          jnp.int32)
-    read = spanned(starts, lengths, capacity)
-    with jax.enable_x64(new_val=True):
-        truth = np.asarray(exact_attention(*(jnp.asarray(x) for x in (q, k, v)), keep=read))[:, 0]
-    arrays = (query, key_pages, value_pages, table, lengths, *((starts,) if windowed else ()))
-    return arrays, (key, value, starts, truth)
+
+    def draw(seed):
+        streams = np.random.default_rng([0x9A6, seed])
+        return (jnp.asarray(streams.normal(size=(rows, heads, width)), jnp.bfloat16),
+                jnp.asarray(streams.normal(size=(kv_heads, count, page_size, width)) * 0.3, jnp.bfloat16),
+                jnp.asarray(streams.normal(size=(kv_heads, count, page_size, width)), jnp.bfloat16))
+
+    def gathered(pages):
+        return jnp.moveaxis(pages[:, table].reshape(kv_heads, rows, capacity, width), 0, 2)
+
+    return table, lengths, starts, draw, gathered
+
+
+PAGED_SEEDS = 8
+"""The paged decode kernel's declared check-1 seeds a config, sized by `seeds_for` paired."""
 
 
 @pytest.mark.parametrize("splits", decode_attention.SPLITS)
@@ -734,33 +768,43 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_confi
                                                                                   natural, splits):
     """`decode_attention.attend_paged` reads a row's pages through its table to the row's length, from
     its start where a window gives one, at each slice count it may take (`SPLITS`, a case each: the six
-    together took up to 101 s of a CPU task), and is within tests/reference_error.py's rule of jax.nn's xla
-    attention over the gathered rows under the same keys' mask against float64, compiled on a GPU and
-    interpreted elsewhere, in both forms of the exponent (`natural`)."""
+    together took up to 101 s of a CPU task), on par with jax.nn's xla attention over the gathered rows
+    under the same keys' mask over drawn inputs (check 1, the truth its float64 run), compiled on a GPU
+    and interpreted elsewhere, in both forms of the exponent (`natural`)."""
     from dew.nn.kernels import tuning
     from dew.nn.kv_cache import PAGED, PagedCase
 
-    arrays, (key, value, starts, truth) = paged_case(page_size, windowed)
-    query, lengths = arrays[0], arrays[4]
+    table, lengths, starts, draw, gathered = paged_case(page_size, windowed)
+    query, key_pages, _ = draw(0)
     if ON_GPU:
-        case = PagedCase(heads=query.shape[1], kv_heads=arrays[1].shape[0], head_dim=query.shape[2],
-                         value_dim=query.shape[2], dtype=query.dtype, pool=arrays[1].dtype,
+        case = PagedCase(heads=query.shape[1], kv_heads=key_pages.shape[0], head_dim=query.shape[2],
+                         value_dim=query.shape[2], dtype=query.dtype, pool=key_pages.dtype,
                          page_size=page_size, quantized=False, groups=1, head_shards=1, softcap=None,
                          arithmetic=False, named="auto", windowed=windowed)
         assert PAGED.kernel("triton").failed(case) == []
-
-    def attend(*arrays):
-        return decode_attention.attend_paged(*arrays, natural=natural, interpret=not ON_GPU)
-
-    plain = jax.nn.dot_product_attention(query[:, None], key, value,
-                                         mask=jnp.asarray(spanned(starts, lengths, key.shape[1])),
-                                         implementation='xla')[:, 0]
     config = decode_attention.Split(splits)
-    with on_the_gpu(), tuning.pinned({decode_attention.PagedDecodeAttention: config}):
-        out = jax.jit(attend)(*arrays)
-    assert out.shape == plain.shape and out.dtype == plain.dtype
-    assert_as_exact_as_the_reference(np.asarray(out, np.float32), np.asarray(plain, np.float32), truth,
-                                     f"paged decode kernel, natural {natural}, {config}")
+
+    def attend(query, key_pages, value_pages):
+        with on_the_gpu(), tuning.pinned({decode_attention.PagedDecodeAttention: config}):
+            return decode_attention.attend_paged(query, key_pages, value_pages, table, lengths,
+                                                 *((starts,) if windowed else ()), natural=natural,
+                                                 interpret=not ON_GPU)
+
+    def plain(query, key_pages, value_pages):
+        key, value = gathered(key_pages), gathered(value_pages)
+        return jax.nn.dot_product_attention(query[:, None], key, value,
+                                            mask=jnp.asarray(spanned(starts, lengths, key.shape[1])),
+                                            implementation='xla')[:, 0]
+
+    out = jax.jit(attend)(*draw(0))
+    assert out.shape == jax.eval_shape(plain, *draw(0)).shape and out.dtype == query.dtype
+    def exact(query, key_pages, value_pages):
+        key, value = gathered(key_pages), gathered(value_pages)
+        return exact_attention(query[:, None], key, value,
+                               keep=np.asarray(spanned(starts, lengths, key.shape[1])))[:, 0]
+
+    assert_as_exact(attend, plain, draw, f"paged decode kernel, natural {natural}, {config}",
+                    seeds=PAGED_SEEDS, terms=True, truth_fn=exact)
 
 
 COMPILED = [(kernel, variant, splits) for kernel, variants in
@@ -896,44 +940,27 @@ def flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask(with
                                                                                  window):
     """FlashAttention chosen for a cache call (`generation.chosen`) reads its documents as its packed
     sequences, the queries put in id order and back: its output and its query, key and value
-    gradients are within tests/reference_error.py's rule of jax.nn's xla attention over the cache's
-    mask, against float64, padding rows zero."""
+    gradients on par with jax.nn's xla attention over the cache's mask over drawn inputs (check 1, the
+    truth float64 attention over the mask), padding rows zero."""
 
     positions, filled, mask = cache_call(window)
-    rng = np.random.default_rng(8)
-    query = jnp.asarray(rng.normal(size=(4, 6, 2, 64)), jnp.bfloat16)
-    key, value = (jnp.asarray(rng.normal(size=(4, 16, 2, 64)), jnp.bfloat16) for _ in range(2))
-    cotangent = jnp.asarray(rng.normal(size=(4, 6, 2, 64)) * np.asarray(positions >= 0)[:, :, None, None],
-                            jnp.float32)
     documents = cache_documents(positions, filled)
+    real = jnp.asarray(positions >= 0)[:, :, None, None]
 
-    def pulled(attend, *operands):
-        wide = jnp.promote_types(operands[0].dtype, jnp.float32)
-        out, pull = jax.vjp(lambda *operands: attend(*operands).astype(wide), *operands)
-        return out, *pull(cotangent.astype(out.dtype))
+    def draw(seed):
+        rng = np.random.default_rng([8, seed])
+        q, k, v = (jnp.asarray(rng.normal(size=(4, length, 2, 64)), jnp.bfloat16) for length in (6, 16, 16))
+        # Padding rows take no cotangent.
+        return q, k, v, jnp.where(real, jnp.asarray(rng.normal(size=(4, 6, 2, 64)), jnp.bfloat16), 0)
 
     def flash(query, key, value):
-        return scaled_dot_product_attention(query, key, value, implementation="flash", causal=True,
-                                            sliding_window=window, segment_ids=documents, max_segments=1)
+        with chosen(attention="flash"):
+            return scaled_dot_product_attention(query, key, value, implementation="flash", causal=True,
+                                                sliding_window=window, segment_ids=documents, max_segments=1)
 
     def plain(query, key, value):
-        out = jax.nn.dot_product_attention(query, key, value, mask=mask, implementation="xla")
-        return out * jnp.asarray(positions >= 0, out.dtype)[:, :, None, None]
+        attended = jax.nn.dot_product_attention(query, key, value, mask=mask, implementation="xla")
+        return jnp.where(real, attended, 0)
 
-    def truth(query, key, value):
-        return exact_attention(query, key, value, keep=np.asarray(mask))
-
-    with chosen(attention="flash"):
-        found = pulled(flash, query, key, value)
-    reference = pulled(plain, query, key, value)
-    with jax.enable_x64(new_val=True):
-        exact = pulled(truth, *(jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value)))
-    # Each row sized by the float64 terms of its sums as the suite's flash gradients are
-    # (`attention_terms`): a query that keeps one key has a gradient that cancels to zero, which a
-    # flash kernel forms from its rounded output.
-    terms = attention_terms(query, key, value, cotangent, mask)
-    for name, mine, theirs, true, summed in zip(("out", "query", "key", "value"), found, reference, exact,
-                                                terms, strict=True):
-        assert_as_exact_as_the_reference(np.asarray(mine, np.float64), np.asarray(theirs, np.float64),
-                                         np.asarray(true), f"window {window} {name}",
-                                         terms=np.asarray(summed))
+    attention_on_par(flash, plain, draw, f"flash over a cache call's documents, window {window}",
+                     keep=np.asarray(mask) & np.asarray(positions >= 0)[:, None, :, None])
