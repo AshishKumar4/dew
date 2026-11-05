@@ -139,10 +139,13 @@ row spans, two rows a thread: a `[block_q, 4]` fp32 tile's words a statistic (`g
 
 
 def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, width: int) -> Tiles | None:
-    """The guarded launch's tiles beside the plain launch's `tiles` (`_plain_forward`): its query blocks, the
-    widest of the family's key extents (`extents`) that divides the plain key tile, so the plain launch's
-    padded keys are whole tiles of it, and the most of the plain launch's consumers, whose live set a
-    consumer's registers hold (`resources.live_registers`): its shifted and unshifted sums of `columns` value
+    """The guarded launch's tiles beside the plain launch's `tiles` (`_plain_forward`): the largest of the
+    family's row extents that divides the plain launch's query blocks (the guarded walk is a rare one's of
+    its overflowed rows alone, so it takes smaller blocks where the plain launch's hold no guarded state: at
+    128 rows on an A100, FS-4324-CENSUS7), the widest of the family's key extents (`extents`) that divides
+    the plain key tile, so the plain launch's padded keys are whole tiles of it, and the most of the plain
+    launch's consumers, whose live set a consumer's registers hold (`resources.live_registers`): its shifted
+    and unshifted sums of `columns` value
     columns fp32 and its rows' statistics (`GUARD_ROWS`) carried, beside a step's logits and weights fp32
     and the two products the step forms (`algebra.stepped`), their operands' fragments where its family
     reads them from registers (`_products`: the logits' of `width`-deep queries and keys, the values' of its
@@ -151,11 +154,9 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
     fragments). Uncounted, the statistics left 64 x 64 on two consumers spilling 20 bytes a thread at heads
     128 and 256 wide (ptxas, sm90a). None where none fits: the plain launch is then illegal at `tiles`
     (`MosaicForward.legal`)."""
-    rows = tiles.block_q
-    carried = [(rows, columns, jnp.float32)] * 2 + [(rows, 4 * GUARD_ROWS, jnp.float32)]
-
     def held(candidate: Tiles) -> bool:
-        block = candidate.block_k
+        rows, block = candidate.block_q, candidate.block_k
+        carried = [(rows, columns, jnp.float32)] * 2 + [(rows, 4 * GUARD_ROWS, jnp.float32)]
         logits, sums = [(rows, block, jnp.float32)] * 2, [(rows, columns, jnp.float32)] * 2
         fragments = _products(family, dtype, (rows, width, block, logits, False, True),
                               (rows, block, columns, logits[:1] + sums, True, False), narrow=candidate.narrow)
@@ -168,8 +169,9 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
         return live <= family.registers(candidate.consumers)
 
     blocks = [block for block in extents(family, dtype, tiles.block_k) if tiles.block_k % block == 0]
-    candidates = (dataclasses.replace(tiles, block_k=block, consumers=consumers, narrow=narrow)
-                  for consumers in range(tiles.consumers, 0, -1) for block in blocks
+    queries = [rows for rows in extents(family, dtype, tiles.block_q) if tiles.block_q % rows == 0]
+    candidates = (dataclasses.replace(tiles, block_q=rows, block_k=block, consumers=consumers, narrow=narrow)
+                  for rows in queries for consumers in range(tiles.consumers, 0, -1) for block in blocks
                   for narrow in stagings(family))
     return next((candidate for candidate in candidates if held(candidate)), None)
 
