@@ -18,7 +18,7 @@ import numpy as np
 from dew.batch import Variables
 from dew.objectives.rl.control import ControlPPOObjective
 from dew.objectives.rl.dreamer import DreamerV3Objective
-from dew.registry import Configured, envs
+from dew.registry import envs
 from dew.rl.aggregation import LABEL, Teacher
 from dew.rl.env import Batched, Driven, Env, Observation, TimeLimit, view
 from dew.rl.evaluation import episodes
@@ -31,7 +31,7 @@ type Environment = Env | Simulator
 """Where an environment run's agent acts: a JAX `Env` batch, or a host `Simulator`."""
 
 
-def built(name: str, arguments: Mapping[str, Configured], *, count: int | None, episode_length: int | None,
+def built(name: str, arguments: Mapping[str, object], *, count: int | None, episode_length: int | None,
           action_repeat: int) -> Environment:
     """The environment `name` (`dew.registry.envs`) of `arguments`, wrapped as its run's record says
     (`dew.config.env.EnvConfig`): an `Env` of one environment cut after `episode_length` steps of
@@ -123,15 +123,26 @@ def imitates_labels(objective: Agent) -> bool:
     return isinstance(objective, DreamerV3Objective) and objective.imitates == LABEL
 
 
-def taught(policy: Agent, variables: Variables, *, labels: bool, demonstrates: bool) -> dict[str, Teacher]:
+class Taught(TypedDict, total=False):
+    """A rollout's teacher, which labels each step, and demonstrator, which flies its prefill (`taught`)."""
+
+    teacher: Teacher
+    demonstrator: Teacher
+
+
+def taught(policy: Agent, variables: Variables, *, labels: bool, demonstrates: bool) -> Taught:
     """A rollout's teacher and demonstrator, the saved teacher run's `policy` over its `variables`: its greedy
     action labelling each step where the run's objective imitates `labels`, and its draws flying the prefill
     where it `demonstrates`. A teacher run of another objective than PPO's is refused."""
     if not isinstance(policy, ControlPPOObjective):
         raise ValueError(f"a teacher is a PPO policy, which acts from the environment's observation alone, "
                          f"not a {type(policy).__name__}")
-    held = {"teacher": Teacher(policy.greedy, variables)} if labels else {}
-    return held | ({"demonstrator": Teacher(policy.act, variables)} if demonstrates else {})
+    held: Taught = {}
+    if labels:
+        held["teacher"] = Teacher(policy.greedy, variables)
+    if demonstrates:
+        held["demonstrator"] = Teacher(policy.act, variables)
+    return held
 
 
 def flights(objective: Agent, env: Environment, steps: int, *, reached: tuple[str, ...], drawn: bool,
@@ -149,6 +160,3 @@ def flights(objective: Agent, env: Environment, steps: int, *, reached: tuple[st
                         models=objective.towers())
     return episodes(policy, env, steps, reached=reached, models=objective.towers())
 
-
-__all__ = ["Agent", "Environment", "Filled", "batched", "built", "filled", "flights", "imitates_labels",
-           "observed", "reads", "seen", "taught"]

@@ -32,6 +32,7 @@ from dew.objectives.rl.dreamer import DreamerV3Objective
 from dew.objectives.rl.run import (
     Agent,
     Environment,
+    Taught,
     batched,
     built,
     filled,
@@ -107,7 +108,7 @@ class RolloutConfig(Registered):
     def _member(name: str) -> type:
         return rollouts[name]
 
-    def build(self, objective: Agent, env: Environment, **taught: object) -> Rollout:
+    def build(self, objective: Agent, env: Environment, taught: Taught) -> Rollout:
         """The rollout of `objective` in `env`, with the teacher and demonstrator `taught` names. Refuses a
         setting the run builds, an objective of another class than the rollout's, and a teacher it takes
         none of."""
@@ -229,7 +230,7 @@ class EnvRunConfig(RunConfig):
             raise ValueError(f"a rollout steps a batch of environments, and {self.env.name} is one; set "
                              "env.count")
         objective = self.agent(env, self.started())
-        rollout = self.rollout.build(objective, env, **self.taught(objective, env))
+        rollout = self.rollout.build(objective, env, self.taught(objective, env))
         validation = {name: split.split(objective, env) for name, split in self.episodes.items()} or None
         return Prepared(self, objective, idle(), rollout=rollout, validation=validation)
 
@@ -292,7 +293,7 @@ class EnvRunConfig(RunConfig):
         with Checkpoints(self.pretrained) as checkpoints:
             return checkpoints.variables(step=self.source.step, ema=bool(self.source.ema))
 
-    def taught(self, objective: Agent, env: Environment) -> dict[str, object]:
+    def taught(self, objective: Agent, env: Environment) -> Taught:
         """The rollout's teacher and demonstrator (`TeacherConfig`), each the teacher run's policy acting in
         `env`: its greedy action labelling each step where `objective` imitates labels, and its draws flying
         the prefill where it demonstrates. An objective imitating labels with no teacher, a teacher that
