@@ -300,7 +300,8 @@ class Pretrained:
     """A saved run's own task declaration (`from_saved`), which its tasks build from as the run's own
     loader builds them (`TextGeneration.from_settings`: its prefix, policy and budget), where a source
     read from its files builds them from its generation config, which an export writes as the
-    representation its format's readers read (ledger 3007)."""
+    representation its format's readers read (ledger 3007). An export writes it beside its config and a
+    load reads it back (`released`, ledger 4314)."""
     names_tokenizer: ClassVar[bool] = True
     """Whether generation_config.json may record the tokenizer's name.
 
@@ -565,8 +566,11 @@ class Pretrained:
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
         extended = _extended(_published(loaded, name_or_dir, selected=bool(selected) or extracted
                                         or reference.subfolder is not None), dex, placed, scan_layers)
+        # An export of a run carries the run's declaration and numerics (`released`); numerics the load
+        # is asked for take the run's place.
+        settings, run_numerics = released(directory)
         return replace(_resident(extended, weights=weights, streaming=streaming, on_host=on_host),
-                       numerics=numerics)
+                       settings=settings, numerics=run_numerics if precision is None else numerics)
 
     @property
     def layouts(self) -> Mapping[str, WeightLayout]:
@@ -751,7 +755,7 @@ class Pretrained:
         decoders.save_export_assets(destination,
                                     tokenizer=self.processor if self.tokenizer is None else self.tokenizer,
                                     generation_config=dict(self.generation_config),
-                                    named=self.names_tokenizer)
+                                    named=self.names_tokenizer, release=self._release())
         for name, module in sorted(modules.items()):
             written = destination / name
             written.parent.mkdir(parents=True, exist_ok=True)
@@ -765,6 +769,18 @@ class Pretrained:
         save_hf_layout(_folder_part(tensors, "") if folders else tensors,
                        {key: value for key, value in self.config.items() if key not in folders},
                        destination, max_shard_size)
+
+    def _release(self) -> dict[str, object] | None:
+        """The release metadata `save` writes beside the config (`decoders.RELEASE_FILE`) where the bundle
+        holds a run's own declaration (`settings`): its task settings' record and its numerics, under the
+        release record's `task` (`dew.config.Release`), which `load` reads back (`released`)."""
+        if self.settings is None:
+            return None
+        from dew.inference.tasks import TaskSettings as Settings
+        from dew.registry import to_record
+
+        numerics = None if self.numerics is None else to_record(self.numerics, Numerics)
+        return {"task": {"settings": to_record(self.settings, Settings), "numerics": numerics}}
 
     def push_to_hub(self, repo_id: str, *, variables: Mapping[str, object] | None = None,
                     private: bool = False, commit_message: str = "Upload dew export",
@@ -1595,6 +1611,22 @@ def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
     with open(directory / "config.json") as handle:
         config = _records.record(json.load(handle), "config.json")
     return config, None
+
+
+def released(directory: Path) -> tuple[TaskSettings | None, Numerics | None]:
+    """The run's own task settings and numerics an export of it wrote (`decoders.RELEASE_FILE`,
+    `Pretrained.save`), or None for each where the directory holds none: a source with no run behind it
+    builds its tasks from its own files."""
+    from dew.inference.tasks import TaskSettings as Settings
+
+    path = directory / decoders.RELEASE_FILE
+    if not path.is_file():
+        return None, None
+    record = _records.record(json.loads(path.read_text()), decoders.RELEASE_FILE)
+    task = _records.record(record["task"], "task")
+    numerics = task.get("numerics")
+    return (from_record(Settings, task["settings"], dtypes=False),
+            None if numerics is None else from_record(Numerics, numerics, dtypes=False))
 
 
 def _decoded(tensors: Mapping[str, unread.Stored], config: Mapping[str, object], param_dtype: str, *,
