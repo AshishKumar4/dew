@@ -35,7 +35,7 @@ import numpy as np
 from dew.algebra import derive, rewritten
 from dew.algebra.forms import Accumulated, Added, Merged, Operand, derived_on
 from dew.nn.kernels.templates import layout, product
-from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Draw, within
+from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Capped, Draw, within
 from dew.nn.precision import float32_einsum, two_product, two_sum
 
 
@@ -110,8 +110,8 @@ class Forward:
         of each logit at log2(e) times its size ties logits the reference keeps apart, so a walk whose rows'
         maxima pass it walks again natural (`walked`, `walked_launches`): folded logits scaled before their
         difference (`base2`, not `raw`), but for a cap's (`Capped`, whose logits stay within it)."""
-        cap = getattr(self.score_mod, "softcap", None)
-        bounded = cap is not None and abs(float(cap)) * LOG2E < FOLD_REACH
+        cap = self.score_mod
+        bounded = isinstance(cap, Capped) and abs(float(cap.softcap)) * LOG2E < FOLD_REACH
         return self.base2 and not self.raw and not bounded
 
     @property
