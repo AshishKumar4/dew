@@ -5,6 +5,7 @@ the update pools the same rows, the clocks count the same steps, and a
 resumed run reads its batches as the run it continues did.
 """
 
+import collections
 import contextlib
 import dataclasses
 import functools
@@ -623,6 +624,23 @@ def regression_steps(x, *, pgle: bool):
         state, loss, *_ = step(state, batch)
         losses.append(loss)
     return {"loss": jnp.stack(losses), "params": state.variables["params"]}
+
+
+def test_a_compiled_steps_memory_is_analysed_once_whoever_reads_it(monkeypatch):
+    """A compiled step's memory analysis is read once (`memory.compiled_memory`), whichever of its readers
+    asks it first: the planner's probe and forecast, the step's headroom and the run's memory record each
+    asked XLA again, and each read walked the program anew (0.2 to 0.5 s of a CPU U-Net step's, four a fit,
+    row 3763)."""
+    analysed = collections.Counter()
+    real = jax.stages.Compiled.memory_analysis
+
+    def counted(compiled):
+        analysed[id(compiled)] += 1
+        return real(compiled)
+
+    monkeypatch.setattr(jax.stages.Compiled, "memory_analysis", counted)
+    regression_steps(regression_rows(0)[0], pgle=False)
+    assert analysed and set(analysed.values()) == {1}
 
 
 def regression_rows(seed: int) -> tuple[np.ndarray]:

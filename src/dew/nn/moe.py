@@ -35,6 +35,7 @@ from jax.sharding import PartitionSpec as P
 from dew.batch import leaves_by_path
 from dew.mesh import EXPERT_AXIS, STAGE_AXIS, LayoutRefused, LogicalAxes, batch_axes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
+from dew.nn.derivatives import KernelGlue, declared_tangent
 
 from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
 from .blocks import normal_kernel
@@ -736,13 +737,15 @@ def expert_dispatch[Parameters](
     return _stored_primal(run, x, indices, parameters, input_weights)
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(0,))
-def _stored_primal(run, x, indices, parameters, input_weights):
+def _stored(run, x, indices, parameters, input_weights):
     """`run` over the parameters as stored, and differentiated over them at
     least fp32 (`_widened`), so a gradient summed across devices or over
-    the exchange's rounds meets the master dtype once, after the sum. A
-    forward that nothing differentiates, serving above all, reads the
-    stored kernels: widened, every layer's experts were copied to fp32 in
+    the exchange's rounds meets the master dtype once, after the sum: a
+    kernel's glue (`_stored_primal`, `dew.nn.derivatives.declared_tangent`),
+    the whole expert layer, which the algebra pass rewrites as any other math
+    around its launches (a protected span would hold every MoE layer out of
+    the pass). A forward that nothing differentiates, serving above all, reads
+    the stored kernels: widened, every layer's experts were copied to fp32 in
     the step, 14.35 GiB of live temporaries for gpt-oss-20b served over an
     expert axis of four RTX 3090s."""
     return run(x, indices, parameters, input_weights)
@@ -793,7 +796,8 @@ def _stored_primal_jvp(run, primals, tangents):
                    tuple(directions[index] for index in live))
 
 
-_stored_primal.defjvp(_stored_primal_jvp, symbolic_zeros=True)
+_stored_primal = declared_tangent(KernelGlue(), _stored, _stored_primal_jvp, nondiff_argnums=(0,),
+                                  symbolic_zeros=True)
 
 
 def _dispatched[Parameters](

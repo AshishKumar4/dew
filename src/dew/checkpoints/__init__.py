@@ -1209,12 +1209,15 @@ class Checkpoints:
         write_atomically(path, json.dumps(dict(pending), sort_keys=True))
 
     def artifact(self, step: int | str | None = None) -> JSON:
-        """Return the selected step's inference declaration.
+        """Return the selected step's inference declaration, from its custom metadata alone (`_custom`), as
+        `control` reads a committed step's: the manager's metadata opens every array's TensorStore besides
+        (1.7 s of a U-Net run's reload, which reads it before anything, row 3763); a local step's as its
+        process holds it.
 
         It is None when the step's objective declares no inference record."""
         step = self.pinned(step)
-        local = step == self._local_latest()
-        custom = self._step_metadata(step, local=local).custom_metadata or {}
+        custom = (self._step_metadata(step, local=True).custom_metadata or {} if step == self._local_latest()
+                  else self._custom(step))
         return json_value(custom.get('artifact'), 'artifact')
 
     def control(self, step: int) -> dict:
