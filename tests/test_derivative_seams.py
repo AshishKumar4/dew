@@ -55,7 +55,7 @@ CONTRACTED = {
     "src/dew/diffusion/schedules/flow.py::time_shift":
         ("test_a_time_shift_holds_every_order", NUMERICS),
     "src/dew/nn/inspection.py::tapped":
-        ("test_a_probes_tap_holds_its_orders", KERNEL),
+        ("test_a_probes_tap_holds_its_orders", SURROGATE),
     "src/dew/nn/categorical.py::_probabilities":
         ("test_the_categorical_losses_hold_every_order", NUMERICS),
     "src/dew/nn/categorical.py::label_terms":
@@ -160,14 +160,23 @@ def _named(node) -> str | None:
     return getattr(node, "attr", None) or getattr(node, "id", None)
 
 
+DECLARING = frozenset({"declared_derivative", "declared_tangent"})
+"""Dew's declaring functions that take the kind of what they declare first (`dew.nn.derivatives`)."""
+
+
 def _maker(node) -> str | None:
-    """The custom derivative `node`, a decorator or a call's function, makes (`CUSTOM`), or None."""
-    if isinstance(node, ast.Call):
-        if _named(node.func) == "partial" and node.args:
-            return _maker(node.args[0])
-        return _maker(node.func)
-    name = _named(node)
-    return name if name in CUSTOM else None
+    """The custom derivative `node`, a decorator or a call, makes (`CUSTOM`), or None: a derivative or
+    tangent declared of the kind `Surrogate()` a surrogate, as `surrogate` declares one."""
+    if not isinstance(node, ast.Call):
+        name = _named(node)
+        return name if name in CUSTOM else None
+    partial = _named(node.func) == "partial" and node.args
+    maker = _maker(node.args[0]) if partial else _maker(node.func)
+    kind = node.args[1:2] if partial else node.args[:1]
+    if (maker in DECLARING and kind and isinstance(kind[0], ast.Call)
+            and _named(kind[0].func) == "Surrogate"):
+        return "surrogate"
+    return maker
 
 
 def seams_of(relative: str, text: str) -> dict[str, str]:
@@ -188,7 +197,7 @@ def seams_of(relative: str, text: str) -> dict[str, str]:
             target = (child.targets[0] if isinstance(child, ast.Assign)
                       else child.target if isinstance(child, ast.AnnAssign) else None)
             if (isinstance(target, ast.Name) and isinstance(child.value, ast.Call)
-                    and (maker := _maker(child.value.func))):
+                    and (maker := _maker(child.value))):
                 found.setdefault(".".join([*scope, target.id]), maker)
             if isinstance(child, ast.Call) and _named(child.func) == "linear_tangent":
                 found.setdefault(".".join([*scope, "linear_tangent"]), "linear_tangent")
@@ -218,10 +227,11 @@ def test_every_custom_derivative_is_under_a_contract():
 
 
 def test_each_seams_kind_is_its_declaration():
-    """A seam is a surrogate exactly where it is declared one (`surrogate`), every other a kernel's or a
-    numerics derivative: a derivative that is not its value's cannot hide in a custom rule of its own,
-    and the safely written true derivatives (time_shift, a guided prediction, a held hook's, a gemm
-    prologue's) are not surrogates. The declaration's own custom rule is the surrogate kind's."""
+    """A seam is a surrogate exactly where it is declared one (`surrogate`, or a derivative or tangent
+    declared of the kind `Surrogate()`), every other a kernel's or a numerics derivative: a derivative
+    that is not its value's cannot hide in a custom rule of its own, and the safely written true
+    derivatives (time_shift, a guided prediction, a held hook's, a gemm prologue's) are not surrogates.
+    The declaration's own custom rule is the surrogate kind's."""
     kinds = {seam: kind for seam, (_, kind) in CONTRACTED.items()}
     assert set(kinds.values()) <= {KERNEL, NUMERICS, SURROGATE}
     marked = {seam for seam, kind in kinds.items() if kind == SURROGATE}
@@ -232,7 +242,8 @@ def test_each_seams_kind_is_its_declaration():
 def test_the_scan_finds_each_form_of_a_custom_derivative():
     """`seams_of` on each form a seam takes, and its maker: a decorator, one within functools.partial, an
     assignment of a call, an annotated one, a nested function's, a linear_tangent call within an
-    expression, and a surrogate's declaration, assigned or decorating."""
+    expression, a surrogate's declaration, assigned or decorating, and a declared derivative or tangent,
+    a surrogate where its kind is `Surrogate()`."""
     text = (
         "import functools\nimport jax\n"
         "@jax.custom_jvp\ndef a(x): return x\n"
@@ -244,11 +255,16 @@ def test_the_scan_finds_each_form_of_a_custom_derivative():
         "e = surrogate(lambda x: x, lambda primals, tangents, value: tangents[0])\n"
         "@functools.partial(surrogate, derivative=lambda primals, tangents, value: tangents[0])\n"
         "def f(x): return x\n"
+        "g = declared_derivative(Surrogate(), lambda x: x, fwd, bwd)\n"
+        "h = declared_tangent(Protected(), lambda x: x, jvp)\n"
+        "@functools.partial(declared_derivative, Surrogate(), forward=fwd, backward=bwd)\n"
+        "def k(x): return x\n"
         "def plain(x): return x\n")
     assert seams_of("m.py", text) == {
         "m.py::a": "custom_jvp", "m.py::b": "custom_vjp", "m.py::c": "custom_jvp", "m.py::d": "custom_vjp",
         "m.py::outer.inner": "custom_vjp", "m.py::tangent.linear_tangent": "linear_tangent",
-        "m.py::e": "surrogate", "m.py::f": "surrogate"}
+        "m.py::e": "surrogate", "m.py::f": "surrogate", "m.py::g": "surrogate",
+        "m.py::h": "declared_tangent", "m.py::k": "surrogate"}
 
 
 def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():

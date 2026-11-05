@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.custom_derivatives import SymbolicZero
 from jax.experimental import checkify
 from jax.sharding import Mesh, PartitionSpec
 from reference_error import equations
@@ -149,6 +150,44 @@ def test_a_declared_tangent_is_one_marked_call_and_differentiates_as_its_rule(ki
     assert not np.array_equal(np.asarray(jax.grad(lambda x: jnp.sum(bare(x)))(x)), np.asarray(jnp.cos(x)))
     found = kinds_of(jax.make_jaxpr(jax.grad(lambda x: jnp.sum(declared(x))))(x))
     assert found and all(seen == kind for seen in found)
+
+
+def test_a_declared_rule_with_symbolic_zeros_meets_one_where_no_tangent_reaches():
+    """With `symbolic_zeros`, an operand no tangent reaches is a `SymbolicZero` in a declared tangent rule
+    (`declared_tangent`) and unperturbed in a declared forward (`declared_derivative`), through the marked
+    call as the bare `jax.custom_jvp` and `jax.custom_vjp` give it, and each differentiates as the bare one
+    does: a rule that skips a zero's term (a tangent JAX cannot transpose through a barrier) sees it."""
+    seen = []
+
+    def primal(x, y):
+        return jnp.sin(x) * y
+
+    def tangent(primals, tangents):
+        (x, y), (dx, dy) = primals, tangents
+        seen.append(type(dy))
+        return primal(x, y), 2.0 * jnp.cos(x) * y * dx
+
+    def forward(x, y):
+        seen.append(y.perturbed)
+        return primal(x.value, y.value), (x.value, y.value)
+
+    def backward(residuals, cotangent):
+        x, y = residuals
+        return 3.0 * cotangent * jnp.cos(x) * y, jnp.zeros_like(y)
+
+    tangents = derivatives.declared_tangent(Protected(), primal, tangent, symbolic_zeros=True)
+    bare_tangents = jax.custom_jvp(primal)
+    bare_tangents.defjvp(tangent, symbolic_zeros=True)
+    derivative = derivatives.declared_derivative(Protected(), primal, forward, backward, symbolic_zeros=True)
+    bare_derivative = jax.custom_vjp(primal)
+    bare_derivative.defvjp(forward, backward, symbolic_zeros=True)
+    x, y = jnp.linspace(0.1, 1.0, 8), jnp.full(8, 2.0)
+    for declared, bare, unreached in ((tangents, bare_tangents, SymbolicZero),
+                                      (derivative, bare_derivative, False)):
+        seen.clear()
+        np.testing.assert_array_equal(np.asarray(jax.grad(lambda x, f=declared: jnp.sum(f(x, y)))(x)),
+                                      np.asarray(jax.grad(lambda x, f=bare: jnp.sum(f(x, y)))(x)))
+        assert seen and set(seen) == {unreached}, seen
 
 
 def test_a_surrogate_is_one_surrogate_call():

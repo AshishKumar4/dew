@@ -111,13 +111,14 @@ def qwen_walk(source, record, name: str, *, wide: bool = False, fill: float | No
     return walk
 
 
-def judged(site: str, draw, dew, truth=None):
+def judged(site: str, draw, dew, truth=None, leaves=None):
     """Check 1 of `dew` against the source's recording of `site` (`SEEDED`) over its declared seeds: a
     case's walk from `truth`, Dew's own float64 path held to the recording's sketch, and the pipeline's
-    sites from the source's float64 truth recorded whole (`indexed_recording`)."""
+    sites from the source's float64 truth recorded whole (`indexed_recording`); with `leaves`, those
+    leaves alone, which `dew` and `truth` then give."""
     seeds = declared_seeds(SEEDED)[site]
     drawn, reference, held = indexed_recording(recording(SEEDED), site, seeds, inputs_of=draw,
-                                               truth_fn=truth)
+                                               truth_fn=truth, leaves=leaves)
     assert_as_exact(as_given(lambda index, inputs: dew(inputs)), reference, drawn, site, seeds=seeds,
                     truth_fn=held)
 
@@ -136,14 +137,26 @@ def test_native_qwen_image_matches_the_source_forward_and_every_gradient(name, s
 def test_a_padded_row_is_its_own_prompt_alone(source, record):
     """Padding a row behind a longer prompt changes nothing it reads: the
     padded keys are excluded and its image sits after its own text. The
-    padding values are masked, so filled with anything the padded walk is
-    still on par with the source's call for each prompt alone (check 1), and
-    without the mask the short row reads its padding as prompt and is not."""
+    padding values are masked, so filling them with anything leaves the
+    prediction where it was, bit for bit in one program, and the walk on par
+    with the source's call for each prompt alone (check 1); without the mask
+    the short row reads its padding as prompt, and its prediction is not."""
     draw = case_draw(record, "padded")
+    lengths = record["cases"]["padded"]["lengths"]
+    inputs = draw(0)
+    filled = {**inputs, "context": np.where(np.arange(max(lengths))[None, :, None]
+                                            < np.asarray(lengths)[:, None, None], inputs["context"], 7.0)}
+    walk = jax.jit(qwen_walk(source, record, "padded"))
+    np.testing.assert_array_equal(np.asarray(walk(filled)["output"]), np.asarray(walk(inputs)["output"]))
     truth = jax.jit(qwen_walk(source, record, "padded", wide=True))
     judged("padded walk", draw, jax.jit(qwen_walk(source, record, "padded", fill=7.0)), truth)
+
+    def prediction(walked):
+        return jax.jit(lambda inputs: {"output": walked(inputs)["output"]})
+
     with pytest.raises(GateFailure):
-        judged("padded walk", draw, jax.jit(qwen_walk(source, record, "padded", masked=False)), truth)
+        judged("padded walk", draw, prediction(qwen_walk(source, record, "padded", masked=False)),
+               prediction(qwen_walk(source, record, "padded", wide=True)), leaves=["output"])
 
 
 def cudnn_attends_a_padded_batch_as_xla_does(without_deterministic_ops):
@@ -359,14 +372,19 @@ def test_published_qwen_image_pipeline_walk_matches_the_source(loaded, record):
     by the mu of this latent's token count, and the RGBA decode. Both rows
     walk in one batch, the shorter prompt padded, and each lands on par with
     the source's call for its prompt alone from float64 over drawn prompts
-    and latents (check 1, ledger 3991). Each prompt also walks alone, the
-    call one image makes, which XLA compiles differently (see the one-row
-    grid walk in test_samplers.py)."""
+    and latents (check 1, ledger 3991)."""
     pipeline = record["pipeline"]
     task = loaded.text_to_image()
     assert task.steps == pipeline["default_steps"] == 40
     assert task.guidance is None and pipeline["true_cfg"] == 1.0
     judged("pipeline walk", pipeline_draw(record), pipeline_walked(loaded, record))
+
+
+def test_a_published_qwen_image_prompt_walked_alone_matches_the_source(loaded, record):
+    """Each prompt walks alone, the call one image makes, which XLA compiles differently from the batch
+    (see the one-row grid walk in test_samplers.py), on par with the source's call for it from float64
+    over drawn prompts and latents (check 1): apart from the batch's walk, the two took 86 s in one test on
+    armada."""
     judged("pipeline walk", pipeline_draw(record), pipeline_walked(loaded, record, alone=True))
 
 
