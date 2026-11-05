@@ -529,17 +529,49 @@ def _paired(left, right, between, issue: Callable | None = None, role: str = "sc
     """Each pair's decayed contraction over keys, `sum_k left_ik right_jk between_ijk` `[C, C]`: a decay a
     key dimension's over the pairs' every key; a scalar decay's (`between` `[C, C, 1]`) the keys'
     product decayed after it, `(left right^T) between`, which spans no `[C, C, K]` tensor (Qwen3.5-27B's
-    derived forward took 66 ms on an H100 spanning it, derived-cells-h100-6d105a908). A pair no decay joins
-    (`between` zero, a token's future) is zero, selected, not multiplied: its product, or its cotangent, may
-    be infinite near float32's largest (a future corrected write's), whose product by a zero decay is NaN in
-    every query's gradient the pair reads (the chunked op's reverse mode, near the largest) and in the
-    decays'."""
+    derived forward took 66 ms on an H100 spanning it, derived-cells-h100-6d105a908). A per-key decay's
+    pairs factor around each sub-chunk's reference (`_factored`): a product of the rows decayed to it by the
+    keys decayed from it, the diagonal sub-chunks' alone elementwise. A pair no decay joins (`between` zero,
+    a token's future) is zero, selected, not multiplied: its product, or its cotangent, may be infinite near
+    float32's largest (a future corrected write's), whose product by a zero decay is NaN in every query's
+    gradient the pair reads (the chunked op's reverse mode, near the largest) and in the decays'."""
     active = jnp.any(between != 0, axis=-1)
+    issue = issue or _issued
     if between.shape[-1] == 1:
         # The product selected before its decay multiplies it: an inactive pair's may overflow, whose zero
         # decay's derivative would read it.
-        return jnp.where(active, (issue or _issued)(role, left, right.T), 0.0) * between[..., 0]
-    return jnp.where(active, float32_einsum("ik,ijk->ij", left, right[None] * between), 0.0)
+        return jnp.where(active, issue(role, left, right.T), 0.0) * between[..., 0]
+    return jnp.where(active, _factored(left, right, between, issue, role), 0.0)
+
+
+def _factored(left, right, between, issue: Callable, role: str):
+    """A per-key decay's pairs `sum_k left_ik right_jk between_ijk` over sub-chunks of `SUB` rows
+    (`recurrence_algebra.SUB`, fla's BC): a pair of an earlier sub-chunk's key `j` and a later one's row `i`
+    is the product of the row decayed to the reference `p` before its sub-chunk and the key decayed from it,
+    `(left_i between_ip) (right_j between_pj)`, each factor at most 1 (every exponent at most zero, each span
+    across a vanished token zero, `_decays_value`), a matrix product `issue` makes; a sub-chunk's own pairs
+    elementwise over its keys (at most SUB^2 K a sub-chunk, not C^2 K)."""
+    from dew.nn.kernels import recurrence_algebra
+
+    count = left.shape[0]
+    sub = recurrence_algebra.SUB
+    starts = range(0, count, sub)
+    rows = []
+    for first in starts:
+        own = slice(first, min(first + sub, count))
+        blocks = []
+        for start in starts:
+            keys = slice(start, min(start + sub, count))
+            if start > first:
+                blocks.append(jnp.zeros((own.stop - own.start, keys.stop - keys.start), jnp.float32))
+            elif start == first:
+                blocks.append(float32_einsum("ik,ijk->ij", left[own], right[None, keys] * between[own, keys]))
+            else:
+                reference = first - 1
+                blocks.append(issue(role, left[own] * between[own, reference],
+                                    (right[keys] * between[reference, keys]).T))
+        rows.append(jnp.concatenate(blocks, axis=1))
+    return jnp.concatenate(rows, axis=0)
 
 
 def _lowered(overlaps):
