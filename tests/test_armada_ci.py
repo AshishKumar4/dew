@@ -582,7 +582,8 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     def ran(stem: str) -> list[list[str]]:
         return lane_runs(tmp_path, stem)
 
-    out = tmp_path / "verdict.json"
+    (tmp_path / ".verdict").mkdir()
+    out = tmp_path / ".verdict/verdict.json"
     assert ci.gpu_lane("3.12", every, out, cache="on", processes=4, deadline=600.0) == 0
     rows = json.loads(out.read_text())["rows"]
     assert [(row["name"], row["exitCode"]) for row in rows] == [
@@ -669,7 +670,8 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
     def ran(stem: str) -> list[list[str]]:
         return lane_runs(tmp_path, stem)
 
-    out = tmp_path / "verdict.json"
+    (tmp_path / ".verdict").mkdir()
+    out = tmp_path / ".verdict/verdict.json"
     assert ci.gpu_lane("3.12", every, out, cache="on", processes=4, deadline=600.0) == 0
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
     borrowed = str(6 * 2 ** 30 / (81920 * 2 ** 20))
@@ -1446,7 +1448,8 @@ def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_
     stay, and its file runs again once the page it trains from changes or a page is added. So are a
     directory `os.walk` lists, the checkout's own directory listed, and a page opened by its name in
     a directory's descriptor. A file it writes is no input, and nor is what the import system or
-    pytest's collection lists."""
+    pytest's collection lists; its counter is in a hidden directory, as a run that lists the checkout's own
+    directory and makes an entry in it keeps no key (row 2559)."""
     (tmp_path / "docs/guides").mkdir(parents=True)
     (tmp_path / "docs/model.md").write_text("width 4\n")
     (tmp_path / "notes").mkdir()
@@ -1455,7 +1458,7 @@ def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_
         "import os\n"
         "from pathlib import Path\n"
         "def test_pages():\n"
-        "    with Path('runs').open('a') as runs: runs.write('x')\n"
+        "    with Path('.verdict/runs').open('a') as runs: runs.write('x')\n"
         "    assert Path('docs/model.md').read_text().startswith('width')\n"
         "    assert sorted(path.name for path in Path('docs').glob('*.md'))\n"
         "    assert [folder for folder, _, _ in os.walk('docs')]\n"
@@ -1465,7 +1468,7 @@ def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_
         "        os.close(os.open('plan.md', os.O_RDONLY, dir_fd=folder))\n"
         "    finally:\n"
         "        os.close(folder)\n")
-    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
+    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker, ".verdict/runs")
     # Each page changed, added or listed anew runs the file again, and the run after reuses that row.
     # Python bytecode a run leaves beside a page (a directory, `None` here) is no change to the pages.
     changes = [(None, "", 1), ("docs/model.md", "width 8\n", 2), ("docs/serving.md", "serve\n", 3),

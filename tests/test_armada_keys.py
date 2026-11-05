@@ -14,6 +14,7 @@ from armada_support import (
     cached_runs,
     commit,
     copied_tools,
+    counted_runs,
     fetcher,
     gpu_lane_at,
     green_runs,
@@ -259,3 +260,73 @@ def test_a_gpu_lane_is_keyed_by_the_session_it_runs_and_nothing_else_of_the_plan
     assert {name: found for name, found in changed.gpu_tier("3.12").items() if name in names} == {
         name: ["changed"] for name in names}
     assert lane_run_counts(changed, tmp_path, names) == [2, 2], "an edit of the session reruns them"
+
+
+REWRITES = {
+    "a fixture under tests/": (
+        {"tests/fixtures/data.json": '{"v": 1}'},
+        "    data = Path('tests/fixtures/data.json')\n"
+        "    assert json.loads(data.read_text())['v'] >= 1\n"
+        "    data.write_text(json.dumps({'v': 2}))\n"),
+    "a tool's data": (
+        {"tools/data.json": '{"v": 1}'},
+        "    data = Path('tools/data.json')\n"
+        "    assert json.loads(data.read_text())['v'] >= 1\n"
+        "    data.write_text(json.dumps({'v': 2}))\n"),
+    "a page a child rewrites": (
+        {"docs/page.md": "page\n"},
+        "    import subprocess, sys\n"
+        "    child = \"from pathlib import Path; page = Path('docs/page.md'); assert page.read_text(); \"\n"
+        "    child += \"page.write_text('changed\\\\n')\"\n"
+        "    subprocess.run([sys.executable, '-c', child], check=True)\n"),
+    "a file in a directory the run makes": (
+        {},
+        "    Path('tests/fixtures/fresh').mkdir(parents=True, exist_ok=True)\n"
+        "    data = Path('tests/fixtures/fresh/data.json')\n"
+        "    data.write_text(json.dumps({'v': 1}))\n"
+        "    assert json.loads(data.read_text())['v'] >= 1\n"
+        "    data.write_text(json.dumps({'v': 2}))\n"),
+    "a hidden fixture": (
+        {"tests/fixtures/.data.json": '{"v": 1}'},
+        "    data = Path('tests/fixtures/.data.json')\n"
+        "    assert json.loads(data.read_text())['v'] >= 1\n"
+        "    data.write_text(json.dumps({'v': 2}))\n"),
+}
+
+
+@pytest.mark.parametrize("what", list(REWRITES))
+def test_a_run_that_writes_an_input_it_read_keeps_no_key(ci, tmp_path, monkeypatch, cache_worker, what):
+    """A key is made after the run from its inputs' bytes as they stand, so a test that reads a file and then
+    writes it leaves a key over the bytes it wrote, which the next commit holding them reuses though no run
+    read them (row 2559). Every file of the checkout is watched while a task runs, tests/ and src/ as any
+    other directory (a tool's data, a page a followed child rewrites, a hidden fixture, a directory the run
+    makes), so such a row keeps no key and runs again; a row that only reads its input is reused."""
+    files, body = REWRITES[what]
+    for name, text in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    written(tmp_path, {"test_writes.py": "import json\nfrom pathlib import Path\ndef test_writes():\n"
+                       "    with Path('runs').open('a') as runs: runs.write('x')\n" + body})
+    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
+    assert run() == 1
+    assert run() == 2, "the key would stand for the bytes the first run wrote"
+
+
+def test_a_task_that_only_reads_keeps_its_key_beside_one_that_writes(ci, tmp_path, monkeypatch, cache_worker):
+    """What one task writes is no input of another that never read it: each task holds a watch of its own, so
+    the file that read a page and rewrote it runs again, and the file of another task that only read its own
+    page is reused."""
+    (tmp_path / "docs").mkdir()
+    for name in ("page", "other"):
+        (tmp_path / f"docs/{name}.md").write_text("page\n")
+    written(tmp_path, {
+        "test_reads.py": "from pathlib import Path\ndef test_reads():\n"
+                         "    with Path('runs-reads').open('a') as runs: runs.write('x')\n"
+                         "    assert Path('docs/page.md').read_text()\n",
+        "test_rewrites.py": "from pathlib import Path\ndef test_rewrites():\n"
+                            "    with Path('runs-rewrites').open('a') as runs: runs.write('x')\n"
+                            "    page = Path('docs/other.md')\n    assert page.read_text()\n"
+                            "    page.write_text('page\\n')\n"})
+    run = counted_runs(ci, tmp_path, monkeypatch, cache_worker, ("reads", "rewrites"))
+    assert run() == [1, 1]
+    assert run() == [1, 2], "the reader is reused, the file that wrote what it read runs again"
