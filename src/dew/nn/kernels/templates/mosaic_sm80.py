@@ -255,14 +255,19 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # transposed left operand loaded in instruction slices took the A100's kernel gradient 7% slower
         # (FS-DENSE-AB1); the right loads only the fragments the next instructions consume, as narrow as
         # its staging allows (`_depth_granule`), which took its input gradient 12% faster. A register operand
-        # (an accumulator's value) is cast once and sliced.
+        # (an accumulator's value) is cast once and sliced. Each instruction's fragments load before the
+        # product ahead of it issues, CUTLASS's warp-level double buffering: every dense kernel gradient on
+        # an A100 took 12 to 14% less time, its outputs bitwise the same, the forward and input gradient
+        # unchanged (FS-C1-NARROW1-a100).
         instruction = self.fragment_depth(int(rhs.shape[0]))
         lhs_depth = max(_depth_granule(lhs, 1, instruction), self.lhs_fragment_depth(int(lhs.shape[1])))
         rhs_depth = _depth_granule(rhs, 0, instruction)
         held = self._left(lhs) if isinstance(lhs, jax.Array) else None
         lefts: dict[int, jax.Array] = {}
         rights: dict[int, jax.Array] = {}
-        for start in range(0, rhs.shape[0], instruction):
+
+        def loaded(start: int) -> tuple[jax.Array, jax.Array]:
+            """Instruction `start`'s fragments, its loads issued the first time a slice is asked for."""
             left_at, right_at = start - start % lhs_depth, start - start % rhs_depth
             if held is None and left_at not in lefts:
                 lefts[left_at] = self._left(lhs.at[:, pl.ds(left_at, lhs_depth)])
@@ -271,8 +276,14 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
                                               optimized=self._matrix_loads)
             left = held[:, start:start + instruction] if held is not None else lefts[left_at][
                 :, start - left_at:start - left_at + instruction]
-            right = rights[right_at][start - right_at:start - right_at + instruction]
-            acc = self._mma(acc, left, right)
+            return left, rights[right_at][start - right_at:start - right_at + instruction]
+
+        starts = range(0, rhs.shape[0], instruction)
+        fragments = loaded(starts[0])
+        for following in (*starts[1:], None):
+            ahead = None if following is None else loaded(following)
+            acc = self._mma(acc, *fragments)
+            fragments = ahead
         return acc
 
     def _mma(self, acc, left, right):
