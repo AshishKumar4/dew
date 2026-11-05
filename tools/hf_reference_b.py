@@ -1041,13 +1041,13 @@ def write_gemma4_moe_block(directory: Path) -> None:
     print(f"{directory}: moe block, {sorted(arrays)}")
 
 
-def gemma3n_tiny_config() -> Gemma3nTextConfig:
+def gemma3n_tiny_config(**replaced) -> Gemma3nTextConfig:
     """Three copies of the residual stream, sparsity on the first two layers,
     widths of 48 and 64, one layer sharing K/V. The per-layer table has as
     many rows as the vocabulary, since the reference indexes it with the
     token ids as they are (the released 262144 rows serve text ids below the
-    multimodal ones)."""
-    return Gemma3nTextConfig.from_dict(dict(
+    multimodal ones). `replaced` fields stand in for the ones spelled here."""
+    return Gemma3nTextConfig.from_dict({**dict(
         vocab_size=64, vocab_size_per_layer_input=64, hidden_size=32,
         intermediate_size=[48, 48, 64, 64], num_hidden_layers=4,
         num_attention_heads=4, num_key_value_heads=2, head_dim=8,
@@ -1058,7 +1058,15 @@ def gemma3n_tiny_config() -> Gemma3nTextConfig:
         hidden_size_per_layer_input=8, altup_num_inputs=3, altup_active_idx=0,
         altup_coef_clip=120.0, altup_correct_scale=True, num_kv_shared_layers=1,
         laurel_rank=8, activation_sparsity_pattern=[0.95, 0.95, 0.0, 0.0],
-        tie_word_embeddings=True))
+        tie_word_embeddings=True), **replaced})
+
+
+def gemma3n_wrapper_text_config() -> Gemma3nTextConfig:
+    """The text half of the Gemma 3n wrapper fixtures (tools/audio_wrapper_reference.py,
+    tools/gemma3n_vision_reference.py): the per-layer table cut at the 48 text ids below the
+    multimodal ones, the logit cap at 5 and no sparse layer."""
+    return gemma3n_tiny_config(vocab_size_per_layer_input=48, final_logit_softcapping=5.0,
+                               activation_sparsity_pattern=[0.0, 0.0, 0.0, 0.0])
 
 
 def tiny_gemma3n() -> Gemma3nForCausalLM:
