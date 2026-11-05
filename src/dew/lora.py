@@ -591,7 +591,7 @@ class AdapterSet:
     @property
     def names(self) -> tuple[str, ...]:
         """The adapters, in the order a row's index names them (`selected`)."""
-        return type(self.model)._dew_lora_bound.names
+        return adapter_names(self.model)
 
     def index(self, name: str | None) -> int:
         """The place of the adapter `name` in `names`; -1, the base model alone, for None."""
