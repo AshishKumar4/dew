@@ -1612,15 +1612,17 @@ def test_closing_a_compiled_from_iter_reader_finalizes_its_native_generators(cyc
     try:
         # A pass's first two rows, or, interleaved, each pass's first.
         assert next(reader)["id"].tolist() == ([0, 1] if cycle == 1 else [0, 0])
+        # One pass after another opens the one it reads alone; interleaved, each pass it reads, and those
+        # its iterator-making executor opens ahead.
         if cycle > 1:
             assert both_started.wait(timeout=5)
-        assert sorted(opened) == list(range(cycle)) and not closed
+        assert (opened == [0] if cycle == 1 else len(opened) >= cycle) and not closed
     finally:
         reader.close()
         reader.close()
     # Grain finalizes the unconsumed lookahead on its iterator-making executor.
     assert all(finalized.wait(timeout=5) for finalized in finalizers)
-    assert sorted(closed) == sorted(opened) == list(range(cycle))
+    assert sorted(closed) == sorted(opened)
 
 
 def test_from_iter_forwards_a_native_stop_request():
