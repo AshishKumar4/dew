@@ -11,9 +11,11 @@ measured, tabled, swept or ranked: a GPU no row names derives its tiles from its
 gap is fixed in the derivation or the kernel.
 """
 
+import collections
 import contextlib
 import dataclasses
 import functools
+import threading
 from collections.abc import Set
 from typing import ClassVar
 
@@ -112,8 +114,14 @@ def backward_holds(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: 
                               rounded, ranged=ranged, skip=skip) for backward in (False, True))
     return holds(both[len(forward):], family, generation.shared_budget(target))
 
-_PLANS: dict = {}
-"""`_planned`'s plans by their call, tiles, bundle and target's facts."""
+PLANS_KEPT = 1024
+"""The plans `_planned` keeps, the least recently read given way first: a Qwen3.5-4B-width step's
+compile_ahead planned 425 (row 4260's profile), and every plan kept for the process's life held each
+geometry a derivation ever tried (row 4390)."""
+
+_PLANS: collections.OrderedDict = collections.OrderedDict()
+"""`_planned`'s plans by their call, tiles, bundle and target's facts, the most recently read last."""
+_PLANNING = threading.Lock()
 
 
 def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target: generation.GpuTarget,
@@ -122,15 +130,22 @@ def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target
              ranged: bool = False, skip: jax.ShapeDtypeStruct | None = None) -> tuple[mainloop.Launch, ...]:
     """`planned` of a call over `shapes` (`jax.ShapeDtypeStruct`s or None) by `family`'s
     bundle on `target`, cached by the facts a plan reads of it (two targets of one family share no plan: an
-    sm87's and an sm80's multiprocessors and shared memory differ)."""
+    sm87's and an sm80's multiprocessors and shared memory differ), `PLANS_KEPT` of them."""
     facts = (target.generation, target.device_kind, target.shared_limit, target.multiprocessors)
     key = (shapes, tiles, family, facts, max_segments, delta, backward, floor, rounded, wide, ranged, skip)
-    if key not in _PLANS:
-        *operands, starts = shapes
-        _PLANS[key] = planned(*operands, tiles=tiles, family=family, starts=starts,
-                                       max_segments=max_segments, delta=delta, backward=backward, floor=floor,
-                                       target=target, rounded=rounded, wide=wide, ranged=ranged, skip=skip)
-    return _PLANS[key]
+    with _PLANNING:
+        if key in _PLANS:
+            _PLANS.move_to_end(key)
+            return _PLANS[key]
+    *operands, starts = shapes
+    found = planned(*operands, tiles=tiles, family=family, starts=starts, max_segments=max_segments,
+                    delta=delta, backward=backward, floor=floor, target=target, rounded=rounded, wide=wide,
+                    ranged=ranged, skip=skip)
+    with _PLANNING:
+        _PLANS[key] = found
+        while len(_PLANS) > PLANS_KEPT:
+            _PLANS.popitem(last=False)
+    return found
 
 
 def ranged(dtype, delta: bool, bound: float | None) -> bool:

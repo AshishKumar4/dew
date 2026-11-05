@@ -1646,9 +1646,10 @@ class Transport[Allocated, Opened](abc.ABC):
         accumulator's axes a vector follows, where a family stages its loads through registers in the
         accumulator's layouts (`mosaic_sm80.Mma`); a vector whose axes go unstated follows its columns."""
 
-    def load_barriers(self, count: int):
+    def load_barriers(self, count: int) -> Any:
         """The scoped allocation of `count` whole loads' completions (`loaded`'s barriers), which a program's
-        allocations hold beside its streams (`scoped`, `resources.Scope`)."""
+        allocations hold beside its streams (`scoped`, `resources.Scope`): a backend's own kind of scoped
+        allocation (a GPU's barriers, a TPU's DMA semaphores)."""
         return plgpu.Barrier(num_barriers=count)
 
     def staging(self, name: str, shaped) -> dict:

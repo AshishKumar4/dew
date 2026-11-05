@@ -600,19 +600,21 @@ def test_a_body_shared_by_its_call_sites_stays_shared():
 
     from dew.telemetry.compiles import Compiles
 
-    def shared(*, on: bool):
+    def bodies(*, on: bool) -> set:
         with algebra.passes(on):
             closed = jax.make_jaxpr(algebra.rewritten(model))(x, ws)
-            jax.clear_caches()
-            with Compiles(None) as heard:
-                jax.jit(algebra.rewritten(model))(x, ws).block_until_ready()
-        bodies = [equation.params["jaxpr"] for equation in closed.jaxpr.eqns
-                  if equation.primitive.name in ("pjit", "jit")]
-        return {id(body) for body in bodies}, len(heard.programs)
+        return {id(equation.params["jaxpr"]) for equation in closed.jaxpr.eqns
+                if equation.primitive.name in ("pjit", "jit")}
 
-    off, on, again = shared(on=False), shared(on=True), shared(on=True)
-    assert len(on[0]) == len(off[0]) == 1 and on[1] == off[1]
-    assert again[0] == on[0]
+    def compiled(*, on: bool) -> int:
+        jax.clear_caches()
+        with algebra.passes(on), Compiles(None) as heard:
+            jax.jit(algebra.rewritten(model))(x, ws).block_until_ready()
+        return len(heard.programs)
+
+    on, again = bodies(on=True), bodies(on=True)
+    assert len(on) == len(bodies(on=False)) == 1 and again == on
+    assert compiled(on=True) == compiled(on=False)
 
 
 def test_the_pass_holds_no_body_past_its_life():
