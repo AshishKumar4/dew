@@ -36,7 +36,7 @@ from dew.devices import xla_flag
 from dew.distributed.placement import placed_bytes
 from dew.mesh import DATA_AXIS, FSDP_AXIS, row_axes
 from dew.nn.kernels.generation import _compute_capability, gpu_target
-from dew.nn.programs import bodies, computed
+from dew.nn.programs import bodies, computed, opaque
 from dew.objectives.base import Objective
 from dew.state import TrainState
 from dew.training.compiled_program import (
@@ -203,8 +203,68 @@ def derived_terms(loss: Callable, params, arguments: Sequence, *, platform: str,
 def simplified(program: jcore.Jaxpr, platform: str, lowering: str | None = None) -> jcore.Jaxpr:
     """`program` as XLA compiles it for `platform`, as JAX lowers it for `lowering` (`compiled`;
     `platform`'s own name where none is given, a GPU's CUDA's), each equation that repeats another one
-    (`deduplicated`) and each sum into a scatter (`folded`) as XLA's simplifiers make them."""
-    return folded(deduplicated(compiled(program, lowering or LOWERED.get(platform, platform))))
+    (`deduplicated`), each sum into a scatter (`folded`) and each sum a product computes (`biased`) as
+    XLA's simplifiers and its GEMM rewriter make them, in every program it runs, a loop's body among
+    them, as XLA's passes run over every computation (`throughout`)."""
+    return throughout(lambda each: biased(folded(deduplicated(each))),
+                      compiled(program, lowering or LOWERED.get(platform, platform)))
+
+
+def throughout(rewrite: Callable[[jcore.Jaxpr], jcore.Jaxpr], program: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`program` rewritten by `rewrite`, and so each program its equations run (a loop's body, a
+    conditional's branches), each rewritten once however many equations run it."""
+    made: dict[int, tuple[jcore.Jaxpr, jcore.Jaxpr]] = {}
+
+    def within(value):
+        if isinstance(value, jcore.Jaxpr):
+            if (held := made.get(id(value))) is not None and held[0] is value:
+                return held[1]
+            # A native kernel's program is no computation XLA's passes run over (`opaque`).
+            inner = rewrite(value.replace(eqns=[equation if opaque(equation) else equation.replace(params={
+                key: within(param) for key, param in equation.params.items()}) for equation in value.eqns]))
+            made[id(value)] = (value, inner)
+            return inner
+        if type(value) in (tuple, list):
+            return type(value)(within(each) for each in value)
+        return value
+
+    return within(program)
+
+
+def biased(program: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`program` with each sum of a cuBLAS product (`cublas_product`) read by that sum alone and a value of
+    its type the product's own: a product of three operands, the sum's addend its third, run where the
+    sum ran, as XLA's GEMM rewriter folds the sum into the GEMM, its bias (`FuseMatrixBiasAdd`,
+    xla/backends/gpu/transforms/gemm_rewriter.cc: a GEMM of one user, its beta 1), which writes in the
+    bias's buffer where nothing else reads it (`in_place`). A tiled head's weight gradient adds each
+    tile's product to its loop's carry: Qwen3.5-4B's step under 'full' at two microbatches was derived
+    holding each tile's 2.37 GiB product beside the carry, which XLA's GEMM writes in (row 4089)."""
+    producers = {out: equation for equation in program.eqns for out in equation.outvars}
+    readers = collections.Counter(value for equation in program.eqns for value in equation.invars
+                                  if isinstance(value, jcore.Var))
+    readers.update(value for value in program.outvars if isinstance(value, jcore.Var))
+    dropped: set[int] = set()
+    replaced: dict[int, jcore.JaxprEqn] = {}
+    for equation in program.eqns:
+        if equation.primitive.name not in ("add", "add_any") or len(equation.invars) != 2:
+            continue
+        out = equation.outvars[0]
+        first, second = equation.invars
+        for made, addend in ((first, second), (second, first)):
+            if not isinstance(made, jcore.Var) or not isinstance(addend, jcore.Var):
+                continue
+            product = producers.get(made)
+            if (product is None or not cublas_product(product) or len(product.invars) != 2
+                    or readers[made] != 1 or made.aval != out.aval or addend.aval != out.aval
+                    or np.issubdtype(out.aval.dtype, np.integer) or id(product) in dropped):
+                continue
+            dropped.add(id(product))
+            replaced[id(equation)] = product.replace(invars=[*product.invars, addend], outvars=[out])
+            break
+    if not replaced:
+        return program
+    return program.replace(eqns=[replaced.get(id(equation), equation) for equation in program.eqns
+                                 if id(equation) not in dropped])
 
 
 def folded(program: jcore.Jaxpr) -> jcore.Jaxpr:
@@ -500,7 +560,7 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
         made = [out for out in equation.outvars
                 if out in last and frontier.buffered(out) and out not in carried]
         made_bytes = sum(map(device_share, made))
-        # A scatter writes its result in the buffer of the base it reads last (`in_place`).
+        # A scatter or a product with a bias writes its result in a buffer it reads last (`in_place`).
         taken = in_place(frontier, equation, held, last, index)
         if made or not frontier.fusing(equation):
             inner = max((peak_bytes(body, platform, workspace, Slicing.entering(equation, body),
@@ -542,23 +602,30 @@ def unfused(frontier: Frontier, equation: jcore.JaxprEqn) -> set[jcore.Var]:
 
 
 def in_place(frontier: Frontier, equation: jcore.JaxprEqn, held: set, last: Mapping, index: int) -> int:
-    """The bytes of the buffer the scatter `equation`, the program's `index`th, writes its result in: its
-    base's, the one buffer the program holds (`held`) that the base is or views (`Frontier.reading`), where
-    it reads that buffer last, its indices and updates read none of it, and it is its result's size, as
-    XLA shares a scatter's first operand's
-    buffer with its result (`HloDataflowAnalysis::CanShareOperandBufferWithUser`,
-    xla/hlo/analysis/hlo_dataflow_analysis.cc); none for any other equation."""
-    if not equation.primitive.name.startswith("scatter") or not equation.invars:
+    """The bytes of the buffer `equation`, the program's `index`th, writes its result in: a scatter's
+    base's, or a product's bias's (`biased`), the one buffer the program holds (`held`) that it is or views
+    (`Frontier.reading`), where the equation reads that buffer last, its other operands read none of it,
+    and it is its result's size, as XLA shares a scatter's first operand's buffer with its result
+    (`HloDataflowAnalysis::CanShareOperandBufferWithUser`, xla/hlo/analysis/hlo_dataflow_analysis.cc) and
+    a GEMM's bias's that nothing else reads (`FuseMatrixBiasAdd`'s `can_overwrite_bias`,
+    xla/backends/gpu/transforms/gemm_rewriter.cc); none for any other equation."""
+    name = equation.primitive.name
+    if name.startswith("scatter") and equation.invars:
+        at = 0
+    elif name == "dot_general" and len(equation.invars) == 3:
+        at = 2
+    else:
         return 0
-    base = equation.invars[0]
+    base = equation.invars[at]
     if not computed(base) or equation.invars.count(base) != 1 or frontier.made_for(base):
         return 0
     kept = frontier.reading([base])
     if len(kept) != 1:
         return 0
     (buffer,) = kept
-    # Its indices and updates read none of that buffer, which a scatter in place would overwrite under them.
-    if buffer not in held or last.get(buffer) != index or buffer in frontier.reading(equation.invars[1:]):
+    # Its other operands read none of that buffer, which writing it in place would overwrite under them.
+    others = [value for number, value in enumerate(equation.invars) if number != at]
+    if buffer not in held or last.get(buffer) != index or buffer in frontier.reading(others):
         return 0
     if device_share(buffer) != device_share(equation.outvars[0]):
         return 0
