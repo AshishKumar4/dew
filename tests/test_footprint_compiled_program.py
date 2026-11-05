@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from dew.nn.programs import called
 from dew.training.compiled_program import compiled, deviceless, lowering_platform
 from dew.training.footprint import Workspace, gemm_workspace, gradient_peak, peak_bytes
 
@@ -97,8 +98,7 @@ def test_a_program_held_by_many_equations_is_compiled_once_and_holds_what_it_did
 
     weights = [jax.ShapeDtypeStruct((64, 64), jnp.float32)] * 8
     program = jax.make_jaxpr(jax.grad(layers))(jax.ShapeDtypeStruct((16, 64), jnp.float32), weights).jaxpr
-    bodies = [equation.params["jaxpr"] for equation in program.eqns
-              if equation.primitive.name == "checkpoint"]
+    bodies = [body for equation in program.eqns if (body := called(equation)) is not None]
     assert len(bodies) >= 8 and len({id(body) for body in bodies}) < len(bodies)
     made = {}
     once = compiled(program, "cuda", made)
