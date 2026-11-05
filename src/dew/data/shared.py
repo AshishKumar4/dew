@@ -13,7 +13,6 @@ members.
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
-from typing import cast
 
 WIDTH = 32
 """The slots of a trie node: a thousand values two nodes deep."""
@@ -57,10 +56,10 @@ class Shared[V](Mapping[str, V]):
 
     def __getitem__(self, key: str) -> V:
         place = self._index[key]
-        node = self._root
-        for level in range(self._depth - 1, -1, -1):
+        node: tuple = self._root
+        for level in range(self._depth - 1, 0, -1):
             node = node[place // WIDTH ** level % WIDTH]
-        return cast(V, node)
+        return node[place % WIDTH]
 
     def __iter__(self) -> Iterator[str]:
         return iter(self._keys)
