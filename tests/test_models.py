@@ -6,6 +6,7 @@ scan orders, the position signal, the mixing across frames, the inflation of
 a 2D UNet into a 3D one, and the stage values the UNets are configured with.
 """
 
+import contextlib
 from pathlib import Path
 
 import jax
@@ -14,9 +15,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from flax.core import freeze, unfreeze
-from float64_terms import float64_terms
 from model_support import moved
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact, torch_with_gradients, widened, with_gradients
 
 from dew.nn.attention_blocks import Stage
@@ -133,73 +132,80 @@ def test_a_vae_encoder_keeps_the_host_reference_precision(batch, backward):
 
 
 VAE_ENCODER = Path(__file__).resolve().parent / "fixtures" / "vae" / "encoder.npz"
+VAE_ENCODER_SEEDS = 8
+"""Diffusers' encoder site's declared check-1 seeds, sized by `seeds_for` paired."""
 
 
 @pytest.mark.parametrize("batch", [1, 4])
 @pytest.mark.parametrize("backward", [False, True], ids=["encode", "vjp"])
 def test_a_vae_encoder_is_as_exact_as_diffusers(batch, backward):
     """The encoder above against Diffusers' own `Encoder` at its geometry
-    (tools/vae_encoder_reference.py): the moments, and the gradients of the
-    image and every parameter, on whichever backend runs the test, by the
-    float64 rule. The host-precision test holds the device to the host;
+    (tools/vae_encoder_reference.py's weights), the moments, and the gradients
+    of the image and every parameter, on whichever backend runs the test, on par
+    with Diffusers' over drawn images and probes (check 1, the truth its float64
+    twin's). The host-precision test holds the device to the host;
     this holds both to the published model. On the CPU the ratios are 1.62
     (moments) and 1.60 (gradients) at a batch of one, where XLA convolves
     another way, and 0.99 and 1.01 at four."""
     import ml_dtypes
+    import torch
+    from diffusers import AutoencoderKL
+
+    from tools.torch_precision import float64_twin, widened as widened_torch
+    from tools.vae_encoder_reference import CONFIG, SIZE, walk
 
     with np.load(VAE_ENCODER) as loaded:
         arrays = dict(loaded)
     names = [key.removeprefix("param.") for key in arrays if key.startswith("param.")]
-    weights = {f"encoder.{name}": arrays[f"param.{name}"].view(ml_dtypes.bfloat16).astype(np.float32)
-               for name in names}
-    params = jax.tree.map(jnp.asarray, translate_vae_weights(weights)["encoder"])
+    source = {name: arrays[f"param.{name}"].view(ml_dtypes.bfloat16).astype(np.float32) for name in names}
+    params = jax.tree.map(jnp.asarray, translate_vae_weights(
+        {f"encoder.{name}": value for name, value in source.items()})["encoder"])
     model = FlaxEncoder(out_channels=4, block_out_channels=(32, 64), layers_per_block=1, norm_num_groups=8)
-    image = jnp.asarray(np.moveaxis(arrays["image"][:batch], 1, -1))
-    probe = jnp.asarray(np.moveaxis(arrays[f"{batch}/probe"], 1, -1))
+    encoder = AutoencoderKL.from_config(CONFIG).encoder.eval()
+    encoder.load_state_dict({name: torch.from_numpy(value) for name, value in source.items()})
+    wide = float64_twin(encoder, lambda: AutoencoderKL.from_config(CONFIG).encoder)
+    shape = jax.eval_shape(model.apply, {"params": params}, jnp.zeros((batch, SIZE, SIZE, 3))).shape
 
-    def part(precision: str, name: str) -> np.ndarray:
-        return arrays[f"{batch}/{precision}.{name}"]
+    def draw(seed):
+        rng = np.random.default_rng([67, batch, seed])
+        return (rng.standard_normal((batch, 3, SIZE, SIZE)).astype(np.float32),
+                rng.standard_normal((shape[0], shape[3], shape[1], shape[2])).astype(np.float32))
 
-    if not backward:
-        moments = jax.jit(model.apply)({"params": params}, image)
-        assert_as_exact_as_the_reference(np.moveaxis(np.asarray(moments), -1, 1), part("fp32", "moments"),
-                                         part("fp64", "moments"), f"batch {batch} moments")
-        return
-    def gradients(p, x):
-        return jax.grad(lambda p, x: jnp.sum(model.apply({"params": p}, x) * probe), argnums=(0, 1))(p, x)
-
-    grad_params, grad_image = jax.jit(gradients)(params, image)
-    # Dew's own path in float64 on the CPU: each gradient entry's terms, what its sums add
-    # (`float64_terms`).
-    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
-        _, (param_terms, image_terms) = float64_terms(gradients, *widened((params, image)))
-
-    def source_layout(tree, name: str) -> np.ndarray:
-        """A Dew gradient in Diffusers' layout: the one tensor translated
-        alone names its place, and kernels transpose back."""
-        shape = arrays[f"param.{name}"].shape
-        [(path, _)] = jax.tree_util.tree_flatten_with_path(
-            translate_vae_weights({f"encoder.{name}": np.zeros(shape, np.float32)})["encoder"])[0]
+    def source_layout(tree, name: str):
+        """A Dew gradient in Diffusers' layout: the one tensor translated alone names its place, and
+        kernels transpose back."""
+        [(path, _)] = jax.tree_util.tree_flatten_with_path(translate_vae_weights(
+            {f"encoder.{name}": np.zeros(source[name].shape, np.float32)})["encoder"])[0]
         value = tree
         for key in path:
             value = value[key.key]
-        value = np.asarray(value)
         if path[-1].key == "kernel":
-            return value.transpose(3, 2, 0, 1) if value.ndim == 4 else value.T
+            return jnp.transpose(value, (3, 2, 0, 1)) if value.ndim == 4 else value.T
         return value
 
-    def native_order(grad_params, grad_image) -> np.ndarray:
-        native = [np.moveaxis(np.asarray(grad_image), -1, 1),
-                  *(source_layout(grad_params, name) for name in names)]
-        return np.concatenate([np.ravel(leaf) for leaf in native])
+    def dew(image, probe):
+        image, probe = jnp.moveaxis(image, 1, -1), jnp.moveaxis(probe, 1, -1)
+        moments = model.apply({"params": params}, image)
+        if not backward:
+            return {"moments": jnp.moveaxis(moments, -1, 1)}
+        grad_params, grad_image = jax.grad(lambda p, x: jnp.sum(model.apply({"params": p}, x) * probe),
+                                           argnums=(0, 1))(params, image)
+        return {"grad_image": jnp.moveaxis(grad_image, -1, 1),
+                **{f"grad_param.{name}": source_layout(grad_params, name) for name in names}}
 
-    def source_order(precision: str) -> np.ndarray:
-        leaves = [part(precision, "grad_image"), *(part(precision, f"grad_param.{name}") for name in names)]
-        return np.concatenate([np.ravel(leaf) for leaf in leaves])
+    def diffusers_walk(model, dtype, context):
+        @as_given
+        def run(image, probe):
+            with context():
+                found = walk(model, torch.from_numpy(np.asarray(image)), torch.from_numpy(np.asarray(probe)),
+                             dtype)
+            return ({"moments": found["moments"]} if not backward else
+                    {key: value for key, value in found.items() if key != "moments"})
+        return run
 
-    assert_as_exact_as_the_reference(native_order(grad_params, grad_image), source_order("fp32"),
-                                     source_order("fp64"), f"batch {batch} gradients",
-                                     terms=native_order(param_terms, image_terms))
+    assert_as_exact(dew, diffusers_walk(encoder, torch.float32, contextlib.nullcontext), draw,
+                    f"batch {batch} {'gradients' if backward else 'moments'}", seeds=VAE_ENCODER_SEEDS,
+                    truth_fn=diffusers_walk(wide, torch.float64, widened_torch))
 
 
 LINEARIZATION_SEEDS = 8
