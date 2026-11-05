@@ -126,7 +126,7 @@ def test_a_rollout_advances_an_environment_whose_state_shares_an_array():
     """A Dreamer rollout donates its live state to the steps that advance it, each buffer once, so it runs
     over an environment whose state holds one array in two fields: three updates at a train ratio of 32 over
     windows of 16 in batches of 8 take the prefill and exactly the steps they owe."""
-    from dew.objectives.rl.config import idle
+    from dew.config.env import idle
     from dew.training import Trainer
 
     env = Batched(TimeLimit(SharedTarget(), episode_length=20), 8)
@@ -288,8 +288,8 @@ def test_an_agent_learns_its_world_from_its_replay(agent):
     dynamics or TransDreamer's, over the walk's position, the walks simulated on the host, or its
     pixels, the pixels' agent predicting the privileged position it never reads better too. Its policy's
     return is the acceptance run's to judge, on a task at the steps the paper reports."""
+    from dew.config.env import idle
     from dew.objectives.base import Step
-    from dew.objectives.rl.config import idle
     from dew.training import Trainer
 
     environments, model = AGENTS[agent]
@@ -408,7 +408,7 @@ def test_a_rollout_from_demonstrations_takes_no_prefill_and_writes_on_them():
     """A Dreamer rollout started from a replay of recorded steps takes no random prefill: after 12 updates
     at a train ratio of 32 over windows of 16 in batches of 8, its environments have taken exactly the
     steps those updates owe, written after the recorded ones."""
-    from dew.objectives.rl.config import idle
+    from dew.config.env import idle
     from dew.rl.replay import ReplayBuffer
     from dew.training import Trainer
 
@@ -514,7 +514,7 @@ def dreamer_targets(objective, *, checkpointed, replay=None):
 def dreamer_fit(directory, objective, rollout, steps, **options):
     """A Dreamer run of `steps` updates over `rollout`, checkpointed every update to `directory`."""
     from dew.checkpoints import Checkpoints, Keep
-    from dew.objectives.rl.config import idle
+    from dew.config.env import idle
     from dew.training import Trainer
 
     data = idle()
