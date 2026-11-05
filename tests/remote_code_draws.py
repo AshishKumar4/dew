@@ -43,14 +43,15 @@ AUDIO_AT = (2, 9)
 
 SITES = {"lfm3-tiny": ("logits", "packed", "decode", "gradients", "update"), "lfm3-biased-tiny": ("biased",),
          "lfm3-vl-tiny": ("logits", "image", "video"),
-         "mimo-v2-tiny": ("logits",), "mimo-v2-vl-tiny": ("logits", "image", "video", "audio"),
+         "mimo-v2-tiny": ("logits",), "mimo-v2-vl-tiny": ("logits", "image", "video", "audio", "mtp"),
          "dream-tiny": ("logits",), "llada-tiny": ("logits",)}
 """Each release fixture's sites: its logits over plain rows; LFM3's over a packed row, through the decode
 cache in chunks, its parameter gradients under a drawn cotangent, and its logits after one SGD step at
 `RATE` on the rows' next-token cross-entropy (`update`), the tied embedding and head stepped once; with
 its convolution's bias (`conv_bias`), over left-padded rows; LFM3-VL's and MiMo-V2.6's over a row whose
 placeholders a drawn image fills (`image`), or a drawn video's frames (`video`), each packed as its
-processor packs it; and MiMo-V2.6's over one whose placeholders drawn audio clips fill (`audio`)."""
+processor packs it; and MiMo-V2.6's over one whose placeholders drawn audio clips fill (`audio`), and its
+prediction layer's over plain rows (`mtp`)."""
 
 
 def vocabulary(config: dict) -> int:

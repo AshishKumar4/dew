@@ -345,7 +345,8 @@ def remote_code_site(source, site: str, *, wide: bool = False) -> Callable[[dict
     logits after one SGD step at `RATE` on the rows' next-token cross-entropy; `biased` over left-padded
     rows, each row's real slots alone (`row0`, `row1`); `image`, `video` and `audio` over a row whose
     placeholders its drawn media fill, laid out as the source's processor reads its own processor's fields
-    (`Processor.from_hf`)."""
+    (`Processor.from_hf`); `mtp`, its language model's first prediction depth's logits over plain rows
+    (`prediction_logits`)."""
     import optax
     from reference_error import widened
     from remote_code_draws import CHUNKS, DOCUMENTS, PADDED, RATE, positions
@@ -389,6 +390,12 @@ def remote_code_site(source, site: str, *, wide: bool = False) -> Callable[[dict
             return {"logits": model.apply({**variables, "params": optax.apply_updates(params, steps)},
                                           inputs["ids"])}
         return jax.jit(updated)
+    if site == "mtp":
+        # A wrapper's prediction depths are its language model's.
+        language = getattr(model, "language_model", model)
+        held = {collection: tree["language_model"] for collection, tree in variables.items()
+                if "language_model" in tree} if language is not model else variables
+        return jax.jit(lambda inputs: {"logits": prediction_logits(language, held, inputs["ids"])})
     if site == "biased":
         def biased(inputs):
             mask = inputs["attention_mask"].astype(bool)

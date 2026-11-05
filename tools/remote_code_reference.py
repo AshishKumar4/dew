@@ -180,6 +180,10 @@ OMITTED = {"mimo-v2-vl-tiny": (
 key: MiMo-V2.6's merger's biases, zeros (transformers' `_init_weights`), and its audio encoder's unused
 token table (`_keys_to_ignore_on_load_missing`)."""
 
+PREDICTING = ("mimo-v2-vl-tiny",)
+"""The fixtures that carry MiMo-V2's prediction layer (`prediction_layer`), under `model.mtp.layers.0.`, which
+the release's own class skips on load."""
+
 AUDIO_TOKENIZER = "audio_tokenizer"
 """The folder a release keeps its audio tokenizer in, its own config and weights, which its model loads
 (MiMo-V2.6's `load_audio_tokenizer`)."""
@@ -193,12 +197,20 @@ def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Mod
     model = built(configured(json.loads((FIXTURES / name / "config.json").read_text())))
     tokenizer = FIXTURES / name / AUDIO_TOKENIZER
     omitted = OMITTED.get(name, ())
+    predicting = name in PREDICTING
     if draw:
         torch.manual_seed(0)
         with torch.no_grad():
             for parameter in model.parameters():
                 parameter.copy_(torch.randn_like(parameter) * 0.1)
         stored = {key: value for key, value in _stored_once(model.state_dict()).items() if key not in omitted}
+        if predicting:
+            layer = prediction_layer(model)
+            with torch.no_grad():
+                for parameter in layer.parameters():
+                    parameter.copy_(torch.randn_like(parameter) * 0.1)
+            stored.update({PREDICTION_STEM + released_name(key): value.contiguous()
+                           for key, value in layer.state_dict().items()})
         save_file(stored, str(FIXTURES / name / "model.safetensors"))
         config = json.loads((FIXTURES / name / "config.json").read_text())
         ids = torch.randint(0, vocabulary(config), (2, 16)).numpy().astype(np.int32)
@@ -208,8 +220,9 @@ def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Mod
         if (tokenizer / "config.json").is_file():
             draw_audio_tokenizer(model, tokenizer)
     state = model.state_dict()
-    missing, unexpected = model.load_state_dict(load_file(str(FIXTURES / name / "model.safetensors")),
-                                                strict=False)
+    held = load_file(str(FIXTURES / name / "model.safetensors"))
+    predicted = {key: held.pop(key) for key in list(held) if key.startswith(PREDICTION_STEM)}
+    missing, unexpected = model.load_state_dict(held, strict=False)
     with torch.no_grad():
         for key in omitted:
             # As the release's loader initializes a missing bias; an unused table stays as it is.
@@ -220,9 +233,61 @@ def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Mod
     if unexpected or set(missing) != shared | set(omitted):
         raise ValueError(f"{name}: the file's tensors differ from the model's: missing {missing}, "
                          f"unexpected {unexpected}")
+    if predicting:
+        # The prediction layer's tensors into the layer composed beside the model, whose own load skips them.
+        model.prediction_layer = prediction_layer(model)
+        model.prediction_layer.load_state_dict({key: predicted[PREDICTION_STEM + released_name(key)]
+                                                for key in model.prediction_layer.state_dict()})
     if (tokenizer / "model.safetensors").is_file():
         model.load_audio_tokenizer(str(tokenizer), device="cpu", dtype=next(model.parameters()).dtype)
     return model.eval()
+
+
+PREDICTION_STEM = "model.mtp.layers.0."
+"""Where a MiMo-V2 checkpoint keeps its one prediction layer (vLLM's `model.mtp.layers.{i}.`)."""
+
+
+def released_name(key: str) -> str:
+    """A tensor of `prediction_layer` under its name past `PREDICTION_STEM`: its block's as vLLM names them,
+    the norm before the feed-forward `pre_mlp_layernorm`."""
+    return key.removeprefix("block.").replace("post_attention_layernorm", "pre_mlp_layernorm")
+
+
+def prediction_layer(model: torch.nn.Module) -> torch.nn.Module:
+    """MiMo-V2's prediction layer as vLLM composes it (vllm/model_executor/models/mimo_v2_mtp.py at 19aba3e,
+    `MiMoV2MTPLayer`), of the release's own modules: the token's embedding and the previous position's final
+    state each RMS-normed (`enorm`, `hnorm`), side by side through one bias-free map (`eh_proj`), then one
+    decoder layer of the sliding kind's attention (its heads, window, base and sinks) over a dense
+    feed-forward at `intermediate_size`, attending causally within its window as the release's sliding
+    layers do (`create_sliding_window_causal_mask`, the release's rotary of the sliding kind), and a final
+    RMS norm (`final_layernorm`); its logits are the model's own head's."""
+    import copy
+
+    modeling = sys.modules[type(model).__module__]
+    config = copy.deepcopy(model.config)
+    config.hybrid_layer_pattern = [1] * config.num_hidden_layers
+    config.moe_layer_freq = [0] * config.num_hidden_layers
+    size, eps = config.hidden_size, config.layernorm_epsilon
+
+    class PredictionLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.enorm = modeling.MiMoV2RMSNorm(size, eps=eps)
+            self.hnorm = modeling.MiMoV2RMSNorm(size, eps=eps)
+            self.eh_proj = torch.nn.Linear(2 * size, size, bias=False)
+            self.block = modeling.MiMoV2DecoderLayer(config, 0)
+            self.final_layernorm = modeling.MiMoV2RMSNorm(size, eps=eps)
+
+        def forward(self, embeds, hidden):
+            x = self.eh_proj(torch.cat([self.enorm(embeds), self.hnorm(hidden)], dim=-1))
+            places = torch.arange(x.shape[1])
+            mask = modeling.create_sliding_window_causal_mask(
+                config=config, input_embeds=x, attention_mask=None, cache_position=places,
+                past_key_values=None, position_ids=places[None])
+            x = self.block(x, attention_mask=mask, position_ids=places[None], cache_position=places,
+                           position_embeddings=model.model.swa_rotary_emb(x, places[None]))
+            return self.final_layernorm(x)
+    return PredictionLayer()
 
 
 def draw_audio_tokenizer(model: torch.nn.Module, folder: Path) -> None:
@@ -397,6 +462,11 @@ def released_outputs(model, site: str, inputs: dict, name: str = "") -> dict[str
                 dtype if field.startswith("pixel") else torch.int64)
                 for field, value in inputs.items() if field != "ids"}
             return {"logits": model(input_ids=ids, **media).logits.numpy()}
+        if site == "mtp":
+            # The prediction layer's logits: each position's final state beside the next token's embedding.
+            hidden = model.model(input_ids=ids).last_hidden_state
+            embeds = model.model.embed_tokens(ids[:, 1:])
+            return {"logits": model.lm_head(model.prediction_layer(embeds, hidden[:, :-1])).numpy()}
         if site == "audio":
             # Each clip's valid mel frames through the release's own pipeline (`get_audio_feature`: its
             # tokenizer's codes, then its encoder), in the model's dtype, filling the placeholders.

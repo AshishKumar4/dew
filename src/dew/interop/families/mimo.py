@@ -35,6 +35,8 @@ from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     NO_AUDIO,
     PLAIN_SPELLING,
+    PREDICTION_INPUTS,
+    PREDICTION_STEP_END,
     DecoderFamily,
     DecoderFields,
     KindFields,
@@ -51,6 +53,7 @@ from dew.interop.decoder_parts import (
     nested_ramp,
     partial_rope_entry,
     plain_partial_rope,
+    prediction_path,
     record_int,
     refuse,
     renamed_name,
@@ -61,6 +64,7 @@ from dew.interop.families.deepseek import deepseek_layout, deepseek_mixture
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.mimo_audio import translate_mimo_audio_config
+from dew.nn.mixers.mlp import MLPMixer
 from dew.nn.vision.mimo import translate_mimo_projector_config, translate_mimo_vision_config
 
 _KINDS = ('full_attention', 'sliding_attention')
@@ -369,6 +373,16 @@ def _mimo_v2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         # A windowed kind rotates whole heads unless it states its own
         # factor (`LayerKind`); MiMoV2Attention turns the same third of both.
         kinds['sliding_attention'].update(num_kv_heads=swa_kv_heads, partial_rotary_factor=factor)
+    if 'sliding_attention' in kinds:
+        # One prediction depth, which the release's code skips on load and vLLM drafts with
+        # (mimo_v2_mtp.py at 19aba3e, `MiMoV2MTPLayer`, one layer for the Pro and the Flash alike): the
+        # sliding kind's attention over a dense feed-forward at `intermediate_size`. A checkpoint
+        # without its tensors holds none (`hf_decoders.held_depths`).
+        kinds[_PREDICTION_FEEDFORWARD] = native_fields(LayerKind)(mixer=MLPMixer(
+            intermediate_size=_records.integer(config['mlp_features'], 'intermediate_size'),
+            activation=_records.text(config['mlp'], 'hidden_act')))
+        config.update(num_nextn_predict_layers=1, mtp_layer_type='sliding_attention',
+                      mtp_feedforward_type=_PREDICTION_FEEDFORWARD)
     return _attention_and_experts(config, hf, used, kinds, value_dim=value_dim,
                                   scale=None, factor=factor, count=count,
                                   sparse=sparse)
@@ -376,15 +390,64 @@ def _mimo_v2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
 
 _FUSED_QKV = grouped_qkv('.self_attn.qkv_proj')
 
+_PREDICTION_FEEDFORWARD = 'prediction_feedforward'
+"""The kind whose MLP mixer is the prediction depth's dense feed-forward, in no layer of the trunk."""
+
+_PREDICTION_LEAVES = {**PREDICTION_INPUTS, **PREDICTION_STEP_END}
+"""A prediction depth's own leaves by their names past `model.mtp.layers.{d}.` (vLLM's
+`MiMoV2MTPLayer`): its normed inputs, their projection and its output norm, `final_layernorm`."""
+
+_PREDICTION_NAMES = (('pre_mlp_layernorm', 'post_attention_layernorm'),)
+"""A prediction depth's block norm under vLLM's name for it, and the trunk layer's."""
+
+
+def _prediction_depth(name: str, config: Mapping[str, object]) -> int | None:
+    """The prediction depth of a `model.mtp.layers.{d}.*` tensor, or None for any other."""
+    parts = name.split('.')
+    if len(parts) > 4 and parts[:3] == ['model', 'mtp', 'layers'] and parts[3].isdigit():
+        return int(parts[3])
+    return None
+
 
 def _mimo_v2_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """The shared map under the family's names; the prediction layers, which the reference skips
-    on load, and the towers and the audio tokenizer's folder, which the text decoder never runs, have
-    no place."""
-    if name.startswith(('model.mtp.', 'visual.', 'audio_encoder.', 'speech_embeddings.',
+    """The shared map under the family's names; a prediction depth's tensors under its own leaves, its
+    block's as the trunk's layer 0's (`prediction_path`), or no place for a model that builds none; and
+    no place for the towers and the audio tokenizer's folder, which the text decoder never runs."""
+    depth = _prediction_depth(name, config)
+    if depth is not None:
+        declared = _records.integer(config.get('num_nextn_predict_layers', 0), 'num_nextn_predict_layers')
+        if not declared:
+            return None
+        tail = '.'.join(name.split('.')[4:])
+
+        def block(tail: str) -> tuple[str, ...] | None:
+            for vllm, trunk in _PREDICTION_NAMES:
+                tail = tail.replace(vllm, trunk)
+            return _mimo_v2_path(f'model.layers.0.{tail}', config)
+        return prediction_path(name, 'mtp', depth, declared, tail, _PREDICTION_LEAVES, block)
+    if name.startswith(('visual.', 'audio_encoder.', 'speech_embeddings.',
                         folder_name(_AUDIO_TOKENIZER, ''))):
         return None
     return renamed_path(_NAMES, name, config)
+
+
+def _mimo_v2_name(dew_name: str, config: Mapping[str, object]) -> str | None:
+    """`_mimo_v2_path` backwards: a prediction depth's leaf under its `model.mtp.layers.{d}.` name, any
+    other under the shared map's."""
+    parts = dew_name.split('.')
+    if not parts[0].startswith('mtp_'):
+        return renamed_name(_NAMES, dew_name, config)
+    stem = f"model.mtp.layers.{parts[0].removeprefix('mtp_')}."
+    own = {path: name for name, path in _PREDICTION_LEAVES.items()}.get(tuple(parts[1:]))
+    if own is not None:
+        return stem + own
+    trunk = renamed_name(_NAMES, '.'.join(('layers_0', *parts[2:])), config)
+    if trunk is None:
+        return None
+    tail = trunk.removeprefix('model.layers.0.')
+    for vllm, layer in _PREDICTION_NAMES:
+        tail = tail.replace(layer, vllm)
+    return stem + tail
 
 
 def _mimo_v2_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
@@ -419,7 +482,8 @@ def _mimo_v2_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
         'image_token_id': record_int(hf_config, 'image_token_id'), 'tokens_per_image': None,
         'video_token_id': (None if hf_config.get('video_token_id') is None
                            else record_int(hf_config, 'video_token_id')),
-        'extra_placeholder_ids': (), 'text_unprefixed': ('embed_tokens.', 'layers.', 'norm.'), **audio}
+        'extra_placeholder_ids': (), 'text_unprefixed': ('embed_tokens.', 'layers.', 'norm.', 'mtp.'),
+        **audio}
 
 
 def _mimo_v2_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -454,7 +518,8 @@ def _mimo_v2_export(model: CausalTransformer) -> Mapping[str, object]:
 
 MIMO_V2 = DecoderFamily(
     ('mimo_v2',), _mimo_v2_config, _matches, 'mimo_v2', 'MiMoV2ForCausalLM',
-    _mimo_v2_export, weight_path=_mimo_v2_path, export_path=partial(renamed_name, _NAMES),
+    _mimo_v2_export, weight_path=_mimo_v2_path, export_path=_mimo_v2_name,
+    prediction_depth=_prediction_depth,
     packed=_FUSED_QKV, packs=lambda config: config.get('attention_projection_layout') == 'fused_qkv',
     preserve_source_layout=True, release_code=SourceCode(*release_pins.MIMO_V2),
     wrapper=_mimo_v2_wrapper, wrapper_folders=(_AUDIO_TOKENIZER,),
