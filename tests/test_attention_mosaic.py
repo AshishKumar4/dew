@@ -450,6 +450,30 @@ def test_the_backward_from_the_kept_output_is_on_par_interpreted(call, form):
     _check_backward(call, SHAPES["interpreted"], form=form, interpret=True, kept=template.Kept.OUTPUT)
 
 
+def test_a_slope_reaches_a_custom_vjp_only_through_the_operands_it_feeds():
+    """A score hook's slope along an input counts as reaching a `jax.custom_vjp` only where that input
+    feeds one, through a jit's program operand by operand (`_reaches_custom_vjp`): a score added to a
+    custom VJP of a parameter has the constant slope one, traced, and the parameter's slope is counted."""
+    from dew.nn.kernels.templates.attention_mosaic_program import _reaches_custom_vjp
+
+    @jax.custom_vjp
+    def held(x):
+        return x
+
+    held.defvjp(lambda x: (x, None), lambda _, cotangent: (cotangent,))
+    traced = jax.make_jaxpr(lambda s, p: jax.jit(lambda s, p: s + held(p))(s, p))(1.0, 2.0).jaxpr
+    assert not _reaches_custom_vjp(traced, {traced.invars[0]})
+    assert _reaches_custom_vjp(traced, {traced.invars[1]})
+    # A jit's outputs reached one by one: its second output, independent of `s`, feeds the custom VJP.
+    paired = jax.make_jaxpr(lambda s, p: (lambda pair: pair[0] + held(pair[1]))(
+        jax.jit(lambda s, p: (s, p))(s, p)))(1.0, 2.0).jaxpr
+    assert not _reaches_custom_vjp(paired, {paired.invars[0]})
+    assert _reaches_custom_vjp(paired, {paired.invars[1]})
+    # No tangent passes a stop_gradient.
+    stopped = jax.make_jaxpr(lambda s: held(jax.lax.stop_gradient(s)))(1.0).jaxpr
+    assert not _reaches_custom_vjp(stopped, {stopped.invars[0]})
+
+
 @INTERPRETS
 def test_the_plain_jax_backward_takes_the_kept_outputs_residuals():
     """The plain-JAX mainloop's backward from residuals a Mosaic training forward keeps its output in

@@ -690,6 +690,20 @@ def test_group_norm_is_as_exact_as_torch_s_where_a_group_s_mean_dwarfs_its_sprea
                     truth_fn=normalized(nn.GroupNorm(groups, epsilon=1e-6, dtype=jnp.float64)))
 
 
+def test_a_group_norm_narrower_than_its_input_normalizes_at_its_own_width(rng):
+    """A float64 input under a float32 group norm is normalized at the module's width, statistics and
+    affine result alike, as flax's GroupNorm of that dtype normalizes it (its centered variance), the
+    activation reading that result: the module's output is flax's activated, bit for bit (row 3465)."""
+    with jax.enable_x64(new_val=True):
+        x = jax.random.normal(rng, (2, 4, 4, 16), jnp.float64) * 3 + 1
+        ours = GroupNorm(4, activation=nn.swish, dtype=jnp.float32)
+        params = ours.init(rng, x)
+        reference = nn.GroupNorm(4, epsilon=1e-6, use_fast_variance=False, dtype=jnp.float32)
+        output = ours.apply(params, x)
+        assert output.dtype == jnp.float32
+        np.testing.assert_array_equal(np.asarray(output), np.asarray(nn.swish(reference.apply(params, x))))
+
+
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 def test_group_norm_activates_its_wide_output_before_its_one_cast(rng, dtype):
     """The activation reads the fp32 affine result, as Diffusers' Flax VAE
