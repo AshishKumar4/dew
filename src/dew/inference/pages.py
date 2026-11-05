@@ -106,7 +106,7 @@ class Transfers:
 class Pages:
     """Free, held and cached pages of one pool of `count` pages of `size` slots, with `host` page slots in
     host memory that a reclaimed prefix page goes to (`Transfers`), and with `states` the row states a
-    shared prefix is read with (`States`), whose pages stay on the device."""
+    shared prefix is read with (`States`), a prefix on the host read as deep as one is kept."""
 
     def __init__(self, count: int, size: int, *, prefix_cache: bool, states: States | None = None,
                  host: int = 0) -> None:
@@ -122,6 +122,9 @@ class Pages:
         """The copies owed before the next step's program (`drained`)."""
         self._reading: list[int] = []
         """Host slots an owed upload still reads, free again once the copies are made."""
+        self._landing: dict[int, tuple[int, bytes]] = {}
+        """The device pages an owed upload writes, each with the host slot it reads and its page's hash:
+        reclaimed before the copy, such a page's keys are still the slot's, which keeps them."""
         self._free: deque[int] = deque(range(count))
         self._holders = np.zeros(count, np.int32)
         self._cached: OrderedDict[int, None] = OrderedDict()
@@ -197,8 +200,13 @@ class Pages:
             self._hold(page)
         entry = None if self.states is None or last is None else self.states.entry(last)
         hashes = prefix_hashes(prompt, self.size, len(prompt) // self.size, salt) if self.prefix_cache else []
-        # A page on the host comes back into a fresh device page, named by its hash there again.
-        pages = [page if page >= 0 else self._uploaded(-1 - page, hashes[index])
+        # A page on the host comes back into a fresh device page, named by its hash there again; every
+        # host copy the row reads leaves the host's ledger first, so no spill the fresh pages cause evicts it.
+        landing = {index: (-1 - page, hashes[index]) for index, page in enumerate(shared) if page < 0}
+        for slot, digest in landing.values():
+            del self._on_host[digest]
+            self._reading.append(slot)
+        pages = [page if index not in landing else self._uploaded(*landing[index])
                  for index, page in enumerate(shared)]
         writing = tuple(digest for digest in hashes[len(shared):] if digest not in self._by_hash)
         self._writing.update(writing)
@@ -208,9 +216,8 @@ class Pages:
     def _uploaded(self, slot: int, digest: bytes) -> int:
         """A fresh device page that host `slot`'s copy of `digest`'s page is read back into, held."""
         page = self._take()
-        del self._on_host[digest]
-        self._reading.append(slot)
         self.transfers.uploads.append((slot, page))
+        self._landing[page] = (slot, digest)
         self._by_hash[digest] = page
         self._hash_of[page] = digest
         return page
@@ -221,6 +228,7 @@ class Pages:
         owed, self.transfers = self.transfers, Transfers()
         self._host_free.extend(self._reading)
         self._reading = []
+        self._landing.clear()
         return owed
 
     def written(self, writing: Sequence[bytes]) -> None:
@@ -267,6 +275,7 @@ class Pages:
         self._hash_of.clear()
         self._host_free.extend(self._on_host.values())
         self._on_host.clear()
+        self._landing.clear()
         if self.states is not None:
             self.states.forget()
 
@@ -281,22 +290,28 @@ class Pages:
             page, _ = self._cached.popitem(last=False)
             digest = self._hash_of.pop(page)
             del self._by_hash[digest]
-            if self.states is not None:
+            landing = self._landing.pop(page, None)
+            if landing is not None:
+                # Its upload has not run: the host slot keeps the page as it was.
+                slot, _ = landing
+                self.transfers.uploads.remove((slot, page))
+                self._reading.remove(slot)
+                self._on_host[digest] = slot
+            elif not self._spilled(page, digest) and self.states is not None:
                 self.states.drop(digest)
-            elif self.host:
-                self._spilled(page, digest)
         self._holders[page] += 1
         return page
 
-    def _spilled(self, page: int, digest: bytes) -> None:
-        """Keep reclaimed `page`'s keys in a host slot under `digest`: a free slot, or the least recently
-        used one's, whose page is forgotten."""
+    def _spilled(self, page: int, digest: bytes) -> bool:
+        """Keep reclaimed `page`'s keys in a host slot under `digest`, a free slot or the least recently used
+        one's, whose page is forgotten; whether a slot took it (none where every slot is read by an owed
+        upload, or the pool keeps no host tier). A state kept after the page (`States`) stays with it."""
         if self._host_free:
             slot = self._host_free.popleft()
         elif self._on_host:
             slot = self._on_host.popitem(last=False)[1]
         else:
-            # Every slot is read by an owed upload this step.
-            return
+            return False
         self._on_host[digest] = slot
         self.transfers.spills.append((page, slot))
+        return True

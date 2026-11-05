@@ -690,10 +690,6 @@ class Server:
         `_host_tree`'s leaves."""
         self._host_tree: jax.tree_util.PyTreeDef | None = None
         if isinstance(rows, PagedRows) and any(part.host for part in rows.pages):
-            if rows.stateful:
-                raise ValueError("a host tier keeps a prefix's pages, and this model's rows read a prefix "
-                                 "with the state its prompt left beside them, which stays on the device; "
-                                 "serve it without host_pages")
             if self.pooled:
                 raise ValueError("a host tier copies a process's pages through its own host; serve a pool's "
                                  "server without host_pages")
