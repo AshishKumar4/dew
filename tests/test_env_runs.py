@@ -227,27 +227,28 @@ def test_a_pretraining_stage_from_its_record_learns_from_its_saved_teacher_as_co
     and which trains on that prefill alone (`train_ratio` inf): it trains, every leaf of its state and of its
     replay bit for bit, as the stage composed in Python does with the teacher's own policy and weights, and
     names the teacher step it read; a DAgger stage from it starts from its last weights."""
-    teacher = teacher_run(tmp_path).prepare().train("teacher")
+    # A step of each run: one update reads, writes and records all a run of more does, compiled once.
+    teacher = teacher_run(tmp_path, 1).prepare().train("teacher")
     scales = {"policy": 0.0, "value": 0.0, "replay_value": 0.0}
     pretrains = {"batch": 8, "length": 8, "train_ratio": float("inf"), "prefill": 16, "capacity": 64}
-    pretraining = student(tmp_path, 2, teacher=TeacherConfig(str(tmp_path / "teacher"), demonstrates=True),
+    pretraining = student(tmp_path, 1, teacher=TeacherConfig(str(tmp_path / "teacher"), demonstrates=True),
                           objective=ObjectiveConfig(DREAMER_V3, {"imitation": 1.0, "scales": scales}),
                           rollout=RolloutConfig("dreamer", pretrains))
     prepared = pretraining.prepare()
-    assert prepared.run.teacher is not None and prepared.run.teacher.step == 2
+    assert prepared.run.teacher is not None and prepared.run.teacher.step == 1
     pretrained = prepared.train("pretrain")
     objective = DreamerV3Objective(world_model(), imitation=1.0, scales=scales)
     race = Batched(FlightEnv(racing(), VIEWS), 8)
     rollout = DreamerRollout(objective, race, capacity=64, batch=8, length=8, train_ratio=float("inf"),
                              prefill=16, demonstrator=Teacher(teacher_policy().act, teacher.variables))
-    assert_bitwise(pretrained, fitted(pretraining, objective, rollout, 2))
+    assert_bitwise(pretrained, fitted(pretraining, objective, rollout, 1))
     assert isinstance(prepared.rollout, DreamerRollout)
     assert_bitwise(prepared.rollout.held_replay, rollout.held_replay)
-    dagger = student(tmp_path, 2, teacher=TeacherConfig(str(tmp_path / "teacher")),
+    dagger = student(tmp_path, 1, teacher=TeacherConfig(str(tmp_path / "teacher")),
                      pretrained=str(tmp_path / "pretrain"), model=EnvRunConfig().model,
                      objective=ObjectiveConfig(DREAMER_V3, {"imitation": 1.0, "imitates": LABEL}))
     prepared = dagger.prepare()
-    assert prepared.run.source.step == 2
+    assert prepared.run.source.step == 1
     assert_bitwise(prepared.objective.variables, pretrained.variables)
 
 
@@ -257,12 +258,12 @@ def test_a_dagger_stage_from_its_record_labels_its_flights_with_its_saved_teache
     stage's replay holds those labels beside the actions flown, which they differ from, its labeller the
     saved teacher's weights bit for bit. The labelling composed in Python is test_aggregation's; this
     stage's record wires it to the saved teacher."""
-    teacher = teacher_run(tmp_path).prepare().train("teacher")
-    dagger = student(tmp_path, 2, teacher=TeacherConfig(str(tmp_path / "teacher")),
+    teacher = teacher_run(tmp_path, 1).prepare().train("teacher")
+    dagger = student(tmp_path, 1, teacher=TeacherConfig(str(tmp_path / "teacher")),
                      objective=ObjectiveConfig(DREAMER_V3, {"imitation": 1.0, "imitates": LABEL}))
     prepared = dagger.prepare()
-    assert prepared.run.teacher is not None and prepared.run.teacher.step == 2
-    assert int(prepared.train("dagger").step) == 2
+    assert prepared.run.teacher is not None and prepared.run.teacher.step == 1
+    assert int(prepared.train("dagger").step) == 1
     assert isinstance(prepared.rollout, DreamerRollout)
     labelled = jax.device_get(prepared.rollout.held_replay)
     filled = int(labelled.filled)
