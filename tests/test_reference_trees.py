@@ -9,8 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from one_draw import assert_as_exact_as_the_reference
-from reference_error import widened
+from reference_error import as_given, assert_as_exact, widened
 from reference_trees import evaluated, tree_contract, tree_sum
 
 from dew.interop import Pretrained
@@ -94,17 +93,28 @@ def test_a_primitive_whose_order_the_tree_does_not_set_is_refused():
         evaluated(jnp.cumsum, "pairwise")(jnp.ones(8))
 
 
+DORY_SEEDS = 8
+"""Check 1's declared seeds for the tiny Dory under each tree, sized by `seeds_for` paired on armada."""
+
+
 @pytest.mark.parametrize("tree", TREES)
 def test_the_tiny_dory_under_each_tree_is_as_exact_as_under_xlas(tree):
-    """The tiny Dory's float32 logits, every one of its sums under the tree, within the rule of
-    XLA's own float32 forward's distance from float64: an equally exact reference."""
+    """The tiny Dory's float32 logits, every one of its sums under the tree, on par with XLA's own float32
+    forward (check 1 over drawn ids, truth its float64 forward): an equally exact reference, and a
+    different program (its logits differ from XLA's on the first draw)."""
     config = json.loads((TINY / "config.json").read_text())
     loaded = Pretrained.load(str(TINY), dtype="float32", attention_impl="xla")
-    ids = jnp.asarray(np.random.default_rng(0).integers(0, config["vocab_size"], (1, 24)), jnp.int32)
-    mine = evaluated(loaded.model.apply, tree)(loaded.variables, ids)
-    plain = loaded.model.apply(loaded.variables, ids)
-    with jax.enable_x64(new_val=True):
-        truth = np.asarray(loaded.model.clone(dtype=jnp.float64).apply(widened(loaded.variables), ids))
-    assert not np.array_equal(np.asarray(mine), np.asarray(plain))
-    assert_as_exact_as_the_reference(np.asarray(mine), np.asarray(plain), truth,
-                                     f"the tiny Dory under {tree}")
+    wide = loaded.model.clone(dtype=jnp.float64)
+
+    def draw(seed):
+        rng = np.random.default_rng([0xD07, seed])
+        return (rng.integers(0, config["vocab_size"], (1, 24)).astype(np.int32),)
+
+    under = evaluated(loaded.model.apply, tree)
+    (ids,) = draw(0)
+    assert not np.array_equal(np.asarray(under(loaded.variables, ids)),
+                              np.asarray(loaded.model.apply(loaded.variables, ids)))
+    assert_as_exact(as_given(lambda ids: under(loaded.variables, ids)),
+                    jax.jit(lambda ids: loaded.model.apply(loaded.variables, ids)), draw,
+                    f"the tiny Dory under {tree}", seeds=DORY_SEEDS,
+                    truth_fn=lambda ids: wide.apply(widened(loaded.variables), ids))
