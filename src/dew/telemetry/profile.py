@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import importlib.util
 import json
 import logging
 import os
@@ -44,21 +45,20 @@ _lifecycle = threading.Lock()
 _logger = logging.getLogger(__name__)
 
 
-def profile_support() -> _Converter | None:
-    """The optional native report converter a capture reports through, None where XProf, the
-    `dewml[profile]` extra, is not installed or lacks its native converters."""
-    try:
-        converter = importlib.import_module("xprof.convert.raw_to_tool_data")
-    except ImportError:
-        return None
-    return converter if isinstance(converter, _Converter) else None
+def profile_installed() -> bool:
+    """Whether XProf, the `dewml[profile]` extra a capture reports through, is installed, asked of the
+    import system without importing it (`require_profile_support` resolves its converters)."""
+    return importlib.util.find_spec("xprof") is not None
 
 
 def require_profile_support() -> _Converter:
     """Resolve the optional native report converter before starting work."""
-    converter = profile_support()
-    if converter is None:
-        raise ImportError("Profiling requires XProf with its native converters; install 'dewml[profile]'.")
+    try:
+        converter = importlib.import_module("xprof.convert.raw_to_tool_data")
+    except ImportError as error:
+        raise ImportError("Profiling requires XProf; install 'dewml[profile]'.") from error
+    if not isinstance(converter, _Converter):
+        raise ImportError("Installed XProf lacks native converters; install 'dewml[profile]'.")
     return converter
 
 

@@ -95,7 +95,7 @@ from dew.training.diloco import DiLoCo
 from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Split, Summary
 from dew.training.inspection import Inspection
-from dew.training.profiling import ProfileReport, ProfileWindow
+from dew.training.profiling import ProfileReport, ProfileWindow, run_window
 from dew.training.quantization import quantize_trunk
 from dew.training.rollout import Rollout
 from dew.training.selection import Best
@@ -571,8 +571,7 @@ class TrainerConfig:
     """Microbatches a pipelined step feeds through the mesh's stages, a
     multiple of `mesh.stage`; unset feeds one a stage."""
     layout: Layout = dataclasses.field(default_factory=Layout)
-    profile: ProfileWindow | None = dataclasses.field(
-        default_factory=lambda: ProfileWindow(None, 2, warmup=10))
+    profile: ProfileWindow | None = dataclasses.field(default_factory=run_window)
     """One profiler window: the steps to trace, the warmup before them and the output directory.
 
     By default every run traces two of its steps once ten have run past its first compile, through Dew's

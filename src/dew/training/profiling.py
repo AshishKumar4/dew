@@ -74,13 +74,19 @@ PGLE_CAPTURE = (
 """Why a capture refuses to run where JAX's AutoPGLE profiles programs, and JAX's own way round it."""
 
 
+def run_window() -> ProfileWindow:
+    """A run's own window, every run's by default (`dew.config.TrainerConfig.profile`): two steps traced
+    once ten have run past its first compile, kept under the run's directory."""
+    return ProfileWindow(None, 2, warmup=10)
+
+
 def capturable() -> bool:
     """Whether every process can take a capture: none holds another (`dew.Profiler`), none runs under
-    JAX's AutoPGLE (`pgle_runs`) and XProf reports on each (`profile_support`); a run's own window
+    JAX's AutoPGLE (`pgle_runs`) and XProf is installed on each (`profile_installed`); a run's own window
     (`ProfileWindow`, no `directory`) is taken where they can, a window naming its directory refuses
     where they cannot (`owned_capture`)."""
     local = (telemetry_profile.active_profile() is None and not pgle_runs()
-             and telemetry_profile.profile_support() is not None)
+             and telemetry_profile.profile_installed())
     return all(from_every_process(local))
 
 
@@ -173,7 +179,7 @@ def reported_window(report: Callable[[Record, int], None], note: Callable[[str],
     every rank's export is written and the pool agreed the run's outcome (`Trainer._reported_outcome`),
     whatever that outcome: its record (`report`) and its note on process zero (`note`). Returns the run's
     `error`, or a failed report as the error of a run that had none, noted on one that had."""
-    if window is None or profiled is None:
+    if window is None or window.directory is None or profiled is None:
         return error
     traced, step = profiled
     try:
