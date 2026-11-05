@@ -29,7 +29,7 @@ from diffusion_stubs import StubText
 from diffusion_support import images_of
 from flax import linen as nn
 from jepa_cases import MASK
-from map_judge import judging, pooled_units, record_units
+from map_judge import judging, sharded
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, chain_roundings, widened
 from residual_orders import permuted, residual_width
@@ -427,7 +427,7 @@ GEMMA4_MOE_CELLS = [cell for cell in cells_of("causal_transformer+gemma4_moe") i
 MLA_CELLS = [cell for cell in cells_of("causal_transformer+mla") if cell[2] == "2x4 fsdp"]
 """The cases whose layout cells' draws run as armada's map tasks (`check1_shards`), each a test of its own
 with the seeds a task draws within 120 s on one core: a map task records its draws (70 to 93 s fixed,
-`map_judge.drawing`), and the one that draws an arm's placed seed checks that arm's `fit` beside them
+`map_judge.record_units`), and the one that draws an arm's placed seed checks that arm's `fit` beside them
 (`assert_fits_as_drawn`), so the judge pools records and trains nothing (rows 2788, 3730). GPT-OSS's
 cells took 188 and 198 s whole and GLM-4 MoE's 95 and 140 s (CI's durations record); a map task of 64
 seeds of one GPT-OSS cell took 38 to 75 s, of 32 seeds of a GLM-4 MoE cell 40 to 68 s (armada, 11-03),
@@ -580,13 +580,6 @@ def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path):
     assert_as_exact(drawn[layout], drawn["one device"], draw, label, seeds=seeds, truth_fn=truth,
                     orders=orders)
     fits = f"{label}: fit's own steps and placement"
-    if judging():
-        # The map tasks ran `fit` on each arm and checked it (`assert_fits_as_drawn`), the one device's
-        # beside the draw of seed 0 and the layout's beside the draw of the last declared seed: the judge
-        # pools their word that each held, and trains nothing.
-        held = sorted(arm for _, _, arms in pooled_units(fits) for arm in arms)
-        assert held == sorted(drawn), f"{fits}: the map tasks held {held}, not every arm"
-        return
     arms = {"one device": (MeshSpec(), 1, 0), layout: (mesh, None, seeds - 1)}
 
     def checked(start: int, stop: int) -> list[str]:
@@ -598,8 +591,13 @@ def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path):
                                  placed=arm == layout)
         return placed
 
-    if not record_units(fits, checked):
-        checked(0, seeds)
+    # The map tasks run `fit` on each arm and check it (`assert_fits_as_drawn`), the one device's beside the
+    # draw of seed 0 and the layout's beside the draw of the last declared seed: the judge pools their word
+    # that each held, and trains nothing.
+    pooled = sharded(fits, checked, seeds)
+    if pooled is not None:
+        held = sorted(arm for arms in pooled for arm in arms)
+        assert held == sorted(drawn), f"{fits}: the map tasks held {held}, not every arm"
 
 
 def assert_fits_as_drawn(case, tmp_path, mesh: MeshSpec, devices, state, steps: int, ours, *, placed: bool):
