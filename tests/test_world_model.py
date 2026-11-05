@@ -123,3 +123,77 @@ def test_a_clip_of_uint8_pixels_trains_as_the_frames_in_minus_one_to_one_it_enco
     step = Step(jnp.asarray(0), jax.random.key(10), None)
     stats = [objective.loss(variables, {"video": video}, step)[0] for video in (pixels, frames)]
     np.testing.assert_array_equal(np.asarray(stats[0].total), np.asarray(stats[1].total))
+
+
+def _tiny_models():
+    """A tokenizer and a dynamics model at the tests' scale, the tokenizer's tree drawn."""
+    from dew.objectives.world_model import CausalTokenizer
+
+    tokenizer = CausalTokenizer((8, 8, 1), patch=4, width=16, depth=1, heads=2, latents=4, bottleneck=4)
+    dynamics = Dynamics(latents=4, bottleneck=4, spatial=2, width=16, depth=1, heads=2, levels=3, frames=4)
+    return tokenizer, tokenizer.init(jax.random.key(4), jnp.zeros((1, 8, 8, 1))), dynamics
+
+
+def _objectives():
+    """The tokenizer's objective and the world model's over it, each with its variables drawn."""
+    from dew.objectives.world_model import TokenizerObjective, WorldModelObjective
+
+    tokenizer, tokens, dynamics = _tiny_models()
+    objectives = (TokenizerObjective(tokenizer), WorldModelObjective(dynamics, tokenizer, tokens))
+    return [(objective, objective.fresh_variables(jax.random.key(5), None)) for objective in objectives]
+
+
+def test_a_padded_batch_scores_its_real_clips_alone():
+    """An evaluation's last batch, three clips padded to four (`VALID_ROWS`, as `FilledBatch` pads it),
+    counts its three real clips alone in each objective's loss (`Objective.row_mean`): the padding's
+    content changes nothing, its mass is the real clips', and a batch of padding alone holds no mass and
+    moves no weight (row 4146: both losses counted the padding, and a batch of it kept a positive mass and a
+    gradient)."""
+    from dew.batch import VALID_ROWS
+    from dew.objectives.base import Step
+
+    video = jnp.asarray(np.random.default_rng(11).uniform(-1, 1, (4, 4, 8, 8, 1)), jnp.float32)
+    real = jnp.asarray([True, True, True, False])
+    padded = [{"video": clips, VALID_ROWS: real} for clips in (video, video.at[3].set(video[0]))]
+    repeats = {"video": video, VALID_ROWS: jnp.zeros((4,), bool)}
+    step = Step(jnp.asarray(0), jax.random.key(12), None, training=False)
+    for objective, variables in _objectives():
+        (other, _), (repeat, _) = (objective.loss(variables, batch, step) for batch in padded)
+        three, _ = objective.loss(variables, {"video": video[:3]}, step)
+        assert (float(other.total), float(other.mass)) == (float(repeat.total), float(repeat.mass))
+        assert float(repeat.mass) == float(three.mass)
+
+        def total(params, objective=objective, variables=variables):
+            return objective.loss({**variables, "params": params}, repeats, step)[0].total
+
+        empty, _ = objective.loss(variables, repeats, step)
+        assert (float(empty.total), float(empty.mass)) == (0.0, 0.0)
+        gradient = jax.grad(total)(variables["params"])
+        assert not any(np.any(np.asarray(leaf)) for leaf in jax.tree.leaves(gradient))
+
+
+def test_an_updates_corruption_is_each_clips_own_however_the_update_is_split():
+    """Each clip's corruption (the tokenizer's patch mask, the world model's step size, signal level and
+    noise) is drawn from the update's example key at the clip's place (`Step.sample`) and kept at its
+    boundary, so an update of four clips read whole or as two microbatches of two, each attempt's key its
+    own, records the same corruption for every clip (row 4147: it was drawn batch-wide from each attempt's
+    key)."""
+    from dew.objectives.base import Recorder, Step
+
+    video = jnp.asarray(np.random.default_rng(13).uniform(-1, 1, (4, 4, 8, 8, 1)), jnp.float32)
+    update = jax.random.key(14)
+
+    def recorded(objective, variables, parts):
+        recorder = Recorder()
+        for rows, attempt in parts:
+            step = Step(jnp.asarray(0), jax.random.key(attempt), None, example_key=update,
+                        example_index=jnp.asarray(rows, jnp.int32), example_count=4, recorder=recorder)
+            objective.loss(variables, {"video": video[np.asarray(rows)]}, step)
+        return {name: tape for name, tape in recorder.tape(4).items() if recorder.kinds[name] == "boundary"}
+
+    for objective, variables in _objectives():
+        whole = recorded(objective, variables, [([0, 1, 2, 3], 15)])
+        split = recorded(objective, variables, [([0, 1], 16), ([2, 3], 17)])
+        assert whole and set(whole) == set(split)
+        for name, tape in whole.items():
+            np.testing.assert_array_equal(tape, split[name], err_msg=name)
