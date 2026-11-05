@@ -6,7 +6,6 @@ import json
 import math
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -2499,14 +2498,15 @@ def test_a_release_check_runs_in_the_whole_suites_second_job_under_its_requireme
 
 
 def install_inputs(root: Path, script: str) -> set[str]:
-    """The files of the checkout at `root` that `script` (its path there) names among its commands' words, and
-    those the shell scripts among them name in turn: a limited check of what an install runs or reads (shlex,
-    comments set aside), not a shell interpreter, so a path a variable builds (`locks/$name.txt`) is none
-    of them."""
+    """The files of the checkout at `root` that `script` (its path there) names in its commands, and those
+    the shell scripts among them name in turn: a limited check of what an install runs or reads (the words of
+    each line that is no comment, a command substitution's and a quote's taken apart), not a shell
+    interpreter, so a path a variable builds (`locks/$name.txt`) is none of them."""
     found, pending = {script}, [script]
     while pending:
-        words = [word for line in (root / pending.pop()).read_text().splitlines()
-                 for word in shlex.split(line, comments=True)]
+        lines = [line for line in (root / pending.pop()).read_text().splitlines()
+                 if not line.lstrip().startswith("#")]
+        words = re.findall(r"[\w./-]+", "\n".join(lines))
         files = {word for word in words if not word.startswith(("/", "..")) and (root / word).is_file()}
         pending.extend(sorted(name for name in files - found if name.endswith(".sh")))
         found |= files
