@@ -20,8 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from certified import assert_certified
-from reference_error import assert_computes_the_oracle
+from one_draw import assert_as_exact_as_the_reference
 from token_support import byte_level_tokenizer
 from transformers.generation.logits_process import (
     EncoderNoRepeatNGramLogitsProcessor,
@@ -348,23 +347,15 @@ def test_frequency_and_presence_penalties_are_vllms(case):
     on four histories: the frequency penalty times each token's count among
     the generated tokens and the presence penalty times whether it was
     generated, the prompt counting for neither, both signs. Dew's two
-    transforms, chained in vLLM's order, compute vLLM's function (Dew in
-    float64 within float64's rounding of vLLM's float64 run, the oracle rule),
-    and in float32 each of their operations is within its own rounding (check
-    2)."""
+    transforms, chained in vLLM's order, held to its float64 run by the
+    float64 rule."""
     frequency, presence = (float(value) for value in PENALTIES["penalties"][case])
     prompts, drawn = ([[int(token) for token in row if token != VOCAB] for row in PENALTIES[name]]
                       for name in ("prompt", "output"))
     native = decoding.chain((decoding.FrequencyPenalty(frequency), decoding.PresencePenalty(presence)))
-    state, label = rows(prompts, drawn), f"penalties {frequency}, {presence}"
-    # vLLM holds each penalty in a float32 tensor, as Dew's float32 run takes it: its float64 run reads that.
-    held = decoding.chain((decoding.FrequencyPenalty(float(np.float32(frequency))),
-                           decoding.PresencePenalty(float(np.float32(presence)))))
-    with jax.enable_x64(new_val=True):
-        wide = np.asarray(held(state, jnp.asarray(PENALTIES["logits"], jnp.float64)))
-    assert_computes_the_oracle(wide, PENALTIES[f"case_{case}_f64"], label, roundings=2)
-    assert_certified(lambda logits: native(state, logits), lambda seed: (np.asarray(PENALTIES["logits"]),),
-                     label, seeds=1)
+    got = np.asarray(jax.jit(native)(rows(prompts, drawn), jnp.asarray(PENALTIES["logits"])))
+    assert_as_exact_as_the_reference(got, PENALTIES[f"case_{case}"], PENALTIES[f"case_{case}_f64"],
+                                     f"penalties {frequency}, {presence}")
 
 
 def stop_string_tokenizer(tmp_path):
