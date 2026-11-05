@@ -776,6 +776,9 @@ class RecordedLeaf:
     dtype: str
     zero_sizes: np.ndarray | None = None
     worst_log: float | None = None
+    share: float | None = None
+    """The share of its worst sized row's squared error the row's largest element carries (`_Draws.factor`),
+    zero where no row is sized; None where the leaf was recorded as rows alone (`rows_summary`)."""
 
     @property
     def log_worst(self) -> float:
@@ -889,6 +892,16 @@ def _rows(values: np.ndarray, runs) -> list[np.ndarray]:
     return [values[start:stop].reshape(-1, width) for width, (start, stop) in spans.items()]
 
 
+def _largest_share(rows: np.ndarray) -> np.ndarray:
+    """Each row's largest element's share of the row's squared error, the row scaled by its largest first so
+    no square overflows: one for a row one element holds alone, zero for a row of zeros."""
+    rows = np.abs(np.asarray(rows, np.float64))
+    largest = np.max(rows, axis=1, keepdims=True) if rows.shape[1] else np.zeros((len(rows), 1))
+    scaled = np.square(rows / np.where(largest > 0, largest, 1.0))
+    total = np.sum(scaled, axis=1)
+    return np.where(total > 0, 1.0 / np.where(total > 0, total, 1.0), 0.0)
+
+
 def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
     """Each reference leaf's evidence against its truth in `held` (`_LaidTruths.of`) as check 1 reads it
     (`RecordedLeaf`), every leaf read in C order with the others in a few passes; None for a reference of
@@ -918,6 +931,7 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
     errors = values - held.values
     mse = np.concatenate([np.mean(block, axis=1) for block in _blocks(np.square(errors), held.runs)])
     rows = np.concatenate([np.zeros(0), *map(_scaled_rms, _rows(errors, held.runs))])
+    shares = np.concatenate([np.zeros(0), *map(_largest_share, _rows(errors, held.runs))])
     # Each laid leaf's rows, its first among them, and those sized past RESOLUTION.
     counts = np.repeat([size // width if width else 0 for _, size, width in held.runs],
                        [leaves for leaves, _, _ in held.runs])
@@ -928,24 +942,29 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
     logs, over = log_over(rows[sized], held.sizes[sized]), _over(rows[sized], held.sizes[sized])
     # The worst sized row of each leaf that has one: the largest of its run of the sized rows.
     some = taken > 0
-    worst_log, worst = np.full(len(counts), LOG_ZERO), np.zeros(len(counts))
+    worst_log, worst, share = np.full(len(counts), LOG_ZERO), np.zeros(len(counts)), np.zeros(len(counts))
     if some.any():
         firsts = (np.cumsum(taken) - taken)[some]
         worst_log[some] = np.maximum.reduceat(logs, firsts)
         worst[some] = np.maximum.reduceat(over, firsts)
+        # The worst row's largest element's share of its squared error, each leaf's worst sized row's.
+        sized_shares = shares[sized]
+        share[some] = [sized_shares[first + int(np.argmax(logs[first:first + count]))]
+                       for first, count in zip(firsts.tolist(), taken[some].tolist(), strict=True)]
     # The rows of float64 zero, each leaf's its span of them.
     unsized = np.flatnonzero(~sized)
     zero_rows = unsized - np.repeat(starts, counts - taken)
     zero_errors, zero_sizes = rows[unsized], held.own[unsized]
     ends = list(itertools.accumulate((counts - taken).tolist(), initial=0))
-    mse, worst, worst_log, finite = mse.tolist(), worst.tolist(), worst_log.tolist(), (
+    mse, worst, worst_log, share, finite = mse.tolist(), worst.tolist(), worst_log.tolist(), share.tolist(), (
         finite & held.finite).tolist()
     for index, at in enumerate(held.laid):
         if read[index]:
             span = slice(ends[index], ends[index + 1])
             summaries[at] = RecordedLeaf(mse[index], worst[index], zero_rows[span], zero_errors[span],
                                          finite=finite[index], dtype=dtype(references[at]),
-                                         zero_sizes=zero_sizes[span], worst_log=worst_log[index])
+                                         zero_sizes=zero_sizes[span], worst_log=worst_log[index],
+                                         share=share[index])
     return summaries
 
 
@@ -1002,9 +1021,11 @@ def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
 
 def _over_orders(first: list[tuple], later: list[tuple]) -> list[tuple]:
     """An arm's evidence on a draw (`_evidence`) over two of its orders: each leaf's errors and rows of
-    float64 zero the first order's, its worst rows the worse of the two, its values finite at both."""
+    float64 zero the first order's, its worst rows the worse of the two, the reference's worst row's share
+    (`RecordedLeaf.share`) that of the order its worst row is, its values finite at both."""
     return [(one[0], one[1], float(np.fmax(one[2], other[2])), float(np.fmax(one[3], other[3])), one[4],
-             one[5] and other[5]) for one, other in zip(first, later, strict=True)]
+             one[5] and other[5], other[6] if other[3] > one[3] else one[6])
+            for one, other in zip(first, later, strict=True)]
 
 
 def _conditioning(reference_fn, truth_fn, draw, seeds, ran=None) -> Conditioning:
@@ -1078,6 +1099,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     stacked: list = [None for _ in arms]
     stacked_rows: list = [None for _ in arms]
     per_example: list[list] = [[] for _ in arms]
+    shares: list[list] = [[] for _ in arms]
     per_example_rows: list[list] = [[] for _ in arms]
 
     def truth_and_terms(inputs):
@@ -1156,15 +1178,24 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
             worst[at_arm].append([(entry[2], entry[3]) for entry in row])
             zero_rows[at_arm].append([entry[4] for entry in row])
             finite[at_arm].append([entry[5] for entry in row])
+            shares[at_arm].append([entry[6] for entry in row])
             per_example[at_arm].append(stacked[at_arm])
             per_example_rows[at_arm].append(stacked_rows[at_arm])
     drawn = [_Draws(names, np.asarray(mine), np.asarray(theirs[at_arm]),
                     np.asarray(worst[at_arm]).reshape(len(mine), -1, 2), zero_rows[at_arm],
                     np.asarray(finite[at_arm]), widths, per_example[at_arm] if examples else None,
-                    per_example_rows[at_arm] if examples else None)
+                    per_example_rows[at_arm] if examples else None, _shares(shares[at_arm], len(mine)))
              for at_arm in range(len(arms))]
     first = drawn[0] if library_fn is None else drawn[0].against_larger(drawn[1], library_leaves)
     return [first, *drawn[len(arms) - len(also):]] if also else first
+
+
+def _shares(found: list[list], count: int) -> np.ndarray | None:
+    """The reference's worst rows' shares over a run's seeds (`_Draws.shares`, seed by leaf), None where any
+    is unknown (a recording's summary keeps no row's elements)."""
+    if any(share is None for seed in found for share in seed):
+        return None
+    return np.asarray(found, np.float64).reshape(count, -1)
 
 
 def _example_ratios(leaves, references, truths) -> list[np.ndarray | None]:
@@ -1296,7 +1327,7 @@ def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, thei
             # adds no error and resolves nothing.
             kept = str(jnp.dtype(leaf.dtype))
             assert kept == their.dtype, (path, kept, their.dtype)
-            row.append((0.0, 0.0, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True))
+            row.append((0.0, 0.0, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True, 0.0))
             continue
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
         paired = was or shared or np.array_equal(np.asarray(true), np.asarray(their_true))
@@ -1325,7 +1356,7 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     `paired`, the two held to truths of their own draws (`null_runs`), no row is paired."""
     if not paired:
         return (mine.mse, theirs.mse, mine.log_worst, theirs.log_worst, NO_ZERO_ROWS,
-                mine.finite and theirs.finite)
+                mine.finite and theirs.finite, theirs.share)
     at_zero = dict(zip(theirs.zero_rows.tolist(), theirs.zero_errors.tolist(), strict=True))
     unrecorded = [at for at in mine.zero_rows.tolist() if at not in at_zero]
     if unrecorded:
@@ -1346,7 +1377,7 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     rows, errors, their_errors = (np.asarray(column, dtype) for column, dtype in zip(
         zip(*zero, strict=True) if zero else ((), (), ()), (np.int64, np.float64, np.float64), strict=True))
     return (mine.mse, theirs.mse, worst, their_worst, (rows, errors, their_errors),
-            mine.finite and theirs.finite)
+            mine.finite and theirs.finite, theirs.share)
 
 
 def _judged(draws: _Draws, index: int, tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)

@@ -5,7 +5,7 @@ import dataclasses
 from collections.abc import Sequence
 
 import numpy as np
-from check1_statistics import ZeroRows, row_factor
+from check1_statistics import RULED_SHARE, ZeroRows, row_factor
 
 
 @dataclasses.dataclass
@@ -29,19 +29,30 @@ class _Draws:
     example_rows: list[list[np.ndarray | None]] | None = None
     """At such a site, each seed's per-example log ratio of Dew's worst row over the reference's worst row
     on the same example, each over its size (`_example_worst_rows`), else None."""
+    shares: np.ndarray | None = None
+    """The share of the reference's worst row's squared error its largest element carries (seed by leaf),
+    zero where no row is sized; None where the reference keeps no rows' elements (a recording's summary)."""
 
     def factor(self, index: int) -> float:
-        """The worst-row rule's factor for leaf `index`, by its rows' width (`row_factor`)."""
-        return row_factor(self.widths[index])
+        """The worst-row rule's factor for leaf `index`: its rows' width's (`row_factor`), but a row of one
+        value's where one element carries past RULED_SHARE of the reference's worst row over these draws."""
+        width = self.widths[index]
+        if width > 2 and self.shares is not None:
+            at = int(np.argmax(self.worst[:, index, 1]))
+            if self.shares[at, index] > RULED_SHARE:
+                return row_factor(1)
+        return row_factor(width)
 
     def joined(self, other: "_Draws") -> "_Draws":
         examples, example_rows = ((getattr(self, field) + getattr(other, field)
                                    if getattr(self, field) is not None and getattr(other, field) is not None
                                    else None) for field in ("examples", "example_rows"))
+        shares = (np.concatenate([self.shares, other.shares])
+                  if self.shares is not None and other.shares is not None else None)
         return _Draws(self.names, *(np.concatenate([getattr(self, field), getattr(other, field)])
                                     for field in ("mine", "theirs", "worst")),
                       self.zero_rows + other.zero_rows, np.concatenate([self.finite, other.finite]),
-                      self.widths, examples, example_rows)
+                      self.widths, examples, example_rows, shares)
 
     def between(self, start: int, stop: int) -> "_Draws":
         """These draws' seeds `start` to `stop`, counted from their first."""
@@ -49,7 +60,8 @@ class _Draws:
         examples, example_rows = (None if getattr(self, field) is None else getattr(self, field)[cut]
                                   for field in ("examples", "example_rows"))
         return _Draws(self.names, self.mine[cut], self.theirs[cut], self.worst[cut], self.zero_rows[cut],
-                      self.finite[cut], self.widths, examples, example_rows)
+                      self.finite[cut], self.widths, examples, example_rows,
+                      None if self.shares is None else self.shares[cut])
 
     def of_examples(self, index: int) -> list[np.ndarray] | None:
         """Leaf `index`'s per-example log ratios a seed, or None where the site stacks none or a seed's
@@ -91,5 +103,7 @@ class _Draws:
                      for seed, other, picked in zip(self.zero_rows, library.zero_rows, pick, strict=True)]
         # A library arm's leaves are judged by their pooled ratio alone: their examples are not Dew's against
         # one reference.
+        shares = (None if self.shares is None or library.shares is None
+                  else np.where(pick, library.shares, self.shares))
         return _Draws(self.names, self.mine, np.where(pick, library.theirs, self.theirs), worst, zero_rows,
-                      self.finite & (library.finite | ~covered), self.widths)
+                      self.finite & (library.finite | ~covered), self.widths, shares=shares)

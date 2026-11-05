@@ -510,35 +510,44 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
 
 
 def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int,
-                 amplified: bool = False) -> tuple[list, list[float]]:
+                 amplified: bool = False, shared: bool = False) -> tuple[list, list[float]]:
     """Check 1's verdicts (`_staged`) on its worst-row rule alone for equally exact pairs as sites run it,
     `runs` runs from `chunk`'s own stream: both arms on one truth, so each row's size is shared; `rows`
     rows a draw of `width` values, truths and errors standard normal, the arms' errors independent; the
     pooled ratio exactly one, so only the rows decide; with `amplified`, one element a row amplified by
-    2^k, k uniform over 0 to 24 in each arm apart, the heavy-tailed rows one element rules. Each run's
+    2^k, k uniform over 0 to 24 in each arm apart, the heavy-tailed rows one element rules, or with `shared`
+    the same k in both arms, as one draw's input amplifies both arms' rounding alike (a site's paired
+    arms: tests/test_weighed_check.py's amplified element). Each run's
     verdict, and its site statistic, the
     least factor that would have failed it at both stages (`_staged`'s second stage is drawn only where
     the first fails), whose high quantiles calibrate NARROW_FACTORS."""
     import numpy as np
-    from reference_error import NO_ZERO_ROWS, REDRAW, _Draws, _staged, _verdict
+    from reference_error import NO_ZERO_ROWS, REDRAW, _Draws, _largest_share, _staged, _verdict
 
-    rng = np.random.default_rng([0x5A, width, rows, seeds, chunk, int(amplified)])
+    rng = np.random.default_rng([0x5A, width, rows, seeds, chunk, int(amplified) + 2 * int(shared)])
     span = (1 + REDRAW) * seeds
     verdicts, statistics = [], []
     for _ in range(runs):
         truth = np.sqrt(np.mean(np.square(rng.standard_normal((span, rows, width))), axis=2))
-        arms = []
+        # Drawn only where shared, so the other controls keep their streams.
+        scale = 2.0 ** rng.integers(0, 25, (span, rows)) if shared else None
+        arms, shares = [], None
         for _ in range(2):
             errors = rng.standard_normal((span, rows, width))
             if amplified:
-                errors[..., 0] *= 2.0 ** rng.integers(0, 25, (span, rows))
-            arms.append((np.sqrt(np.mean(np.square(errors), axis=2)) / truth).max(axis=1))
+                errors[..., 0] *= scale if shared else 2.0 ** rng.integers(0, 25, (span, rows))
+            sized = np.sqrt(np.mean(np.square(errors), axis=2)) / truth
+            arms.append(sized.max(axis=1))
+            # The reference's (the second arm's) worst row's largest element's share, as check 1 reads it.
+            at = np.argmax(sized, axis=1)
+            shares = _largest_share(errors[np.arange(span), at])[:, None]
         worst = np.stack(arms, axis=-1)[:, None, :]
 
-        def drawn(start, stop, worst=worst):
+        def drawn(start, stop, worst=worst, shares=shares):
             count = stop - start
             return _Draws(["rows"], np.ones((count, 1)), np.ones((count, 1)), np.log(worst[start:stop]),
-                          [[NO_ZERO_ROWS]] * count, np.ones((count, 1), bool), (width,))
+                          [[NO_ZERO_ROWS]] * count, np.ones((count, 1), bool), (width,),
+                          shares=shares[start:stop])
 
         over, unresolved, stage = _staged(drawn, seeds, f"rows of {width}")
         verdicts.append((_verdict(over, unresolved), stage))
@@ -567,6 +576,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--orders", type=int, help="judge an orbit class's rows over this many orders")
     parser.add_argument("--amplified", action="store_true", help="with --rows, one element a row amplified "
                         "by 2^k, k uniform over 0 to 24, in each arm apart")
+    parser.add_argument("--shared", action="store_true", help="with --amplified, the same k in both arms, as "
+                        "one draw's input amplifies a site's paired arms alike")
     parser.add_argument("--paired", action="store_true", help="run both arms on the same draws, as a site "
                         "does: Dew the reference at another order (REORDERED), or with --fault its fault")
     options = parser.parse_args(argv)
@@ -579,11 +590,12 @@ def main(argv: list[str]) -> int:
         if options.today or options.paired or options.orders or options.fault or options.seeds is None:
             parser.error("--rows takes the rows a draw as its name and --seeds, and no other mode's flags")
         verdicts, statistics = row_controls(options.rows, int(options.name), options.seeds, options.runs,
-                                            options.chunk, options.amplified)
+                                            options.chunk, options.amplified, options.shared)
         import numpy as np
 
         print(json.dumps({"rows": int(options.name), "width": options.rows, "seeds": options.seeds,
-                          "amplified": options.amplified, "chunk": options.chunk, "runs": len(verdicts),
+                          "amplified": options.amplified, "shared": options.shared, "chunk": options.chunk,
+                          "runs": len(verdicts),
                           "reds": sum(verdict != "pass" for verdict, _ in verdicts),
                           "quantiles": {str(tail): float(np.quantile(statistics, 1 - tail))
                                         for tail in (5e-4, 1e-4)}}), flush=True)
