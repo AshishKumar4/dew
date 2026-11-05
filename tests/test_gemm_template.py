@@ -521,6 +521,49 @@ def test_a_dense_product_whose_extents_no_tile_divides_holds_check_1(transpose_r
 
 @INTERPRETS
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+@pytest.mark.parametrize("frozen", [True, False])
+def test_an_adapted_products_fused_form_holds_check_1(generation_name, frozen):
+    """LoRA's adapted product as one template product over the depth its rank extends (`gemm.low_rank`,
+    row 1304), interpreted on each family, holds check 1 against the adapter's own program (`lora`'s
+    branch: its factors at the layer's dtype, the low-rank products summed in fp32, the base product
+    beside them), value and gradients; the kernel frozen (closed over, no gradient taken) or trained."""
+    rows, depth, width, rank, scale = 128, 128, 256, 16, 2.0
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        bf16 = functools.partial(jnp.asarray, dtype=jnp.bfloat16)
+        return (bf16(rng.standard_normal((rows, depth))), bf16(rng.standard_normal((depth, width)) / 16),
+                bf16(rng.standard_normal((depth, rank)) / 16), bf16(rng.standard_normal((rank, width)) / 16),
+                bf16(rng.standard_normal((rows, width))))
+
+    def adapter(x, w, a, b, wide=jnp.float32, out=jnp.bfloat16):
+        hidden = jnp.dot(x, a, preferred_element_type=wide)
+        update = scale * jnp.dot(hidden, b.astype(wide), preferred_element_type=wide)
+        return (jnp.dot(x, w, preferred_element_type=wide) + update).astype(out)
+
+    def fused(x, w, a, b):
+        return gemm.low_rank(x, w, a, b, scale, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+
+    def differentiated(f):
+        def value_and_gradients(x, w, a, b, ct):
+            if frozen:
+                y, pull = jax.vjp(lambda x, a, b: f(x, w, a, b), x, a, b)
+            else:
+                y, pull = jax.vjp(f, x, w, a, b)
+            return (y, *pull(ct.astype(y.dtype)))
+        return value_and_gradients
+
+    with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic_gpu"), \
+            generation.routes() as routes:
+        truth = differentiated(functools.partial(adapter, wide=jnp.float64, out=jnp.float64))
+        assert_as_exact(differentiated(fused), jax.jit(differentiated(adapter)), draw,
+                        f"low rank {generation_name} {'frozen' if frozen else 'trained'}", seeds=SEEDS,
+                        truth_fn=truth)
+    assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic_gpu"}
+
+
+@INTERPRETS
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
 @pytest.mark.parametrize("transpose_rhs", [False, True])
 def test_a_decode_steps_dense_product_runs_swapped_and_holds_check_1(generation_name, transpose_rhs):
     """A dense product of fewer rows than a role's (a decode step's 4 rows by 256 by 384) derives a swapped
