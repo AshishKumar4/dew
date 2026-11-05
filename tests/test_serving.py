@@ -1386,10 +1386,10 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode
 
 
 @pytest.mark.mesh(devices=4)
-@pytest.mark.parametrize("decoding", ["mesh", "device"])
+@pytest.mark.parametrize("decoding", [2, 1], ids=["two", "one"])
 def test_a_server_that_prefills_on_a_mesh_of_its_own_draws_what_one_mesh_draws(decoding):
     """Disaggregated serving: the prompts prefill on two devices of their own and their rows' decoder state
-    moves to the decoding devices, two of a mesh or one alone, where they decode; every request, a prompt
+    moves to the decoding devices, a mesh of two or of one, where they decode; every request, a prompt
     arriving while others decode among them, draws what its lone call draws, and a reload reaches the
     prefill mesh's copy as the decoding one's (ledger 875)."""
     from dew.training import Layout, MeshSpec
@@ -1398,8 +1398,7 @@ def test_a_server_that_prefills_on_a_mesh_of_its_own_draws_what_one_mesh_draws(d
     bound = task(Sampling(temperature=1.0))
     layout = Layout(min_shard=1, tolerance=1.0)
     with boxed(decoder_axes(bound.model)):
-        decoded = (place(bound.variables, MeshSpec(fsdp=2).build(devices[2:]), layout) if decoding == "mesh"
-                   else jax.device_put(bound.variables, devices[3]))
+        decoded = place(bound.variables, MeshSpec(fsdp=decoding).build(devices[4 - decoding:]), layout)
     served = dataclasses.replace(bound, variables=decoded)
     alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]

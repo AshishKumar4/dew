@@ -677,7 +677,7 @@ class Server:
             raise ValueError("a server that prefills on a mesh of its own prefills each prompt whole over a "
                              "dense cache; serve it without page_size, chunk or a speculative plan")
         self._prefill_rows = NamedSharding(mesh, P(batch_axes(mesh) or None))
-        self._prefill = Fetched(prefill_program(self._prefill_rows))
+        self._prefill = prefill_program(self._prefill_rows)
         self._prefill_variables = _on_mesh(self.variables, mesh)
 
     def _keep_states(self, formats) -> None:
