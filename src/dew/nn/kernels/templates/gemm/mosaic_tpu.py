@@ -131,9 +131,9 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
         return {'rows': m_tile_ids[slot], 'depth': step, 'columns': column,
                 GROUPS: jnp.minimum(group_ids[slot], groups - 1)}
 
-    sides = [_laid(side, axes, {'rows': block_m, 'depth': block_k, 'columns': block_n}, origin)
-             for side, axes in zip((*prologue_operands, *epilogue_operands), (*prologue_axes, *epilogue_axes),
-                                   strict=True)]
+    laid = [_laid(side, axes, {'rows': block_m, 'depth': block_k, 'columns': block_n}, origin)
+            for side, axes in zip((*prologue_operands, *epilogue_operands), (*prologue_axes, *epilogue_axes),
+                                  strict=True)]
 
     def out_index(column, slot, step, group_offsets, group_ids, m_tile_ids):
         return m_tile_ids[slot], column
@@ -147,7 +147,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
             in_specs=[pl.BlockSpec((block_m, block_k), lhs_index),
                       pl.BlockSpec((None, block_n, block_k) if transpose_rhs else (None, block_k, block_n),
                                    rhs_index),
-                      *(spec for _, spec in sides)],
+                      *(spec for _, spec in laid)],
             out_specs=tuple(pl.BlockSpec((block_m, block_n), out_index) for _ in dtypes),
             grid=(width // block_n, active, steps),
             scratch_shapes=[pltpu.VMEM((block_m, block_n), jnp.float32)]),
@@ -156,7 +156,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
         cost_estimate=cost(2 * rows * depth * width, lhs, rhs, *prologue_operands, *epilogue_operands,
                            *out_shape),
         name="dew_gmm",
-    )(*metadata, lhs, rhs, *(side for side, _ in sides))
+    )(*metadata, lhs, rhs, *(side for side, _ in laid))
     outs = tuple(out[:rows] for out in outs)
     return outs if out_dtypes else outs[0]
 
@@ -222,8 +222,8 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Bloc
     def origin(column, block, slot, group_offsets, group_ids, m_tile_ids):
         return {'rows': m_tile_ids[slot], 'depth': block, GROUPS: group_ids[slot]}
 
-    sides = [_laid(side, axes, {'rows': block_k, 'depth': block_m}, origin)
-             for side, axes in zip(prologue_operands, prologue_axes, strict=True)]
+    laid = [_laid(side, axes, {'rows': block_k, 'depth': block_m}, origin)
+            for side, axes in zip(prologue_operands, prologue_axes, strict=True)]
 
     def out_index(column, block, slot, group_offsets, group_ids, m_tile_ids):
         return group_ids[slot], block, column
@@ -236,7 +236,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Bloc
             num_scalar_prefetch=3,
             in_specs=[pl.BlockSpec((block_k, block_m), rows_index),
                       pl.BlockSpec((block_k, block_n), cotangent_index),
-                      *(spec for _, spec in sides)],
+                      *(spec for _, spec in laid)],
             out_specs=pl.BlockSpec((None, block_m, block_n), out_index),
             grid=(width // block_n, depth // block_m, active),
             scratch_shapes=[pltpu.VMEM((block_m, block_n), jnp.float32)]),
@@ -244,7 +244,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Bloc
         interpret=interpret,
         cost_estimate=cost(2 * rows * depth * width, lhs, rhs, *prologue_operands, out_shape),
         name="dew_tgmm",
-    )(*metadata, lhs, rhs, *(side for side, _ in sides))
+    )(*metadata, lhs, rhs, *(side for side, _ in laid))
 
 
 def _laid(side: jax.Array, side_axes: tuple, extent: dict, origin) -> tuple[jax.Array, pl.BlockSpec]:
