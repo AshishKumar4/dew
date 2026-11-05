@@ -17,10 +17,15 @@ set only what the method leaves free: its group size, its reference penalty's we
 | rloo (arXiv:2402.14740) | rloo | reinforce | none | k1 in the reward, reward_kl | constant (one token) |
 """
 
+from __future__ import annotations
+
 import dataclasses
 import math
-from collections.abc import Mapping
-from typing import TypedDict
+from collections.abc import Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, TypedDict
+
+if TYPE_CHECKING:
+    from dew.sampling.text import Sampling
 
 
 class RolloutSettings(TypedDict, total=False):
@@ -30,6 +35,20 @@ class RolloutSettings(TypedDict, total=False):
     estimator: str
     varied: bool
     overlong: tuple[int, int]
+
+
+class PromptSettings(RolloutSettings, total=False):
+    """A prompt rollout's settings, which its scheduler takes whether each step draws its own completions
+    (`RolloutScheduler.sampled`) or a server draws them ahead (`RolloutScheduler.served`): the method's
+    (`RolloutSettings`) and the run's own."""
+
+    decode: Callable[[Sequence[int]], str]
+    groups: int
+    max_new_tokens: int
+    truncation: str
+    sampling: Sampling | None
+    admit: int | None
+    generation_batches: int
 
 
 _NO_PENALTY = {"beta": 0.0, "reward_kl": 0.0}

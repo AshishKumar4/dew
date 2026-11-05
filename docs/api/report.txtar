@@ -514,6 +514,13 @@ dew.config.lm.PromptRollout
   admit: int | None = None
   overlong_cache: int | None = None
   generation_batches: int = 1
+  served: Annotated[ServedRollout, tyro.conf.subcommand('served')] | None = None
+dew.config.lm.ServedRollout
+  slots: int = 8
+  ahead: int = 1
+  max_lag: int = 1
+  sync_every: int = 1
+  page_size: int | None = None
 dew.config.sweep.GridSearch
 dew.config.sweep.OptunaSearch
   seed: int = 0

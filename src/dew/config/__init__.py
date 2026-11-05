@@ -50,10 +50,11 @@ from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._records import JSON, duration, earlier_fields, is_share, recorded_duration
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
+from dew.cleanup import attempted
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.data import records
 from dew.data.compile import fitted
-from dew.data.dataset import Loader, Ramp, Reader, ramped
+from dew.data.dataset import Closeable, Loader, Ramp, Reader, ramped
 from dew.data.pipeline import Dataset, ObjectiveData
 from dew.data.plan import PLAN_VERSIONS, SCHEDULE, PlanOrderChanged
 from dew.distributed.placement import Layout, MeshSpec
@@ -862,19 +863,23 @@ def _local_tracker(directory: str, name: str):
     return LocalTracker(local_records(directory, name, "tracking"))
 
 
-def _closed(tracker, checkpoints: Checkpoints | None, primary: BaseException | None) -> None:
-    """Close `tracker` on every rank and agree on the outcome, then close `checkpoints`, even where
-    the tracker's close failed.
+def _closed(tracker, checkpoints: Checkpoints | None, primary: BaseException | None,
+            rollout: Closeable | None = None) -> None:
+    """Close `rollout` (what it runs beside the trainer: a served policy's engine, a reward pool), then
+    `tracker` on every rank and agree on the outcome, then `checkpoints`, each even where one before it
+    failed.
 
     `primary` is the exception the run is already unwinding with, if any. A
     close that fails is noted on it rather than replacing it, since the run's
     own failure is the one a caller wants; without one, the first failure is
-    raised with the other noted on it.
+    raised with the others noted on it.
     """
+    closes = [*([] if rollout is None else [("closing the rollout", rollout.close)]),
+              *([] if tracker is None else
+                [("closing the tracker", functools.partial(tracker.__exit__, type(primary), primary, None))])]
     error = None
     try:
-        if tracker is not None:
-            tracker.__exit__(type(primary), primary, None)
+        attempted(closes)
     except BaseException as failure:
         error = failure
     failed = None
@@ -2148,7 +2153,8 @@ class RunConfig:
             return state
 
         finally:
-            _closed(tracker, checkpoints, sys.exception())
+            _closed(tracker, checkpoints, sys.exception(),
+                    rollout if isinstance(rollout, Closeable) else None)
 
     def compiled_ahead[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
                                          steps: int | None, rollout: Rollout | None,
