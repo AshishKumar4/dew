@@ -79,6 +79,7 @@ def test_the_differential_is_the_papers_equation_forward_and_back():
         return reference(np.asarray(attention), np.asarray(projection), float(strength),
                          np.asarray(cotangent))
 
+    @as_given
     def truth(attention, projection, strength, cotangent):
         wide = [np.asarray(value, np.float64) for value in (attention, projection, cotangent)]
         return reference(wide[0], wide[1], float(strength), wide[2])

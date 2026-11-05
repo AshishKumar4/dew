@@ -150,6 +150,7 @@ def flux2_arms(source, arrays, record, name):
             drawn["latent"], drawn["context"], weights[id(module)], drawn["probe"])
         return out, grad_latent, grad_context, {tensor: grad_params[tensor] for tensor in tensors}
 
+    @as_given
     def truth(inputs):
         with float64():
             return reference_walk(wide, inputs)

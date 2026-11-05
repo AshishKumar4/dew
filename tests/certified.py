@@ -50,9 +50,20 @@ class Lane:
     over its probes (`_probes`): 0 where every one was its exact value rounded to nearest, 1 where each
     was one of the two neighbours of its exact value on the lane's grid (faithful), n where each was
     within n - 1 steps of the grid past them; a division by a size-1 broadcast divisor its own form's
-    (`BROADCAST`)."""
+    (`BROADCAST`).
+
+    `kept`: the rounding primitives and formats that read a subnormal operand as it is on a lane that
+    `flushes` (`SUBNORMAL_OPERANDS`): XLA on the CPU flushes per primitive, its expm1 and log1p returning
+    a subnormal argument where its multiply reads one as zero (ledger 4023). Each is held as a lane that
+    keeps subnormals (`flushes_in`)."""
     flushes: bool
     reach: dict[tuple[str, str], int]
+    kept: frozenset[tuple[str, str]] = frozenset()
+
+    def flushes_in(self, name: str, fmt: Format) -> bool:
+        """Whether the rounding primitive `name` flushes in `fmt` on this lane: the lane's, but where it
+        reads a subnormal operand as it is (`kept`)."""
+        return self.flushes and (name, fmt.name) not in self.kept
 
 
 def _grid_index(value, fmt: Format, flushes: bool) -> np.ndarray:
@@ -417,7 +428,7 @@ def _rounding(name: str, integral):
         divisor = np.shape(operands[-1])
         broadcast = name == "div" and len(divisor) == np.ndim(result) and divisor != np.shape(result)
         reach = measured.reach[name + BROADCAST if broadcast else name, fmt.name]
-        return LEVELS[name](operands, result, fmt, measured.flushes) <= reach
+        return LEVELS[name](operands, result, fmt, measured.flushes_in(name, fmt)) <= reach
     return contract
 
 
@@ -835,9 +846,10 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
         # Every normal binade near zero, where the functions are their argument to within a last bit (their
         # enclosures' precision raised there, `_near_zero_interval`); a quarter densest across (-0.5, 1),
         # where XLA's log1p rounds farthest, and out to 8; and their domains' reach: log1p's down to just
-        # above -1 and up to fp32's largest, expm1's across fp32's range. A subnormal operand is read as the
-        # lane reads it (`flushes`), whose expm1 keeps one its multiply flushes.
-        value = scaled(-126, 0)
+        # above -1 and up to fp32's largest, expm1's across fp32's range. Their subnormal binades too, which a
+        # lane reads as its own primitive does (`Lane.flushes_in`: XLA:CPU's expm1 keeps one its multiply
+        # flushes, ledger 4023).
+        value = scaled(fmt.emin - fmt.precision + 1, 0)
         value[quarter:2 * quarter] = (rng.uniform(-1, 0, quarter) if name == "log1p"
                                       else rng.uniform(-104, 89, quarter))
         value[2 * quarter:3 * quarter] = rng.uniform(-0.5, 1, quarter) * 2.0 ** rng.integers(0, 4, quarter)
@@ -857,22 +869,53 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
     return [value.astype(DTYPES[fmt.name]) for value in drawn]
 
 
+SUBNORMAL_OPERANDS = {
+    "add": lambda tiny: (tiny, tiny), "sub": lambda tiny: (tiny, -tiny),
+    "mul": lambda tiny: (tiny, 2.0 ** 100), "div": lambda tiny: (tiny, 2.0 ** -100),
+    "sqrt": lambda tiny: (tiny,), "rsqrt": lambda tiny: (tiny,),
+    "log": lambda tiny: (tiny,), "log1p": lambda tiny: (tiny,), "expm1": lambda tiny: (-tiny,),
+    "erf_inv": lambda tiny: (tiny,),
+}
+"""Each rounding primitive's operands at a subnormal `tiny` whose result tells a subnormal read as it is from
+one read as zero (`lane`'s `kept`); exp, logistic and square return the same result either way, so a lane's
+flushing holds them as it holds every other operation."""
+
+
+def _keeps_subnormals(name: str, fmt: Format) -> bool:
+    """Whether the lane's `name` in `fmt` reads a subnormal operand as it is: its result at
+    `SUBNORMAL_OPERANDS`' subnormal differs from its result with that operand zero."""
+    import jax
+
+    tiny = 2.0 ** (fmt.emin - 4)
+    subnormal = [np.asarray(value, DTYPES[fmt.name]) for value in SUBNORMAL_OPERANDS[name](tiny)]
+    # Each subnormal zeroed with its sign, as a lane that flushes it reads it.
+    zeroed = [np.asarray(np.copysign(0.0, value) if abs(float(value)) == tiny else value, DTYPES[fmt.name])
+              for value in SUBNORMAL_OPERANDS[name](tiny)]
+    run = getattr(jax.lax, name)
+    return bool(np.any(_bits(np.asarray(run(*subnormal))) != _bits(np.asarray(run(*zeroed)))))
+
+
 @functools.cache
 def lane() -> Lane:
     """The lane check 2 runs on (the process's default backend), measured once: whether it reads a
-    subnormal operand as zero (2^-140 times 2^100), and each rounding primitive's reach in each format,
-    the largest level (`LEVELS`) of the lane's own results on its probes (`_probes`), each operation
-    run as `certified` runs it, eagerly and alone. A lane result that breaks an exact case (UNREACHED)
-    is a finding no reach admits, raised here."""
+    subnormal operand as zero (2^-140 times 2^100), the rounding primitives that read one as it is where
+    it does (`_keeps_subnormals`), and each rounding primitive's reach in each format, the largest level
+    (`LEVELS`) of the lane's own results on its probes (`_probes`), each operation run as `certified`
+    runs it, eagerly and alone, at the primitive's own flushing. A lane result that breaks an exact case
+    (UNREACHED) is a finding no reach admits, raised here."""
     import jax
 
     flushes = float(jax.lax.mul(np.float32(2.0 ** -140), np.float32(2.0 ** 100))) == 0.0
-    reach = {}
+    kept = frozenset((name, fmt.name) for name in SUBNORMAL_OPERANDS for fmt in FORMATS.values()
+                     if flushes and _keeps_subnormals(name, fmt))
+    measured = Lane(flushes, {}, kept)
+    reach = measured.reach
     for name, levels in LEVELS.items():
         for fmt in FORMATS.values():
             operands = _probes(name, fmt)
             # Each primitive is `jax.lax`'s function of its own name.
-            found = levels(operands, np.asarray(getattr(jax.lax, name)(*operands)), fmt, flushes)
+            found = levels(operands, np.asarray(getattr(jax.lax, name)(*operands)), fmt,
+                           measured.flushes_in(name, fmt))
             if np.any(found == UNREACHED):
                 at = int(np.argmax(found == UNREACHED))
                 raise ArithmeticError(f"the lane's {name} in {fmt.name} breaks an exact case at "
@@ -884,11 +927,12 @@ def lane() -> Lane:
         dividend, divisor = _probes("div", fmt)
         rows = PROBES // 32
         operands = [dividend[:rows * 32].reshape(rows, 32), divisor[:rows].reshape(rows, 1)]
-        found = LEVELS["div"](operands, np.asarray(jax.lax.div(*operands)), fmt, flushes)
+        found = LEVELS["div"](operands, np.asarray(jax.lax.div(*operands)), fmt,
+                              measured.flushes_in("div", fmt))
         if np.any(found == UNREACHED):
             raise ArithmeticError(f"the lane's broadcast div in {fmt.name} breaks an exact case")
         reach["div" + BROADCAST, fmt.name] = int(np.max(found))
-    return Lane(flushes, reach)
+    return measured
 
 
 CONTRACTS = {
@@ -983,58 +1027,43 @@ def certified(fn, *arguments) -> tuple:
     bind, its own compiled program, under its equation's own context), and each held to its contract
     (CONTRACTS) on the operands it was given: `(outputs, findings)`, the outputs as that run computed
     them, and every equation whose result breaks its contract or that has none, by its path, with its
-    first element that breaks. This certifies the op-by-op program; a fused program's internals are
-    check 1's."""
+    first element that breaks. The program is walked as the gate walks every program
+    (`float64_terms.walked`, by `Certifying`): its calls, branches and scans inside, a scan a step at a
+    time, each step's equations by the step's path. This certifies the op-by-op program; a fused
+    program's internals are check 1's."""
     import jax
+    from float64_terms import evaluated_on, walked
 
     closed, shape = jax.make_jaxpr(fn, return_shape=True)(*arguments)
     findings: list[str] = []
-    outputs = _run(closed.jaxpr, closed.consts, jax.tree.leaves(arguments), findings)
+    leaves = jax.tree.leaves(arguments)
+    with evaluated_on(leaves):
+        outputs = walked(closed.jaxpr, closed.consts, leaves, Certifying(findings))
     return jax.tree.unflatten(jax.tree.structure(shape), outputs), findings
 
 
-def _run(jaxpr, consts, arguments, findings, where: str = "") -> list:
-    from float64_terms import _body
-    from jax.extend import core
+@dataclasses.dataclass(frozen=True)
+class Certifying:
+    """The walk's rule of check 2 (`float64_terms.Rule`, `certified`), unpruned: every equation executed is
+    held, its outputs read or not; each primitive bound natively on its operands and held to its contract
+    (`_held`), its findings appended to `findings` by its path: each call's equation `name#index`, a scan's
+    step its index, joined by `/`."""
 
-    env = {}
+    findings: list
+    path: tuple[str, ...] = ()
+    pruned = False
 
-    def read(var):
-        # A literal at its traced type: its Python value may be wider (a float64 scalar for a float32).
-        return np.asarray(var.val, var.aval.dtype) if isinstance(var, core.Literal) else env[var]
+    def at(self, index: int, name: str | None = None) -> "Certifying":
+        return Certifying(self.findings, (*self.path, str(index) if name is None else f"{name}#{index}"))
 
-    env.update(zip(jaxpr.constvars, consts, strict=True))
-    env.update(zip(jaxpr.invars, arguments, strict=True))
-    for index, eqn in enumerate(jaxpr.eqns):
-        operands = [read(var) for var in eqn.invars]
-        at = f"{where}{eqn.primitive.name}#{index}"
-        with eqn.ctx.manager:
-            body = _body(eqn)
-            if eqn.primitive.name == "cond":
-                branch = eqn.params["branches"][int(np.asarray(operands[0]))]
-                results = _run(branch.jaxpr, branch.consts, operands[1:], findings, at + "/")
-            elif eqn.primitive.name == "scan":
-                results = _scanned(eqn.params, operands, findings, at + "/")
-            elif body is not None:
-                results = _run(*body, operands, findings, at + "/")
-            else:
-                results = eqn.primitive.bind(*operands, **eqn.params)
-                results = list(results) if eqn.primitive.multiple_results else [results]
-                _held(eqn, operands, results, findings, at)
-        env.update(zip(eqn.outvars, results, strict=True))
-    return [read(var) for var in jaxpr.outvars]
+    def held(self, dtype):
+        return dtype
 
-
-def _scanned(params, operands, findings, where: str) -> list:
-    """A scan run a step at a time (`float64_terms.scanned_steps`, `_run` of its body), every step's
-    equations held to their contracts as the program's are, each by its step's path."""
-    from float64_terms import scanned_steps
-
-    body = params["jaxpr"]
-    walked = scanned_steps(params, [(value,) for value in operands], lambda step, inputs: [
-        (value,) for value in _run(body.jaxpr, body.consts, [value for (value,) in inputs], findings,
-                                   f"{where}{step}/")], lanes=1)
-    return [value for (value,) in walked]
+    def primitive(self, eqn, operands: list) -> list:
+        results = eqn.primitive.bind(*operands, **eqn.params)
+        results = list(results) if eqn.primitive.multiple_results else [results]
+        _held(eqn, operands, results, self.findings, "/".join(self.path))
+        return results
 
 
 _OBSERVING: list[list] = []
