@@ -33,6 +33,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.typing import DTypeLike
 
+from dew.nn.kernels import launches
+
 from ..precision import exact_float32
 from . import generation
 
@@ -270,7 +272,7 @@ def _interpreting(platform: str) -> bool:
 def _call(body, platform: str, grid: tuple[int, ...], in_specs, out_specs, out_shape):
     """One Mosaic `pallas_call`, interpreted where the process holds no TPU."""
     params = pltpu.CompilerParams(dimension_semantics=("parallel", "parallel", "arbitrary"))
-    return pl.pallas_call(body, grid=grid, in_specs=list(in_specs), out_specs=list(out_specs),
+    return launches.pallas_call(body, grid=grid, in_specs=list(in_specs), out_specs=list(out_specs),
                           out_shape=out_shape, compiler_params=params,
                           interpret=_interpreting(platform))
 
