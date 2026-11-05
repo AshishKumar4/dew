@@ -868,8 +868,9 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
 def test_a_scoring_server_answers_image_requests_as_each_draws_alone(tmp_path):
     """A text-to-image task served by a `ScoringServer` (`TextToImage.scoring`), as an `Engine` serves it
     beside other kinds: requests alike share a pass up to its four images, a request of another prompt
-    count or other settings (its steps, its negative prompt) walks in a pass of its own, and each
-    request's images are those its lone call draws under its key and settings, on par with that call
+    count or other settings (its steps, its negative prompt) walks in a pass of its own, one prepared
+    under a key and step count apart from its walk's among them, and each request's images are those
+    its lone call draws under its keys and settings, on par with that call
     against the float64 pipeline over the same prepared noise and conditions (check 1)."""
     from arm_arithmetic import widened
     from reference_error import as_given, assert_as_exact, seeds_for
@@ -880,7 +881,9 @@ def test_a_scoring_server_answers_image_requests_as_each_draws_alone(tmp_path):
     pipe = TextToImage.from_run(str(tmp_path))
     requests = ({"prompts": ("a water lily", "a sunflower")}, {"prompts": ("a rose", "a tulip")},
                 {"prompts": ("a daisy",)},
-                {"prompts": ("an iris", "a lotus"), "steps": 4, "negative": "blurry"})
+                {"prompts": ("an iris", "a lotus"), "steps": 4, "negative": "blurry", "prepare_steps": 2})
+    # The last request's noise is prepared under a key of its own, apart from its walk's.
+    apart = 1000
     server = ScoringServer.from_task(*pipe.scoring(steps=3, guidance=2.0, images=4))
     wide = dataclasses.replace(pipe, model=pipe.model.clone(dtype=jnp.float64),
                                variables=widened(pipe.variables))
@@ -888,19 +891,34 @@ def test_a_scoring_server_answers_image_requests_as_each_draws_alone(tmp_path):
     def draw(seed):
         return (np.arange(len(requests)) + len(requests) * seed,)
 
+    def preparing(request, key):
+        """The key and steps the request's noise and conditions are prepared under."""
+        if "prepare_steps" not in request:
+            return key, request.get("steps", 3)
+        return key + apart, request["prepare_steps"]
+
     def prepared(request, key):
         """The request's lone call's inputs and its settings."""
-        steps = request.get("steps", 3)
-        return pipe.prepare(list(request["prompts"]), key=key, steps=steps,
-                            unconditional=request.get("negative")), {"steps": steps, "guidance": 2.0}
+        prepare_key, prepare_steps = preparing(request, key)
+        return (pipe.prepare(list(request["prompts"]), key=prepare_key, steps=prepare_steps,
+                             unconditional=request.get("negative")),
+                {"steps": request.get("steps", 3), "guidance": 2.0})
 
     @as_given
     def served(keys):
-        futures = [server.submit(ImageRequest(**request, key=int(key)))
-                   for request, key in zip(requests, keys, strict=True)]
+        futures, streamed = [], []
+        for index, (request, key) in enumerate(zip(requests, keys, strict=True)):
+            prepare_key, prepare_steps = preparing(request, int(key))
+            # The second request streams its walk: each step's number and its two rows' clean predictions.
+            on_step = (lambda step, rows: streamed.append((step, rows.shape))) if index == 1 else None
+            futures.append(server.submit(ImageRequest(**{**request, "prepare_steps": prepare_steps},
+                                                      key=int(key), prepare_key=prepare_key,
+                                                      on_step=on_step)))
         server.run()
         admitted = [future.admitted for future in futures]
         assert admitted[0] == admitted[1] and len(set(admitted[1:])) == 3
+        assert [step for step, _ in streamed] == [1, 2, 3]
+        assert {shape[0] for _, shape in streamed} == {2}
         return tuple(future.result().host().images for future in futures)
 
     @as_given

@@ -3,9 +3,12 @@ images, beside `TextGeneration`. The reverse walk it runs is `dew.sampling`'s (`
 
 from __future__ import annotations
 
+import contextlib
 import functools
+import itertools
 import os
-from collections.abc import Callable, Mapping, Sequence
+import threading
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Generic
 
@@ -458,27 +461,38 @@ class TextToImage(SavedRunTask, InItsForm):
         requests, each with its own key (`TextToImage.scoring`)."""
         mesh = mesh_of(self.variables)
         walking = requests[0].walking
-        prepared = [self._inputs(self._resolved(
-            mesh, list(request.prompts), None, request=request.key, count=walking.count,
-            process=walking.process, selected=walking.times,
-            unconditional=None if request.negative is None else list(request.negative), image=None,
-            image_latents=None, mask=None, noise=None, initial=None, encode_key=None),
-            owns_grid=self.grid is not None)
-            for request in requests]
+
+        def inputs(request: _Drawn) -> DenoisingInputs:
+            """The request's noise and conditions as `prepare` prepares them for its own key and steps."""
+            process, times = self.prepared_process(request.preparing)
+            return self._inputs(self._resolved(
+                mesh, list(request.prompts), None, request=request.prepared, count=request.preparing,
+                process=process, selected=times,
+                unconditional=None if request.negative is None else list(request.negative), image=None,
+                image_latents=None, mask=None, noise=None, initial=None, encode_key=None),
+                owns_grid=self.grid is not None)
+
+        prepared = [inputs(request) for request in requests]
         noise, conditions, unconditional = (jax.tree.map(lambda *leaves: jnp.stack(leaves), *branch)
                                             for branch in zip(*((inputs.noise, dict(inputs.conditions),
                                                                  dict(inputs.unconditional))
                                                                 for inputs in prepared), strict=True))
         walks = jnp.stack([jax.random.fold_in(request.key, 1) for request in requests])
         grid = _default_grid(walking.process, walking.count) if walking.times is None else walking.times
-        with region("inference.image"):
-            initial = program(_initials, static_argnums=(0, 1, 2))(
-                walking.solver, walking.process, grid, noise, walks)
+        with region("inference.image"), _streams(requests, [inputs.rows for inputs in prepared]) as streams:
+            solver = walking.solver
+            initial = program(_initials, static_argnums=(0, 1, 2))(solver, walking.process, grid, noise,
+                                                                   walks)
+            if streams is not None:
+                solver, initial = _Streaming(solver), (initial, streams)
             models = sampling_modules(self.model, walking.guidance, self.autoencoder)
             generated = program(_walks, *models, static_argnums=(0, 1, 2, 3, 4, 5))(
                 self.model, walking.process, self.autoencoder, self.finish, self.final_denoise,
-                walking.decode, walking.solver, walking.guidance, np.asarray(grid, np.float32), initial,
+                walking.decode, solver, walking.guidance, np.asarray(grid, np.float32), initial,
                 self.variables, conditions, unconditional, noise, walks)
+            if streams is not None:
+                # Its streams close once every step has reached the host.
+                jax.block_until_ready(generated)
         return [replace(jax.tree.map(lambda leaf, index=index: leaf[index], generated), rows=inputs.rows)
                 for index, inputs in enumerate(prepared)]
 
@@ -779,7 +793,12 @@ class ImageRequest:
     """One request a served text-to-image task answers (`TextToImage.scoring`): its prompts, an image
     each, the key its draws come from, and the settings of its lone call `task(prompts, key=key, ...)`:
     `steps`, `guidance` and `solver` (the scoring task's where omitted), and `negative`, its negative
-    prompts, one or one a prompt, in place of the task's blank."""
+    prompts, one or one a prompt, in place of the task's blank. A request whose noise and conditions are
+    prepared apart from its walk, as `task(task.prepare(prompts, key=prepare_key, steps=prepare_steps,
+    unconditional=negative), key=key, steps=steps, ...)` prepares them, names `prepare_key` and
+    `prepare_steps` (its `key` and `steps` where None). `on_step`, where given, streams the walk: it is
+    called on the runtime's callback thread with each solver step's number, from 1, and the clean
+    prediction that step reads, the request's rows as a host array, as the walk runs."""
 
     prompts: str | Sequence[str]
     key: int | jax.Array
@@ -787,6 +806,72 @@ class ImageRequest:
     guidance: Guidance | float | None | Omitted = OMITTED
     solver: Solver | None = None
     negative: str | Sequence[str] | None = None
+    prepare_key: int | jax.Array | None = None
+    prepare_steps: int | None = None
+    on_step: Callable[[int, np.ndarray], None] | None = None
+
+
+_STREAMS: dict[int, Callable[[int, np.ndarray], None]] = {}
+"""Each served request's step stream that a walk running now feeds (`_streams`), by its number."""
+_STREAMING = threading.Lock()
+_STREAMED = itertools.count()
+
+
+@contextlib.contextmanager
+def _streams(requests: Sequence[_Drawn], rows: Sequence[int | None]) -> Iterator[jax.Array | None]:
+    """The stream numbers of a served pass's requests, -1 for a request that streams none, each request's
+    `on_step` registered while the pass runs with its real `rows` alone, its steps counted from 1; None
+    where none streams."""
+    if all(request.on_step is None for request in requests):
+        yield None
+        return
+    numbers = [-1 if request.on_step is None else next(_STREAMED) for request in requests]
+
+    def counted(on_step: Callable[[int, np.ndarray], None], real: int | None) -> Callable[[np.ndarray], None]:
+        steps = itertools.count(1)
+        return lambda held: on_step(next(steps), held[:real])
+
+    with _STREAMING:
+        _STREAMS.update({number: counted(request.on_step, real)
+                         for number, request, real in zip(numbers, requests, rows, strict=True)
+                         if request.on_step is not None})
+    try:
+        yield jnp.asarray(numbers, jnp.int32)
+    finally:
+        with _STREAMING:
+            for number in numbers:
+                _STREAMS.pop(number, None)
+
+
+def _streamed(numbers: np.ndarray, denoised: np.ndarray) -> None:
+    """A served step's clean predictions to their requests' streams: one request's, or a pass's mapped
+    over its requests, as the runtime calls a callback under `vmap`."""
+    numbers, denoised = np.asarray(numbers), np.asarray(denoised)
+    if numbers.ndim == 0:
+        numbers, denoised = numbers[None], denoised[None]
+    with _STREAMING:
+        streams = [_STREAMS.get(int(number)) for number in numbers]
+    for stream, rows in zip(streams, denoised, strict=True):
+        if stream is not None:
+            stream(rows)
+
+
+@struct.dataclass
+class _Streaming:
+    """`inner`, sending each step's clean prediction to its request's stream (`ImageRequest.on_step`): a
+    served pass's solver where a request in it streams, its state the inner one beside the request's
+    stream number (`_streams`)."""
+
+    inner: Solver
+
+    def init(self, x, times, process, *, key):
+        raise ValueError("a streaming walk starts from the state its pass builds beside its streams")
+
+    def step(self, x, t, t_next, denoised, eps, state, key, process, denoise, /):
+        held, number = state
+        jax.debug.callback(_streamed, number, denoised)
+        x, held = self.inner.step(x, t, t_next, denoised, eps, held, key, process, denoise)
+        return x, (held, number)
 
 
 @dataclass(frozen=True)
@@ -803,12 +888,16 @@ class _Walking:
 
 @dataclass(frozen=True, eq=False)
 class _Drawn:
-    """An admitted request: its prompts, negatives, typed key and settings."""
+    """An admitted request: its prompts, negatives, the typed keys its noise is prepared and its walk
+    draws under, the step count it is prepared for and its walk's settings."""
 
     prompts: tuple[str, ...]
     negative: tuple[str, ...] | None
+    prepared: jax.Array
     key: jax.Array
+    preparing: int
     walking: _Walking
+    on_step: Callable[[int, np.ndarray], None] | None = None
 
     def alike(self, other: _Drawn) -> bool:
         """Whether `other` walks in one program beside this one: as many prompts and negatives, and the
@@ -858,11 +947,18 @@ class ImageScoring:
         if negative is not None and len(negative) not in (1, len(prompts)):
             raise ValueError("an image request's negatives are one or one a prompt")
         count = self.steps if request.steps is None else request.steps
+        preparing = count if request.prepare_steps is None else request.prepare_steps
+        if task.grid is not None and preparing != count:
+            raise ValueError("prepared noise belongs to a different source grid; prepare it for these steps")
         process, times = task.prepared_process(count)
+        task.prepared_process(preparing)
         walking = _Walking(count, process, times,
                            self.guidance if request.guidance is OMITTED else task._guidance(request.guidance),
                            self.solver if request.solver is None else request.solver, self.decode)
-        return ScoringRequest((_Drawn(prompts, negative, request_key(request.key), walking),), None)
+        key = request_key(request.key)
+        prepared = key if request.prepare_key is None else request_key(request.prepare_key)
+        drawn = _Drawn(prompts, negative, prepared, key, preparing, walking, request.on_step)
+        return ScoringRequest((drawn,), None)
 
     def planned(self) -> _ImagePass:
         return _ImagePass(self.images)
