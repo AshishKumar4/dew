@@ -67,6 +67,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     refused,
     split_queries,
     stagings,
+    values_deferred,
     varying_slopes,
     whole_tiles,
 )
@@ -118,6 +119,10 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     score_dtypes: tuple[str, ...] = ()
     scale: float = 1.0
     natural: bool = NATURAL
+    subtracted: bool = False
+    """Whether an inference walk's fold takes its logits as a difference of raw products scaled after it is
+    taken (`algebra.Forward.subtracted`: no fold's reach, no natural rewalk), a decode step's
+    (`attention_decode`), whose walk the memory bounds."""
 
     def spans(self, start, end, query_ids, key_ids) -> KeySpans:
         """The call's spans from its arrays and the op's static form and key count."""
@@ -253,7 +258,8 @@ class MosaicForward(_Mainloop[Tiles]):
                 # The inference walk, its rows beside the output where it keeps them.
                 return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
                                       out_dtype=self.out_dtype, masked=self.masked, splits=self.splits,
-                                      table=table, sources=sources, **form), None
+                                      table=table, sources=sources, subtracted=self.subtracted,
+                                      **form), None
 
     def completed(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
         """A pin's or an explicit config's natural rewalk derived once where it names none (`_relaunched`,
@@ -272,7 +278,7 @@ class MosaicForward(_Mainloop[Tiles]):
         rewalks at its own tiles, which must hold (rows 2621, 2647)."""
         if not self._launch_legal(ba, config, target):
             return False
-        if config.natural_form or self._natural(ba.arguments["query"]):
+        if config.natural_form or self._unrewalked(ba.arguments["query"]):
             return True
         relaunch = config.relaunch
         return (config.block_k % relaunch.block_k == 0 and relaunch.consumers <= config.consumers
@@ -314,7 +320,18 @@ class MosaicForward(_Mainloop[Tiles]):
 
         config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles,
                           lambda config: self._launch_legal(ba, config, target), overlapped=True)
-        return None if config is None else self._relaunched(ba, config, target)
+        if config is None:
+            return None
+        if values_deferred(family, self.form, self.splits, query.dtype, ba.arguments.get("drop") is not None):
+            # The P·V a step late where its walk holds the carried weights at the same tiles, its scalars
+            # beside them below its budget: a walk of two products in flight pins their accumulators and the
+            # weights they read, and ptxas serialized one at its budget (C7512 and 96 bytes spilled, 228 of
+            # tiles and 12 scalars against 240 at 64 x 256, width 64, et-gate64).
+            deferred = dataclasses.replace(config, deferred=True)
+            if (self._launch_legal(ba, deferred, target) and self.registers(ba, deferred)
+                    + family.scalar_registers() < self.register_budget(deferred)):
+                config = deferred
+        return self._relaunched(ba, config, target)
 
     def streaming(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> Tiles:
         """`config` for a call whose walk the device's memory bounds (`streams`), its key tile the least its
@@ -348,7 +365,7 @@ class MosaicForward(_Mainloop[Tiles]):
         tiles it spilled 2 KB at width 64); a call that keeps its logits natural rewalks nothing. None where
         no tile holds the rewalk."""
         config = dataclasses.replace(config, relaunch_k=None, relaunch_consumers=None, relaunch_columns=None)
-        if self._natural(ba.arguments["query"]):
+        if self._unrewalked(ba.arguments["query"]):
             return config
         query, value = ba.arguments["query"], ba.arguments["value"]
         family = bundle_of(config, query.dtype)
@@ -384,6 +401,18 @@ class MosaicForward(_Mainloop[Tiles]):
         power, scale = prescale(query.dtype, query.shape[3], self.scale)
         return not algebra.folds(scale, power, natural=self.natural, score_mod=self.score_mod)
 
+    def _unrewalked(self, query: jax.Array) -> bool:
+        """Whether the call of `query` walks no natural rewalk: its logits natural (`_natural`), or a fold no
+        logit's reach passes (`algebra.Forward.reaches`: a subtracted fold's raw products), at the scale its
+        launch takes (`attention_mosaic_forward._prepared`)."""
+        if self._natural(query):
+            return True
+        power, scale = prescale(query.dtype, query.shape[3], self.scale)
+        taken = power if self.form != "spans" else 1.0
+        return not algebra.Forward(self.form, self.keys, ids=False, scale=scale * taken,
+                                   score_mod=self.score_mod, natural=self.natural, prescale=power / taken,
+                                   subtracted=self.subtracted).reaches
+
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         """The program's shared memory (`_forward_allocations`, `resources.shared_bytes`), at the call's
         widths as the launch stages them (`_width`)."""
@@ -416,9 +445,12 @@ class MosaicForward(_Mainloop[Tiles]):
         if peaks:
             return _peaks_registers(family, config, query.dtype, params=params, width=width)
         value_width = columns or config.columns or _width(value.shape[-1], family, query.dtype)
-        return _forward_registers(family, config, value_width, query.dtype,
-                                  ba.arguments.get("residuals") is Kept.SPLIT, natural=natural, params=params,
-                                  width=width)
+        residuals = ba.arguments.get("residuals")
+        # The plain inference walk's weights carried a step where it issues their P·V late
+        # (`Tiles.deferred`).
+        deferred = config.deferred and residuals is not Kept.SPLIT
+        return _forward_registers(family, config, value_width, query.dtype, residuals is Kept.SPLIT,
+                                  natural=natural, params=params, width=width, deferred=deferred)
 
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
@@ -479,7 +511,8 @@ def _anchor_registers(family: mosaic.Family, block_q: int, block_k: int) -> int:
 
 
 def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
-                       natural: bool = False, params: tuple = (), width: int | None = None) -> int:
+                       natural: bool = False, params: tuple = (), width: int | None = None,
+                       deferred: bool = False) -> int:
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
     sums `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A
     training forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the
@@ -498,7 +531,9 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     196). Where its family reads operands from registers, its products' fragments beside their tiles
     (`_products`): the logits' product of `width`-deep queries and keys, and the values' product of the
     weights. A key tile whose indices do not fold (`Family.folds_indices`) holds the places its masks
-    compare, the queries' and the keys', an int32 tile each."""
+    compare, the queries' and the keys', an int32 tile each. A walk that issues a tile's P·V a step late
+    (`deferred`, `values_deferred`) carries the tile's weights across the next step, its logits read while
+    that product runs."""
     block_q, block_k = tiles.block_q, tiles.block_k
     hooked, vectors = _hook_live(family, block_q, block_k, params)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
@@ -518,7 +553,7 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     products = _products(family, dtype, (block_q, depth, block_k, [logits], False, True),
                          (block_q, block_k, value_width, [weights], True, False), narrow=tiles.narrow,
                          lhs_swizzle=query_swizzle(family))
-    carried = [(block_q, value_width, jnp.float32)]
+    carried = [(block_q, value_width, jnp.float32), *([weights] if deferred else [])]
     scored = resources.live_registers(family, carried, [logits, *hooked]) + vectors
     # A training walk's per-query rows (`TRAINING_ROWS`), in the accumulator's row layout.
     rows = TRAINING_ROWS * family.row_registers(block_q, jnp.float32) if residuals else 0
@@ -599,7 +634,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
             *, scale: float | None = None, natural: bool = NATURAL, residuals: Kept = Kept.NONE,
             interpret: bool = False, out_dtype=None, masked: bool = False, splits: int = 1,
-            table: jax.Array | None = None, sources: jax.Array | None = None):
+            table: jax.Array | None = None, sources: jax.Array | None = None, subtracted: bool = False):
     """The template's forward on this mainloop (`MosaicForward`): `query` `[B, Q, H, D]` over `key`
     `[B, K, Hk, D]` and `value` `[B, K, Hk, Dv]`, and the keys `spans` leaves each query under `hooks`, as
     `dew.nn.kernels.templates.attention.reference` computes it; with `residuals` `Kept.SPLIT` the training
@@ -613,10 +648,12 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     A paged call's `key` and `value` are its pools `[Hk, P, page, D]` and `table` its page table `[B, pages
     a row]` int32: row `b`'s key `s` at offset `s % page` of page `table[b, s // page]`. With `sources`
     `[B]` int32 (a call of rows of keys, inference), batch row `b` reads key row `sources[b]` of `key` and
-    `value` `[R, K, Hk, D]`: a serving step's work list over its cache's rows, no row copied.
+    `value` `[R, K, Hk, D]`: a serving step's work list over its cache's rows, no row copied. `subtracted`
+    an inference walk's fold of raw products (`MosaicForward.subtracted`).
     """
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
-                             out_dtype=out_dtype, masked=masked, splits=splits, table=table, sources=sources)
+                             out_dtype=out_dtype, masked=masked, splits=splits, table=table, sources=sources,
+                             subtracted=subtracted)
     return op(*args, residuals=residuals, interpret=interpret)
 
 
@@ -631,8 +668,8 @@ def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
 
 def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
                   scale: float | None, natural: bool, out_dtype=None, masked: bool = False,
-                  splits: int = 1, table: jax.Array | None = None, sources: jax.Array | None = None
-                  ) -> tuple[MosaicForward, tuple]:
+                  splits: int = 1, table: jax.Array | None = None, sources: jax.Array | None = None,
+                  subtracted: bool = False) -> tuple[MosaicForward, tuple]:
     """`forward`'s op and its arguments, a dropping call's draw among them, which its legality rule refuses
     (`refused`)."""
     hooks = Hooks() if hooks is None else hooks
@@ -644,7 +681,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        output_width=power_of_two(value.shape[3]), form=spans.form, keys=spans.keys,
                        scale=logit_scale(query.shape[3], scale), natural=natural,
                        out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name, masked=masked,
-                       splits=splits)
+                       splits=splits, subtracted=subtracted)
     return op, (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params),
                 tuple(param.value for param in hooks.output_params), hooks.initial, hooks.drop,

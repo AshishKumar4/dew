@@ -100,12 +100,12 @@ def derived_backward(scale: float, walked: str, hooked: bool = False, dropped: b
                          accurate=accurate, saturation=SATURATION)
 
 
-def backward_derived(how: algebra.Recompute, *, accurate: bool) -> bool:
-    """Whether the backward's derived forms walk a call (behind the switch, `dew.algebra.forms.derived`):
-    where its declaration states the walk. Its accurate form (the anchor test, the keyed sums, raw logits'
-    recomputation) is a rounding choice the fast class's derivation does not make (§1.5's compensation rules,
-    the next build): there the template's own forms run, under the replacement rule."""
-    return algebra.derived_on() and not accurate and how == algebra.PLAIN
+def backward_derived() -> bool:
+    """Whether the backward's derived forms walk a call (behind the switch, `dew.algebra.forms.derived`), in
+    every form: its recomputation's units (`how`) and its accurate form's anchor test are declared
+    (`softmax_cotangents`), and the accurate form's keyed sums and its cotangents' parts' products are each
+    mainloop's own, through the derived step's `stepped` (`attention_portable._accurate_sums`)."""
+    return algebra.derived_on()
 
 
 def backward_declaration(*, scale: float, walked: str, hooked: bool = False, dropped: bool = False,

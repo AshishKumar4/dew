@@ -42,7 +42,7 @@ def test_every_mainloop_s_tiles_lie_in_the_kernel_extents():
     and on every family of each GPU (`bundles.layouts`) the Mosaic mainloop's rows (its unit, `_derived`)
     and walked extents (`attention_mosaic_program.extents`), at every head width's staging (a power of two,
     `template.power_of_two`, in the Mosaic mainloop's whole swizzled rows)."""
-    for tiles in (*attention_triton.FORWARD_STEPS, *attention_triton.BACKWARD_STEPS):
+    for tiles in (*attention_triton.FORWARD_TILES, *attention_triton.BACKWARD_TILES):
         assert tiles.block_q in ROWS and tiles.block_k in KEYS, tiles
     for name, dtype in itertools.product(GPUS, DTYPES):
         for family in bundles.layouts(name, dtype):
