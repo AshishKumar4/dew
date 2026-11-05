@@ -1118,6 +1118,49 @@ def test_a_server_over_a_pool_draws_what_each_request_draws_alone(tmp_path, page
     assert (reports[1]["shared"] > 0) == paged
 
 
+def test_a_speculating_server_over_an_adapter_set_reseeds_its_depths_under_each_rows_adapter():
+    """A speculating server (`Speculative`) over an adapter set whose adapters adapt the stream's input
+    map (`project_in`, which reseeding a block's prediction depths reads, `DecodeOps.embed`) draws each
+    request at zero temperature as the greedy walk under its own adapter, or the base, each block's
+    reseeding under the row's adapter (row 4222's review)."""
+    from dew.lora import AdapterSet, LoRA
+    from dew.sampling import Sampling, Speculative
+
+    model = decoder().clone(max_seq_len=32, num_nextn_predict_layers=1, embedding_features=8)
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+
+    def drawn(key: int):
+        adapter = LoRA(rank=2, modules=("project_in",)).apply(model, params, key=key)
+        factors = jax.tree_util.tree_map_with_path(
+            lambda path, leaf: (jax.random.normal(jax.random.key(key), leaf.shape, leaf.dtype)
+                                if jax.tree_util.keystr(path).endswith("'lora_B']") else leaf),
+            adapter.variables["params"])
+        return dataclasses.replace(adapter, variables={**adapter.variables, "params": factors})
+
+    adapters = AdapterSet.of({"first": drawn(1), "second": drawn(2)})
+    served = TextGeneration(adapters.model, adapters.variables, RunProcessor(Digits()),
+                            sampling=Sampling(temperature=0), strategy=Speculative(block=3))
+    server = Server.from_task(served, slots=3, capacity=32)
+    prompts, names = ([1, 2, 3], [7, 8, 9], [4, 5, 6]), ("first", None, "second")
+    tickets = [server.submit(np.asarray([prompt]), 6, key=0, adapter=name)
+               for prompt, name in zip(prompts, names, strict=True)]
+    server.run()
+    walks = []
+    for ticket, prompt, index in zip(tickets, prompts, (0, -1, 1), strict=True):
+        walked = np.asarray([prompt], np.int32)
+        for _ in range(6):
+            scores = adapters.model.apply(adapters.variables, jnp.asarray(walked),
+                                          adapters=jnp.asarray([index], jnp.int32))[:, -1]
+            walked = np.concatenate([walked, np.asarray(scores).argmax(-1)[:, None].astype(np.int32)], axis=1)
+        held = ticket.result().host()
+        # The prompt and the response it drew, which an end of sequence may stop short of six.
+        drawn_to = 3 + int(np.asarray(held.lengths)[0])
+        np.testing.assert_array_equal(np.asarray(held.tokens)[0, :drawn_to], walked[0, :drawn_to])
+        walks.append(walked[0, 3:])
+    # The adapters move the walk: the rows' adapters are what the draws read.
+    assert len({tuple(walk) for walk in walks}) > 1
+
+
 @pytest.mark.parametrize("cache", [None, KVCache(page_size=2, pages=64)], ids=["dense", "paged"])
 def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(tmp_path, cache):
     """One server over an adapter set (`dew.lora.AdapterSet`) of a published decoder: the fixture's PEFT

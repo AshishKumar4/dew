@@ -50,19 +50,15 @@ def mode_served_refusals(args) -> dict:
     return {"scoring": scoring, "compiled": len(compiled)}
 
 
-def mode_served_rollout(args) -> dict:
+def served_run(records: list) -> tuple:
     """A GRPO run over the pool whose rollouts one server over every process's devices draws ahead of the
-    trainer (`RolloutScheduler.served`), every process stepping it together as each call admits its groups
-    and reloading it at each push (`NativeRolloutServer.waited`, row 4279): three updates, the weights
-    pushed every second one, so a batch submitted a step ahead trails the trainer. Each process's report:
-    the steps trained, whether its server spans the pool, the engine threads left (a pooled server has
-    none), and each call's admitted groups and lag."""
+    trainer (`RolloutScheduler.served`), its weights pushed every second update: the rollout, the trainer
+    and each process's prompt stream, its call records logged into `records`."""
     import jax
     import jax.numpy as jnp
     import optax
 
     from dew.data.dataset import Loader
-    from dew.inference.rollouts import NativeRolloutServer
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.rl import GRPOObjective, RolloutScheduler
     from dew.sampling import Sampling
@@ -77,7 +73,6 @@ def mode_served_rollout(args) -> dict:
     rows = len(batch["prompt"]) // processes
     local = {name: value[rank * rows:(rank + 1) * rows] for name, value in batch.items()}
     objective = GRPOObjective(model, seq_len=7, variables=params, behavior_importance=2.0)
-    records = []
     rollout = RolloutScheduler.served(objective, lambda text, record: float(len(text)), tasks=rows, slots=8,
                                       groups=2, max_new_tokens=4, sampling=Sampling(temperature=1.0),
                                       ahead=1, max_lag=2, sync_every=2, log=records.append)
@@ -85,7 +80,20 @@ def mode_served_rollout(args) -> dict:
                       mesh=MeshSpec(fsdp=jax.device_count()), layout=Layout(min_shard=TINY), rollout=rollout)
     data = Loader(train=lambda partition: itertools.repeat(local), val=None, records=rows * processes,
                   batch=rows * processes)
-    final = trainer.fit(rollout.tasks(data), steps=3, log_every=1, checkpoint_every=None)
+    return rollout, trainer, rollout.tasks(data)
+
+
+def mode_served_rollout(args) -> dict:
+    """A served GRPO run over the pool (`served_run`) whose server every process steps together as each
+    call admits its groups and reloads at each push (`NativeRolloutServer.waited`, row 4279): three
+    updates, so a batch submitted a step ahead trails the trainer. Each process's report: the steps
+    trained, whether its server spans the pool, the engine threads left (a pooled server has none), and
+    each call's admitted groups and lag."""
+    from dew.inference.rollouts import NativeRolloutServer
+
+    records = []
+    rollout, trainer, tasks = served_run(records)
+    final = trainer.fit(tasks, steps=3, log_every=1, checkpoint_every=None)
     server = rollout.acquisition.weights
     assert isinstance(server, NativeRolloutServer)
     pooled = server.pooled
@@ -96,8 +104,45 @@ def mode_served_rollout(args) -> dict:
             "groups": [record.groups for record in records], "lags": [record.lag for record in records]}
 
 
+def mode_served_step_failure(args) -> dict:
+    """A served GRPO run over the pool (`served_run`) whose server's second step fails on process 1
+    alone: every process hears it at that step's agreement and stops its server, none waiting on a round
+    the other never reads (`NativeRolloutServer.waited`). Each process's report: the error it raised and
+    whether its server then refuses a draw as stopped."""
+    import jax
+
+    from dew.inference.rollouts import NativeRolloutServer
+    from dew.inference.serving import Server
+
+    stepped = Server.step
+    calls = []
+
+    def failing(server, *step_args, **step_kwargs):
+        calls.append(None)
+        if jax.process_index() == 1 and len(calls) == 2:
+            raise RuntimeError("an injected step failure")
+        return stepped(server, *step_args, **step_kwargs)
+
+    Server.step = failing
+    rollout, trainer, tasks = served_run([])
+    try:
+        trainer.fit(tasks, steps=3, log_every=1, checkpoint_every=None)
+        raised = None
+    except RuntimeError as error:
+        raised = f"{type(error).__name__}: {error}"
+    server = rollout.acquisition.weights
+    assert isinstance(server, NativeRolloutServer)
+    try:
+        server.submit([3, 4], 2, key=0)
+        stopped = None
+    except RuntimeError as error:
+        stopped = str(error)
+    return {"raised": raised, "stopped": stopped}
+
+
 MODES: dict[str, Callable[..., dict]] = {"served_refusals": mode_served_refusals,
-                                         "served_rollout": mode_served_rollout}
+                                         "served_rollout": mode_served_rollout,
+                                         "served_step_failure": mode_served_step_failure}
 
 
 if __name__ == "__main__":

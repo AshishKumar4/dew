@@ -128,7 +128,7 @@ class DecodeOps:
     reindex: Reindex
     verify: Verify | None = None
     propose: Propose | None = None
-    embed: Callable[[jax.Array], jax.Array] | None = None
+    embed: Callable[[jax.Array, jax.Array | None], jax.Array] | None = None
     depths: int = 0
     record: Record | None = None
     draft: DraftBlock | None = None
@@ -939,7 +939,7 @@ def block_step(state: DecoderState, step: StepState, terminated: jax.Array, plan
         # last emitted slot, the target's own state first; a row that
         # emitted nothing keeps what it had.
         replayed, carried = reseed(
-            ops, following, (state.hidden, *state.drafts), seen, ops.embed(emitted),
+            ops, following, (state.hidden, *state.drafts), seen, ops.embed(emitted, following.adapters),
             stretch, base, last, prior_tokens=step.total())
 
         def kept(fresh, held):

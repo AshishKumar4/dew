@@ -706,8 +706,9 @@ def _drafting(model: nn.Module, params: Variables, pad_id: int):
             method="mtp_step", capture_intermediates=False, **_rows(state.adapters))
         return dataclasses.replace(state, cache=updated["cache"]), logits, states
 
-    def embed(tokens: jax.Array) -> jax.Array:
-        prepared = model.apply(params, tokens, method="stream_embeddings")
+    def embed(tokens: jax.Array, adapters: jax.Array | None = None) -> jax.Array:
+        # Under the rows' adapters, as every forward of them (`DecoderState.adapters`).
+        prepared = model.apply(params, tokens, method="stream_embeddings", **_rows(adapters))
         assert isinstance(prepared, jax.Array)
         return prepared
 

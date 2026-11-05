@@ -524,8 +524,9 @@ class NativeRolloutServer:
         for its own futures' work beside the server (a reward scored, an environment stepped) to finish one
         or to submit a draw. The steps run where the run's other programs run, in the same order on every
         process: a thread of their own would enter the mesh's collectives in another order on each, and
-        its agreements interleave with the run's (ledger 4279). A step that fails stops the server, every
-        request it holds settled with the failure (`Server.fail`), on every process."""
+        its agreements interleave with the run's (ledger 4279). A step that fails on any process stops the
+        server on every one, each step's outcome agreed before the next round (`agreed`), every request it
+        holds settled with the failure (`Server.fail`)."""
         server = self._server
         if server is None or not server.pooled:
             while live := pending():
@@ -550,8 +551,10 @@ class NativeRolloutServer:
             if not any(each["waits"] for each in said):
                 return
             if any(each["busy"] for each in said):
+                # Its outcome agreed before any process reads the next round: a step that fails on one
+                # process fails on every one (`agreed`'s PeerFailure), each failing its own server.
                 try:
-                    server.step()
+                    agreed("rollout step", server.step)
                 except BaseException as failure:
                     self._failure = failure
                     server.fail(failure)

@@ -329,6 +329,20 @@ def test_a_pool_draws_its_rollouts_ahead_from_one_server_it_steps_together(tmp_p
         assert max(report["lags"]) > 0, report
 
 
+@pytest.mark.distributed
+def test_a_pooled_servers_step_failing_on_one_process_stops_it_on_every_one(tmp_path):
+    """A served GRPO run over two processes whose server's step fails on one process alone fails on both,
+    neither left waiting on a round the other never reads: the failing process raises its own error, the
+    other hears it at the step's agreement (`PeerFailure`), and each server then refuses a draw as
+    stopped (row 4279's review)."""
+    reports = run_pool("served_step_failure", tmp_path, 2, timeout=300,
+                       script=Path(__file__).with_name("serving_pool_worker.py"))
+    assert reports[1]["raised"].startswith("RuntimeError: an injected step failure"), reports
+    assert reports[0]["raised"].startswith("PeerFailure"), reports
+    for report in reports:
+        assert report["stopped"] is not None and "stopped" in report["stopped"], report
+
+
 def document_corpus(directory: Path, documents: int, length) -> Corpus:
     """A corpus whose documents each say which document they are.
 
