@@ -1765,7 +1765,8 @@ class Checkpoints:
         state_tree = self._item(state, saved, share, rollout)
         written = placement(state_tree)
         grid = _grid({name: leaf for name, leaf in state_tree.items() if name != 'position'})
-        state_tree, deltas = _with_ema_deltas(state_tree)
+        coded, deltas = _with_ema_deltas(state_tree)
+        state_tree = dict(coded)
         if saved is not None:
             state_tree['position'] = jax.tree.map(
                 lambda leaf: jax.device_put(leaf, state.step.sharding), state_tree['position'])
