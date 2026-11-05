@@ -176,12 +176,12 @@ class NativeModels:
         """The request's image, as Dew's `pipe(pipe.prepare([prompt], key=prepare_key, steps=prepare_steps,
         unconditional=negative), key=key, steps=steps, ...)` draws it, each step's preview emitted as the
         walk runs (`progress.preview_png`), then the decode's."""
-        answer, answered = self.submitted(request, emit)
+        answer, answered = self._sample(request, emit)
         return answered(answer.result())
 
     def text(self, request, emit):
         """The request's greedy continuation, its text streamed as its tokens arrive."""
-        answer, answered = self.submitted(request, emit)
+        answer, answered = self._text(request, emit)
         return answered(answer.result())
 
     def submitted(self, request, emit):
