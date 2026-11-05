@@ -31,7 +31,7 @@ from jax.experimental.pallas.ops.tpu.megablox.gmm import make_group_metadata
 from dew.nn.kernels import launches
 from dew.nn.kernels.templates.axes import GROUPS, at_group, by_rows, held, named
 from dew.nn.kernels.templates.cost import estimate
-from dew.nn.kernels.templates.gemm import rows_padded
+from dew.nn.kernels.templates.gemm import rows_padded, sides_padded
 
 LANES = 128
 """A vreg's lanes: Mosaic TPU tiles a block's minor dimensions by them (a block of two dimensions or more
@@ -82,10 +82,8 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
     lengths = jnp.concatenate([sizes, jnp.maximum(m - jnp.sum(sizes), 0)[None]])
     metadata, active = make_group_metadata(group_sizes=lengths, m=m, tm=block_m, start_group=jnp.int32(0),
                                            num_nonzero_groups=groups + 1, visit_empty_groups=False)
-    prologue_operands = tuple(_side_padded(side, axes, block_m)
-                              for side, axes in zip(prologue_operands, prologue_axes, strict=True))
-    epilogue_operands = tuple(_side_padded(side, axes, block_m)
-                              for side, axes in zip(epilogue_operands, epilogue_axes, strict=True))
+    prologue_operands = sides_padded(prologue_operands, prologue_axes, block_m)
+    epilogue_operands = sides_padded(epilogue_operands, epilogue_axes, block_m)
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
     steps = depth // block_k
     sides = len(prologue_operands) + len(epilogue_operands)
@@ -181,8 +179,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Bloc
     metadata, active = make_group_metadata(group_sizes=group_sizes.astype(jnp.int32), m=m, tm=block_k,
                                            start_group=jnp.int32(0), num_nonzero_groups=groups,
                                            visit_empty_groups=True)
-    prologue_operands = tuple(_side_padded(side, axes, block_k)
-                              for side, axes in zip(prologue_operands, prologue_axes, strict=True))
+    prologue_operands = sides_padded(prologue_operands, prologue_axes, block_k)
 
     def kernel(group_offsets, group_ids, m_tile_ids, lhs_ref, rhs_ref, *refs):
         *side_refs, out_ref, acc_ref = refs
@@ -277,7 +274,3 @@ def _held(refs, axes_of: tuple, rows: int) -> tuple:
 def _as_tuple(outs) -> tuple:
     return outs if isinstance(outs, tuple) else (outs,)
 
-
-def _side_padded(side: jax.Array, axes: tuple, block: int) -> jax.Array:
-    """A side operand padded as the rows are along the dimension that follows them, wherever it is."""
-    return rows_padded(side, axes.index('rows'), block) if 'rows' in axes else side
