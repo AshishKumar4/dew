@@ -102,15 +102,14 @@ def backward_holds(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: 
     `family`'s bundle at `tiles` on `target`, planned there and within its block's shared memory (`holds`);
     where they do not, the rule's gradient is the portable math's. Planned on the device's own target off a
     GPU, an interpreted call's states launch held no program at the interpreted target's shared budget
-    (`Launch.resident`)."""
-    shapes = [None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (q, k, v, g, beta, h0,
-                                                                                    starts, skip)]
-    *operands, starts, skip = shapes
-    forward = planned(*operands, tiles=tiles, family=family, starts=starts, max_segments=max_segments,
-                      delta=delta, floor=floor, rounded=rounded, ranged=ranged, target=target, skip=skip)
-    both = planned(*operands, tiles=tiles, family=family, starts=starts, max_segments=max_segments,
-                   backward=True, delta=delta, floor=floor, rounded=rounded, ranged=ranged, target=target,
-                   skip=skip)
+    (`Launch.resident`). Each plan is the call's cached one (`_planned`): planned afresh at each of a
+    Qwen3.5-4B-width step's 168 traces of its GDN layers, it took 11.37 s of its 182.9 s compile_ahead on
+    sm90, its 425 plans 13.34 s (cProfile, armada job 20261105140541-69454bb5 at base/kernels 384436fbe8,
+    row 4260)."""
+    *shapes, skip = (None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype)
+                     for x in (q, k, v, g, beta, h0, starts, skip))
+    forward, both = (_planned(tuple(shapes), tiles, family, target, max_segments, delta, backward, floor,
+                              rounded, ranged=ranged, skip=skip) for backward in (False, True))
     return holds(both[len(forward):], family, generation.shared_budget(target))
 
 _PLANS: dict = {}

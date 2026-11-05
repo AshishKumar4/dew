@@ -190,6 +190,25 @@ def on_default_device(variables: Variables) -> Variables:
                          if isinstance(leaf, (np.ndarray, np.generic)) else leaf, in_place=True)
 
 
+def _extension_drawn(model: nn.Module, selected: Callable[[tuple[str, ...]], bool], key: int | jax.Array, *,
+                     shaped: bool = False) -> Variables:
+    """The variables an extension adds to a source (cross-attention's blocks, DEX's projections and
+    constants): `model`, the source with the extension, drawn from `key` (`request_key`) over a token more
+    than the prediction depths it carries, which each read one further on, and the leaves whose path
+    `selected` takes kept, plain. Only those leave the program, so the source's own draws are dead code to
+    XLA; with `shaped`, a source loaded without its weights, their shapes alone."""
+    from dew.batch import select, thaw
+    from dew.nn.inputs import request_key
+    from dew.nn.protocols import Predicting
+
+    length = 1 + (model.num_nextn_predict_layers if isinstance(model, Predicting) else 0)
+
+    def drawn(draw: jax.Array) -> Variables:
+        return select(thaw(unboxed(model.init(draw, jnp.zeros((1, length), jnp.int32)))), selected)
+
+    return jax.eval_shape(drawn, request_key(key)) if shaped else owned_program(drawn)(request_key(key))
+
+
 @dataclass(frozen=True)
 class Pretrained:
     """A native model with explicit variables and its checkpoint's host processor.
@@ -598,10 +617,9 @@ class Pretrained:
         cross-attention, so `save` and `export` refuse the result; a run's
         checkpoint keeps it.
         """
-        from dew.batch import freeze, merge, select, thaw
+        from dew.batch import freeze, merge
         from dew.nn.cross_attention import NAME, crossing
-        from dew.nn.inputs import request_key
-        from dew.nn.protocols import CrossAttending, Predicting
+        from dew.nn.protocols import CrossAttending
         from dew.optim import parameter_name
 
         if not isinstance(self.model, CrossAttending):
@@ -609,16 +627,7 @@ class Pretrained:
         if self.model.cross_attention is not None:
             raise ValueError("this bundle already reads a context; attach cross-attention to the source")
         model = self.model.with_cross_attention(cross)
-        # A token more than the prediction depths a source carries, which each read one further on.
-        length = 1 + (model.num_nextn_predict_layers if isinstance(model, Predicting) else 0)
-
-        def drawn(draw: jax.Array) -> Variables:
-            # Only the blocks leave the program, so the source's own draws are dead code to XLA; they
-            # join the loaded tree plain, as the tree entered.
-            return select(thaw(unboxed(model.init(draw, jnp.zeros((1, length), jnp.int32)))),
-                          lambda path: path[0] == "params" and crossing(path))
-
-        blocks = owned_program(drawn)(request_key(key))
+        blocks = _extension_drawn(model, lambda path: path[0] == "params" and crossing(path), key)
         variables = merge(self.variables, blocks)
         # Each block's module, its path under `params` to and with the block's own name.
         added = {"/".join(keys[1:keys.index(NAME) + 1]) for keys in (
@@ -637,26 +646,17 @@ class Pretrained:
         extension: `save` and `export` write each layer's differential at its learned lambda folded into
         its output projection (`dew.nn.dex.folded`), what the model computes outside a run, and refuse a
         layer whose heads' outputs pass through more before it; a run's checkpoint keeps the extension."""
-        from dew.batch import FROZEN, freeze, merge, select, thaw
+        from dew.batch import FROZEN, freeze, merge
         from dew.nn.dex import DEX_COLLECTION, DEX_CONSTANTS, DEX_PARAMETERS
-        from dew.nn.inputs import request_key
-        from dew.nn.protocols import Differential, Predicting
+        from dew.nn.protocols import Differential
 
         if not isinstance(self.model, Differential):
             raise TypeError(f"a {type(self.model).__name__} takes no differential extension")
         model = self.model.with_dex(extension)
-        # A token more than the prediction depths a source carries, which each read one further on.
-        length = 1 + (model.num_nextn_predict_layers if isinstance(model, Predicting) else 0)
-
-        def drawn(draw: jax.Array) -> Variables:
-            # Only the extension leaves the program, so the source's own draws are dead code to XLA; it
-            # joins the loaded tree plain, as the tree entered.
-            return select(thaw(unboxed(model.init(draw, jnp.zeros((1, length), jnp.int32)))),
-                          lambda path: (path[0] == "params" and path[-1] in DEX_PARAMETERS)
-                          or (path[0] == DEX_COLLECTION and path[-1] in DEX_CONSTANTS))
-
         shaped = any(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(self.variables))
-        added = jax.eval_shape(drawn, request_key(key)) if shaped else owned_program(drawn)(request_key(key))
+        added = _extension_drawn(
+            model, lambda path: (path[0] == "params" and path[-1] in DEX_PARAMETERS)
+            or (path[0] == DEX_COLLECTION and path[-1] in DEX_CONSTANTS), key, shaped=shaped)
         variables = merge(self.variables, added)
         if extension.trains == "attention":
             decoder, attention = model.dex_sites()
@@ -755,7 +755,15 @@ class Pretrained:
             written = destination / name
             written.parent.mkdir(parents=True, exist_ok=True)
             written.write_bytes(module.read_bytes())
-        save_hf_layout(tensors, dict(self.config), destination, max_shard_size)
+        # A bundle's folders each get their own tensors and config back (`DecoderFamily.wrapper_folders`).
+        folders = {decoder_parts.folder_config(folder): folder for folder in _folders(self.config)
+                   if decoder_parts.folder_config(folder) in self.config}
+        for key, folder in folders.items():
+            save_hf_layout(_folder_part(tensors, decoder_parts.folder_name(folder, "")),
+                           dict(_records.record(self.config[key], key)), destination / folder, max_shard_size)
+        save_hf_layout(_folder_part(tensors, "") if folders else tensors,
+                       {key: value for key, value in self.config.items() if key not in folders},
+                       destination, max_shard_size)
 
     def push_to_hub(self, repo_id: str, *, variables: Mapping[str, object] | None = None,
                     private: bool = False, commit_message: str = "Upload dew export",
@@ -1256,7 +1264,7 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.Wra
     into the three mrope sections its wrapper positions rows with.
     """
     family = config.get("model_type")
-    text_config = _records.record(config["text_config"], "text_config")
+    text_config = decoders.text_scope(config)
     text_fields = record["text"].copy()
     if max_seq_len is not None:
         text_fields["max_seq_len"] = max_seq_len
@@ -1284,7 +1292,7 @@ def _wrapper_model(config: Mapping[str, object], record: decoder_parts.WrapperFi
     """Build the wrapper its record describes: the decoder above, the towers and
     projectors it names, and the placeholder ids its prompts carry."""
     family = _records.text(config["model_type"], "model_type")
-    text_config = _records.record(config["text_config"], "text_config")
+    text_config = decoders.text_scope(config)
     audio_record = record["audio"]
     audio_projector = record["audio_projector"]
     return MultimodalTransformer(
@@ -1321,8 +1329,9 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     the source's own processor code where the load ran its code
     (`SourceReference.remote_code`).
     """
-    processor_files = any((directory / name).exists()
-                          for name in ("processor_config.json", "preprocessor_config.json"))
+    # A bundle may state its processing in its own config instead (MiMo-V2.6's `processor_config`).
+    processor_files = config.get("processor_config") is not None or any(
+        (directory / name).exists() for name in ("processor_config.json", "preprocessor_config.json"))
     media = _media_wrapper(config) and processor_files
     if media or (directory / "tokenizer_config.json").exists() or gguf_path is not None:
         from dew.data.text import load_tokenizer
@@ -1383,6 +1392,8 @@ def load_processor(source: sources.SourceReference, model: nn.Module) -> Process
     component = None if description is None else description.backbone
     if component is None:
         config, _ = _source_config(source.name, directory, source.revision, None)
+        # The folders' configs beside it, which its media read (`_with_folders`).
+        config = _with_folders(config, source, sources.snapshot(source.name, source.revision, weights=False))
     else:
         config = component.config
         directory = directory / component.config_folder
@@ -1607,6 +1618,53 @@ def _decoded(tensors: Mapping[str, unread.Stored], config: Mapping[str, object],
     tensors = quantization.dequantize(tensors, param_dtype=param_dtype)
     _share_quantized_aliases(tensors, aliases, quantized_tensors)
     return tensors, quantized_tensors, scale_dtype, grid, decoders.checked_groups(aliases)
+
+
+def _folders(config: Mapping[str, object]) -> tuple[str, ...]:
+    """The folders of a bundle whose media read their own config and weights
+    (`DecoderFamily.wrapper_folders`); none for any other source."""
+    family = config.get("model_type")
+    return decoders.family_entry(family).wrapper_folders if decoders.bundles(config) and isinstance(
+        family, str) else ()
+
+
+def _with_folders(config: Mapping[str, object], source: sources.SourceReference,
+                  root: Path) -> Mapping[str, object]:
+    """`config` with each of its bundle's folders' configs beside its own (`_folders`), under
+    `decoder_parts.folder_config`, as the source keeps them; a folder the source lacks adds none, for its
+    family to refuse the media that read it."""
+    folded = dict(config)
+    for folder in _folders(config):
+        path = source.component(folder).optional_file(root, "config.json")
+        if path is not None:
+            folded[decoder_parts.folder_config(folder)] = _records.record(json.loads(path.read_text()),
+                                                                          f"{folder}/config.json")
+    return folded
+
+
+def _with_folder_tensors(tensors: Mapping[str, unread.Stored], config: Mapping[str, object],
+                         source: sources.SourceReference, root: Path, *, weights: bool
+                         ) -> Mapping[str, unread.Stored]:
+    """`tensors` with each of the bundle's folders' (`_folders`) whose config the source holds
+    (`_with_folders`) under `decoder_parts.folder_name`, read as the load reads the source's own: whole,
+    or by their headers alone without its weights."""
+    held = dict(tensors)
+    for folder in (folder for folder in _folders(config) if decoder_parts.folder_config(folder) in config):
+        part = source.component(folder)
+        stored = (sources.load_shards(part.directory(part.weights(root))) if weights
+                  else sources.stored_tensors(part, root) or {})
+        held.update({decoder_parts.folder_name(folder, name): tensor for name, tensor in stored.items()})
+    return held
+
+
+def _folder_part(tensors: Mapping[str, np.ndarray], prefix: str) -> Mapping[str, np.ndarray]:
+    """The tensors named under `prefix`, the prefix off, each built as `tensors` builds it; the empty
+    prefix with no folder's name (`_folders`) keeps the rest, the root's."""
+    specs = tensor_specs(tensors)
+    names = {name.removeprefix(prefix): name for name in specs
+             if (name.startswith(prefix) if prefix else "/" not in name)}
+    return LazyTensors({local: specs[name] for local, name in names.items()},
+                       lambda local: tensors[names[local]])
 
 
 def _language_model_tensors(tensors: Mapping[str, unread.Stored], record: decoder_parts.WrapperFields
@@ -1843,15 +1901,16 @@ def _lazy_route(config: Mapping[str, object]) -> DecoderRoute | WrapperRoute:
 
 
 def _media_wrapper(config: Mapping[str, object]) -> bool:
-    """Whether a source is a media wrapper, its decoder under text_config.
+    """Whether a source is a media wrapper: its decoder under text_config, or a bundle its decoder
+    family reads whole (`DecoderFamily.wrapper`, `decoders.bundles`), its decoder at its root or nested.
 
     Where its model_type is a registered decoder family, the text half is
-    the model unless the family reads its media bundle whole
-    (`DecoderFamily.wrapper`). DiffusionGemma nests its text config too.
+    the model unless the family reads its media bundle whole. DiffusionGemma
+    nests its text config too.
     """
     family = config.get("model_type")
-    return (family != "diffusion_gemma" and decoders.carries_text(config)
-            and (family not in decoders.families() or decoders.bundles(config)))
+    return family != "diffusion_gemma" and (decoders.bundles(config) if family in decoders.families()
+                                            else decoders.carries_text(config))
 
 
 def _spelled_source_weights(spelling: Mapping[str, str], model: CausalTransformer,
@@ -2240,10 +2299,6 @@ def native_backbone(directory: str | Path, *, param_dtype: str) -> tuple[Mapping
     return component.config, translated.built.variables
 
 
-DEPTH_COUNTS = ("num_nextn_predict_layers", "mtp_num_hidden_layers", "num_mtp_layers", "n_mtp_layers")
-"""The fields a source's config counts its multi-token prediction depths by, family by family."""
-
-
 def _scopes(config: dict) -> list[dict]:
     """The scopes a decoder's fields are stated in: `config`'s top, then its `text_config` if any."""
     text = config.get("text_config")
@@ -2251,25 +2306,26 @@ def _scopes(config: dict) -> list[dict]:
 
 
 def _kept_depths(config: Mapping[str, object], kept: int) -> dict:
-    """`config` as the config of a checkpoint holding its first `kept` prediction depths alone: each
-    depth count it states (`DEPTH_COUNTS`, at its top or in its `text_config`) at most `kept`. A DSpark
-    drafter's stages, which its `compress_ratios` list past the trunk's layers, draft as one, its heads
-    on its last stage (`dew.interop.families.deepseek`), so it is kept whole or, at 0, not at all;
-    a count between is refused. A load reads, builds and saves the source this config states
-    (`Pretrained.load(prediction_depths=)`)."""
+    """`config` as the config of a checkpoint holding its first `kept` prediction depths alone: each of
+    its scopes (its top, its `text_config`) as its family keeps them (`DecoderFamily.kept_depths`: its
+    own count fields at most `kept`, a DSpark drafter whole or not at all), a wrapper's text by the type
+    the wrapper declares for it (`typed_part`), else by the wrapper's family; a scope no
+    decoder family reads holds no depths a load builds. A load reads, builds and saves the source this
+    config states (`Pretrained.load(prediction_depths=)`)."""
     written = copy.deepcopy(dict(config))
+    families = decoders.families()
+
+    def family_of(scope: Mapping[str, object]):
+        model_type = scope.get("model_type")
+        return families.get(model_type) if isinstance(model_type, str) else None
+
+    top = family_of(written)
     for scope in _scopes(written):
-        for counted in DEPTH_COUNTS:
-            if isinstance(scope.get(counted), int) and scope[counted] > kept:
-                scope[counted] = kept
-        ratios, layers = scope.get("compress_ratios"), scope.get("num_hidden_layers")
-        if scope.get("dspark_block_size") and isinstance(ratios, list) and isinstance(layers, int):
-            stages = len(ratios) - layers
-            if 0 < kept < stages:
-                raise ValueError(f"a DSpark drafter's {stages} stages draft as one, its heads on the last: "
-                                 f"prediction_depths keeps all of them or none (0), not {kept}")
-            if not kept:
-                scope["compress_ratios"], scope["dspark_block_size"] = ratios[:layers], 0
+        # A wrapper's text config typed as the wrapper declares it where it names no type (`typed_part`).
+        typed = scope if scope is written else decoders.typed_part(written, scope, "text")
+        family = family_of(typed) or top
+        if family is not None:
+            scope.update(family.kept_depths(scope, kept))
     return written
 
 
@@ -2332,6 +2388,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         directory = configured.directory(root)
     mamba_ssm = mamba2.is_mamba_ssm(config)
     config = _native_config(config, overrides)
+    # A bundle's folders' configs beside its own, which its media read (`DecoderFamily.wrapper_folders`).
+    config = _with_folders(config, configured, root)
     family = config.get("model_type")
     if routed is None:
         listed = tensors
@@ -2358,6 +2416,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         tensors = sources.load_shards(directory)
     if mamba_ssm:
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
+    if language is None and isinstance(route, WrapperRoute):
+        tensors = _with_folder_tensors(tensors, config, configured, root, weights=weights)
     if prediction_depths is not None:
         # Before a wrapper's language model is taken out of it, by the wrapper's own names: a discarded
         # depth's spellings are neither read nor compared (`_language_model_tensors`).

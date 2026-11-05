@@ -287,11 +287,12 @@ def test_a_named_template_refuses_a_state_row_no_bulk_copy_takes(states):
     """fp32 `x` and `B` with a bf16 `C` at `states` states, whose B rows a bulk copy's 16 bytes divide and
     whose C rows (8 or 24 bytes) they do not: the template's streams copy each unpadded in its own dtype, so a
     call naming the template is refused for C's rows, typed (row 2975), at the trust boundary of its operands'
-    layout."""
+    layout, where the same call with an fp32 C (16 or 48 bytes) is taken (row 4304)."""
     from dew.nn.kernels.selection import KernelRefused
 
     shape = (1, selective.CHUNK, selective.block_scan.THREADS, states)
     inputs, _, _ = draw(jnp.float32, 0, *shape, packed=False)
+    jax.eval_shape(dispatched("fast", named=True, c_dtype=jnp.float32, target="sm90"), *inputs)
     with pytest.raises(KernelRefused) as refused:
         jax.eval_shape(dispatched("fast", named=True, c_dtype=jnp.bfloat16, target="sm90"), *inputs)
     assert [refusal.code for refusal in refused.value.refusals] == ["state rows"]

@@ -91,7 +91,7 @@ from ..precision import (
     rounded_to,
     two_product,
 )
-from ..sharding import automatic_axes, manual_map
+from ..sharding import automatic_axes, manual_map, on_shards
 from . import generation, tuning
 from .generation import INHERENT, device_generation
 from .selection import Kernel, Op, Requirement, select
@@ -282,15 +282,13 @@ def _placed(axes, operands, *, whole_last: bool) -> bool:
 
 def _per_shard(local, axes, operands, replicated):
     """`local(*operands)` as it runs: whole where no mesh axis splits, else on
-    each shard (`manual_map`), the operands placed as `axes` names and those
+    each shard (`on_shards`), the operands placed as `axes` names and those
     marked `replicated` (a norm's weight) whole on every shard, so the weight's
     gradient sums over the shards. Every output takes the first operand's place."""
     if not automatic_axes():
         return local(*operands)
-    spec = logical_spec(axes, operands[0].shape)
-    specs = tuple(None if operand is None else jax.sharding.PartitionSpec() if whole else spec
-                  for operand, whole in zip(operands, replicated, strict=True))
-    return manual_map(local, specs, spec)(*operands)
+    whole = {index for index, replicated in enumerate(replicated) if replicated}
+    return on_shards(local, logical_spec(axes, operands[0].shape), operands, whole)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -376,12 +374,18 @@ FP16_NORM_FASTER = ("FSNORM16 (base/kernels 4d31032c6, CUPTI, arms rotated): Qwe
                     "74.5 and 227.8)")
 """The receipt behind the fused norm's fp16 cells."""
 
+NORM_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
+    ('sm80', 'bfloat16'): ('pallas', FUSED_FASTER),
+    ('sm90', 'bfloat16'): ('pallas', FUSED_FASTER),
+    ('sm80', 'float16'): ('pallas', FP16_NORM_FASTER),
+    ('sm90', 'float16'): ('pallas', FP16_NORM_FASTER),
+}
+"""The fused norm's declared cells (`selection.Op.declared`), (device generation, dtype) to the old route
+and its receipt: a literal of them, which the selector reads and thresh's declared-set seam registers
+(.thresh/thresh.cue, row 3209)."""
+
 NORM: Op[NormCase] = Op('rms_norm', (Kernel('pallas', NORM_SUPPORTS), Kernel('xla', (), generic=True)),
-                        lambda case: 'xla',
-                        declared={**{(device, 'bfloat16'): ('pallas', FUSED_FASTER)
-                                     for device in ('sm80', 'sm90')},
-                                  **{(device, 'float16'): ('pallas', FP16_NORM_FASTER)
-                                     for device in ('sm80', 'sm90')}})
+                        lambda case: 'xla', declared=NORM_CELLS)
 """The norm selector: XLA's arithmetic, but the fused kernel where it measured faster (bf16 rows on an
 A100 and an H100: the seam 76/187 against 103/200 us and 36/81 against 44/89, the gated norm's 118;224
 against 123;343 and 52;101 against 59;149; fp16 rows, `FP16_NORM_FASTER`) and its requirements hold."""
@@ -441,10 +445,14 @@ SWIGLU_SUPPORTS: tuple[Requirement[SwigluCase], ...] = (
 as the kernel reads them."""
 
 
+SWIGLU_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
+    ('sm80', 'bfloat16'): ('pallas', FUSED_FASTER),
+    ('sm90', 'bfloat16'): ('pallas', FUSED_FASTER),
+}
+"""The fused SiLU product's declared cells (`selection.Op.declared`), as `NORM_CELLS` holds the norm's."""
+
 SWIGLU: Op[SwigluCase] = Op('swiglu', (Kernel('pallas', SWIGLU_SUPPORTS), Kernel('xla', (), generic=True)),
-                            lambda case: 'xla',
-                            declared={(device, 'bfloat16'): ('pallas', FUSED_FASTER)
-                                      for device in ('sm80', 'sm90')})
+                            lambda case: 'xla', declared=SWIGLU_CELLS)
 """The SwiGLU selector: XLA's arithmetic, but the fused product where it measured faster (a bf16 product
 on an A100 and an H100: 193;320 against 235;361 us and 87;147 against 113;171) and its requirements hold.
 A product of the operands' common dtype, so a bf16 gate over an fp32 up (Gemma-4's per-layer input) is an

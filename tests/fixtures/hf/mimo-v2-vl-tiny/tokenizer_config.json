@@ -1,0 +1,15 @@
+{
+  "backend": "tokenizers",
+  "bos_token": "w1",
+  "eos_token": "w2",
+  "extra_special_tokens": [
+    "<|image|>",
+    "<|video|>",
+    "<|vision_start|>",
+    "<|vision_end|>",
+    "<|audio|>"
+  ],
+  "model_max_length": 1000000000000000019884624838656,
+  "pad_token": "w0",
+  "tokenizer_class": "TokenizersBackend"
+}

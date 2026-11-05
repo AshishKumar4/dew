@@ -22,6 +22,7 @@ from jax.experimental.pallas import triton as plgpu
 
 from dew.nn.kernels import launches
 from dew.nn.kernels.templates.axes import GROUPS, by_rows, held, named, placed
+from dew.nn.kernels.templates.gemm import rows_padded
 
 
 def gmm(lhs: jax.Array, rhs: jax.Array, *, tile, transpose_rhs: bool, out_dtypes: tuple, interpret: bool,
@@ -41,10 +42,10 @@ def gmm(lhs: jax.Array, rhs: jax.Array, *, tile, transpose_rhs: bool, out_dtypes
     # and are dropped (the launch prefers tiles that divide); padded depth is zeroed again after the
     # prologue, which need not keep it zero.
     depth_axis, width_axis = (1, 0) if transpose_rhs else (0, 1)
-    lhs = _padded_axis(_padded_axis(lhs, 1, block_k), 0, block_m)
-    rhs = _padded_axis(_padded_axis(rhs, depth_axis, block_k), width_axis, block_n)
+    lhs = rows_padded(rows_padded(lhs, 1, block_k), 0, block_m)
+    rhs = rows_padded(rows_padded(rhs, depth_axis, block_k), width_axis, block_n)
     matrices = (rhs,) if paired is None else (
-        rhs, _padded_axis(_padded_axis(paired, depth_axis, block_k), width_axis, block_n))
+        rhs, rows_padded(rows_padded(paired, depth_axis, block_k), width_axis, block_n))
     (padded, padded_depth), padded_width = lhs.shape, rhs.shape[width_axis]
     prologue_operands = _padded_on(_padded_on(prologue_operands, prologue_axes, 'depth', block_k),
                                    prologue_axes, 'rows', block_m)
@@ -116,8 +117,8 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, *, tile, out_dtype, interpret: bool, pr
     block_m, block_n, block_k = tile.block_m, tile.block_n, tile.block_k
     # Padded as `gmm`'s: the depth and width dropped from the gradient, the rows it sums zeroed again
     # after the prologue.
-    lhs = _padded_axis(_padded_axis(lhs, 1, block_k), 0, block_m)
-    rhs = _padded_axis(_padded_axis(rhs, 1, block_n), 0, block_m)
+    lhs = rows_padded(rows_padded(lhs, 1, block_k), 0, block_m)
+    rhs = rows_padded(rows_padded(rhs, 1, block_n), 0, block_m)
     (padded, padded_depth), padded_width = lhs.shape, rhs.shape[1]
     prologue_operands = _padded_on(_padded_on(prologue_operands, prologue_axes, 'depth', block_k),
                                    prologue_axes, 'rows', block_m)
@@ -198,19 +199,9 @@ def _kept(x: jax.Array, start, extent: int, *, axis: int) -> jax.Array:
     return jnp.where(kept, x, jnp.zeros_like(x))
 
 
-def _padded_axis(array: jax.Array, axis: int, block: int) -> jax.Array:
-    """`array` padded with zeros along `axis` to a multiple of `block`."""
-    extra = -array.shape[axis] % block
-    if not extra:
-        return array
-    widths = [(0, 0)] * array.ndim
-    widths[axis] = (0, extra)
-    return jnp.pad(array, widths)
-
-
 def _padded_on(sides: tuple, axes_of: tuple, axis_name: str, block: int) -> tuple:
     """Each side operand padded along the dimension that follows `axis_name`, where one does."""
-    return tuple(_padded_axis(side, axes.index(axis_name), block) if axis_name in axes else side
+    return tuple(rows_padded(side, axes.index(axis_name), block) if axis_name in axes else side
                  for side, axes in zip(sides, axes_of, strict=True))
 
 
