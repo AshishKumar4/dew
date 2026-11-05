@@ -326,15 +326,17 @@ because its Python API is still marked as subject to change.
 | Module | Holds |
 |---|---|
 | `dew.algebra.terms` | The term language and its conversion to and from jaxprs |
-| `dew.algebra.facts` | Facts about each value (e-class analyses) |
-| `dew.algebra.rules` | `Rules` and `RuleFamily`, the registry and the sets registered: `identities`, `contracted`, `stable`, `linear`, `joined`, each declared as its rewrites with their instances (`reuse` and `error_free`, §1, are not built; `decoupled` and `carried` are the derivations' own sets, never registered) |
+| `dew.algebra.rules` | The shape of each value a rule makes (`FACTS`, an e-class analysis; the magnitude bound is the region's, `terms.Region.magnitudes`, §6.3), `Rules` and `RuleFamily`, the registry and the sets registered: `identities`, `contracted`, `stable`, `linear`, `joined`, each declared as its rewrites with their instances (`reuse` and `error_free`, §1, are not built; `decoupled` and `carried` are the derivations' own sets, never registered) |
 | `dew.algebra.linear_scan` | A recurrence's token update read as an affine map by rules, and its chunk form derived by identities and extracted under the work-span model (§6.9) |
-| `dew.algebra.cost` | `Price`, `CostModel` and error-aware DAG extraction |
+| `dew.algebra.cost` | A node's work in the cost vocabulary (`work`, `templates.cost.Work`), the two schedules (`fused`, `walk`) that turn it into seconds, and the DAG cost models extraction reads (`model`, `stable`) |
+| `dew.algebra.extract` | Extraction: egglog's greedy DAG (`cheapest`) and the exact one, its oracle (§6.5) |
 | `dew.algebra.error` | Dev time: each candidate DAG's error, sampled on its declaration's cases against the float64 truth |
 | `dew.nn.derivatives` | Below the engine, so every model module can import it: the marker primitive, its kinds, and the custom-derivative declarations (`declared_derivative`, `declared_tangent`, each of a kind, and `surrogate`, row 3271) |
 | `dew.algebra.program` | The compile-time pass (`rewritten`), its switch (`passes`) and its report |
-| `dew.algebra.derive` | Template declarations and their derived forms |
-| `dew.algebra.generate` | The dev-time generator and its `--check` |
+| `dew.algebra.derive` | A monoid walk's declaration (`Reduction`) and its derived forms; the derivation context every derivation keys on (`context`) |
+| `dew.algebra.scan`, `dew.algebra.carry` | A recurrence's declaration (`Scan`) and its chunk forms, split into what every chunk computes at once and what its carry runs in sequence |
+| `dew.algebra.forms` | What every derivation shares: the derived forms (`Derived`), their refusal, their evaluation, and the switch the templates take them behind (`derived`) |
+| `dew.algebra.generate` | Parked (§6.11): the dev-time generator and its `--check` |
 | `dew.algebra.bits` | Bit-level forms (§7): a declared GF(2)-linear transform of a stored word, its cheapest instruction form over the integer pipes and its proof |
 
 ### 6.2 Terms
