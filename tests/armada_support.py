@@ -181,16 +181,16 @@ def cached_checkout(ci, root: Path, monkeypatch, cache_worker) -> Path:
     return root / ".verdict/verdict.json"
 
 
-def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
+def cached_runs(ci, root: Path, monkeypatch, cache_worker, counter: str = "runs") -> Callable[[], int]:
     """The checkout's one 3.12 task, run green on one CPU class against the shared test cache as armada
     starts it (`armada_task`) under the cache's policy (`cached_checkout`): each call, how many times its
-    test has run, which it counts in `runs`."""
+    test has run, which it counts in `counter`."""
     verdict = cached_checkout(ci, root, monkeypatch, cache_worker)
 
     def run(policy: str = "on") -> int:
         rows = armada_task(ci, monkeypatch, verdict, policy)
         assert [row["exitCode"] for row in rows] == [0]
-        return len((root / "runs").read_text())
+        return len((root / counter).read_text())
 
     return run
 
