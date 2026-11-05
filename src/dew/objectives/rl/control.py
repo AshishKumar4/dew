@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import contextlib
 import functools
-import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NotRequired, TypedDict
@@ -30,6 +29,7 @@ from flax import linen as nn
 from dew.batch import Batch, Variables, unboxed
 from dew.nn.kernels.options import program
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step, traced_update_flops
+from dew.rl.distributions import normal_entropy, normal_log_density, tanh_log_jacobian
 from dew.rl.env import Carry, Env, Memory, Observation, Params, Transition, Tree, env_rollout, view
 from dew.rl.evaluation import episodes
 from dew.rl.simulator import Simulator, branched, rollout_start, simulator_rollout
@@ -85,17 +85,14 @@ def tanh_normal_log_prob(raw: jax.Array, location: jax.Array, scale: jax.Array) 
     """The log-density of the action tanh(`raw`), `raw` drawn from N(location, scale), summed over
     the action: the normal's log-density less log(1 - tanh(raw)^2), in its stable form
     2 (log 2 - raw - softplus(-2 raw))."""
-    normal = -0.5 * jnp.square((raw - location) / scale) - jnp.log(scale) - 0.5 * math.log(2 * math.pi)
-    jacobian = 2 * (math.log(2.0) - raw - jax.nn.softplus(-2 * raw))
-    return jnp.sum(normal - jacobian, axis=-1)
+    return jnp.sum(normal_log_density(raw, location, scale) - tanh_log_jacobian(raw), axis=-1)
 
 
 def tanh_normal_entropy(location: jax.Array, scale: jax.Array, key: jax.Array) -> jax.Array:
     """The squashed normal's entropy as Brax estimates it: the normal's, plus the tanh's log-Jacobian
     at one draw, summed over the action."""
     raw = location + scale * jax.random.normal(key, location.shape, location.dtype)
-    jacobian = 2 * (math.log(2.0) - raw - jax.nn.softplus(-2 * raw))
-    return jnp.sum(0.5 + 0.5 * math.log(2 * math.pi) + jnp.log(scale) + jacobian, axis=-1)
+    return jnp.sum(normal_entropy(scale) + tanh_log_jacobian(raw), axis=-1)
 
 
 class ControlPPOObjective(Objective[Ratio]):

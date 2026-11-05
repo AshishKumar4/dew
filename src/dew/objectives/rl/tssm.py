@@ -161,22 +161,17 @@ class TSSM(nn.Module):
         return jnp.where(first[..., None], self.start, embedded)
 
     def states(self, x: jax.Array, first: jax.Array) -> jax.Array:
-        """The states h `[B, T, width]` of a window's inputs `x` `[B, T, width]`, each step attending to
-        the steps of its episode up to itself; the window's first step starts its own segment."""
-        segment, positions = _segments(first)
-        mask = (segment[:, :, None] == segment[:, None, :]) & jnp.tril(jnp.ones((x.shape[1],) * 2, bool))
-        for block in self.blocks:
-            query, keys, values = block.projected(x, positions)
-            x = block.finished(x, query, keys, values, mask)
-        return self.out_norm(x)
+        """The states h `[B, T, width]` of a window's inputs `x` (`window`'s)."""
+        return self.window(x, first)[0]
 
-    def window_cache(self, x: jax.Array, first: jax.Array, horizon: int) -> Cache:
-        """For each step k of a window `[B, T]`, the cache imagination from it attends to: the window's keys
-        and values (`Window`, held once), of which k reads its episode's steps up to k, and `horizon` slots
-        of its own for the steps it imagines, the next at the position after k's."""
+    def window(self, x: jax.Array, first: jax.Array) -> tuple[jax.Array, Window]:
+        """The states h `[B, T, width]` of a window's inputs `x` `[B, T, width]`, each step attending to
+        the steps of its episode up to itself, the window's first step starting its own segment; and the
+        window's keys and values, which imagination from each of its steps attends to (`Window`,
+        `window_cache`)."""
         rows, length = first.shape
         segment, positions = _segments(first)
-        # [B, k, t]: the window's step t is in the cache of start k.
+        # [B, k, t]: step k attends to step t of its episode up to itself.
         valid = (segment[:, :, None] == segment[:, None, :]) & jnp.tril(jnp.ones((length,) * 2, bool))
         keys, values = [], []
         for block in self.blocks:
@@ -184,7 +179,16 @@ class TSSM(nn.Module):
             keys.append(key)
             values.append(value)
             x = block.finished(x, query, key, value, valid)
-        window = Window(jnp.stack(keys, 1), jnp.stack(values, 1), valid.reshape(rows * length, length))
+        return self.out_norm(x), Window(jnp.stack(keys, 1), jnp.stack(values, 1),
+                                        valid.reshape(rows * length, length))
+
+    @nn.nowrap
+    def window_cache(self, window: Window, first: jax.Array, horizon: int) -> Cache:
+        """For each step k of a window `[B, T]`, the cache imagination from it attends to: the window's keys
+        and values (`window`'s, held once), of which k reads its episode's steps up to k, and `horizon` slots
+        of its own for the steps it imagines, the next at the position after k's."""
+        rows, length = first.shape
+        _, positions = _segments(first)
         own = (rows * length, self.layers, horizon, self.heads, self.width // self.heads)
         return Cache(jnp.zeros(own, self.dtype), jnp.zeros(own, self.dtype),
                      jnp.zeros((rows * length, horizon), bool), jnp.zeros(rows * length, jnp.int32),

@@ -42,9 +42,11 @@ from dew.nn.categorical import kl_divergence
 from dew.nn.kernels.options import program
 from dew.nn.precision import at_least_fp32, divided
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, traced_update_flops
-from dew.objectives.rl.tssm import TSSM, Cache
+from dew.objectives.rl.tssm import TSSM, Cache, Window
 from dew.rl.aggregation import LABEL, Teacher, labelled, paired
 from dew.rl.distributions import (
+    normal_entropy,
+    normal_log_density,
     onehot_sample,
     symlog,
     twohot_bins,
@@ -422,14 +424,6 @@ def _shifted(stoch: jax.Array) -> jax.Array:
     return jnp.concatenate([jnp.zeros_like(stoch[:, :1]), stoch[:, :-1]], 1)
 
 
-def normal_log_prob(action: jax.Array, mean: jax.Array, std: jax.Array) -> jax.Array:
-    return jnp.sum(-0.5 * jnp.square((action - mean) / std) - jnp.log(std) - 0.5 * math.log(2 * math.pi), -1)
-
-
-def normal_entropy(std: jax.Array) -> jax.Array:
-    return jnp.sum(0.5 + 0.5 * math.log(2 * math.pi) + jnp.log(std), -1)
-
-
 def lambda_return(last: jax.Array, term: jax.Array, reward: jax.Array, value: jax.Array, boot: jax.Array,
                   discount: float, lam: float) -> jax.Array:
     """The code's lambda-returns `[B, T - 1]` of sequences `[B, T]` (agent.py:482-490): from the last
@@ -597,11 +591,12 @@ class DreamerV3Objective(Objective[Ratio]):
         return deter, model.categorical(posterior), posterior
 
     def observed(self, variables: Variables, observation: Observation, previous: jax.Array, first: jax.Array,
-                 key: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+                 key: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, Window | None]:
         """The posterior latents over windows `[B, T, ...]` from a zero latent: each step's
         deterministic state, drawn categoricals and posterior log-probabilities, each step drawing from
         its own of `T` keys split from `key`, as the code's scan seeds each step's sample
-        (rssm.py:63-90)."""
+        (rssm.py:63-90); and a transformer's window, whose keys and values imagination from each step
+        attends to (`TSSM.window`), None for the recurrent core."""
         rows, length = first.shape
         model = self.model.bind(variables, rngs={"latent": key})
         dynamics = model.dynamics
@@ -610,8 +605,8 @@ class DreamerV3Objective(Objective[Ratio]):
             # actions before each step.
             posterior = model.posterior(None, model.embed(observation))
             stoch = model.categorical(posterior)
-            deter = dynamics.states(dynamics.inputs(_shifted(stoch), previous, first), first)
-            return deter, stoch, posterior
+            deter, window = dynamics.window(dynamics.inputs(_shifted(stoch), previous, first), first)
+            return deter, stoch, posterior, window
 
         def step(latent, inputs):
             deter, stoch = latent
@@ -624,7 +619,7 @@ class DreamerV3Objective(Objective[Ratio]):
                  jax.random.split(key, length))
         _, found = jax.lax.scan(step, self.model.initial((rows,)), steps)
         deter, stoch, posterior = (jnp.swapaxes(x, 0, 1) for x in found)
-        return deter, stoch, posterior
+        return deter, stoch, posterior, None
 
     def act(self, variables: Params, observed: Observation, key: jax.Array,
             memory: Memory) -> tuple[jax.Array, Tree, AgentMemory]:
@@ -688,7 +683,7 @@ class DreamerV3Objective(Objective[Ratio]):
         previous = jnp.concatenate([jnp.zeros_like(action[:, :1]), action[:, :-1]], 1)
         rows, length = reward.shape
 
-        deter, stoch, posterior = self.observed(variables, observation, previous, first, world_key)
+        deter, stoch, posterior, window = self.observed(variables, observation, previous, first, world_key)
         prior = model.prior(deter)
         feature = WorldModel.feature(deter, stoch)
         # `kl_divergence(logits, reference)` is KL(reference || logits): the code's dynamics loss
@@ -713,7 +708,7 @@ class DreamerV3Objective(Objective[Ratio]):
             # Each replayed step's imitated action at the state it was taken at; a last step's has no effect.
             mean, std = model.policy(jax.lax.stop_gradient(feature))
             imitated = jnp.asarray(batch[self.imitates], jnp.float32)
-            losses["imitation"] = (1 - last) * -normal_log_prob(imitated, mean, std)
+            losses["imitation"] = (1 - last) * -jnp.sum(normal_log_density(imitated, mean, std), -1)
         if not any(self.scales[name] for name in ("policy", "value", "replay_value")):
             total = sum((self.scales[name] * jnp.mean(value) for name, value in losses.items()),
                         jnp.zeros(()))
@@ -727,9 +722,9 @@ class DreamerV3Objective(Objective[Ratio]):
         latent_key, act_key, last_key = jax.random.split(imagine_key, 3)
         cache, dynamics = None, model.dynamics
         if dynamics is not None:
+            assert window is not None, "a transformer's posterior pass keeps its window"
             # Each start's cache, the window's keys and values of its episode up to it.
-            inputs = dynamics.inputs(_shifted(stoch), previous, first)
-            cache = jax.lax.stop_gradient(dynamics.window_cache(inputs, first, self.imagination))
+            cache = jax.lax.stop_gradient(dynamics.window_cache(window, first, self.imagination))
         state, begin = env.at(start_deter, start_stoch, latent_key, cache)
 
         def policy(params: Params, feature: Observation, key: jax.Array, memory: Memory) -> tuple[
@@ -793,8 +788,9 @@ class DreamerV3Objective(Objective[Ratio]):
         bonus (agent.py:420-440), and where `smoothness` weighs it each step's mean against the one before
         it (SkyDreamer Eq 11, on the mean alone)."""
         mean, std = policy
-        log_pi = normal_log_prob(jax.lax.stop_gradient(actions), mean, std)[:, :-1]
-        loss = weight[:, :-1] * -(log_pi * advantage + self.entropy * normal_entropy(std)[:, :-1])
+        log_pi = jnp.sum(normal_log_density(jax.lax.stop_gradient(actions), mean, std), -1)[:, :-1]
+        entropy = jnp.sum(normal_entropy(std), -1)[:, :-1]
+        loss = weight[:, :-1] * -(log_pi * advantage + self.entropy * entropy)
         if self.smoothness:
             loss = loss + self.smoothness * jnp.sum(jnp.square(mean[:, 1:] - mean[:, :-1]), -1)
         return loss
@@ -1232,4 +1228,4 @@ def episodes_return(objective: DreamerV3Objective, env: Env | Simulator, variabl
 
 __all__ = ["AUXILIARY_SCALE", "AgentMemory", "ConvDecoder", "ConvEncoder", "Critic", "DreamerRollout",
            "DreamerV3Objective", "LatentEnv", "WorldModel", "demonstration_replay", "episodes_return",
-           "lambda_return", "normal_entropy", "normal_log_prob"]
+           "lambda_return"]

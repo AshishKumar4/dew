@@ -405,7 +405,7 @@ def test_a_grpo_run_draws_its_rollouts_ahead_from_dews_own_server(tmp_path):
     assert max(lags) > 0
     assert LMRunConfig.load(str(tmp_path / "served")).rollout == config.rollout
     record = json.loads((tmp_path / "served" / "run.json").read_text())
-    del record["rollout"]["served"]
+    del record["fields"]["rollout"]["served"]
     (tmp_path / "served" / "run.json").write_text(json.dumps(record))
     loaded = LMRunConfig.load(str(tmp_path / "served")).rollout
     assert loaded is not None and loaded.served is None

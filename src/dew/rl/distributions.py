@@ -6,10 +6,13 @@ bins symexp(linspace(-20, 20, 255)) predicts a scalar of any scale as its bins' 
 from both ends toward the middle so uniform probabilities predict zero exactly, and is trained by
 the cross-entropy of a target's two-hot encoding, its weight split between its two neighbouring bins.
 A categorical latent mixes its softmax with 1% uniform (`unimix`) and is drawn one-hot, its gradient
-passed straight through the probabilities.
+passed straight through the probabilities. A continuous policy's normal reads its per-coordinate terms
+here (`normal_log_density`, `normal_entropy`), and a tanh-squashed one its log-Jacobian too.
 """
 
 from __future__ import annotations
+
+import math
 
 import jax
 import jax.numpy as jnp
@@ -80,6 +83,24 @@ def unimix_log_probs(logits: jax.Array, unimix: float = 0.01) -> jax.Array:
     return jnp.log((1 - unimix) * categorical.probabilities(logits) + unimix / logits.shape[-1])
 
 
+def normal_log_density(x: jax.Array, mean: jax.Array, std: jax.Array) -> jax.Array:
+    """Each coordinate's log-density of `x` under the normal N(`mean`, `std`), before any sum: a diagonal
+    normal's log-likelihood is their sum, a squashed one's adds its transform's log-Jacobian first
+    (`tanh_log_jacobian`)."""
+    return -0.5 * jnp.square((x - mean) / std) - jnp.log(std) - 0.5 * math.log(2 * math.pi)
+
+
+def normal_entropy(std: jax.Array) -> jax.Array:
+    """Each coordinate's entropy of a normal of scale `std`, before any sum."""
+    return 0.5 + 0.5 * math.log(2 * math.pi) + jnp.log(std)
+
+
+def tanh_log_jacobian(raw: jax.Array) -> jax.Array:
+    """Each coordinate's log(1 - tanh(`raw`)^2), the log-Jacobian of squashing `raw` by tanh, in its stable
+    form 2 (log 2 - raw - softplus(-2 raw)), finite where tanh(raw) rounds to one."""
+    return 2 * (math.log(2.0) - raw - jax.nn.softplus(-2 * raw))
+
+
 def onehot_sample(key: jax.Array, log_probs: jax.Array) -> jax.Array:
     """A one-hot draw from the categorical `log_probs`, its gradient the probabilities' (straight
     through)."""
@@ -88,5 +109,5 @@ def onehot_sample(key: jax.Array, log_probs: jax.Array) -> jax.Array:
     return drawn + probs - jax.lax.stop_gradient(probs)
 
 
-__all__ = ["onehot_sample", "symexp", "symlog", "twohot_bins", "twohot_loss", "twohot_mean",
-           "unimix_log_probs"]
+__all__ = ["normal_entropy", "normal_log_density", "onehot_sample", "symexp", "symlog", "tanh_log_jacobian",
+           "twohot_bins", "twohot_loss", "twohot_mean", "unimix_log_probs"]

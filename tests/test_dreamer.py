@@ -372,8 +372,8 @@ def test_the_worlds_kl_losses_are_the_codes_and_the_representation_one_spares_th
         # The loss draws its posterior from the first of its step key's two halves.
         world_key = jax.random.split(step.key)[0]
         previous = jnp.concatenate([jnp.zeros_like(windows["action"][:, :1]), windows["action"][:, :-1]], 1)
-        deter, _, posterior = objective.observed(variables, model.seen(windows["observation"]), previous,
-                                                 windows["first"], world_key)
+        deter, _, posterior, _ = objective.observed(variables, model.seen(windows["observation"]), previous,
+                                                    windows["first"], world_key)
         prior = model.bind(variables, rngs={"latent": world_key}).prior(deter)
     post, prior = np.asarray(posterior, np.float64), np.asarray(prior, np.float64)
     divergence = np.sum(np.exp(post) * (post - prior), axis=(-1, -2))
