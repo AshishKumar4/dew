@@ -13,7 +13,7 @@ from jax.typing import ArrayLike
 from dew.diffusion.discrete import DiscreteDenoiser
 from dew.diffusion.process import Denoiser
 from dew.nn.autoencoders import AutoEncoder
-from dew.sampling.guidance import Guidance, Walk, guidance_modules, pair_of
+from dew.sampling.guidance import Guidance, Walk, pair_of
 from dew.sampling.solvers import RowKeys, RowSolver, Solver
 
 
@@ -199,10 +199,11 @@ def _stepped(solver: Solver, key: jax.Array | RowKeys, index: jax.Array) -> Call
 def sampling_modules(model: nn.Module, guidance: Guidance | None,
                      autoencoder: AutoEncoder | None) -> tuple[nn.Module, ...]:
     """Every network a walk of `model` under `guidance` that `autoencoder` decodes runs: the
-    denoiser, an autoguide (`guidance_modules`) and the autoencoder's towers (`AutoEncoder.towers`,
+    denoiser, an autoguide (`Guidance.modules`) and the autoencoder's towers (`AutoEncoder.towers`,
     none for a network-free one), which the program that walks it compiles for (`compiler_options`), a
     task's and an objective's alike."""
-    return (model, *guidance_modules(guidance), *(() if autoencoder is None else autoencoder.towers()))
+    return (model, *(() if guidance is None else guidance.modules()),
+            *(() if autoencoder is None else autoencoder.towers()))
 
 
 def walk_and_decode(denoise: Denoiser, autoencoder: AutoEncoder | None, params, x_T: jax.Array, *,
