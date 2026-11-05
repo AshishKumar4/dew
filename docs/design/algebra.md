@@ -104,11 +104,12 @@ bodies, by the site's declared class:
 
 Each site declares its class where it defines its derivative (`dew.nn.derivatives`: `kernel_derivative`,
 `numerics_derivative`, `numerics_tangent`, `surrogate`; §6.10), so the class is read from the site, never
-inferred. A bare custom derivative in `src/dew` fails a slop check, not a default. A custom derivative is
-marked whole, its primal, forward and backward one span: a function `jax.custom_vjp` or `jax.custom_jvp`
-decorates carries `functools.partial(marked, Kind())` as the decorator above it, or the derivative is the
-argument of `marked(Kind(), ...)` where it is made; the check matches those two forms and nothing else
-(a reference to JAX's `custom_vjp_call_p` is no definition). Rows 4026 to 4030 mark each lane's sites.
+inferred. A bare custom derivative in `src/dew` fails a slop check, not a default. Each declaring function
+wraps `jax.custom_vjp` or `jax.custom_jvp` and returns the derivative as one marked call of its kind, its
+primal, forward and backward one span (`dew.nn.derivatives.spanned`: its arrays the operands, static
+arguments bound in), so the check refuses `jax.custom_vjp` and `jax.custom_jvp` anywhere in `src/dew` but
+`dew/nn/derivatives.py` (a reference to JAX's `custom_vjp_call_p` is no application). Rows 4026 to 4030
+declare each lane's sites.
 
 ### 1.4 Facts and rules
 
@@ -838,7 +839,8 @@ from there. What exists: the four kinds, `marked_call_p` with its transform rule
 `surrogate`, the precision transforms marked `Protected`, and the pass reading a marked call's kind
 (`program._within`, `program._opened`: a protected call an opaque leaf, a surrogate's and a kernel glue's body
 rewritten within its call, an Algebra span opened into the region around it, its call kept where no form
-lands). Not yet: the custom-derivative sites marked, and the slop check.
+lands), and the declaring functions (`kernel_derivative`, `numerics_derivative`, `numerics_tangent`,
+`surrogate`). Not yet: each lane's sites declared through them (rows 4026 to 4030), and the slop check.
 
 ```python
 class Protected: ...                  # error-free transforms and numerics bodies (§1.2, §1.3)
