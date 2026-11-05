@@ -2131,9 +2131,9 @@ def test_every_fixture_archive_names_nothing_of_the_machine_that_wrote_it():
 def test_an_image_pipeline_receipt_names_its_dataset_and_none_of_its_hosts_directories(tmp_path):
     """The image pipeline's receipt records its config as the data benchmark's does (tools/receipt_paths):
     the flowers' TFDS directory, given shell-expanded outside the checkout as its docstring lays it out
-    (`<data dir>/oxford_flowers102/<version>`), as its dataset and version, and a bucket's URI as given
-    (rows 2872, 4209: a receipt recorded /home/<user>/..., then the version directory alone, and a gs://
-    path as gs:/bucket)."""
+    (`<data dir>/oxford_flowers102/<version>`), as its dataset and version, a bucket's URI as given and a
+    local file's URI as its path (rows 2872, 4209: a receipt recorded /home/<user>/..., then the version
+    directory alone, and a gs:// path as gs:/bucket; the review of 4209: a file:// URI kept whole)."""
     tool = load("benchmark_image_pipeline")
     config = tool.Config(flowers=str(tmp_path / "data" / "oxford_flowers102" / "2.1.1"), out=tmp_path / "out")
     recorded = tool.recorded_config(config)
@@ -2141,6 +2141,8 @@ def test_an_image_pipeline_receipt_names_its_dataset_and_none_of_its_hosts_direc
     assert recorded["images"] == config.images
     bucket = "gs://tfds-data/datasets/oxford_flowers102/2.1.1"
     assert tool.recorded_config(tool.Config(flowers=bucket))["flowers"] == bucket
+    local = (tmp_path / "data" / "oxford_flowers102" / "2.1.1").as_uri()
+    assert tool.recorded_config(tool.Config(flowers=local))["flowers"] == "oxford_flowers102/2.1.1"
 
 
 def test_the_disk_bank_and_host_offload_receipts_name_none_of_their_hosts_directories(tmp_path):
