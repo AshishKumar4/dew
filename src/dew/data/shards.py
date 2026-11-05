@@ -172,7 +172,6 @@ class _ShardPass[Place](grain.IterDataset):
             make_iter_buffer_size=self.loading.read_buffer,
             # Each shard open reads a row ahead on a thread of its own, none where the reading holds none
             # ahead (a member's share of a mix's read-ahead), as the shards it opens next.
-            iter_buffer_size=min(self.loading.read_buffer, 1),
         )
         limited = rows if self.quota is None else experimental.LimitIterDataset(rows, self.quota)
         return _Passing(limited.__iter__())
