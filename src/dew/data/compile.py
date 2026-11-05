@@ -174,9 +174,10 @@ def _automatic(pipeline: Pipeline, read: Read, root: str | None) -> Pipeline:
     costs more to run than its records cost to read back (`Costly`: a learned tokenizer's encoding)
     and the chain writes no cache: each corpus of a mixture or phases its own, in a root this process
     may write. The maps are the ones
-    a cache keys (`_cacheable`) and reads again unchanged (none `_volatile`), and in an indexed read
-    none that rejects, whose cache a read by index reads back as a stream, slower than it reruns
-    them. It stands for them only in a memory or indexed read, by each input's place in a store
+    a cache keys (`_cacheable`) and reads again unchanged (none `_volatile`), one that rejects among
+    them too: a read by index reads its cache back as each input's outputs, faster than it reruns them
+    (row 803: 1,500 1024x768 JPEGs decoded and resized in 2.4 s on 16 threads, read back in 0.6 s).
+    It stands for them only in a memory or indexed read, by each input's place in a store
     whose content is named, in a clean checkout whose steps are exact (`Manifest`), and nowhere
     else, so a chain no cache could serve reads as it is written, never refused. It holds the
     records the maps make, and fills, publishes, replays and evicts as `cache(url)` does (`Cache`),
@@ -195,7 +196,7 @@ def _automatic(pipeline: Pipeline, read: Read, root: str | None) -> Pipeline:
 
     def kept(stage: Stage) -> bool:
         return (isinstance(stage, (Map, MapWithIndex)) and _cacheable(stage) and not _volatile(stage)
-                and not _external(stage) and not (read == "indexed" and stage.rejects))
+                and not _external(stage))
 
     at = next((index for index, stage in enumerate(pipeline.stages) if not kept(stage)), len(pipeline.stages))
     prefix = pipeline.stages[:at]
