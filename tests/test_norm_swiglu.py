@@ -137,10 +137,11 @@ def assert_drawn_as_exact(fused, xla, exact, draw, leaves, label, seeds):
                     draw, label, seeds=seeds, truth_fn=truth)
 
 
-def compare(functions, draw, labels, seeds, *, coefficient=None):
-    """Every output's dtype and accumulation on `draw`'s first operands (`gated`); their accuracy held by
-    check 1 over `draw`'s `seeds` (`assert_drawn_as_exact`). `coefficient` of the first operands, where
-    the weight gradient's accumulation is held."""
+def compare(functions, draw, labels, seeds, *, coefficient=None, judged=None):
+    """Every output's dtype and accumulation on `draw`'s first operands (`gated`); the accuracy of the
+    `judged` labels (every one by default) held by check 1 over `draw`'s `seeds`
+    (`assert_drawn_as_exact`). `coefficient` of the first operands, where the weight gradient's
+    accumulation is held."""
     xla, pallas, exact = functions
     operands, seed = draw(0)
     reference = jax.jit(functools.partial(evaluated, xla))(operands, seed)
@@ -148,9 +149,10 @@ def compare(functions, draw, labels, seeds, *, coefficient=None):
     gated(labels, actual, reference, seed, coefficient and coefficient(operands))
 
     def leaves(result):
-        return {label: value for label, value in zip(labels, result, strict=True) if value is not None}
+        return {label: value for label, value in zip(labels, result, strict=True)
+                if value is not None and label in (judged or labels)}
 
-    assert_drawn_as_exact(pallas, xla, exact, draw, leaves, " ".join(labels), seeds)
+    assert_drawn_as_exact(pallas, xla, exact, draw, leaves, " ".join(judged or labels), seeds)
 
 
 def gated(labels, actual, reference, seed, coefficient):
@@ -247,10 +249,12 @@ def test_rms_ragged_widths_and_many_rows(dtype, shape):
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype):
     """Repeated tokens hold the row arithmetic fixed while the column sum grows to Qwen3.5-0.8B's size,
-    isolating partial-sum error from bf16 midpoint flips: the output and both gradients hold check 1 over
-    the step's draws."""
+    isolating partial-sum error from bf16 midpoint flips: the weight gradient holds check 1 over the
+    step's draws. Its output and input gradient are one token's row repeated, which a draw's seeds hold
+    no better than one row's: they hold check 1 at rows of their own (`test_rms_ragged_widths_and_many_rows`,
+    and each config's at 4,099 rows, `every_config_of_the_norm_kernels_holds_the_float64_gate`)."""
     compare(norm_functions(dtype, offset=True, after_cast=True), lambda draw: full_step(dtype, draw),
-            ("y", "x", "scale"), SEEDS[(24576, 1000)],
+            ("y", "x", "scale"), SEEDS[(24576, 1000)], judged=("scale",),
             coefficient=lambda operands: scale_coefficient(operands[0], dtype, after_cast=True))
 
 

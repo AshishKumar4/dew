@@ -63,7 +63,8 @@ def test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla(sizes
     sizes = SIZES[sizes]
     x, w, dy, group = operands(sizes, dtype)
     fmt = FORMAT[dtype]
-    forward, kernel_gradient = forward_products(x, w, sizes, fmt), kernel_gradient_products(x, dy, sizes, fmt)
+    forward = forward_products(x[:sum(sizes)], w, sizes, fmt)
+    kernel_gradient = kernel_gradient_products(x, dy, sizes, fmt)
     arrays = [jnp.asarray(value, dtype) for value in (x, w, dy)]
     group_sizes = jnp.asarray(sizes, jnp.int32)
     # One warpgroup a tile at two row blocks, and two (CUTLASS's cooperative schedule; a pair of
@@ -197,8 +198,8 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
         # Mosaic's interpreter's ordered callbacks run eagerly: a jitted `linear_call` cannot carry them.
         y, dx, dw = (products if implementation == "mosaic_gpu" else jax.jit(products))(*operands_)
     assert (y.dtype, dx.dtype, dw.dtype) == (jnp.bfloat16, jnp.bfloat16, jnp.float32)
-    routed(y, group, forward_products(x, w, sizes), BFLOAT16, "y")
-    routed(dx, group, input_gradient_products(dy, w, sizes), BFLOAT16, "dx")
+    routed(y, group, forward_products(x[:sum(sizes)], w, sizes), BFLOAT16, "y")
+    routed(dx, group, input_gradient_products(dy[:sum(sizes)], w, sizes), BFLOAT16, "dx")
     for index, held_products in enumerate(kernel_gradient_products(x, dy, sizes)):
         held(dw[index], held_products, FLOAT32, f"dw of group {index}")
 
@@ -416,7 +417,7 @@ def test_a_tile_of_192_columns_stages_every_column_it_writes():
     sizes = SIZES["ragged"]
     x, w, _, group = operands(sizes, jnp.bfloat16)
     wide = np.tile(w, (1, 1, 2))[..., :192]
-    forward = forward_products(x, wide, sizes)
+    forward = forward_products(x[:sum(sizes)], wide, sizes)
     for warpgroups in (1, 2):
         tiles = mosaic_gpu.Tiles(128, 192, 64, 2, 1, warpgroups=warpgroups)
         got = mosaic_gpu.gmm(jnp.asarray(x, jnp.bfloat16), jnp.asarray(wide, jnp.bfloat16),
@@ -446,7 +447,7 @@ def test_an_ampere_gpus_mosaic_and_triton_launches_are_each_as_exact_as_xla(size
     launch, each named: every routed element a value its exact products admit, rounded once to its output
     dtype, unrouted rows zero."""
     x, w, _, group = operands(SIZES[sizes], jnp.bfloat16)
-    products = forward_products(x, w, SIZES[sizes])
+    products = forward_products(x[:sum(SIZES[sizes])], w, SIZES[sizes])
     group_sizes = jnp.asarray(SIZES[sizes], jnp.int32)
     lhs, rhs = jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.bfloat16)
 
