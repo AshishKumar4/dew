@@ -21,6 +21,7 @@ from pathlib import Path, PurePosixPath
 from typing import BinaryIO, NamedTuple, Protocol, TypedDict, runtime_checkable
 
 import fsspec
+import grain.python as grain
 from filelock import FileLock, Timeout
 from fsspec.implementations.cached import CachingFileSystem, WholeFileCacheFileSystem
 from fsspec.implementations.local import LocalFileSystem
@@ -345,13 +346,56 @@ class BoundedFileCache(WholeFileCacheFileSystem):
         }
 
 
-def mirror_metrics() -> dict[str, float]:
-    """What this process's mirrors (`dewcache::`) did, summed over every one it opened, as a run logs it
-    beside its data metrics (`data/mirror/...`, row 4299): none where it opened none."""
+MIRRORED = "_dew_mirrored"
+"""The key under which a loading worker's position states what its process's mirrors did
+(`mirrored`), which a run's statistics add to its own (`mirror_metrics`)."""
+
+
+def mirrored() -> dict[str, float]:
+    """What this process's mirrors (`dewcache::`) did, summed over every one it opened: none where it
+    opened none."""
     held = [mirror.metrics() for mirror in BoundedFileCache._cache.values()]
-    if not held:
-        return {}
-    return {f"data/mirror/{name}": float(sum(stats[name] for stats in held)) for name in held[0]}
+    return {name: float(sum(stats[name] for stats in held)) for name in held[0]} if held else {}
+
+
+def mirror_metrics(state: object = None) -> dict[str, float]:
+    """What the mirrors of a run's reading processes did, as a run logs it beside its data metrics
+    (`data/mirror/...`, row 4299): this process's, and each loading worker's its position `state` states
+    (`MIRRORED`), none where none opened one."""
+    totals = dict(mirrored())
+
+    def found(value: object) -> None:
+        if isinstance(value, Mapping):
+            for name, held in value.get(MIRRORED, {}).items():
+                totals[name] = totals.get(name, 0.0) + held
+            for child in value.values():
+                found(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                found(child)
+
+    found(state)
+    return {f"data/mirror/{name}": held for name, held in totals.items()}
+
+
+class Mirrored(grain.IterDataset):
+    """A loading worker's rows, its position stating what its process's mirrors did (`MIRRORED`), which
+    the run's statistics add to the reading process's (`mirror_metrics`, row 4299); a
+    position restores as its rows' alone."""
+
+    def __iter__(self) -> grain.DatasetIterator:
+        return _MirroredIterator(self._parent.__iter__())
+
+
+class _MirroredIterator(grain.DatasetIterator):
+    def __next__(self) -> object:
+        return next(self._parent)
+
+    def get_state(self) -> dict:
+        return {**self._parent.get_state(), MIRRORED: mirrored()}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self._parent.set_state({name: value for name, value in state.items() if name != MIRRORED})
 
 
 # Registered as this module loads, which reads no configuration, so `dewcache::` URLs open through
