@@ -917,7 +917,8 @@ def test_a_scoring_server_answers_image_requests_as_each_draws_alone(tmp_path):
         server.run()
         admitted = [future.admitted for future in futures]
         assert admitted[0] == admitted[1] and len(set(admitted[1:])) == 3
-        assert [step for step, _ in streamed] == [1, 2, 3]
+        # A walk's solver steps between its grid's points; the closing denoise is no step.
+        assert [step for step, _ in streamed] == list(range(1, len(pipe.process.times(3))))
         assert {shape[0] for _, shape in streamed} == {2}
         return tuple(future.result().host().images for future in futures)
 
