@@ -20,14 +20,14 @@ from dew.training import MeshSpec, Trainer
 from dew.training.planning import PlanRefused
 
 
-def deep(remat=None):
+def deep(remat=None, split: int | None = 1):
     """A decoder whose residuals are most of what its step holds, on one device, reading its batch
-    whole: two layers over 256 tokens, the derivation's case (each layer's residuals there are some forty
-    times its parameters)."""
+    whole, or in `split` microbatches, or in the split its plan finds (None): two layers over 256 tokens,
+    the derivation's case (each layer's residuals there are some forty times its parameters)."""
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2, mlp_features=64,
                               max_seq_len=256, remat=remat)
     return one_device(Trainer(LMObjective(model, seq_len=256), optax.sgd(1e-2), key=jax.random.key(0),
-                              split=1))
+                              split=split))
 
 
 DEEP = {"text": jnp.asarray((np.arange(8 * 257).reshape(8, 257) * 7) % 64, jnp.int32)}
@@ -111,92 +111,79 @@ def test_an_objective_that_trains_two_modules_unset_reads_the_derivation(monkeyp
     assert trainer.plan["derived"]
 
 
-def assert_told_from_no_remat_up(trainer, remat: str, *, lighter: bool) -> None:
-    """`trainer`, set to `remat`, compiled there alone, once, after the derivation read the rungs from no
-    remat up to its own, and stopped at the last, fitting (`lighter`) or every one refused."""
+def test_the_first_compile_is_at_the_fewest_microbatches_the_derivation_says_fit(monkeypatch, tmp_path):
+    """With room for the step at four microbatches and not at two, as both its compile and its derivation
+    say, the search's first compile is at four, the fewest the derivation says fit, which the compile
+    confirms: the step compiles once, where the search compiled the whole batch first and halved the
+    range by compiles (row 3341). The plan records the splits the derivation read."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
+    need = {}
+    for split in (2, 4):
+        sizing = deep(split=split)
+        compiled_need = needs(monkeypatch, sizing, lambda sizing=sizing: compiled(sizing))
+        (judged,) = [entry for entry in sizing.plan["derived"] if entry["split"] == split]
+        need[split] = (compiled_need, LIMIT - judged["headroom"])
+    room = max(need[4])
+    assert room < min(need[2]), need
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
+    free(monkeypatch, room)
+    trainer = deep(split=None)
     with Compiles("step") as compiles:
         compiled(trainer)
-    derived = trainer.plan["derived"]
-    assert compiles.count == 1 and trainer.plan["probes"][0]["remat"] == trainer.plan["remat"] == remat
-    assert derived and derived[0]["remat"] is None and all(entry["remat"] != remat for entry in derived)
-    assert [entry["label"] for entry in derived][-1] == ("fits" if lighter else "refuses")
-    assert {entry["label"] for entry in derived[:-1]} <= {"refuses"}
+    assert compiles.count == 1 and trainer.plan["split"] == 4 and trainer.plan["remat"] is None
+    assert {entry["split"]: entry["label"] for entry in trainer.plan["derived"]}[2] == "refuses"
 
 
-def test_a_run_set_to_full_recompute_with_room_for_every_rung_is_told_its_base_rung_fits(monkeypatch,
-                                                                                          tmp_path):
-    """A run that sets its remat compiles there alone, once, and before it compiles reads the derivation
-    from no remat up to its own (row 2536): with room for every rung, a run set to full recomputation
-    reads the base rung fit, which its plan records beside the rung it compiled."""
+def test_a_run_that_sets_its_remat_derives_its_own_rung_alone_and_compiles_there_once(monkeypatch, tmp_path):
+    """A run that sets its remat compiles at it alone (row 2111), once, its split derived there; no rung
+    below its own is traced for it, which cost a run every lighter rung's trace before its first step to
+    say only whether one fits (row 3341)."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
     free(monkeypatch, LIMIT)
-    assert_told_from_no_remat_up(deep(REMAT_POLICIES["full"]), "full", lighter=True)
-
-
-def test_a_run_set_to_the_least_rung_that_fits_is_told_every_rung_below_it_refused(
-        monkeypatch, tmp_path, room):
-    """A run set to the least rung that fits, the rung a run that sets none compiles at with room for the
-    step under full recomputation alone, reads every rung below it refused, and the derivation stops
-    there."""
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "unset"))
-    free(monkeypatch, room)
-    unset = deep()
-    compiled(unset)
-    remat = unset.plan["remat"]
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "set"))
-    assert_told_from_no_remat_up(deep(REMAT_POLICIES[remat]), remat, lighter=False)
-
-
-def test_a_run_set_to_a_policy_off_the_ladder_is_told_no_rung_below_it(monkeypatch, tmp_path):
-    """A policy off the ladder, which no climb from no remat reaches, has no rung known below it: the
-    run compiles at it with nothing derived."""
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
-    free(monkeypatch, LIMIT)
-    off = deep(REMAT_POLICIES["save_qkv_proj"])
-    compiled(off)
-    assert off.plan["derived"] == [] and off.plan["remat"] == "save_qkv_proj"
+    for remat in ("full", "save_qkv_proj"):
+        trainer = deep(REMAT_POLICIES[remat])
+        with Compiles("step") as compiles:
+            compiled(trainer)
+        assert compiles.count == 1 and trainer.plan["remat"] == remat
+        assert trainer.plan["derived"] and {entry["remat"] for entry in trainer.plan["derived"]} == {remat}
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_run_over_two_devices_that_sets_its_remat_is_told_the_rung_its_derivation_fits(
-        monkeypatch, tmp_path, caplog):
-    """A run sharded over two devices (fsdp 2, as the two-GPU run that raised row 2536) that sets
-    full recomputation reads its derivation per device, each its share of the batch and the state
-    (`candidate_footprint`), and with room for every rung is told the base rung fits, where its search
-    compiles at its own alone; the derivation's climb compiles nothing, so it says it compiles nothing
-    (train 333's review: rows 2615, 2616)."""
+def test_a_run_over_two_devices_that_sets_its_remat_derives_its_share_and_compiles_once(
+        monkeypatch, tmp_path):
+    """A run sharded over two devices (fsdp 2, as the two-GPU run that raised row 2536) that sets full
+    recomputation derives its footprint per device, each its share of the batch and the state
+    (`candidate_footprint`), at its own rung, which fits with room for every rung, and compiles there
+    once (rows 2615, 3341)."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "two"))
     free(monkeypatch, LIMIT)
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=8, num_heads=2, mlp_features=64,
                               max_seq_len=256, remat=REMAT_POLICIES["full"])
     trainer = Trainer(LMObjective(model, seq_len=256), optax.sgd(1e-2), key=jax.random.key(0), split=1,
                       mesh=MeshSpec(fsdp=2).build(jax.devices()[:2]))
-    with caplog.at_level(logging.WARNING, logger="dew"), Compiles("step") as compiles:
+    with Compiles("step") as compiles:
         compiled(trainer)
     derived = trainer.plan["derived"]
     assert compiles.count == 1 and trainer.plan["remat"] == "full"
-    assert derived and derived[0]["remat"] is None and derived[-1]["label"] == "fits"
-    assert not [record for record in caplog.records if "compiling it again" in record.getMessage()]
-    assert [record for record in caplog.records if "recomputes less" in record.getMessage()]
+    assert [(entry["remat"], entry["label"]) for entry in derived] == [("full", "fits")]
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_run_over_a_tensor_axis_that_sets_its_remat_hears_its_derivation_cannot_judge_it(
-        monkeypatch, tmp_path, caplog):
+def test_a_run_over_a_tensor_axis_whose_footprint_the_derivation_cannot_judge_compiles_its_own_rung(
+        monkeypatch, tmp_path):
     """A run over a tensor axis of two that sets full recomputation, whose footprint the derivation reads
-    per device only over data and fsdp axes, hears once that its derivation cannot judge its layout,
-    rather than nothing, and compiles at its own rung alone (row 2721; 2615 stays open for such layouts)."""
+    per device only over data and fsdp axes ("unknown", row 2615), compiles at its own rung once, as it
+    would with no derivation (row 2721)."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "tensor"))
     free(monkeypatch, LIMIT)
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=8, num_heads=2, mlp_features=64,
                               max_seq_len=256, remat=REMAT_POLICIES["full"])
     trainer = Trainer(LMObjective(model, seq_len=256), optax.sgd(1e-2), key=jax.random.key(0), split=1,
                       mesh=MeshSpec(tensor=2).build(jax.devices()[:2]))
-    with caplog.at_level(logging.WARNING, logger="dew"), Compiles("step") as compiles:
+    with Compiles("step") as compiles:
         compiled(trainer)
     assert compiles.count == 1 and trainer.plan["remat"] == "full"
     assert trainer.plan["derived"][-1]["label"] == "unknown"
-    assert len([record for record in caplog.records if record.name == "dew.training.planning"]) == 1
 
 
 def test_a_compile_the_derivation_judged_otherwise_is_told_as_a_model_miss(monkeypatch, tmp_path, caplog):
