@@ -403,6 +403,38 @@ def test_a_gradient_added_to_a_zero_carry_holds_the_gradient_alone():
     assert peak(carried) == peak(product)
 
 
+def test_a_scatter_whose_updates_read_its_base_holds_them_apart():
+    """A scatter writes in its base's buffer only where its updates read none of it, and its updates
+    computed from its base are held apart, as XLA fuses no producer reading a scatter's in-place operand
+    into it (`CanEmitInputFusedScatter`, xla/service/gpu/gpu_fusible.cc): a product scattered into itself
+    through a view holds the product and the scatter's result, and one scattered into itself ten times
+    over holds the updates' ten copies beside them (review of row 4089)."""
+    from dew.training.footprint import peak_bytes, simplified
+
+    size = 4096 * 256
+    shapes = (jax.ShapeDtypeStruct((512, size // 256), jnp.float32),
+              jax.ShapeDtypeStruct((512, 256), jnp.float32))
+
+    def product(logits, hidden):
+        return jax.lax.dot_general(logits, hidden, (((0,), (0,)), ((), ())))
+
+    def viewed(logits, hidden):
+        flat = product(logits, hidden).reshape(size)
+        indices = jnp.arange(size // 256, dtype=jnp.int32)
+        return flat.at[indices * 256].add(flat.reshape(size // 256, 256)[:, 0])
+
+    def repeated(logits, hidden):
+        flat = product(logits, hidden).reshape(size)
+        indices = jnp.arange(10 * size, dtype=jnp.int32) % size
+        return flat.at[indices].add(jnp.concatenate([flat] * 10))
+
+    def peak(function):
+        return peak_bytes(simplified(jax.make_jaxpr(function)(*shapes).jaxpr, "gpu"), "gpu", Workspace(0, 0))
+
+    assert peak(viewed) >= 2 * size * 4, peak(viewed)
+    assert peak(repeated) >= (1 + 10 + 1) * size * 4, peak(repeated)
+
+
 def test_a_transposed_input_returned_flat_is_a_copy():
     """A transpose of an input whose layout is fixed reorders its elements into a buffer of their own,
     which a flattening of it returned holds, where a transpose of a value the program computes is laid
