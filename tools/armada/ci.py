@@ -262,7 +262,9 @@ CACHE_PREFIX = f"testcache/format-{RECORD_FORMAT}"
 def shared(python: str) -> str:
     """The hash of what every test file's run shares: `python`, the `SHARED` files, every lock,
     .armada.json's parts a test process sees (`armada_seen`), the XLA and JAX settings it inherits
-    (`session.keyed_environment`), and the names of tests/'s conftest.py and
+    (`session.keyed_environment`), a CPU task's and a GPU lane's alike (the lane's command, selection and
+    environment are session.py's, so they are `SHARED` and nothing of this file is a lane's key), and the
+    names of tests/'s conftest.py and
     __init__.py files and of src/'s own entries, whose arrival can change what an import finds (a conftest.py
     or a top-level package that shadows another), and of every data file under tests/ but its fixtures and
     under src/ (an existence probe before the recorder starts). A module within a package under src/ is its
@@ -297,13 +299,6 @@ def shared(python: str) -> str:
     for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), "src"}):
         digest.update(name.encode() + shared_contents(name))
     return digest.hexdigest()
-
-
-def lane_inputs(python: str) -> str:
-    """The hash of what a GPU lane's file shares (`gpu_lane`): what every test file's run shares (`shared`),
-    and this file, which sets the environment, share and deadline each file runs under on a GPU, where a
-    CPU task's are the session's."""
-    return hashlib.sha256((shared(python) + contents(__file__).hex()).encode()).hexdigest()
 
 
 FIXTURES = Path("tests/fixtures")
@@ -1902,14 +1897,16 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
     """The test files that take another path on a GPU, each with its evidence: where its tests read
     the backend and its marks of `session.MARKS`, over every record of its rows,
     on every class, a split file's under each count of groups it was planned as. A file is out
-    only where every record is of these inputs (`fresh`), a CPU task's (`shared`) or a GPU lane's
-    (`lane_inputs`), and says neither, so a file whose inputs changed since it ran is in as "changed",
-    and one without a record, or with one the Worker did not return, as "unrecorded": a new file, or one
-    no green run of these tools has recorded."""
+    only where every record is of these inputs (`fresh`, `shared`: a CPU task's and a GPU lane's alike)
+    and says neither, so a file whose inputs changed since it ran is in as "changed", and one without a
+    record, or with one the Worker did not return, as "unrecorded": a new file, or one no green run of
+    these tools has recorded. A lane's record made under a node's own XLA or JAX settings
+    (`session.keyed_environment`) is "changed" here, where the caller has none of them: a miss, as it is
+    for any input this host does not share."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         raise SystemExit("the GPU tier is chosen from the test cache's records, which need its URL and token")
-    inputs = (shared(python), lane_inputs(python))
+    common = shared(python)
     prefix = f"{CACHE_PREFIX}/{python}/"
     # One reading of the checkout, which every record's key reads its inputs from.
     reading = Reading()
@@ -1919,7 +1916,7 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
         found = recorded(f"{prefix}{key}", token)
         if found is None:
             return name, ["unrecorded"]
-        current = any(fresh(found, name, common, reading) for common in inputs)
+        current = fresh(found, name, common, reading)
         return name, found["reads"] or ([] if current else ["changed"])
 
     try:
@@ -2073,7 +2070,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     [total] = (int(megabytes) * 2 ** 20 for megabytes in gpu_query("memory.total"))
     budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
     held = device_class(network)
-    threads = str(max(1, len(os.sched_getaffinity(0)) // processes))
+    threads = max(1, len(os.sched_getaffinity(0)) // processes)
 
     def needs(name: str) -> dict | None:
         return recorded(record_key(python, row(python, name, ""), held), token)
@@ -2087,7 +2084,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     shares = {name: share for name, (share, _) in needed.items()}
     holds = {name: held for name, (_, held) in needed.items()}
     # Before any test writes under tests/, the inputs every file's key hashes.
-    common = lane_inputs(python)
+    common = shared(python)
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)}
 
     def run(names: list[str]) -> None:
@@ -2101,9 +2098,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                     waiting.remove(fits)
                     # Its pool taken at its first op, or grown where it holds the whole share, as this lane
                     # says whatever its own environment does: a GPU node's session grows every job's pool.
-                    environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
-                               "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
-                               "OMP_NUM_THREADS": threads}
+                    environ = session.lane_environment(shares[fits], total, budget, threads)
                     running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache,
                                         session.GRACE, common, environ, None, network)] = fits
                     continue
