@@ -904,10 +904,11 @@ def test_a_streamed_position_an_earlier_dew_saved_in_its_shards_interleave_resum
                    loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1))
     stream = data.train(DataPartition())
     try:
-        assert [np.asarray(batch["id"]).tolist() for batch, _ in zip(stream, range(3))] == saved["before"]
+        assert [np.asarray(batch["id"]).tolist() for batch in itertools.islice(stream, 3)] == saved["before"]
         assert "iterators_in_use" not in stream.get_state().decode()
         stream.set_state(saved["state"].encode())
-        assert [np.asarray(batch["id"]).tolist() for batch, _ in zip(stream, range(8))] == saved["after_ids"]
+        resumed = [np.asarray(batch["id"]).tolist() for batch in itertools.islice(stream, 8)]
+        assert resumed == saved["after_ids"]
     finally:
         stream.close()
 
