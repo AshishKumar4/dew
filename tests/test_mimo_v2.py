@@ -18,6 +18,10 @@ from dew.interop import Pretrained, codecs
 from dew.interop.sources import load_shards
 
 TINY = Path(__file__).parent / 'fixtures' / 'hf' / 'mimo-v2-tiny'
+WHOLE = Path(__file__).parent / 'fixtures' / 'hf' / 'mimo-v2-vl-tiny'
+"""The release with its towers, its audio tokenizer's folder and its prediction layer
+(tools/remote_code_reference.py), whose check 1 against the release is
+tests/test_remote_code_releases.py's."""
 
 
 def fixture(name):
@@ -113,17 +117,16 @@ def test_a_window_named_by_sliding_window_size_alone_loads_the_same_model(tmp_pa
     assert json.loads((tmp_path / 'saved' / 'config.json').read_text()) == config
 
 
-def test_the_towers_and_prediction_layers_ride_along_unread(tmp_path):
-    """A release's tower and prediction-layer tensors, which the text decoder
-    never runs, leave its logits as they were and are written back as they
-    came."""
+def test_the_towers_of_a_config_that_names_none_ride_along_unread(tmp_path):
+    """A checkpoint's tower tensors beside a config that names no tower, which
+    its text decoder never runs, leave its logits as they were and are
+    written back as they came."""
     source = tmp_path / 'release'
     shutil.copytree(TINY, source)
     tensors = load_file(TINY / 'model.safetensors')
     extra = {'visual.blocks.0.attn.qkv.weight': np.full((6, 4), 0.25, np.float32),
              'audio_encoder.layers.0.mlp.fc1.weight': np.arange(8, dtype=np.float32).reshape(2, 4),
-             'speech_embeddings.0.weight': np.ones((3, 4), np.float32),
-             'model.mtp.layers.0.enorm.weight': np.full((4,), 2.0, np.float32)}
+             'speech_embeddings.0.weight': np.ones((3, 4), np.float32)}
     save_file({**tensors, **extra}, source / 'model.safetensors')
     loaded, actual = logits(source)
     np.testing.assert_array_equal(actual, logits(TINY)[1])
@@ -131,6 +134,65 @@ def test_the_towers_and_prediction_layers_ride_along_unread(tmp_path):
     written = load_file(tmp_path / 'saved' / 'model.safetensors')
     for name, tensor in extra.items():
         np.testing.assert_array_equal(written[name], tensor, err_msg=name)
+
+
+def test_a_release_with_its_towers_loads_whole_and_saves_back_as_it_came(tmp_path):
+    """MiMo-V2.6 with its towers is a bundle its family reads whole (row 357): the decoder at the config's
+    root, the ViT and its merger, the audio encoder over the codes of the tokenizer the release keeps in a
+    folder of its own, and the prediction layer vLLM drafts with. It saves back every tensor it read under
+    its own name, the folder's in the folder beside the folder's config, the config as it was published,
+    and loads again to the same variables; its language model alone (`text_only`) computes the bundle's
+    logits over text bit for bit."""
+    import jax
+
+    from dew.nn.multimodal import MultimodalTransformer
+
+    loaded = Pretrained.load(WHOLE, dtype='float32', attention_impl='reference')
+    model = loaded.model
+    assert isinstance(model, MultimodalTransformer)
+    assert None not in (model.vision, model.projection, model.audio)
+    assert model.num_nextn_predict_layers == 1
+    loaded.save(tmp_path / 'saved')
+    for folder in (Path(), Path('audio_tokenizer')):
+        saved, released = tmp_path / 'saved' / folder, WHOLE / folder
+        assert (json.loads((saved / 'config.json').read_text())
+                == json.loads((released / 'config.json').read_text()))
+        written, read = load_file(saved / 'model.safetensors'), load_file(released / 'model.safetensors')
+        assert sorted(written) == sorted(read)
+        for name, tensor in read.items():
+            np.testing.assert_array_equal(written[name], tensor, err_msg=name)
+    again = Pretrained.load(tmp_path / 'saved', dtype='float32', attention_impl='reference')
+    jax.tree.map(np.testing.assert_array_equal, again.variables, loaded.variables)
+    text = Pretrained.load(WHOLE, dtype='float32', attention_impl='reference', text_only=True)
+    ids = np.load(WHOLE / 'input_ids.npy')
+    np.testing.assert_array_equal(np.asarray(model.apply(loaded.variables, ids)),
+                                  np.asarray(text.model.apply(text.variables, ids)))
+
+
+def test_a_release_without_its_audio_tokenizer_is_refused_whole_and_loads_as_text(tmp_path):
+    """A release whose config names its audio tower and whose folder lacks the tokenizer the tower reads
+    is refused whole, before any weight is read; its language model alone still loads."""
+    source = tmp_path / 'release'
+    shutil.copytree(WHOLE, source)
+    shutil.rmtree(source / 'audio_tokenizer')
+    with pytest.raises(ValueError):
+        Pretrained.load(source, dtype='float32', attention_impl='reference')
+    text = Pretrained.load(source, dtype='float32', attention_impl='reference', text_only=True)
+    assert text.model.num_nextn_predict_layers == 1
+
+
+def test_a_release_without_a_processor_of_its_own_refuses_raw_media_and_reads_its_fields():
+    """MiMo-V2.6 ships no processor, only its config's `processor_config`: raw images are refused, and the
+    processed fields it states lay out into the model's inputs (`Processor.from_hf`)."""
+    from remote_code_draws import draw
+
+    loaded = Pretrained.load(WHOLE, dtype='float32', attention_impl='reference')
+    with pytest.raises(ValueError):
+        loaded.processor('w1 w2', images=[np.zeros((8, 8, 3), np.uint8)])
+    drawn = draw('image', 0, dict(loaded.config))
+    fields = loaded.processor.from_hf({'input_ids': drawn['ids'], 'pixel_values': drawn['pixel_values'],
+                                       'image_grid_thw': drawn['image_grid_thw']})
+    assert int((np.asarray(fields.token_fields['image_indices']) >= 0).sum()) == 6
 
 
 STORED = {'quant_method': 'fp8', 'fmt': 'e4m3', 'weight_block_size': [128, 128],
