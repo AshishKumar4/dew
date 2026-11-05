@@ -516,16 +516,17 @@ def test_a_paged_window_cache_decodes_what_the_compact_cache_decodes(source, qua
 def test_a_paged_drafting_cache_drafts_what_the_compact_cache_drafts(source, quantized):
     """The DSpark drafter's window cache takes the decoder's layout: after a prefill and a verified
     stretch recorded into it, a paged cache drafts the compact cache's logits at the same format, bit
-    for bit, its context written as the stage's keys and values and read back in their basis."""
+    for bit, both drafted in one program, its context written as the stage's keys and values and read
+    back in their basis. Op by op the two drafts took 110 s of the test (ledger 3903)."""
     from dew.sampling.text import decode_ops, prefill_state
 
     loaded, plain, reference = source
     ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
 
-    def drafted(layout: KVCache) -> np.ndarray:
+    def drafted(layout: KVCache, variables, ids):
         model = plain.with_kv_cache(layout)
-        ops = decode_ops(model, loaded.variables, 0, 0)
-        state, _ = prefill_state(model, loaded.variables, ModelInputs(ids[:, :prompt]), ops)
+        ops = decode_ops(model, variables, 0, 0)
+        state, _ = prefill_state(model, variables, ModelInputs(ids[:, :prompt]), ops)
         keep = jnp.arange(3)[None, :] < jnp.asarray([3, 1])[:, None]
         state, _, context = ops.verify(state, ids[:, prompt:prompt + 3], keep)
         state = ops.record(state, context, keep)
@@ -536,10 +537,12 @@ def test_a_paged_drafting_cache_drafts_what_the_compact_cache_drafts(source, qua
             return jnp.argmax(logits, axis=-1)
 
         ops.draft(state, ids[:, prompt + 3], choose)
-        return np.asarray(jnp.stack(scored, 1))
+        return jnp.stack(scored, 1)
 
-    np.testing.assert_array_equal(drafted(KVCache(quantized=quantized, page_size=4)),
-                                  drafted(KVCache(quantized=quantized)))
+    np.testing.assert_array_equal(*jax.jit(lambda variables, ids: [
+        drafted(layout, variables, ids)
+        for layout in (KVCache(quantized=quantized, page_size=4), KVCache(quantized=quantized))])(
+            loaded.variables, ids))
 
 
 def uncached_window_steps(module, variables, hidden, quantized: str):
