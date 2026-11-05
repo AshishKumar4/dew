@@ -545,8 +545,8 @@ def _transposable(score_mod, params: tuple) -> bool:
 
 def _entrywise(jaxpr: jax_core.Jaxpr, inputs: set[int], tile: tuple[int, int]) -> bool:
     """Whether every operation of `jaxpr` that reads its `inputs` (by place) acts one entry at a time
-    (`layout.ENTRYWISE`, a scalar's broadcast, a nested call's own operations so), each value it reads of them
-    and each it gives a scalar or the `tile`."""
+    (`dew.nn.programs.ENTRYWISE`, a scalar's broadcast, a nested call's own operations so), each value it
+    reads of them and each it gives a scalar or the `tile`."""
     tainted = {jaxpr.invars[index] for index in inputs}
     for eqn in jaxpr.eqns:
         read = [index for index, var in enumerate(eqn.invars)
