@@ -239,7 +239,8 @@ def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str
     every other value, count whole. Matching an axis's size to the batch size cannot identify its
     sharding: a weight or a scan's layer axis can have that size too."""
     program, count, shapes = traced_gradient(loss, params, arguments)
-    return _kept(compiled(program, lowering or LOWERED.get(platform, platform)), count, shapes, platform)
+    return _kept(deduplicated(compiled(program, lowering or LOWERED.get(platform, platform))), count, shapes,
+                 platform)
 
 
 def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
@@ -260,8 +261,8 @@ def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
     xla/service/gpu/gpu_hlo_schedule.cc). With `deferred`, the gradient's own equations run after the rest
     of the backward (`sunk`)."""
     program, count, _ = traced_gradient(loss, params, arguments)
-    return _peak(compiled(program, lowering or LOWERED.get(platform, platform)), count, platform, workspace,
-                 consumed, deferred)
+    lowered = deduplicated(compiled(program, lowering or LOWERED.get(platform, platform)))
+    return _peak(lowered, count, platform, workspace, consumed, deferred)
 
 
 def _kept(lowered: jcore.Jaxpr, count: int, shapes: Sequence, platform: str) -> int:
@@ -561,9 +562,12 @@ class Frontier:
     def fused(self, value) -> bool:
         """Whether `value` holds no buffer of its own: recomputed where it is read, or a view; a value an
         optimization barrier reads is computed into a buffer of its own, which the barrier's result is
-        and every other reader reads (`forwards`)."""
-        if not computed(value) or value in self.inputs or value in self.barred:
+        and every other reader reads (`forwards`), unless it is a view of another's (`view`)."""
+        if not computed(value) or value in self.inputs:
             return False
+        if value in self.barred:
+            # A barrier's operand holds a buffer unless it is another's storage.
+            return self.view(value)
         equation = self.producers.get(value)
         if value in self.forwards:
             return self.stored(self.forwards[value])
