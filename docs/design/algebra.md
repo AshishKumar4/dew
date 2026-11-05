@@ -1020,9 +1020,16 @@ Agreed with the GEMM template's owner (2026-11-03):
   template's promotion and epilogue: a form may re-encode the codes, never the scales.
 - The consumer checks in each form it takes: its instructions, its encoder and the encoder's version (in the
   checkpoint), the decoder's live registers per thread (which `resources.py` prices before a tile is admitted)
-  and its instruction mix in `Work`'s units (which `cost.py` prices). Its tests prove it again.
-- The decoder is emitted inline (Mosaic GPU takes inline asm through `plgpu.inline_mgpu`) at a matrix-operand
-  hook the GEMM template adds (row 3621).
+  and its issues by pipe (`BitForm.issues`). `Work` holds no integer pipe yet: the consumer's head adds the
+  ALU's and the FMA pipe's integer issues to it, each 64 results a clock per multiprocessor (§7.2), so
+  `cost.py` prices a form's mix beside the tile's other work. Its tests prove the form again.
+- The decoder is emitted inline at a matrix-operand hook the GEMM template adds (row 3621): `BitForm.ptx(i)`
+  writes output register `i` as one PTX block over the stored word (`$1`) into the register (`$0`), each step
+  as its pipe's instruction (`shr`, `shl` and `shf` on the ALU, `mul.lo` and `mul.hi` by a power of two on the
+  FMA pipe, `lop3` for a mask), for Mosaic GPU's or Triton's inline assembly (constraints `=r,r`, a register
+  a block). `BitForm.traced` computes the same registers in `jax.numpy` for the hook's portable path and the
+  interpreter. Both evaluate one definition of each step (`bits._run`), the one `proven` checks. PTX fixes the
+  arithmetic, not the SASS: ptxas chooses the instructions, which the consumer's compile report shows.
 - Scope: NVFP4 and MXFP4 on sm90 and sm80; FP8 on sm80, which has no FP8 MMA; FP8 and FP4 packing in the
   epilogue. FP8 on sm90 needs no decode: wgmma multiplies E4M3 and E5M2 from shared memory.
 - A form is taken only where it is bit-identical over its whole domain and timed no slower on the real GEMM.
