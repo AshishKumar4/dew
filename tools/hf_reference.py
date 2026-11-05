@@ -532,7 +532,6 @@ def write_modernbert_tiny(name: str = 'modernbert-tiny') -> None:
     segment ids of rows packing two documents, under which
     tests/test_hf_modernbert.py runs the reference on drawn ids itself.
     """
-    from torch_precision import float64, float64_twin
     from transformers import ModernBertConfig, ModernBertForMaskedLM
 
     torch.manual_seed(0)
@@ -550,19 +549,6 @@ def write_modernbert_tiny(name: str = 'modernbert-tiny') -> None:
     documents = np.where(np.arange(ids.shape[1]) < 5, 1, 2)[None].repeat(ids.shape[0], 0)
     np.save(directory / 'attention_mask.npy', mask)
     np.save(directory / 'segment_ids.npy', documents.astype(np.int32))
-    tokens = torch.from_numpy(ids).long()
-    model.eval()
-    # The reference's own bf16 run, which a bf16 forward is held to, on a
-    # copy: a round trip through bf16 would round the float64 run's weights.
-    import copy
-
-    with torch.no_grad():
-        narrow = copy.deepcopy(model).to(torch.bfloat16)
-        np.save(directory / 'hidden_bf16.npy', narrow.model(tokens).last_hidden_state.float().numpy())
-    # Its float64 twin (`float64_twin`), whose inverse frequencies are built in float64.
-    wide = float64_twin(model)
-    with float64(), torch.no_grad():
-        np.save(directory / 'hidden_f64.npy', wide.model(tokens).last_hidden_state.double().numpy())
 
 
 def tiny_qwen3() -> Qwen3ForCausalLM:
