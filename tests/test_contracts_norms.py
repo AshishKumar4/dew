@@ -67,8 +67,9 @@ def plain_rms(x, epsilon: float = 1e-6):
 
 
 def _declared_cube(declare: str):
-    """The cube declared through `dew.nn.derivatives`' function `declare`, its rule the cube's own derivative
-    (a backward over residuals, or a tangent), so every order it takes is the plain formula's."""
+    """The cube declared through `dew.nn.derivatives`' builder `declare` as a rule its numerics need as
+    written (`Protected`), its rule the cube's own derivative (a backward over residuals, or a tangent), so
+    every order it takes is the plain formula's."""
     from dew.nn import derivatives
 
     def cube(x):
@@ -78,24 +79,23 @@ def _declared_cube(declare: str):
         def tangent(primals, tangents):
             [x], [dx] = primals, tangents
             return cube(x), 3 * x * x * dx
-        return getattr(derivatives, declare)(cube, tangent)
+        return getattr(derivatives, declare)(derivatives.Protected(), cube, tangent)
 
     def forward(x):
         return cube(x), x
 
     def backward(x, cotangent):
         return (3 * x * x * cotangent,)
-    return getattr(derivatives, declare)(cube, forward, backward)
+    return getattr(derivatives, declare)(derivatives.Protected(), cube, forward, backward)
 
 
-@pytest.mark.parametrize("declare", ["kernel_derivative", "numerics_derivative", "kernel_tangent",
-                                     "numerics_tangent"])
+@pytest.mark.parametrize("declare", ["declared_derivative", "declared_tangent"])
 @pytest.mark.parametrize("edge", EDGES)
 def test_a_declared_derivative_holds_every_order(declare, edge):
-    """`dew.nn.derivatives`' declaring functions (a kernel's or a rule's reverse-mode derivative, a kernel's
-    or a rule's tangent): a cube declared with its own derivative holds every order it takes finite wherever
-    float64 is a normal float32 and the plain formula is; a reverse-mode rule takes no forward order, as a
-    bare `jax.custom_vjp` takes none (`REVERSE_ONLY`)."""
+    """`dew.nn.derivatives`' declaring builders (a reverse-mode derivative and a tangent, each of a kind): a
+    cube declared with its own derivative holds every order it takes finite wherever float64 is a normal
+    float32 and the plain formula is; a reverse-mode rule takes no forward order, as a bare `jax.custom_vjp`
+    takes none (`REVERSE_ONLY`)."""
     declared = _declared_cube(declare)
     (x,) = normal_draw(4012, (5,), scale=EDGES[edge] ** (1 / 3))
     (direction,) = normal_draw(4013, (5,), scale=EDGES[edge] ** (1 / 3))

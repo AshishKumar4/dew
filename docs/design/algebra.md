@@ -102,14 +102,14 @@ bodies, by the site's declared class:
   optimizes inside each body (`Surrogate`) and never replaces the rule with autodiff's derivative of the forward,
   nor equates the two.
 
-Each site declares its class where it defines its derivative (`dew.nn.derivatives`: `kernel_derivative`,
-`numerics_derivative`, `numerics_tangent`, `surrogate`; §6.10), so the class is read from the site, never
-inferred. A bare custom derivative in `src/dew` fails a slop check, not a default. Each declaring function
-wraps `jax.custom_vjp` or `jax.custom_jvp` and returns the derivative as one marked call of its kind, its
-primal, forward and backward one span (`dew.nn.derivatives.spanned`: its arrays the operands, static
-arguments bound in), so the check refuses `jax.custom_vjp` and `jax.custom_jvp` anywhere in `src/dew` but
-`dew/nn/derivatives.py` (a reference to JAX's `custom_vjp_call_p` is no application). Rows 4026 to 4030
-declare each lane's sites.
+Each site declares its class where it defines its derivative (`dew.nn.derivatives`: `declared_derivative` or
+`declared_tangent` with its kind, or `surrogate`; §6.10), so the class is read from the site, never inferred. A
+bare custom derivative in `src/dew` fails a slop check, not a default. Each declaring function wraps
+`jax.custom_vjp` or `jax.custom_jvp` and returns the derivative as one marked call of its kind, its primal,
+forward and backward one span (`dew.nn.derivatives.bound_span`: its arrays the operands, its other arguments
+and its `nondiff_argnums` bound in), so the check (SLOP026) refuses `jax.custom_vjp` and `jax.custom_jvp`
+anywhere in `src/dew` but `dew/nn/derivatives.py` (a reference to JAX's `custom_vjp_call_p` is no application).
+Rows 4026 to 4030 declare each lane's sites.
 
 ### 1.4 Facts and rules
 
@@ -316,7 +316,7 @@ because its Python API is still marked as subject to change.
 | `dew.algebra.linear_scan` | A recurrence's token update read as an affine map by rules, and its chunk form derived by identities and extracted under the work-span model (§6.9) |
 | `dew.algebra.cost` | `Price`, `CostModel` and error-aware DAG extraction |
 | `dew.algebra.error` | Dev time: each candidate DAG's error, sampled on its declaration's cases against the float64 truth |
-| `dew.nn.derivatives` | Below the engine, so every model module can import it: the marker primitive, its kinds, and the custom-derivative declarations (`kernel_derivative`, `numerics_derivative`, `numerics_tangent`, `surrogate`, row 3271) |
+| `dew.nn.derivatives` | Below the engine, so every model module can import it: the marker primitive, its kinds, and the custom-derivative declarations (`declared_derivative`, `declared_tangent`, each of a kind, and `surrogate`, row 3271) |
 | `dew.algebra.program` | The compile-time pass (`rewritten`), its switch (`passes`) and its report |
 | `dew.algebra.derive` | Template declarations and their derived forms |
 | `dew.algebra.generate` | The dev-time generator and its `--check` |
@@ -841,8 +841,8 @@ from there. What exists: the four kinds, `marked_call_p` with its transform rule
 `surrogate`, the precision transforms marked `Protected`, and the pass reading a marked call's kind
 (`program._within`, `program._opened`: a protected call an opaque leaf, a surrogate's and a kernel glue's body
 rewritten within its call, an Algebra span opened into the region around it, its call kept where no form
-lands), and the declaring functions (`kernel_derivative`, `kernel_tangent`, `numerics_derivative`,
-`numerics_tangent`, `surrogate`). Not yet: each lane's sites declared through them (rows 4026 to 4030), and the slop check.
+lands), the declaring functions (`declared_derivative`, `declared_tangent`, `surrogate`), and the slop check
+(SLOP026), which lands once each lane's sites are declared through them (rows 4026 to 4030).
 
 ```python
 class Protected: ...                  # error-free transforms and numerics bodies (§1.2, §1.3)
@@ -857,9 +857,8 @@ marked_call_p: jax.extend.core.Primitive   # a call: params jaxpr (a ClosedJaxpr
 
 def marked(kind: Kind, fn: Callable) -> Callable: ...   # fn traced as one marked_call of its body
 
-def kernel_derivative(fn, fwd, bwd) -> Callable: ...    # custom_vjp with KernelGlue bodies
-def numerics_derivative(fn, fwd, bwd) -> Callable: ...  # custom_vjp with Protected bodies
-def numerics_tangent(fn, jvp) -> Callable: ...          # custom_jvp with a Protected rule
+def declared_derivative(kind, fn, fwd, bwd, *, nondiff_argnums=()) -> Callable: ...  # a custom_vjp of `kind`
+def declared_tangent(kind, fn, jvp, *, nondiff_argnums=()) -> Callable: ...         # a custom_jvp of `kind`
 def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
     # row 3271: the value forward's exactly; derivative(primals, tangents, value) the declared output tangent,
     # linear in the tangents, so reverse mode transposes it and higher orders differentiate it
@@ -880,7 +879,7 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
   marked call, so the compiled program holds none.
 - `dew.nn.precision`'s error-free transforms are `marked(Protected(), …)`, replacing the name scope the first cut
   reads.
-- Every custom-derivative site declares itself through one of the four declarations, in place of a bare
+- Every custom-derivative site declares itself through one of the three declarations, in place of a bare
   `jax.custom_vjp` or `jax.custom_jvp`. `linear_tangent` takes its caller's declared kind: `KernelGlue` at a kernel
   site, `Protected` at a numerics one (`sampling.flow`'s KL, the chunked heads, `nn.precision`'s products), and
   `Algebra` at nGPT's join and normed hidden, which the compile-time sets rewrite until the engine retires them. A bare custom derivative in `src/dew` fails a slop check, so the inventory of §1.3 stays complete.
