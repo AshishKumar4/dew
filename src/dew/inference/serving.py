@@ -624,8 +624,8 @@ class Server:
         """The groups of slots on this process's devices, which it seats and reads: every group on one
         process; on a mesh over several, each process its own, and every step agreed among them
         (`_agreed`)."""
-        self._pooled = self._admitted is not None and not self._admitted.is_fully_addressable
-        """Whether the server's mesh spans several processes, which step it together."""
+        self.pooled = self._admitted is not None and not self._admitted.is_fully_addressable
+        """Whether the server's mesh spans several processes, which step it together (`run`, `step`)."""
 
         with self._context():
             groups, source_shapes = packed_layout(model, variables)
@@ -1074,7 +1074,7 @@ class Server:
         admission's width): this process's alone on a mesh within one process. A step is one program
         every process enters, so a server over several processes is stepped on each of them together,
         through `run` or `step`, not by an `Engine` of each's own."""
-        return from_every_process(value) if self._pooled else [value]
+        return from_every_process(value) if self.pooled else [value]
 
     def __call__(
         self,
@@ -1219,7 +1219,7 @@ class Server:
         """This process's rows of an admission's arrays placed as the admission is (`_admitted`): every row
         where one process holds the mesh, and on a mesh over several, the admission's global arrays made
         of each process's rows."""
-        if not self._pooled:
+        if not self.pooled:
             return jax.device_put(local, self._admitted)
         assert self._admitted is not None, "a server over several processes is on a mesh"
         return [jax.make_array_from_process_local_data(self._admitted, np.asarray(leaf)) for leaf in local]

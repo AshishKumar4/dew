@@ -395,6 +395,10 @@ class NativeRolloutServer:
             raise ValueError("a rollout's draws end on its policy's EOS ids or stop strings, or are cut "
                              "short; this server's task also ends rows on criteria of its own, which no "
                              "draw's policy names")
+        if server.pooled:
+            raise ValueError("a rollout server's engine steps its server from one process, and this one's "
+                             "mesh spans several, which step it together (Server.run): serve each "
+                             "process's rollouts from a server over its own devices")
         reads = bool(progressed(server.model, Progress(jnp.asarray(version, jnp.int32))))
         if reads and server.progress.updates is None:
             raise ValueError("a run's versions draw a model that reads the run's progress at their updates "

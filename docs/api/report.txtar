@@ -520,6 +520,7 @@ dew.config.lm.ServedRollout
   ahead: int = 1
   max_lag: int = 1
   sync_every: int = 1
+  page_size: int | None = None
 dew.config.sweep.GridSearch
 dew.config.sweep.OptunaSearch
   seed: int = 0
