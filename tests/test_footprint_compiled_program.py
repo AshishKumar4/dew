@@ -83,6 +83,30 @@ def test_a_called_program_holds_what_it_would_inline(case):
         assert peak(called) == held
 
 
+def test_a_program_held_by_many_equations_is_compiled_once_and_holds_what_it_did():
+    """A body traced once and run by many equations (a layer's checkpoint called again and again) is
+    compiled once a call (`compiled`'s `made`), each equation inlining it afresh, and the program compiled
+    so holds what compiling it for each held: a Qwen3.5-4B step's gradient compiled 90,259 programs,
+    eight of its derivation's sixteen seconds a candidate (row 4261)."""
+    layer = jax.checkpoint(lambda h, w: jnp.tanh(h @ w))
+
+    def layers(h, weights):
+        for w in weights:
+            h = layer(h, w)
+        return jnp.sum(h)
+
+    weights = [jax.ShapeDtypeStruct((64, 64), jnp.float32)] * 8
+    program = jax.make_jaxpr(jax.grad(layers))(jax.ShapeDtypeStruct((16, 64), jnp.float32), weights).jaxpr
+    bodies = [equation.params["jaxpr"] for equation in program.eqns
+              if equation.primitive.name == "checkpoint"]
+    assert len(bodies) >= 8 and len({id(body) for body in bodies}) < len(bodies)
+    made = {}
+    once = compiled(program, "cuda", made)
+    assert len(made) < len(bodies) + 1
+    assert peak_bytes(once, "gpu", Workspace(0, 0)) == peak_bytes(compiled(program, "cuda"), "gpu",
+                                                                   Workspace(0, 0))
+
+
 def test_a_shard_map_over_one_device_holds_what_it_would_inline():
     """A `shard_map` whose manual axes are all of size one is its body inline in the program XLA compiles
     (`_shard_map_lowering_shardy`, jax/_src/shard_map.py: no manual computation is made), so a gradient
