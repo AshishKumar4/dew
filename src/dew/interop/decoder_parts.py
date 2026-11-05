@@ -2075,6 +2075,12 @@ class DecoderFamily:
     aliases: Mapping[str, str] = field(default_factory=dict)
     """The config class's `attribute_map`: another spelling of a field, read as that field before
     `defaults` fill what neither spells."""
+    prediction_counts: tuple[str, ...] = ('num_nextn_predict_layers',)
+    """The fields the family's config counts its multi-token prediction depths by, as its config class
+    names them; an alias that spells one (`aliases`) counts it too (`kept_depths`)."""
+    whole_drafter: Callable[[Mapping[str, object], int], dict] | None = None
+    """Where the family's prediction stages draft as one (DSpark's), the fields a config keeping `kept`
+    of them states differently (`kept_depths`): the drafter whole or, at 0, none."""
     release_code: SourceCode | None = None
     """The release whose own code is the family's reference, where transformers has no class for it:
     a model exported natively (`PretrainedDecoder.from_model`) writes its `auto_map` and its modules,
@@ -2111,6 +2117,19 @@ class DecoderFamily:
     wrapper's text config (Kimi K2.5's, through DeepSeek V3's reader, and K3's, through the reader
     Kimi Linear shares), or a config of the mixture-of-experts LLaDA sources, whose model_type 'llada'
     also names the dense one."""
+
+    def kept_depths(self, config: Mapping[str, object], kept: int) -> dict:
+        """The fields `config`, one scope of a source's config (its top, or a wrapper's `text_config`),
+        states differently as the config of a checkpoint holding the family's first `kept` prediction
+        depths alone (`Pretrained.load(prediction_depths=)`): each count by the family's spelling, an
+        alias or its default (`prediction_counts`, `aliases`, `defaults`) at most `kept`, and a drafter
+        the family drafts whole kept whole or not at all (`whole_drafter`)."""
+        stated = {**self.defaults, **config}
+        counts = {*self.prediction_counts,
+                  *(alias for alias, name in self.aliases.items() if name in self.prediction_counts)}
+        changed = {name: kept for name in counts
+                   if type(stated.get(name)) is int and stated[name] > kept}
+        return changed if self.whole_drafter is None else {**changed, **self.whole_drafter(stated, kept)}
 
     def readings(self, tensors: Mapping[str, Stored],
                  config: Mapping[str, object]) -> tuple[Reading, ...]:

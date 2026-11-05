@@ -26,6 +26,7 @@ from flax import linen as nn
 from flax.core.scope import DenyList
 
 from .decoder_stack import WRITTEN, Loop, PassView, SharedPassView
+from .layer_names import group_layers
 
 
 def _preamble(model, loop: Loop, x, injected, *, stop: bool):
@@ -70,7 +71,7 @@ class PassStack:
                 out[collection] = tree
             elif self._per_pass(collection):
                 passes = [view.inside({collection: tree})[collection] for view in self.views]
-                named = [{name: value for name, value in entries.items() if _is_layer(name)}
+                named = [{name: value for name, value in entries.items() if group_layers(name) is not None}
                          for entries in passes]
                 out[collection] = {name: jax.tree.map(lambda *leaves: jnp.stack(leaves),
                                                       *(entries[name] for entries in named))
@@ -91,8 +92,8 @@ class PassStack:
                 if self._per_pass(collection):
                     out.setdefault(collection, {}).update(
                         {view._moved(name, view.offset - view.first): value
-                         for name, value in entries.items() if _is_layer(name)})
-                    entries = {name: value for name, value in entries.items() if not _is_layer(name)}
+                         for name, value in entries.items() if group_layers(name) is not None})
+                    entries = {name: value for name, value in entries.items() if group_layers(name) is None}
                 out[collection] = _merged(out.get(collection, {}), entries)
         return out
 
@@ -113,10 +114,6 @@ def _appended(held, sown):
     if isinstance(sown, tuple):
         return (*(held or ()), *sown)
     return sown
-
-
-def _is_layer(name: str) -> bool:
-    return name.startswith('layers_')
 
 
 def run_loop(model, x, *, train: bool, decode: bool, **inputs):

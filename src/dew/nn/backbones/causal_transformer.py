@@ -1524,7 +1524,7 @@ class CausalTransformer(LinearProducts):
         does; `layer_state` reads one layer back. Neither is a Flax method, so
         the filter the capture calls on every module runs no module call.
         """
-        return method == "__call__" and (module.name or "").startswith("layers_")
+        return method == "__call__" and group_layers(module.name or "") is not None
 
     layer_collections: ClassVar[tuple[str, ...]] = (_INTERMEDIATES, _FINAL)
     """The collections a reader of layer states opens (`LayerStates`)."""
