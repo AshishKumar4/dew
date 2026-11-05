@@ -1360,7 +1360,7 @@ pyzmq==27.2.0
     #   ipykernel
     #   jupyter-client
     #   jupyter-server
-qwix==0.1.8.post2
+qwix==0.1.8.post3
     # via
     #   dewml (pyproject.toml)
     #   tokamax
