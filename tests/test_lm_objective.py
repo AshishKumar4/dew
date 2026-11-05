@@ -165,6 +165,47 @@ def test_loss_is_the_cross_entropy_of_the_shifted_sequence():
     assert written_cross_entropy(objective.model)(params, tokens) != unshifted
 
 
+class NativeLanguageModel(nn.Module):
+    """A Linen language model as one writes it with no Dew contract in mind: its `__call__` gives the
+    sequence's logits, and it names no `logits` method."""
+
+    causal: bool = True
+
+    @nn.compact
+    def __call__(self, tokens, **_):
+        return nn.Dense(VOCAB, dtype=jnp.float32)(nn.Embed(VOCAB, 8)(tokens))
+
+
+class AliasedLanguageModel(NativeLanguageModel):
+    """`NativeLanguageModel` with the method that only forwards to its call, which the objective required."""
+
+    def logits(self, tokens, **fields):
+        return self(tokens, **fields)
+
+
+def test_a_native_models_call_is_scored_with_no_method_that_forwards_to_it():
+    """A model whose `__call__` gives its logits and which names no `logits` is scored by its own forward
+    (`forward_method`), as a caller of `apply` reads it: the objective's loss over it and its gradient are
+    the ones the same model with a `logits` that only forwards to `__call__` gives, bit for bit, where the
+    objective refused it without that method (row 171)."""
+    from dew.nn.protocols import forward_method
+
+    native, aliased = NativeLanguageModel(), AliasedLanguageModel()
+    assert forward_method(native, "logits") == forward_method(native, "hidden_states") == "__call__"
+    assert forward_method(aliased, "logits") == "logits"
+    tokens = token_batch()
+    scored = []
+    for model in (native, aliased):
+        objective = make_objective(model=model, ema_decay=None, token_accuracy=False)
+        params = objective.init(jax.random.key(0))
+        def loss(params, objective=objective):
+            return objective.scalar_loss(params, {TEXT_KEY: tokens}, step_at())[0]
+
+        scored.append(jax.jit(jax.value_and_grad(loss))(params))
+    for native_leaf, aliased_leaf in zip(*map(jax.tree.leaves, scored), strict=True):
+        np.testing.assert_array_equal(np.asarray(native_leaf), np.asarray(aliased_leaf))
+
+
 VALID_SEEDS = 8
 """Check 1's declared seeds for the loss of rows whose last token is invalid (`seeds_for`, paired)."""
 
