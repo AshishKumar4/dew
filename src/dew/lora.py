@@ -73,7 +73,7 @@ from dew.cache import INTERCEPTED
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_names import group_layers, stored_layers
-from dew.nn.dense import _contractions, _linear_site
+from dew.nn.dense import _contractions, _linear_site, _plain_dense
 from dew.nn.dropout import Dropout
 from dew.nn.flops import (
     MissingFlopsCount,
@@ -82,7 +82,8 @@ from dew.nn.flops import (
     parameter_flops,
     projection_flops,
 )
-from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general
+from dew.nn.kernels import gemm, selection
+from dew.nn.precision import accumulated, at_least_fp32, biased, float32_dot_general
 from dew.nn.protocols import (
     Counted,
     CountedConditionedSpatial,
@@ -844,6 +845,9 @@ class _Branch:
         if not _linear_site(context, "/".join(root + module.path)):
             return next_fun(*args, **kwargs)
         x = args[0] if args else kwargs["inputs"]
+        fused = self._fused(module, x, target)
+        if fused is not None:
+            return fused
         output = next_fun(*args, **kwargs)
         axes, batch_dims = _contractions(module, x.ndim)
         if batch_dims:
@@ -875,6 +879,38 @@ class _Branch:
             x = Dropout(self.dropout, deterministic=False)(x)
         return output + _low_rank(module, x, a, b, _scale(target, self.rslora), axes, rowwise=False)
 
+
+    def _fused(self, module: nn.Module, x: jax.Array, target: Target) -> jax.Array | None:
+        """The site's adapted output as one template product (`gemm.low_rank`, row 1304) where its selector
+        names it (`gemm.LOW_RANK`: by name until a receipt qualifies it) and the site is a plain dense layer
+        it takes: initialized, its kernel a matrix, a product of its own (no quantizing product class), no
+        adapter set's rows, no dropout drawn on the branch; its operands promoted as the layer promotes them,
+        its bias added after. None everywhere else, where the base product and the update run apart."""
+        if (self.bound.names or not _plain_dense(module) or module.is_initializing()
+                or not module.has_variable("params", "kernel")):
+            return None
+        if self.dropout and module.has_rng("dropout"):
+            return None
+        kernel = meta.unbox(module.get_variable("params", "kernel"))
+        # A plain Dense contracts `x`'s last axis, with no batch axes.
+        if (kernel.ndim != 2
+                or not all(module.has_variable("params", factor) for factor in LOW_RANK_FACTORS)
+                or module.dot_general_cls is not None
+                or module.dot_general not in (None, float32_dot_general)):
+            return None
+        if selection.select(gemm.LOW_RANK, None).kernel != "fused":
+            return None
+        a, b = (meta.unbox(module.get_variable("params", factor)) for factor in LOW_RANK_FACTORS)
+        # Promoted as the layer promotes its operands, and the adapter its factors (`_low_rank`).
+        x, kernel, a, b = promote_dtype(x, kernel, a, b, dtype=module.dtype)
+        rows = x.reshape(-1, x.shape[-1])
+        out = gemm.low_rank(rows, kernel, a, b, _scale(target, self.rslora), out_dtype=x.dtype,
+                            precision=module.precision)
+        out = out.reshape(*x.shape[:-1], kernel.shape[1])
+        if module.use_bias:
+            # The bias added as the layer adds it (`dense._biased`).
+            out = biased(out, meta.unbox(module.get_variable("params", "bias")))
+        return out
 
     def _selected(self, module: nn.Module, x: jax.Array) -> tuple[jax.Array, jax.Array]:
         """An adapter set's rows at `module` (`AdapterSet`), as `selected` names them, and the target's
