@@ -1002,20 +1002,24 @@ def test_a_server_drafts_speculative_blocks_as_a_lone_call_does(temperature, dec
 
 
 @pytest.mark.distributed
-def test_a_server_over_a_pool_draws_what_each_request_draws_alone(tmp_path):
+@pytest.mark.parametrize("paged", [False, True], ids=["dense", "paged"])
+def test_a_server_over_a_pool_draws_what_each_request_draws_alone(tmp_path, paged):
     """One server over a mesh that spans two processes, each seating and reading its own groups of rows and
-    the pool stepping it together, each step's admission agreed: every process's requests draw what one
-    process serving them all draws (ledger 1423)."""
+    the pool stepping it together, each step's admission, fields and restores agreed: a round of requests
+    on the second process alone, then a round with the longest request on it, serves every request what
+    one process serving them all draws, over a dense cache and a paged one sharing prompt pages; and an
+    engine, which steps one process's kinds, refuses the pooled server (ledger 1423)."""
     from pathlib import Path
 
     from process_support import run_pool, run_worker
 
     worker = Path(__file__).with_name("serving_worker.py")
     reports = run_pool("pooled_server", tmp_path / "pool", 2, script=worker, devices=2, fsdp_size=4,
-                       timeout=300)
-    single = run_worker("pooled_server", tmp_path / "single.json", script=worker, fsdp_size=1, devices=1)
-    assert reports[0]["tokens"] + reports[1]["tokens"] == single["tokens"]
-    assert reports[0]["lengths"] + reports[1]["lengths"] == single["lengths"]
+                       paged=paged or None, timeout=300)
+    single = run_worker("pooled_server", tmp_path / "single.json", script=worker, fsdp_size=1, devices=1,
+                        paged=paged or None)
+    assert {**reports[0]["drawn"], **reports[1]["drawn"]} == single["drawn"]
+    assert [report["engine"] for report in (*reports, single)] == ["refuses it", "refuses it", "takes it"]
 
 
 @pytest.mark.parametrize("cache", [None, KVCache(page_size=2, pages=64)], ids=["dense", "paged"])

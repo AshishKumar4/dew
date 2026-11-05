@@ -137,6 +137,7 @@ class Looked:
         self.waiting: list[str] = []
         self.answered: list[str] = []
         self.arrived = lambda: None
+        self.pooled = False
         self.hook: Callable[[], None] | None = None
         self.failure: BaseException | None = None
 
