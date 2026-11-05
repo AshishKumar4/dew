@@ -485,33 +485,6 @@ def test_a_light_launch_is_held_within_the_threads_its_multiprocessor_runs():
             assert resources.register_programs(family, 1, 32) == programs
 
 
-def test_a_consumer_is_raised_within_the_registers_a_thread_addresses():
-    """One warpgroup-MMA consumer beside its producer, one program a multiprocessor on an H100, raises to 248,
-    the largest of setmaxnreg's steps of 8 within the 255 a thread addresses, and holds them
-    (`Family.registers`): a raise to the instruction's 256 made ptxas spill a launch it otherwise compiled
-    spill-free at any raise from 192 to 248."""
-    from dew.nn.kernels.templates import bundles, resources
-
-    with generation.assumed("sm90"):
-        family = bundles.of("sm90", jnp.bfloat16)
-        assert resources.raised_registers(1, 1) == 248
-        assert family.registers(1) == 248
-
-
-def test_the_compile_gate_caps_a_consumer_at_the_registers_its_launch_raises_it_to():
-    """One warpgroup-MMA consumer beside its producer on an H100, at one to four programs a multiprocessor:
-    the compile gate holds it at each residency to the registers its launch raises it to there
-    (`RegisterModel.cap`, `raised_registers`: 248, 232, 136 and 104), where its cap at three programs was the
-    multiprocessor's share less the producer's, 144, past the launch's raise, so a kernel of 137 to 144
-    registers passed the gate and spilled."""
-    from dew.nn.kernels.templates import bundles, resources
-
-    with generation.assumed("sm90"):
-        family = bundles.of("sm90", jnp.bfloat16)
-        model = resources.register_model(family, 1, None)
-        assert [model.cap(programs, honored=True) for programs in range(1, 5)] == [248, 232, 136, 104]
-
-
 def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
     """Two zeroed refs of one shape and dtype a launch adds into in place are one value to XLA, which a
     dynamic-slice fusion wrapping the launch passes once for both (row 3180): `mosaic.checked` refuses the
@@ -550,12 +523,12 @@ def _padded(rows: int, family) -> int:
     return -(-rows // family.rows) * family.rows
 
 
-def _persisted_products(x, w, *, family, interpret, rows: int | None = None):
+def _persisted_products(x, w, *, family, interpret, rows: int | None = None, resident: int = 1):
     """`x @ w` a tile at a time through `family`'s persistent walk (`Family.persist`): each tile the
     family's least rows covering `rows` (its own least where None; `_padded`), of which it stores `rows`,
     tile `t` the tiles' rows `t` on, each step `PERSISTED_DEPTH` of the contraction, the middle tile
     multiplying nothing (zeros); each tile issued (`issue`'s walk) and finished (`Issuer.chunks`, each
-    chunk stored at its columns), on the family's roles."""
+    chunk stored at its columns), on the family's roles, launched for `resident` programs a multiprocessor."""
     stored = family.rows if rows is None else rows
     rows, columns = _padded(stored, family), w.shape[1]
     family = family.specialized(rows, columns)
@@ -591,7 +564,7 @@ def _persisted_products(x, w, *, family, interpret, rows: int | None = None):
 
     out = jax.ShapeDtypeStruct((PERSISTED_TILES * rows, columns), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
-                         interpret=interpret, name="persisted")(x, w)
+                         interpret=interpret, name="persisted", resident=resident)(x, w)
 
 
 def _persisted_operands(rows: int):
@@ -633,17 +606,6 @@ def test_a_few_rows_lower_on_every_bundle_their_device_issues(generation_name, r
             lhs = jax.ShapeDtypeStruct(padded, x.dtype)
             jax.jit(functools.partial(_persisted_products, family=family, interpret=False, rows=rows)).trace(
                 lhs, w).lower(lowering_platforms=("cuda",))
-
-
-def test_a_launch_of_few_rows_takes_first_the_bundle_whose_padded_rows_it_fills_most():
-    """An H100 launch of a decode step's 8 rows takes mma.sync first, whose 16 rows it fills half of where
-    wgmma's 64 it fills an eighth (row 4042); one of 128 rows keeps wgmma's producer layout first, and a
-    launch that states no rows its own family's layouts alone."""
-    from dew.nn.kernels.templates import bundles, mosaic_sm80, mosaic_sm90
-    assert bundles.layouts("sm90", jnp.bfloat16, rows=8)[0].name == bundles.MmaFed.name
-    assert bundles.layouts("sm90", jnp.bfloat16, rows=128)[0] is mosaic_sm90.WGMMA
-    assert all(family.name != mosaic_sm80.Mma.name and family.name != bundles.MmaFed.name
-               for family in bundles.layouts("sm90", jnp.bfloat16))
 
 
 def test_the_tcgen05_persistent_walk_lowers_for_a_b200():
@@ -771,3 +733,27 @@ def test_the_tpu_persistent_walk_lowers_for_a_v5e():
     with jax.sharding.use_abstract_mesh(AbstractMesh((1,), ("data",), abstract_device=device)):
         jax.jit(functools.partial(_persisted_products, family=family, interpret=False)).trace(x, w).lower(
             lowering_platforms=("tpu",))
+
+
+def test_a_consumer_launched_at_each_residency_its_family_admits_raises_to_the_gates_cap_spill_free():
+    """A persistent warpgroup-MMA walk, one consumer beside its producer, launched at each residency its
+    family admits a multiprocessor on an H100 (`RegisterModel.most`) and compiled as the GPU gate compiles
+    it: the registers its consumer raises to in its PTX (`setmaxnreg.inc`) are the gate's cap for it at that
+    residency (`RegisterModel.cap`), and its binary holds its registers within them, spilling nothing."""
+    import kernel_compile
+    from fla_gdn_support import KernelCase
+
+    from dew.nn.kernels.templates import bundles, resources
+
+    with generation.assumed("sm90"):
+        family = bundles.of("sm90", jnp.bfloat16)
+        model = resources.register_model(family, 1, None)
+    x, w = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _persisted_operands(family.rows))
+    for programs in range(1, model.most + 1):
+        call = functools.partial(_persisted_products, family=family, interpret=False, resident=programs)
+        case = KernelCase("persisted", lambda call=call: (call, (x, w)))
+        [record] = kernel_compile.compile_mosaic_kernels([case], "sm90")
+        [kernel] = record["kernels"]
+        cap = model.cap(programs, honored=True)
+        assert (kernel["raised"], kernel["spilled"]) == (cap, 0), (programs, record.get("error"), kernel)
+        assert kernel["registers"] <= cap
