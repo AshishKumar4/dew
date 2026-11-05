@@ -11,6 +11,7 @@ from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import NamedTuple, Protocol
 
 import jax
+import numpy as np
 from egglog import get_callable_args
 from jax.core import ShapedArray
 from jax.extend import core as jcore
@@ -217,6 +218,17 @@ class Operand(NamedTuple):
     load: Callable[[], jax.Array]
 
 
+def _scaled(operand: terms.Term, value: Callable[[terms.Term], jax.Array]) -> tuple:
+    """An exponential's operand as a declaration's exponential takes it (`derive.Reduction.exponential`): a
+    product of a value and a literal as the value and the literal's scale, so the exponential carries the
+    scale's product itself (raw logits' `exp((s - m) c)`, its rounding compensated); else the value alone."""
+    if (args := get_callable_args(operand, terms.Term.binary)) is not None and terms.text(args[1]) == "mul":
+        for scaled, literal in ((args[0], args[2]), (args[2], args[0])):
+            if get_callable_args(literal, terms.Term.literal) is not None:
+                return value(scaled), float(np.asarray(value(literal)))
+    return (value(operand),)
+
+
 def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping[Hashable, jax.Array], *,
               product: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
               chosen: Mapping[Hashable, terms.Term] | None = None,
@@ -265,7 +277,7 @@ def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping
                                            preferred_element_type=params.get("preferred_element_type"))
         elif (exponential is not None and (args := get_callable_args(term, terms.Term.unary)) is not None
               and terms.text(args[1]) == exponential[0]):
-            made = exponential[1](value(args[0]))
+            made = exponential[1](*_scaled(args[0], value))
         elif (rescale is not None and (args := get_callable_args(term, terms.Term.binary)) is not None
               and terms.text(args[1]) == terms.RESCALE):
             made = rescale(value(args[0]), value(args[2]))

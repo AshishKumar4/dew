@@ -953,20 +953,28 @@ def peaked(spec: Forward, m: jax.Array, new: jax.Array) -> tuple[jax.Array, jax.
 
 def carried(spec: Forward, m: jax.Array, safe: jax.Array) -> jax.Array:
     """The factor `exp(m - safe)` a state takes from its maximum `m` to `safe` (`peak`, `merge`), in the
-    accurate form with its exponent compensated (`peak`)."""
+    accurate form with its exponent compensated (`natural_carried`)."""
     if not spec.natural:
         return spec.power(m - safe)
+    return natural_carried(m, safe, raw=spec.raw, scale=spec.scale)
+
+
+def natural_carried(m: jax.Array, safe: jax.Array, *, raw: bool, scale: float) -> jax.Array:
+    """The accurate form's rescale `exp(m - safe)` (`carried`; the derived forms' declared rescale,
+    `declaration`), its exponent compensated: of raw products (`Forward.raw`) at their `scale`, else of
+    scaled logits."""
+    power = functools.partial(natural_exp, scale=scale) if raw else natural_exp
     # TwoSum: m - safe is difference + error exactly; raw, the scale's product with it is split exactly too
     # (TwoProduct over truncated halves, whose products are exact, so a compiler's contraction of any of
     # them into a fused multiply-add changes no bit); exp's derivative is itself.
     difference, error = two_sum(m, -safe)
-    alpha = spec.power(difference)
-    if spec.raw:
-        product, rounding = two_product(difference, np.float32(spec.scale), bit_split=True)
+    alpha = power(difference)
+    if raw:
+        product, rounding = two_product(difference, np.float32(scale), bit_split=True)
         alpha = natural_exp(product)
-        error = rounding + error * spec.scale
+        error = rounding + error * scale
     corrected = alpha * (1.0 + error)
-    return jnp.where(finite(corrected), corrected, spec.power(difference))
+    return jnp.where(finite(corrected), corrected, power(difference))
 
 
 def weights(spec: Forward, s: jax.Array, m: jax.Array, coords: Coords | None = None) -> jax.Array:
@@ -1757,7 +1765,8 @@ def value_parts(weights: jax.Array, dtype) -> Parts:
     return weights_parts(weights, dtype, rows=True)
 
 
-def softmax_of(logits: jax.Array, values: jax.Array, *, base2: bool, keys_first: bool = False) -> jax.Array:
+def softmax_of(logits: jax.Array, values: jax.Array, *, base2: bool, keys_first: bool = False,
+               held: bool = False, raw: float | None = None) -> jax.Array:
     """Attention's math on a template's formed tiles, whole (theme A's declaration, `declaration`): each
     query's softmax over its `logits` (scaled, in the exponent's base, -inf at each key it does not see, as
     `modify` forms them; `[rows, keys]`, or `[keys, rows]` where the tile holds its keys first, a decode
@@ -1765,12 +1774,19 @@ def softmax_of(logits: jax.Array, values: jax.Array, *, base2: bool, keys_first:
     the `values` `[keys, width]` by Dew's product in fp32 (`float32_einsum`, `[rows, width]`, or `[width,
     rows]` keys first), over their total; its weights anchored at its largest logit, at least the dtype's
     least finite value where it sees no key, so such a query's weights and output are zeros, with no mask an
-    element, and the anchor grows with the walk (a walked correction `exp(k_carried - k_now)` at most 1)."""
+    element, and the anchor grows with the walk (a walked correction `exp(k_carried - k_now)` at most 1). The
+    accurate form's (`declaration`'s `natural`) holds its largest's weight to 1 (`held`, `weights`), or, over
+    raw products (`Forward.raw`), scales each difference by their `raw` scale after the subtraction, its
+    exponential the one its declaration names."""
     exponent = jnp.exp2 if base2 else jnp.exp
     keys_axis = 0 if keys_first else 1
     m = jnp.max(logits, axis=keys_axis)
     safe = jnp.maximum(m, jnp.finfo(logits.dtype).min)
-    p = exponent(logits - (safe[None, :] if keys_first else safe[:, None]))
+    anchor = safe[None, :] if keys_first else safe[:, None]
+    difference = logits - anchor
+    if raw is not None:
+        difference = difference * np.float32(raw)
+    p = exponent(jnp.where(logits < anchor, difference, 0.0) if held else difference)
     total = jnp.sum(p, axis=keys_axis)
     over = jnp.where(total == 0, 1.0, total)
     subscripts, per_query = ("kq,kd->dq", over[None, :]) if keys_first else ("qk,kd->qd", over[:, None])
@@ -1778,7 +1794,8 @@ def softmax_of(logits: jax.Array, values: jax.Array, *, base2: bool, keys_first:
     return summed / per_query
 
 
-def declaration(*, base2: bool, keys_first: bool = False, factor: float | None = None):
+def declaration(*, base2: bool, keys_first: bool = False, factor: float | None = None, natural: bool = False,
+                raw: float | None = None):
     """Attention's forward as theme A's declaration (`dew.algebra.derive.Reduction`): `softmax_of` over the
     template's formed tiles, walked along the keys, its exponent the base the template folds (`folds`: 2
     where it folds `log2(e)` into its logits), its tile keys first where the mainloop holds it so; over the
@@ -1787,36 +1804,54 @@ def declaration(*, base2: bool, keys_first: bool = False, factor: float | None =
     hand step's 62 fewer multiplies a step at Qwen3's tile, its exponent's argument one fused multiply-add a
     logit (`rules._contracted`). Its derived forms stand beside this module's (`plain_step`, `merge`,
     `finish`), behind the one switch (`dew.algebra.forms.derived`, `derived_forms`), which they replace
-    only on par with them against float64 and no slower in the kernel (docs/design/algebra.md)."""
+    only on par with them against float64 and no slower in the kernel (docs/design/algebra.md). The accurate
+    form's (`natural`, `Forward.natural`) declares its exponential (`natural_exp`) and its rescale
+    (`natural_carried`, its exponent compensated), which the derivation evaluates as they are and rewrites
+    none: over scaled logits its largest weight held to 1 (`softmax_of`'s `held`), over raw products
+    (`Forward.raw`) each difference scaled by their `raw` scale, which the exponential carries and the
+    rescale compensates."""
     tile = ("keys", "rows") if keys_first else ("rows", "keys")
 
     def walked(logits, values):
         scaled = logits if factor is None else logits * np.float32(factor)
-        return softmax_of(scaled, values, base2=base2, keys_first=keys_first)
+        return softmax_of(scaled, values, base2=base2, keys_first=keys_first, held=natural and raw is None,
+                          raw=raw)
 
+    accurate = {"exponential": natural_exp,
+                "rescale": functools.partial(natural_carried, raw=raw is not None,
+                                             scale=1.0 if raw is None else raw)} if natural else {}
     return derive.Reduction(walked, {"logits": tile, "values": ("keys", "width")}, walked="keys",
-                            exponent=2 if base2 else "e")
+                            exponent=2 if base2 else "e", **accurate)
 
 
 @functools.cache
-def derived_forms(base2: bool, keys_first: bool = False, factor: float | None = None) -> derive.Derived:
-    """The forward's derived forms (`declaration`'s, the fast class), the template's behind the switch
+def derived_forms(base2: bool, keys_first: bool = False, factor: float | None = None, natural: bool = False,
+                  raw: float | None = None) -> derive.Derived:
+    """The forward's derived forms (`declaration`'s), the template's behind the switch
     (`dew.algebra.forms.derived`): `plain_step`, `merge` and `finish` take them in place of their own; a
-    step over raw products, their `factor` (`declaration`)."""
+    step over raw products, their `factor` (`declaration`). The fast form's are the fast class's; the
+    accurate form's (`natural`) the accurate class's, which admits no reordering past the error-free rules."""
     from dew.algebra import SATURATION
-    return derive.derive(declaration(base2=base2, keys_first=keys_first, factor=factor), accurate=False,
-                         saturation=SATURATION)
+    declared = declaration(base2=base2, keys_first=keys_first, factor=factor, natural=natural, raw=raw)
+    return derive.derive(declared, accurate=natural, saturation=SATURATION)
+
+
+def _form_key(spec: Forward) -> tuple:
+    """The accurate form's part of the derived forms' key (`derived_forms`): natural, and a raw product's
+    scale (`Forward.raw`); the fast form's none."""
+    return (True, spec.scale if spec.raw else None) if spec.natural else ()
 
 
 def states_derived(spec: Forward, *states: Partial) -> bool:
     """Whether the derived forms walk a state of `spec` (behind the switch, `dew.algebra.forms.derived`):
-    where the declaration states its walk. Its accurate forms (`Forward.natural`: the compensated exponent,
-    the largest weight held to 1, raw logits), its compensated running sums (`Forward.compensated`) and the
-    headroom guard's shifted sums (`Forward.headroom`, a state's `Guard`) are rounding and representation
-    choices the fast class's derivation does not make (error-aware extraction's compensation rules, §1.5, the
-    next build, docs/design/algebra.md §6.9): there the template's own forms run, under the replacement rule
-    (a derived form replaces a hand-written one only where it states the walk)."""
-    return derived_on() and not (spec.natural or spec.compensated or spec.headroom) and all(
+    where the declaration states its walk, the accurate form's among them (`Forward.natural`: its exponential
+    and its compensated rescale declared, its largest weight held to 1 or its raw products scaled after their
+    difference, `declaration`). Its compensated running sums (`Forward.compensated`) and the headroom guard's
+    shifted sums (`Forward.headroom`, a state's `Guard`) are representation choices the derivation does not
+    make yet (error-aware extraction's compensation rules, docs/design/algebra.md §6.9): there the template's
+    own forms run, under the replacement rule (a derived form replaces a hand-written one only where it states
+    the walk)."""
+    return derived_on() and not (spec.compensated or spec.headroom) and all(
         state.guard is None and state.low is None for state in states)
 
 
@@ -1832,7 +1867,7 @@ def _slotted(key: tuple, shapes: Mapping) -> tuple[str, ...]:
     return fields
 
 
-def _stated(spec: Forward, state: Partial) -> tuple[tuple[bool, bool], dict]:
+def _stated(spec: Forward, state: Partial) -> tuple[tuple, dict]:
     """The derived forms a merge or a finish of `state` reads, and the walk's tiles it names them by: its
     base's walk, queries first, over tiles of a key per query of fp32 values beside its rows: a merge's and a
     finish's forms read the state alone, a maximum, a total and a row's sums a query, the same at any keys a
@@ -1840,7 +1875,7 @@ def _stated(spec: Forward, state: Partial) -> tuple[tuple[bool, bool], dict]:
     are these, whatever walk came before (a hand-written step's, a dropping walk's, a supplied state)."""
     rows, width = state.m.shape[-1], state.acc.shape[-1]
     tiles = {"logits": ((rows, rows), jnp.float32), "values": ((rows, width), jnp.float32)}
-    return (spec.base2, False), tiles
+    return (spec.base2, False, None, *_form_key(spec)), tiles
 
 
 def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
@@ -1849,7 +1884,7 @@ def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     (`Keys.accumulate`), every product the mainloop's (`Keys.dot`)."""
     # Over the raw products where the mainloop gives them (`logits_of`), their factor the declaration's own.
     raw = keys.products is not None
-    key = (spec.base2, bool(keys.coords.keys_first), *((spec.factor,) if raw else ()))
+    key = (spec.base2, bool(keys.coords.keys_first), spec.factor if raw else None, *_form_key(spec))
     forms = derived_forms(*key)
     tiles = {"logits": keys.products if raw else keys.logits, "values": keys.values}
     fields = _slotted(key, {name: (value.shape, value.dtype) for name, value in tiles.items()})
