@@ -240,7 +240,8 @@ def forward_rows(form: str):
 def derived_backward(form: str, along: str):
     """The backward declaration's derived forms walked `along` key tiles (queries first) or query tiles (keys
     first), from the template forward's residual rows (`forward_rows`): its logits the tile's, -inf where
-    unseen, and D about no anchor (its whole `delta`)."""
+    unseen, and D about no anchor (its whole `delta`), each product the template's CPU mainloop's issuer
+    (`attention.interpreted_dot`), as its portable mainloop gives the derived forms theirs."""
     forms = derive.derive(attention_backward_algebra.backward_declaration(scale=SCALE, walked=along),
                           accurate=False, saturation=SATURATION)
     seen = seen_of(form)
@@ -265,7 +266,8 @@ def derived_backward(form: str, along: str):
                   "anchor": jnp.zeros_like(delta), "delta": delta, "seen": seen}
         parts = [tile(values, index) for index in range(LENGTH // BLOCK)]
         mapped = [forms.mapped(part) for part in parts]
-        dq, dk, dv, *_ = forms.finish(walked(forms, parts), values, shapes=shaped(parts[0]))
+        dq, dk, dv, *_ = forms.finish(walked(forms, parts, template.interpreted_dot), values,
+                                      shapes=shaped(parts[0]))
         if along == "rows":
             return jnp.concatenate([parts[0] for parts in mapped]), dk, dv
         return (dq, jnp.concatenate([parts[1] for parts in mapped]),
@@ -292,23 +294,14 @@ def oracle_backward(form: str):
     return run
 
 
-SERVED_BY_TEMPLATE = {("causal", "keys"), ("started", "keys")}
-"""The backward cells the template's own form serves, the derived form not on par there until the engine's
-error-aware extraction prices the choice that passes (docs/design/algebra.md §1.5, the generator's first
-acceptance case, row 3310; a causal call walked queries first, whose derived dV erred 1.62 times the
-template's, 1.74 where its first queries see no key)."""
-
-
 @pytest.mark.parametrize("walked", ["keys", "rows"], ids=["queries-first", "keys-first"])
 @pytest.mark.parametrize("form", list(SPANS))
-def test_the_backward_serving_each_cell_is_on_par(form, walked):
-    """The backward form serving each cell on par against the float64 gradients (check 1): the backward
-    declaration's derived forms, walked queries first or keys first, held to the template's own backward at
-    the same tiles; the template's form where it serves (`SERVED_BY_TEMPLATE`), held to XLA's."""
-    if (form, walked) in SERVED_BY_TEMPLATE:
-        served, reference = oracle_backward(form), xla_backward(form)
-    else:
-        served, reference = derived_backward(form, walked), oracle_backward(form)
+def test_the_derived_backward_is_on_par_in_every_cell(form, walked):
+    """The backward's derived forms on par against the float64 gradients (check 1) in every cell: the backward
+    declaration's forms, walked queries first or keys first, held to the template's own backward at the same
+    tiles, each product the mainloop's issuer (row 3310: a queries-first walk's dV over all of a key tile's
+    queries at once, by Dew's fp32 product in place of the issuer's, erred 1.63 times the template's)."""
+    served, reference = derived_backward(form, walked), oracle_backward(form)
     assert_as_exact(jax.jit(served), jax.jit(reference), backward_draw,
                     f"attention backward {form} {walked}", seeds=16, truth_fn=xla_backward(form))
 

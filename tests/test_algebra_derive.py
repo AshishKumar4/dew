@@ -126,11 +126,12 @@ def shaped(tile: dict) -> dict:
     return {name: (value.shape, value.dtype) for name, value in tile.items()}
 
 
-def walked(forms: derive.Derived, tiles: list[dict]):
-    """The state after stepping each of `tiles` (its operands' tiles) in order, from the empty state."""
+def walked(forms: derive.Derived, tiles: list[dict], product=None):
+    """The state after stepping each of `tiles` (its operands' tiles) in order, from the empty state, each
+    product `product`'s where given (a mainloop's issuer)."""
     state = forms.init(shaped(tiles[0]))
     for tile in tiles:
-        state = forms.step(state, tile)
+        state = forms.step(state, tile, product=product)
     return state
 
 
