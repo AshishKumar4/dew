@@ -28,7 +28,7 @@ import jax
 from dew._records import integer, number, record
 from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
 from dew.data.pipeline import Dataset, cut_unit
-from dew.decision.data import made_by
+from dew.decision.data import SCHEDULE_MIXTURE, made_by
 from dew.decision.head import DecisionHead, JointSchemaHead, LabelReadout
 from dew.decision.laya import LAYA
 from dew.decision.layout import (
@@ -99,6 +99,7 @@ class DecisionRunConfig(DecoderRunConfig):
 
     RESUMABLE: ClassVar[tuple[str, ...]] = (*DecoderRunConfig.RESUMABLE, "calibrate")
     BUILT: ClassVar[tuple[str, ...]] = (*DecoderRunConfig.BUILT, "option_text")
+    UNSEEDED: ClassVar[str] = SCHEDULE_MIXTURE
 
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("decision"))
     """The decision objective and its arguments: its scoring rule (`loss`),
@@ -298,7 +299,9 @@ class DecisionRunConfig(DecoderRunConfig):
             weights = record(facts["mixture_weights"], "mixture_weights")
             summary["mixture"] = {name: value for name, value in weights.items()
                                   if number(value, f"mixture_weights.{name}") > 0}
-            summary["made"] = made_by(facts)
+            made = made_by(facts)
+            if made is not None:
+                summary["made"] = made
         # Compiled once: `train` reads the run's length and cadences off this loader and trains on it.
         dataset, held = self.compiled(objective.data(), self.chain(), self.validation)
         summary["records"] = dataset.records

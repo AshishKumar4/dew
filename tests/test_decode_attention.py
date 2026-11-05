@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_arithmetic import float64_held
 from attention_oracle import attention_terms, exact_attention, float64_weights
 from model_support import as_stepped
 from one_draw import assert_as_exact_as_the_reference
@@ -464,7 +465,7 @@ def test_a_windowed_decode_step_attends_as_its_whole_pass():
     variables = model.init(jax.random.key(0), tokens)
     whole = as_stepped(jax.jit(lambda held: model.apply(variables, held)), tokens, 4)
     with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
+        wide = float64_held(variables)
         truth = np.asarray(model.clone(dtype=jnp.float64).apply(wide, tokens), np.float64)
     cache = model.apply(variables, 2, method=CausalTransformer.init_cache, mutable=["cache"])[1]["cache"]
     _, state = model.apply({**variables, "cache": cache}, tokens[:, :4], decode=True, mutable=["cache"])

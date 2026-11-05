@@ -19,6 +19,7 @@ from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import (
+    AURC,
     ECE,
     Accuracy,
     Brier,
@@ -95,6 +96,26 @@ def test_ece_and_accuracy_merge_across_batches_as_one_pass():
     assert whole == pytest.approx(laya, abs=1e-12) and merged == pytest.approx(laya, abs=1e-12)
     accuracy = Accuracy()
     assert accuracy.finalize(accuracy(decisions(tops, correct), {})) == pytest.approx(correct.mean())
+
+
+def test_aurc_merges_a_pass_without_copying_its_answers_until_it_finalizes():
+    """AURC merged batch by batch is the whole pass's, and merging copies none of a batch's answers: it
+    keeps each batch's as it came and joins them once, at the pass's end, where joining every batch onto
+    the answers before it copied them once a batch after, quadratic in a pass's batches (row 3942)."""
+    rng = np.random.default_rng(2)
+    tops = rng.uniform(0.5, 1.0, 400)
+    correct = rng.uniform(size=400) < tops
+    metric = AURC()
+    whole = metric.finalize(metric(decisions(tops, correct), {}))
+    batches = [metric(decisions(tops[start:start + 10], correct[start:start + 10]), {})
+               for start in range(0, len(tops), 10)]
+    held = batches[0]
+    for batch in batches[1:]:
+        held = metric.merge(held, batch)
+    kept = jax.tree.leaves(held)
+    assert all(any(np.shares_memory(answers, merged) for merged in kept)
+               for batch in batches for answers in jax.tree.leaves(batch))
+    assert metric.finalize(held) == whole
 
 
 TOKENIZER = ByteTokenizer()

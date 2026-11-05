@@ -223,7 +223,8 @@ def a_fused_attention_counts_the_pairs_its_mask_computes(window):
 def test_a_fused_attention_counts_its_value_product_at_the_values_width():
     """`Q K^T` and its two backward products run at the query's width, `P V` and its two at the
     value's, which a model may set apart (MiMo's 192 and 128): FlashAttention-3's forward and
-    backward calls, as the wheel issues them, count each product at its own width."""
+    backward calls, as the wheel issues them, count each product at its own width, and the
+    backward's recomputed `Q K^T` in the hardware's count alone."""
     batch, length, heads, query_width, value_width = 1, 64, 2, 192, 128
     module = f"""HloModule step
 
@@ -242,7 +243,9 @@ custom_call_target="dew_flash3_mha_bwd", api_version=API_VERSION_TYPED_FFI
     counted = hlo_flops(module)
     assert counted is not None
     product = 2 * batch * heads * length * length
-    assert counted.hardware == (1 + 2) * product * (query_width + value_width)
+    assert counted.model == (1 + 2) * product * (query_width + value_width)
+    # The backward recomputes its scores, `Q K^T` at the query's width, the hardware's work alone.
+    assert counted.hardware == counted.model + product * query_width
 
 
 UNSIZED = """HloModule step

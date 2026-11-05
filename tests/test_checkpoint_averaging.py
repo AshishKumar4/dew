@@ -10,9 +10,9 @@ import shutil
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 import pytest
 from etils import epath
+from optim_support import stage_local_sgd
 from reference_error import as_given, assert_as_exact
 
 from dew.batch import freeze, thaw
@@ -55,7 +55,8 @@ def trained(directory, steps: int, *, adapted: bool, key: int = 0, ema_decay: fl
     rows = [{"text": (np.arange(9, dtype=np.int32) + index) % 16} for index in range(16)]
     data = compile(Memory(rows).shuffle(key).repeat().batch(8), read="memory", loading=LOADING)
     checkpoints = Checkpoints(str(directory), keep=1)
-    Trainer(objective, optax.sgd(0.5), key=key, checkpoints=checkpoints, mesh=mesh or MeshSpec()).fit(
+    # A schedule's rate, so a staged run keeps its layers stage-local (`stage_local_sgd`, row 3996).
+    Trainer(objective, stage_local_sgd(0.5), key=key, checkpoints=checkpoints, mesh=mesh or MeshSpec()).fit(
         data, steps=steps, checkpoint_every=steps, log_every=100)
     checkpoints.wait()
     return str(directory)

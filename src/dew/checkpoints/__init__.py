@@ -83,7 +83,7 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 from dew import _records
 from dew._coordination import broadcast_from_process_zero, from_every_process, seen_by_every_process
 from dew._hashing import fmix32
-from dew._records import JSON, duration, json_value, record, share
+from dew._records import JSON, duration, json_value, record, share, text
 from dew.batch import PARAMETER_ROOTS, Variables
 from dew.checkpoints._step_records import counted_processes, gather_positions, read_position, step_record
 from dew.checkpoints.served import unpacked
@@ -307,30 +307,33 @@ def _kept(step: int, metrics: Mapping[str, float], custom: Mapping) -> Kept:
                 rankings=copy.deepcopy(rules))
 
 
-def step_artifact(step_directory: str) -> JSON:
-    """The inference declaration the step at `step_directory` records (`Checkpoints.artifact`), Orbax
-    reading the step's metadata alone, opening no manager; None where it records none or is no Orbax
-    step."""
+def _step_custom(step_directory: str) -> Mapping[str, object] | None:
+    """The custom metadata the step at `step_directory` records, Orbax reading the step's metadata alone,
+    opening no manager; None for a directory that is no Orbax step. One whose metadata does not read
+    raises, naming it."""
     if not (epath.Path(step_directory) / "_CHECKPOINT_METADATA").exists():
         return None
-    custom = ocp.metadata.get_step_metadata(step_directory).custom_metadata or {}
-    return json_value(custom.get("artifact"), "artifact")
+    try:
+        return ocp.metadata.get_step_metadata(step_directory).custom_metadata or {}
+    except ValueError as error:
+        raise ValueError(f"{step_directory}'s step metadata does not read") from error
+
+
+def step_artifact(step_directory: str) -> JSON:
+    """The inference declaration the step at `step_directory` records (`Checkpoints.artifact`,
+    `_step_custom`); None where it records none or is no Orbax step."""
+    custom = _step_custom(step_directory)
+    return None if custom is None else json_value(custom.get("artifact"), "artifact")
 
 
 def frozen_entries(step_directory: str) -> list[str]:
-    """The `FROZEN_STORE` entries the step at `step_directory` records,
-    relative to its run directory, which `dew.io.publish` carries beside it.
-
-    Orbax reads the step's metadata, opening no manager. A directory with
-    none, which is no Orbax step, records no entry; one whose metadata does
-    not read raises."""
-    if not (epath.Path(step_directory) / "_CHECKPOINT_METADATA").exists():
-        return []
-    try:
-        custom = ocp.metadata.get_step_metadata(step_directory).custom_metadata or {}
-    except ValueError as error:
-        raise ValueError(f"{step_directory}'s step metadata does not read") from error
-    digests = {digest for names in (custom.get("frozen") or {}).values() for digest in names.values()}
+    """The `FROZEN_STORE` entries the step at `step_directory` records (`_step_custom`), relative to its
+    run directory, which `dew.io.publish` carries beside it; none for a directory that is no Orbax
+    step."""
+    custom = _step_custom(step_directory)
+    frozen = {} if custom is None else record(custom.get("frozen") or {}, "frozen")
+    digests = {text(digest, "frozen digest") for names in frozen.values()
+               for digest in record(names, "frozen").values()}
     return [f"{FROZEN_STORE}/{digest}" for digest in sorted(digests)]
 
 

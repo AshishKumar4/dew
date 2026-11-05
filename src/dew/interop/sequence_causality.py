@@ -36,8 +36,7 @@ from jax.core import ShapedArray
 from jax.extend import core
 
 from dew.nn.nested import nested
-from dew.nn.programs import CALLS
-from dew.training.compiled_program import bodies
+from dew.nn.programs import CALLS, bodies
 
 CAUSAL_ATTENTION = "causal attention"
 """The rule of a program tier 3's attention runs (`torchax_fallback._dew_attention`, `attested`), causal

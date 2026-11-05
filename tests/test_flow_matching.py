@@ -162,9 +162,11 @@ def mixture_contrasts(runs: np.ndarray) -> dict[str, np.ndarray]:
     return contrasts | within("third channel's spread", samples[..., 2].std(axis=1), MODE_STD, 0.04)
 
 
+@pytest.mark.shards(units=80, per_task=27)
 def test_flow_matching_learns_a_two_mode_mixture():
     """Flow matching learns the mixture: over independent training runs, the runs' samples meet the toy's
-    margins on average (the learning gate), each claim's two sides held by the one-sided t."""
+    margins on average (the learning gate), each claim's two sides held by the one-sided t. CI trains the
+    runs in map tasks of 27 each (`shards`), about 50 s apiece where the 80 together took 125 s (row 3980)."""
     assert_learns(mixture_contrasts, "two-mode mixture", units=MIXTURE_RUNS)
 
 

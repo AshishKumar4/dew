@@ -51,7 +51,7 @@ from dew.newton_schulz import (
     polar_express,
 )
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import boxed, declared_axes, layers_of, parameter_path
+from dew.nn.sharding import boxed, declared_axes, layer_norms, layers_of, parameter_path
 from dew.registry import Aliases, JsonDict, from_record, record_argument, schedules, to_record
 
 # Attention stores its projections either as one matrix over the flattened
@@ -994,16 +994,9 @@ def scale_by_trust_ratio(min_norm: float = 0.0, trust_coefficient: float = 1.0,
         if params is None:
             raise ValueError("the trust ratio reads the parameters; pass them to the update")
 
-        def norm(leaf: jax.Array, stacked: int) -> jax.Array:
-            # Each stored layer's norm over its own values, kept against its layers' axes: the values
-            # flattened to one axis, as `optax.safe_norm` takes one axis or two.
-            flat = leaf.reshape((*leaf.shape[:stacked], -1))
-            held = optax.safe_norm(flat, min_norm, axis=-1, keepdims=True)
-            return held.reshape((*leaf.shape[:stacked], *(1,) * (leaf.ndim - stacked)))
-
         def scaled(path, update, param):
             stacked = layers_of(path)[1]
-            param_norm, update_norm = norm(param, stacked), norm(update, stacked)
+            param_norm, update_norm = (layer_norms(leaf, stacked, min_norm) for leaf in (param, update))
             ratio = trust_coefficient * param_norm / (update_norm + eps)
             # A layer whose parameters or update are zero would never move: it keeps its update.
             return update * jnp.where((param_norm == 0.0) | (update_norm == 0.0),
@@ -2329,7 +2322,7 @@ class OptimConfig:
 
 
 STACKED_STATES: frozenset[type] = frozenset({
-    optax.EmptyState, optax.MaskedNode, optax.ScaleByAdamState, optax.ScaleByAmsgradState,
+    optax.MaskedNode, optax.ScaleByAdamState, optax.ScaleByAmsgradState,
     optax.ScaleByAdaDeltaState, optax.ScaleByAdanState, optax.ScaleByBeliefState, optax.ScaleByLionState,
     optax.ScaleByRmsState, optax.ScaleByRpropState, optax.ScaleByRssState, optax.ScaleByRStdDevState,
     optax.ScaleByScheduleState, optax.TraceState, optax.EmaState, optax.AddNoiseState, optax.ZeroNansState,
@@ -2340,7 +2333,9 @@ STACKED_STATES: frozenset[type] = frozenset({
 """The optimizer states whose transforms step a stage-local run's stacked leaf as they step its layers
 one by one (`dew.training.stages.whole_reading`): optax's that act a number at a time, or read every
 leaf together, and Dew's own, whose rules read a stacked leaf as its layers (`layers_of`). The masks
-and labels a transform holds as functions are its caller's, which Dew cannot read."""
+and labels a transform holds as functions are its caller's, which Dew cannot read. A stateless
+transform's `optax.EmptyState` is none of these: it names no transform, and optax's LAMB trust ratio and
+adaptive clip, which read a leaf whole, hold one (row 3934)."""
 
 
 __all__ = [

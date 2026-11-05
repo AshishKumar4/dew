@@ -28,6 +28,7 @@ import math
 from collections.abc import Mapping
 
 import numpy as np
+from map_judge import pooled_units, record_units
 from sampling_gate import FALSE_RED
 from scipy import stats
 
@@ -92,10 +93,18 @@ def assert_learns(contrasts_of, label: str, *, units: int) -> None:
 
     Raises LearningFailure naming each claim that falls short, with its mean contrast, its units'
     spread and its t; refuses a site of fewer than FEWEST_UNITS units, contrasts of another count, and a
-    contrast that is not finite."""
+    contrast that is not finite. A site too long for one task (`shards(units=, per_task=)`) runs as
+    armada's map and judge (`tests/map_judge.py`): each map task records the contrasts of its units, and
+    the judge pools them, every unit from zero once, and judges them as one task that took them all."""
     if units < FEWEST_UNITS:
         raise ValueError(f"{label}: {units} units, fewer than {FEWEST_UNITS}; declare more")
-    claims, table = _table(contrasts_of(np.arange(units)), label)
+    if record_units(label, lambda start, stop: contrasts_of(np.arange(start, stop)), upto=units):
+        return
+    pooled = pooled_units(label, units)
+    contrasts = contrasts_of(np.arange(units)) if pooled is None else {
+        claim: np.concatenate([np.asarray(payload[claim]) for _, _, payload in pooled])
+        for claim in pooled[0][2]}
+    claims, table = _table(contrasts, label)
     if table.shape[0] != units:
         raise ValueError(f"{label}: {table.shape[0]} contrasts a claim for {units} units")
     t, needed = t_statistics(table), threshold(units)

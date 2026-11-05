@@ -18,6 +18,7 @@ import pytest
 from affine_run import Replaying, dataset
 from check1_statistics import GateFailure, Inconclusive
 from flax import linen as nn
+from map_judge import drawing
 from reference_error import (
     MOST_SEEDS,
     as_given,
@@ -433,19 +434,27 @@ def test_the_outer_gradient_where_the_inner_step_diverges_is_on_par_weighed_over
     gradient_corner("padded")
 
 
-def corner_failure(dew, label: str) -> GateFailure:
+def corner_failure(dew, label: str) -> GateFailure | None:
     """The failure the one-token corner's public flow decides for `dew` against the literal loop: its own
     budgets, MOST_SEEDS unweighted and its weighed seeds (`CORNER_SEEDS`, `conditioning`), structured
-    findings, never Inconclusive."""
+    findings, never Inconclusive; None in a map task of a site CI shards (`check1_shards`), whose judge
+    decides it."""
     adaptation = ChunkAdaptation(window=1, rate=0.5)
 
     def reference(truth):
         return jax.jit(lambda variables, hidden, targets, weights: equation_71(
             MODEL, variables, hidden, targets, weights, {}, adaptation, truth=truth))
 
-    with pytest.raises(GateFailure) as raised:
+    def judged():
         assert_as_exact(dew, reference(truth=False), draw, label, seeds=MOST_SEEDS,
                         truth_fn=reference(truth=True), conditioning=CORNER_SEEDS["forward", "documents"])
+
+    if drawing():
+        # A map task records its draws, judging nothing; its judge pools them and decides the failure.
+        judged()
+        return None
+    with pytest.raises(GateFailure) as raised:
+        judged()
     assert not isinstance(raised.value, Inconclusive) and raised.value.findings
     return raised.value
 
@@ -462,10 +471,12 @@ def test_the_weighed_corner_holds_no_rate_a_thousandth_off():
     corner_failure(jax.jit(dew), "a rate off at the corner")
 
 
+@pytest.mark.check1_shards(seeds=512, per_task=2048, conditioning=256, conditioning_per_task=256)
 def test_the_weighed_corner_fails_an_error_past_parity():
     """An arm whose every error is 1.6 times the literal loop's, the loop's own result moved 0.6 of its error
     further from float64, fails the corner's public flow decided (`corner_failure`): past PARITY, never
-    held on par."""
+    held on par. CI draws it as the corner's own site is drawn, its weighed seeds in map tasks of their own
+    (`check1_shards`), where its 120 s in one task passed the group target (row 3828)."""
     adaptation = ChunkAdaptation(window=1, rate=0.5)
     loop, exact = (jax.jit(lambda *arguments, truth=truth: equation_71(MODEL, *arguments, {}, adaptation,
                                                                           truth=truth))

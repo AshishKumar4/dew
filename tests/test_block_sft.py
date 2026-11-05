@@ -590,14 +590,16 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     replace(loaded, model=obj.model).save(tmp_path / "published", variables=resumed.variables)
     readback = Pretrained.load(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
     restored = BlockDiffusionObjective(readback.model, prompt_length=8, variables=readback.variables)
-    assert_tree_close(nn.unbox(restored.init(jax.random.key(0))), resumed.variables, 0)
+    # Each program compiled once, as a run's are: run op by op, the init and the two losses compiled each
+    # of their operations apart, a third of the test (row 3978).
+    fresh = nn.unbox(jax.jit(restored.init)(jax.random.key(0)))
+    assert_tree_close(fresh, resumed.variables, 0)
     # The published task's loss under the run's draws for the unrepeated rows.
     started = Trainer(obj, optax.sgd(0.001), key=run_key).initial_state()
     step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.fold_in(started.key, 0), ema=None,
                 **example_fields(started, 0, 1, {"text": inputs}))
-    original_loss = obj.scalar_loss(resumed.variables, {"text": inputs}, step)[0]
-    fresh = nn.unbox(restored.init(jax.random.key(0)))
-    restored_loss = restored.scalar_loss(fresh, {"text": inputs}, step)[0]
+    original_loss = jax.jit(lambda tree: obj.scalar_loss(tree, {"text": inputs}, step)[0])(resumed.variables)
+    restored_loss = jax.jit(lambda tree: restored.scalar_loss(tree, {"text": inputs}, step)[0])(fresh)
     np.testing.assert_array_equal(restored_loss, original_loss)
     prompt = jax.tree.map(jnp.asarray, batch["text"]).slice_tokens(stop=8)
     key = jax.random.key(11)

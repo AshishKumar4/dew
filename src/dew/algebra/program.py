@@ -32,6 +32,7 @@ from dew.cache import ALGEBRA
 from dew.nn.derivatives import Algebra, KernelGlue, Surrogate, marked_call_p
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
+from dew.nn.programs import inlined
 
 
 @dataclasses.dataclass(frozen=True)
@@ -209,10 +210,10 @@ def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jco
     made_by = {var: equation for equation in jaxpr.eqns for var in equation.outvars}
     spliced: dict[int, list[jcore.JaxprEqn]] = {}
     windows = _windows(jaxpr)
-    target = cost.target() if windows else None
+    deriving = _deriving(accurate, saturation) if windows else None
     for window, yielded in windows:
         began = time.perf_counter()
-        done, reused = _derived(window, accurate, saturation, target)
+        done, reused = _derived(window, accurate, saturation, deriving)
         seconds = time.perf_counter() - began
         landed = _splices(window, yielded, done, made_by, spliced) if done.picked else {}
         spliced.update(landed)
@@ -260,14 +261,24 @@ def structure(window: jcore.Jaxpr) -> Hashable:
     return tuple(var.aval for var in window.invars), tuple(equations), tuple(map(operand, window.outvars))
 
 
+def _deriving(accurate: bool, saturation: Saturation) -> Hashable:
+    """What a rewrite's derivation reads beside its program, which keeps every rewrite the pass holds
+    (`_derived`, `_closed`): the numerics' forms, the saturation, the device it is priced for (`cost.target`,
+    resolved: a named target, an assumed generation or the process's own), the matmul precision a product
+    of none stated is priced at (`cost._mode`) and the rule sets the registry admits for those numerics
+    (`rules.admitted`, by name), so a target assumed, a precision set or a set registered later derives
+    afresh."""
+    return (accurate, saturation, cost.target(), str(jax.config.jax_default_matmul_precision),
+            tuple(sets.name for sets in rules.admitted(accurate)))
+
+
 def _derived(window: jcore.Jaxpr, accurate: bool, saturation: Saturation,
-             target: generation.GpuTarget | None) -> tuple[Rewrite, bool]:
+             deriving: Hashable) -> tuple[Rewrite, bool]:
     """`window`'s rewrite (`_region`) and whether an earlier window derived it: one derivation for each
-    structure (`structure`), numerics' forms, saturation and target it is priced for (`cost.target`, which
-    the pricing reads where it runs), the process's latest `WINDOWS_HELD` kept. The planner's candidates and
-    a resumed run's relowering trace one step's program again and again, each window of it as the last
-    trace's."""
-    key = (structure(window), accurate, saturation, target)
+    structure (`structure`) and what else it reads (`deriving`, `_deriving`), the process's latest
+    `WINDOWS_HELD` kept. The planner's candidates and a resumed run's relowering trace one step's program
+    again and again, each window of it as the last trace's."""
+    key = (structure(window), deriving)
     with _HOLDING:
         done = _DERIVED.get(key)
         if done is not None:
@@ -659,23 +670,13 @@ def _opened(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
             equations.append(equation)
             continue
         body = _opened(equation.params["call_jaxpr"])
-        inner: dict[jcore.Var, jcore.Var | jcore.Literal] = dict(
-            zip(body.invars, equation.invars, strict=True))
-        for var, value in zip(body.constvars, body.consts, strict=True):
-            fresh = jcore.Var(var.aval)
-            inner[var] = fresh
-            constvars.append(fresh)
-            consts.append(value)
-
-        def within(atom: jcore.Var | jcore.Literal, inner=inner) -> jcore.Var | jcore.Literal:
-            return atom if isinstance(atom, jcore.Literal) else inner.get(atom, atom)
-
-        for made in body.eqns:
-            outvars = [jcore.DropVar(var.aval) if isinstance(var, jcore.DropVar) else jcore.Var(var.aval)
-                       for var in made.outvars]
-            inner.update(zip(made.outvars, outvars, strict=True))
-            equations.append(made.replace(invars=[within(atom) for atom in made.invars], outvars=outvars))
-        computed.update(zip(equation.outvars, map(within, body.outvars), strict=True))
+        # The body's constants the program's own, each a fresh variable of it (`inlined`).
+        fresh = [jcore.Var(var.aval) for var in body.constvars]
+        constvars += fresh
+        consts += list(body.consts)
+        made, returned = inlined(body, equation.invars, fresh)
+        equations += made
+        computed.update(zip(equation.outvars, returned, strict=True))
     return jaxpr.replace(constvars=constvars, consts=consts, eqns=equations,
                          outvars=[outer(atom) for atom in jaxpr.outvars])
 
@@ -709,7 +710,7 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcor
     if not all(isinstance(aval, ShapedArray) for aval in closed.in_avals):
         return closed
     rewrites = _REWRITTEN.setdefault(closed, {})
-    key = (accurate, saturation, ALGEBRA.value.target)
+    key = _deriving(accurate, saturation)
     if key not in rewrites:
         made = _rewritten(closed, accurate, saturation)
         rewrites[key] = None if made is closed else made

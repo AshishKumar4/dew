@@ -74,7 +74,7 @@ from collections.abc import Callable, Mapping, Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import summed_as_run, widened
+from arm_arithmetic import Truth, summed_as_run, unrewritten, widened
 from check1_statistics import (
     CONFIDENCE,
     FACTOR,
@@ -301,18 +301,24 @@ def _refuse_numpy_arms(draw, *arms) -> None:
                             f"values unconverted")
 
 
-def _compiled(fn, compile, pairing=None):
-    """`fn` as the gate runs it: as given (`_given`), as it is where it is a `without_ynn` program
-    already (another jit around it would nest its compiler options), or compiled by `compile`, a
-    window loop's arm within it (`over_windows`); compiled without YNNPACK's fusions, paired with its
-    check's other arms by `pairing` (`_Paired`)."""
+def _compiled(fn, compile, pairing=None, *, reference: bool = False):
+    """`fn` as the gate runs it: as given (`_given`), as it is where it is a `without_ynn` program already
+    (another jit around it would nest its compiler options), or compiled by `compile`, a window loop's arm
+    within it (`over_windows`), without YNNPACK's fusions, paired by `pairing` (`_Paired`); a `reference`
+    unrewritten (`arm_arithmetic.unrewritten`)."""
+    run = unrewritten if reference else _as_is
     if _given(fn) or getattr(fn, "without_ynn", False):
-        return fn
+        return run(fn)
     if getattr(fn, "dew_programs", False):
-        return fn if compile is jax.jit else _Paired(pairing, _with_ynn_off(fn), fn)
+        return run(fn) if compile is jax.jit else _Paired(pairing, run(_with_ynn_off(fn)), run(fn))
     if isinstance(fn, _Windowed):
-        return _Windowed(_compiled(fn.fn, compile, pairing))
-    return compile(fn) if compile is jax.jit else _Paired(pairing, compile(fn), jax.jit(fn))
+        return _Windowed(_compiled(fn.fn, compile, pairing, reference=reference))
+    return run(compile(fn)) if compile is jax.jit else _Paired(pairing, run(compile(fn)), run(jax.jit(fn)))
+
+
+def _as_is(fn):
+    """`fn` itself: a candidate arm, run as its users run it."""
+    return fn
 
 
 @dataclasses.dataclass(eq=False)
@@ -418,45 +424,18 @@ def _with_mode(findings: list, arms) -> list:
             for finding in findings]
 
 
-class _Truth:
-    """A check's float64 truth as the gate runs it (`_truth_program`): compiled from its first call, or,
-    where it cannot be traced and returns host values run as it is given (a NumPy truth), as given. A truth
-    that returns JAX values and cannot be traced does host work on its inputs (a widening or a conversion
-    on the host): it fails at its first seed with its trace's error, naming itself; it passes `as_given`."""
-
-    def __init__(self, fn):
-        self.fn, self.run = fn, None
-
-    def __call__(self, *inputs):
-        if self.run is not None:
-            return self.run(*inputs)
-        compiled = jax.jit(self.fn)
-        try:
-            # Compiled from the first call on, never run eagerly: a seed's truth is the same whichever seed
-            # a process draws first (a map task's, DRAWS), and a large truth pays no eager run.
-            values = compiled(*inputs)
-        except Exception as untraced:
-            first = self.fn(*inputs)
-            if all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(first)):
-                raise untraced
-            self.run = self.fn
-            return first
-        self.run = compiled
-        return values
-
-
 def _truth_program(fn):
-    """`fn`, a check's float64 truth, as the gate runs it: compiled, once a signature, so the truth runs
-    as one float64 program on the device's FP64 units rather than one eager dispatch an equation, every
-    primitive at its own float64 semantics. A truth the gate runs as given (`as_given`: torch, a
-    recording, a host loop), one compiled already (a jit, `dew_programs`), or none, as it is; a window
-    loop's by its own; a NumPy truth (its first call returns host values) as given after that call. A
-    JAX truth with host work inside fails at its trace, loudly, and passes `as_given`."""
+    """`fn`, a check's float64 truth, as the gate runs it, unrewritten (`arm_arithmetic.unrewritten`):
+    compiled, once a signature, so the truth runs as one float64 program on the device's FP64 units rather
+    than one eager dispatch an equation, every primitive at its own float64 semantics. A truth the gate runs
+    as given (`as_given`: torch, a recording, a host loop), one compiled already (a jit, `dew_programs`), or
+    none, as it is; a window loop's by its own; a NumPy truth (its first call returns host values) as given
+    after that call. A JAX truth with host work inside fails at its trace, loudly, and passes `as_given`."""
     if fn is None or _given(fn) or getattr(fn, "dew_programs", False) or hasattr(fn, "lower"):
-        return fn
+        return unrewritten(fn)
     if isinstance(fn, _Windowed):
         return _Windowed(_truth_program(fn.fn))
-    return _Truth(fn)
+    return Truth(fn)
 
 
 def _with_ynn_off(fn):
@@ -472,18 +451,17 @@ def _with_ynn_off(fn):
 
 def _arms(dew_fn, reference_fn):
     """The two arms of a check as the gate runs them (docs/design/testing.md, "the numerical contract"):
-    where both are Dew paths, each without YNNPACK's fusions (`without_ynn`), whose microkernels the
-    host's instruction set picks at run time, so the two run the same kind of code on any host: a
-    plain function the gate compiles so, an arm that runs Dew's own programs (`dew_programs`) with
-    them compiled so through Dew's seam; where one runs as it is given (`as_given`: torch, NumPy, a
-    recording, a host loop over programs of its own), the other as Dew's users run it, with the
-    fusions (`jax.jit`). A site passes plain functions; the gate compiles them, so no site can compile
-    one arm otherwise than its other. One function as both arms compiles once. A program XLA:CPU cannot
-    compile without the fusions turns both arms over to them, decided once a site (`_ynn_decided`)."""
+    where both are Dew paths, each without YNNPACK's fusions (`without_ynn`), whose microkernels the host's
+    instruction set picks at run time, so the two run the same kind of code on any host: a plain function
+    the gate compiles so, an arm that runs Dew's own programs (`dew_programs`) with them compiled so through
+    Dew's seam; where one runs as it is given (`as_given`: torch, NumPy, a recording, a host loop over
+    programs of its own), the other as Dew's users run it, with the fusions (`jax.jit`). A site passes plain
+    functions; the gate compiles them, so no site can compile one arm otherwise than its other. The
+    reference runs unrewritten (`_compiled`), so one function as both arms compiles twice. A program XLA:CPU
+    cannot compile without the fusions turns both arms over to them, decided once a site (`_ynn_decided`)."""
     compile, pairing = (jax.jit if _given(dew_fn) or _given(reference_fn) else without_ynn), _Pairing()
     _refuse_owned_policies(compile, dew_fn, reference_fn)
-    reference = _compiled(reference_fn, compile, pairing)
-    return (reference if dew_fn is reference_fn else _compiled(dew_fn, compile, pairing)), reference
+    return _compiled(dew_fn, compile, pairing), _compiled(reference_fn, compile, pairing, reference=True)
 
 
 def _arms_with(dew_fn, reference_fn, further: list, label: str):
@@ -1032,19 +1010,20 @@ def _over_orders(first: list[tuple], later: list[tuple]) -> list[tuple]:
 def _conditioning(reference_fn, truth_fn, draw, seeds, ran=None) -> Conditioning:
     """Check 1's conditioning of `reference_fn` (tests/conditioning.py): its rounding scale at a draw as its
     arm runs (`summed_as_run`, a window loop's by window), its heavy elements over `seeds` as `ran`, its
-    compiled arm where given, runs it."""
+    compiled arm where given, runs it; the reference and its truth unrewritten, as their arms run."""
     from rounding_bound import rounding_scale
+    scaled = reference_fn.fn if isinstance(reference_fn, _Windowed) else reference_fn
 
     def scale_of(inputs, seed):
         with summed_as_run():
             if not isinstance(reference_fn, _Windowed):
-                return rounding_scale(reference_fn, *inputs, seed=seed)[1]
-            each = [rounding_scale(reference_fn.fn, *jax.tree.map(lambda leaf, at=index: leaf[at], inputs),
-                                   seed=seed)[1] for index in range(_window_count(inputs))]
+                return rounding_scale(scaled, *inputs, seed=seed)[1]
+            each = [rounding_scale(scaled, *jax.tree.map(lambda leaf, at=at: leaf[at], inputs), seed=seed)[1]
+                    for at in range(_window_count(inputs))]
             return jax.tree.map(lambda *scale: None if scale[0] is None else np.stack(scale), *each,
                                 is_leaf=lambda leaf: leaf is None)
 
-    return conditioned(ran or reference_fn, truth_fn, draw, seeds, scale_of)
+    return conditioned(unrewritten(ran or reference_fn), unrewritten(truth_fn), draw, seeds, scale_of)
 
 
 def _truth_and_terms(truth_fn, terms_fn, inputs):
@@ -1507,16 +1486,16 @@ class _SiteTerms:
 
 
 def _cancelling_terms(draw, truth, program=None):
-    """The truth program a site's rows are sized by their terms with (`assert_as_exact`'s `terms`), where
-    its truth holds a row of float64 zero (below RESOLUTION of its leaf) on its first draw, decided from the
-    truth alone before any arm runs (bible §7, ledger 2851): a row whose truth is exactly zero or cancels is
-    judged at the size of what it sums, as the one-draw rule judges it, not held to the reference's residue
-    there (a fused attention's causal first row, whose one key makes its gradient exactly zero in float64,
-    its rounding's residue Dew's and the reference's alike). None where no row is zero, or where the
-    truth is not a JAX program its terms can be traced from (run as given, recorded, a window loop's).
-    `program`, the truth as the draws run it (`_truth_program`), evaluates the first draw's truth, so its
-    first call's run and trace serve the draws too, once a process (a map task's draws, DRAWS); a reference
-    standing for it runs compiled, not eagerly (ledger 3774)."""
+    """The truth program a site's rows are sized by their terms with (`assert_as_exact`'s `terms`), where its
+    truth holds a row of float64 zero (below RESOLUTION of its leaf) on its first draw, decided from the truth
+    alone before any arm runs (bible §7, ledger 2851): a row whose truth is exactly zero or cancels is judged
+    at the size of what it sums, as the one-draw rule judges it, not held to the reference's residue there (a
+    fused attention's causal first row, whose one key makes its gradient exactly zero in float64, its
+    rounding's residue Dew's and the reference's alike). None where no row is zero, or where the truth is not
+    a JAX program its terms can be traced from (run as given, recorded, a window loop's). `program`, the truth
+    as the draws run it (`_truth_program`), evaluates the first draw's truth, so its first call's run and
+    trace serve the draws too, once a process (a map task's draws, DRAWS); a reference standing for it runs
+    compiled, not eagerly (ledger 3774)."""
     if truth is None or isinstance(truth, _Windowed) or _given(truth) or getattr(truth, "recorded", False):
         return None
     # The truth on the site's first draw, and its terms only where it holds a zero row: only a zero row whose
@@ -1525,9 +1504,10 @@ def _cancelling_terms(draw, truth, program=None):
     # run or traced so (host work on its values, NumPy or torch; a kernel that refuses float64) has no
     # terms: it keeps the residue rule and runs as it always has, the gate's own run of it reporting any
     # failure of its own.
+    run = program or unrewritten(jax.jit(truth))
     try:
         with jax.enable_x64(new_val=True):
-            leaves = [*map(np.asarray, jax.tree.leaves((program or jax.jit(truth))(*widened(draw(0)))))]
+            leaves = [*map(np.asarray, jax.tree.leaves(run(*widened(draw(0)))))]
             if not np.any(_LaidTruths.of(leaves).sizes == 0):
                 return None
             truths, terms = float64_terms(truth, *widened(draw(0)))
@@ -1547,7 +1527,7 @@ def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn,
     `FEWEST_SEEDS`, or with a library arm not named by its row and leaves."""
     terms_fn = None
     if callable(terms):
-        terms_fn = _SiteTerms(terms)
+        terms_fn = _SiteTerms(unrewritten(terms))
     elif terms:
         terms_fn = truth_fn if truth_fn is not None else reference_fn
         terms_fn = terms_fn.fn if isinstance(terms_fn, _Windowed) else terms_fn
@@ -1804,7 +1784,7 @@ def _site_terms(terms_fn, terms, draw, truth, truth_program):
     found (`map_judge.judging`): no truth runs there. A program traced for its terms is traced once a
     signature, its static runs compiled once for the site's every draw (`float64_terms`)."""
     if terms is not False and not judging() and terms_fn is None:
-        program = truth_program if isinstance(truth_program, _Truth) else None
+        program = truth_program if isinstance(truth_program, Truth) else None
         terms_fn = _cancelling_terms(draw, truth, program)
     return terms_fn if terms_fn is None or isinstance(terms_fn, _SiteTerms) else functools.partial(
         float64_terms, terms_fn)
@@ -2088,6 +2068,10 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
     undecided, the verdict then ", conditioned"'s."""
     if paired and dew_fn is None:
         raise ValueError("a paired null run takes its other implementation, `dew_fn`")
+    # The reference and the truth run their programs unrewritten, as a site's do (`_arms`, `_truth_program`).
+    reference_fn = (_Windowed(unrewritten(reference_fn.fn)) if isinstance(reference_fn, _Windowed)
+                    else unrewritten(reference_fn))
+    truth_fn = unrewritten(truth_fn)
     verdicts = []
     # Each run's draws: both budgets whole, the unweighted check's and the weighed one's, and the
     # reference's own beside them where unpaired, so no two runs share a draw.

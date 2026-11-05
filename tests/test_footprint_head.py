@@ -217,7 +217,10 @@ def test_a_diloco_groups_step_is_planned_by_its_own_optimizer_state():
                       mesh=MeshSpec(diloco=1).build(compile_only_gpus("sm90", 1)))
     rows = {"x": np.ones((8, 3), np.float32), "y": np.zeros((8, 2), np.float32)}
     ahead = compile_ahead(trainer, rows, capacity=1 << 30)
-    assert [probe["derived"]["peak"] is not None for probe in ahead.plan["probes"]] == [True]
+    # The peak the plan derived read each gradient consumed where it is made: Adam over the group's own
+    # in-device moments (rows 3806, 4019).
+    assert [(probe["derived"]["peak"] is not None, probe["derived"]["consumed"])
+            for probe in ahead.plan["probes"]] == [(True, True)]
 
 
 def test_a_step_whose_head_takes_its_gradient_in_the_backward_holds_every_gradient():

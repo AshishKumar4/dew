@@ -5,6 +5,7 @@ the bodies of nested programs, scans, loops, conditionals and checkpoints are re
 
 import dataclasses
 import gc
+import json
 import os
 import subprocess
 import sys
@@ -817,3 +818,185 @@ def test_a_parameter_is_keyed_by_what_it_is_not_by_its_printed_form():
     for value in [value for pair in (*equal, *unequal) for value in pair]:
         key = terms.parameter_key(value)
         assert ast.literal_eval(repr(key)) == key, value
+
+
+REGISTERED_AFTER = """
+import json
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from egglog import i64, rewrite, var
+from jax.core import eval_jaxpr
+
+from dew import algebra
+from dew.algebra import rules
+from dew.algebra.terms import Term
+
+
+def sums(x, y):
+    return jnp.sum(jnp.exp(x), -1) + jnp.sum(jnp.tanh(y), -1)
+
+
+def branched(x, y):
+    return jax.lax.cond(jnp.sum(x) > 0, sums, lambda x, y: sums(y, x), x, y)
+
+
+rng = np.random.default_rng(0)
+x, y = (jnp.asarray(rng.standard_normal((5, 38)), jnp.float32) for _ in range(2))
+closed = jax.make_jaxpr(branched)(x, y)
+
+
+def computed():
+    window = jax.jit(algebra.rewritten(sums))(x, y)
+    rewritten = algebra.program_of(closed)
+    body = eval_jaxpr(rewritten.jaxpr, rewritten.consts, x, y)[0]
+    return float(jnp.max(jnp.abs(window - sums(x, y)))), float(jnp.max(jnp.abs(body - sums(x, y))))
+
+
+before = computed()
+variable, params = var("x", Term), var("params", i64)
+exponential = rules.RuleFamily("the exponential as its argument", (rewrite(variable.unary("exp", params)).to(
+    variable),), (jnp.exp, lambda x: x, None))
+rules.register(rules.Rules.declared("registered after", "reorders", (exponential,), "a test's"))
+print(json.dumps({"before": before, "after": computed()}))
+"""
+"""A process that rewrites a program's window and a branch body of one held program, registers a rule set
+(one that rewrites an exponential to its argument), and rewrites them again."""
+
+
+def test_a_rule_set_registered_after_a_rewrite_reaches_the_programs_rewritten_after_it():
+    """A window's and a body's rewrite are kept by everything their derivation reads, the rule sets the
+    registry admits among them: a set registered after a program was rewritten (a user extending the
+    algebra in a running process) reaches the next rewrite of a window of its structure and of the same held
+    branch body, where a rewrite kept from before it would stand."""
+    done = subprocess.run([sys.executable, "-c", REGISTERED_AFTER], capture_output=True, text=True,
+                          check=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
+    found = json.loads(done.stdout.strip().splitlines()[-1])
+    assert max(found["before"]) < 1e-4
+    assert min(found["after"]) > 0.1
+
+
+def test_a_value_is_priced_at_the_bytes_its_dtype_holds():
+    """A region's values are priced at their own element size (`cost.work`): a program reading bfloat16
+    operands reads half the device bytes one reading float32 operands of the same shape does, and its product
+    stages half the bytes into its tile walk, so the pass weighs a narrow program's memory as it is."""
+    def priced(dtype):
+        def contracted(a, b):
+            return jnp.dot(a + b, b, preferred_element_type=jnp.float32)
+
+        a, b = (jnp.ones((64, 64), dtype) for _ in range(2))
+        region = terms.region(jax.make_jaxpr(contracted)(a, b))
+        graph, bundle, _ = program.graphed(region)
+        _, price = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                                 cost_model=cost.model(region, cost.fused(cost.target("sm90"))))
+        return price.work
+
+    narrow, wide = priced(jnp.bfloat16), priced(jnp.float32)
+    assert (wide.device_bytes, wide.shared_bytes) == (2 * 64 * 64 * 4, 2 * 64 * 64 * 4)
+    assert (narrow.device_bytes, narrow.shared_bytes) == (2 * 64 * 64 * 2, 2 * 64 * 64 * 2)
+
+
+def test_a_window_rewritten_under_another_matmul_precision_is_derived_again():
+    """A window's derivation is keyed by the matmul precision its pricing reads for a product of no stated
+    precision (`jax.default_matmul_precision`: TF32 at the default, the CUDA cores' IEEE fp32 above it): a
+    held program rewritten again under another precision is derived afresh, not read from the first."""
+    def scaled(x, y, b):
+        x, y = jnp.tanh(x), jnp.tanh(y)
+        return jnp.dot(x, y.T) * 0.5 + jnp.dot(b, y.T) * 0.5
+
+    closed = jax.make_jaxpr(scaled)(*rows(16, (12, 72), (12, 72), (12, 72)))
+    reused = []
+    for precision in ("default", "highest"):
+        with report.refusals(), jax.default_matmul_precision(precision):
+            algebra.program_of(closed)
+            reused.append([made.reused for made in report.rewrites()])
+    assert reused[0] and not any(reused[0]) and not any(reused[1])
+
+
+def _scaled_twice(s, q_pos, k_pos, a, b):
+    """A score hook the pass rewrites: two bounded scales of the bounded logits summed (the magnitudes the
+    pass's reordering reads), one product of their sum."""
+    capped = jnp.tanh(s)
+    return capped * jnp.tanh(a) + capped * jnp.tanh(b)
+
+
+def _scaled_operands(seed: int, shape: tuple[int, ...]) -> tuple:
+    """A tile of `shape` and two scalar scales, drawn by `seed`."""
+    rng = np.random.default_rng(seed)
+    return (jnp.asarray(rng.standard_normal(shape), jnp.float32),
+            *(jnp.asarray(rng.uniform(0.5, 2.0), jnp.float32) for _ in range(2)))
+
+
+def _multiplies(closed) -> int:
+    return sum(equation.primitive is jax.lax.mul_p for equation in equations(closed))
+
+
+def test_a_score_hook_and_its_slopes_pass_the_algebra_pass_before_a_kernel_places_them():
+    """A score hook and its derivative are rewritten by the algebra pass before a kernel's tile places them
+    (docs/design/algebra.md §2): the tile's hook (`attention_algebra.hooked`) and its slopes
+    (`attention_gradient.scored`) trace the hook's cheaper form, one multiply of the two scales' sum, which
+    they compute as the hook does (check 1); with the pass off, the hook as written."""
+    from dew.nn.kernels.templates.attention_algebra import hooked
+    from dew.nn.kernels.templates.attention_gradient import scored
+
+    q_pos, k_pos = jnp.arange(16)[:, None], jnp.arange(32)[None, :]
+
+    def tile(s, a, b):
+        return hooked(_scaled_twice, s, q_pos, k_pos, (a, b))
+
+    def sloped(s, a, b):
+        return scored(_scaled_twice, s, q_pos, k_pos, (a, b), slopes=True)
+
+    def draw(seed):
+        return _scaled_operands(seed, (16, 32))
+
+    assert _multiplies(jax.make_jaxpr(tile)(*draw(0))) == 1
+    with algebra.passes(on=False):
+        assert _multiplies(jax.make_jaxpr(tile)(*draw(0))) == 2
+    rewritten, written = jax.make_jaxpr(sloped)(*draw(0)), None
+    with algebra.passes(on=False):
+        written = jax.make_jaxpr(sloped)(*draw(0))
+    assert _multiplies(rewritten) < _multiplies(written)
+    assert_as_exact(jax.jit(tile), jax.jit(lambda s, a, b: _scaled_twice(s, q_pos, k_pos, a, b)), draw,
+                    "a rewritten score hook", seeds=8)
+
+
+def test_a_fused_gemms_producer_passes_the_algebra_pass_before_the_fuser_places_it():
+    """A fused GEMM's producer is rewritten by the algebra pass before the fuser stages it (algebra.md §2):
+    a producer of two scales of one operand summed is staged as its cheaper form, its window's rewrite
+    spliced (the fused products' values against their references: tests/test_gemm_template.py)."""
+    from dew.nn.kernels.templates.gemm import fused
+
+    def producer(values):
+        x, a, b = values
+        capped = jnp.tanh(x)
+        return capped * jnp.tanh(a) + capped * jnp.tanh(b)
+
+    with report.refusals():
+        fused._split(producer, _scaled_operands(1, (64, 128)))
+        assert any(made.spliced for made in report.rewrites())
+
+
+def test_a_tiles_transient_hook_is_released_once_its_trace_is_done():
+    """A tile's hook is often a closure made for its trace (a keys-first tile's transposed hook,
+    `layout.transposed`), which the pass's rewrite of it holds no longer than the trace: once traced and
+    dropped, it is collected."""
+    import gc
+    import weakref
+
+    from dew.nn.kernels.templates.attention_algebra import hooked
+
+    def made():
+        def transient(s, q_pos, k_pos, a, b):
+            return _scaled_twice(s, q_pos, k_pos, a, b)
+        return transient
+
+    def traced(hook) -> weakref.ref:
+        jax.make_jaxpr(lambda s, a, b: hooked(hook, s, jnp.arange(16)[:, None], jnp.arange(32)[None, :],
+                                              (a, b)))(*_scaled_operands(2, (16, 32)))
+        return weakref.ref(hook)
+
+    held = traced(made())
+    gc.collect()
+    assert held() is None

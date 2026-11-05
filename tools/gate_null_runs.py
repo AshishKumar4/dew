@@ -477,6 +477,7 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
     whole-field draws: each draw of Dew and of the reference one of the class's own draws, every leaf
     together (512 of them, drawn past every run's seeds)."""
     import numpy as np
+    from arm_arithmetic import unrewritten
     from reference_error import NO_ZERO_ROWS, REDRAW, _drawn, _Draws, _staged
 
     # The same draws under either procedure, so their verdicts compare run by run.
@@ -484,6 +485,8 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
     span = (1 + REDRAW) * seeds
     if law in CLASSES:
         reference, draw, truth, *_ = CLASSES[law]()
+        # The reference and its truth run their programs unrewritten, as a site's do.
+        reference, truth = unrewritten(reference), unrewritten(truth)
         pool = _drawn(reference, reference, draw, range(3 * OFFSET * 1024, 3 * OFFSET * 1024 + 512), truth)
         names, values = pool.names, np.asarray(pool.mine)
     verdicts = []
@@ -567,6 +570,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--paired", action="store_true", help="run both arms on the same draws, as a site "
                         "does: Dew the reference at another order (REORDERED), or with --fault its fault")
     options = parser.parse_args(argv)
+    from arm_arithmetic import unrewritten
     from reference_error import _drawn, null_runs, seeds_for
 
     if options.amplified and options.rows is None:
@@ -593,6 +597,8 @@ def main(argv: list[str]) -> int:
                           "today": options.today, "chunk": options.chunk, "verdicts": verdicts}), flush=True)
         return 0
     reference, draw, truth, permuting = CLASSES[options.name]()
+    # The reference and its truth run their programs unrewritten, as a site's do.
+    reference, truth = unrewritten(reference), unrewritten(truth)
     if (options.orders or options.paired) and permuting is None:
         parser.error(f"{options.name} has no orbit; --orders and --paired take an orbit class")
     if options.draws is not None:

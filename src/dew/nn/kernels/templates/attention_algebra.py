@@ -32,7 +32,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.algebra import derive
+from dew.algebra import derive, rewritten
 from dew.algebra.forms import Operand, derived_on
 from dew.nn.kernels.templates import layout, product
 from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Draw, within
@@ -1593,9 +1593,11 @@ def inverse(total: jax.Array) -> jax.Array:
 
 
 def hooked(score_mod: Callable, logits: jax.Array, q_pos, k_pos, params) -> jax.Array:
-    """`score_mod` on a tile; a custom-derivative call in it lowers as its primal function (Dew's JAX
-    build, constraints.txt)."""
-    return score_mod(logits, q_pos, k_pos, *params)
+    """`score_mod` on a tile, rewritten by the algebra pass before the tile places it (docs/design/algebra.md
+    §2, `dew.algebra.rewritten`; the hook as written where the pass is off), each window's derivation held
+    across a launch's tiles (`program._derived`); a custom-derivative call in it lowers as its primal
+    function (Dew's JAX build, constraints.txt)."""
+    return rewritten(score_mod)(logits, q_pos, k_pos, *params)
 
 
 def _scaled(x: jax.Array, rows: bool = False) -> tuple[jax.Array, jax.Array]:

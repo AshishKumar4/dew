@@ -3,6 +3,10 @@ must refuse, and the rounding it must admit."""
 
 import json
 import math
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -38,10 +42,6 @@ from dew.nn.precision import accumulated
 def test_without_ynn_computes_what_xla_cpu_computes_with_every_ynnpack_fusion_off(tmp_path):
     """Each of tests/ynn_programs.py's programs under `without_ynn` gives, bit for bit, what the same
     program gives jitted in a process whose XLA:CPU runs with every YNNPACK fusion off."""
-    import os
-    import subprocess
-    import sys
-    from pathlib import Path
 
     import ynn_programs
     from reference_error import without_ynn
@@ -238,7 +238,8 @@ def test_a_without_ynn_arm_runs_over_windows():
 
 def test_the_gate_compiles_two_dew_arms_without_ynnpack_and_one_beside_a_given_arm_as_users_run_it():
     """Check 1 compiles its arms itself (`_arms`): two Dew paths each `without_ynn`, one function as
-    both arms once, a window loop's arm within it, an arm compiled so already as it is; beside an arm
+    both arms twice (its reference unrewritten), a window loop's arm within it, an arm compiled so already
+    as it is; beside an arm
     run `as_given` (torch, NumPy, a program of its own), which it never traces, the Dew arm with the
     fusions, as users run it. A NumPy arm passes `as_given`, and the verdict holds."""
     from reference_error import _arms, _Windowed, as_given, assert_as_exact, over_windows, without_ynn
@@ -252,8 +253,9 @@ def test_the_gate_compiles_two_dew_arms_without_ynnpack_and_one_beside_a_given_a
     mine, theirs = _arms(dew, written)
     assert mine.without_ynn and theirs.without_ynn
     np.testing.assert_array_equal(mine(np.ones(3, np.float32)), 2 * np.ones(3, np.float32))
+    # One function as both arms compiles twice: the reference runs its programs unrewritten.
     same, again = _arms(dew, dew)
-    assert same is again and same.without_ynn
+    assert same is not again and same.without_ynn and again.without_ynn
     compiled = without_ynn(dew)
     assert _arms(compiled, written)[0] is compiled
     windowed, _ = _arms(over_windows(dew), written)
@@ -261,7 +263,7 @@ def test_the_gate_compiles_two_dew_arms_without_ynnpack_and_one_beside_a_given_a
 
     host = as_given(lambda x: np.asarray(x) + np.asarray(x))
     mine, theirs = _arms(dew, host)
-    assert theirs is host and not getattr(mine, "without_ynn", False)
+    assert theirs.wrapped is host and not getattr(mine, "without_ynn", False)
     np.testing.assert_array_equal(mine(np.ones(3, np.float32)), 2 * np.ones(3, np.float32))
     def draw(seed):
         return (np.random.default_rng(seed).standard_normal(8).astype(np.float32),)
@@ -866,7 +868,8 @@ def test_a_float64_truth_runs_as_one_compiled_program():
     own. A NumPy truth (it cannot be traced, and returns host values) runs as given, and so do a truth
     `as_given`, one compiled already and a window loop's by its own; a check over a compiled truth judges
     as over the eager one."""
-    from reference_error import _Truth, _truth_program, _Windowed, as_given, over_windows
+    from arm_arithmetic import Truth
+    from reference_error import _truth_program, _Windowed, as_given, over_windows
 
     calls = []
 
@@ -883,16 +886,17 @@ def test_a_float64_truth_runs_as_one_compiled_program():
         np.testing.assert_allclose(first["y"], truth(x, w)["y"], rtol=1e-14)
         numpy = _truth_program(lambda x, w: {"y": np.asarray(x) @ np.asarray(w)})
         numpy(x, w)
-        assert numpy.run is numpy.fn
+        assert numpy.run.wrapped is numpy.fn
         # A truth that widens its inputs on the host and returns JAX values fails at its first call.
         hosted = _truth_program(lambda x, w: truth(np.asarray(x, np.float64), np.asarray(w, np.float64)))
         with pytest.raises(jax.errors.TracerArrayConversionError):
             hosted(x, w)
+    # A truth run as given, or compiled already, is itself, its programs unrewritten.
     given = as_given(truth)
-    assert _truth_program(given) is given and _truth_program(_product) is _product
+    assert _truth_program(given).wrapped is given and _truth_program(_product).wrapped is _product
     assert _truth_program(None) is None
     windowed = _truth_program(over_windows(truth))
-    assert isinstance(windowed, _Windowed) and isinstance(windowed.fn, _Truth)
+    assert isinstance(windowed, _Windowed) and isinstance(windowed.fn, Truth)
     assert_as_exact(_reordered, _product, _draw, "a compiled truth", seeds=8, truth_fn=truth)
 
 
@@ -2423,3 +2427,5 @@ def test_check_1_holds_an_arm_to_a_bitwise_repeat_only_where_one_is_promised(
             null_runs(bits_apart(), a_product_draw, label, seeds=8, runs=1, truth_fn=jnp.matmul)
     else:
         null_runs(bits_apart(), a_product_draw, label, seeds=8, runs=1, truth_fn=jnp.matmul)
+
+

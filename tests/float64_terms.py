@@ -13,6 +13,7 @@ from typing import Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
+from arm_arithmetic import unrewritten
 
 from dew.nn import programs
 
@@ -35,14 +36,6 @@ added to a parameter, devices' partials) and moved, by a remat name
 A product or quotient of a sum by a value that is none carries them too,
 scaled element by element (`_applied`), as `s_i sum_k x_ik` sums the terms
 `s_i x_ik`; a product of two sums ends them."""
-
-CALLS = programs.CALLS | {"remat", "custom_vjp_call_jaxpr"}
-"""The calls whose bodies are evaluated op by op, as the computation's own:
-a jit, a remat (`jax.checkpoint` binds 'remat2'), a custom rule's primal, a
-marked span (`dew.nn.derivatives.marked`, lowered as its body). A
-shard_map's per-device program is too, on each device's blocks (`_mapped`).
-A body that runs elsewhere, a Pallas kernel, is one operation, its outputs
-their own size."""
 
 
 def float32_values(jaxpr) -> int:
@@ -200,7 +193,8 @@ def _traced(fn, args):
                              getattr(jax.typeof(leaf), "weak_type", False)) for leaf in leaves))
     traces = TRACES.setdefault(fn, {})
     if key not in traces:
-        closed, shapes = jax.make_jaxpr(fn, return_shape=True)(*args)
+        # A truth's program as written: traced with the algebra pass off (`arm_arithmetic.unrewritten`).
+        closed, shapes = jax.make_jaxpr(unrewritten(fn), return_shape=True)(*args)
         traces[key] = (closed, jax.tree.structure(shapes))
     return traces[key]
 
@@ -420,14 +414,12 @@ def _carried(equation) -> list[int]:
 
 
 def _body(equation):
-    """The jaxpr and constants a call runs (`CALLS`), or None."""
-    if equation.primitive.name not in CALLS:
-        return None
-    for name in ("jaxpr", "call_jaxpr", "fun_jaxpr"):
-        body = equation.params.get(name)
-        if body is not None:
-            return (body.jaxpr, body.consts) if hasattr(body, "consts") else (body, [])
-    return None
+    """The jaxpr and constants a call runs (`dew.nn.programs.CALLS`: a jit, a remat, a custom rule's primal, a
+    marked span, each evaluated op by op as the computation's own), or None. A shard_map's per-device program
+    is evaluated too, on each device's blocks (`_mapped`); a body that runs elsewhere, a Pallas kernel, is
+    one operation, its outputs their own size."""
+    body = programs.called(equation)
+    return None if body is None else (body, body.consts)
 
 
 def _squared(value):

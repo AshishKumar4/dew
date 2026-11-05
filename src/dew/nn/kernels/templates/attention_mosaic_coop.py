@@ -22,6 +22,8 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _streamed,
     _views_of,
+    modelled,
+    part_count,
     stated,
 )
 from dew.nn.kernels.templates.attention_mosaic_scores import _Backward, _tile_scores
@@ -168,9 +170,13 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         entry, out_type=(), grid=(heads, keys_padded // block_k, batch),
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math, name="attention_dkv_shared",
-        # The model's products this launch owns (`stated`): dQ's, dK's, dV's and dP's; its `S` recomputed.
-        cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, 4 * width, query, key, value,
-                    dout))
+        # The products this launch issues (`stated`): its `S` recomputed, dP's, dV's, and each part of dK's
+        # and of dQ's (`part_count`); the model's of them it owns (`modelled`): dQ's, dK's, dV's and dP's.
+        cost=stated(walk.spec, batch, heads, walk.spec.queries or queries,
+                    width + 2 * value.shape[-1] + 2 * part_count(query.dtype, walk.accurate) * width,
+                    query, key, value, dout),
+        model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
+                             2 * width + 2 * value.shape[-1]))
     dq = jax.new_ref(jnp.zeros((batch, queries, heads, width), jnp.float32))
     dkv = mosaic.stacked_zeros(shapes, groups)
     launch(query, key, value, dout, peak, total, anchor, delta, key_index, *leaves, dq, *dkv)

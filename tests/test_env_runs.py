@@ -199,6 +199,28 @@ def test_a_command_line_names_the_run_its_record_does(tmp_path):
     assert EnvRunConfig.cli(args) == stated
 
 
+def test_a_student_resumed_by_its_command_keeps_the_teacher_step_it_pinned(tmp_path):
+    """A student whose teacher's step it leaves to its pinning (`TeacherConfig.step` None) pins the
+    teacher's latest as it starts; once the teacher has trained on, the same command resumed reads the
+    step it pinned (`EnvRunConfig.BUILT`, `RunConfig.resumed`) and trains on, where it pinned the
+    teacher's new latest and its resume was refused (row 3931). A run of no teacher stays one."""
+    teacher_run(tmp_path).prepare().train("teacher")
+    taught = TeacherConfig(str(tmp_path / "teacher"), demonstrates=True)
+    pretrains = {"batch": 8, "length": 8, "train_ratio": float("inf"), "prefill": 16, "capacity": 64}
+    # Named in its trainer, as `dew train` names a run by its file.
+    command = student(tmp_path, 1, teacher=taught, rollout=RolloutConfig("dreamer", pretrains),
+                      objective=ObjectiveConfig(DREAMER_V3, {"imitation": 1.0}),
+                      trainer=trainer(tmp_path, 1, name="taught"))
+    command.prepare().train("taught")
+    teacher_run(tmp_path, steps=4).prepare().train("teacher")
+    again = dataclasses.replace(command, trainer=trainer(tmp_path, 2, name="taught"))
+    prepared = again.prepare()
+    assert prepared.run.teacher is not None and prepared.run.teacher.step == 2
+    assert int(prepared.train("taught").step) == 2
+    untaught = student(tmp_path, 1, trainer=trainer(tmp_path, 1, name="taught"))
+    assert untaught.resumed().teacher is None
+
+
 def test_stages_from_their_records_learn_from_their_saved_teacher_as_composed_in_python(tmp_path):
     """A teacher trained as an environment run (PPO over the race's privileged view), then two stages of a
     student, each built from its record: pretraining, whose prefill the teacher demonstrates with its

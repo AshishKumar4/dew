@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from arm_arithmetic import float64_held
 from decision_support import decision_rows
 from float64_terms import float64_forward
 from interop_support import assert_reloads, assert_same_stored_tensors, token_draw
@@ -500,7 +501,7 @@ def test_a_float64_model_computes_in_float64():
     tensors = tensors_of(loaded)
     with jax.enable_x64(new_val=True):
         model = loaded.model.clone(dtype=jnp.float64)
-        variables = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), loaded.variables)
+        variables = float64_held(loaded.variables)
         ids, cotangent = REFERENCE['input_ids'], REFERENCE['cotangent'].astype(np.float64)
 
         def loss(params):

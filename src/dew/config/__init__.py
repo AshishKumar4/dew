@@ -55,7 +55,7 @@ from dew.data import records
 from dew.data.compile import fitted
 from dew.data.dataset import Loader, Ramp, Reader, ramped
 from dew.data.pipeline import Dataset, ObjectiveData
-from dew.data.plan import PlanOrderChanged
+from dew.data.plan import SCHEDULE, PlanOrderChanged
 from dew.distributed.placement import Layout, MeshSpec
 from dew.files import write_atomically
 from dew.interop.weights import AUTO
@@ -998,16 +998,32 @@ def _learns_alike(before: ObjectiveConfig | None, now: ObjectiveConfig | None) -
 
 
 @contextlib.contextmanager
-def _routed(saved: Mapping[str, object]) -> Iterator[None]:
+def _routed(saved: Mapping[str, object], unseeded: str) -> Iterator[None]:
     """Within the block, a refusal of a resumed run's changed chain (`PlanOrderChanged`) names the record
-    `saved` of the run it resumes as a route where that record holds its chain, as a run.json written of
-    a chain the codec could not describe does not (`{"unrecorded": reason}`)."""
+    `saved` of the run it resumes as a route where that record rebuilds its chains (`_reads_back`), as a
+    run.json written of a chain the codec could not describe does not (`{"unrecorded": reason}`), and
+    the schedule's route as the run's kind spells it (`unseeded`, `RunConfig.UNSEEDED`)."""
     try:
         yield
     except PlanOrderChanged as refused:
         named = registry.class_record(saved)
-        chain = None if named is None else named[1].get("data")
-        raise refused.routed(recorded=isinstance(chain, Mapping) and "unrecorded" not in chain) from None
+        recorded = named is not None and _reads_back(named[1])
+        raise refused.routed(recorded=recorded, unseeded=unseeded) from None
+
+
+def _reads_back(fields: Mapping[str, object]) -> bool:
+    """Whether a saved run's record `fields` holds its data and rebuilds every chain it records, as
+    `RunConfig.load` reads them (`_read_chain`): the record route of a refusal (`RECORD`) names such a
+    record alone, where an unrecorded chain, a recipe's record or an unrecorded split would refuse it
+    again (row 3913)."""
+    if fields.get("data") is None:
+        return False
+    try:
+        for name in _CHAINS:
+            _read_chain(name, fields.get(name))
+    except ValueError:
+        return False
+    return True
 
 
 def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -1254,6 +1270,17 @@ def _within(node: dict[str, JSON], key: str) -> dict[str, JSON]:
     return held
 
 
+def _holds(config: "RunConfig", path: str) -> bool:
+    """Whether `config` holds every record along the dotted `path` up to its field: false past an optional
+    record it holds none of (a teacher of None)."""
+    held: object = config
+    for group in path.split(".")[:-1]:
+        held = getattr(held, group, None)
+        if held is None:
+            return False
+    return True
+
+
 def _recorded_at(config: "RunConfig", path: str) -> JSON:
     """The value `config`'s record holds at the dotted `path` (`_placed`), as `override` writes it."""
     *groups, field = _placed(config, path)[0]
@@ -1334,6 +1361,11 @@ class RunConfig:
     (a decision run's option text). A run that leaves one None and resumes a saved run under its name
     takes the saved run's value (`resumed`), so running the same command again resumes what it trained;
     one it sets is its own, and a resume refuses it where it differs (`check_resume`)."""
+
+    UNSEEDED: ClassVar[str] = SCHEDULE
+    """How a run of this kind reads a mix saved unseeded and seeded now, as the refusal of its resume names
+    it (`PlanOrderChanged.routed`): the data layer's `mix(..., seed=None)`; a decision run's mixture's
+    order (`dew.decision.data.SCHEDULE_MIXTURE`)."""
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     data: Annotated[Dataset | None, tyro.conf.Suppress] = None
@@ -1711,14 +1743,15 @@ class RunConfig:
         (`earlier_run`); itself where it resumes none (`TrainerConfig.resumes`) or leaves none to its
         build."""
         trainer = self.trainer
-        unset = [path for path in self.BUILT if _recorded_at(self, path) is None]
+        unset = [path for path in self.BUILT if _holds(self, path) and _recorded_at(self, path) is None]
         if not unset or trainer.name is None or trainer.resume == "never" or not trainer.resumes():
             return self
         saved = self._saved_record(trainer.directory(trainer.name))
         recorded = None if saved is None else self._saved_as(saved)
         if recorded is None:
             return self
-        return self.override({path: _recorded_at(recorded, path) for path in unset})
+        # A field of a record the saved run held none of (a teacher it had not) takes nothing.
+        return self.override({path: _recorded_at(recorded, path) for path in unset if _holds(recorded, path)})
 
     def build_run(self) -> Prepared:
         """Build what this run trains, the run as it stands, its sources already pinned (`prepare`
@@ -2044,12 +2077,13 @@ class RunConfig:
         target = self.trainer.compile_ahead
         assert target is not None
         mesh = self.trainer.mesh.build(target.compile_only())
-        held = epath.Path(self.trainer.checkpoint_dir, name).is_dir()
+        held = epath.Path(self.trainer.directory(name)).is_dir()
         trainer = self.built(objective, mesh, rollout,
                              checkpoints=self.trainer.checkpoints(name) if held else None)
         with generation.run_precision(self.trainer.precision):
             # The run's bound in examples as its data was compiled to it (`viewed`).
-            return target.compiled(trainer, dataset, steps, dataset.examples if steps is None else None)
+            return target.compiled(trainer, dataset, steps, dataset.examples if steps is None else None,
+                                   self.trainer.resume)
 
     def viewed(self, objective: Objective[Loss, Effects], dataset: Dataset | Loader, *, name: str,
                rollout: Rollout | None = None,
@@ -2062,7 +2096,7 @@ class RunConfig:
         from dew.training.ahead import first_step_batch
 
         run, loader, _, _, steps = self.readied(objective, dataset, validation, (), name)
-        held = epath.Path(run.trainer.checkpoint_dir, name).is_dir()
+        held = epath.Path(run.trainer.directory(name)).is_dir()
         trainer = run.built(objective, run.trainer.mesh, rollout,
                             checkpoints=run.trainer.checkpoints(name) if held else None)
         with generation.run_precision(run.trainer.precision):
@@ -2133,9 +2167,8 @@ class RunConfig:
             from dew.training.startup import resume_admitted
 
             if "record" in resumed:
-                with _routed(resumed["record"]):
-                    resume_admitted(built, dataset, resume,
-                                    examples=dataset.examples if steps is None else None)
+                with _routed(resumed["record"], self.UNSEEDED):
+                    resume_admitted(built, dataset, resume)
 
         agreed("run resume", check_resumed)
         agreed("run data", check_data)

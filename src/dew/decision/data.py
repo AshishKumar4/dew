@@ -475,6 +475,10 @@ STREAMED_WINDOW = 2**14
 """The rows a corpus read as a stream draws its order from (`mixture`): decision examples are rows of
 text, so this many hold tens of megabytes."""
 
+SCHEDULE_MIXTURE = 'read its mixture in the schedule it saved (`mixture(..., order="schedule")`)'
+"""How a decision run reads a mixture saved before its corpus order was seeded, as the refusal of its
+resume names it (`dew.data.plan.SCHEDULE`'s spelling for a decision mixture, rows 3870, 3976)."""
+
 
 def mixture(root_url: str, *, weights: Mapping[str, float] | None = None, descriptor: str | None = None,
             seed: int | None = 0, order: Literal["seeded", "schedule"] = "seeded"
@@ -496,7 +500,7 @@ def mixture(root_url: str, *, weights: Mapping[str, float] | None = None, descri
     from dew.data.sources import Source
     from dew.data.sources.concatenate import Concatenate
 
-    stated, pinned = _stated(root_url, descriptor)
+    stated, pinned, digest = _stated(root_url, descriptor)
     shares = {
         name: _records.number(value, f"weights.{name}")
         for name, value in record(stated.get("weights", {}), "weights").items()
@@ -515,9 +519,11 @@ def mixture(root_url: str, *, weights: Mapping[str, float] | None = None, descri
     if not training:
         raise ValueError(f"no corpus of {root_url} has a positive weight")
     # Each corpus states the mixture it is read in: its positive weights and where the manifest that made
-    # it is read, which a run's summary reads it from (`made_by`), a few words a corpus, not its copy.
+    # it is read, with the digest of the bytes read there, which a run's summary reads it from and checks
+    # (`made_by`), a few words a corpus, not its copy.
     made = {"mixture_weights": {name: weight for name, weight in sorted(shares.items()) if weight > 0},
-            "mixture_root": root_url, **({} if descriptor is None else {"mixture_descriptor": descriptor})}
+            "mixture_root": root_url, **({} if descriptor is None else {"mixture_descriptor": descriptor}),
+            "mixture_sha256": digest}
     training = [dataclasses.replace(child, source=dataclasses.replace(child.source, mixture=made))
                 for child in training]
     if order not in ("seeded", "schedule"):
@@ -542,29 +548,41 @@ def corpus(root_url: str, name: str, split: Literal["train", "held"] = "held",
     shards and index its manifest names (or the corpus's one JSONL file), each row an `Example` under
     `example`; None when the corpus has no such split. A benchmark reads one corpus's held rows through
     this, whatever its weight."""
-    stated, pinned = _stated(root_url, descriptor)
+    stated, pinned, _ = _stated(root_url, descriptor)
     return _corpus(root_url, stated, pinned, name, split)
 
 
-def made_by(facts: Mapping[str, object]) -> Mapping[str, object]:
+def made_by(facts: Mapping[str, object]) -> Mapping[str, object] | None:
     """The manifest a decision mixture's corpora state they were made by (`mixture`): read again from
-    the root and descriptor they name, or the copy a chain recorded before they named them."""
+    the root and descriptor they name, refused where its bytes are not the ones the corpora were read by
+    (row 3969); None where they name none, as a chain recorded before they named it does (row 3968)."""
     root = facts.get("mixture_root")
     if root is None:
-        return record(facts.get("mixture_made", {}), "mixture_made")
+        return None
+    root_url = _records.text(root, "mixture_root")
     descriptor = facts.get("mixture_descriptor")
-    return _stated(_records.text(root, "mixture_root"),
-                   None if descriptor is None else _records.text(descriptor, "mixture_descriptor"))[0]
+    replaced = None if descriptor is None else _records.text(descriptor, "mixture_descriptor")
+    stated, _, digest = _stated(root_url, replaced)
+    read = facts.get("mixture_sha256")
+    if read is not None and read != digest:
+        raise ValueError(f"the mixture manifest at {replaced or root_url} is not the one this run's corpora "
+                         f"were read by (sha256 {read}, now {digest}): it was rewritten after the run read "
+                         "it, so its summary would name another; restore that manifest, or train a new run")
+    return stated
 
 
-def _stated(root_url: str, descriptor: str | None) -> tuple[Mapping[str, object], Mapping[str, object]]:
-    """The mixture's manifest, as `descriptor` pins it, and that pin."""
+def _stated(root_url: str, descriptor: str | None
+            ) -> tuple[Mapping[str, object], Mapping[str, object], str]:
+    """The mixture's manifest, as `descriptor` pins it, that pin, and the sha256 of the manifest's bytes
+    (the descriptor's where one pins it)."""
     from dew.data.storage import Store
 
     fs, path = Store(root_url).resolve()
     with fs.open(path.rstrip("/") + "/mixture.json", "rb") as handle:
-        stated = record(json.load(handle), "mixture.json")
-    return _descriptor(root_url, stated, descriptor)
+        payload = handle.read()
+    stated, pinned = _descriptor(root_url, record(json.loads(payload), "mixture.json"), descriptor)
+    digest = pinned.get("sha256") if descriptor is not None else hashlib.sha256(payload).hexdigest()
+    return stated, pinned, _records.text(digest, "descriptor sha256")
 
 
 def _corpus(root_url: str, stated: Mapping[str, object], pinned: Mapping[str, object],

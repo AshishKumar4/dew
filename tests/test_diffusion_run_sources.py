@@ -89,7 +89,11 @@ def test_a_shape_only_pipeline_load_retains_geometry_without_eager_native_copies
 
 
 def value(objective, params, batch) -> float:
-    loss, _ = objective.loss(params, batch, Step(jnp.asarray(0), jax.random.PRNGKey(5), None))
+    """The objective's loss on `batch` at a fixed key, one compiled program as a run's step compiles it:
+    run op by op, a pipeline's loss compiled each of its thousand operations apart (row 3984). Two
+    objectives that trace one program score alike, bit for bit."""
+    step = Step(jnp.asarray(0), jax.random.PRNGKey(5), None)
+    loss, _ = jax.jit(lambda tree: objective.loss(tree, batch, step))(params)
     return float(loss.total / loss.mass)
 
 

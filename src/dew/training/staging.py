@@ -24,11 +24,14 @@ import jax.extend.core as jcore
 from jax.core import ShapedArray
 
 from dew.distributed.placement import placed_bytes
-from dew.training.compiled_program import bodies, computed, inlined
+from dew.nn.programs import CALLS, called, computed, inlined
 
-PURE_CALLS = frozenset({"jit", "pjit", "closed_call", "core_call"})
-"""The operations that call a program on their operands and do nothing else, which `flattened` runs in
-their caller: an optax helper's `jit` over a whole tree reads each leaf apart from the rest within it."""
+PURE_CALLS = CALLS - {"remat2", "checkpoint", "custom_jvp_call", "custom_vjp_call", "marked_call"}
+"""The calls (`dew.nn.programs.CALLS`) that run a program on their operands and do nothing else, which
+`flattened` runs in their caller: an optax helper's `jit` over a whole tree reads each leaf apart from the
+rest within it. A checkpoint's and a custom derivative's call do more than their program, a rule of their
+own, and a marked span is a boundary the algebra pass reads (`dew.nn.derivatives.marked`: a protected
+span's inside no rule touches), so each stays a call."""
 
 CHUNKS = 16
 """The most chunks the fields' bytes are cut into where no group of leaves read together is larger
@@ -38,7 +41,7 @@ cut one leaf a chunk would pay that wait thousands of times for no device memory
 
 def flattened(program: jcore.Jaxpr, operands: Sequence, consts: Sequence = ()) -> tuple[list, list]:
     """`program`'s equations over `operands`, each call of `PURE_CALLS` that places nothing replaced by its
-    own program's (`inlined`, fresh values for each), and its results."""
+    own program's (`called`, `inlined`, fresh values for each), and its results."""
     equations, returned = inlined(program, operands, consts)
     expanded: list[jcore.JaxprEqn] = []
     renamed: dict = {}
@@ -48,12 +51,12 @@ def flattened(program: jcore.Jaxpr, operands: Sequence, consts: Sequence = ()) -
 
     for equation in equations:
         reading = [read(value) for value in equation.invars]
-        called = bodies(equation)
+        body = called(equation)
         placing = [sharding for key in ("in_shardings", "out_shardings")
                    for sharding in equation.params.get(key, ())
                    if isinstance(sharding, jax.sharding.Sharding)]
-        if equation.primitive.name in PURE_CALLS and len(called) == 1 and not placing:
-            inner, outputs = flattened(called[0], reading, tuple(called[0].consts))
+        if body is not None and equation.primitive.name in PURE_CALLS and not placing:
+            inner, outputs = flattened(body, reading, tuple(body.consts))
             expanded.extend(inner)
             renamed.update(zip(equation.outvars, outputs, strict=True))
         else:

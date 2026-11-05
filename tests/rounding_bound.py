@@ -30,6 +30,7 @@ import weakref
 import jax
 import jax.numpy as jnp
 import numpy as np
+from arm_arithmetic import unrewritten
 from float64_terms import SUMS, _evaluated, _static, _target, evaluated_on
 
 EXACT = frozenset({
@@ -153,8 +154,10 @@ def rounding_scale(fn, *args, seed: int = 0):
     weighs alike for every arm. The program is traced at `args` as given, its roundings those formats', and
     evaluated in float64; a non-floating output's scale is None. A static program (no branch or loop its
     values pick) evaluates compiled, once a signature and matmul precision; any other walks eagerly."""
-    closed = jax.make_jaxpr(fn)(*args)
-    tree = jax.tree.structure(jax.eval_shape(fn, *args))
+    # The program as written: traced with the algebra pass off, a reference's (`arm_arithmetic.unrewritten`).
+    written = unrewritten(fn)
+    closed = jax.make_jaxpr(written)(*args)
+    tree = jax.tree.structure(jax.eval_shape(written, *args))
     # Traced in the caller's arithmetic (its default matmul precision among it), replayed in float64's own.
     traced = str(jax.config.jax_default_matmul_precision)
     with evaluated_on(jax.tree.leaves(args)), jax.enable_x64(new_val=True), \
