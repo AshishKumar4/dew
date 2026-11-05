@@ -102,6 +102,25 @@ def test_a_run_records_the_data_plan_it_reads_by_and_one_saved_before_reads_by_e
     assert RunConfig.load(str(directory)).data_plan_version == 8
 
 
+def test_a_run_trained_on_a_compiled_loader_records_the_version_the_loader_reads_by(tmp_path):
+    """A run handed a loader already compiled (`RunConfig.train` of a `Loader`) reads the order the loader
+    was compiled in, so its record names the loader's data plan version, which rebuilding the run reads by,
+    not this Dew's (train 589's review: a loader compiled at 8 trained under a record naming 9)."""
+    import numpy as np
+    from affine_run import FEATURES
+
+    from dew.data import Memory, compile
+    from dew.data.plan import PLAN_VERSIONS
+
+    rows = np.random.default_rng(0).normal(size=(16, FEATURES)).astype(np.float32)
+    loader = compile(Memory([{"x": row, "y": 2 * row[:2]} for row in rows]).batch(8).repeat(), plan_version=8)
+    assert loader.plan.version == 8 != PLAN_VERSIONS[-1]
+    config = TrainerConfig(name="loaded", checkpoint_dir=str(tmp_path / "runs"), steps=1, eval_every=None,
+                           checkpoint_every=None)
+    RunConfig(trainer=config).train(Regression(), loader, name="loaded")
+    assert RunConfig.load(str(tmp_path / "runs" / "loaded")).data_plan_version == 8
+
+
 def test_a_record_with_an_unknown_field_or_without_a_required_one_is_refused():
     record = RunConfig().to_dict()
     with pytest.raises(ValueError):

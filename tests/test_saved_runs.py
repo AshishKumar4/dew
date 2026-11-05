@@ -205,22 +205,45 @@ def test_a_run_an_earlier_main_saved_resumes_when_its_command_runs_again(tmp_pat
     assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
 
 
+@pytest.mark.parametrize("named", [None, "another"])
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
-def test_a_run_an_earlier_main_saved_resumes_through_its_python_train(tmp_path, monkeypatch, recorded, kind):
+def test_a_run_an_earlier_main_saved_resumes_through_its_python_train(tmp_path, monkeypatch, recorded, kind,
+                                                                      named):
     """A kind's run saved at an earlier main resumes from its last checkpoint as a Python experiment trains
     it: its objective and data built, then handed to `RunConfig.train` with the run naming no data plan
     version, as one written in Python does. The train resolves it itself, the saved run's (`resumed`, which
     `readied` asks), so the resume compares alike and fits the one step past its checkpoint, and the record
     it writes names the version it read by (train 589's review: a run trained so read by this Dew's version
-    and recorded none, so a saved run's resume was refused)."""
+    and recorded none, so a saved run's resume was refused). The run it resumes is the one `train` is
+    given the name of, whatever its trainer names, none or another (`named`)."""
     run, last, built = rebuilt(tmp_path, monkeypatch, recorded, kind)
     prepared = built.prepare()
-    python = dataclasses.replace(prepared, run=dataclasses.replace(prepared.run, data_plan_version=None))
+    python = dataclasses.replace(prepared, run=dataclasses.replace(
+        prepared.run, data_plan_version=None, trainer=dataclasses.replace(prepared.run.trainer, name=named)))
     python.train(kind)
     records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
     started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
     assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
     assert RunConfig.load(str(run)).data_plan_version == 8
+
+
+@pytest.mark.parametrize(("landed", "version"), [(9, 9), (None, 9)])
+def test_a_run_saved_while_its_version_was_data_plan_loads_and_resumes_by_it(tmp_path, monkeypatch, landed,
+                                                                             version):
+    """A run a Dew saved while a run's data plan version was its field `data_plan` (main 1af304d0, before
+    the field was `data_plan_version`, train 589's review) records the version it compiled at, or None
+    where it was trained in Python, which that Dew compiled at this Dew's, 9: it loads by that version and
+    resumes when its command runs again (row 4107)."""
+    recorded, kind = next((recorded, kind) for recorded, kind in SAVED if kind == "lm")
+    run, last, built = rebuilt(tmp_path, monkeypatch, recorded, kind)
+    record = json.loads((run / "run.json").read_text())
+    fields = {name: value for name, value in record["fields"].items() if name != "data_plan_version"}
+    (run / "run.json").write_text(json.dumps({**record, "fields": {**fields, "data_plan": landed}}))
+    assert RunConfig.load(str(run)).data_plan_version == version
+    built.prepare().train(kind)
+    records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
+    started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
+    assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
 
 
 def test_reading_a_saved_run_opens_no_device_before_its_process_is_prepared(tmp_path):
