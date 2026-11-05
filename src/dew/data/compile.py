@@ -83,7 +83,6 @@ from dew.data.lowering import (
     _Build,
     _epoch_records,
     _Locality,
-    _member_key,
     _order_records,
     _Present,
     _split_spans,
@@ -693,15 +692,21 @@ def _made(prepared: Sequence[Pipeline], read: Read, counts: Sequence[dict[str, C
     return made
 
 
+def _own_key(branch: Pipeline) -> str | None:
+    """A named chain's own key, read outside any mixture: the key a mixture keys it by as its first member
+    of that name (`_member_keys`), which its shuffles draw by from plan version 9 (`_Build.ordered`); None
+    for a chain given no name."""
+    return None if branch.name is None else _member_keys(_members([branch]))[0]
+
+
 def _build(branch: Pipeline, read: Read, loading: Loading, *, batch: int, training: bool, seed: int = 0,
-           lowering: _Lowering | None = None, version: int = PLAN_VERSIONS[-1],
-           named: int | None = None) -> _Build:
+           lowering: _Lowering | None = None, version: int = PLAN_VERSIONS[-1]) -> _Build:
     """The build a reader of a prepared `branch` reads it by, in batches of `batch`: training's, or a
     scored or published pass's, by the lowering its analysis gives unless `lowering` says otherwise, and
-    the data plan `version` it reads by, and a named chain's own key (`named`, `_Build.named`)."""
+    the data plan `version` it reads by, and the branch's own key where it is named (`_own_key`)."""
     lowered = _analyzed(branch, read, validation=not training) if lowering is None else lowering
     return _Build(read, loading, seed, batch, lowered, training=training, elastic=branch._elastic,
-                  version=version, named=named)
+                  version=version, named=_own_key(branch))
 
 
 @compiling
@@ -838,8 +843,6 @@ def _staged(
         raise ValueError(
             "rejections='mask' needs an objective proven mask-safe; no objective currently declares it"
         )
-    # A named chain's own key, which its shuffles draw by outside any mix (`_Build.ordered`).
-    named = None if train.name is None else _member_key(_members([train]), 0)
     stated = next((stage for stage in train.stages if isinstance(stage, TokenBudget)), None)
     batch_tokens = None if stated is None else stated.tokens
     if measured is None:
@@ -857,7 +860,7 @@ def _staged(
     if validation_counts and not any(count.accepted for count in validation_counts.values()):
         validation = None
     build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed,
-                   version=version, named=named)
+                   version=version)
     passes = None
     if epochs is not None and measured.ahead == "layout":
         # The bound it held with its pack counted its passes as it held the documents (`Limit.passes`). The
@@ -873,7 +876,7 @@ def _staged(
         if passes is not None:
             original, train = _rebound(original, epochs * passes), _rebound(train, epochs * passes)
             build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed,
-                   version=version, named=named)
+                   version=version)
     elif epochs is not None:
         # Epochs of a read with a record count count it, read endlessly; of one with none, the source
         # examples a pass holds, its prepared rows as held, bounded to that many passes (`_bounded`).
@@ -881,7 +884,7 @@ def _staged(
         original, train = ((_endless(original), _endless(train)) if passes is None else
                            (_bounded(original, epochs * passes), _bounded(train, epochs * passes)))
         build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed,
-                   version=version, named=named)
+                   version=version)
     return _Staged(train, validation, original, build, counts, validation_counts, batch_tokens, passes)
 
 
@@ -1039,7 +1042,10 @@ def _compiled(
     plan = Plan(
         "global" if global_order else "per-share",
         manifest,
-        {"read": read, "seed": seed, **build.lowering.order},
+        # A named chain's own key, which its shuffles draw by from version 9 (`_own_key`), so a position
+        # saved under another name is refused, as another permutation of its records.
+        {"read": read, "seed": seed, **({"named": build.named} if build.version >= 9 and build.named else {}),
+         **build.lowering.order},
         _derived(train, build),
         cache=_cache_references(original, read),
         members={key: fingerprint(manifest) for key, (manifest, _) in members.items()},
@@ -1073,7 +1079,7 @@ def _compiled(
             build=dataclasses.replace(
                 tuned, lowering=_analyzed(validation, read, validation=True), training=False,
                 batch=_output_batch(validation),
-                named=None if validation.name is None else _member_key(_members([validation]), 0),
+                named=_own_key(validation),
             ).tuned(validation),
             host=_held_coordinated(validation, packed) + _held_steps(validation) + host,
         )
@@ -1761,8 +1767,11 @@ def fitted[Entry](
         loader = dataset
     if named is None:
         return loader, None
+    # Validation reads by the version training does, a loader compiled already by its own.
+    version = plan_version if loader.plan is None else loader.plan.version
     return loader, {name: held(entry, objective=objective, batch=loader.batch, seed=seed, widths=widths,
-                               measured=scored[name]) if isinstance(entry, Dataset) else entry
+                               measured=scored[name], plan_version=version)
+                    if isinstance(entry, Dataset) else entry
                     for name, entry in named.items()}
 
 
@@ -1796,8 +1805,8 @@ def _reads_on(chain: Pipeline) -> bool:
 
 
 def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int | None = None,
-         seed: int = 0, widths: Mapping[str, object] | None = None, measured: _Measured | None = None
-         ) -> Reader:
+         seed: int = 0, widths: Mapping[str, object] | None = None, measured: _Measured | None = None,
+         plan_version: int = PLAN_VERSIONS[-1]) -> Reader:
     """`dataset` read once to validate or evaluate on, in its own batches, else in batches of `batch`,
     read and loaded as it asks, its random steps drawing from `seed`; one that states neither batch is
     refused. A pass reads every record: a batch it fills only in part keeps the records it holds,
@@ -1817,7 +1826,7 @@ def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int
     # The chain's own batch is the one it is read in; validation's `batch` adds none to it.
     return validation(measured.branches[0], batch=1, objective=objective, read=_held_read(chain),
                       loading=chain._loading or _DEFAULT_LOADING, provision=True, seed=seed, widths=widths,
-                      measured=measured)
+                      measured=measured, plan_version=plan_version)
 
 
 def _held_batched(chain: Pipeline, batch: int | None, *, unbatched: bool = False) -> Pipeline:
@@ -1860,10 +1869,12 @@ def validation(
     seed: int = 0,
     widths: Mapping[str, object] | None = None,
     measured: _Measured | None = None,
+    plan_version: int = PLAN_VERSIONS[-1],
 ) -> Reader:
     """Compile one finite evaluation branch without constructing a training
     stream. With no `read`, the sources choose it (`_preferred_read`); `widths` are the run's static
-    widths its steps bind to (`run_widths`), and `measured` the branch as they measured it, batched."""
+    widths its steps bind to (`run_widths`), and `measured` the branch as they measured it, batched; it
+    reads by data plan version `plan_version`, its run's (`compile`)."""
     read = read or _preferred_read((pipeline,), provision=provision)
 
     # One pass reads every record, in the chain's own batches or `batch`'s (`_held_batched`).
@@ -1876,7 +1887,8 @@ def validation(
     (pipeline,) = _made(prepared, read, ({},), training=False)
     packed = _coordinated(pipeline)
     # A token budget is fixed-length rows by now (`_budgeted`).
-    build = _build(pipeline, read, loading, batch=_output_batch(prepared[0]), training=False, seed=seed)
+    build = _build(pipeline, read, loading, batch=_output_batch(prepared[0]), training=False, seed=seed,
+                   version=plan_version)
     return functools.partial(_validation_reader, pipeline=pipeline, build=build.tuned(pipeline),
                              host=packed + _held_steps(pipeline) + host)
 

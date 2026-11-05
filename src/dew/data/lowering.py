@@ -1384,10 +1384,10 @@ class _Build:
     version: int = PLAN_VERSIONS[-1]
     """The data plan version it reads by (`dew.data.plan.PLAN_VERSIONS`): 9 a corpus's shuffles each by its
     own key (`ordered`), 8 each by its seed alone."""
-    named: int | None = None
+    named: str | None = None
     """The key of the chain this builds, read outside any mixture, where it was given a name: the key a
-    mixture would key it by as its first member of that name (`_member_key`), which its shuffles draw by
-    (`ordered`)."""
+    mixture keys it by as its first member of that name (`dew.data.compile._own_key`), which its shuffles
+    draw by (`ordered`)."""
 
     @property
     def global_order(self) -> bool:

@@ -1071,21 +1071,21 @@ def earlier_option_text(record: Mapping[str, object]) -> Mapping[str, object]:
     return {**record, "fields": {**named[1], "option_text": "named"}}
 
 
-def earlier_option_writing(record: Mapping[str, object], directory: str) -> Mapping[str, object]:
+def earlier_option_writing(record: Mapping[str, object], checkpoints: Checkpoints) -> Mapping[str, object]:
     """A saved decision run's record (`earlier_run`'s) whose option text is None, which a Dew before row
     3867 recorded where the run left it to its layout: the writing the layout its last checkpoint in
-    `directory` records wrote (`dew.decision.layout.layout_writing`), so a resume writes its rows as it
-    did, whatever a later Dew's layout leaves; as it is where no checkpoint records one (a run that
-    trained no step). Carried to 1.0 (ledger 1552)."""
+    `checkpoints` (its tiers, as the run keeps them) records wrote (`dew.decision.layout.layout_writing`),
+    so a resume writes its rows as it did, whatever a later Dew's layout leaves; as it is where no
+    checkpoint records one (a run that trained no step, or a layout no record described), whose writing
+    its build resolves again (`RunConfig.check_resume`). Carried to 1.0 (ledger 1552)."""
     named = registry.class_record(record)
     if named is None or "option_text" not in named[1] or named[1]["option_text"] is not None:
         return record
     from dew.decision.layout import Layout, layout_writing
     from dew.inference.tasks import earlier_shapes
 
-    with Checkpoints(directory) as checkpoints:
-        step = checkpoints.latest
-        artifact = None if step is None else checkpoints.artifact(step)
+    step = checkpoints.latest
+    artifact = None if step is None else checkpoints.artifact(step)
     laid = earlier_shapes(artifact).get("layout") if isinstance(artifact, Mapping) else None
     if not isinstance(laid, Mapping):
         return record
@@ -1630,14 +1630,18 @@ class RunConfig:
         things: another class, or a field outside `RESUMABLE` that differs. A changed `rope_theta`
         keeps every shape, so it would otherwise continue the old weights under new semantics. The
         saved fields are read back as this class reads them (`from_dict`), so a field the record
-        predates takes its default."""
+        predates takes its default, and one it left to its build unresolved takes this build's."""
         recorded = self._saved_as(saved)
         if recorded is None:
             raise ValueError(f"the run to resume is no {type(self).__name__}; resume it as the run it "
                              "records, or train under another name")
         before, now = recorded._fields_record(), self._fields_record()
+        # A field the saved run left to its build and its record holds unresolved, which no checkpoint
+        # states either (`earlier_option_writing`), is the one this build resolves (`BUILT`).
+        unresolved = {path for path in self.BUILT if "." not in path and before.get(path) is None}
         changed = sorted(name for name in now.keys() | before.keys()
-                         if name not in self.RESUMABLE and now.get(name) != before.get(name))
+                         if name not in self.RESUMABLE and name not in unresolved
+                         and now.get(name) != before.get(name))
         if "objective" in changed and _learns_alike(recorded.objective, self.objective):
             changed.remove("objective")
         if recorded.trainer.quantization != self.trainer.quantization:
@@ -1657,13 +1661,13 @@ class RunConfig:
         return type(self).from_dict({name: value for name, value in named[1].items() if name not in _CHAINS})
 
     @staticmethod
-    def _saved_record(directory: str) -> Mapping[str, object] | None:
+    def _saved_record(directory: str, checkpoints: Checkpoints) -> Mapping[str, object] | None:
         """The record of the saved run in its checkpoints' `directory`, read as every earlier shape of a
         saved run is (`earlier_run`); None where none was saved."""
         saved = epath.Path(directory) / RUN_FILE
         if not saved.exists():
             return None
-        return earlier_option_writing(earlier_run(json.loads(saved.read_text())), directory)
+        return earlier_option_writing(earlier_run(json.loads(saved.read_text())), checkpoints)
 
     @classmethod
     def cli(cls, args: Sequence[str] | None = None, *, default: Self | None = None) -> Self:
@@ -1749,8 +1753,15 @@ class RunConfig:
         record = json.loads((path if named_file else path / RUN_FILE).read_text())
         # The packages trusted first, so the record's earlier shapes are read with its classes imported.
         registry.import_trusted(record, trust)
-        held = earlier_option_writing(earlier_run(record), str(path.parent if named_file else path))
-        return cls.read(held, trust=trust)
+        held = earlier_run(record)
+        run = cls.read(held, trust=trust)
+        # Its checkpoints' tiers as the run kept them, under the directory it was saved in.
+        saved = str(path.parent if named_file else path)
+        local = run.trainer.local_directory
+        with Checkpoints(saved, local_directory=None if local is None else os.path.join(
+                local, os.path.basename(saved.rstrip("/")))) as checkpoints:
+            settled = earlier_option_writing(held, checkpoints)
+        return run if settled is held else cls.read(settled, trust=trust)
 
     @classmethod
     def read(cls, record: Mapping[str, object], *, trust: Sequence[str] = ()) -> Self:
@@ -1788,7 +1799,8 @@ class RunConfig:
         unset = [path for path in self.BUILT if _holds(self, path) and _recorded_at(self, path) is None]
         if not unset or trainer.name is None or trainer.resume == "never" or not trainer.resumes():
             return self
-        saved = self._saved_record(trainer.directory(trainer.name))
+        with trainer.checkpoints(trainer.name) as checkpoints:
+            saved = self._saved_record(trainer.directory(trainer.name), checkpoints)
         recorded = None if saved is None else self._saved_as(saved)
         if recorded is None:
             return self
@@ -2206,7 +2218,7 @@ class RunConfig:
 
         def check_resumed() -> None:
             if checkpoints.resumed(resume) is not None and (
-                    record := self._saved_record(checkpoints.directory)) is not None:
+                    record := self._saved_record(checkpoints.directory, checkpoints)) is not None:
                 self.check_resume(record)
                 resumed["record"] = record
 
