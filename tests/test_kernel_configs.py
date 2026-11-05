@@ -396,17 +396,20 @@ FP8_FORMS = ("forward fp8",)
 HOOKED_FORMS = ("kernel gradient exact fp32", "normed biased forward", "normed biased input gradient",
                 "normed kernel gradient", "exact normed kernel gradient", "fp16 normed biased forward",
                 "cast forward", "gated forward", "gated kernel gradient", "residual forward",
-                "two bf16 outputs forward", "scaled forward", "row scaled forward", "paired swiglu forward",
-                "paired forward")
+                "two bf16 outputs forward", "scaled forward", "row scaled forward")
 """The hooked and exactly summed forms a family whose model counts what they hold emits
 (`Family.counts_hooks`): prologues (a norm, a cast, SwiGLU's gate tile), epilogues over side vectors and a
-side tile, a second output, a paired product, and the running sum, each priced by what it materializes
+side tile, a second output, and the running sum, each priced by what it materializes
 (`grouped_matmul._Mosaic.registers`)."""
+
+PAIRED_FORMS = ("paired swiglu forward", "paired forward")
+"""The paired products a family whose consumers issue no ring's loads emits beside those counting hooks,
+their only hook the epilogue over their two accumulators (`grouped_matmul._pair_alone`, row 2100)."""
 
 
 def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
-    """Each GEMM Mosaic launch form (`PLAIN_FORMS`, `HOOKED_FORMS`) at a projection's extents: its name,
-    launch, abstract operands and options."""
+    """Each GEMM Mosaic launch form (`PLAIN_FORMS`, `PAIRED_FORMS`, `HOOKED_FORMS`) at a projection's
+    extents: its name, launch, abstract operands and options."""
     from test_gemm_template import (
         biased,
         casted,
@@ -565,7 +568,8 @@ def _emitted_forms(family, shape: str | None = None) -> set[str]:
     and whose contraction steps by its narrowest depth (`Family.column_unit`, `Family.depths`)."""
     if family is None:
         return set()
-    forms = {*PLAIN_FORMS, *(HOOKED_FORMS if family.counts_hooks else ()),
+    forms = {*PLAIN_FORMS, *(PAIRED_FORMS if family.counts_hooks or not family.feeds_itself else ()),
+             *(HOOKED_FORMS if family.counts_hooks else ()),
              *(FP8_FORMS if family.takes_fp8 else ())}
     if shape is None:
         return forms
