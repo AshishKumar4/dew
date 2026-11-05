@@ -26,10 +26,12 @@ import dataclasses
 import gc
 import json
 import math
+import sys
 import time
 import zlib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -47,6 +49,9 @@ from dew.registry import models
 from dew.sampling.text import decode_ops, prefill_state
 from dew.telemetry.benchmark import resident_memory
 from dew.training import Layout, MeshSpec
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from receipt_paths import recorded
 
 WIDTHS = {
     "tiny": {"vocab_size": 256, "emb_features": 64, "num_heads": 4, "head_dim": 16,
@@ -332,7 +337,7 @@ def main(config: OffloadConfig) -> None:
             print(json.dumps(record, default=float))
     if config.out is not None:
         with open(config.out, "w") as handle:
-            json.dump({"config": dataclasses.asdict(config), "records": records}, handle,
+            json.dump({"config": recorded(config, paths=("out",)), "records": records}, handle,
                       indent=1, default=float)
 
 
