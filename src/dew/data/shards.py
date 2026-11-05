@@ -10,7 +10,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 import grain.experimental as experimental
 import grain.python as grain
 
-from dew._records import boolean, record
+from dew._records import boolean, integer, record
 
 from .dataset import LONG_RUN, DataPartition, Loading, logged_run, restore_parent
 from .sources.base import Shard, ShardManifest, ShardReader
@@ -164,15 +164,85 @@ class _ShardPass[Place](grain.IterDataset):
             # A worker dealt no place or no row of the bound reads nothing (Grain's interleave of no dataset
             # raises).
             return _Passing(None)
-        empty = _EmptyRun(self.name)
-        rows = experimental.InterleaveIterDataset(
-            self.root.map(_Reader(self.reader, empty, self.loading)),
-            cycle_length=self.cycle,
-            num_make_iter_threads=max(self.loading.threads, 1),
-            make_iter_buffer_size=self.loading.read_buffer,
-        )
+        reader = _Reader(self.reader, _EmptyRun(self.name), self.loading)
+        rows = (_Sequential(self.root, reader, self.loading) if self.cycle == 1
+                else interleaved(self.root, reader, self.cycle, self.loading))
         limited = rows if self.quota is None else experimental.LimitIterDataset(rows, self.quota)
         return _Passing(limited.__iter__())
+
+
+def interleaved(places: grain.MapDataset, reader: Callable[..., grain.IterDataset], cycle: int,
+                loading: Loading) -> grain.IterDataset:
+    """`places` read by `reader`, `cycle` of them open at once, by Grain's interleave: each open place read a
+    row ahead on a thread of the interleave's own, the next ones opened ahead on the loading's threads."""
+    return experimental.InterleaveIterDataset(places.map(reader), cycle_length=cycle,
+                                              num_make_iter_threads=max(loading.threads, 1),
+                                              make_iter_buffer_size=loading.read_buffer)
+
+
+class _Sequential(grain.IterDataset):
+    """A share's places read one after another, each by `reader` as the one before it ends, on the thread
+    that reads them: the rows, in their order, of Grain's interleave of one place at a time (`interleaved`),
+    which read each open place a row ahead on a thread of its own, so a thousand members of a mix, each its
+    place open, held a thousand threads (row 4079); a place's own reads run under the reading's loading."""
+
+    def __init__(self, places: grain.MapDataset, reader: Callable[..., grain.IterDataset], loading: Loading):
+        super().__init__()
+        self.places, self.reader, self.loading = places, reader, loading
+
+    def __iter__(self) -> grain.DatasetIterator:
+        return _SequentialIterator(self.places, self.reader, self.loading)
+
+
+class _SequentialIterator(grain.DatasetIterator):
+    """`_Sequential`'s reads: the place it reads (`place`) and its rows' position there, None before it
+    opens; a position an earlier Dew saved, its interleave's of one place at a time, read on by that
+    interleave (`earlier`)."""
+
+    def __init__(self, places: grain.MapDataset, reader: Callable[..., grain.IterDataset], loading: Loading):
+        super().__init__()
+        self.places, self.reader, self.loading = places, reader, loading
+        self.place, self.rows = 0, None
+        self.earlier: grain.DatasetIterator | None = None
+
+    def __next__(self):
+        if self.earlier is not None:
+            return next(self.earlier)
+        while self.place < len(self.places):
+            if self.rows is None:
+                self.rows = iter(self.reader(self.places[self.place]))
+            try:
+                return next(self.rows)
+            except StopIteration:
+                self.rows.close()
+                self.rows, self.place = None, self.place + 1
+        raise StopIteration
+
+    def get_state(self) -> Mapping[str, object]:
+        if self.earlier is not None:
+            return self.earlier.get_state()
+        return {"place": self.place, "rows": None if self.rows is None else self.rows.get_state()}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self.close()
+        if "place" not in state:
+            # A position an earlier Dew saved, its interleave's of one place at a time, handed back to that
+            # interleave as it is: the one translation of it (CONTRIBUTING's), deleted at 1.0.
+            self.earlier = interleaved(self.places, self.reader, 1, self.loading).__iter__()
+            self.earlier.set_state(state)
+            return
+        self.place = integer(state["place"], "sequential shard pass's place")
+        rows = state["rows"]
+        if rows is not None:
+            self.rows = iter(self.reader(self.places[self.place]))
+            self.rows.set_state(record(rows, "sequential shard pass's rows"))
+
+    def close(self) -> None:
+        if self.earlier is not None:
+            self.earlier.close()
+        if self.rows is not None:
+            self.rows.close()
+        self.earlier, self.rows = None, None
 
 
 NOTHING: Mapping[str, object] = {"rows": None}
