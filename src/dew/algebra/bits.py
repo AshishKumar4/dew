@@ -531,3 +531,22 @@ NVFP4_BFLOAT16_FORM = BitForm(
 without searching: a rotation by 6 and left shifts by 2 and 6 and of the rotation's by 2 (on the FMA pipe),
 four masked XORs, the fp4 challenge's price (5 issues on the busiest pipe, 8 instructions). Its encoder is
 the stored layout's version: weights stored in it decode by this form alone."""
+
+
+NVFP4_OWED = 2.0 ** 8
+"""The factor an NVFP4 tile's decode (`nvfp4_decoded`) owes its values, which the epilogue's fp32 scale takes:
+the decode's 2^-126 (`NVFP4_BFLOAT16`) against its block scale's 2^118, each value and its scale then in
+bfloat16's normal range, the product exact."""
+
+
+def nvfp4_decoded(words: jax.Array, scales: jax.Array) -> jax.Array:
+    """An NVFP4 tile in bfloat16, each value its E2M1 code times its block's E4M3 scale over `NVFP4_OWED`,
+    exactly: `words` `[depth / 8, columns]` uint32, each the stored (`BitForm.prepared`) word of a column's
+    eight consecutive codes along the depth, and `scales` `[depth / 16, columns]` float8_e4m3fn, one for
+    each sixteen; `[depth, columns]`. A code's decode (`NVFP4_BFLOAT16_FORM.values`) is `code 2^-126`, a
+    scale's widening `scale 2^118`: their product in float32 is exact (at most six significant bits) and
+    within bfloat16's normal range, a GEMM operand prologue's per stage (the template's matrix-operand hook,
+    algebra.md 7.4)."""
+    codes = NVFP4_BFLOAT16_FORM.values(words.T, jnp.bfloat16).T.astype(jnp.float32)
+    widened = scales.astype(jnp.float32) * np.float32(2.0 ** 118)
+    return (codes * jnp.repeat(widened, 16, axis=0)).astype(jnp.bfloat16)
