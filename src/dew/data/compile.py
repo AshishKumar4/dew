@@ -1789,10 +1789,10 @@ def fitted[Entry](
         loader = dataset
     if named is None:
         return loader, None
-    # Validation reads by the version training does, a loader compiled already by its own.
-    version = plan_version if loader.plan is None else loader.plan.version
+    # Validation reads by the version training does: a loader handed compiled already reads by its own,
+    # which the run takes as its version (`RunConfig.readied`, the rule's one home).
     return loader, {name: held(entry, objective=objective, batch=loader.batch, seed=seed, widths=widths,
-                               measured=scored[name], plan_version=version)
+                               measured=scored[name], plan_version=plan_version)
                     if isinstance(entry, Dataset) else entry
                     for name, entry in named.items()}
 
