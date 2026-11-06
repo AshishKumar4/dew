@@ -229,7 +229,7 @@ class Mixture:
     shared_features: int = 0
     shared_gate: bool = False
     implementation: str = 'auto'
-    dispatch: str = 'global'
+    dispatch: str = 'auto'
     capacity_factor: float | None = None
     hash_layers: tuple[int, ...] | None = None
     latent_features: int | None = None
