@@ -147,7 +147,8 @@ def translate_muse_glimmer_vision_config(hf_config: Mapping[str, object]) -> Rec
     if vision.get("model_type", "muse_glimmer_vision") != "muse_glimmer_vision":
         raise ValueError(f"vision model_type {vision.get('model_type')!r} is not Muse Glimmer's trunk")
     fields = _MUSE_CONFIG.read(vision, set(), {})
-    unknown = sorted(set(fields["layer_types"]) - {"full_attention", "window_attention"})
+    unknown = sorted(set(_records.strings(fields["layer_types"], "layer_types"))
+                     - {"full_attention", "window_attention"})
     if unknown:
         raise ValueError(f"layer_types {unknown} are neither window_attention nor full_attention")
     return {"class": "muse_glimmer", "fields": fields}
@@ -156,7 +157,7 @@ def translate_muse_glimmer_vision_config(hf_config: Mapping[str, object]) -> Rec
 def _read_kinds(vision: Mapping[str, object], used: set[str], record: dict[str, object]) -> dict[str, object]:
     """Each layer's kind, the reference's cadence over the depth where unstated."""
     used.add("layer_types")
-    layers = int(record["num_hidden_layers"])
+    layers = _records.integer(record["num_hidden_layers"], "num_hidden_layers")
     record["layer_types"] = _records.strings(vision.get("layer_types") or default_layer_types(layers),
                                              "layer_types")
     return record

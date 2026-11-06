@@ -353,7 +353,7 @@ def gemma4_tower_layouts(variables: Variables) -> tuple[WeightLayout, ...]:
 
 def gemma4_projector_layouts(params: Variables) -> tuple[WeightLayout, ...]:
     """The layouts that write a Gemma 4 embedder's projection from its parameters, rooted at `params`."""
-    return Gemma4Projector.checkpoint.written(params)
+    return _GEMMA4_PROJECTOR.written(params)
 
 
 def translate_gemma4_projector_weights(
@@ -392,11 +392,11 @@ def _read_heads(vision: Mapping[str, object], used: set[str],
     """The key/value heads, the query heads' count where unstated, and each head's width, the trunk's
     over its heads where unstated."""
     used.update(("num_key_value_heads", "head_dim"))
-    heads = int(record["num_heads"])
+    heads = _records.integer(record["num_heads"], "num_heads")
+    width = _records.integer(record["hidden_size"], "hidden_size")
     record["num_key_value_heads"] = _records.integer(vision.get("num_key_value_heads", heads),
                                                      "num_key_value_heads")
-    record["head_dim"] = _records.integer(vision.get("head_dim", int(record["hidden_size"]) // heads),
-                                          "head_dim")
+    record["head_dim"] = _records.integer(vision.get("head_dim", width // heads), "head_dim")
     return record
 
 
@@ -436,5 +436,6 @@ def translate_gemma4_projector_config(vision: Mapping[str, object], text_width: 
 
 Gemma4Vision.checkpoint = TowerLayout("vision_tower.", _GEMMA4_ROUTES, config=_GEMMA4_CONFIG,
                                       model_type="gemma4_vision")
-Gemma4Projector.checkpoint = ProjectorLayout("embed_vision.", GEMMA4_PROJECTOR_TENSORS,
-                                             read=translate_gemma4_projector_weights)
+_GEMMA4_PROJECTOR = ProjectorLayout("embed_vision.", GEMMA4_PROJECTOR_TENSORS,
+                                    read=translate_gemma4_projector_weights)
+Gemma4Projector.checkpoint = _GEMMA4_PROJECTOR
