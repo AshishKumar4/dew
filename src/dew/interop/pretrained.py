@@ -469,10 +469,9 @@ class Pretrained:
              step: int | str | None = None, ema: bool | None = None) -> Self:
         """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
-        `name_or_dir` is a local HF directory or a Hub model ID. Decoder, tower and
-        projector weights keep their usual internal paths, and a wrapper's variables
-        join under its existing component names. Processor files are loaded only when
-        the source has them.
+        `name_or_dir` is a local HF directory or a Hub model ID. Decoder, tower and projector weights keep
+        their usual internal paths, and a wrapper's variables join under its existing component names.
+        Processor files are loaded only when the source has them.
 
         `dtype` sets the compute dtype, and `param_dtype` separately sets the storage
         dtype of floating parameters: BF16 over FP32 master weights unless stated, or an exported

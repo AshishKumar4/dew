@@ -69,7 +69,8 @@ def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = Non
     task = run.objective.saved_task
     released_task = task is not None and issubclass(task, ReleasedTask)
     if task is not None and issubclass(task, ReleasedTask) and task.publishes(run):
-        released = task.from_saved(run, ema=ema, mesh=mesh, layout=layout)
+        # Under the numerics its step trained in, as every load of the run builds it (`SavedRun.formed`).
+        released = run.formed(task.from_saved(run, ema=ema, mesh=mesh, layout=layout))
         with reading_home("saved run export", writes=publishes):
             released.save_pretrained(str(destination))
     elif not released_task and source_publishes(run):
