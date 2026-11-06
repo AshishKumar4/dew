@@ -1027,7 +1027,7 @@ def _intra_held(call: Call, block: int, outputs: int = 1) -> Held:
     factors every output shares beside the block's tiles: its prefix halves, the rows' gate down and the keys
     gated up (`algebra.key_block_pairs`), a pair's decay's two terms (`between`: the exp2 of the fractions'
     difference and the scale of the wholes'), a sub-chunk's middle factor and its laid references, each
-    output's gated rows, their masks, and one product's operands."""
+    output's gated rows, their masks, and one product's operands, its right a key sub-chunk's."""
     pairing = _pairing_operand(call)
     # Live at once beside the sums: the prefix halves and their separated pair, the rows' grid, the keys
     # and the queries as read, each output's rows and their gated form, the keys gated up, the gate down, a
@@ -1037,7 +1037,7 @@ def _intra_held(call: Call, block: int, outputs: int = 1) -> Held:
     return Held(carried=[f32(CHUNK, CHUNK)] * outputs, phases=(
         [f32(CHUNK, block)] * 5,
         [f32(CHUNK, block)] * (10 + 2 * outputs) + masks(CHUNK, block) * 2
-        + fragments(call, (pairing, CHUNK, block), (pairing, CHUNK, block))))
+        + fragments(call, (pairing, CHUNK, block), (pairing, algebra.SUB, block))))
 
 
 def _doubling_held(call: Call) -> list:
@@ -1195,8 +1195,17 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
             rows = [operand("queries") if name == "scores"
                     else operand("keys") * family.rows_of(beta_ref.at[h, span])[:, None] for name in products]
             strict = [name == "system" for name in products]
+            keyed, *gated = pairing
+
+            def staged(up):
+                """The keys gated up in `keyed`'s parts, a sub-chunk's rows read transposed."""
+                parts = product.formed(up, len(keyed)) if len(keyed) > 1 else (up,)
+                refs = tuple(family.staged(part, ref) for part, ref in zip(parts, keyed, strict=True))
+                return lambda start, count: Parts(tuple(ref.at[pl.ds(start, count)] for ref in refs),
+                                                  jnp.float32).T
+
             pairs = algebra.key_block_pairs(rows, operand("keys"), prefix, at_token,
-                                            Issuer(call, {"pairs": pairing}).summed, chunk=CHUNK,
+                                            Issuer(call, {"pairs": gated}).summed, staged, chunk=CHUNK,
                                             diagonal=call.factored)
             if not call.factored:
                 pairs = [found + algebra.key_diagonal_pairs(lambda c, row=row: row, shifted, 1,
@@ -1223,8 +1232,9 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
     formed = [held if name == "scores" else _systems(call) for name in products]
     out_type = (*(form.shape(call.heads * CHUNK) for form in formed),
                 *((gates.shape(call.heads * width),) * 2 if scored else ()))
-    # Each output's product a key sub-chunk; the exponentials a key block's rows gated down and its keys up.
-    work = Work(flops=outputs * (CHUNK // algebra.SUB) * 2 * CHUNK * CHUNK * width, span=steps,
+    # Each output's product a key sub-chunk's columns; the exponentials a key block's rows gated down and its
+    # keys up.
+    work = Work(flops=outputs * 2 * CHUNK * CHUNK * width, span=steps,
                 exponentials=2 * CHUNK * width)
     staging, landing = _intra_staged(call, keys, products=products)
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
@@ -1272,9 +1282,10 @@ def _pairing_operand(call: Call) -> Operand:
 
 
 def _pairing(call: Call, block: int) -> list:
-    """The factored pairs' staging (`Issuer`'s 'pairs'): two sets, the gated rows' and the gated keys',
-    each a `[C, block]` tile a part (`_pairing_operand`)."""
-    return [staging_tiles(_pairing_operand(call), (CHUNK, block))[0] for _ in range(2)]
+    """The factored pairs' staging: the keys gated up, staged once for every output's products
+    (`algebra.key_block_pairs`' `staged`), then the gated rows' two sets (`Issuer`'s 'pairs', one formed
+    while the other's product reads it), each a `[C, block]` tile a part (`_pairing_operand`)."""
+    return [staging_tiles(_pairing_operand(call), (CHUNK, block))[0] for _ in range(3)]
 
 
 def _weighted_held(call: Call, block: int) -> Held:
