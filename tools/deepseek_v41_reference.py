@@ -36,26 +36,10 @@ spelling at toy width, a model.safetensors under the release's tensor names,
 the tokenizer the engram hash reads, source.json and reference.npz with
 
     input_ids                  [2, 16] prompt rows
-    logits                     full-sequence logits
-    loss, learning_rate        next-token cross entropy, one SGD step's rate
-    updated_logits             logits after that step with torch's gradients
-    decode_prompt              the prefill length of the cached run
-    prompt_logits              that prefill's logits
-    decode_logits              teacher-forced one-token steps after it
-    generated                  greedy ids after the prefill
-    draft_ids, draft_logits,   DSpark's forward_spec at every decode step
-    draft_confidence
-    selection_{rows,picks,scale}
-                               every top-k of the forward in call order: its
-                               scored rows (NaN past a row's width), sorted
-                               picks (-1 past k), and each row's largest
-                               finite magnitude (`selection_margins`)
-    qat_*                      the same with the quantizers on: the forward,
-                               loss, update (read through the plain forward),
-                               cached run and top-k calls
+    decode_prompt              the prefill length of a cached run
     qat_{window,entries,index}_{in,out}
-                               every quantizer call of that forward in call
-                               order: the blocks it read and wrote
+                               every quantizer call of the quantized forward
+                               in call order: the blocks it read and wrote
 
 source.json records NOISE and what it can reach at the seed (`Record.assess`).
 
@@ -846,8 +830,11 @@ def write(seed: int):
         {"bos_token_id": 0, "eos_token_id": 1, "pad_token_id": 2, "do_sample": False}, indent=1) + "\n")
     for name in ("tokenizer.json", "tokenizer_config.json"):
         shutil.copy(TOKENIZER / name, FIXTURE / name)
+    # The prompt rows and every quantizer call's blocks, what the suite reads: its model-level claims are
+    # the release's as released (`write_release_recording`).
     np.savez(FIXTURE / "reference.npz", **{name: value for name, value in outputs.items()
-                                           if not name.endswith(("_margin", "_flip"))})
+                                           if name in ("input_ids", "decode_prompt")
+                                           or (name.startswith("qat_") and name.endswith(("_in", "_out")))})
     print(json.dumps({"seed": seed, **assessment}))
     import transformers
 
