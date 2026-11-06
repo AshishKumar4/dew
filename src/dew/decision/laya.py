@@ -114,14 +114,20 @@ class LayaConfig:
     its default where the file states none), which `read` reads and `record` writes: the encoder Laya's
     agent names (`LAYA_REQUIRED`), the head's depth, the layout's window, question budgets (Laya's own,
     `LAYA_BUDGETS`, where it states none) and option layout, and the temperatures by type and by type and
-    option count (`temperatures`)."""
+    option count (`temperatures`). A key a layout states names its layout's field (`laid`), and the
+    spellings of that field's values where Laya spells them (`spelled`, the option layout's by
+    `LAYA_OPTION_LAYOUTS`, sequential for a row whose options are not parallel), which `of` writes and
+    `layout` reads."""
 
     encoder: str | None = field(default=None, metadata={"read": _records.text})
     head_layers: int = field(default=2, metadata={"read": _records.integer})
-    max_len: int = field(default=512, metadata={"read": _records.integer})
-    head_max_len: int | None = field(default=LAYA_BUDGETS["head_max_len"], metadata={"read": _budget})
-    option_tokens: int | None = field(default=LAYA_BUDGETS["option_tokens"], metadata={"read": _budget})
-    option_layout: str = field(default="sequential", metadata={"read": _records.text})
+    max_len: int = field(default=512, metadata={"read": _records.integer, "laid": "max_len"})
+    head_max_len: int | None = field(default=LAYA_BUDGETS["head_max_len"],
+                                     metadata={"read": _budget, "laid": "head_max_len"})
+    option_tokens: int | None = field(default=LAYA_BUDGETS["option_tokens"],
+                                      metadata={"read": _budget, "laid": "option_tokens"})
+    option_layout: str = field(default=LAYA_OPTION_LAYOUTS[False], metadata={
+        "read": _records.text, "laid": "parallel", "spelled": LAYA_OPTION_LAYOUTS})
     temperature: tuple[float, ...] | float = field(default=1.0, metadata={"read": _temperature})
     temperature_by_options: Mapping[str, float] = field(default_factory=dict, metadata={
         "read": lambda value, key: {name: _records.number(each, name)
@@ -150,16 +156,24 @@ class LayaConfig:
         """The config of a head of `layers` over `layout`, its `calibration`'s temperatures held within their
         bounds as the task applies them, so that a reader which does not hold them answers as it does."""
         applied = calibration.temperatures.applied()
-        return cls(encoder=encoder, head_layers=layers, max_len=layout.max_len,
-                   head_max_len=layout.head_max_len, option_tokens=layout.option_tokens,
-                   option_layout="parallel" if layout.parallel else "sequential",
+        laid = {}
+        for held in fields(cls):
+            if "laid" in held.metadata:
+                value, spelled = getattr(layout, held.metadata["laid"]), held.metadata.get("spelled")
+                laid[held.name] = value if spelled is None else spelled[value]
+        return cls(encoder=encoder, head_layers=layers, **laid,
                    temperature=tuple(applied.types.get(kind, applied.default) for kind in TEMPERATURE_TYPES),
                    temperature_by_options=dict(applied.buckets))
 
     def layout(self) -> MarkerLayout:
-        """The layout this config states, which Laya's readers lay rows out by."""
-        return MarkerLayout(max_len=self.max_len, head_max_len=self.head_max_len,
-                            option_tokens=self.option_tokens, parallel=self.option_layout == "parallel")
+        """The layout this config states, which Laya's readers lay rows out by: a spelled value Laya spells
+        none of (the release's file named in its place) reads as its first spelling's."""
+        laid = {}
+        for held in fields(self):
+            if "laid" in held.metadata:
+                value, spelled = getattr(self, held.name), held.metadata.get("spelled")
+                laid[held.metadata["laid"]] = value if spelled is None else value == spelled[True]
+        return MarkerLayout(**laid)
 
     def temperatures(self) -> Temperatures:
         """The temperatures this config states, by type (`TEMPERATURE_TYPES`) or one over every type, and
