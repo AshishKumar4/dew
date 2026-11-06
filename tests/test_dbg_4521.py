@@ -9,6 +9,7 @@ import jax
 import numpy as np
 import pytest
 import test_decision_context as context
+from arm_arithmetic import summed_as_run, unrewritten
 from test_decision_streams import LETTERED, examples, in_streams
 
 
@@ -33,14 +34,18 @@ def test_diagnostic():
                 if identity not in seen:
                     seen.add(identity)
                     hlo = compiled.lower(*args).compile().as_text()
-                    lines = [line for line in hlo.splitlines() if "ynn" in line.lower()
-                             or "operand_precision" in line]
-                    print("HLO", mode, str(identity)[:350], json.dumps(lines)[:14000], flush=True)
+                    lines = [line for line in hlo.splitlines() if 'kind=kCustom' in line]
+                    short = [re.sub(r', metadata=.*', '', line.strip()) for line in lines]
+                    if os.environ.get("DBG_HLO"):
+                        print("HLO", mode, [x.shape for x in jax.tree.leaves(args[1])],
+                              json.dumps(short)[:6000], flush=True)
                 return compiled(*args)
             return run
 
         context.without_ynn = compile
-        d, r, t = dew(*variables), reference(*variables), truth(*variables)
+        with summed_as_run():
+            d, r = dew(*variables), unrewritten(reference)(*variables)
+        t = unrewritten(truth)(*variables)
         outputs[mode] = (d, r, t)
         total = [0.0, 0.0]
         for key in d:
@@ -48,9 +53,9 @@ def test_diagnostic():
             er = np.asarray(r[key], np.float64) - np.asarray(t[key])
             total[0] += float(np.sum(ed ** 2))
             total[1] += float(np.sum(er ** 2))
-            print("ROW", mode, repr(key), json.dumps({
-                "dew": np.asarray(d[key]).tolist(), "ref": np.asarray(r[key]).tolist(),
-                "truth": np.asarray(t[key]).tolist(), "dew_rms": float(np.sqrt(np.mean(ed ** 2))),
-                "ref_rms": float(np.sqrt(np.mean(er ** 2)))}), flush=True)
+            print("ROW", mode, repr(key.split("Which")[0]), json.dumps({
+                "dew_rms": float(np.sqrt(np.mean(ed ** 2))),
+                "ref_rms": float(np.sqrt(np.mean(er ** 2))),
+                "ratio": float(np.sqrt(np.sum(ed ** 2) / np.sum(er ** 2)))}), flush=True)
         print("TOTAL", mode, total, "ratio", np.sqrt(total[0] / total[1]), flush=True)
     context.without_ynn = original
