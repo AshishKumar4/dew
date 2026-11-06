@@ -1619,13 +1619,16 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
     run = selected(session.pytest_run(python, report, *measured), network, whole, bool(release),
                    site is not None)
-    # The tests an attempt the fleet recalled passed (`resumed`): set aside, their seconds kept for the rows.
+    # The tests an attempt the fleet recalled passed (`resumed`): set aside by their exact ids (progress.py's
+    # `SET_ASIDE`), their seconds kept for the rows.
     done_before = {} if site is not None or release or coverage is not None else resumed(tests)
-    command = [*pytest_command(run, tests, split, release), "-p", "progress",
-               *(word for node in done_before for word in ("--deselect", node))]
+    aside = out.with_name(f"{out.name}.set-aside.json")
+    aside.write_text(json.dumps(sorted(done_before)))
+    command = [*pytest_command(run, tests, split, release), "-p", "progress"]
     environment = session.pytest_environment({**environ, **site_environment(site),
                                               "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection),
-                                              "DEW_UNRECORDED": str(unrecorded), "DEW_STACKS": str(stacks)})
+                                              "DEW_UNRECORDED": str(unrecorded), "DEW_STACKS": str(stacks),
+                                              progress.SET_ASIDE: str(aside)})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
     returncode, output, expired, dump, opened = ran_pytest(command, environment, deadline, grace, stacks)
