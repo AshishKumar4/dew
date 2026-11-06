@@ -226,7 +226,7 @@ def projector_native_layouts(kind: str, params: Variables) -> tuple[WeightLayout
     """The layouts that write a natively built `kind` projector's tensors back from its parameters,
     each under its name past the layout's prefix (`ProjectorLayout.tensors`), rooted at `params`."""
     layout = projector_layout(kind)
-    names = {("params", *path): name for name, path in layout.tensors.items()}
+    names: dict[tuple[str, ...], str] = {("params", *path): name for name, path in layout.tensors.items()}
     return native_layouts({"params": params}, lambda path: names[path],
                           lambda name: ("params", *layout.path(name)))
 
