@@ -167,7 +167,7 @@ def test_more_replicas_than_hosts_are_refused(tmp_path):
     done = launch("--", sys.executable, str(WORKER), "--out", str(tmp_path / "x.json"),
                   "--mesh", json.dumps({"fsdp": 4, "replicas": 2}), devices=8)
     # Refused as the mesh is built: a ValueError, and no record written.
-    assert "ValueError" in raised(done) and not (tmp_path / "x.json").exists()
+    assert "ValueError" in raised(done) and not (tmp_path / "x.json").exists(), done.stdout + done.stderr
 
 
 def test_replicas_in_a_process_outside_any_pool_are_refused_by_granule():
