@@ -464,7 +464,8 @@ class MultimodalTransformer(DecoderWrapper):
                       image_groups=None, block_groups=None, rotary_positions=None,
                       audio_indices=None, routed_experts=None, routed=None,
                       coordinates: Coordinates | None = None, whole_blocks: bool = False,
-                      progress: Progress | None = None):
+                      progress: Progress | None = None, attention_key_runs=None,
+                      attention_key_positions=None, attention_tree: tuple[int, ...] | None = None):
         """Run the decoder over text with the media embeddings spliced in.
 
         `conditioning` holds the towers' payloads, and `image_indices` and
@@ -476,7 +477,8 @@ class MultimodalTransformer(DecoderWrapper):
         position too, so the `[B, S, layers, top_k]` layout matches the text.
         `coordinates`, `whole_blocks` and `progress` are the language model's
         (`CausalTransformer.hidden_and_mtp_inputs`): the tokens as the decoder reads them, so the
-        cursor counts the places the layers do.
+        cursor counts the places the layers do; and so are a cached call's key runs, key positions and
+        tree (`attention_tree`), which a tree's verify sets (`dew.sampling.trees.TreeBlock`).
         """
         if decode:
             allocated = self.has_variable("cache", POSITION)
@@ -508,7 +510,9 @@ class MultimodalTransformer(DecoderWrapper):
             fused.tokens, train=train, decode=decode, input_embeddings=fused.embeddings,
             image_groups=image_groups, block_groups=block_groups, rotary_positions=rotary_positions,
             media_mask=fused.media, routed_experts=routed_experts, routed=routed, coordinates=coordinates,
-            conditioning=context, whole_blocks=whole_blocks, progress=progress)
+            conditioning=context, whole_blocks=whole_blocks, progress=progress,
+            attention_key_runs=attention_key_runs, attention_key_positions=attention_key_positions,
+            attention_tree=attention_tree)
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, image_indices=None,
@@ -582,6 +586,11 @@ class MultimodalTransformer(DecoderWrapper):
     def head_logits(self, states):
         """The decoder's head over states its continuum level already read (`SteppedInContext`)."""
         return self.language_model.head_logits(states)
+
+    @property
+    def verifies_trees(self) -> bool:
+        """Whether its language model reads a tree call along its paths (`TreeVerifying`)."""
+        return self.language_model.verifies_trees
 
     def states_and_logits(self, tokens, **kwargs):
         """Return the final hidden states and their logits from one media-aware forward pass."""

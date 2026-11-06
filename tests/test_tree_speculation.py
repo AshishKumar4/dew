@@ -220,14 +220,28 @@ def _predicting(kind: str, max_seq_len: int = 40):
     return decoder(kind).clone(max_seq_len=max_seq_len, num_nextn_predict_layers=1)
 
 
+def _wrapped(kind: str):
+    """A text-only multimodal wrapper over `_predicting(kind)`, its cache adding the next position."""
+    from dew.nn.multimodal import MultimodalTransformer
+    from dew.nn.vision import GemmaProjector, SiglipVision
+
+    return MultimodalTransformer(
+        _predicting(kind), SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
+                                        image_size=8, patch_size=4),
+        GemmaProjector(text_width=16, patches_per_side=2, tokens_per_side=1), family="gemma3",
+        image_token_id=1)
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["decoder", "wrapper"])
 @pytest.mark.parametrize("kind", DEPTHS)
-def test_a_models_prediction_depths_draft_its_tree_through_generate(kind):
+def test_a_models_prediction_depths_draft_its_tree_through_generate(kind, wrapped):
     """`generate` under `TreeSpeculative` drafts with the model's prediction depths (`decode_ops`' tree
     drafter) and verifies the tree in one pass: at zero temperature its draws are greedy decoding's, its
-    lengths too, whatever the depths propose (ledger 4527)."""
+    lengths too, whatever the depths propose (ledger 4527); a multimodal wrapper's as its language
+    model's."""
     from dew.sampling import Sample, Sampling, TreeSpeculative, generate
 
-    model = _predicting(kind)
+    model = _wrapped(kind) if wrapped else _predicting(kind)
     prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
     params = jax.jit(model.init)(jax.random.key(0), prompts)
     sampling = Sampling(temperature=0)
