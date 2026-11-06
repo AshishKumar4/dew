@@ -98,9 +98,7 @@ def scored(task: Decide, asked: Sequence[tuple[str, str | None]], images=()) -> 
         assert task.processor is not None and task.layout.images
         media = Images.of(task.processor, images, task.processor.image_text())
         [row] = task._encoded(state, QUESTION, media.tokens, context=context)
-        # Every request's row at the layout's window, one program for every draw.
-        inputs = DecisionInputs.collate([row], task.specials.pad, context_length=task.context_length,
-                                        width=task.layout.max_len)
+        inputs = DecisionInputs.collate([row], task.specials.pad, context_length=task.context_length)
         logits = forward(task.variables, inputs, media=media.inputs(task.processor, row))
     else:
         # Laid out as a call over requests lays them out (`Decide.rows`).
