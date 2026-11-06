@@ -623,6 +623,21 @@ def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
     assert within(error, bound), (float(error.max()), float(bound.max()))
 
 
+def assert_within_rounding(computed, exact, magnitudes, roundings: int, dtype, label: str) -> None:
+    """`computed`, `exact`'s value computed in `dtype` through at most `roundings` roundings a value, each
+    of a quantity within `magnitudes`, is within gamma_n of them of the exact value (n the roundings, u
+    `dtype`'s unit roundoff; half `reduction_bound`'s two-sided bound): a bound derived from the arithmetic
+    alone, for a claim no float64 reference can hold, a float64 computation's own accuracy. `exact` is the
+    exact value (each a `fractions.Fraction`, or a float64 that holds it exactly)."""
+    error = np.abs(np.asarray(computed, np.float64) - np.asarray([float(value) for value in np.ravel(exact)],
+                                                                   np.float64).reshape(np.shape(exact)))
+    bound = reduction_bound(magnitudes, roundings, dtype) / 2
+    worst = float(np.broadcast_to(bound, error.shape).max())
+    assert within(error, bound), (f"{label}: {int(np.sum(error > bound))} values past gamma_{roundings} of "
+                                  f"their magnitudes in {np.dtype(dtype).name}, the worst "
+                                  f"{float(error.max()):.3e} against {worst:.3e}")
+
+
 RESOLUTION = 1024 * float(np.finfo(np.float64).eps)
 """The smallest row float64 resolves, over its leaf's size: a row below it is
 float64's own rounding of the leaf (a packed row's padding at 4e-19 of a
