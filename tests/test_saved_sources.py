@@ -210,9 +210,11 @@ WORKER = Path(__file__).with_name("saved_export_worker.py")
 @pytest.mark.mesh
 @pytest.mark.parametrize("scan", [False, True], ids=["looped", "scanned"])
 def test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time(tmp_path, scan):
-    """Two real processes export a decoder whose kernels span both, looped or scanning its layers (ledger
-    4103), every layer's attention extended by DEX, as a saved run's release (`export_run`, ledger 2874), in a score of shards, each output
-    projection folded as it is written: each reads one tensor home at a time, together, so neither host's
+    """Two real processes export a decoder whose kernels span both, looped or scanning its layers over a
+    banked store (each run's row read home as it is written, `stored_layers`, ledger 4103), every layer's
+    attention extended by DEX, as a saved run's release (`export_run`, ledger 2874), in a score of shards,
+    each output projection folded as it is written: each reads one tensor home at a time, together, so
+    neither host's
     resident pages rise during the export by half the model (2.0 to 5.5 MB of 31 MB on armada), where the
     pool reading the whole tree home first rises past half (23 to 39 MB), and the same measure over that
     tree held home rises at least half of it on each host, so the measure sees the bytes in that run

@@ -674,6 +674,15 @@ class CacheCapacity(Protocol):
 
 
 @runtime_checkable
+class BankedStacks(Protocol):
+    """A model whose stacks of like layers a store may hold banked, each run's layers one array under the
+    run's name (`layers_3_7`, `dew.inference.banks`): where in `store` each stack lies and the runs it is
+    banked by (`DecoderBank`)."""
+
+    def bank_sites(self, store: VariableDict) -> tuple[DecoderBank, ...]: ...
+
+
+@runtime_checkable
 class StagedStacks(Protocol):
     """A model whose stacks of like layers a pipeline over the stage axis runs: where in `store`, the
     variables a stage-local state is made from, each stack's run lies and how the pipeline over
