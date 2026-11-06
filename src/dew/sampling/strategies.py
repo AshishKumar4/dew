@@ -123,7 +123,8 @@ class DecodeOps:
     positions to the drafter's windows, and `draft` drafts the next block from
     each row's first token, handing each position's logits to a `choose`.
     `draft_tree` drafts a tree of candidates after each row's root token
-    (`dew.sampling.trees.DraftTree`), which `TreeSpeculative` verifies.
+    (`dew.sampling.trees.DraftTree`), which `TreeSpeculative` verifies: the
+    prediction depths' (`dew.sampling.text.decode_ops`) where the model has them.
     `crosses` says which rows a call taking them from `lengths` tokens to
     `following` carries past the position where the model's cached keys go
     stale (`text.rebuild_position`), each such row rebuilding every cache in
@@ -1089,9 +1090,9 @@ def tree_step(state: DecoderState, step: StepState, terminated: jax.Array, plan:
     opening = dataclasses.replace(step, active=active & (step.step < budget))
     first = transform(opening, state.logits.astype(jnp.float32))
     root = select(keys[:, 0], first, opening.active)
-    drafted = draft_tree(state, root, shape, keys[:, 1])
-    fed = jnp.concatenate([root[:, None], drafted.tokens], axis=1)
     block = TreeBlock(shape, cursor, _coordinates(state, step, jnp.zeros((1, 1), jnp.int32))[:, 0])
+    drafted = draft_tree(state, root, block, keys[:, 1])
+    fed = jnp.concatenate([root[:, None], drafted.tokens], axis=1)
     _, verified, _ = verify(state, fed, jnp.broadcast_to((active & ~walking)[:, None], fed.shape),
                             rebuilds=False, tree=block)
     raw = verified.astype(jnp.float32)

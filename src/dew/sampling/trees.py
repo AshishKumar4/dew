@@ -135,7 +135,8 @@ class TreeDraft(NamedTuple):
 
 
 class DraftTree(Protocol):
-    """`DecodeOps.draft_tree`: a tree of `shape`'s nodes after each row's `root` token `[rows]`, drawn with
-    the rows' `keys` where it samples (`TreeDraft`)."""
+    """`DecodeOps.draft_tree`: a tree of `block`'s shape's nodes after each row's `root` token `[rows]`, the
+    root at its place `block.base` and its cache slot `block.cursor`, drawn with the rows' `keys` where it
+    samples (`TreeDraft`)."""
 
-    def __call__(self, state, root: jax.Array, shape: TreeShape, keys: jax.Array, /) -> TreeDraft: ...
+    def __call__(self, state, root: jax.Array, block: TreeBlock, keys: jax.Array, /) -> TreeDraft: ...

@@ -92,8 +92,17 @@ from dew.sampling.decoding import (
     TopP,
     Typical,
 )
-from dew.sampling.strategies import DecodeOps, DecoderState, Draws, Sample, Speculative, Strategy
-from dew.sampling.trees import TreeBlock
+from dew.sampling.strategies import (
+    DecodeOps,
+    DecoderState,
+    Draws,
+    Propose,
+    Reindex,
+    Sample,
+    Speculative,
+    Strategy,
+)
+from dew.sampling.trees import DraftTree, TreeBlock, TreeDraft
 
 ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
 
@@ -661,7 +670,9 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     elif not depths or not exposed:
         made = DecodeOps(advance, reindex, run, crosses=crossed, capacity=capacity)
     else:
-        made = DecodeOps(advance, reindex, run, *_drafting(model, params, pad_id), depths, crosses=crossed,
+        propose, embed = _drafting(model, params, pad_id)
+        made = DecodeOps(advance, reindex, run, propose, embed, depths,
+                         draft_tree=_tree_drafting(propose, reindex, depths), crosses=crossed,
                          capacity=capacity)
     return made
 
@@ -745,6 +756,61 @@ def _drafting(model: nn.Module, params: Variables, pad_id: int):
         return prepared
 
     return propose, embed
+
+
+def _tree_drafting(propose: Propose, reindex: Reindex, depths: int) -> DraftTree:
+    """`DecodeOps.draft_tree` over the model's prediction depths: each node's children the tokens its
+    parent's step ranks first, in rank order, each a pick (`TreeDraft.log_q` None, as EAGLE-2's and
+    Medusa's trees draft them), a depth at a time: the root's step from the target's last state, then
+    each fed node's from its parent's, depth `d`'s nodes through the prediction depth a chain drafts its
+    `d`-th candidate with (`Speculative`). Each node steps as a row of its own, over a copy of its
+    parent's prediction caches (`reindex`), so a node reads its own path alone whatever the depths'
+    mixers are, attention or recurrent; only the depths' caches are copied (`_prediction_caches`), and
+    none of the drafting state outlives the draft."""
+    def draft(state: DecoderState, root: jax.Array, block: TreeBlock, keys: jax.Array) -> TreeDraft:
+        del keys  # every node is a pick
+        shape, rows = block.shape, root.shape[0]
+        assert state.hidden is not None, "a tree's root drafts from the target's last state"
+        drafting = dataclasses.replace(state, cache=_prediction_caches(state.cache))
+        fed = [-1]  # the level just stepped, its nodes in order (-1 the root), each a row apiece
+        drafting, logits, hidden = propose(drafting, state.hidden[:, None], root[:, None], None,
+                                           jnp.ones((rows, 1), bool), block.base[:, None], 0, "draft")
+        tokens: list[jax.Array | None] = [None] * shape.nodes
+        for depth in range(1, int(shape.depths.max()) + 1):
+            width = max(len(shape.children[parent + 1]) for parent in fed)
+            # Each fed node's ranked tokens `[rows, len(fed), width]`, its children taking them in order.
+            ranked = jax.lax.top_k(logits[:, 0], width)[1].reshape(rows, len(fed), width).astype(jnp.int32)
+            for at, parent in enumerate(fed):
+                for rank, child in enumerate(shape.children[parent + 1]):
+                    tokens[child] = ranked[:, at, rank]
+            following = [node for parent in fed for node in shape.children[parent + 1]
+                         if shape.children[node + 1]]
+            if not following:
+                break
+            # Each next node's row: its parent's, row by row (`[rows, len(following)]` flattened).
+            parents = np.asarray([fed.index(shape.parents[node]) for node in following])
+            gathered = (jnp.arange(rows)[:, None] * len(fed) + parents[None, :]).reshape(-1)
+            stepped = jnp.stack([tokens[node] for node in following], axis=1).reshape(-1)
+            places = jnp.repeat(block.base + depth, len(following))[:, None]
+            drafting, logits, hidden = propose(
+                reindex(drafting, gathered), hidden[gathered], stepped[:, None], None,
+                jnp.ones((stepped.shape[0], 1), bool), places, depth % depths, "draft")
+            fed = following
+        return TreeDraft(jnp.stack(tokens, axis=1), None)
+
+    return draft
+
+
+def _prediction_caches(cache: Mapping) -> dict:
+    """The prediction depths' caches within a model's (a decoder's `mtp_{depth}` scopes, a wrapper's below
+    its language model's), the only ones a depth's step reads or writes (`mtp_step`)."""
+    kept = {}
+    for name, tree in cache.items():
+        if name.startswith("mtp_"):
+            kept[name] = tree
+        elif isinstance(tree, Mapping) and (inner := _prediction_caches(tree)):
+            kept[name] = inner
+    return kept
 
 
 def _block_drafting(model: nn.Module, params: Variables):

@@ -141,7 +141,8 @@ def _ranked(ranks):
     from dew.sampling.trees import TreeDraft
 
     def drafting(ops):
-        def draft(state, root, shape, keys):
+        def draft(state, root, block, keys):
+            shape = block.shape
             del keys
             every = jnp.ones(root.shape[0], bool)
             held = [ops.advance(state, root, every)]
@@ -209,6 +210,76 @@ def test_a_tree_past_its_rows_cache_walks_as_greedy_decoding_does():
     np.testing.assert_array_equal(np.asarray(drawn.tokens), np.asarray(plain.tokens)[:, 13:])
 
 
+DEPTHS = ["attention", "recurrent"]
+"""The prediction depths a model drafts its tree with (`decode_ops`' `draft_tree`): attention's, and a
+gated delta net's, whose row state a node's sibling must not see."""
+
+
+def _predicting(kind: str, max_seq_len: int = 40):
+    """A tiny decoder of one `kind` layer (`model_support.decoder`) with one prediction depth of that kind."""
+    return decoder(kind).clone(max_seq_len=max_seq_len, num_nextn_predict_layers=1)
+
+
+@pytest.mark.parametrize("kind", DEPTHS)
+def test_a_models_prediction_depths_draft_its_tree_through_generate(kind):
+    """`generate` under `TreeSpeculative` drafts with the model's prediction depths (`decode_ops`' tree
+    drafter) and verifies the tree in one pass: at zero temperature its draws are greedy decoding's, its
+    lengths too, whatever the depths propose (ledger 4527)."""
+    from dew.sampling import Sample, Sampling, TreeSpeculative, generate
+
+    model = _predicting(kind)
+    prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
+    params = jax.jit(model.init)(jax.random.key(0), prompts)
+    sampling = Sampling(temperature=0)
+    plain = generate(model, params, prompts, 8, key=jax.random.key(1), sampling=sampling, strategy=Sample())
+    tree = generate(model, params, prompts, 8, key=jax.random.key(1), sampling=sampling,
+                    strategy=TreeSpeculative(SHAPE))
+    np.testing.assert_array_equal(np.asarray(tree.tokens), np.asarray(plain.tokens))
+    np.testing.assert_array_equal(np.asarray(tree.lengths), np.asarray(plain.lengths))
+
+
+@pytest.mark.parametrize("kind", DEPTHS)
+def test_each_drafted_node_ranks_its_children_as_its_path_drafted_alone(kind):
+    """The prediction depths' tree drafter gives each node the children its own path ranks first: the
+    tokens a chain of the depths' steps (`DecodeOps.propose`) over the node's root-to-node path alone ranks
+    first, in rank order, so no node reads a sibling's step, a recurrent depth's row state among them."""
+    from dew.sampling.text import _prediction_caches
+
+    model = _predicting(kind)
+    prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
+    params = jax.jit(model.init)(jax.random.key(0), prompts)
+    ops = decode_ops(model, params, 0, 1)
+    state, _ = jax.jit(lambda prompts: prefill_state(model, params, ModelInputs(prompts), ops))(prompts)
+    root = jnp.argmax(state.logits, axis=-1).astype(jnp.int32)
+    block = TreeBlock(SHAPE, jnp.full(2, 3, jnp.int32), jnp.full(2, 3, jnp.int32))
+    assert ops.draft_tree is not None and ops.propose is not None
+    drafted = np.asarray(jax.jit(lambda: ops.draft_tree(state, root, block, jax.random.split(
+        jax.random.key(2), 2)))().tokens)
+    every = jnp.ones((2, 1), bool)
+
+    @jax.jit
+    def ranked(path):
+        """The tokens the chain over `path` (fed tokens after the root) ranks first after its last."""
+        drafting = dataclasses.replace(state, cache=_prediction_caches(state.cache))
+        hidden, fed = state.hidden[:, None], root
+        for depth in range(len(path) + 1):
+            drafting, logits, out = ops.propose(drafting, hidden, fed[:, None], None, every,
+                                                block.base[:, None] + depth, 0, "draft")
+            hidden = out
+            if depth < len(path):
+                fed = path[depth]
+        return jnp.argsort(-logits[:, 0], axis=-1)
+
+    for parent in range(-1, SHAPE.nodes):
+        children = SHAPE.children[parent + 1]
+        if not children:
+            continue
+        path = () if parent < 0 else SHAPE.ancestry(parent)
+        order = np.asarray(ranked(tuple(jnp.asarray(drafted[:, node]) for node in path)))
+        for rank, child in enumerate(children):
+            np.testing.assert_array_equal(drafted[:, child], order[:, rank], err_msg=f"node {child}")
+
+
 def test_generate_refuses_a_tree_for_a_model_without_a_tree_drafter():
     """`generate` under `TreeSpeculative` drafts with the model's tree drafter, and a model with none is
     refused rather than decoded another way."""
@@ -229,7 +300,8 @@ def _sampled(sharpness: float):
     from dew.sampling.trees import TreeDraft
 
     def drafting(ops):
-        def draft(state, root, shape, keys):
+        def draft(state, root, block, keys):
+            shape = block.shape
             every = jnp.ones(root.shape[0], bool)
             held = [ops.advance(state, root, every)]
             tokens, log_q = [], []
