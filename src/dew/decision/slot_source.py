@@ -1,6 +1,7 @@
 """The slot-readout release's metadata, labels and prompt, over native source components."""
 
 import dataclasses
+import functools
 import json
 from collections.abc import Mapping
 from pathlib import Path
@@ -13,16 +14,18 @@ from flax import linen as nn
 
 from dew import _records
 from dew._coordination import read_home, writes_weights
+from dew._files import write_atomically
 from dew.batch import Variables
 from dew.data.text import HFTokenizer
 from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
 from dew.interop.pretrained import Pretrained, with_overrides
-from dew.interop.release import computed_in
-from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors
+from dew.interop.releases import HeadFiles
+from dew.interop.safetensors_io import LazyTensors
 from dew.nn.attention import AttentionImpl
 from dew.registry import dtype_name, from_record, import_path
 
 from .calibration import Calibration
+from .formats import beyond_default
 from .head import Head, LabelReadout, SlotReadout
 from .layout import (
     LABEL_NAMES,
@@ -37,7 +40,7 @@ from .layout import (
     Text,
 )
 from .model import DecisionModel
-from .release import released_decision, released_length, stated_release
+from .release import released_decision, released_length
 from .sources import PretrainedDecision
 
 SLOT_SYSTEM = ("Apply the question to the state. Choose exactly one of the listed options. Respond with only "
@@ -138,13 +141,24 @@ class SlotHeadSource(HeadComponent):
             **fields, "dtype": None if compute is None else dtype_name(compute)}}, "head"), width)
 
 
+def _torch_readout(tensors: Mapping[str, np.ndarray], path: Path) -> None:
+    """The slot-and-pointer head's tensors written as the release's `readout_head.pt`, by the process of a
+    pool that publishes (`writes_weights`), each read on every one (`SlotSource.readout`)."""
+    import torch
+
+    held = {name: torch.frombuffer(host, dtype=getattr(torch, str(host.dtype))).reshape(host.shape)
+            for name, host in tensors.items()}
+    if writes_weights():
+        torch.save(held, path)
+
 class SlotSource(SourceKind):
     """Readout metadata beside a native decoder, with the release's prompt as a layout value."""
 
     @staticmethod
-    def save(bundle: PretrainedDecision, directory: str | Path, *,
-             max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
-        """Write the held native backbone and the release's readout, without loading the source again."""
+    def head_files(bundle: PretrainedDecision) -> HeadFiles:
+        """The slot readout in its release (`dew.decision.formats`): `readout.json`, its mode, slots and
+        attention, and the slot-and-pointer head's tensors in `readout_head.pt` (none for the tied label
+        readout, which reads the backbone's own head), beside the backbone's standard checkpoint."""
         head = _records.record(bundle.head.record(), "head")
         fields = _records.record(head["fields"], "head.fields")
         names = {import_path(LabelReadout): "slot_lm", import_path(SlotReadout): "head"}
@@ -156,42 +170,41 @@ class SlotSource(SourceKind):
             raise ValueError("the slot format needs its whole-question layout")
         ids = _records.listed(fields["label_ids"], "label_ids", read=lambda value, _: value,
                              what="a list of label ids")
-        # The prompt an external release derives (its canonical bare labels), which the release states the
-        # layout over where its labels are others; the readout reads the layout's own.
-        canonical, _ = _labels(bundle.decision_tokenizer, len(ids))
-        prompt = SlotSource.layout(max_len=layout.max_len, labels=canonical, blocks=layout.blocks)
         _one_variant(mode, layout.labels)
         picked = layout.labels.ids(bundle.decision_tokenizer, len(ids))
         actual = (tuple(_records.integers(group, "label_ids") for group in ids) if mode == "slot_lm"
                   else tuple((_records.integer(value, "label_ids"),) for value in ids))
         if actual != picked:
             raise ValueError("the slot readout reads the labels its layout writes, in the layout's order")
-        root = Path(directory)
-        bundle.backbone().save(root, max_shard_size=max_shard_size)
         readout = {"readout": mode, "head_dim": fields.get("head_dim", 256), "n_slots": len(ids)}
-        # The release's attention field states its full attention as the config `Pretrained.save` writes
-        # does: the bundle's own, the load's overrides over the release's. The rows' blocks may serve
+        # The release's attention field states its full attention as the config its backbone's layout
+        # writes does: the bundle's own, the load's overrides over the release's. The rows' blocks may serve
         # another kind as well.
         if _full_attention(_records.record(bundle.config.get("modeling_overrides", {}),
                                            "modeling_overrides")) == "block_bidirectional":
             readout["attention"] = "noncausal"
-        bundle.decision_tokenizer.save_pretrained(root)
+        tensors = SlotSource.readout(bundle)
+        written = json.dumps(readout, indent=2) + "\n"
+        files = {"readout.json": lambda path: write_atomically(str(path), written)}
         if mode == "head":
-            import torch
+            files["readout_head.pt"] = functools.partial(_torch_readout, tensors)
+        return HeadFiles(tensors, files=files)
 
-            tensors = {name: torch.frombuffer(host, dtype=getattr(torch, str(host.dtype))).reshape(host.shape)
-                       for name, host in SlotSource.readout(bundle).items()}
-            # Read on every process of a pool, written by the one that publishes (`writes_weights`).
-            if writes_weights():
-                torch.save(tensors, root / "readout_head.pt")
-        (root / "readout.json").write_text(json.dumps(readout, indent=2) + "\n")
-        # The release's window, which the readout's prompt takes (`describe`), and the layout whole where
-        # it is another than that prompt, and the calibration where the task has one.
-        stated_release(root, None if layout == prompt else layout,
-                       bundle.calibration if bundle.calibration != Calibration() else None,
-                       max_length=layout.max_len, numerics=bundle.numerics,
-                       compute=None if bundle.numerics is None
-                       else computed_in(bundle.numerics, bundle.model, bundle.variables))
+    @staticmethod
+    def stated(bundle: PretrainedDecision) -> tuple[QuestionLayout | None, int, Calibration | None]:
+        """What the slot release states beside its files: its window, which the readout's prompt takes
+        (`describe`), the layout whole where it is another than that prompt, and the calibration where the
+        task has one."""
+        layout = bundle.layout
+        assert isinstance(layout, QuestionLayout) and layout.labels is not None
+        fields = _records.record(_records.record(bundle.head.record(), "head")["fields"], "head.fields")
+        count = len(_records.listed(fields["label_ids"], "label_ids", read=lambda value, _: value,
+                                    what="a list of label ids"))
+        # The prompt an external release derives (its canonical bare labels), which the release states the
+        # layout over where its labels are others.
+        canonical, _ = _labels(bundle.decision_tokenizer, count)
+        prompt = SlotSource.layout(max_len=layout.max_len, labels=canonical, blocks=layout.blocks)
+        return (None if layout == prompt else layout), layout.max_len, beyond_default(bundle.calibration)
 
     @staticmethod
     def readout(bundle: PretrainedDecision) -> Mapping[str, np.ndarray]:
@@ -206,17 +219,6 @@ class SlotSource(SourceKind):
         return LazyTensors({name: jax.ShapeDtypeStruct(params[path[0]].shape, params[path[0]].dtype)
                             for name, path in _PATHS.items()},
                            lambda name: np.array(read_home(params[_PATHS[name][0]]), copy=True, order="C"))
-
-    @staticmethod
-    def export(bundle: PretrainedDecision, variables: Mapping[str, object] | None = None
-               ) -> Mapping[str, np.ndarray]:
-        """Every tensor of the slot release `save` writes: the backbone's under their checkpoint names
-        and the slot-and-pointer head's under the release's (`readout_head.pt`), with `variables` in
-        place of the backbone's."""
-        from dew.decision.sources import joined_release
-
-        return joined_release(bundle.backbone().export(variables), SlotSource.readout(bundle),
-                              "the backbone's shards and readout_head.pt")
 
     @staticmethod
     def layout(*, max_len: int = SLOT_WINDOW, keep: Literal["start", "end", "all"] = "all",
@@ -294,5 +296,4 @@ class SlotSource(SourceKind):
                     "label_ids": [row[0] for row in ids], "head_dim": dimension, "slot_rows": count}},
                     _path, weight_file="readout_head.pt", initialize=_initialize))
         return CompositeSource(NativeComponent(config), head, PretrainedDecision.from_components, "",
-                               {"layout": layout, "calibration": calibration, "strict_specials": False,
-                                "writer": SlotSource.save, "exporter": SlotSource.export})
+                               {"layout": layout, "calibration": calibration, "strict_specials": False})

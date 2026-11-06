@@ -4,7 +4,7 @@ and the slot readout's formats cannot state of a task, and the loader reads back
 A format's own files state the head, the backbone and the tokenizer; a task also lays its rows out by a layout
 and reports its answers through a calibration. Laya's `rl_agent_config.json` states a layout's window, two
 budgets and an option layout, the joint head's states no layout at all, and the slot readout's prompt is its
-labels', its blocks' and its window. The writers state the rest here (`stated_release`), and the one decision
+labels', its blocks' and its window. Its plan states the rest here (`decision_envelope`), and the one decision
 loader, `DecisionSource.describe` and `SlotSource.describe`, takes it over what the format derives
 (`released_decision`), so a task of any layout a run trains with exports and loads as the task it was.
 """
@@ -14,42 +14,36 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
 
+from dew.config.release import Release
 from dew.decision.calibration import Calibration
 from dew.decision.layout import Layout
 from dew.nn.precision import Numerics
 from dew.registry import from_record, to_record
 
-if TYPE_CHECKING:
-    from dew.config.release import Release
 
-
-def stated_release(directory: Path, layout: Layout | None = None, calibration: Calibration | None = None, *,
-                   max_length: int | None = None, numerics: Numerics | None = None,
-                   compute: str | None = None) -> None:
-    """Write the export in `directory`'s release (`dew.config.Release`) with the decision facts its format
-    cannot state: the `layout` whole, its `max_length` alone where its format derives the rest of it, the
-    `calibration` where it holds more than the format's own files (None states none), and the `numerics`
-    the task traces under and the dtype its model `compute`s in (`dew.interop.release.computed_in`), which
-    its loader builds the task in (`dew.interop.release.released`): a task's, which a writer states where
-    it writes one (None for a source's own bundle, whose files state its dtype). A task declaration its
-    backbone's writer wrote (`Pretrained.save`) stays as it wrote it."""
-    from dew.config.release import Release
-
-    held = Release.load(directory) or Release()
+def decision_envelope(held: Release, layout: Layout | None = None, calibration: Calibration | None = None, *,
+                      max_length: int | None = None, numerics: Numerics | None = None,
+                      compute: str | None = None) -> Release:
+    """The release record of a decision release (`dew.config.Release`): `held`, what its backbone's own plan
+    states (`dew.interop.releases.bundle_plan`), with the decision facts its format cannot state: the
+    `layout` whole, its `max_length` alone where its format derives the rest of it, the `calibration`
+    where it holds more than the format's own files (None states none), and the `numerics` the task traces
+    under and the dtype its model `compute`s in (`dew.interop.release.computed_in`), which its loader
+    builds the task in (`dew.interop.release.released`): a task's, where it states one (None for a source's
+    own bundle, whose files state its dtype). A task declaration `held` states stays as it is."""
     stated = None if layout is None else _record(to_record(layout, Layout))
     calibrated = None if calibration is None else _record(to_record(calibration, Calibration))
     task = held.task if held.task is not None or compute is None else {
         "numerics": None if numerics is None else to_record(numerics, Numerics),
         "dtypes": {"compute": compute}}
-    replace(held, task=task, layout=stated, max_length=max_length, calibration=calibrated).write(directory)
+    return replace(held, task=task, layout=stated, max_length=max_length, calibration=calibrated)
 
 
 def released_decision[L: Layout](directory: Path, layout: L, calibration: Calibration, *,
                                  kind: type[L]) -> tuple[L, Calibration]:
     """`layout` and `calibration`, the ones a decision format derives of its own files, as the release beside
-    them states them over those (`stated_release`), the layout as a `kind` (a Laya head reads rows a
+    them states them over those (`decision_envelope`), the layout as a `kind` (a Laya head reads rows a
     `QuestionLayout` lays out, the joint head's a `JointLayout`'s)."""
     release = _loaded(directory)
     if release is not None and release.layout is not None:

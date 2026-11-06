@@ -92,8 +92,8 @@ def released(directory: Path) -> tuple[TaskSettings | None, Numerics | None, Dty
     if release is None or release.task is None:
         return None, None, None, {}
     task = release.task
-    # A decision release states its task's numerics alone (`dew.decision.release.stated_release`): its own
-    # files declare its task.
+    # A decision release states its task's numerics alone (`dew.decision.release.decision_envelope`): its
+    # own files declare its task.
     settings, numerics = task.get("settings"), task.get("numerics")
     dtypes = _records.record(task["dtypes"], "dtypes")
     return (None if settings is None else from_record(TaskSettings, _records.record(settings, "settings"),

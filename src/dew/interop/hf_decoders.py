@@ -85,7 +85,7 @@ from dew.nn.vision.siglip import translate_gemma_projector_config, translate_sig
 from dew.registry import from_record, towers
 
 if TYPE_CHECKING:
-    from dew.config.release import Release
+    pass
 
 GENERATION_CONFIG_FILE = "generation_config.json"
 
@@ -1232,10 +1232,9 @@ def save_export_assets(
     tokenizer: str | ExportTokenizer | None = None,
     generation_config: Mapping[str, object] | None = None,
     named: bool = True,
-    release: "Release | None" = None,
 ) -> None:
-    """Write the tokenizer files and generation_config.json beside exported weights, and the run's
-    release where the export has one (`release`, `dew.config.release.RELEASE_FILE`).
+    """Write the tokenizer files and generation_config.json beside exported weights, where the release
+    holds one (`generation_config`, None where its format holds none).
 
     Readers of the HF layout (transformers, llama.cpp and the runtimes on it) locate the
     vocabulary through tokenizer_config.json, so the tokenizer writes its own files here
@@ -1244,10 +1243,9 @@ def save_export_assets(
     `tokenizer_name` the source's generation config carried is dropped. A name is
     resolved through `tokenizer_for` from local files only. Dew's byte vocabulary has
     no files, so it alone is recorded, as `tokenizer_name: "byte"`; unless `named`,
-    where the layout has no such field and it is refused before anything is written.
+    where the layout has no such field (or no generation config) and it is refused before anything is
+    written.
     """
-    values = dict(GENERATION_DEFAULTS if generation_config is None else generation_config)
-    values.pop('tokenizer_name', None)
     byte = False
     writer: ExportTokenizer | None = None
     if isinstance(tokenizer, str):
@@ -1258,7 +1256,7 @@ def save_export_assets(
         writer = None if isinstance(resolved, ByteTokenizer) else resolved
     elif tokenizer is not None:
         writer = tokenizer
-    if byte and not named:
+    if byte and (not named or generation_config is None):
         raise ValueError("the byte vocabulary has no tokenizer files, and this layout's "
                          "generation_config.json has no field to name it by; export a run trained "
                          "on a Hugging Face tokenizer")
@@ -1274,13 +1272,13 @@ def save_export_assets(
                     target = Path(directory) / written.relative_to(staged)
                     target.parent.mkdir(parents=True, exist_ok=True)
                     os.replace(written, target)
+    if generation_config is None:
+        return
+    values = dict(generation_config)
+    values.pop('tokenizer_name', None)
     if byte:
         values['tokenizer_name'] = "byte"
     write_atomically(os.path.join(directory, GENERATION_CONFIG_FILE), json.dumps(values, indent=2))
-    # An export without a run's declaration replaces one an earlier export of the directory wrote.
-    from dew.config.release import Release
-
-    (Release() if release is None else release).write(directory)
 
 
 def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, object],

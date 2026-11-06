@@ -86,6 +86,8 @@ if TYPE_CHECKING:
     from dew.inference.images import TextToImage
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, SavedRun, TextGeneration
     from dew.inputs import InputSpec
+    from dew.interop.layouts import Unwritable
+    from dew.interop.releases import ReleasePlan
     from dew.nn.autoencoders import AutoEncoder
     from dew.nn.backbones.decoder_stack import DecoderBank
     from dew.sampling.guidance import Guidance
@@ -643,15 +645,19 @@ class SettingsTask(SavedTask, Protocol):
 
 @runtime_checkable
 class ReleasedTask(SavedTask, Protocol):
-    """A saved task that publishes its run as a released checkpoint of its own layout
-    (`Decide.save_pretrained`), which `dew export` writes in place of its model's source layout where its
-    layout states the run (`publishes`), and its run's native release where it does not."""
+    """A saved task that publishes its run as a release of its own (`release_plan`, a decision task's
+    format, a model's native release), which `dew export` writes in place of its model's source layout
+    where it states the run's model (`unstated`), and its run's native release where it does not
+    (`dew.interop.saved_sources.run_plan`)."""
 
-    def save_pretrained(self, directory: str) -> None: ...
+    def release_plan(self) -> ReleasePlan | Unwritable:
+        """Its release (`dew.interop.releases`), or why none states it."""
+        ...
 
     @classmethod
-    def publishes(cls, run: SavedRun) -> bool:
-        """Whether its layout states `run`'s model."""
+    def unstated(cls, run: SavedRun) -> Unwritable | None:
+        """Why its release does not state `run`'s model, read off the run's record before its weights are;
+        None where it does."""
         ...
 
 

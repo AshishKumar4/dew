@@ -7,6 +7,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- Every release Dew writes is planned once and written once (`dew.interop.releases.ReleasePlan`): `dew
+  export`, `Pretrained.save`, `Decide.save_pretrained` and `SavedModel.save_pretrained` each write a plan of
+  a model part, a decision head's files, the task's assets and one release record, and `export` returns the
+  plan's tensors. A run whose model no family's layout writes (a Qwen3-MoE or Qwen2-MoE config, a decoder
+  with cross-attention, a decision head with no release format) exports as its native release, stating why,
+  where `dew export` refused some of them. Each decision release format is declared once, beside its reader
+  (`dew.decision.formats`). `dew.decision.LayaCheckpoint` is removed: `Decide.save_pretrained` writes
+  Laya's format.
 - A decision release may state one temperature over every question type (`Temperatures.default`): Laya's
   `rl_agent_config.json` takes a number for `temperature` beside its per-type list, and a release record's
   calibration states it for formats whose files hold none.

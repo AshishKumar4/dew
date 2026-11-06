@@ -29,7 +29,7 @@ from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
 from dew.data.mixing import CorpusCounts
 from dew.data.pipeline import Pack, Refused, Rejected, cut_counts, cut_unit
-from dew.data.text import HFTokenizer, Tokenizer
+from dew.data.text import Tokenizer
 from dew.decision.calibration import (
     BUCKET_MINIMUM,
     TYPE_MINIMUM,
@@ -42,7 +42,7 @@ from dew.decision.calibration import (
 from dew.decision.data import Example
 from dew.decision.head import Head
 from dew.decision.images import Images
-from dew.decision.laya import LAYA, LayaCheckpoint
+from dew.decision.laya import LAYA
 from dew.decision.layout import (
     OPTION_TILE,
     QUESTION_FIELDS,
@@ -95,6 +95,8 @@ if TYPE_CHECKING:
     from dew.decision.objective import DecisionObjective
     from dew.decision.sources import PretrainedDecision
     from dew.distributed.placement import Layout as Placement, MeshSpec
+    from dew.interop.layouts import Unwritable
+    from dew.interop.releases import ReleasePlan
 
 TASK_FILE = "decide.json"
 """The file `Decide.save` writes into a run: its calibration, budget and name."""
@@ -407,15 +409,19 @@ class Decide(SavedRunTask, InItsForm):
         return step_calibrations(directory, step)
 
     @classmethod
-    def publishes(cls, run: SavedRun) -> bool:
-        """Whether the format its head is released in states `run`'s backbone: one with cross-attention
-        layers (a decision context's encoder read through them) none states, so its export is its run's
-        native release (`dew.inference.models.write_run_release`)."""
-        from dew.inference.tasks import saved_model
-        from dew.interop.pretrained import source_states
+    def unstated(cls, run: SavedRun) -> "Unwritable | None":
+        """Why the format its head is released in does not state `run`'s backbone
+        (`dew.decision.formats.format_unstated`: a backbone no family's layout writes, one with
+        cross-attention layers a decision context's encoder is read through among them), so its export is
+        its run's native release; None where it does."""
+        from dew.decision.formats import format_unstated
+        from dew.inference.tasks import saved_model, saved_settings
 
         # The record's model is the backbone the head reads (`from_saved`).
-        return source_states(saved_model(run.record, None).build())
+        backbone = saved_model(run.record, None).build()
+        head = Head.from_record(saved_settings(run.record, DecideSettings).head,
+                                DecisionModel.head_size(backbone)[0])
+        return format_unstated(head.release_format, backbone)
 
     @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: "MeshSpec | Mesh | None" = None,
@@ -504,32 +510,28 @@ class Decide(SavedRunTask, InItsForm):
         task = replace(task, budget=replace(task.budget, options=widest))
         return task if calibrate_on is None else task.calibrated(calibrate_on)
 
-    def save_pretrained(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
-        """Write this task as a released checkpoint, which `from_pretrained` reads back.
+    def release_plan(self) -> "ReleasePlan | Unwritable":
+        """This task's release (`dew.decision.formats.decision_plan`), or why none states it.
 
         The files are those of the format its head is released in (`Head.release_format`): Laya's layout
-        for a `DecisionHead` (`LayaCheckpoint.save`, the files llama.cpp's converter and `/v1/systemone`
-        server read too), the joint head's for a `JointSchemaHead`, the slot readout's for a
-        `LabelReadout` or a `SlotReadout` (`PretrainedDecision.of`). What a format's files cannot state,
-        the task's own layout and a calibration beyond temperatures, goes beside them in the release
-        (`dew.config.Release`), which the one decision loader reads back over them
-        (`dew.decision.release`), so a task of any layout it was trained with exports and loads as the
-        task it is. The calibration's temperatures go into Laya's file held within their bounds as this
-        task applies them, so that a reader which does not hold them answers as this task does.
-        """
-        if self.model.head.release_format != "laya":
-            from dew.decision.sources import PretrainedDecision
+        for a `DecisionHead` (the files llama.cpp's converter and `/v1/systemone` server read too), the
+        joint head's for a `JointSchemaHead`, the slot readout's for a `LabelReadout` or a `SlotReadout`.
+        What a format's files cannot state, the task's own layout and a calibration beyond temperatures,
+        goes beside them in the release (`dew.config.Release`), which the one decision loader reads back
+        over them (`dew.decision.release`), so a task of any layout it was trained with exports and loads
+        as the task it is. The calibration's temperatures go into Laya's file held within their bounds as
+        this task applies them, so that a reader which does not hold them answers as this task does."""
+        from dew.decision.formats import decision_plan, format_unstated
+        from dew.decision.sources import PretrainedDecision
 
-            PretrainedDecision.of(self).save(directory, max_shard_size=max_shard_size)
-            return
-        if not isinstance(self.tokenizer, HFTokenizer):
-            raise ValueError("a released checkpoint holds the files of a Hugging Face tokenizer, and this "
-                             f"task's is a {type(self.tokenizer).__name__}")
-        if not isinstance(self.layout, QuestionLayout):
-            raise ValueError(f"Laya's head reads rows a QuestionLayout lays out, not a "
-                             f"{type(self.layout).__name__}")
-        LayaCheckpoint(self.model, self.variables, self.layout, self.tokenizer, self.specials,
-                       self.calibration, self.precision).save(directory, max_shard_size=max_shard_size)
+        why = format_unstated(self.model.head.release_format, self.model.backbone)
+        return why if why is not None else decision_plan(PretrainedDecision.of(self))
+
+    def save_pretrained(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
+        """Write this task as a released checkpoint (`release_plan`), which `from_pretrained` reads back."""
+        from dew.interop.releases import writable
+
+        writable(self.release_plan(), "decision task").write(directory, max_shard_size=max_shard_size)
 
     def save(self, directory: str) -> None:
         """Write this task's calibration, budget and name into the run `directory`.

@@ -63,7 +63,7 @@ from dew.interop.pipeline_assembly import (
     text_components,
 )
 from dew.interop.processors import Processor, hosts
-from dew.interop.release import load_settings, release_record, with_rounding
+from dew.interop.release import load_settings, with_rounding
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, tensor_specs
 from dew.interop.saved_sources import RunPipeline, pinned_run, pipeline_of_run, released_run
 from dew.interop.streaming import WeightLayout
@@ -95,6 +95,7 @@ if TYPE_CHECKING:
     from jax.sharding import Mesh
 
     from dew.inference.tasks import SavedRun, TaskSettings
+    from dew.interop.releases import ReleasePlan
     from dew.interop.torchax_fallback import TorchAdmission
     from dew.lora import Adapter, LoRA
     from dew.nn.attention import AttentionImpl
@@ -210,7 +211,7 @@ def _extension_drawn(model: nn.Module, selected: Callable[[tuple[str, ...]], boo
 
 def source_states(model: nn.Module) -> bool:
     """Whether a source's format states `model`'s layers: none holds cross-attention layers, which a run's
-    own checkpoint and its native release keep (`dew.inference.models.write_run_release`)."""
+    own checkpoint and its native release keep (`dew.interop.releases.native_plan`)."""
     from dew.nn.protocols import CrossAttending
 
     return not (isinstance(model, CrossAttending) and model.cross_attention is not None)
@@ -742,39 +743,36 @@ class Pretrained:
                 "no quantized tensors to write back in it")
         return quantization
 
+    def parts(self, variables: Mapping[str, object] | None = None
+              ) -> dict[str, tuple[Mapping[str, object], Mapping[str, np.ndarray]]]:
+        """`export`'s tensors by the folder of the release that holds them, each with its config: the
+        source's own config.json as published at the root (""), and a bundle's folders each their own
+        (`DecoderFamily.wrapper_folders`), so the release loads as the source did."""
+        tensors = self.export(variables)
+        folders = {decoder_parts.folder_config(folder): folder for folder in _folders(self.config)
+                   if decoder_parts.folder_config(folder) in self.config}
+        root = {key: value for key, value in self.config.items() if key not in folders}
+        parts = {"": (root, _folder_part(tensors, "") if folders else tensors)}
+        for key, folder in folders.items():
+            parts[folder] = (dict(_records.record(self.config[key], key)),
+                             _folder_part(tensors, decoder_parts.folder_name(folder, "")))
+        return parts
+
+    def release_plan(self, variables: Mapping[str, object] | None = None) -> ReleasePlan:
+        """This bundle's release (`dew.interop.releases.bundle_plan`), which `save` writes."""
+        from dew.interop.releases import bundle_plan
+
+        return bundle_plan(self, variables)
+
     def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None,
              max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
-        """Write `export`'s tensors, the source's own config.json as published, and its tokenizer files,
-        and the source's own Python modules a load ran (`code`), so the directory loads as the source
-        did.
+        """Write its release (`release_plan`): `export`'s tensors, the source's own config.json as published,
+        and its tokenizer files, and the source's own Python modules a load ran (`code`), so the directory
+        loads as the source did.
 
         The tensors are written in shards of at most `max_shard_size`.
         """
-        from dew.interop.safetensors_io import save_hf_layout
-        values = self.variables if variables is None else variables
-        destination = Path(directory)
-        # Either half may refuse the bundle, each before it writes a file, as may the source's code.
-        tensors = self.export(values)
-        modules = {} if self.code is None else sources.code_modules(self.code)
-        decoders.save_export_assets(destination,
-                                    tokenizer=self.processor if self.tokenizer is None else self.tokenizer,
-                                    generation_config=dict(self.generation_config),
-                                    named=self.names_tokenizer,
-                                    release=None if self.settings is None else release_record(
-                                        self.settings, self.numerics, self.model, values))
-        for name, module in sorted(modules.items()):
-            written = destination / name
-            written.parent.mkdir(parents=True, exist_ok=True)
-            written.write_bytes(module.read_bytes())
-        # A bundle's folders each get their own tensors and config back (`DecoderFamily.wrapper_folders`).
-        folders = {decoder_parts.folder_config(folder): folder for folder in _folders(self.config)
-                   if decoder_parts.folder_config(folder) in self.config}
-        for key, folder in folders.items():
-            save_hf_layout(_folder_part(tensors, decoder_parts.folder_name(folder, "")),
-                           dict(_records.record(self.config[key], key)), destination / folder, max_shard_size)
-        save_hf_layout(_folder_part(tensors, "") if folders else tensors,
-                       {key: value for key, value in self.config.items() if key not in folders},
-                       destination, max_shard_size)
+        self.release_plan(variables).write(directory, max_shard_size=max_shard_size)
 
     def push_to_hub(self, repo_id: str, *, variables: Mapping[str, object] | None = None,
                     private: bool = False, commit_message: str = "Upload dew export",

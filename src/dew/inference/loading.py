@@ -137,7 +137,7 @@ def pipeline(
 
 
 def released_model(root: epath.Path) -> bool:
-    """Whether `root` holds a native release (`dew.inference.models.write_run_release`): a release record
+    """Whether `root` holds a native release (`dew.interop.releases.native_plan`): a release record
     that states the run it was written of, which a source's own files never state."""
     from dew.config.release import Release
 

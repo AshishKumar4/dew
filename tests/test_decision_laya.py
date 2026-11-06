@@ -85,10 +85,10 @@ def laid(parallel: bool) -> tuple[DecisionInputs, ...]:
 def draw(seed: int) -> dict[str, np.ndarray]:
     """A seed's weights for the tiny checkpoint's model: kernels and embeddings at their initializer's
     scale, norms' scales about one and biases off zero, under Dew's paths (`dew.`) and Laya's names
-    (`param.`, `dew.decision.laya.laya_tensors`), the requests the fixture's cases."""
+    (`param.`, its release's: `Decide.release_plan`), the requests the fixture's cases."""
     from flax.traverse_util import flatten_dict, unflatten_dict
 
-    from dew.decision.laya import laya_tensors
+    from dew.interop.releases import writable
 
     rng = np.random.default_rng([1557, 7, seed])
     checkpoint = tiny()
@@ -102,7 +102,8 @@ def draw(seed: int) -> dict[str, np.ndarray]:
         else:
             leaf = rng.normal(0.0, 1.0, shape) / np.sqrt(np.prod(shape[:-1]))
         drawn[path] = leaf.astype(np.float32)
-    tensors, _ = laya_tensors(checkpoint.model, unflatten_dict(drawn))
+    held = replace(checkpoint, variables=unflatten_dict(drawn))
+    tensors = writable(held.release_plan(), "decision task").tensors()
     return {**{f"dew.{'/'.join(path)}": value for path, value in drawn.items()},
             **{f"param.{name}": np.asarray(tensors[name], np.float32) for name in tensors}}
 

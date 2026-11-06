@@ -278,7 +278,7 @@ def published_config(model: DiffusionGemma) -> Mapping[str, object]:
 def publishable(model: DiffusionGemma) -> bool:
     """Whether transformers' DiffusionGemmaForBlockDiffusion can build the config `model` publishes
     (`_unbuildable`): a block decoder with none of what it requires exports as its run's native release
-    (`dew.inference.models.write_run_release`)."""
+    (`dew.interop.releases.native_plan`)."""
     return not _unbuildable(published_config(model))
 
 
