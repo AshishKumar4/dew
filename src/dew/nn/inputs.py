@@ -234,7 +234,7 @@ class ModelInputs:
             raise ValueError("tokens must be an integer [B, S] array")
         reserved = {"tokens", "conditioning", "train", "decode", "rngs", "method",
                     "mutable", "capture_intermediates", "attention_pairwise_mask",
-                    "attention_key_positions", "attention_key_runs"}
+                    "attention_key_positions", "attention_key_runs", "attention_key_valid"}
         if reserved.intersection(self.token_fields):
             raise ValueError(
                 f"token_fields cannot contain {sorted(reserved.intersection(self.token_fields))}"
@@ -567,7 +567,9 @@ class AttentionMetadata:
     a run reads it.
     `pairwise_mask` `[B, S, keys]`, or `key_runs` `[B, S, R, 2]`, each query's
     key intervals whose union it reads, replaces a call's visibility, a
-    windowed layer windowing it over `key_positions` `[B, keys]`.
+    windowed layer windowing it over `key_positions` `[B, keys]`, and
+    `key_valid` `[B, keys]` hides the keys it marks out from every query (a
+    cached call's keys a call excludes, read as the template's key ids).
 
     `image_groups` and `block_groups` `[B, S]` int32 number the tokens' blocks,
     each a run of contiguous tokens, an image's or a prompt's, and -1 for a
@@ -596,6 +598,7 @@ class AttentionMetadata:
     pairwise_mask: jax.Array | None = None
     key_positions: jax.Array | None = None
     key_runs: jax.Array | None = None
+    key_valid: jax.Array | None = None
     token_ids: jax.Array | None = None
     engram_ids: jax.Array | None = None
     media: jax.Array | None = None
@@ -626,7 +629,7 @@ class AttentionMetadata:
         return None if self.coordinates is None else self.coordinates.entered
 
 
-MIXING = ("pairwise_mask", "key_positions", "key_runs", "position_bias", "admitted", "entered")
+MIXING = ("pairwise_mask", "key_positions", "key_runs", "key_valid", "position_bias", "admitted", "entered")
 """The `AttentionMetadata` fields that say which tokens a mixer lets each token
 read, or how much: a call's own mask, or its keys' runs, and the key positions
 it is read by, an additive bias, a server's mixed layout. A mixer runs a call that sets one only
