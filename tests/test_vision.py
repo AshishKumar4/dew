@@ -319,9 +319,10 @@ def shared_fixture(name):
 
 
 def real(values, grid, merge: int = 1):
-    """Each row's own entries of padded `[B, L, ...]` values, a row's patches `prod(grid) / merge**2`."""
-    counts = np.prod(grid, axis=1) // merge ** 2
-    return np.concatenate([np.asarray(values)[row, :count] for row, count in enumerate(counts)])
+    """Each row's own entries of padded `[B, L, ...]` values, a row's patches `prod(grid) / merge**2`;
+    `grid` a host array, so the counts are static where the values are traced."""
+    counts = np.prod(np.asarray(grid), axis=1) // merge ** 2
+    return jnp.concatenate([values[row, :int(count)] for row, count in enumerate(counts)])
 
 
 MIMO_RECORDING = FIXTURES / "mimo-vision-tiny" / "recording.npz"
@@ -441,10 +442,9 @@ def test_muse_glimmer_tower_is_as_exact_as_the_reference():
                     reference, draw, "muse glimmer tower", seeds=seeds, truth_fn=truth)
     draw, reference, truth, seeds = recorded_site(
         MUSE_RECORDING, "muse glimmer image", muse_generator().image_draw,
-        lambda inputs: wide_run(inputs, "image", lambda wide_tower, image: np.asarray(
-            wide_tower.apply(wide, image))[0]))
+        lambda inputs: wide_run(inputs, "image", lambda wide_tower, image: wide_tower.apply(wide, image)[0]))
     image = jax.jit(lambda pixels: tower.apply(variables, pixels))
-    assert_as_exact(as_given(lambda index, inputs: {"tower": np.asarray(image(inputs["image"]))[0]}),
+    assert_as_exact(as_given(lambda index, inputs: {"tower": image(inputs["image"])[0]}),
                     reference, draw, "muse glimmer image", seeds=seeds, truth_fn=truth)
 
 
