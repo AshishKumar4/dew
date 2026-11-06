@@ -4,6 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from layout_parity import layouts_agree
 
 from dew.checkpoints import _filled
 from dew.nn.kernels.generation import chosen
@@ -115,17 +116,18 @@ def _keeping_gradients(optimizer):
     return optax.chain(kept, optimizer)
 
 
-def _decoder(*, scanned=False, remat=None, mixture=False, rows=8, dex=False):
-    """`_trained`'s tied bf16 decoder over fp32 parameters, as its LM objective, and the batch of
-    `rows` rows it trains on; with `dex`, its first layer's two heads a differential pair whose lambda
-    anneals over its first ten updates, the whole decoder training beside it."""
+def _decoder(*, scanned=False, remat=None, mixture=False, rows=8, dex=False, seed=0, dtype=jnp.bfloat16):
+    """`_trained`'s tied decoder over fp32 parameters, computing in `dtype` (bf16), as its LM objective,
+    and the batch of `rows` rows `seed` draws for it to train on; with `dex`, its first layer's two heads a
+    differential pair whose lambda anneals over its first ten updates, the whole decoder training beside
+    it."""
     from dew.batch import TEXT_KEY
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
     from dew.objectives.routing import ExpertBalance
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=4 if scanned else 2, num_heads=2,
                               num_kv_heads=1, mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
-                              tie_embeddings=True, dtype=jnp.bfloat16, scan_layers=scanned, remat=remat,
+                              tie_embeddings=True, dtype=dtype, scan_layers=scanned, remat=remat,
                               mixture={"experts": 4, "top_k": 2} if mixture else None)
     if dex:
         from dew.nn.dex import DifferentialExtension
@@ -133,11 +135,12 @@ def _decoder(*, scanned=False, remat=None, mixture=False, rows=8, dex=False):
         model = model.with_dex(DifferentialExtension(((0, (0, 1)),), anneal_steps=10, trains="all"))
     objective = LMObjective(model, seq_len=8, pad_id=0,
                             balance=ExpertBalance(aux_loss_alpha=.01) if mixture else None)
-    return objective, {TEXT_KEY: jnp.asarray(np.random.default_rng(0).integers(1, 64, (rows, 9)), jnp.int32)}
+    tokens = np.random.default_rng(seed).integers(1, 64, (rows, 9))
+    return objective, {TEXT_KEY: jnp.asarray(tokens, jnp.int32)}
 
 
 def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1, split=None,
-             mixture=False, rows=8, ragged=False, scanned=False, remat=None, longer=None, dex=False):
+             mixture=False, rows=8, ragged=False, scanned=False, remat=None, longer=None, dex=False, seed=0):
     """A tied bf16 decoder over fp32 parameters, trained `steps` steps on
     one batch and then `padded` steps on a batch of padding alone, with
     `copies` on or off on this device's generation, on `mesh` with every
@@ -150,15 +153,19 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
     stacked weights, each layer's stored apart, and each block recomputes
     as `remat` names. With `longer`, every other step reads a batch of that
     many rows, whose shape the trainer plans apart. A `dex` decoder's first
-    layer is a differential pair (`_decoder`). Returns the state, each step's
-    loss and the trainer, its plan the last shape's."""
+    layer is a differential pair (`_decoder`). `seed` draws the batch and the
+    start; a float64 process trains a float64 decoder (a check-1 truth,
+    `_on_par_with_the_plain_update`). Returns the state, each step's loss and
+    the trainer, its plan the last shape's."""
     from dew.batch import TEXT_KEY
     from dew.training import Layout, MeshSpec, Trainer
-    objective, batch = _decoder(scanned=scanned, remat=remat, mixture=mixture, rows=rows, dex=dex)
+    wide = jax.config.read("jax_enable_x64")
+    objective, batch = _decoder(scanned=scanned, remat=remat, mixture=mixture, rows=rows, dex=dex, seed=seed,
+                                dtype=jnp.float64 if wide else jnp.bfloat16)
     long = longer and {TEXT_KEY: jnp.asarray(np.random.default_rng(1).integers(1, 64, (longer, 9)),
                                              jnp.int32)}
     with chosen(narrow_copies='on' if copies else 'off'):
-        trainer = Trainer(objective, optimizer, key=jax.random.key(0), mesh=mesh or MeshSpec(),
+        trainer = Trainer(objective, optimizer, key=jax.random.key(seed), mesh=mesh or MeshSpec(),
                           layout=Layout(min_shard=1, tolerance=1.0), accumulation=accumulation, split=split)
         state = trainer.initial_state()
         steps_by = {False: (trainer.compile(state, batch), None)}
@@ -174,18 +181,21 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
     return state, losses, trainer
 
 
-def _assert_plain_update(narrow, losses, plain, plain_losses):
-    """`narrow`, trained through copies, holds bitwise the parameters, last
-    gradient (`_keeping_gradients`) and losses of `plain`, trained without;
-    each copy is split as its parameter is, so a gather moves bf16, and is
-    the cast of the parameters the last update wrote. Returns the copies'
-    paths under `params`."""
-    assert plain.compute is None
-    for a, b in zip(jax.tree.leaves((narrow.variables, narrow.opt_state)),
-                    jax.tree.leaves((plain.variables, plain.opt_state)), strict=True):
-        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
-    for a, b in zip(losses, plain_losses, strict=True):
-        np.testing.assert_array_equal(a, b)
+def _on_par_with_the_plain_update(optimizer, label: str, **options):
+    """`_trained`'s run through copies on par with the same run without them, its parameters, optimizer
+    state (the last gradient, `_keeping_gradients`) and losses, over the starts and batches the seeds draw
+    (check 1), the truth the run without copies in float64: the two compile two programs."""
+    def run(copies, seed):
+        state, losses, _ = _trained(optimizer(), copies=copies, seed=int(seed), **options)
+        return {"state": (state.variables, state.opt_state), "losses": losses}
+
+    layouts_agree(run, lambda seed: (np.int32(seed),), label, layout=True, reference=False)
+
+
+def _copies_of(narrow):
+    """`narrow`'s copies, each split as its parameter is, so a gather moves bf16, and the cast of the
+    parameters the last update wrote, bit for bit: one exactly rounded cast of the same values. Returns
+    the copies' paths under `params`."""
     masters = {tuple(key.key for key in path): leaf.sharding
                for path, leaf in jax.tree_util.tree_flatten_with_path(narrow.variables)[0]}
     paths = {}
@@ -205,29 +215,31 @@ def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradien
     """Through the trainer, a tied decoder's projection kernels are read
     through bf16 copies and its tied table and norm scales are not. Under
     plain SGD, whose update reads the gradient once, every parameter and the
-    last gradient after three steps are bitwise what the in-forward cast
-    gives: the copies change no gradient, and the tied table's two uses
-    still sum in fp32. So too where the batch is split over data-parallel
+    last gradient after three steps are on par with what the in-forward cast
+    gives (check 1): the copies change no gradient, and the tied table's two
+    uses still sum in fp32. So too where the batch is split over data-parallel
     devices, whose gradients are summed across them, and where every
     parameter is split over fsdp devices too (the lane's eight: data 8,
     data 4 x fsdp 2, fsdp 8)."""
     from dew.training import MeshSpec
 
     mesh = MeshSpec(fsdp=fsdp)
-    narrow, losses, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=True, mesh=mesh)
-    plain, plain_losses, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=False,
-                                      mesh=mesh)
-    names = {"/".join(path) for path in _assert_plain_update(narrow, losses, plain, plain_losses)}
+    _on_par_with_the_plain_update(lambda: _keeping_gradients(optax.sgd(0.5)), "a tied decoder's copies",
+                                  mesh=mesh)
+    narrow, _, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=True, mesh=mesh)
+    names = {"/".join(path) for path in _copies_of(narrow)}
     assert names and all(name.endswith("kernel") and "proj" in name for name in names), names
 
 
 def test_a_scanned_decoder_reads_every_layers_kernels_through_copies_with_the_same_gradients():
     """A decoder that scans its layers over their stacked weights reads each layer's projection
     kernels through bf16 copies, stacked as the scan reads them, as an unscanned decoder does: under
-    plain SGD the parameters, the last gradient and the losses are bitwise the in-forward cast's."""
-    narrow, losses, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=True, scanned=True)
-    plain, plain_losses, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=False, scanned=True)
-    names = {"/".join(path) for path in _assert_plain_update(narrow, losses, plain, plain_losses)}
+    plain SGD the parameters, the last gradient and the losses are on par with the in-forward cast's
+    (check 1)."""
+    _on_par_with_the_plain_update(lambda: _keeping_gradients(optax.sgd(0.5)), "a scanned decoder's copies",
+                                  scanned=True)
+    narrow, _, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=True, scanned=True)
+    names = {"/".join(path) for path in _copies_of(narrow)}
     layers = {name.split("/")[0] for name in names}
     assert {f"layers_{index}" for index in range(4)} <= layers, names
 
@@ -249,7 +261,7 @@ def test_a_window_of_microbatches_reads_its_copies_and_commits_the_plain_update(
     fp32 as without copies, and a loss whose balance terms pool apart (a
     mixture's) replays the window's microbatches through the copies too:
     under SGD every parameter and the last pooled gradient after two
-    windows are bitwise the plain run's, with the parameters and their
+    windows are on par with the plain run's (check 1), with the parameters and their
     copies split over fsdp devices too (pairwise over the window's kind,
     its pooling and the mesh)."""
     from dew.training import MeshSpec
@@ -257,10 +269,10 @@ def test_a_window_of_microbatches_reads_its_copies_and_commits_the_plain_update(
     # Each microbatch keeps a row for every row shard of the lane's devices.
     run = {"steps": 2 * accumulation, "accumulation": accumulation, "split": split, "mixture": mixture,
            "rows": split * max(8, jax.device_count()), "ragged": True, "mesh": MeshSpec(fsdp=fsdp)}
-    narrow, losses, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=True, **run)
-    plain, plain_losses, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=False, **run)
-    assert int(narrow.updates) == int(plain.updates) == 2
-    assert _assert_plain_update(narrow, losses, plain, plain_losses)
+    _on_par_with_the_plain_update(lambda: _keeping_gradients(optax.sgd(0.5)), "a window's copies", **run)
+    narrow, _, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=True, **run)
+    assert int(narrow.updates) == 2
+    assert _copies_of(narrow)
 
 
 def test_a_dex_decoder_through_its_copies_trains_as_it_does_without_them():
@@ -268,11 +280,12 @@ def test_a_dex_decoder_through_its_copies_trains_as_it_does_without_them():
     lambda the anneal computes on before its cast to bfloat16, which outside training (no updates) it
     casts at once: the copies, chosen off the loss the step runs, its committed updates among its
     inputs, leave lambda out, so through them every parameter, the last gradient and every loss over
-    three updates are bitwise a plain run's."""
-    narrow, losses, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=True, steps=3, dex=True)
-    plain, plain_losses, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=False, steps=3, dex=True)
+    three updates are on par with a plain run's (check 1)."""
+    _on_par_with_the_plain_update(lambda: _keeping_gradients(optax.sgd(0.5)), "a dex decoder's copies",
+                                  steps=3, dex=True)
+    narrow, _, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=True, steps=3, dex=True)
     assert int(narrow.updates) == 3
-    assert _assert_plain_update(narrow, losses, plain, plain_losses)
+    assert _copies_of(narrow)
 
 
 def test_a_skipped_update_keeps_the_copies_of_the_parameters_it_kept():
@@ -422,7 +435,8 @@ def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads
     """Each shape a run meets plans its copies itself (`_at_base_rung`): where a longer batch fits only
     without them and a shorter one with them, the steps take turns, each reading the state as its own plan
     compiled it, the copies dropped before the longer batch's step and built again before the shorter's,
-    and under plain SGD the run lands bitwise on the parameters and losses of one without copies."""
+    and under plain SGD the run lands on par with the parameters and losses of one without copies
+    (check 1)."""
     free = 2 ** 39
     monkeypatch.setattr(jax.Device, "memory_stats",
                         lambda device: {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - free})
@@ -437,10 +451,10 @@ def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads
     shorter, longer, longer_without = used(8, copies=True), used(64, copies=True), used(64, copies=False)
     free = max(shorter, longer_without)
     assert free < longer
-    narrow, losses, trainer = trained(copies=True, longer=64, steps=3)
+    narrow, _, trainer = trained(copies=True, longer=64, steps=3)
     assert not trainer.plan["narrow"] and narrow.compute is not None
-    plain, plain_losses, _ = trained(copies=False, longer=64, steps=3)
-    _assert_plain_update(narrow, losses, plain, plain_losses)
+    _on_par_with_the_plain_update(lambda: optax.sgd(0.5), "a run whose shapes plan their copies apart",
+                                  steps=3, accumulation=2, split=1, remat="full", rows=8, longer=64)
 
 
 def test_a_restored_state_drops_its_templates_copies():
