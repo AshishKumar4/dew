@@ -934,13 +934,6 @@ def activation_part(key: str = 'hidden_act') -> ConfigPart[CausalTransformer]:
     return ConfigPart(_read_activation, lambda model: {key: hf_activation(model.mlp)})
 
 
-def _flag(key: str, field: str, *, default: bool) -> ConfigField[CausalTransformer]:
-    """A boolean the config states under `key`, its class's `default` where it states none or null
-    (`config_flag`)."""
-    return ConfigField(key, field, default, parse=lambda value, key: config_flag({key: value}, key,
-                                                                                  default=default))
-
-
 def inert(key: str, why: str, *, neutral: object = None) -> ConfigPart[CausalTransformer]:
     """A key the reference reads to no effect at `neutral` (or absent, or null), refused at any other
     value, saying `why`; written as nothing."""
@@ -1241,9 +1234,9 @@ def decoder_layout(spelling: DecoderSpelling = PLAIN_DECODER, *,
         geometry, *(() if spelling.activation is None else (activation_part(spelling.activation),)),
         _layer_kinds(spelling),
         rope_part(spelling.rope, ramps=spelling.ramps) if rope is None else rope,
-        *(_flag(name, name, default=False) if name in reads else constant(name, value=False)
+        *(flag(name, name, default=False) if name in reads else constant(name, value=False)
           for name in ('attention_bias', 'mlp_bias')),
-        _flag('tie_word_embeddings', 'tie_embeddings', default=spelling.tie_embeddings),
+        flag('tie_word_embeddings', 'tie_embeddings', default=spelling.tie_embeddings),
         constant('qk_norm', spelling.qk_norm), constant('scale_after_cast', spelling.scale_after_cast))
 
 
@@ -1356,7 +1349,8 @@ def integer(key: str, field: str, default: object = REQUIRED, *aliases: str) -> 
 
 
 def flag(key: str, field: str, *, default: bool) -> ConfigField:
-    """A boolean the config states under `key`, its class's `default` where it states none or null."""
+    """A boolean the config states under `key`, its class's `default` where it states none or null
+    (`config_flag`)."""
     return ConfigField(key, field, default,
                        parse=lambda value, key: config_flag({key: value}, key, default=default))
 

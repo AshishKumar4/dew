@@ -13,7 +13,8 @@ from reference_error import as_given, assert_as_exact, declared_seeds, indexed_r
 from safetensors.numpy import load_file, save_file
 from ssd_support import MAMBA2_130M_HF, mamba2_130m, mamba2_130m_logits, mamba2_interop_draw
 
-from dew.interop.mamba2 import config_from_hf
+from dew.interop.decoder_parts import translated
+from dew.interop.families.mamba import MAMBA2
 from dew.interop.pretrained import Pretrained
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "hf" / "mamba2-tiny"
@@ -153,7 +154,7 @@ def test_a_mamba_ssm_checkpoint_loads_and_saves_as_its_hf_port(tmp_path, tensors
     assert_logits_of_the_fixture(source, "mamba_ssm's names loaded")
     assert sorted(load_file(tmp_path / "saved" / "model.safetensors")) == sorted(tensors)
     saved = json.loads((tmp_path / "saved" / "config.json").read_text())
-    assert config_from_hf(saved) == config_from_hf(json.loads((FIXTURE / "config.json").read_text()))
+    assert translated(saved, MAMBA2) == translated(json.loads((FIXTURE / "config.json").read_text()), MAMBA2)
 
 
 INTEROP = Path(__file__).resolve().parent / "fixtures" / "mamba2" / "interop_seeded.npz"
