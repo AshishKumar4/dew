@@ -17,6 +17,7 @@ from dew.batch import Variables
 from dew.data.text import HFTokenizer
 from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
 from dew.interop.pretrained import Pretrained, with_overrides
+from dew.interop.release import computed_in
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors
 from dew.nn.attention import AttentionImpl
 from dew.registry import dtype_name, from_record, import_path
@@ -36,12 +37,16 @@ from .layout import (
     Text,
 )
 from .model import DecisionModel
+from .release import released_decision, released_length, stated_release
 from .sources import PretrainedDecision
 
 SLOT_SYSTEM = ("Apply the question to the state. Choose exactly one of the listed options. Respond with only "
                "its uppercase letter, with no explanation or reasoning.")
 _NOT_ONE_TOKEN = frozenset(["BQ", "BZ", "CJ", "CQ", "CZ", "DQ", "DZ", "EJ", "EY", "FJ", "FQ", "FV", "FZ",
                             "GJ", "GK", "GQ", "GZ", "HJ", "IY", "JF", "JG", "JH", "JL", "JN", "JQ"])
+SLOT_WINDOW = 32768
+"""The window a slot release's prompt takes where its release states none (`SlotSource.layout`): an external
+release that never declared one."""
 SLOT_LABELS = tuple(name for name in LABEL_NAMES if name not in _NOT_ONE_TOKEN)[:256]
 """OneJev qev/prompt.py's 256 labels at 81ce62f1597c91e46767d4d02d6ac2e18534fe94."""
 _PATHS = {"slot": ("slots",), "q.weight": ("q",), "k.weight": ("k",)}
@@ -100,6 +105,14 @@ def _labels(tokenizer: HFTokenizer, count: int) -> tuple[Labels, tuple[tuple[int
     return labels, labels.ids(tokenizer, len(names))
 
 
+
+def _one_variant(mode: str, labels: Labels) -> None:
+    """Refuse a pointer head (`mode` "head", a `SlotReadout`) labels of more than one variant: it reads one
+    label id a slot, so the others its layout writes it could not read."""
+    if mode == "head" and len(labels.variants) != 1:
+        raise ValueError(f"the slot pointer head reads one label id a slot, and its layout's labels are "
+                         f"written {len(labels.variants)} ways")
+
 @dataclasses.dataclass(frozen=True)
 class SlotHeadSource(HeadComponent):
     def build(self, backbone: Pretrained | None, dtype: str, attention_impl: AttentionImpl, *,
@@ -141,17 +154,18 @@ class SlotSource(SourceKind):
         layout = bundle.layout
         if not isinstance(layout, QuestionLayout) or layout.labels is None:
             raise ValueError("the slot format needs its whole-question layout")
-        labels = layout.labels
-        expected = SlotSource.layout(max_len=layout.max_len, labels=labels, blocks=layout.blocks)
-        if layout != expected or bundle.calibration != Calibration():
-            raise ValueError("the slot format holds its release prompt and uncalibrated logits")
         ids = _records.listed(fields["label_ids"], "label_ids", read=lambda value, _: value,
                              what="a list of label ids")
-        canonical, picked = _labels(bundle.decision_tokenizer, len(ids))
+        # The prompt an external release derives (its canonical bare labels), which the release states the
+        # layout over where its labels are others; the readout reads the layout's own.
+        canonical, _ = _labels(bundle.decision_tokenizer, len(ids))
+        prompt = SlotSource.layout(max_len=layout.max_len, labels=canonical, blocks=layout.blocks)
+        _one_variant(mode, layout.labels)
+        picked = layout.labels.ids(bundle.decision_tokenizer, len(ids))
         actual = (tuple(_records.integers(group, "label_ids") for group in ids) if mode == "slot_lm"
                   else tuple((_records.integer(value, "label_ids"),) for value in ids))
-        if labels != canonical or actual != picked:
-            raise ValueError("the slot format records its canonical bare labels in tokenizer order")
+        if actual != picked:
+            raise ValueError("the slot readout reads the labels its layout writes, in the layout's order")
         root = Path(directory)
         bundle.backbone().save(root, max_shard_size=max_shard_size)
         readout = {"readout": mode, "head_dim": fields.get("head_dim", 256), "n_slots": len(ids)}
@@ -171,6 +185,12 @@ class SlotSource(SourceKind):
             if writes_weights():
                 torch.save(tensors, root / "readout_head.pt")
         (root / "readout.json").write_text(json.dumps(readout, indent=2) + "\n")
+        # The release's window, which the readout's prompt takes (`describe`), and the layout whole where
+        # it is another than that prompt, and the calibration where the task has one.
+        stated_release(root, None if layout == prompt else layout,
+                       bundle.calibration if bundle.calibration != Calibration() else None,
+                       max_length=layout.max_len, numerics=bundle.numerics,
+                       compute=computed_in(bundle.numerics, bundle.model, bundle.variables))
 
     @staticmethod
     def readout(bundle: PretrainedDecision) -> Mapping[str, np.ndarray]:
@@ -198,7 +218,7 @@ class SlotSource(SourceKind):
                               "the backbone's shards and readout_head.pt")
 
     @staticmethod
-    def layout(*, max_len: int = 32768, keep: Literal["start", "end", "all"] = "all",
+    def layout(*, max_len: int = SLOT_WINDOW, keep: Literal["start", "end", "all"] = "all",
                labels: Labels = _LABELS,
                blocks: bool = False) -> QuestionLayout:
         """The release's whole-prompt encoding with thinking disabled and its question last."""
@@ -258,13 +278,20 @@ class SlotSource(SourceKind):
         # the backbone the native loader builds under them reads blocks, of whatever kind.
         blocks = reads_blocks(config, overrides)
         tokenizer = HFTokenizer(str(directory), local_files_only=True)
-        labels, ids = _labels(tokenizer, count)
+        labels, _ = _labels(tokenizer, count)
+        # The release's window, else an external release's default, over its prompt; and the layout and
+        # calibration it states whole over that, whose labels the readout reads.
+        layout, calibration = released_decision(
+            directory, SlotSource.layout(max_len=released_length(directory, SLOT_WINDOW), labels=labels,
+                                         blocks=blocks), Calibration(), kind=QuestionLayout)
+        read = layout.labels or labels
+        _one_variant(mode, read)
+        ids = read.ids(tokenizer, min(count, read.capacity(tokenizer)))
         head = (SlotHeadSource({"class": import_path(LabelReadout), "fields": {
                     "label_ids": [list(row) for row in ids]}}, _path)
                 if mode == "slot_lm" else SlotHeadSource({"class": import_path(SlotReadout), "fields": {
                     "label_ids": [row[0] for row in ids], "head_dim": dimension, "slot_rows": count}},
                     _path, weight_file="readout_head.pt", initialize=_initialize))
-        layout = SlotSource.layout(labels=labels, blocks=blocks)
         return CompositeSource(NativeComponent(config), head, PretrainedDecision.from_components, "",
-                               {"layout": layout, "calibration": Calibration(), "strict_specials": False,
+                               {"layout": layout, "calibration": calibration, "strict_specials": False,
                                 "writer": SlotSource.save, "exporter": SlotSource.export})

@@ -577,6 +577,11 @@ dew.config.lm.ServedRollout
   max_lag: int = 1
   sync_every: int = 1
   page_size: int | None = None
+dew.config.release.Release
+  task: Mapping[str, object] | None = None
+  layout: Mapping[str, object] | None = None
+  max_length: int | None = None
+  calibration: Mapping[str, object] | None = None
 dew.config.sweep.GridSearch
 dew.config.sweep.OptunaSearch
   seed: int = 0
@@ -636,6 +641,8 @@ dew.decision.config.DecisionRunConfig
   segments: Annotated[tuple[RowSegment, ...], record_argument(tuple[RowSegment, ...])] | None = None
   reads: Annotated[Reads, record_argument(Reads)] | None = None
   parallel: bool | None = None
+  shared_state: int | None = None
+  siblings: bool | None = None
   unit: Unit | None = None
   order: RowOrder | None = None
   split: Literal['part', 'question', 'whole'] | None = None

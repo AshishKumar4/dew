@@ -96,7 +96,7 @@ def exported(args) -> dict:
     from dew.interop.pretrained import Pretrained, PretrainedDecoder
     from dew.interop.saved_sources import export_run
     from dew.nn.dex import DifferentialExtension
-    from dew.registry import models
+    from dew.registry import ModelConfig, models, to_record
     from dew.training import Layout, MeshSpec
 
     PretrainedDecoder.save = functools.partialmethod(PretrainedDecoder.save, max_shard_size=SHARD)
@@ -122,7 +122,9 @@ def exported(args) -> dict:
         refused = False
     except RuntimeError:
         refused = True
-    run = SimpleNamespace(objective=SimpleNamespace(saved_task=None))
+    # A run of a causal decoder, as its record states its model, which an export reads its layout by.
+    run = SimpleNamespace(objective=SimpleNamespace(saved_task=None),
+                          record={"model": to_record(ModelConfig.from_model(model), ModelConfig)})
 
     def restoring(exported) -> None:
         """`export_run`'s model from here on: `exported`, which the run's restore stands in for."""

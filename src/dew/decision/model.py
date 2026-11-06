@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from dew.batch import COORDINATES_FIELD, Variables, part, prefix_sum, thaw
 from dew.decision.head import Head
 from dew.decision.layout import DecisionInputs
+from dew.decision.shared_state import entered_documents, entering
 from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, ModelInputs
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
@@ -139,6 +140,14 @@ class DecisionModel(HeadedModel):
             if blocked or inputs.slots is not None or inputs.reads is None:
                 raise ValueError("a row in streams reads as its layout's reads say, which blocks and "
                                  "parallel options say otherwise")
+            if entering(inputs.reads, inputs.fragments):
+                # A row over one state whose questions each enter its shared part: documents every layer
+                # reads so, a recurrence from the shared part's memory too (`Entered`).
+                count = inputs.max_segments * len(inputs.reads)
+                entered = replace(laid, entered=entered_documents(inputs.streams, inputs.segments, count))
+                states, sown = applied(inputs.tokens, train=train, coordinates=entered, method=states_method,
+                                       conditioning=conditioning, rngs=rngs, **stepped)
+                return _array(states), spanned, sown
             # Each token reads the streams its record says, as runs over its document's (`stream_runs`).
             runs = stream_runs(inputs.streams, inputs.segments, inputs.reads, inputs.fragments)
             states, sown = applied(inputs.tokens, train=train, coordinates=laid, attention_key_runs=runs,
@@ -180,6 +189,20 @@ class DecisionModel(HeadedModel):
         QK-Clip finds every layer's maxima where it finds its weights (row 1608)."""
         states, spanned, sown = self._read(variables, inputs, media=media, train=train, rngs=rngs,
                                            progress=progress, opened=opened)
+        logits, head_sown = self.head_logits(variables, states, inputs, spanned, train=train, rngs=rngs,
+                                             opened=opened)
+        if "qk" in opened:
+            sown = {**sown, "qk": {"backbone": sown.get("qk", {}), "head": head_sown.get("qk", {})}}
+        return logits, sown
+
+    def head_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
+                    spanned: jax.Array | None = None, *, train: bool = False,
+                    rngs: dict[str, jax.Array] | None = None,
+                    opened: Sequence[str] = ()) -> tuple[jax.Array, Variables]:
+        """The head's option logits `[B, Q, K]` over the backbone's `states`, -inf past each question's
+        options, and what it sowed into the `opened` collections: the head's part of `observed_logits`,
+        which reads its questions' spans from `spanned`, the pass that holds them, where the head pools
+        them."""
         head = thaw(part(variables, "head"))
         clipped = "qk" in opened
         head_sown: dict = {}
@@ -208,9 +231,7 @@ class DecisionModel(HeadedModel):
             logits = _array(
                 applied(states, inputs, table, train=train, rngs=rngs) if spans is None
                 else applied(states, inputs, table, spanned=spans, train=train, rngs=rngs))
-        if clipped:
-            sown = {**sown, "qk": {"backbone": sown.get("qk", {}), "head": head_sown.get("qk", {})}}
-        return jnp.where(inputs.options, logits, -jnp.inf), sown
+        return jnp.where(inputs.options, logits, -jnp.inf), head_sown
 
     def readout_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
                        labels: tuple[tuple[int, ...], ...]) -> jax.Array:

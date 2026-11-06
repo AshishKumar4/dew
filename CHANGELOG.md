@@ -13,6 +13,26 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   teacher crossed to the device every step. Its checkpoints store the teacher banked (`layers_0_2`): a
   host-layout distillation saved before this keeps its teacher per layer (`layers_0` to `layers_2`) and
   does not restore into it; start such a run afresh from its teacher.
+- A decision release may state one temperature over every question type (`Temperatures.default`): Laya's
+  `rl_agent_config.json` takes a number for `temperature` beside its per-type list, and a release record's
+  calibration states it for formats whose files hold none.
+- A decision run's question rows can ask a request's questions over one copy of its state (`--shared-state n`,
+  `QuestionLayout.shared_state`): a row holds the state once and up to `n` questions after it, each read as
+  its own row reads it, at its own row's positions, so a request of `q` questions reads its state once a row
+  rather than `q` times. `--siblings` lets each question also read the questions before it in its row. A
+  request that outgrows a row takes several, each repeating the state.
+- A trained model whose objective declares no inference task (a JEPA encoder, a control policy, a DreamerV3
+  agent) exports as a native release: `dew export` writes its weights as safetensors and its model, settings
+  and numerics in the release record, and `dew.pipeline` loads it back from a directory or the Hub as the
+  model and weights its run trained (`dew.inference.models.SavedModel`), its parameters stored in the
+  `param_dtype` asked and its other state as written. Such a run saved before this release records no
+  declaration and is refused.
+- Every export states what its format's files cannot in one release record (`dew.config.Release`,
+  `dew_release.json`): a decision task's layout, its calibration beyond temperatures, a slot readout's window
+  and the numerics its task traces under, which the one decision loader reads back over the format's own files.
+  `Decide.save_pretrained` writes the format its head is released in (`Head.release_format`: Laya's, the joint
+  head's or the slot readout's), where only Laya's was written, so a task of any layout it trained with
+  exports and loads as the task it is.
 - A streamed Parquet store reads file by file: its shards are its files, each read row group by row group,
   its footer read as its reader reaches it, so a stream's first record waits for one file's footer, where it
   waited for every one's (FineWeb-Edu's default configuration, 2410 files on the Hub: 196 s). This is data
