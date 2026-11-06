@@ -28,6 +28,7 @@ import dataclasses
 import functools
 
 import attention_inplace_operands as inplace
+import attention_kernels_matrix as kernels_matrix
 import attention_matrix as matrix
 import attention_triton_stages as triton_stages
 import decode_matrix
@@ -220,6 +221,15 @@ def test_the_attention_matrix_holds_on_this_gpu():
     reference path at every pair of axis values the route serves, each cell on its own GPU, without XLA's
     deterministic ops (a deterministic run never derives the one launch its cells pin)."""
     run_cells(cells_of(matrix.a_routes_training_step_is_on_par))
+
+
+@pytest.mark.usefixtures("without_deterministic_ops")
+def test_the_attention_kernels_matrix_holds_on_this_gpu():
+    """The attention op's kernels' check-1 matrix (tests/kernel_matrix.py): each GPU kernel's training step
+    through the public call on par with the reference path at every pair of axis values it serves, each cell
+    on its own GPU, without XLA's deterministic ops (FlashAttention's and cuDNN's refuse a deterministic
+    call)."""
+    run_cells(cells_of(kernels_matrix.a_kernels_training_step_is_on_par))
 
 
 def test_the_decode_matrix_holds_on_this_gpu():

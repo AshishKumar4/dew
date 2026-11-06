@@ -18,6 +18,7 @@ pins between two correct kernels.
 
 import functools
 
+import attention_kernels_matrix as kernels_matrix
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -31,6 +32,7 @@ from attention_oracle import (
     reference,
     value_and_grads,
 )
+from gpu_flow import cells_of, run_cells
 from reference_error import (
     FEWEST_SEEDS,
     ORDERS,
@@ -476,3 +478,11 @@ def test_splash_compiles_within_a_tpus_scoped_vmem(dtype, width, softcap):
     capped = {"softcap": 30.0} if softcap else {}
     found = value_and_grads('tpu', query, key, value, causal=True, **capped)
     assert all(np.isfinite(array).all() for array in found)
+
+
+@on_tpu
+def test_the_attention_kernels_matrix_holds_on_this_tpu():
+    """The attention op's kernels' check-1 matrix (tests/kernel_matrix.py) on the TPU tier: splash's training
+    step through the public call on par with the reference path at every pair of axis values it serves,
+    each cell on its own TPU (`attention_kernels_matrix`)."""
+    run_cells(cells_of(kernels_matrix.a_kernels_training_step_is_on_par))
