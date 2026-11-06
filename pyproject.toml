@@ -126,9 +126,10 @@ profile = ["xprof>=2.23.1,!=2.23.2,<3"]
 # jax, jaxlib and flax>=0.12.0 unpinned, which the pins above satisfy.
 # Dew's build of it (pypi.dewml.dev): 0.1.8, get_current_rule reaching a nested
 # provider where the outer one's rules match nothing, a public
-# qwix.is_quantized(model), and conv_general_qt's backward over grouped
-# convolutions.
-quantization = ["qwix==0.1.8.post3"]
+# qwix.is_quantized(model), conv_general_qt's backward over grouped
+# convolutions, and conv_general's scales over an integer product in at least
+# float32, CUDA convolving int8 codes exactly in float32 chunks (post4).
+quantization = ["qwix==0.1.8.post4"]
 test = [
     "pytest",
     # tools/armada/ci.py's coverage report: branch coverage of src/dew over the suite on armada.
