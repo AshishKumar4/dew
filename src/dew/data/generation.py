@@ -137,10 +137,13 @@ def _publish(
     # A stream's fill numbers its rows by the shards its key says it read (`filled_version`).
     streamed, version = any(row.startswith("[") for row in completions), filled_version(key.fill)
     if of_several and streamed:
-        stored = {shard.id for shard in source.manifest(version).shards}
-        if any(json.loads(row)[0] not in stored for row in completions):
+        manifest = source.manifest(version)
+        named = {json.loads(row)[0] for row in completions}
+        if not named <= {shard.id for shard in manifest.shards} and not named <= {
+                shard.id for shard in manifest.parts()}:
             # A stream cut into more shards than its store's keys its rows by its own cuts, which no
-            # generation of the store holds: it publishes nothing.
+            # generation of the store holds: it publishes nothing. One read by the store's finer shards
+            # (a Parquet store's row groups) publishes them as its own (`ShardManifest.parts`).
             return None
     expected = tuple(_source_ids(source, version, streamed=streamed, completed=completions))
     expected_keys = {_row_key(row) for row in expected}
@@ -396,12 +399,16 @@ def _source_ids(source: Source, version: int, *, streamed: bool = False,
         return
     # Counted off its store's footers, a default read's threads at once, where its shards state no rows.
     manifest = source.manifest(version).sized(Loading().threads)
+    shards = manifest.shards
     if manifest.subdivide is not None:
-        store_shards = {shard.id for shard in manifest.shards}
-        if any(isinstance(row, list) and row[0] not in store_shards for row in map(json.loads, completed)):
-            raise ValueError("cache publication needs the store's own shards; "
-                             "row-wise node splits cannot be published")
-    for shard in manifest.shards:
+        named = {row[0] for row in map(json.loads, completed) if isinstance(row, list)}
+        if not named <= {shard.id for shard in shards}:
+            # A fill keyed by the store's finer shards numbers its rows by them (`ShardManifest.parts`).
+            shards = manifest.parts()
+            if not shards or not named <= {shard.id for shard in shards}:
+                raise ValueError("cache publication needs the store's own shards; "
+                                 "row-wise node splits cannot be published")
+    for shard in shards:
         if shard.rows is not None:
             yield from ((shard.id, index) for index in range(shard.rows))
         else:

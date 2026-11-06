@@ -727,7 +727,11 @@ def _build(branch: Pipeline, read: Read, loading: Loading, *, batch: int, traini
            lowering: _Lowering | None = None, version: int = PLAN_VERSIONS[-1]) -> _Build:
     """The build a reader of a prepared `branch` reads it by, in batches of `batch`: training's, or a
     scored or published pass's, by the lowering its analysis gives unless `lowering` says otherwise, and
-    the data plan `version` it reads by, and the branch's own key where it is named (`_own_key`)."""
+    the data plan `version` it reads by, and the branch's own key where it is named (`_own_key`): every read
+    builds here, so a version this Dew reads by none of is refused here, whichever read asks it."""
+    if version not in PLAN_VERSIONS:
+        raise ValueError(f"this Dew reads data plans by version {', '.join(map(str, PLAN_VERSIONS))}, not "
+                         f"{version}: resume a run saved under another with the Dew that wrote it")
     lowered = _analyzed(branch, read, validation=not training) if lowering is None else lowering
     return _Build(read, loading, seed, batch, lowered, training=training, elastic=branch._elastic,
                   version=version, named=_own_key(branch))
@@ -762,9 +766,6 @@ def compile(
     holds once it is prepared (`_staged`, `Loader.pass_examples`). `plan_version` is the data plan version
     it reads by (`dew.data.plan.PLAN_VERSIONS`): this Dew's, or the one a resumed run saved under, which
     reads its order as it did (`dew.config.RunConfig.data_plan_version`)."""
-    if plan_version not in PLAN_VERSIONS:
-        raise ValueError(f"this Dew reads data plans by version {', '.join(map(str, PLAN_VERSIONS))}, not "
-                         f"{plan_version}: resume a run saved under another with the Dew that wrote it")
     branches = (train,) if validation is None else (train, validation)
     read = read or train.mode or _preferred_read(branches, provision=provision)
     loading = loading or train._loading or _DEFAULT_LOADING
