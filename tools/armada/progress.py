@@ -24,5 +24,6 @@ def pytest_runtest_logreport(report) -> None:
     elif report.when == "teardown" and report.nodeid in _called:
         seconds = _called.pop(report.nodeid)
         if report.passed:
+            Path(artifacts).mkdir(parents=True, exist_ok=True)
             with (Path(artifacts) / PROGRESS).open("a") as progress:
                 progress.write(json.dumps({"node": report.nodeid, "seconds": seconds}) + "\n")
