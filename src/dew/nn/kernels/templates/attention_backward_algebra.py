@@ -48,16 +48,17 @@ def softmax_cotangents(logits, products, peak, total, anchor, delta, keep=None, 
 
 @functools.cache
 def derived_cotangents(keys_first: bool, dropped: bool, masked: bool, how: algebra.Recompute = algebra.PLAIN,
-                       accurate: bool = False) -> derive.Derived:
+                       accurate: bool = False, anchored: bool = False) -> derive.Derived:
     """The backward tile's derived softmax algebra (`softmax_cotangents`' forms, the fast class), the
     template's behind the switch (`dew.algebra.forms.derived`): each mainloop's backward launch forms its
     tile's products and logits and takes its weights and score cotangents from these forms, its mask an
     operand where the tile has one (`masked`), in the recomputation's units (`how`) and the `accurate`
-    form's, its anchor keys' mask then an operand (`at_anchor`)."""
+    form's, its anchor keys' mask an operand there and where a fast form's mainloop holds the anchor's own
+    term exactly 0 as its hand form does (`anchored`: portable's and Triton's, not Mosaic's FA3 math)."""
     tile = ("keys", "rows") if keys_first else ("rows", "keys")
     axes = {"logits": tile, "products": tile, "peak": ("rows",), "total": ("rows",), "anchor": ("rows",),
             "delta": ("rows",), **({"keep": tile} if dropped else {}), **({"seen": tile} if masked else {}),
-            **({"at_anchor": tile} if accurate else {})}
+            **({"at_anchor": tile} if accurate or anchored else {})}
     declared = functools.partial(softmax_cotangents, keys_first=keys_first, how=how, accurate=accurate)
     return derive.derive(derive.Reduction(declared, axes, walked="keys", exponent="e"), accurate=accurate,
                          saturation=SATURATION)
@@ -90,13 +91,14 @@ def softmax_gradients(logits, q, k, values, dout, peak, total, anchor, delta, sl
 
 @functools.cache
 def derived_backward(scale: float, walked: str, hooked: bool = False, dropped: bool = False,
-                     how: algebra.Recompute = algebra.PLAIN, accurate: bool = False) -> derive.Derived:
+                     how: algebra.Recompute = algebra.PLAIN, accurate: bool = False,
+                     anchored: bool = False) -> derive.Derived:
     """The backward's derived forms (`backward_declaration`'s, of the fast class or `accurate`'s), the
     template's behind the switch (`dew.algebra.forms.derived`): walked over the keys for dQ, over the queries
     for dK and dV, each walked sum's product the mainloop's to issue where it takes the step
     (`Derived.step`'s `stepped`, `Accumulated`: the accurate form's keyed sums and split products)."""
     return derive.derive(backward_declaration(scale=scale, walked=walked, hooked=hooked, dropped=dropped,
-                                              how=how, accurate=accurate),
+                                              how=how, accurate=accurate, anchored=anchored),
                          accurate=accurate, saturation=SATURATION)
 
 
@@ -109,18 +111,20 @@ def backward_derived() -> bool:
 
 
 def backward_declaration(*, scale: float, walked: str, hooked: bool = False, dropped: bool = False,
-                         how: algebra.Recompute = algebra.PLAIN, accurate: bool = False):
+                         how: algebra.Recompute = algebra.PLAIN, accurate: bool = False,
+                         anchored: bool = False):
     """Attention's backward as theme A's declaration (`softmax_gradients`), walked over its key tiles
     (`walked="keys"`, queries first: dQ the walk's sum, dK and dV each tile's own) or its query tiles
     (`"rows"`, keys first: dK and dV the walk's sums, dQ each tile's own), from the forward's natural
     residual rows and its D and the tile's mask, its hook's slopes an operand where a score hook reads the
     logits and its dropout multipliers where the call drops, its weights recomputed in the forward's units
-    (`how`: from raw products, its logits then the raw products and its maximum theirs); the `accurate`
-    form's with its anchor keys' mask (`at_anchor`, the tile's as `seen`)."""
+    (`how`: from raw products, its logits then the raw products and its maximum theirs); with its anchor
+    keys' mask (`at_anchor`, the tile's as `seen`) in the `accurate` form's and where a fast form's
+    mainloop holds the anchor's own term exactly 0 (`anchored`)."""
     tile = ("rows", "keys")
     axes = {"logits": tile, "q": ("rows", "width"), "k": ("keys", "width"), "values": ("keys", "values"),
             "dout": ("rows", "values"), "peak": ("rows",), "total": ("rows",), "anchor": ("rows",),
             "delta": ("rows",), "seen": tile, **({"slope": tile} if hooked else {}),
-            **({"keep": tile} if dropped else {}), **({"at_anchor": tile} if accurate else {})}
+            **({"keep": tile} if dropped else {}), **({"at_anchor": tile} if accurate or anchored else {})}
     return derive.Reduction(functools.partial(softmax_gradients, scale=scale, how=how, accurate=accurate),
                             axes, walked=walked, exponent="e")
