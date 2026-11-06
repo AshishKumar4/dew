@@ -439,10 +439,12 @@ class Run:
 
 def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = None,
              carried: bool = True) -> Run:
-    """The records of the gated delta rule's call on the template, forced (`generation.chosen`) at JAX's own
-    default precision as a model runs it: `mainloop.kept_forward` at the tiles the route takes
-    (`tuning.seen`), its output and final memory bit for bit the route's own (the certify build is the
-    production program), on the device's bundle, interpreted off a GPU. Operands `[1, T, ...]`. With
+    """The records of the gated delta rule's training call on the template, forced (`generation.chosen`) at
+    JAX's own default precision as a model trains it: `mainloop.kept_forward` at the tiles the route takes
+    (`tuning.seen`), its output and final memory bit for bit the route's training forward's (the certify
+    build is the production program), on the device's bundle, interpreted off a GPU. A call no gradient
+    follows runs another program, its states and output in one walk that never stores the states it reads
+    (`mainloop.forward`), which this witness does not hold. Operands `[1, T, ...]`. With
     `carried`, each chunk's fp32 memory leaving it: the same launches at the same tiles over the chunks up to
     it, whose final memory, rounded as the launch stores `h`, is the next chunk's `h` bit for bit (`seams`,
     each chunk's: end_j == start_{j+1}); without, the initial and the final memories alone."""
@@ -457,8 +459,9 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
         with tuning.seen() as launches:
             # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.
-            o, final = jax.jit(lambda *x: recurrence_chunk.chunk_gated_delta_rule(
-                *x, starts=starts, max_segments=max_segments, write_bound=1.0))(*operands)
+            # The training forward: the primal of the route's VJP, as a training step runs it.
+            o, final = jax.jit(lambda *x: jax.vjp(lambda *y: recurrence_chunk.chunk_gated_delta_rule(
+                *y, starts=starts, max_segments=max_segments, write_bound=1.0), *x)[0])(*operands)
         [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
                    if isinstance(op, template.Mosaic)]
 
