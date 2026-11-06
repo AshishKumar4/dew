@@ -919,7 +919,10 @@ def test_a_refusal_under_the_remat_rung_reaches_the_route():
     def selected() -> str:
         return recurrence_chunk.port_kernel(*operands, bound=1.0, product='training', report=False)
 
-    with report.refusals(), generation.assumed('sm90'), recurrence_chunk.recomputing(('delta_memory',)):
+    # The run's rounded products are its declaration's at the default precision (`rounds_products`; the
+    # suite's lanes configure 'highest').
+    with (report.refusals(), generation.assumed('sm90'), recurrence_chunk.recomputing(('delta_memory',)),
+          jax.default_matmul_precision('default')):
         target = template.Mosaic.launched()
         assert selected() == 'mosaic_gpu'
         training = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))

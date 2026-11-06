@@ -3,6 +3,7 @@
 import contextlib
 import functools
 from fractions import Fraction
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -705,3 +706,109 @@ def test_a_weighted_total_rounds_once_and_keeps_excluded_values_out(axis):
     np.testing.assert_array_equal(np.asarray(total), np.sum(kept, axis=reduced).astype(np.float32))
     exact_mass = np.sum(weights.astype(np.float64), axis=reduced).astype(np.float32)
     np.testing.assert_array_equal(np.asarray(mass), exact_mass)
+
+
+def test_a_routes_declaration_is_the_runs_configured_precision_where_the_call_states_none():
+    """A run's configured product precision (`Numerics.matmul`, `run_precision`) is each route's declaration
+    where a call states none (`dew.nn.precision.effective_precision`): attention hands a call to the
+    reference path, which honours it, where whole products of its dtype do not compute the run's
+    (`exact_products`: an algorithm narrowing them; a 16-bit or fp32 query at 'highest' keeps the fused
+    routes, which multiply whole); a native recurrence keeps an
+    fp32 product whole at 'highest' whatever the forms (`rounds_products`), the ports, whose fp32 products
+    are TF32, take no fp32 call there, and the template takes none under an algorithm that narrows its
+    operands, each handing the call to XLA, which computes the declaration; a dilated depthwise
+    convolution's exact forms take a declaration of exact products alone, not one narrowing the operands;
+    and Muon's iteration multiplies in the run's compute dtype in its fast forms (`iteration_dtype`:
+    bfloat16 under bf16-mixed, the measured default), float32 under 32-true and float64 under a float64
+    run."""
+    from dew.newton_schulz import ns_operands
+    from dew.nn import precision
+    from dew.nn.attention import reference_only
+    from dew.nn.kernels import recurrence_chunk
+    from dew.nn.precision import Dtypes, Numerics
+
+    def admits(supports, dtype) -> bool:
+        requirement = next(one for one in supports if one.code == "precision")
+        return requirement.analysis(SimpleNamespace(dtype=np.dtype(dtype))) is None
+
+    query = jnp.ones((1, 4, 2, 8), jnp.float32)
+    ports = (recurrence_chunk.PORT_SUPPORTS, recurrence_chunk.SSD_SUPPORTS)
+    # The suite's lanes configure 'highest' (lane_environment); the run here declares the default.
+    with generation.run_precision(Numerics("32-true")), jax.default_matmul_precision("default"):
+        assert not reference_only(query, None, None, force_fp32_for_softmax=True)
+        assert precision.rounds_products() and recurrence_chunk.fast_rounding()
+        assert all(admits(supports, np.float32) for supports in (*ports, recurrence_chunk.TEMPLATE_SUPPORTS))
+    with generation.run_precision(Numerics("32-true", matmul="highest")):
+        assert not reference_only(query, None, None, force_fp32_for_softmax=True)
+        assert not reference_only(query.astype(jnp.bfloat16), None, None, force_fp32_for_softmax=True)
+        assert precision.effective_precision(None) == "highest"
+        assert not precision.rounds_products() and not recurrence_chunk.fast_rounding()
+        assert not any(admits(supports, np.float32) for supports in ports)
+        assert all(admits(supports, jnp.bfloat16) for supports in ports)
+        assert admits(recurrence_chunk.TEMPLATE_SUPPORTS, np.float32)
+    with generation.run_precision(Numerics("32-true", matmul="TF32_TF32_F32")):
+        assert reference_only(query, None, None, force_fp32_for_softmax=True)
+        assert not admits(recurrence_chunk.TEMPLATE_SUPPORTS, np.float32)
+    # The TPU scan and the selective template widen a 16-bit call's operands and multiply them in fp32,
+    # which bf16 parts narrow.
+    widening = (recurrence_chunk.TPU_SCAN_SUPPORTS, recurrence_chunk.SELECTIVE_SUPPORTS)
+    with generation.run_precision(Numerics("32-true", matmul="BF16_BF16_F32")):
+        assert not any(admits(supports, jnp.bfloat16) for supports in widening)
+    with generation.run_precision(Numerics("32-true", matmul="highest")):
+        assert all(admits(supports, jnp.bfloat16) for supports in widening)
+    tf32 = jax.lax.DotAlgorithmPreset.TF32_TF32_F32
+    assert precision.exact_products(None, jnp.float32)
+    assert precision.exact_products(jax.lax.Precision.HIGHEST, jnp.float32)
+    assert precision.exact_products(jax.lax.DotAlgorithmPreset.BF16_BF16_F32, jnp.bfloat16)
+    assert not precision.exact_products(tf32, jnp.float32)
+    assert not precision.exact_products(jax.lax.DotAlgorithmPreset.BF16_BF16_F32, jnp.float32)
+    for numerics, dtype in ((Numerics(), jnp.bfloat16), (Numerics("32-true"), jnp.float32),
+                            (Numerics(forms="accurate"), jnp.float32),
+                            (Numerics(Dtypes(compute="float64")), jnp.float64)):
+        with generation.run_precision(numerics):
+            assert ns_operands(jnp.float32) == jnp.dtype(dtype), numerics
+
+
+
+@pytest.mark.kernel
+def test_an_fp32_delta_rules_route_computes_the_runs_declared_products():
+    """An fp32 gated delta rule's forward, routed for an H100 under the run's fast forms at each declared
+    product precision, takes a route that computes the declaration: at the default, any (the port's TF32
+    products, the template's two bf16 parts an operand: `fast_rounding`); at 'highest' and F32_F32_F32 no
+    route that narrows them (the port refuses, `_port_precision`), the template's launches multiplying
+    whole (its three parts an operand, twice the default's two parts' products, by the FLOPs each launch
+    states) where it takes the call; and under a TF32 algorithm XLA alone, which computes it (the template's
+    and the port's 'precision' requirements)."""
+    from dew.nn.kernels import recurrence
+    from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+    from dew.nn.kernels.templates import product
+    from dew.nn.kernels.templates.recurrence import mainloop
+    from dew.training._lowering import kernel_calls
+
+    rows, length, heads, width = 1, 128, 2, 64
+    operands = [jax.ShapeDtypeStruct((rows, length, heads, width), jnp.float32)] * 3 + [
+        jax.ShapeDtypeStruct((rows, length, heads), jnp.float32)] * 2
+    hooks = recurrence.Hooks(decay='scalar', scale=width ** -0.5, write_bound=1.0)
+
+    def forward(query, key, value, log_decay, beta):
+        return chunk(hooks, Chunk(query, key, value, log_decay=log_decay, beta=beta))[0]
+
+    def routed(matmul: str) -> tuple[set[str], list[float]]:
+        mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+        with (generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh),
+              generation.routes() as found, generation.run_precision(Numerics("32-true")),
+              jax.default_matmul_precision(matmul)):
+            lowered = jax.jit(forward).trace(*operands).lower(lowering_platforms=("cuda",))
+        kernels = {route.kernel for route in found if route.choice == "gated_delta_rule"}
+        launches = [call.flops or 0.0 for call in kernel_calls(lowered) if call.kind == "mosaic_gpu"]
+        return kernels, sorted(launches)
+
+    fast, fast_flops = routed("default")
+    whole_terms = len(product.terms(mainloop.PARTS, mainloop.PARTS))
+    rounded_terms = len(product.terms(mainloop.FAST_PARTS, mainloop.FAST_PARTS))
+    for matmul in ("highest", "F32_F32_F32"):
+        kernels, flops = routed(matmul)
+        assert "fla" not in kernels, matmul
+        if kernels == {"mosaic_gpu"} and fast == {"mosaic_gpu"}:
+            assert flops == [held * whole_terms / rounded_terms for held in fast_flops], matmul
+    assert routed("TF32_TF32_F32") == ({"xla"}, [])
