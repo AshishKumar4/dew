@@ -816,6 +816,14 @@ NARROW_HYBRID, NARROW_HYBRID_TAILED = HybridSite(seeds=256), HybridSite(seeds=51
 one-entry-booked-twice's at 512."""
 
 
+SEGMENT = (Served(12, shared=6), Served(12, flipped=(7,), shared=6), Served(12, flipped=(6,), shared=6))
+"""A segment of 6 tokens three prompts declare shared (a decision's state, each question past it its own
+request), ending inside their second page: past it they differ before any kept page boundary, so each
+later one reads the first's first page and its segment's 2 tokens of the second, copied into its own,
+starting from the state kept at the segment's end (`dew.inference.pages.segment_hash`); asked at once,
+the later ones wait for the first to write it."""
+
+
 @pytest.mark.parametrize("requests, options, hits, rounds, site", [
     ((Served(12), Served(12), Served(12, flipped=(9,)), Served(12, flipped=(1,)), Served(12),
       Served(12, flipped=(6,))), {}, (0, 8, 16, 16, 24, 24), None, WIDE_HYBRID),
@@ -827,9 +835,11 @@ one-entry-booked-twice's at 512."""
      (0, 0, 8), None, NARROW_HYBRID),
     ((Served(9), Served(12, flipped=(0,)), Served(12, flipped=(0, 1)), Served(9)),
      {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 1,
-      "prefix_states": 4}, (0, 0, 0, 0), None, NARROW_HYBRID)],
+      "prefix_states": 4}, (0, 0, 0, 0), None, NARROW_HYBRID),
+    (SEGMENT, {}, (0, 6, 12), None, NARROW_HYBRID),
+    (SEGMENT, {}, (12,), (3,), NARROW_HYBRID)],
     ids=["by-default", "in-pieces", "every-page", "restores-past-admission", "from-the-host",
-         "from-one-host-slot"])
+         "from-one-host-slot", "a-shared-segment", "a-shared-segment-asked-at-once"])
 @pytest.mark.check1_shards(seeds=256, per_task=64)
 def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(requests, options, hits, rounds,
                                                                              site):
@@ -870,7 +880,9 @@ def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
     back (a pool without the tier reads none: its other prompt takes the pages); in a pool of eight pages
     two other prompts reclaim a prompt's two shared pages, and a tier of one host slot keeps one of them
     alone, where the store holds the state after the deepest page only, so the repeat reads nothing back.
-    Each request
+    A segment three prompts declare shared, ending inside a page (`SEGMENT`), is read by each later one
+    from the state kept at its end, its last page copied into the prompt's own, one a round or all asked
+    at once. Each request
     draws what it draws alone and scores it as a full
     forward does (check 1)."""
     # A vocabulary of 256 at least and eight draws a request, so each request's scores spread enough to
@@ -881,6 +893,20 @@ def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
     assert_served_as_exact(task, requests, f"hybrid shared prefix {hits}",
                            serving={**HYBRID_SHARED, **options}, hits=hits, rounds=rounds, budget=site.budget,
                            seeds=(site.seeds, site.seeds))
+
+
+def test_a_shared_segment_is_refused_where_no_server_keeps_it_or_it_splits_its_prompt():
+    """A declared shared segment (`Server.submit`'s `shared`) is kept by a paged server with a prefix cache
+    alone and holds some of the prompt's tokens but not its last: a dense server's, an empty one and a
+    whole prompt are refused."""
+    bound = hybrid_task()
+    prompt = np.arange(1, 9, dtype=np.int32)
+    with pytest.raises(ValueError):
+        Server.from_task(bound, slots=2, capacity=64).submit(prompt, 2, key=0, shared=4)
+    server = Server.from_task(bound, **HYBRID_SHARED)
+    for shared in (0, 8):
+        with pytest.raises(ValueError):
+            server.submit(prompt, 2, key=0, shared=shared)
 
 
 def served_alongside(bound, slots=4, admission=2, **options):
