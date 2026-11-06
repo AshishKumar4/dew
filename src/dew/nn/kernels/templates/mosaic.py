@@ -1793,7 +1793,9 @@ class Transport[Allocated, Opened](abc.ABC):
         range starts inside the tile; otherwise combined with every partial the programs after it up to
         `gathered` left, each awaited, in their order, and stored (`store`). `combine(running, partial)` is
         the algebra's merge of two partials of one tile (a sum's addition by default; a split walk's
-        softmax merge, a scan's composition), which the work's declaration supplies."""
+        softmax merge, a scan's composition), which the work's declaration supplies. `summed` may be a
+        pytree (a merge's partial of several leaves): `partials` is then a ref a leaf, in its structure,
+        and a program's one signal releases them all."""
         raise NotImplementedError(f"{self.name} fixes no tile up across programs (`fixes_up`)")
 
 
@@ -2145,7 +2147,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         # CAS. Interpreted, the partials are left before they are read (`tail.ordered`).
         @pl.when(start > 0)
         def _():
-            partials[program] = summed
+            jax.tree.map(lambda leaf, ref: ref.__setitem__(program, leaf), summed, partials)
             if ready is not None:
                 plgpu.semaphore_signal(ready.at[program], memory_scope="gpu")
 
@@ -2154,7 +2156,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             def added(other, running):
                 if ready is not None:
                     plgpu.semaphore_wait(ready.at[other], memory_scope="gpu")
-                return combine(running, partials[other])
+                # The partials' structure read off the running value's: a ref may itself be a tree.
+                return combine(running, jax.tree.map(lambda _, ref: ref[other], running, partials))
 
             store(lax.fori_loop(program + 1, gathered, added, summed))
 
