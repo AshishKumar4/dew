@@ -1374,6 +1374,13 @@ class Issuer[Accumulator](abc.ABC):
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
         """`lhs @ rhs` into a fresh fp32 accumulator, `lhs` in registers (16-bit), its value."""
 
+    def summed_window(self, block_k: int) -> int:
+        """The steps of `block_k` depths an exactly summed kernel gradient's partial covers before it is
+        added into the running sum (`gemm.mosaic_gpu._walked_gradient`): one, each step's partial apart,
+        unless its accumulator is a value it may carry across steps."""
+        del block_k
+        return 1
+
     def summed_apart(self, running: jax.Array, lhs, rhs, interpret: bool, scale: Callable | None = None
                      ) -> jax.Array:
         """`running` plus `lhs @ rhs` summed apart (exact sums, `templates.product.promoted`): the step's own

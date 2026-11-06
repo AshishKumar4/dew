@@ -1114,6 +1114,13 @@ class MosaicPackedGmm(MosaicGmm):
         return super().registers(ba, config) + 3 * config.block_n * 16 // resources.THREADS
 
 
+WINDOWED_STAGES = 3
+"""The deepest ring an exactly summed kernel gradient whose sums promote a window at a time takes
+(`mosaic.Issuer.summed_window`): its window's sum, carried across steps beside the running sum, held its
+128 x 128 tile in 255 registers at three stages and spilled 8 bytes at four and five (NSDIAG-WIN), where the
+register model reads the same 216 at every depth."""
+
+
 @dataclasses.dataclass(frozen=True)
 class MosaicTgmm(_Mosaic):
     """`Tgmm` on Hopper (`mosaic_gpu.tgmm`): `block_m` x `block_n` tiles of each group's gradient, its rows
@@ -1180,6 +1187,9 @@ class MosaicTgmm(_Mosaic):
     # legality, registers and launch are that call's; exact sums take no split.
     def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         if config.splits > 1 and ba.arguments['exact_sums']:
+            return False
+        if ba.arguments['exact_sums'] and config.stages > WINDOWED_STAGES and (
+                mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype).summed_window(config.block_k) > 1):
             return False
         return super().legal(ba, config, target)
 
