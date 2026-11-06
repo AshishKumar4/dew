@@ -482,9 +482,11 @@ def reached(maxima: jax.Array, *, unseen: bool) -> jax.Array:
     return jnp.where(maxima == -jnp.inf, 0.0, reach) if unseen else reach
 
 
-type Launch[O] = Callable[..., tuple[O, jax.Array, jax.Array]]
+type Launch[O, F] = Callable[..., tuple[O, jax.Array, jax.Array] | tuple[O, None, F]]
 """A whole launch of a call in a form (`walked_launches`), `launch(form, live, again=False, into=None)`: its
-outputs, each row's running maximum and whether its weighted values overflowed; `again` a plain launch run
+outputs, each row's running maximum and whether its weighted values overflowed; or, a launch whose programs
+state their rows' rewalk flags themselves (`F`, its mainloop's own), its outputs, no maxima and those flags,
+which it takes back as `live`; `again` a plain launch run
 once more inside the guard's rare branch, a recomputation (its kernel named apart, its products counted
 once); `into` refs holding the plain launch's outputs, which it writes its rows `live` into in place
 (`walked_launches`' `in_place`)."""
@@ -563,22 +565,25 @@ def finished_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     return Partial(out, m, total)
 
 
-def rewalks(spec: Forward, maxima: jax.Array | None, over: jax.Array | None
-            ) -> tuple[jax.Array | None, Forward]:
+def rewalks(spec: Forward, maxima: jax.Array, over: jax.Array) -> tuple[jax.Array, Forward]:
     """The rows a plain launch's guards walk again (`walked_launches`), from its rows' running `maxima` and
-    whether their weighted values `over`flowed, and the form they walk in: where the fold reaches
-    (`Forward.reaches`), those whose maximum passes `FOLD_REACH` (`reached`: a padded query's -inf, a row
-    that reads nothing, as a slice's of no keys) or that overflowed, in the natural form (`unfolded`); else
-    those that overflowed, in the call's. A launch's programs state them so of their own rows; given no
-    maxima, the form alone."""
+    whether their weighted values `over`flowed, and the form they walk in (`rewalked_form`): where the fold
+    reaches (`Forward.reaches`), those whose maximum passes `FOLD_REACH` (`reached`: a padded query's -inf, a
+    row that reads nothing, as a slice's of no keys) or that overflowed; else those that overflowed. A
+    launch's programs state them so of their own rows."""
     if spec.reaches:
-        live = None if maxima is None else (reached(maxima, unseen=spec.form == "spans") >= FOLD_REACH) | over
-        return live, unfolded(spec)
-    return over, spec
+        return (reached(maxima, unseen=spec.form == "spans") >= FOLD_REACH) | over, rewalked_form(spec)
+    return over, rewalked_form(spec)
 
 
-def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Array, O, O], O], *,
-                       masked: bool = False, in_place: bool = False) -> O:
+def rewalked_form(spec: Forward) -> Forward:
+    """The form a plain launch's guards walk its rows again in (`rewalks`): the natural form where the fold
+    reaches (`unfolded`), else the call's."""
+    return unfolded(spec) if spec.reaches else spec
+
+
+def walked_launches[O, F](spec: Forward, launch: Launch[O, F], kept: Callable[[jax.Array, O, O], O], *,
+                          masked: bool = False, in_place: bool = False) -> O:
     """`walked`'s guards over whole launches, for a mainloop whose program walks its keys once (a producer
     streams them, so no program walks again): `launch(form, live)` runs the call in `form`, plain where
     `live` is None, else with its rows `live` shifting (`guarded`), and returns its outputs, each row's
@@ -607,18 +612,26 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
     H100), and the masked launch's `kept` selected over them every call; its empty launch costs its
     prologue."""
     if masked or in_place:
-        outputs, maxima, over = launch(spec, None)
+        plain = launch(spec, None)
+        outputs = plain[0]
         if not (spec.reaches or spec.headroom):
             return outputs
         # A launch whose programs state its rows' rewalk flags themselves (`rewalks`) gives them in its
-        # overflows' place and no maxima: no array operation between the launches (ET-DPROF-h100: the two
-        # fusions forming them took 6.3 us of a batch-1 decode step's 30.7).
-        live, form = (over, rewalks(spec, None, None)[1]) if maxima is None else rewalks(spec, maxima, over)
-        if in_place:
+        # overflows' place and no maxima, and rewalks in place: no array operation between the launches
+        # (ET-DPROF-h100: the two fusions forming them took 6.3 us of a batch-1 decode step's 30.7).
+        if plain[1] is None or in_place:
+            live, form = ((plain[2], rewalked_form(spec)) if plain[1] is None
+                          else rewalks(spec, plain[1], plain[2]))
             held = jax.tree.map(jax.new_ref, outputs)
             launch(form, live, into=held)
             return jax.tree.map(jax.freeze, held)
+        live, form = rewalks(spec, plain[1], plain[2])
         return kept(live, launch(form, live)[0], outputs)
+
+    def plain_launch(form: Forward) -> tuple[O, jax.Array, jax.Array]:
+        result = launch(form, None)
+        assert result[1] is not None, "a launch states its rows' rewalk flags in a masked walk alone"
+        return result
 
     def guarded_launch(form: Forward, outputs: O, over: jax.Array) -> O:
         if not form.headroom:
@@ -631,7 +644,7 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
                             lambda: kept(over, launch(form, over)[0], launch(form, None, again=True)[0]),
                             lambda: outputs)
 
-    outputs, maxima, over = launch(spec, None)
+    outputs, maxima, over = plain_launch(spec)
     if not spec.reaches:
         return guarded_launch(spec, outputs, over)
     # The call's own rows alone: a padded query's maximum is -inf, a row that reads nothing (`seen`).
@@ -640,7 +653,7 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
     natural = unfolded(spec)
 
     def unfolded_launch() -> O:
-        unfolded_outputs, _, unfolded_over = launch(natural, None)
+        unfolded_outputs, _, unfolded_over = plain_launch(natural)
         return guarded_launch(natural, unfolded_outputs, unfolded_over)
 
     return jax.lax.cond(reach >= FOLD_REACH, unfolded_launch, lambda: guarded_launch(spec, outputs, over))
