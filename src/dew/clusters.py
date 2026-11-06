@@ -109,6 +109,12 @@ class Launched:
                    else {LOCAL_DEVICES: ",".join(str(device) for device in local_device_ids)})}
 
 
+def _ranked(environ: Mapping[str, str], count: str, rank: str, local: str) -> Joining:
+    """A process a scheduler ranked in `environ`: its pool's size, its rank and the accelerator it takes on
+    its host, at its rank there, as JAX places it; the coordinator left to JAX's detection."""
+    return Joining(None, int(environ[count]), int(environ[rank]), (int(environ[local]),))
+
+
 @dataclasses.dataclass(frozen=True)
 class OpenMPI:
     """Processes `mpirun` started: Open MPI's ranks (OMPI_COMM_WORLD_SIZE, _RANK, _LOCAL_RANK), the
@@ -121,9 +127,8 @@ class OpenMPI:
         return "OMPI_COMM_WORLD_SIZE" in _environ(self.environ)
 
     def joining(self) -> Joining:
-        environ = _environ(self.environ)
-        return Joining(None, int(environ["OMPI_COMM_WORLD_SIZE"]), int(environ["OMPI_COMM_WORLD_RANK"]),
-                       (int(environ["OMPI_COMM_WORLD_LOCAL_RANK"]),))
+        return _ranked(_environ(self.environ), "OMPI_COMM_WORLD_SIZE", "OMPI_COMM_WORLD_RANK",
+                       "OMPI_COMM_WORLD_LOCAL_RANK")
 
 
 _SLURM = ("SLURM_JOB_ID", "SLURM_STEP_NODELIST", "SLURM_NTASKS", "SLURM_PROCID", "SLURM_LOCALID")
@@ -143,9 +148,7 @@ class Slurm:
         return all(variable in environ for variable in _SLURM)
 
     def joining(self) -> Joining:
-        environ = _environ(self.environ)
-        return Joining(None, int(environ["SLURM_NTASKS"]), int(environ["SLURM_PROCID"]),
-                       (int(environ["SLURM_LOCALID"]),))
+        return _ranked(_environ(self.environ), "SLURM_NTASKS", "SLURM_PROCID", "SLURM_LOCALID")
 
 
 _GOOGLE_PCI_VENDOR = "0x1ae0"
