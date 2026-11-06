@@ -35,18 +35,22 @@ STATISTICS = {"peak": jnp.float32, "total": jnp.float32, "anchor": jnp.float32, 
 its delta, and the anchor keys."""
 
 
-def streams_statistics(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int) -> bool:
-    """Whether the fused launch at `config` streams its query tiles' statistics (`STATISTICS`) beside them:
-    where its copies move a vector (`Transport.copies_vectors`) and its block holds their rings beside its
-    own allocations (the GPU's `shared_limit`, `launch_scope`); else a step reads them from global memory
-    (`_rows`). At width 128 their rings' 2,560 bytes put FlashAttention 3's 64 x 64 launch on two consumers
-    past an H100's 232,448, where the derivation then took one consumer (et-bwdderive)."""
+def streamed_statistics(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int) -> int:
+    """How many of its query tiles' statistics (`STATISTICS`, in order) the fused launch at `config` streams
+    beside them: where its copies move a vector (`Transport.copies_vectors`), the most whose rings its block
+    holds beside its own allocations (the GPU's `shared_limit`, `launch_scope`); a step reads the rest from
+    global memory (`_rows`). FlashAttention 3's 64 x 64 launch on two consumers at width 128 holds two of
+    the five on an H100 (a ring 1,056 bytes, 2,976 free; all five put it past the block and the derivation on
+    one consumer, et-bwdderive, et-fusedbytes)."""
     if not family.copies_vectors:
-        return False
+        return 0
     limit = generation.gpu_target().shared_limit
-    allocations = _fused_allocations(family, config, width, dtype, stages, streamed=True)
-    return limit is None or resources.shared_bytes(
-        family, launch_scope(family, allocations, 0, reduces=False)) <= limit
+    for count in range(len(STATISTICS), 0, -1):
+        allocations = _fused_allocations(family, config, width, dtype, stages, streamed=count)
+        if limit is None or resources.shared_bytes(
+                family, launch_scope(family, allocations, 0, reduces=False)) <= limit:
+            return count
+    return 0
 
 
 def stores_typed(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int, *,
@@ -66,14 +70,14 @@ def stores_typed(family: mosaic.Family, config: BackwardTiles, width: int, dtype
 
 
 def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int, *,
-                       streamed: bool | None = None, typed: bool = False) -> tuple[list, dict, list]:
+                       streamed: int | None = None, typed: bool = False) -> tuple[list, dict, list]:
     """The fused launch's allocations as `Family.scoped` takes them, in `_fused_launch`'s order: its
     consumers' resident keys and values; a tile's weights and score cotangents staged for the transposed
     products' left operands and dQ's; dK's and dV's output stage (fp32, the head widths equal,
     `MosaicBackward.legal`), held across the walks where a tile's dQ adds read it
     (`Transport.adds_through_shared`); the two loads' barriers; its query and output-cotangent streams in
-    `stages` slots (`Family.streams`), and where it streams them (`streamed`, `streams_statistics` by
-    default) its query tiles' per-row statistics (`STATISTICS`) a stream each beside them, which a step
+    `stages` slots (`Family.streams`), and the first `streamed` of its query tiles' per-row statistics
+    (`STATISTICS`; `streamed_statistics` by default) a stream each beside them, which a step
     reads from shared memory (elsewhere from global memory, `_rows`), loaded ahead with its tile as
     FlashAttention 3's
     producer loads LSE and dPsum (hopper/mainloop_bwd_sm90_tma_gmma_ws.hpp's `smem_lse`, `smem_dpsum`), not
@@ -90,9 +94,9 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
               plgpu.SMEM((consumers, 2, block_q, block_k), dtype), *([stage] if held else []),
               family.load_barriers(consumers), family.load_barriers(consumers)]
     if streamed is None:
-        streamed = streams_statistics(family, config, width, dtype, stages)
+        streamed = streamed_statistics(family, config, width, dtype, stages)
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype),
-              **({name: ((block_q,), kind) for name, kind in STATISTICS.items()} if streamed else {})}
+              **{name: ((block_q,), kind) for name, kind in list(STATISTICS.items())[:streamed]}}
     out = plgpu.SMEM((consumers, block_k, width), dtype) if typed else stage
     return scoped, family.streams(blocks, stages, consumers), [] if held and not typed else [out]
 
@@ -142,15 +146,22 @@ def _fused_out(family: mosaic.Family, sums: tuple, views: tuple, index, rows: in
         family.stored(tuple(value.astype(stage.dtype) for value in sums), views, smem=smem)
 
 
-def _statistics(family: mosaic.Family, refs: list, row, head, block_q: int, *, streamed: bool
+def _statistics(family: mosaic.Family, refs: list, row, head, block_q: int, *, streamed: int
                 ) -> tuple[dict, Callable]:
     """A fused program's query tiles' statistics (`STATISTICS`, their `refs` at its batch `row` and `head`):
-    their views, streamed beside each tile where the launch streams them (`streams_statistics`), and
-    `rows_of(slots, first query)`, a tile's rows from its slots, else from global memory (`_rows`)."""
-    if not streamed:
-        return {}, lambda slots, first: tuple(_rows(family, ref, row, head, first, block_q) for ref in refs)
-    views = {name: (ref.at[row, head], lambda j: (j,)) for name, ref in zip(STATISTICS, refs, strict=True)}
-    return views, lambda slots, first: tuple(family.rows_of(slots[name]) for name in STATISTICS)
+    the views of the first `streamed`, streamed beside each tile (`streamed_statistics`), and
+    `rows_of(slots, first query)`, a tile's rows, those from its slots, the rest from global memory
+    (`_rows`)."""
+    names = list(STATISTICS)
+    views = {name: (ref.at[row, head], lambda j: (j,))
+             for name, ref in zip(names[:streamed], refs, strict=False)}
+
+    def rows_of(slots, first):
+        return tuple(family.rows_of(slots[name]) if index < streamed
+                     else _rows(family, ref, row, head, first, block_q)
+                     for index, (name, ref) in enumerate(zip(names, refs, strict=True)))
+
+    return views, rows_of
 
 
 @tuning.lowered_once(("walk",))
@@ -240,7 +251,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         family.roles(consumers, consumer, producer)
 
     stages = min(program.tiles.stages, q_steps)
-    stats_streamed = streams_statistics(family, program.tiles, width, query.dtype, stages)
+    stats_streamed = streamed_statistics(family, program.tiles, width, query.dtype, stages)
     typed = stores_typed(family, program.tiles, width, query.dtype, stages, grouped=grouped)
     scoped, rings, after = _fused_allocations(family, program.tiles, width, query.dtype, stages,
                                               streamed=stats_streamed, typed=typed)
