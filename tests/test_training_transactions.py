@@ -11,7 +11,7 @@ import pytest
 from affine_run import raw_leaf
 from flax import linen as nn, struct
 from flax.training import dynamic_scale as dynamic_scale_lib
-from reference_error import assert_as_exact, dew_programs
+from reference_error import as_given, assert_as_exact, dew_programs, widened
 
 from dew.batch import under
 from dew.checkpoints import Checkpoints
@@ -241,13 +241,18 @@ def _maxima(tree):
             if any(getattr(entry, "key", None) == "max_logits" for entry in path)]
 
 
+QK_CLIP_SEEDS = 4
+"""Check 1's declared seeds for the step's QK-Clip against the clip's own update."""
+
+
 @pytest.mark.parametrize("staged", [False, pytest.param(True, marks=pytest.mark.mesh)],
                          ids=["whole", "staged"])
 def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged):
     """An optimizer that holds a QK-Clip, composed however it is (`clips_qk`), has the run ask its
     objective for the attention logit maxima (`Step.qk_stats`), a masked-diffusion objective's as an
     LM's, and its update over two pooled microbatches is `scale_by_qk_clip`'s at both microbatches'
-    per-head maximum, bit for bit (the step's own update is zero). The second microbatch reads only a
+    per-head maximum, on par from float64 over drawn spoken rows (check 1: the step and the clip's own
+    update compile two programs; the step's own update is zero). The second microbatch reads only a
     token whose embedding, as the mask token's, is zero, so each of its logits is 0, which the run
     shows reading it first; the first's maxima are the window's after it. A threshold no head reaches
     moves nothing. Pipelined over two stages, each layer sows its geometry once a microbatch, and the
@@ -269,7 +274,10 @@ def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged)
     objective = MaskedDiffusionObjective(model, MDLM(mask_id=mask)(), seq_len=8, head_chunks=1,
                                          variables=variables, ema_decay=None)
     rows = 2 * jax.device_count()
-    spoken = {"text": jnp.asarray(np.random.default_rng(6).integers(0, silent, size=(rows, 8)), jnp.int32)}
+    def said(seed):
+        return {"text": jnp.asarray(np.random.default_rng([6, seed]).integers(0, silent, size=(rows, 8)),
+                                    jnp.int32)}
+    spoken = said(0)
     quiet = {"text": jnp.full((rows, 8), silent, jnp.int32)}
     placement = {"mesh": MeshSpec(fsdp=2, stage=2), "microbatches": 2} if staged else {}
 
@@ -294,19 +302,31 @@ def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged)
         assert int(final.updates) == 1
         return start, opt_state, pooled, jax.tree.map(np.asarray, train.stored(final).variables["params"])
 
-    _, _, heard, _ = trained(.05, quiet, spoken)
-    assert all(np.all(peak == 0) for peak in _maxima(heard))
-    start, opt_state, pooled, final = trained(.05, spoken, quiet)
+    _, _, first_quiet, _ = trained(.05, quiet, spoken)
+    assert all(np.all(peak == 0) for peak in _maxima(first_quiet))
+    start, _, pooled, final = trained(.05, spoken, quiet)
     assert max(float(np.max(peak)) for peak in _maxima(pooled)) > .05
-    both = jax.tree_util.tree_map_with_path(
-        lambda path, leaf: np.maximum(leaf, 0) if any(getattr(entry, "key", None) == "max_logits"
-                                                      for entry in path) else leaf, pooled)
-    zero = jax.tree.map(np.zeros_like, start)
-    updates, after = jax.jit(clip(.05).update)(zero, opt_state, start, qk_stats=both)
-    expected = jax.tree.map(np.asarray, stepped(start, updates, opt_state, after))
-    jax.tree.map(np.testing.assert_array_equal, final, expected)
     assert any(not np.array_equal(after, before) for after, before in
                zip(jax.tree.leaves(final), jax.tree.leaves(start), strict=True))
+
+    def heard(pooled):
+        """The window's per-head maxima as the clip reads them, a silent head's negative floor at zero."""
+        return jax.tree_util.tree_map_with_path(
+            lambda path, leaf: np.maximum(leaf, 0) if any(getattr(entry, "key", None) == "max_logits"
+                                                          for entry in path) else leaf, pooled)
+
+    def draw(seed):
+        """A run over drawn spoken rows: its start, optimizer state, pooled maxima and stepped weights."""
+        return trained(.05, said(seed), quiet)
+
+    def clipped(start, opt_state, pooled, final):
+        updates, after = jax.jit(clip(.05).update)(jax.tree.map(jnp.zeros_like, start), opt_state, start,
+                                                   qk_stats=heard(pooled))
+        return stepped(start, updates, opt_state, after)
+
+    assert_as_exact(as_given(lambda start, opt_state, pooled, final: final), as_given(clipped), draw,
+                    "a QK-Clip at a window's pooled maxima", seeds=QK_CLIP_SEEDS,
+                    truth_fn=as_given(lambda *drawn: clipped(*widened(drawn))))
     start, _, _, still = trained(1e30, spoken, quiet)
     jax.tree.map(np.testing.assert_array_equal, still, start)
 

@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from layout_parity import layouts_agree
+from layout_parity import LAYOUT_SEEDS, layouts_agree
 
 from dew.checkpoints import _filled
 from dew.nn.kernels.generation import chosen
@@ -209,6 +209,7 @@ def _copies_of(narrow):
     return paths
 
 
+@pytest.mark.check1_shards(seeds=LAYOUT_SEEDS, per_task=2)
 @pytest.mark.parametrize("fsdp", [1, pytest.param(2, marks=pytest.mark.mesh(devices=2)),
                                   pytest.param(8, marks=pytest.mark.mesh(devices=8))])
 def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradients(fsdp):
@@ -231,6 +232,7 @@ def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradien
     assert names and all(name.endswith("kernel") and "proj" in name for name in names), names
 
 
+@pytest.mark.check1_shards(seeds=LAYOUT_SEEDS, per_task=2)
 def test_a_scanned_decoder_reads_every_layers_kernels_through_copies_with_the_same_gradients():
     """A decoder that scans its layers over their stacked weights reads each layer's projection
     kernels through bf16 copies, stacked as the scan reads them, as an unscanned decoder does: under
@@ -244,6 +246,7 @@ def test_a_scanned_decoder_reads_every_layers_kernels_through_copies_with_the_sa
     assert {f"layers_{index}" for index in range(4)} <= layers, names
 
 
+@pytest.mark.check1_shards(seeds=LAYOUT_SEEDS, per_task=2)
 @pytest.mark.parametrize(("accumulation", "split", "mixture", "fsdp"), [
     (2, 1, False, 1), (1, 2, True, 1),
     pytest.param(2, 1, True, 2, marks=pytest.mark.mesh(devices=2)),
@@ -275,6 +278,7 @@ def test_a_window_of_microbatches_reads_its_copies_and_commits_the_plain_update(
     assert _copies_of(narrow)
 
 
+@pytest.mark.check1_shards(seeds=LAYOUT_SEEDS, per_task=2)
 def test_a_dex_decoder_through_its_copies_trains_as_it_does_without_them():
     """A decoder whose differential lambda anneals over the run's updates reads, in training, a float32
     lambda the anneal computes on before its cast to bfloat16, which outside training (no updates) it
@@ -437,12 +441,10 @@ def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads
     compiled it, the copies dropped before the longer batch's step and built again before the shorter's,
     and under plain SGD the run lands on par with the parameters and losses of one without copies
     (check 1)."""
-    free = 2 ** 39
+    free = budget = 2 ** 39
 
     def stats(device):
-        # The float64 truth's wider arrays are planned in the whole memory: its plan is not the arms'.
-        held = 2 ** 39 if jax.config.read("jax_enable_x64") else free
-        return {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - held}
+        return {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - budget}
     monkeypatch.setattr(jax.Device, "memory_stats", stats)
 
     def trained(*, copies, rows=8, longer=None, steps=0):
@@ -453,12 +455,21 @@ def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads
         return free - trained(copies=copies, rows=rows)[2].plan["probes"][0]["headroom"]
 
     shorter, longer, longer_without = used(8, copies=True), used(64, copies=True), used(64, copies=False)
-    free = max(shorter, longer_without)
+    free = budget = max(shorter, longer_without)
     assert free < longer
     narrow, _, trainer = trained(copies=True, longer=64, steps=3)
     assert not trainer.plan["narrow"] and narrow.compute is not None
-    _on_par_with_the_plain_update(lambda: optax.sgd(0.5), "a run whose shapes plan their copies apart",
-                                  steps=3, accumulation=2, split=1, remat="full", rows=8, longer=64)
+
+    def run(copies, seed):
+        nonlocal budget
+        # The float64 truth's wider arrays are planned in the whole memory, where the arms' plans are not.
+        budget = 2 ** 39 if jax.config.read("jax_enable_x64") else free
+        state, losses, _ = _trained(optax.sgd(0.5), copies=copies, seed=int(seed), steps=3, accumulation=2,
+                                    split=1, remat="full", rows=8, longer=64)
+        return {"state": state.variables, "losses": losses}
+
+    layouts_agree(run, lambda seed: (np.int32(seed),), "a run whose shapes plan their copies apart",
+                  layout=True, reference=False)
 
 
 def test_a_restored_state_drops_its_templates_copies():
