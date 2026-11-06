@@ -1785,6 +1785,71 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
         assert run() == runs, path
 
 
+def test_a_row_runs_again_only_where_its_tests_reach_a_changed_definition_or_a_registry_they_read(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A module's top level is cut by statement: each inert definition (a class, a function, a constant, an
+    import) is the input of the rows whose run reaches it, by a name code it executed reads or an attribute it
+    read of the module, a `getattr` by a name only the run knows among them; the rest, which runs as the
+    module is imported, a registration among it, every importer's (train 668: every sampled cold row had a
+    widely imported module's top level changed). So an edit to a class no test of a file uses reruns none of
+    its rows, a class added beside them none, and an edit to what a registry holds at import every file that
+    imports its module, the registry's readers among them."""
+    for name, source in {
+            "src/reg/__init__.py": "",
+            "src/reg/registry.py": "REGISTRY = {}\n\n\ndef register(kind):\n"
+                                   "    REGISTRY[kind.__name__] = kind\n    return kind\n",
+            "src/reg/models.py": "from reg.registry import register\n\n\n@register\nclass Listed:\n"
+                                 "    VALUE = 1\n\n\nclass Named:\n    VALUE = 2\n\n\nclass Looked:\n"
+                                 "    VALUE = 3\n"}.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(source)
+    counted = "    with open('runs-{0}', 'a') as runs: runs.write('x')\n"
+    tests = {
+        # Reads the registry its module fills as it is imported, by a name it never writes.
+        "registry": "from reg import models\nfrom reg.registry import REGISTRY\n",
+        # Uses one class by its name.
+        "named": "from reg.models import Named\n",
+        # Reads a class of the module by a name it computes.
+        "looked": "from reg import models\n",
+        # Imports the module and uses nothing of it.
+        "idle": "import reg.models\n"}
+    checks = {"registry": "    assert REGISTRY['Listed'].VALUE\n", "named": "    assert Named.VALUE\n",
+              "looked": "    assert getattr(models, ''.join(['Loo', 'ked'])).VALUE\n",
+              "idle": "    assert True\n"}
+    written(tmp_path, {f"test_{name}.py": "import sys\nsys.path.insert(0, 'src')\n" + head
+                       + f"\n\ndef test_{name}():\n" + counted.format(name) + checks[name]
+                       for name, head in tests.items()})
+    interpreter(tmp_path, "3.12")
+    url, _, _ = cache_worker
+    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    cached(monkeypatch, url)
+    out = tmp_path / "verdict.json"
+
+    def run():
+        # Each file a task of its own: a task's later files share what its earlier ones ran (followed.py's
+        # `recorded`), which keys them all.
+        for name in tests:
+            ci.task("3.12", [f"tests/test_{name}.py"], "", out, 600.0)
+            assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [0], name
+        return [len((tmp_path / f"runs-{name}").read_text()) for name in tests]
+
+    models = tmp_path / "src/reg/models.py"
+    assert run() == [1, 1, 1, 1]
+    assert run() == [1, 1, 1, 1]
+    # A class no file names, changed, or one added: no row runs again.
+    models.write_text(models.read_text().replace("VALUE = 2", "VALUE = 2\n    OTHER = 20"))
+    assert run() == [1, 2, 1, 1]
+    models.write_text(models.read_text() + "\n\nclass Added:\n    VALUE = 4\n")
+    assert run() == [1, 2, 1, 1]
+    # The class a file reads by a computed name: that file alone.
+    models.write_text(models.read_text().replace("VALUE = 3", "VALUE = 30"))
+    assert run() == [1, 2, 2, 1]
+    # The registered class, which its module's import puts in the registry: every importer of the module.
+    models.write_text(models.read_text().replace("VALUE = 1", "VALUE = 10"))
+    assert run() == [2, 3, 3, 2]
+    assert run() == [2, 3, 3, 2]
+
+
 def test_ci_gangs_run_every_multihost_case_in_exactly_one_gang(ci, tmp_path):
     """`ci.py gangs` reads the models from test_multihost.py: each gang's -k selects a part of the
     file's collected cases, the parts are disjoint and cover every case, and a model added to
