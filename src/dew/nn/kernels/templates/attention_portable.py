@@ -410,8 +410,9 @@ def _derived_dq(formed, q, do, q_pos, m, anchor, delta, total, lo, hi, draw, cho
     (`anchor`, `delta`, its anchor keys `chosen`) and denominator `total`, dQ at the call's whole scale, its
     query the call's own (the launch's `q` is taken by the power of two `prescale`, `attention.prescale`:
     exactly undone); the row sums D's refinement and the hook's parameters read (`gradient.dq_rows`) from
-    each tile's weights and cotangents the walk gives. The accurate form's dQ products are this mainloop's
-    own (`_accurate_sums`), its cotangents' parts', and its keyed sums its own (`gradient.dq_issued`)."""
+    each tile's weights and cotangents the walk gives. Its dQ products are this mainloop's own
+    (`_cotangent_sums`), its cotangents' parts', and the accurate form's keyed sums its own
+    (`gradient.dq_issued`)."""
     forms = derived_backward(grad_scale, "keys", hooked, draw is not None, how, accurate, anchored=True)
     call_q = by_power(q, 1.0 / prescale)
 
@@ -431,9 +432,8 @@ def _derived_dq(formed, q, do, q_pos, m, anchor, delta, total, lo, hi, draw, cho
     def step(j, carry):
         state, sums = carry
         tiles, slopes, seen = tiles_at(j)
-        stepped = _accurate_sums(interpreted_dot) if accurate else None
         state, (weights, cotangents) = forms.step(state, tiles, product=interpreted_dot, outputs=(3, 4),
-                                                  stepped=stepped)
+                                                  stepped=_cotangent_sums(interpreted_dot, accurate=accurate))
         if not accurate:
             sums, _ = gradient.dq_rows(sums, weights, cotangents, slopes, seen, kinds=score_kinds,
                                        summed=summed)
@@ -453,16 +453,18 @@ def _derived_dq(formed, q, do, q_pos, m, anchor, delta, total, lo, hi, draw, cho
     return sums._replace(dq=forms.finish(state, shapes=shapes)[0])
 
 
-def _accurate_sums(dot: Callable) -> Callable:
-    """The accurate form's walked sums of products (`Derived.step`'s `stepped`): each the score cotangents'
-    product with the keys (dQ's, `Accumulated`) by their parts (`algebra.cotangent_product`, the accurate
-    form's three), added into the sum the step carries, as the hand form's `gradient.dq_step` adds them;
-    every other sum the derived forms' own."""
+def _cotangent_sums(dot: Callable, *, accurate: bool) -> Callable:
+    """A walk's sum of the score cotangents' products (`Derived.step`'s `stepped`): its first reduction's (the
+    declaration's order: dQ's over the keys, dK's then dV's over the queries, `Accumulated`), by the
+    cotangents' parts narrowed to the other operand's dtype (`algebra.cotangent_product`: one part fast, the
+    accurate form's three), whose 16-bit products are exact in fp32, added into the sum the step carries as
+    every tensor-core mainloop adds them: two identical keys' cotangents cancel in dQ exactly, as the
+    reference's do; every other sum the derived forms' own."""
     def stepped(states, parts):
-        return tuple(None if not isinstance(part, Accumulated) else
+        return tuple(None if index or not isinstance(part, Accumulated) else
                      (state if part.factor is None else algebra.expand(part.factor, state) * state)
-                     + algebra.cotangent_product(part.weights, part.values, dot, accurate=True)
-                     for state, part in zip(states, parts, strict=True))
+                     + algebra.cotangent_product(part.weights, part.values, dot, accurate=accurate)
+                     for index, (state, part) in enumerate(zip(states, parts, strict=True)))
 
     return stepped
 
@@ -537,12 +539,15 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             return (tiled, *(grad + piece if kind == Kind.KEY else grad
                              for grad, kind, piece in zip(grads, score_kinds, pieces, strict=True)))
 
+        # dK's products this mainloop's own, its cotangents' parts' (`_cotangent_sums`, `dSᵀ Q`).
+        stepped = _cotangent_sums(lambda a, b: interpreted_dot(a.T, b), accurate=accurate)
+
         def step(i, carry):
             sums, hooks = carry
             tiles, slopes, seen = tiles_of(i)
             if slopes is None:
-                return forms.step(sums, tiles), hooks
-            sums, (cotangents,) = forms.step(sums, tiles, outputs=(4,))
+                return forms.step(sums, tiles, stepped=stepped), hooks
+            sums, (cotangents,) = forms.step(sums, tiles, outputs=(4,), stepped=stepped)
             return sums, hooked(i, hooks, gradient.pulled(cotangents, slopes, seen, score_kinds)[1])
 
         lo, hi = ranges.q_lo[row, j], ranges.q_hi[row, j]
