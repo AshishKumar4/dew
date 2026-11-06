@@ -318,9 +318,9 @@ def test_a_step_with_copies_traces_its_loss_as_often_as_one_without():
             trainer = Trainer(Counted(objective.model, seq_len=8, pad_id=0), optax.sgd(0.5),
                               key=jax.random.key(0), mesh=MeshSpec(), layout=Layout(min_shard=1))
             state = trainer.initial_state()
-            trainer.compile(state, batch)
+            stepped, *_ = trainer.compile(state, batch)(state, batch)
             counted[copies] = len(traces)
-        assert trainer.plan["narrow"] == copies
+        assert (stepped.compute is not None) == copies
     assert counted[True] == counted[False], counted
 
 
