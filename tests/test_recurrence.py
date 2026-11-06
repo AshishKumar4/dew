@@ -233,12 +233,13 @@ def test_every_hook_combination_steps_as_its_float64_form(hooks):
             np.testing.assert_array_equal(np.asarray(history)[1], np.asarray(given.held)[1])
 
 
-@pytest.mark.parametrize('hooks', [hooks for hooks in HOOKS + FORMED if hooks.conv is None], ids=str)
+@pytest.mark.parametrize('hooks', HOOKS + FORMED, ids=str)
 def test_every_hook_steps_on_the_template_as_its_float64_form(hooks):
     """A decode token through the recurrence template's step on Mosaic GPU (`templates.recurrence.step`,
     interpreted off a GPU) at a model's widths, 128 keys and values a head (Qwen3.5's, Kimi Linear's,
     Mamba2's state): its output and state within tests/reference_error.py's rule of the XLA form's fp32 run
-    against its float64 run; an idle row's output zeros and its state its own bits."""
+    against its float64 run, and under a conv its moved history the history's own bits; an idle row's output
+    zeros and its state and history its own bits."""
     from dew.nn.kernels.templates import bundles
     from dew.nn.kernels.templates.recurrence import step as template
 
@@ -250,9 +251,14 @@ def test_every_hook_steps_on_the_template_as_its_float64_form(hooks):
                     f'{hooks} on the template', seeds={**SEEDS, **FORMED_SEEDS}[hooks],
                     truth_fn=jax.jit(functools.partial(recurrence.step_reference, hooks)))
     given = operands(hooks, **widths)
-    out, _, state = stepped(given)
+    assert template.serves(hooks, given)
+    out, history, state = stepped(given)
     np.testing.assert_array_equal(np.asarray(out)[1], 0.0)
     np.testing.assert_array_equal(np.asarray(state)[1], np.asarray(given.state)[1])
+    if hooks.conv is not None:
+        moved = recurrence.step_reference(hooks, given)[1]
+        np.testing.assert_array_equal(np.asarray(history), np.asarray(moved))
+        np.testing.assert_array_equal(np.asarray(history)[1], np.asarray(given.held)[1])
 
 
 UNEVEN = {recurrence.Hooks(decay='scalar'): 8,
