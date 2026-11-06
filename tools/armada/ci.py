@@ -2144,7 +2144,9 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
     times of the run that recorded it. Each train folds main's CI so (the land queue), and nothing else
     writes the record. A site its file's marks shard (`sites`) keeps its entries: its judge's row times
     its pooling, no measure of its draws, so its map tasks are weighed by armada's measures of them, never
-    by the record (`site_entries`), and a judge armada did not run is a row of its task's name."""
+    by the record (`site_entries`), and a judge armada did not run is a row of its task's name. A
+    whole_suite cell a row set aside (its `whole_suite` names it, its `tests` do not: a train's batch)
+    keeps its entry too."""
     changed = set(subprocess.run(["git", "diff", "--name-only", verdict["sha"], "--", "tests"], check=True,
                                  capture_output=True, text=True).stdout.split())
     rows: dict[str, list[dict]] = {}
@@ -2170,8 +2172,12 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
             continue
         observed = {node: seconds for row_ in held for node, seconds in row_["tests"].items()}
         marked = sites(name)
-        own = {node: seconds for node, seconds in kept.items()
-               if node.split("::")[0] == name and session.test_name(node) not in marked}
+        # Its whole_suite cells its rows set aside (collected, not run: a train's batch) keep their times,
+        # which only the whole suite's run observes (row 4377: a train's fold dropped a 1108 s cell the
+        # whole run then packed cold).
+        aside = {node for row_ in held for node in row_.get("whole_suite", [])} - observed.keys()
+        own = {node: seconds for node, seconds in kept.items() if node.split("::")[0] == name
+               and session.test_name(node) not in marked and node not in aside}
         if stale(own, observed, sum(row_["seconds"] for row_ in held), max(counts, default=1), target):
             kept = {node: seconds for node, seconds in kept.items() if node not in own}
             kept.update({node: round(seconds, 3) for node, seconds in observed.items()})
