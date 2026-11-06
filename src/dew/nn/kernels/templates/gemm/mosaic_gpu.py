@@ -503,19 +503,15 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         raise ValueError("a transposed lhs is a dense call's without a prologue")
     k, rows = lhs.shape if transpose_lhs else lhs.shape[::-1]
     matrices, k2, n = rhs.shape
-    g = group_sizes.shape[0]
+    # A dense call's one matrix is its one group, its sizes unread (a TPU core's dense launch passes none).
+    g = matrices if group_sizes is None else group_sizes.shape[0]
     if transpose_rhs:
         k2, n = n, k2
     # A packed matrix's words hold eight depths each.
     k2 = k2 if scales is None else 8 * k2
-    if scales is not None and (
-            not transpose_rhs or rhs.dtype != jnp.uint32 or scales.shape != (matrices, n, k2 // 16)
-            or block_k % NVFP4_STEP or block_n % 64 or paired is not None or exact_sums or transpose_lhs
-            or prologue is not None or epilogue is not None or tiles.cluster > 1 or tiles.splits > 1
-            or tiles.swapped):
-        raise ValueError(f"an NVFP4 matrix {rhs.shape} with scales {scales.shape} is read transposed in "
-                         f"256-deep steps and 64-column tiles with no hooks, pair, exact sums, cluster or "
-                         f"split, not by {tiles}")
+    if scales is not None:
+        _packed_taken(rhs, scales, tiles, transpose_rhs=transpose_rhs, hooked=(prologue, epilogue, paired),
+                      exact_sums=exact_sums, transpose_lhs=transpose_lhs, depth=k2, width=n)
     if dense and matrices != 1:
         raise ValueError("a dense product takes one matrix")
     if first is not None and (dense or paired is not None):
@@ -527,16 +523,8 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         raise ValueError(f"a [{rows}, {k}] x [{matrices}, {k2}, {n}] product does not take {tiles}")
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
     if k == 0:
-        # Dew: a product of no depth sums nothing, its rows zeros through the epilogue on whole arrays (its
-        # hooks are a tile's elementwise arithmetic), with no launch: a walk of no steps has no block of the
-        # matrix to view (JAX 0.12 refuses a zero-extent slice).
-        # Its side operands by group read at each row as XLA's program reads them (`axes.at_rows`, row 4489).
-        zeros = (jnp.zeros((rows, n), jnp.float32),) * accumulators
-        by_row = tuple(axes.at_rows(side, side_axes, group_sizes, rows) if axes.GROUPS in side_axes else side
-                       for side, side_axes in zip(epilogue_operands, epilogue_axes, strict=True))
-        values = zeros if epilogue is None else epilogue(*zeros, *by_row)
-        values = values if isinstance(values, tuple) else (values,)
-        outs = tuple(value.astype(dtype) for value, dtype in zip(values, dtypes, strict=True))
+        outs = _of_no_depth((rows, n), group_sizes, accumulators, epilogue, epilogue_operands, epilogue_axes,
+                            dtypes)
         return outs if out_dtypes else outs[0]
     if tiles.splits > 1 and (not dense or paired is not None or exact_sums or prologue is not None
                              or epilogue is not None or not split_runs(k // block_k, tiles.splits)):
@@ -600,6 +588,34 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
 NVFP4_STEP = 256
 """The depth an NVFP4 matrix's step decodes (`gmm`'s `scales`): two 128-depth groups of its staged order, so
 each column's block scales are a 16-byte row, a copy's least."""
+
+
+def _packed_taken(rhs, scales, tiles: Tiles, *, transpose_rhs: bool, hooked: tuple, exact_sums: bool,
+                  transpose_lhs: bool, depth: int, width: int) -> None:
+    """Dew: refuses a packed matrix's call (`gmm`'s `scales`) its decode does not take: its words read
+    transposed, its scales its blocks', in `NVFP4_STEP`-deep steps and 64-column tiles, with no hook, pair,
+    exact sums, transposed rows, cluster, split or swap."""
+    if (not transpose_rhs or rhs.dtype != jnp.uint32 or scales.shape != (rhs.shape[0], width, depth // 16)
+            or tiles.block_k % NVFP4_STEP or tiles.block_n % 64 or any(hook is not None for hook in hooked)
+            or exact_sums or transpose_lhs or tiles.cluster > 1 or tiles.splits > 1 or tiles.swapped):
+        raise ValueError(f"an NVFP4 matrix {rhs.shape} with scales {scales.shape} is read transposed in "
+                         f"256-deep steps and 64-column tiles with no hooks, pair, exact sums, cluster or "
+                         f"split, not by {tiles}")
+
+
+def _of_no_depth(shape: tuple, group_sizes, accumulators: int, epilogue, epilogue_operands: tuple,
+                 epilogue_axes: tuple, dtypes: tuple) -> tuple:
+    """Dew: `gmm`'s outputs of a product of no depth, which sums nothing: its rows zeros through the epilogue
+    on whole arrays (its hooks are a tile's elementwise arithmetic), with no launch (a walk of no steps has
+    no block of the matrix to view: JAX 0.12 refuses a zero-extent slice); its side operands by group read at
+    each row as XLA's program reads them (`axes.at_rows`, row 4489)."""
+    rows = shape[0]
+    zeros = (jnp.zeros(shape, jnp.float32),) * accumulators
+    by_row = tuple(axes.at_rows(side, side_axes, group_sizes, rows) if axes.GROUPS in side_axes else side
+                   for side, side_axes in zip(epilogue_operands, epilogue_axes, strict=True))
+    values = zeros if epilogue is None else epilogue(*zeros, *by_row)
+    values = values if isinstance(values, tuple) else (values,)
+    return tuple(value.astype(dtype) for value, dtype in zip(values, dtypes, strict=True))
 
 
 def split_runs(steps: int, splits: int) -> bool:
