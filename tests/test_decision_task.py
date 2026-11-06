@@ -285,36 +285,39 @@ def test_a_questions_tournament_is_its_own_beside_a_longer_one(decide):
 
 def test_finalists_play_one_round_keep_each_groups_best_and_answer_over_every_option(decide):
     """A released engine's knock-out (`Finalists`, StartLux-Decision a99977d93): fourteen options in groups
-    of at most four, the first ones longer (4, 4, 3, 3); each group's two best, in group order; the five
-    best of those eight by their group round; the final over them; and the answer over every option, the
-    finalists sharing 0.99 as the final gave it them and the knocked-out 0.01 by their group rounds."""
+    of at most four, the first ones longer (4, 4, 3, 3), asked together; each group's two best, in group
+    order; the five best of those eight by their group round; the final over them; and the answer over
+    every option, the finalists sharing 0.99 as the final gave it them and the knocked-out 0.01 by their
+    group rounds, all over their total (the engine's `knockout_combine`)."""
     request = CASES["many_options"]
     question = Question.from_wire(request["questions"]["intent"])
     assert isinstance(question, Choice)
     options, described = list(question.options), dict(zip(question.options, question.descriptions,
                                                            strict=True))
 
-    def asked(chosen):
-        return decide(request["state"], {"g": Choice(question.instructions,
-                                                     {option: described[option] for option in chosen})})["g"]
+    def over(chosen):
+        return Choice(question.instructions, {option: described[option] for option in chosen})
 
     groups = [options[0:4], options[4:8], options[8:11], options[11:14]]
+    rounds = decide(request["state"], {f"intent/{part}": over(group) for part, group in enumerate(groups)})
     first, kept = {}, []
-    for group in groups:
-        answer = asked(group)
+    for part in range(len(groups)):
+        answer = rounds[f"intent/{part}"]
         seen = dict(zip(answer.options, map(float, answer.probabilities), strict=True))
         first |= seen
-        kept += sorted(group, key=lambda option: -seen[option])[:2]
+        kept += sorted(answer.options, key=lambda option: -seen[option])[:2]
     finalists = sorted(kept, key=lambda option: -first[option])[:5]
-    final = asked(finalists)
+    final = decide(request["state"], {"intent": over(finalists)})["intent"]
     rest = [option for option in options if option not in finalists]
-    expected = {option: 0.99 * float(value) for option, value in zip(final.options, final.probabilities,
-                                                                     strict=True)}
-    expected |= {option: 0.01 * first[option] / sum(first[each] for each in rest) for option in rest}
+    residual = 0.01
+    shared = {option: float(value) * (1 - residual)
+              for option, value in zip(final.options, final.probabilities, strict=True)}
+    shared |= {option: residual * first[option] / sum(first[each] for each in rest) for option in rest}
+    total = sum(shared.values())
     answer = decide.tournament(request["state"], {"intent": question},
-                               rounds=Finalists(group=4, keep=2, final=5, residual=0.01))["intent"]
+                               rounds=Finalists(group=4, keep=2, final=5, residual=residual))["intent"]
     assert answer.options == question.options
-    np.testing.assert_allclose(answer.probabilities, [expected[option] for option in options], rtol=1e-6)
+    assert answer.probabilities.tolist() == [shared[option] / total for option in options]
     assert answer.choice == final.choice
 
 

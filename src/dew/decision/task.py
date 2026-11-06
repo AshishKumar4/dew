@@ -947,6 +947,7 @@ class Decide(SavedRunTask, InItsForm):
             kept = []
             for part in range(len(groups)):
                 answer = answers[f"{name}/{part}"]
+                assert isinstance(answer, ChoiceAnswer)
                 seen = dict(zip(answer.options, map(float, answer.probabilities), strict=True))
                 first[name] |= seen
                 # The best of the group, a tie to the earlier option (a stable sort, as the engine's).

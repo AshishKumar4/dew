@@ -1396,8 +1396,15 @@ def normalized(name: str, policy: Literal["as_is", "words", "lower"]) -> str:
 def empty_value(value: JSON) -> bool:
     """Whether `value` is empty, as `Values.empty` reads it: None, a string of whitespace, or a list or
     mapping holding nothing."""
-    return value is None or (isinstance(value, str) and not value.strip()) or (
-        isinstance(value, (list, dict)) and not value)
+    match value:
+        case None:
+            return True
+        case str():
+            return not value.strip()
+        case list() | dict():
+            return not value
+        case _:
+            return False
 
 
 @dataclass(frozen=True)
@@ -1915,10 +1922,10 @@ def rendered(value: JSON, policy: Render, specials: Specials, values: Values | N
     written by `policy`."""
     if values is not None and values.empty is not None and empty_value(value):
         return values.empty
-    if (values is not None and values.indexed is not None and isinstance(value, list)
-            and len(value) > values.indexed):
-        return "\n".join(values.item.format(index=at, value=rendered(entry, policy, specials))
-                         for at, entry in enumerate(value, start=values.start))
+    match value:
+        case list() if values is not None and values.indexed is not None and len(value) > values.indexed:
+            return "\n".join(values.item.format(index=at, value=rendered(entry, policy, specials))
+                             for at, entry in enumerate(value, start=values.start))
     if policy == "question":
         return render(value).replace(specials.marker_text, " ")
     if policy == "compact":
@@ -1938,17 +1945,18 @@ def turned(value: JSON, turns: Turns, values: Values, specials: Specials) -> str
     is refused (ValueError)."""
     if empty_value(value):
         return "" if values.empty is None else values.empty
-    if not isinstance(value, list) or not all(isinstance(turn, dict) and {"role", "content"} <= turn.keys()
-                                              for turn in value):
-        raise ValueError("a state written as turns is a list of {'role': ..., 'content': ...} turns, "
-                         f"not {json.dumps(value, ensure_ascii=False)[:80]}")
-    written = []
-    for turn in value:
-        assert isinstance(turn, dict)
-        role = turns.roles.get(str(turn["role"]), str(turn["role"]))
-        written.append(turns.open.format(role=role) + rendered(turn["content"], turns.content, specials)
-                       + turns.close.format(role=role))
-    return "".join(written)
+    match value:
+        case list() if all(isinstance(turn, dict) and {"role", "content"} <= turn.keys() for turn in value):
+            written = []
+            for turn in value:
+                assert isinstance(turn, dict)
+                role = turns.roles.get(str(turn["role"]), str(turn["role"]))
+                content = rendered(turn["content"], turns.content, specials)
+                written.append(turns.open.format(role=role) + content + turns.close.format(role=role))
+            return "".join(written)
+        case _:
+            raise ValueError("a state written as turns is a list of {'role': ..., 'content': ...} turns, "
+                             f"not {json.dumps(value, ensure_ascii=False)[:80]}")
 
 
 def written_state(value: JSON, segment: State, specials: Specials) -> str:
