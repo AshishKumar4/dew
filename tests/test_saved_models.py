@@ -173,5 +173,5 @@ def test_a_run_whose_average_is_its_reference_never_reads_as_averaged():
     from dew.registry import import_path
 
     run = SavedRun("a run its objective alone answers for", {"objective": import_path(DPOObjective)}, 0)
-    assert run.averaged(True) is False
-    assert run.averaged(None) is False
+    assert run.averaged(ema=True) is False
+    assert run.averaged(ema=None) is False
