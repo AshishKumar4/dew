@@ -23,6 +23,7 @@ from test_linear_attention import fused_case
 from dew.nn.inputs import MixerCall
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import KernelRefused
+from dew.nn.linear import decode_kernel
 
 CHOICES = frozenset({"delta_decode"})
 """The generation.CHOICES entries the family's cells run (row 184)."""
@@ -62,17 +63,17 @@ def _drawn(held):
 
 @functools.cache
 def _taken(case: tuple[tuple[str, str], ...]) -> bool:
-    """Whether the decode selector gives `case`'s tokens its kernel under its generation, traced
-    (`jax.eval_shape`), the layer asking it."""
+    """Whether the decode selector gives `case`'s tokens its kernel under its generation, named as the cell
+    names it, as the layer asks it (`linear.decode_kernel`: a gated delta net's conv, gates and gated norm for
+    the fused step to take)."""
     named = dict(case)
-    held = jnp.dtype(named["state"])
-    layer = fused_case(4, 128, 3, jnp.bfloat16, held)[0]
-    with generation.assumed(named["generation"]), generation.routes() as found:
+    # `fused_case`'s recurrent state: three rows, four value heads 128 wide.
+    state = jax.ShapeDtypeStruct((3, 4, 128, 128), jnp.dtype(named["state"]))
+    with generation.assumed(named["generation"]), generation.chosen(delta_decode=named["kernel"]):
         try:
-            jax.eval_shape(_decoded(layer, named["kernel"]), *_drawn(held)(0))
+            return decode_kernel(state, fuses=True) == named["kernel"]
         except KernelRefused:
             return False
-    return any(route == ("delta_decode", named["kernel"]) for route in _choices(found))
 
 
 def _choices(found) -> set[tuple[str, str]]:

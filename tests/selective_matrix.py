@@ -21,7 +21,6 @@ from selective_support import SEEDED_CASES, selective_draw, selective_xla
 from test_selective_template import the_template_is_as_exact_as_mamba_ssm
 
 from dew.nn.kernels import generation, recurrence_chunk
-from dew.nn.kernels.selection import KernelRefused
 from dew.nn.mixers.mamba import selective_scan as portable
 
 CHOICES = frozenset({"selective_scan"})
@@ -30,18 +29,15 @@ CHOICES = frozenset({"selective_scan"})
 
 @functools.cache
 def _taken(case: tuple[tuple[str, str], ...]) -> bool:
-    """Whether the scan's selector gives `case`'s recorded call the template under its generation, traced
-    (`jax.eval_shape`) as the cell runs it."""
+    """Whether the scan's selector, deciding (no kernel named: its measured qualification read), gives
+    `case`'s recorded call the template under its generation, traced (`jax.eval_shape`) as the cell runs
+    it."""
     named = dict(case)
     *_, dtype, _ = SEEDED_CASES[named["case"]]
     scan = functools.partial(recurrence_chunk.selective_scan, portable=portable)
     arrays = selective_draw(0, named["case"])
     with generation.assumed(named["generation"]), generation.routes() as found:
-        try:
-            with generation.chosen(selective_scan="mosaic_gpu"):
-                jax.eval_shape(functools.partial(selective_xla, dtype=jnp.dtype(dtype), scan=scan), arrays)
-        except KernelRefused:
-            return False
+        jax.eval_shape(functools.partial(selective_xla, dtype=jnp.dtype(dtype), scan=scan), arrays)
     return any(route.kernel == "mosaic_gpu" for route in found)
 
 
