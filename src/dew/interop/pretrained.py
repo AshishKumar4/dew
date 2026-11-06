@@ -63,7 +63,7 @@ from dew.interop.pipeline_assembly import (
     text_components,
 )
 from dew.interop.processors import Processor, hosts
-from dew.interop.release import load_settings, release_record
+from dew.interop.release import load_settings, release_record, with_rounding
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, tensor_specs
 from dew.interop.saved_sources import RunPipeline, pinned_run, pipeline_of_run, released_run
 from dew.interop.streaming import WeightLayout
@@ -563,6 +563,8 @@ class Pretrained:
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
+        # Rounding as its run's export states it, which its config cannot (`dew.interop.release.rounding`).
+        loaded = replace(loaded, model=with_rounding(loaded.model, loading.rounds))
         extended = _extended(_published(loaded, name_or_dir, selected=bool(selected) or extracted
                                         or reference.subfolder is not None), dex, placed, scan_layers)
         return replace(_resident(extended, weights=weights, streaming=streaming, on_host=on_host),
