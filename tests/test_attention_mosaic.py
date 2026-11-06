@@ -109,7 +109,7 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | No
     if form in ("fused-shared-dq", "fused-producer-dq"):
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True, dkv_family="wgmma",
                                                      dkv_consumers=2, shared_dq=True, staged_logits=True,
-                                                     producer_dq=form == "fused-producer-dq")
+                                                     producer_dq=form == "fused-producer-dq", family=WGMMA)
     if form == "fused-keys-first":
         return False, attention_mosaic.BackwardTiles(128, 64, 2, 1, fused=True, family=WGMMA, **FED)
     if form == "accurate":
@@ -1201,7 +1201,7 @@ def test_a_backward_whose_dkv_launch_holds_more_keys_than_its_dq_launch_writes_e
     dQ consumer (`dkv_consumers=2` on a producer's layout), over 192 keys, under the interpreter: the dK/dV
     launch's last program holds a partial key block, and every key's gradients are written, on par with the
     reference (check 1)."""
-    config = attention_mosaic.BackwardTiles(64, 64, 2, 1, dkv_family="wgmma", dkv_consumers=2)
+    config = attention_mosaic.BackwardTiles(64, 64, 2, 1, dkv_family="wgmma", dkv_consumers=2, family=WGMMA)
     _check_backward("full", (1, 192, 2, 1), form=None, config=config, interpret=True, width=64)
 
 
@@ -1211,7 +1211,7 @@ def test_a_causal_backward_whose_consumers_stage_shared_logits_walks_each_query_
     logits tile (`staged_logits`), over 128 causal queries and keys, under the interpreter: each consumer's
     query walk is its own block's, and the gradients are on par with the reference (check 1)."""
     config = attention_mosaic.BackwardTiles(64, 64, 2, 1, dkv_family="wgmma", dkv_consumers=2,
-                                            staged_logits=True)
+                                            staged_logits=True, family=WGMMA)
     _check_backward("causal", (1, 128, 2, 1), form=None, config=config, interpret=True, width=64)
 
 
