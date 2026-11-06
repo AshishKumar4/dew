@@ -204,6 +204,7 @@ def released(args) -> dict:
     scopes = scoped_growth(saved_sources)
     warm = Path(args.run_dir).parent / f"warm{rank}"
     saved_sources.export_run(saved_sources.pinned_run(args.run_dir), warm, publishes=rank == 0)
+    saved_sources.export_run(saved_sources.pinned_run(args.run_dir), warm, publishes=rank == 0)
     scopes.clear()
     release = saved_sources.released_run(args.run_dir)
     read = list(scopes)
