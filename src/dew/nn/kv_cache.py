@@ -515,8 +515,8 @@ class KVStore:
     def _scales_written(self, buffer: jax.Array, layer: jax.Array | int | None, *, values: jax.Array,
                         positions: jax.Array) -> jax.Array:
         """Scales `values` `[rows, tokens, heads]` stored at `positions` in their leaf's layout
-        (`scale_shape`); -1 drops: a dense cache's `[rows, heads, capacity]` takes each row's tokens at their slots along its
-        last axis, at `layer` of a run's bank (`_written`)."""
+        (`scale_shape`); -1 drops: a dense cache's `[rows, heads, capacity]` takes each row's tokens at
+        their slots along its last axis, at `layer` of a run's bank (`_written`)."""
         if self.layout.page_size is not None:
             return self._written(buffer, layer, values=values, positions=positions)
         slots = jnp.where(positions >= 0, positions, DROPPED)
