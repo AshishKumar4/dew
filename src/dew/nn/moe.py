@@ -66,6 +66,20 @@ SCORE_FUNCTIONS = ('softmax', 'sigmoid', 'sqrtsoftplus')
 GROUPED_MATMULS = ('auto', 'xla', 'pallas')
 EXPERT_DISPATCHES = ('auto', 'global', 'exchange')
 
+
+def exchanges(num_experts: int, shards: int) -> bool:
+    """Whether `num_experts` experts over `shards` expert shards exchange their tokens: an expert axis
+    greater than one that divides them, each shard holding whole experts."""
+    return shards > 1 and not num_experts % shards
+
+
+def resolved_dispatch(dispatch: str, num_experts: int, shards: int) -> str:
+    """The dispatch `dispatch` names for `num_experts` experts over `shards` expert shards: 'auto' the
+    exchange where they exchange (`exchanges`), the global dispatch anywhere else, either other as named."""
+    if dispatch == 'auto':
+        return 'exchange' if exchanges(num_experts, shards) else 'global'
+    return dispatch
+
 # What a router writes and reads, by name. Its choices, scores and log partitions are sown under
 # `ROUTER_COLLECTION` where a caller opens it, and its balancing bias is a variable of
 # `EXPERT_BIAS_COLLECTION`, which the step that balances the load rewrites (`dew.objectives.routing`).
@@ -729,10 +743,8 @@ def expert_dispatch[Parameters](
         raise ValueError(f"routing {indices.shape} does not describe tokens {x.shape}")
     mesh = jax.sharding.get_abstract_mesh()
     shards = mesh.shape.get(EXPERT_AXIS, 1)
-    if dispatch == 'auto':
-        dispatch = 'exchange' if shards > 1 and not num_experts % shards else 'global'
-    if dispatch == 'exchange' and not initializing and (
-            shards <= 1 or num_experts % shards):
+    dispatch = resolved_dispatch(dispatch, num_experts, shards)
+    if dispatch == 'exchange' and not initializing and not exchanges(num_experts, shards):
         raise LayoutRefused("exchange dispatch needs an expert mesh axis greater than one "
                          "that divides num_experts")
     capacity = None
