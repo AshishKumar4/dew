@@ -783,10 +783,11 @@ class GatedDeltaNet(nn.Module):
     `fix_query_key_value_ordering` does (modeling_qwen3_next.py:540-586).
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset({"tree"})
-    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's alone: a recurrence reads every
-    earlier token of its document, with no mask or bias to narrow it, and on a tree its path's
-    (`tree_conv`, `tree_rule`)."""
+    reads: ClassVar[frozenset[str]] = frozenset({"tree", "key_runs"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's alone, and the key runs that
+    mask its attention beside it: a recurrence reads every earlier token of its document, with no mask
+    or bias to narrow it, and on a tree its path's (`tree_conv`, `tree_rule`). Key runs without a tree
+    are refused."""
 
     emb_features: int
     num_k_heads: int
@@ -1062,6 +1063,9 @@ class GatedDeltaNet(nn.Module):
         heads = ((key_dim, self.head_k_dim), (key_dim, self.head_k_dim), (self.value_features, None))
         shards = sequence_shards()
         tree = None if attention_metadata is None else attention_metadata.tree
+        if tree is None and attention_metadata is not None and attention_metadata.key_runs is not None:
+            raise ValueError("a gated delta net reads key runs only as a tree call's attention mask, and "
+                             "would run them as if unset")
         if tree is not None:
             out = self._tree(mixed, g, beta, tree, heads, widths, wide)
         elif shards > 1:
