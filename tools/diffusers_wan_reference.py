@@ -52,8 +52,9 @@ from torch_precision import default_dtype, float64, float64_twin, widened
 TRANSFORMER_COHORT = "diffusers-0.34"
 """The transformer half's releases: Diffusers 0.39.0's variant transformer computes otherwise than the
 0.34.0 one Dew's port follows."""
-PIPELINE_COHORT = "diffusers"
-"""The pipeline half's: the test extra's, whose UniPC walk Dew's follows."""
+PIPELINE_COHORT = "diffusers-wan"
+"""The pipeline half's: the test extra's Diffusers, whose UniPC walk Dew's follows, and Transformers, whose
+UMT5 text tower it encodes the prompts with."""
 SOURCE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/wan-source"
 BASE = {"patch_size": [1, 2, 2], "num_attention_heads": 2, "attention_head_dim": 12, "in_channels": 4,
         "out_channels": 4, "text_dim": 20, "freq_dim": 16, "ffn_dim": 40, "num_layers": 2,

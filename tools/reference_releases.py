@@ -45,6 +45,9 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
     "diffusers-pipelines": {"diffusers": tested("diffusers"), "transformers": "4.49.0"},
     "diffusers-limits": {"diffusers": tested("diffusers"), "mpmath": "1.3.0"},
     "diffusers-0.40": {"diffusers": "0.40.0"},
+    # Wan 2.1's pipeline fixture: its walk and its UMT5 text tower, the test extra's releases
+    # (diffusers_wan_reference).
+    "diffusers-wan": {"diffusers": tested("diffusers"), "transformers": tested("transformers")},
     # Wan 2.1's transformer fixture, recorded against diffusers 0.34.0, whose variant transformer 0.39.0
     # computes otherwise (diffusers_wan_reference); the pipeline's walk is the test extra's.
     "diffusers-0.34": {"diffusers": "0.34.0", "transformers": "5.16.1"},
