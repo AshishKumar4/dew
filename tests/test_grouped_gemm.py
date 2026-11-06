@@ -307,6 +307,25 @@ def test_tritons_tile_counts_every_stage_where_its_mma_reads_shared_memory_async
         assert tile.stages * step <= generation.shared_budget(target)
 
 
+@pytest.mark.parametrize("product", ["forward", "input gradient", "kernel gradient"])
+def test_an_amperes_gpt_oss_projection_routes_to_a_kernel_that_lowers(product):
+    """gpt-oss-120b's expert projections (2880 wide and deep) on an A100, the selector unnamed: with the input
+    gradient's declared Triton cell gone (505803b8e2) each product routes to a kernel that takes it and
+    lowers for CUDA, never a refusal; on an A100 itself the template refused the forward it was named for
+    (NS2295-CELLS2-a100, row 4474), where the unnamed call takes the next kernel."""
+    sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    x, w, dy = bf16((512, 2880)), bf16((4, 2880, 2880)), bf16((512, 2880))
+    calls = {"forward": lambda x, w, dy, sizes: gemm.gemm(x, w, sizes, out_dtype=jnp.bfloat16),
+             "input gradient": lambda x, w, dy, sizes: gemm.gemm(dy, w, sizes, transpose_rhs=True,
+                                                                 out_dtype=jnp.bfloat16),
+             "kernel gradient": lambda x, w, dy, sizes: gemm.gemm_t(x, dy, sizes, out_dtype=jnp.bfloat16)}
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
+    with generation.assumed("sm80"), jax.sharding.use_abstract_mesh(mesh), generation.routes() as routes:
+        jax.jit(calls[product]).trace(x, w, dy, sizes).lower(lowering_platforms=("cuda",))
+    assert {route.kernel for route in routes if route.choice == "grouped_matmul"}, routes
+
+
 def ragged_draw(seed):
     """The ragged sizes' rows, matrices and cotangent in bf16, at a seed (`operands`)."""
     x, w, dy, _ = operands(SIZES["ragged"], jnp.bfloat16, seed)
