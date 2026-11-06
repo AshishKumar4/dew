@@ -49,8 +49,8 @@ CHECKPOINTS = quantized_checkpoints()
 
 @pytest.fixture(scope="module", params=CHECKPOINTS, ids=[directory.name for directory in CHECKPOINTS])
 def stored(request):
-    """A codec's checkpoint, loaded."""
-    return Pretrained.load(request.param, dtype="float32", attention_impl="reference")
+    """A codec's checkpoint, its decoder loaded (a media wrapper's text checkpoint, which holds its codec)."""
+    return Pretrained.load(request.param, dtype="float32", attention_impl="reference", text_only=True)
 
 
 VIEW_SEEDS = 8
