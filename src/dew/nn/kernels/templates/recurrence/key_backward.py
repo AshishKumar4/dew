@@ -8,6 +8,7 @@ which XLA sums over a key head's value heads and cumulates over each chunk (`gra
 import dataclasses
 import functools
 from collections.abc import Callable
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -469,7 +470,40 @@ def _key_pairs_held(call: Call, keys: int) -> Held:
         + held_tile(parted, CHUNK, keys) + fragments(call, (parted, CHUNK, CHUNK), (parted, CHUNK, keys)),))
 
 
-def gradients(run, laid_do, dht, tiles) -> tuple:
+class KeyKept(NamedTuple):
+    """Each launch of a decay a key dimension's backward's outputs as it stores them (`gradients`), nothing
+    computed again for them: what check 2's witness holds each launch to (tests/recurrence_witness.py)."""
+
+    run: object
+    """The prepared call (`mainloop.prepared`): its laid operands, intra scores, inverse, gated keys,
+    corrected values and stored memories."""
+    d_scores: jax.Array
+    local: jax.Array
+    """`_key_scores_back`'s scores' gradient and corrected values' gradient from each chunk's own output."""
+    dh: jax.Array
+    dv: jax.Array
+    dh0: jax.Array
+    decayed: jax.Array
+    """`_reverse`'s gradient of the memory each chunk leaves, corrected values' and initial memory's
+    gradients, and its memory decay's terms."""
+    dq_memory: jax.Array
+    dk_memory: jax.Array
+    dg_memory: jax.Array
+    d_weights: jax.Array
+    dbeta_memory: jax.Array
+    """`_key_memory_back`'s queries', keys' and log decay's gradients, the weights' and beta's."""
+    values: jax.Array
+    d_system: jax.Array
+    dbeta_values: jax.Array
+    """`_key_values_back`'s values' gradient, the system's and beta's."""
+    dq_pairs: jax.Array
+    dk_pairs: jax.Array
+    dg_pairs: jax.Array
+    dbeta_pairs: jax.Array
+    """`_key_pairs_back`'s queries', keys', log decay's and beta's gradients through the pairs."""
+
+
+def gradients(run, laid_do, dht, tiles) -> tuple[tuple, KeyKept]:
     """`(dq [R, H * Dk], dk [R, H * Dk], dv [R, HV * Dv], dg [R, HV * Dk], dbeta [R, HV], dh0 [B * HV * Dk,
     Dv])` fp32 of the gated delta rule under a decay a key dimension, laid as the prepared run's
     (`mainloop.prepared`'s, its intra launch's scores and inverse, its gated keys), fla_kda's DAG: the local
@@ -477,7 +511,7 @@ def gradients(run, laid_do, dht, tiles) -> tuple:
     (XLA's, `algebra.key_gated`'s), the memory's and WY part and the pairs' part, summed; the log decay's
     gradient each token's terms, the memory decay's on each chunk's last token (`_reverse`'s fourth),
     cumulated from the chunk's end (its prefix is the chunk's own), a key head's value heads' queries' and
-    keys' gradients summed."""
+    keys' gradients summed. Returns them with each launch's outputs as stored (`KeyKept`)."""
     from dew.nn.kernels.templates.recurrence.mainloop_backward import _reverse
 
     call = run.call
@@ -506,4 +540,6 @@ def gradients(run, laid_do, dht, tiles) -> tuple:
         """A value head's gradient `[R, HV * Dk]` summed onto its key head's `[R, H * Dk]`."""
         return x.reshape(rows, heads // group, group, width).sum(2).reshape(rows, -1)
 
-    return keyed(dq_m + dq_p), keyed(dk_m + dk_p), dv, dg, (dbeta_m + dbeta_v + dbeta_p).T, dh0
+    kept = KeyKept(run, d_scores, local, dh, dv2, dh0, decayed, dq_m, dk_m, dg_m, d_weights, dbeta_m, dv,
+                   d_system, dbeta_v, dq_p, dk_p, dg_p, dbeta_p)
+    return (keyed(dq_m + dq_p), keyed(dk_m + dk_p), dv, dg, (dbeta_m + dbeta_v + dbeta_p).T, dh0), kept

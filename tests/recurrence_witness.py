@@ -84,6 +84,11 @@ def point(x) -> Iv:
     return Iv(x, x)
 
 
+def held_iv(x) -> Iv:
+    """`x` as an interval: an enclosure as it is, a record as its point."""
+    return x if isinstance(x, Iv) else point(x)
+
+
 def _outward(lo, hi) -> Iv:
     return Iv(np.nextafter(lo, -np.inf), np.nextafter(hi, np.inf))
 
@@ -141,13 +146,20 @@ def within(native, iv: Iv) -> np.ndarray:
 @dataclasses.dataclass(frozen=True)
 class Lane:
     """The arithmetic a launch runs in: `exp2`'s reach (the most steps of the fp32 grid its result lies from
-    its correctly rounded value) and whether fp32 results below the normal range flush to zero. The witness
-    is of bf16 calls, whose launches store their values in bf16 (an fp32 call's, the template takes none at
-    these widths, is a later link's), and `block`, its family's tile width, over which a product's
-    contraction is issued in column blocks (`mainloop.block_of`)."""
+    its correctly rounded value) and whether fp32 results below the normal range flush to zero; `block`, its
+    family's tile width, over which a product's contraction is issued in column blocks (`mainloop.block_of`);
+    and how the call holds its operands and passed values (`held`, `given`, `wide`), which `enclosed` reads
+    from its run."""
     reach: int
     flushes: bool
     block: int
+    held: int = 1
+    """The parts the call holds the values its launches pass between them in (`mainloop.Call.held`): one, a
+    16-bit value's own or an fp32 one TF32 operand of; two or three bf16 parts (`product.formed`)."""
+    given: int = 1
+    """The parts its operands, the queries, keys and values, are given in (`mainloop.Call.given`)."""
+    wide: bool = False
+    """Whether the call is fp32's, its output stored fp32 and a one-part operand TF32."""
 
 
 def fp32(iv: Iv, lane: Lane) -> Iv:
@@ -167,9 +179,38 @@ def fused(iv: Iv, lane: Lane) -> Iv:
     return hull(iv, fp32(iv, lane))
 
 
-def staged(iv: Iv) -> Iv:
-    """A register value staged for a product as the call's launches hold it: cast to bf16."""
-    return cast(iv, BFLOAT16)
+PART_BOUNDS = (1 + 2.0 ** -8, 2.0 ** -8 * (1 + 2.0 ** -8), 2.0 ** -16 * (1 + 2.0 ** -8))
+"""Each bf16 part's magnitude over its fp32 value's (`product.bf16_parts`): the first the value rounded,
+within half a bf16 unit, 2^-8 of it; each later the remainder rounded, within 2^-8 of the last."""
+
+
+def staged(iv: Iv, lane: Lane) -> Iv:
+    """A register value as the call's launches hold it (`Lane.held`): cast to bf16 (a 16-bit call's), its fp32
+    value (three parts summing to it, or one TF32 operand, which its product reads, `dot`), or two parts'
+    sum, within 2^-16 of it."""
+    if lane.held == 1:
+        return iv if lane.wide else cast(iv, BFLOAT16)
+    if lane.held == 2:
+        reach = 2.0 ** -16 * np.maximum(np.abs(iv.lo), np.abs(iv.hi))
+        return _outward(iv.lo - reach, iv.hi + reach)
+    return iv
+
+
+def held_cell(x, lane: Lane) -> Iv:
+    """The fp32 values a stored record `x` holds as the call holds it (`staged`): those rounding to it in
+    bf16, those its two parts sum within 2^-16 of, or itself."""
+    if lane.held == 1 and not lane.wide:
+        return cell(x, BFLOAT16)
+    if lane.held == 2:
+        x = np.asarray(x, np.float64)
+        reach = 2.0 ** -16 * np.abs(x) * (1 + 2.0 ** -7)
+        return _outward(x - reach, x + reach)
+    return point(x)
+
+
+def out(iv: Iv, lane: Lane) -> Iv:
+    """The output as the call stores it: in its operands' dtype, bf16 or fp32 (`Lane.wide`)."""
+    return iv if lane.wide else cast(iv, BFLOAT16)
 
 
 def aligned(iv: Iv, fmt: Format) -> np.ndarray:
@@ -180,29 +221,47 @@ def aligned(iv: Iv, fmt: Format) -> np.ndarray:
     return np.maximum(at(iv.lo, fmt), at(iv.hi, fmt))
 
 
-def dot(a: Iv, b: Iv, lane: Lane, fmt: Format = BFLOAT16, into: Iv | None = None) -> Iv:
+def dot(a: Iv, b: Iv, lane: Lane, fmt: Format = BFLOAT16, into: Iv | None = None,
+        parts: tuple[int, int] = (1, 1)) -> Iv:
     """`a @ b` (`[M, K] @ [K, N]`) as one product the tensor cores accumulate in fp32: each term's exact range
     (products of 16-bit values of `fmt`), summed within the native-dot contract's bound
     (`native_certificates.native_dot_holds`: gamma_n at a truncating add's unit, n the terms that may be
     nonzero, an add of an exact zero exact), the float64 sums within n 2^-52 of their own. The bound's
     magnitudes are the terms' as the tensor cores align them (`aligned`): a subnormal operand's at `fmt`'s
     least normal, the exponent its field holds. With `into`, the product accumulated into fp32 registers
-    holding values within it (a tensor core's accumulate-in-place): one more term of the sum."""
+    holding values within it (a tensor core's accumulate-in-place): one more term of the sum. Operands held in
+    `parts` (`Lane.held`, `Lane.given`): a one-part fp32 operand read as TF32 (`operand`); bf16 parts
+    multiplied over the pairs `product.terms` issues, each exact, their sum the exact product less the pairs
+    dropped (`PART_BOUNDS`' products of them), the terms `product.terms` times as many."""
+    from dew.nn.kernels.templates import product
+
+    pa, pb = parts
+    if lane.wide and pa == 1:
+        a, fmt = operand(a), FLOAT32
+    if lane.wide and pb == 1:
+        b, fmt = operand(b), FLOAT32
+    issued = product.terms(pa, pb)
+    dropped = [(i, j) for i in range(pa) for j in range(pb) if (i, j) not in issued]
+    share = sum(PART_BOUNDS[i] * PART_BOUNDS[j] for i, j in issued) if pa * pb > 1 else 1.0
+    lost = sum(PART_BOUNDS[i] * PART_BOUNDS[j] for i, j in dropped)
+    if pa * pb > 1:
+        fmt = BFLOAT16
     terms = mul(Iv(a.lo[:, None, :], a.hi[:, None, :]), Iv(b.lo.T[None, :, :], b.hi.T[None, :, :]))
     if into is not None:
         terms = Iv(np.concatenate([terms.lo, into.lo[..., None]], -1),
                    np.concatenate([terms.hi, into.hi[..., None]], -1))
-    live = ((terms.lo != 0) | (terms.hi != 0)).sum(-1)
-    magnitude = (aligned(a, fmt)[:, None, :] * aligned(b, fmt).T[None, :, :]).sum(-1) * (1 + 2.0 ** -50)
+    live = ((terms.lo != 0) | (terms.hi != 0)).sum(-1) * len(issued)
+    pairs = aligned(a, fmt)[:, None, :] * aligned(b, fmt).T[None, :, :]
+    magnitude = pairs.sum(-1) * share * (1 + 2.0 ** -50)
     if into is not None:
         magnitude = magnitude + np.maximum(np.abs(into.lo), np.abs(into.hi)) * (1 + 2.0 ** -50)
     # The native-dot contract's allowance, and the float64 interval sums' own roundings beside it.
     slack = (allowance(magnitude, live, TRUNCATING["float32"], truncating_underflow(lane.flushes))
-             + (live + 1) * 2.0 ** -52 * magnitude)
+             + (live + 1) * 2.0 ** -52 * magnitude + lost * pairs.sum(-1) * (1 + 2.0 ** -50))
     return onto(_outward(terms.lo.sum(-1) - slack, terms.hi.sum(-1) + slack), FLOAT32)
 
 
-def blocked(a: Iv, b: Iv, lane: Lane) -> Iv:
+def blocked(a: Iv, b: Iv, lane: Lane, parts: tuple[int, int] = (1, 1)) -> Iv:
     """`a @ b` as the mainloop issues it over its contraction's column blocks, the lane's family's tile
     width (`Lane.block`): each block's product a fresh accumulator (`dot`), summed in fp32 from zero
     (`sum`'s first add exact)."""
@@ -210,7 +269,7 @@ def blocked(a: Iv, b: Iv, lane: Lane) -> Iv:
     total = None
     for start in range(0, width, block):
         part = dot(Iv(a.lo[:, start:start + block], a.hi[:, start:start + block]),
-                   Iv(b.lo[start:start + block], b.hi[start:start + block]), lane)
+                   Iv(b.lo[start:start + block], b.hi[start:start + block]), lane, parts=parts)
         total = part if total is None else fp32(add(total, part), lane)
     return total
 
@@ -287,7 +346,7 @@ def inverse(k, beta, exponents: Exponents, lane: Lane) -> Iv:
     """The solve's stored inverse less its unit diagonal, `[C, C]` (`mainloop._solved`): the system
     `algebra.keyed` (`k k^T` over the key blocks, times the pairs' decays, times the row's write gate), then
     `algebra.doubled` on `-system`, each level's two merges staged in fp16 (a 16-bit call) or as parts."""
-    product = blocked(point(k), point(np.asarray(k).T), lane)
+    product = blocked(point(k), point(np.asarray(k).T), lane, parts=(lane.given, lane.given))
     decayed = fp32(mul(product, exponents.pairs(lane)), lane)
     system = fp32(mul(decayed, point(np.asarray(beta)[:, None])), lane)
     return solved(where(_lags() > 0, system, point(np.zeros((CHUNK, CHUNK)))), lane)
@@ -302,15 +361,21 @@ def solved(system: Iv, lane: Lane) -> Iv:
     first = (rows % 2 == 1) & (cols == rows - 1)
     current = Iv(identity + np.where(first, lower_a.lo, 0.0), identity + np.where(first, lower_a.hi, 0.0))
 
+    # A 16-bit call's merges in fp16; an fp32 call's as it holds its values (`mainloop._merged`).
     def merge(x: Iv) -> Iv:
-        return cast(x, FLOAT16)
+        return staged(x, lane) if lane.wide else cast(x, FLOAT16)
+
+    def merged(x: Iv, y: Iv) -> Iv:
+        if lane.wide:
+            return dot(x, y, lane, parts=(lane.held, lane.held))
+        return dot(x, y, lane, FLOAT16)
 
     width = 2
     while width < CHUNK:
         lower = ((rows // width) % 2 == 1) & (cols // width == rows // width - 1)
-        power = dot(merge(current), merge(lower_a), lane, FLOAT16)
+        power = merged(merge(current), merge(lower_a))
         masked = where(lower, power, point(np.zeros((CHUNK, CHUNK))))
-        joined = dot(merge(masked), merge(current), lane, FLOAT16)
+        joined = merged(merge(masked), merge(current))
         current = fp32(add(current, joined), lane)
         width *= 2
     return Iv(current.lo - identity, current.hi - identity)
@@ -325,15 +390,17 @@ def weighted(lower, tile, beta, decay: Iv | None, lane: Lane) -> tuple[Iv, Iv]:
         # A head's decay a row's, `[C]`; a key dimension's its own entry's, `[C, Dk]`.
         scaled = fp32(mul(scaled, decay if decay.lo.ndim == 2 else Iv(decay.lo[:, None], decay.hi[:, None])),
                       lane)
-    value = fp32(add(scaled, dot(point(lower), staged(scaled), lane)), lane)
-    return value, staged(value)
+    held = (lane.held, lane.held)
+    value = fp32(add(scaled, dot(point(lower), staged(scaled, lane), lane, parts=held)), lane)
+    return value, staged(value, lane)
 
 
 def corrected(values: Iv, weights, entering, lane: Lane) -> Iv:
     """`algebra.corrected`'s fp32 value, `u - w S`: the stored weighted values `values`, the stored weighted
     keys, and the memory entering staged as the states launch stores it (`entering`, its key slices each a
     fresh product summed from zero)."""
-    return fp32(add(values, neg(blocked(point(weights), point(entering), lane))), lane)
+    product = blocked(point(weights), point(entering), lane, parts=(lane.held, lane.held))
+    return fp32(add(values, neg(product)), lane)
 
 
 def carried(carry: Iv, values: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
@@ -342,7 +409,7 @@ def carried(carry: Iv, values: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
     gate = exponents.gated(lane)
     gated = fp32(mul(values, Iv(gate.lo[:, None], gate.hi[:, None])), lane)
     keys = point(np.asarray(k).T)
-    write = dot(keys, staged(gated), lane)
+    write = dot(keys, staged(gated, lane), lane, parts=(lane.given, lane.held))
     decay = exponents.raised(lane)
     held = Iv(np.full(carry.lo.shape, decay.lo[-1]), np.full(carry.lo.shape, decay.hi[-1]))
     return fp32(add(fused(mul(carry, held), lane), write), lane)
@@ -352,42 +419,87 @@ def output(q, k, entering, values, exponents: Exponents, scale: float, lane: Lan
     """The chunk's fp32 output before its store (`algebra.chunk_scores`, `chunk_output`): its own pairs'
     scores staged as the call holds them, the memory it entered read through the decayed queries, each term
     scaled by fp32's `scale` and their sum rounded once, either product before it maybe contracted."""
-    scores = fp32(mul(blocked(point(q), point(np.asarray(k).T), lane), exponents.pairs(lane)), lane)
-    scores = staged(where(_lags() >= 0, scores, point(np.zeros((CHUNK, CHUNK)))))
-    memory = blocked(point(q), point(entering), lane)
+    given, held = lane.given, lane.held
+    products = blocked(point(q), point(np.asarray(k).T), lane, parts=(given, given))
+    scores = fp32(mul(products, exponents.pairs(lane)), lane)
+    scores = staged(where(_lags() >= 0, scores, point(np.zeros((CHUNK, CHUNK)))), lane)
+    memory = blocked(point(q), held_iv(entering), lane, parts=(given, held))
     decay = exponents.raised(lane)
     memory = fp32(mul(memory, Iv(decay.lo[:, None], decay.hi[:, None])), lane)
     factor = point(np.float32(scale))
-    local = dot(scores, point(values), lane)
+    local = dot(scores, held_iv(values), lane, parts=(held, held))
     return fp32(add(fused(mul(memory, factor), lane), fused(mul(local, factor), lane)), lane)
 
 
-def keys_gated_enclosures(step: "Step", scale: float, lane: Lane) -> dict[str, Iv]:
+def keys_gated_enclosures(step: "Step", scale: float, lane: Lane,
+                          entering: Iv | None = None) -> dict[str, Iv]:
     """`enclosures` of a chunk whose write gate takes the keys' side (`mainloop.Call.gated_keys`, Mamba2's SSD
     under the fast forms): the memory it leaves, fp32 (`algebra.keys_gated_carried`: the carry decayed to the
     chunk's end, plus each key row gated in fp32 by its write gate times its decay to the end and rounded to
     the values' dtype, against the values as given), and its output before its store (`chunk_scores` with
     each key column scaled by its write gate before the scores round, `chunk_output`). The scores' tile is a
     derived form (`algebra.derived_tile`), its products, decays and gates multiplied in either association:
-    their enclosure is both's hull."""
+    their enclosure is both's hull. `entering` is the memory its output reads, by default the stored `h`."""
     exponents = Exponents.of(step.g)
+    entering = point(step.h) if entering is None else entering
     gate = fp32(mul(exponents.gated(lane), point(step.beta)), lane)
-    keys = staged(fp32(mul(point(step.k), Iv(gate.lo[:, None], gate.hi[:, None])), lane))
-    write = dot(Iv(keys.lo.T, keys.hi.T), point(step.v), lane)
+    keys = staged(fp32(mul(point(step.k), Iv(gate.lo[:, None], gate.hi[:, None])), lane), lane)
+    write = dot(Iv(keys.lo.T, keys.hi.T), point(step.v), lane, parts=(lane.held, lane.given))
     decay = exponents.raised(lane)
     held = Iv(np.full(step.carry.lo.shape, decay.lo[-1]), np.full(step.carry.lo.shape, decay.hi[-1]))
     leaving = fp32(add(fused(mul(step.carry, held), lane), write), lane)
-    products, pairs = blocked(point(step.q), point(np.asarray(step.k).T), lane), exponents.pairs(lane)
+    products = blocked(point(step.q), point(np.asarray(step.k).T), lane, parts=(lane.given, lane.given))
+    pairs = exponents.pairs(lane)
     columns = point(np.asarray(step.beta)[None, :])
     scores = hull(fp32(mul(fp32(mul(products, pairs), lane), columns), lane),
                   fp32(mul(products, fp32(mul(pairs, columns), lane)), lane))
-    scores = staged(where(_lags() >= 0, scores, point(np.zeros((CHUNK, CHUNK)))))
-    memory = fp32(mul(blocked(point(step.q), point(step.h), lane), Iv(decay.lo[:, None], decay.hi[:, None])),
-                  lane)
+    scores = staged(where(_lags() >= 0, scores, point(np.zeros((CHUNK, CHUNK)))), lane)
+    memory = fp32(mul(blocked(point(step.q), entering, lane, parts=(lane.given, lane.held)),
+                      Iv(decay.lo[:, None], decay.hi[:, None])), lane)
     factor = point(np.float32(scale))
-    local = dot(scores, point(step.v), lane)
+    local = dot(scores, point(step.v), lane, parts=(lane.held, lane.given))
     output = fp32(add(fused(mul(memory, factor), lane), fused(mul(local, factor), lane)), lane)
-    return {"h": leaving, "o": staged(output)}
+    return {"h": leaving, "o": out(output, lane)}
+
+
+def walk_enclosures(step: "Step", scale: float, lane: Lane, *, write: str) -> dict[str, Iv]:
+    """`enclosures` of a chunk of the fused inference walk (`mainloop._scan`, a 16-bit call no gradient
+    follows, under a decay a head), whose records are its inverse (the delta rule's, `_solved`'s), its output
+    and the memory it leaves: the memory it enters in its registers, staged as the memories' form for its
+    products, the walk's corrected values from it (`_scan_corrected`: under the delta rule
+    `(I + L) (beta (v - exp2(g) k S))`, the keys' prediction from the memory decayed to each token, its
+    difference from the values write-gated and corrected by the stored inverse; the gated values without
+    it; the values as given where the keys take the gate), and the output and leaving memory from them."""
+    exponents = Exponents.of(step.g)
+    entering = staged(step.carry, lane)
+    if write == "keys":
+        return keys_gated_enclosures(step, scale, lane, entering)
+    found = {}
+    if write == "delta":
+        found["a"] = staged(inverse(step.k, step.beta, exponents, lane), lane)
+        predicted = blocked(point(step.k), entering, lane, parts=(lane.given, lane.held))
+        decay = exponents.raised(lane)
+        decayed = fused(mul(Iv(decay.lo[:, None], decay.hi[:, None]), neg(predicted)), lane)
+        difference = fp32(add(point(step.v), decayed), lane)
+        scaled = fp32(mul(difference, point(np.asarray(step.beta)[:, None])), lane)
+        lower = dot(point(step.a), staged(scaled, lane), lane, parts=(lane.held, lane.held))
+        corrected = fp32(add(scaled, lower), lane)
+    else:
+        corrected = fp32(mul(point(step.v), point(np.asarray(step.beta)[:, None])), lane)
+    output_ = output(step.q, step.k, entering, staged(corrected, lane), exponents, scale, lane)
+    return {**found, "h": carried(step.carry, corrected, step.k, exponents, lane), "o": out(output_, lane)}
+
+
+def values_gated_enclosures(step: "Step", scale: float, lane: Lane) -> dict[str, Iv]:
+    """`enclosures` of a chunk without the delta rule whose write gate takes the values' side (its values held
+    in parts, `Lane.held`: an fp32 call's, or a 16-bit one's under the accurate forms, Lightning's or the
+    SSD's): its corrected values, the values times their write gate as stored (`algebra.weighted`'s
+    identity inverse, `corrected` with no weighted keys), the memory it leaves (`carried`), and its output."""
+    exponents = Exponents.of(step.g)
+    written = fp32(mul(point(step.v), point(np.asarray(step.beta)[:, None])), lane)
+    values = meet(written, held_cell(step.c, lane))
+    return {"c": staged(written, lane), "h": carried(step.carry, values, step.k, exponents, lane),
+            "o": out(output(step.q, step.k, step.h, step.c, exponents, scale, lane), lane)}
 
 
 class Step(NamedTuple):
@@ -412,7 +524,7 @@ def solved_step(step: Step, decay: Iv, lane: Lane) -> tuple[Iv, Iv, Iv]:
     _, w = weighted(step.a, step.k, step.beta, decay, lane)
     _, u = weighted(step.a, step.v, step.beta, None, lane)
     c = corrected(u, step.w, step.h, lane)
-    return w, staged(c), meet(c, cell(step.c, BFLOAT16))
+    return w, staged(c, lane), meet(c, held_cell(step.c, lane))
 
 
 def enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
@@ -423,10 +535,10 @@ def enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
         return key_enclosures(step, scale, lane)
     exponents = Exponents.of(step.g)
     w, c, values = solved_step(step, exponents.raised(lane), lane)
-    stored = staged(inverse(step.k, step.beta, exponents, lane))
+    stored = staged(inverse(step.k, step.beta, exponents, lane), lane)
     return {"a": stored, "w": w, "c": c,
             "h": carried(step.carry, values, step.k, exponents, lane),
-            "o": staged(output(step.q, step.k, step.h, step.c, exponents, scale, lane))}
+            "o": out(output(step.q, step.k, step.h, step.c, exponents, scale, lane), lane)}
 
 
 SUB = recurrence_algebra.SUB
@@ -486,8 +598,8 @@ def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     # `range_decay`: the difference of the compensated prefixes, then `raised`'s fraction.
     spread = bound[-1][None, :] + bound + 2.0 ** -46 * (np.abs(exact[-1])[None, :] + np.abs(exact)) + FRACTION
     reach = exp2(_outward(exact[-1][None, :] - exact - spread, exact[-1][None, :] - exact + spread), lane)
-    written = staged(fp32(mul(point(step.k), reach), lane))
-    write = dot(Iv(written.lo.T, written.hi.T), staged(values), lane)
+    written = staged(fp32(mul(point(step.k), reach), lane), lane)
+    write = dot(Iv(written.lo.T, written.hi.T), staged(values, lane), lane)
     held = Iv(np.broadcast_to(raised.lo[-1][:, None], step.carry.lo.shape),
               np.broadcast_to(raised.hi[-1][:, None], step.carry.lo.shape))
     leaving = fp32(add(fused(mul(step.carry, held), lane), write), lane)
@@ -496,17 +608,17 @@ def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     # Each key block's scores scaled before their sum: one rounding a block more, at most the width's.
     width = np.asarray(step.k).shape[-1]
     slack = width * 2.0 ** -24 * np.maximum(np.abs(scores.lo), np.abs(scores.hi))
-    scores = staged(where(_lags() >= 0, _outward(scores.lo - slack, scores.hi + slack), zeros))
-    queries = staged(fp32(mul(fp32(mul(point(step.q), raised), lane), factor), lane))
+    scores = staged(where(_lags() >= 0, _outward(scores.lo - slack, scores.hi + slack), zeros), lane)
+    queries = staged(fp32(mul(fp32(mul(point(step.q), raised), lane), factor), lane), lane)
     left = Iv(np.concatenate([queries.lo, scores.lo], 1), np.concatenate([queries.hi, scores.hi], 1))
     right = point(np.concatenate([step.h, step.c], 0))
-    return {"a": staged(solved(system, lane)), "w": w, "c": c, "h": leaving,
-            "o": staged(dot(left, right, lane))}
+    return {"a": staged(solved(system, lane), lane), "w": w, "c": c, "h": leaving,
+            "o": out(dot(left, right, lane), lane)}
 
 
 def stored_memory(iv: Iv, lane: Lane) -> Iv:
     """The memory as the states launch stores it: bf16, or fp32 exactly."""
-    return staged(iv)
+    return staged(iv, lane)
 
 
 def exp2_reach(native, low: float = -2.0, high: float = 2.0) -> int:
@@ -536,6 +648,14 @@ RECORDS = ("a", "w", "c", "o", "h", "leaving")
 KEYS_GATED_RECORDS = ("o", "h", "leaving")
 """The records a call whose write gate takes the keys' side keeps (`keys_gated_enclosures`): its values are
 its corrected values, held as given."""
+VALUES_GATED_RECORDS = ("c", "o", "h", "leaving")
+"""The records a call without the delta rule whose write gate takes the values' side keeps
+(`values_gated_enclosures`)."""
+WRITES = {"delta": RECORDS, "keys": KEYS_GATED_RECORDS, "values": VALUES_GATED_RECORDS}
+"""Each write's records (`Run.write`)."""
+WALKED = {"delta": ("a", "o", "leaving"), "keys": ("o", "leaving"), "values": ("o", "leaving")}
+"""Each write's records in the fused inference walk (`walk_enclosures`), which stores no memory a chunk enters
+and no weighted keys or corrected values."""
 """The records the witness holds (`enclosed`)."""
 
 
@@ -581,9 +701,19 @@ class Run:
     begins: np.ndarray
     scale: float
     """The output's scale (the keys' width's inverse root, a delta rule's; 1, the SSD's)."""
-    gated: bool
-    """Whether its write gate takes the keys' side (`mainloop.Call.gated_keys`, the SSD's under the fast
-    forms): no inverse, weighted keys or corrected values of its own (`a`, `w` zero, `c` the values)."""
+    write: str
+    """Its write (`WRITES`): the delta rule's; the write gate on the keys' side (`mainloop.Call.gated_keys`,
+    the SSD's under the fast forms), no inverse, weighted keys or corrected values of its own (`a`, `w`, `c`
+    zero); or on the values' side without the delta rule, its corrected values the gated values (`a`, `w`
+    zero)."""
+    held: int
+    """The parts its launches hold the values they pass in (`Lane.held`)."""
+    given: int
+    """The parts its operands are given in (`Lane.given`)."""
+    wide: bool
+    """Whether it is an fp32 call (`Lane.wide`)."""
+    walked: bool
+    """Whether it is the fused inference walk's (`walk_enclosures`), its records `WALKED`'s."""
 
     @property
     def chunks(self) -> int:
@@ -626,7 +756,8 @@ def laid_chunks(length: int, starts, max_segments: int | None) -> np.ndarray:
 
 
 def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = None,
-             floor: float | None = None, carried: bool = True, delta: bool = True) -> Run:
+             floor: float | None = None, carried: bool = True, delta: bool = True,
+             rounded: bool | None = None, walked: bool = False) -> Run:
     """The records of the gated delta rule's training call on the template, forced (`generation.chosen`) at
     JAX's own default precision as a model trains it: `mainloop.kept_forward` at the tiles the route takes
     (`tuning.seen`), its output and final memory bit for bit the route's training forward's (the certify
@@ -638,8 +769,13 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     each chunk's: end_j == start_{j+1}); without, the initial and the final memories alone. A packed call's
     documents (`starts` `[1, T]`) lay their own chunks (`laid_chunks`), a document beginning inside a chunk
     included, its first chunk entering the zero memory. Without the `delta` rule, the template's op as the
-    SSD's route calls it (`recurrence_chunk.template_rule`, scale 1, its output in the operands' dtype, the
-    fast forms' keys taking the write gate, `mainloop.Call.gated_keys`)."""
+    SSD's route calls it (`recurrence_chunk.template_rule`, scale 1, its output in the operands' dtype),
+    `rounded` as the route's fast forms round it unless given (a 16-bit call's keys then take the write
+    gate, `mainloop.Call.gated_keys`; unrounded, Lightning's, its values held in parts). An fp32 call's
+    operands and passed values are held in parts as the mainloop holds them (`Lane.held`, `Lane.given`),
+    each record their sum. `walked`, the inference forward no gradient follows: a 16-bit call's under a decay
+    a head runs its fused walk (`mainloop._scan`, `kept_forward` keeping nothing), whose records are its
+    inverse, output and final memory (`WALKED`)."""
     import jax
     import jax.numpy as jnp
 
@@ -654,12 +790,16 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     operands = (q, k, v, g, beta, h0)
     dtype = jnp.result_type(q, k, v)
     scale = k.shape[-1] ** -0.5 if delta else 1.0
-    # Without the delta rule a 16-bit call's keys take the write gate under the fast forms
-    # (`mainloop.Call.gated_keys`), its values held as given; the accurate forms' hold them in parts, which
-    # the witness's lanes do not.
-    rounded = not delta and recurrence_chunk.fast_rounding()
-    assert delta or (rounded and jnp.dtype(dtype).itemsize == 2), \
-        "the witness holds a call without the delta rule where its keys take the write gate"
+    if rounded is None:
+        rounded = recurrence_chunk.chunk_rounding(delta, dtype) if delta else recurrence_chunk.fast_rounding()
+    family = mainloop.family_of(dtype) or bundles.INTERPRETED
+    # The parts its operands and passed values take (`mainloop.prepared`'s `given` and `held`): one of a
+    # 16-bit value; an fp32 one's three, or under the fast forms its family's (`mainloop._fast_parts`).
+    wide = jnp.dtype(dtype) == jnp.float32
+    fast = 1 if family.takes_tf32 and family.transposes_tf32 else mainloop.FAST_PARTS
+    given = (fast if rounded else mainloop.PARTS) if wide else 1
+    held = given if delta or rounded else mainloop.PARTS
+    write = "delta" if delta else ("keys" if held == 1 else "values")
 
     def route(*x):
         if not delta:
@@ -671,16 +811,16 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
 
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
         with tuning.seen() as launches:
-            # The training forward: the primal of the route's VJP, as a training step runs it.
-            o, final = jax.jit(lambda *x: jax.vjp(route, *x)[0])(*operands)
+            # The training forward: the primal of the route's VJP, as a training step runs it; or the
+            # inference forward.
+            o, final = jax.jit(route if walked else lambda *x: jax.vjp(route, *x)[0])(*operands)
         [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
                    if isinstance(op, template.Mosaic)]
 
         def kept(*x, starts=starts):
             return jax.jit(lambda *x: mainloop.kept_forward(
                 *x, tiles=tiles, starts=starts, max_segments=max_segments, floor=floor, scale=scale,
-                delta=delta, rounded=rounded,
-                family=mainloop.family_of(dtype) or bundles.INTERPRETED,
+                delta=delta, rounded=rounded, family=family, keeps=not walked,
                 interpret=generation.backend() != "gpu"))(*x)
 
         kept_o, kept_final, (a, (w, h, c)) = kept(*operands)
@@ -698,13 +838,23 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                 for first, count in table[:-1]] if carried else []
     # The chunks the launches lay out (a packed call's every sequence's, its worst case's), of which the
     # call's come first.
-    laid = np.shape(h)[0] // (heads * key_width)
+    if walked:
+        # The walk stores no memories, weighted keys or corrected values (`WALKED`), each chunk its own.
+        assert starts is None and jnp.dtype(dtype).itemsize == 2, "the walk is a 16-bit call's, unpacked"
+        laid = chunks
+        w = np.zeros((held * laid * CHUNK, heads * key_width))
+        h, c = (np.zeros((held * laid * heads * key_width, value_width)),
+                np.zeros((held * laid * CHUNK, heads * value_width)))
+    laid = np.shape(h)[0] // (held * heads * key_width)
     if not delta:
-        # Its keys take the gate: no inverse, weighted keys or corrected values of its own (`Run.gated`).
-        a, w, c = (np.zeros((laid * CHUNK, heads * width)) for width in (CHUNK, key_width, value_width))
+        # No inverse or weighted keys of its own, nor corrected values where its keys take the gate.
+        a, w = (np.zeros((held * laid * CHUNK, heads * width)) for width in (CHUNK, key_width))
+        if write == "keys":
+            c = np.zeros((held * laid * CHUNK, heads * value_width))
 
     def summed(x, rows):
-        return np.asarray(x, np.float64).reshape(rows, -1)
+        """A record's stacked parts (`mainloop.Operand`) summed, exactly, `[rows, ...]`."""
+        return np.asarray(x, np.float64).reshape(held, rows, -1).sum(0)
 
     def chunked(x, width):
         return summed(x, laid * CHUNK).reshape(laid, CHUNK, heads, width).transpose(0, 2, 1, 3)[:chunks]
@@ -713,13 +863,14 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     carries = [np.asarray(h0, np.float64)[0], *(np.asarray(end, np.float64)[0] for end in ends)]
     unknown = np.full(carries[0].shape, np.nan)
     carries += [unknown] * (chunks - len(carries)) + [np.asarray(kept_final, np.float64)[0]]
-    hosted_operands = {name: _laid(value, table) for name, value in hosted(operands).items()}
+    hosted_operands = {name: _laid(value, table)
+                       for name, value in hosted(operands, given=given, delta=delta).items()}
     output = _laid(np.asarray(kept_o, np.float64)[0], table).reshape(chunks, CHUNK, heads, value_width)
     # A document past the row's first begins on the zero memory (`chunked_launch.Sequences`).
     begins = np.asarray([first > 0 and (starts is not None and bool(np.asarray(starts)[0, first]))
                          for first, _ in table])
     return Run(**hosted_operands, a=chunked(a, CHUNK), w=chunked(w, key_width), h=memories, scale=scale,
-               gated=not delta,
+               write=write, held=held, given=given, wide=bool(wide), walked=walked,
                c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
                begins=begins)
 
@@ -733,26 +884,35 @@ def _laid(x: np.ndarray, table: np.ndarray) -> np.ndarray:
     return found
 
 
-def hosted(operands: tuple) -> dict[str, np.ndarray]:
+def hosted(operands: tuple, *, given: int = 1, delta: bool = True) -> dict[str, np.ndarray]:
     """A call's operands `(q, k, v, g, beta, h0)` as its launches read them, one row's, float64 (`Run`'s): the
-    queries, keys and values in their common dtype (fp32's three parts summed exactly), the write gate rounded
-    to it, the log decay fp32."""
+    queries, keys and values in their common dtype, in its `given` parts summed exactly (`product.formed`; an
+    fp32 one-part operand itself, which its products read as TF32), the delta rule's write gate rounded to it
+    (without the rule its own fp32), the log decay fp32."""
     import jax.numpy as jnp
+
+    from dew.nn.kernels.templates import product
 
     q, k, v, g, beta, _ = operands
     dtype = jnp.result_type(q, k, v)
 
     def host(x):
-        return np.asarray(jnp.asarray(x).astype(dtype).astype(jnp.float32), np.float64)[0]
+        held = jnp.asarray(x).astype(dtype).astype(jnp.float32)
+        if given > 1:
+            return sum(np.asarray(part, np.float64) for part in product.formed(held, given))[0]
+        return np.asarray(held, np.float64)[0]
 
-    return {"q": host(q), "k": host(k), "v": host(v), "g": np.asarray(g, np.float64)[0], "beta": host(beta)}
+    gate = host(beta) if delta else np.asarray(jnp.asarray(beta, jnp.float32), np.float64)[0]
+    return {"q": host(q), "k": host(k), "v": host(v), "g": np.asarray(g, np.float64)[0], "beta": gate}
 
 
 def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
     """Each record's enclosure `[N, H, ...]` (`enclosures`), each chunk's step from the fp32 memory it enters:
     `a`, `w`, `c`, `o`; `h`, the memory each chunk enters as stored; and `leaving`, the fp32 memory it
     leaves."""
-    enclose = keys_gated_enclosures if run.gated else enclosures
+    writes = {"delta": enclosures, "keys": keys_gated_enclosures, "values": values_gated_enclosures}
+    enclose = functools.partial(walk_enclosures, write=run.write) if run.walked else writes[run.write]
+    lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide)
     found: dict[str, list] = {}
     for n in range(run.chunks):
         for head in range(run.heads):
@@ -768,13 +928,13 @@ def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
 def records(run: Run) -> dict[str, np.ndarray]:
     """Each record `[N, H, ...]`, as `enclosed` names them."""
     held = {"a": run.a, "w": run.w, "c": run.c, "o": run.o, "h": run.h, "leaving": run.carries[1:]}
-    return {name: held[name] for name in (KEYS_GATED_RECORDS if run.gated else RECORDS)}
+    return {name: held[name] for name in (WALKED if run.walked else WRITES)[run.write]}
 
 
 def witness(run: Run, lane: Lane) -> dict:
     """Whether each record of `run` lies inside its step's enclosure (`enclosed`), by record `[N, H, ...]`."""
     found, recorded_ = enclosed(run, lane), records(run)
-    return {name: within(recorded_[name], found[name]) for name in found}
+    return {name: within(recorded_[name], found[name]) for name in recorded_}
 
 
 def refusals(faulty: Run, claimed: Run, lane: Lane) -> dict[str, tuple[np.ndarray, np.ndarray]]:
@@ -784,7 +944,7 @@ def refusals(faulty: Run, claimed: Run, lane: Lane) -> dict[str, tuple[np.ndarra
     from native_certificates import separated
 
     truth, fault, found = enclosed(claimed, lane), enclosed(faulty, lane), records(faulty)
-    return {name: (within(found[name], truth[name]), separated(truth[name], fault[name])) for name in truth}
+    return {name: (within(found[name], truth[name]), separated(truth[name], fault[name])) for name in found}
 
 
 def rounded_cumsums(g) -> np.ndarray:
@@ -825,8 +985,9 @@ factor over sub-chunks (`algebra.factored_range`)."""
 
 
 def draw(seed: int, regime: str, *, chunks: int = 3, heads: int = 1, width: int = 64,
-         per_key: bool = False):
-    """A bf16 call's operands `(q, k, v, g, beta, h0)` of one row of `chunks` chunks: unit queries and keys,
+         per_key: bool = False, dtype=None):
+    """A call's operands `(q, k, v, g, beta, h0)` of one row of `chunks` chunks, in `dtype` (bf16 by default):
+    unit queries and keys,
     normal values, the regime's log decays (`REGIMES`), a write gate in (0, 1), an initial memory; `per_key`,
     a decay a key dimension in (`FLOOR`, 0) instead (Kimi delta attention's bounded gate)."""
     import jax.numpy as jnp
@@ -848,9 +1009,9 @@ def draw(seed: int, regime: str, *, chunks: int = 3, heads: int = 1, width: int 
         g = FLOOR / (1 + np.exp(1.0 - rng.normal(size=(*shape, width))))
     beta = 0.0 if regime == "decay" else 1 / (1 + np.exp(-rng.normal(size=shape)))
     h0 = 0.3 * rng.normal(size=(1, heads, width, width))
-    return (jnp.asarray(q, jnp.bfloat16), jnp.asarray(k, jnp.bfloat16), jnp.asarray(v, jnp.bfloat16),
-            jnp.asarray(g, jnp.float32), jnp.asarray(np.broadcast_to(beta, shape), jnp.bfloat16),
-            jnp.asarray(h0, jnp.float32))
+    dtype = jnp.bfloat16 if dtype is None else dtype
+    return (jnp.asarray(q, dtype), jnp.asarray(k, dtype), jnp.asarray(v, dtype), jnp.asarray(g, jnp.float32),
+            jnp.asarray(np.broadcast_to(beta, shape), dtype), jnp.asarray(h0, jnp.float32))
 
 
 def shifted_refusals(operands: tuple, lane: Lane) -> dict[str, tuple[np.ndarray, np.ndarray]]:
@@ -882,16 +1043,17 @@ def cumsum_refusals(operands: tuple, lane: Lane) -> dict[str, tuple[np.ndarray, 
     return refusals(faulty, dataclasses.replace(faulty, g=hosted(operands)["g"]), lane)
 
 
-def handed_refusals(operands: tuple, truth: Run, at: int, lane: Lane) -> tuple[np.ndarray, np.ndarray]:
-    """A state rounded to bf16 where fp32 is held: the call over the chunks from `at` on, from the fp32 memory
-    `truth`'s chunks before it leave rounded to bf16, its first chunk's leaving memory held to the step from
-    the memory unrounded (`refusals`)."""
+def handed_refusals(operands: tuple, truth: Run, at: int, lane: Lane, *,
+                    walked: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """A state rounded to bf16 where fp32 is held: the call over the chunks from `at` on (the fused inference
+    walk's where `walked`), from the fp32 memory `truth`'s chunks before it leave rounded to bf16, its first
+    chunk's leaving memory held to the step from the memory unrounded (`refusals`)."""
     import jax.numpy as jnp
     import ml_dtypes as dtypes
 
     carry = truth.carries[at]
     handed = np.asarray(np.asarray(carry, np.float32).astype(dtypes.bfloat16), np.float32)
-    tail = recorded(*(x[:, at * CHUNK:] for x in operands[:5]), jnp.asarray(handed)[None])
+    tail = recorded(*(x[:, at * CHUNK:] for x in operands[:5]), jnp.asarray(handed)[None], walked=walked)
     claimed = dataclasses.replace(tail, carries=np.concatenate([carry[None], tail.carries[1:]]))
     return refusals(tail, claimed, lane)["leaving"]
 
@@ -991,3 +1153,570 @@ def assert_keys_gated_witnessed(lane: Lane, heads: int = 1) -> None:
     q, k, v, g, beta, h0 = operands
     faulty = recorded(q, k, v, g, jnp.ones_like(beta), h0, delta=False)
     assert_refusals(refusals(faulty, dataclasses.replace(faulty, **hosted(operands)), lane), UNGATED_SHARES)
+
+
+PARTS_SHARES = {"h": 0.9, "c": 0.9, "o": 0.8}
+"""The least share of each record at which an fp32 call whose values are held in parts, run at bf16 instead,
+is refused: its stored memories and corrected values (99% of them over two draws, interpreted at 5dd8e1788)
+and its outputs (89%); the fp32 memory it leaves carries the call's own rounding as much (41-44%)."""
+
+
+def assert_parts_witnessed(lane: Lane, heads: int = 1) -> None:
+    """The step witness where the launches hold the values they pass in parts (`Lane.held`): an fp32 call of
+    three chunks with the delta rule and without it (two parts under the fast forms), and a bf16 call without
+    it unrounded (Lightning's, the accurate forms' SSD: its values in three parts), every record each keeps
+    inside its step's enclosure; and the fp32 call run in bf16 refused against the fp32 call's enclosures."""
+    import jax.numpy as jnp
+
+    wide = draw(0, "mild", heads=heads, dtype=jnp.float32)
+    for run in (recorded(*wide), recorded(*wide, delta=False), recorded(*draw(0, "mild", heads=heads),
+                                                                        delta=False, rounded=False)):
+        held = witness(run, lane)
+        for name in WRITES[run.write]:
+            assert np.all(held[name]), (run.write, run.held, name, np.mean(held[name]))
+    q, k, v, g, beta, h0 = wide
+    narrow = recorded(*(x.astype(jnp.bfloat16) for x in (q, k, v)), g, beta.astype(jnp.bfloat16), h0)
+    claimed = recorded(*wide)
+    held = {"write": claimed.write, "held": claimed.held, "given": claimed.given, "wide": True}
+    as_claimed = dataclasses.replace(narrow, **hosted(wide, given=claimed.given), **held)
+    assert_refusals(refusals(narrow, as_claimed, lane), PARTS_SHARES)
+
+
+WALK_HANDED_SHARE = 0.55
+"""The least share of the fp32 memory the walk's second chunk leaves at which its entering memory rounded to
+bf16 is refused: 0.597 of it interpreted at a8dccec7a (the training call's states launch, `HANDED_SHARE`,
+reads the stored memory too, which the walk never stores)."""
+
+
+def assert_walk_witnessed(lane: Lane, heads: int = 1) -> None:
+    """The step witness of the fused inference walk (`walk_enclosures`, `mainloop._scan`): a bf16 call of
+    three chunks no gradient follows, with the delta rule and without it (its keys taking the write gate, and
+    unrounded), every record each keeps inside its step's enclosure; and the walk run from a memory rounded to
+    bf16 where fp32 is held refused (`handed_refusals`, `WALK_HANDED_SHARE`)."""
+    operands = draw(0, "mild", heads=heads)
+    for run in (recorded(*operands, walked=True), recorded(*operands, delta=False, walked=True),
+                recorded(*operands, delta=False, rounded=False, walked=True)):
+        held = witness(run, lane)
+        for name in WALKED[run.write]:
+            assert np.all(held[name]), (run.write, name, np.mean(held[name]))
+    from native_certificates import assert_refused
+
+    slow = draw(1, "slow", chunks=2, heads=heads)
+    assert_refused(*handed_refusals(slow, recorded(*slow, walked=True), 1, lane, walked=True),
+                   WALK_HANDED_SHARE)
+
+
+class BackStep(NamedTuple):
+    """One chunk and value head of a training call's fast backward under the delta rule
+    (`mainloop_backward.kept_backward`), its inputs as the launches read them (float64, one value head's):
+    the forward's `q`, `k`, `v`, `g`, `beta` and the records the forward kept (the inverse `a`, the weighted
+    keys `w`, the corrected values `c` and the memory the chunk entered `h`), the output's gradient `do`, and
+    the gradient of the memory the chunk leaves, `grad` (an interval: the next chunk's stored record, or the
+    final memory's gradient as given)."""
+
+    q: np.ndarray
+    k: np.ndarray
+    v: np.ndarray
+    g: np.ndarray
+    beta: np.ndarray
+    a: np.ndarray
+    w: np.ndarray
+    c: np.ndarray
+    h: np.ndarray
+    do: np.ndarray
+    grad: Iv
+    dh: np.ndarray
+    """The gradient of the memory the chunk leaves as stored (`Kept.dh`), which the query/key launch reads."""
+    local: np.ndarray
+    dv: np.ndarray
+    ds: np.ndarray
+    dw: np.ndarray
+
+
+BACK_RECORDS = ("local", "dv", "entering", "ds", "dq", "dk", "dw", "d_l", "values", "keys")
+"""The records the delta rule's fast backward keeps, each a launch's (`Kept`): `_local_back`'s `local`,
+`_reverse`'s `dv` and the gradient of the memory each chunk enters (`entering`), `_scores_back`'s `ds`,
+`_query_key`'s `dq`, `dk`, `dw`, `_system_back`'s `d_l`, `_values_back`'s `values` and `_keys_back`'s
+`keys`."""
+
+
+def tr(iv: Iv) -> Iv:
+    """`iv` transposed."""
+    return Iv(iv.lo.T, iv.hi.T)
+
+
+def back_enclosures(step: BackStep, scale: float, lane: Lane, *, write: str = "delta") -> dict[str, Iv]:
+    """Each launch's records of a chunk of a fast backward (fla's DAG, its rounding:
+    `mainloop_backward.gradients`), from the inputs it reads (`BackStep`), each register operand staged as
+    the call holds it (`staged`), each sum of products a `dot`'s over its operands' parts (the operands and
+    the output's gradient `Lane.given`'s, every stored record and staged value `Lane.held`'s):
+
+    - `local`: `A^T do`, `A[t, s] = scale (q_t . k_s) exp2(E_t - E_s)` (`s <= t`), its transpose's product
+      `k q^T` decayed and scaled in fp32 and staged (`algebra.local_gradient`);
+    - `dv`: `du = (k grad) exp2(E_last - E) + local` (`algebra.reverse_carried`), `grad` staged; where the
+      write gate takes the keys' side (`write` "keys", the SSD's), the walk's gate on it, `du beta`, in the
+      operands' form (`algebra.gated_values_back`);
+    - `entering`: `grad exp2(E_last) + scale q^T (do exp2(E)) - w^T du`, the memory's gradient into the
+      chunk (no `w^T du` without the delta rule);
+    - `ds`: `do c^T` (by each value column's write gate where the keys take it) decayed, causal and scaled
+      (`algebra.scores_gradient`);
+    - `dq`, `dk`, `dw`: `scale (do h^T) exp2(E) + ds k`, `(c grad^T) exp2(E_last - E) (beta) + ds^T q`,
+      `-du h^T` (`algebra.memory_gradients`; no `dw` without the delta rule);
+    - the delta rule's `d_l`: `-(X^T tril(dX, -1) X^T)` decayed, `dX = dw (k beta exp2 E)^T + du (v beta)^T`,
+      `X = I + a` (`algebra.system_gradient`); `values`: `(X^T du) beta` (`algebra.values_gradient`); and
+      `keys`: `(X^T dw) exp2(E) beta + (d_l k) beta + (beta d_l)^T k` (`algebra.keys_gradient`)."""
+    exponents = Exponents.of(step.g)
+    raised, gated, pairs = exponents.raised(lane), exponents.gated(lane), exponents.pairs(lane)
+    given, held = lane.given, lane.held
+    factor = point(np.float32(scale))
+    zeros = point(np.zeros((CHUNK, CHUNK)))
+    rows = Iv(raised.lo[:, None], raised.hi[:, None])
+    ranged = Iv(gated.lo[:, None], gated.hi[:, None])
+    q, k, v, do = point(step.q), point(step.k), point(step.v), point(step.do)
+    beta = np.asarray(step.beta)[:, None]
+    keyed_gate = write == "keys"
+    # The corrected values: as given where the keys take the gate, else a stored record.
+    values_parts = given if keyed_gate else held
+    lag = _lags()
+
+    transposed = fp32(mul(blocked(k, tr(q), lane, parts=(given, given)), tr(pairs)), lane)
+    scores = staged(where(lag.T >= 0, fp32(mul(transposed, factor), lane), zeros), lane)
+    local = dot(scores, do, lane, parts=(held, given))
+    du = fp32(add(fp32(mul(blocked(k, staged(step.grad, lane), lane, parts=(given, held)), ranged), lane),
+                  point(step.local)), lane)
+    dv = fp32(mul(du, point(beta)), lane) if keyed_gate else du
+    kept = Iv(np.full(step.grad.lo.shape, raised.lo[-1]), np.full(step.grad.lo.shape, raised.hi[-1]))
+    # The decayed output gradient fp32 in two bf16 parts against the queries (fla's split product,
+    # `mainloop_backward._reverse`): the parts' sum within 2^-16 of it.
+    read = fp32(mul(do, rows), lane)
+    reach = 2.0 ** -16 * np.maximum(np.abs(read.lo), np.abs(read.hi))
+    reads = dot(tr(q), _outward(read.lo - reach, read.hi + reach), lane, parts=(given, 2))
+    entering = fp32(add(fused(mul(step.grad, kept), lane), fused(mul(reads, factor), lane)), lane)
+    if write == "delta":
+        entering = fp32(add(entering, neg(dot(tr(point(step.w)), point(step.dv), lane, parts=(held, held)))),
+                        lane)
+    ds = blocked(do, tr(point(step.c)), lane, parts=(given, values_parts))
+    if keyed_gate:
+        ds = fp32(mul(ds, point(beta.T)), lane)
+    ds = fp32(mul(fp32(mul(ds, pairs), lane), factor), lane)
+    ds = staged(where(lag >= 0, ds, zeros), lane)
+    narrow, scored = point(step.ds), (given if keyed_gate else held)
+    entered = tr(point(step.h))
+    dq = fp32(add(fp32(mul(fp32(mul(blocked(do, entered, lane, parts=(given, held)), rows), lane), factor),
+                       lane), dot(narrow, k, lane, parts=(scored, given))), lane)
+    dk = fp32(mul(dot(point(step.c), tr(point(step.dh)), lane, parts=(values_parts, held)), ranged), lane)
+    if keyed_gate:
+        dk = fp32(mul(dk, point(beta)), lane)
+    dk = fp32(add(dk, dot(tr(narrow), q, lane, parts=(scored, given))), lane)
+    found = {"local": local, "dv": dv, "entering": entering, "ds": ds, "dq": dq, "dk": dk}
+    if write != "delta":
+        return found
+    dw = neg(dot(point(step.dv), entered, lane, parts=(held, held)))
+    lower_t = tr(point(step.a))
+    weighting = fp32(mul(point(np.asarray(step.beta)), raised), lane)
+    keyed = staged(fp32(mul(k, Iv(weighting.lo[:, None], weighting.hi[:, None])), lane), lane)
+    valued = staged(fp32(mul(v, point(beta)), lane), lane)
+    d_x = dot(point(step.dv), tr(valued), lane, parts=(held, held),
+              into=dot(point(step.dw), tr(keyed), lane, parts=(held, held)))
+    d_x = where(lag > 0, d_x, zeros)
+    d_x = fp32(add(d_x, dot(staged(d_x, lane), lower_t, lane, parts=(held, held))), lane)
+    d_x = fp32(add(d_x, dot(lower_t, staged(d_x, lane), lane, parts=(held, held))), lane)
+    d_l = staged(where(lag > 0, neg(fp32(mul(d_x, pairs), lane)), zeros), lane)
+    du_held = point(step.dv)
+    values = fp32(add(du_held, dot(lower_t, staged(du_held, lane), lane, parts=(held, held))), lane)
+    values = fp32(mul(values, point(beta)), lane)
+    dw_held = point(step.dw)
+    through = fp32(add(dw_held, dot(lower_t, staged(dw_held, lane), lane, parts=(held, held))), lane)
+    through = fp32(mul(through, rows), lane)
+    combined = fp32(add(through, dot(d_l, k, lane, parts=(held, given))), lane)
+    weighted = staged(fp32(mul(d_l, point(beta)), lane), lane)
+    keys = fp32(add(fp32(mul(combined, point(beta)), lane), dot(tr(weighted), k, lane, parts=(held, given))),
+                lane)
+    return {**found, "dw": dw, "d_l": d_l, "values": values, "keys": keys}
+
+
+class BackRun(NamedTuple):
+    """A training call's fast backward under the delta rule as its launches kept it (`recorded_backward`):
+    its forward's run (`Run`), the output's and final memory's gradients `do` `[N, H, C, Dv]` and `dfinal`
+    `[H, Dk, Dv]`, and each launch's records by name (`BACK_RECORDS`), `[N, H, ...]` float64 (the gradient
+    of the memory each chunk leaves `dh`, `[N, H, Dk, Dv]`, beside them), with the dtype each is stored in."""
+
+    run: Run
+    do: np.ndarray
+    dfinal: np.ndarray
+    dh: np.ndarray
+    dh0: np.ndarray
+    records: dict
+    dtypes: dict
+
+    def step(self, n: int, head: int, lane: Lane) -> BackStep:
+        """Chunk `n` and value head `head`'s inputs, the gradient of the memory it leaves the final memory's
+        as given for the last, else what the next chunk's stored record holds (`held_cell`)."""
+        run, records = self.run, self.records
+        last = n == run.chunks - 1
+        grad = point(self.dfinal[head]) if last else held_cell(self.dh[n, head], lane)
+        # Where the keys take the gate, the corrected values are the values as given.
+        corrected = run.step(n, head).v if run.write == "keys" else run.c[n, head]
+        # Without the delta rule there are no weights' gradients, which nothing then reads.
+        dw = records["dw"][n, head] if "dw" in records else np.zeros_like(run.w[n, head])
+        forward = run.step(n, head)
+        return BackStep(forward.q, forward.k, forward.v, forward.g, forward.beta, forward.a, forward.w,
+                        corrected, forward.h, self.do[n, head], grad, self.dh[n, head],
+                        records["local"][n, head], records["dv"][n, head], records["ds"][n, head], dw)
+
+
+def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True) -> BackRun:
+    """The fast backward of a call over one row (`draw`'s `operands`; under the `delta` rule, or without it
+    the SSD's route's under the run's fast forms), run as a training step runs it (the route's VJP), and the
+    same build's `mainloop_backward.kept_backward` at the forward's kept values, checked to give the step's
+    gradients bit for bit: each launch's outputs as stored (`Kept`), laid a chunk and value head at a time
+    (their parts summed), for output and final memory gradients `seed` draws."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.nn.kernels import generation, recurrence_chunk, tuning
+    from dew.nn.kernels.templates import bundles
+    from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward, template
+
+    q, k, v, _, _, h0 = operands
+    dtype = jnp.result_type(q, k, v)
+    run = recorded(*operands, delta=delta)
+    rng = np.random.default_rng([2084, seed])
+    do = jnp.asarray(rng.standard_normal(v.shape), dtype)
+    dfinal = jnp.asarray(rng.standard_normal(h0.shape), jnp.float32)
+    scale = run.scale
+    rounded = (recurrence_chunk.chunk_rounding(delta=True, dtype=dtype) if delta
+               else recurrence_chunk.fast_rounding())
+    family = mainloop.family_of(dtype) or bundles.INTERPRETED
+    interpret = generation.backend() != "gpu"
+
+    def route(*x):
+        if not delta:
+            return recurrence_chunk.template_rule(*x, None, scale=scale, delta=False, wide=False,
+                                                  rounded=rounded)
+        return recurrence_chunk.chunk_gated_delta_rule(*x, write_bound=1.0)
+
+    with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
+        with tuning.seen() as launches:
+            native = jax.jit(lambda *x: jax.vjp(route, *x)[1]((do, dfinal)))(*operands)
+        [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
+                   if isinstance(op, template.Mosaic)]
+
+        def kept(*x):
+            _, _, (inverse, held) = mainloop.kept_forward(*x, tiles=tiles, scale=scale, rounded=rounded,
+                                                         delta=delta, family=family, interpret=interpret)
+            grads, saved = mainloop_backward.kept_backward(*x, do, dfinal, tiles=tiles, scale=scale,
+                                                           rounded=rounded, delta=delta, family=family,
+                                                           interpret=interpret, inverse=inverse, kept=held)
+            # The prepared run stays inside the program; the witness reads its records from `Run`.
+            return grads, saved._replace(run=None)
+
+        grads, saved = jax.jit(kept)(*operands)
+    for mine, theirs in zip(grads[:6], native, strict=True):
+        assert np.array_equal(np.asarray(mine).view(np.uint8), np.asarray(theirs).view(np.uint8)), \
+            "the certify build is the production program"
+    _, length, heads, value_width = v.shape
+    key_width, chunks = k.shape[-1], run.chunks
+    # The chunks the launches lay, of the memories' rows a part (`Run.held` of them stacked).
+    laid = np.shape(saved.dh)[0] // (run.held * heads * key_width)
+
+    def chunked(x, width):
+        """A record's stacked parts summed exactly, laid `[N, H, C, width]`."""
+        rows = np.asarray(x, np.float64).reshape(-1, laid * CHUNK, heads * width).sum(0)
+        return rows.reshape(laid, CHUNK, heads, width).transpose(0, 2, 1, 3)[:chunks]
+
+    named = {"local": (saved.local, value_width), "dv": (saved.dv, value_width), "ds": (saved.ds, CHUNK),
+             "dq": (saved.dq, key_width), "dk": (saved.dk, key_width)}
+    if delta:
+        named |= {"dw": (saved.dw, key_width), "d_l": (saved.d_l, CHUNK),
+                  "values": (saved.values, value_width), "keys": (saved.keys, key_width)}
+    records = {name: chunked(x, width) for name, (x, width) in named.items()}
+    dtypes = {name: jnp.dtype(x.dtype) for name, (x, _) in named.items()}
+    dh = np.asarray(saved.dh, np.float64).reshape(-1, laid, heads, key_width, value_width).sum(0)[:chunks]
+    dtypes["entering"] = jnp.dtype(saved.dh.dtype)
+    hosted_do = _laid(np.asarray(do, np.float64)[0], laid_chunks(length, None, None))
+    return BackRun(run, hosted_do.reshape(chunks, CHUNK, heads, value_width).transpose(0, 2, 1, 3),
+                   np.asarray(dfinal, np.float64)[0], dh,
+                   np.asarray(saved.dh0, np.float64).reshape(heads, key_width, value_width), records, dtypes)
+
+
+def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
+    """Whether each record of `back` lies within its launch's enclosure (`back_enclosures`), as stored (in
+    its record's dtype): `[N, H, ...]` each, the gradient each chunk's memory enters with the record before
+    it (the initial memory's, `dh0`, for the first)."""
+    run = back.run
+    lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide)
+
+    def stored(iv: Iv, dtype) -> Iv:
+        """An enclosure as its record is stored: fp32 as it is; a 16-bit record its one rounding, or where
+        the call holds its values in parts (`Lane.held`), the parts' sum (`staged`)."""
+        if dtype == np.float32:
+            return iv
+        return staged(iv, lane) if run.held > 1 else cast(iv, {"bfloat16": BFLOAT16,
+                                                                  "float16": FLOAT16}[str(dtype)])
+
+    found: dict[str, list] = {}
+    for n in range(run.chunks):
+        for head in range(run.heads):
+            step = back_enclosures(back.step(n, head, lane), run.scale, lane, write=run.write)
+            for name in step:
+                if name == "entering":
+                    record = back.dh0[head] if n == 0 else back.dh[n - 1, head]
+                    dtype = np.float32 if n == 0 else back.dtypes["entering"]
+                else:
+                    record, dtype = back.records[name][n, head], back.dtypes[name]
+                found.setdefault(name, []).append(within(record, stored(step[name], dtype)))
+    return {name: np.stack(held) for name, held in found.items()}
+
+
+CARRIED_GRADIENT_SHARES = {"local": 0.9, "entering": 0.9}
+"""The least share of the records reading the output's gradient at which a backward that read another
+output's and final memory's gradients (another seed's) is refused: 99.9% of the local and memory gradients
+interpreted at 1e3091f19. The records each launch forms from the claimed records alone (`dv` from the
+claimed local gradient and memory's, its last chunk's alone from the final memory's) refuse only where
+the given gradients enter them."""
+
+
+def assert_backward_witnessed(lane: Lane, heads: int = 1) -> None:
+    """The step witness of the fast backward (`back_enclosures`), each form it takes: a bf16 call of three
+    chunks under the delta rule and without it (the SSD's, its keys taking the gate), and an fp32 call under
+    the delta rule (its values in parts), every record each launch keeps inside its step's enclosure; and a
+    backward that read another output's and final memory's gradients refused (`CARRIED_GRADIENT_SHARES`):
+    its records, claimed for those given."""
+    import jax.numpy as jnp
+
+    operands = draw(0, "mild", heads=heads)
+    wide = draw(0, "mild", heads=heads, dtype=jnp.float32)
+    for back in (recorded_backward(operands), recorded_backward(operands, delta=False),
+                 recorded_backward(wide)):
+        held = back_witnessed(back, lane)
+        for name, inside in held.items():
+            assert np.all(inside), (back.run.write, back.run.held, name, np.mean(inside))
+    back = recorded_backward(operands)
+    other = recorded_backward(operands, seed=1)
+    claimed = back._replace(dh=other.dh, dh0=other.dh0, records=other.records)
+    refused = back_witnessed(claimed, lane)
+    for name, share in CARRIED_GRADIENT_SHARES.items():
+        assert np.mean(~refused[name]) >= share, (name, np.mean(~refused[name]))
+
+
+class KeyBackStep(NamedTuple):
+    """One chunk and value head of a decay a key dimension's fast backward (`key_backward.gradients`), its
+    inputs as the launches read them (float64, one value head's): the forward's `q`, `k`, `v`, `g` `[C, Dk]`,
+    `beta`, its intra scores `scores` (stored, scaled and decayed), inverse `a` and weighted keys `w`, its
+    gated keys `kg`
+    (stored, `algebra.key_decayed_write`'s), its corrected values `c` and the memory the chunk entered `h`;
+    the output's gradient `do` and the gradient of the memory the chunk leaves, `grad` (an interval) and
+    `dh` (its record); and the records later launches read: `local`, `dv` (the reverse walk's), `d_scores`,
+    `d_system` (the values launch's inverse part plus the memory launch's)."""
+
+    q: np.ndarray
+    k: np.ndarray
+    v: np.ndarray
+    g: np.ndarray
+    beta: np.ndarray
+    scores: np.ndarray
+    a: np.ndarray
+    w: np.ndarray
+    kg: np.ndarray
+    c: np.ndarray
+    h: np.ndarray
+    do: np.ndarray
+    grad: Iv
+    dh: np.ndarray
+    local: np.ndarray
+    dv: np.ndarray
+    d_scores: np.ndarray
+    d_system: np.ndarray
+
+
+def key_pairs_back(d_pairs: Iv, rows, k: np.ndarray, exponents: Exponents, lane: Lane) -> tuple:
+    """`algebra.key_decayed_pairs_back`'s gradients through a chunk's pairs `P[i, j] = sum_k r_ik k_jk
+    exp2(E_ik - E_jk)` (`key_pairs`'), given their gradient `d_pairs` `[C, C]` (as stored, scaled as they
+    were): the rows' `sum_j dP_ij k_j exp2(E_i - E_j)` and the keys' `sum_i dP_ij r_i exp2(E_i - E_j)`, each
+    `[C, Dk]` fp32. The launch factors each pair's decay at sub-chunk boundaries and sums the pieces in an
+    order of its own, its products in two bf16 parts of the pairs' gradient (`_parted`); the enclosure is the
+    exact sum within its terms' one native sum's bound (as `key_pairs`'), each term's decay `between`'s."""
+    exact, bound = exponents.exact, exponents.bound
+    decay = between(exact[:, None, :], bound[:, None, :], exact[None, :, :], bound[None, :, :], lane)
+    lag = _lags()[:, :, None] >= 0
+    decay = where(lag, decay, point(np.zeros(decay.lo.shape)))
+    gradient = Iv(d_pairs.lo[:, :, None], d_pairs.hi[:, :, None])
+    weighted = mul(gradient, decay)
+    d_rows = mul(weighted, point(np.asarray(k)[None, :, :]))
+    held = held_iv(rows)
+    d_keys = mul(weighted, Iv(held.lo[:, None, :], held.hi[:, None, :]))
+
+    def summed(terms: Iv, axis: int) -> Iv:
+        magnitude = np.maximum(np.abs(terms.lo), np.abs(terms.hi)).sum(axis)
+        count = terms.lo.shape[axis]
+        slack = allowance(magnitude, count, TRUNCATING["float32"], truncating_underflow(lane.flushes)) \
+            + 2.0 ** -16 * magnitude * (1 + 2.0 ** -7)
+        return _outward(terms.lo.sum(axis) - slack, terms.hi.sum(axis) + slack)
+
+    return summed(d_rows, 1), summed(d_keys, 0)
+
+
+def key_back_enclosures(step: KeyBackStep, scale: float, lane: Lane) -> dict[str, Iv]:
+    """Each launch's records of a chunk of a decay a key dimension's fast backward (fla_kda's DAG,
+    `key_backward.gradients`), from the inputs it reads (`KeyBackStep`):
+
+    - `_key_scores_back`: `d_scores = do c^T`, causal (`algebra.key_scores_back`), and `local = scores^T do`;
+    - `_reverse`: `dv = kg grad + local` (`algebra.key_reverse_carried`, the gated keys' product taking no
+      row's decay), and the memory entered's `grad exp2(E_last) + qg^T do - w^T dv`, `qg` the queries gated
+      to the chunk's start and scaled, `do` as given;
+    - `_key_memory_back` (`algebra.key_memory_block`): `dq_m = scale exp2(E) (do h^T)`, `dk_m = exp2(E_last -
+      E) (c dh^T) + d(kg beta) exp2(E) beta`, `d(kg beta) = -(dw + L^T dw)`, `dw = dv h^T`;
+    - `_key_values_back` (`algebra.key_values_back`): `values = beta (dv + L^T dv)`;
+    - `_key_pairs_back`: the pairs' transpose of the scores' gradient scaled (`key_pairs_back`) for `dq_p`,
+      and of the system's for `dk_p`."""
+    exponents = Exponents.of(step.g)
+    raised = exponents.raised(lane)
+    factor = point(np.float32(scale))
+    zeros = point(np.zeros((CHUNK, CHUNK)))
+    lag = _lags()
+    q, do = point(step.q), point(step.do)
+    beta = np.asarray(step.beta)[:, None]
+    d_scores = where(lag >= 0, dot(do, tr(point(step.c)), lane), zeros)
+    local = dot(tr(point(step.scores)), do, lane)
+    dv = fp32(add(dot(point(step.kg), staged(step.grad, lane), lane), point(step.local)), lane)
+    last = Iv(np.broadcast_to(raised.lo[-1][:, None], step.grad.lo.shape),
+              np.broadcast_to(raised.hi[-1][:, None], step.grad.lo.shape))
+    query_gated = staged(fp32(mul(fp32(mul(q, raised), lane), factor), lane), lane)
+    entering = fp32(add(fused(mul(step.grad, last), lane), dot(tr(query_gated), do, lane)), lane)
+    entering = fp32(add(entering, neg(dot(tr(point(step.w)), point(step.dv), lane))), lane)
+    d_query = fp32(mul(fp32(mul(dot(do, tr(point(step.h)), lane), raised), lane), factor), lane)
+    exact, bound = exponents.exact, exponents.bound
+    spread = bound[-1][None, :] + bound + 2.0 ** -46 * (np.abs(exact[-1])[None, :] + np.abs(exact)) + FRACTION
+    to_last = exp2(_outward(exact[-1][None, :] - exact - spread, exact[-1][None, :] - exact + spread), lane)
+    d_key = fp32(mul(dot(point(step.c), tr(point(step.dh)), lane), to_last), lane)
+    d_weight = dot(point(step.dv), tr(point(step.h)), lane)
+    lower_t = tr(point(step.a))
+    d_gated = neg(fp32(add(d_weight, dot(lower_t, staged(d_weight, lane), lane)), lane))
+    dk_memory = fp32(add(d_key, fp32(mul(fp32(mul(d_gated, raised), lane), point(beta)), lane)), lane)
+    du = point(step.dv)
+    values = fp32(mul(fp32(add(du, dot(lower_t, du, lane)), lane), point(beta)), lane)
+    d_scores_scaled = fp32(mul(point(step.d_scores), factor), lane)
+    dq_pairs, scored_keys = key_pairs_back(d_scores_scaled, step.q, step.k, exponents, lane)
+    keyed_rows = fp32(mul(point(step.k), point(beta)), lane)
+    d_keyed, system_keys = key_pairs_back(point(step.d_system), keyed_rows, step.k, exponents, lane)
+    # The keys' gradient summed over both pairs (`algebra.key_decayed_pairs_back`'s 'keys').
+    keys = fp32(add(scored_keys, system_keys), lane)
+    dk_pairs = fp32(add(fp32(mul(d_keyed, point(beta)), lane), keys), lane)
+    return {"d_scores": d_scores, "local": local, "dv": dv, "entering": entering, "dq_memory": d_query,
+            "dk_memory": dk_memory, "values": values, "dq_pairs": dq_pairs, "dk_pairs": dk_pairs}
+
+
+KEY_BACK_RECORDS = ("d_scores", "local", "dv", "entering", "dq_memory", "dk_memory", "values", "dq_pairs",
+                    "dk_pairs")
+"""The records a decay a key dimension's fast backward keeps (`key_backward.KeyKept`), one value head's."""
+
+
+def recorded_key_backward(operands: tuple, seed: int = 0) -> tuple[BackRun, dict]:
+    """The fast backward of a 16-bit call under the delta rule and a decay a key dimension over one row
+    (`draw(..., per_key=True)`'s `operands`), run as a training step runs it and kept by the same build
+    (`kept_backward`, `key_backward.KeyKept`), checked bit for bit against the step's gradients: its records
+    and its forward's stored intra scores and gated keys, `[N, H, ...]` float64."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.nn.kernels import generation, recurrence_chunk, tuning
+    from dew.nn.kernels.templates import bundles
+    from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward, template
+
+    q, k, v, _, _, h0 = operands
+    dtype = jnp.result_type(q, k, v)
+    # A declared floor's factored pairs, as the forward's witness holds them (`assert_key_decays_witnessed`).
+    run = recorded(*operands, floor=FLOOR)
+    rng = np.random.default_rng([2084, seed])
+    do = jnp.asarray(rng.standard_normal(v.shape), dtype)
+    dfinal = jnp.asarray(rng.standard_normal(h0.shape), jnp.float32)
+    scale, rounded = run.scale, recurrence_chunk.chunk_rounding(delta=True, dtype=dtype)
+    family = mainloop.family_of(dtype) or bundles.INTERPRETED
+    interpret = generation.backend() != "gpu"
+
+    def route(*x):
+        return recurrence_chunk.chunk_gated_delta_rule(*x, floor=FLOOR, write_bound=1.0)
+
+    with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
+        with tuning.seen() as launches:
+            native = jax.jit(lambda *x: jax.vjp(route, *x)[1]((do, dfinal)))(*operands)
+        [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
+                   if isinstance(op, template.Mosaic)]
+
+        def kept(*x):
+            _, _, (inverse, held) = mainloop.kept_forward(*x, tiles=tiles, scale=scale, rounded=rounded,
+                                                         floor=FLOOR, family=family, interpret=interpret)
+            grads, saved = mainloop_backward.kept_backward(
+                *x, do, dfinal, tiles=tiles, scale=scale, rounded=rounded, floor=FLOOR, family=family,
+                interpret=interpret, inverse=inverse, kept=held)
+            # The prepared run stays inside the program: its intra scores and gated keys leave it.
+            return grads, saved._replace(run=None), saved.run.scores, saved.run.keys
+
+        grads, saved, scores, gated_keys = jax.jit(kept)(*operands)
+    for mine, theirs in zip(grads[:6], native, strict=True):
+        assert np.array_equal(np.asarray(mine).view(np.uint8), np.asarray(theirs).view(np.uint8)), \
+            "the certify build is the production program"
+    _, _, heads, value_width = v.shape
+    key_width, chunks = k.shape[-1], run.chunks
+    laid = np.shape(saved.dh)[0] // (heads * key_width)
+
+    def chunked(x, width):
+        rows = np.asarray(x, np.float64).reshape(-1, laid * CHUNK, heads * width).sum(0)
+        return rows.reshape(laid, CHUNK, heads, width).transpose(0, 2, 1, 3)[:chunks]
+
+    named = {"d_scores": (saved.d_scores, CHUNK), "local": (saved.local, value_width),
+             "dv": (saved.dv, value_width), "dq_memory": (saved.dq_memory, key_width),
+             "dk_memory": (saved.dk_memory, key_width), "values": (saved.values, value_width),
+             "d_system": (saved.d_system, CHUNK), "dq_pairs": (saved.dq_pairs, key_width),
+             "dk_pairs": (saved.dk_pairs, key_width), "scores": (scores, CHUNK),
+             "kg": (gated_keys, key_width)}
+    records = {name: chunked(x, width) for name, (x, width) in named.items()}
+    dtypes = {name: jnp.dtype(x.dtype) for name, (x, _) in named.items()}
+    dh = np.asarray(saved.dh, np.float64).reshape(laid, heads, key_width, value_width)[:chunks]
+    dtypes["entering"] = jnp.dtype(saved.dh.dtype)
+    hosted_do = _laid(np.asarray(do, np.float64)[0], laid_chunks(v.shape[1], None, None))
+    back = BackRun(run, hosted_do.reshape(chunks, CHUNK, heads, value_width).transpose(0, 2, 1, 3),
+                   np.asarray(dfinal, np.float64)[0], dh,
+                   np.asarray(saved.dh0, np.float64).reshape(heads, key_width, value_width), records, dtypes)
+    return back, records
+
+
+def key_back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
+    """`back_witnessed` under a decay a key dimension (`key_back_enclosures`): whether each record lies
+    within its launch's enclosure as stored."""
+    run, records = back.run, back.records
+
+    def stored(iv: Iv, dtype) -> Iv:
+        return iv if dtype == np.float32 else cast(iv, {"bfloat16": BFLOAT16, "float16": FLOAT16}[str(dtype)])
+
+    found: dict[str, list] = {}
+    for n in range(run.chunks):
+        for head in range(run.heads):
+            last = n == run.chunks - 1
+            grad = point(back.dfinal[head]) if last else held_cell(back.dh[n, head], lane)
+            forward = run.step(n, head)
+            step = KeyBackStep(forward.q, forward.k, forward.v, forward.g, forward.beta,
+                               records["scores"][n, head], forward.a, forward.w, records["kg"][n, head],
+                               forward.c,
+                               forward.h, back.do[n, head], grad, back.dh[n, head], records["local"][n, head],
+                               records["dv"][n, head], records["d_scores"][n, head],
+                               records["d_system"][n, head])
+            enclosed_ = key_back_enclosures(step, run.scale, lane)
+            for name in KEY_BACK_RECORDS:
+                if name == "entering":
+                    record = back.dh0[head] if n == 0 else back.dh[n - 1, head]
+                    dtype = np.float32 if n == 0 else back.dtypes["entering"]
+                else:
+                    record, dtype = records[name][n, head], back.dtypes[name]
+                found.setdefault(name, []).append(within(record, stored(enclosed_[name], dtype)))
+    return {name: np.stack(held) for name, held in found.items()}
+
+
+def assert_key_backward_witnessed(lane: Lane, heads: int = 1) -> None:
+    """The step witness of a decay a key dimension's fast backward (`key_back_enclosures`, Kimi delta
+    attention's): a bf16 call of three chunks, every record each launch keeps inside its step's enclosure."""
+    back, _ = recorded_key_backward(draw(0, "mild", heads=heads, per_key=True))
+    held = key_back_witnessed(back, lane)
+    for name, inside in held.items():
+        assert np.all(inside), (name, np.mean(inside))
