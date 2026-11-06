@@ -224,3 +224,13 @@ def test_the_uncertainty_head_learns_each_levels_weighted_error():
             {"params": head, "constants": params["constants"][UNCERTAINTY]},
             schedule.model_time(times[:1]))[0]
         assert float(jnp.mean(jnp.asarray(errors)) * jnp.exp(-u)) == pytest.approx(0.5, rel=0.15)
+
+
+def test_edm2s_output_head_returns_the_runs_output_dtype():
+    """EDM2's final projection sums and returns in the run's output dtype (float32 by default), not the
+    bfloat16 a bf16 compute rounds to; its time embedding takes the compute dtype."""
+    model = EDM2UNet(output_channels=4, model_channels=16, channel_mult=(1,), num_blocks=1,
+                     attn_resolutions=(), dtype=jnp.bfloat16)
+    x, time = jnp.ones((1, 8, 8, 4), jnp.float32), jnp.ones((1,), jnp.float32)
+    params = model.init(jax.random.key(0), x, time)
+    assert model.apply(params, x, time).dtype == jnp.float32
