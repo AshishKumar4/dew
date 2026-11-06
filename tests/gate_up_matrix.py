@@ -62,7 +62,16 @@ def supported(case: dict[str, str]) -> bool:
     return [route.kernel for route in routes if route.choice == "gate_up"] == ["joined"]
 
 
-CASES = ()
+CASES = (
+    ('sm90', 'swiglu', 'none', 'plain', 'bfloat16'),
+    ('sm90', 'geglu', 'bias', 'scaled', 'float16'),
+    ('sm80', 'swiglu', 'none', 'scaled', 'float32'),
+    ('sm80', 'geglu', 'bias', 'plain', 'bfloat16'),
+    ('sm90', 'swiglu', 'bias', 'plain', 'float32'),
+    ('sm80', 'swiglu', 'none', 'plain', 'float16'),
+    ('sm90', 'geglu', 'none', 'plain', 'float32'),
+    ('sm90', 'swiglu', 'none', 'scaled', 'bfloat16'),
+)
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
 (`kernel_matrix.covering("gate_up")`, regenerated where the axes or the route's support change)."""
 
