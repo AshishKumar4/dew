@@ -1979,6 +1979,7 @@ def test_each_form_of_a_custom_derivative_is_a_seam():
         "def returned(x):\n    return surrogate(f, g)(x)\n"
         "nested = functools.partial(functools.partial(jax.custom_jvp, nondiff_argnums=(1,)))(f)\n"
         "tangent_partial = functools.partial(linear_tangent(f, g, h))\n"
+        "wrapped = contracted('test_ok')(functools.partial(jax.custom_jvp(p)))\n"
         "def passed(p):\n    return wrap(jax.custom_jvp(p))\n"
         "def plain(x): return x\n")
     found = [seam for seam, _, _, _ in rules.derivative_seams("m.py", ast.parse(text))]
@@ -1989,7 +1990,7 @@ def test_each_form_of_a_custom_derivative_is_a_seam():
         "m.py::e": "surrogate", "m.py::f": "surrogate", "m.py::g": "declared_derivative:Surrogate",
         "m.py::h": "declared_tangent:Protected", "m.py::k": "declared_tangent:KernelGlue",
         "m.py::returned.surrogate": "surrogate", "m.py::passed.custom_jvp": "custom_jvp",
-        "m.py::nested": "custom_jvp", "m.py::linear_tangent": "linear_tangent"}
+        "m.py::nested": "custom_jvp", "m.py::linear_tangent": "linear_tangent", "m.py::wrapped": "custom_jvp"}
 
 
 def test_a_custom_derivative_without_its_contract_is_reported(tmp_path):
