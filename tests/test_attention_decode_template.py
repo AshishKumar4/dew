@@ -45,11 +45,11 @@ def _hooks(hook: str, heads: int, positions: int, sinks: jax.Array) -> template.
     return None
 
 
-def _drawn(positions: int, heads: int, kv_heads: int, dtype):
+def _drawn(positions: int, heads: int, kv_heads: int, dtype, width: int = 64):
     def draw(seed: int):
         streams = jax.random.split(jax.random.key(seed), 4)
-        query = jax.random.normal(streams[0], (len(LENGTHS), positions, heads, 64), dtype)
-        key, value = (jax.random.normal(stream, (len(LENGTHS), KEYS, kv_heads, 64), dtype)
+        query = jax.random.normal(streams[0], (len(LENGTHS), positions, heads, width), dtype)
+        key, value = (jax.random.normal(stream, (len(LENGTHS), KEYS, kv_heads, width), dtype)
                       for stream in streams[1:3])
         sinks = jax.random.normal(streams[3], (heads,), jnp.float32)
         return query, key, value, sinks
@@ -78,6 +78,26 @@ def test_a_decode_step_through_the_template_is_on_par_interpreted(call, hook, dt
     assert_as_exact(jax.jit(ours), jax.jit(reference), _drawn(positions, heads, kv_heads, dtype),
                     f"template decode {call} {hook} {jnp.dtype(dtype).name}", seeds=SEEDS)
 
+
+
+@INTERPRETS
+def test_a_256_wide_decode_step_whose_split_launch_does_not_fit_is_on_par_interpreted():
+    """A 256-wide bf16 decode step (Qwen3.5-0.8B's heads: 8 query heads over 2 key heads) on an H100, whose
+    split launch's fp32 slices and the query's stage pass its shared memory, runs a slice a row through the
+    template (`attention_decode.plan`), on par with the reference path (check 1)."""
+    spans = _spans(1)
+
+    def ours(query, key, value, sinks):
+        del sinks
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, value, spans, None, interpret=True)
+
+    def reference(query, key, value, sinks):
+        del sinks
+        return template.reference(query, key, value, spans, None)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), _drawn(1, 8, 2, jnp.bfloat16, 256),
+                    "template decode 256 wide bfloat16", seeds=SEEDS)
 
 @INTERPRETS
 @pytest.mark.parametrize("call", ["one-query", "verify-four"])
