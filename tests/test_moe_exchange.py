@@ -94,6 +94,25 @@ def test_a_dropless_exchange_moves_its_rows_in_one_ragged_all_to_all_each_way(sk
     assert "ragged_all_to_all" in backward and "scan" not in backward
 
 
+@pytest.mark.parametrize("spec, exchanged", [
+    (MeshSpec(expert=4, fsdp=2), True), (MeshSpec(expert=2, fsdp=4), True), (MeshSpec(fsdp=8), False)],
+    ids=["4-way", "2-way", "no-expert-axis"])
+def test_an_expert_mesh_exchanges_by_default_and_any_other_mesh_dispatches_globally(spec, exchanged):
+    """A mixture's default dispatch (`'auto'`) keeps an expert mesh's experts in place, exchanging the
+    tokens (`ragged_all_to_all`), and gathers no expert's weights; on a mesh without an expert axis it
+    dispatches globally, as `'global'` does (ledger 1711: on a 4-way expert mesh, the global dispatch
+    gathered every expert's weights, 200,704 bytes of eight, where the exchange moved 4,096)."""
+    x, weights, indices = map(jnp.asarray, routing_case(24, 8, 2, skewed=False))
+    layer = ExpertMLP(8, 12, 8)
+    parameters = nn.unbox(layer.init(jax.random.key(19), x, weights, indices))
+    with jax.set_mesh(spec.build()):
+        ran = primitives(jax.make_jaxpr(layer.apply)(parameters, x, weights, indices).jaxpr)
+        named = layer.clone(dispatch="exchange" if exchanged else "global")
+        named = primitives(jax.make_jaxpr(named.apply)(parameters, x, weights, indices).jaxpr)
+    assert ("ragged_all_to_all" in ran) == exchanged
+    assert ran == named
+
+
 def test_exchange_preserves_placed_expert_and_width_gradients():
     x, weights, indices = map(jnp.asarray, routing_case(24, 8, 2, skewed=False))
     model = ExpertMLP(8, 16, 8)
@@ -108,7 +127,9 @@ def test_exchange_preserves_placed_expert_and_width_gradients():
     x, weights, indices = (jax.device_put(value, token_spec) for value in (x, weights, indices))
     specs = ((NamedSharding(mesh, P()), token_spec), (parameter_specs, token_spec, token_spec))
     with jax.set_mesh(mesh):
-        expected = jax.jit(jax.value_and_grad(functools.partial(objective, model, indices),
+        # The global dispatch named: the default exchanges on this expert mesh.
+        named = model.clone(dispatch='global')
+        expected = jax.jit(jax.value_and_grad(functools.partial(objective, named, indices),
                             (0, 1, 2), has_aux=True), out_shardings=specs)(parameters, x, weights)
         actual = jax.jit(jax.value_and_grad(functools.partial(
             objective, model.clone(dispatch='exchange'), indices),
