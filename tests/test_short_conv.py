@@ -330,3 +330,44 @@ def test_the_conv_keeps_the_kernel_contract_on_a_mesh_that_splits_rows(axis):
     rows, whole = PartitionSpec(axis), PartitionSpec()
     assert_runs_per_shard(gradients, draw, [rows, whole, whole, rows, rows, rows, rows, rows], mesh,
                           f"conv split over {axis}", seeds=SHARDED_SEEDS, truth_fn=exact)
+
+
+@pytest.mark.parametrize("taps", [2, 4])
+def test_a_document_that_enters_a_history_convolves_as_if_it_followed_it(taps):
+    """`entered_conv1d` of packed documents, each entering one of the histories `held` holds or none, gives
+    each document's tokens what `xla_conv1d` gives them where the history stands right before the document
+    in a row of its own, bit for bit; a document entering none, what it gives a document alone. The
+    histories are the documents' own last tokens as `document_tails` reads them, zeros in front of a
+    document shorter than the conv reads behind."""
+    from dew.nn.linear import document_tails, entered_conv1d
+
+    rng = np.random.default_rng(taps)
+    channels, width = 6, taps - 1
+    lengths = [(5, 0), (3, 1), (1, 1), (2, 0), (4, 4)]
+    tokens = sum(length for length, _ in lengths)
+    x = jnp.asarray(rng.standard_normal((1, tokens + 2, channels)), jnp.float32)
+    kernel = jnp.asarray(rng.standard_normal((channels, taps)), jnp.float32)
+    documents = np.concatenate([*(np.full(length, number, np.int32)
+                                  for number, (length, _) in enumerate(lengths, start=1)),
+                                np.zeros(2, np.int32)])
+    valid = documents > 0
+    held = jnp.asarray(rng.standard_normal((1, len(lengths), width, channels)), jnp.float32)
+    entered = jnp.asarray([[slot - 1 if slot else -1 for _, slot in lengths]], jnp.int32)
+    out = entered_conv1d(x, kernel, valid[None], documents[None], held, entered)
+    begin = 0
+    for number, (length, slot) in enumerate(lengths):
+        own = x[:, begin:begin + length]
+        behind = held[:, slot - 1] if slot else jnp.zeros((1, width, channels), jnp.float32)
+        alone = xla_conv1d(jnp.concatenate([behind, own], axis=1), kernel)[:, width:]
+        np.testing.assert_array_equal(np.asarray(out[:, begin:begin + length]), np.asarray(alone),
+                                      err_msg=str(number))
+        begin += length
+    assert not np.any(np.asarray(out[:, tokens:]))
+    tails = np.asarray(document_tails(x, valid[None], documents[None], width, len(lengths)))
+    begin = 0
+    for number, (length, _) in enumerate(lengths):
+        expected = np.zeros((width, channels), np.float32)
+        kept = min(length, width)
+        expected[width - kept:] = np.asarray(x[0, begin + length - kept:begin + length])
+        np.testing.assert_array_equal(tails[0, number], expected, err_msg=str(number))
+        begin += length
