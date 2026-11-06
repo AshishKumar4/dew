@@ -4,11 +4,12 @@
 
 import dataclasses
 from collections.abc import Mapping
+from types import MappingProxyType
 
 from flax import linen as nn
 
 from dew import _records
-from dew.interop.weights import in_params
+from dew.interop.layouts import Route, Table, mapped
 from dew.nn.activations import HIDDEN_ACT
 from dew.registry import Record, towers
 
@@ -20,9 +21,10 @@ from .common import (
     TowerLayout,
     _vision_section,
     activation_name,
-    block_tensor_path,
+    block_routes,
     head_width,
     rope_base,
+    tensor_routes,
 )
 from .vit import MergeProjector, VisionTransformer, ViTLayout
 
@@ -119,18 +121,12 @@ _BLOCK_NORMS = {"operator_norm": "input_layernorm", "ffn_norm": "post_attention_
 _HEAD_NORMS = {"q_layernorm": "q_norm", "k_layernorm": "k_norm"}
 
 
-def lfm3_vl_vision_path(hf_name: str) -> tuple[str, ...]:
-    """One LFM3-VL trunk tensor name, its `vision_tower.` prefix off, into its path in the trunk tree;
-    anything else raises ValueError."""
-    parts = hf_name.split(".")
-    path = _TENSORS.get(hf_name) or block_tensor_path(parts, _BLOCK_MAPS, prefix="layers", norm_bias=False,
-                                                      norms=_BLOCK_NORMS)
-    if (path is None and len(parts) == 5 and parts[0] == "layers" and parts[1].isdigit()
-            and parts[2] == "self_attn" and parts[3] in _HEAD_NORMS and parts[4] == "weight"):
-        path = (f"blocks_{parts[1]}", "self_attn", _HEAD_NORMS[parts[3]], "scale")
-    if path is None:
-        raise ValueError(f"unknown tensor name {hf_name!r}")
-    return path
+_LFM3_ROUTES = Table(
+    *tensor_routes(_TENSORS),
+    block_routes(_BLOCK_MAPS, prefix="layers", norm_bias=False, norms=_BLOCK_NORMS),
+    Route("layers.{index}.self_attn.{norm}.weight", "params/blocks_{index}/self_attn/{norm}/scale",
+          MappingProxyType({"norm": mapped(_HEAD_NORMS)})))
+"""An LFM3-VL trunk's tensor names past `vision_tower.`, both ways."""
 
 
 _INTEGERS = ("hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads",
@@ -186,7 +182,7 @@ def translate_lfm3_vl_projector_config(hf_config: Mapping[str, object], text_wid
     }}
 
 
-Lfm3VlVision.checkpoint = TowerLayout("vision_tower.", in_params(lfm3_vl_vision_path))
+Lfm3VlVision.checkpoint = TowerLayout("vision_tower.", _LFM3_ROUTES)
 Lfm3VlProjector.checkpoint = ProjectorLayout("multi_modal_projector.", {
     "layer_norm.weight": ("norm", "scale"), "layer_norm.bias": ("norm", "bias"),
     "linear_1.weight": ("fc1", "kernel"), "linear_1.bias": ("fc1", "bias"),

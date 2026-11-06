@@ -3,7 +3,6 @@ rotate-half rotary, a sliding window on every layer when it states one, and
 an ungated feed-forward, every map biased under `use_bias`."""
 
 from collections.abc import Mapping
-from functools import partial
 
 from dew import _records
 from dew.interop.decoder_parts import (
@@ -13,10 +12,11 @@ from dew.interop.decoder_parts import (
     DecoderFields,
     base_config,
     hf_ungated,
-    renamed_name,
-    renamed_path,
+    reads,
+    spelled,
     ungated_mlp,
 )
+from dew.interop.layouts import ConfigLayout, ConfigPart
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
@@ -76,9 +76,9 @@ def _matches(fields: CausalTransformer) -> bool:
 
 
 STARCODER2 = DecoderFamily(
-    ('starcoder2',), _starcoder2_config, _matches, 'starcoder2', 'Starcoder2ForCausalLM', _starcoder2_export,
-    weight_path=partial(renamed_path, GPT_MLP),
-    export_path=partial(renamed_name, GPT_MLP),
+    ('starcoder2',), ConfigLayout(ConfigPart(reads(_starcoder2_config), _starcoder2_export)), _matches,
+    'starcoder2', 'Starcoder2ForCausalLM',
+    routes=spelled(GPT_MLP),
     preserve_source_layout=False,
     padding_idx=True,
     defaults={'max_position_embeddings': 4096},

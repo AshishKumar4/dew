@@ -10,11 +10,11 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
-from dew.interop.weights import in_params
+from dew.interop.layouts import Table
 from dew.nn.dense import Dense
 from dew.nn.precision import float32_dot_general
 from dew.nn.scan_orders import patchify
-from dew.nn.text_encoders import _encoder_layer_path
+from dew.nn.text_encoders import encoder_layer_routes
 from dew.nn.vision.vit import LearnedPositions, MergeProjector, SpecialTokens, VisionTransformer, ViTLayout
 from dew.registry import Record
 
@@ -28,6 +28,7 @@ from .common import (
     _vision_section,
     head_width,
     rope_base,
+    tensor_routes,
     trunk_geometry,
 )
 
@@ -151,13 +152,9 @@ _LLAMA4_VISION_TENSORS = {
 }
 
 
-def llama4_vision_path(hf_name: str) -> tuple[str, ...] | None:
-    """One Llama 4 vision tensor name into its path in a trunk tree."""
-    path = _LLAMA4_VISION_TENSORS.get(hf_name) or _encoder_layer_path(
-        hf_name.split("."), "model", _LAYER_NORMS, _LAYER_PROJECTIONS, block="blocks")
-    if path is None:
-        raise ValueError(f"unknown tensor name {hf_name!r}")
-    return path
+_LLAMA4_ROUTES = Table(*tensor_routes(_LLAMA4_VISION_TENSORS),
+                       encoder_layer_routes("model", _LAYER_NORMS, _LAYER_PROJECTIONS, block="blocks"))
+"""A Llama 4 trunk's tensor names, both ways."""
 
 
 def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Record:
@@ -208,6 +205,6 @@ def translate_llama4_projector_config(text_width: int) -> Record:
     return {"class": "llama4", "fields": {"text_width": int(text_width)}}
 
 
-Llama4Vision.checkpoint = TowerLayout("vision_model.", in_params(llama4_vision_path))
+Llama4Vision.checkpoint = TowerLayout("vision_model.", _LLAMA4_ROUTES)
 Llama4Projector.checkpoint = ProjectorLayout("multi_modal_projector.",
                                              {"linear_1.weight": ("linear", "kernel")})

@@ -437,6 +437,17 @@ def _encoder_layer_path(parts, root: str, norms: Mapping[str, str] = _NORMS,
     return block_tensor_path(parts, maps, prefix=f"{root}.layers", block=block, norms=norms)
 
 
+def encoder_layer_routes(root: str, norms: Mapping[str, str] = _NORMS,
+                         projections: Mapping[str, str] = _PROJECTIONS, *, block: str = "layers"):
+    """`_encoder_layer_path`'s names both ways (`dew.nn.vision.common.block_routes`): a `clip_layer`'s
+    two layer norms, biased attention maps and biased fc1/fc2 MLP under `<root>.layers.N`."""
+    from dew.nn.vision.common import block_routes
+
+    maps = {**{("self_attn", source): ("self_attn", name) for source, name in projections.items()},
+            **{("mlp", source): ("mlp", name) for source, name in _MLP.items()}}
+    return block_routes(maps, prefix=f"{root}.layers", block=block, norms=norms)
+
+
 def _tower_path(hf_name: str, prefix: str,
                 tensors: Mapping[str, tuple[str, ...]], block: str = "layers") -> tuple[str, ...] | None:
     """`hf_name`, a tensor of the tower nested under `prefix`, into its path in
