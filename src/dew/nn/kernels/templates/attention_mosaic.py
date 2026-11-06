@@ -63,6 +63,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     bundle,
     bundle_of,
     extents,
+    fewer_rows,
     launch_scope,
     layouts,
     query_rows,
@@ -93,7 +94,8 @@ def _column_blocks_of(family: mosaic.Family, dtype, value_width: int) -> list[in
 def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held: int, walked: int,
                                                 tiles: Callable[[int, int, int], Config],
                                                 fits: Callable[[Config], bool], *,
-                                                overlapped: bool, walks: Callable = extents) -> Config | None:
+                                                overlapped: bool, walks: Callable = extents,
+                                                rows: int | None = None) -> Config | None:
     """A launch's config from its family's facts and the call's extents (design §7), no space ranked: its
     consumers the family's (`Family.consumers`) where its step `overlapped` (a softmax between its products,
     which runs under its partner's products as the consumers take turns, FlashAttention-3's), else one (a
@@ -109,8 +111,9 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     where its family's products read operands from registers, a tile its transposed streams staged at the
     family's own swizzle do not fit fits them staged narrowest (`Tiles.narrow`), a wide stage's bandwidth
     traded for the larger tile; fewer consumers where no tile of the family's count holds the block (a GPU
-    of a smaller one). `tiles(rows, walked, consumers)` builds the config. None where no tile fits."""
-    rows = query_rows(family, dtype, held)
+    of a smaller one). `tiles(rows, walked, consumers)` builds the config; `rows` a consumer's where given
+    (a backward's `fewer_rows`). None where no tile fits."""
+    rows = query_rows(family, dtype, held) if rows is None else rows
     most = family.consumers if overlapped else 1
     for consumers in range(max(1, min(most, -(-held // rows))), 0, -1):
         for extent in walks(family, dtype, walked):
@@ -119,6 +122,12 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
                 if fits(config):
                     return config
     return None
+
+
+def _sides(rows: int, family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
+    """A backward's walked tile of a consumer's `rows` below a role's (`fewer_rows`): whole multiples of them
+    and of its swizzled rows, a launch's walked tile the other's consumer rows (`extents`' bounds)."""
+    return tuple(side for side in walked_extents(family, dtype, extent) if side % rows == 0)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1198,17 +1207,23 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # The fewest dK/dV programs a key block's widths split among whose share of the sums its consumer's
         # registers hold (`BackwardTiles.columns`: a width of 256's whole dK and dV sums pass them).
         # Its logits' queries a stream of their own, else where that passes the block staged a step
-        # (`BackwardTiles.staged_logits`).
-        for columns in (1, 2, 4):
-            for staged in (False, True):
-                def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged
-                          ) -> BackwardTiles:
-                    return BackwardTiles(walked, rows, 2, consumers, family=family.name, columns=columns,
-                                         staged_logits=staged, **dkv)
+        # (`BackwardTiles.staged_logits`). Where no tile of a role's rows holds the block, fewer rows a
+        # consumer on a family whose warps arrange themselves by them (`fewer_rows`, `bundle_of`), each
+        # launch's tiles that many rows a side (an A100's heads 256 wide: every 64-row tile's two stages of
+        # queries and output cotangents beside its resident keys and values past its 166,912 bytes, the
+        # two launches at 32 x 32 150,560, et-bwd256sm80).
+        for rows in (None, *fewer_rows(family)):
+            walks = extents if rows is None else functools.partial(_sides, rows)
+            for columns in (1, 2, 4):
+                for staged in (False, True):
+                    def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged
+                              ) -> BackwardTiles:
+                        return BackwardTiles(walked, rows, 2, consumers, family=family.name, columns=columns,
+                                             staged_logits=staged, **dkv)
 
-                if config := _derived(family, query.dtype, key.shape[1], query.shape[1], tiles, fits,
-                                      overlapped=False):
-                    return config
+                    if config := _derived(family, query.dtype, key.shape[1], query.shape[1], tiles, fits,
+                                          overlapped=False, walks=walks, rows=rows):
+                        return config
         return None
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
