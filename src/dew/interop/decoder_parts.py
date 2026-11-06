@@ -1290,7 +1290,8 @@ def reads(translate: Callable[[Mapping[str, object], set[str]], DecoderFields]) 
     """A reader of a whole record (`translate`, the source config and the keys read) as a config part's
     read (`ConfigPart`)."""
     def read(hf_config: Mapping[str, object], used: set[str], record: dict[str, object]) -> dict[str, object]:
-        translated = translate(hf_config, used)
+        # The reader's own record where it is the first part, kept typed as it builds it (`NativeFields`).
+        translated = cast(dict[str, object], translate(hf_config, used))
         if not record:
             return translated
         record.update(translated)
