@@ -92,6 +92,14 @@ class WgmmaIssuer(mosaic.Issuer):
 
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
+    def summed_columns(self, columns: int) -> int:
+        # A step's product summed apart 128 columns at a time, a fresh accumulator of 64 registers a thread
+        # beside the running sum: a whole 256-column one beside it held no tile (272 registers at FP8's
+        # 128 x 256 x 128), so an exactly summed product took 128-column tiles, 828 us at FP8's
+        # 8192 x 4096 x 14336 where its plain 256-column tile took 647 and cuBLASLt 601 (FS-3620-STAGES2-h100;
+        # row 3620). Each part's columns of the stage are whole swizzled tiles.
+        return min(columns, 128)
+
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
         if interpret:
             return jnp.dot(lhs, rhs[...], preferred_element_type=jnp.float32)
