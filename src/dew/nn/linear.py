@@ -246,8 +246,9 @@ def _stream_order(valid):
 def entered_conv1d(x, kernel, valid, documents, held, entered, *, bias=None, parts=None, dtype=None,
                    activation: bool = True):
     """`causal_conv1d` of packed documents of which each convolves after a history of its own: a tap that
-    reaches before its document's first real token reads `held` `[B, D, K - 1, C]` at the slot the
-    document enters (`entered` `[B, D]`, -1 for none, which reads the zeros `causal_conv1d` reads), where
+    reaches before its document's first real token reads `held` `[B, D, K - 1, C]` at the document the
+    document enters (`entered` `[B, D]`, numbered from 1 as `dew.batch.Entered` numbers them, 0 for none,
+    which reads the zeros `causal_conv1d` reads), where
     `documents` `[B, S]` numbers each token's document from 1 (0 on padding) and `valid` marks the real
     tokens, each document's a run of them: the questions of a row over one state, each convolving after
     its state's last `K - 1` tokens (`document_tails`; row 1506). XLA's arithmetic, `xla_conv1d`'s."""
@@ -261,7 +262,7 @@ def entered_conv1d(x, kernel, valid, documents, held, entered, *, bias=None, par
     # Each real token's count of the real tokens before it in its document, and the history slot it enters.
     begins = real & (jnp.pad(documents, ((0, 0), (1, 0)), constant_values=-1)[:, :-1] != documents)
     rank = document_ranks(real, begins)
-    slot = jnp.take_along_axis(jnp.asarray(entered, jnp.int32), jnp.maximum(documents - 1, 0), axis=1)
+    slot = jnp.take_along_axis(jnp.asarray(entered, jnp.int32), jnp.maximum(documents - 1, 0), axis=1) - 1
     slot = jnp.where(documents > 0, slot, -1)
     rows = jnp.arange(batch)[:, None]
     history = jnp.asarray(held).astype(wide)

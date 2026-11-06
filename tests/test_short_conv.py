@@ -348,7 +348,7 @@ def test_a_document_that_enters_a_history_convolves_as_if_it_followed_it(taps):
                                   for number, (length, _) in enumerate(lengths, start=1)),
                                 np.zeros(2, np.int32)])
     valid = documents > 0
-    entered = jnp.asarray([[slot - 1 if slot else -1 for _, slot in lengths]], jnp.int32)
+    entered = jnp.asarray([[slot for _, slot in lengths]], jnp.int32)
 
     def draw(seed):
         rng = np.random.default_rng(seed)
