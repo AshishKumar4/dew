@@ -1007,18 +1007,29 @@ def key_block(call: Call, held: Callable[[int], Held], staged: Callable[[int], t
     widest, unit = family.depths(jnp.bfloat16)[0], family.narrowest_columns(jnp.bfloat16)
     if streamed is None:
         return fitting_block(call, held, staged, widest, unit)
+    resident = functools.partial(_resident, call, held, staged, streamed)
+    return max(_key_blocks(call), key=lambda block: (resident(block), block))
 
-    def resident(block: int) -> int:
-        staging, landing = staged(block)
-        registers = held(block).registers(family, _addressed(staging, landing))
-        if registers > family.registers(1):
-            return 0
-        _, scope, _, _ = shared_allocation(call, streamed(block), staging, landing)
-        found = _planned_launch(call, scope, registers, floor=1, most=1)
-        return found.programs if found else 0
 
-    blocks = [block for block in whole_blocks(widest, unit) if call.width % block == 0]
-    return max(blocks, key=lambda block: (resident(block), block))
+def _key_blocks(call: Call) -> list[int]:
+    """The key blocks a walk under a decay a key dimension may take (`key_block`), each dividing the keys."""
+    family = call.family
+    widest, unit = family.depths(jnp.bfloat16)[0], family.narrowest_columns(jnp.bfloat16)
+    return [block for block in whole_blocks(widest, unit) if call.width % block == 0]
+
+
+def _resident(call: Call, held: Callable[[int], Held], staged: Callable[[int], tuple],
+              streamed: Callable[[int], dict], block: int) -> int:
+    """The programs a multiprocessor holds of a walk at key block `block` (`_planned_launch`, at its register
+    model and its shared memory), none past a thread's registers."""
+    family = call.family
+    staging, landing = staged(block)
+    registers = held(block).registers(family, _addressed(staging, landing))
+    if registers > family.registers(1):
+        return 0
+    _, scope, _, _ = shared_allocation(call, streamed(block), staging, landing)
+    found = _planned_launch(call, scope, registers, floor=1, most=1)
+    return found.programs if found else 0
 
 
 def _intra_held(call: Call, block: int, outputs: int = 1) -> Held:
@@ -1111,12 +1122,22 @@ def _intra(q, k, g, beta, taken, call: Call, *, scale: float, solves: bool):
     block on an A100, whose mma.sync then ran them as two launches of 0.87 ms each (M-JS-7). Where the pairs
     do not factor, each sub-chunk's own pairs taking their own decays besides, each output is a launch of its
     own (no model calls one: every model's Kimi delta attention declares its floor)."""
-    if solves and not call.factored:
+    if solves and not (call.factored and _intra_merges(call)):
         scores, hi, lo = _intra_walk(q, k, g, beta, taken, call, scale=scale, products=("scores",))
         (system,) = _intra_walk(q, k, g, beta, taken, call, scale=scale, products=("system",))
         return scores, system, hi, lo
     return _intra_walk(q, k, g, beta, taken, call, scale=scale,
                        products=("scores", "system") if solves else ("scores",))
+
+
+def _intra_merges(call: Call) -> bool:
+    """Whether the scores and the system take one intra walk (`_intra_walk`): a key block at which a
+    multiprocessor holds a program of it, both sums in shared memory (an A100's or an H100's; an sm86's 99
+    KB held none of a narrow key dimension's, whose outputs then walk a launch each)."""
+    resident = functools.partial(_resident, call, functools.partial(_intra_held, call, outputs=2),
+                                 functools.partial(_intra_staged, call, products=("scores", "system")),
+                                 functools.partial(_intra_streamed, call, queries=True))
+    return any(resident(block) for block in _key_blocks(call))
 
 
 def _shifted_keys(call: Call, tiles, keys: jax.Array, prefix: tuple):
