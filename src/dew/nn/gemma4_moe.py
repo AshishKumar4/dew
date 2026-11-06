@@ -75,7 +75,7 @@ class Gemma4Experts(nn.Module):
     out_features: int
     activation: GatedActivation = 'geglu'
     implementation: str = 'auto'
-    dispatch: str = 'global'
+    dispatch: str = 'auto'
     capacity_factor: float | None = None
     norm_eps: float = 1e-6
     scale_offset: bool = False

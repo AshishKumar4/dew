@@ -47,7 +47,7 @@ class GptOssExperts(nn.Module):
     intermediate_size: int
     num_local_experts: int
     implementation: str = 'auto'
-    dispatch: str = 'global'
+    dispatch: str = 'auto'
     capacity_factor: float | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -116,7 +116,7 @@ class GptOssMLP(nn.Module):
     num_local_experts: int
     num_experts_per_tok: int
     implementation: str = 'auto'
-    dispatch: str = 'global'
+    dispatch: str = 'auto'
     capacity_factor: float | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
