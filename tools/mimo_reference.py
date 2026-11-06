@@ -2,7 +2,8 @@
 
 The fixtures tests/test_vision.py and tests/test_mimo_audio.py hold Dew to. The reference is
 XiaomiMiMo/MiMo-V2.6-Pro-MOPD's `modeling_mimo_v2.py`, fetched at `MIMO_REVISION` (`mimo_module`); the
-log mel frames are torchaudio's, recorded by tools/torchaudio_mel_worker.py. Each array file stores fp32 and float64 references, IEEE products.
+log mel frames are torchaudio's, recorded by tools/torchaudio_mel_worker.py. Each array file stores fp32
+and float64 references, IEEE products.
 
 - `mimo-vision-tiny`: the reference config, the ViT's and merger's tensors as the release names them,
   packed pixels with each row's grid, and `refs.npz`: the trunk (the merger's input) and the merger's
