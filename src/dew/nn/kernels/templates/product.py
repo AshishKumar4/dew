@@ -45,14 +45,20 @@ def declared(compute: Dtype, precision: PrecisionLike, *, outputs: tuple = (),
     their fp32 products are TF32, which only the default precision asks for."""
     compute = jnp.dtype(compute)
     above = not asks_default_precision(precision, configured=True)
-    return Product(compute, compute in EIGHT or promoted(above=above, outputs=outputs),
+    return Product(compute, compute in EIGHT or promoted(above=above, outputs=outputs, compute=compute),
                    _refusal(compute, operands, above))
 
 
-def promoted(*, above: bool, outputs: tuple) -> bool:
-    """Whether a product asked for above the default precision (`above`) promotes each depth step's
-    partial apart: where an output is fp32, whose IEEE sums a 16-bit output's one rounding hides."""
-    return above and jnp.dtype(jnp.float32) in {jnp.dtype(dtype) for dtype in outputs}
+def promoted(*, above: bool, outputs: tuple, compute: Dtype | None = None) -> bool:
+    """Whether a product promotes each depth step's partial apart (`exact_sums`): where an output is fp32,
+    whose sums a 16-bit output's one rounding hides, and the product is asked above the default precision
+    (`above`) or multiplies 16-bit operands (`compute`). A tensor core adds each instruction's products
+    into one fp32 accumulator in order, and its error grows with the depth: every Dew launch's fp32 sum of
+    bf16 products, Triton's and the template's at four tiles alike, was 1.661x XLA's RMS error from
+    float64 at a depth of 128 and 3.88x at 512 on an A100 (M-NS-1, NS4331-VALUE4-a100; row 4331)."""
+    if jnp.dtype(jnp.float32) not in {jnp.dtype(dtype) for dtype in outputs}:
+        return False
+    return above or (compute is not None and jnp.dtype(compute) in HALF)
 
 
 def _refusal(compute: jnp.dtype, operands: tuple, above: bool) -> str | None:
