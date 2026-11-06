@@ -805,6 +805,8 @@ def _rmtrees(paths: Sequence[epath.Path], failures: list[OSError]) -> None:
     for path in paths:
         try:
             path.rmtree()
+        except FileNotFoundError:
+            continue
         except OSError as error:
             failures.append(error)
 
@@ -1360,6 +1362,8 @@ class Checkpoints:
         # a save Orbax refuses leaves the step's committed record as it was, and one it takes replaces it.
         self._staged[step] = (copy.deepcopy(custom),
                               tuple(name for name in (*ROLES, ONE_ITEM) if name in payloads))
+        # Orbax may delete a step the cut's deletion is still in (its retention's `_finalize`): one at a time.
+        self._deleted()
         try:
             with region("checkpoint.submit"):
                 persistent.save(step, args=ocp.args.Composite(**{
@@ -1401,7 +1405,8 @@ class Checkpoints:
         short reads as cut, and its leftovers go at the first projection of a later process. It runs where
         every process of the pool does, in `save`, `wait` and `close`, before the store's collection
         reads the steps' references (`_frozen`). Process 0 deletes behind the pool, which waits on it for
-        the cut alone: `wait`, `close` and the next projection join the deletion (`_deleted`)."""
+        the cut alone: `wait`, `close`, the next projection and the next save's submission, which may
+        delete a step the deletion is in, join it (`_deleted`)."""
         self._deleted()
         persistent = self._manager
         plan, self._plan = self._plan, None
