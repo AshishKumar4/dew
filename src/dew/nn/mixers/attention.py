@@ -135,9 +135,9 @@ def mixed_attention_refusal(ctx: MixerContext, *, alibi: bool, bidirectional_ima
         "attention sinks": ctx.attention_sinks,
         "ALiBi": alibi,
         "keys shared from another layer": ctx.kv_shared,
-        "bidirectional attention, image groups or blocks": (not ctx.causal or bidirectional_images
-                                                            or bidirectional_blocks),
+        "bidirectional attention": not ctx.causal,
     }
+    del bidirectional_images, bidirectional_blocks
     named = [reason for reason, refused in refusals.items() if refused]
     return None if not named else ", ".join(named)
 
@@ -1366,11 +1366,16 @@ class CausalSelfAttention(nn.Module):
             self.put_variable("cache", TABLE, self.get_variable("cache", TABLE).at[admitted.slots].set(
                 admitted.tables, mode="drop"))
         token_rows = jnp.concatenate([jnp.arange(rows), jnp.repeat(admitted.slots, width)])
-        store.write_tokens(key[0], value[0], token_rows, positions)
+        # The call's tokens' groups of the fields the layer reads whole, kept beside their keys (`GROUPS`).
+        groups = {name: jnp.asarray(getattr(metadata, name), jnp.int32)[0] for name in self._group_fields()
+                  if getattr(metadata, name) is not None}
+        store.write_tokens(key[0], value[0], token_rows, positions, groups)
         prompt = positions[rows:].reshape(pieces, width)
         index.value = (index.value + (positions[:rows] >= 0)).at[admitted.slots].set(
             admitted.cursors + jnp.sum(prompt >= 0, axis=1, dtype=jnp.int32), mode="drop")
-        if self._one_work_list(store, query):
+        # A piece reading its groups whole sees its group's keys past its own slot (`visibility_mask`), which
+        # the work list's spans, each its query's slot, do not state: its keys by the mask below.
+        if not groups and self._one_work_list(store, query):
             return self._worked(store, query, index.value, positions[:rows], prompt, admitted.slots)
         if self._pages(store, query[0, :rows], windowed=False):
             decoded = store.decode(query[0, :rows], held_reads(index.value, positions[:rows]),
@@ -1383,12 +1388,18 @@ class CausalSelfAttention(nn.Module):
             # A padding piece's row is past the cache's; it reads row 0 and is never drawn from.
             held = jnp.where(admitted.slots < rows, admitted.slots, 0)
             keys, values = store.read_rows(held)
-            keep = causal_attention_mask(prompt, self.ctx.max_seq_len,
-                                         key_valid=filled_slots(index.value[held], self.ctx.max_seq_len))
+            real, slots = filled_slots(index.value[held], self.ctx.max_seq_len), prompt
+            key_groups = {name: store.read_groups(name)[held] for name in groups}
         else:
             # A piece that starts its row reads only its own keys, in its own order.
             keys, values = (x[0, rows:].reshape(pieces, width, *x.shape[2:]) for x in (key, value))
-            keep = ((prompt[:, None, :, None] >= prompt[:, None, None, :]) & (prompt >= 0)[:, None, None, :])
+            real = prompt >= 0
+            slots = jnp.where(real, jnp.arange(width, dtype=jnp.int32), -1)
+            key_groups = {name: held[rows:].reshape(pieces, width) for name, held in groups.items()}
+        # Each query's keys up to its own slot, widened by the groups it reads whole as a prefill's are
+        # (`visibility_mask`: a block or an image holding its key runs on to its end).
+        keep = visibility_mask(width, keys.shape[1], True, None, key_valid=real, query_slots=slots,
+                               **key_groups)
         # A padding query reads one key, so its (unused) output stays finite.
         keep = keep | ((prompt < 0)[:, None, :, None] & (jnp.arange(keep.shape[-1]) == 0))
         prefilled = scaled_dot_product_attention(
