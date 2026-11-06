@@ -258,9 +258,10 @@ class WandbTracker(_OwnedTracker):
         if self._run is None:
             import wandb
 
-            settings = None if not self.shared else wandb.Settings(
-                mode="shared", x_primary=self.primary, x_label=self.label,
-                **({} if self.primary else {"x_update_finish_state": False}))
+            settings = (None if not self.shared
+                        else wandb.Settings(mode="shared", x_primary=True, x_label=self.label) if self.primary
+                        else wandb.Settings(mode="shared", x_primary=False, x_label=self.label,
+                                            x_update_finish_state=False))
             self._run = wandb.init(
                 project=self.project, name=self.name, entity=self.entity,
                 config=self.config, id=self.id, resume="allow",
