@@ -177,7 +177,7 @@ class SlotSource(SourceKind):
         # it is another than that prompt, and the calibration where the task has one.
         stated_release(root, None if layout == prompt else layout,
                        bundle.calibration if bundle.calibration != Calibration() else None,
-                       max_length=layout.max_len)
+                       max_length=layout.max_len, numerics=bundle.numerics)
 
     @staticmethod
     def readout(bundle: PretrainedDecision) -> Mapping[str, np.ndarray]:

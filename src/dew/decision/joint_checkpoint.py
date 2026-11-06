@@ -174,4 +174,5 @@ def save(bundle: "PretrainedDecision", directory: str | Path, *,
     write_file(head_tensors(bundle.head_variables["params"]), root / HEAD_WEIGHTS, {"format": "pt"})
     # The release's own: the layout the rows are laid out by, which the head's files state none of, and a
     # calibration, which they hold none of.
-    stated_release(root, bundle.layout, bundle.calibration if bundle.calibration != Calibration() else None)
+    stated_release(root, bundle.layout, bundle.calibration if bundle.calibration != Calibration() else None,
+                   numerics=bundle.numerics)

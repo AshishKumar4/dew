@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 from dew.decision.calibration import Calibration
 from dew.decision.layout import Layout
+from dew.nn.precision import Numerics
 from dew.registry import from_record, to_record
 
 if TYPE_CHECKING:
@@ -25,17 +26,22 @@ if TYPE_CHECKING:
 
 
 def stated_release(directory: Path, layout: Layout | None = None, calibration: Calibration | None = None, *,
-                   max_length: int | None = None) -> None:
+                   max_length: int | None = None, numerics: Numerics | None = None) -> None:
     """Write the export in `directory`'s release (`dew.config.Release`) with the decision facts its format
-    cannot state: the `layout` whole, its `max_length` alone where its format derives the rest of it, and
-    the `calibration` where it holds more than the format's own files (None states none). The export's task
-    declaration stays as its backbone's writer wrote it (`Pretrained.save`)."""
+    cannot state: the `layout` whole, its `max_length` alone where its format derives the rest of it, the
+    `calibration` where it holds more than the format's own files (None states none), and the `numerics`
+    the task traces under, with the dtype they compute in, which its loader builds the task under
+    (`dew.interop.release.released`). A task declaration its backbone's writer wrote (`Pretrained.save`)
+    stays as it wrote it."""
     from dew.config.release import Release
+    from dew.registry import dtype_name
 
     held = Release.load(directory) or Release()
     stated = None if layout is None else _record(to_record(layout, Layout))
     calibrated = None if calibration is None else _record(to_record(calibration, Calibration))
-    replace(held, layout=stated, max_length=max_length, calibration=calibrated).write(directory)
+    task = held.task if held.task is not None or numerics is None else {
+        "numerics": to_record(numerics, Numerics), "dtypes": {"compute": dtype_name(numerics.dtypes.compute)}}
+    replace(held, task=task, layout=stated, max_length=max_length, calibration=calibrated).write(directory)
 
 
 def released_decision(directory: Path, layout: Layout, calibration: Calibration, *,

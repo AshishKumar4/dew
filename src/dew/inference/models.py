@@ -28,10 +28,11 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew._records import json_value, record as named_fields, text as named
-from dew.batch import Variables, unboxed
+from dew.batch import PARAMETER_ROOTS, Variables
 from dew.inference.tasks import SavedRunTask, saved_model, saved_settings
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, flatten, read_weights, save_sharded, unflatten
 from dew.nn.precision import Numerics
+from dew.nn.protocols import ComputesIn
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -109,8 +110,11 @@ class SavedModel(SavedRunTask):
         stored = None if param_dtype is None else jnp.dtype(resolve_dtype(param_dtype))
         variables = unflatten(read_weights(directory))
         if stored is not None:
-            variables = jax.tree.map(lambda leaf: leaf.astype(stored) if jnp.issubdtype(
-                leaf.dtype, jnp.floating) else leaf, variables)
+            # Its parameters stored as asked, its other state as written, as a run's load stores them
+            # (`PARAMETER_ROOTS`, `Checkpoints.materialized`).
+            variables = {name: jax.tree.map(lambda leaf: leaf.astype(stored) if jnp.issubdtype(
+                leaf.dtype, jnp.floating) else leaf, part) if (name,) in PARAMETER_ROOTS else part
+                         for name, part in variables.items()}
         numerics = None if task.get("numerics") is None else from_record(
             Numerics, named_fields(task["numerics"], "numerics"), dtypes=False)
         return cls(model, place(variables, mesh, layout),
@@ -121,22 +125,22 @@ class SavedModel(SavedRunTask):
         """Write this model as a release: its variables as safetensors, `<collection>/<path>` the name of
         each leaf, read home a tensor at a time (`save_sharded`), and the release record beside them
         (`dew.config.Release`): the objective that trained it, its model's record and settings, and the
-        numerics and dtype it computes in, which `from_pretrained` rebuilds it from."""
+        numerics and the dtype it states it computes in, which `from_pretrained` rebuilds it from."""
         from dew.config.release import Release
         from dew.registry import ModelConfig, dtype_name, import_path, record_fields, to_record
 
         root = Path(directory)
         root.mkdir(parents=True, exist_ok=True)
-        stated = jax.tree.leaves(unboxed(self.variables))
-        floating = [leaf.dtype for leaf in stated if jnp.issubdtype(leaf.dtype, jnp.floating)]
-        compute = getattr(self.model, "dtype", None) or jnp.result_type(*floating)
+        # The dtype the model states it computes in, which its record holds too; one that states none
+        # computes in what its inputs and parameters make, which no record of its storage says.
+        compute = self.model.dtype if isinstance(self.model, ComputesIn) else None
         save_sharded(flatten(self.variables), root, max_shard_size)
         Release(task={
             "objective": import_path(self.objective),
             "model": json_value(to_record(ModelConfig.from_model(self.model), ModelConfig), "model"),
             "settings": json_value(record_fields(self.settings, type(self.settings)), "settings"),
             "numerics": None if self.numerics is None else to_record(self.numerics, Numerics),
-            "dtypes": {"compute": dtype_name(compute)}}).write(root)
+            "dtypes": {} if compute is None else {"compute": dtype_name(compute)}}).write(root)
 
 
 class ReleasesModel:

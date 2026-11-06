@@ -120,7 +120,9 @@ class PretrainedDecision(Pretrained):
 
         encoder, backbone = task.model.backbone, thaw(part(task.variables, "backbone"))
         decoder = PretrainedDecoder.from_model(encoder, backbone).bound(encoder, backbone)
-        held = {field.name: getattr(decoder, field.name) for field in dataclasses.fields(Pretrained)}
+        # The task's numerics, which a decoder bundle built of its model states none of.
+        held = {**{field.name: getattr(decoder, field.name) for field in dataclasses.fields(Pretrained)},
+                "numerics": task.precision}
         writer, exporter = formats[head.release_format]
         return cls(**held, head=head, head_variables=thaw(part(task.variables, "head")), layout=task.layout,
                    specials=task.specials, calibration=task.calibration, decision_tokenizer=task.tokenizer,
