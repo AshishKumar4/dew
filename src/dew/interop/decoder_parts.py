@@ -1089,7 +1089,8 @@ def rope_part(spelling: RopeSpelling, *, ramps: tuple[str, ...] | None = None,
 
 
 def partial_rope_part(spelling: RopeSpelling = PLAIN_SPELLING, *, default_factor: float,
-                      layout: tuple[str, ...] = (), kind: str = 'default') -> ConfigPart[CausalTransformer]:
+                      layout: tuple[str, ...] = (), kind: str = 'default',
+                      whole_is_none: bool = False) -> ConfigPart[CausalTransformer]:
     """A rotary turning a fraction of each head, both ways: read as its one record states it
     (`read_partial_rope`: the record's fraction, else the config's flat one, else `default_factor`, the
     class's), the ramp over the rotated width under the `kind` convention; written as its base, ramp and
@@ -1099,7 +1100,8 @@ def partial_rope_part(spelling: RopeSpelling = PLAIN_SPELLING, *, default_factor
         ropes, factor = read_partial_rope(hf_config, used, spelling, default_factor=default_factor,
                                           layout=layout)
         place_ropes(record, ropes)
-        record['partial_rotary_factor'] = factor
+        # A family whose model turns whole heads by default holds the whole head as none.
+        record['partial_rotary_factor'] = None if whole_is_none and factor == 1.0 else factor
         record['partial_rotary_type'] = kind
         return record
 

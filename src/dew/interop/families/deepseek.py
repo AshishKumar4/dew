@@ -314,7 +314,7 @@ DEEPSEEK_DECODER = decoder_layout(rope=rope_part(PLAIN_SPELLING, ramps=('yarn', 
 
 
 def _read_mla(hf_config: Mapping[str, object], used: set[str], config: DecoderFields, *,
-              sparse: bool) -> DecoderFields:
+              sparse: bool, points_head_dim: bool = True) -> DecoderFields:
     """The MLA block of a DeepSeek V2, V3 or V3.2 config (`mla_export` writes it back): its layers
     (`sparse` picks V3.2's, every layer deepseek_sparse_attention, its lightning indexer's geometry among
     the mixer's) and the MLA `mixer` record."""
@@ -335,7 +335,7 @@ def _read_mla(hf_config: Mapping[str, object], used: set[str], config: DecoderFi
                     f"every layer is {sparse_name}")
     nope = _records.integer(hf_config['qk_nope_head_dim'], 'qk_nope_head_dim')
     rope = _records.integer(hf_config['qk_rope_head_dim'], 'qk_rope_head_dim')
-    head_dim = hf_config.get('head_dim')
+    head_dim = hf_config.get('head_dim') if points_head_dim else None
     if head_dim is not None and _records.integer(head_dim, 'head_dim') != rope:
         refuse(f"head_dim {head_dim!r}",
                 "DeepSeek points head_dim at the rope slice, "
@@ -416,13 +416,18 @@ def _read_experts(hf_config: Mapping[str, object], used: set[str], config: Decod
 
 
 def deepseek_layout_of(*, sparse: bool = False,
-                       mixture: Callable[[Mapping[str, object], int, set], MixtureFields] = deepseek_mixture
-                       ) -> ConfigLayout[CausalTransformer]:
+                       mixture: Callable[[Mapping[str, object], int, set], MixtureFields] = deepseek_mixture,
+                       points_head_dim: bool = True) -> ConfigLayout[CausalTransformer]:
     """A DeepSeek V2, V3 or V3.2 config, both ways: the shared decoder (`DEEPSEEK_DECODER`), the MLA block
-    and its prediction depths, and the routed experts (`mixture`, the family's reader)."""
+    and its prediction depths, and the routed experts (`mixture`, the family's reader). A class that points
+    head_dim at the rope slice whatever the config says (`points_head_dim` False: GlmMoeDsaConfig's) reads
+    no head_dim."""
+    decoder = DEEPSEEK_DECODER if points_head_dim else decoder_layout(
+        DecoderSpelling(fixed={'head_dim': None}),
+        rope=rope_part(PLAIN_SPELLING, ramps=('yarn', 'llama3'), per_kind=False))
     return ConfigLayout(
-        DEEPSEEK_DECODER,
-        ConfigPart(partial(_read_mla, sparse=sparse),
+        decoder,
+        ConfigPart(partial(_read_mla, sparse=sparse, points_head_dim=points_head_dim),
                    lambda model: {**mla_export(model),
                                   'num_nextn_predict_layers': model.num_nextn_predict_layers}),
         ConfigPart(partial(_read_experts, mixture=mixture), deepseek_moe_export))
