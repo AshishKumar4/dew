@@ -74,7 +74,7 @@ draw = token_ids(2037, 48, (2, 6))
 def checkpoint(kind: str) -> None:
     """Read the same files through transformers before recording logits or decoded weights."""
     torch.manual_seed(2037)
-    config = Qwen3Config(vocab_size=48, hidden_size=32, intermediate_size=64, num_hidden_layers=1,
+    config = Qwen3Config(vocab_size=48, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
                         num_attention_heads=2, num_key_value_heads=1, head_dim=16,
                         max_position_embeddings=32, tie_word_embeddings=True)
     config._attn_implementation = "eager"

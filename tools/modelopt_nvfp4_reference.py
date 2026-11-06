@@ -159,7 +159,7 @@ def tiny(*, mixed: bool = False) -> None:
     from torch_precision import float64_twin
 
     torch.manual_seed(2049)
-    config = Qwen3Config(vocab_size=96, hidden_size=64, intermediate_size=128, num_hidden_layers=1,
+    config = Qwen3Config(vocab_size=96, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
                         num_attention_heads=4, num_key_value_heads=2, head_dim=16,
                         max_position_embeddings=64, tie_word_embeddings=True)
     config._attn_implementation = "eager"
