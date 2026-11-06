@@ -160,8 +160,8 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     each consumer's `block_k` keys of a query head resident, walked by the query tiles that see them,
     streamed with their output cotangents through a ring each, queries first (`_fused_step`), under the
     first pass's D and the forward's denominator (each query tile's streamed beside it, `STATISTICS`), each
-    tile's dQ added into dQ atomically
-    (`Family.added`); where key heads are shared, each query head's dK and dV added into its key head's own
+    tile's dQ added into dQ atomically (`Family.added`); where key heads are shared, each query head's dK and
+    dV added into its key head's own
     (FlashAttention 3's grouped epilogue, hopper/epilogue_bwd.hpp's CollectiveEpilogueBwdGQA: Qwen3-8B's step
     1.7% the faster causal, 1.3% full, ET-GQA1-h100, where XLA summed fp32 copies a query head's), else
     stored (their zeros cost an ungrouped D64 step 1.7%). The grouped adds' zeros are one ref of both
@@ -263,15 +263,23 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                                        common=family.feeds_itself)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              2 * width + 2 * value.shape[-1]))
-    # dQ added into zeros in place, and grouped dK and dV in one ref of both (`mosaic.stacked_zeros`): one
-    # copy, or dQ each consumer's own interpreted (`Family.added`), a consumer's keys its own.
-    copies = consumers if walk.interpret else 1
+    operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
+    return _fused_called(launch, operands, (shapes, groups), copies=consumers if walk.interpret else 1,
+                         grouped=grouped)
+
+
+def _fused_called(launch: Callable, operands: tuple, stacked: tuple, *, copies: int, grouped: bool
+                  ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """The fused launch called on its `operands` (`_fused_launch`'s): dQ added into zeros in place, and
+    grouped dK and dV in one ref of both (`mosaic.stacked_zeros`, `stacked` their shapes and grouping): one
+    copy of dQ, or each consumer's own interpreted (`Family.added`, `copies`), a consumer's keys its own."""
+    query = operands[0]
+    batch, queries, heads, width = query.shape
     dq = jax.new_ref(jnp.zeros((copies, batch, queries, heads, width), jnp.float32))
-    operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves, dq)
     if not grouped:
-        dk, dv = launch(*operands)
+        dk, dv = launch(*operands, dq)
         return jax.freeze(dq).sum(axis=0), dk, dv
-    dkv = mosaic.stacked_zeros(shapes, groups)
-    launch(*operands, *dkv)
-    dk, dv = mosaic.stacked_read(dkv, groups)
+    dkv = mosaic.stacked_zeros(*stacked)
+    launch(*operands, dq, *dkv)
+    dk, dv = mosaic.stacked_read(dkv, stacked[1])
     return jax.freeze(dq).sum(axis=0), dk, dv
