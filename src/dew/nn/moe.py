@@ -64,7 +64,7 @@ SCORE_FUNCTIONS = ('softmax', 'sigmoid', 'sqrtsoftplus')
 # 'mosaic_gpu', 'cutlass'); 'auto' is the kernels where they run the call, else XLA
 # (`expert_projection`, through the GEMM template).
 GROUPED_MATMULS = ('auto', 'xla', 'pallas')
-EXPERT_DISPATCHES = ('global', 'exchange')
+EXPERT_DISPATCHES = ('auto', 'global', 'exchange')
 
 # What a router writes and reads, by name. Its choices, scores and log partitions are sown under
 # `ROUTER_COLLECTION` where a caller opens it, and its balancing bias is a variable of
@@ -703,7 +703,11 @@ def expert_dispatch[Parameters](
     scales each expert's input instead, as Llama 4 does. `x` is
     `[batch, length, width]` or `[tokens, width]`.
 
-    `dispatch='global'` routes the tokens where they are, in a `shard_map` that
+    `dispatch='auto'`, the default, is `'exchange'` on an expert mesh axis greater
+    than one that divides the experts, where the experts stay in place, and
+    `'global'` on any other (ledger 1711: on a 4-way expert mesh, global
+    gathered 200,704 bytes of eight experts' weights a step, exchange moved
+    4,096). `dispatch='global'` routes the tokens where they are, in a `shard_map` that
     holds them as the residual stream does, so each device runs its own rows
     through every expert on device-local rows, as the Pallas kernels need
     (MaxText's `sparse_matmul_route_and_compute`). `'exchange'` is expert
@@ -725,6 +729,8 @@ def expert_dispatch[Parameters](
         raise ValueError(f"routing {indices.shape} does not describe tokens {x.shape}")
     mesh = jax.sharding.get_abstract_mesh()
     shards = mesh.shape.get(EXPERT_AXIS, 1)
+    if dispatch == 'auto':
+        dispatch = 'exchange' if shards > 1 and not num_experts % shards else 'global'
     if dispatch == 'exchange' and not initializing and (
             shards <= 1 or num_experts % shards):
         raise LayoutRefused("exchange dispatch needs an expert mesh axis greater than one "
@@ -1037,7 +1043,7 @@ class ExpertMLP(nn.Module):
     out_features: int
     activation: GatedActivation = 'swiglu'
     implementation: str = 'auto'
-    dispatch: str = 'global'
+    dispatch: str = 'auto'
     capacity_factor: float | None = None
     swiglu_limit: float | None = None
     scale_inputs: bool = False
@@ -1142,7 +1148,7 @@ class SparseMLP(nn.Module):
     out_features: int
     activation: GatedActivation = 'swiglu'
     implementation: str = 'auto'
-    dispatch: str = 'global'
+    dispatch: str = 'auto'
     capacity_factor: float | None = None
     score_function: str = 'softmax'
     normalize_weights: bool = True
