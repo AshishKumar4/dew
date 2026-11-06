@@ -99,11 +99,15 @@ def test_a_masked_row_no_kept_output_reads_passes_and_one_multiplied_away_is_ref
 
 def test_examples_independent_of_their_batch_pass_and_a_batch_statistic_is_refused():
     """Null: a row-wise function gives each example's output whatever its batch. Fault: normalizing by the
-    batch's mean makes an example's output depend on its neighbours."""
-    x = jnp.asarray(np.random.default_rng(2).standard_normal((6, 4)), jnp.float32)
-    assert_examples_independent(jax.jit(lambda x: jnp.tanh(x) * 2), (x,), "row-wise", parts=3)
+    batch's mean makes an example's output depend on its neighbours, which a part's own mean moves far past
+    rounding."""
+    def draw(seed):
+        return (jnp.asarray(np.random.default_rng([4549, seed]).standard_normal((6, 4)), jnp.float32),)
+
+    assert_examples_independent(lambda x: jnp.tanh(x) * 2, draw, "row-wise", seeds=8, parts=3)
+    # Refused at the reversal, whose mean sums its rows in another order, or by check 1 over the parts.
     with pytest.raises(AssertionError):
-        assert_examples_independent(jax.jit(lambda x: x - jnp.mean(x, axis=0)), (x,), "batch mean", parts=3)
+        assert_examples_independent(lambda x: x - jnp.mean(x, axis=0), draw, "batch mean", seeds=8, parts=3)
 
 
 def test_a_run_restarted_midstream_ends_where_one_run_ends_and_hidden_state_is_refused():
