@@ -90,6 +90,7 @@ class Evaluation(step: int, split: str, scores: dict[str, float], coordinated_ba
 class Field(key: str, shape: tuple[int, ...], variable_axes: tuple[int, ...] = ()) -> None  [dew.inputs.spec]
   .held(self, batch: Batch) -> tuple[int, ...]
   .of(cls, key: str, batch: Batch) -> Field  [classmethod]
+class GpuFacts(part: str, generation: str, capability: tuple[int, int] | None, multiprocessors: int | None, clock_hz: float | None, memory_bandwidth: float | None, l2_bytes: int | None, shared_per_block: int, registers: int | None, thread_registers: int | None, resident_threads: int | None, resident_blocks: int | None, dense_peaks: Mapping[str, float], instruction_families: tuple[str, ...], bundles: tuple[str, ...]) -> None  [dew.nn.kernels.generation]
 class ImageGrid(images: jax.Array, captions: tuple[str, ...] = ()) -> None  [dew.artifacts]
   .replace(self, **updates)
 class InputSpec(sample: Field, conditions: Mapping[str, Condition] = <factory>, mask: Field | None = None) -> None  [dew.inputs.spec]
@@ -327,6 +328,7 @@ class WandbTracker(project: str, name: str | None = None, *, entity: str | None 
   .render(value: Reported) -> Payload  [staticmethod]
   .run: property
 __version__: str
+def gpu_facts(part: str | None = None) -> GpuFacts  [dew.nn.kernels.generation]
 def pipeline(source: str, *, mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None, dtype: DTypeLike | None = None, param_dtype: DTypeLike | Literal['auto'] | None = None, ema: bool | None = None, step: int | str | None = None, revision: str | None = None, trust: Sequence[str] = (), options: SourceOptions | None = None, precision: Numerics | str | None = None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration | SavedTask  [dew.inference.loading]
 def sample(denoise: dew.diffusion.process.Denoiser | dew.diffusion.discrete.DiscreteDenoiser, x_T: jax.Array, steps: int | None = None, *, solver: dew.sampling.solvers.common.Solver[StateT], guidance: dew.sampling.guidance.Guidance | None = None, key: int | jax.Array | dew.sampling.solvers.common.RowKeys, times: jax.Array | numpy.ndarray | numpy.bool | numpy.number | bool | int | float | complex | collections.abc.Sequence[float] | None = None, initial: StateT | None = None, final_denoise: bool = True, record: collections.abc.Callable[[jax.Array, StateT, jax.Array], RecordT] | None = None) -> jax.Array | tuple[jax.Array, RecordT]  [dew.sampling.walks]
 -- config --
