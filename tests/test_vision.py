@@ -30,6 +30,7 @@ Tolerances and the differences actually observed, fp32 on CPU:
 """
 
 import dataclasses
+import functools
 import json
 from pathlib import Path
 
@@ -37,10 +38,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from float64_terms import float64_forward
 from one_draw import assert_as_exact_as_the_reference
-from reference_error import as_given, assert_as_exact, ieee_fixture
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    declared_seeds,
+    ieee_fixture,
+    indexed_recording,
+    recording,
+)
 from safetensors.numpy import load_file
+from tool_support import run_from
 
 from dew.nn.vision import (
     gemma4,
@@ -317,29 +325,49 @@ def real(values, grid, merge: int = 1):
     return np.concatenate([np.asarray(values)[row, :count] for row, count in enumerate(counts)])
 
 
+MIMO_RECORDING = FIXTURES / "mimo-vision-tiny" / "recording.npz"
+
+
+@functools.cache
+def mimo_generator():
+    """tools/mimo_reference.py, whose seeded draws the recorded sites' inputs are drawn again by."""
+    with run_from("mimo_reference", "tools") as module:
+        return module
+
+
+def mimo_site(site: str, inputs_of):
+    """`site`'s draw, recorded reference and truth over its declared seeds, and the count."""
+    seeds = declared_seeds(MIMO_RECORDING)[site]
+    return (*indexed_recording(recording(MIMO_RECORDING), site, seeds, inputs_of=inputs_of), seeds)
+
+
 def test_mimo_tower_is_as_exact_as_the_reference():
     """MiMo ViT on two rows, a 4x6 image and a two-frame 4x4 clip: full layers, a band of three keys
-    either side in the processor's order and in merge-block column order, and the sinks, within
-    the float64 gate; with the sinks zeroed the trunk leaves the reference by far more."""
-    config, tensors, _, refs = shared_fixture("mimo-vision-tiny")
+    either side in the processor's order and in merge-block column order, and the sinks; over drawn
+    pixels its trunk is on par with the release's from its float64 run's (check 1,
+    tools/mimo_reference.py --record-vision); with the sinks zeroed the trunk leaves it by far more."""
+    config, tensors, _, _ = shared_fixture("mimo-vision-tiny")
     tower = towers.from_record(mimo.translate_mimo_vision_config(config)).build()
     variables, _ = tower_variables("mimo", tensors, "float32")
-    out = tower.apply(variables, refs["pixels"], refs["grid"])
-    grid = refs["grid"]
-    _, terms = float64_forward(tower, variables, refs["pixels"], grid)
-    assert_as_exact_as_the_reference(real(out, grid), real(refs["tower"], grid),
-                                     real(refs["tower_f64"], grid), "mimo tower",
-                                     terms=real(np.asarray(terms), grid))
+    grid = np.asarray(mimo_generator().MIMO_GRIDS, np.int32)
+    draw, reference, truth, seeds = mimo_site("mimo tower", mimo_generator().vision_draw)
+    trunk = jax.jit(lambda variables, pixels: tower.apply(variables, pixels, grid))
+
+    def dew(held):
+        return as_given(lambda index, inputs: {"tower": real(trunk(held, inputs["pixels"]), grid)})
+
+    assert_as_exact(dew(variables), reference, draw, "mimo tower", seeds=seeds, truth_fn=truth)
     sinkless = jax.tree_util.tree_map_with_path(
         lambda path, leaf: jnp.zeros_like(leaf) if path[-1].key.startswith("sinks_") else leaf, variables)
     with pytest.raises(AssertionError):
-        assert_as_exact_as_the_reference(real(tower.apply(sinkless, refs["pixels"], refs["grid"]), grid),
-                                         real(refs["tower"], grid), real(refs["tower_f64"], grid), "sinkless")
+        assert_as_exact(dew(sinkless), reference, draw, "sinkless", seeds=seeds, truth_fn=truth)
 
 
 @pytest.mark.parametrize("native", [False, True])
 def test_mimo_merger_is_as_exact_as_the_reference(native):
-    config, _, projector_tensors, refs = shared_fixture("mimo-vision-tiny")
+    """MiMo's merger, read from the release's config or built natively, over drawn trunk features of the
+    two rows, on par with the release's from its float64 run's (check 1)."""
+    config, _, projector_tensors, _ = shared_fixture("mimo-vision-tiny")
     record = mimo.translate_mimo_projector_config(config, config["text_config"]["hidden_size"])
     projector = projectors.from_record(record)
     if native:
@@ -349,10 +377,11 @@ def test_mimo_merger_is_as_exact_as_the_reference(native):
             width=vision["hidden_size"] * vision["spatial_merge_size"] ** 2,
             out_width=config["text_config"]["hidden_size"])
     variables = {"params": projector_variables("mimo", projector_tensors, "float32")[0]}
-    out = projector.apply(variables, refs["tower"])
-    grid = refs["grid"]
-    assert_as_exact_as_the_reference(real(out, grid, 2), real(refs["projector"], grid, 2),
-                                     real(refs["projector_f64"], grid, 2), "mimo merger")
+    grid = np.asarray(mimo_generator().MIMO_GRIDS, np.int32)
+    draw, reference, truth, seeds = mimo_site("mimo merger", mimo_generator().merger_draw)
+    merged = jax.jit(lambda trunk: projector.apply(variables, trunk))
+    assert_as_exact(as_given(lambda index, inputs: {"merger": real(merged(inputs["trunk"]), grid, 2)}),
+                    reference, draw, "mimo merger", seeds=seeds, truth_fn=truth)
 
 
 def test_muse_glimmer_tower_is_as_exact_as_the_reference():

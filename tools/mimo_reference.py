@@ -14,9 +14,13 @@ Each array file stores fp32 and float64 references, IEEE products.
   batch and once with its batches bounded at 30 frames, its own grouping run under that bound.
 - `mimo-audio-tiny/mel.npz` (`--mel`): torchaudio stops at torch 2.11, so this part runs in an
   environment of torch 2.11 and torchaudio 2.11, the transform built in the dtype it computes in.
+- `mimo-vision-tiny/recording.npz` (`--record-vision`): the fixture's tower and merger over drawn pixels
+  (`vision_draw`) and drawn trunk features (`merger_draw`), their outputs and float64 truths recorded
+  over seeds for check 1 (`recorded_references.record_case`).
 
     python tools/mimo_reference.py
     <torch 2.11 + torchaudio python> tools/mimo_reference.py --mel
+    PYTHONPATH=src:tests python tools/mimo_reference.py --record-vision
 """
 
 import argparse
@@ -167,6 +171,83 @@ def write_mimo_vision_tiny() -> None:
            "projector": merged, "projector_f64": merged_f64})
 
 
+VISION_WIDTH = 3 * MIMO_VISION["temporal_patch_size"] * MIMO_VISION["patch_size"] ** 2
+"""Each packed patch's pixels: its channels, frames and rows of pixels."""
+
+
+def vision_draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's packed pixels of MIMO_GRIDS' two rows, padded into one batch (`packed_rows`), drawn apart
+    from the fixture's own (seed 11)."""
+    return {"pixels": packed_rows(MIMO_GRIDS, VISION_WIDTH, 1_000 + seed)[0]}
+
+
+def merger_draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's trunk features of MIMO_GRIDS' two rows, the merger's input, padded into one batch."""
+    rng = np.random.default_rng([0x3e9, seed])
+    rows = [rng.standard_normal((int(np.prod(grid)), MIMO_VISION["hidden_size"])).astype(np.float32)
+            for grid in MIMO_GRIDS]
+    return {"trunk": padded(rows).astype(np.float32)}
+
+
+def record_mimo_vision() -> None:
+    """The fixture's tower and merger (mimo-vision-tiny's tensors, loaded into the release's modules) over
+    seeds: the trunk of drawn pixels and the merger of drawn trunk features, each row's real entries in
+    float32 and float64, recorded for check 1 (`record_case`)."""
+    from recorded_references import provenance, record_case, save
+    from safetensors.torch import load_file
+    from torch_precision import float64
+
+    modeling = mimo_module()
+    config = SimpleNamespace(**MIMO_VISION)
+    directory = FIXTURES / "mimo-vision-tiny"
+    held = {name: tensor for file in ("model.safetensors", "projector.safetensors")
+            for name, tensor in load_file(str(directory / file)).items()}
+    narrow = modeling.MiMoVisionTransformer(config).float().eval()
+    # The merger's biases zero, as the release stores none and the fixture holds none.
+    with torch.no_grad():
+        for name, tensor in narrow.merger.named_parameters():
+            if name.endswith("bias"):
+                tensor.zero_()
+    narrow.load_state_dict({**narrow.state_dict(), **held})
+    with float64():
+        wide = modeling.MiMoVisionTransformer(config).eval()
+        wide.load_state_dict({name: tensor.double() for name, tensor in narrow.state_dict().items()})
+
+    def trunks(model, pixels, dtype):
+        caught, out = {}, []
+        hook = model.merger.register_forward_hook(lambda module, inputs, output: caught.update(x=inputs[0]))
+        with torch.no_grad():
+            for row, grid in zip(pixels, MIMO_GRIDS, strict=True):
+                model(torch.from_numpy(row[:int(np.prod(grid))]).to(dtype), torch.tensor([grid]))
+                out.append(caught["x"].double().numpy())
+        hook.remove()
+        return {"tower": np.concatenate(out)}
+
+    def merged(model, trunk, dtype):
+        with torch.no_grad():
+            return {"merger": np.concatenate([
+                model.merger(torch.from_numpy(row[:int(np.prod(grid))]).to(dtype)).double().numpy()
+                for row, grid in zip(trunk, MIMO_GRIDS, strict=True)])}
+
+    def tower_case(inputs):
+        narrow_out = trunks(narrow, inputs["pixels"], torch.float32)
+        with float64():
+            return narrow_out, trunks(wide, inputs["pixels"], torch.float64)
+
+    def merger_case(inputs):
+        narrow_out = merged(narrow, inputs["trunk"], torch.float32)
+        with float64():
+            return narrow_out, merged(wide, inputs["trunk"], torch.float64)
+
+    arrays = {**record_case("mimo tower", vision_draw, tower_case, store_inputs=False),
+              **record_case("mimo merger", merger_draw, merger_case, store_inputs=False)}
+    written = save(directory / "recording.npz", {**arrays, "provenance": provenance(
+        MIMO_REPO, MIMO_REVISION, "cpu",
+        "PYTHONPATH=src:tests python tools/mimo_reference.py --record-vision",
+        torch=torch.__version__)}, reference=f"{MIMO_REPO}@{MIMO_REVISION}", license="mit")
+    print(f"{written}: {sorted(arrays)}")
+
+
 def write_mel() -> None:
     """torchaudio's mel frames of a fixed half second at MiMo's settings, fp32 and float64."""
     from torchaudio.transforms import MelSpectrogram
@@ -269,8 +350,14 @@ def write_mimo_audio_tiny() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mel", action="store_true", help="write mimo-audio-tiny/mel.npz, under torchaudio")
-    if parser.parse_args().mel:
+    parser.add_argument("--record-vision", action="store_true",
+                        help="record mimo-vision-tiny's tower and merger over seeds")
+    arguments = parser.parse_args()
+    if arguments.mel:
         write_mel()
+        return
+    if arguments.record_vision:
+        record_mimo_vision()
         return
     write_mimo_vision_tiny()
     write_mimo_audio_tiny()
