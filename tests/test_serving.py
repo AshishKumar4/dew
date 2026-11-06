@@ -1196,7 +1196,9 @@ def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(t
     and loaded by directory. Requests naming either adapter, or none, share the server's steps and its
     one copy of the base, and each draws what a task over its adapter alone (or the base) draws, on par
     with that task against its float64 twin (check 1), over a dense cache and over a paged one sharing
-    prompt pages, where one prompt under two adapters shares none (ledger 870)."""
+    prompt pages, where one prompt under two adapters shares none (ledger 870). An adapter bound over
+    other weights than the set's base is refused, which the set would run over the first's (ledger
+    4494)."""
     from pathlib import Path
 
     from arm_arithmetic import widened
@@ -1221,6 +1223,11 @@ def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(t
     second.save(second.variables, tmp_path / "set" / "second")
     adapters = AdapterSet.load(decoder.model, decoder.variables, tmp_path / "set", layouts=decoder.layouts)
     assert adapters.names == ("fixture", "second")
+    # An adapter over other weights than the set's base would run over the first adapter's: refused.
+    moved = jax.tree.map(lambda leaf: leaf * 0.5, decoder.variables)
+    elsewhere = LoRA(rank=2, modules=("q_proj",)).apply(decoder.model, moved, key=0, layouts=decoder.layouts)
+    with pytest.raises(ValueError):
+        AdapterSet.of({"fixture": fixture, "elsewhere": elsewhere})
     sampling = Sampling(temperature=1.0)
     served = dataclasses.replace(decoder, model=adapters.model, variables=adapters.variables
                                  ).text_generation(sampling=sampling)
