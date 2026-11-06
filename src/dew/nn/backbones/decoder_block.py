@@ -315,6 +315,20 @@ class Mixture:
                 "check that reaches a shard_map. Serve the model with dew.inference.serving.Server, or "
                 "generate with the mixture's dispatch='global', the same layer")
 
+    @property
+    def fixed_weights(self) -> bool:
+        """Whether a token's expert weight is fixed whatever its router scores: one expert's softmax score
+        renormalized over itself (`top_k=1` with `norm_topk_prob`, as a parallel or GPT OSS router does
+        too), which is 1, so a model's loss reaches the router through none of its outputs, only through a
+        balance loss or a z-loss (`dew.objectives.routing.refuse_fixed_router`)."""
+        return (self.top_k == 1 and self.norm_topk_prob and self.score_function == 'softmax'
+                and not self.bias_in_weights and not self.weight_sum_min)
+
+    def router_scope(self, activation: GatedActivation | str) -> str:
+        """The scope its router's score projection takes in its layer: GPT OSS's (its `activation`
+        'swigluoai') and a parallel mixture's (Gemma 4's) `router`, any other's `SparseMLP.gate`."""
+        return 'router' if activation == 'swigluoai' or self.parallel else 'gate'
+
     def build(self, *, out_features: int, hidden_features: int, activation: GatedActivation,
               dense: Callable[..., nn.Module], norm_eps: float, scale_offset: bool = False,
               scale_after_cast: bool = False, swiglu_limit: float | None = None,

@@ -64,6 +64,7 @@ from dew.objectives.base import (
 )
 from dew.objectives.lm.chunked import model_logits
 from dew.objectives.lm.head import HeadedObjective
+from dew.objectives.routing import refuse_fixed_router
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
@@ -200,6 +201,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
                  eos_token_ids: Sequence[int] | Omitted = OMITTED):
         self.eos_token_ids = ended(model, eos_token_ids)
         model = self.bind_model(model, variables=variables, processor=processor)
+        refuse_fixed_router(model, None, self.variables)
         if not (isinstance(model, BlockDenoiser) and isinstance(model, LayerScalars)):
             raise Lacks("canvas",
                         f"block diffusion encodes a clean prefix into a model's cache and denoises canvases "
