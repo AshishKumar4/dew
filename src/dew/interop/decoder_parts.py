@@ -893,14 +893,19 @@ DECODER_FIELDS: ConfigLayout[CausalTransformer] = ConfigLayout(
     ConfigField('num_attention_heads', 'num_heads', parse=_records.integer),
     ConfigPart(_read_heads, lambda model: {'num_key_value_heads': model.kv_heads,
                                            'head_dim': model.features_per_head}),
-    ConfigPart(_read_activation, lambda model: {'hidden_act': hf_activation(model.mlp)}),
     ConfigPart(_read_widths, lambda model: {'intermediate_size': model.hidden_features}),
     ConfigPart(_read_context,
                lambda model: {'max_position_embeddings': model.context_length or model.max_seq_len}),
     ConfigField('rms_norm_eps', 'norm_eps', 1e-6, parse=_records.number),
 )
-"""The decoder's geometry every family's config states under transformers' shared names, both ways:
-`base_config` reads them and `hf_decoders.export_config` writes them."""
+"""The decoder's geometry every family's config states under transformers' shared names, both ways
+(`decoder_layout`)."""
+
+
+def activation_part(key: str = 'hidden_act') -> ConfigPart[CausalTransformer]:
+    """The gated MLP's activation (`_read_activation`: `hidden_act`, else Gemma's `hidden_activation`),
+    written under the key the family's class reads (`key`)."""
+    return ConfigPart(_read_activation, lambda model: {key: hf_activation(model.mlp)})
 
 
 def _flag(key: str, field: str, *, default: bool) -> ConfigField[CausalTransformer]:
@@ -939,6 +944,8 @@ class DecoderSpelling:
     keys: Mapping[str, str] = dataclasses.field(default_factory=lambda: MappingProxyType({}))
     """The family's own keys for the shared geometry's (`Restated`: Qwen3.5-MoE's dense width is its
     experts', `moe_intermediate_size`)."""
+    activation: str = 'hidden_act'
+    """The key the class reads its activation under (Gemma 2's and later's `hidden_activation`)."""
     fixed: Mapping[str, object] = dataclasses.field(default_factory=lambda: MappingProxyType({}))
     """Shared geometry the class fixes and states nowhere (`Restated`)."""
     ramps: tuple[str, ...] | None = None
@@ -1123,7 +1130,7 @@ def decoder_layout(spelling: DecoderSpelling = PLAIN_DECODER, *,
     geometry = (DECODER_FIELDS if not spelling.keys and not spelling.fixed
                 else Restated(DECODER_FIELDS, spelling.keys, spelling.fixed))
     return ConfigLayout(
-        geometry, _layer_kinds(spelling),
+        geometry, activation_part(spelling.activation), _layer_kinds(spelling),
         rope_part(spelling.rope, ramps=spelling.ramps) if rope is None else rope,
         *(_flag(name, name, default=False) if name in reads else constant(name, value=False)
           for name in ('attention_bias', 'mlp_bias')),
@@ -1154,7 +1161,7 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
     for optional in _OPTIONAL_FIELDS - reads:
         if optional in hf_config and _neutral(hf_config, optional):
             used.add(optional)
-    shared = DECODER_FIELDS.read(hf_config, used, {})
+    shared = _read_activation(hf_config, used, DECODER_FIELDS.read(hf_config, used, {}))
 
     ropes = read_rope(hf_config, used, rope) if isinstance(rope, RopeSpelling) else rope
     rope_theta, rope_local_theta = ropes.theta, ropes.local_theta
