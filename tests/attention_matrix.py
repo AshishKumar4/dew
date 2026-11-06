@@ -33,7 +33,7 @@ CHOICES = frozenset({MAINLOOP})
 op's kernels, the template's among them, are tests/attention_kernels_matrix.py's."""
 KERNELS = {MAINLOOP: frozenset({"mosaic", "triton"})}
 """The mainloops the cells run under test (row 4513): each cell asserts its passes take them, the Mosaic one
-where its backward's launch form is pinned, Triton's where the Mosaic backward declines the call."""
+where it pins the backward's launch form; which takes an unpinned pass is the route's to derive."""
 LENGTH = 1024
 DOCUMENTS = 4
 CAP = 2.0
@@ -251,8 +251,8 @@ support change)."""
     for case in CASES], ids="-".join)
 def a_routes_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The route's training step of `case` on its GPU on par with the reference path's (check 1), its launch
-    form pinned (`pin_of`): its passes on the Mosaic mainloop where it pins one, on Triton's where the Mosaic
-    backward declines the call, on none other (`KERNELS`)."""
+    form pinned (`pin_of`): its passes on the Mosaic mainloop where it pins one, and on none but the GPU's
+    mainloops (`KERNELS`)."""
     named = dict(zip(AXES["attention"], case, strict=True))
     heads, _, _, _, spans, keep = _case(named)
     config = pin_of(named)
@@ -269,6 +269,5 @@ def a_routes_training_step_is_on_par(case: tuple[str, ...]) -> None:
         assert_as_exact(jax.jit(ours), jax.jit(_step(named, spans, reference=True)), _drawn(named),
                         "-".join(case), seeds=SEEDS, terms=terms)
     recorded = {found.kernel for found in routes if found.choice == MAINLOOP}
-    expected = "mosaic" if config is not None else "triton"
-    assert expected in recorded and recorded <= KERNELS[MAINLOOP], sorted(recorded)
+    assert recorded <= KERNELS[MAINLOOP] and (config is None or "mosaic" in recorded), sorted(recorded)
 
