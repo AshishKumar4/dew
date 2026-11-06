@@ -28,12 +28,14 @@ from dew.sampling.solvers import Euler
 @pytest.mark.mesh(devices=8)
 def test_an_lm_run_over_a_qwen35_release_exports_in_the_releases_layout(tmp_path, monkeypatch):
     """`dew export` of an LM run over a Qwen3.5 release, a multimodal wrapper whose language model it
-    trains, writes the release's own layout (row 4525), where a wrapper's run was refused: read back, it is
-    the run's model with the weights the run saved, which compute the run's logits."""
+    trains, writes the release's own layout (row 4525), its config and every tensor under the release's
+    names, where a wrapper's run was written as its native release: read back, it is the run's model with
+    the weights the run saved, which compute the run's logits."""
     from interop_support import assert_restores
     from saved_run_kinds import QWEN, over
 
     from dew.interop.pretrained import Pretrained
+    from dew.interop.sources import load_shards
     from dew.nn.multimodal import MultimodalTransformer
 
     # The run names its source by its path in the repo, read from the checkout's root.
@@ -41,11 +43,15 @@ def test_an_lm_run_over_a_qwen35_release_exports_in_the_releases_layout(tmp_path
     trained(over(QWEN, tmp_path, drawn=False), tmp_path, "over_qwen", trainer={"checkpoint_final": True})
     saved = SavedRun.pinned(str(tmp_path / "runs" / "over_qwen"))
     export_run(saved, tmp_path / "exported")
+    released = Path(QWEN)
+    assert (json.loads((tmp_path / "exported" / "config.json").read_text())["model_type"]
+            == json.loads((released / "config.json").read_text())["model_type"])
+    assert load_shards(tmp_path / "exported").keys() == load_shards(released).keys()
     model = Pretrained.from_saved(saved).model
     assert isinstance(model, MultimodalTransformer)
     restored = Pretrained.load(tmp_path / "exported", dtype="float32",
                                attention_impl=model.language_model.attention_impl)
-    assert_restores(model, saved.variables(), restored, np.arange(1, 9, dtype=np.int32)[None])
+    assert_restores(model, saved.variables(ema=None), restored, np.arange(1, 9, dtype=np.int32)[None])
 
 
 @pytest.mark.mesh(devices=8)

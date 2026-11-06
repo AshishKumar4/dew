@@ -147,7 +147,7 @@ def test_a_qwen35_wrapper_written_from_the_model_alone_is_its_release(tmp_path):
     which transformers' Qwen3_5ForConditionalGeneration reads to the release's logits, bit for bit, over
     prompts with an image each."""
     import torch
-    from interop_support import assert_reloads, assert_same_stored_tensors, fixture_ids
+    from interop_support import assert_reloads, assert_same_stored_tensors
     from PIL import Image
     from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
@@ -164,7 +164,8 @@ def test_a_qwen35_wrapper_written_from_the_model_alone_is_its_release(tmp_path):
                          for directory in (exported, source))
     assert {name: written[name] for name in ("model_type", "image_token_id", "video_token_id")} == {
         name: released[name] for name in ("model_type", "image_token_id", "video_token_id")}
-    assert_reloads(loaded, exported, fixture_ids(source, shape=(2, 8))(0)[0])
+    ids = np.random.default_rng(0).integers(0, loaded.model.language_model.vocab_size, (2, 8), np.int32)
+    assert_reloads(loaded, exported, ids)
     processor = AutoProcessor.from_pretrained(source)
     pictures = [Image.fromarray(array) for array in np.load(source / "images.npy")]
     inputs = processor(text=json.loads((source / "prompts.json").read_text()), images=pictures,

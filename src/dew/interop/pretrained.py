@@ -1356,6 +1356,16 @@ _WRAPPER_WRITERS = {"qwen3_5": _WrapperWriter("Qwen3_5ForConditionalGeneration",
 """The wrappers a model built in Dew is written back as, by family (row 4525): Qwen 3.5's."""
 
 
+def wrapper_writes(model: nn.Module) -> bool:
+    """Whether a family's layout states `model`, a multimodal wrapper: one of a family Dew writes
+    (`_WRAPPER_WRITERS`) whose media are a vision tower and its projector, which
+    `PretrainedDecoder.from_model` writes in that layout (`_wrapper_config`); a run's export of any other
+    is its native release (`dew.interop.saved_sources.source_publishes`)."""
+    return (isinstance(model, MultimodalTransformer) and model.family in _WRAPPER_WRITERS
+            and model.vision is not None and model.projection is not None and model.audio is None
+            and model.audio_projection is None)
+
+
 def _wrapper_language(model: MultimodalTransformer) -> dict[str, object]:
     """The text_config of a wrapper built in Dew: its language model as its text family writes it
     (`hf_decoders.export_config`), with what the wrapper reads beside it (`_wrapper_text_fields`'
@@ -1391,10 +1401,10 @@ def _wrapper_config(model: MultimodalTransformer, processor: Processor | None) -
     tower's and projector's vision_config, its image placeholder id, and the video's of the `processor`
     its prompts were made with, where it reads videos. A wrapper no writer writes is refused (TypeError),
     as a model the config reads back as another is (`_refuse_lossy_wrapper`)."""
-    writer = _WRAPPER_WRITERS.get(model.family)
-    if (writer is None or model.vision is None or model.projection is None or model.audio is not None
-            or model.audio_projection is not None):
+    if not wrapper_writes(model):
         raise TypeError(f"a {model.family} MultimodalTransformer has no Hugging Face layout Dew writes")
+    assert model.vision is not None and model.projection is not None
+    writer = _WRAPPER_WRITERS[model.family]
     text = _wrapper_language(model)
     if text["model_type"] != f"{model.family}_text":
         raise ValueError(f"a {model.family} wrapper holds a {model.family}_text language model, and this one "
