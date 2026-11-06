@@ -990,8 +990,11 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     operands at the indices `live` alone, those a reverse pass differentiates, so a frozen operand's
     cotangent is never formed. `primal(*operands)` gives the output where no derivative is taken (a kernel
     that saves nothing), `forward`'s where None. Without `nested`, a derivative's level runs `forward` as
-    it is, not as a custom JVP of its own: a value it names (`checkpoint_name`) is a residual a remat
-    policy can keep, and no higher order differentiates through it (a kernel's custom VJP takes none)."""
+    it is on its operands held still (`stop_gradient`), not as a custom JVP of its own: a value it names
+    (`checkpoint_name`) is a residual a remat policy can keep, and no order differentiates the kernels'
+    forward, whose custom VJP takes none (what it saves reaches `pulled` alone, whose tangent reads the
+    operands': run as it was, a jvp of a gradient through a named kernel reached Mosaic GPU's call, which
+    no JAX rule differentiates, row 2655)."""
     import jax
     from jax.custom_derivatives import SymbolicZero, zero_from_primal
 
@@ -1025,7 +1028,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     pulled = declared_tangent(kind, pulled_by, pulled_jvp, nondiff_argnums=(3,))
 
     def bounded_jvp(primals, tangents):
-        output, saved = (produced if nested else forward)(*primals)
+        output, saved = produced(*primals) if nested else forward(*jax.lax.stop_gradient(primals))
         # Only the perturbed operands are the linear map's: its transpose takes no known zero.
         directions, tree = jax.tree.flatten(tangents, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
         live = [index for index, direction in enumerate(directions)

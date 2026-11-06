@@ -34,7 +34,7 @@ from ssd_support import ssd_orbit, stepwise_scan
 
 from dew.algebra.scan import RESET_DECAY
 from dew.nn.kernels.recurrence_chunk import ssd_operands
-from dew.nn.kernels.ssd import ssd_chunk_scan
+from dew.nn.kernels.ssd import _chunk_scan
 
 pytestmark = pytest.mark.kernel
 
@@ -162,7 +162,7 @@ def parity_functions(chunk_size: int, roundings: int, platform: str = "tpu"):
     XLA's, and XLA's independently checked float64 truth. The kernel and the scan, two Dew paths,
     compile without YNNPACK fusions on the CPU lane (`without_ynn`)."""
     mine = without_ynn(lambda operands, seeded: evaluated(
-        lambda *o: ssd_chunk_scan(*o, chunk_size, platform), operands, seeded))
+        lambda *o: _chunk_scan(*o, chunk_size, platform), operands, seeded))
     xla = without_ynn(lambda operands, seeded: evaluated(
         lambda *o: xla_chunk_scan(*o, chunk_size), operands, seeded))
     recurrence = jax.jit(lambda operands, seeded: evaluated(stepwise_scan, operands, seeded))
@@ -313,7 +313,7 @@ def test_the_scan_preserves_resets_and_initial_state_gradients(reference, kind, 
     operands, seeded = case_draw(reference, kind, case)(0)
     chunk_size = case[0] if kind == "fixture" else case[1]
     run = jax.jit(lambda inputs, cotangents: evaluated(
-        lambda *args: ssd_chunk_scan(*args, chunk_size, "tpu"), inputs, cotangents))
+        lambda *args: _chunk_scan(*args, chunk_size, "tpu"), inputs, cotangents))
     actual = jax.tree.map(np.asarray, run(operands, seeded))
     expected = {"output": operands[0], "final": operands[-1],
                 **dict(zip(("x", "B", "C", "A dt", "state"), operands, strict=True))}

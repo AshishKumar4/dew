@@ -2,7 +2,7 @@
 """Time the Mamba-2 SSD chunked scan: the template's portable math in XLA against the Pallas kernel.
 
 `dew.nn.mixers.mamba2.chunk_ssd` picks between the recurrence template's
-portable math (`portable_scan`) and `dew.nn.kernels.ssd.ssd_chunk_scan` from
+portable math (`portable_scan`) and `dew.nn.kernels.ssd._chunk_scan` from
 the backend and the geometry. This
 tool times the two on the same chunked operands, forward and forward+backward,
 so the selection rule in `ssd_kernel_runs` can be checked against numbers
@@ -12,7 +12,7 @@ row also says whether that rule would have chosen the kernel for its geometry.
 The scan alone is what is timed. The padding, the group expansion, the `dt`
 scaling and the `D` skip around it are the same operations on both paths, so
 they would add the same constant to both rows; the transposes the kernel needs
-are inside `ssd_chunk_scan` and are timed with it.
+are inside `_chunk_scan` and are timed with it.
 
 This needs a TPU to mean anything. On CPU the kernel runs through
 pallas' interpreter, which is orders of magnitude slower than either path and
@@ -35,7 +35,7 @@ import jax.numpy as jnp
 import tyro
 
 from dew.nn.kernels.recurrence_chunk import chunk_delta_rule
-from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_runs
+from dew.nn.kernels.ssd import _chunk_scan, ssd_kernel_runs
 from dew.telemetry.benchmark import largest_difference, samples
 
 IMPLEMENTATIONS = ('xla', 'kernel')
@@ -95,7 +95,7 @@ def kernel_platform(config: BenchmarkConfig) -> str:
 
 
 def portable_scan(x, B, C, a, carried, chunk_size: int):
-    """The scan as the recurrence template's portable math runs it, on `ssd_chunk_scan`'s operands
+    """The scan as the recurrence template's portable math runs it, on `_chunk_scan`'s operands
     (`x` scaled by `dt`, `B` and `C` a head each, `a` the per-step `A dt`, `carried` `[B, H, P, N]`):
     `chunk_delta_rule` without the delta rule, every write gate one."""
     out, final = chunk_delta_rule(C, B, x, a[..., None], jnp.ones(a.shape, a.dtype),
@@ -105,7 +105,7 @@ def portable_scan(x, B, C, a, carried, chunk_size: int):
 
 def scan_fn(implementation: str, platform: str, chunk_size: int):
     if implementation == 'kernel':
-        return lambda *args: ssd_chunk_scan(*args, chunk_size, platform)
+        return lambda *args: _chunk_scan(*args, chunk_size, platform)
     return lambda *args: portable_scan(*args, chunk_size)
 
 
