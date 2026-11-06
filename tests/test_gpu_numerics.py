@@ -23,6 +23,7 @@ process (`gpu_flow`), each cell its own file's property:
 import functools
 
 import jax.numpy as jnp
+import narrow_copies_matrix
 import norm_swiglu_matrix
 import pytest
 import test_audio as audio
@@ -109,3 +110,10 @@ def test_the_norm_swiglu_matrix_holds_on_this_gpu():
     kernel on par with XLA's arithmetic at every pair of axis values the kernels serve, each cell on its own
     GPU."""
     run_cells(cells_of(norm_swiglu_matrix.a_fused_entrys_training_step_is_on_par))
+
+
+def test_the_narrow_copies_matrix_holds_on_this_gpu():
+    """The narrow copies' check-1 matrix (tests/kernel_matrix.py): a decoder's training run through the copies
+    of its weights the update writes on par with the forward's own casts at every pair of axis values the
+    copies serve, each cell on its own GPU."""
+    run_cells(cells_of(narrow_copies_matrix.a_narrow_copy_training_run_is_on_par))
