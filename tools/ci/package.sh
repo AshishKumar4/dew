@@ -1,10 +1,10 @@
 #!/bin/sh
 # CI's package gate: what a release attaches and Dew's index serves, installed the way a user installs it. The sdist
 # and wheel build and pass twine, and name no requirement by URL, which an index refuses and twine passes
-# (tools/check_distribution.py); the wheel installs into an empty environment and runs (tools/smoke_wheel.py); an
-# install from PyPI alone stops at resolving jax, on which Dew carries fixes; and the accelerator extras resolve
-# against Dew's package index. GitHub's CI runs it for a pull request and a release on a hosted runner
-# (.github/workflows/ci.yml).
+# (tools/check_distribution.py); the wheel installs into an empty environment and runs, its requirements at their newest
+# and at the lower bounds dewml declares (tools/smoke_wheel.py); an install from PyPI alone stops at resolving jax, on
+# which Dew carries fixes; and the accelerator extras resolve against Dew's package index. GitHub's CI runs it for a
+# pull request and a release on a hosted runner (.github/workflows/ci.yml).
 #
 # Usage: sh tools/ci/package.sh [dist directory]   from the checkout's top, with uv on PATH; the directory (dist by
 #                                                   default) is left holding the sdist and wheel it checked.
