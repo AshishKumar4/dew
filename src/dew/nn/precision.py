@@ -85,7 +85,9 @@ __all__ = [
     "configured_precision",
     "correctly_rounded_divide",
     "divided",
+    "effective_precision",
     "exact_float32",
+    "exact_products",
     "float32_dot_general",
     "float32_einsum",
     "float32_matmul",
@@ -93,6 +95,7 @@ __all__ = [
     "fp32_result_dot_general",
     "head_dot_general",
     "head_product",
+    "iteration_dtype",
     "l2norm",
     "numerics_of",
     "operand_precision",
@@ -103,6 +106,7 @@ __all__ = [
     "rms_weighted",
     "rounded_operand",
     "rounded_to",
+    "rounds_products",
     "rounds_to_bf16",
     "running_sum",
     "running_total",
@@ -307,6 +311,50 @@ def asks_default_precision(precision: jax.lax.PrecisionLike, *, configured: bool
     if not names and configured:
         names = precision_names(jax.config.jax_default_matmul_precision)
     return names <= {'DEFAULT'}
+
+
+def effective_precision(precision: jax.lax.PrecisionLike) -> jax.lax.PrecisionLike:
+    """The precision a product multiplies at, resolved once: the one it states, else the run's configured
+    one (`jax_default_matmul_precision`, a run's `Numerics.matmul`, `generation.run_precision`), which a
+    route takes as the call's declaration, honouring it or handing the call to a route that does, never
+    replacing it with a backend's own arithmetic."""
+    return precision if precision_names(precision) else jax.config.jax_default_matmul_precision
+
+
+def rounds_products() -> bool:
+    """Whether the run's declaration lets a native route round an fp32 product's operands (TF32, or bf16
+    parts): its fast forms (`Numerics.forms`) at a configured precision of no more than the default
+    (`asks_default_precision`); a run at 'highest' or a dot algorithm keeps them whole whatever its forms."""
+    from dew.nn.kernels.generation import numerics
+
+    return numerics().forms == "fast" and asks_default_precision(None, configured=True)
+
+
+def iteration_dtype() -> jnp.dtype:
+    """The dtype an optimizer's matrix iteration (Muon's and M3's Newton-Schulz, `dew.newton_schulz`)
+    multiplies in under the run's numerics: its compute dtype in its fast forms (bfloat16 under
+    bf16-mixed, the measured default there: a Qwen3.5-4B decision step 844 ms against 1287 at TF32 and 4641
+    at IEEE float32 on an H100), at least float32 of it in its accurate ones; a float64 run iterates in
+    float64."""
+    from dew.nn.kernels.generation import numerics
+
+    held = numerics()
+    compute = jnp.dtype(held.dtypes.compute)
+    return compute if held.forms == "fast" else jnp.promote_types(compute, jnp.float32)
+
+
+def exact_products(precision: jax.lax.PrecisionLike, dtype: DTypeLike) -> bool:
+    """Whether a route that multiplies `dtype` operands whole with float32 sums (an fp32 FMA, a 16-bit
+    operand's exact product, fp32 operands in bf16 parts that hold their 24 bits) computes the declaration
+    `effective_precision(precision)`: a precision level, each a floor (DEFAULT, HIGH, HIGHEST), or a dot
+    algorithm whose products are whole for these operands (F32_F32_F32, and a 16-bit operand's own
+    BF16_BF16_F32 or F16_F16_F32); not an algorithm that narrows them (TF32's, bf16 parts of an fp32
+    product) or widens them (F64), which a route hands to XLA, which computes it."""
+    dtype = jnp.dtype(dtype)
+    whole = {"DEFAULT", "HIGH", "HIGHEST", "F32_F32_F32"}
+    whole |= {jnp.dtype(jnp.bfloat16): {"BF16_BF16_F32"},
+              jnp.dtype(jnp.float16): {"F16_F16_F32"}}.get(dtype, set())
+    return precision_names(effective_precision(precision)) <= whole
 
 
 def products_dtype(*operands) -> jnp.dtype | None:
@@ -604,10 +652,12 @@ def _held(product: jax.Array, preferred_element_type: DTypeLike | None, *operand
     return product.astype(held)
 
 
-def float32_matmul(lhs, rhs, precision: jax.lax.PrecisionLike = None) -> jax.Array:
+def float32_matmul(lhs, rhs, precision: jax.lax.PrecisionLike = None,
+                   preferred_element_type: DTypeLike | None = None) -> jax.Array:
     """`lhs @ rhs` at `precision`, JAX's configured one where unstated, accumulated as
-    `float32_dot_general` is."""
-    return accumulated(functools.partial(jnp.matmul, precision=precision), lhs, rhs)
+    `float32_dot_general` is, summed and returned in `preferred_element_type` where given."""
+    return accumulated(functools.partial(jnp.matmul, precision=precision), lhs, rhs,
+                       preferred_element_type=preferred_element_type)
 
 
 @dataclasses.dataclass(frozen=True)
