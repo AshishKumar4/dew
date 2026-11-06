@@ -702,15 +702,15 @@ def report(args: argparse.Namespace) -> int:
                           if row.name in plans] for arm in ARMS}
         verdicts[row.name] = {"state": state, "unit": row.unit, "gated": row.gated, **numbers,
                               **({"plans": selected} if any(selected.values()) else {})}
-        if selected["base"] and any(plan != selected["base"][0] for plans in selected.values()
-                                    for plan in plans):
-            state += " (its arms planned otherwise: the verdicts' plans)"
         if (state in (*UNQUALIFIED, "broken", "failed") or (state == "regressed" and row.gated)
                 or (claiming and claimed(row) and state in
                     ("not measured on this hardware", "not compared"))):
             failed.append(f"{row.name} ({state})")
         if not row.gated:
             state = f"{state}, not gated"
+        if selected["base"] and any(plan != selected["base"][0] for plans in selected.values()
+                                    for plan in plans):
+            state += " (its arms planned otherwise: the verdicts' plans)"
         if state.startswith("partial"):
             state += " (" + ", ".join(f"{arm} {count} of {rounds} rounds unmeasured"
                                       for arm, count in numbers["unmeasured rounds"].items()) + ")"

@@ -31,7 +31,7 @@ def test_the_report_fails_on_a_broken_row_and_not_on_an_ungated_one(gate, tmp_pa
     rows = [gate.Row("gated", "ms", "").__dict__, gate.Row("shown", "ms", "", gated=False).__dict__]
     steady = [{"gated": 10.0, "shown": 10.0}, {"gated": 10.0625, "shown": 10.0625}] * 3
     results = {"base": "main", "head": "head", "alone": "main~aa", "rows": rows, "rounds": 6,
-               "samples": {"main": steady, "main~aa": steady[::-1], "head": [head] * 6}}
+               "samples": {"base": steady, "alone": steady[::-1], "head": [head] * 6}}
     (tmp_path / "gate.json").write_text(json.dumps(results))
     monkeypatch.setattr(sys, "argv", ["perf_gate.py", "report", str(tmp_path / "gate.json")])
     assert gate.main() == code
