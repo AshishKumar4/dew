@@ -1265,19 +1265,6 @@ def gpu_placed() -> bool:
     return assumption() is None and jax.default_backend() == 'gpu' and placed_platform() == 'gpu'
 
 
-def cuda_lowered() -> bool:
-    """Whether a library's CUDA call lowers here for the call's target: on this process's own GPU
-    (`gpu_placed`), or within `assumed` on a GPU host whose own GPU is the assumed generation's, where a
-    compile ahead's program for that GPU's compile-only devices lowers it as for its own (an FFI target
-    the library registered, and the facts it reads of the GPU: FlashAttention's, dew_flash_attn)."""
-    import jax
-    if gpu_placed():
-        return True
-    found = assumption()
-    return (found is not None and jax.default_backend() == 'gpu'
-            and _generation(jax.local_devices()[0]) == found.generation)
-
-
 def backend() -> str:
     """The platform a call's code is chosen for: `placed_platform()`, or within `assumed` the
     assumed generation's, 'gpu' for an `smXY` and 'tpu' for a TPU's, so a choice keyed on the
