@@ -1478,6 +1478,12 @@ def refuse_lossy_export(model: CausalTransformer, config: Mapping[str, object]) 
     except ValueError as error:
         raise ValueError(f"the {config['model_type']} config written for this model does not read back: "
                          f"{error}") from error
+    refuse_rebuilt(model, rebuilt, _records.text(config['model_type'], 'model_type'))
+
+
+def refuse_rebuilt(model: CausalTransformer, rebuilt: CausalTransformer, model_type: str) -> None:
+    """Refuse a `model` its `model_type` config reads back as `rebuilt`, another computation
+    (`refuse_lossy_export`), naming the fields that differ."""
     lost: dict[str, tuple[str, str]] = {}
     for declared in dataclasses.fields(model):
         if declared.name in _RUNTIME_FIELDS:
@@ -1488,7 +1494,7 @@ def refuse_lossy_export(model: CausalTransformer, config: Mapping[str, object]) 
             lost[declared.name] = (repr(theirs), repr(ours))
     if lost:
         raise ValueError(
-            f"{sorted(lost)} would not survive an export as {config['model_type']}: its config reads back "
+            f"{sorted(lost)} would not survive an export as {model_type}: its config reads back "
             f"{', '.join(f'{name}={read}' for name, (read, _) in lost.items())} where this model has "
             f"{', '.join(f'{name}={held}' for name, (_, held) in lost.items())}, "
             "so transformers would compute "

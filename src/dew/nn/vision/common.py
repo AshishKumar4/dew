@@ -16,7 +16,7 @@ from dew import _records
 from dew.batch import Variables
 from dew.interop.decoder_parts import read_rope_theta
 from dew.interop.unread import Stored
-from dew.interop.weights import placed
+from dew.interop.weights import native_layouts, placed
 from dew.registry import Record, projectors, towers
 
 if TYPE_CHECKING:
@@ -178,6 +178,25 @@ def block_tensor_path(parts: list[str], maps: Mapping[tuple[str, str], tuple[str
     return None
 
 
+def block_tensor_name(path: tuple[str, ...], maps: Mapping[tuple[str, str], tuple[str, ...]], *,
+                      prefix: str = "blocks", block: str = "blocks",
+                      norms: Mapping[str, str] = _BLOCK_NORMS) -> str | None:
+    """`block_tensor_path`'s inverse: the tensor name of the leaf at `path` under `{block}_N`, for a
+    trunk built natively rather than read; None for a leaf of no block."""
+    head, *rest = path
+    index = head.removeprefix(f"{block}_")
+    if index == head or not index.isdigit() or not rest:
+        return None
+    leaf = rest[-1]
+    norm = {native: name for name, native in norms.items()}
+    if len(rest) == 2 and rest[0] in norm and leaf in ("scale", "bias"):
+        return f"{prefix}.{index}.{norm[rest[0]]}.{'weight' if leaf == 'scale' else 'bias'}"
+    pair = {native: names for names, native in maps.items()}.get(tuple(rest[:-1]))
+    if pair is not None and leaf in ("kernel", "bias"):
+        return f"{prefix}.{index}.{pair[0]}.{pair[1]}.{'weight' if leaf == 'kernel' else 'bias'}"
+    return None
+
+
 def tower_layout(kind: str) -> TowerLayout:
     """Where tower kind `kind`'s tensors sit: its class's `checkpoint` (`dew.registry.towers`)."""
     return _held(towers[kind].checkpoint if kind in towers else None, "tower", kind)
@@ -201,6 +220,15 @@ def projector_variables(kind: str, hf_tensors: Mapping[str, Stored], param_dtype
     """One projector kind's parameters, in the requested storage (`projector_layout`), and the
     layouts that write its tensors back from them."""
     return projector_layout(kind).variables(hf_tensors, param_dtype)
+
+
+def projector_native_layouts(kind: str, params: Variables) -> tuple[WeightLayout, ...]:
+    """The layouts that write a natively built `kind` projector's tensors back from its parameters,
+    each under its name past the layout's prefix (`ProjectorLayout.tensors`), rooted at `params`."""
+    layout = projector_layout(kind)
+    names: dict[tuple[str, ...], str] = {("params", *path): name for name, path in layout.tensors.items()}
+    return native_layouts({"params": params}, lambda path: names[path],
+                          lambda name: ("params", *layout.path(name)))
 
 
 def _held[Layout](layout: Layout | None, what: str, kind: str) -> Layout:
