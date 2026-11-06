@@ -244,7 +244,7 @@ def test_a_none_of_the_above_that_overfills_a_row_over_one_state_is_declined_whe
     example = Example(STATES[0], YES_NO, {"first": "yes", "second": "yes"})
     [row] = SHARED.rows(TOKENIZER, SPECIALS, STATES[0], YES_NO)
     fitting = dataclasses.replace(SHARED, max_len=len(row.tokens))
-    head = LabelReadout(features=8, label_ids=(), count=4)
+    head = LabelReadout(features=8, label_ids=LABELS.ids(TOKENIZER, 4), count=4)
     [fitted] = Fit(fitting, TOKENIZER, SPECIALS, head, none_of_the_above=1.0).map(
         {"example": example})["decision_rows"]
     assert fitted.names == tuple(YES_NO) and fitted.declined == "unfit"
@@ -258,7 +258,7 @@ def test_a_head_that_reads_across_its_rows_questions_refuses_a_row_over_one_stat
     joint = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
     with pytest.raises(ValueError):
         Fit(SHARED, TOKENIZER, SPECIALS, joint).map({"example": example})
-    readout = LabelReadout(features=8, label_ids=(), count=4)
+    readout = LabelReadout(features=8, label_ids=LABELS.ids(TOKENIZER, 4), count=4)
     assert len(Fit(SHARED, TOKENIZER, SPECIALS, readout).map({"example": example})["decision_rows"]) == 1
 
 
