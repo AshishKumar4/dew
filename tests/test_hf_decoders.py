@@ -1732,8 +1732,9 @@ def test_a_wrappers_decoder_reads_as_its_language_model_load_reads_it():
     does (`decoder_config`, ledger 3006): Qwen 3.5's wrapper unties its head at its own scope over a text
     config that ties it, which tools/kernel_picks.py's decoder (`model_of`) unties as the load does, and
     states its modeling overrides there, which `model_of`'s decoder builds as the load does (its full
-    attention block-bidirectional); a registered family that reads its whole record (Kimi K2.5's) is
-    read as it is."""
+    attention block-bidirectional); a media bundle its family reads whole (Kimi K2.5's) is its text
+    checkpoint's record, its towers' sections gone, which its language model alone builds as the load
+    does; and any other registered family's record is read as it is (Llama's)."""
     import argparse
 
     from tool_support import run_from
@@ -1759,7 +1760,15 @@ def test_a_wrappers_decoder_reads_as_its_language_model_load_reads_it():
     assert built.kinds["full_attention"].mixer.bidirectional_blocks
     assert built.kinds == blocked.kinds
     whole = json.loads((FIXTURES / "kimi-k25-tiny" / "config.json").read_text())
-    assert decoder_config(whole) is whole
+    text = decoder_config(whole)
+    assert "vision_config" in whole and "vision_config" not in text
+    assert {name: value for name, value in whole.items() if name in text} == dict(text)
+    kimi = model_of(argparse.Namespace(config=str(FIXTURES / "kimi-k25-tiny"), revision=None,
+                                       dtype="float32"))
+    alone = Pretrained.load(FIXTURES / "kimi-k25-tiny", text_only=True, dtype="float32").model
+    assert kimi.kinds == alone.kinds and kimi.num_layers == alone.num_layers
+    plain = json.loads((FIXTURES / "llama-tiny" / "config.json").read_text())
+    assert decoder_config(plain) is plain
 
 
 def test_a_decoder_of_the_default_feed_forward_width_exports(tmp_path):
