@@ -109,6 +109,8 @@ from dew.inference.serving_kernel import (
     copy_program,
     decode_programs,
     dispatched,
+    entry_programs,
+    entry_shapes,
     joined,
     mixed_refusal,
     opened,
@@ -423,7 +425,8 @@ class PagedRows:
         if any(part.prefix_cache for part in self.pages) and any(
                 row_state(path) for path, _ in jax.tree_util.tree_leaves_with_path(cache)):
             for part in self.pages:
-                part.states = States(self.states)
+                # A state gives way to a host slot as a reclaimed page does, as many as the pages'.
+                part.states = States(self.states, host=part.host)
 
     @property
     def stateful(self) -> bool:
@@ -725,6 +728,13 @@ class Server:
             states = jax.tree_util.tree_map_with_path(store, self.cache)
             self._states = states
             self._restored, self._captured = map(Fetched, state_programs(formats, states))
+        self._host_states: dict[int, list[np.ndarray]] | None = None
+        """The row state store's host tier: each of this process's host slots, by the slot's global index,
+        its entry of each state leaf (`dew.inference.pages.States`); None without one."""
+        if self._states is not None and isinstance(rows, PagedRows) and rows.pages[0].host:
+            self._host_states = {}
+            self._read_entries, self._written_entries = map(Fetched, entry_programs(self._states,
+                                                                                    self._admitted))
         self._host: dict[int, list[np.ndarray]] | None = None
         """The prefix cache's host tier: each of this process's host slots, by the slot's global index, its
         page of each pool leaf (`dew.inference.pages.Transfers`); None without one."""
@@ -1131,13 +1141,16 @@ class Server:
         # seating's does; each process's captures and page copies come back with it.
         (admission, _), booked = self._agreed("serving admission", admitted, lambda held: held[1])
         captures = [tuple(pair) for held in booked for pair in held["captures"]]
-        copies, spills, uploads = ([tuple(pair) for held in booked for pair in held[name]]
-                                   for name in ("copies", "spills", "uploads"))
+        copies, spills, uploads, state_spills, state_uploads = (
+            [tuple(pair) for held in booked for pair in held[name]]
+            for name in ("copies", "spills", "uploads", "state_spills", "state_uploads"))
         with self._context():
             # Spills read reclaimed pages before anything writes them (a copy's fresh page may be one), and
             # a copy reads its segment's page after an upload lands it there.
             self._transferred(spills, uploads)
             self._copied(copies)
+            # A state giving way goes to the host, and one a seated row reads comes back, before restores.
+            self._moved_states(state_spills, state_uploads)
             if restores:
                 self._resident, self._carried = self._restored(
                     self._resident, self._carried, self._states, *_padded(restores, self.slots, 0))
@@ -1178,15 +1191,23 @@ class Server:
         """The page copies this process's seating owes (`dew.inference.pages.Transfers`), by the pool's and
         the host tier's global page and slot: its groups' pages and slots lie at their groups' offsets."""
         if not isinstance(self.rows, PagedRows):
-            return {"copies": [], "spills": [], "uploads": []}
+            return {"copies": [], "spills": [], "uploads": [], "state_spills": [], "state_uploads": []}
         per, host = self.rows.pages[0].count, self.rows.pages[0].host
         owed = [(group, self.rows.pages[group].drained()) for group in self._local]
+        # The row states' moves, by the store's global entry and the host tier's global slot.
+        entries = self.rows.states
+        moved = [(group, (([], []) if part.states is None else part.states.drained()))
+                 for group, part in ((group, self.rows.pages[group]) for group in self._local)]
         return {"copies": [[group * per + source, group * per + page] for group, held in owed
                            for source, page in held.copies],
                 "spills": [[group * per + page, group * host + slot] for group, held in owed
                            for page, slot in held.spills],
                 "uploads": [[group * host + slot, group * per + page] for group, held in owed
-                            for slot, page in held.uploads]}
+                            for slot, page in held.uploads],
+                "state_spills": [[group * entries + entry, group * host + slot]
+                                 for group, (spills, _) in moved for entry, slot in spills],
+                "state_uploads": [[group * host + slot, group * entries + entry]
+                                  for group, (_, uploads) in moved for slot, entry in uploads]}
 
     def _copied(self, copies: Sequence[tuple[int, int]]) -> None:
         """Copy each shared segment's last page into the fresh page a prompt sharing it writes past the
@@ -1206,38 +1227,68 @@ class Server:
     def _transferred(self, spills: Sequence[tuple[int, int]], uploads: Sequence[tuple[int, int]]) -> None:
         """Make the page copies every process's seating owes before the step's program writes any page: each
         reclaimed prefix page out to its host slot, then each shared one back from its slot into its fresh
-        page, a fixed number a call so one program of each serves every step. A process keeps the slots of
-        its own groups, and hands the pages written in a row per group, its groups' rows its own
-        (`_placed`), each group's at most as many as its share of an admission reads."""
+        page (`_host_moves`)."""
         if self._host is None:
             return
+
+        def write(pages: np.ndarray, held: Variables) -> None:
+            self._resident, self._carried = self._written_pages(self._resident, self._carried, pages, held)
+
+        self._host_moves(spills, uploads, self._host, phase="the prefix cache's spilled pages",
+                         read=lambda pages: self._read_pages(self._resident, self._carried, pages),
+                         write=write, shapes=lambda count: page_shapes(self._resident, self._carried, count))
+
+    def _moved_states(self, spills: Sequence[tuple[int, int]], uploads: Sequence[tuple[int, int]]) -> None:
+        """Make the row state moves every process's seating owes before the step's restores
+        (`dew.inference.pages.States`): each entry giving way out to its host slot, then each host state a
+        seated row reads back into its entry (`_host_moves`)."""
+        if self._host_states is None or self._states is None:
+            return
+        states = self._states
+
+        def write(entries: np.ndarray, held: Variables) -> None:
+            self._states = self._written_entries(self._states, entries, held)
+
+        self._host_moves(spills, uploads, self._host_states, phase="the prefix cache's spilled row states",
+                         read=lambda entries: self._read_entries(self._states, entries), write=write,
+                         shapes=lambda count: entry_shapes(states, count))
+
+    def _host_moves(self, spills: Sequence[tuple[int, int]], uploads: Sequence[tuple[int, int]],
+                    tier: dict[int, list[np.ndarray]], *, read: Callable[[np.ndarray], Variables],
+                    write: Callable[[np.ndarray, Variables], None], shapes: Callable[[int], Variables],
+                    phase: str) -> None:
+        """Move a device store's places (a pool's pages, a row state store's entries) to and from the host
+        `tier`: each spilled place out to its slot, `read` a fixed number a call, then each uploaded slot
+        back into its place, `write` a fixed number a call, so one program of each serves every step. A
+        process keeps the slots of its own groups, and hands the places written in a row per group, its
+        groups' rows its own (`_placed`), each group's at most as many as its share of an admission
+        reads."""
         assert isinstance(self.rows, PagedRows)
         host, width = self.rows.pages[0].host, self.admission * self.rows.width
         for start in range(0, len(spills), width):
             batch = spills[start:start + width]
-            pages, _ = _padded(batch, width, 1)
-            read = self._read_pages(self._resident, self._carried, pages)
-            # A pool's pages come home with every process agreeing; a server of one process's alone.
-            leaves = (jax.tree.leaves(collective_host(read, phase="the prefix cache's spilled pages"))
-                      if self.pooled else pinned_get(jax.tree.leaves(read)))
+            places, _ = _padded(batch, width, 1)
+            read_out = read(places)
+            # A pool's places come home with every process agreeing; a server of one process's alone.
+            leaves = (jax.tree.leaves(collective_host(read_out, phase=phase)) if self.pooled
+                      else pinned_get(jax.tree.leaves(read_out)))
             for index, (_, slot) in enumerate(batch):
                 if slot // host in self._local:
-                    self._host[slot] = [np.asarray(leaf)[index].copy() for leaf in leaves]
+                    tier[slot] = [np.asarray(leaf)[index].copy() for leaf in leaves]
         share = width // self.groups
         by_group = [[pair for pair in uploads if pair[0] // host == group] for group in range(self.groups)]
-        shapes = page_shapes(self._resident, self._carried, share)
+        held_shapes = shapes(share)
         for start in range(0, max(map(len, by_group)), share):
-            pages = np.full((self.groups, share), DROPPED, np.int32)
-            held = [np.zeros((len(self._local), *leaf.shape), leaf.dtype) for leaf in jax.tree.leaves(shapes)]
+            places = np.full((self.groups, share), DROPPED, np.int32)
+            held = [np.zeros((len(self._local), *leaf.shape), leaf.dtype)
+                    for leaf in jax.tree.leaves(held_shapes)]
             for group, pairs in enumerate(by_group):
-                for index, (slot, page) in enumerate(pairs[start:start + share]):
-                    pages[group, index] = page
+                for index, (slot, place) in enumerate(pairs[start:start + share]):
+                    places[group, index] = place
                     if group in self._local:
-                        for rows, held_page in zip(held, self._host[slot], strict=True):
-                            rows[self._local.index(group), index] = held_page
-            self._resident, self._carried = self._written_pages(
-                self._resident, self._carried, pages,
-                jax.tree.unflatten(jax.tree.structure(shapes), self._placed(held)))
+                        for rows, held_place in zip(held, tier[slot], strict=True):
+                            rows[self._local.index(group), index] = held_place
+            write(places, jax.tree.unflatten(jax.tree.structure(held_shapes), self._placed(held)))
 
     def run(self) -> None:
         """Step until every queued and running request has resolved. A step that fails stops the server:

@@ -1,4 +1,5 @@
-"""Actual Diffusers 0.34.0 Wan 2.1 objects, saved and walked, for tests/fixtures.
+"""Actual Diffusers Wan 2.1 objects, saved and walked, for tests/fixtures: the transformer at Diffusers
+0.34.0, the pipeline at the release the test extra pins.
 
 The transformer half constructs tiny `WanTransformer3DModel` instances with
 every parameter moved off its initialization, saves each with
@@ -23,7 +24,7 @@ the walk it steps the published UniPC scheduler alone, at 10 and 50 steps,
 on a fixed sequence of model outputs that no sample feeds back into: its
 timesteps and the sample after every step, in float32 and in float64.
 
-Run with the Dew test environment's diffusers 0.34.0 and torch, on CPU:
+Run with the Dew test environment's diffusers and torch, on CPU:
 
     python tools/diffusers_wan_reference.py transformer OUTPUT_DIR
     python tools/diffusers_wan_reference.py bundle OUTPUT_DIR tests/fixtures/wan_transformer.tar.xz
@@ -48,8 +49,12 @@ from diffusers_reference_helpers import recording, restore_transformers_names
 from reference_releases import RELEASES
 from torch_precision import default_dtype, float64, float64_twin, widened
 
-COHORT = "diffusers-0.34"
-DIFFUSERS = RELEASES[COHORT]["diffusers"]
+TRANSFORMER_COHORT = "diffusers-0.34"
+"""The transformer half's releases: Diffusers 0.39.0's variant transformer computes otherwise than the
+0.34.0 one Dew's port follows."""
+PIPELINE_COHORT = "diffusers-wan"
+"""The pipeline half's: the test extra's Diffusers, whose UniPC walk Dew's follows, and Transformers, whose
+UMT5 text tower it encodes the prompts with."""
 SOURCE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/wan-source"
 BASE = {"patch_size": [1, 2, 2], "num_attention_heads": 2, "attention_head_dim": 12, "in_channels": 4,
         "out_channels": 4, "text_dim": 20, "freq_dim": 16, "ffn_dim": 40, "num_layers": 2,
@@ -163,11 +168,12 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
 
 
 def transformer(destination: str) -> None:
-    root = recording(destination, COHORT)
+    root = recording(destination, TRANSFORMER_COHORT)
     arrays: dict[str, np.ndarray] = {}
     for name, case in CASES.items():
         arrays.update({f"{name}.{key}": value for key, value in build(name, case, root).items()})
-    record = {"diffusers": DIFFUSERS, "torch": torch.__version__, "base": BASE, "seed": SEED,
+    record = {"diffusers": RELEASES[TRANSFORMER_COHORT]["diffusers"], "torch": torch.__version__,
+              "base": BASE, "seed": SEED,
               "cases": {name: {"config": {**BASE, **case.config}, "size": list(case.size),
                                "length": case.length, "times": list(case.times)}
                         for name, case in CASES.items()}}
@@ -310,7 +316,7 @@ def pipeline(destination: str) -> None:
     the whole pipeline in float64 (`float64`: the Wan modules' float32 pins,
     the call's float32 latents and the UniPC tables widened with it), under
     `_f64` names."""
-    root = recording(destination, COHORT)
+    root = recording(destination, PIPELINE_COHORT)
     pipe = build_pipeline(root)
     generator = torch.Generator().manual_seed(SEED + 9)
     shape = (len(PROMPTS), PIPELINE_VAE["z_dim"], (FRAMES - 1) // 4 + 1, HEIGHT // 8, WIDTH // 8)
@@ -326,7 +332,8 @@ def pipeline(destination: str) -> None:
         wide = WanPipeline.from_pretrained(root / "pipeline", torch_dtype=torch.float64)
         arrays.update(encoded_and_walked(wide, latents.double(), "_f64"))
     arrays.update(scheduler_replay())
-    record = {"diffusers": DIFFUSERS, "torch": torch.__version__, "seed": SEED, "transformer": PIPELINE,
+    record = {"diffusers": RELEASES[PIPELINE_COHORT]["diffusers"], "torch": torch.__version__, "seed": SEED,
+              "transformer": PIPELINE,
               "vae": PIPELINE_VAE, "prompts": PROMPTS, "frames": FRAMES, "height": HEIGHT, "width": WIDTH,
               "steps": STEPS, "guidance": GUIDANCE, "replay_steps": list(REPLAY_STEPS)}
     np.savez_compressed(root / "wan_pipeline.npz", **arrays)

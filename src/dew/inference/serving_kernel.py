@@ -851,6 +851,46 @@ def state_programs(formats: Formats, states: Variables) -> tuple[OuterProgram, O
             outer_program(_captured, donate_argnums=(0,), in_shardings=capture, out_shardings=placed))
 
 
+def _read_entries(states: Variables, entries: jax.Array) -> Variables:
+    """A row state store's `entries` (`state_programs`' store), each leaf's `[len(entries), ...]`, its run's
+    layers after (`row_axis`), so the host keeps each entry alike; None off the store."""
+    def read(path, leaf):
+        return None if leaf is None else jnp.moveaxis(jnp.take(leaf, entries, axis=row_axis(path)),
+                                                      row_axis(path), 0)
+
+    return jax.tree_util.tree_map_with_path(read, states, is_leaf=lambda x: x is None)
+
+
+def entry_shapes(states: Variables, count: int) -> Variables:
+    """The shapes `count` of a row state store's entries take as `_read_entries` reads them."""
+    return jax.eval_shape(_read_entries, states, jax.ShapeDtypeStruct((count,), jnp.int32))
+
+
+def _written_entries(states: Variables, entries: jax.Array, held: Variables) -> Variables:
+    """`states` with its `entries`, `[groups, count]`, each group's own, set to `held`'s, each leaf
+    `[groups, count, ...]` as `_read_entries` reads it; an entry past the store is dropped."""
+    def written(path, leaf, values):
+        if leaf is None:
+            return None
+        axis = row_axis(path)
+        flat = jnp.moveaxis(values.reshape(-1, *values.shape[2:]), 0, axis)
+        places = (*(slice(None),) * axis, entries.reshape(-1))
+        return leaf.at[places].set(flat.astype(leaf.dtype), mode="drop")
+
+    return jax.tree_util.tree_map_with_path(written, states, held, is_leaf=lambda x: x is None)
+
+
+def entry_programs(states: Variables, rows: NamedSharding | None) -> tuple[OuterProgram, OuterProgram]:
+    """The programs that move a row state store's entries, placed as `states` is, between the device and
+    the host (`dew.inference.pages.States`' spills and uploads): reading entries out, and writing entries
+    in, the entries handed in a row per group placed as the server's admitted rows are (`rows`), the store
+    donated."""
+    placed = jax.tree.map(lambda leaf: leaf.sharding, states)
+    return (outer_program(_read_entries, in_shardings=(placed, None)),
+            outer_program(_written_entries, donate_argnums=(0,), in_shardings=(placed, None, rows),
+                          out_shardings=placed))
+
+
 def opened_in(formats: Formats) -> OuterProgram:
     """`opened`, allocating its state in `formats`: an outer program (`dew.nn.kernels.options.program`),
     one for every layout."""

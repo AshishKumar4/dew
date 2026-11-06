@@ -1,4 +1,4 @@
-"""Diffusers 0.34.0 scheduler files reconstructed from their own configs.
+"""Diffusers scheduler files reconstructed from their own configs, at the release the test extra pins.
 
 `tools/diffusers_reference.py` proves the solver updates over grids Dew's own
 processes supply. This tool proves the other half: that
@@ -24,7 +24,7 @@ stochastic class is fed the exact draws Dew's solver makes at that step;
 in both precisions and in Dew. A separate record checks the native bridge's
 identities against the source tree.
 
-Run on CPU in an isolated reference environment with Dew, diffusers==0.34.0
+Run on CPU in an isolated reference environment with Dew, the test extra's diffusers
 and torchsde==0.2.6:
 
     PYTHONPATH=src python tools/diffusers_source_reference.py
