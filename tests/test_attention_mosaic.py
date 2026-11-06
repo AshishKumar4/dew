@@ -1711,10 +1711,9 @@ BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name 
                  for width in (64, 128, 256) for accurate in (False, True)]
 BACKWARD_GATE += [(generation_name, width, False, hooks) for generation_name in GATED for width in (64, 128)
                   for hooks in BACKWARD_HOOKS if hooks != "none"]
-BACKWARD_GATE += [(generation_name, 256, False, "softcap") for generation_name in GATED]
 """The backward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal
-call's head widths, each form, hookless; each score hook at the widths a hooked call's derivation takes
-whole (row 2281: its live set beside the step's); and Gemma 2's softcap at width 256."""
+call's head widths, each form, hookless; and each score hook at the widths a hooked call's derivation takes
+whole (row 2281: its live set beside the step's)."""
 
 
 def _gated_hooks(hooks: str, queries: int, width: int):

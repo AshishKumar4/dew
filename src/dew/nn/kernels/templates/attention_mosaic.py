@@ -941,9 +941,9 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         carried = [(block_k, width // share, jnp.float32), (block_k, value_width // share, jnp.float32)]
         products = [(block_q, block_k // share, jnp.float32)] * 2 + [(block_q, block_k // share, jnp.int8)]
         statistics = DKV_STATISTICS * family.row_registers(block_q, jnp.float32)
-        # A score hook's pullback (its slopes, `gradient.pulled`) beside the output cotangents' product.
-        pullback = products[1:] + [(block_q, block_k // share, jnp.float32)] * slopes
-        return resources.live_registers(family, carried, products, pullback,
+        # A score hook's slopes held beside both products to its pullback (as the fused launch's below).
+        slope_tiles = [(block_q, block_k // share, jnp.float32)] * slopes
+        return resources.live_registers(family, carried, products + slope_tiles,
                                         [(block_q, width // share, jnp.float32)]) + statistics
     carried = [(block_k, width // config.columns, jnp.float32), (block_k, value_width // config.columns,
                                                                  jnp.float32)]
@@ -959,10 +959,12 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
                               (block_k, block_q, value_width, [logits], False, False),
                               (block_k, block_q, width, [logits], False, False),
                               (block_q, block_k, width, dq_tile, False, False))
-        # A score hook's pullback (its slopes, `gradient.pulled`) beside the output cotangents' product; a
-        # dropping call's multipliers (`algebra.drawn`) beside the logits' and its products.
-        drawn = [logits] if dropped else []
-        return resources.live_registers(family, carried, products + drawn, pullback + drawn, dq_tile,
+        # A score hook's slopes (`gradient.tile_logits`) formed with the logits and held to its pullback
+        # (`gradient.pulled`) beside both products, and a dropping call's multipliers (`algebra.drawn`): the
+        # fused launch at 64 x 64 and width 128 under a softcap spilled 104 bytes where its slopes priced a
+        # phase of their own, 246 registers (softcap2).
+        held = [logits] * slopes + ([logits] if dropped else [])
+        return resources.live_registers(family, carried, products + held, pullback + held, dq_tile,
                                         *fragments) + statistics
     queries = block_q // config.consumers if split else block_q
     held, vectors = _hook_live(family, queries, block_k, params, grads="keys", keys_first=True)
@@ -1222,13 +1224,16 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         dkv_family = bundle_of(config.dkv, dtype)
         q_stages = min(config.stages, padded_q // config.block_q)
         if config.queries_first:
-            allocations = _coop_allocations if config.shared_keys else _fused_allocations
-            # The fused launch reduces across no warps, its statistics and D its operands and its sums its
-            # products' (an A100's at 64 x 64 reserves no reduction scratch, its lowering's 114,688 bytes the
-            # model's without it, et-fused80).
+            # The fused launch reduces across no warps but a score hook's (`reducing`), its statistics and D
+            # its operands and its sums its products' (an A100's at 64 x 64 reserves no reduction scratch,
+            # its lowering's 114,688 bytes the model's without it, et-fused80).
             # The fused launch's dK and dV in the operands' dtype where it stores them so (`stores_typed`).
+            reduced = reducing(family, config.consumers, self.score_mod)
+            allocations = (_coop_allocations if config.shared_keys
+                           else functools.partial(_fused_allocations, reduced=reduced))
             typed = {} if config.shared_keys else {"typed": stores_typed(
-                family, config, width, dtype, q_stages, grouped=query.shape[2] != key.shape[2])}
+                family, config, width, dtype, q_stages, grouped=query.shape[2] != key.shape[2],
+                reduced=reduced)}
             launches = [(family, config, allocations(family, config, width, dtype, q_stages, **typed),
                          config.shared_keys)]
         else:
