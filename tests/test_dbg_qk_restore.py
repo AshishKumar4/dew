@@ -17,7 +17,7 @@ from dew.state import TrainState
 
 
 def train_state(variables):
-    count = jnp.zeros((), jnp.int32)
+    count = jnp.ones((), jnp.int32)
     return TrainState(step=count, microstep=count, updates=count, variables=variables,
                       opt_state={"count": count}, ema=None,
                       key=jax.random.key_data(jax.random.key(0)), scale=None,
@@ -119,6 +119,19 @@ def test_corrupt_tuple_collection_refused(tmp_path):
     shutil.copytree(tmp_path / FROZEN_STORE / digest, tmp_path / FROZEN_STORE / wrong)
     with pytest.raises(ValueError, match="holds content with digest"):
         checkpoints._frozen_values({"observations": wrong}, {"observations": value})
+
+
+def test_partial_tuple_collection_preserves_template_dtype(tmp_path):
+    value = {"attention": {"head_dim": (jnp.asarray(4),), "extra": jnp.ones(3)},
+             "unread": jnp.zeros(2)}
+    checkpoints = Checkpoints(str(tmp_path))
+    _, digests = checkpoints._frozen({"variables": {"observations": value}})
+    template = {"attention": {"head_dim": (jax.ShapeDtypeStruct((), jnp.float32),)}}
+    restored = checkpoints._frozen_values(
+        digests["variables"], {"observations": template})["observations"]
+    assert jax.tree.structure(restored) == jax.tree.structure(template)
+    assert restored["attention"]["head_dim"][0].dtype == jnp.float32
+    assert float(restored["attention"]["head_dim"][0]) == 4
 
 
 def test_orbax_tuple_metadata(tmp_path):
