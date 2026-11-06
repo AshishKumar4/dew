@@ -21,13 +21,11 @@ from jax.ad_checkpoint import checkpoint_name
     (np.float32, 2.0 ** -140, 2.0 ** -70), (ml_dtypes.bfloat16, 2.0 ** -130, 2.0 ** -66)])
 def test_the_lane_flushes_operands_and_results_alike_however_it_compiles(dtype, subnormal, halves):
     """In float32 and in bfloat16, the lane reads a subnormal operand as zero exactly where it flushes a
-    subnormal product (of two `halves`) and where a comparison reads it as zero, jitted and eager, with
-    YNNPACK's fusions and without: the one fact of subnormals its measure takes (`Lane.flushes`), which
+    subnormal product (of two `halves`) and where a comparison reads it as zero, jitted and eager: the one
+    fact of subnormals its measure takes (`Lane.flushes`), which
     every contract reads."""
-    from reference_error import without_ynn
-
     flushes, tiny, half = ct.lane().flushes, dtype(subnormal), dtype(halves)
-    for run in (jax.jit, lambda fn: fn, without_ynn):
+    for run in (jax.jit, lambda fn: fn):
         assert (float(run(lambda x: jnp.multiply(x, dtype(2.0 ** 100)))(tiny)) == 0.0) == flushes
         assert (float(run(jnp.multiply)(half, half)) == 0.0) == flushes
         assert bool(run(jnp.equal)(tiny, dtype(0))) == flushes

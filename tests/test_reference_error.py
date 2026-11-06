@@ -3,10 +3,6 @@ must refuse, and the rounding it must admit."""
 
 import json
 import math
-import os
-import subprocess
-import sys
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -39,23 +35,6 @@ from reference_error import (
 from dew.nn.precision import accumulated
 
 
-@pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
-def test_without_ynn_computes_what_xla_cpu_computes_with_every_ynnpack_fusion_off(tmp_path):
-    """Each of tests/ynn_programs.py's programs under `without_ynn` gives, bit for bit, what the same
-    program gives jitted in a process whose XLA:CPU runs with every YNNPACK fusion off."""
-
-    import ynn_programs
-    from reference_error import without_ynn
-
-    out = tmp_path / "theirs.npz"
-    flags = os.environ.get("XLA_FLAGS", "") + " --xla_cpu_experimental_ynn_fusion_type="
-    subprocess.run([sys.executable, str(Path(ynn_programs.__file__)), str(out)], check=True,
-                   env={**os.environ, "XLA_FLAGS": flags})
-    with np.load(out) as theirs:
-        for name, value in ynn_programs.outputs(without_ynn).items():
-            np.testing.assert_array_equal(np.asarray(value), theirs[name], err_msg=name)
-
-
 def one_key_draw(seed):
     """bf16 queries [2, 5, 4, 32] over a single key and value of two heads."""
     rng = np.random.default_rng([1698, 1, seed])
@@ -85,57 +64,11 @@ def written_attention(query, key, value):
     return jnp.einsum("bnts,bsnh->btnh", weights, values)
 
 
-@pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
-def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_both_arms_with_them(
-        tmp_path, monkeypatch):
-    """XLA:CPU refuses jax.nn's XLA attention's backward over a single key without YNNPACK's fusions, at
-    every matmul precision; check 1 decides, once before its draws, that both arms of that site take the
-    fusions (`_ynn_decided`), the two still of one kind, names that decision in its stage's line
-    (STAGES_LOG) and in the report CI reads (`SWITCHED`), and judges them."""
-    import json
-
-    from reference_error import STAGES_LOG, SWITCHED, without_ynn
-
-    with pytest.raises(jax.errors.JaxRuntimeError):
-        without_ynn(pulled_by_itself(xla_attention))(*one_key_draw(0))
-    log = tmp_path / "stages.jsonl"
-    monkeypatch.setenv(STAGES_LOG, str(log))
+def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_judges_its_arms():
+    """XLA:CPU compiles jax.nn's XLA attention's backward over a single key only with YNNPACK's fusions;
+    check 1 compiles both arms as Dew's users compile them, with the fusions, and judges them (row 4471)."""
     assert_as_exact(pulled_by_itself(xla_attention), pulled_by_itself(written_attention), one_key_draw,
                     "attention over one key", seeds=16)
-    lines = [json.loads(line) for line in log.read_text().splitlines()]
-    assert [entry["label"] for entry in lines] == ["attention over one key"]
-    assert lines[0]["ynn"] is not None
-    assert [entry["label"] for entry in SWITCHED] == ["attention over one key"]
-    SWITCHED.clear()
-
-
-@pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
-def test_a_process_whose_xla_refuses_the_ynn_options_moves_no_site_onto_the_fusions(monkeypatch):
-    """Where XLA:CPU refuses WITHOUT_YNN's options themselves, a site of two Dew paths raises before
-    deciding (`_ynn_option_held`), so it moves onto the fusions and passes nowhere."""
-    import reference_error
-
-    reference_error._ynn_option_held.cache_clear()
-    monkeypatch.setattr(reference_error, "WITHOUT_YNN", {"xla_cpu_no_such_option": "none"})
-    try:
-        with pytest.raises(RuntimeError):
-            assert_as_exact(pulled_by_itself(xla_attention), pulled_by_itself(written_attention),
-                            one_key_draw, "attention over one key, its options refused", seeds=16)
-        assert not reference_error.SWITCHED
-    finally:
-        reference_error._ynn_option_held.cache_clear()
-
-
-@pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
-def test_without_ynn_takes_a_callers_compiler_options_over_its_own():
-    """A caller who asks for YNNPACK's dot fusion gets the dot the default XLA:CPU computes, bit for
-    bit."""
-    from reference_error import without_ynn
-    from ynn_programs import w, x
-
-    dot_fusion = {"xla_cpu_experimental_ynn_fusion_type": "LIBRARY_FUSION_TYPE_DOT"}
-    np.testing.assert_array_equal(without_ynn(jnp.dot, compiler_options=dot_fusion)(x, w),
-                                  jax.jit(jnp.dot)(x, w))
 
 
 def test_windows_stack_a_sites_own_draws_and_its_arms_take_them_all():
@@ -228,22 +161,12 @@ def test_each_window_runs_one_draws_program_compiled_once():
     assert traces == [((2,), (2,))]
 
 
-def test_a_without_ynn_arm_runs_over_windows():
-    """A `without_ynn` arm, whose compiler options refuse to be nested on the CPU lane, runs over windows
-    as one draw's program."""
-    from reference_error import over_windows, without_ynn
-
-    x = np.ones((3, 2), np.float32)
-    np.testing.assert_array_equal(over_windows(without_ynn(lambda x: x * 2))(x), x * 2)
-
-
-def test_the_gate_compiles_two_dew_arms_without_ynnpack_and_one_beside_a_given_arm_as_users_run_it():
-    """Check 1 compiles its arms itself (`_arms`): two Dew paths each `without_ynn`, one function as
-    both arms twice (its reference unrewritten), a window loop's arm within it, an arm compiled so already
-    as it is; beside an arm
-    run `as_given` (torch, NumPy, a program of its own), which it never traces, the Dew arm with the
-    fusions, as users run it. A NumPy arm passes `as_given`, and the verdict holds."""
-    from reference_error import _arms, _Windowed, as_given, assert_as_exact, over_windows, without_ynn
+def test_the_gate_compiles_each_dew_arm_as_users_run_it_and_runs_a_given_arm_as_it_is():
+    """Check 1 compiles its arms itself (`_arms`), each as Dew's users compile it (row 4471): a plain
+    function by `jax.jit`, one function as both arms twice (its reference unrewritten), a window loop's arm
+    within it, an arm compiled already as it is; an arm run `as_given` (torch, NumPy, a program of its own)
+    it never traces. A NumPy arm passes `as_given`, and the verdict holds."""
+    from reference_error import _arms, _Windowed, as_given, assert_as_exact, over_windows
 
     def dew(x):
         return jnp.asarray(x) * 2
@@ -252,19 +175,17 @@ def test_the_gate_compiles_two_dew_arms_without_ynnpack_and_one_beside_a_given_a
         return x + x
 
     mine, theirs = _arms(dew, written)
-    assert mine.without_ynn and theirs.without_ynn
-    np.testing.assert_array_equal(mine(np.ones(3, np.float32)), 2 * np.ones(3, np.float32))
-    # One function as both arms compiles twice: the reference runs its programs unrewritten.
+    np.testing.assert_array_equal(mine(np.ones(3, np.float32)), theirs(np.ones(3, np.float32)))
     same, again = _arms(dew, dew)
-    assert same is not again and same.without_ynn and again.without_ynn
-    compiled = without_ynn(dew)
+    assert same is not again
+    compiled = jax.jit(dew)
     assert _arms(compiled, written)[0] is compiled
     windowed, _ = _arms(over_windows(dew), written)
-    assert isinstance(windowed, _Windowed) and windowed.fn.without_ynn
+    assert isinstance(windowed, _Windowed) and hasattr(windowed.fn, "lower")
 
     host = as_given(lambda x: np.asarray(x) + np.asarray(x))
     mine, theirs = _arms(dew, host)
-    assert theirs.wrapped is host and not getattr(mine, "without_ynn", False)
+    assert theirs.wrapped is host
     np.testing.assert_array_equal(mine(np.ones(3, np.float32)), 2 * np.ones(3, np.float32))
     def draw(seed):
         return (np.random.default_rng(seed).standard_normal(8).astype(np.float32),)
@@ -277,7 +198,7 @@ def test_a_numpy_arm_is_refused_unless_it_is_given_and_windows_keep_their_arms_p
     would compute in JAX); passed `as_given` it runs as given. A window loop of a given arm is
     classified by that arm, so its Dew partner compiles with the fusions as it does without windows.
     A paired sizing of one function against itself stays paired, its draws from SIZING_FROM on."""
-    from reference_error import SIZING_FROM, _arms, as_given, assert_as_exact, over_windows, seeds_for
+    from reference_error import SIZING_FROM, as_given, assert_as_exact, seeds_for
 
     def dew(x):
         return jnp.asarray(x) * 2
@@ -291,8 +212,6 @@ def test_a_numpy_arm_is_refused_unless_it_is_given_and_windows_keep_their_arms_p
     with pytest.raises(TypeError):
         assert_as_exact(dew, numpy, draw, "a NumPy arm unmarked", seeds=8)
     assert_as_exact(dew, as_given(numpy), draw, "a NumPy arm as given", seeds=8)
-    windowed, _ = _arms(over_windows(dew), over_windows(as_given(numpy)))
-    assert not getattr(windowed.fn, "without_ynn", False)
     seen = []
 
     def drawn(seed):
@@ -816,51 +735,38 @@ def test_a_library_arm_holds_dew_to_the_larger_of_its_error_and_the_references()
     assert [(verdict, stage) for verdict, stage, _ in verdicts] == [("pass", 1), ("pass", 1)], verdicts
 
 
-def test_a_reference_compiled_with_options_of_its_own_runs_as_given():
-    """A reference compiled with compiler options of its own (a trainer step's, `as_a_step`) runs as
-    given: the gate would nest it in its own jit, which a jit with options of its own refuses (row
-    1800)."""
-    from reference_error import _arms
-
+def test_a_reference_compiled_with_options_of_its_own_runs_as_it_is():
+    """A reference compiled with compiler options of its own (a trainer step's, `as_a_step`) runs as it is,
+    marked `as_given` or not: the gate never nests a compiled program in its own jit, which a jit with
+    options of its own would refuse (row 1800)."""
     own = jax.jit(lambda x: {"y": x * 2}, compiler_options={"xla_cpu_enable_fast_math": False})
     def doubled(x):
         return {"y": jnp.asarray(x) + jnp.asarray(x)}
 
-    mine, theirs = _arms(doubled, as_given(own))
-    assert theirs.as_given and not getattr(mine, "without_ynn", False)
-    # Unmarked, the gate nests it in its own jit, which a jit with options of its own refuses.
-    _, nested = _arms(doubled, own)
-    with pytest.raises(ValueError):
-        nested(np.ones(4, np.float32))
-    assert_as_exact(doubled, as_given(own),
-                    lambda seed: (np.random.default_rng(seed).standard_normal(64).astype(np.float32),),
-                    "a reference with options", seeds=8)
+    def draw(seed):
+        return (np.random.default_rng(seed).standard_normal(64).astype(np.float32),)
+
+    for reference in (own, as_given(own)):
+        assert_as_exact(doubled, reference, draw, "a reference with options", seeds=8)
 
 
-def test_an_arm_compiled_outside_the_gates_policy_is_refused():
-    """An arm compiled without YNNPACK's fusions (`without_ynn`) beside an arm run as given, where the
-    gate compiles Dew's arm with the fusions as its users run it, is refused rather than run unseen
-    without them (row 2287); beside another Dew arm, where the gate compiles without them too, it runs
-    as the gate would compile it. A plain jit is nested under the gate's own compile, whose options
-    apply; a jit with options of its own refuses that nesting itself (row 1800). Every other arm kind
-    runs: plain, as given, a window loop's."""
-    from reference_error import _arms, over_windows, without_ynn
+def test_every_arm_kind_runs_as_the_gate_compiles_it():
+    """Every arm kind runs beside every other: plain, compiled already (a jit, its own options kept), as
+    given, a window loop's."""
+    from reference_error import _arms, over_windows
 
     def doubled(x):
         return {"y": jnp.asarray(x) + jnp.asarray(x)}
 
     given = as_given(lambda x: {"y": np.asarray(x) * 2})
-    with pytest.raises(TypeError):
-        _arms(without_ynn(doubled), given)
-    with pytest.raises(TypeError):
-        _arms(over_windows(without_ynn(doubled)), given)
+    owned = jax.jit(doubled, compiler_options={"xla_cpu_enable_fast_math": False})
     x = np.ones(4, np.float32)
-    for dew, reference in ((without_ynn(doubled), doubled), (doubled, given), (jax.jit(doubled), given),
-                           (jax.jit(doubled), doubled), (doubled, doubled)):
+    for dew, reference in ((doubled, given), (jax.jit(doubled), given), (jax.jit(doubled), doubled),
+                           (doubled, doubled), (owned, doubled)):
         mine, theirs = _arms(dew, reference)
         np.testing.assert_array_equal(np.asarray(mine(x)["y"]), np.asarray(theirs(x)["y"]))
-    with pytest.raises(ValueError):
-        _arms(jax.jit(doubled, compiler_options={"xla_cpu_enable_fast_math": False}), doubled)[0](x)
+    mine, theirs = _arms(over_windows(doubled), over_windows(given))
+    np.testing.assert_array_equal(np.asarray(mine(x[None])["y"]), np.asarray(theirs(x[None])["y"]))
 
 
 def test_a_float64_truth_runs_as_one_compiled_program():
@@ -899,12 +805,11 @@ def test_a_float64_truth_runs_as_one_compiled_program():
     assert_as_exact(_reordered, _product, _draw, "a compiled truth", seeds=8, truth_fn=truth)
 
 
-def test_an_arm_of_dew_programs_compiles_them_as_the_gate_compiles_its_other_arm(monkeypatch):
-    """Beside another Dew arm, an arm of Dew's own programs (`dew_programs`) runs with Dew's compile
-    seam holding WITHOUT_YNN open (`compiled_with`), so a program it compiles through the seam
-    (`dew.nn.kernels.options.program`) carries the option, and beside an arm `as_given` it runs as it
-    is; the seam adds nothing once the arm returns, and a run's own XLA flag for an option wins."""
-    from reference_error import WITHOUT_YNN, _arms, as_given, dew_programs
+def test_an_arm_of_dew_programs_runs_its_programs_as_dew_compiles_them(monkeypatch):
+    """An arm of Dew's own programs (`dew_programs`) runs as it is, its programs compiled through Dew's seam
+    with the seam's options alone, beside a Dew arm or one `as_given`; a run's own XLA flag for an option
+    the seam holds open wins."""
+    from reference_error import _arms, as_given, dew_programs
 
     from dew.nn.kernels import options
 
@@ -918,16 +823,13 @@ def test_an_arm_of_dew_programs_compiles_them_as_the_gate_compiles_its_other_arm
     def written(x):
         return x + x
 
-    mine, _ = _arms(programs, written)
-    np.testing.assert_array_equal(mine(np.ones(3, np.float32)), 2 * np.ones(3, np.float32))
-    expected = WITHOUT_YNN if jax.default_backend() == "cpu" else {}
-    assert seen == [expected] and options.compiler_options() == {}
-    mine, _ = _arms(programs, as_given(lambda x: np.asarray(x) * 2))
-    mine(np.ones(3, np.float32))
-    assert seen[-1] == {}
-    with options.compiled_with({"xla_cpu_experimental_ynn_fusion_type": ""}):
-        assert options.compiler_options() == {"xla_cpu_experimental_ynn_fusion_type": ""}
-        monkeypatch.setenv("XLA_FLAGS", "--xla_cpu_experimental_ynn_fusion_type=dot")
+    for reference in (written, as_given(lambda x: np.asarray(x) * 2)):
+        mine, _ = _arms(programs, reference)
+        np.testing.assert_array_equal(mine(np.ones(3, np.float32)), 2 * np.ones(3, np.float32))
+    assert seen == [{}, {}]
+    with options.compiled_with({"xla_cpu_enable_fast_math": False}):
+        assert options.compiler_options() == {"xla_cpu_enable_fast_math": False}
+        monkeypatch.setenv("XLA_FLAGS", "--xla_cpu_enable_fast_math=true")
         assert options.compiler_options() == {}
     assert options.compiler_options() == {}
 

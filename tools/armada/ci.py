@@ -1402,9 +1402,8 @@ def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     if done.returncode not in (0, 2, 5) and not errors:
         errors = dict.fromkeys(tests, f"pytest --collect-only exited {done.returncode}\n{output[-4000:]}")
     seconds = (time.monotonic() - began) / len(tests)
-    # A collection runs no test, so it moved no site onto YNNPACK's fusions: counted, not unknown.
     rows = [{"name": row(python, name, COLLECT), "exitCode": 1 if name in errors else 0, "seconds": seconds,
-             "output": errors.get(name, ""), "ynn_switched": [], "cells": {},
+             "output": errors.get(name, ""), "cells": {},
              **(red_as(COLLECT, []) if name in errors else {})}
             for name in tests]
     out.write_text(json.dumps({"rows": rows}))
@@ -1431,16 +1430,6 @@ def flow_cells(cases) -> dict[str, dict]:
     unqualified, and a reused row keeps its counts (ledger 2643)."""
     return {node_of(case): json.loads(item.get("value") or "null") for case in cases
             for item in case.iter("property") if item.get("name") == "cells"}
-
-
-def ynn_switched(cases) -> list[dict]:
-    """The accuracy gate's sites a file's cases moved onto YNNPACK's fusions (each case's JUnit property
-    `ynn_switched`, tests/conftest.py), green cases included: each its test node, label and XLA:CPU's
-    refusal, as every row a task runs carries them for the train report to count, an empty list where
-    nothing moved, so a row without the field is one recorded before it, uncounted."""
-    return [{"node": node_of(case), **site} for case in cases
-            for item in case.iter("property") if item.get("name") == "ynn_switched"
-            for site in json.loads(item.get("value") or "[]")]
 
 
 def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dict[str, float]:
@@ -1488,7 +1477,7 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
             # as a row its task's deadline cut off is (review).
             rows.append({"name": row(python, name, group), "exitCode": 1, "seconds": 0.0,
                          "output": f"{INTERRUPTED} of {deadline:.0f} s before this group was read or run",
-                         "tests": {}, "ynn_switched": [], "cells": {},
+                         "tests": {}, "cells": {},
                          "timings": {row(python, name, ""): 0.0}, **red_as("deadline", [])})
             continue
         part = out.with_name(f"{out.name}.{index}")
@@ -1746,7 +1735,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
                      # Its whole_suite cells, every one collected, run or set aside (executed.py).
                      **{key: cells for key, cells in counts.get(name, {}).items() if key in MARKED},
-                     "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
+                     "cells": flow_cells(own),
                      "timings": {row(python, name, group if site else ""): seconds}, **cause, **asked(site),
                      **later_judged(site)})
     out.write_text(json.dumps({"rows": rows + ran}))

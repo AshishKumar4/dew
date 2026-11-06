@@ -196,8 +196,6 @@ def test_a_collect_task_rows_each_file_red_where_it_would_not_import(ci, tmp_pat
     assert {name: (row["kind"], row["failed"]) for name, row in rows.items() if row["exitCode"]} == {
         "3.14:tests/test_broken.py#collect": ("collect", []),
         "3.14:tests/test_missing.py#collect": ("collect", [])}
-    # A collection runs no test, so its rows count no site moved onto YNNPACK's fusions.
-    assert all(row["ynn_switched"] == [] for row in rows.values())
 
 
 def test_a_targeted_pytest_selects_the_tests_a_task_would_and_its_own_arguments_override(ci, tmp_path):
@@ -908,27 +906,24 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
 
 def test_every_row_carries_its_cases_reports_and_a_reused_row_keeps_them(ci, tmp_path, monkeypatch,
                                                                          cache_worker):
-    """Each row a task runs carries the sites its file's cases moved onto YNNPACK's fusions (`ynn_switched`),
-    and its GPU flows' counts by case (`cells`), from the JUnit properties tests/conftest.py writes, green
-    rows included, empty where its cases report none; a green row a later task reuses keeps them as it ran."""
-    sites = [{"label": "a site over one key", "refused": "Dot with multiple contracting dimensions"}]
+    """Each row a task runs carries its GPU flows' counts by case (`cells`), from the JUnit property
+    tests/conftest.py writes, green rows included, empty where its cases report none; a green row a later task
+    reuses keeps them as it ran."""
     counts = {"passed": 2, "failed": 0, "skipped": 1, "device": "cpu"}
     written(tmp_path, {
         "test_gpu_band.py": "import json\nfrom pathlib import Path\n"
                             "def test_the_band_runs(record_property):\n"
                             "    with Path('runs').open('a') as runs: runs.write('x')\n"
-                            f"    record_property('ynn_switched', json.dumps({sites!r}))\n"
                             f"    record_property('cells', json.dumps({counts!r}))\n"
                             "def test_still(): pass\n",
         "test_plain.py": "def test_plain(): pass\n"})
     out = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
 
-    def fields() -> dict[str, tuple]:
-        return {row["name"]: (row["ynn_switched"], row["cells"]) for row in armada_task(ci, monkeypatch, out)}
+    def fields() -> dict[str, dict]:
+        return {row["name"]: row["cells"] for row in armada_task(ci, monkeypatch, out)}
 
     node = "tests/test_gpu_band.py::test_the_band_runs"
-    expected = {"3.12:tests/test_gpu_band.py": ([{"node": node, **sites[0]}], {node: counts}),
-                "3.12:tests/test_plain.py": ([], {})}
+    expected = {"3.12:tests/test_gpu_band.py": {node: counts}, "3.12:tests/test_plain.py": {}}
     assert fields() == expected
     assert fields() == expected
     assert (tmp_path / "runs").read_text() == "x", "the second task reused the rows"

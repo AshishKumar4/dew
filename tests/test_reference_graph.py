@@ -141,13 +141,10 @@ def norm_backward(summed):
     return composed(("g", "x", "scale", "squares"), (projected, dx, dscale), ("dx", "dscale"))
 
 
-@pytest.mark.skipif(jax.default_backend() != "cpu", reason="YNNPACK's fusions are XLA:CPU's")
-def test_a_node_xla_cpu_compiles_only_with_ynnpacks_fusions_moves_both_sides_onto_them():
-    """The gate compiles each node's sides by check 1's policy (`_compiled_alike`), its mode decided once
-    on the node's parents: attention's XLA backward over a single key in bf16, which XLA:CPU compiles
-    only with YNNPACK's fusions, moves both sides onto them, recorded in SWITCHED, and passes (3113)."""
-    from reference_error import SWITCHED, without_ynn
-
+def test_attentions_backward_over_one_key_is_held_as_any_node():
+    """Attention's XLA backward over a single key in bf16, whose dot of no contracting dimension XLA:CPU
+    compiles only with YNNPACK's fusions, is held as any node is, both sides compiled as Dew's users
+    compile them (3113)."""
     def backward(query, key, value):
         out, pull = jax.vjp(lambda q, k, v: jax.nn.dot_product_attention(q, k, v, implementation="xla"),
                             query, key, value)
@@ -156,15 +153,10 @@ def test_a_node_xla_cpu_compiles_only_with_ynnpacks_fusions_moves_both_sides_ont
     rng = np.random.default_rng(3113)
     inputs = {name: jnp.asarray(rng.standard_normal(shape), jnp.bfloat16)
               for name, shape in (("query", (2, 5, 4, 32)), ("key", (2, 1, 2, 32)), ("value", (2, 1, 2, 32)))}
-    with pytest.raises(jax.errors.JaxRuntimeError):
-        without_ynn(backward)(**inputs)
     node = Node("dquery", tuple(inputs), Pointwise(), jax.jit(backward))
     graph = composed(tuple(inputs), (node,), ("dquery",))
-    SWITCHED.clear()
     assert_graph_as_exact(graph, graph, graph, inputs, lambda order: (inputs, lambda outputs: outputs),
                           "one key")
-    assert SWITCHED and all(entry["label"].startswith("one key dquery") for entry in SWITCHED)
-    SWITCHED.clear()
 
 
 def backward_inputs():

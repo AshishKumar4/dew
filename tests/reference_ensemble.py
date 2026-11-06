@@ -12,7 +12,6 @@ from reference_error import (
     FACTOR,
     ORDERS,
     _arms_with,
-    _ynn_decided,
     assert_as_exact_over_orders,
     assert_rows_as_exact_over_orders,
     row_errors,
@@ -181,11 +180,8 @@ def assert_graph_as_exact(dew, reference, truth, inputs, orbit, label: str) -> d
 def _compiled_alike(mine, theirs, parents: dict, label: str):
     """A node's two sides as the gate holds them: compiled by check 1's own policy (`_arms`), Dew's node and
     the reference's paired, each reference member paired with Dew's as `assert_as_exact` pairs its further
-    references (`_arms_with`, its refusal of mixed kinds too), and their mode decided once on the node's
-    parents (`_ynn_decided`): two Dew paths without YNNPACK's fusions on the CPU, a side run as given beside
-    Dew's as its users compile it, Dew's own programs through its seam (ledger 3048, 3113: a YNNPACK
-    fusion's float32-rounded products against a loop's contracted ones failed an equally exact sum on some
-    hosts). Each side is called with the parents by name, as a node's program is. The witness
+    references (`_arms_with`): each as Dew's users compile it, a side run as given as it is. Each side is
+    called with the parents by name, as a node's program is. The witness
     (`Graph.fused`), the production path, keeps its own compile."""
     names = mine.parents
 
@@ -199,8 +195,7 @@ def _compiled_alike(mine, theirs, parents: dict, label: str):
         return lambda **given: arm(*(given[name] for name in names))
 
     dew, reference, members = _arms_with(positional(mine.fn), positional(theirs.fn),
-                                         [positional(fn) for fn in theirs.members.values()], label)
-    _ynn_decided(label, [dew, reference, *members], [parents[name] for name in names])
+                                         [positional(fn) for fn in theirs.members.values()])
     return (dataclasses.replace(mine, fn=by_name(dew)),
             dataclasses.replace(theirs, fn=by_name(reference),
                                 members=dict(zip(theirs.members, map(by_name, members), strict=True))))

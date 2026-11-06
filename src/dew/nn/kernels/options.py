@@ -103,10 +103,8 @@ _COMPILED_WITH: contextvars.ContextVar[tuple[Mapping[str, Option], ...]] = conte
 @contextlib.contextmanager
 def compiled_with(options: Mapping[str, Option]) -> Iterator[None]:
     """Every program Dew compiles while this is open adds `options` to its XLA options
-    (`compiler_options`), each but those the run's XLA_FLAGS sets itself: the accuracy gate's seam,
-    through which an arm that runs Dew's own compiled programs (a trainer's step, a task's forward)
-    compiles them as the gate compiles a Dew arm it compiles itself (tests/reference_error.py,
-    `dew_programs`). A program compiled before it opened keeps its own options. The options are the
+    (`compiler_options`), each but those the run's XLA_FLAGS sets itself: a dump directory, say, for every
+    program a step compiles. A program compiled before it opened keeps its own options. The options are the
     context's (a `ContextVar`): another thread, or a worker not handed this context, compiles
     without them."""
     token = _COMPILED_WITH.set((*_COMPILED_WITH.get(), dict(options)))
