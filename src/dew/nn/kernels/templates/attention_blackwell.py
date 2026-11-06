@@ -348,7 +348,8 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
     # The key tiles holding the call's keys, none of padding alone but a call of no keys' one (its zero
     # values weigh to a zero output, as `padded_call` pads it for).
     blocks = max(1, -(-spec.keys // block_k))
-    target = generation.gpu_target("sm100")
+    # The GPU in effect, its tensor memory's columns the accumulators' bound (`Accumulators.scratch`).
+    target = generation.gpu_target()
     transforms = mosaic_sm100.swizzled(dtype, width)
     key_stages = mosaic_sm100.Stages(tiles.stages, (((block_k, width), dtype, transforms),))
     value_stages = mosaic_sm100.Stages(tiles.stages, (((block_k, value_width), dtype,
