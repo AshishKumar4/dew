@@ -153,13 +153,14 @@ def draw(hooks: recurrence.Hooks, seed: int, state_dtype=jnp.float32, value_widt
 
 
 def one_tap_operands(dtype, seed: int) -> recurrence.Step:
-    """A one-tap token, preserving the two dtypes' consecutive draws at the original seed."""
-    channels = 2 * 16 + 16
+    """A one-tap token over a head of a model's widths (`KEY_WIDTH`, `VALUE_WIDTH`, the launch's), preserving
+    the two dtypes' consecutive draws at the original seed."""
+    channels = 2 * KEY_WIDTH + VALUE_WIDTH
     rng = np.random.default_rng(seed)
     operands = {}
     for operand_dtype in (jnp.float32, jnp.bfloat16):
         operands[operand_dtype] = recurrence.Step(
-            jnp.asarray(rng.standard_normal((ROWS, 1, 16, 16)) * 0.3, jnp.float32),
+            jnp.asarray(rng.standard_normal((ROWS, 1, KEY_WIDTH, VALUE_WIDTH)) * 0.3, jnp.float32),
             token=jnp.asarray(rng.standard_normal((ROWS, channels)), operand_dtype),
             held=jnp.zeros((ROWS, 0, channels), operand_dtype),
             taps=jnp.asarray(rng.standard_normal((channels, 1)), operand_dtype))
@@ -255,7 +256,7 @@ def test_a_write_gate_without_the_delta_rule_scales_what_the_token_writes():
         np.testing.assert_array_equal(np.asarray(out), 0.0)
         np.testing.assert_array_equal(np.asarray(state), 0.0)
     one_tap = recurrence.Hooks(conv=recurrence.Conv(None), decay='none', delta=False)
-    channels = 2 * 16 + 16
+    channels = 2 * KEY_WIDTH + VALUE_WIDTH
     for dtype in (jnp.float32, jnp.bfloat16):
         given = one_tap_operands(dtype, 3)
         for step in (recurrence.step, recurrence.step_reference):
