@@ -1505,8 +1505,9 @@ mamba_ssm in every recorded case (tests/test_gpu_recurrence.py)."""
 SELECTIVE: Op[SelectiveCase] = Op('selective_scan', (Kernel('mosaic_gpu', SELECTIVE_SUPPORTS),
                                                      Kernel('xla', (), generic=True)))
 """The selective scan's selector: the recurrence template's scan (`templates.recurrence.selective`) where
-it takes the call, else the portable math. On an H100 the template's training step took 6.82 ms at
-8x2048x5120 against mamba_ssm's 7.21 (mamba1-scan2-h100-ac0dc3a9b)."""
+it takes the call, else the portable math. On an A100 its training step, B's and C's gradients added
+atomically, took 11.3 ms at 8x2048x5120 and 9.22 at 4x2048x8192 (W3-a100-3-selective-ab-a100-8ca2795113, at
+44bec4713f, whose backward base's is again)."""
 
 
 def selective_kernel(x, A, B, C) -> str:
