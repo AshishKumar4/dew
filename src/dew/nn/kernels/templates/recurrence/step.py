@@ -186,21 +186,17 @@ def _program(hooks, inputs, active_ref, state_out, moved, out_ref, scratch, *, b
         writes = [_staged(hooks, inputs, token, p, *keyed[p], vectors, exchanged, interpret=interpret)
                   for p in range(block.heads)]
         mosaic.synced(interpret)
-        held = [token.tile(state_ref, k) for k in range(key_width)]
-        out, updated = _stepped(hooks, held, value, vectors, token.per_head(writes), token)
+        out = _stepped(hooks, state_ref, state_out, value, vectors, token.per_head(writes), token)
         out = _epilogue(hooks, inputs, token, out, value, exchanged, interpret=interpret)
-        for k, entry in enumerate(updated):
-            # Held as `recurrence._held` holds it: bf16 rounded stochastically, salted by its key and value.
-            # The key's entry laid over the block as the entry is: a scalar's bit cast lowers to no vector.
-            keyed = jnp.zeros_like(entry) + _key_entry(vectors, token, 1, k)
-            kept = recurrence.salted_bf16(entry, keyed, value) if state_out.dtype == jnp.bfloat16 else entry
-            token.stored(state_out, kept, k)
         token.stored(out_ref, out)
 
     @pl.when(active_ref[token.row] == 0)
     def _():
-        for k in range(key_width):
+        def copied(k, carry):
             token.stored(state_out, token.tile(state_ref, k), k)
+            return carry
+
+        lax.fori_loop(0, key_width, copied, None)
         token.stored(out_ref, jnp.zeros((block.heads, block.columns), jnp.float32))
         if conv is not None:
             conv.write(conv.held())
@@ -353,28 +349,53 @@ def _softplus(x):
     return jnp.maximum(x, 0.0) + jnp.where(u == 1.0, y, jnp.log(u) * (y / (u - 1.0)))
 
 
-def _stepped(hooks, held: list, value, vectors, write, token: _Token):
-    """`recurrence.update` over a block `held` (a `Dk` list of its `[heads, columns]` entries): the output,
-    `q^T S'`, and the updated block, each key dimension's vectors read from `vectors` as each head's scalars
-    (`_key_entry`), each sum over the keys a pairwise tree (`_tree_sum`)."""
-    key_width = len(held)
+def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token):
+    """`recurrence.update` over the block's column of the state, a key a turn of a rolled loop, read from
+    `state_ref` (its delta rule's correction a pass of its own, which reads it again) and written to
+    `state_out` as it is held (`recurrence._held`): the output `q^T S'`. Each key dimension's vectors are read
+    from `vectors` as each head's scalars (`_key_entry`) and each sum over the keys a pairwise tree
+    (`_tree_added`). Every key's entry held at once, a 128-key column spilled 1260 to 1276 bytes a thread
+    (sm80, sm90; the fused step's compile, jsf-r06j)."""
+    key_width = state_ref.shape[2]
 
     def entry(which, k):
         return _key_entry(vectors, token, which, k)
 
+    levels = key_width.bit_length()
+    empty = tuple(jnp.zeros_like(value) for _ in range(levels))
     corrected = value
     if hooks.delta:
-        corrected = value - _tree_sum([(entry(1, k) * entry(2, k)) * held[k] for k in range(key_width)])
-    updated = [held[k] * entry(2, k) + (entry(1, k) * write) * corrected for k in range(key_width)]
-    return _tree_sum([entry(0, k) * updated[k] for k in range(key_width)]), updated
+        def correction(k, partials):
+            return _tree_added(partials, k, (entry(1, k) * entry(2, k)) * token.tile(state_ref, k))
+
+        corrected = value - lax.fori_loop(0, key_width, correction, empty)[-1]
+
+    def updated(k, partials):
+        entry_k = token.tile(state_ref, k) * entry(2, k) + (entry(1, k) * write) * corrected
+        # Held as `recurrence._held` holds it: bf16 rounded stochastically, salted by its key and value, the
+        # key's entry laid over the block as the entry is (a scalar's bit cast lowers to no vector).
+        keyed = jnp.zeros_like(entry_k) + entry(1, k)
+        kept = (recurrence.salted_bf16(entry_k, keyed, value) if state_out.dtype == jnp.bfloat16
+                else entry_k)
+        token.stored(state_out, kept, k)
+        return _tree_added(partials, k, entry(0, k) * entry_k)
+
+    return lax.fori_loop(0, key_width, updated, empty)[-1]
 
 
-def _tree_sum(terms: list):
-    """`terms` summed pairwise, as XLA's reduction sums them: a thread's running sum of 128 keys' terms put
-    the fused step's output at 1.55 to 1.61 times the XLA form's distance from float64 (jsf-r06h)."""
-    while len(terms) > 1:
-        terms = [terms[i] + terms[i + 1] if i + 1 < len(terms) else terms[i] for i in range(0, len(terms), 2)]
-    return terms[0]
+def _tree_added(partials: tuple, index, term) -> tuple:
+    """The `index`-th of a power of two's terms added into the pairwise tree of the ones before (`partials`,
+    a complete subtree's sum a level, `index`'s set bits the levels held): the term carried up the held
+    levels, each the earlier sum on the left, and left at the first free one; the last term leaves the total
+    at the top. XLA's reduction sums pairwise: a thread's running sum of 128 keys' terms put the fused step's
+    output at 1.55 to 1.61 times the XLA form's distance from float64 (jsf-r06h)."""
+    carry, active, found = term, jnp.ones((), bool), []
+    for level, partial in enumerate(partials):
+        held = ((index >> level) & 1) == 1
+        found.append(jnp.where(active & ~held, carry, jnp.where(active & held, 0.0, partial)))
+        carry = jnp.where(active & held, partial + carry, carry)
+        active = active & held
+    return tuple(found)
 
 
 def _epilogue(hooks, inputs, token: _Token, out, value, exchanged, *, interpret: bool):
