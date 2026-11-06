@@ -1203,6 +1203,39 @@ def test_a_shared_modules_comments_and_docstrings_rekey_no_row_and_its_code_does
     assert ci.shared("3.12") != before
 
 
+def test_a_test_files_or_conftests_comments_and_docstrings_rerun_it_not_and_its_code_does(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A test file and a conftest a run executes are its input by their code (followed.py's `WHOLE`): an edit
+    to a comment or a docstring of either, which pytest's assertion rewriter reads to compile and no test
+    reads, reruns nothing, as the owner asks of a comment-only edit (row 4385: one conftest edit re-keyed
+    every file); an edit to what either does reruns the file. A test that reads its own text is that text's
+    reader, keyed by its bytes."""
+    counted = "    with open('runs', 'a') as runs: runs.write('x')\n"
+    fixture = "import pytest\n\n\n@pytest.fixture\ndef base():\n"
+    written(tmp_path, {"conftest.py": fixture + "    return 1\n",
+                       "test_a.py": "def test_a(base):\n" + counted + "    assert base == 1\n"})
+    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
+    commit(tmp_path, "base")
+    assert run() == 1
+    noted = '"""A file."""\n\n\n# Its test.\ndef test_a(base):\n    """Its one."""\n' + counted
+    for path, text, runs in (
+            ("tests/test_a.py", noted + "    assert base == 1\n", 1),
+            ("tests/conftest.py", "import pytest\n\n\n# The base.\n@pytest.fixture\ndef base():\n"
+                                  '    """One."""\n    return 1\n', 1),
+            ("tests/conftest.py", fixture + "    return 2 - 1\n", 2),
+            ("tests/test_a.py", "def test_a(base):\n" + counted + "    assert base == len(['one'])\n", 3)):
+        (tmp_path / path).write_text(text)
+        commit(tmp_path, f"{path} edited")
+        assert run() == runs, path
+    # A test that reads its own text reruns on a comment of it.
+    reader = ("from pathlib import Path\n\n\ndef test_a(base):\n" + counted
+              + "    assert 'test_a' in Path(__file__).read_text()\n")
+    for text, runs in ((reader, 4), (reader + "# A note.\n", 5)):
+        (tmp_path / "tests/test_a.py").write_text(text)
+        commit(tmp_path, "the test reads itself")
+        assert run() == runs
+
+
 def test_a_durations_change_reruns_only_the_groups_it_moves(ci, tmp_path, monkeypatch, cache_worker):
     """The durations record is no file's input but a split file's groups', which are cut from that file's
     own entries: a change to another file's entries reuses every row, and so does one to the split file's
@@ -1389,6 +1422,13 @@ def test_a_fixture_reruns_only_the_files_that_opened_listed_or_probed_it(ci, tmp
     commit(tmp_path, "a model's fixtures arrive")
     # A new model's directory reruns what listed the directory it arrived in, and nothing else.
     assert run() == [1, 2, 2, 2, 2, 1]
+    # A probe answers whether the fixture is there, its kind and its size, never its bytes: a probed file's
+    # edit of the same size reruns none of its probers, and one that changes its size reruns each.
+    for text, runs in (("v\n", [1, 2, 2, 2, 2, 1]), ("wider\n", [1, 3, 3, 2, 2, 1])):
+        (fixtures / "model/weights.bin").write_text(text)
+        git(tmp_path, "add", "tests/fixtures")
+        commit(tmp_path, f"the probed weights become {text!r}")
+        assert run() == runs
 
 
 def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, monkeypatch, cache_worker):
@@ -1687,12 +1727,13 @@ def test_a_tool_that_comes_or_goes_runs_no_file_again_that_imported_none(tmp_pat
 def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests_executed(
         ci, tmp_path, monkeypatch, cache_worker):
     """A train that loses a head loses the test modules and modules the head added, and its other
-    files keep their rows (the land queue's recompose after a pull): a test module, or a module in a
-    package no test imported, added or taken away runs no other file again. A module added beside
-    one a file's tests executed under src/, which an import there may now find, runs that file
-    again, and only that one, and so does its removal, and so does an __init__.py added to, or taken
-    from, a namespace package on the way to one; a top-level package added under src/, which may
-    shadow any import, runs every file."""
+    files keep their rows (the land queue's recompose after a pull): a test module, a module in a
+    package no test imported, or a module of another name beside one a file's tests executed, added or
+    taken away runs no other file again (train 668: a module added to nn/backbones re-keyed 589 rows).
+    A module of a name an import the file's run tried and failed looks for runs it again, as the import
+    now finds it, and only it, and so does its removal; so does a package of the name of a module it
+    executed, which shadows it, and an __init__.py added to, or taken from, a namespace package on the
+    way to one; a top-level package added under src/, which may shadow any import, runs every file."""
     # src/pkg/space is a namespace package on the way to pkg.space.sub.used: its import executes no file.
     for name, source in {"src/pkg/__init__.py": "", "src/pkg/space/sub/__init__.py": "",
                          "src/pkg/space/sub/used.py": "def value(): return 1\n",
@@ -1707,6 +1748,9 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
                            f"    from {package} import value\n"
                            f"    with open('runs-{name}', 'a') as runs: runs.write('x')\n"
                            "    assert value()\n"
+                           # An optional module it may find, which its run tries.
+                           + ("    try:\n        from other import optional\n    except ImportError:\n"
+                              "        pass\n" if name == "lone" else "")
         for name, package in (("uses", "pkg.space.sub.used"), ("lone", "other.lone"))})
     interpreter(tmp_path, "3.12")
     url, _, _ = cache_worker
@@ -1721,13 +1765,19 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
 
     changes = [(None, None, [1, 1]), ("tests/test_added.py", "def test_added(): pass\n", [1, 1]),
                ("src/idle/new.py", "def value(): return 3\n", [1, 1]),
-               ("src/other/extra.py", "def value(): return 4\n", [1, 2]),
-               ("src/other/extra.py", None, [1, 3]), ("tests/test_added.py", None, [1, 3]),
-               ("src/pkg/space/__init__.py", "", [2, 3]), ("src/pkg/space/__init__.py", None, [3, 3]),
-               ("src/top/__init__.py", "", [4, 4])]
+               ("src/other/extra.py", "def value(): return 4\n", [1, 1]),
+               ("src/other/extra.py", None, [1, 1]),
+               ("src/other/optional.py", "VALUE = 1\n", [1, 2]), ("src/other/optional.py", None, [1, 3]),
+               ("src/other/lone/__init__.py", "def value(): return 5\n", [1, 4]),
+               ("src/other/lone/__init__.py", None, [1, 5]), ("tests/test_added.py", None, [1, 5]),
+               ("src/pkg/space/__init__.py", "", [2, 5]), ("src/pkg/space/__init__.py", None, [3, 5]),
+               ("src/top/__init__.py", "", [4, 6])]
     for path, source, runs in changes:
         if path and source is None:
             (tmp_path / path).unlink()
+            # A package taken away whole, as git leaves no empty directory.
+            if not any((tmp_path / path).parent.iterdir()):
+                (tmp_path / path).parent.rmdir()
         elif path:
             (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
             (tmp_path / path).write_text(source)

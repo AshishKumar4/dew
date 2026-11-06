@@ -328,3 +328,21 @@ class DeterministicObjective(Objective):
         preds = self.model.apply(step.ema, data, jnp.zeros((data.shape[0],), jnp.float32))
         return Representations(features=jnp.mean(preds, axis=(1, 2)),
                                labels=jnp.zeros((data.shape[0],), jnp.int32))
+
+
+EXPORT_SEEDS = 8
+"""Check 1's declared seeds for a trained denoiser against Diffusers' reading of its export."""
+
+
+def assert_export_recomputes(export, forward, call, draw, label: str) -> None:
+    """Diffusers' own denoiser read from `export` (`diffusers_consumer.denoiser`) recomputes the trained
+    `forward(*inputs)` over the inputs the seeds draw (`draw(seed)`), on par from float64 (check 1): Dew's
+    trained forward against Diffusers' float32 run, Diffusers' float64 run the truth. `call(model, tensor,
+    *inputs)` is the denoiser's call on a draw."""
+    from reference_error import as_given, assert_as_exact
+
+    from tools import diffusers_consumer as consumer
+
+    narrow, wide = consumer.denoiser(export, call), consumer.denoiser(export, call, wide=True)
+    assert_as_exact(as_given(lambda *inputs: np.asarray(forward(*inputs))), as_given(narrow), draw, label,
+                    seeds=EXPORT_SEEDS, truth_fn=as_given(wide))
