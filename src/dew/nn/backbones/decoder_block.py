@@ -793,6 +793,14 @@ class DecoderBlock(nn.Module):
             self.attn_hc = HyperConnection(**sites, name='attn_hc')
             self.ffn_hc = HyperConnection(**sites, name='ffn_hc')
 
+    def _stated_eps(self, where: str) -> float:
+        """The block's epsilon for a part of it that states one (`where`): its norms of None take each
+        input's dtype's (`RMSNorm.epsilon`), which none of these parts reads."""
+        if self.norm_eps is None:
+            raise ValueError(f"{where} states its epsilon; a block whose norms take their input's (norm_eps "
+                             "None) runs none")
+        return self.norm_eps
+
     def setup(self):
         projections = self.projections()
         norm = decoder_norm(
@@ -853,7 +861,7 @@ class DecoderBlock(nn.Module):
                     "altup runs Gemma 3n's block, which has its pre-norms and "
                     "neither a parallel branch nor a layer scalar")
             self.altup_layer = AltUpLayer(
-                spec=self.altup, emb_features=self.emb_features, norm_eps=self.norm_eps,
+                spec=self.altup, emb_features=self.emb_features, norm_eps=self._stated_eps('altup'),
                 dtype=self.dtype, precision=self.precision, name='altup')
         if self.laurel_rank is not None:
             if self.laurel_rank < 1 or not self.wiring.pre_norms:
@@ -863,7 +871,7 @@ class DecoderBlock(nn.Module):
                 f"with {self.wiring}")
             self.laurel = LaurelBlock(
                 rank=self.laurel_rank, emb_features=self.emb_features,
-                norm_eps=self.norm_eps, dtype=self.dtype, precision=self.precision,
+                norm_eps=self._stated_eps('laurel'), dtype=self.dtype, precision=self.precision,
                 name='laurel')
         if self.hyper_connections is not None:
             self._stream_sites(self.hyper_connections)
@@ -876,7 +884,8 @@ class DecoderBlock(nn.Module):
                     "attention residuals run Kimi K3's block, a plain pre-norm block whose "
                     "residual is the depth mixture: no output norms, layer scalar, parallel "
                     "branch, altup, laurel, per-layer inputs, hyper-connections or residual multiplier")
-            site = functools.partial(DepthAttention, emb_features=self.emb_features, norm_eps=self.norm_eps)
+            site = functools.partial(DepthAttention, emb_features=self.emb_features,
+                                     norm_eps=self._stated_eps('attention residuals'))
             self.attention_res = site(name='attention_res')
             if self.feedforward is not None:
                 self.mlp_res = site(name='mlp_res')

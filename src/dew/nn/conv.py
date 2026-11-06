@@ -311,6 +311,8 @@ class Conv(nn.Conv):
             return (*sizes, self.features)
         if padding == 'VALID':
             padding = ((0, 0),) * len(kernel)
+        if isinstance(padding, str):
+            raise ValueError(f"padding {padding!r} is none a convolution reads")
         sizes = tuple((extent + sum(pad) - tap) // step + 1
                       for extent, tap, step, pad in zip(extents, effective, strides, padding, strict=True))
         return (*sizes, self.features)

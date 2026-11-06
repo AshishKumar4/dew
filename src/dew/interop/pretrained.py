@@ -1958,9 +1958,10 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.S
     # A bundle's language model alone (`text_only`) reads its decoder's tensors under the bundle's names, and
     # retains its media's by name, unread (`decoders.bundle_media`).
     media = decoders.bundle_media(config, tensors.keys()) if decoders.bundles(config) else frozenset()
+    held = tensors
     if media:
         specs = tensor_specs(tensors)
-        held, tensors = tensors, LazyTensors(
+        tensors = LazyTensors(
             {name: spec for name, spec in specs.items() if name not in media}, tensors.__getitem__)
     placed, readings = decoders.read_decoder(tensors, record, family, param_dtype=param_dtype, lazy=lazy,
                                              checked=checked)

@@ -68,6 +68,19 @@ class HostProcessor(Protocol):
     def batch_decode(self, sequences: list[list[int]], *, skip_special_tokens: bool) -> list[str]: ...
 
 
+class MediasProcessor(Protocol):
+    """A processor whose public call takes its media as `medias` beside one `text` (Kimi K2.5's release's
+    KimiK25Processor), keeping one placeholder an item (`Processor._medias_fields`)."""
+
+    def __call__(self, *, medias: Sequence[Mapping[str, object]], text: str,
+                 return_tensors: str) -> Mapping[str, object]: ...
+
+
+def takes_medias(reference: HostProcessor | MediasProcessor) -> TypeGuard[MediasProcessor]:
+    """Whether a processor's public call takes `medias` (`MediasProcessor`), read from its signature."""
+    return "medias" in inspect.signature(type(reference).__call__).parameters
+
+
 def hosts(reference: PreTrainedTokenizerBase) -> TypeGuard[HostProcessor]:
     """Whether `reference` offers every HostProcessor operation, checked by
     name because a tokenizer's own annotations are narrower than what dew
@@ -293,17 +306,12 @@ class Processor:
         """Return the source's media fields before Dew aligns them to model rows: its processor's own,
         or, for a processor whose public call takes its media as `medias` (Kimi K2.5's release's), the
         fields that call gives as the other processors give them (`_medias_fields`)."""
-        if self._takes_medias:
+        if takes_medias(self._media_reference):
             return self._medias_fields(images, **kwargs)
         # An audio-only processor takes no images keyword at all.
         if images is None:
             return self._media_reference(**kwargs)
         return self._media_reference(images=images, **kwargs)
-
-    @property
-    def _takes_medias(self) -> bool:
-        """Whether the source's processor takes its media as `medias` beside its text (`_medias_fields`)."""
-        return "medias" in inspect.signature(type(self._media_reference).__call__).parameters
 
     def _medias_fields(self, images: Media | Sequence[object] | None,
                        **kwargs: Unpack[ProcessorCall]) -> dict[str, np.ndarray]:
@@ -321,6 +329,9 @@ class Processor:
                              "audio: hand the model its processed fields (`from_hf`)")
         from PIL import Image as PILImage
 
+        reference = self._media_reference
+        if not takes_medias(reference):
+            raise TypeError(f"{type(reference).__name__} takes no medias")
         text = kwargs.get("text")
         if text is None:
             raise ValueError(f"{type(self._media_reference).__name__} takes its media with their text")
@@ -342,7 +353,7 @@ class Processor:
                 taken, given = given[:count], given[count:]
             medias = [{"type": "image", "image": PILImage.fromarray(np.asarray(image))
                        if isinstance(image, np.ndarray) else image} for image in taken]
-            values = self._media_reference(medias=medias, text=row, return_tensors="np")
+            values = reference(medias=medias, text=row, return_tensors="np")
             ids = np.asarray(values["input_ids"]).reshape(-1)
             grid = np.asarray(values["grid_thws"]).reshape(-1, 3) if taken else np.zeros((0, 3), np.int64)
             places = np.flatnonzero(ids == image_id)
@@ -417,7 +428,7 @@ class Processor:
                     for message in messages for content in (message.get("content"),)
                     if isinstance(content, Sequence) and not isinstance(content, str)
                     for part in content)
-        if media and self._takes_medias:
+        if media and takes_medias(self._media_reference):
             # Its template writes each image part's placeholder, and its call reads the images beside the
             # text (`_medias_fields`), as its own call over the messages does (kimi_k25_processor.py:103-119).
             text = self.reference.apply_chat_template(messages, tokenize=False,
