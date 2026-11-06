@@ -450,7 +450,7 @@ def test_a_site_whose_last_judgement_needed_its_later_draws_draws_them_in_the_fi
     assert (whole["exitCode"], whole.get("more"), whole.get("check1_later")) == (1, None, True)
     # The file changed, so both sites run again: the halved site's later draws are in the first wave.
     source = tmp_path / "tests/test_site.py"
-    source.write_text(source.read_text() + "\n# changed\n")
+    source.write_text(source.read_text() + "\nCHANGED = 1\n")
     again = planned(ci)
     assert (waves(again, "test_on_par"), waves(again, "test_halved")) == ([False, True, True],
                                                                           [False, False, False])
