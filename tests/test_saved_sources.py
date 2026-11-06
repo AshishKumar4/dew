@@ -51,7 +51,11 @@ def test_an_lm_run_over_a_qwen35_release_exports_in_the_releases_layout(tmp_path
     assert isinstance(model, MultimodalTransformer)
     restored = Pretrained.load(tmp_path / "exported", dtype="float32",
                                attention_impl=model.language_model.attention_impl)
-    assert_restores(model, saved.variables(ema=None), restored, np.arange(1, 9, dtype=np.int32)[None])
+    # The release states its context (the source's 512 positions), not the run's window, which is how
+    # long a model runs rather than what it computes (`hf_decoders._RUNTIME_FIELDS`).
+    language = model.language_model.clone(max_seq_len=restored.model.language_model.max_seq_len)
+    assert_restores(model.clone(language_model=language), saved.variables(ema=None), restored,
+                    np.arange(1, 9, dtype=np.int32)[None])
 
 
 @pytest.mark.mesh(devices=8)

@@ -180,6 +180,21 @@ def test_a_qwen35_wrapper_written_from_the_model_alone_is_its_release(tmp_path):
     np.testing.assert_array_equal(logits(exported), logits(source))
 
 
+def test_a_qwen35_wrapper_holding_cross_attention_is_written_as_no_release():
+    """A Qwen3.5 wrapper whose layers hold cross-attention is no release's layout (`wrapper_writes`), so its
+    run's export is the run's native release (`source_publishes`), as a decoder's with them is; the wrapper
+    without them is its release's."""
+    from dew.interop import Pretrained
+    from dew.interop.pretrained import wrapper_writes
+    from dew.nn.cross_attention import CrossAttention
+
+    loaded = Pretrained.load(FIXTURES / "qwen38-dense-tiny", dtype="float32", attention_impl="reference")
+    crossed = loaded.model.with_cross_attention(CrossAttention(layer_ids=(3,), context_length=3,
+                                                               context_features=8))
+    assert wrapper_writes(loaded.model)
+    assert not wrapper_writes(crossed)
+
+
 def load_wrapper(name):
     directory = FIXTURES / name
     record = translate_wrapper_config(
