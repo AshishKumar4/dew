@@ -142,9 +142,15 @@ def round_to_bf16(state, key, value):
     bits and the token's `key` `[..., Dk]` and `value` `[..., Dv]`, so it is
     deterministic and differs from token to token (`fmix32`, the mixer every Dew noise takes;
     `precision.stochastic_bf16`, its rounding)."""
+    return salted_bf16(state, key[..., :, None], value[..., None, :])
+
+
+def salted_bf16(state, key, value):
+    """`round_to_bf16` of `state` with its `key` and `value` broadcast to it as they are (a decode program's
+    column of the state, a key's entry and the column's values: `templates.recurrence.step`)."""
     bits = jax.lax.bitcast_convert_type(state, jnp.uint32)
-    salt = (jax.lax.bitcast_convert_type(key, jnp.uint32)[..., :, None] * jnp.uint32(0x9E3779B1)
-            + jax.lax.bitcast_convert_type(value, jnp.uint32)[..., None, :] * jnp.uint32(0x85EBCA77))
+    salt = (jax.lax.bitcast_convert_type(key, jnp.uint32) * jnp.uint32(0x9E3779B1)
+            + jax.lax.bitcast_convert_type(value, jnp.uint32) * jnp.uint32(0x85EBCA77))
     return stochastic_bf16(state, fmix32(bits ^ salt))
 
 
