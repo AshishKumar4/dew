@@ -92,9 +92,11 @@ class StoredRow:
         """The row's last axis in runs of `widths` (a packed projection's members,
         `dew.inference.projections.unpacked`), each read from the row as it is read."""
         starts = np.cumsum([0, *widths[:-1]])
+        # Each member sliced where the bank lies before it is read home, so a row's members read it home
+        # once between them, a member's share each.
         return [Deferred((*self.shape[:-1], width), self.dtype,
-                         functools.partial(lambda start, width: np.asarray(self)[..., start:start + width],
-                                           int(start), int(width)))
+                         functools.partial(lambda start, width: read_home(
+                             self.bank[self.index][..., start:start + width]), int(start), int(width)))
                 for start, width in zip(starts, widths, strict=True)]
 
     def __jax_array__(self) -> jax.Array:
@@ -108,9 +110,10 @@ class StoredRow:
 
 class Deferred:
     """A leaf an export builds on the host as it writes it (`np.asarray`), its shape and dtype known
-    before: what a transformation makes of a bank's rows (`StoredRow`), a packed row's member
-    (`StoredRow.split`) or an adapter's merge of a row's kernel (`dew.lora.Adapter.merge`), so an export
-    of a banked store holds one tensor's work at a time."""
+    before: what a transformation makes of a leaf, a bank's row (`StoredRow`) among them: a packed row's
+    member (`StoredRow.split`), an adapter's merge of a row's kernel (`dew.lora.Adapter.merge`) or a DEX
+    layer's output projection with its differential folded in (`dew.nn.dex.folded`), so an export holds
+    one tensor's work at a time."""
 
     def __init__(self, shape: tuple[int, ...], dtype, build: Callable[[], np.ndarray | jax.Array]):
         self.shape, self.dtype, self.build = tuple(shape), np.dtype(dtype), build
@@ -121,8 +124,8 @@ class Deferred:
 
     def __array__(self, dtype=None, copy=None) -> np.ndarray:
         del copy
-        held = np.asarray(self.build())
-        return held if dtype is None else held.astype(dtype)
+        # Rounded once, to the dtype asked for or its own, from what its build makes.
+        return np.asarray(self.build()).astype(self.dtype if dtype is None else dtype, copy=False)
 
 
 def deferred(leaf) -> bool:
