@@ -680,6 +680,12 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
         step += [weights]
     if residuals:
         step.append((block_q // 2, block_k, jnp.int32))
+        if family.operands_in_registers:
+            # Its values' block's fragments whole beside the step, where the family's products read
+            # registers: an A100's training walk at 64 x 128, width 64, loads the step's query, key and
+            # value blocks up front, their fragments live at once beside its logits (the liveness pass at
+            # its peak, census80b), ptxas 255 registers and 48 to 56 bytes spilled where the step priced 252.
+            step.append((block_k, value_width * family.rhs_copies, dtype))
     step += _mask_places(family, block_q, block_k)
     phases = [step]
     if natural:
