@@ -920,10 +920,14 @@ TPU_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
 def _paged_preferred(case: PagedCase) -> str:
     """The device's paged kernel where the layer's `AttentionImpl` leaves the choice to it ('auto', or the
     fused kernel the device's own decode would take, 'cudnn' or 'tpu'), else the gathered rows through
-    the layer's own kernel."""
+    the layer's own kernel. On a GPU the attention template's decode over the pages, Dew's Pallas kernel
+    where the template takes no such step: on a GH200 the template's paged step took 0.65 to 0.89 of the
+    Pallas kernel's time (B32 x 4096 keys, 16-key pages 176.6 against 269.8 us, 64-key 174.7 against
+    215.4; B1 x 32768 64.8 against 85.0 and 64.7 against 72.8; 32 query heads over 8, 128 wide, bf16), 1 to
+    2% over its own dense read (M-DD-2, CUPTI step sums, three interleaved rounds, W5-gh200)."""
     device = generation.backend()
     if device == 'gpu' and case.named in ('auto', 'cudnn'):
-        return 'triton'
+        return 'template'
     if device == 'tpu' and case.named in ('auto', 'tpu'):
         return 'tpu'
     return 'gathered'
@@ -935,10 +939,11 @@ PAGED: Op[PagedCase] = Op('paged_decode', (
     Kernel('tpu', TPU_PAGED_SUPPORTS),
     Kernel('gathered', (), generic=True),
 ), _paged_preferred)
-"""The paged selector: a decode step over a paged pool reads it through its device's paged kernel where
-that kernel's requirements hold (`TRITON_PAGED_SUPPORTS`, `TPU_PAGED_SUPPORTS`), else on a GPU through the
-attention template's decode where its requirements hold (`TEMPLATE_PAGED_SUPPORTS`), else the gathered rows
-through the layer's attention (`CausalSelfAttention._decode_attention`)."""
+"""The paged selector: a decode step over a paged pool reads it on a GPU through the attention template's
+decode where its requirements hold (`TEMPLATE_PAGED_SUPPORTS`, `_paged_preferred`'s receipt), else Dew's
+Pallas kernel where its requirements hold (`TRITON_PAGED_SUPPORTS`), on a TPU through jax's paged kernel
+(`TPU_PAGED_SUPPORTS`), else the gathered rows through the layer's attention
+(`CausalSelfAttention._decode_attention`)."""
 
 
 def _head_shards(query: jax.Array) -> int:
