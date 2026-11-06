@@ -346,6 +346,10 @@ class MosaicForward(_Mainloop[Tiles]):
         if config.deferred and not values_deferred(family, self.form, self.splits, query.dtype, dropped,
                                                    self.parts):
             return False
+        # A tile of fewer rows than a role's lays its warps along its keys, 32 key columns each (Mosaic's
+        # layouts take whole such tiles a warp: a 96-key tile's three refused, dd-q5p4).
+        if config.block_q < family.role_rows and config.block_k % (WARPGROUP_WARPS * 32):
+            return False
         # Its key tiles (the launch's, its natural rewalk's) split among the consumers that copy them
         # (`Transport.shares_rows`: two mma.sync consumers' cp.async in whole 64-row parts, so no 32-key tile
         # of two consumers, fs-qualified6).
@@ -711,6 +715,10 @@ def _keys(ba: tokamax.BoundArguments) -> int:
     its pools' page (`forward`'s `table`)."""
     page = _page(ba)
     return ba.arguments["key"].shape[1] if page is None else ba.arguments["table"].shape[1] * page
+
+
+WARPGROUP_WARPS = 4
+"""The warps of a consumer role, a warpgroup's."""
 
 
 def _computed(ba: tokamax.BoundArguments):
