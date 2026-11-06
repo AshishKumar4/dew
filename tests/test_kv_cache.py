@@ -300,6 +300,18 @@ class Decoder(nn.Module):
         return store.decode(query, lengths, None)
 
 
+
+def _decode_drawn(rows: int, capacity: int, kv_heads: int, width: int):
+    """A decode step's draws by seed: a cache's keys and values `[rows, capacity, kv_heads, width]` and a
+    query a row of twice the key heads, unit Gaussians in bf16."""
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        key, value = (jax.random.normal(stream, (rows, capacity, kv_heads, width), jnp.bfloat16)
+                      for stream in streams[:2])
+        return key, value, jax.random.normal(streams[2], (rows, 2 * kv_heads, width), jnp.bfloat16)
+
+    return draw
+
 @INTERPRETS
 def test_a_grouped_pools_decode_reads_each_group_s_pages_through_the_template_interpreted():
     """A bf16 pool split between two groups of rows (`KVCache.groups`), which the GPU's Pallas paged kernel
@@ -324,13 +336,8 @@ def test_a_grouped_pools_decode_reads_each_group_s_pages_through_the_template_in
         spans = template.spans(1, capacity, rows, lengths=lengths)
         return template.reference(query[:, None], key, value, spans)[:, 0]
 
-    def draw(seed: int):
-        streams = jax.random.split(jax.random.key(seed), 3)
-        key, value = (jax.random.normal(stream, (rows, capacity, kv_heads, width), jnp.bfloat16)
-                      for stream in streams[:2])
-        return key, value, jax.random.normal(streams[2], (rows, 2 * kv_heads, width), jnp.bfloat16)
-
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "grouped pool's template decode", seeds=8)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), _decode_drawn(rows, capacity, kv_heads, width),
+                    "grouped pool's template decode", seeds=8)
 
 
 
@@ -368,14 +375,8 @@ def test_a_quantized_pools_decode_reads_its_codes_through_the_template_interpret
         spans = template.spans(1, capacity, rows, lengths=lengths)
         return template.reference(query[:, None], key, value, spans)[:, 0]
 
-    def draw(seed: int):
-        streams = jax.random.split(jax.random.key(seed), 3)
-        key, value = (jax.random.normal(stream, (rows, capacity, kv_heads, width), jnp.bfloat16)
-                      for stream in streams[:2])
-        return key, value, jax.random.normal(streams[2], (rows, 2 * kv_heads, width), jnp.bfloat16)
-
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"{stored} {page} cache's template decode",
-                    seeds=8)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), _decode_drawn(rows, capacity, kv_heads, width),
+                    f"{stored} {page} cache's template decode", seeds=8)
 
 @pytest.mark.parametrize("mixed", [False, True], ids=["rectangular", "mixed"])
 def test_a_paged_write_past_its_rows_pages_drops_and_leaves_their_slots(mixed):
