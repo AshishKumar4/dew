@@ -45,7 +45,7 @@ from dew.nn.sharding import grouped_heads, manual_map, rows_like, varying_like
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
 from .generation import INHERENT, triton_runs
 from .selection import Kernel, KernelRefused, Op, Requirement, select, selected
-from .ssd import ssd_chunk_scan, ssd_kernel_platform
+from .ssd import _chunk_scan, ssd_kernel_platform
 from .templates import base, scan as block_scan
 
 CHUNK_SIZE = 64
@@ -1241,7 +1241,7 @@ def _scan_widths(width: int) -> int:
 
 
 def ssd_operands(x, dt, A, B, C, chunk_size: int, starts=None):
-    """A layer's SSD operands as the chunk scan takes them (`dew.nn.kernels.ssd.ssd_chunk_scan`):
+    """A layer's SSD operands as the chunk scan takes them (`dew.nn.kernels.ssd._chunk_scan`):
     `(x dt, B, C, A dt)`, the groups of `B` and `C` expanded over the heads, the sequence padded to whole
     chunks of `chunk_size`, `x` scaled by its step and the log decay `A dt` a step, `RESET_DECAY` at each
     packed document's first token (`starts`)."""
@@ -1267,7 +1267,7 @@ def _ssd_tpu(x, dt, A, B, C, D, carried, chunk_size: int, starts, platform, work
     scaled, B, C, a = ssd_operands(x, dt, A, B, C, chunk_size, starts)
 
     def kernel(x, B, C, a, carried):
-        return ssd_chunk_scan(x, B, C, a, carried, chunk_size, platform)
+        return _chunk_scan(x, B, C, a, carried, chunk_size, platform)
 
     # The groups are expanded, so any split of the heads divides them.
     rows, split = grouped_heads(scaled.shape, scaled.shape[2])

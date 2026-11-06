@@ -92,7 +92,7 @@ CONTRACTED = {
         ("test_the_delta_rule_ports_hold_their_orders", KERNEL),
     "src/dew/nn/kernels/mamba_ssd.py::ssd_scan":
         ("test_the_ssd_port_holds_its_orders", KERNEL),
-    "src/dew/nn/kernels/ssd.py::ssd_chunk_scan":
+    "src/dew/nn/kernels/ssd.py::_chunk_scan":
         ("test_the_tpu_ssd_scan_holds_its_orders", KERNEL),
     "src/dew/nn/kernels/recurrence.py::linear_tangent":
         ("test_the_decode_step_holds_every_order", NUMERICS),

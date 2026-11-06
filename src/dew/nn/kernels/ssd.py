@@ -14,7 +14,7 @@ them in one program and writes only `y`, the final state and, for a
 gradient, each chunk's entering state. Mosaic's grid is ordered and a
 revisited window survives a step, so `grid=(batch, heads, chunks)` runs the
 chunk innermost with the state in the shared output window. It takes the
-operands as the XLA scan does, `[B, T, H, ...]` (`ssd_chunk_scan`); the
+operands as the XLA scan does, `[B, T, H, ...]` (`_chunk_scan`); the
 heads go ahead of the time inside it, the one layout Mosaic blocks.
 
 The backward is the hand-written reverse recurrence, `dS_n = exp(acs_C-1)
@@ -279,7 +279,7 @@ def _call(body, name: str, platform: str, grid: tuple[int, ...], in_specs, out_s
 
 
 def _forward(x, b, c, a, state, chunk_size: int, platform: str, *, keep_entered: bool):
-    """The forward kernel. Operands arrive as `ssd_chunk_scan` takes them and
+    """The forward kernel. Operands arrive as `_chunk_scan` takes them and
     the output leaves so; `keep_entered` also returns the state every chunk
     entered with, which is the residual the backward pass reads."""
     batch, total, heads, head_dim = x.shape
@@ -344,5 +344,5 @@ def _ssd_bwd(chunk_size: int, platform: str, residual, cotangent):
     return _backward(x, b, c, a, entered, dy, dfinal, chunk_size, platform)
 
 
-ssd_chunk_scan = derivatives.declared_derivative(derivatives.KernelGlue(), _ssd_scan, _ssd_fwd, _ssd_bwd,
+_chunk_scan = derivatives.declared_derivative(derivatives.KernelGlue(), _ssd_scan, _ssd_fwd, _ssd_bwd,
                                                  nondiff_argnums=(5, 6))
