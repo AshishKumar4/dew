@@ -3,6 +3,7 @@ form's one launch of a hookless call, each consumer's keys resident over the que
 dK and dV, and each tile's dQ added into dQ."""
 
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -105,6 +106,17 @@ def _fused_out(family: mosaic.Family, sums: tuple, views: tuple, index, rows: in
         family.stored(sums, views, smem=smem)
 
 
+def _statistics(family: mosaic.Family, refs: list, row, head, block_q: int) -> tuple[dict, Callable]:
+    """A fused program's query tiles' statistics (`STATISTICS`, their `refs` at its batch `row` and `head`):
+    their views, streamed beside each tile where its family's copies move a vector
+    (`Transport.copies_vectors`), and `rows_of(slots, first query)`, a tile's rows from its slots, else from
+    global memory (`_rows`)."""
+    if not family.copies_vectors:
+        return {}, lambda slots, first: tuple(_rows(family, ref, row, head, first, block_q) for ref in refs)
+    views = {name: (ref.at[row, head], lambda j: (j,)) for name, ref in zip(STATISTICS, refs, strict=True)}
+    return views, lambda slots, first: tuple(family.rows_of(slots[name]) for name in STATISTICS)
+
+
 @tuning.lowered_once(("walk",))
 def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans: _Spans | None, *,
                   walk: _Backward) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -147,20 +159,12 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         out_smem = out_smem[0] if out_smem else None
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         key_head = lax.div(head, heads // kv_heads)
-        streamed_rows = family.copies_vectors
-        views = {**_views_of({"queries": q_ref, "douts": do_ref}, row, head),
-                 **({name: (ref.at[row, head], lambda j: (j,)) for name, ref in zip(STATISTICS, stat_refs,
-                                                                                    strict=True)}
-                    if streamed_rows else {})}
+        statistics, rows_of = _statistics(family, stat_refs, row, head, block_q)
+        views = {**_views_of({"queries": q_ref, "douts": do_ref}, row, head), **statistics}
         streams = family.opened(streams, views)
         pair_first = lax.axis_index("k_tiles") * pair
         streamed = _streamed([program.readers(pair_first + index * block_k, q_steps, spans_of, row)[:2]
                               for index in range(consumers)])
-
-        def rows_of(slots, q_first):
-            if streamed_rows:
-                return tuple(family.rows_of(slots[name]) for name in STATISTICS)
-            return tuple(_rows(family, ref, row, head, q_first, block_q) for ref in stat_refs)
 
         def consumer(index):
             k_first = pair_first + index * block_k
@@ -175,7 +179,6 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                                      staged.at[index], coords_of, whole, adds)
             shapes = ((block_k, width), (block_k, width))
             run = program.whole_run(k_first, q_steps, spans_of)
-
             segments = functools.partial(program.segmented, step, run)
 
             # The tiles its partner reads around its own (`Family.walk_own`); on a layout whose consumers
