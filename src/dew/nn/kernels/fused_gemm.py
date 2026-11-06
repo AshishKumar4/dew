@@ -47,7 +47,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
 from jax.extend import core as jax_core
 
-from dew import algebra
+from dew import _cache, algebra
 from dew.algebra import cost as algebra_cost
 from dew.nn import programs
 from dew.nn.kernels import gemm, generation
@@ -139,7 +139,8 @@ def analysis(region, *inputs) -> Analysis:
     priced_calls: list = []
     token = _PRICED.set(priced_calls)
     try:
-        with generation.routes() as found:
+        # Its routes are its own, no caller's report's: what a pass only weighs is no decision a call took.
+        with _cache.KERNEL_ROUTES(()), generation.routes() as found:
             jax.eval_shape(functools.partial(fused, region), *inputs)
     except KernelRefused as refusal:
         return Analysis(None, None, None, refused=str(refusal))
