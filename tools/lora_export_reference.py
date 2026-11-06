@@ -285,7 +285,7 @@ def consume() -> None:
     # Before Diffusers' pipelines: the transformers names they import.
     restore_transformers_names()
 
-    from tools.recorded_references import record_case
+    from tools.recorded_references import input_digest, record_case
 
     FIXTURES.mkdir(parents=True, exist_ok=True)
     for name, case in PIPELINES.items():
@@ -293,17 +293,20 @@ def consume() -> None:
         with (source_directory(case.source) as source,
               pipeline_outputs(case.source, adapter, wide=False) as narrow,
               pipeline_outputs(case.source, adapter, wide=True) as wide):
-            # The adapter moves the prediction, or the check would hold the base model alone.
-            first = narrow(pipeline_inputs(source, case.source))
-            assert not np.array_equal(first["adapted"], first["base"]), f"{name}: the adapter moves nothing"
+            movements = {}
 
-            def evaluate(inputs, narrow=narrow, wide=wide):
+            def evaluate(inputs, narrow=narrow, wide=wide, movements=movements):
                 found, truth = narrow(inputs), wide(inputs)
+                # How far the adapter moves the float64 prediction off its base, which the test holds
+                # well above rounding at every recorded seed, or check 1 would hold the base model alone.
+                movements[int(input_digest(inputs))] = np.abs(truth["adapted"] - truth["base"]).max()
                 return ({kind: found[kind] for kind in ("adapted", "merged")},
                         {kind: truth[kind] for kind in ("adapted", "merged")})
 
             arrays = record_case("prediction", functools.partial(pipeline_inputs, source, case.source),
                                  evaluate, store_inputs=False)
+            arrays["prediction.movement"] = np.asarray([movements[int(digest)]
+                                                        for digest in arrays["prediction.input_digest"]])
         meta = {"peft": peft.__version__,
                 "transformers": transformers.__version__, "diffusers": diffusers.__version__,
                 "torch": torch.__version__}

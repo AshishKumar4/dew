@@ -1355,6 +1355,9 @@ def test_diffusers_reads_the_adapter_dew_writes_at_dews_prediction(family, pipel
     merged_variables = adapter.merge(own)
     recorded = recording(EXPORTS / f"{family}.npz")
     seeds = int(recorded["prediction.seeds"])
+    # The adapter moves the reference's prediction at every recorded seed, or check 1 would pass a Dew that
+    # drops it.
+    assert (recorded["prediction.movement"] > 0.1).all(), recorded["prediction.movement"]
 
     def predictions(inputs, adapted_variables, merged_variables, adapted_model):
         guidance = jnp.asarray(inputs["guidance"]) if inputs.get("guidance", np.zeros(0)).size else None
