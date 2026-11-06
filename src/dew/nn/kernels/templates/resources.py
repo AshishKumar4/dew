@@ -73,6 +73,10 @@ SMEM_ALIGNMENT = 1024
 BARRIER_BYTES = 8
 """A barrier's shared memory."""
 
+TMEM_ADDRESS_BYTES = 4
+"""The shared memory a tensor memory allocation keeps its address in (Mosaic GPU's `tcgen05.alloc` writes the
+column it allocated to a 32-bit word there), unaligned as a barrier is."""
+
 
 def allocated(*sizes: int) -> int:
     """The shared memory allocations of `sizes` bytes take, each rounded up to `SMEM_ALIGNMENT`."""
@@ -248,12 +252,14 @@ class Scope:
     an `emit_pipeline`'s slots); tiles scoped `after` the walks, each `(shape, dtype)`; whether the
     program `reduces` across warps, reserving its family's scratch (`Family.reduction_scratch`); and its
     `reducing_warpgroups`, each reserving its share where its arithmetic reduces implicitly
-    (`Family.warpgroup_reduction_scratch`, the kernel's)."""
+    (`Family.warpgroup_reduction_scratch`, the kernel's); and its `addresses`, the unaligned words its
+    kernel keeps beside them (a tensor memory allocation's address, `TMEM_ADDRESS_BYTES`)."""
     program: tuple = ()
     walks: tuple = ()
     after: tuple = ()
     reduces: bool = False
     reducing_warpgroups: int = 0
+    addresses: int = 0
 
 
 def _count(barriers) -> int:
@@ -291,10 +297,10 @@ def scratch_bytes(family: "Family", scope: Scope) -> int:
 
 def shared_bytes(family: "Family", scope: Scope) -> int:
     """The shared memory a program of `scope` asks for: its scratch (`scratch_bytes`), then every
-    barrier (`BARRIER_BYTES`)."""
+    barrier (`BARRIER_BYTES`) and every address word (`Scope.addresses`)."""
     barriers = sum(_count(leaf.num_barriers) for tree in (scope.program, scope.walks)
                    for leaf in jax.tree.leaves(tree) if _barrier(leaf))
-    return scratch_bytes(family, scope) + BARRIER_BYTES * barriers
+    return scratch_bytes(family, scope) + BARRIER_BYTES * barriers + scope.addresses
 
 
 MOST_STAGES = 8

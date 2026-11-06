@@ -603,8 +603,12 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # A prologue's side operand by group streams with no group's origin here; Triton's and the TPU's
         # launches read it at their tile's group (`axes.at_group`).
         grouped = any(GROUPS in axes for axes in ba.arguments['hooks'].prologue_axes)
+        # A step that prepares its operands (a prologue's rewrite, a consumer's own share of the rows' stage,
+        # an exactly summed step's product apart) runs in the consumer issuing its products.
+        prepared = ba.arguments['hooks'].prologue is not None or self.STAGED_ROWS or summed
         return (first == second and (jnp.dtype(first).itemsize == 2 or self._fp8(ba, first, family))
                 and family is not None and not grouped
+                and (family.issues_in_consumers or not prepared)
                 and (family.counts_hooks or not hooked) and (family.counts_sums or not summed)
                 and self._hooks_lower(ba, first, target)
                 and (self.EXACT_SUMS or not ba.arguments.get('exact_sums'))
@@ -747,14 +751,14 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                 and bool(ba.arguments.get('exact_sums')))
 
     def _family(self, ba, target) -> mosaic.Family | None:
-        """The bundle the launch runs on `target`: its instruction family's (`bundles.of`), none where the
-        family has none (a TPU's launches are their own; a CPU interprets a GPU's only where
-        `generation.assumed` names it)."""
-        return bundles.of(target.generation, ba.arguments['tokens'].dtype)
+        """The bundle the launch runs on `target`: its instruction family's (`bundles.of`; its kernels state
+        their tiles' accumulators, `mosaic_gpu.gmm`'s and `tgmm`'s), none where the family has none (a
+        TPU's launches are their own; a CPU interprets a GPU's only where `generation.assumed` names it)."""
+        return bundles.of(target.generation, ba.arguments['tokens'].dtype, stated=True)
 
     def _families(self, ba, target) -> tuple[mosaic.Family, ...]:
         """The bundles the launch may run on `target`, in preference order (`bundles.layouts`)."""
-        return bundles.layouts(target.generation, ba.arguments['tokens'].dtype)
+        return bundles.layouts(target.generation, ba.arguments['tokens'].dtype, stated=True)
 
     @abc.abstractmethod
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
@@ -843,8 +847,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         """Whether `config` is a tile of the call on `target` apart from its resources: of the launch's
         family there (a layout of it, `bundles.layouts`), in its granularity (whole roles of rows for each
-        consumer, whole column units, one of
-        its depths, at most its consumers, at most the programs its registers hold) with a ring of two
+        consumer, exactly the family's accumulator rows where it fixes them, whole column units, one of
+        its depths, at most its consumers, at most the programs its registers hold), its accumulators held
+        in the tensor memory a family keeps them in (`mosaic.Issuer.tensor_columns`), with a ring of two
         stages at least (a walk keeping one step's products in flight holds its slot while the next step's
         loads fill another), its blocks dividing the call's extents, its cluster at most the family's
         (`mosaic.Family.cluster`), and a one-dimensional side operand's block, copied untiled, at most one
@@ -853,6 +858,13 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         family = next((bundle for bundle in self._families(ba, target) if bundle.name == config.family), None)
         if (family is None or config.cluster > family.cluster or not self._divides(ba, config)
                 or report.refused(self, ba, config)):
+            return False
+        # A family fixing its accumulator's rows takes a tile of exactly them a consumer, and one holding its
+        # accumulators in tensor memory a tile whose accumulators it holds (a paired product's two).
+        accumulators = 1 if ba.arguments.get('paired') is None else 2
+        if ((accumulators > 1 and not family.takes_pairs)
+                or family.accumulator_rows not in (None, config.block_m // config.warpgroups)
+                or family.tensor_columns(config.block_n, accumulators) > (target.tmem_columns or 0)):
             return False
         if not self._granular(ba, config, family):
             return False
@@ -1682,7 +1694,7 @@ def _takes_pair(name: str, case: GroupedCase) -> bool:
     its only hook is the epilogue over its two accumulators (`_pair_alone`: mma.sync's SwiGLU, 254 to 255
     registers and no spill at Qwen3-30B-A3B's and Qwen3.5-4B's gate|up on sm80, row 2100); every other
     hands it on (`APART`)."""
-    family = bundles.of(case.call.target.generation, jnp.bfloat16)
+    family = bundles.of(case.call.target.generation, jnp.bfloat16, stated=True)
     if name != MosaicGmm.name or family is None:
         return False
     bound = case.call.bound.get(name)
@@ -1691,12 +1703,13 @@ def _takes_pair(name: str, case: GroupedCase) -> bool:
 
 def _pair_alone(ba, family: mosaic.Family) -> bool:
     """Whether `ba` is a paired product whose only hook is the epilogue over its two accumulators (no
-    prologue, no side operand, no exact sums) on a family whose model counts it: one whose consumers issue
-    no ring's loads (`Family.feeds_itself`: sm120's fed mma.sync spilled 208 and 280 bytes at the paired
-    128 x 64 x 64 tile its model admitted, NS2100-1)."""
+    prologue, no side operand, no exact sums) on a family whose model counts it: one that takes a pair
+    (`mosaic.Issuer.takes_pairs`) whose consumers issue no ring's loads (`Family.feeds_itself`: sm120's fed
+    mma.sync spilled 208 and 280 bytes at the paired 128 x 64 x 64 tile its model admitted, NS2100-1)."""
     hooks = ba.arguments['hooks']
-    return (ba.arguments.get('paired') is not None and hooks.prologue is None and not family.feeds_itself
-            and not ba.arguments.get('epilogue_operands') and not ba.arguments.get('exact_sums'))
+    return (ba.arguments.get('paired') is not None and hooks.prologue is None and family.takes_pairs
+            and not family.feeds_itself and not ba.arguments.get('epilogue_operands')
+            and not ba.arguments.get('exact_sums'))
 
 class Apart:
     """`launched`'s answer for a paired product no launch takes whole: its two products run apart

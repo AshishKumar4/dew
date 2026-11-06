@@ -384,13 +384,15 @@ class Allocations:
         makes), after the walks where the family scopes them apart, its pipeline's memory reused."""
         consumers = tiles.warpgroups
         staging = tuple(family.output_staging(self.outputs, consumers))
+        persisted, addresses = family.persist_scratch(consumers)
         multicast = ('matrix',) if tiles.cluster > 1 and 'matrix' in self.blocks else ()
         streams = family.streams(self.blocks, tiles.stages, consumers, multicast=multicast)
         held, walks = family.lifetimes(streams, steps)
         if walks:
-            return resources.Scope(program=(*held, self.staged), walks=walks,
-                                   after=tuple((buffer.shape, buffer.dtype) for buffer in staging))
-        return resources.Scope(program=(*held, self.staged, staging))
+            return resources.Scope(program=(*held, self.staged, persisted), walks=walks,
+                                   after=tuple((buffer.shape, buffer.dtype) for buffer in staging),
+                                   addresses=addresses)
+        return resources.Scope(program=(*held, self.staged, persisted, staging), addresses=addresses)
 
 
 def _typed(dtype) -> jax.ShapeDtypeStruct:
@@ -734,13 +736,13 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
             walks = (tiles.splits * grid[0] * grid[1],) if tail is None else (tail.segments, multiprocessors)
             # Its step is its products and its waits (the prologue's rewrite apart), small enough that a
             # rotation of its ring unrolled takes fewer instructions an HGMMA (`mosaic.stepping`); an exactly
-            # summed step is not (its product apart and its IEEE add of the tile beside the running sum), and
-            # a rotation of them spilled as the ring deepened (row 3620: FP8 at 128 x 128 x 128 spilled 152
-            # bytes at five stages and 424 at six, a tile 34% slower than at four, FS-3620-SERIAL2,
-            # FS-3620-STAGES1-h100).
+            # summed step is not (its product apart, its IEEE add beside the running sum): a rotation of them
+            # spilled as the ring deepened (row 3620: FP8 at 128 x 128 x 128 spilled 152 bytes at five stages
+            # and 424 at six, 34% slower than at four, FS-3620-SERIAL2, FS-3620-STAGES1-h100).
             family.persist(streams, walks, schedule, issue, finish, consumers=consumers,
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
-                           in_flight=family.in_flight, unrolled=prologue is None and not exact_sums)
+                           in_flight=family.in_flight, unrolled=prologue is None and not exact_sums,
+                           accumulators=(part,) * len(matrices))
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(blocks, tiles.stages, consumers,
@@ -808,21 +810,26 @@ def _fixed_loaded(family: mosaic.Family, prologue_gmems, prologue_axes: tuple, f
 
 def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store, sides: tuple, origins: dict,
               group, place: tuple) -> None:
-    """Dew: a consumer's share of a `gmm` tile, its accumulators whole (`accs`): its epilogue on its side
-    tiles (`sides`, each its global ref, axes, staging and barrier), loaded at `origins`, a side operand by
-    group at the tile's `group` (the unrouted rows' the last's, as XLA's program reads them) and handed
-    the epilogue at each of the share's rows, then each output stored at `place` (`mosaic.Family.persist`'s
-    `store`)."""
+    """Dew: a consumer's share of a `gmm` tile from its accumulators (`accs`), read out a chunk of columns
+    at a time (`mosaic.Issuer.chunks`: all of them at once where its registers hold them): its epilogue on
+    its side tiles' same columns (`sides`, each its global ref, axes, staging and barrier, loaded at
+    `origins`, a side operand by group at the tile's `group`, the unrouted rows' the last's, as XLA's
+    program reads them, and handed the epilogue at each of the share's rows), then each output stored at
+    `place`, its column the chunk's (`mosaic.Family.persist`'s `store`)."""
     family.loaded([(gmem.at[axes.named(side_axes, origins | axes.at_group(side_axes, gmem.shape, group))],
                     smem.at[wg], barrier.at[wg])
                    for gmem, side_axes, smem, barrier in sides],
                   axes=tuple(axes.held(side_axes) for _, side_axes, _, _ in sides))
     rows = origins['rows'].size
-    values = accs if epilogue is None else epilogue(*accs, *(axes.by_rows(smem[wg], side_axes, rows)
-                                                           for _, side_axes, smem, _ in sides))
-    values = values if isinstance(values, tuple) else (values,)
-    for output, (o_gmem, value) in enumerate(zip(o_gmems, values, strict=True)):
-        store(output, value, o_gmem, place)
+    row_start, first, stored, column, *ladder = place
+    for start, chunk in family.chunks(accs):
+        columns = {'columns': slice(start, start + chunk[0].shape[-1])}
+        values = chunk if epilogue is None else epilogue(*chunk, *(
+            axes.by_rows(smem.at[wg].at[axes.placed(axes.held(side_axes), columns)][...], side_axes, rows)
+            for _, side_axes, smem, _ in sides))
+        values = values if isinstance(values, tuple) else (values,)
+        for output, (o_gmem, value) in enumerate(zip(o_gmems, values, strict=True)):
+            store(output, value, o_gmem, (row_start, first, stored, column + start, *ladder))
 
 
 def _gmm_scheduled(index, *, table_gmem, lhs_gmem, matrix_gmems: dict, prologue_gmems, shape: tuple,
@@ -1175,7 +1182,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
             walks = (g * grid[0] * grid[1],) if tail is None else (tail.segments, multiprocessors)
             family.persist(streams, walks, schedule, issue, finish, consumers=consumers,
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
-                           in_flight=family.in_flight)
+                           in_flight=family.in_flight, accumulators=(part,))
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, consumers))

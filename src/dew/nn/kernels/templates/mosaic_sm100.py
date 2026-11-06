@@ -1,6 +1,6 @@
 """Blackwell's bundle (Mosaic GPU, sm100 and sm103): tcgen05's products, issued by one thread into
 accumulators in tensor memory, and the warpgroups a mainloop runs them in, which the GEMM template's
-(`gemm.mosaic_blackwell`) and the attention template's Blackwell mainloops share.
+(the GEMM template's, on `RINGS`) and the attention template's Blackwell mainloops share.
 
 A program runs two warpgroups (`roles`). The first issues: one warp's TMA loads fill a ring of operand
 stages (`Stages`), one warp issues each step's products once its stage is there, the products releasing
@@ -405,7 +405,7 @@ class CommittedRing(mosaic.Ring):
 
 CHUNK_COLUMNS = 64
 """The accumulator columns an epilogue reads out of tensor memory at once: 64 fp32 registers a thread of its
-warpgroup, the Blackwell GEMM's epilogue chunk (`gemm.mosaic_blackwell.Tiles.epilogue_n`)."""
+warpgroup, the GEMM epilogue's chunk (`chunk_columns`)."""
 
 
 class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
@@ -418,6 +418,14 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
     rows = 128  # a product's rows on one CTA (tcgen05's M without a CTA pair)
 
     role_rows = 128
+
+    accumulator_rows = rows
+
+    issues_in_consumers = False
+
+    counts_hooks = False  # its model is an epilogue chunk's accumulator alone (`chunk_columns`)
+
+    takes_pairs = False
 
     operands_in_registers = False
 
@@ -561,6 +569,10 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
     """The accumulator turns a launch's tensor memory holds: an epilogue reads one while the products fill
     the other."""
 
+    def tensor_columns(self, columns: int, accumulators: int) -> int:
+        # Each turn holds every accumulator of a tile (`persist`).
+        return self.turns * columns * accumulators
+
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None) -> dict:
         if multicast:
@@ -580,6 +592,12 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         issuing warpgroup, its load warp running `load()` and its product warp `products()` (`kernel`'s
         warpgroups: the table's and one)."""
         mosaic.tabled(lax.axis_index("wg"), table, lambda: _issuing(load, products))
+
+    def persist_scratch(self, consumers: int) -> tuple[tuple, int]:
+        # Its accumulator turns' barriers, filled and drained (`persist`), and its tensor memory's address.
+        return ((plgpu.Barrier(num_barriers=self.turns, orders_tensor_core=True),
+                 plgpu.Barrier(num_barriers=self.turns, num_arrivals=consumers, orders_tensor_core=True)),
+                resources.TMEM_ADDRESS_BYTES)
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
@@ -668,10 +686,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
             self.roles_of(((consumers, epilogue),), load=load, products=issue_all)
 
         pl.run_scoped(scoped, plgpu.TMEM((self.rows, self.turns * width), jnp.float32),
-                      plgpu.Barrier(num_barriers=self.turns, orders_tensor_core=True),
-                      plgpu.Barrier(num_barriers=self.turns, num_arrivals=consumers,
-                                    orders_tensor_core=True),
-                      *staging, collective_axes="wg")
+                      *self.persist_scratch(consumers)[0], *staging, collective_axes="wg")
 
 
 RINGS = Tcgen05Rings()

@@ -1231,6 +1231,28 @@ class Issuer[Accumulator](abc.ABC):
     beside the first and each step's product), so such a call derives a tile that spills nothing: every
     family's, an fp32 output of 16-bit products being exactly summed (`templates.product.promoted`)."""
 
+    accumulator_rows: int | None = None
+    """The rows of a consumer's accumulator its products issue into, where the family fixes them (tcgen05's
+    M on one CTA); None where a tile takes any whole roles of rows."""
+
+    issues_in_consumers: bool = True
+    """Whether a walk's step runs in the consumer that issues its products, so it can prepare their operands
+    first: a prologue's rewrite, a kernel gradient's zeroed neighbouring rows, an exactly summed step's own
+    product. Where not (tcgen05's: one warp issues them, the tensor core reading each stage as loaded), a
+    call needing that is not a template's launch's there."""
+
+    takes_pairs: bool = True
+    """Whether a launch on it takes a paired product whole, its model pricing the second accumulator beside
+    the first in a consumer's registers (`column_registers`); where not (tcgen05's, whose accumulators stay
+    in tensor memory, read out in chunks), its two products run apart."""
+
+    def tensor_columns(self, columns: int, accumulators: int) -> int:
+        """The tensor memory columns a program's `accumulators` fp32 accumulators of `columns` columns each
+        take (`generation.GpuTarget.tmem_columns` bounds them): none where its consumers hold them in
+        registers."""
+        del columns, accumulators
+        return 0
+
     def column_registers(self, columns: int, dtype) -> int:
         """The registers a consumer thread holds for a vector of `columns` entries of `dtype` in the
         accumulator's column layout (`column`), broadcast over its rows: a family whose register model
@@ -1799,6 +1821,13 @@ class Transport[Allocated, Opened](abc.ABC):
         it whole."""
         del consumers
         return [plgpu.SMEM(shape, dtype) for shape, dtype in outputs]
+
+    def persist_scratch(self, consumers: int) -> tuple[tuple, int]:
+        """What `persist` scopes in shared memory besides its outputs' staging, which a template's
+        allocations count (`resources.Scope`): its barriers, and its address words
+        (`resources.Scope.addresses`); none where its accumulators live in registers."""
+        del consumers
+        return (), 0
 
     def published(self) -> None:
         """A consumer's writes to shared memory made visible to the readers that read it asynchronously

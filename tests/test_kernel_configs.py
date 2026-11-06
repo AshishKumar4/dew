@@ -573,16 +573,21 @@ def _derived_and_refused(launch, ba, target) -> tuple:
 def _emitted_forms(family, shape: str | None = None) -> set[str]:
     """The forms a family's GEMM launches emit (`PLAIN_FORMS`, `EXACT_FORMS`, `HOOKED_FORMS`, `FP8_FORMS`):
     none without a bundle, the exactly summed ones where its register model counts a running sum
-    (`Family.counts_sums`), the hooked ones where it counts what they hold (`Family.counts_hooks`), the FP8
-    ones where its products take FP8 (`Family.takes_fp8`);
+    (`Family.counts_sums`), the hooked ones where it counts what they hold (`Family.counts_hooks`), the
+    paired ones where its launches take a pair whole (`Family.takes_pairs`), the FP8 ones where its products
+    take FP8 (`Family.takes_fp8`); where its consumers do not issue their products, none whose step prepares
+    them (`Family.issues_in_consumers`: a kernel gradient's consumer zeroes its stage's neighbouring rows
+    first, an exactly summed step takes its product apart);
     at a projection `shape`, each whose output's width steps by the family's column unit and whose
     contraction steps by its narrowest depth (`Family.column_unit`, `Family.depths`)."""
     if family is None:
         return set()
-    forms = {*PLAIN_FORMS, *(PAIRED_FORMS if family.counts_hooks or not family.feeds_itself else ()),
-             *(EXACT_FORMS if family.counts_sums else ()),
+    paired = family.takes_pairs and (family.counts_hooks or not family.feeds_itself)
+    forms = {*PLAIN_FORMS, *(PAIRED_FORMS if paired else ()), *(EXACT_FORMS if family.counts_sums else ()),
              *(HOOKED_FORMS if family.counts_hooks else ()),
              *(FP8_FORMS if family.takes_fp8 else ())}
+    if not family.issues_in_consumers:
+        forms = {form for form in forms if "kernel gradient" not in form and form not in EXACT_FORMS}
     if shape is None:
         return forms
     _, depth, width, _ = GEMM_SHAPES[shape]
@@ -605,10 +610,11 @@ def _emitted_forms(family, shape: str | None = None) -> set[str]:
 def test_every_gemm_form_derives_a_tile_at_every_shape(generation_name, shape):
     """Every GEMM Mosaic GPU launch form a generation's family emits (`_emitted_forms`) derives a tile at
     every real projection (`_gemm_mainloop_cases`): an eligibility regression fails here rather than leaving
-    the compile gate fewer cases. A GPU whose family has no bundle (`bundles.of`: a B200's tcgen05, consumer
-    Blackwell's TMA-fed mma.sync) emits none."""
+    the compile gate fewer cases. Its launches state their tiles' accumulators, so a B200's tcgen05 bundle is
+    theirs (`bundles.of`'s `stated`); a GPU whose family has no bundle (consumer Blackwell's TMA-fed mma.sync)
+    emits none."""
     cases = _gemm_mainloop_cases(generation_name, shape)
-    forms = _emitted_forms(bundles.of(generation_name, jnp.bfloat16), shape)
+    forms = _emitted_forms(bundles.of(generation_name, jnp.bfloat16, stated=True), shape)
     assert {case.name.split(" Tiles(")[0].removesuffix(" refused") for case in cases} == forms
 
 
