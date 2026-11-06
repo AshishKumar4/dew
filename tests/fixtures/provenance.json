@@ -1,8 +1,9 @@
 {
  "references": {
-  "joint_checkpoint/tiny/images.npz": {
-   "tool": "tools/joint_checkpoint_reference.py",
-   "sources": [{"repo": "Cloudflare/clef", "version": "2f3de3dd85f379784083b0814d997ab627200f0c", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  "joint_checkpoint/tiny/joint.npz": {
+   "tool": "tools/venv_reference.py joint",
+   "sources": [{"repo": "Cloudflare/clef", "version": "2f3de3dd85f379784083b0814d997ab627200f0c", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "note": "The release's own code (tools/joint_worker.py) over check 1's drawn head weights and pictures, its torch math on the CPU (torch 2.8.0), float32 and float64, its evidence and its truth's sketch, sized paired with Dew's run."
   },
   "joint_checkpoint/tiny/logits.npz": {
    "tool": "tools/joint_checkpoint_reference.py",

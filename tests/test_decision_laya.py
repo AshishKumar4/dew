@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from decision_support import dew_variables, drawn_weights
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import GateFailure, Inconclusive, as_given, assert_as_exact, indexed_recording, recording
 from reference_runs import assert_as_exact_as_recorded
@@ -83,25 +84,14 @@ def laid(parallel: bool) -> tuple[DecisionInputs, ...]:
 
 
 def draw(seed: int) -> dict[str, np.ndarray]:
-    """A seed's weights for the tiny checkpoint's model: kernels and embeddings at their initializer's
-    scale, norms' scales about one and biases off zero, under Dew's paths (`dew.`) and Laya's names
-    (`param.`, `dew.decision.laya.laya_tensors`), the requests the fixture's cases."""
-    from flax.traverse_util import flatten_dict, unflatten_dict
+    """A seed's weights for the tiny checkpoint's model (`drawn_weights`), under Dew's paths (`dew.`) and
+    Laya's names (`param.`, `dew.decision.laya.laya_tensors`), the requests the fixture's cases."""
+    from flax.traverse_util import unflatten_dict
 
     from dew.decision.laya import laya_tensors
 
-    rng = np.random.default_rng([1557, 7, seed])
     checkpoint = tiny()
-    drawn = {}
-    for path, value in flatten_dict(checkpoint.variables).items():
-        shape = np.shape(value)
-        if path[-1] == "scale":
-            leaf = rng.normal(1.0, 0.3, shape)
-        elif path[-1] == "bias":
-            leaf = rng.normal(0.0, 0.3, shape)
-        else:
-            leaf = rng.normal(0.0, 1.0, shape) / np.sqrt(np.prod(shape[:-1]))
-        drawn[path] = leaf.astype(np.float32)
+    drawn = drawn_weights(checkpoint.variables, np.random.default_rng([1557, 7, seed]))
     tensors, _ = laya_tensors(checkpoint.model, unflatten_dict(drawn))
     return {**{f"dew.{'/'.join(path)}": value for path, value in drawn.items()},
             **{f"param.{name}": np.asarray(tensors[name], np.float32) for name in tensors}}
@@ -115,17 +105,10 @@ def model_at(dtype) -> DecisionModel:
     return DecisionModel(model.backbone.clone(dtype=dtype), model.head.clone(dtype=dtype))
 
 
-def variables_of(dtype, inputs) -> dict:
-    from flax.traverse_util import unflatten_dict
-
-    return unflatten_dict({tuple(key.removeprefix("dew.").split("/")): jnp.asarray(value, dtype)
-                           for key, value in inputs.items() if key.startswith("dew.")})
-
-
 def dew(dtype, inputs, *, typed: bool = True) -> dict:
     """Dew's option logits at `dtype` under a draw's weights, each question alone (`laid`); `typed`
     False drops the question type, the one place a choice and a noul differ in the head."""
-    model, variables = model_at(dtype), variables_of(dtype, inputs)
+    model, variables = model_at(dtype), dew_variables(dtype, inputs)
 
     def scored(row):
         row = row if typed else replace(row, kinds=jnp.zeros_like(row.kinds))
@@ -166,7 +149,7 @@ def test_padded_rows_score_as_they_do_alone():
     assert all(np.all(np.isneginf(batched[row, width:])) for row, width in enumerate(widths))
 
     def in_one_batch(dtype, inputs):
-        scores = model_at(dtype).logits(variables_of(dtype, inputs), batch)[:, 0]
+        scores = model_at(dtype).logits(dew_variables(dtype, inputs), batch)[:, 0]
         return {**dew(dtype, inputs), "sequential": jnp.concatenate(
             [scores[row, :width] for row, width in enumerate(widths)])}
     assert_as_exact_as_recorded(FIXTURE, "laya", LAYA_SEEDS, draw, in_one_batch, "batched Laya logits")

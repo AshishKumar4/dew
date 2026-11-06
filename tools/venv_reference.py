@@ -35,6 +35,8 @@ scheduler's grid."""
 
 NATIVE_PIPELINES = "huggingface/diffusers 0.39.0 with huggingface/transformers 4.49.0"
 """The diffusers-pipelines cohort (tools/reference_releases.py) the saved tiny pipelines' own calls run in."""
+JOINT_RELEASE = "the joint-head release tests/fixtures/joint_checkpoint/tiny/source.json names"
+"""The joint site's reference, the release its fixture names."""
 SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py",
                   "reference": "danijar/dreamerv3 e01491fad6434b2245a3b8ca201dd7faedcc458c",
                   "license": "MIT"},
@@ -44,6 +46,9 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
          "laya": {"test": "test_decision_laya", "worker": "laya_worker.py",
                   "reference": "NandhaKishorM/laya a4a8921afebfd852bba0000475cfb6ab737a124c",
                   "license": "Apache-2.0", "distribution": ("transformers", "5.16.1")},
+         "joint": {"test": "test_decision_joint_checkpoint", "worker": "joint_worker.py",
+                   "reference": JOINT_RELEASE, "license": "Apache-2.0",
+                   "distribution": ("transformers", "5.16.1")},
          "kimi-k3": {"test": "test_kimi_k3", "worker": "kimi_worker.py", "device": "cuda",
                      "reference": "moonshotai/Kimi-K3 f831ab66814297da540d832a5235f8e904f29d06",
                      "license": "other (kimi-k3)", "distribution": ("fla-core", "0.5.2")},
