@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import pytest
 from generation_support import INTERPRETS
 from hypothesis import strategies as st
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
@@ -167,9 +167,10 @@ def test_a_far_short_rows_slices_merge_through_its_masked_rewalk_interpreted(mer
 def test_a_decode_steps_slices_merged_in_the_launch_rewalk_rows_whose_sums_pass_fp32s_largest_interpreted():
     """A decode step cut into 8 slices a row and merged in the launch (`MosaicForward.merges`), its values
     near bf16's largest under equal logits, so its rows' weighted values pass fp32's largest and its guarded
-    rewalk walks each row's keys whole, merging nothing (`_inference_walk`): on par with the step walked
-    whole (check 1)."""
-    spans = _decode_spans((300, DECODE_KEYS))
+    rewalk walks each row's keys whole, merging nothing (`_inference_walk`): on par with jax's own attention,
+    which normalizes its weights before their product (check 1)."""
+    lengths = (300, DECODE_KEYS)
+    spans = _decode_spans(lengths)
 
     def large(seed: int):
         query, key, _ = _decode_draw(seed)
@@ -177,8 +178,12 @@ def test_a_decode_steps_slices_merged_in_the_launch_rewalk_rows_whose_sums_pass_
                                    jnp.float32, 2.9e38, 3.3e38).astype(jnp.bfloat16)
         return jnp.zeros_like(query), key, value
 
+    def reference(query, key, value):
+        return jax.nn.dot_product_attention(query, key, value, implementation="xla",
+                                            key_value_seq_lengths=jnp.asarray(lengths, jnp.int32))
+
     assert_as_exact(jax.jit(functools.partial(_slices_merged, spans=spans, merges=True)),
-                    jax.jit(lambda q, k, v: template.reference(q, k, v, spans)), large,
+                    as_given(jax.jit(reference)), large,
                     "a decode step's slices merged in the launch past fp32's largest", seeds=SEEDS)
 
 
