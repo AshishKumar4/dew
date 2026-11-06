@@ -15,13 +15,15 @@ import importlib.util
 import sys
 from pathlib import Path
 
+SOURCE = Path(__file__).resolve().parents[2] / "src" / "dew" / "_cleanup.py"
+"""The file of `dew._cleanup`, which a process that has not imported it loads by its path (`_cleanup`)."""
+
 
 def _cleanup():
-    """The module `dew._cleanup`: the process's own where it is loaded, else src/dew/_cleanup.py's file."""
+    """The module `dew._cleanup`: the process's own where it is loaded, else `SOURCE`'s."""
     if "dew._cleanup" in sys.modules:
         return sys.modules["dew._cleanup"]
-    path = Path(__file__).resolve().parents[2] / "src" / "dew" / "_cleanup.py"
-    spec = importlib.util.spec_from_file_location("dew._cleanup", path)
+    spec = importlib.util.spec_from_file_location("dew._cleanup", SOURCE)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module

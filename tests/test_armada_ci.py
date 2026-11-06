@@ -1361,8 +1361,9 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
     for tool in (ROOT / "tools/armada").glob("*.py"):
         (armada / tool.name).write_text(tool.read_text())
     # The group ownership child_groups.py loads, which every test process is started through.
-    (tmp_path / "src/dew").mkdir(parents=True)
-    (tmp_path / "src/dew/_cleanup.py").write_text((ROOT / "src/dew/_cleanup.py").read_text())
+    owner = ci.child_groups.SOURCE.relative_to(ROOT)
+    (tmp_path / owner).parent.mkdir(parents=True)
+    (tmp_path / owner).write_text((ROOT / owner).read_text())
     (tmp_path / "tests/fixtures").mkdir(parents=True, exist_ok=True)
     (tmp_path / "tests/fixtures/data.json").write_text("{}\n")
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
@@ -1371,7 +1372,7 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
                ("tests/fixtures/data.json", "{}\n", 2), ("tests/conftest.py", "VALUE = 1\n", 3),
                ("src/package/__init__.py", "", 4), ("tests/more/test_added.py", "VALUE = 2\n", 4),
                ("tools/armada/child_groups.py", "# its process group\n", 5),
-               ("src/dew/_cleanup.py", "# the group's lifetime\n", 6)]
+               (str(owner), "# the group's lifetime\n", 6)]
     for path, text, runs in changes:
         if path:
             (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
@@ -1568,8 +1569,9 @@ def test_a_tool_that_comes_or_goes_runs_no_file_again_that_imported_none(tmp_pat
     # The harness as a checkout holds it, under the checkout's root, beside the project it reads.
     shutil.copytree(ROOT / "tools/armada", tmp_path / "tools/armada",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-    (tmp_path / "src/dew").mkdir(parents=True)
-    shutil.copy(ROOT / "src/dew/_cleanup.py", tmp_path / "src/dew/_cleanup.py")
+    owner = load("child_groups", "tools/armada").SOURCE.relative_to(ROOT)
+    (tmp_path / owner).parent.mkdir(parents=True)
+    shutil.copy(ROOT / owner, tmp_path / owner)
     shutil.copy(ROOT / "pyproject.toml", tmp_path / "pyproject.toml")
     module = load("ci", str(tmp_path / "tools/armada"))
     monkeypatch.chdir(tmp_path)
