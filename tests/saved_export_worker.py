@@ -22,9 +22,11 @@ import ctypes
 import functools
 import gc
 import hashlib
+import os
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from flax import linen as nn
 from process_support import serve_mode, worker_parser
@@ -202,8 +204,9 @@ def released(args) -> dict:
     PretrainedDecoder.save = functools.partialmethod(PretrainedDecoder.save, max_shard_size=RELEASE_SHARD)
     rank = jax.process_index()
     scopes = scoped_growth(saved_sources)
-    warm = Path(args.run_dir).parent / f"warm{rank}"
-    saved_sources.export_run(saved_sources.pinned_run(args.run_dir), warm, publishes=rank == 0)
+    warm_cache = Path(args.run_dir).parent / "warm-cache"
+    with patch.dict(os.environ, {"XDG_CACHE_HOME": str(warm_cache)}):
+        saved_sources.released_run(args.run_dir)
     scopes.clear()
     release = saved_sources.released_run(args.run_dir)
     read = list(scopes)
