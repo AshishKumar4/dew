@@ -7,6 +7,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A distillation under a host layout (`Layout(host=("variables",))`) keeps its frozen teacher as it keeps
+  a frozen stack: each scanned run of the teacher's layers, its frozen split's beside its params, is one
+  bank beside the accelerator, which the teacher's forward reads a layer at a time, where the whole
+  teacher crossed to the device every step. Its checkpoints store the teacher banked (`layers_0_2`): a
+  host-layout distillation saved before this keeps its teacher per layer (`layers_0` to `layers_2`) and
+  does not restore into it; start such a run afresh from its teacher.
 - A streamed Parquet store reads file by file: its shards are its files, each read row group by row group,
   its footer read as its reader reaches it, so a stream's first record waits for one file's footer, where it
   waited for every one's (FineWeb-Edu's default configuration, 2410 files on the Hub: 196 s). This is data

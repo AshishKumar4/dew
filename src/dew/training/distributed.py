@@ -375,7 +375,7 @@ def placed_start(initial_state: Callable[[Initializer, jax.Array], TrainState], 
     frozen tree between them. One program builds the rest, a frozen leaf the init builds among it,
     taking the other held arrays over."""
     moving, frozen = apart(shardings)
-    if frozen is None or not through:
+    if not frozen or not through:
         taken, kept = placed_held(initializer, abstract.variables, shardings.variables, mesh)
         return taking_over(initial_state, taken, kept, shardings)(key)
     inputs = jax.tree.leaves(initializer)
