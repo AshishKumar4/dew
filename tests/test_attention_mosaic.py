@@ -605,8 +605,8 @@ def test_the_forward_is_on_par_dropping_interpreted(call, training):
 @pytest.mark.parametrize("form", [*HOOKED_FORMS, "fused"])
 def test_the_backward_is_on_par_dropping_interpreted(form):
     """The backward in each form under probability dropout over a causal call, the fast form's one launch
-    too (each consumer's tile its own draw), its D the dropped products' own pass
-    (`attention_mosaic_backward._centre_launch`), under the interpreter."""
+    too (each consumer's tile its own draw), its D the forward's dropped split sums' about the anchor's
+    value as its draw keeps it (`algebra.anchor_multipliers`), under the interpreter."""
     _check_backward("causal", SHAPES["interpreted"], form=form, interpret=True, drop=True)
 
 
