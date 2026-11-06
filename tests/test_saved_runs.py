@@ -65,6 +65,17 @@ def archived(recorded: str, kind: str) -> tarfile.TarFile:
     return tarfile.open(fileobj=io.BytesIO(stored.tobytes()), mode="r:xz")
 
 
+def test_every_task_a_registered_objective_saves_its_runs_as_is_a_saved_kinds(tmp_path):
+    """Every task a registered objective saves its runs as (`dew.registry.objectives`' `saved_task`) is the
+    task of a kind the corpus saves a run of (`SAVED_KINDS`), so a run of it a main saved exports and loads
+    back as its run (`test_a_run_an_earlier_main_saved_exports_and_loads_back_answering_as_its_run`); a
+    masked-diffusion run's task had no kind."""
+    declared = {objectives[name].saved_task for name in objectives} - {None}
+    saved = {objectives[build(tmp_path / kind, drawn=False).objective.name].saved_task
+             for kind, build in SAVED_KINDS.items()}
+    assert declared <= saved, sorted(task.__name__ for task in declared - saved)
+
+
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 def test_a_saved_run_names_no_owner_time_or_place_of_the_machine_that_wrote_it(recorded, kind):
     """Each archive of the corpus names nothing of its writer's machine, which the fetched store
