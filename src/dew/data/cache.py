@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 import weakref
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack
@@ -935,7 +936,26 @@ class _CachedReader:
 
     def __call__(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
         return _CachedIter(self.reader(shard, options), self.cache, self.key, shard, self.transform,
-                           self.published, self.source, self.transparent, self.shards, self.halted)
+                           self.published, self.source, self.transparent, self.shards, self.halted,
+                           self.held_parts)
+
+    def held_parts(self) -> Mapping[str, tuple[Shard, ...]]:
+        """The store's finer shards a read by them fills (`ShardManifest.parts`), by the file each is of,
+        derived once for every shard this reader opens; none for a file two of its shards read (a store
+        concatenated with itself), whose parts are no one shard's."""
+        return self._parts
+
+    @cached_property
+    def _parts(self) -> Mapping[str, tuple[Shard, ...]]:
+        if self.source is None:
+            return {}
+        manifest = self.source.manifest(filled_version(self.key.fill))
+        files = Counter(shard.uri for shard in manifest.shards)
+        held: dict[str, list[Shard]] = {}
+        for part in manifest.parts():
+            if files[part.uri] == 1:
+                held.setdefault(part.uri, []).append(part)
+        return {uri: tuple(parts) for uri, parts in held.items()}
 
 
 class _CachedIter(grain.IterDataset):
@@ -951,11 +971,12 @@ class _CachedIter(grain.IterDataset):
         transparent: bool,
         shards: int | None,
         halted: set[str],
+        parts: Callable[[], Mapping[str, tuple[Shard, ...]]],
     ):
         super().__init__(parent)
         self.cache, self.key, self.shard, self.transform = cache, key, shard, transform
         self.published, self.input_parent, self.source = published, parent, source
-        self.transparent, self.shards, self.halted = transparent, shards, halted
+        self.transparent, self.shards, self.halted, self.parts = transparent, shards, halted, parts
 
     def __iter__(self) -> grain.DatasetIterator:
         return _CachedIterator(self.input_parent.__iter__(), self.writer, self.shard, self.transform,
@@ -980,10 +1001,7 @@ class _CachedIter(grain.IterDataset):
     def _parted(self, published: _Published) -> _Parted | None:
         """Its shard's records as the generation holds them in its store's finer shards, every one of
         its parts held (`ShardManifest.parts`, each stating its rows); None where they are not."""
-        if self.source is None:
-            return None
-        parts = [part for part in self.source.manifest(filled_version(self.key.fill)).parts()
-                 if part.uri == self.shard.uri]
+        parts = self.parts().get(self.shard.uri, ())
         if not parts or any(part.rows is None or (part.rows and not published.generation.holds((part.id, 0)))
                             for part in parts):
             return None

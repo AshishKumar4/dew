@@ -144,11 +144,11 @@ class ShardManifest:
     fixed_parts: bool = False
 
     def parts(self) -> tuple[Shard, ...]:
-        """The store's finer shards its subdivision always cuts (`fixed_parts`); none where it cuts by
-        count, or cuts none."""
+        """The store's finer shards its subdivision always cuts (`fixed_parts`), as a read by more readers
+        than its shards cuts them; none where it cuts by count, or cuts none."""
         if not self.fixed_parts or self.subdivide is None:
             return ()
-        return self.subdivide(len(self.shards))
+        return self.subdivide(len(self.shards) + 1)
 
     def sized(self, reads: int) -> ShardManifest:
         """The manifest with each shard's rows its store counts (`counted`), `reads` at once (its reading's
