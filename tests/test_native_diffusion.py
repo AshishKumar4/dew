@@ -265,7 +265,6 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
     the same noise, whatever process trains, its task draws the pipeline's own task's images, and the
     grid a saved run records rebuilds a task that draws them too."""
     import dataclasses
-    import functools
     import shutil
 
     import jax
@@ -325,17 +324,8 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
     def evaluation(seed):
         return objective.evaluate(variables, batch, stepped(seed)[0]).images
 
-    # Each walk compiled once for every seed, its weights an argument.
-    walk = jax.jit(functools.partial(walked, source, objective))
-
     def reference(seed):
-        return walk(variables, *stepped(seed))
-
-    @functools.cache
-    def wide_walk():
-        """The walk in float64, compiled once for every seed's truth."""
-        wide = dataclasses.replace(source, model=source.model.clone(dtype=jnp.float64))
-        return jax.jit(functools.partial(walked, wide, DiffusionObjective(wide, **settings)))
+        return walked(source, objective, variables, *stepped(seed))
 
     def truth(seed):
         # The seed's noise drawn once in float32, as the arms draw it, then widened: drawn under x64, the
@@ -347,7 +337,9 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
             step, x_T = stepped(seed)
         assert x_T.dtype == jnp.float32, x_T.dtype
         with jax.enable_x64(new_val=True):
-            return np.asarray(wide_walk()(widened(variables), step, jnp.asarray(x_T, jnp.float64)))
+            wide = dataclasses.replace(source, model=source.model.clone(dtype=jnp.float64))
+            return np.asarray(walked(wide, DiffusionObjective(wide, **settings), widened(variables), step,
+                                     jnp.asarray(x_T, jnp.float64)))
 
     # On par with the solver's own walk from the same noise over the seeds' step keys (check 1).
     assert_as_exact(as_given(evaluation), as_given(reference), lambda seed: (np.int32(seed),),
