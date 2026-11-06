@@ -37,6 +37,8 @@ class ReleaseParity:
     """The wire requests of each seed, `[[{state, questions: {id: wire}}, ...], ...]`."""
     gradients: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     """Each recorded `gradient.<name>`'s head parameter, by its path in the head's tree."""
+    blocks: bool = False
+    """Whether the release reads its rows in blocks, whose numbering its engine recorded (`blocks`)."""
     attention_impl: str = "reference"
     """The attention the release is loaded with, as its own tests load it."""
     every_slot: bool = False
@@ -100,15 +102,16 @@ def assert_answers_as_its_engine(parity: ReleaseParity, scratch: Path) -> None:
         laid = DecisionInputs.collate(rows, task.specials.pad, questions=options.shape[1],
                                       options=options.shape[2])
         mask = np.arange(held["tokens"].shape[1])[None] < held["lengths"][:, None]
-        # Its rows read in blocks where Dew lays them so, as the engine numbered them; read whole, the
-        # engine's numbering is unread.
-        blocked = rows[0].blocks is not None
+        # A release read in blocks numbers them as its engine did; one read whole leaves its engine's
+        # numbering unread.
+        blocked = parity.blocks
         for row, encoded in enumerate(rows):
             np.testing.assert_array_equal(encoded.tokens, held["tokens"][row, :held["lengths"][row]])
             assert len(encoded.questions) == int(np.sum(np.any(options[row], axis=-1)))
             for at, laid_question in enumerate(encoded.questions):
                 np.testing.assert_array_equal(laid_question.options, spans[row, at][options[row, at]])
             if blocked:
+                assert encoded.blocks is not None
                 np.testing.assert_array_equal(encoded.blocks, held["blocks"][row, :held["lengths"][row]])
         inputs = replace(laid, tokens=jnp.asarray(held["tokens"]), segments=jnp.asarray(mask, jnp.int32),
                          positions=jnp.broadcast_to(jnp.arange(mask.shape[1]), mask.shape),
