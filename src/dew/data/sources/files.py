@@ -1381,4 +1381,4 @@ class _JsonArray(grain.DatasetIterator):
         return {"read": self.read}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        self.read = integer(state["read"], "JSON array items read")
+        self.read = integer(state["read"], "JSON array items read") + 1
