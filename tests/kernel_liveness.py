@@ -275,6 +275,12 @@ def divergent_values(module) -> set:
             pass
         elif name == 'llvm.inline_asm' and _assembly(op) == 'mov.b64 $0, $1;':
             mark(op.results, op.operands)
+        elif _optimization_barrier(op) and len(op.results) == len(op.operands):
+            # Each value through an optimization barrier as it went in (its outputs tied to its inputs): a
+            # uniform descriptor or slot address stays uniform (the fused attention backward's statistics
+            # stream, read 228 where ptxas held 224: half its wgmma descriptors through a barrier).
+            for result, operand in zip(op.results, op.operands, strict=True):
+                mark((result,), (operand,))
         else:
             mark(op.results, op.operands, forced=bool(DIVERGENT.match(name)))
         for block in blocks:
