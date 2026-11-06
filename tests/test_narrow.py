@@ -439,14 +439,12 @@ def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_dropped(monkeypatch):
 def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads(monkeypatch):
     """Each shape a run meets plans its copies itself (`_at_base_rung`): where a longer batch fits only
     without them and a shorter one with them, the steps take turns, each reading the state as its own plan
-    compiled it, the copies dropped before the longer batch's step and built again before the shorter's,
-    and under plain SGD the run lands on par with the parameters and losses of one without copies
-    (check 1)."""
-    free = budget = 2 ** 39
-
-    def stats(device):
-        return {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - budget}
-    monkeypatch.setattr(jax.Device, "memory_stats", stats)
+    compiled it, the copies dropped before the longer batch's step and built again before the shorter's
+    as the cast of the parameters the last update wrote (`_copies_of`). That the copies change no update
+    is the other runs' claim (`_on_par_with_the_plain_update`)."""
+    free = 2 ** 39
+    monkeypatch.setattr(jax.Device, "memory_stats",
+                        lambda device: {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - free})
 
     def trained(*, copies, rows=8, longer=None, steps=0):
         return _trained(optax.sgd(0.5), copies=copies, steps=steps, accumulation=2, split=1, remat="full",
@@ -456,21 +454,11 @@ def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads
         return free - trained(copies=copies, rows=rows)[2].plan["probes"][0]["headroom"]
 
     shorter, longer, longer_without = used(8, copies=True), used(64, copies=True), used(64, copies=False)
-    free = budget = max(shorter, longer_without)
+    free = max(shorter, longer_without)
     assert free < longer
     narrow, _, trainer = trained(copies=True, longer=64, steps=3)
     assert not trainer.plan["narrow"] and narrow.compute is not None
-
-    def run(copies, seed):
-        nonlocal budget
-        # The float64 truth's wider arrays are planned in the whole memory, where the arms' plans are not.
-        budget = 2 ** 39 if x64() else free
-        state, losses, _ = _trained(optax.sgd(0.5), copies=copies, seed=int(seed), steps=3, accumulation=2,
-                                    split=1, remat="full", rows=8, longer=64)
-        return {"state": state.variables, "losses": losses}
-
-    layouts_agree(run, lambda seed: (np.int32(seed),), "a run whose shapes plan their copies apart",
-                  layout=True, reference=False)
+    assert _copies_of(narrow)
 
 
 def test_a_restored_state_drops_its_templates_copies():
