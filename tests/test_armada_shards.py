@@ -558,8 +558,9 @@ def test_a_trains_fold_keeps_the_whole_suite_cells_its_batch_set_aside(ci, tmp_p
         {"name": "3.12:tests/test_cells.py", "exitCode": 0, "seconds": 2.0, "whole_suite": [cell],
          "tests": {light: 1.0, "tests/test_cells.py::test_new": 1.0}}]}
     assert ci.folded(record, batch, 120.0) == {**record, "tests/test_cells.py::test_new": 1.0}
-    whole = {**batch, "rows": [{**batch["rows"][0], "seconds": 1112.0, "tests": {light: 1.0, cell: 1110.0}}]}
-    assert ci.folded(record, whole, 120.0) == {light: 1.0, cell: 1110.0}
+    whole = {**batch, "rows": [{**batch["rows"][0], "seconds": 1113.0,
+                                "tests": {light: 1.0, cell: 1110.0, "tests/test_cells.py::test_new": 1.0}}]}
+    assert ci.folded(record, whole, 120.0) == {light: 1.0, cell: 1110.0, "tests/test_cells.py::test_new": 1.0}
 
 
 def test_a_sites_judge_and_map_tasks_leave_its_files_cut_and_recorded_times_as_they_were(ci, tmp_path):
