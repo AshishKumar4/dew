@@ -1096,6 +1096,20 @@ class Issuer[Accumulator](abc.ABC):
         del rows, columns
         return self
 
+    def relay_bytes(self, rows: int, depth: int) -> int:
+        """The shared memory a consumer's register left operand of `rows` x `depth` (an accumulator's value a
+        product reads) takes on its way to the product's layout (`relaying`): none where the cast stays in
+        registers."""
+        del rows, depth
+        return 0
+
+    def relaying(self, tile) -> Self:
+        """The issuer whose register left operands relay through `tile`, a consumer's own plain
+        shared-memory tile (`plain`) of at least `relay_bytes` (`[rows, depth]` of the operand's dtype):
+        itself where none do."""
+        del tile
+        return self
+
     held_registers: int = 40
     """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,
     indices, the walk's carry): CUTLASS's cooperative sm90 kernel's 168 less its accumulator's 128."""
