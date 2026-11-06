@@ -314,7 +314,7 @@ class MosaicForward(_Mainloop[Tiles]):
         by the share of their rows its queries fill (`layouts`: a decode step's few rows mma.sync's before
         wgmma's, row 4042), that takes the call and derives a config."""
         query = ba.arguments["query"]
-        config = None
+        config, chosen = None, None
         for family in layouts(target.generation, query.dtype, query.shape[1]):
             if self.refusal(ba, family) is not None:
                 continue
@@ -325,9 +325,11 @@ class MosaicForward(_Mainloop[Tiles]):
             config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles,
                               lambda config: self._launch_legal(ba, config, target), overlapped=True)
             if config is not None:
+                chosen = family
                 break
-        if config is None:
+        if config is None or chosen is None:
             return None
+        family = chosen
         if values_deferred(family, self.form, self.splits, query.dtype, ba.arguments.get("drop") is not None):
             # The P·V a step late where its walk holds the carried weights at the same tiles, its scalars
             # beside them below its budget: a walk of two products in flight pins their accumulators and the
@@ -624,7 +626,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             *, scale: float | None = None, natural: bool = NATURAL,
             residuals: Literal[Kept.NONE] = Kept.NONE, interpret: bool = False, out_dtype=None,
             masked: bool = False, splits: int = 1, table: jax.Array | None = None,
-            sources: jax.Array | None = None) -> jax.Array:
+            sources: jax.Array | None = None, subtracted: bool = False) -> jax.Array:
     ...
 
 
@@ -633,7 +635,8 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             *, scale: float | None = None, natural: bool = NATURAL,
             residuals: Literal[Kept.SPLIT, Kept.OUTPUT], interpret: bool = False,
             out_dtype=None, masked: bool = False, splits: int = 1, table: jax.Array | None = None,
-            sources: jax.Array | None = None) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
+            sources: jax.Array | None = None, subtracted: bool = False
+            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
     ...
 
 
