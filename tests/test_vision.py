@@ -329,14 +329,24 @@ def mimo_generator():
         return module
 
 
-def wide_projection(projector, wide, grid, name: str):
-    """A recorded projector site's truth: `projector`'s float64 twin over `wide`, its variables in float64,
-    each row's merged entries of a seed's drawn trunk features, under `name`."""
-    def run(inputs):
+def assert_projected_as_recorded(projector, family: str, tensors, grids, path, site: str, draw_of,
+                                 name: str):
+    """A recorded projector site held by check 1: `projector` over `family`'s `tensors` (its variables in
+    float32, and in float64 for its twin, the truth) on a seed's drawn trunk features of `grids`' rows,
+    each row's merged entries under `name`, on par with the recording's reference at `path`."""
+    grid = np.asarray(grids, np.int32)
+    variables = {"params": projector_variables(family, tensors, "float32")[0]}
+    wide = widened(lambda: {"params": projector_variables(family, tensors, "float64")[0]})
+
+    def twin(inputs):
         with jax.enable_x64(new_val=True):
             trunk = jnp.asarray(inputs["trunk"], jnp.float64)
             return {name: real(projector.clone(dtype=jnp.float64).apply(wide, trunk), grid, 2)}
-    return run
+
+    draw, reference, truth, seeds = recorded_site(path, site, draw_of, twin)
+    projected = jax.jit(lambda trunk: projector.apply(variables, trunk))
+    assert_as_exact(as_given(lambda index, inputs: {name: real(projected(inputs["trunk"]), grid, 2)}),
+                    reference, draw, site, seeds=seeds, truth_fn=truth)
 
 
 def widened(build):
@@ -388,15 +398,8 @@ def test_mimo_merger_is_as_exact_as_the_reference(native):
             hidden_size=vision["hidden_size"], spatial_merge_size=vision["spatial_merge_size"],
             width=vision["hidden_size"] * vision["spatial_merge_size"] ** 2,
             out_width=config["text_config"]["hidden_size"])
-    variables = {"params": projector_variables("mimo", projector_tensors, "float32")[0]}
-    grid = np.asarray(mimo_generator().MIMO_GRIDS, np.int32)
-    wide = widened(lambda: {"params": projector_variables("mimo", projector_tensors, "float64")[0]})
-
-    draw, reference, truth, seeds = recorded_site(MIMO_RECORDING, "mimo merger", mimo_generator().merger_draw,
-                                                  wide_projection(projector, wide, grid, "merger"))
-    merged = jax.jit(lambda trunk: projector.apply(variables, trunk))
-    assert_as_exact(as_given(lambda index, inputs: {"merger": real(merged(inputs["trunk"]), grid, 2)}),
-                    reference, draw, "mimo merger", seeds=seeds, truth_fn=truth)
+    assert_projected_as_recorded(projector, "mimo", projector_tensors, mimo_generator().MIMO_GRIDS,
+                                 MIMO_RECORDING, "mimo merger", mimo_generator().merger_draw, "merger")
 
 
 MUSE_RECORDING = FIXTURES / "muse-glimmer-vision-tiny" / "recording.npz"
@@ -448,16 +451,9 @@ def test_muse_glimmer_projector_is_as_exact_as_the_reference():
     projector = projectors.from_record(muse_glimmer.translate_muse_glimmer_projector_config(config))
     routed = {name[len(prefix):]: tensor for name, tensor in projector_tensors.items()
               for prefix in projector_layout("muse_glimmer").prefix if name.startswith(prefix)}
-    variables = {"params": projector_variables("muse_glimmer", routed, "float32")[0]}
-    grid = np.asarray(muse_generator().MUSE_GRIDS, np.int32)
-    wide = widened(lambda: {"params": projector_variables("muse_glimmer", routed, "float64")[0]})
-
-    draw, reference, truth, seeds = recorded_site(MUSE_RECORDING, "muse glimmer projector",
-                                                  muse_generator().trunk_draw,
-                                                  wide_projection(projector, wide, grid, "projector"))
-    projected = jax.jit(lambda trunk: projector.apply(variables, trunk))
-    assert_as_exact(as_given(lambda index, inputs: {"projector": real(projected(inputs["trunk"]), grid, 2)}),
-                    reference, draw, "muse glimmer projector", seeds=seeds, truth_fn=truth)
+    assert_projected_as_recorded(projector, "muse_glimmer", routed, muse_generator().MUSE_GRIDS,
+                                 MUSE_RECORDING, "muse glimmer projector", muse_generator().trunk_draw,
+                                 "projector")
 
 
 def test_gemma4_clipping_matches_reference_forward_and_backward():
