@@ -202,6 +202,7 @@ def released(args) -> dict:
     PretrainedDecoder.save = functools.partialmethod(PretrainedDecoder.save, max_shard_size=RELEASE_SHARD)
     rank = jax.process_index()
     scopes = scoped_growth(saved_sources)
+    saved_sources._fingerprint(saved_sources.pinned_run(args.run_dir), None)
     warm = Path(args.run_dir).parent / f"warm{rank}"
     saved_sources.export_run(saved_sources.pinned_run(args.run_dir), warm, publishes=rank == 0)
     scopes.clear()
