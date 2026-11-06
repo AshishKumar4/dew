@@ -162,7 +162,8 @@ def test_a_cached_call_reads_its_runs_and_its_keys_validity_as_the_mask_they_mea
                   attention_key_valid=jnp.asarray(valid))
     np.testing.assert_array_equal(np.asarray(paired), np.asarray(masked))
     with pytest.raises(ValueError):
-        read(decoder, attention_key_valid=jnp.asarray(valid))
+        decoder.apply({**params, "cache": cache}, block, decode=True, mutable=["cache"],
+                      attention_key_valid=jnp.asarray(valid))
     if "chunked_attention" in kinds:
         return
     template = decoder.clone(dtype=jnp.bfloat16, attention_impl="template")
