@@ -60,7 +60,7 @@ class Iterated(Dataset):
     def records(self, read: Read) -> Records:
         raise ValueError(f"{self.describe()} is an iterator, read only as a stream")
 
-    def manifest(self) -> ShardManifest:
+    def manifest(self, version: int) -> ShardManifest:
         return ShardManifest((Shard(self.describe(), self.describe()),), self._read_shard)
 
     def _read_shard(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
