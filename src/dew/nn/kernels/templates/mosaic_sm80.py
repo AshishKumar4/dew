@@ -243,11 +243,32 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         return ref
 
     def _left(self, lhs):
-        """A product's left operand in the MMA's layout: a shared-memory tile read, or a register value's
-        (an accumulator's, the fork's relayout) cast."""
-        if isinstance(lhs, jax.Array):
-            return plgpu.layout_cast(lhs.astype(self.dtype), self.lhs)
-        return plgpu.load(lhs, layout=self.lhs, optimized=self._matrix_loads)
+        """A product's left operand in the MMA's layout: a shared-memory tile read, or a register value's (an
+        accumulator's) cast, in registers where each warp holds whole rows of it, else relayed through shared
+        memory (`relay_bytes`)."""
+        if not isinstance(lhs, jax.Array):
+            return plgpu.load(lhs, layout=self.lhs, optimized=self._matrix_loads)
+        value = lhs.astype(self.dtype)
+        if not self.relay_bytes(*value.shape):
+            return plgpu.layout_cast(value, self.lhs)
+
+        def relayed(scratch):
+            # Every warp's columns stored, then each warp's rows read whole; the second sync keeps the next
+            # relay's stores off a tile a slower warp still reads.
+            plgpu.store(scratch, value, optimized=False)
+            mosaic.synced(interpret=False)
+            loaded = plgpu.load(scratch, layout=self.lhs, optimized=self._matrix_loads)
+            mosaic.synced(interpret=False)
+            return loaded
+
+        return pl.run_scoped(relayed, plgpu.SMEM(value.shape, self.dtype))
+
+    def relay_bytes(self, rows: int, depth: int) -> int:
+        """The shared memory a consumer's register left operand of `rows` x `depth` takes between its layouts
+        (an accumulator's, warps along its columns, to the product's, each warp its rows whole): none where
+        its warps lie along its rows alone (`m_warps` of four), the tile once otherwise (no register
+        relayout crosses warps)."""
+        return 0 if self.m_warps == 4 else rows * depth * self.dtype.itemsize
 
     @property
     def _matrix_loads(self) -> bool:

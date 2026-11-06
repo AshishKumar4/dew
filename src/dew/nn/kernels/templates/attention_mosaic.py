@@ -14,6 +14,7 @@ from typing import ClassVar, Literal, overload
 import jax
 import jax.numpy as jnp
 import tokamax
+from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew._devices import deterministic_ops_requested
 from dew.nn.kernels import generation
@@ -464,8 +465,11 @@ class MosaicForward(_Mainloop[Tiles]):
                                            min(config.stages, steps), out_dtype=out_dtype)
         # Its guarded launch reduces its keys' magnitudes across warps (`reducing`'s `guarded`).
         guarded = algebra.headroom(value.dtype) and ba.arguments.get("residuals") is not Kept.SPLIT
+        # Each consumer's weights relayed to P·V's operand layout where its warps split their keys.
+        relayed = ((plgpu.SMEM((config.consumers, config.block_q, config.block_k), query.dtype),)
+                   if family.relay_bytes(config.block_q, config.block_k) else ())
         return resources.shared_bytes(family, launch_scope(family, allocations, reducing(
-            family, config.consumers, self.score_mod, self.output_mod, guarded=guarded)))
+            family, config.consumers, self.score_mod, self.output_mod, guarded=guarded), relayed=relayed))
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles, *, peaks: bool = False,
                   columns: int | None = None) -> int:

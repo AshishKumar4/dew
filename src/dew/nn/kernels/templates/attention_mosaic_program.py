@@ -331,15 +331,16 @@ DROPPING = Refusal('dropout_places',
 """Why this mainloop refuses a dropping call that draws at a slice's global places (`refused`)."""
 
 
-def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int, *, reduces: bool = True
-           ) -> resources.Scope:
+def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int, *, reduces: bool = True,
+                 relayed: tuple = ()) -> resources.Scope:
     """A launch's `allocations` (`(scoped, streams)`, `Family.scoped`'s, and those it scopes after its
     walks where it has them, `after_walks`) by lifetime (`Family.lifetimes`), with the algebra's
     reductions' scratch where it `reduces` (a launch reducing its scores, weights or cotangents across
-    warps) and its `reducing_warpgroups`' scratch (`resources.Scope`)."""
+    warps) and its `reducing_warpgroups`' scratch (`resources.Scope`), and the tiles its products' register
+    operands take on their way to the products' layout within its walk (`relayed`, `Issuer.relay_bytes`)."""
     scoped, streams, *after = allocations
     held, walks = family.lifetimes(streams)
-    return resources.Scope(program=(scoped, *held), walks=walks,
+    return resources.Scope(program=(scoped, *held, *relayed), walks=walks,
                            after=tuple((tile.shape, tile.dtype) for tile in (after[0] if after else ())),
                            reduces=reduces, reducing_warpgroups=reducing_warpgroups)
 
