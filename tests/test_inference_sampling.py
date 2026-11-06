@@ -3,6 +3,7 @@
 Bindings, shape buckets and cache pause/gather are Dew policies; Transformers oracles their tokens.
 """
 
+import functools
 from dataclasses import replace
 
 import jax
@@ -12,10 +13,13 @@ import pytest
 import torch
 from model_support import decoder
 from transformers.generation.logits_process import (
+    EpsilonLogitsWarper,
     MinPLogitsWarper,
+    RepetitionPenaltyLogitsProcessor,
     TemperatureLogitsWarper,
     TopKLogitsWarper,
     TopPLogitsWarper,
+    TypicalLogitsWarper,
 )
 
 from dew.inference import TextGeneration, tasks
@@ -108,27 +112,64 @@ def warped(logits, sampling):
     return scores.log_softmax(-1).numpy()
 
 
+SOURCE_CHAIN = {"do_sample": True, "temperature": 0.7, "top_p": 0.9, "min_p": 0.05, "repetition_penalty": 1.3,
+                "typical_p": 0.9, "epsilon_cutoff": 0.01}
+"""A source's generation config of every control transformers' chain applies beside the common ones."""
+
+
+def source_warped(prefix, logits) -> np.ndarray:
+    """`SOURCE_CHAIN`'s filtered log probabilities as transformers 5.16.1 builds the chain from a generation
+    config: the repetition penalty over the prefix, then temperature, its default top-k of 50, top-p,
+    min-p, typical and epsilon sampling, in that order."""
+    ids = torch.LongTensor(np.asarray(prefix, np.int64))
+    scores = torch.tensor(np.asarray(logits).copy())
+    scores = RepetitionPenaltyLogitsProcessor(SOURCE_CHAIN["repetition_penalty"])(ids, scores)
+    for warper in (TemperatureLogitsWarper(SOURCE_CHAIN["temperature"]), TopKLogitsWarper(50),
+                   TopPLogitsWarper(SOURCE_CHAIN["top_p"]), MinPLogitsWarper(SOURCE_CHAIN["min_p"]),
+                   TypicalLogitsWarper(SOURCE_CHAIN["typical_p"]),
+                   EpsilonLogitsWarper(SOURCE_CHAIN["epsilon_cutoff"])):
+        scores = warper(ids, scores)
+    return scores.log_softmax(-1).numpy()
+
+
 @pytest.mark.parametrize("sampling", [
     Sampling(temperature=0.7, top_p=0.6),
     Sampling(temperature=1.3, min_p=0.4),
     Sampling(temperature=0.8, top_k=9, top_p=0.8, min_p=0.35),
+    None,
 ])
 def test_cached_generation_records_the_transformers_filtered_distribution(task, sampling):
     """Transformers 5.16.1 filters in temperature/top-k/top-p/min-p order.
     The selected action's raw and filtered log probabilities agree to 3e-6.
+    None is a source whose generation config names controls beyond the
+    common ones (`SOURCE_CHAIN`): it draws from its own chain
+    (`PretrainedDecoder.text_generation`) as transformers' chain built from
+    that config filters (`source_warped`), every draw in its support
+    (row 4410).
     """
+    from pathlib import Path
+
+    from dew.interop.pretrained import PretrainedDecoder
+
     inputs = jnp.array([[1, 2], [4, 5]])
-    actual = task(inputs, 4, key=jax.random.key(1), sampling=sampling)
+    if sampling is None:
+        source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {},
+                                   generation_config=SOURCE_CHAIN)
+        generation = source.text_generation()
+    else:
+        generation = functools.partial(task, sampling=sampling)
+    actual = generation(inputs, 4, key=jax.random.key(1))
     for step in range(4):
-        logits = task.model.apply(task.variables, actual.tokens[:, :2 + step])[:, -1]
-        filtered = warped(logits, sampling)
+        prefix = actual.tokens[:, :2 + step]
+        logits = task.model.apply(task.variables, prefix)[:, -1]
+        filtered = source_warped(prefix, logits) if sampling is None else warped(logits, sampling)
         selected = np.asarray(actual.tokens[:, 2 + step])
         expected = filtered[np.arange(2), selected]
         assert np.all(np.isfinite(expected))
         np.testing.assert_allclose(actual.behavior_log_probs[:, step], expected, atol=3e-6, rtol=0)
         raw = torch.tensor(np.asarray(logits).copy()).log_softmax(-1).numpy()[np.arange(2), selected]
         np.testing.assert_allclose(actual.raw_log_probs[:, step], raw, atol=3e-6, rtol=0)
-    repeated = task(inputs, 4, key=jax.random.key(1), sampling=sampling)
+    repeated = generation(inputs, 4, key=jax.random.key(1))
     np.testing.assert_array_equal(repeated.tokens, actual.tokens)
 
 
@@ -163,7 +204,6 @@ def test_a_source_binds_a_chain_only_for_controls_its_policy_lacks(task):
     from pathlib import Path
 
     from dew.interop.pretrained import PretrainedDecoder
-    from dew.sampling import decoding
 
     source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {},
                         generation_config={"do_sample": True, "temperature": 0.7, "top_p": 0.4,
@@ -174,10 +214,8 @@ def test_a_source_binds_a_chain_only_for_controls_its_policy_lacks(task):
     assert bound.logits is None and bound.n == 2
     assert (bound.sampling.repetition_penalty, bound.sampling.typical_p) == (2.0, 0.9)
     rare = replace(altered, generation_config={**altered.generation_config, "epsilon_cutoff": 0.01})
-    # Its unset top_k samples the top 50, as transformers' chain does (`TRANSFORMERS_TOP_K`).
-    assert [type(transform) for transform in rare.text_generation().logits] == [
-        decoding.RepetitionPenalty, decoding.Temperature, decoding.TopK, decoding.TopP, decoding.MinP,
-        decoding.Typical, decoding.EpsilonCutoff]
+    # It binds a chain of its own, whose draws are transformers' chain's (`source_warped`).
+    assert rare.text_generation().logits is not None
     override = rare.text_generation(sampling=Sampling(temperature=0))
     assert override.logits is None and override.sampling.repetition_penalty == 1.0 and override.n == 2
     plain = override([[1, 2]], 6, key=jax.random.key(1), n=1)

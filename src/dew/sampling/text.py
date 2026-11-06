@@ -21,7 +21,7 @@ import hashlib
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Generic, Literal, get_args
+from typing import Generic, Literal, TypedDict, get_args
 
 import jax
 import jax.numpy as jnp
@@ -372,9 +372,22 @@ def rounding_keys(keys: jax.Array) -> jax.Array:
     return jax.vmap(derived)(jax.random.key_data(keys))
 
 
+class AdapterField(TypedDict, total=False):
+    """A forward's field naming each row's adapter of an adapter set's model (`dew.lora.AdapterSet`)."""
+
+    adapters: jax.Array
+
+
+def adapter_field(adapters: jax.Array | None) -> AdapterField:
+    """The call field naming each row's adapter of an adapter set's model (`DecoderState.adapters`), none
+    for a model of no set."""
+    return {} if adapters is None else {"adapters": adapters}
+
+
 def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops: DecodeOps,
                   cache: Variables | None = None, rounding: jax.Array | None = None,
-                  progress: Progress = END) -> tuple[DecoderState, jax.Array]:
+                  progress: Progress = END, adapters: jax.Array | None = None
+                  ) -> tuple[DecoderState, jax.Array]:
     """The state after the prompt, and which rows hold a real token.
 
     A `Selective` decoder skips the prompt-wide head, the largest array a
@@ -384,10 +397,14 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     prompt position's context. `cache` continues a cache the caller holds,
     whose cursors say where each prompt resumes; None allocates an empty one. `rounding` is each
     row's stochastic-rounding key data (`rounding_keys`), which the cache then holds for every later
-    call (`dew.nn.kv_cache.with_rounding_keys`); None leaves the cache's.
+    call (`dew.nn.kv_cache.with_rounding_keys`); None leaves the cache's. `adapters` is each row's adapter
+    of an adapter set's model, held as int32, which every forward of the row names
+    (`DecoderState.adapters`).
     """
+    adapters = None if adapters is None else jnp.asarray(adapters, jnp.int32)
     batch, width = inputs.tokens.shape
-    held = _empty_cache(model, params, batch, ops.depths, ops.record is not None) if cache is None else cache
+    held = (_empty_cache(model, params, batch, ops.depths, ops.record is not None, adapters) if cache is None
+            else cache)
     if rounding is not None:
         held = with_rounding_keys(held, rounding)
     exposed = isinstance(model, Exposing)
@@ -406,15 +423,16 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
         capture_intermediates=False,
         **inputs.kwargs(),
         **progressed(model, progress),
+        **adapter_field(adapters),
     )
     states, logits = answer if exposed or selective else (None, answer)
     if ops.record is not None:
-        states = _context(model, params, updated)
+        states = _context(model, params, updated, adapters)
     drawn = logits if selective else logits[rows, slot]
     rotary = flat_field(inputs.token_fields, "rotary_positions")
     logical = jnp.asarray(rotary) if rotary is not None else token_positions(inputs.token_fields)
     state = DecoderState(updated["cache"], drawn, next_position(inputs.token_fields, real),
-                         None if states is None else states[rows, slot])
+                         None if states is None else states[rows, slot], adapters=adapters)
     if rebuild_position(model) is not None:
         if cache is not None or logical is not None or inputs.conditioning:
             raise ValueError('LongRoPE cache rebuilding requires a fresh text prompt '
@@ -437,12 +455,14 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     return state, last >= 0
 
 
-def _empty_cache(model: nn.Module, params: Variables, batch: int, depths: int, drafter: bool) -> Variables:
+def _empty_cache(model: nn.Module, params: Variables, batch: int, depths: int, drafter: bool,
+                 adapters: jax.Array | None = None) -> Variables:
     """A zeroed decode cache for `batch` rows, with the prediction depths' (`depths`) and the block
-    drafter's own (`drafter`) beside it. A decoder whose every mixer is tokenwise (`MLPMixer`) keeps no
-    cache, and its collection is empty."""
+    drafter's own (`drafter`) beside it, allocated under the rows' `adapters` (`DecoderState.adapters`),
+    as a forward allocates it. A decoder whose every mixer is tokenwise (`MLPMixer`) keeps no cache, and
+    its collection is empty."""
     def initialized(method: str) -> dict:
-        _, mutated = model.apply(params, batch, method=method, mutable=["cache"])
+        _, mutated = model.apply(params, batch, method=method, mutable=["cache"], **adapter_field(adapters))
         return flatten_dict(dict(mutated["cache"])) if "cache" in mutated else {}
 
     cache = initialized("init_cache")
@@ -451,9 +471,11 @@ def _empty_cache(model: nn.Module, params: Variables, batch: int, depths: int, d
     return unflatten_dict(cache)
 
 
-def _context(model: nn.Module, params: Variables, updated: Mapping) -> jax.Array:
-    """The block drafter's context `[B, S, targets * D]` a forward recorded."""
-    context = model.apply(params, updated["prediction_inputs"], method="draft_context")
+def _context(model: nn.Module, params: Variables, updated: Mapping,
+             adapters: jax.Array | None = None) -> jax.Array:
+    """The block drafter's context `[B, S, targets * D]` a forward recorded, under the rows' `adapters`."""
+    context = model.apply(params, updated["prediction_inputs"], method="draft_context",
+                          **adapter_field(adapters))
     assert isinstance(context, jax.Array)
     return context
 
@@ -557,7 +579,8 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
             return model.apply(
                 {**params, "cache": state.cache}, jnp.where(valid, tokens, pad_id),
                 decode=True, coordinates=laid, mutable=["cache", *recorded], rngs=None,
-                method="states_and_logits" if exposed else None, capture_intermediates=False, **at)
+                method="states_and_logits" if exposed else None, capture_intermediates=False, **at,
+                **adapter_field(state.adapters))
 
         history, lengths, drafts, rebuilt = state.tokens, state.lengths, state.drafts, None
         if original is not None and history is not None and lengths is not None:
@@ -571,7 +594,7 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
             before = slots < original
             answer, updated = append(valid & (before | ~crossing[:, None]))
             ordinary = (answer, updated["cache"], drafts,
-                        None if blocks is None else _context(model, params, updated))
+                        None if blocks is None else _context(model, params, updated, state.adapters))
 
             def rebuild():
                 fresh = _rebuilt(model, params, made, state, history, following, slots, progress)
@@ -586,7 +609,8 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
             lengths, rebuilt = following, crossing
         else:
             answer, updated = append(valid)
-            cache, context = updated["cache"], None if blocks is None else _context(model, params, updated)
+            cache, context = (updated["cache"],
+                              None if blocks is None else _context(model, params, updated, state.adapters))
         states, logits = answer if exposed else (None, answer)
         if blocks is not None:
             states = context
@@ -641,18 +665,20 @@ def _rebuilt(model: nn.Module, params: Variables, ops: DecodeOps, state: Decoder
     exposed, drafter = isinstance(model, Exposing), ops.record is not None
     (batch, width), rows = history.shape, jnp.arange(history.shape[0])[:, None]
     real = jnp.arange(width)[None, :] < following[:, None]
-    empty = with_rounding_keys_of(_empty_cache(model, params, batch, ops.depths, drafter), state.cache)
+    empty = with_rounding_keys_of(_empty_cache(model, params, batch, ops.depths, drafter, state.adapters),
+                                  state.cache)
     answer, updated = model.apply(
         {**params, 'cache': empty}, history, coordinates=laid_out(history.shape, valid=real), decode=True,
         mutable=['cache', *(['embeddings'] if ops.depths else []),
                  *(['prediction_inputs'] if drafter else [])],
-        method='states_and_logits' if exposed else None, **progressed(model, progress))
+        method='states_and_logits' if exposed else None, **progressed(model, progress),
+        **adapter_field(state.adapters))
     states = answer[0] if exposed else None
     reseeded = dataclasses.replace(state, cache=updated['cache'])
     context = None
     if ops.record is not None:
         # The drafter's windows over the history's context, as a prefill records them.
-        context = _context(model, params, updated)
+        context = _context(model, params, updated, state.adapters)
         reseeded = ops.record(reseeded, context, real)
         context = context[rows, slots]
     if ops.depths and states is not None:
@@ -684,11 +710,12 @@ def _drafting(model: nn.Module, params: Variables, pad_id: int):
             {**params, "cache": state.cache}, hidden, ids, depth=depth, coordinates=laid,
             rotary_positions=positions if rotary else None, input_embeddings=embeds, decode=True,
             mutable=["cache"], rngs=None, prediction_phase=prediction_phase,
-            method="mtp_step", capture_intermediates=False)
+            method="mtp_step", capture_intermediates=False, **adapter_field(state.adapters))
         return dataclasses.replace(state, cache=updated["cache"]), logits, states
 
-    def embed(tokens: jax.Array) -> jax.Array:
-        prepared = model.apply(params, tokens, method="stream_embeddings")
+    def embed(tokens: jax.Array, adapters: jax.Array | None = None) -> jax.Array:
+        # Under the rows' adapters, as every forward of them (`DecoderState.adapters`).
+        prepared = model.apply(params, tokens, method="stream_embeddings", **adapter_field(adapters))
         assert isinstance(prepared, jax.Array)
         return prepared
 
@@ -700,13 +727,13 @@ def _block_drafting(model: nn.Module, params: Variables):
     def record(state: DecoderState, context: jax.Array, valid: jax.Array) -> DecoderState:
         _, updated = model.apply({**params, "cache": state.cache}, context, None,
                                  coordinates=laid_out(valid.shape, valid=valid), method="draft",
-                                 mutable=["cache"])
+                                 mutable=["cache"], **adapter_field(state.adapters))
         return dataclasses.replace(state, cache=updated["cache"])
 
     def draft(state: DecoderState, tokens: jax.Array,
               choose: Callable[[int, jax.Array], jax.Array]) -> None:
         model.apply({**params, "cache": state.cache}, None, tokens, choose=choose,
-                    method="draft", mutable=["cache"])
+                    method="draft", mutable=["cache"], **adapter_field(state.adapters))
 
     return record, draft
 
