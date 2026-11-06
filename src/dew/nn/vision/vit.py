@@ -28,9 +28,9 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, Initializer, PrecisionLike
 
-from dew.batch import coordinates
+from dew.batch import Variables, coordinates
 from dew.interop.unread import Stored, held
-from dew.interop.weights import Tree, checkpoint_array, insert, placed
+from dew.interop.weights import Tree, checkpoint_array, insert, native_layouts, placed
 from dew.nn.activations import activation as named_activation
 from dew.nn.backbones.decoder_block import DecoderBlock
 from dew.nn.blocks import table_rows, torch_bicubic_resize, torch_cubic_weights
@@ -668,3 +668,24 @@ def translate_vit_weights(hf_tensors: Mapping[str, Stored],
         kernel = ("params", "patch_embed", "kernel")
         layouts += (WeightLayout(PATCH_CONVOLUTION, (kernel,), conv.shape, (1, 0)),)
     return variables, layouts
+
+
+def native_vit_layouts(variables: Variables, name_of: Callable[[tuple[str, ...]], str],
+                       path_of: Callable[[str], tuple[str, ...] | None], convolution: tuple[int, ...]
+                       ) -> tuple[WeightLayout, ...]:
+    """`translate_vit_weights`' layouts for a trunk built natively rather than read: each leaf's as
+    `native_layouts` binds it, the patch map's Dense kernel as the `convolution`-shaped
+    `PATCH_CONVOLUTION` it reads, `[out, in, ...]`."""
+    from flax.traverse_util import flatten_dict, unflatten_dict
+
+    from dew.interop.streaming import WeightLayout
+
+    kernel = ("params", "patch_embed", "kernel")
+    shape = tuple(variables["params"]["patch_embed"]["kernel"].shape)
+    if shape != (int(np.prod(convolution[1:])), convolution[0]):
+        raise ValueError(f"the patch map's kernel {shape} is no {convolution} convolution")
+    rest = {collection: unflatten_dict({path: leaf for path, leaf in flatten_dict(dict(tree)).items()
+                                        if (collection, *path) != kernel})
+            for collection, tree in variables.items()}
+    return (*native_layouts(rest, name_of, path_of),
+            WeightLayout(PATCH_CONVOLUTION, (kernel,), convolution, (1, 0)))
