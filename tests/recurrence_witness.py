@@ -1308,3 +1308,124 @@ def back_enclosures(step: BackStep, scale: float, lane: Lane) -> dict[str, Iv]:
     keys = fp32(add(fp32(mul(combined, point(beta)), lane), dot(tr(weighted), k, lane)), lane)
     return {"local": local, "dv": dv, "entering": entering, "ds": ds, "dq": dq, "dk": dk, "dw": dw,
             "d_l": d_l, "values": values, "keys": keys}
+
+
+class BackRun(NamedTuple):
+    """A training call's fast backward under the delta rule as its launches kept it (`recorded_backward`):
+    its forward's run (`Run`), the output's and final memory's gradients `do` `[N, H, C, Dv]` and `dfinal`
+    `[H, Dk, Dv]`, and each launch's records by name (`BACK_RECORDS`), `[N, H, ...]` float64 (the gradient
+    of the memory each chunk leaves `dh`, `[N, H, Dk, Dv]`, beside them), with the dtype each is stored in."""
+
+    run: Run
+    do: np.ndarray
+    dfinal: np.ndarray
+    dh: np.ndarray
+    dh0: np.ndarray
+    records: dict
+    dtypes: dict
+
+    def step(self, n: int, head: int, lane: Lane) -> BackStep:
+        """Chunk `n` and value head `head`'s inputs, the gradient of the memory it leaves the final memory's
+        as given for the last, else what the next chunk's stored record holds (`held_cell`)."""
+        run, records = self.run, self.records
+        last = n == run.chunks - 1
+        grad = point(self.dfinal[head]) if last else held_cell(self.dh[n, head], lane)
+        return BackStep(run.q[n, head], run.k[n, head], run.v[n, head], run.g[n, head], run.beta[n, head],
+                        run.a[n, head], run.w[n, head], run.c[n, head], run.h[n, head], self.do[n, head],
+                        grad, self.dh[n, head], records["local"][n, head], records["dv"][n, head],
+                        records["ds"][n, head], records["dw"][n, head])
+
+
+def recorded_backward(operands: tuple, seed: int = 0) -> BackRun:
+    """The fast backward of a 16-bit call under the delta rule over one row (`draw`'s `operands`), run as a
+    training step runs it (the route's VJP), and the same build's `mainloop_backward.kept_backward` at the
+    forward's kept values, checked to give the step's gradients bit for bit: each launch's outputs as stored
+    (`Kept`), laid a chunk and value head at a time, for output and final memory gradients `seed` draws."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.nn.kernels import generation, recurrence_chunk, tuning
+    from dew.nn.kernels.templates import bundles
+    from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward, template
+
+    q, k, v, _, _, h0 = operands
+    dtype = jnp.result_type(q, k, v)
+    run = recorded(*operands)
+    rng = np.random.default_rng([2084, seed])
+    do = jnp.asarray(rng.standard_normal(v.shape), dtype)
+    dfinal = jnp.asarray(rng.standard_normal(h0.shape), jnp.float32)
+    scale = k.shape[-1] ** -0.5
+    rounded = recurrence_chunk.chunk_rounding(delta=True, dtype=dtype)
+    family = mainloop.family_of(dtype) or bundles.INTERPRETED
+    interpret = generation.backend() != "gpu"
+
+    def route(*x):
+        return recurrence_chunk.chunk_gated_delta_rule(*x, write_bound=1.0)
+
+    with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
+        with tuning.seen() as launches:
+            native = jax.jit(lambda *x: jax.vjp(route, *x)[1]((do, dfinal)))(*operands)
+        [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
+                   if isinstance(op, template.Mosaic)]
+
+        def kept(*x):
+            _, _, (inverse, held) = mainloop.kept_forward(*x, tiles=tiles, scale=scale, rounded=rounded,
+                                                         family=family, interpret=interpret)
+            return mainloop_backward.kept_backward(*x, do, dfinal, tiles=tiles, scale=scale, rounded=rounded,
+                                                   family=family, interpret=interpret, inverse=inverse,
+                                                   kept=held)
+
+        grads, saved = jax.jit(kept)(*operands)
+    for mine, theirs in zip(grads[:6], native, strict=True):
+        assert np.array_equal(np.asarray(mine).view(np.uint8), np.asarray(theirs).view(np.uint8)), \
+            "the certify build is the production program"
+    _, length, heads, value_width = v.shape
+    key_width, chunks = k.shape[-1], run.chunks
+    laid = np.shape(saved.dh)[0] // (heads * key_width)
+
+    def chunked(x, width):
+        rows = np.asarray(x, np.float64).reshape(-1, laid * CHUNK, heads * width).sum(0)
+        return rows.reshape(laid, CHUNK, heads, width).transpose(0, 2, 1, 3)[:chunks]
+
+    named = {"local": (saved.local, value_width), "dv": (saved.dv, value_width), "ds": (saved.ds, CHUNK),
+             "dq": (saved.dq, key_width), "dk": (saved.dk, key_width), "dw": (saved.dw, key_width),
+             "d_l": (saved.d_l, CHUNK), "values": (saved.values, value_width),
+             "keys": (saved.keys, key_width)}
+    records = {name: chunked(x, width) for name, (x, width) in named.items()}
+    dtypes = {name: jnp.dtype(x.dtype) for name, (x, _) in named.items()}
+    dh = np.asarray(saved.dh, np.float64).reshape(laid, heads, key_width, value_width)[:chunks]
+    dtypes["entering"] = jnp.dtype(saved.dh.dtype)
+    hosted_do = _laid(np.asarray(do, np.float64)[0], laid_chunks(length, None, None))
+    return BackRun(run, hosted_do.reshape(chunks, CHUNK, heads, value_width).transpose(0, 2, 1, 3),
+                   np.asarray(dfinal, np.float64)[0], dh,
+                   np.asarray(saved.dh0, np.float64).reshape(heads, key_width, value_width), records, dtypes)
+
+
+def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
+    """Whether each record of `back` lies within its launch's enclosure (`back_enclosures`), as stored (in
+    its record's dtype): `[N, H, ...]` each, the gradient each chunk's memory enters with the record before
+    it (the initial memory's, `dh0`, for the first)."""
+    def stored(iv: Iv, dtype) -> Iv:
+        return iv if dtype == np.float32 else cast(iv, {"bfloat16": BFLOAT16, "float16": FLOAT16}[str(dtype)])
+
+    found: dict[str, list] = {}
+    for n in range(back.run.chunks):
+        for head in range(back.run.heads):
+            step = back_enclosures(back.step(n, head, lane), back.run.scale, lane)
+            for name in BACK_RECORDS:
+                if name == "entering":
+                    record = back.dh0[head] if n == 0 else back.dh[n - 1, head]
+                    dtype = np.float32 if n == 0 else back.dtypes["entering"]
+                else:
+                    record, dtype = back.records[name][n, head], back.dtypes[name]
+                found.setdefault(name, []).append(within(record, stored(step[name], dtype)))
+    return {name: np.stack(held) for name, held in found.items()}
+
+
+def assert_backward_witnessed(lane: Lane, heads: int = 1) -> None:
+    """The step witness of the delta rule's fast backward (`back_enclosures`): a bf16 call of three chunks,
+    every record each launch keeps inside its step's enclosure."""
+    back = recorded_backward(draw(0, "mild", heads=heads))
+    held = back_witnessed(back, lane)
+    for name in BACK_RECORDS:
+        assert np.all(held[name]), (name, np.mean(held[name]))
