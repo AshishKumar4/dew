@@ -101,7 +101,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
         return _portable_gemm(lhs if straight else lhs.astype(compute), rhs, group_sizes, prologue,
                               prologue_arrays, prologue_axes, epilogue, epilogue_arrays, epilogue_axes,
                               dtypes, several, transpose_rhs, precision, compute if straight else None,
-                              paired=paired)
+                              paired=paired, dense=dense)
 
     def forward(*operands):
         return value(*operands), ()
@@ -405,7 +405,7 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
     def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired):
         return _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue,
                               epilogue_arrays, epilogue_axes, dtypes, several, transpose_rhs, precision,
-                              paired=paired)
+                              paired=paired, dense=dense)
 
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays,
                        epilogue_arrays, paired)
@@ -506,9 +506,10 @@ def _apart(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, prologu
 
 def _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
                    epilogue_axes, dtypes, several: bool, transpose_rhs: bool, precision: PrecisionLike,
-                   compute=None, paired: jax.Array | None = None):
+                   compute=None, paired: jax.Array | None = None, dense: bool = False):
     """`gemm`'s arithmetic in XLA: the kernels' products of `lhs`'s dtype summed in at least fp32 (an fp64
-    product's in fp64, which no kernel takes), one rounding;
+    product's in fp64, which no kernel takes), one rounding, a `dense` call's as XLA's own dot
+    (`grouped_matmul.xla_dot`: one group of every row, nothing to mask, no ragged dot to trace);
     with `compute`, the products of the operands rounded to it, its tangent the MoE projection's
     (`grouped_matmul.portable_projection`, whose sum, at least fp32, it reads); with `paired`, both matrices'
     products, the epilogue's two accumulators."""
@@ -524,8 +525,10 @@ def _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_ax
     else:
         product = lhs if prologue is None else prologue(lhs, *prologue_arrays).astype(lhs.dtype)
         wide = at_least_fp32(lhs.dtype)
-        accs = tuple(grouped_matmul.xla_ragged_dot(product, each.astype(lhs.dtype), group_sizes,
-                                                   precision=precision, preferred_element_type=wide)
+        accs = tuple(grouped_matmul.xla_dot(product, each[0].astype(lhs.dtype), precision=precision,
+                                            preferred_element_type=wide) if dense
+                     else grouped_matmul.xla_ragged_dot(product, each.astype(lhs.dtype), group_sizes,
+                                                        precision=precision, preferred_element_type=wide)
                      for each in matrices)
     outs = accs if epilogue is None else _as_tuple(epilogue(*accs, *epilogue_arrays))
     outs = tuple(out.astype(dtype) for out, dtype in zip(outs, dtypes, strict=True))
