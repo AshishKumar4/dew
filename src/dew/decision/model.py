@@ -186,10 +186,10 @@ class DecisionModel(HeadedModel):
 
         def applied(*args, **kwargs) -> jax.Array:
             if not clipped:
-                return self.head.apply(head, *args, **kwargs)
+                return _array(self.head.apply(head, *args, **kwargs))
             out, held = self.head.apply(head, *args, mutable=["qk"], **kwargs)
             head_sown.update(held)
-            return out
+            return _array(out)
         # The questions' spans are pooled from the pass that holds them: the context's, where it holds
         # them. A head that pools none reads a question in its context through the cross-attention alone.
         spans = spanned if self.head.pools_spans else None

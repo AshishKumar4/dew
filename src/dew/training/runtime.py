@@ -204,8 +204,8 @@ def _join_process_pool(environment: ClusterEnvironment | None, joins: bool) -> N
     """
     tasks = slurm_tasks_here()
     slurm = isinstance(environment, Scheduler) and environment.name == "slurm"
-    if (slurm and (environment.place().process_count or 0) > 1 and tasks is not None
-            and runs_on_gpu(os.environ)):
+    place = environment.place() if slurm and isinstance(environment, Scheduler) else None
+    if place is not None and (place.process_count or 0) > 1 and tasks is not None and runs_on_gpu(os.environ):
         # Before joining: a pool whose ranks see GPUs they will not use
         # trains on fewer than it was given, and nothing reports it.
         gpus = communicators.local_gpus()
