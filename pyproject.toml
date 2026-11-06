@@ -50,7 +50,7 @@ dependencies = [
     "transformers>=5.16.1",
     "jinja2>=3.1",
     "filelock>=3.13",
-    "huggingface_hub>=1.0",
+    "huggingface_hub>=1.13",
     "fsspec>=2026.6.0",
     # dew.data.sources.urls fetches HTTP(S) through fsspec's aiohttp session under aiohttp's total deadline.
     "aiohttp>=3.9",
