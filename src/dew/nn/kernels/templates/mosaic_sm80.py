@@ -445,6 +445,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     stores_through_registers = True
 
+    copies_rows_alone = False  # cp.async lands a copy in whole swizzled tiles of rows
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
 
     adds_vectors = False  # its atomic adds take no layout replicating a vector's entries (a [bk] key sum's)
