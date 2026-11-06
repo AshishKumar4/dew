@@ -217,10 +217,10 @@ DORY_CONFIG = ConfigLayout(
                    rope=ConfigPart(_rope, _rope_written)),
     ConfigPart(_layers, lambda model: {}),
     # DoryConfig states each of these, which the release writes.
-    expect('hidden_act', 'Dory requires SiLU', value='silu', stated=True),
+    expect('hidden_act', 'Dory requires SiLU', value='silu', written=True),
     inert('tie_word_embeddings', 'Dory requires untied embeddings', neutral=False),
-    expect('attention_bias', 'Dory projects without biases', value=False, stated=True),
-    expect('mlp_bias', 'Dory projects without biases', value=False, stated=True),
+    expect('attention_bias', 'Dory projects without biases', value=False, written=True),
+    expect('mlp_bias', 'Dory projects without biases', value=False, written=True),
     kind_mixer('mlp', 'mlp', MLPMixer, ConfigLayout(integer('intermediate_size', 'intermediate_size'),
                                                     constant('activation', value='swiglu'))),
     Nested('ngpt', NGPT, ConfigLayout(

@@ -150,7 +150,7 @@ K2_HORIZON_CONFIG = ConfigLayout(
     inert('tie_word_embeddings', 'the remote K2HorizonForCausalLM ties no head to its embedding',
           neutral=False),
     expect('query_key_norm', 'its per-head norm weighs the whole projection, which no release sets',
-           value=False, stated=True),
+           value=False, written=True, required=True),
     ConfigPart(_gate, lambda model: {'attention_gate_func': (
         {value: name for name, value in _GATES.items()}[model.output_gate_activation]
         if model.output_gate else None)}),

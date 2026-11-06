@@ -175,10 +175,11 @@ def activation_part(key: str = 'hidden_act') -> ConfigPart[CausalTransformer]:
     return ConfigPart(_read_activation, lambda model: {key: hf_activation(model.mlp)})
 
 
-def inert(key: str, why: str, *, neutral: Configured = None) -> ConfigPart[CausalTransformer]:
+def inert[Model](key: str, why: str, *, neutral: Configured = None) -> ConfigPart[Model]:
     """A key the reference reads to no effect at `neutral` (or absent, or null), refused at any other
     value, saying `why`; written as nothing."""
-    def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+    def read(hf_config: Mapping[str, object], used: set[str],
+             record: NativeFields[Model]) -> NativeFields[Model]:
         used.add(key)
         if hf_config.get(key) not in (None, neutral):
             refuse(f"{key}={hf_config[key]!r}", why)
@@ -206,16 +207,20 @@ def unwritten(why: str) -> ConfigPart[CausalTransformer]:
     return ConfigPart(lambda hf_config, used, record: record, write)
 
 
-def expect(key: str, why: str, *, value: Configured, stated: bool = False) -> ConfigPart[CausalTransformer]:
+def expect[Model](key: str, why: str, *, value: Configured, written: bool = False,
+                  required: bool = False) -> ConfigPart[Model]:
     """A key the family's reference computes only at `value`, refused at any other, saying `why`: its
-    class's default where unstated, written as nothing; or, where the class defaults to another
-    (`stated`: K2 Horizon's per-head q/k norm), refused unless stated and written."""
-    def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+    class's default where unstated, or, where the class defaults to another (`required`: K2 Horizon's
+    per-head q/k norm), refused unless stated; written as `value` where readers take another where it is
+    unstated (`written`: vLLM's DeepSeek router reads a softmax where no `scoring_func` is), else as
+    nothing."""
+    def read(hf_config: Mapping[str, object], used: set[str],
+             record: NativeFields[Model]) -> NativeFields[Model]:
         used.add(key)
-        if (hf_config.get(key) if stated else hf_config.get(key, value)) != value:
+        if (required and key not in hf_config) or hf_config.get(key, value) != value:
             refuse(key, f'{why}; requires {value!r}')
         return record
-    return ConfigPart(read, lambda model: {key: value} if stated else {})
+    return ConfigPart(read, lambda model: {key: value} if written else {})
 
 
 def remote_code(repo: str, module: str, name: str) -> ConfigPart[CausalTransformer]:
@@ -460,10 +465,10 @@ def kind_mixer[Mixer](kind: str, name: str, mixer: type[Mixer], layout: ConfigLa
                       fixed: Mapping[str, Configured] | None = None) -> ConfigPart[CausalTransformer]:
     """The mixer the layers of `kind` hold (a hybrid's delta net, SSD or lightning attention), its keys
     `layout`'s, both ways: read into the kind's record as the `mixers` registry's `name` beside what the
-    family's reference fixes of it (`fixed`), its keys read as nothing where no layer is of the kind;
-    written from the mixer the kind holds."""
+    family's reference fixes of it (`fixed`), its keys read as nothing where no layer or prediction step
+    is of the kind; written from the mixer the kind holds."""
     def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
-        if kind not in _records.strings(record['layer_types'], 'layer_types'):
+        if kind not in _record_kinds(record):
             used.update(layout.names())
             return record
         fields = layout.read(hf_config, used, NativeFields(mixer, {}))
@@ -475,9 +480,18 @@ def kind_mixer[Mixer](kind: str, name: str, mixer: type[Mixer], layout: ConfigLa
         return record
 
     def write(model: CausalTransformer) -> Mapping[str, object]:
-        held = model.kind_of(kind).mixer if kind in model.per_layer_types else None
+        steps = (model.mtp_layer_type, model.mtp_feedforward_type)
+        held = model.kind_of(kind).mixer if kind in (*model.per_layer_types, *steps) else None
         return layout.write(held) if isinstance(held, mixer) else {}
     return ConfigPart(read, write)
+
+
+def _record_kinds(record: DecoderFields) -> set[str]:
+    """The kinds a translated record's layers and its prediction steps hold (`mtp_layer_type`,
+    `mtp_feedforward_type`: Nemotron-H's step builds blocks of kinds no trunk layer need hold)."""
+    steps = (record.get('mtp_layer_type'), record.get('mtp_feedforward_type'))
+    return {*_records.strings(record['layer_types'], 'layer_types'),
+            *(_records.text(kind, 'mtp_layer_type') for kind in steps if kind is not None)}
 
 
 def kinds_among(kinds: tuple[str, ...], why: str) -> ConfigPart[CausalTransformer]:

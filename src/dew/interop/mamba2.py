@@ -21,19 +21,29 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from functools import partial
 from typing import TYPE_CHECKING
 
 from dew import _records
 from dew.interop.decoder_config import expect, flag, integer
-from dew.interop.decoder_parts import in_trunk, record_bool, record_int, refuse_export
-from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Route, Routes, Table, constant, unread
+from dew.interop.decoder_parts import in_trunk, record_int, refuse_export
+from dew.interop.layouts import (
+    ConfigField,
+    ConfigLayout,
+    ConfigPart,
+    Nested,
+    Route,
+    Routes,
+    Table,
+    constant,
+    unread,
+)
 from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
 if TYPE_CHECKING:
     from dew.interop.decoder_parts import DecoderFields
+    from dew.registry import Configured
 
 MODEL_TYPE = "mamba2"
 
@@ -73,59 +83,59 @@ def backbone_layout(*, vocab: int, hidden: int, layers: int, tied: bool) -> Conf
         expect('hidden_act', "the mixer's conv activates with silu", value='silu'))
 
 
-def _time_step_limit(hf_config: Mapping[str, object]) -> tuple[float, float]:
+def _time_step_limit(value: Configured, key: str) -> tuple[float, float]:
     """The step's (lower, upper) clamp. The reference leaves the upper bound open by default.
     transformers 5.x writes an infinite bound as the {"__float__": "Infinity"} record `records` reads, and
     every published port (AntonV/mamba2-130m-hf, Mamba-Codestral-7B) writes JSON's bare `Infinity`, which
-    json.loads (and so transformers) reads as float('inf'); the default is this module's own value and is
-    not read from one."""
-    if "time_step_limit" not in hf_config:
-        return 0.0, float("inf")
-    limit = hf_config["time_step_limit"]
-    if not isinstance(limit, (list, tuple)) or len(limit) != 2:
-        raise ValueError(f"time_step_limit is a (lower, upper) pair, got {limit!r}")
+    json.loads (and so transformers) reads as float('inf')."""
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"{key} is a (lower, upper) pair, got {value!r}")
     lower, upper = (math.inf if isinstance(bound, float) and bound == math.inf
-                    else _records.number(bound, "time_step_limit") for bound in limit)
+                    else _records.number(bound, key) for bound in value)
     return lower, upper
 
 
-def _ssd(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
-    """`Mamba2Config`'s SSD layer (configuration_mamba2.py), every layer's mixer: its heads, whose width the
-    model's `expand` times over, as the reference's validate_architecture requires."""
-    integer, boolean = partial(record_int, hf_config, used=used), partial(record_bool, hf_config, used=used)
-    hidden, expand = _records.integer(record['emb_features'], 'emb_features'), integer("expand", 2)
-    heads, head_dim = integer("num_heads", 128), integer("head_dim", 64)
-    if hidden * expand != heads * head_dim:
-        raise ValueError(
-            f"hidden_size * expand ({hidden * expand}) must equal num_heads * head_dim "
-            f"({heads * head_dim}), as the reference's validate_architecture requires")
-    used.add("time_step_limit")
-    record['mixer'] = Mamba2Mixer(
-        num_heads=heads, head_dim=head_dim, state_size=integer("state_size", 128),
-        n_groups=integer("n_groups", 8), conv_kernel=integer("conv_kernel", 4),
-        chunk_size=integer("chunk_size", 256), use_bias=boolean("use_bias", default=False),
-        use_conv_bias=boolean("use_conv_bias", default=True), time_step_limit=_time_step_limit(hf_config))
+SSD_FIELDS: ConfigLayout[Mamba2Mixer] = ConfigLayout(
+    integer('num_heads', 'num_heads', 128), integer('head_dim', 'head_dim', 64),
+    integer('state_size', 'state_size', 128), integer('n_groups', 'n_groups', 8),
+    integer('conv_kernel', 'conv_kernel', 4), integer('chunk_size', 'chunk_size', 256),
+    flag('use_bias', 'use_bias', default=False), flag('use_conv_bias', 'use_conv_bias', default=True),
+    ConfigField('time_step_limit', 'time_step_limit', [0.0, math.inf], parse=_time_step_limit, spell=list))
+"""`Mamba2Config`'s SSD layer (configuration_mamba2.py), every layer's mixer, both ways."""
+
+
+def _ssd(model: CausalTransformer) -> Mamba2Mixer:
+    mixer = model.mixer
+    assert isinstance(mixer, Mamba2Mixer), "the family matches a Mamba-2 mixer alone"
+    return mixer
+
+
+def _expand(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+    """The SSD's width over the model's, as the reference's validate_architecture requires it whole."""
+    mixer = record['mixer']
+    assert isinstance(mixer, Mamba2Mixer), "`SSD_FIELDS` builds every layer's mixer"
+    hidden = _records.integer(record['emb_features'], 'emb_features')
+    expand = record_int(hf_config, 'expand', 2, used=used)
+    width = mixer.num_heads * mixer.head_dim
+    if hidden * expand != width:
+        raise ValueError(f"hidden_size * expand ({hidden * expand}) must equal num_heads * head_dim "
+                         f"({width}), as the reference's validate_architecture requires")
     return record
 
 
-def _ssd_written(model: CausalTransformer) -> Mapping[str, object]:
-    """`_ssd` backwards: the SSD layer's geometry (its width over the model's as `expand`, whole as the
-    reference's validate_architecture requires), its bounds and biases."""
-    mixer = model.mixer
-    assert isinstance(mixer, Mamba2Mixer), "the family matches a Mamba-2 mixer alone"
-    expand, remainder = divmod(mixer.num_heads * mixer.head_dim, model.emb_features)
+def _expanded(model: CausalTransformer) -> Mapping[str, object]:
+    width = _ssd(model).num_heads * _ssd(model).head_dim
+    expand, remainder = divmod(width, model.emb_features)
     if remainder:
         refuse_export('mixer', f"Mamba2Config states the SSD width as a whole multiple of hidden_size "
-                               f"{model.emb_features}, not {mixer.num_heads * mixer.head_dim}")
-    return {
-        'expand': expand, 'num_heads': mixer.num_heads, 'head_dim': mixer.head_dim,
-        'state_size': mixer.state_size, 'n_groups': mixer.n_groups, 'conv_kernel': mixer.conv_kernel,
-        'chunk_size': mixer.chunk_size, 'use_bias': mixer.use_bias, 'use_conv_bias': mixer.use_conv_bias,
-        'time_step_limit': list(mixer.time_step_limit)}
+                               f"{model.emb_features}, not {width}")
+    return {'expand': expand}
 
 
 CONFIG = ConfigLayout(
-    backbone_layout(vocab=32768, hidden=4096, layers=64, tied=False), ConfigPart(_ssd, _ssd_written),
+    backbone_layout(vocab=32768, hidden=4096, layers=64, tied=False),
+    Nested('mixer', Mamba2Mixer, SSD_FIELDS, _ssd, build=lambda fields: fields.value),
+    ConfigPart(_expand, _expanded),
     # Init-time fields of the reference, nothing the forward reads.
     unread("time_step_rank", "time_step_min", "time_step_max", "time_step_floor", "rescale_prenorm_residual"))
 """`Mamba2Config`'s fields (configuration_mamba2.py), both ways."""
