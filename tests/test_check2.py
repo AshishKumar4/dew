@@ -764,6 +764,24 @@ def test_the_recurrence_step_witness_holds_a_packed_call(begins):
 
 
 @INTERPRETS
+def test_the_recurrence_step_witness_holds_a_decay_a_key_dimension_and_refuses_one_a_head():
+    """The step witness (row 2084 (e)) on a bf16 call of three chunks under a decay a key dimension (Kimi
+    delta attention's, its floor's factored pairs): every record inside its step's enclosure; and a kernel
+    reading each token's mean decay for all its keys refused, its weighted keys and leaving memory outside
+    the enclosures on the call's own decays."""
+    operands = rw.draw(0, "mild", per_key=True)
+    lane = rw.interpreted_lane()
+    held = rw.witness(rw.recorded(*operands, floor=rw.FLOOR), lane)
+    for name in rw.RECORDS:
+        assert np.all(held[name]), (name, np.mean(held[name]))
+    found = rw.shared_decay_refusals(operands, lane)
+    for name, (inside, apart) in found.items():
+        assert not np.any(inside & apart), name
+    shares = {name: float(np.mean(apart)) for name, (_, apart) in found.items()}
+    assert shares["leaving"] > 0.5, shares
+
+
+@INTERPRETS
 def test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16():
     """The step witness's faults on the interpreted mainloop, each refused where it lands
     (`rw.assert_carry_faults_refused`): a dropped carry and a state rounded to bf16 where fp32 is held."""
