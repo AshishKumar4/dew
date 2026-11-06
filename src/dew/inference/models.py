@@ -29,7 +29,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew._records import integer, json_value, record as named_fields
-from dew.batch import PARAMETER_ROOTS, Variables
+from dew.batch import PARAMETER_ROOTS, Variables, under_roots
 from dew.inference.tasks import SavedRun, SavedRunTask, saved_model, saved_settings
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, flatten, read_weights, save_sharded, unflatten
 from dew.nn.precision import Numerics
@@ -123,18 +123,26 @@ class ReleasedRun(SavedRun):
     """Whether its variables are the run's average (`SavedRun.averaged`)."""
 
     @classmethod
-    def of(cls, directory: str | Path) -> Self:
-        """The run step the release in `directory` holds; a directory that holds none is refused."""
+    def of(cls, directory: str | Path, trust: Sequence[str] = ()) -> Self:
+        """The run step the release in `directory` holds, the packages `trust` names that its record imports
+        imported first (`dew.registry.import_trusted`), as a run's are (`SavedRun.at`); a directory that
+        holds none is refused. A model's release written before it stated its run (its objective, model,
+        settings and numerics) reads as the declaration its run would have recorded, at step 0."""
         from dew.config.release import Release
         from dew.inference.tasks import earlier_shapes
+        from dew.registry import import_trusted
 
         release = Release.load(directory)
         task = None if release is None else release.task
-        if task is None or "run" not in task:
+        if task is None or ("run" not in task and "objective" not in task):
             raise ValueError(f"{directory} holds no native release: its release record states no run "
                              "(`dew export` of a run writes one)")
-        held = cls.declared(str(directory), earlier_shapes(named_fields(task["run"], "run")),
-                            integer(task["step"], "step"))
+        record = (named_fields(task["run"], "run") if "run" in task else
+                  {"objective": task["objective"], "model": task["model"],
+                   **named_fields(task.get("settings", {}), "settings"),
+                   **({} if task.get("numerics") is None else {"precision": task["numerics"]})})
+        import_trusted(record, trust)
+        held = cls.declared(str(directory), earlier_shapes(record), integer(task.get("step", 0), "step"))
         return replace(held, average=task.get("averaged") is True)
 
     def averaged(self, ema: bool | None) -> bool:
@@ -161,9 +169,9 @@ class ReleasedRun(SavedRun):
         variables = unflatten(read_weights(self.directory))
         if param_dtype is not None:
             stored = jnp.dtype(resolve_dtype(param_dtype))
-            variables = {name: jax.tree.map(lambda leaf: leaf.astype(stored) if jnp.issubdtype(
-                leaf.dtype, jnp.floating) else leaf, part) if (name,) in parameter_roots else part
-                         for name, part in variables.items()}
+            variables = jax.tree_util.tree_map_with_path(
+                lambda path, leaf: leaf.astype(stored) if jnp.issubdtype(leaf.dtype, jnp.floating)
+                and under_roots(path, parameter_roots) else leaf, variables)
         return place(variables, mesh, layout)
 
 

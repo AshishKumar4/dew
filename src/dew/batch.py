@@ -665,6 +665,12 @@ PARAMETER_ROOTS = (("params",), (FROZEN,))
 and a storage dtype casts: the trained ones and the frozen."""
 
 
+def under_roots(path: tuple, roots: tuple[tuple[str, ...], ...]) -> bool:
+    """Whether the leaf at `path` (a tree path of `DictKey`s) lies under one of `roots`, each a path of
+    names: the parameters a load stores in its `param_dtype` (`PARAMETER_ROOTS`), the rest as written."""
+    return any(path[:len(root)] == tuple(jax.tree_util.DictKey(name) for name in root) for root in roots)
+
+
 def freeze(variables: Variables, trainable: PathFilter) -> Variables:
     """Move the `params` leaves that `trainable` rejects into the `FROZEN` collection.
 

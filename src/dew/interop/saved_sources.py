@@ -95,6 +95,9 @@ def source_publishes(run: SavedRun) -> bool:
     from dew.nn.diffusion_gemma import DiffusionGemma
     from dew.registry import from_record, models
 
+    if "model" not in run.record:
+        # A package's run that records no model of Dew's (its task rebuilds its own) has no source layout.
+        return False
     model_config = saved_model(run.record, None)
     trained = models[model_config.name]
     if trained is CausalTransformer:

@@ -88,7 +88,7 @@ from dew._coordination import broadcast_from_process_zero, from_every_process, s
 from dew._files import write_atomically
 from dew._hashing import fmix32
 from dew._records import JSON, duration, json_value, record, share, text
-from dew.batch import PARAMETER_ROOTS, Variables
+from dew.batch import PARAMETER_ROOTS, Variables, under_roots
 from dew.checkpoints._payloads import (
     _NEEDS,
     MODEL,
@@ -1827,10 +1827,8 @@ class Checkpoints:
         target = resolve_dtype(param_dtype)
         selected = set()
         if target is not None:
-            roots = tuple(tuple(jax.tree_util.DictKey(name) for name in root) for root in parameter_roots)
             selected = {path for path, leaf in jax.tree_util.tree_flatten_with_path(template["variables"])[0]
-                        if jnp.issubdtype(leaf.dtype, jnp.floating) and
-                        any(path[:len(root)] == root for root in roots)}
+                        if jnp.issubdtype(leaf.dtype, jnp.floating) and under_roots(path, parameter_roots)}
         typed = jax.tree_util.tree_map_with_path(
             lambda path, leaf, sharding: jax.ShapeDtypeStruct(
                 leaf.shape, target if path[1:] in selected else leaf.dtype, sharding=sharding),

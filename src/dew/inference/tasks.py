@@ -403,10 +403,13 @@ class SavedRun:
         return declared_objective(self.record)
 
     def averaged(self, ema: bool | None) -> bool:
-        """Whether the variables `variables(ema=ema)` reads are the run's average: `ema` where given, else
-        whether the step stored one."""
+        """Whether the variables `variables(ema=ema)` reads are the run's average: never where its average is
+        its frozen reference (`Objective.ema_is_reference`), else `ema` where given, else whether the step
+        stored one."""
         from dew.checkpoints import Checkpoints
 
+        if self.objective.ema_is_reference:
+            return False
         if ema is not None:
             return ema
         with Checkpoints(self.directory) as checkpoints:

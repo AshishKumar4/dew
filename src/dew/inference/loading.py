@@ -126,7 +126,7 @@ def pipeline(
                              "`param_dtype` are what a load may set of them")
         from dew.inference.models import ReleasedRun
 
-        return _from_saved(ReleasedRun.of(str(root)), mesh=mesh, layout=layout, dtype=dtype,
+        return _from_saved(ReleasedRun.of(str(root), trust), mesh=mesh, layout=layout, dtype=dtype,
                            param_dtype=None if param_dtype == "auto" else param_dtype, ema=None)
     if precision is not None and (dtype is not None or param_dtype is not None):
         raise ValueError("precision sets a source's dtype and param_dtype; pass the numerics or the dtypes, "
@@ -142,7 +142,9 @@ def released_model(root: epath.Path) -> bool:
     from dew.config.release import Release
 
     release = Release.load(str(root))
-    return release is not None and release.task is not None and "run" in release.task
+    # A model's release written before it stated its run names its objective (`ReleasedRun.of`).
+    return release is not None and release.task is not None and ("run" in release.task
+                                                                 or "objective" in release.task)
 
 
 def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
