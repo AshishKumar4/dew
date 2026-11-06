@@ -58,7 +58,7 @@ def assert_answers_as_its_engine(parity: ReleaseParity, scratch: Path) -> None:
         def observed(params, hidden):
             # The head over `hidden` as the model calls it (`DecisionModel.head_logits`), its parameters
             # these; the probe's sum over the real options.
-            variables = {**held, "head": {**held["head"], "params": params}}
+            variables = {**held, "params": {**held["params"], "head": params}}
             scores = task.model.head_logits(variables, hidden, inputs)
             return jnp.sum(jnp.where(inputs.options, scores, 0) * probe)
 
