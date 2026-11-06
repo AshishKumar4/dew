@@ -892,7 +892,7 @@ def _dq_registers(family: mosaic.Family, config: BackwardTiles, width: int, valu
 
 def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
                         accurate: bool, dq: bool, split: bool = False, params: tuple = (),
-                        slopes: int = 0) -> int:
+                        slopes: int = 0, dropped: bool = False) -> int:
     """The registers a backward launch's consumer holds at `config` (`resources.live_registers`): a dQ
     consumer's dQ sums `[bq, D]` fp32 carried (and the accurate form's keyed sums) and its per-query rows,
     beside a step's logits and output cotangents' products fp32, then its score cotangents fp32 and one part
@@ -945,8 +945,11 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
                               (block_k, block_q, value_width, [logits], False, False),
                               (block_k, block_q, width, [logits], False, False),
                               (block_q, block_k, width, dq_tile, False, False))
-        # A score hook's pullback (its slopes, `gradient.pulled`) beside the output cotangents' product.
-        return resources.live_registers(family, carried, products, pullback, dq_tile, *fragments) + statistics
+        # A score hook's pullback (its slopes, `gradient.pulled`) beside the output cotangents' product; a
+        # dropping call's multipliers (`algebra.drawn`) beside the logits' and its products.
+        drawn = [logits] if dropped else []
+        return resources.live_registers(family, carried, products + drawn, pullback + drawn, dq_tile,
+                                        *fragments) + statistics
     queries = block_q // config.consumers if split else block_q
     held, vectors = _hook_live(family, queries, block_k, params, grads="keys", keys_first=True)
     step = [(queries, block_k, jnp.float32)] * 2 + held
@@ -992,7 +995,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     initial state (`Initial`, or None) and a training forward's residuals (`forward`'s). Returns its
     gradients (`Gradients`). Its config comes from the family's facts and the call's extents (`derived`: one
     launch for a fast-form call whose score hook takes no parameters, deterministic mode's a full or causal
-    one's, two for the accurate form and a call whose hook does or that drops),
+    one's, two for the accurate form and a call whose hook does),
     legal within the device's block and a consumer's registers (`legal`)."""
 
     HOOKS = ("score_mod",)
@@ -1031,18 +1034,22 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                          block=_block(config), scale=self.scale, rounded=self.rounded), None
 
     def legal(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> bool:
-        # The one launch adds each tile's dQ under the first pass's D: the fast form's, an undropped call's
-        # of equal head widths, its dK/dV program queries first on the dQ launch's layout or keys first on
+        # The one launch adds each tile's dQ under the first pass's D: the fast form's, a call's of equal
+        # head widths, its dK/dV program queries first on the dQ launch's layout or keys first on
         # one whose consumers share a key block (`split_queries`), each consumer's share of a slot's queries
         # a warpgroup MMA's rows (dQ's product's M), or keys first each consumer its own keys over the whole
         # slot where they share dQ (`BackwardTiles.shared_dq`). A score hook's and an initial state's only
         # queries first (at width 256 its consumers sharing a key block, `attention_mosaic_coop`), and a
         # hook of no parameters, whose gradients no launch writes (Gemma 2's softcap, FlashAttention 3's);
         # the state's (gpt-oss's sinks) the first pass's D and the keys' share of the weights give
-        # (`gradient.split_mass`), its weights' denominator the forward's.
-        hooked = bool(self.score_kinds) or ba.arguments["drop"] is not None
-        if (config.fused and (self.score_mod is not None or ba.arguments["initial"] is not None)
-                and not config.queries_first):
+        # (`gradient.split_mass`), its weights' denominator the forward's. A dropping call's only queries
+        # first, each consumer its own keys and its own draw, under the dropping call's D (FlashAttention
+        # 2's).
+        hooked, dropped = bool(self.score_kinds), ba.arguments["drop"] is not None
+        if config.fused and (self.score_mod is not None or ba.arguments["initial"] is not None or dropped
+                             ) and not config.queries_first:
+            return False
+        if config.fused and dropped and config.shared_keys:
             return False
         found = {family.name: family for family in layouts(target.generation, ba.arguments["query"].dtype)}
         dkv_family = found.get(config.dkv.family)
@@ -1113,7 +1120,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         row 3171's toy one alone the slower, 1 x 1024 over three short documents and a window of 256,
         1.38 times: 20 us a step); in deterministic mode (`deterministic_ops_requested`) only a full or
         causal call's, queries first on a layout whose consumers feed their rings, every add across programs
-        in a fixed order (`Family.ticketed`); otherwise (the accurate form, a hooked or dropping call, a
+        in a fixed order (`Family.ticketed`); otherwise (the accurate form, a hook with parameters, a
         width no fused launch holds) two launches, the dQ launch then the keys-first dK/dV one, in a fixed
         order."""
         family = self._family(ba, target)
@@ -1241,7 +1248,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                                                   for param in ba.arguments["score_params"]), strict=True))
             counts.append(_backward_registers(family, tiles, width, value_width, query.dtype,
                                               accurate=self.accurate, dq=dq, split=split, params=params,
-                                              slopes=self.score_slopes[0 if dq else 1]))
+                                              slopes=self.score_slopes[0 if dq else 1],
+                                              dropped=ba.arguments["drop"] is not None))
         return counts[0], counts[1]
 
     def _held(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> bool:

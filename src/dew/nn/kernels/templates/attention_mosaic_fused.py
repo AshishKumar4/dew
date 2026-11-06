@@ -14,6 +14,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew._devices import deterministic_ops_requested
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import mosaic, resources
+from dew.nn.kernels.templates.attention import Dropout
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     TileWalk,
@@ -173,22 +174,19 @@ def _turns(family: mosaic.Family, interpret: bool, dq_tiles: tuple, dkv_tiles: t
             family.partials_ready(dkv_tiles, interpret) if grouped else None)
 
 @tuning.lowered_once(("walk",))
-def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans: _Spans | None, *,
-                  walk: _Backward) -> tuple[jax.Array, jax.Array, jax.Array]:
+def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans: _Spans | None,
+                  drop: Dropout | None, *, walk: _Backward) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The fast form's one launch of a call whose score hook, if any, takes no parameters
-    (`BackwardTiles.fused`), on the dQ launch's layout:
-    each consumer's `block_k` keys of a query head resident, walked by the query tiles that see them,
-    streamed with their output cotangents through a ring each, queries first (`_fused_step`), under the
-    first pass's D and the forward's denominator (each query tile's streamed beside it, `STATISTICS`), each
-    tile's dQ added into dQ atomically (`Family.added`); where key heads are shared, each query head's dK and
-    dV added into its key head's own
-    (FlashAttention 3's grouped epilogue, hopper/epilogue_bwd.hpp's CollectiveEpilogueBwdGQA: Qwen3-8B's step
-    1.7% the faster causal, 1.3% full, ET-GQA1-h100, where XLA summed fp32 copies a query head's), else
-    stored (their zeros cost an ungrouped D64 step 1.7%). The grouped adds' zeros are one ref of both
-    (`mosaic.stacked_zeros`, `[2, B, Kp, KV, D]`): where XLA wraps the launch in a dynamic-slice fusion (a
-    step's stacked forward rows, sliced for this launch's operands), two refs of equal zeros were one buffer,
-    dK and dV each the sum of both (row 3180, ET-3180-PLAIN-h100). Returns dQ `[B, Qp, H, D]`, dK and dV
-    `[B, Kp, KV, D]`: dQ fp32, dK and dV the keys' and values' dtype where it stores them so
+    (`BackwardTiles.fused`), dropping where `drop` draws (under the dropping call's D,
+    `gradient.centre_finish`), on the dQ launch's layout: each consumer's `block_k` keys of a query head
+    resident, walked by the query tiles that see them, streamed with their output cotangents through a ring
+    each, queries first (`_fused_step`), under the first pass's D and the forward's denominator (each query
+    tile's streamed beside it, `STATISTICS`), each tile's dQ added into dQ atomically (`Family.added`); where
+    key heads are shared, each query head's dK and dV added into its key head's own (FlashAttention 3's
+    grouped epilogue, hopper/epilogue_bwd.hpp's CollectiveEpilogueBwdGQA: Qwen3-8B's step 1.7% the faster
+    causal, 1.3% full, ET-GQA1-h100, where XLA summed fp32 copies a query head's), into one ref of both
+    (`_fused_called`), else stored (their zeros cost an ungrouped D64 step 1.7%). Returns dQ `[B, Qp, H, D]`,
+    dK and dV `[B, Kp, KV, D]`: dQ fp32, dK and dV the keys' and values' dtype where it stores them so
     (`stores_typed`), fp32 otherwise."""
     batch, queries, heads, width = query.shape
     keys_padded, kv_heads = key.shape[1], key.shape[2]
@@ -200,14 +198,14 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     grouped = heads != kv_heads
     # Deterministic mode orders every add across programs (`Family.ticketed`; `MosaicBackward.legal`).
     deterministic, group = deterministic_ops_requested(), heads // kv_heads
-    leaves, treedef = jax.tree.flatten(spans)
+    leaves, treedef = jax.tree.flatten((spans, drop))
     # Grouped dK's and dV's zeros one ref of both, the program's views and the host's read of one grouping.
     shapes = [(batch, keys_padded, kv_heads, width)] * 2
     groups = mosaic.stacked_groups(shapes)
 
     def body(*refs, streams, after=None):
         (q_ref, k_ref, v_ref, do_ref, *stat_refs), refs = refs[:9], refs[9:]
-        spans_of, refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
+        (spans_of, drop_of), refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
         if grouped:
             dq_ref, dkv_ref, *refs = refs
             dk_ref, dv_ref = mosaic.stacked_views([dkv_ref], groups)
@@ -235,7 +233,8 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                            (v_ref.at[keys_view], v_smem.at[index], v_loaded.at[index])))
             lo, hi, whole = program.readers(k_first, q_steps, spans_of, row)
             coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first,
-                                          shape=(block_q, block_k))
+                                          shape=(block_q, block_k),
+                                          draw=None if drop_of is None else drop_of.draw(row, head))
             k_tile = lax.div(k_first, block_k)
             adds = functools.partial(_dq_added, walk, dq_ref, out_smem, (row, head), index,
                                      ticket=(dq_ready, k_tile) if deterministic else None)
@@ -299,8 +298,11 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
 def _fused_called(launch: Callable, operands: tuple, stacked: tuple, *, copies: int, grouped: bool
                   ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The fused launch called on its `operands` (`_fused_launch`'s): dQ added into zeros in place, and
-    grouped dK and dV in one ref of both (`mosaic.stacked_zeros`, `stacked` their shapes and grouping): one
-    copy of dQ, or each consumer's own interpreted (`Family.added`, `copies`), a consumer's keys its own."""
+    grouped dK and dV in one ref of both (`mosaic.stacked_zeros`, `[2, B, Kp, KV, D]`, `stacked` their shapes
+    and grouping: where XLA wraps the launch in a dynamic-slice fusion, a step's stacked forward rows sliced
+    for this launch's operands, two refs of equal zeros were one buffer, dK and dV each the sum of both, row
+    3180, ET-3180-PLAIN-h100): one copy of dQ, or each consumer's own interpreted (`Family.added`,
+    `copies`), a consumer's keys its own."""
     query = operands[0]
     batch, queries, heads, width = query.shape
     dq = jax.new_ref(jnp.zeros((copies, batch, queries, heads, width), jnp.float32))
