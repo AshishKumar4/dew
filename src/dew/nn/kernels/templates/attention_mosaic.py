@@ -166,7 +166,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         """Whether a launch of `ba` runs at `config` on `target`: the target's family's bundle (`bundle`),
         tiles its program takes (`whole_tiles`), a call the launch takes (`refusal`), and the block and
         registers `Template.legal` holds it to. A pinned or stored config is held to it as a derived one."""
-        found = {family.name: family for family in layouts(target.generation, ba.arguments["query"].dtype)}
+        query = ba.arguments["query"]
+        found = {family.name: family for family in layouts(target.generation, query.dtype, query.shape[1])}
         family = found.get(config.family)
         # A forward's and a dQ launch's layout streams through a producer (`Family.stream`); a layout whose
         # consumers feed their own rings (`split_queries`) runs the dK/dV launches alone, the keys-first one
@@ -309,17 +310,22 @@ class MosaicForward(_Mainloop[Tiles]):
         its registers and the block hold, two stages; the family's consumers taking turns, a step's softmax
         running under the other's products, the training forward's too (its anchored walk's step is the
         plain one's, TWOPASS4-h100: 1.05 ms at 64 x 64 on two consumers against 1.41 at 64 x 128 on one,
-        causal llama-d128 2 x 4096 on an H100 PCIe)."""
-        family = self._family(ba, target)
-        if family is None:
-            return None
+        causal llama-d128 2 x 4096 on an H100 PCIe). Its family the first of the device's bundles, ranked
+        by the share of their rows its queries fill (`layouts`: a decode step's few rows mma.sync's before
+        wgmma's, row 4042), that takes the call and derives a config."""
         query = ba.arguments["query"]
+        config = None
+        for family in layouts(target.generation, query.dtype, query.shape[1]):
+            if self.refusal(ba, family) is not None:
+                continue
 
-        def tiles(rows: int, walked: int, consumers: int) -> Tiles:
-            return Tiles(rows, walked, 2, consumers, family.name)
+            def tiles(rows: int, walked: int, consumers: int, family=family) -> Tiles:
+                return Tiles(rows, walked, 2, consumers, family.name)
 
-        config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles,
-                          lambda config: self._launch_legal(ba, config, target), overlapped=True)
+            config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles,
+                              lambda config: self._launch_legal(ba, config, target), overlapped=True)
+            if config is not None:
+                break
         if config is None:
             return None
         if values_deferred(family, self.form, self.splits, query.dtype, ba.arguments.get("drop") is not None):
