@@ -95,10 +95,8 @@ import numpy as np
 import pytest
 from lane_environment import outside_suite
 from flax import linen as nn
-from float64_terms import float64_forward
 from interop_support import assert_restores, assert_same_stored_tensors, written_tensors
 from model_support import cached_round_trips, encoded_form, flat_tree, prediction_logits, streamed_export
-from one_draw import assert_as_exact_as_the_reference
 from process_support import raised
 from reference_error import (
     FACTOR,
@@ -145,6 +143,10 @@ GRADIENTS = ("glm_moe_dsa", "deepseek_v4", "kimi_k25", "qwen3_next", "glm5_next"
 # Every case runs each train since the export checks compile Dew's forward (ledgers 2182, 2278): GLM-5's
 # released standalone export, 173 s in train 279's CI before, is 99 s on armada at 7f18417b3 after; the
 # gradients and the cases reading GLM-5 Next's round trip 41-55 s.
+
+
+EXPORT_SEEDS = 8
+"""Check 1's declared seeds for a trained export's logits against the reference's over it."""
 
 
 @pytest.fixture(scope="module")
@@ -237,8 +239,20 @@ def test_transformers_reads_the_trained_export(trip, tmp_path):
     assert actual == expected
     label = f"{trip.case.name} logits"
     if not trip.case.orders:
-        _, terms = float64_forward(trip.source.model, trip.trained, np.asarray(trip.ids, np.int32))
-        assert_as_exact_as_the_reference(trip.ours, trip.theirs, trip.truth, label, terms=terms)
+        # The trained weights held, the logits over ids each seed draws of the fixture's own tokens: Dew's
+        # forward against the reference's over the export, its float64 run the truth (check 1).
+        forward = jax.jit(trip.source.model.apply)
+        narrow, wide = (tool.reference_forward(trip.case, trip.export, wide=wide) for wide in (False, True))
+        tokens = np.unique(trip.ids)
+
+        def draw(seed):
+            return (np.random.default_rng([241, seed]).choice(tokens, size=trip.ids.shape),)
+
+        def ours(ids):
+            return np.asarray(forward(trip.trained, jax.numpy.asarray(ids, jax.numpy.int32)), np.float32)
+
+        assert_as_exact(as_given(ours), as_given(narrow), draw, label, seeds=EXPORT_SEEDS,
+                        truth_fn=as_given(wide))
         return
     forward = jax.jit(trip.source.model.apply)  # one compile for every order
     mine, theirs = [], [distance(trip.theirs, trip.truth)]
