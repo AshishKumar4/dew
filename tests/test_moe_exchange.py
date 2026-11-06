@@ -90,7 +90,8 @@ def test_a_dropless_exchange_moves_its_rows_in_one_ragged_all_to_all_each_way(sk
         backward = primitives(jax.make_jaxpr(jax.grad(functools.partial(objective, layer, indices),
                                                       has_aux=True))(parameters, x, weights).jaxpr)
     assert forward.count("ragged_all_to_all") == 2 and "all_to_all" not in forward and "scan" not in forward
-    assert "ragged_all_to_all" in backward and "all_to_all" not in backward and "scan" not in backward
+    # JAX's transpose of the collective exchanges its offsets by an all_to_all of its own.
+    assert "ragged_all_to_all" in backward and "scan" not in backward
 
 
 def test_exchange_preserves_placed_expert_and_width_gradients():
