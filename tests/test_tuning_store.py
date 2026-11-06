@@ -3,11 +3,13 @@ its timings, written and read back equal, through tokamax's public API alone."""
 
 import dataclasses
 import functools
+import gc
 import itertools
 import json
 import os
 import subprocess
 import sys
+import weakref
 from pathlib import Path
 
 import jax
@@ -21,6 +23,7 @@ from dew import _cache
 from dew.nn.kernels import generation, norm_swiglu, tuning
 from dew.nn.kernels.templates import attention, report
 from dew.nn.precision import Numerics
+from dew.telemetry import compiles
 
 
 def test_a_steps_launches_and_their_timings_round_trip_through_dews_json():
@@ -306,44 +309,44 @@ def test_two_hooks_share_an_identity_only_where_they_lower_to_one_program():
             assert_computes_the_oracle(one(tile), other(tile), f"{one} and {other}", roundings=0)
 
 
-TRACES: list[str] = []
-"""Each field `_CountingKernel` traced, in order."""
-
-
-@dataclasses.dataclass(frozen=True)
-class _CountingKernel(_HookedKernel):
-    """`_HookedKernel`, each trace of a hook field counted (`TRACES`): JAX's own tracing cache serves a
-    function's second trace without calling it, so the hook's calls do not count the identity's traces."""
-
-    def traced(self, name, value):
-        TRACES.append(name)
-        return super().traced(name, value)
+def _traced(block: compiles.Compiles) -> int:
+    """The programs JAX traced while `block` was open (its trace events): what an identity's analysis cost."""
+    return sum(program.kind == "traced" for program in block.programs)
 
 
 def test_a_hook_is_traced_once_while_it_lives_under_one_configuration():
     """A launch's identity traces a hook once for its object while it lives (a model's layers share it), at
-    the op's layouts and the trace's configuration: twice asked, traced once; another object of one code,
-    apart; a bundle rebuilt around the same callable (a bind's), traced once for it; arbitrary callable
-    dataclasses, once an object; under another random bits' construction, apart where its program differs. The
-    whole identity, its kernels' names (`report.launching`), reads it alike."""
+    the op's layouts and the trace's configuration: asked again, it traces no program (JAX's trace events);
+    another object of one code, apart; a bundle rebuilt around the same callable (a bind's), traced once for
+    it; arbitrary callable dataclasses, once an object; under another random bits' construction, apart where
+    its program differs; let go, the hook is released, its identity holding no reference to it. The whole
+    identity, its kernels' names (`report.launching`), reads it alike."""
     def scaling(scale):
         def hook(tile):
             return tile * scale
         return hook
 
-    TRACES.clear()
-    op, shared = _CountingKernel(), scaling(2.0)
-    first = op.identified("prologue", shared)
-    assert first == op.identified("prologue", shared) and TRACES == ["prologue"]
+    op, shared = _HookedKernel(), scaling(2.0)
+    first, bundle = op.identified("prologue", shared), op.identified("hooks", _Hooks(shared, (0,)))
+    with compiles.Compiles(None) as again:
+        assert op.identified("prologue", shared) == first
+        assert op.identified("hooks", _Hooks(shared, (0,))) == bundle
+    assert _traced(again) == 0
     assert op.identified("prologue", scaling(3.0)) != first
-    assert op.identified("hooks", _Hooks(shared, (0,))) == op.identified("hooks", _Hooks(shared, (0,)))
-    # The bundle's trace traces its function within it.
-    assert TRACES == ["prologue", "prologue", "hooks", "prologue"]
-    TRACES.clear()
+    for hook in (_Times(2.0), _Initialized(2.0)):
+        key = op.identified("prologue", hook)
+        with compiles.Compiles(None) as again:
+            assert op.identified("prologue", hook) == key
+        assert _traced(again) == 0
     assert op.identified("prologue", _Times(2.0)) == op.identified("prologue", _Times(2.0))
     assert op.identified("prologue", _Times(2.0, added=True)) != op.identified("prologue", _Times(2.0))
     assert op.identified("prologue", _Initialized(2.0)) == op.identified("prologue", _Initialized(2.0))
-    assert TRACES == ["prologue"] * 6
+    let_go = scaling(5.0)
+    op.identified("prologue", let_go)
+    released = weakref.ref(let_go)
+    del let_go
+    gc.collect()
+    assert released() is None
     hooked = _HookedKernel(prologue=shared)
     whole = report._identity(hooked, hooked.bind(TILE, _Hooks(shared, (0,))))
     assert whole == report._identity(hooked, hooked.bind(TILE, _Hooks(shared, (0,))))
@@ -362,28 +365,23 @@ def test_a_hook_is_traced_once_while_it_lives_under_one_configuration():
 def test_rebuilt_softcap_and_bias_hooks_share_their_analysis(biased):
     from dew.nn.kernels.templates.attention_mosaic import MosaicForward
 
-    calls = []
-
     def cap():
         hook = attention.Capped(2.0)
         return attention.Biased(hook) if biased else hook
 
     @dataclasses.dataclass(frozen=True)
-    class Counted(MosaicForward):
+    class Scored(MosaicForward):
         score_kinds: tuple[attention.Kind, ...] = (attention.Kind.KEY,) if biased else ()
         score_dtypes: tuple[str, ...] = ("float32",) if biased else ()
 
-        def traced(self, name, value):
-            calls.append(name)
-            return super().traced(name, value)
-
-    op = Counted()
-    keys = [op.identified("score_mod", cap()) for _ in range(3)]
-    assert keys[0] == keys[1] == keys[2]
-    assert calls == ["score_mod"]
+    op = Scored()
+    first = op.identified("score_mod", cap())
+    with compiles.Compiles(None) as again:
+        keys = [op.identified("score_mod", cap()) for _ in range(2)]
+    assert keys == [first, first] and _traced(again) == 0
     changed = attention.Capped(3.0)
     changed = attention.Biased(changed) if biased else changed
-    assert op.identified("score_mod", changed) != keys[0]
+    assert op.identified("score_mod", changed) != first
 
 
 @pytest.mark.parametrize("forms", (("fast", "accurate"), ("accurate", "fast")))

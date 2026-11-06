@@ -339,7 +339,7 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
 
     def program(at, q_ref, k_ref, hi_ref, lo_ref, beta_ref, ds_ref, da_ref, taken_ref, dq_ref, dk_ref, dg_ref,
                 db_ref, *, streams, staging, landing):
-        pairs, squares, referenced, *padded = staging
+        pairs, squares, gated_rows, referenced, *padded = staging
         n, h = at["chunks"], at["heads"]
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
         keyed = h // call.group * width
@@ -397,10 +397,18 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
                 ahead.at[pl.ds(0, CHUNK)][...] = value
                 return family.tile_of(ahead.at[pl.ds(e, CHUNK)])
 
+            staged_rows = iter(gated_rows)
+
+            def staged(value):
+                """A pairs' rows gated down staged once a key block in `_parted`'s form, its own set."""
+                buffers = next(staged_rows)
+                return Parts([family.staged(part, buffer) for part, buffer in
+                              zip(product.formed(value, parted.parts), buffers, strict=True)], jnp.float32)
+
             found = {}
             algebra.key_decayed_pairs_back(
                 d_pairs, [lambda c: query, lambda c: key * betas[:, None]], lambda c: key, 1, gated,
-                reference, Issuer(call, {"pairs": list(pairs)}).summed, chunk=CHUNK,
+                reference, Issuer(call, {"pairs": list(pairs)}).summed, staged, chunk=CHUNK,
                 emit=lambda kind, p, c, grad: found.__setitem__((kind, p), grad),
                 **({} if call.factored else {"shifted": shifted, "lower": lower, "d_loads": d_loads}))
             d_query, d_keyed, d_key = found["rows", 0], found["rows", 1], found["keys", 0]
@@ -434,9 +442,10 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
 
 
 def _key_pairs_staged(call: Call, keys: int) -> tuple:
-    """`_key_pairs_back`'s staging tiles and landings at key block `keys`: two sets of a key block's and two
-    of a chunk's square in `_parted`'s form, and the sub-chunks' references' plain tile; a key block's
-    landing."""
+    """`_key_pairs_back`'s staging tiles and landings at key block `keys`: two sets of a key block's (the
+    products' own), two of a chunk's square (the pairs' gradients) and two of a key block's (the pairs' rows
+    gated down, staged once a key block) in `_parted`'s form, and the sub-chunks' references' plain tile; a
+    key block's landing."""
     parted = _parted(call)
     # Where the call's pairs do not factor (`Call.factored`), a key block's keys and separated prefix below a
     # sub-chunk's rows and a tile above them (`algebra.key_diagonal_pairs_back`'s shifted reads).
@@ -444,6 +453,7 @@ def _key_pairs_staged(call: Call, keys: int) -> tuple:
                                        plgpu.SMEM((CHUNK + algebra.SUB, keys), jnp.float32))
     staging = ([staging_tiles(parted, (CHUNK, keys))[0] for _ in range(2)],
                [staging_tiles(parted, (CHUNK, CHUNK))[0] for _ in range(2)],
+               [staging_tiles(parted, (CHUNK, keys))[0] for _ in range(2)],
                plgpu.SMEM((2, CHUNK // algebra.SUB, keys), jnp.float32), *padded)
     return staging, {"block": _fp32(call).landing(CHUNK, keys)}
 

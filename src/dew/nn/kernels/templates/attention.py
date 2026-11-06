@@ -36,8 +36,9 @@ import jax
 import jax.numpy as jnp
 
 from dew._hashing import fmix32
-from dew.nn.kernels import tuning
-from dew.nn.precision import at_least_fp32, float32_einsum
+from dew.nn.derivatives import Protected
+from dew.nn.kernels import generation, tuning
+from dew.nn.precision import at_least_fp32, compensated_sum, float32_einsum
 
 
 @jax.tree_util.register_dataclass
@@ -57,6 +58,17 @@ class KeySpans:
     key_ids: jax.Array | None
     keys: int = dataclasses.field(metadata={"static": True})
     form: str = dataclasses.field(default="spans", metadata={"static": True})
+    per_span: int = dataclasses.field(default=1, metadata={"static": True})
+    """The consecutive queries each interval of a call of one run and no documents holds, `start` and `end`
+    then `[B, Q // per_span]`: a key head's packed rows of one position (`attention_decode.packed`), which a
+    program reads by position (`per_query` repeats them)."""
+
+    def per_query(self) -> "KeySpans":
+        """These spans an interval a query (`per_span` 1)."""
+        if self.per_span == 1:
+            return self
+        start, end = (jnp.repeat(bound, self.per_span, axis=1) for bound in (self.start, self.end))
+        return KeySpans(start, end, self.query_ids, self.key_ids, self.keys, self.form)
 
 
 def within(keys: jax.Array, start: jax.Array, end: jax.Array,
@@ -78,6 +90,7 @@ def within(keys: jax.Array, start: jax.Array, end: jax.Array,
 def dense(spans: KeySpans) -> jax.Array:
     """Whether each key is visible to each query (`within`), every one: `[B, Q, K]` boolean, by broadcasting
     alone, so a batch-sharded call's spans take no gather."""
+    spans = spans.per_query()
     keys = jnp.arange(spans.keys)[None, None, :]
     ids = (None if spans.query_ids is None or spans.key_ids is None
            else (spans.query_ids[:, :, None], spans.key_ids[:, None, :]))
@@ -90,6 +103,7 @@ def dense(spans: KeySpans) -> jax.Array:
 def reads(spans: KeySpans) -> jax.Array:
     """Whether each query sees a key, `[B, Q]`: one of its intervals holds one, of its document where the
     call has ids, counted among that document's keys in index order however the documents lie (`_runs`)."""
+    spans = spans.per_query()
     start, end = spans.start, spans.end
     runs = start.ndim == 3
     if spans.query_ids is None or spans.key_ids is None:
@@ -450,6 +464,7 @@ def block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
     run: each run's tile envelope over a block's queries and its tiles every query of the block sees whole,
     the envelopes merged into their sorted union where a call has several (`_merged`), the widest run's
     whole tiles the block's, and each key block read by the query blocks some range of which holds it."""
+    spans = spans.per_query()
     runs = spans.start.ndim == 3
     keys = spans.keys
     key_blocks = -(-keys // block_k)
@@ -589,10 +604,25 @@ class Initial:
 
 def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
     """The `Initial` of one value-free logit a query head, `values` `[H]`, in fp32 or their own wider
-    dtype (`at_least_fp32`)."""
+    dtype (`at_least_fp32`), each head's gradient its rows' terms summed once rounded (`_spread_sinks`)."""
     wide = at_least_fp32(values.dtype)
-    m = jnp.broadcast_to(values.astype(wide)[None, :, None], (batch, values.shape[0], queries))
+    m = _spread_sinks((batch, values.shape[0], queries))(values.astype(wide))
     return Initial(m, jnp.ones_like(m), jnp.zeros((*m.shape, width), wide))
+
+
+@functools.cache
+def _spread_sinks(shape: tuple[int, int, int]) -> Callable:
+    """A head's sink, `[H]`, read by every batch row and query of `shape` `[B, H, Q]` (`sinks`),
+    differentiated at every order (`generation.linear_tangent`): reverse mode sums its rows' cotangents in
+    one compensated reduction, rounded once (`compensated_sum`), forward mode takes the broadcast's own
+    tangent. A sink's gradient sums a term a row, which XLA's float32 reduction left 1.4 times as far from
+    float64 as the sum rounded once, beside a reference whose sum YNNPACK's fusions take (row 4524)."""
+    def spread(values: jax.Array) -> jax.Array:
+        return jnp.broadcast_to(values[None, :, None], shape)
+
+    return generation.linear_tangent(lambda values: (spread(values), None),
+                                     lambda saved, operands, cotangent: (compensated_sum(cotangent, (0, 2)),),
+                                     spread, kind=Protected())
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1064,6 +1094,9 @@ class PaddedCall:
     `table[b, s // page]`), its `key` and `value` its pools flattened, `[KV, P·page, D]`."""
     page: int | None = None
     """A paged call's keys a page: its pools' `[KV, P, page, D]`, their own."""
+    per_span: int = 1
+    """The queries each of `start`'s and `end`'s intervals holds (`KeySpans.per_span`), unpadded where more
+    than one: a program reads them by position."""
 
     @property
     def key_rows(self) -> int:
@@ -1079,11 +1112,12 @@ class PaddedCall:
 
 
 def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
-                block: int, table: jax.Array | None = None, *, query_block: int | None = None
-                ) -> PaddedCall:
+                block: int, table: jax.Array | None = None, *, query_block: int | None = None,
+                by_position: bool = False) -> PaddedCall:
     """A call's one padding for every mainloop of the template (`PaddedCall`): its queries and keys at
     whole `block`s (a backend's largest tile), its queries at whole `query_block`s instead where a launch
-    walks no key block of its own over them (an inference forward's), its head widths at powers of two. A
+    walks no key block of its own over them (an inference forward's), its head widths at powers of two, its
+    spans an interval a query unless the caller's programs read them `by_position` (`KeySpans.per_span`). A
     paged call's (`table`, its page table) `key` and `value` are its pools `[KV, P, page, D]`, flattened,
     padded in their widths alone: its keys are its table's slots, whole blocks where its page is."""
     queries, width = query.shape[1], query.shape[3]
@@ -1114,12 +1148,18 @@ def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
         padded_key, padded_value = pool(key, padded_d), pool(value, padded_dv)
     else:
         padded_key, padded_value = pad(key, padded_k, padded_d), pad(value, padded_k, padded_dv)
-    return PaddedCall(pad(query, padded_q, padded_d), padded_key, padded_value,
-                   pad_rows(spans.start, padded_q), pad_rows(spans.end, padded_q),
+    # Intervals each of several queries' (a decode step's packed positions) stay a position each where the
+    # caller's programs read them by position (`by_position`: the Mosaic forward's); an interval a query
+    # elsewhere.
+    if not by_position:
+        spans = spans.per_query()
+    start, end = ((spans.start, spans.end) if spans.per_span > 1
+                  else (pad_rows(spans.start, padded_q), pad_rows(spans.end, padded_q)))
+    return PaddedCall(pad(query, padded_q, padded_d), padded_key, padded_value, start, end,
                    pad_ids(spans.query_ids, padded_q), pad_ids(spans.key_ids, padded_k),
                    tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.score_params),
                    tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.output_params),
-                   queries, keys, table, page)
+                   queries, keys, table, page, spans.per_span)
 
 
 def kept_dtype(dtype) -> str:

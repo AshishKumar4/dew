@@ -105,11 +105,13 @@ class Tcgen05:
 
     @staticmethod
     def kernel(entry: Callable, *, out_type, grid: tuple, grid_names: tuple, scratch: tuple,
-               interpret, name: str | None = None, topology: Topology = SINGLE) -> Callable:
-        """`entry` as a program of `WARPGROUPS` warpgroups (axis 'wg'), its kernel named `name`, `grid` the
-        clusters of `topology`'s CTAs (one each without a pair)."""
+               interpret, name: str | None = None, topology: Topology = SINGLE,
+               warpgroups: int = WARPGROUPS) -> Callable:
+        """`entry` as a program of `warpgroups` warpgroups (axis 'wg', `WARPGROUPS` by default: a template
+        whose roles are more, `mosaic.tabled`'s), its kernel named `name`, `grid` the clusters of
+        `topology`'s CTAs (one each without a pair)."""
         return mosaic.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
-                             warpgroups=WARPGROUPS, family=Tcgen05.name, scratch=scratch,
+                             warpgroups=warpgroups, family=Tcgen05.name, scratch=scratch,
                              interpret=interpret, name=name, cluster=topology.ctas)
 
     @staticmethod
@@ -162,6 +164,12 @@ class Tcgen05:
         """The issuing warpgroup's warps alone (a program's end, `drain`'s, and each tile's in `roles`): its
         load warp runs `load`, its product warp `products`."""
         pl.when(lax.axis_index("wg") == ISSUE)(lambda: _issuing(load, products))
+
+    @staticmethod
+    def issuing(load: Callable[[], None], products: Callable[[], None]) -> None:
+        """The issuing warpgroup's warps where a role table places it (`mosaic.tabled`'s producer, after the
+        template's rows): its load warp runs `load`, its product warp `products`."""
+        _issuing(load, products)
 
 
 TCGEN05 = Tcgen05()
@@ -525,7 +533,7 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
     def added_into(self, acc, value, interpret: bool):
         raise NotImplementedError(f"{self._HOME}; nothing adds a register tile into one")
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None):
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False):
         raise NotImplementedError(f"{self._HOME}; a fresh product takes the launch's, not its own")
 
     def registers_product(self, lhs, rhs, interpret: bool):

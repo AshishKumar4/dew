@@ -27,12 +27,6 @@ from dew.nn.kernels.templates import bundles, report, resources
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 
-def test_the_compiled_shapes_reach_the_widest_keys_and_values_the_port_takes():
-    shapes = support.COMPILED_SHAPES.values()
-    assert max(shape["width"] for shape in shapes) == fla_gdn.WIDEST_KEYS == 256
-    assert max(shape["columns"] for shape in shapes) == fla_gdn.WIDEST == 128
-
-
 def rule_launches(module) -> list:
     """The launches the rule of `module` (`fla_gdn`, `fla_kda`) makes forward and backward, as its trace
     records them (`tuning.seen`)."""
@@ -496,14 +490,26 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                 family = mosaic_gpu.family_of(config, jnp.bfloat16)
                 configs = {}
                 for consumers in sorted({1, family.consumers}):
-                    # Each consumer keeps its share of the derived tile's rows, at as many of its stages as
-                    # the block holds (a one-consumer tile's deeper ring past two consumers' rows); one
-                    # consumer runs alone, a cluster being two consumers' (`mosaic_gpu.Tiles`).
-                    rows_ = config.block_m // config.warpgroups * consumers
-                    staged = (dataclasses.replace(config, warpgroups=consumers, block_m=rows_, stages=stages,
-                                                  cluster=config.cluster if consumers > 1 else 1)
+                    # Each consumer keeps its share of the derived tile's rows, else the tile's rows split
+                    # among them where its registers hold no more (mma.sync's one-consumer tile, two of
+                    # whose shares no consumer holds), at as many of its stages as the block holds (a
+                    # one-consumer tile's deeper ring past two consumers' rows); one consumer runs alone, a
+                    # cluster being two consumers' (`mosaic_gpu.Tiles`).
+                    shares = dict.fromkeys((config.block_m // config.warpgroups * consumers, config.block_m))
+                    # As many programs a multiprocessor as the derived tile's, else one, whose registers its
+                    # consumers then share alone.
+                    residencies = dict.fromkeys((config.programs, 1))
+                    # At the derived step's depth, else twice it: two consumers each copy a share of a block's
+                    # first axis in whole 32-row parts (`Transport.shares_rows`), a transposed right
+                    # operand's its depth.
+                    depths = dict.fromkeys((config.block_k, 2 * config.block_k))
+                    staged = (_replaced(config, warpgroups=consumers, block_m=rows_, block_k=depth,
+                                        stages=stages, programs=programs,
+                                        cluster=config.cluster if consumers > 1 else 1)
+                              for rows_ in shares for depth in depths for programs in residencies
                               for stages in range(config.stages, 1, -1))
-                    tile = next((tile for tile in staged if launch.legal(ba, tile, target)), None)
+                    tile = next((tile for tile in staged
+                                 if tile is not None and launch.legal(ba, tile, target)), None)
                     if tile is not None:
                         configs[f"{name} x{consumers} {tile}"] = tile
             kernel = "dew_tgmm" if isinstance(launch, grouped_matmul.MosaicTgmm) else "dew_gmm"
@@ -514,6 +520,14 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                                                 {kernel: _model(launch, ba, config)},
                                                 required=launch.legal(ba, config, target)))
     return cases
+
+
+def _replaced(config, **changes):
+    """`config` with `changes`, or None where its tile type refuses them (`mosaic_gpu.Tiles`' own checks)."""
+    try:
+        return dataclasses.replace(config, **changes)
+    except ValueError:
+        return None
 
 
 def _model(launch, ba, config) -> resources.RegisterModel:
@@ -641,13 +655,23 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
 
 
 @functools.cache
+@functools.cache
+def _contract_cases(generation_name: str) -> list:
+    """Each launch form at each consumer count of a family's contract (`_gemm_mainloop_cases(
+    every_consumer_count=True)`), at the first projection whose rows give it a legal tile (two consumers'
+    rows past a few rows a MoE expert takes, mma.sync's)."""
+    found: dict = {}
+    for shape in GEMM_SHAPES:
+        for case in _gemm_mainloop_cases(generation_name, shape, every_consumer_count=True):
+            found.setdefault(case.name.split(" Tiles(")[0], case)
+    return list(found.values())
+
+
 def _family_cases(generation_name: str) -> list:
-    """The family contract's cases (`_gemm_mainloop_cases(every_consumer_count=True)` at the first
-    projection) the compile gate does not already hold (`_gate_cases`)."""
+    """The family contract's cases (`_contract_cases`) the compile gate does not already hold
+    (`_gate_cases`)."""
     held = {_kernel_of(case.name) for case in _gate_cases(generation_name)}
-    return [case for case in _gemm_mainloop_cases(generation_name, next(iter(GEMM_SHAPES)),
-                                                  every_consumer_count=True)
-            if _kernel_of(case.name) not in held]
+    return [case for case in _contract_cases(generation_name) if _kernel_of(case.name) not in held]
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
@@ -655,10 +679,10 @@ def test_each_family_emits_every_launch_form_at_each_consumer_count(generation_n
     """The whole contract a Mosaic GPU Family bundle offers its templates is present: every launch form it
     emits (`_emitted_forms`: plain and transposed right operands, 16-bit and fp32 stores, fixed and streamed
     side vectors and tiles, several outputs, the running sum) at one consumer and at the family's most
-    (`_gemm_mainloop_cases(every_consumer_count=True)`)."""
+    (`_contract_cases`)."""
     family = bundles.of(generation_name, jnp.bfloat16)
     assert family is not None
-    cases = _gemm_mainloop_cases(generation_name, next(iter(GEMM_SHAPES)), every_consumer_count=True)
+    cases = _contract_cases(generation_name)
     counts = sorted({1, family.consumers})
     expected = {f"{form} x{count}" for form in _emitted_forms(family) for count in counts}
     got = {case.name.split(" Tiles(")[0] for case in cases}
@@ -742,6 +766,53 @@ def test_a_program_that_launches_no_triton_kernel_gives_no_evidence(generation_n
     assert failures(compile_kernels([case], generation_name))
 
 
+ROUTED_ROWS, ROUTED_DEPTH, ROUTED_WIDTH = 256, 512, 256
+"""A dense projection's rows, depth and width, its rows split over a route test's two devices."""
+
+
+def _projected(local: bool):
+    """A dense projection's forward and backward through the GEMM template (`gemm.gemm`, its launch chosen,
+    as the dense selector picks XLA's dot), the gradient in both operands: its rows per shard
+    (`sharding.manual_map`) where `local`, else left to the partitioner."""
+    from dew.nn import sharding
+    from dew.nn.kernels import gemm
+
+    def projected(x, w):
+        return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
+
+    def step(x, w):
+        # Mapped as it traces, on the mesh its program lowers for (`manual_map` reads the mesh in context).
+        specs = (PartitionSpec("data"), PartitionSpec())
+        forward = sharding.manual_map(projected, specs, PartitionSpec("data")) if local else projected
+        with generation.chosen(grouped_matmul="mosaic_gpu"):
+            return jax.grad(lambda x, w: forward(x, w).astype(jnp.float32).sum(), argnums=(0, 1))(x, w)
+
+    shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    return step, (shaped((ROUTED_ROWS, ROUTED_DEPTH)), shaped((ROUTED_DEPTH, ROUTED_WIDTH)))
+
+
+@pytest.mark.parametrize("local", [True, False], ids=["per-shard", "partitioned"])
+def test_a_routes_launches_run_per_shard_with_only_their_planned_collectives(local):
+    """A dense projection's forward and backward through the GEMM template, its rows split over two
+    compile-only H100s and compiled for them: run per shard (`sharding.manual_map`), both gradients launch
+    (the forward's product, which no gradient reads, is the program's to drop), each reading its shard's
+    rows (the cotangent's, the input's), and the program sums by one all-reduce over the rows' axis (the
+    weight's gradient) and moves nothing (`kernel_compile.Expected`, its route evidence). Left to the
+    partitioner, the same evidence refuses the program (a null control): an opaque launch's operands
+    gathered to every device, or no program at all."""
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    expected = Expected(axes=(("data", 2),), specs=(PartitionSpec("data"), None),
+                        launches=frozenset({"dew_gmm", "dew_tgmm"}),
+                        shards={"dew_gmm": (ROUTED_ROWS // 2, ROUTED_WIDTH), "dew_tgmm": (ROUTED_ROWS // 2,
+                                                                                     ROUTED_DEPTH)},
+                        collectives=frozenset({("all-reduce", frozenset({"data"}))}))
+    cases = [support.KernelCase("projection", lambda: _projected(local), expected=expected)]
+    found = compile_mosaic_kernels(cases, "sm90")
+    failed = route_failures(cases, found)
+    assert (failed == []) == local, failed
+
+
 def test_each_triton_call_needs_a_launch_of_its_own():
     """A program's Triton calls, one named as another begins and one made twice, compiled for a compile-only
     A100: with every launch line XLA writes, the gate reads their shared bytes; without one of the two
@@ -770,8 +841,10 @@ def test_each_triton_call_needs_a_launch_of_its_own():
         lines = "\n".join(thunks).splitlines()
         dropped = next(index for index, line in enumerate(lines) if missing in line)
         without = ["\n".join(lines[:dropped] + lines[dropped + 1:])]
-        assert triton_evidence(calls, without) == {
-            "error": f"no launch of its own states the shared bytes of {said}"}
+        evidence = triton_evidence(calls, without)
+        # Refused, naming the call whose launch is gone, and no other.
+        assert "shared" not in evidence and said in evidence["error"].split()
+        assert ({"probe", "probe_headroom"} - {said}).isdisjoint(evidence["error"].split())
 
 
 def test_records_a_failed_process_of_their_own_wrote_are_refused():

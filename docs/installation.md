@@ -99,10 +99,10 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post53,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post54,<0.12.1`.
 <!-- END JAX requirement -->
 
-It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of its native code, post45's, which post46's to post53's Python fixes left as it was, carrying the Mosaic GPU fixes below that live in them, and the index serves them too. Every other package, jaxlib included, comes from PyPI. The fixes:
+It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of its native code, post45's, which post46's to post54's Python fixes left as it was, carrying the Mosaic GPU fixes below that live in them, and the index serves them too. Every other package, jaxlib included, comes from PyPI. The fixes:
 
 - A Pallas Triton kernel's cache key leaves out its source locations ([jax-ml/jax#41502](https://github.com/jax-ml/jax/issues/41502)), so two checkouts share one compiled kernel. JAX is removing its Pallas Triton backend and takes no change to it, so this fix stays in the build while Dew runs Pallas Triton.
 - The device-to-host transfer guard holds on a CPU array's first implicit host read (`float`, `item`, `np.asarray`, its buffer), as on the copy an accelerator array's first read caches.
@@ -145,6 +145,8 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - Mosaic GPU's layout inference computes each check of a shared-memory-to-registers transfer once, where its search asked the same one again on every reduction, about a millisecond a time: an sm90 Kimi delta attention kernel with three shared-memory scratch refs had spent 134 s of 150 s in it, and its lowering ran past ten minutes.
 - A Pallas Mosaic GPU scratch ref can state that it is plain, neither tiled nor swizzled (`plgpu.PlainTransform()`), so layout inference takes its layout as given rather than searching every tiling and swizzle for it and its subviews, which ran out of fuel on Kimi delta attention's `(64, 32)` subviews read at row offsets no tiling divides. With both, that kernel's forward lowers in 3.8 s and compiles in 8.2 s for sm90.
 - A Mosaic GPU `async_load` after a warpgroup barrier and the GPU dialect's index and dimension reads or its dynamic shared memory base takes no automatic barrier of its own, as none of them touches a thread's shared memory: a pre-Hopper pipeline's step synchronizes once, which made an A100 GEMM's kernel gradient 8% faster.
+- A program's compilation cache key reads each kernel its custom calls serialize in an MLIR context of its own, so threads keying programs at once, each of them holding Mosaic GPU kernels, key them alike; the program's own context, which its thread's lowerings share, is left as it was.
+- Mosaic GPU's `emit_pipeline` runs collectively over a thread axis (`thread_axis`): every thread of a kernel's warpgroups runs one input pipeline over shared buffers, each copying an equal share of a block on a pre-Hopper GPU, as an Ampere kernel with several consumer warpgroups splits its loads.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 

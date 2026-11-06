@@ -1271,9 +1271,9 @@ class Issuer[Accumulator](abc.ABC):
         or registers."""
 
     @abc.abstractmethod
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False) -> jax.Array:
         """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, its value, with `then` issued while the
-        product runs."""
+        product runs; `interpret`, as `products`' (an instruction no CPU rule lowers computed as its sum)."""
 
     @abc.abstractmethod
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
@@ -1775,11 +1775,13 @@ class Transport[Allocated, Opened](abc.ABC):
         del pending
 
     @abc.abstractmethod
-    def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:
+    def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:
         """`value` added into its view (fp32, in global memory) through `smem` (a chunk of its columns at a
         time where `smem` is narrower, `chunked`), atomically against every other role's adds into it;
         interpreted, a read and a write of the view, atomic against other
-        programs' alone (the interpreter runs a program's roles at once and a grid's programs in turn)."""
+        programs' alone (the interpreter runs a program's roles at once and a grid's programs in turn).
+        `smem` is written once at most `pending` of the program's earlier adds may still be reading theirs
+        (each through a buffer of its own: a caller's slots of a stage in turn), 0 its own add's last."""
 
     def partials_ready(self, shape: tuple[int, ...], interpret: bool):
         """The semaphores of `shape` a tile's partials are signalled on across programs (`fixed_up`); none
@@ -1793,7 +1795,9 @@ class Transport[Allocated, Opened](abc.ABC):
         range starts inside the tile; otherwise combined with every partial the programs after it up to
         `gathered` left, each awaited, in their order, and stored (`store`). `combine(running, partial)` is
         the algebra's merge of two partials of one tile (a sum's addition by default; a split walk's
-        softmax merge, a scan's composition), which the work's declaration supplies."""
+        softmax merge, a scan's composition), which the work's declaration supplies. `summed` may be a
+        pytree (a merge's partial of several leaves): `partials` is then a ref a leaf, in its structure,
+        and a program's one signal releases them all."""
         raise NotImplementedError(f"{self.name} fixes no tile up across programs (`fixes_up`)")
 
 
@@ -2122,15 +2126,16 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def store_wait(self, pending: int) -> None:
         plgpu.wait_smem_to_gmem(pending, wait_read_only=True)
 
-    def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:
+    def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:
         if interpret:
             # Mosaic GPU's interpreter (jax 0.11.2) takes no TMA reduction.
             view[...] = view[...] + value
             return
-        # A TMA reduce from `smem` a chunk of its columns at a time (`chunked`), the previous add's reads of
-        # it done first; its writes go on.
-        for piece, place in chunked(value, view, smem):
-            plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+        # A TMA reduce from `smem` a chunk of its columns at a time (`chunked`), the reads of it the add
+        # before made done first (`pending` of the earlier ones' through their own buffers still going on);
+        # its writes go on.
+        for index, (piece, place) in enumerate(chunked(value, view, smem)):
+            plgpu.wait_smem_to_gmem(pending if index == 0 else 0, wait_read_only=True)
             smem[...] = piece
             plgpu.commit_smem()
             plgpu.copy_smem_to_gmem(smem, place, reduction_op="add")
@@ -2145,7 +2150,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         # CAS. Interpreted, the partials are left before they are read (`tail.ordered`).
         @pl.when(start > 0)
         def _():
-            partials[program] = summed
+            jax.tree.map(lambda leaf, ref: ref.__setitem__(program, leaf), summed, partials)
             if ready is not None:
                 plgpu.semaphore_signal(ready.at[program], memory_scope="gpu")
 
@@ -2154,7 +2159,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             def added(other, running):
                 if ready is not None:
                     plgpu.semaphore_wait(ready.at[other], memory_scope="gpu")
-                return combine(running, partials[other])
+                # The partials' structure read off the running value's: a ref may itself be a tree.
+                return combine(running, jax.tree.map(lambda _, ref: ref[other], running, partials))
 
             store(lax.fori_loop(program + 1, gathered, added, summed))
 

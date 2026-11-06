@@ -23,9 +23,10 @@ compares (`_orderings`), and the two sides' difference zero as a rational functi
 (`_zero`). A certificate is a reduced-tile proof: the laws hold of the forms at the small tile they were
 proven at. A kernel's tile shares it where its forms' structure (`skeleton`) is that tile's and its extents
 are equal and unequal as that tile's are (tests/test_algebra_laws.py), so a broadcast or reshape that confuses
-two axes shows the same at both. That a law proven at the small tile holds at a kernel's is not proven: a
-form whose reductions treat their elements alike holds its laws at any extent in every case the suite has
-seen, but a form that held them at a few elements and broke them at more would share the certificate."""
+two axes shows the same at both; each structure is proven at two and at three walked elements a tile, so a
+form that holds its laws at two and breaks them at more (a sum as a tile's maximum plus its minimum) shares
+no kernel's certificate. That a law proven at three holds at a kernel's extents is not proven: a form whose
+reductions treat their elements alike holds its laws at any extent in every case the suite has seen."""
 
 import dataclasses
 import functools
