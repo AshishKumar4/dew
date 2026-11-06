@@ -1286,8 +1286,11 @@ def back_enclosures(step: BackStep, scale: float, lane: Lane, *, write: str = "d
                   point(step.local)), lane)
     dv = fp32(mul(du, point(beta)), lane) if keyed_gate else du
     kept = Iv(np.full(step.grad.lo.shape, raised.lo[-1]), np.full(step.grad.lo.shape, raised.hi[-1]))
-    read = staged(fp32(mul(do, rows), lane), lane)
-    reads = dot(tr(q), read, lane, parts=(given, held))
+    # The decayed output gradient fp32 in two bf16 parts against the queries (fla's split product,
+    # `mainloop_backward._reverse`): the parts' sum within 2^-16 of it.
+    read = fp32(mul(do, rows), lane)
+    reach = 2.0 ** -16 * np.maximum(np.abs(read.lo), np.abs(read.hi))
+    reads = dot(tr(q), _outward(read.lo - reach, read.hi + reach), lane, parts=(given, 2))
     entering = fp32(add(fused(mul(step.grad, kept), lane), fused(mul(reads, factor), lane)), lane)
     if write == "delta":
         entering = fp32(add(entering, neg(dot(tr(point(step.w)), point(step.dv), lane, parts=(held, held)))),
@@ -1491,7 +1494,8 @@ def assert_backward_witnessed(lane: Lane, heads: int = 1) -> None:
 class KeyBackStep(NamedTuple):
     """One chunk and value head of a decay a key dimension's fast backward (`key_backward.gradients`), its
     inputs as the launches read them (float64, one value head's): the forward's `q`, `k`, `v`, `g` `[C, Dk]`,
-    `beta`, its intra scores `scores` (stored, scaled and decayed) and inverse `a`, its gated keys `kg`
+    `beta`, its intra scores `scores` (stored, scaled and decayed), inverse `a` and weighted keys `w`, its
+    gated keys `kg`
     (stored, `algebra.key_decayed_write`'s), its corrected values `c` and the memory the chunk entered `h`;
     the output's gradient `do` and the gradient of the memory the chunk leaves, `grad` (an interval) and
     `dh` (its record); and the records later launches read: `local`, `dv` (the reverse walk's), `d_scores`,
@@ -1504,6 +1508,7 @@ class KeyBackStep(NamedTuple):
     beta: np.ndarray
     scores: np.ndarray
     a: np.ndarray
+    w: np.ndarray
     kg: np.ndarray
     c: np.ndarray
     h: np.ndarray
@@ -1549,7 +1554,7 @@ def key_back_enclosures(step: KeyBackStep, scale: float, lane: Lane) -> dict[str
     - `_key_scores_back`: `d_scores = do c^T`, causal (`algebra.key_scores_back`), and `local = scores^T do`;
     - `_reverse`: `dv = kg grad + local` (`algebra.key_reverse_carried`, the gated keys' product taking no
       row's decay), and the memory entered's `grad exp2(E_last) + qg^T do - w^T dv`, `qg` the queries gated
-      to the chunk's start and scaled;
+      to the chunk's start and scaled, `do` as given;
     - `_key_memory_back` (`algebra.key_memory_block`): `dq_m = scale exp2(E) (do h^T)`, `dk_m = exp2(E_last -
       E) (c dh^T) + d(kg beta) exp2(E) beta`, `d(kg beta) = -(dw + L^T dw)`, `dw = dv h^T`;
     - `_key_values_back` (`algebra.key_values_back`): `values = beta (dv + L^T dv)`;
@@ -1569,6 +1574,7 @@ def key_back_enclosures(step: KeyBackStep, scale: float, lane: Lane) -> dict[str
               np.broadcast_to(raised.hi[-1][:, None], step.grad.lo.shape))
     query_gated = staged(fp32(mul(fp32(mul(q, raised), lane), factor), lane), lane)
     entering = fp32(add(fused(mul(step.grad, last), lane), dot(tr(query_gated), do, lane)), lane)
+    entering = fp32(add(entering, neg(dot(tr(point(step.w)), point(step.dv), lane))), lane)
     d_query = fp32(mul(fp32(mul(dot(do, tr(point(step.h)), lane), raised), lane), factor), lane)
     exact, bound = exponents.exact, exponents.bound
     spread = bound[-1][None, :] + bound + 2.0 ** -46 * (np.abs(exact[-1])[None, :] + np.abs(exact)) + FRACTION
@@ -1679,7 +1685,8 @@ def key_back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
             grad = point(back.dfinal[head]) if last else held_cell(back.dh[n, head], lane)
             forward = run.step(n, head)
             step = KeyBackStep(forward.q, forward.k, forward.v, forward.g, forward.beta,
-                               records["scores"][n, head], forward.a, records["kg"][n, head], forward.c,
+                               records["scores"][n, head], forward.a, forward.w, records["kg"][n, head],
+                               forward.c,
                                forward.h, back.do[n, head], grad, back.dh[n, head], records["local"][n, head],
                                records["dv"][n, head], records["d_scores"][n, head],
                                records["d_system"][n, head])
