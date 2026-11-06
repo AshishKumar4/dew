@@ -593,16 +593,15 @@ TINY = {"architecture": "causal_transformer", "dtype": "bfloat16", "batch_size":
 are, which a GPU routes to FlashAttention."""
 
 
-def test_a_step_compiled_ahead_for_an_absent_gpu_is_judged_and_one_that_substituted_a_kernel_is_not(
-        gate, tmp_path):
+def test_a_step_compiled_ahead_for_an_absent_gpu_is_a_sample_of_its_planners_seconds(gate, tmp_path):
     """The compile ahead's own process (`COMPILED`), run as `compile` runs it, outside the suite's settings as
     a node's prepare runs it: a decoder's step planned and compiled for one compile-only sm90 GPU of a stated
-    memory, here with no GPU attached. With the gate's XLA attention (`AHEAD_ATTENTION`, which lowers here:
-    ledger 4616), its planner's seconds are its sample and every selected field of its plan keeps its own
-    value. With cuDNN's attention asked for, which runs as XLA's with no GPU attached, the program it names
-    as substituted is the gate's unsupported row, failing the gate, never a time."""
+    memory, here with no GPU attached, with the gate's XLA attention (`AHEAD_ATTENTION`, which lowers here:
+    ledger 4616): its planner's seconds are its sample, nothing substituted, and every selected field of its
+    plan keeps its own value. A substitution comes only from a route Dew derives (a kernel named outright is
+    refused on a host with no GPU), so the gate's reading of one is tested at the process boundary
+    (`compile`'s test), never by asserting the route."""
     import os
-    from types import SimpleNamespace
 
     from lane_environment import outside_suite
 
@@ -619,16 +618,6 @@ def test_a_step_compiled_ahead_for_an_absent_gpu_is_judged_and_one_that_substitu
     seconds, plan = compiled(gate.AHEAD_ATTENTION)
     assert isinstance(seconds, float) and seconds > 0
     assert set(plan) == set(gate.SELECTED) and plan["split"] == 1
-    substituted, _ = compiled("cudnn")
-    assert isinstance(substituted, str) and substituted.startswith(gate.UNSUPPORTED)
-    row = gate.Row("compile tiny 1x1024 (xla attention)", "s", "", floor=gate.COMPILE_FLOOR)
-    results = tmp_path / "compile.json"
-    results.write_text(json.dumps({"base": "main", "head": "head", "alone": "main~aa", "rounds": 1,
-                                   "rows": [row.__dict__],
-                                   "samples": {arm: [{row.name: substituted}] for arm in gate.ARMS}}))
-    verdicts = tmp_path / "verdicts.json"
-    assert gate.report(SimpleNamespace(results=results, table=None, claim=False, verdicts=str(verdicts))) == 1
-    assert json.loads(verdicts.read_text())["rows"][row.name]["state"] == "unsupported"
 
 
 def paired(rates: dict[str, list[float]], session: str = "s") -> dict[str, list[dict]]:
