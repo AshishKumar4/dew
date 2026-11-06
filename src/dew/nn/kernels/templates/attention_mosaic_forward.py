@@ -34,7 +34,13 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_portable, mosaic, resources
+from dew.nn.kernels.templates import (
+    attention_algebra as algebra,
+    attention_portable,
+    mosaic,
+    operands,
+    resources,
+)
 from dew.nn.kernels.templates.attention import (
     Draw,
     Dropout,
@@ -69,6 +75,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     bundle_of,
     extents,
     issued_into,
+    issued_pairs,
     modelled,
     query_swizzle,
     reducing,
@@ -127,7 +134,7 @@ def _stores_through_query(family: mosaic.Family, width: int, value_width: int, d
 
 def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_width: int, dtype,
                          residuals: bool, stages: int, *, peaks: bool = False, out_dtype=None,
-                         pieces: int = 1, certified: bool = False) -> tuple[list, dict]:
+                         pieces: int = 1, certified: bool = False, parts: int = 1) -> tuple[list, dict]:
     """The forward program's allocations as `Family.scoped` takes them, in `_launch`'s order: its consumers'
     query stages and their rows' status; each one's output stage where the value is not as wide as the query
     and as narrow, `out_dtype`, the query's by default (the output stores through the query's stage where it
@@ -136,9 +143,11 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     the consumers' turns' barrier; and its key and value streams in `stages` slots (`Family.streams`), a
     peak walk's keys alone, each slot loaded in `pieces` copies (a paged call's tile of several pages); the
     query's stage at its swizzle (`query_swizzle`); a certify form's fp32 stage of a step's sums last
-    (`certified_walk`)."""
+    (`certified_walk`). An fp32 call's `parts` (`MosaicForward.parts`) stage each tile's parts one above the
+    other, the query's and each slot's rows `parts` times theirs, a part a copy of its own, its query loads a
+    barrier each."""
     consumers, block_q, block_k = tiles.consumers, tiles.block_q, tiles.block_k
-    scoped = [mosaic.staged((consumers, block_q, width), dtype, query_swizzle(family)),
+    scoped = [mosaic.staged((consumers, parts * block_q, width), dtype, query_swizzle(family)),
               plgpu.SMEM((consumers, block_q), jnp.float32)]
     if residuals:
         scoped.append(plgpu.SMEM((consumers, block_q, value_width), jnp.float32))
@@ -151,13 +160,13 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     if relays(family, tiles, peaks=peaks):
         # The weights' way to the values' product where the family's warps split them (`Family.relaying`).
         scoped.append(mosaic.plain((consumers, block_q, block_k), dtype))
-    scoped += [family.load_barriers(consumers), family.schedule(consumers)]
-    blocks = {"keys": ((block_k, width), dtype)}
+    scoped += [family.load_barriers(consumers * parts), family.schedule(consumers)]
+    blocks = {"keys": ((parts * block_k, width), dtype)}
     if not peaks:
-        blocks["values"] = ((block_k, value_width), dtype)
+        blocks["values"] = ((parts * block_k, value_width), dtype)
     # The logits' product reads the keys transposed.
     return scoped, family.streams(blocks, stages, consumers, swizzles=transposed_swizzles(tiles, "keys"),
-                                  copies=dict.fromkeys(blocks, pieces))
+                                  copies=dict.fromkeys(blocks, pieces * parts))
 
 
 def relays(family: mosaic.Family, tiles: Tiles, *, peaks: bool = False) -> bool:
@@ -167,10 +176,14 @@ def relays(family: mosaic.Family, tiles: Tiles, *, peaks: bool = False) -> bool:
     return not peaks and family.relay_bytes(tiles.block_q, tiles.block_k) > 0
 
 
-def guarded_columns(family: mosaic.Family, value_width: int, dtype) -> int:
+def guarded_columns(family: mosaic.Family, value_width: int, dtype, *, parts: int = 1) -> int:
     """The value columns a guarded launch walks at once (`_plain_forward`): a block of the family's swizzled
-    columns (`Family.column_unit`)."""
-    return min(value_width, family.column_unit(dtype))
+    columns (`Family.column_unit`); an fp32 call's quarter of one (`MosaicForward.parts`: its weights' parts
+    formed beside the guard's two weight tiles and sums, at 64 x 64 on an H100 a whole unit's guarded walk
+    spilled 24 bytes and its natural one 484, half a unit's natural one 16, et-fp32regs6), its values' block
+    staged at the swizzle that fits it (`mosaic.staged`, unstated)."""
+    unit = family.column_unit(dtype)
+    return min(value_width, unit if parts == 1 else unit // 4)
 
 
 GUARD_ROWS = 4
@@ -180,7 +193,7 @@ row spans, two rows a thread: a `[block_q, 4]` fp32 tile's words a statistic (`g
 
 
 def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, width: int, *,
-                  held_only: bool = True) -> Tiles | None:
+                  held_only: bool = True, parts: int = 1) -> Tiles | None:
     """The guarded launch's tiles beside the plain launch's `tiles` (`_plain_forward`): the largest of the
     family's row extents that divides the plain launch's query blocks (the guarded walk is a rare one's of
     its overflowed rows alone, so it takes smaller blocks where the plain launch's hold no guarded state: at
@@ -196,7 +209,10 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
     fragments). Uncounted, the statistics left 64 x 64 on two consumers spilling 20 bytes a thread at heads
     128 and 256 wide (ptxas, sm90a). None where none fits: the plain launch is then illegal at `tiles`
     (`MosaicForward.legal`); unless `held_only`, its least candidate then, which a launch pinned at `tiles`
-    walks whatever its legality (a resource witness lowers as pinned)."""
+    walks whatever its legality (a resource witness lowers as pinned). An fp32 call's `parts`
+    (`MosaicForward.parts`) form its weights' parts one at a time beside them, its remainder and the part
+    (`_parted_products`), and bound its keys' magnitudes from their first parts (et-fp32e: the parts formed
+    at once and their magnitudes summed, 64 x 64 at width 64 spilled 1,820 bytes on an H100)."""
     def held(candidate: Tiles) -> bool:
         rows, block = candidate.block_q, candidate.block_k
         # Priced in the layout the guarded launch takes at its share (`bundle_of`).
@@ -211,6 +227,11 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
         # every A100 guarded tile was refused, gate80 46 of 96 against 70; the A100's guarded launch at width
         # 64 still spills 40 bytes counted apart, its decode path the Triton mainloop's until it does not).
         magnitudes = [logits[0], (columns, block, jnp.float32)]
+        if parts > 1:
+            # Its weights' part and remainder beside them (`_parted_products`), and its keys' magnitudes a
+            # vector read beside the tile (`_Guard.magnitudes`), no tile of them.
+            logits = [*logits, (rows, block, jnp.float32), (rows, block, dtype)]
+            magnitudes = [logits[0]]
         live = resources.live_registers(arranged, carried, logits + sums, magnitudes, *fragments)
         if arranged.operands_in_registers:
             # Its products' fragments loaded beside the step's tiles, which they read (mma.sync: priced
@@ -227,8 +248,11 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
         tiles.block_q]
     # Its key blocks copied by its consumers together where its family's copies split them
     # (`Transport.shares_rows`: two mma.sync consumers' cp.async in whole 64-row parts).
+    # An fp32 call's guarded walk on one consumer, the most registers (its parts beside the guard's two
+    # weights and products: 64 x 64 on two spilled on an H100, et-fp32j).
+    most = 1 if parts > 1 else tiles.consumers
     candidates = (dataclasses.replace(tiles, block_q=rows, block_k=block, consumers=consumers, narrow=narrow)
-                  for rows in queries for consumers in range(tiles.consumers, 0, -1) for block in blocks
+                  for rows in queries for consumers in range(most, 0, -1) for block in blocks
                   if family.shares_rows(block, consumers) for narrow in stagings(family))
     ranked = list(candidates)
     return next((candidate for candidate in ranked if held(candidate)), None if held_only else ranked[-1])
@@ -299,7 +323,7 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
                     scale: float, natural: bool, tiles: Tiles, interpret: bool, rows: bool = False,
                     out_dtype=None, masked: bool = False, splits: int = 1, table: jax.Array | None = None,
                     sources: jax.Array | None = None, subtracted: bool = False, merges: bool = False,
-                    flagged: bool = False):
+                    flagged: bool = False, parts: int = 1):
     """The inference walk's launches: its spec, `launch(form, live, again)` and `kept` as
     `algebra.walked_launches` takes them and `finished`, its outputs from the walk's: `MosaicForward`'s launch
     without residuals, at `tiles`, under the default's guards over whole launches (`algebra.walked_launches`).
@@ -322,7 +346,9 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
 
     A `flagged` walk (one that rewalks in place, `algebra.walked_launches`' `in_place`) has its plain launch
     state its rows' rewalk flags (`_launch`'s `flags`, `_Flags`), which the masked rewalk reads as they are:
-    no array operation between the two launches."""
+    no array operation between the two launches. An fp32 call's operands enter as their `parts`
+    (`MosaicForward.parts`), stacked along the batch axis, each launch reading them so (`_launch`'s
+    `parts`)."""
     merges = merges and splits > 1
     family = bundle_of(tiles, query.dtype)
     call, spec, (raw, k, v), (spans_of, hooked), taken = _prepared(
@@ -356,7 +382,7 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
             launched = [_launch(q, k, v if into is not None and first is not None else values, at_spans,
                                 held._replace(output=()) if split else held, None,
                                 spec=form, hooks=_unhooked(hooks) if split else hooks, tiles=at,
-                                family=family, training=False, interpret=interpret,
+                                family=family, training=False, interpret=interpret, parts=parts,
                                 counted=form.natural == spec.natural and not again, kept=again,
                                 finishes=rows, columns=first, splits=splits, table=paged, sources=sources,
                                 out_dtype=jnp.float32 if split else out_dtype, walks=walks,
@@ -375,10 +401,16 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
                 return (out, *finished), None, _Flags.stated(status, at.block_q)
             overflowed = functools.reduce(jnp.logical_or, [block[0][1] > 0 for block in launched])
             return (out, *finished), status[0], overflowed
-        unit = guarded_columns(family, v.shape[-1], v.dtype)
+        unit = guarded_columns(family, v.shape[-1], v.dtype, parts=parts)
         # The plain launch's legality held a guarded tile at its tiles (`MosaicForward.legal`); a launch
         # pinned past it walks the least.
-        guarded = guarded_tiles(family, at, unit, v.dtype, q.shape[-1], held_only=False)
+        guarded = guarded_tiles(family, at, unit, v.dtype, q.shape[-1], held_only=False, parts=parts)
+        # An fp32 call's keys' magnitudes over all their columns (`_Guard.magnitudes`), from its values'
+        # parts summed exactly, read beside each tile: its blocks' transposed tiles are too few rows to load.
+        magnitudes = None
+        if parts > 1:
+            whole = jnp.sum(v.astype(jnp.float32).reshape(parts, -1, *v.shape[1:]), axis=0)
+            magnitudes = jnp.swapaxes(jnp.max(jnp.abs(whole), axis=-1), 1, 2)
         hooked_blocks = hooks.output_mod is not None
         assert guarded is not None, at
         guarded_spans = _spans_of(spec, call, guarded.block_q, guarded.block_k)
@@ -405,11 +437,11 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
         # 128 took two launches of 1.74 us each (ET-DPROF-h100, row 4043).
         together = len(column_blocks) > 1 and hooked.initial is None
         for first, columns, held in column_blocks[:1] if together else column_blocks:
-            guard = _Guard(flags.rows)
+            guard = _Guard(flags.rows, magnitudes)
             launched = _launch(
                 q, k, v, guarded_spans, held._replace(output=()), guard, spec=form, hooks=_unhooked(hooks),
                 tiles=guarded, family=bundle_of(guarded, q.dtype), training=False, interpret=interpret,
-                columns=first,
+                columns=first, parts=parts,
                 splits=rewalk_splits, table=paged, sources=sources,
                 out_dtype=jnp.float32 if hooked_blocks else out_dtype,
                 finishes=finishes, column_width=columns.shape[-1] if first is not None else None,
@@ -823,10 +855,19 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
     row, head = place
     family, tiles = program.family, program.tiles
     shape = (tiles.block_q, tiles.block_k)
-    if product is None:
-        s = family.product(q, slots["keys"].transpose((1, 0)), shape, turn, interpret=interpret)
-    else:
+    if product is not None:
         s = product()
+    elif program.parts > 1:
+        # An fp32 call's logits its parts' products (`product.terms`), smallest first, into one fresh
+        # accumulator in place (`Family.issued`: a term's own accumulator read before the next serializes
+        # wgmma's, ptxas C7512), the partner's turn once they are in.
+        keys = program.parted(slots["keys"], tiles.block_k)
+        s = family.summed(shape, lambda acc: family.issued(acc, q.refs, keys.T.refs, interpret=interpret),
+                          interpret=interpret)
+        if turn is not None:
+            turn()
+    else:
+        s = family.product(q, slots["keys"].transpose((1, 0)), shape, turn, interpret=interpret)
     slots.release("keys")
     k_first = index * tiles.block_k
     # The tile's places formed a step, not held across the walk beside its sums (`_coords`).
@@ -864,17 +905,18 @@ def _empty(family: mosaic.Family, shape: tuple[int, int], live: jax.Array | None
     return start._replace(guard=algebra.Guard(nothing, nothing, start.acc, start.total, live))
 
 
-def _value_tile(shape: tuple, dtype, turn, slots) -> algebra.Operand:
+def _value_tile(program: _Program, shape: tuple, dtype, turn, slots) -> algebra.Operand:
     """A step's value tile of `shape` and `dtype` from its `slots` (`_consumer`'s): its type beside its slot's
     acquisition, which the step defers to the form reading it, the slot taken once the partner's products
-    are issued (its turn on the tensor cores is over when this one's come)."""
+    are issued (its turn on the tensor cores is over when this one's come); an fp32 call's an fp32 tile, its
+    parts (`_Program.parted`)."""
     def slot():
         turn(wait=False)
         value = slots["values"]
         turn(arrive=False)
-        return value
+        return program.parted(value, shape[0])
 
-    return algebra.Operand(shape, dtype, slot)
+    return algebra.Operand(shape, jnp.float32 if program.parts > 1 else dtype, slot)
 
 
 def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_view, status_views, q_smem,
@@ -899,14 +941,20 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     (`_kept_rows`). With `merging` (a split launch that merges its slices: their states' slots and its
     semaphores, `_merge`), its output is its slices' merge, the last slice's program's. With `relay` (its
     own tile, `relays`), its weights reach the values' product through it."""
-    row, head, _ = place
+    row, head, kv_head = place
     family, tiles = program.family, program.tiles
     if relay is not None:
         # Its weights reach the values' product through its own tile (`relays`).
         family = family.relaying(relay)
     lo, hi, whole = program.reach(first, spans, row)
-    family.loaded(((q_view, q_smem, q_loaded),))
-    q = family.held(q_smem)
+    if program.parts > 1:
+        # An fp32 call's query parts one above the other, a copy and a barrier each, read where they lie.
+        family.loaded(tuple((view, q_smem.at[pl.ds(part * tiles.block_q, tiles.block_q)], barrier)
+                            for part, (view, barrier) in enumerate(zip(q_view, q_loaded, strict=True))))
+        q = program.parted(q_smem, tiles.block_q)
+    else:
+        family.loaded(((q_view, q_smem, q_loaded),))
+        q = family.held(q_smem)
     # The output's sums are as wide as its stage (a training walk's its split sums'), the values' width
     # whatever the query's.
     value_width = out_smem.shape[-1]
@@ -925,9 +973,15 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
                        hooks=hooks, drawn=hooked.drop is not None, held=held, product=product,
                        interpret=interpret)
 
-    values = functools.partial(_value_tile, (tiles.block_k, value_width), views["values"][0].dtype, turn)
+    values_ref = views["values"][0]
+    values = functools.partial(_value_tile, program, (tiles.block_k, value_width),
+                               (values_ref[0] if isinstance(values_ref, mosaic.Pieces) else values_ref).dtype,
+                               turn)
 
     def dot(lhs, rhs):
+        if isinstance(rhs, operands.Parts):
+            return _parted_products(family, None, None, lhs, rhs, interpret,
+                                    shape=(lhs.shape[0], rhs.shape[1]))
         return family.registers_product(lhs, rhs, interpret)
 
     def step(index, slots, carry, accumulators):
@@ -936,7 +990,11 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         if guard is not None:
             # Its keys' largest value magnitudes from the value tile it holds (`Family.key_magnitudes`).
             def largest():
-                return family.key_magnitudes(slots["values"])
+                if guard.magnitudes is None:
+                    return family.key_magnitudes(slots["values"])
+                # An fp32 call's, each key's over all its columns, read beside the tile (`_Guard`).
+                k_first = index * tiles.block_k
+                return family.columns_of(guard.magnitudes.at[row, kv_head, pl.ds(k_first, tiles.block_k)])
 
             keys = algebra.Keys(coords, logits, tile, dot, products=products, largest=largest)
             return algebra.plain_step(spec, carry, keys), accumulators
@@ -1270,10 +1328,44 @@ def _started(program: _Program, spec: algebra.Forward, guard: _Guard | None, hoo
     return start, live, merged
 
 
+def _parted_products(family: mosaic.Family, acc, scale, weights: jax.Array, values: operands.Parts,
+                     interpret: bool, *, shape: tuple[int, int] | None = None):
+    """`acc` with an fp32 call's P·V issued into it in place, its factor `scale` first where given, or a
+    fresh accumulator of `shape` where `acc` is None: the fp32 `weights`' bf16 parts (`product.bf16_parts`'),
+    the largest first, each product with the values' parts (`values`) the pair's orders under their count
+    (`product.terms`'), all into the one accumulator (`issued_pairs`). Each part formed from the weights
+    alone as it is taken (`_part`), so a consumer holds the weights and one part beside the sums."""
+    count = len(values.refs)
+
+    def pairs():
+        for i in range(count):
+            part = _part(weights, i)
+            for j in range(count - i):
+                yield part, values.refs[j]
+
+    if acc is None:
+        return issued_pairs(family, None, pairs(), interpret, shape=shape)
+    if scale is not None:
+        acc = family.rescaled_products(acc, scale, (), None, interpret)
+    return issued_pairs(family, acc, pairs(), interpret)
+
+
+def _part(weights: jax.Array, index: int) -> jax.Array:
+    """The `index`-th bf16 part of fp32 `weights` (`product.bf16_parts`'), each element's from its own weight:
+    its remainder past the parts before it, rounded. A weight is at most 1, no part of it saturating."""
+    rest = weights
+    for _ in range(index):
+        rest = rest - rest.astype(jnp.bfloat16).astype(jnp.float32)
+    return rest.astype(jnp.bfloat16)
+
+
 def _accumulated(family: mosaic.Family, interpret: bool) -> Callable:
     """`algebra.Keys.accumulate` on the family's accumulator: the tile's products issued into it in place,
     after its factor where the step gives one (`Family.rescaled_products`)."""
     def accumulate(acc, scale, parts, value):
+        if isinstance(value, operands.Parts):
+            (weights,) = parts
+            return _parted_products(family, acc, scale, weights, value, interpret)
         if scale is None:
             return issued_into(family, acc, parts, value, interpret)
         return family.rescaled_products(acc, scale, parts, value, interpret)
@@ -1397,7 +1489,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
             table: tuple[jax.Array, int] | None = None, column_width: int | None = None,
             walks: "_Flags | None" = None, sources: jax.Array | None = None, shared_by: int = 1,
             column_blocks: int = 1, certified: bool = False, into: tuple | None = None,
-            keeping: jax.Array | None = None, merges: bool = False, flags: bool = False):
+            keeping: jax.Array | None = None, merges: bool = False, flags: bool = False, parts: int = 1):
     """The forward's launch in `spec`'s form (`guard`'s rows shifting where given): its rows' status `[2, B,
     H, Qp]` fp32, their maxima in the walk's units and 1 where their weighted values overflowed
     (`algebra.walked_launches`), and its output `[B, Qp, H, Dv]` in `out_dtype` (the query's by default). In
@@ -1461,19 +1553,19 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
                      page=None if table is None else table[1],
                      column_width=column_width, shared_by=shared_by, column_blocks=column_blocks,
                      certified=certified, merges=merges and splits > 1, flags=flags,
-                     walk_rows=None if walks is None else walks.granule)
+                     walk_rows=None if walks is None else walks.granule, parts=parts)
 
 
 @tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
                       "counted", "finishes", "target", "name", "splits", "page", "column_width", "shared_by",
-                      "column_blocks", "certified", "merges", "flags", "walk_rows"))
+                      "column_blocks", "certified", "merges", "flags", "walk_rows", "parts"))
 def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.Forward, tiles: Tiles,
               family: mosaic.Family, training: bool, interpret: bool,
               peaks: bool, out_dtype, counted: bool, finishes: bool, target: generation.GpuTarget,
               name: str, splits: int = 1, page: int | None = None,
               column_width: int | None = None, shared_by: int = 1, column_blocks: int = 1,
               certified: bool = False, merges: bool = False, flags: bool = False,
-              walk_rows: int | None = None):
+              walk_rows: int | None = None, parts: int = 1):
     """`_launch`'s kernel launched on its operands and the arrays its programs read beside them (`read`, the
     hooks' among them, `_Hooked`), its static `hooks` holding their arrays' shapes and dtypes in their place
     (its functions a key's, which `tuning.holdable` reads), lowered once for every call of its static facts
@@ -1481,6 +1573,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     `name` its kernel's (`mosaic.kernel` reports it as the launch tracing it names it)."""
     leaves, treedef = jax.tree.flatten(read)
     batch, queries, heads, width = query.shape
+    # An fp32 call's batch rows, its parts stacked along them (`MosaicForward.parts`).
+    batch //= parts
     # A block of the values' columns where it walks one in place (`_launch`'s `column_width`).
     value_width = value.shape[-1] if column_width is None else column_width
     # A paged call's pools `[KV, P·size, D]`, its keys its table's slots.
@@ -1494,7 +1588,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     steps = keys_count // block_k
     # No more stages than key tiles: a slot past them would load past the keys.
     program = _Program(family, tiles, steps, min(tiles.stages, steps), spec.keys, spec.form == "causal",
-                       spec.queries, splits, _per_span(spec, read.spans))
+                       spec.queries, splits, _per_span(spec, read.spans), parts=parts)
     # The output stores through the query's stage where the two are as wide (its rows are read before the
     # store); else it takes a stage of its own beside the query's and the rings (`_forward_allocations`).
     out_dtype = query.dtype if out_dtype is None else jnp.dtype(out_dtype)
@@ -1503,7 +1597,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     pieces = block_k // page if page is not None and page < block_k else 1
     scoped, rings = _forward_allocations(family, tiles, width, value_width, query.dtype, training,
                                          program.stages, peaks=peaks, out_dtype=out_dtype, pieces=pieces,
-                                         certified=certified)
+                                         certified=certified, parts=parts)
     out_type = _out_types(batch, queries, heads, value_width * column_blocks, out_dtype, splits=splits,
                           peaks=peaks, training=training, finishes=finishes,
                           certified=steps if certified else 0, merges=merges, flags=flags)
@@ -1527,6 +1621,11 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
         named = {"keys": refs.k} if peaks else {"keys": refs.k, "values": refs.v}
         views = _key_views(named, row, lax.div(head, group), read.sources, read.table, page=page,
                            block_k=block_k, column_block=column)
+        if parts > 1:
+            # Each stream's tile its parts' rows, a copy each (`mosaic.viewed`'s pieces of refs).
+            views = {name: (mosaic.Pieces(ref.at[part * batch + row, :, lax.div(head, group)]
+                                          for part in range(parts)), index)
+                     for (name, (_, index)), ref in zip(views.items(), named.values(), strict=True)}
         streams = family.opened(streams, views)
         pair_first = program.query_tile(queries // pair) * pair
         streamed = _streamed([program.reach(pair_first + index * block_q, read.spans, row)[:2]
@@ -1538,7 +1637,9 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
 
         def consumer(index):
             block = _Block.of(program, row, head, pair_first + index * block_q, queries)
-            stages = (refs.q_smem.at[index], refs.q_loaded.at[index])
+            stages = (refs.q_smem.at[index],
+                      refs.q_loaded.at[index] if parts == 1
+                      else tuple(refs.q_loaded.at[index * parts + part] for part in range(parts)))
             if peaks:
                 _peak_consumer(program, spec, index, refs.q.at[block.rows],
                                tuple(ref.at[block.state] for ref in refs.written), *stages,
@@ -1554,7 +1655,9 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                 block, written, tuple(stage.at[index] for stage in refs.stages), training=training,
                 finishes=finishes, columns_at=columns_at, certified=certified,
                 merges=(ready, (row, axis, index), splits) if merges else None)
-            _consumer(program, spec, index, refs.q.at[row, pl.ds(block.first, block_q), head], out_view,
+            q_view = (refs.q.at[row, pl.ds(block.first, block_q), head] if parts == 1 else mosaic.Pieces(
+                refs.q.at[part * batch + row, pl.ds(block.first, block_q), head] for part in range(parts)))
+            _consumer(program, spec, index, q_view, out_view,
                       status, *stages, refs.out_smem.at[index], refs.row_smem.at[index], streams, views, turn,
                       streamed, block.first, read.spans, read.hooked, read.guard,
                       (row, head, lax.div(head, group)), hooks=hooks, residuals=residuals,
