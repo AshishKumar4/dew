@@ -155,23 +155,19 @@ def test_a_far_short_rows_slices_merge_through_its_masked_rewalk_interpreted():
 @functools.partial(jax.jit, static_argnames="slices")
 def _sliced_step(query, key, value, lengths, *, slices: int):
     """A decode step of rows `lengths` long, its keys cut into `slices` slices a row at the decode plan's
-    config and merged, as `attention_decode.attend` walks them (the fold's raw products, `subtracted`);
-    lengths an operand, so every drawn length compiles one program."""
+    config, merged in the launch (`MosaicForward.merges`: the last slice's program merges the others'
+    states, the interpreter's programs in turn standing in for its waits), the fold's raw products
+    (`subtracted`) as `attention_decode.attend` walks them; lengths an operand, so every drawn length
+    compiles one program."""
     spans = _decode_spans(lengths)
     with generation.assumed("sm90"):
         rows, row_spans, _ = attention_decode.packed(query, spans, DECODE_KV)
         config = attention_decode.plan(rows, key, value, row_spans, None, scale=None,
                                        target=generation.gpu_target()).config
         with tuning.pinned({attention_mosaic.MosaicForward: config}):
-            out, maximum, total = attention_mosaic.forward(
-                rows, key, value, row_spans, template.Hooks(), scale=None, natural=False,
-                residuals=Kept.OUTPUT, interpret=True, out_dtype=jnp.float32, masked=True, splits=slices,
-                subtracted=True)[:3]
-        if slices == 1:
-            # One slice's launch gives its rows without a slices axis.
-            out, maximum, total = out[:, None], maximum[:, :, None], total[:, :, None]
-        spec = attention_decode._spec(rows, row_spans, template.Hooks(), scale=None)
-        merged = algebra.merged_slices(spec, out, maximum, total)
+            merged = attention_mosaic.forward(
+                rows, key, value, row_spans, template.Hooks(), scale=None, natural=False, interpret=True,
+                out_dtype=jnp.float32, masked=True, splits=slices, subtracted=True, merges=True)
         return template.ungrouped_rows(merged, DECODE_HEADS).astype(query.dtype)
 
 
@@ -186,8 +182,8 @@ def _whole_step(query, key, value, lengths):
 @hypothesis.given(lengths=st.tuples(st.integers(1, DECODE_KEYS), st.integers(1, DECODE_KEYS)))
 def test_a_decode_steps_keys_cut_into_any_slice_count_merge_to_its_attention_interpreted(slices, lengths):
     """A decode step's keys cut into `slices` slices a row (`attention_mosaic.forward`'s `splits` at the
-    decode plan's config, a program a slice), the slices merged (`algebra.merged_slices`), rows of their own
-    lengths: on par with the step walked whole."""
+    decode plan's config, a program a slice), the slices merged in the launch (`MosaicForward.merges`), rows
+    of their own lengths: on par with the step walked whole."""
     lengths = jnp.asarray(lengths, jnp.int32)
     assert_as_exact(lambda q, k, v: _sliced_step(q, k, v, lengths, slices=slices),
                     lambda q, k, v: _whole_step(q, k, v, lengths), _decode_draw,
