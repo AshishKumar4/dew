@@ -1920,6 +1920,25 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         self.published()
         return buffer
 
+    def converted(self, codes, into, interpret: bool, *, row_scale: jax.Array | None = None) -> Ref:
+        """A stage of quantized codes (`codes`, int8 or an FP8 in shared memory, `[rows, depth]`) as the tile
+        a product reads (`into`, a shared tile of its 16-bit dtype): each code cast exactly, each row scaled
+        by `row_scale` (fp32 `[rows]` in registers, a per-token scale) in fp32 before its one rounding,
+        written and published as `staged` writes a register operand."""
+        if interpret:
+            value = codes[...].astype(jnp.float32)
+        else:
+            # A plain register layout: an 8-bit stage takes no ldmatrix, and the cast keeps its layout.
+            value = plgpu.load(codes, optimized=False).astype(jnp.float32)
+        if row_scale is not None:
+            value = value * row_scale[:, None]
+        if interpret:
+            into[...] = value.astype(into.dtype)
+            return into
+        plgpu.store(into, value.astype(into.dtype), optimized=False)
+        self.published()
+        return into
+
     def programs(self, consumers: int, registers: int | None = None) -> int:
         """The most programs of one launch a multiprocessor's registers hold at once, each `consumers`
         consumer roles holding `registers` (None: the family's budget, `registers`): at warpgroup MMA's
