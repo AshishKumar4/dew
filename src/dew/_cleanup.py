@@ -243,13 +243,15 @@ def stop(process: subprocess.Popen, grace: float = 0.0, interrupt: int = signal.
         os.close(held[0])
         held[1].wait()
         killed = True
-    left: list[int] = []
-    if killed:
-        deadline = time.monotonic() + settle
-        while (left := members(process.pid)) and time.monotonic() < deadline:
-            time.sleep(POLL_SECONDS)
+    deadline = time.monotonic() + settle
+    # The leader reaped within the budget: a leader of many threads reads as a zombie, no member, while its
+    # other threads end, and only then can it be reaped.
     with contextlib.suppress(subprocess.TimeoutExpired):
-        process.wait(0)
+        process.wait(settle if killed else 0)
+    left = members(process.pid) if killed else []
+    while left and time.monotonic() < deadline:
+        time.sleep(POLL_SECONDS)
+        left = members(process.pid)
     return left
 
 
