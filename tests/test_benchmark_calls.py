@@ -157,7 +157,24 @@ def test_a_comparison_reads_two_arms_paired_and_role_swapped_against_their_own_n
     result = compared(slow, fast, pairs=64, warmup=1, level=1 - FALSE_RED / 2)
     low, _ = result.interval
     alone_low, alone_high = result.alone
-    assert alone_low <= 1.0 <= alone_high < low <= 4.0
+    assert alone_low <= 1.0 <= alone_high < low <= 4.0 and result.differs
+
+
+def test_paired_ratios_are_judged_against_their_a_a_by_one_rule_and_too_few_are_refused():
+    """`judged`, the one judgment `compared` and a timing window (tools/timing.py) read a time by: a call's
+    paired ratios differ from their reference only where their interval lies apart from 1 and outside the
+    A/A's, so ratios the A/A's own noise makes, or ones whose interval holds 1, do not; and ratios too few to
+    reach an interval at the level are refused, as `_median_rank` refuses them."""
+    from dew.telemetry.benchmark import judged
+
+    noise = [1.0 + (index - 31.5) / 1000 for index in range(64)]
+    assert judged([4 * value for value in noise], noise).differs
+    assert not judged(noise, noise).differs
+    # Apart from 1, but within the A/A's wider noise: the placement's own.
+    wide = [1.0 + (index - 31.5) / 100 for index in range(64)]
+    assert not judged([1.02 * value for value in noise], wide).differs
+    with pytest.raises(ValueError, match="take more"):
+        judged(noise[:4], noise)
 
 
 def test_a_medians_rank_holds_it_at_its_level_and_no_higher_rank_does():

@@ -80,10 +80,14 @@ def test_a_window_times_every_arm_in_reversed_rounds_beside_its_a_a_each_revisio
     for cell in case["cells"]:
         arms = {arm["arm"]: arm for arm in cell["arms"]}
         assert len(arms) == 4
-        assert arms["sin"]["ratio_range"] == [1.0, 1.0] and arms["sin"]["differs"] is False
+        # The reference is the band's own end, never judged against it.
+        assert arms["sin"]["ratio_median"] == 1.0 and arms["sin"]["differs"] is None
         assert all(len(arm["ratios"]) == 2 for arm in arms.values())
         assert arms["sin~aa"]["digest_is_reference"] and not arms["cos"]["digest_is_reference"]
-        assert len(cell["noise_band"]) == 2
+        # Four calls an arm reach no interval at the window's level (dew.telemetry.benchmark.judged): said so,
+        # and no arm is judged.
+        assert "take more" in cell["unjudged"] and cell["noise_band"] is None
+        assert all(arm["differs"] is None for arm in arms.values())
     assert len(summary["run_order"]) == 3 * 2 * 4
     # A revision held here and pushed nowhere is refused before any arm is built.
     (repo / "src/cells.py").write_text(BUILDER.format(sign=2.0))
