@@ -1,5 +1,6 @@
 """Diagnostic test hook for the CPU slot-scoring experiment."""
 import os
+import contextlib
 
 
 def pytest_configure():
@@ -9,6 +10,11 @@ def pytest_configure():
     from dew.objectives.lm.adaptation import _Chain
 
     reference_error.WITHOUT_YNN = {}
+    if os.environ.get("DEW_DBG_USER_DEFAULT") == "1":
+        os.environ["DEW_WIDE_CPU_ARITHMETIC"] = "0"
+        reference_error.summed_as_run = contextlib.nullcontext
+        print("USER_SCOPE", "precision", jax.config.jax_default_matmul_precision,
+              "wide_cpu", os.environ["DEW_WIDE_CPU_ARITHMETIC"], flush=True)
     if os.environ.get("DEW_DBG_POLICY_HIGHEST") == "1":
         import arm_arithmetic
         import dew.nn.precision

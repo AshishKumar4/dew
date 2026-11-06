@@ -11,9 +11,12 @@ NODE = "tests/test_chunk_adaptation.py::test_each_windows_gradient_from_its_leve
 judge = sys.argv[1] == "--judge"
 outcomes = {}
 modes = ("highest",) if os.environ.get("POLICY_ONLY") else ("baseline", "token")
+if os.environ.get("USER_ONLY"):
+    modes = ("user",)
 for mode in modes:
     environment = {**os.environ, "PYTHONPATH": "src:tests", "DEW_DBG_TOKEN": str(int(mode == "token")),
-                   "DEW_DBG_POLICY_HIGHEST": str(int(mode == "highest"))}
+                   "DEW_DBG_POLICY_HIGHEST": str(int(mode == "highest")),
+                   "DEW_DBG_USER_DEFAULT": str(int(mode == "user"))}
     with tempfile.TemporaryDirectory(prefix="dbg-4522-") as temporary:
         if judge:
             pool = Path(temporary)
@@ -32,4 +35,6 @@ for mode in modes:
 print("RESULT", json.dumps(outcomes), flush=True)
 expected = ({"highest": 0} if os.environ.get("POLICY_ONLY") else
             {"baseline": 1, "token": 0} if judge else {"baseline": 0, "token": 0})
+if os.environ.get("USER_ONLY"):
+    expected = {"user": 0}
 raise SystemExit(0 if outcomes == expected else 1)
