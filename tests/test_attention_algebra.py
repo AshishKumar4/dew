@@ -229,7 +229,7 @@ def test_a_state_at_fp32s_least_maximum_keeps_its_mass(derived):
     real = algebra.Partial(jnp.full((4, 8), 3.0), jnp.full((4,), least), jnp.full((4,), 2.0))
     with forms.derived(derived):
         merged = algebra.merge(spec, algebra.empty(4, 8), real)
-        out, maximum, total = algebra.finish(spec, merged, initial=True)
+        out, _, total = algebra.finish(spec, merged, initial=True)
         rows = algebra.finished_rows(spec, real)
     np.testing.assert_array_equal(np.asarray(out), 1.5)
     np.testing.assert_array_equal(np.asarray(total), 2.0)
