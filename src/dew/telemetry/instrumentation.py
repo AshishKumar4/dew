@@ -692,14 +692,25 @@ def _counted_trips(loop: _Instruction, caller: _Computation,
     """The trip count of a loop that counts one integer tuple element from a
     constant start, by a constant positive step, while it is below a constant
     bound: the loop every `fori_loop` and `scan` with static bounds lowers
-    to, and the form XLA's own trip-count analysis reads. Infinite for any
-    other loop, and for one whose last step overflows the counter's type,
-    since a wrapped counter need never reach the bound."""
+    to, and the form XLA's own trip-count analysis reads; where that bound is
+    one side of an `and`, at most its trips, a bound as every branch of a
+    conditional counted is (a loop of at most one trip, the attention guards').
+    Infinite for any other loop, and for one whose last step overflows the
+    counter's type, since a wrapped counter need never reach the bound."""
     condition = computations.get(_called(loop, 'condition'))
     body = computations.get(_called(loop, 'body'))
     if condition is None or body is None or not loop.operands:
         return math.inf
-    compare = condition.instructions.get(condition.root or '')
+    root = condition.instructions.get(condition.root or '')
+    sides = root.operands if root is not None and root.op == 'and' else [condition.root or '']
+    return min((_compared_trips(loop, caller, condition, body, condition.instructions.get(side))
+                for side in sides), default=math.inf)
+
+
+def _compared_trips(loop: _Instruction, caller: _Computation, condition: _Computation, body: _Computation,
+                    compare: _Instruction | None) -> float:
+    """`_counted_trips` of `loop` by `compare`, its condition's counted bound, or infinite where it is
+    none."""
     if (compare is None or compare.op != 'compare' or 'direction=LT' not in compare.attributes
             or len(compare.operands) != 2):
         return math.inf
