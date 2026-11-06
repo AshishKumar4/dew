@@ -23,6 +23,7 @@ fold's reach, and its overflowed rows again shifting under headroom). Its legali
 
 import dataclasses
 import functools
+import math
 from collections.abc import Callable
 from typing import Any, NamedTuple
 
@@ -81,12 +82,20 @@ from dew.nn.kernels.templates.cost import estimate
 
 
 def _out_types(batch: int, queries: int, heads: int, value_width: int, out_dtype, *, splits: int, peaks: bool,
-               training: bool, finishes: bool, certified: int = 0) -> tuple:
+               training: bool, finishes: bool, certified: int = 0, merges: bool = False) -> tuple:
     """`_launch`'s outputs' types: a peak walk's maxima and anchor keys; a training walk's status, residual
     rows, anchor keys and split sums; else its status and output `[B, S·Qp, H, Dv]` (a split launch's slices
-    along its query axis), and its finished rows where it `finishes`."""
+    along its query axis), and its finished rows where it `finishes`. A split launch that `merges` its slices
+    gives their status, its merged output `[B, Qp, H, Dv]` and finished rows `[2, B, H, Qp]`, and the slices'
+    states its merge read (`algebra.slice_state`: `[B, S, Qp, H, Dv]` and `[2, B, H, S, Qp]` fp32)."""
     rows_out = splits * queries
     status_type = jax.ShapeDtypeStruct((2, batch, heads, rows_out), jnp.float32)
+    if merges:
+        out_type = (status_type, jax.ShapeDtypeStruct((batch, queries, heads, value_width), out_dtype))
+        if finishes:
+            out_type += (jax.ShapeDtypeStruct((2, batch, heads, queries), jnp.float32),)
+        return (*out_type, jax.ShapeDtypeStruct((batch, splits, queries, heads, value_width), jnp.float32),
+                jax.ShapeDtypeStruct((2, batch, heads, splits, queries), jnp.float32))
     if peaks:
         return (jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32),
                 jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32))
@@ -156,7 +165,8 @@ each row's shift, reach, unshifted denominator and liveness), each held by the f
 row spans, two rows a thread: a `[block_q, 4]` fp32 tile's words a statistic (`guarded_tiles`)."""
 
 
-def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, width: int) -> Tiles | None:
+def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, width: int, *,
+                  held_only: bool = True) -> Tiles | None:
     """The guarded launch's tiles beside the plain launch's `tiles` (`_plain_forward`): the largest of the
     family's row extents that divides the plain launch's query blocks (the guarded walk is a rare one's of
     its overflowed rows alone, so it takes smaller blocks where the plain launch's hold no guarded state: at
@@ -171,7 +181,8 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
     the guarded launch at 64 x 64, width 128, spilled 132 bytes on an A100, its IR live set 274, 144 of it
     fragments). Uncounted, the statistics left 64 x 64 on two consumers spilling 20 bytes a thread at heads
     128 and 256 wide (ptxas, sm90a). None where none fits: the plain launch is then illegal at `tiles`
-    (`MosaicForward.legal`)."""
+    (`MosaicForward.legal`); unless `held_only`, its least candidate then, which a launch pinned at `tiles`
+    walks whatever its legality (a resource witness lowers as pinned)."""
     def held(candidate: Tiles) -> bool:
         rows, block = candidate.block_q, candidate.block_k
         carried = [(rows, columns, jnp.float32)] * 2 + [(rows, 4 * GUARD_ROWS, jnp.float32)]
@@ -199,7 +210,8 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
     candidates = (dataclasses.replace(tiles, block_q=rows, block_k=block, consumers=consumers, narrow=narrow)
                   for rows in queries for consumers in range(tiles.consumers, 0, -1) for block in blocks
                   for narrow in stagings(family))
-    return next((candidate for candidate in candidates if held(candidate)), None)
+    ranked = list(candidates)
+    return next((candidate for candidate in ranked if held(candidate)), None if held_only else ranked[-1])
 
 
 def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
@@ -244,7 +256,7 @@ def _walked_blocks(live: jax.Array, splits: int, block_q: int) -> jax.Array:
 def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
                     scale: float, natural: bool, tiles: Tiles, interpret: bool, rows: bool = False,
                     out_dtype=None, masked: bool = False, splits: int = 1, table: jax.Array | None = None,
-                    sources: jax.Array | None = None, subtracted: bool = False):
+                    sources: jax.Array | None = None, subtracted: bool = False, merges: bool = False):
     """The inference walk's launches: its spec, `launch(form, live, again)` and `kept` as
     `algebra.walked_launches` takes them and `finished`, its outputs from the walk's: `MosaicForward`'s launch
     without residuals, at `tiles`, under the default's guards over whole launches (`algebra.walked_launches`).
@@ -259,7 +271,12 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
     With `rows`, the training forward that keeps its output for the backward's D (`takes_output_residuals`):
     the output and the residuals every mainloop's training forward gives, from the plain launch's finished
     rows, which a row its guards rewalk keeps too (its weighted values overflowed, not its maximum or
-    denominator), no anchor key and the output as the split sums (`output_split`)."""
+    denominator), no anchor key and the output as the split sums (`output_split`).
+
+    A split walk that `merges` its slices merges them in its launches (`_launch`'s `merges`), the initial
+    state's among them: its outputs the rows' whole, `[B, Q, H, Dv]` and the rows' finished `[B, H, Q]`, as
+    an unsplit walk's, its guards' live rows any of a row's slices'."""
+    merges = merges and splits > 1
     family = bundle_of(tiles, query.dtype)
     call, spec, (raw, k, v), (spans_of, hooked), taken = _prepared(
         query, key, value, spans, hooks, scale=scale, natural=natural, tiles=tiles, family=family,
@@ -297,22 +314,31 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
                                 out_dtype=jnp.float32 if split else out_dtype, walks=walks,
                                 shared_by=len(blocks),
                                 column_width=(values.shape[-1] if into is not None and first is not None
-                                              else None), **in_place)
+                                              else None), merges=merges, **in_place)
                         for first, values, held in blocks]
             if into is not None:
                 return (), jnp.zeros(live.shape, jnp.float32), jnp.zeros_like(live)
-            status, _, *finished = launched[0]
+            status, _, *finished = launched[0][:-2] if merges else launched[0]
             out = _output_whole(jnp.concatenate([block[1] for block in launched], axis=-1), hooks, hooked,
                                 out_dtype or q.dtype, split)
             overflowed = functools.reduce(jnp.logical_or, [block[0][1] > 0 for block in launched])
             return (out, *finished), status[0], overflowed
         unit = guarded_columns(family, v.shape[-1], v.dtype)
-        guarded = guarded_tiles(family, at, unit, v.dtype, q.shape[-1])
+        # The plain launch's legality held a guarded tile at its tiles (`MosaicForward.legal`); a launch
+        # pinned past it walks the least.
+        guarded = guarded_tiles(family, at, unit, v.dtype, q.shape[-1], held_only=False)
         hooked_blocks = hooks.output_mod is not None
-        # The plain launch's legality held a guarded tile at its tiles (`MosaicForward.legal`).
         assert guarded is not None, at
         guarded_spans = _spans_of(spec, call, guarded.block_q, guarded.block_k)
-        walks = _walked_blocks(live, splits, guarded.block_q) if masked or into is not None else None
+        # A merging walk's guarded rewalk walks each of its rows' keys whole, one program a query block (its
+        # rows live in every slice where in any, `_whole_rows`), and merges nothing: its tiles and column
+        # blocks are not the plain launch's, whose grid its legality holds resident (`MosaicForward.legal`),
+        # and it runs where a row's sums overflowed alone.
+        rewalk_splits = 1 if merges else splits
+        if merges:
+            live = live.reshape(*live.shape[:2], splits, -1)[:, :, 0]
+            in_place = {"into": into, "keeping": live.astype(jnp.int32)} if into is not None else {}
+        walks = _walked_blocks(live, rewalk_splits, guarded.block_q) if masked or into is not None else None
         # A masked launch's rows its own whole, their finished maxima and denominators beside their output
         # (`kept`): a fold's natural rewalk's are its rows' own, in its units.
         finishes = rows and (masked or into is not None)
@@ -331,7 +357,7 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
             launched = _launch(
                 q, k, v, guarded_spans, held._replace(output=()), guard, spec=form, hooks=_unhooked(hooks),
                 tiles=guarded, family=family, training=False, interpret=interpret, columns=first,
-                splits=splits, table=paged, sources=sources,
+                splits=rewalk_splits, table=paged, sources=sources,
                 out_dtype=jnp.float32 if hooked_blocks else out_dtype,
                 finishes=finishes, column_width=columns.shape[-1] if first is not None else None,
                 walks=walks, column_blocks=len(column_blocks) if together else 1, **in_place)
@@ -349,33 +375,40 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
         # `walked_launches` reads the plain launch's maxima and overflows.
         return (out, *finished), jnp.zeros(live.shape, jnp.float32), jnp.zeros_like(live)
 
-    def kept(live: jax.Array, guarded: tuple, plain: tuple) -> tuple:
-        # The rewalk's outputs at its rows (its output, and a masked launch's finished rows), the plain
-        # launch's elsewhere and past them.
-        live = _whole_rows(live, splits)
-        taken = (jnp.where(jnp.swapaxes(live, 1, 2)[..., None], guarded[0], plain[0]),
-                 *(jnp.where(live, mine, theirs)
-                   for mine, theirs in zip(guarded[1:], plain[1:], strict=False)))
-        return (*taken, *plain[len(guarded):])
+    return (spec, launch, functools.partial(_kept, splits=splits, merges=merges),
+            functools.partial(_walked_outputs, queries=call.queries, width=value.shape[3], rows=rows,
+                              splits=splits, merges=merges))
 
-    def finished(walked: tuple):
-        out, *rows_of = walked
-        if splits > 1:
-            # A split launch's slices along the query axis (`_launch`'s `splits`): `[B, S, Q, H, Dv]`, its
-            # rows `[B, H, S, Q]`, each slice's maxima and denominators its own, for a merge
-            # (`attention_decode`).
-            out = out.reshape(out.shape[0], splits, -1, *out.shape[2:])
-            out = out[:, :, :call.queries, :, :value.shape[3]]
-            maximum, total = (array.reshape(*array.shape[:2], splits, -1)[..., :call.queries]
-                              for array in rows_of[0])
-            return out, maximum, total
-        out = out[:, :call.queries, :, :value.shape[3]]
-        if not rows:
-            return out
-        maximum, total = (array[:, :, :call.queries] for array in rows_of[0])
-        return out, maximum, total, jnp.full(maximum.shape, -1, jnp.int32), output_split(out)
 
-    return spec, launch, kept, finished
+def _kept(live: jax.Array, guarded: tuple, plain: tuple, *, splits: int, merges: bool) -> tuple:
+    """The inference walk's outputs from its rewalk's and its plain launch's (`_inference_walk`'s `kept`):
+    the rewalk's at its `live` rows (its output, and a masked launch's finished rows), the plain launch's
+    elsewhere and past them; a merged walk's a row's, live where any of its slices is."""
+    live = (jnp.any(live.reshape(*live.shape[:2], splits, -1), axis=2) if merges
+            else _whole_rows(live, splits))
+    taken = (jnp.where(jnp.swapaxes(live, 1, 2)[..., None], guarded[0], plain[0]),
+             *(jnp.where(live, mine, theirs) for mine, theirs in zip(guarded[1:], plain[1:], strict=False)))
+    return (*taken, *plain[len(guarded):])
+
+
+def _walked_outputs(walked: tuple, *, queries: int, width: int, rows: bool, splits: int, merges: bool):
+    """The inference walk's outputs from its launches' (`_inference_walk`'s `finished`), unpadded to the
+    call's `queries` and value `width`: the output, and with `rows` its finished maxima and denominators, an
+    anchor key of none and the output as the split sums. An unmerged split launch's are its slices along the
+    query axis (`_launch`'s `splits`): `[B, S, Q, H, Dv]`, its rows `[B, H, S, Q]`, each slice's maxima and
+    denominators its own, for a merge (`attention_decode`); a merging one's the rows' whole, theirs alone."""
+    out, *rows_of = walked
+    if splits > 1 and not merges:
+        out = out.reshape(out.shape[0], splits, -1, *out.shape[2:])[:, :, :queries, :, :width]
+        maximum, total = (array.reshape(*array.shape[:2], splits, -1)[..., :queries] for array in rows_of[0])
+        return out, maximum, total
+    out = out[:, :queries, :, :width]
+    if not rows:
+        return out
+    maximum, total = (array[:, :, :queries] for array in rows_of[0])
+    if merges:
+        return out, maximum, total
+    return out, maximum, total, jnp.full(maximum.shape, -1, jnp.int32), output_split(out)
 
 
 def _column_blocks(value: jax.Array, hooked: _Hooked, columns: int | None, *, whole: bool = True
@@ -658,6 +691,20 @@ class _Block(NamedTuple):
         rows = tuple(finished[0].at[place, *self.state] for place in range(2)) if finishes else None
         return self.status(status_ref), out_ref.at[self.rows], rows
 
+    def merging(self, written: tuple, finishes: bool) -> tuple:
+        """Its views in a launch that merges its slices (`_out_types`' `merges`): its slice's status, the
+        merged output's and (where the launch `finishes` them) finished rows' at its rows unsliced, and every
+        slice's state at its rows (`algebra.Partial` of views `[S, bq, Dv]` and `[S, bq]`), which its
+        merge's slots are (`Family.fixed_up`)."""
+        status_ref, out_ref, *rest = written
+        row, sliced, head = self.rows
+        at = pl.ds(self.first, sliced.size)
+        rows = tuple(rest[0].at[place, row, head, at] for place in range(2)) if finishes else None
+        sums, states = rest[-2:]
+        slots = algebra.Partial(sums.at[row, :, at, head], states.at[0, row, head, :, at],
+                                states.at[1, row, head, :, at])
+        return self.status(status_ref), out_ref.at[row, at, head], rows, slots
+
     def certified(self, written: tuple) -> tuple:
         """Its views of a certify form's state after each key tile (`_out_types`' last two): the rows'
         maxima's and denominators' `[tiles, block_q]` and the sums' `[tiles, block_q, Dv]`."""
@@ -737,11 +784,25 @@ def _empty(family: mosaic.Family, shape: tuple[int, int], live: jax.Array | None
     return start if live is None else algebra.headroomed(start, live)
 
 
+def _value_tile(shape: tuple, dtype, turn, slots) -> algebra.Operand:
+    """A step's value tile of `shape` and `dtype` from its `slots` (`_consumer`'s): its type beside its slot's
+    acquisition, which the step defers to the form reading it, the slot taken once the partner's products
+    are issued (its turn on the tensor cores is over when this one's come)."""
+    def slot():
+        turn(wait=False)
+        value = slots["values"]
+        turn(arrive=False)
+        return value
+
+    return algebra.Operand(shape, dtype, slot)
+
+
 def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_view, status_views, q_smem,
               q_loaded, out_smem, row_smem, streams, views: dict, turn, streamed: tuple, first,
               spans: _Spans | None, hooked: _Hooked, guard: _Guard | None, place: tuple, *, hooks: Hooks,
               residuals: _Residuals | None, anchors: tuple | None = None, interpret: bool,
-              finished: tuple | None = None, certified: tuple | None = None, kept=None):
+              finished: tuple | None = None, certified: tuple | None = None, kept=None,
+              merging: tuple | None = None):
     """A consumer's query block (batch row, head and key head `place`): its walk of the key tiles it reads
     through the family's streams (`algebra.plain_step` a step) from the hooks' initial state, the score hook
     on each tile, passing those of the program's `streamed` range its partner alone reads; then its output
@@ -755,7 +816,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     XLA, `_trained_forward`). With `certified` (its views and an fp32 stage, `_Block.certified`), the plain
     walk stores its state after each key tile (`certified_walk`). With `kept` (a launch into the plain
     launch's outputs, `_Read.kept`), it writes its rows `kept` alone, every other row of its views as it was
-    (`_kept_rows`)."""
+    (`_kept_rows`). With `merging` (a split launch that merges its slices: their states' slots and its
+    semaphores, `_merge`), its output is its slices' merge, the last slice's program's."""
     row, head, _ = place
     family, tiles = program.family, program.tiles
     lo, hi, whole = program.reach(first, spans, row)
@@ -769,7 +831,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     # place the algebra passes through (`algebra.Keys.accumulate`), a constant no loop may carry.
     state_rows = (row, head, pl.ds(first, tiles.block_q))
     start, live, merged = _started(program, spec, guard, hooked, state_rows, first, value_width,
-                                   training=residuals is not None)
+                                   training=residuals is not None, merges=merging is not None)
     pl.when(consumer == 1)(turn)
     # The queries' intervals and ids read once, before the walk (`_query_bounds`).
     held = None if spans is None else program.bounds(first, spans, row)
@@ -778,18 +840,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
                        hooks=hooks, drawn=hooked.drop is not None, held=held, product=product)
 
-    def value_of(slots):
-        # The value slot, once the partner's products are issued: its turn on the tensor cores is over when
-        # this one's come.
-        turn(wait=False)
-        slot = slots["values"]
-        turn(arrive=False)
-        return slot
-
-    def values(slots) -> algebra.Operand:
-        # The value tile's type beside its slot's acquisition, which the step defers to the form reading it.
-        return algebra.Operand((tiles.block_k, value_width), views["values"][0].dtype,
-                               functools.partial(value_of, slots))
+    values = functools.partial(_value_tile, (tiles.block_k, value_width), views["values"][0].dtype, turn)
 
     def dot(lhs, rhs):
         return family.registers_product(lhs, rhs, interpret)
@@ -849,9 +900,77 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
                       smem=out_smem)
     pl.when(consumer == 0)(turn)
     overflowed = jnp.where(algebra.overflowed(state.acc), 1.0, 0.0)
-    family.stored((family.as_row(state.m), family.as_row(overflowed)), status_views, smem=row_smem)
+    # A row that saw no key -inf (`algebra.reached`'s convention), every other its maximum, `LEAST` included.
+    maximum = jnp.where(algebra.no_keys(state.total), -jnp.inf, state.m)
+    family.stored((family.as_row(maximum), family.as_row(overflowed)), status_views, smem=row_smem)
+    merge = None
+    if merging is not None:
+        slots, ready = merging
+        initial = (None if hooked.initial is None
+                   else functools.partial(_initial_rows, family, hooked, state_rows))
+        merge = _Merge(slots, ready, program.split(), program.splits, initial)
     _stored_walk(program, spec, state, trained, hooked, (row, head, first), hooks=hooks, residuals=residuals,
-                 out=(out_view, out_smem), rows=(finished, row_smem), keep=keep)
+                 out=(out_view, out_smem), rows=(finished, row_smem), keep=keep, merge=merge)
+
+
+def _written_views(block: _Block, written: tuple, stages: tuple, *, training: bool, finishes: bool,
+                   columns_at, certified: bool, merges: tuple | None) -> tuple:
+    """A consumer's views of its launch's outputs `written` (`_launched`'s), its `stages` its scratch:
+    a training launch's status and residuals; an inference launch's status, output (its block of the
+    columns, `columns_at`) and finished rows, a merging launch's merge (`_merging_of`, `merges` its
+    semaphores, place and slices) and a certified launch's certificate. None for each it does not write."""
+    out_view = finished = residuals = certify = merging = None
+    if training:
+        status_ref, rows_ref, keys_ref, others_ref = written
+        residuals = _Residuals(tuple(rows_ref.at[place, *block.state] for place in range(5)),
+                               keys_ref.at[block.state], others_ref.at[block.state], stages[0])
+        return block.status(status_ref), out_view, finished, residuals, certify, merging
+    if merges is not None:
+        status, out_view, finished, merging = _merging_of(block, written, finishes, columns_at, *merges)
+    else:
+        status, out_view, finished = block.inference(written, finishes)
+        if certified:
+            certify = (*block.certified(written), stages[-1])
+    if columns_at is not None:
+        out_view = out_view.at[:, columns_at]
+    return status, out_view, finished, residuals, certify, merging
+
+
+def _merging_of(block: _Block, written: tuple, finishes: bool, columns_at, ready, place: tuple, splits: int
+                ) -> tuple:
+    """A consumer's views in a launch that merges its slices (`_Block.merging`), a block of the columns'
+    slots at `columns_at` where the launch walks one, and its semaphores, a slice each (`_Merge`): at
+    `place`, its batch row, the grid's head (a head's block of the columns) and the consumer."""
+    status, out_view, finished, slots = block.merging(written, finishes)
+    if columns_at is not None:
+        slots = slots._replace(acc=slots.acc.at[:, :, columns_at])
+    row, axis, index = place
+    tile = lax.div(lax.axis_index("q_tiles"), splits)
+    return status, out_view, finished, (slots, None if ready is None else ready.at[row, axis, tile, index])
+
+
+class _Merge(NamedTuple):
+    """A split launch's merge of its slices (`_launch`'s `merges`) at a consumer's rows: every slice's
+    state's slots (`algebra.Partial` of views, `_Block.merging`), its semaphores a slice (None interpreted,
+    `Family.partials_ready`), this program's slice, the slices, and the call's initial state's read (as the
+    call gives it, `_initial_rows`; None without one), which the last slice alone makes. Every slice but the
+    last leaves its state in its slot and signals; the last merges them in turn and the initial state
+    (`algebra.initial_state`), finishes and stores the rows' output (`Family.fixed_up`, the algebra's merge
+    its combine): one launch, no merge in XLA after it."""
+    slots: algebra.Partial
+    ready: Any
+    split: jax.Array
+    splits: int
+    initial: Callable[[], algebra.Partial] | None
+
+
+def _initial_rows(family: mosaic.Family, hooked: _Hooked, rows: tuple) -> algebra.Partial:
+    """The call's initial state at a consumer's `rows` as the call gives it (its maximum natural, its sums
+    unnormalized), in the family's layouts."""
+    assert hooked.initial is not None
+    m0, total0, acc0 = hooked.initial
+    return algebra.Partial(family.tile_of(acc0.at[rows]), family.rows_of(m0.at[rows]),
+                           family.rows_of(total0.at[rows]))
 
 
 def _kept_of(program: _Program, kept, *, rows: tuple) -> jax.Array:
@@ -973,27 +1092,50 @@ def _deferred_walk(spec: algebra.Forward, family: mosaic.Family, tiles: Tiles, q
 
 def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partial, trained: tuple | None,
                  hooked: _Hooked, place: tuple, *, hooks: Hooks, residuals: _Residuals | None, out: tuple,
-                 rows: tuple, keep: jax.Array | None = None) -> None:
+                 rows: tuple, keep: jax.Array | None = None, merge: _Merge | None = None) -> None:
     """A consumer's walk's result stored (`_consumer`): its output under the output hook through `out` (its
     view and stage), its finished rows through `rows` (their views, None where the launch finishes none, and
     their stage); a training walk's (`trained`, its anchor's terms) its residual rows and anchor keys
     instead, no output. `place` its batch row, head and first query; with `keep`, each written at those rows
-    alone, every other row of its view as it was (`_kept_rows`)."""
+    alone, every other row of its view as it was (`_kept_rows`). With `merge`, the output the slices'
+    merge's, which the last slice's program stores (`_Merge`)."""
     family = program.family
     row, head, first = place
     (out_view, out_smem), (finished, row_smem) = out, rows
     if residuals is None or trained is None:
         out_params = tuple(_param(family, ref, param.kind, row, head, first, state.acc)
                            for ref, param in zip(hooked.output, hooks.output_params, strict=True))
-        output, maximum, denominator = algebra.finish(spec, state, initial=hooked.initial is not None,
-                                                      output_mod=hooks.output_mod, output_params=out_params)
-        family.stored((_kept_rows(family, keep, output, out_view),), (out_view,), smem=out_smem)
-        if finished is not None:
-            # Its rows as the backward reads them beside the output (`Output`): the maximum and denominator
-            # `finish` leaves.
-            family.stored(tuple(_kept_rows(family, keep, family.as_row(part), view)
-                                for part, view in zip((maximum, denominator), finished, strict=True)),
-                          finished, smem=row_smem)
+
+        def store(state: algebra.Partial, form: algebra.Forward, *, initial: bool) -> None:
+            output, maximum, denominator = algebra.finish(form, state, initial=initial,
+                                                          output_mod=hooks.output_mod,
+                                                          output_params=out_params)
+            family.stored((_kept_rows(family, keep, output, out_view),), (out_view,), smem=out_smem)
+            if finished is not None:
+                # Its rows as the backward reads them beside the output (`Output`): the maximum and
+                # denominator `finish` leaves.
+                family.stored(tuple(_kept_rows(family, keep, family.as_row(part), view)
+                                    for part, view in zip((maximum, denominator), finished, strict=True)),
+                              finished, smem=row_smem)
+
+        if merge is None:
+            store(state, spec, initial=hooked.initial is not None)
+            return
+        # A slice's state finished (a short row's slice may see no key) and folded (`algebra.slice_state`),
+        # in the units its finished rows are in (`algebra.finished_form`: a fold's natural ones); each slot a
+        # slice from the last, which merges the others' in turn, then the initial state's, and finishes
+        # once: no row's output multiplied back by its denominator.
+        form = algebra.finished_form(spec)
+        own = algebra.slice_state(form, *algebra.finish(spec, state, initial=True))
+        slot = merge.splits - 1 - merge.split
+
+        def merged(running: algebra.Partial) -> None:
+            if merge.initial is not None:
+                running = algebra.merge(form, running, algebra.initial_state(form, merge.initial()))
+            store(running, form, initial=True)
+
+        family.fixed_up(own, merge.slots, merge.ready, slot, slot, merge.splits, merged,
+                        combine=functools.partial(algebra.merge, form))
         return
     maximum, denominator = algebra.finished_rows(spec, state, initial=hooked.initial is not None)
     own, others_total, key = trained
@@ -1016,7 +1158,7 @@ def _walk_of(family: mosaic.Family, streams, lo, hi, counted, *, interpret: bool
 
 
 def _started(program: _Program, spec: algebra.Forward, guard: _Guard | None, hooked: _Hooked, rows: tuple,
-             first, value_width: int, *, training: bool
+             first, value_width: int, *, training: bool, merges: bool = False
              ) -> tuple[algebra.Partial, jax.Array | None, bool]:
     """A consumer's walk's start at its `rows` (batch row, head, queries from `first`): its state, its
     guard's live rows (None unguarded) and whether the initial state merges past the walk instead
@@ -1030,9 +1172,11 @@ def _started(program: _Program, spec: algebra.Forward, guard: _Guard | None, hoo
         # A split launch's live rows its slice's (`_Program.splits`), slice by slice along their query axis.
         slice_first = program.split() * (guard.live.shape[-1] // program.splits) + first
         live = family.rows_of(guard.live.at[row, head, pl.ds(slice_first, block_q)]) > 0
-    merged = hooked.initial is not None and guard is None and not training
+    # A launch that merges its slices takes the initial state into their merge alone (`_merge`), no slice's
+    # walk.
+    merged = hooked.initial is not None and guard is None and not training and not merges
     start = (_initial(family, spec, hooked, rows, live) if hooked.initial is not None and not merged
-             else _empty(family, (block_q, value_width), live))
+             and not merges else _empty(family, (block_q, value_width), live))
     return start, live, merged
 
 
@@ -1163,7 +1307,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
             table: tuple[jax.Array, int] | None = None, column_width: int | None = None,
             walks: jax.Array | None = None, sources: jax.Array | None = None, shared_by: int = 1,
             column_blocks: int = 1, certified: bool = False, into: tuple | None = None,
-            keeping: jax.Array | None = None):
+            keeping: jax.Array | None = None, merges: bool = False):
     """The forward's launch in `spec`'s form (`guard`'s rows shifting where given): its rows' status `[2, B,
     H, Qp]` fp32, their maxima in the walk's units and 1 where their weighted values overflowed
     (`algebra.walked_launches`), and its output `[B, Qp, H, Dv]` in `out_dtype` (the query's by default). In
@@ -1193,10 +1337,14 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     form's (`certified_walk`): its plain walk's state after each key tile beside its outputs. With `into`
     (refs holding the plain launch's outputs but its status, `_Read.into`), it writes its rows `keeping` into
     them in place and gives its status alone: a masked rewalk's rows, every other row the plain launch's bits,
-    no copy of the outputs and no select over them (`algebra.walked_launches`' `in_place`).
+    no copy of the outputs and no select over them (`algebra.walked_launches`' `in_place`). A split launch
+    that `merges` its slices gives their merge, the last slice's program's, the initial state's among them
+    (`_Merge`), as its output `[B, Qp, H, Dv]` and finished rows `[2, B, H, Qp]`, its status the slices':
+    legal where every program of its grid is resident at once (`MosaicForward.legal`), as the merge's waits
+    need.
     """
-    if splits > 1 and (training or peaks or hooked.initial is not None):
-        raise ValueError("a split launch walks an inference call with no initial state")
+    if splits > 1 and (training or peaks or (hooked.initial is not None and not merges)):
+        raise ValueError("a split launch walks an inference call, an initial state only into its merge")
     # Each launch named apart, so its compile reports and profile rows say which it is; a launch over a block
     # of the value columns by the block's width, every block's one kernel (the name is a static of its
     # lowering, `_launched`: named by its first column, a width 256 compiled four, train 505's review).
@@ -1204,7 +1352,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     block_width = column_width or value.shape[-1]
     name = (f"attention_{kind}{'_natural' if spec.natural else ''}{'_kept' if kept else ''}"
             f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{block_width}'}"
-            f"{'_certified' if certified else ''}")
+            f"{'_certified' if certified else ''}{'_merged' if merges else ''}")
     # The hooks' functions and their arrays' shapes and dtypes static, their arrays the programs' operands.
     # A block of the values' columns its index a scalar the programs read, so every block's launch is one
     # kernel (`_key_views`): a static index compiled a kernel a block, four at width 256 (the forward's
@@ -1222,24 +1370,23 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
                      name=name if splits == 1 else f"{name}_split", splits=splits,
                      page=None if table is None else table[1],
                      column_width=column_width, shared_by=shared_by, column_blocks=column_blocks,
-                     certified=certified)
+                     certified=certified, merges=merges and splits > 1)
 
 
 @tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
                       "counted", "finishes", "target", "name", "splits", "page", "column_width", "shared_by",
-                      "column_blocks", "certified"))
+                      "column_blocks", "certified", "merges"))
 def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.Forward, tiles: Tiles,
               family: mosaic.Family, training: bool, interpret: bool,
               peaks: bool, out_dtype, counted: bool, finishes: bool, target: generation.GpuTarget,
               name: str, splits: int = 1, page: int | None = None,
               column_width: int | None = None, shared_by: int = 1, column_blocks: int = 1,
-              certified: bool = False):
+              certified: bool = False, merges: bool = False):
     """`_launch`'s kernel launched on its operands and the arrays its programs read beside them (`read`, the
     hooks' among them, `_Hooked`), its static `hooks` holding their arrays' shapes and dtypes in their place
     (its functions a key's, which `tuning.holdable` reads), lowered once for every call of its static facts
     and its operands' shapes and dtypes (`tuning.lowered_once`); `target` the GPU its config is derived for,
     `name` its kernel's (`mosaic.kernel` reports it as the launch tracing it names it)."""
-    del target
     leaves, treedef = jax.tree.flatten(read)
     batch, queries, heads, width = query.shape
     # A block of the values' columns where it walks one in place (`_launch`'s `column_width`).
@@ -1267,11 +1414,12 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                          certified=certified)
     out_type = _out_types(batch, queries, heads, value_width * column_blocks, out_dtype, splits=splits,
                           peaks=peaks, training=training, finishes=finishes,
-                          certified=steps if certified else 0)
-    # A launch into the plain launch's outputs (`_Read.into`) gives its status alone, the rest in place.
+                          certified=steps if certified else 0, merges=merges)
+    # A launch into the plain launch's outputs (`_Read.into`) gives its status alone, the rest in place, but
+    # a merging launch's slices' states, its own.
     in_place = read.into is not None
     if in_place:
-        out_type = out_type[:1]
+        out_type = (out_type[0], *out_type[-2:]) if merges else out_type[:1]
     layout = _Layout(treedef, len(out_type), len(scoped) - 2, peaks or (reuse and not training))
 
     def body(*refs, streams):
@@ -1291,6 +1439,9 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
         streamed = _streamed([program.reach(pair_first + index * block_q, read.spans, row)[:2]
                               for index in range(consumers)])
         turn = functools.partial(family.turn, refs.schedule, consumers)
+        # A merging launch's semaphores, a slice each of a consumer's query block (`_Merge`).
+        ready = (family.partials_ready((batch, heads * column_blocks, queries // pair, consumers, splits),
+                                       bool(interpret)) if merges else None)
 
         def consumer(index):
             block = _Block.of(program, row, head, pair_first + index * block_q, queries)
@@ -1302,28 +1453,20 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                streamed, block.first, read.spans, read.hooked, (row, head), hooks=hooks,
                                interpret=interpret)
                 return
-            out_view = finished = residuals = certify = None
-            written = (*refs.written, *read.into) if in_place else refs.written
-            if training:
-                status_ref, rows_ref, keys_ref, others_ref = written
-                status = block.status(status_ref)
-                residuals = _Residuals(tuple(rows_ref.at[place, *block.state] for place in range(5)),
-                                       keys_ref.at[block.state], others_ref.at[block.state],
-                                       refs.stages[0].at[index])
-            else:
-                status, out_view, finished = block.inference(written, finishes)
-                if certified:
-                    certify = (*block.certified(written), refs.stages[-1].at[index])
-                if column_blocks > 1 or (in_place and column is not None):
-                    # A block of the columns writes its own of the output's, the whole call's in place.
-                    assert column is not None  # a launch of several column blocks reads its own
-                    out_view = out_view.at[:, pl.ds(column * value_width, value_width)]
+            written = (refs.written[0], *read.into, *refs.written[1:]) if in_place else refs.written
+            # A block of the columns writes its own of the output's, the whole call's in place.
+            columns_at = (pl.ds(column * value_width, value_width)
+                          if column is not None and (column_blocks > 1 or in_place) else None)
+            status, out_view, finished, residuals, certify, merging = _written_views(
+                block, written, tuple(stage.at[index] for stage in refs.stages), training=training,
+                finishes=finishes, columns_at=columns_at, certified=certified,
+                merges=(ready, (row, axis, index), splits) if merges else None)
             _consumer(program, spec, index, refs.q.at[row, pl.ds(block.first, block_q), head], out_view,
                       status, *stages, refs.out_smem.at[index], refs.row_smem.at[index], streams, views, turn,
                       streamed, block.first, read.spans, read.hooked, read.guard,
                       (row, head, lax.div(head, group)), hooks=hooks, residuals=residuals,
                       anchors=read.anchors, interpret=interpret, finished=finished, certified=certify,
-                      kept=read.kept)
+                      kept=read.kept, merging=merging)
 
         def producer():
             family.stream(streams, views, *streamed)
@@ -1344,9 +1487,12 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,
                                 peaks=peaks, training=training, counted=counted, shared_by=shared_by)
     grid = (heads * column_blocks, queries // pair * splits, batch)
+    # A merging launch's every program resident at once (`MosaicForward.legal`), its registers capped so
+    # that many fit a multiprocessor's (`Family.kernel`'s `resident`).
+    resident = (-(-math.prod(grid) // target.multiprocessors) if merges and target.multiprocessors else 1)
     return family.kernel(entry, out_type=out_type, grid=grid,
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
-                         interpret=interpret,
+                         interpret=interpret, resident=resident,
                          approx_math=approx_math, name=name, cost=cost, model_flops=model,
                          reducing_warpgroups=reducing(family, consumers, hooks.score_mod, hooks.output_mod,
                                                       guarded=read.guard is not None)
