@@ -1081,6 +1081,35 @@ class CausalSelfAttention(nn.Module):
                            softcap=self.ctx.attn_logit_softcap, sinks=bool(self.ctx.attention_sinks),
                            wide_logits=self.ctx.wide_logits)
 
+    def _prefixed(self, query, key, value, places, prefix, attention_metadata: AttentionMetadata | None):
+        """A bidirectional canvas's call over its encoder's frozen prefix and its own tokens: the query and
+        the keys and values joined, the real keys `[B, alloc + S]` the kernel reads beside the call (its key
+        validity, no dense mask) and the keys' places. Every canvas query reads the same retained encoder
+        keys and all canvas keys (modeling_diffusion_gemma.py:1399-1401); a local layer retains the last
+        window-1 prefix keys. The encoder's keys are read from its cache in whatever layout keeps them
+        (`KVStore.read`: paged, quantized, its keys in the layout's rotation, which the canvas's queries
+        and keys take too, as a sharing layer's do)."""
+        B, S = query.shape[:2]
+        store = KVStore.open(self, self.ctx.kv_cache, B, self.ctx.max_seq_len, key.shape[-2], key.shape[-1],
+                             key.dtype, value_dim=self.value_dim, places=self._reads_places)
+        cached_key, cached_value = store.read()
+        rotation = self.ctx.kv_cache.key_rotation(self.ctx.head_dim)
+        if rotation is not None:
+            query, key = rotated(query, rotation), rotated(key, rotation)
+        alloc = cached_key.shape[-3]
+        valid_prefix = cached_validity(self, alloc)
+        if self.ctx.sliding_window is not None:
+            retained = jnp.arange(alloc)[None, :] > prefix[:, None] - self.ctx.sliding_window
+            valid_prefix = valid_prefix & retained
+        canvas_valid = (jnp.ones((B, S), bool)
+                        if attention_metadata is None or attention_metadata.valid is None
+                        else attention_metadata.valid)
+        key_places = (jnp.concatenate([store.read_places(), jnp.broadcast_to(places, (B, S))], axis=-1)
+                      if self._reads_places else jnp.arange(alloc + S))
+        return (query, jnp.concatenate([cached_key.astype(key.dtype), key], axis=-3),
+                jnp.concatenate([cached_value.astype(value.dtype), value], axis=-3),
+                jnp.concatenate([valid_prefix, canvas_valid], axis=-1), key_places)
+
     def _masking(
         self,
         query,
@@ -1120,33 +1149,9 @@ class CausalSelfAttention(nn.Module):
         cursor = starts = None  # the decode mask the kernels stand in for, when this call builds it
         prefix_valid = None
         if prefix is not None:
-            # Every canvas query reads the same retained encoder keys and all
-            # canvas keys (modeling_diffusion_gemma.py:1399-1401). A local
-            # layer retains the last window-1 prefix keys. The encoder's keys are
-            # read from its cache in whatever layout keeps them (`KVStore.read`:
-            # paged, quantized, its keys in the layout's rotation, where the
-            # canvas's queries and keys are taken too, as a sharing layer's).
-            store = KVStore.open(self, self.ctx.kv_cache, B, self.ctx.max_seq_len, key.shape[-2],
-                                 key.shape[-1], key.dtype, value_dim=self.value_dim,
-                                 places=self._reads_places)
-            cached_key, cached_value = store.read()
-            rotation = self.ctx.kv_cache.key_rotation(self.ctx.head_dim)
-            if rotation is not None:
-                query, key = rotated(query, rotation), rotated(key, rotation)
-            alloc = cached_key.shape[-3]
-            prefix_slots = jnp.arange(alloc)[None, :]
-            valid_prefix = cached_validity(self, alloc)
-            if self.ctx.sliding_window is not None:
-                valid_prefix = valid_prefix & (prefix_slots > prefix[:, None] - self.ctx.sliding_window)
-            canvas_valid = (jnp.ones((B, S), bool) if attention_metadata is None
-                            or attention_metadata.valid is None else attention_metadata.valid)
-            # The real keys the kernel reads beside the call (its key validity), no dense mask.
-            prefix_valid = jnp.concatenate([valid_prefix, canvas_valid], axis=-1)
-            key = jnp.concatenate([cached_key.astype(key.dtype), key], axis=-3)
-            value = jnp.concatenate([cached_value.astype(value.dtype), value], axis=-3)
+            query, key, value, prefix_valid, key_places = self._prefixed(query, key, value, places, prefix,
+                                                                         attention_metadata)
             causal, window = False, None
-            key_places = (jnp.concatenate([store.read_places(), jnp.broadcast_to(places, (B, S))], axis=-1)
-                          if self._reads_places else jnp.arange(alloc + S))
         elif self.ctx.kv_shared and decode:
             # The provider's stashed keys carry the full history, read as its own cache is.
             key_places, history = held
@@ -1399,7 +1404,8 @@ class CausalSelfAttention(nn.Module):
         # Each query's keys up to its own slot, widened by the groups it reads whole as a prefill's are
         # (`visibility_mask`: a block or an image holding its key runs on to its end).
         keep = visibility_mask(width, keys.shape[1], causal=True, sliding_window=None, key_valid=real,
-                               query_slots=slots, **key_groups)
+                               query_slots=slots, block_groups=key_groups.get("block_groups"),
+                               image_groups=key_groups.get("image_groups"))
         # A padding query reads one key, so its (unused) output stays finite.
         keep = keep | ((prompt < 0)[:, None, :, None] & (jnp.arange(keep.shape[-1]) == 0))
         prefilled = scaled_dot_product_attention(

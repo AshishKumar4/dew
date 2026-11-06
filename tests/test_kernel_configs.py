@@ -736,6 +736,53 @@ def test_a_program_that_launches_no_triton_kernel_gives_no_evidence(generation_n
     assert failures(compile_kernels([case], generation_name))
 
 
+ROUTED_ROWS, ROUTED_DEPTH, ROUTED_WIDTH = 256, 512, 256
+"""A dense projection's rows, depth and width, its rows split over a route test's two devices."""
+
+
+def _projected(local: bool):
+    """A dense projection's forward and backward through the GEMM template (`gemm.gemm`, its launch chosen,
+    as the dense selector picks XLA's dot), the gradient in both operands: its rows per shard
+    (`sharding.manual_map`) where `local`, else left to the partitioner."""
+    from dew.nn import sharding
+    from dew.nn.kernels import gemm
+
+    def projected(x, w):
+        return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
+
+    def step(x, w):
+        # Mapped as it traces, on the mesh its program lowers for (`manual_map` reads the mesh in context).
+        specs = (PartitionSpec("data"), PartitionSpec())
+        forward = sharding.manual_map(projected, specs, PartitionSpec("data")) if local else projected
+        with generation.chosen(grouped_matmul="mosaic_gpu"):
+            return jax.grad(lambda x, w: forward(x, w).astype(jnp.float32).sum(), argnums=(0, 1))(x, w)
+
+    shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    return step, (shaped((ROUTED_ROWS, ROUTED_DEPTH)), shaped((ROUTED_DEPTH, ROUTED_WIDTH)))
+
+
+@pytest.mark.parametrize("local", [True, False], ids=["per-shard", "partitioned"])
+def test_a_routes_launches_run_per_shard_with_only_their_planned_collectives(local):
+    """A dense projection's forward and backward through the GEMM template, its rows split over two
+    compile-only H100s and compiled for them: run per shard (`sharding.manual_map`), both gradients launch
+    (the forward's product, which no gradient reads, is the program's to drop), each reading its shard's
+    rows (the cotangent's, the input's), and the program sums by one all-reduce over the rows' axis (the
+    weight's gradient) and moves nothing (`kernel_compile.Expected`, its route evidence). Left to the
+    partitioner, the same evidence refuses the program (a null control): an opaque launch's operands
+    gathered to every device, or no program at all."""
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    expected = Expected(axes=(("data", 2),), specs=(PartitionSpec("data"), None),
+                        launches=frozenset({"dew_gmm", "dew_tgmm"}),
+                        shards={"dew_gmm": (ROUTED_ROWS // 2, ROUTED_WIDTH), "dew_tgmm": (ROUTED_ROWS // 2,
+                                                                                     ROUTED_DEPTH)},
+                        collectives=frozenset({("all-reduce", frozenset({"data"}))}))
+    cases = [support.KernelCase("projection", lambda: _projected(local), expected=expected)]
+    found = compile_mosaic_kernels(cases, "sm90")
+    failed = route_failures(cases, found)
+    assert (failed == []) == local, failed
+
+
 def test_each_triton_call_needs_a_launch_of_its_own():
     """A program's Triton calls, one named as another begins and one made twice, compiled for a compile-only
     A100: with every launch line XLA writes, the gate reads their shared bytes; without one of the two

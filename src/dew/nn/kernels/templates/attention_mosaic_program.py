@@ -725,10 +725,10 @@ class _Spans(NamedTuple):
 
     start: jax.Array
     end: jax.Array
-    lo: jax.Array
-    hi: jax.Array
-    full_lo: jax.Array
-    full_hi: jax.Array
+    lo: jax.Array | None
+    hi: jax.Array | None
+    full_lo: jax.Array | None
+    full_hi: jax.Array | None
     q_lo: jax.Array | None
     q_hi: jax.Array | None
     query_ids: jax.Array | None = None
@@ -915,7 +915,8 @@ class _Program[T: (Tiles, BackwardTiles)]:
             # A block holding padding rows is whole nowhere: its padding sees no key (`algebra.seen`).
             count = jnp.where(self.padded(first), 0, self.whole(first, walked))
             return *self._sliced(jnp.int32(0), walked), lambda index: index < count
-        if spans.lo is None:
+        if spans.lo is None or spans.hi is None or spans.full_lo is None or spans.full_hi is None:
+            # Read by position (`_spans_of`): no block map.
             return self._positions_reach(first, spans, row)
         block = lax.div(first, self.tiles.block_q)
         full_lo, full_hi = spans.full_lo[row, block], spans.full_hi[row, block]
@@ -929,7 +930,7 @@ class _Program[T: (Tiles, BackwardTiles)]:
 
         return *self._sliced(spans.lo[row, block], spans.hi[row, block]), whole
 
-    def _positions(self, first, spans: _Spans, row) -> list[tuple[jax.Array, jax.Array, jax.Array]]:
+    def _positions(self, first, spans: _Spans, row) -> list[tuple[jax.Array, ...]]:
         """The positions a query block from `first` holds rows of, in a call whose intervals each hold
         `per_span` queries (`KeySpans.per_span`): each one's index, its interval `[start, end)` (batch row
         `row`'s, read once) and whether the block holds its rows; as many as the block can hold,
@@ -999,9 +1000,11 @@ class _Program[T: (Tiles, BackwardTiles)]:
             return self._first_reader(k_first, q_steps), jnp.int32(q_steps), lambda index: (
                 (index >= start) & (index < end))
         block = lax.div(k_first, self.tiles.block_k)
+        full_lo, full_hi = spans.full_lo, spans.full_hi
+        assert full_lo is not None and full_hi is not None, "a key block's walk reads its block map"
 
         def seen_whole(index):
-            inside = (block >= spans.full_lo[row, index]) & (block < spans.full_hi[row, index])
+            inside = (block >= full_lo[row, index]) & (block < full_hi[row, index])
             if spans.query_doc is None or spans.key_doc is None:
                 return inside
             doc = spans.key_doc[row, block]
