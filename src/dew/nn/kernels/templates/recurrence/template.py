@@ -272,11 +272,11 @@ class Mosaic(base.Template[mainloop.Tiles]):
              firsts: jax.Array | None = None, max_segments: int | None = None, scale: float | None = None,
              delta: bool = True, wide: bool = False, floor: float | None = None, bound: float | None = None,
              rounded: bool = False, skip: jax.Array | None = None, recomputed: bool = False,
-             config: mainloop.Tiles, return_residuals: bool = False):
+             every: bool = False, config: mainloop.Tiles, return_residuals: bool = False):
         del return_residuals
         return mosaic_rule(query, key, value, g, beta, state, tiles=config, starts=starts, firsts=firsts,
                            max_segments=max_segments, scale=scale, delta=delta, wide=wide, floor=floor,
-                           bound=bound, rounded=rounded, skip=skip, recomputed=recomputed), None
+                           bound=bound, rounded=rounded, skip=skip, recomputed=recomputed, every=every), None
 
     @staticmethod
     def launched() -> generation.GpuTarget:
