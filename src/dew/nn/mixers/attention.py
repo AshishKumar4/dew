@@ -123,13 +123,10 @@ def held_reads(index: jax.Array, positions: jax.Array) -> jax.Array:
 def mixed_attention_refusal(ctx: MixerContext, *, alibi: bool, bidirectional_images: bool,
                             bidirectional_blocks: bool) -> str | None:
     """Why attention over `ctx` cannot run a serving step's mixed call
-    (`dew.nn.inputs.Admitted`), or None: it reads a full-precision cache,
-    dense or one page pool, whole and causal, and nothing a row carries
-    besides."""
+    (`dew.nn.inputs.Admitted`), or None: it reads a cache, dense or one page
+    pool, whole and causal, and nothing a row carries besides."""
     layout = ctx.kv_cache
     refusals = {
-        "a quantized or rotated cache": (layout.quantized is not None
-                                          or layout.key_rotation(ctx.head_dim) is not None),
         "a page pool split into groups": layout.page_size is not None and layout.groups != 1,
         "an attention chunk": ctx.attention_chunk is not None,
         "ALiBi": alibi,
@@ -1397,6 +1394,10 @@ class CausalSelfAttention(nn.Module):
         prompt = positions[rows:].reshape(pieces, width)
         index.value = (index.value + (positions[:rows] >= 0)).at[admitted.slots].set(
             admitted.cursors + jnp.sum(prompt >= 0, axis=1, dtype=jnp.int32), mode="drop")
+        # A cache keeping its keys rotated (an int8 one's) is read by queries in the same rotation.
+        rotation = self.ctx.kv_cache.key_rotation(self.ctx.head_dim)
+        if rotation is not None:
+            query = rotated(query, rotation)
         # A windowed layer's window where it narrows the cache: each decoding row from its first key under
         # it (`_decode_masks`, a block read whole from its start), each piece's query over its own window.
         window = self.ctx.sliding_window
@@ -1417,7 +1418,9 @@ class CausalSelfAttention(nn.Module):
             decoded = self._decode_attention(query[0, :rows, None], *store.read(), positions[:rows], starts,
                                              self.sinks)
         queries = query[0, rows:].reshape(pieces, width, *query.shape[2:])
-        if admitted.continuing:
+        # A piece over a quantized or rotated cache reads its keys as the cache keeps them, from its row,
+        # as its own prefill reads them back (`KVStore.read_rows`).
+        if admitted.continuing or self.ctx.kv_cache.quantized is not None or rotation is not None:
             # A padding piece's row is past the cache's; it reads row 0 and is never drawn from.
             held = jnp.where(admitted.slots < rows, admitted.slots, 0)
             keys, values = store.read_rows(held)
