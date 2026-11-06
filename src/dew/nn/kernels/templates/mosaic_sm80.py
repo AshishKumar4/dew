@@ -138,11 +138,13 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # each product states it, `plgpu.mma`'s `m_warps`): of the splits whose atom, `m_warps * 16` rows by
         # `(4 // m_warps) * 8` columns, divides the share, the one reading its operands from shared memory
         # fewest times a step, each warp reading its rows' share whole and its columns' share whole
-        # (`rows * (4 // m) + columns * m`), the most along the rows on a tie. A 128 x 128 share so splits
+        # (`rows * (4 // m) + columns * m`), the fewest along the rows on a tie, so a 32-column block read
+        # transposed (a guarded attention walk's magnitudes, 32 x 32 at a 64 x 32 share) takes whole row
+        # atoms, where four warps' 64-row atom cast it to no layout (et-sm80sc5). A 128 x 128 share so splits
         # 2 x 2 (512 reads a step, where four warps along its rows read 640), each warp holding half the
         # right operand's fragments.
         splits = [m for m in (4, 2, 1) if rows % (m * 16) == 0 and columns % ((4 // m) * 8) == 0]
-        m_warps = min(splits, key=lambda m: (rows * (4 // m) + columns * m, -m)) if splits else 4
+        m_warps = min(splits, key=lambda m: (rows * (4 // m) + columns * m, m)) if splits else 4
         return dataclasses.replace(self, m_warps=m_warps)
 
     @property
