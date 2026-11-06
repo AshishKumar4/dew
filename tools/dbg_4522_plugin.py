@@ -12,6 +12,7 @@ def pytest_configure():
     reference_error.WITHOUT_YNN = {}
     if os.environ.get("DEW_DBG_USER_DEFAULT") == "1":
         os.environ["DEW_WIDE_CPU_ARITHMETIC"] = "0"
+        jax.config.update("jax_default_matmul_precision", None)
         reference_error.summed_as_run = contextlib.nullcontext
         print("USER_SCOPE", "precision", jax.config.jax_default_matmul_precision,
               "wide_cpu", os.environ["DEW_WIDE_CPU_ARITHMETIC"], flush=True)

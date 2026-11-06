@@ -30,6 +30,7 @@ if os.environ.get("POLICY_HIGHEST"):
     dew.nn.precision.FP32_SUMS = "highest"
 if os.environ.get("POLICY_USER_DEFAULT"):
     os.environ["DEW_WIDE_CPU_ARITHMETIC"] = "0"
+    jax.config.update("jax_default_matmul_precision", None)
     summed_as_run = contextlib.nullcontext
 
 _original_scored = _Chain.scored
