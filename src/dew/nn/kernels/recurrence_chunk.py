@@ -465,7 +465,7 @@ def _portable_rule(chunk_size: int, delta: bool, scale: float, dtype: jnp.dtype)
 
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
                            starts=None, max_segments: int | None = None, floor: float | None = None,
-                           write_bound: float | None = None, firsts=None):
+                           write_bound: float | None = None, firsts=None, entered=None):
     """`torch_chunk_gated_delta_rule` (modeling_qwen3_next.py:374-453) with one
     log decay per head, `g` `[B, S, H]`, or `chunk_kimi_delta_attention`
     (modeling_glm5_next.py:482-578) with one per key dimension, `[B, S, H,
@@ -495,7 +495,8 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
     hooks = recurrence.Hooks(decay='vector' if g.ndim == 4 else 'scalar', scale=key.shape[-1] ** -0.5,
                              floor=floor, write_bound=write_bound)
     return chunk(hooks, Chunk(query, key, value, log_decay=g, beta=beta, state=state, starts=starts,
-                              firsts=firsts), chunk_size=chunk_size, max_segments=max_segments)
+                              firsts=firsts, entered=entered),
+                 chunk_size=chunk_size, max_segments=max_segments)
 
 
 @jax.tree_util.register_dataclass
