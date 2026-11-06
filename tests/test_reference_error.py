@@ -262,6 +262,11 @@ def test_check_1_sizes_a_cancelling_row_by_its_terms_and_admits_nothing_else():
                         terms=True, truth_fn=as_given(lambda x, w: {"rows": np.zeros((64, 4))}))
 
 
+def found(failure: GateFailure) -> list[tuple[str, str, float]]:
+    """A gate failure's findings as data: each one's leaf, rule and measure (`Finding`), not its wording."""
+    return [(finding.leaf, finding.rule, finding.measure) for finding in failure.findings]
+
+
 def sharded_site(monkeypatch, root, shards, site):
     """`site()` run as armada runs a sharded site: a map task for each range of `shards` (DRAWS), its
     records under `root` (RECORDS), then their judge (POOL over `root`); what each map task's run
@@ -317,7 +322,7 @@ def test_a_sharded_sites_map_tasks_size_its_cancelling_rows_and_its_judge_runs_n
                      site(cancelling(split=True, leak=True), "leaked"))
     # The judge, the last to run, ran no truth before it refused.
     assert truths == [], "a judge runs no truth"
-    assert str(pooled.value) == str(whole.value)
+    assert found(pooled.value) == found(whole.value)
 
 
 MIX = np.random.default_rng(2442).standard_normal((4, 4)).astype(np.float32)
@@ -456,7 +461,7 @@ def test_a_site_sharded_across_map_tasks_is_judged_by_their_pooled_draws_as_whol
         assert_as_exact(halved, jnp.matmul, a_product_draw, "halved", seeds=16)
     with pytest.raises(GateFailure) as pooled:
         judged(halved, "halved", [(0, 40), (40, 80), (40, 80)])
-    assert str(pooled.value) == str(whole.value)
+    assert found(pooled.value) == found(whole.value)
     with pytest.raises(PoolRefused) as short:
         judged(halved, "halved, short", [(0, 16)])
     with pytest.raises(PoolRefused) as gapped:
@@ -476,7 +481,7 @@ def test_a_site_sharded_across_map_tasks_is_judged_by_their_pooled_draws_as_whol
     with pytest.raises(GateFailure) as both:
         sharded_site(monkeypatch, tmp_path / "both stages", [(0, 16), (16, 56), (56, 80)],
                      lambda: assert_as_exact(halved, jnp.matmul, a_product_draw, "halved", seeds=16))
-    assert str(both.value) == str(whole.value)
+    assert found(both.value) == found(whole.value)
     monkeypatch.delenv(LATER)
     # Two tests' sites of one label, their records under one pool: each judge pools its own test's alone.
     def as_test(test, dew, *, records=None, pool=None):
