@@ -78,6 +78,13 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
         "kernel": ("fused", "step"),
         "state": ("float32", "bfloat16"),
     },
+    "norm_swiglu": {
+        "generation": ("sm90", "sm80"),
+        "op": ("rms_norm", "swiglu"),
+        "form": ("plain", "stream", "gated", "apart", "packed"),
+        "dtype": ("bfloat16", "float16", "float32"),
+        "width": ("narrow", "ragged", "wide", "beyond"),
+    },
 }
 """Each family's axes and their values. Attention's: the GPU; the head width; 8 query heads over 8 key heads,
 2, or 4; a causal, a full or a causal call over three documents and padding; no hook, two key or two tile
@@ -100,7 +107,11 @@ names (its form's port, fla's or mamba_ssm's, the reference); the operands' dtyp
 documents. The short conv's: the GPU; a gated delta net's training shapes (Qwen3.5-0.8B's or 9B's); the
 operands' dtype; whole rows or packed documents. The selective scan's: the GPU; the recorded mamba_ssm case
 (tests/selective_support.py's `SEEDED_CASES`). The recurrent decode's: the GPU; the fused step or the step
-alone; the dtype its recurrent state is held in."""
+alone; the dtype its recurrent state is held in. The fused norms' and SiLU products' (the choices `rms_norm`
+and `swiglu`): the GPU; the RMS norm or the SwiGLU product; the norm's plain, stream (a residual stream and
+its norm) or gated form, or the product of a gate and an up projection apart or of one packed projection; the
+operands' dtype; the feature width, narrower than a warp, ragged, a whole row of a program, or past the norm's
+register tile (4096 and 16384 features: the norm refuses the last)."""
 
 SEEDED: dict[str, tuple[tuple[int, tuple[str, ...]], ...]] = {
     "attention": (
@@ -120,6 +131,7 @@ CELLS: dict[str, tuple[str, str]] = {
     "short_conv": ("short_conv_matrix", "a_short_convs_training_step_is_on_par"),
     "selective_scan": ("selective_matrix", "a_selective_scan_is_as_exact_as_mamba_ssm"),
     "delta_decode": ("delta_decode_matrix", "a_decode_token_is_on_par"),
+    "norm_swiglu": ("norm_swiglu_matrix", "a_fused_entrys_training_step_is_on_par"),
 }
 """Each family's matrix cell function, by its module and name (`gpu_flow.cell`)."""
 
@@ -133,6 +145,7 @@ FLOWS: tuple[str, ...] = (
     "tests/test_gpu_recurrence.py::test_the_short_conv_matrix_holds_on_this_gpu",
     "tests/test_gpu_recurrence.py::test_the_selective_scan_matrix_holds_on_this_gpu",
     "tests/test_gpu_recurrence.py::test_the_recurrent_decode_matrix_holds_on_this_gpu",
+    "tests/test_gpu_numerics.py::test_the_norm_swiglu_matrix_holds_on_this_gpu",
 )
 """The flows that run the matrices' cells, by pytest node id."""
 
