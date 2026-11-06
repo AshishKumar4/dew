@@ -231,17 +231,24 @@ def split(function: Callable, state, operands: Sequence, carried: Sequence[int],
     prepared = list({terms.key(term): term for form in (*carry_forms, *emit_forms)
                      for term in _free(form, reading)}.values())
     # Each prepared value's products named by the forms that read it: an emitted output's a local readout's,
-    # every other the carry's write.
+    # a pairing of two of the chunk's operands among them its scores (`C Bᵀ`); every other the carry's write.
     emitted = {terms.key(term) for form in emit_forms for term in _free(form, reading)}
     consts = list(closed.consts)
+
+    def operand(term: Term) -> bool:
+        return get_callable_args(term, Term.leaf) is not None
 
     def prepare(*values, issue=None):
         leaves = [*consts, None, *values]
 
         def evaluated(term: Term):
             role = EMIT_ROLES[1] if terms.key(term) in emitted else CARRY_ROLES[1]
-            named = None if issue is None else lambda left, right: role
-            return forms.evaluator(region, leaves, {}, product=issue, named=named)(term)
+
+            def named(left: Term, right: Term) -> str:
+                return "scores" if role == EMIT_ROLES[1] and operand(left) and operand(right) else role
+
+            naming = None if issue is None else named
+            return forms.evaluator(region, leaves, {}, product=issue, named=naming)(term)
 
         return tuple(evaluated(term) for term in prepared)
 
