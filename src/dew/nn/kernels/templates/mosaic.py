@@ -757,7 +757,16 @@ class Ring:
     every program's producer loads the same view, its share of the block multicast into each program's slot,
     and each program's load barrier awaits the whole block. A release arrives at each program's barrier, so
     a slot is free once every consumer of every program has released it (CUTLASS's PipelineTmaAsync), and
-    the producer's drain holds its program until the others' last releases have reached it."""
+    the producer's drain holds its program until the others' last releases have reached it.
+
+    Its protocol is the one the kernel challenge's Lean model proves safe for every slot, consumer, producer,
+    byte and stage count (`Ring.ring_safe`, okc/notes/gpu-theory.md), on that proof's hypotheses, which
+    `ring` builds and every use keeps: a slot's load barrier expects the arrivals its step's copies make
+    (`copies`, `Pieces`), and its release barrier the arrivals of every consumer that reads it (`consumers`,
+    each program's with `multicast`, or the products' one commit); each wait is at the parity of its turn
+    (`Turn`), which flips once a wrap of the ring. tests/test_ring_protocol.py holds those hypotheses over
+    every interleaving of the toolkit's own walks, and fails a flipped parity, a missing arrival and an
+    early release."""
     smem: jax.Ref | state_types.TransformedRef
     full: jax.Ref
     consumed: jax.Ref
