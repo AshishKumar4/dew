@@ -15,7 +15,7 @@ from reference_error import assert_as_exact
 
 from dew.nn import precision
 from dew.nn.blocks import table_rows
-from dew.nn.kernels import gemm
+from dew.nn.kernels import gemm, generation
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -141,6 +141,37 @@ def test_an_adapted_product_holds_every_reverse_order(edge):
 
     assert_contract(adapted, primals, direction, cotangent, f"an adapted product {edge}", truth_fn=plain,
                     plain_fn=plain, without=FORWARD_ORDERS)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_an_nvfp4_products_kernels_hold_every_order(edge, kernel="xla"):
+    """`gemm.nvfp4_product` on its selector's `kernel` (`xla` here, the decoded matrix's product; `packed`,
+    the template's mainloop decoding each stage in place through `generation.linear_tangent` as `gemm` is,
+    on an H100 and an A100 in the GPU flow, tests/test_gpu_gemm.py: Mosaic GPU's interpreter runs its kernel
+    through ordered callbacks, which no rematerialization differentiates): every order runs in the rows,
+    finite wherever float64 is a normal float32 and wherever the plain product (the rows times the decoded
+    values times the deferred factor, its float64 run the truth) is, at values whose products near float32's
+    ends (row 3621). The frozen words and scales take no cotangent."""
+    codes = np.random.default_rng(3621).integers(0, 16, size=(256, 64))
+    e2m1 = np.asarray([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    magnitudes = np.where(codes >= 8, -1.0, 1.0) * e2m1[codes & 7]
+    exponents = np.random.default_rng(3622).integers(-2, 3, size=(16, 64))
+    block = jnp.asarray(np.exp2(exponents), jnp.float8_e4m3fn)
+    matrix = gemm.NvFp4.of(jnp.asarray(magnitudes, jnp.float32), block, 0.5)
+    values = matrix.decoded().astype(jnp.float32) * matrix.factor
+    primals = normal_draw(3623, (64, 256), scale=EDGES[edge])
+    direction = normal_draw(3624, (64, 256), scale=EDGES[edge])
+    (cotangent,) = normal_draw(3625, (64, 64))
+
+    def product(rows):
+        with generation.chosen(nvfp4=kernel):
+            return gemm.nvfp4_product(rows, matrix, out_dtype=rows.dtype)
+
+    def plain(rows):
+        return rows @ values.astype(rows.dtype)
+
+    assert_contract(product, primals, direction, cotangent, f"an NVFP4 product's {kernel} kernel {edge}",
+                    truth_fn=plain, plain_fn=plain)
 
 
 GROUPS = jnp.asarray([3, 0, 5], jnp.int32)
