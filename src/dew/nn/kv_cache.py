@@ -708,17 +708,18 @@ class KVStore:
         hooks = template.Hooks(None if softcap is None else template.Capped(softcap), initial=initial)
         interpret = generation.placed_platform() != "gpu"
         pools = [self._get(name) for name, _ in self.payloads]
-        # A quantized cache's codes read as they lie, dequantized in the walk by their scales (`scale_shape`).
-        scales = (None if self.layout.quantized is None
-                  else tuple(self._get(scale) for _, scale in (self.payloads * 2)[:2]))
+        # A quantized cache's codes read as they lie, dequantized in the walk by their scales (`scale_shape`):
+        # the keys' and the values' (a cache keeping its keys as its values reads the keys' twice).
+        held = None
+        if self.layout.quantized is not None:
+            held = (self._get(self.payloads[0][1]), self._get(self.payloads[-1][1]))
         if self.layout.page_size is None:
-            keys, values = (pools[0], pools[-1]) if scales is not None else self.read()
+            keys, values = (pools[0], pools[-1]) if held is not None else self.read()
             return attention_decode.attend(query, keys, values, spans, hooks, interpret=interpret,
-                                           sources=sources, scales=scales)
+                                           sources=sources, scales=held)
         table = self._absolute(self._get(TABLE))[sources]
-        if scales is not None:
-            # `[KV, P, page]` at each call row's pages: `[B, KV, keys]` (`template_quantized`'s).
-            scales = tuple(_rows_ordered(scale, table) for scale in scales)
+        # `[KV, P, page]` at each call row's pages: `[B, KV, keys]` (`template_quantized`'s).
+        scales = None if held is None else (_rows_ordered(held[0], table), _rows_ordered(held[1], table))
         return attention_decode.attend(query, pools[0], pools[-1], spans, hooks, interpret=interpret,
                                        table=table, scales=scales)
 
