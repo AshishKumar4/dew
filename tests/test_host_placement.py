@@ -31,10 +31,11 @@ import optax
 import pytest
 from affine_run import BATCH, Counting, Features, Spread, val_batches
 from flax import linen as nn
-from layout_parity import layouts_agree
 from model_support import float64_twin
+from placement_parity import layouts_agree, x64
 from process_support import run_pool
 from reference_error import assert_as_exact
+from selection_margins import MARGIN, top_margin
 
 from dew.data.dataset import Loader
 from dew.inference.banks import CheckpointBanks, HeldBanks
@@ -68,7 +69,7 @@ def fit(layout, directory, steps, optimizer=None, **options):
 def trained(layout, seed, steps, optimizer=None, **options):
     """`steps` updates of the affine model from the start `seed` draws, without evaluation or checkpoints:
     a check-1 arm's run (`layouts_agree`), in float64 where the process runs in it."""
-    wide = jax.config.read("jax_enable_x64")
+    wide = x64()
 
     def stream(partition):
         def held(value):
@@ -77,7 +78,7 @@ def trained(layout, seed, steps, optimizer=None, **options):
         return (jax.tree.map(held, batch) for batch in Counting())
 
     trainer = Trainer(Features(), optimizer or optax.adam(0.1), key=jax.random.key(int(seed)),
-                      layout=layout, **options)
+                      layout=layout, param_dtype="float64" if wide else None, **options)
     return trainer.fit(Loader(train=stream, val=None, records=None, batch=BATCH), steps=steps,
                        log_every=steps)
 
@@ -194,12 +195,12 @@ def test_a_host_resident_bank_scores_what_a_resident_bank_scores(shape):
     """The logits of a stack whose banks are in host memory, against the same
     banks on the device and against the plain loop.
 
-    Bitwise against the resident banks: the fetch is a copy, and a copy that
-    changed a value would show here whatever the layer kind, the grouping or
-    the head. Against the plain loop on par from float64 over drawn prompts
-    (check 1): the scan reassociates where the loop does not, and the fetching
-    adds nothing to it (row 3950: an absolute bound measured on one machine
-    stood in for the check).
+    On par from float64 over drawn prompts (check 1) with the resident banks,
+    whose program differs by the fetch's copies alone (another compiled HLO,
+    so no common bits are promised), and with the plain loop: the scan
+    reassociates where the loop does not, and the fetching adds nothing to it
+    (row 3950: an absolute bound measured on one machine stood in for the
+    check).
     """
     plain, scanned, variables, tokens = pair(**SHAPES[shape])
     before = np.asarray(plain.apply(variables, tokens))
@@ -207,8 +208,6 @@ def test_a_host_resident_bank_scores_what_a_resident_bank_scores(shape):
     banks = [name for name in on_host["params"] if name.startswith("layers_")]
     assert memory_kinds({name: on_host["params"][name] for name in banks}) == {"pinned_host"}
     assert memory_kinds(resident["params"]) == {"device"}
-    fetched = scanned.apply(on_host, tokens)
-    assert np.array_equal(np.asarray(fetched), np.asarray(scanned.apply(resident, tokens)))
     assert all(not leaf.is_deleted() for leaf in jax.tree.leaves(variables))
     after = np.asarray(plain.apply(variables, tokens))
     np.testing.assert_array_equal(after, before)
@@ -226,14 +225,18 @@ def test_a_host_resident_bank_scores_what_a_resident_bank_scores(shape):
     # The fetched stack called as a caller calls it, its host-resident banks fetched per call.
     assert_as_exact(lambda drawn: scanned.apply(on_host, jnp.asarray(drawn)),
                     jax.jit(lambda drawn: plain.apply(variables, drawn)), draw,
-                    f"{shape}: a fetched stack's logits", seeds=HOST_SCAN_SEEDS, truth_fn=wide_logits)
+                    f"{shape}: a fetched stack's logits", seeds=HOST_SCAN_SEEDS, truth_fn=wide_logits,
+                    also={"resident banks": lambda drawn: scanned.apply(resident, jnp.asarray(drawn))})
 
 
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 def test_a_host_resident_bank_decodes_through_the_cache_it_allocates(shape):
     """A prefill and greedy steps through a fetched stack: the same
-    continuation as the resident banks, out of a cache the fetched run
-    allocated and wrote itself.
+    continuation as the resident banks on each row whose every step's choice
+    is decided, at least one, its top logit clearing the next by the selection margin
+    (`selection_margins.MARGIN`; the two compile two programs, whose
+    rounding may pick another token at a near tie), out of a cache the
+    fetched run allocated and wrote itself.
 
     The cache comes back out as the store holds the stack, each run's
     layers one bank under the run's name and a run of one per layer, the
@@ -244,10 +247,14 @@ def test_a_host_resident_bank_decodes_through_the_cache_it_allocates(shape):
     _, scanned, variables, tokens = pair(**SHAPES[shape])
     resident, on_host = stores(scanned, variables)
     greedy = Sampling(temperature=0.0)
-    fetched = generate(scanned, on_host, tokens, 4, key=0, sampling=greedy)
-    assert np.array_equal(
-        np.asarray(fetched.tokens),
-        np.asarray(generate(scanned, resident, tokens, 4, key=0, sampling=greedy).tokens))
+    fetched = generate(scanned, on_host, tokens, 4, key=0, sampling=greedy).host()
+    held = generate(scanned, resident, tokens, 4, key=0, sampling=greedy).host()
+    # Each step's logits: the resident run's prompt and continuation read back whole, its last token aside.
+    decisions = np.asarray(scanned.apply(resident, jnp.asarray(held.tokens[:, :-1])),
+                           np.float64)[:, held.prompt_width - 1:]
+    decided = np.all(top_margin(decisions, 1) > MARGIN, axis=-1)
+    assert decided.any(), f"{shape}: no row's continuation is decided at every step"
+    np.testing.assert_array_equal(fetched.tokens[decided], held.tokens[decided])
 
     cache = scanned.apply(on_host, 2, method="init_cache", mutable=["cache"])[1]["cache"]
     assert sorted(cache) == sorted(name for name in on_host["params"] if name.startswith("layers_"))
@@ -255,9 +262,29 @@ def test_a_host_resident_bank_decodes_through_the_cache_it_allocates(shape):
     assert {leaf.shape[row_axis(path)] for path, leaf in jax.tree_util.tree_leaves_with_path(cache)} == {2}
 
 
+def placements_agree(model, placed, resident, tokens, label: str):
+    """`model`'s logits from the `placed` store on par from float64 over drawn prompts shaped as `tokens`
+    (check 1) with its logits from the `resident` one, the resident store in float64 the truth: the two
+    compile two programs, so no common bits are promised."""
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), jax.device_get(resident))
+        truth = jax.jit(float64_twin(model).apply)
+
+    def draw(seed):
+        return (np.random.default_rng([4405, seed]).integers(1, VOCAB, size=tokens.shape).astype(np.int32),)
+
+    def wide_logits(drawn):
+        with jax.enable_x64(new_val=True):
+            return truth(wide, jnp.asarray(drawn))
+
+    assert_as_exact(lambda drawn: model.apply(placed, jnp.asarray(drawn)),
+                    lambda drawn: model.apply(resident, jnp.asarray(drawn)), draw, label,
+                    seeds=HOST_SCAN_SEEDS, truth_fn=wide_logits)
+
+
 def test_a_layout_offloads_only_the_layers_it_names():
     """Banks the patterns do not name stay on the device, and a stack split
-    between the two places computes what the resident one computes."""
+    between the two places computes what the resident one computes (check 1)."""
     _plain, scanned, variables, tokens = pair(num_layers=4, bank_layers=2)
     selected = Layout(min_shard=1, tolerance=1.0,
                       host_parameters=("params/layers_0", "params/layers_1"))
@@ -266,8 +293,7 @@ def test_a_layout_offloads_only_the_layers_it_names():
     kinds = {name: memory_kinds(tree) for name, tree in split["params"].items()}
     assert kinds == {"embed_tokens": {"device"}, "norm": {"device"},
                      "layers_0_1": {"pinned_host"}, "layers_2_3": {"device"}}
-    assert np.array_equal(np.asarray(scanned.apply(split, tokens)),
-                          np.asarray(scanned.apply(resident, tokens)))
+    placements_agree(scanned, split, resident, tokens, "a stack split between host and device")
 
 
 def test_banked_training_preserves_each_layers_dropout_rng_lineage():
@@ -292,8 +318,9 @@ def test_banked_training_preserves_each_layers_dropout_rng_lineage():
 
 
 def test_a_checkpoint_restores_bank_by_bank_into_host_memory(tmp_path):
-    """A run's saved weights read one bank at a time, against the same
-    checkpoint read into resident banks."""
+    """A run's saved weights read one bank at a time compute what the same
+    checkpoint read into resident banks computes (check 1), and unstack to the
+    run's weights bit for bit: values moved, not computed."""
     plain, scanned, _, tokens = pair(num_layers=8, bank_layers=4, emb_features=2,
                                       num_heads=1, num_kv_heads=1, mlp_features=4)
     directory = str(tmp_path / "run")
@@ -312,8 +339,7 @@ def test_a_checkpoint_restores_bank_by_bank_into_host_memory(tmp_path):
     resident = CheckpointBanks(directory).place(scanned, layout=DEVICE)
     on_host = CheckpointBanks(directory).place(scanned, layout=BANKS)
     assert memory_kinds(on_host["params"]["layers_0_3"]) == {"pinned_host"}
-    assert np.array_equal(np.asarray(scanned.apply(on_host, tokens)),
-                          np.asarray(scanned.apply(resident, tokens)))
+    placements_agree(scanned, on_host, resident, tokens, "a checkpoint read bank by bank into host memory")
     trained = StackView(scanned.bind({}).groups).unstack(resident)
     assert identical(trained, state.variables)
 

@@ -1072,13 +1072,10 @@ def test_a_run_resumed_at_another_rate_steps_at_it_on_the_compiled_step(tmp_path
                                    atol=2 * np.spacing(np.abs(start).max()))
     if not grouped:
         # A resumed step's rate is the one a run configured so from its start steps at, bit for bit: the
-        # same program reading the same rate operands.
-        for name, peak in (("slow", 4e-3), ("fast", 8e-3)):
+        # same program reading the same rate operands. The schedule's own values are its tests'
+        # (tests/test_optim_schedules.py, against torch's).
+        for name in ("slow", "fast"):
             assert runs[name]["rates"]["3"] == runs["fresh " + name]["rates"]["3"]
-            # And it is optax's schedule at that update, bit for bit: Dew's Cosine is optax's own pieces,
-            # the same float32 operations on the same operands.
-            schedule = optax.warmup_cosine_decay_schedule(0.0, peak, 1, 8)
-            assert runs[name]["rates"]["3"] == float(schedule(2))
 
 
 def test_the_compiled_step_consumes_the_state_it_is_given():
