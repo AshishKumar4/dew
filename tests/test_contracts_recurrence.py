@@ -14,7 +14,7 @@ from contract_support import EDGES, FORWARD_ORDERS, REVERSE_ONLY, assert_contrac
 from ssd_support import stepwise_scan
 
 from dew.algebra import SATURATION, forms as algebra_forms, scan
-from dew.nn.kernels import generation, recurrence, recurrence_chunk, short_conv
+from dew.nn.kernels import generation, recurrence, recurrence_chunk, short_conv, ssd
 from dew.nn.mixers.mamba2 import chunk_ssd
 
 DELTA_RULE_EDGES = {"normal": 1.0, "the largest its chunk holds": 2.0**62, "near the largest": 2.0**63,
@@ -97,6 +97,12 @@ in one case took 127 to 156 s near float32's largest, each order's program compi
 def outside(taken: str) -> tuple[str, ...]:
     """The orders outside `taken`'s set (`ORDER_SETS`), which its case leaves to the others."""
     return tuple(name for orders in ORDER_SETS.values() for name in orders if name not in ORDER_SETS[taken])
+
+
+INTERPRETED_REMAT = ("jvp of grad, remat", "second jvp, remat") if INTERPRETED else ()
+"""The orders a kernel Mosaic GPU's interpreter runs takes on no CPU: JAX's checkpoint takes no ordered
+effect, which the interpreter's callbacks carry (`NotImplementedError: Effects not supported in AD of
+checkpoint`); a GPU's kernel carries none."""
 
 
 @pytest.mark.parametrize("taken", list(ORDER_SETS))
@@ -276,7 +282,8 @@ def test_the_template_rule_holds_its_orders(edge, taken):
         return plain_delta_rule(*operands, jnp.zeros((1, 1, 64, 64), operands[0].dtype), 64 ** -0.5)[0]
 
     assert_contract(jax.jit(rule), primals, direction, cotangent, f"the template rule {edge}",
-                    truth_fn=jax.jit(recurrent), plain_fn=jax.jit(recurrent), without=outside(taken))
+                    truth_fn=jax.jit(recurrent), plain_fn=jax.jit(recurrent),
+                    without=outside(taken) + INTERPRETED_REMAT)
 
 
 @pytest.mark.parametrize("taken", list(ORDER_SETS))
@@ -306,7 +313,8 @@ def test_the_selective_scan_holds_its_orders(edge, taken):
         return portable(*operands, None, None, chunk_size=32)[0]
 
     assert_contract(jax.jit(scanned), primals, direction, cotangent, f"the selective scan {edge}",
-                    truth_fn=jax.jit(plain), plain_fn=jax.jit(plain), without=outside(taken))
+                    truth_fn=jax.jit(plain), plain_fn=jax.jit(plain),
+                    without=outside(taken) + INTERPRETED_REMAT)
 
 
 @pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
@@ -409,23 +417,25 @@ def test_the_ssd_port_holds_its_orders(edge, taken):
 # A TPU's scan near float32's largest is out of its contract: at the 2^63 draw 23 of the 731 outputs float64
 # puts past 2^127 are infinite, the least 2^126.9 (a chunk's two terms summed past float32's largest), where
 # mamba_ssm's own chunked scan leaves 55 of the same draw's outputs non-finite (row 2656).
-@pytest.mark.parametrize("taken", list(ORDER_SETS))
 @pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
-def test_the_tpu_ssd_scan_holds_its_orders(edge, taken):
+def test_the_tpu_ssd_scan_holds_its_orders(edge):
     """Mamba2's chunked scan on a TPU's Pallas kernel (`ssd._chunk_scan`, a custom VJP, interpreted off a
-    TPU) as every caller reaches it: Mamba-2's scan with the kernel named on a TPU (`mamba2.chunk_ssd`,
-    `generation.assumed`), whose products' wrapper takes every order through the portable math
-    (`_per_product`, row 2655): each order of `taken`'s set finite wherever float64 is a normal float32 and
-    the recurrence a token at a time is (`plain_ssd`), at inputs, gates and states whose products near
-    float32's least normal."""
-    primals, direction, cotangent = ssd_draw(2677, EDGES[edge])
+    TPU), its operands the inputs scaled by their steps, each head's gates and each step's decay `A dt`: its
+    primal and reverse derivative finite wherever float64 is a normal float32 and the recurrence a token at a
+    time is (`ssd_support.stepwise_scan`), at inputs, gates and states whose products near float32's least
+    normal. Its other orders are its route's, the products' wrapper the other kernels' contracts hold
+    (`_per_product`, row 2655), which a CPU cannot reach: its selector takes the kernel on a TPU alone, and
+    under an assumed one it lowers the kernel itself (`ssd._interpreting`)."""
+    (x, steps, decay, b, c, _, state), direction, cotangent = ssd_draw(2677, EDGES[edge])
 
-    def tpu(*operands):
-        with generation.assumed("v5e"), generation.chosen(ssd="tpu"):
-            return chunk_ssd(*operands, chunk_size=64)
+    def tpu(x, b, c, a, state):
+        return ssd._chunk_scan(x, b, c, a, state, 64, "tpu")
 
-    assert_contract(jax.jit(tpu), primals, direction, cotangent, f"the TPU ssd scan {edge}",
-                    truth_fn=jax.jit(plain_ssd), plain_fn=jax.jit(plain_ssd), without=outside(taken))
+    heads = tuple(jnp.repeat(t, 2, axis=2) for t in (b, c))
+    primals = (x * steps[..., None], *heads, steps * decay, state)
+    along = (direction[0], *(jnp.repeat(t, 2, axis=2) for t in direction[3:5]), direction[1], direction[6])
+    assert_contract(tpu, primals, along, cotangent, f"the TPU ssd scan {edge}", truth_fn=stepwise_scan,
+                    plain_fn=stepwise_scan, without=REVERSE_ONLY)
 
 
 @pytest.mark.parametrize("edge", EDGES)
