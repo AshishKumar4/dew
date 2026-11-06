@@ -978,6 +978,8 @@ def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci,
     (tmp_path / "resume" / "progress.jsonl").write_text(progress.read_text().splitlines()[0] + "\n")
     (tmp_path / "ran").unlink()
     monkeypatch.setenv("ARMADA_RESUME", str(tmp_path / "resume"))
+    # The group's green record of the whole run gone, as a recalled attempt wrote none.
+    stored.clear()
     assert ci.task("3.12", ["tests/test_cut.py"], "2/3", out, 600.0) == 0
     assert (tmp_path / "ran").read_text() == "3"
     [row] = json.loads(out.read_text())["rows"]
