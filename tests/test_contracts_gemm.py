@@ -120,6 +120,29 @@ def test_a_grouped_gemm_holds_every_order(edge):
                     plain_fn=plain)
 
 
+@pytest.mark.parametrize("edge", EDGES)
+def test_an_adapted_product_holds_every_reverse_order(edge):
+    """`gemm.low_rank` (LoRA's adapted product as one product over the depth its rank extends, its custom VJP
+    declared through `derivatives.declared_derivative`): every reverse order, under a nested jit and a scan,
+    in the rows, the kernel and both factors, finite wherever float64 is a normal float32 and wherever the
+    plain adapted product (`x·W + s·(x·A)·B`, its float64 run the truth) is, at values whose products near
+    float32's ends. It takes no forward order yet: a custom VJP has none (row 1304; the appended pair walked
+    in place brings one)."""
+    shapes = ((8, 16), (16, 12), (16, 4), (4, 12))
+    primals = normal_draw(1304, *shapes, scale=EDGES[edge])
+    direction = normal_draw(1305, *shapes, scale=EDGES[edge])
+    (cotangent,) = normal_draw(1306, (8, 12))
+
+    def adapted(rows, kernel, a, b):
+        return gemm.low_rank(rows, kernel, a, b, 0.5, out_dtype=rows.dtype)
+
+    def plain(rows, kernel, a, b):
+        return rows @ kernel + 0.5 * ((rows @ a) @ b)
+
+    assert_contract(adapted, primals, direction, cotangent, f"an adapted product {edge}", truth_fn=plain,
+                    plain_fn=plain, without=FORWARD_ORDERS)
+
+
 GROUPS = jnp.asarray([3, 0, 5], jnp.int32)
 """A grouped product's sizes: eight rows, an empty middle expert."""
 
