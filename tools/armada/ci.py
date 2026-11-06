@@ -1477,8 +1477,10 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     common = shared(python)
     names, kept = kept_of(tests)
     whole_files = {name: at for (name, group), at in kept.items() if not group}
-    code = tested(python, names, split, out, deadline, cache, grace, common, {}, coverage, whole=whole,
-                  release=release, kept=whole_files, census=census)
+    # The census's tests run under CENSUS, which also keeps their rows from the records (`tested`).
+    environ = {CENSUS: "1"} if census else {}
+    code = tested(python, names, split, out, deadline, cache, grace, common, environ, coverage, whole=whole,
+                  release=release, kept=whole_files)
     # A map task's red row fails its task: armada runs no judge on draws a map task did not pass, and reads
     # the judge red, naming it (`site_entries`).
     site = SITE.fullmatch(split)
@@ -1500,8 +1502,8 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
                          "timings": {row(python, name, ""): 0.0}, **red_as("deadline", [])})
             continue
         part = out.with_name(f"{out.name}.{index}")
-        code = max(code, tested(python, [name], group, part, left, cache, grace, common, {}, coverage,
-                                whole=whole, release=release, kept={name: at}, census=census))
+        code = max(code, tested(python, [name], group, part, left, cache, grace, common, environ, coverage,
+                                whole=whole, release=release, kept={name: at}))
         rows += json.loads(part.read_text())["rows"]
     out.write_text(json.dumps({"rows": rows}))
     return code
@@ -1648,13 +1650,11 @@ def dumped(done: subprocess.Popen, stacks: Path) -> str:
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, whole: bool = False, release: str = "",
-           kept: Mapping[str, tuple[str, str]] | None = None, census: bool = False) -> int:
+           kept: Mapping[str, tuple[str, str]] | None = None) -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
-    Hub open, recorded on the network lane's class (`device_class`); `release`, a release check's; `census`,
-    the census's (`CENSUS`), whose rows, run in another numerical mode than the records' inputs say, are
-    recorded nowhere. A check-1 site's map task (`SITE`) is never reused: its draws, among its artifacts, are
-    what its judge reads."""
+    Hub open, recorded on the network lane's class (`device_class`); `release`, a release check's. A check-1
+    site's map task (`SITE`) is never reused: its draws, among its artifacts, are what its judge reads."""
     began = time.monotonic()
     group = split or (f"{RELEASE}{release}" if release else "")
     site = SITE.fullmatch(group)
@@ -1669,7 +1669,6 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # its data where COVERAGE_FILE says.
     measured = [] if coverage is None else ["coverage", "run"]
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
-    environ = {**environ, CENSUS: "1"} if census else environ
     run = selected(session.pytest_run(python, report, *measured), network, whole, bool(release),
                    site is not None)
     command = pytest_command(run, tests, split, release)
@@ -1762,9 +1761,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      "timings": {row(python, name, group if site else ""): seconds}, **cause, **asked(site),
                      **later_judged(site)})
     out.write_text(json.dumps({"rows": rows + ran}))
-    if coverage is None and not release and not census:
+    if coverage is None and not release and CENSUS not in environ:
         # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which runs
-        # under its requirement's overlay and on the whole suite's run alone, nor the census's.
+        # under its requirement's overlay and on the whole suite's run alone, nor the census's (`CENSUS`).
         record(python, ran, log, common, network, opened,
                set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set())
     return 0
