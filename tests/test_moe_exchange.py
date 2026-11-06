@@ -113,6 +113,27 @@ def test_an_expert_mesh_exchanges_by_default_and_any_other_mesh_dispatches_globa
     assert ran == named
 
 
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("expert, exchanged", [(4, True), (1, False)], ids=["expert-mesh", "no-expert-axis"])
+def test_a_config_built_runs_step_exchanges_on_an_expert_mesh_by_default(tmp_path, expert, exchanged):
+    """An LM run built from its config, a mixture of eight experts at its default dispatch, lowers its
+    training step (`--trainer.lower-for`) with the exchange's `ragged_all_to_all` on a 4-way expert mesh
+    and with none where the mesh has no expert axis (ledger 1711's flow, row 4615)."""
+    import dataclasses
+
+    from run_kinds import lm, trained
+
+    from dew.training._lowering import Lowered
+
+    run = lm(tmp_path, drawn=False)
+    fields = {**run.model.fields, "mixture": {"experts": 8, "top_k": 2, "expert_features": 16}}
+    run = dataclasses.replace(run, model=dataclasses.replace(run.model, fields=fields))
+    with pytest.raises(Lowered) as lowered:
+        trained(run, tmp_path, "lowered", trainer={"mesh": MeshSpec(expert=expert, fsdp=8 // expert),
+                                                   "lower_for": "sm90"})
+    assert ("ragged_all_to_all" in lowered.value.lowered.as_text()) == exchanged
+
+
 def test_exchange_preserves_placed_expert_and_width_gradients():
     x, weights, indices = map(jnp.asarray, routing_case(24, 8, 2, skewed=False))
     model = ExpertMLP(8, 16, 8)
