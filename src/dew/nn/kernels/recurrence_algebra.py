@@ -356,7 +356,8 @@ def _decays_tangent(primals, tangents):
                             linear_map(_ranged, _ranged_transpose, decay, dg))
 
 
-decays = derivatives.declared_tangent(derivatives.Protected(), _decays, _decays_tangent)
+decays = derivatives.contracted("test_the_chunked_delta_rule_holds_every_order", "numerics")(
+    derivatives.declared_tangent(derivatives.Protected(), _decays, _decays_tangent))
 
 
 def factor(a, issue: Issue = portable):
@@ -451,8 +452,9 @@ def _decayed_product_tangent(name: str, issue: Issue, primals, tangents):
     return jnp.where(kept, product * decay, 0.0), jnp.where(kept, weighed, 0.0)
 
 
-_decayed_product = derivatives.declared_tangent(derivatives.Protected(), _decayed_primal,
-                                                  _decayed_product_tangent, nondiff_argnums=(0, 1))
+_decayed_product = derivatives.contracted("test_the_chunked_delta_rule_holds_every_order", "numerics")(
+    derivatives.declared_tangent(derivatives.Protected(), _decayed_primal,
+                                   _decayed_product_tangent, nondiff_argnums=(0, 1)))
 
 
 def intra(key, keyed, pairs, issue: Issue = portable):
@@ -552,8 +554,9 @@ def _remembered_tangent(issue, name, primals, tangents):
     return remembered(decayed, entered, issue, name), issue(name, d_decayed, entered) + read
 
 
-remembered = derivatives.declared_tangent(derivatives.Protected(), _remembered, _remembered_tangent,
-                                          nondiff_argnums=(2, 3))
+remembered = derivatives.contracted("test_the_chunked_delta_rule_holds_every_order", "numerics")(
+    derivatives.declared_tangent(derivatives.Protected(), _remembered, _remembered_tangent,
+                                 nondiff_argnums=(2, 3)))
 
 
 class Span(NamedTuple):

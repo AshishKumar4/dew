@@ -59,7 +59,7 @@ from dew.batch import (
     unboxed,
 )
 from dew.distributed.placement import Layout, RefinesLayout
-from dew.nn.derivatives import surrogate
+from dew.nn.derivatives import contracted, surrogate
 from dew.nn.inspection import INSPECTED, Watched, watching
 from dew.nn.kernels.options import Held, Option, compiler_options, owned_program
 from dew.nn.precision import (
@@ -688,7 +688,8 @@ def _ruled_tangent(primals, tangents, _value) -> jax.Array:
                              zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
 
 
-_ruled = surrogate(lambda value, rule, params: value, _ruled_tangent)
+_ruled = contracted("test_a_ruled_loss_holds_every_order", "surrogate")(
+    surrogate(lambda value, rule, params: value, _ruled_tangent))
 """`value`, whose derivative in `params` is `rule` (`Objective.with_gradients`): a surrogate
 (`dew.nn.derivatives.surrogate`), the loss's own derivative replaced by a learning rule's."""
 

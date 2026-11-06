@@ -1234,8 +1234,9 @@ def _scan_bwd(chunk: int, interpret: bool, residual, cotangent):
             dh0.reshape(shape).astype(h0.dtype), None)
 
 
-ssd_scan = derivatives.declared_derivative(derivatives.KernelGlue(), _scan, _scan_fwd, _scan_bwd,
-                                           nondiff_argnums=(8, 9))
+ssd_scan = derivatives.contracted("test_the_ssd_port_holds_its_orders", "kernel")(
+    derivatives.declared_derivative(derivatives.KernelGlue(), _scan, _scan_fwd, _scan_bwd,
+                                    nondiff_argnums=(8, 9)))
 """mamba_ssm's chunked SSD scan on the ported kernels: `(y, final)` for `x` `[B, T, H, P]`, the step
 `dt` `[B, T, H]` through its bias, softplus and limit, `A` `[H]`, `B` and `C` `[B, T, G, N]` in `x`'s
 dtype, `D` `[H]`, each row's initial state `h0` `[B, H, P, N]` and each token's document `seq` `[B, T]`

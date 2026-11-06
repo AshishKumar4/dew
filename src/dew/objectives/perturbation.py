@@ -64,7 +64,7 @@ from jax.custom_derivatives import zero_from_primal
 from dew._distributions import counter_key
 from dew.batch import Batch, Variables, leaves_by_path
 from dew.data.dataset import rows_of
-from dew.nn.derivatives import surrogate
+from dew.nn.derivatives import contracted, surrogate
 from dew.nn.kernels.generation import linear_map
 from dew.nn.precision import at_least_fp32, float32_einsum
 from dew.nn.protocols import OutputTable, RematChoosing, head_table
@@ -212,7 +212,8 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
             return moved, zero_from_primal(aux)
 
         # The loss, differentiated as the node-perturbation estimate: a surrogate, no derivative of the loss.
-        estimated = surrogate(value, estimate)
+        estimated = contracted("test_a_node_perturbation_estimate_holds_every_order", "surrogate")(
+            surrogate(value, estimate))
         return estimated(variables["params"], (held, batch, step))
 
     def _estimate_of(self, residuals, cotangent) -> Variables:

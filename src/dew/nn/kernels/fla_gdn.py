@@ -1192,8 +1192,9 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, wide: bool,
     return dq, dk, dv, dg.astype(jnp.float32), db, dh0, None
 
 
-chunk_gated_delta_rule = derivatives.declared_derivative(derivatives.KernelGlue(), _rule, _rule_fwd,
-                                                         _rule_bwd, nondiff_argnums=(7, 8, 9, 10, 11))
+chunk_gated_delta_rule = derivatives.contracted("test_the_delta_rule_ports_hold_their_orders", "kernel")(
+    derivatives.declared_derivative(derivatives.KernelGlue(), _rule, _rule_fwd,
+                                    _rule_bwd, nondiff_argnums=(7, 8, 9, 10, 11)))
 """fla's chunked gated delta rule on the ported kernels: `(o, final)` for `q`, `k` `[B, T, H, K]`
 (normalized as the caller wants them), `v` `[B, T, HV, V]`, the per-token natural log decay `g`
 `[B, T, HV]` fp32, `beta` `[B, T, HV]` and each row's initial memory `h0` `[B, HV, K, V]` fp32, the

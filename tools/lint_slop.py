@@ -72,6 +72,14 @@ Scope is per rule, because the rules are not all about the same thing:
   launch point's (`nn/kernels/launches.py`), which holds each launch to the
   per-shard boundary (`sharding.per_shard`), so no route launches a kernel over
   operands an automatic mesh axis splits (rows 1897, 1923, 4077).
+- SLOP028 is about `src/<package>`: every custom derivative (`DERIVATIVE_MAKERS`:
+  JAX's custom_jvp and custom_vjp, Dew's declaring functions and linear_tangent)
+  declares at its seam the contract that holds it, `contracted(test, kind)` of
+  `dew.nn.derivatives`, decorating it or wrapping its making call: `test` a test
+  function of tests/test_contracts_*.py (`assert_contract`: every order finite
+  against its float64 truth and an independent plain formula), and `kind`
+  "surrogate" exactly where a surrogate is declared, "kernel" or "numerics"
+  elsewhere (row 4411).
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -2281,8 +2289,117 @@ def tolerances(module: Module) -> Iterator[Finding]:
                       f"{what} compares floats within a tolerance ({why}); {gate}")
 
 
+DERIVATIVE_MAKERS = frozenset({"custom_jvp", "custom_vjp", "surrogate", "declared_derivative",
+                               "declared_tangent", "linear_tangent"})
+"""What makes a custom derivative (SLOP028): JAX's own, and Dew's (`dew.nn.derivatives`; a declaring builder's
+kind its first argument; `generation.linear_tangent`, whose call makes one), as a decorator, a call, or
+within functools.partial."""
+
+DERIVATIVE_KINDS = frozenset({"kernel", "numerics", "surrogate"})
+"""A contracted seam's kinds (`dew.nn.derivatives.contracted`)."""
+
+SURROGATE_RULE = "src/dew/nn/derivatives.py::surrogate.rule"
+"""The surrogate declaration's own custom rule: a surrogate's seam though JAX's custom_jvp makes it."""
+
+
+def _maker_of(node: ast.expr, given: tuple = ()) -> str | None:
+    """The custom derivative `node`, a decorator or a call, makes (`DERIVATIVE_MAKERS`), or None: a
+    declaring builder's with the kind its first argument constructs (`declared_derivative:Surrogate`), as
+    the algebra pass reads it (docs/design/algebra.md §1.3); `given`, a partial's arguments past the
+    function."""
+    if isinstance(node, ast.Call):
+        name = _call_name(node.func)
+        if name == "partial" and node.args:
+            return _maker_of(node.args[0], tuple(node.args[1:]))
+        if name in ("declared_derivative", "declared_tangent"):
+            return _maker_of(node.func, tuple(node.args))
+        return _maker_of(node.func)
+    name = _call_name(node)
+    if name in ("declared_derivative", "declared_tangent"):
+        kind = given[0] if given else None
+        return f"{name}:{_call_name(kind.func) if isinstance(kind, ast.Call) else None}"
+    return name if name in DERIVATIVE_MAKERS - {"linear_tangent"} else None
+
+
+def _call_name(node: ast.expr) -> str | None:
+    return getattr(node, "attr", None) or getattr(node, "id", None)
+
+
+def derivative_seams(relative: str, tree: ast.Module) -> Iterator[tuple[str, str, ast.AST, ast.expr | None]]:
+    """`relative`'s custom derivatives: each seam's `relative::qualified name`, what makes it, the node to
+    report, and its declaration (`contracted(...)`), if any: a decorated function's decorator, or the call
+    wrapping an assigned maker's call or a linear_tangent call."""
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+    def declared(node: ast.expr) -> ast.expr | None:
+        """The `contracted(...)` call wrapping the call `node` (`contracted(...)(node)`), if any."""
+        outer = parents.get(node)
+        if (isinstance(outer, ast.Call) and outer.args == [node] and isinstance(outer.func, ast.Call)
+                and _call_name(outer.func.func) == "contracted"):
+            return outer.func
+        return None
+
+    def walk(node: ast.AST, scope: list[str]) -> Iterator[tuple[str, str, ast.AST, ast.expr | None]]:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if not isinstance(child, ast.ClassDef):
+                    makers = [maker for maker in map(_maker_of, child.decorator_list) if maker]
+                    if makers:
+                        contract = next((decorator for decorator in child.decorator_list
+                                         if isinstance(decorator, ast.Call)
+                                         and _call_name(decorator.func) == "contracted"), None)
+                        yield ".".join([*scope, child.name]), makers[0], child, contract
+                yield from walk(child, [*scope, child.name])
+                continue
+            target = (child.targets[0] if isinstance(child, ast.Assign)
+                      else child.target if isinstance(child, ast.AnnAssign) else None)
+            if isinstance(target, ast.Name) and isinstance(child.value, ast.Call):
+                made = child.value
+                inner = (made.args[0] if isinstance(made.func, ast.Call)
+                         and _call_name(made.func.func) == "contracted" and made.args else made)
+                if isinstance(inner, ast.Call) and (maker := _maker_of(inner)):
+                    yield ".".join([*scope, target.id]), maker, child, declared(inner)
+            if isinstance(child, ast.Call) and _call_name(child.func) == "linear_tangent":
+                yield ".".join([*scope, "linear_tangent"]), "linear_tangent", child, declared(child)
+            yield from walk(child, scope)
+
+    for name, maker, node, contract in walk(tree, []):
+        yield f"{relative}::{name}", maker, node, contract
+
+
+@functools.cache
+def contract_tests(checkout: Path) -> frozenset[str]:
+    """The test functions of `checkout`'s tests/test_contracts_*.py, each the holder of a contract."""
+    return frozenset(node.name for path in (checkout / "tests").glob("test_contracts_*.py")
+                     for node in ast.parse(path.read_text()).body
+                     if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"))
+
+
+def derivative_contracts(module: Module) -> Iterator[Finding]:
+    """SLOP028: every custom derivative of `module` declares the contract that holds it, a test of its own
+    checkout's."""
+    checkout = module.path.parents[len(Path(module.relative).parts) - 1]
+    for seam, maker, node, contract in derivative_seams(module.relative, module.tree):
+        where = (module.relative, node.lineno, node.col_offset + 1, "SLOP028")
+        if contract is None:
+            yield Finding(*where, f"{seam.split('::')[1]} ({maker}) makes a custom derivative with no "
+                                  "contract: declare `contracted(test, kind)` of dew.nn.derivatives at it")
+            continue
+        arguments = [argument.value if isinstance(argument, ast.Constant) else None
+                     for argument in contract.args]
+        test, kind = [*arguments, None, None][:2]
+        surrogate = maker == "surrogate" or maker.endswith(":Surrogate") or seam == SURROGATE_RULE
+        if len(arguments) != 2 or test not in contract_tests(checkout):
+            yield Finding(*where, f"{seam.split('::')[1]}'s contract names {test!r}, no test function of "
+                                  "tests/test_contracts_*.py")
+        elif kind not in DERIVATIVE_KINDS or (kind == "surrogate") != surrogate:
+            yield Finding(*where, f"{seam.split('::')[1]}'s contract kind {kind!r} is not its declaration's: "
+                                  f"\"surrogate\" exactly where a surrogate is declared, else \"kernel\" or "
+                                  "\"numerics\"")
+
+
 CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections, compile_points,
-                  pallas_launches)
+                  pallas_launches, derivative_contracts)
 UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private)
 
 

@@ -38,7 +38,7 @@ from flax.typing import PrecisionLike
 from jax.custom_derivatives import zero_from_primal
 from jax.extend import core as jax_core
 
-from dew.nn.derivatives import KernelGlue, declared_tangent
+from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.product import declared
@@ -140,8 +140,9 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
                   *gradients[1:]]
         return tuple(leaves[index] for index in live)
 
-    differentiable = generation.linear_tangent(forward, grouped_matmul.GROUPED.bound(backward), portable,
-                                                live_cotangents=True)
+    differentiable = contracted("test_a_grouped_gemm_holds_every_order", "kernel")(
+        generation.linear_tangent(forward, grouped_matmul.GROUPED.bound(backward), portable,
+                                   live_cotangents=True))
     return differentiable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired)
 
 
@@ -433,7 +434,8 @@ def _prologued(prologue, prologue_jvp):
 
     # The fused kernel's derivative glue (`derivatives.KernelGlue`): the producer's own derivative, true and
     # rewritten as any other math, written once for the prologue the kernel applies to its tiles.
-    prologued = declared_tangent(KernelGlue(), lambda lhs, *sides: prologue(lhs, *sides), tangent)
+    prologued = contracted("test_a_gemm_prologue_holds_every_order", "kernel")(
+        declared_tangent(KernelGlue(), lambda lhs, *sides: prologue(lhs, *sides), tangent))
     return prologued
 
 

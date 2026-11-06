@@ -74,7 +74,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Coordinates, unboxed
 from dew.nn.dense import _contractions, _linear_site
-from dew.nn.derivatives import surrogate
+from dew.nn.derivatives import contracted, surrogate
 from dew.nn.kernels.generation import backend, linear_map
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import accumulated, at_least_fp32, correctly_rounded_divide
@@ -618,7 +618,8 @@ def _frozen_fp8_tangent(primals, tangents, value):
     return linear_map(tangent, transposed, residuals, tangents[0])
 
 
-frozen_fp8_product = surrogate(_frozen_fp8_value, _frozen_fp8_tangent)
+frozen_fp8_product = contracted("test_a_frozen_fp8_product_holds_every_order", "surrogate")(
+    surrogate(_frozen_fp8_value, _frozen_fp8_tangent))
 """`x @ kernel` in float32, `[M, in]` by a frozen kernel packed as `frozen_fp8_leaves`: FP8 products
 forward and for `x`'s gradient, and no gradient for the kernel, which is frozen. A surrogate
 (`dew.nn.derivatives.surrogate`): forward mode (`jax.jvp`, MeanFlow's target) takes the input's tangent
@@ -1294,7 +1295,8 @@ def _grouped_convolution_gradient() -> type:
     # The integer convolution, differentiated as the float one at its dequantized operands: a surrogate,
     # whose value carries the quantized operands so the forward quantizes once (a static-scale
     # activation's running statistics update once a step).
-    quantized_training = surrogate(_qt_forward, straight_through, nondiff_argnums=tuple(range(2, 11)))
+    quantized_training = contracted("test_a_quantized_convolution_holds_every_order_it_takes", "surrogate")(
+        surrogate(_qt_forward, straight_through, nondiff_argnums=tuple(range(2, 11))))
 
     class GroupedConvolutionGradient(qwix.QtProvider):
         """Differentiates a quantized grouped convolution, which Qwix's

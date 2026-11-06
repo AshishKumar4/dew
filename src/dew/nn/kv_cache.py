@@ -46,6 +46,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.batch import prefix_sum
 from dew.mesh import LayoutRefused, logical_spec, mesh_axes
+from dew.nn.derivatives import contracted
 from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import INHERENT, backend
 from dew.nn.kernels.selection import Kernel, Op, Requirement, selected
@@ -847,9 +848,10 @@ def gpu_paged(softcap: float | None):
     turn down included, and forward mode takes the forward-mode path's tangent (`_gathered_tangent`),
     with no context of the caller's. An inactive row reads one slot, so its unused output stays
     finite."""
-    return generation.linear_tangent(functools.partial(_paged_forward, softcap=softcap),
-                                     functools.partial(_paged_backward, softcap=softcap),
-                                     functools.partial(_gathered_tangent, softcap=softcap))
+    return contracted("test_the_paged_decode_kernel_holds_every_order", "kernel")(
+        generation.linear_tangent(functools.partial(_paged_forward, softcap=softcap),
+                                  functools.partial(_paged_backward, softcap=softcap),
+                                  functools.partial(_gathered_tangent, softcap=softcap)))
 
 
 def _template_forward(query, key, value, table, lengths, starts=None, sinks=None, *, softcap=None):
@@ -875,9 +877,10 @@ def template_paged(softcap: float | None):
     """The attention template's decode over the pages (`_template_forward`) under the layer's `softcap`,
     over `(query, key, value, table, lengths, starts, sinks)` as `gpu_paged` takes them, its derivatives at
     every order the gathered attention's (`generation.linear_tangent`), as `gpu_paged`'s."""
-    return generation.linear_tangent(functools.partial(_template_forward, softcap=softcap),
-                                     functools.partial(_paged_backward, softcap=softcap),
-                                     functools.partial(_gathered_tangent, softcap=softcap))
+    return contracted("test_the_paged_decode_kernel_holds_every_order", "kernel")(
+        generation.linear_tangent(functools.partial(_template_forward, softcap=softcap),
+                                  functools.partial(_paged_backward, softcap=softcap),
+                                  functools.partial(_gathered_tangent, softcap=softcap)))
 
 
 def _pages_per_block(pages: int) -> int:

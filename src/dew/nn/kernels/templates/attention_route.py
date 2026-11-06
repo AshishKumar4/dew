@@ -20,6 +20,7 @@ from typing import Literal, overload
 import jax
 import jax.numpy as jnp
 
+from dew.nn.derivatives import contracted
 from dew.nn.kernels import generation, selection
 from dew.nn.kernels.templates import attention_decode, attention_mosaic, attention_portable, attention_triton
 from dew.nn.kernels.templates.attention import (
@@ -120,6 +121,7 @@ def drops() -> bool:
     return not _on_gpu()
 
 
+@contracted("test_a_fused_attention_kernel_holds_its_reverse_orders", "kernel")
 @functools.partial(jax.custom_vjp, nondiff_argnums=(0,))
 def _attend(config: _Config, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             hooks: Hooks) -> jax.Array:

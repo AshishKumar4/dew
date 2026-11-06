@@ -27,6 +27,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from dew._hashing import fmix32
+from dew.nn.derivatives import contracted
 from dew.nn.kernels import launches
 from dew.nn.precision import (
     L2NORM_EPS,
@@ -366,7 +367,8 @@ def _skip_backward(saved, operands, grad):
     return summed.astype(skip.dtype), (grad * skip[:, None]).astype(value.dtype)
 
 
-_skip = linear_tangent(_skip_forward, _skip_backward, _skip_product)
+_skip = contracted("test_the_decode_step_holds_every_order", "numerics")(
+    linear_tangent(_skip_forward, _skip_backward, _skip_product))
 """`D v` (`_skip_product`) differentiated at every order (`generation.linear_tangent`): forward mode the
 product's own tangent, reverse mode its gradient in `D` summing every token's and value's product as a
 product (at JAX's configured precision) rather than one reduction over them all: XLA:CPU's reduction,
@@ -745,7 +747,8 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
         return jax.vjp(portable, *operands)[1](cotangent)
 
     launched = functools.partial(_launched, hooks, dtype=dtype)
-    return linear_tangent(lambda operands: (launched(operands), ()), pulled, portable)(operands)
+    return contracted("test_the_decode_step_holds_every_order", "kernel")(
+        linear_tangent(lambda operands: (launched(operands), ()), pulled, portable))(operands)
 
 
 def _launched(hooks: Hooks, operands: Step, *, dtype):
