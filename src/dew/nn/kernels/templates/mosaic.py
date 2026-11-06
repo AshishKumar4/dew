@@ -957,6 +957,17 @@ def synced(interpret: bool) -> None:
     plgpu.inline_mgpu()(lambda ctx: mgpu_utils.warpgroup_barrier())()
 
 
+def converts(dtype) -> bool:
+    """Whether the current device converts quantized codes of `dtype` to 16 bits in registers
+    (`Family.converted`): integer codes on any, FP8 codes where its tensor instructions take 8-bit operands
+    (`generation.Architecture.tensor_rates`' '8bit', sm_89 on), as PTX's e4m3x2 and e5m2x2 conversions
+    require (an A100's ptxas refused them, dd-quant4's q3)."""
+    if jnp.issubdtype(dtype, jnp.integer):
+        return True
+    architecture = generation.architecture(generation.gpu_target().generation)
+    return architecture is not None and "8bit" in architecture.tensor_rates
+
+
 def staged(shape: tuple, dtype, swizzle: int | None = None):
     """A shared-memory block of `shape` whose rows are staged at `swizzle` bytes: as layout inference stages
     them where unstated (the widest that fits); otherwise in 8-row tiles of the swizzle's row, explicitly,
@@ -1925,14 +1936,21 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         rows) as the tile a product reads (`into`, a shared tile of its 16-bit dtype): each code cast
         exactly, each row scaled by `row_scale` (fp32 `[rows]` in registers, a per-token scale) in fp32
         before its one rounding, written and published as `staged` writes a register operand."""
+        if not converts(codes.dtype):
+            raise ValueError(f"this device converts no {jnp.dtype(codes.dtype).name} codes in registers "
+                             "(`converts`)")
         if interpret:
             value = codes[...].astype(jnp.float32)
             if row_scale is not None:
                 value = value * row_scale[:, None]
         else:
             # Read in the accumulator's layout, whose rows a row vector broadcasts along (`as_row`); an 8-bit
-            # stage takes no ldmatrix.
-            value = plgpu.load(codes, layout=self.layout, optimized=False).astype(jnp.float32)
+            # stage takes no ldmatrix. Integer codes by way of int32: Mosaic's packed int8-to-16-bit
+            # conversion assembles to sm_90's sub.bf16x2 (an A100's ptxas refused it, dd-quant4's q4).
+            loaded = plgpu.load(codes, layout=self.layout, optimized=False)
+            if jnp.issubdtype(codes.dtype, jnp.integer):
+                loaded = loaded.astype(jnp.int32)
+            value = loaded.astype(jnp.float32)
             if row_scale is not None:
                 value = value * self.as_row(row_scale)[:, None]
         if interpret:
