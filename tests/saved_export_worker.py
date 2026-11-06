@@ -116,9 +116,18 @@ def resident_growth(into: list[int]) -> Iterator[None]:
     modules_before = set(sys.modules)
     compiles_before = len(COMPILES)
     tracing = os.environ.get("DBG_TRACE_ALLOC") == "1"
+    tracker = None
+    memray_path = None
+    if os.environ.get("DBG_MEMRAY") == "1" and len(TRACE) == 1:
+        import memray
+        memray_path = f"/tmp/pool-memray-{os.getpid()}.bin"
+        tracker = memray.Tracker(memray_path, native_traces=True)
+        tracker.__enter__()
     if tracing:
         tracemalloc.start()
     yield
+    if tracker is not None:
+        tracker.__exit__(None, None, None)
     into.append(resident_memory()["VmHWM"] - before)
     detail_after = memory_detail()
     record = {"before": detail_before, "after": detail_after,
@@ -131,6 +140,13 @@ def resident_growth(into: list[int]) -> Iterator[None]:
         record["top"] = [str(s) for s in tracemalloc.take_snapshot().statistics("lineno")[:4]]
         tracemalloc.stop()
     TRACE.append(record)
+    if memray_path is not None:
+        reader = memray.FileReader(memray_path)
+        record["native_peak"] = [(allocation.size, allocation.n_allocations,
+                                  list(allocation.hybrid_stack_trace())[:10])
+                                 for allocation in sorted(reader.get_high_watermark_allocation_records(),
+                                                          key=lambda allocation: allocation.size,
+                                                          reverse=True)[:6]]
 
 
 def exported(args) -> dict:
