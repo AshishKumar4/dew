@@ -2,6 +2,7 @@
 before the first record but the first file's, each file resumed within it, and a position saved under
 version 9 read by 9."""
 
+import grain.python as grain
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -61,12 +62,12 @@ def test_a_streamed_parquet_store_opens_its_first_file_alone_before_its_first_re
 
 def test_a_streamed_parquet_store_resumes_within_a_file_where_it_stopped():
     """A stream of a Parquet store saved partway through a file's row groups resumes at the record after the
-    last one read, in that file, and reads each file's records once, in order."""
+    last one read, in that file, and reads each file's records once, in the seeded shard order."""
     url = written("resumed")
 
     def opened():
         return compile(Pipeline(Files(url, format="parquet")).batch(2), read="streamed", loading=READ,
-                       epochs=1).train(DataPartition())
+                       seed=0, epochs=1).train(DataPartition())
 
     saving = opened()
     try:
@@ -75,7 +76,9 @@ def test_a_streamed_parquet_store_resumes_within_a_file_where_it_stopped():
         after = ids(saving)
     finally:
         saving.close()
-    assert before + after == list(range(FILES * GROUPS * ROWS))
+    file_order = grain.MapDataset.range(FILES).shuffle(seed=0)
+    expected = [number * GROUPS * ROWS + row for number in file_order for row in range(GROUPS * ROWS)]
+    assert before + after == expected
     resumed = opened()
     try:
         resumed.set_state(saved)
@@ -94,7 +97,7 @@ def test_a_parquet_streams_position_saved_under_plan_version_9_resumes_by_9_alon
     lines.child("rows.jsonl").write(b"".join(b'{"id": %d}\n' % row for row in range(FILES * GROUPS * ROWS)))
 
     def opened(source, version=None):
-        return compile(Pipeline(source).batch(2), read="streamed", loading=READ, epochs=1,
+        return compile(Pipeline(source).repeat(1).batch(2), read="streamed", loading=READ,
                        **({} if version is None else {"plan_version": version})).train(DataPartition())
 
     for source in (Files(url, format="parquet"), Files(lines.url, format="jsonl")):
@@ -103,13 +106,14 @@ def test_a_parquet_streams_position_saved_under_plan_version_9_resumes_by_9_alon
             ids(next(saving) for _ in range(5))
             saved = saving.get_state()
             expected = ids(saving)
+            assert len(expected) == FILES * GROUPS * ROWS - 10
         finally:
             saving.close()
         for version in (9, None):
             resumed = opened(source, version)
             try:
                 if source.kind == "parquet" and version is None:
-                    with pytest.raises(ValueError):
+                    with pytest.raises(ValueError, match="9"):
                         resumed.set_state(saved)
                     continue
                 resumed.set_state(saved)
@@ -127,14 +131,17 @@ def test_a_streamed_parquet_file_read_by_more_shares_than_files_places_each_reco
     pq.write_table(pa.Table.from_pylist([{"id": row} for row in range(GROUPS * ROWS)]), sink,
                    row_group_size=ROWS)
     root.child("part-00.parquet").write(sink.getvalue().to_pybytes())
+    # The batch size is global: four rows give each of the two shares two.
     chain = Pipeline(Files(root.url, format="parquet")).map_with_index(
-        lambda index, row: {**row, "place": index}, identity="place@1").batch(2)
+        lambda index, row: {**row, "place": index}, identity="place@1").batch(4)
     read = compile(chain, read="streamed", loading=READ, epochs=1)
     placed = []
     for share in range(2):
         stream = read.train(DataPartition(share, 2))
         try:
-            placed += [(int(batch["id"][at]), int(batch["place"][at])) for batch in stream for at in range(2)]
+            mine = [(int(batch["id"][at]), int(batch["place"][at])) for batch in stream for at in range(2)]
+            assert len(mine) == (2 - share) * ROWS
+            placed += mine
         finally:
             stream.close()
     assert sorted(placed) == [(row, row) for row in range(GROUPS * ROWS)]
