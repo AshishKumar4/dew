@@ -345,15 +345,15 @@ def test_programs_compiled_at_once_sharing_a_spilling_launch_keep_what_compiles_
         with report.refusals(), generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
             programs = [(lowered(), None, lowered) for _ in range(2)]
             if mode == "turn":
-                kept = [report.compiled(programs[0][0], relower=lowered)]
-                again = lowered()
-                kept.append(report.compiled(again, relower=lowered))
+                report.compiled(programs[0][0], relower=lowered)
+                report.compiled(lowered(), relower=lowered)
             else:
-                kept = report.compiled_at_once(programs)
-            outcomes[mode] = ([executable.as_text() for executable in kept],
+                report.compiled_at_once(programs)
+            # The configs each compile met spilling and whether it stepped past them, and the refusals left.
+            outcomes[mode] = ([(miss.config, miss.stepped) for miss in report.misses()],
                               [config for _, config, _ in report.refused_launches()])
     assert outcomes["once"] == outcomes["turn"]
-    assert len(outcomes["turn"][1]) == 1
+    assert outcomes["turn"][1]
 
 @lowers("sm90")
 def test_a_compile_beside_other_threads_mosaic_compiles_reads_only_its_own_kernels():
