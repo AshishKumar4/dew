@@ -377,7 +377,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     def registers(self, consumers: int, programs: int = 1) -> int:
         # Each role at its thread's share of the multiprocessor's 64K registers: two programs' 256 threads
         # hold 255 each.
-        _most(consumers)
+        _most(self, consumers)
         return resources.entry_registers(consumers, programs)
 
     def stores_columns(self, columns: int, rows: int) -> bool:
@@ -395,7 +395,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         # cluster; its kernels' default parameters reserve the scratch an implicit reduction takes
         # (`reduction_scratch`).
         del reducing_warpgroups, scalars  # its programs read a table from global memory as any operand
-        _most(consumers, clustered=cluster > 1)
+        _most(self, consumers, clustered=cluster > 1)
         threads = {} if consumers == 1 else {"num_threads": consumers, "thread_name": "wg"}
         built = launches.kernel(mosaic.dependent(entry, interpret), name=name or self.name,
                                 out_type=out_type, grid=grid, grid_names=grid_names, **threads,
@@ -411,13 +411,13 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                              **_collective(_consumers(streams)))
 
     def roles(self, consumers: int, consumer, producer) -> None:
-        _most(consumers)
+        _most(self, consumers)
         del producer
         consumer(0 if consumers == 1 else lax.axis_index("wg"))
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None):
-        _most(consumers, clustered=bool(multicast))
+        _most(self, consumers, clustered=bool(multicast))
         # `emit_pipeline` copies a step's block whole, one view a stream.
         if any(count > 1 for count in (copies or {}).values()):
             raise ValueError("an mma.sync family's pipeline loads a step's block in one copy, not in pieces")
@@ -452,7 +452,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         # Each tile's pipeline fills and drains before its output copy. Synchronize at that lifetime
         # boundary so the output's shared memory can reuse the pipeline's slots; two consumers stage their
         # rows' share of it side by side, in one collective scope.
-        _most(consumers)
+        _most(self, consumers)
         del in_flight, unrolled, accumulators  # its walk carries its accumulators
         index = 0 if consumers == 1 else lax.axis_index("wg")
         staging = self.output_staging(outputs, consumers)
@@ -595,11 +595,11 @@ class Mma(MmaIssuer, CpAsync):
         return tuple(mosaic.swizzle_columns(dtype, swizzle) for swizzle in (mosaic.SWIZZLE_BYTES, 64))
 
 
-def _most(consumers: int, *, clustered: bool = False) -> None:
-    """mma.sync's programs take one compute warpgroup or two (`Mma.consumers`), no producer, and no cluster
-    (`clustered`: cp.async loads its own program's shared memory alone)."""
-    if consumers not in range(1, Mma.consumers + 1) or clustered:
-        raise NotImplementedError(f"an mma.sync program takes one to {Mma.consumers} consumer warpgroups, "
+def _most(family: "CpAsync", consumers: int, *, clustered: bool = False) -> None:
+    """A cp.async family's programs take one compute warpgroup up to its bundle's own (`consumers`), no
+    producer, and no cluster (`clustered`: cp.async loads its own program's shared memory alone)."""
+    if consumers not in range(1, family.consumers + 1) or clustered:
+        raise NotImplementedError(f"an mma.sync program takes one to {family.consumers} consumer warpgroups, "
                                   f"not {consumers}, and no cluster")
 
 
