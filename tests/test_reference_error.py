@@ -2443,3 +2443,36 @@ def test_check_1_holds_an_arm_to_a_bitwise_repeat_only_where_one_is_promised(
         null_runs(bits_apart(), a_product_draw, label, seeds=8, runs=1, truth_fn=jnp.matmul)
 
 
+
+
+def test_an_arm_declared_to_vary_run_to_run_is_judged_by_its_one_run_and_held_to_its_inputs_on_a_cpu(
+        monkeypatch):
+    """An arm whose last bits move from run to run on the same inputs (an atomic accumulation's order):
+    where a repeat is promised on a GPU (deterministic mode), an undeclared one is refused as no function
+    of its inputs, and one declared `run_to_run` is judged by each draw's one run and passes; on a CPU,
+    whose interpreted programs are functions of their inputs, the declared one is held to its repeat as
+    every arm is (row 4448)."""
+    from reference_error import UnpairedDraw, run_to_run
+
+    import dew._devices
+
+    calls = [0]
+
+    @as_given
+    def wobbling(x):
+        calls[0] += 1
+        return {"y": np.asarray(x, np.float32) * np.float32(1 + 2.0 ** -23 * (calls[0] % 2))}
+
+    def plain(x):
+        return {"y": jnp.asarray(x, jnp.float32)}
+
+    def draw(seed):
+        return (np.random.default_rng([4448, seed]).standard_normal(64).astype(np.float32),)
+
+    with pytest.raises(UnpairedDraw):
+        assert_as_exact(run_to_run(wobbling, "atomic adds"), plain, draw, "on a CPU", seeds=8)
+    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
+    monkeypatch.setattr(dew._devices, "deterministic_ops_requested", lambda: True)
+    with pytest.raises(UnpairedDraw):
+        assert_as_exact(wobbling, plain, draw, "undeclared", seeds=8)
+    assert_as_exact(run_to_run(wobbling, "atomic adds"), plain, draw, "declared", seeds=8)
