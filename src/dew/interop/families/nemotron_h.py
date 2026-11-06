@@ -113,7 +113,8 @@ def _layer_types(hf_config: Mapping[str, object], used: set[str], record: Decode
     if not layers or set(layers) - set(_PATTERN.values()):
         raise ValueError(
             f"layers_block_type must contain Mamba-2, attention, MLP or MoE blocks, got {layers}")
-    record.update(layer_types=layers, num_layers=len(layers))
+    # Each kind's record its mixer's (`kind_mixer`).
+    record.update(layer_types=layers, num_layers=len(layers), kinds={})
     return record
 
 

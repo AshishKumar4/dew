@@ -558,15 +558,19 @@ TRAINING_ROUTER = unread('output_router_logits', 'router_aux_loss_coef')
 """A router's training controls, which a forward reads to no effect."""
 
 
-def _mixture(model: CausalTransformer) -> Mixture | None:
-    return model.mixture
+def stated_experts(model: CausalTransformer) -> Mixture | None:
+    """The model's routed experts as a config states them: their width the model's feed-forward's where
+    they name none of their own (`Mixture.expert_features`)."""
+    mixture = model.mixture
+    return None if mixture is None else dataclasses.replace(
+        mixture, expert_features=mixture.expert_features or model.hidden_features)
 
 
 def experts(*fields: ConfigEntry[Mixture], present: Callable[[Mapping[str, object]], bool] | None = None
             ) -> Nested[CausalTransformer, Mixture]:
     """A model's routed experts (`Mixture`), their keys `fields`, under its `mixture` (none where
     `present`, of the source config, says the config routes no layer)."""
-    return Nested('mixture', Mixture, ConfigLayout(*fields), _mixture, present=present)
+    return Nested('mixture', Mixture, ConfigLayout(*fields), stated_experts, present=present)
 
 
 LOCAL_EXPERTS = ConfigLayout(experts(integer('num_local_experts', 'experts'),

@@ -42,6 +42,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
 if TYPE_CHECKING:
+    from dew._records import JSON
     from dew.interop.decoder_parts import DecoderFields
     from dew.registry import Configured
 
@@ -88,11 +89,12 @@ def _time_step_limit(value: Configured, key: str) -> tuple[float, float]:
     transformers 5.x writes an infinite bound as the {"__float__": "Infinity"} record `records` reads, and
     every published port (AntonV/mamba2-130m-hf, Mamba-Codestral-7B) writes JSON's bare `Infinity`, which
     json.loads (and so transformers) reads as float('inf')."""
-    if not isinstance(value, (list, tuple)) or len(value) != 2:
+    def bound(stated: JSON, key: str) -> float:
+        return math.inf if stated == math.inf else _records.number(stated, key)
+    bounds = _records.listed(value, key, read=bound, what="a (lower, upper) pair")
+    if len(bounds) != 2:
         raise ValueError(f"{key} is a (lower, upper) pair, got {value!r}")
-    lower, upper = (math.inf if isinstance(bound, float) and bound == math.inf
-                    else _records.number(bound, key) for bound in value)
-    return lower, upper
+    return bounds[0], bounds[1]
 
 
 SSD_FIELDS: ConfigLayout[Mamba2Mixer] = ConfigLayout(
@@ -100,7 +102,8 @@ SSD_FIELDS: ConfigLayout[Mamba2Mixer] = ConfigLayout(
     integer('state_size', 'state_size', 128), integer('n_groups', 'n_groups', 8),
     integer('conv_kernel', 'conv_kernel', 4), integer('chunk_size', 'chunk_size', 256),
     flag('use_bias', 'use_bias', default=False), flag('use_conv_bias', 'use_conv_bias', default=True),
-    ConfigField('time_step_limit', 'time_step_limit', [0.0, math.inf], parse=_time_step_limit, spell=list))
+    ConfigField('time_step_limit', 'time_step_limit', [0.0, math.inf], parse=_time_step_limit,
+                value=lambda mixer: list(mixer.time_step_limit)))
 """`Mamba2Config`'s SSD layer (configuration_mamba2.py), every layer's mixer, both ways."""
 
 
