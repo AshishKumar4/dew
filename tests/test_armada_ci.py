@@ -1865,6 +1865,26 @@ def test_a_plan_without_build_output_or_fetched_payloads_finds_what_a_task_recor
     assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
 
 
+def test_a_plan_finds_what_a_task_recorded_beside_a_deleted_packages_bytecode(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A task's checkout, carried across commits in its environment's snapshot, holds a package a commit
+    deleted, its bytecode alone (src/<package>/__pycache__/); the planner's clean tree has none. Its rows key
+    as the plan's: a directory of nothing but build output is no input of its parent's listing (train 636:
+    src/dew/cli/ keyed every row apart from its plan's, and 240 kept rows ran in two tasks past their
+    deadline)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    stale = tmp_path / "src" / "gone" / "__pycache__"
+    stale.mkdir(parents=True)
+    (stale / "__init__.cpython-312.pyc").write_bytes(b"bytecode")
+    (tmp_path / "tests/test_a.py").write_text(
+        "from pathlib import Path\ndef test_a():\n"
+        "    assert sorted(path.name for path in Path('src').iterdir())\n"
+        "    with Path('runs-a').open('a') as runs: runs.write('x')\n")
+    armada_task(ci, monkeypatch, verdict)
+    shutil.rmtree(stale.parent)
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+
+
 def test_a_row_that_read_its_installs_metadata_is_reused_by_a_planner_without_it(
         ci, tmp_path, monkeypatch, cache_worker):
     """A run that read its editable install's metadata (setuptools' <name>.egg-info, which importlib.metadata
