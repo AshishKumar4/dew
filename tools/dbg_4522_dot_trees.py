@@ -66,9 +66,19 @@ for name, lhs, rhs in (
         return jax.lax.map(lambda at: jnp.einsum("bd,bdf->bf", at, b, precision=precision),
                            a.swapaxes(0, 1)).swapaxes(0, 1)
 
+    def transposed(a, b):
+        rhs = jax.lax.optimization_barrier(b.swapaxes(-1, -2))
+        return jnp.einsum("btd,bfd->btf", a, rhs, precision=precision)
+
+    def padded(a, b):
+        columns = b.shape[-1]
+        rhs = jnp.pad(b, ((0, 0), (0, 0), (0, max(16 - columns, 0))))
+        return jnp.einsum("btd,bdf->btf", a, rhs, precision=precision)[..., :columns]
+
     outputs = {}
     with summed_as_run():
-        for geometry, fn in (("batch", batch), ("token", token)):
+        for geometry, fn in (("batch", batch), ("token", token), ("transposed", transposed),
+                             ("pad16", padded)):
             for mode in ("on", "off"):
                 outputs[geometry, mode] = np.asarray(jax.jit(fn, compiler_options=(
                     {} if mode == "on" else {"xla_cpu_experimental_ynn_fusion_type": ""}))(lhs, rhs))

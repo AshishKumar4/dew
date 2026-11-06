@@ -97,6 +97,10 @@ def make(kind, variant):
                         if variant == "manual-wide-" + site:
                             return float64_sum(functools.partial(jnp.einsum, spec), lhs, rhs,
                                                dtype=lhs.dtype)
+                        if variant == "manual-pad16" and site != "head":
+                            columns = rhs.shape[-1]
+                            rhs = jnp.pad(rhs, ((0, 0), (0, max(16 - columns, 0))))
+                            return float32_einsum(spec, lhs, rhs)[..., :columns]
                         result = float32_einsum(spec, lhs, rhs)
                         return (jax.lax.optimization_barrier(result)
                                 if variant == "manual-barrier-" + site else result)
@@ -135,6 +139,8 @@ if os.environ.get("BARRIERS"):
                 "manual-barrier-up", "manual-barrier-head", "manual-barrier-silu")
 if os.environ.get("TOKEN_PROOF"):
     variants = ("literal", "actual", "actual-token", "token-categorical", "equation")
+if os.environ.get("PAD_PROOF"):
+    variants = ("literal", "actual", "manual", "manual-pad16")
 programs = {(variant, mode): jax.jit(make(kind, variant), compiler_options=(
     {} if mode == "on" else {"xla_cpu_experimental_ynn_fusion_type": ""}))
     for variant in variants for mode in ("on", "off")}
