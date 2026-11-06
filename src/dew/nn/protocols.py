@@ -123,6 +123,7 @@ __all__ = [
     "StagedStacks",
     "TimeScaled",
     "TokenModel",
+    "TreeVerifying",
     "TritonGemm",
     "VocabularyRows",
     "label_logits",
@@ -1115,6 +1116,17 @@ class Selective(Protocol):
 
     def states_and_logits_at(self, tokens: jax.Array, slots: jax.Array, **kwargs: ModelKwarg
                              ) -> tuple[jax.Array, jax.Array]: ...
+
+
+@runtime_checkable
+class TreeVerifying(Protocol):
+    """A decoder whose cached call reads a tree of candidate tokens along its paths (`attention_tree`
+    beside its key runs, `dew.nn.inputs.AttentionMetadata.tree_parents`), so tree speculative decoding
+    verifies a tree with it (`dew.sampling.trees.TreeBlock`); `verifies_trees` is False where its layers
+    read a call's tokens in their order before its mixers see the tree."""
+
+    @property
+    def verifies_trees(self) -> bool: ...
 
 
 @runtime_checkable

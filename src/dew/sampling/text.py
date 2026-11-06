@@ -71,6 +71,7 @@ from dew.nn.protocols import (
     ProjectionGroup,
     Selective,
     Serving,
+    TreeVerifying,
     refuse_prefix,
 )
 from dew.nn.visibility import with_served_blocks
@@ -553,8 +554,8 @@ def _step_places(state: DecoderState, width: int, tree: TreeBlock | None, capaci
     places the rows reach. A windowed layer windows the runs over the keys' places (`call_visibility`): the
     prefix's slots' as the chain's cache reads them, a node's its depth past the root's."""
     if tree is not None:
-        return ({"attention_key_runs": tree.runs(), "attention_key_positions": tree.key_positions(capacity)},
-                tree.positions())
+        return ({"attention_tree": tree.shape.fed_parents, "attention_key_runs": tree.runs(),
+                 "attention_key_positions": tree.key_positions(capacity)}, tree.positions())
     return {}, None if state.positions is None else state.positions[:, None] + jnp.arange(width)[None, :]
 
 
@@ -671,9 +672,11 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
         made = DecodeOps(advance, reindex, run, crosses=crossed, capacity=capacity)
     else:
         propose, embed = _drafting(model, params, pad_id)
+        # A tree drafted where the target reads one along its paths (`TreeVerifying`).
+        treed = isinstance(model, TreeVerifying) and model.verifies_trees
         made = DecodeOps(advance, reindex, run, propose, embed, depths,
-                         draft_tree=_tree_drafting(propose, reindex, depths), crosses=crossed,
-                         capacity=capacity)
+                         draft_tree=_tree_drafting(propose, reindex, depths) if treed else None,
+                         crosses=crossed, capacity=capacity)
     return made
 
 

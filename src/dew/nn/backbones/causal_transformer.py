@@ -1367,6 +1367,13 @@ class CausalTransformer(LinearProducts):
             block_groups=block_groups, rotary_positions=rotary_positions, coordinates=coordinates,
             conditioning=conditioning)]
 
+    @property
+    def verifies_trees(self) -> bool:
+        """Whether a cached call reads a tree along its paths (`dew.nn.protocols.TreeVerifying`): every
+        decoder but one whose n-gram hashes or routing blocks read the call's tokens in their order
+        (`check_tree`); a mixer that reads no tree refuses one itself."""
+        return self.engram is None and (self.mixture is None or self.mixture.routing_block is None)
+
     def mtp_step(self, hidden, tokens, *, depth: int = 0, input_embeddings=None, rotary_positions=None,
                  decode: bool = False, prediction_phase: PredictionPhase = "ordinary",
                  coordinates: Coordinates | None = None):
@@ -1710,9 +1717,8 @@ class CausalTransformer(LinearProducts):
             raise ValueError("attention_key_runs and attention_pairwise_mask each name a call's whole "
                              "visibility; pass one")
         if tree is not None:  # N-gram hashes and routing blocks read the tokens in their order.
-            routed = self.mixture is not None and self.mixture.routing_block is not None
             positions = None if coordinates is None else coordinates.positions
-            check_tree(tree, tokens.shape[1], decode=decode, ordered=self.engram is not None or routed,
+            check_tree(tree, tokens.shape[1], decode=decode, ordered=not self.verifies_trees,
                        positioned=positions is not None or rotary_positions is not None)
         if self.engram is None and (self.mixture is None or not self.mixture.media_bias):
             media_mask = None
