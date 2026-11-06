@@ -259,8 +259,7 @@ class CloudTPU:
         environ = _environ(self.environ)
         if not _in_cloud_tpu_vm(environ):
             return None
-        if any(environ.get(variable) is not None for variable in
-               ("TPU_PROCESS_ADDRESSES_PATH", "TPU_PROCESS_ADDRESSES", "TPU_WORKER_HOSTNAMES")):
+        if _gke_workers(environ) is not None:
             return "gketpu"
         if "TPU_SKIP_MDS_QUERY" not in environ and _metadata("agent-worker-number", environ) is not None:
             return "gcetpu"
@@ -288,11 +287,11 @@ class CloudTPU:
                        None if rank is None or per_slice is None else int(rank) + slice_id * per_slice)
 
     def _tpu_env(self, variable: str) -> str | None:
-        """A TPU runtime variable: the environment's, or on GCE the metadata's `tpu-env` line naming it
-        (`get_tpu_env_value`, jax/_src/clusters/cloud_tpu_cluster.py, jax-ml/jax 19a48d1de)."""
+        """A TPU runtime variable: the environment's, or the metadata's `tpu-env` line naming it, on GKE as
+        on GCE (`get_tpu_env_value`, jax/_src/clusters/cloud_tpu_cluster.py, jax-ml/jax 19a48d1de)."""
         environ = _environ(self.environ)
-        if variable in environ or self._kind != "gcetpu":
-            return environ.get(variable)
+        if variable in environ:
+            return environ[variable]
         for line in (_metadata("tpu-env", environ) or "").split("\n"):
             key, _, value = line.partition(":")
             if value and key.strip() == variable:

@@ -9,7 +9,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 - `Wandb(shared=True)` (`--trainer.wandb.shared`) opens a run's W&B run in shared mode as its primary writer, so other
   processes log into it on axes of their own (`WandbTracker(..., shared=True, primary=False, label=...)`), whose
-  rows W&B drops from a run opened plainly. It needs wandb 0.19 or later.
+  rows W&B drops from a run opened plainly. It needs wandb 0.19.9 or later and W&B Server 0.68 or later.
 - `dew.clusters` names the scheduler a run's processes start under: `ClusterEnvironment` (a `name`, `detected()` and
   `joining()`), with Open MPI, Slurm, Cloud TPU, Kubernetes and `dew launch`'s pool built in. `prepare_process(cluster=...)`
   joins a scheduler's pool without `dew launch`, a scheduler of your own among them; `dew launch` reads the same

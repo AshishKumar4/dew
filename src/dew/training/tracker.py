@@ -220,7 +220,7 @@ class WandbTracker(_OwnedTracker):
     """A Weights & Biases run, opened on the first value logged into it.
 
     `shared` opens it in W&B's shared mode (`wandb.Settings(mode="shared")`,
-    wandb 0.19 or later), where several processes write one run, each its
+    wandb 0.19.9 or later and W&B Server 0.68 or later), where several processes write one run, each its
     own `label`: the `primary` writer opens it and logs on `train/step`; any
     other attaches to the run's `id`, logs its `label`'s metrics on its own
     step (`<label>/step`) and leaves the run's state to the primary

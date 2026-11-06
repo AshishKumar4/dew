@@ -202,10 +202,10 @@ def _join_process_pool(environment: ClusterEnvironment | None, joins: bool) -> N
     node than the GPUs its task sees is refused: JAX gives each task the GPU
     at its SLURM_LOCALID, and the others would sit idle.
     """
-    place = environment.place() if isinstance(environment, Scheduler) else None
     tasks = slurm_tasks_here()
-    if (place is not None and environment is not None and environment.name == "slurm"
-            and (place.process_count or 0) > 1 and tasks is not None and runs_on_gpu(os.environ)):
+    slurm = isinstance(environment, Scheduler) and environment.name == "slurm"
+    if (slurm and (environment.place().process_count or 0) > 1 and tasks is not None
+            and runs_on_gpu(os.environ)):
         # Before joining: a pool whose ranks see GPUs they will not use
         # trains on fewer than it was given, and nothing reports it.
         gpus = communicators.local_gpus()
