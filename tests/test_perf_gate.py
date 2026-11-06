@@ -573,10 +573,11 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round_and_refuses_a_
         gate.compile_battery(args)
 
 
-TINY = {"architecture": "causal_transformer", "dtype": "float32", "batch_size": 2, "seq_len": 8,
-        "config": {"vocab_size": 96, "emb_features": 32, "num_layers": 1, "num_heads": 2, "mlp_features": 64,
-                   "max_seq_len": 16}}
-"""A step small enough to plan and compile ahead in a test."""
+TINY = {"architecture": "causal_transformer", "dtype": "bfloat16", "batch_size": 1, "seq_len": 1024,
+        "config": {"vocab_size": 96, "emb_features": 128, "num_layers": 1, "num_heads": 2, "mlp_features": 128,
+                   "max_seq_len": 1024}}
+"""A step small enough to plan and compile ahead in a test, its heads 64 wide over 1024 tokens as lm-dense's
+are, which a GPU routes to FlashAttention."""
 
 
 def test_a_step_is_planned_ahead_for_an_absent_gpu_and_a_kernel_this_host_cannot_lower_is_named(

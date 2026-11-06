@@ -703,7 +703,7 @@ def report(args: argparse.Namespace) -> int:
             state += f", insensitive (its A/A reaches past its {row.floor:.0%} floor)"
         if "why" in numbers:
             state += f" ({numbers['why']})"
-        cells = (["-"] * 5 if "ratio" not in numbers else
+        cells = (["-"] * 5 if row.head_only or "ratio" not in numbers else
                  [f"{numbers['base']:.2f}", f"{numbers['head']:.2f}", f"{numbers['ratio']:.4f}",
                   *(f"{low:.4f}-{high:.4f}" for low, high in (numbers["interval"], numbers["alone"]))])
         if row.head_only and "exit_codes" in numbers:
