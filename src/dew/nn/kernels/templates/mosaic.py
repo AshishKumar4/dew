@@ -1923,7 +1923,7 @@ class Transport[Allocated, Opened](abc.ABC):
     def partials_ready(self, shape: tuple[int, ...], interpret: bool):
         """The semaphores of `shape` a tile's partials are signalled on across programs (`fixed_up`); none
         interpreted, where the programs' order stands in for them (`tail.ordered`)."""
-        raise NotImplementedError(f"{self.name} fixes no tile up across programs (`fixes_up`)")
+        return None if interpret else pl.get_global(plgpu.SemaphoreType.REGULAR(shape))
 
     def ticketed(self, ready, ticket, body: Callable[[], None]) -> None:
         """`body`, an add into global memory (`added`), in its turn among the programs adding there: once
@@ -1931,7 +1931,20 @@ class Transport[Allocated, Opened](abc.ABC):
         writes complete and `ready` signalled, so the adds land in a fixed order (a deterministic sum,
         FlashAttention 3's dQ semaphore); `body` alone where `ready` is None (interpreted, the programs'
         order standing in)."""
-        raise NotImplementedError(f"{self.name} orders no adds across programs (`fixes_up`)")
+        if ready is None:
+            body()
+            return
+        # Wait without taking: the semaphore counts the adds done, each program's turn the count before it.
+        plgpu.semaphore_wait(ready, ticket, decrement=False, memory_scope="gpu")
+        body()
+        # Its writes complete in global memory before the next turn (`added_settled`).
+        self.added_settled()
+        plgpu.semaphore_signal(ready, 1, memory_scope="gpu")
+
+    @abc.abstractmethod
+    def added_settled(self) -> None:
+        """A program's adds into global memory complete (`added`), past any copy of its still in flight (a
+        TMA reduction's); a family that adds from its registers has none in flight."""
 
     def fixed_up(self, summed, partials, ready, program, start, gathered, store,
                  combine=operator.add) -> None:
@@ -1942,8 +1955,28 @@ class Transport[Allocated, Opened](abc.ABC):
         the algebra's merge of two partials of one tile (a sum's addition by default; a split walk's
         softmax merge, a scan's composition), which the work's declaration supplies. `summed` may be a
         pytree (a merge's partial of several leaves): `partials` is then a ref a leaf, in its structure,
-        and a program's one signal releases them all."""
-        raise NotImplementedError(f"{self.name} fixes no tile up across programs (`fixes_up`)")
+        and a program's one signal releases them all. GPU-scope signals and waits: TGHYBRID1-h100's SASS
+        releases each partial with MEMBAR.GPU and a strong global add, and acquires it with a strong CAS,
+        which sm_70 on issues. Interpreted, the partials are left before they are read (`tail.ordered`)."""
+        @pl.when(start > 0)
+        def _():
+            # Unoptimized: a partial's leaf may move less than a cache line (a 16-row decode's statistics,
+            # 64 bytes), which an optimized global transfer refuses.
+            jax.tree.map(lambda leaf, ref: plgpu.store(ref.at[program], leaf, optimized=False), summed,
+                         partials)
+            if ready is not None:
+                plgpu.semaphore_signal(ready.at[program], memory_scope="gpu")
+
+        @pl.when(start == 0)
+        def _():
+            def added(other, running):
+                if ready is not None:
+                    plgpu.semaphore_wait(ready.at[other], memory_scope="gpu")
+                # The partials' structure read off the running value's: a ref may itself be a tree.
+                return combine(running, jax.tree.map(
+                    lambda _, ref: plgpu.load(ref.at[other], optimized=False), running, partials))
+
+            store(lax.fori_loop(program + 1, gathered, added, summed))
 
 
 class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allocated, Opened]):
@@ -2286,44 +2319,10 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             plgpu.commit_smem()
             plgpu.copy_smem_to_gmem(smem, place, reduction_op="add")
 
-    def partials_ready(self, shape: tuple[int, ...], interpret: bool):
-        return None if interpret else pl.get_global(plgpu.SemaphoreType.REGULAR(shape))
-
-    def ticketed(self, ready, ticket, body: Callable[[], None]) -> None:
-        if ready is None:
-            body()
-            return
-        # Wait without taking: the semaphore counts the adds done, each program's turn the count before it.
-        plgpu.semaphore_wait(ready, ticket, decrement=False, memory_scope="gpu")
-        body()
-        # Its writes complete in global memory, not only its stage read (`store_wait`), before the next turn.
+    def added_settled(self) -> None:
+        # Its adds are TMA reductions (`added`), each in flight past its issue until waited.
         plgpu.wait_smem_to_gmem(0)
-        plgpu.semaphore_signal(ready, 1, memory_scope="gpu")
 
-    def fixed_up(self, summed, partials, ready, program, start, gathered, store,
-                 combine=operator.add) -> None:
-        # GPU-scope signals and waits, proven to lower and run on an H100 at the pinned JAX: TGHYBRID1-h100's
-        # SASS releases each partial with MEMBAR.GPU and a strong global add, and acquires it with a strong
-        # CAS. Interpreted, the partials are left before they are read (`tail.ordered`).
-        @pl.when(start > 0)
-        def _():
-            # Unoptimized: a partial's leaf may move less than a cache line (a 16-row decode's statistics,
-            # 64 bytes), which an optimized global transfer refuses.
-            jax.tree.map(lambda leaf, ref: plgpu.store(ref.at[program], leaf, optimized=False), summed,
-                         partials)
-            if ready is not None:
-                plgpu.semaphore_signal(ready.at[program], memory_scope="gpu")
-
-        @pl.when(start == 0)
-        def _():
-            def added(other, running):
-                if ready is not None:
-                    plgpu.semaphore_wait(ready.at[other], memory_scope="gpu")
-                # The partials' structure read off the running value's: a ref may itself be a tree.
-                return combine(running, jax.tree.map(
-                    lambda _, ref: plgpu.load(ref.at[other], optimized=False), running, partials))
-
-            store(lax.fori_loop(program + 1, gathered, added, summed))
 
 def summing(shape: tuple[int, ...], consumers: int) -> dict:
     """`summed_across`' allocations for `pl.run_scoped` (collective across the consumers, in a scope after

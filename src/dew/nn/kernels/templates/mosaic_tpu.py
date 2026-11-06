@@ -399,6 +399,10 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         del swizzle
         return pltpu.VMEM(shape, dtype)
 
+    def added_settled(self) -> None:
+        # Its adds are synchronous copies (`added`), done when they return.
+        pass
+
     def schedule(self, consumers: int):
         # One role a core takes no turns (`turn` passes for one consumer): a semaphore it never signals, no
         # byte of its VMEM (`resources.scratch_bytes`).
