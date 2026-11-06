@@ -695,35 +695,76 @@ def _counted_trips(loop: _Instruction, caller: _Computation,
     to, and the form XLA's own trip-count analysis reads; where that bound is
     one side of an `and`, at most its trips, a bound as every branch of a
     conditional counted is (a loop of at most one trip, the attention guards').
-    Infinite for any other loop, and for one whose last step overflows the
-    counter's type, since a wrapped counter need never reach the bound."""
+    Its condition and step are read through copies and through the fusions an
+    executable wraps them in (`_term`). Infinite for any other loop, and for
+    one whose last step overflows the counter's type, since a wrapped counter
+    need never reach the bound."""
     condition = computations.get(_called(loop, 'condition'))
     body = computations.get(_called(loop, 'body'))
     if condition is None or body is None or not loop.operands:
         return math.inf
-    root = condition.instructions.get(condition.root or '')
-    sides = root.operands if root is not None and root.op == 'and' else [condition.root or '']
-    return min((_compared_trips(loop, caller, condition, body, condition.instructions.get(side))
-                for side in sides), default=math.inf)
+    root = _term(condition, condition.root, computations)
+    sides = root[2] if root is not None and root[0] == 'and' else (root,)
+    return min((_compared_trips(loop, caller, body, side, computations) for side in sides),
+               default=math.inf)
 
 
-def _compared_trips(loop: _Instruction, caller: _Computation, condition: _Computation, body: _Computation,
-                    compare: _Instruction | None) -> float:
-    """`_counted_trips` of `loop` by `compare`, its condition's counted bound, or infinite where it is
-    none."""
-    if (compare is None or compare.op != 'compare' or 'direction=LT' not in compare.attributes
-            or len(compare.operands) != 2):
+def _compared_trips(loop: _Instruction, caller: _Computation, body: _Computation, compare: tuple | None,
+                    computations: dict[str, _Computation]) -> float:
+    """`_counted_trips` of `loop` by `compare` (a `_term`), its condition's counted bound, or infinite
+    where it is none."""
+    if (compare is None or compare[0] != 'compare' or 'direction=LT' not in compare[1]
+            or len(compare[2]) != 2):
         return math.inf
-    counter = _INTEGER_TYPE.match(condition.elements.get(_origin(condition, compare.operands[0]), ''))
-    index = _element_index(condition, compare.operands[0])
-    bound = _constant(condition, compare.operands[1])
-    if counter is None or index is None or bound is None:
+    counter, bound = compare[2]
+    if counter is None or counter[0] != 'element' or bound is None or bound[0] != 'constant':
         return math.inf
-    start = _constant(caller, _tuple_element(caller, loop.operands[0], index))
-    step = _increment(body, _tuple_element(body, body.root, index), index)
-    if start is None or step is None:
+    kind = _INTEGER_TYPE.match(counter[2])
+    start = _constant(caller, _tuple_element(caller, loop.operands[0], counter[1]))
+    step = _step(_term(body, _tuple_element(body, body.root, counter[1]), computations), counter[1])
+    if kind is None or start is None or step is None:
         return math.inf
-    return counted_trips(start, bound, step, int(counter.group(2)), signed=counter.group(1) == 's')
+    return counted_trips(start, bound[1], step, int(kind.group(2)), signed=kind.group(1) == 's')
+
+
+def _term(computation: _Computation, name: str | None, computations: dict[str, _Computation],
+          bound: tuple = ()) -> tuple | None:
+    """The expression that makes `name` in `computation`, through copies and through a fusion of
+    elementwise ops over its operands (an executable's loop condition and counter step): `('element',
+    index, type)` for an element of the computation's tuple parameter, `('constant', value)` for an
+    integer constant, `(op, attributes, operands)` for any other instruction, its operands each such a
+    term; a fused computation's parameters bound to its fusion's operands (`bound`). None where it is
+    none of these."""
+    made = _source(computation, name)
+    if made is None:
+        return None
+    if made.op == 'parameter' and bound:
+        # A fused computation's parameter, its number its one operand (`parameter(1)`).
+        number = int(made.operands[0]) if made.operands and made.operands[0].isdigit() else len(bound)
+        return bound[number] if number < len(bound) else None
+    value = _constant(computation, made_name := _origin(computation, name))
+    if value is not None:
+        return ('constant', value)
+    index = _element_index(computation, made_name)
+    if index is not None:
+        return ('element', index, computation.elements.get(made_name, ''))
+    operands = tuple(_term(computation, operand, computations, bound) for operand in made.operands)
+    if made.op == 'fusion':
+        fused = computations.get(_called(made, 'calls'))
+        return None if fused is None else _term(fused, fused.root, computations, operands)
+    return (made.op, made.attributes, operands)
+
+
+def _step(stepped: tuple | None, index: int) -> int | None:
+    """The constant a loop's body adds to its counter, element `index` of its parameter, to make the term
+    `stepped`, or None where it adds none."""
+    if stepped is None or stepped[0] != 'add' or len(stepped[2]) != 2:
+        return None
+    for counter, step in (stepped[2], stepped[2][::-1]):
+        if counter is not None and counter[0] == 'element' and counter[1] == index and step is not None \
+                and step[0] == 'constant':
+            return step[1]
+    return None
 
 
 def counted_trips(start: int, bound: int, step: int, bits: int, *, signed: bool) -> float:
@@ -779,18 +820,6 @@ def _tuple_element(computation: _Computation, name: str | None, index: int) -> s
     if built is None or built.op != 'tuple' or index >= len(built.operands):
         return None
     return built.operands[index]
-
-
-def _increment(body: _Computation, name: str | None, index: int) -> int | None:
-    """The constant the body adds to element `index` of its parameter to make
-    `name`, or None when `name` is anything else."""
-    added = _source(body, name)
-    if added is None or added.op != 'add' or len(added.operands) != 2:
-        return None
-    for counter, step in (added.operands, added.operands[::-1]):
-        if _element_index(body, counter) == index:
-            return _constant(body, step)
-    return None
 
 
 def _weights(computations: dict[str, _Computation], entry: str) -> dict[str, float]:
