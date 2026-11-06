@@ -172,7 +172,9 @@ def laid_logits(agent, model, exact, cases: dict | None = None) -> dict[str, np.
     device = next(model.parameters()).device
     logits = {}
     for key, parallel, _, collated in laid(agent, cases):
-        batch = {field: value.to(device) for field, value in collated.items()}
+        # collate_items' `meta` is a list of the items' own fields, which the forward does not read.
+        batch = {field: value.to(device) for field, value in collated.items()
+                 if isinstance(value, torch.Tensor)}
         arguments = (batch["input_ids"], batch["attention_mask"], batch["marker_pos"], batch["marker_mask"],
                      batch["qtype"])
         extra = {"position_ids": batch["position_ids"], "option_ids": batch["option_ids"]} if parallel else {}
