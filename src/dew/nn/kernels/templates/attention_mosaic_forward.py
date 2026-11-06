@@ -169,6 +169,14 @@ each row's shift, reach, unshifted denominator and liveness), each held by the f
 row spans, two rows a thread: a `[block_q, 4]` fp32 tile's words a statistic (`guarded_tiles`)."""
 
 
+def _magnitudes_cast(family: mosaic.Family, rows: int, block: int, columns: int) -> bool:
+    """Whether a guarded launch at `rows` x `block` reads its keys' magnitudes (`Family.key_magnitudes`: the
+    value block transposed, `[columns, block]`, in its share's layout) in whole row atoms of its arranged
+    family (`Issuer.transposed_rows`): a 64-row atom took no 32-column block (an A100's 256-wide softcap
+    forward, et-sm80sc3)."""
+    return columns % family.specialized(rows, block).transposed_rows == 0
+
+
 def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, width: int, *,
                   held_only: bool = True) -> Tiles | None:
     """The guarded launch's tiles beside the plain launch's `tiles` (`_plain_forward`): the largest of the
@@ -217,7 +225,8 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
     # (`Transport.shares_rows`: two mma.sync consumers' cp.async in whole 64-row parts).
     candidates = (dataclasses.replace(tiles, block_q=rows, block_k=block, consumers=consumers, narrow=narrow)
                   for rows in queries for consumers in range(tiles.consumers, 0, -1) for block in blocks
-                  if family.shares_rows(block, consumers) for narrow in stagings(family))
+                  if family.shares_rows(block, consumers) and _magnitudes_cast(family, rows, block, columns)
+                  for narrow in stagings(family))
     ranked = list(candidates)
     return next((candidate for candidate in ranked if held(candidate)), None if held_only else ranked[-1])
 
