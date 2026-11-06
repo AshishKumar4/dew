@@ -29,49 +29,56 @@ def gate():
 ])
 def test_the_report_fails_on_a_broken_row_and_not_on_an_ungated_one(gate, tmp_path, monkeypatch, head, code):
     rows = [gate.Row("gated", "ms", "").__dict__, gate.Row("shown", "ms", "", gated=False).__dict__]
-    results = {"base": "main", "head": "head", "rows": rows,
-               "samples": {"main": [{"gated": 10.0, "shown": 10.0}, {"gated": 10.1, "shown": 10.1}],
-                           "head": [head, head]}}
+    steady = [{"gated": 10.0, "shown": 10.0}, {"gated": 10.0625, "shown": 10.0625}] * 3
+    results = {"base": "main", "head": "head", "alone": "main~aa", "rows": rows, "rounds": 6,
+               "samples": {"main": steady, "main~aa": steady[::-1], "head": [head] * 6}}
     (tmp_path / "gate.json").write_text(json.dumps(results))
     monkeypatch.setattr(sys, "argv", ["perf_gate.py", "report", str(tmp_path / "gate.json")])
     assert gate.main() == code
 
 
-def test_a_row_is_judged_by_its_calibrated_noise_and_a_row_noisier_than_its_floor_says_so(
-        gate, tmp_path, monkeypatch, capsys):
-    """With a calibration, a row's band is at least its null noise (one tree against itself): a 4% slower
-    head regresses a row whose noise is 1%, and on a row whose noise is 6% it is level, the row named
-    insensitive since a change of its 2% floor is beneath its noise. A 10% slower head still regresses that
-    row: insensitive widens the band, never drops the row. A row given an anchor is judged against it too."""
-    rows = [gate.Row("quiet", "ms", "").__dict__, gate.Row("loud", "ms", "").__dict__]
+def samples(*values) -> list[float]:
+    """Six rounds' samples, `values` cycled: literals a binary float holds exactly."""
+    return [float(values[index % len(values)]) for index in range(6)]
 
-    def judged(slower: float) -> tuple[int, str]:
-        results = {"base": "main", "head": "head", "rows": rows, "rounds": 3,
-                   "samples": {"main": [{"quiet": 10.0, "loud": 10.0}, {"quiet": 10.01, "loud": 10.01},
-                                        {"quiet": 10.0, "loud": 10.0}],
-                               "head": [{"quiet": 10.0 * slower, "loud": 10.0 * slower}] * 3}}
-        (tmp_path / "gate.json").write_text(json.dumps(results))
-        (tmp_path / "noise.json").write_text(json.dumps({"noise": {"quiet": 0.01, "loud": 0.06}}))
-        (tmp_path / "anchors.json").write_text(json.dumps({"rows": {"quiet": [9.0, 9.01, 9.0]}}))
-        monkeypatch.setattr(sys, "argv", ["perf_gate.py", "report", str(tmp_path / "gate.json"),
-                                          "--calibration", str(tmp_path / "noise.json"),
-                                          "--verdicts", str(tmp_path / "verdicts.json"),
-                                          "--anchors", str(tmp_path / "anchors.json")])
-        code = gate.main()
-        return code, capsys.readouterr().out
 
-    code, _ = judged(1.04)
-    assert code == 1
-    verdicts = json.loads((tmp_path / "verdicts.json").read_text())
-    assert verdicts["failed"] == ["quiet (regressed)"]
-    assert {name: (row["state"], row["unit"], row["insensitive"], row["band"])
-            for name, row in verdicts["rows"].items()} == {"quiet": ("regressed", "ms", False, 0.02),
-                                                           "loud": ("level", "ms", True, 0.06)}
-    # Against its anchor, a run's samples the runner kept, the head is judged as against the base.
-    assert verdicts["rows"]["quiet"]["anchor"]["state"] == "regressed"
-    assert "anchor" not in verdicts["rows"]["loud"]
-    code, _ = judged(1.10)
-    assert code == 1 and "loud (regressed)" in json.loads((tmp_path / "verdicts.json").read_text())["failed"]
+def test_a_row_is_judged_by_its_rounds_ratios_against_its_own_a_a_and_acted_on_past_its_floor(gate):
+    """Each round's head over its base, against each round's A/A over its base, judged at LEVEL
+    (`benchmark.judged`): a head whose six ratios all pass 1 but lie within the A/A's interval is level,
+    where the spread band a run judged by before called its separated samples regressed; past the A/A and
+    past the 2% floor it regresses, or is faster; past the A/A within the floor it differs below its floor,
+    and passes; an A/A wider than the floor makes the row insensitive, said beside its state."""
+    row = gate.Row("step", "ms", "")
+    base = samples(8.0)
+    # Ratios 1.03125 and 1.0625 against an A/A whose ratios span 0.9375 to 1.0625.
+    state, numbers = gate.verdict(row, base, samples(8.25, 8.5), samples(7.5, 8.5))
+    assert (state, numbers["differs"], numbers["insensitive"]) == ("level", False, True)
+    assert numbers["interval"] == [1.03125, 1.0625] and numbers["alone"] == [0.9375, 1.0625]
+    tight = samples(8.0, 8.0625)
+    state, numbers = gate.verdict(row, base, samples(8.5, 8.75), tight)
+    assert (state, numbers["ratio"], numbers["interval"], numbers["alone"]) == (
+        "regressed", 1.078125, [1.0625, 1.09375], [1.0, 1.0078125])
+    assert gate.verdict(row, base, samples(7.5, 7.25), tight)[0] == "faster"
+    state, numbers = gate.verdict(row, base, samples(8.125), tight)
+    assert (state, numbers["differs"], numbers["insensitive"]) == ("different, below floor", True, False)
+    # Higher is better: throughput that falls past the floor regresses.
+    assert gate.verdict(gate.Row("rate", "items/s", ""), base, samples(7.5, 7.25), tight)[0] == "regressed"
+
+
+def test_a_row_any_arm_left_unmeasured_in_a_round_is_partial_and_too_few_rounds_are_unjudged(gate):
+    """Rounds every arm measured are never picked out of a run some arm missed: one missing A/A round makes
+    the row partial; five complete rounds reach no interval at 0.95 and are unjudged, which fails the
+    gate as the gate's own."""
+    row = gate.Row("step", "ms", "")
+    base, head, alone = samples(8.0), samples(8.5), samples(8.0, 8.0625)
+    state, numbers = gate.verdict(row, base, head, [*alone[:5], None])
+    assert state == "partial" and numbers["unmeasured rounds"] == {"A/A": 1}
+    state, numbers = gate.verdict(row, base[:5], head[:5], alone[:5])
+    assert state == "unjudged" and "short of 0.95" in numbers["why"]
+    assert "unjudged" in gate.UNQUALIFIED and "partial" in gate.UNQUALIFIED
+
+
+
 
 
 def after(command, flag):
@@ -102,7 +109,8 @@ def standing_in(gate, monkeypatch, *, passed: bool, peaks: bool = True) -> list:
         "benchmark_image_pipeline.py": lambda command: {
             "pipeline": {"device_crop_flip_jitter": {"images_per_second": 5.0, "peak_device_bytes": peak}}},
         "qwen35_pair.py": lambda command: {"comparison": {
-            "dew_tokens_per_s": 720.0, "dew_over_torch": 1.0 if passed else 0.72, "tolerance": 0.01,
+            "dew_tokens_per_s": 720.0, "dew_over_torch": 1.0 if passed else 0.75, "interval": [0.75, 0.75],
+            "alone": [0.96875, 1.03125], "differs": not passed, "rounds": 6,
             "performance_claim_passed": passed}},
     }
     commands = []
@@ -135,8 +143,9 @@ def test_external_reference_subprocess_failure_keeps_its_measurement(gate, tmp_p
                            torch_python="torch", out=tmp_path / "gate.json")
     name = next(row.name for row in gate.BATTERY if row.head_only)
     sample = gate.measure(ROOT, Path(sys.executable), args, ROOT / "tools", is_head=True)
-    assert sample[name] == {"exit_code": 1, "value": 720.0, "ratio": 0.72,
-                            "tolerance": 0.01, "passed": False}
+    assert sample[name] == {"exit_code": 1, "value": 720.0, "ratio": 0.75, "interval": [0.75, 0.75],
+                            "alone": [0.96875, 1.03125], "differs": True, "rounds": 6, "passed": False}
+    assert gate.reference_verdict([sample[name]])[0] == "failed"
     assert Path(sample[f"evidence {name}"]).is_file()
     assert len(commands) == 2
     assert gate.measure(ROOT, Path(sys.executable), args, ROOT / "tools", is_head=False) == {}
@@ -164,16 +173,17 @@ def test_a_head_reads_every_row_of_the_battery_from_the_tool_it_names(gate, tmp_
 
 def test_a_faster_head_whose_measured_peak_grows_regresses_and_an_unmeasured_peak_is_never_zero(
         gate, tmp_path, monkeypatch):
-    """Two measures decide (testing.md): a head faster on a step's time whose measured peak grew past its band
-    regresses on its peak row, whatever its time did; a base whose tool predates the peak (no
+    """Two measures decide (testing.md): a head faster on a step's time whose measured peak grew past its
+    floor regresses on its peak row, whatever its time did; a base whose tool predates the peak (no
     peak_device_bytes) is not compared on it, never read as zero."""
     [row] = [row for row in gate.BATTERY if row.name == "peak step lm-dense 4x1024"]
     assert row.unit == "GiB" and row.gated
-    assert gate.verdict(row, [3.0, 3.0, 3.0], [3.3, 3.3, 3.3])[0] == "regressed"
+    tight = samples(3.0, 3.0078125)
+    assert gate.verdict(row, samples(3.0), samples(3.25, 3.3125), tight)[0] == "regressed"
     [time] = [row for row in gate.BATTERY if row.name == "step lm-dense 4x1024"]
-    assert gate.verdict(time, [5.0, 5.1, 5.0], [4.0, 4.1, 4.0])[0] == "faster"
+    assert gate.verdict(time, samples(5.0), samples(4.0, 4.125), samples(5.0, 5.015625))[0] == "faster"
     assert gate.peak({"ms_per_step": 5.0}) is None
-    assert gate.verdict(row, [None, None, None], [3.0, 3.0, 3.0])[0] == "not compared"
+    assert gate.verdict(row, [None] * 6, samples(3.0), [None] * 6)[0] == "not compared"
     # A tree whose tools measure no peak: its peak rows unmeasured, every time row still measured.
     from types import SimpleNamespace
 
@@ -192,13 +202,14 @@ def test_a_faster_head_whose_measured_peak_grows_regresses_and_an_unmeasured_pea
 
 def test_a_step_reports_its_mfu_from_the_same_invocation_and_a_lower_one_regresses(gate):
     """Each step probe's MFU row reads benchmark_step's train/mfu from the invocation that times it, in
-    percent, higher the better: a head whose MFU falls past its band regresses, one whose tool predates the
+    percent, higher the better: a head whose MFU falls past its floor regresses, one whose tool predates the
     MFU is not compared on it, never read as zero."""
     [row] = [row for row in gate.BATTERY if row.name == "mfu step lm-dense 4x1024"]
     assert row.unit == "% mfu" and row.gated
-    assert gate.verdict(row, [40.0, 40.2, 40.1], [36.0, 36.1, 36.0])[0] == "regressed"
-    assert gate.verdict(row, [40.0, 40.2, 40.1], [44.0, 44.1, 44.0])[0] == "faster"
-    assert gate.verdict(row, [None, None, None], [40.0, 40.0, 40.0])[0] == "not compared"
+    base, tight = samples(40.0), samples(40.0, 40.125)
+    assert gate.verdict(row, base, samples(36.0, 36.25), tight)[0] == "regressed"
+    assert gate.verdict(row, base, samples(44.0, 44.25), tight)[0] == "faster"
+    assert gate.verdict(row, [None] * 6, samples(40.0), [None] * 6)[0] == "not compared"
 
 
 def test_a_full_fine_tune_steps_adamw_on_the_device_it_is_sized_for_and_is_unmeasured_off_it(gate):
@@ -218,13 +229,13 @@ def test_a_full_fine_tune_steps_adamw_on_the_device_it_is_sized_for_and_is_unmea
         [case] = step.cases_from_json(json.dumps([gate.STEP_CASES[name]]))
         assert case.optimizer == "adamw" and set(case.config) <= declared
         rows = [row for row in gate.BATTERY if row.name.endswith(name.removeprefix("step "))]
-        assert len(rows) == 4
+        assert len(rows) == 3
         for row in rows:
             assert not gate.claimed(row)
             assert gate.hardware_status(row, device) is None
             unmeasured = gate.hardware_status(row, other)
             assert unmeasured.startswith("not measured on this hardware")
-            assert gate.verdict(row, [unmeasured] * 3, [unmeasured] * 3)[0] == "not measured on this hardware"
+            assert gate.verdict(row, *[[unmeasured] * 6] * 3)[0] == "not measured on this hardware"
 
 
 def standing_in_environments(gate, monkeypatch) -> tuple[list, list]:
@@ -357,16 +368,16 @@ def test_a_tree_imports_the_wheels_its_lock_names_and_dew_from_its_own_source(ga
 
 
 def test_a_head_that_grows_its_compile_by_more_than_a_quarter_regresses(gate):
-    """A step's compile row fails a head that grows it by more than the materiality `COMPILE_FLOOR` names:
-    a fifth more over steady rounds is level, a third more regresses, a third less is faster; its step
-    row keeps the 2% floor."""
-    compile_row = next(row for row in gate.BATTERY if row.name == "compile lm-dense 4x1024")
+    """A compile row fails a head that grows it by more than the materiality `COMPILE_FLOOR` names: a
+    fifth more, past its A/A, differs below its floor and passes, a half more regresses, a half less is
+    faster; a step row keeps the 2% floor."""
+    compile_row = gate.Row("compile lm-dense 4x1024", "s", "", floor=gate.COMPILE_FLOOR)
     step_row = next(row for row in gate.BATTERY if row.name == "step lm-dense 4x1024")
-    base = [60.0, 60.5, 61.0]
-    assert gate.verdict(compile_row, base, [72.0, 72.5, 73.0])[0] == "level"
-    assert gate.verdict(compile_row, base, [80.0, 80.5, 81.0])[0] == "regressed"
-    assert gate.verdict(compile_row, base, [40.0, 40.5, 41.0])[0] == "faster"
-    assert gate.verdict(step_row, [10.0, 10.0, 10.01], [10.5, 10.5, 10.51])[0] == "regressed"
+    base, tight = samples(64.0), samples(64.0, 64.5)
+    assert gate.verdict(compile_row, base, samples(76.0, 77.0), tight)[0] == "different, below floor"
+    assert gate.verdict(compile_row, base, samples(96.0, 97.0), tight)[0] == "regressed"
+    assert gate.verdict(compile_row, base, samples(32.0, 33.0), tight)[0] == "faster"
+    assert gate.verdict(step_row, base, samples(68.0, 69.0), tight)[0] == "regressed"
 
 
 CACHED = """
@@ -419,8 +430,8 @@ def locked_tree(tree: Path) -> Path:
 def test_one_tree_against_itself_under_a_setting_sets_it_in_the_heads_processes_alone(
         gate, tmp_path, monkeypatch):
     """`--head-env` with one tree as base and head: every process of the head holds the setting, its rows'
-    and the device-kind probe of its hardware row alike, every process of the base keeps the caller's,
-    and the results and the table name it."""
+    and the device-kind probe of its hardware row alike, every process of the base and of its A/A keeps the
+    caller's, and the results and the table name it."""
     from types import SimpleNamespace
 
     monkeypatch.setenv("XLA_FLAGS", "--xla_dump_to=/caller")
@@ -436,51 +447,54 @@ def test_one_tree_against_itself_under_a_setting_sets_it_in_the_heads_processes_
     assert gate.run(args) == 0
     sides: dict[str, set] = {}
     for _, command, env in rows:
-        # A row's process names its side's cache; the head's device-kind probe, for its hardware row, is
+        # A row's process names its arm's cache; the head's device-kind probe, for its hardware row, is
         # told by its command, as it keeps the caller's cache.
         probe = command[1] == "-c" and "device_kind" in command[2]
         side = "probe" if probe else Path(env["JAX_COMPILATION_CACHE_DIR"]).name
         sides.setdefault(side, set()).add(env["XLA_FLAGS"])
-    assert sides == {"base": {"--xla_dump_to=/caller"}, "head": {off}, "probe": {off}}
+    assert sides == {"base": {"--xla_dump_to=/caller"}, "alone": {"--xla_dump_to=/caller"}, "head": {off},
+                     "probe": {off}}
     results = json.loads(out.read_text())
     assert results["head settings"] == {"XLA_FLAGS": off}
     table = tmp_path / "gate.md"
-    assert gate.report(SimpleNamespace(results=out, table=str(table), claim=False)) == 0
+    assert gate.report(SimpleNamespace(results=out, table=str(table), claim=False)) == 1
     assert f"buffers-off ran with XLA_FLAGS='{off}'" in table.read_text()
 
 
-def test_a_gate_keeps_each_trees_compiles_apart_and_judges_compile_rows_on_the_first_round(
+def test_a_gate_keeps_each_arms_compiles_apart_and_places_its_arms_at_random_each_round(
         gate, tmp_path, monkeypatch):
-    """A run gives each tree a cache of its own beside its results (made where absent), removes them at
-    its end, records each tree's compile rows in the first round alone and the step rows in every round,
-    and keeps the first round's seconds and the later rounds' apart."""
+    """A run measures three arms, the base, the head and the base again (its A/A), each with a compile cache
+    and a peak cache of its own beside its results (made where absent) that it keeps across its rounds and
+    removes at its end; each round's arms in an order drawn at random and kept, every arm in every round,
+    every row each round; the first round's seconds and the later rounds' apart."""
     from types import SimpleNamespace
 
     _, rows = standing_in_environments(gate, monkeypatch)
     trees = {name: locked_tree(tmp_path / name) for name in ("main", "head")}
     out = tmp_path / "not" / "yet" / "gate.json"
-    args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", rounds=3,
+    args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", rounds=6,
                            only=["lm-dense 4x1024"], claim=False, model="unused", flowers="unused",
                            torch_python="", out=str(out), environments=str(tmp_path / "environments"))
     assert gate.run(args) == 0
-    caches = [(tree.name, env["JAX_COMPILATION_CACHE_DIR"]) for tree, _, env in rows
-              if "JAX_COMPILATION_CACHE_DIR" in env]
-    by_tree = {tree: {cache for name, cache in caches if name == tree} for tree in trees}
-    assert all(len(found) == 1 for found in by_tree.values()) and by_tree["main"] != by_tree["head"]
-    assert {Path(cache).name for found in by_tree.values() for cache in found} == {"base", "head"}
-    assert not any(Path(cache).exists() for found in by_tree.values() for cache in found)
+    caches = {(Path(env["JAX_COMPILATION_CACHE_DIR"]).name, env["DEW_PEAK_CACHE"]) for _, _, env in rows
+              if "JAX_COMPILATION_CACHE_DIR" in env}
+    assert {name for name, _ in caches} == {"base", "head", "alone"} and len(caches) == 3
+    assert all(Path(peaks).name == f"{name}-peaks" for name, peaks in caches)
+    assert not any(Path(peaks).parent.exists() for _, peaks in caches)
     results = json.loads(out.read_text())
-    for tree in trees:
-        compiles = ["compile lm-dense 4x1024" in sample for sample in results["samples"][tree]]
-        assert compiles == [True, False, False], (tree, compiles)
+    assert results["alone"] == "main~aa" and set(results["samples"]) == {"main", "head", "main~aa"}
+    assert all(sorted(order) == sorted(results["samples"]) for order in results["orders"])
+    assert len(results["orders"]) == 6
+    for arm, taken in results["samples"].items():
+        assert all("step lm-dense 4x1024" in sample for sample in taken) and len(taken) == 6, arm
     assert set(results["seconds"]) == {"first round", "later rounds"}
     assert gate.report(SimpleNamespace(results=out, table=None, claim=False)) == 0
 
 
-def test_a_probe_measuring_compiles_alone_runs_in_the_first_round_alone(gate, tmp_path, monkeypatch):
-    """A probe whose every row is a first round's compile, the Server's program by program, runs once
-    per tree: a later round would recompile it uncached and read nothing. Each of its programs is a
-    row of its own, and the whole warm is shown beside them, ungated."""
+def test_the_servers_compiles_are_measured_cold_in_every_arm_and_round(gate, tmp_path, monkeypatch):
+    """The Server's warm compiles, program by program, read and write no compile cache, so each arm's every
+    round is a cold sample of each, judged as any row is: each program a gated row of its own, and the whole
+    warm shown beside them, ungated."""
     from types import SimpleNamespace
 
     _, rows = standing_in_environments(gate, monkeypatch)
@@ -491,9 +505,135 @@ def test_a_probe_measuring_compiles_alone_runs_in_the_first_round_alone(gate, tm
                            torch_python="", out=str(out), environments=str(tmp_path / "environments"))
     assert gate.run(args) == 0
     served = [command for _, command, _ in rows if Path(command[1]).name == "benchmark_serving_compile.py"]
-    assert len(served) == len(trees)
+    assert len(served) == 3 * 3
     gated = {row.name: row for probe in gate.PROBES for row in probe.rows if "compile serve" in row.name}
     assert sorted(name for name, row in gated.items() if row.gated) == sorted(
         f"compile serve dory-1.0-4b {program}"
         for program in ("construction", "admission 1", "admission 2", "admission 4", "admission 8"))
     assert not gated["compile serve dory-1.0-4b warm 16 slots"].gated
+
+
+def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round_and_refuses_a_substituted_program(
+        gate, tmp_path, monkeypatch):
+    """`compile` plans and compiles each of a kind's steps ahead of its run for one compile-only GPU of the
+    kind's generation and memory, in each tree's environment of the lock the GPU run used, three arms a
+    round in an order kept, every sample a process of its own with an empty compile cache: a head whose
+    planning takes half as long again regresses past COMPILE_FLOOR, and a step whose program substituted a
+    kernel is unsupported, failing the gate as the gate's own; each sample's selected plan is kept. A step
+    sized for another device is not compiled for this kind."""
+    from types import SimpleNamespace
+
+    built, _ = standing_in_environments(gate, monkeypatch)
+    building = gate.subprocess.run
+    compiled = []
+
+    def child(command, **kwargs):
+        if Path(command[1]).name != "compiled.py":
+            return building(command, **kwargs)
+        case, cache = json.loads(command[2]), Path(kwargs["env"]["JAX_COMPILATION_CACHE_DIR"])
+        compiled.append((Path(kwargs["cwd"]).name, command[3:], cache, cache.exists()))
+        substituted = ["attention: flash ran as xla at site"] if case["config"] == gate.LM_MOE else []
+        seconds = 48.0 if Path(kwargs["cwd"]).name == "head" else 32.0
+        printed = json.dumps({"seconds": seconds, "substituted": substituted,
+                              "plan": {"split": 1, "rows": 4}})
+        return subprocess.CompletedProcess(command, 0, f"compiling\n{printed}\n", "")
+
+    monkeypatch.setattr(gate.subprocess, "run", child)
+    trees = {name: locked_tree(tmp_path / name) for name in ("main", "head")}
+    out = tmp_path / "compile.json"
+    args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", kind="h100",
+                           lock="cuda12", rounds=6, only=["lm-dense", "lm-moe"], out=str(out),
+                           environments=str(tmp_path / "environments"))
+    assert gate.compile_battery(args) == 0
+    results = json.loads(out.read_text())
+    assert results["target"] == {"kind": "h100", "generation": "sm90", "capacity_gib": 80, "lock": "cuda12"}
+    assert [row["name"] for row in results["rows"]] == ["compile lm-dense 4x1024", "compile lm-moe 4x1024"]
+    assert len(compiled) == 2 * 3 * 6
+    assert {tuple(argv) for _, argv, _, _ in compiled} == {("sm90", str(80 << 30))}
+    assert len({cache for _, _, cache, _ in compiled}) == len(compiled)
+    assert not any(made for *_, made in compiled)
+    assert {tree for tree, *_ in compiled} == {"main", "head"}
+    assert built and all(python.parent.parent.name.startswith("cuda12-") for _, python in built)
+    assert len(results["orders"]) == 6 and all(len(set(order)) == 3 for order in results["orders"])
+    assert results["plans"]["head"][0]["compile lm-dense 4x1024"] == {"split": 1, "rows": 4}
+    verdicts = tmp_path / "verdicts.json"
+    assert gate.report(SimpleNamespace(results=out, table=None, claim=False, verdicts=str(verdicts))) == 1
+    states = {name: row["state"] for name, row in json.loads(verdicts.read_text())["rows"].items()}
+    assert states == {"compile lm-dense 4x1024": "regressed", "compile lm-moe 4x1024": "unsupported"}
+    a100 = SimpleNamespace(**{**vars(args), "kind": "a100", "rounds": 1, "only": ["finetune"],
+                              "out": str(tmp_path / "a100.json")})
+    assert gate.compile_battery(a100) == 0
+    assert [row["name"] for row in json.loads(Path(a100.out).read_text())["rows"]] == [
+        "compile finetune-1.7b 1x2048"]
+    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_autotune_level=4")
+    with pytest.raises(SystemExit, match="autotuning"):
+        gate.compile_battery(args)
+
+
+TINY = {"architecture": "causal_transformer", "dtype": "float32", "batch_size": 2, "seq_len": 8,
+        "config": {"vocab_size": 96, "emb_features": 32, "num_layers": 1, "num_heads": 2, "mlp_features": 64,
+                   "max_seq_len": 16}}
+"""A step small enough to plan and compile ahead in a test."""
+
+
+def test_a_step_is_planned_ahead_for_an_absent_gpu_and_a_kernel_this_host_cannot_lower_is_named(
+        gate, tmp_path):
+    """The compile ahead's own process (`COMPILED`), run as `compile` runs it: a decoder's step planned and
+    compiled for one compile-only sm90 GPU of a stated memory, here with no GPU attached, its planner's
+    seconds and selected plan reported; its attention routed to FlashAttention, which this host's
+    environment holds no wheel of (the CPU lock's), runs as XLA's, which it names as substituted, so the
+    gate never takes that program for the GPU's."""
+    script = gate._script(tmp_path / "compiled.json", gate.COMPILED)
+
+    def compiled(config: dict) -> dict:
+        case = json.dumps({**TINY, "config": {**TINY["config"], **config}})
+        done = gate._run(ROOT, Path(sys.executable), "", [str(script), case, "sm90", str(1 << 30)],
+                         ROOT / "tools", 900, tmp_path / config.get("attention_impl", "auto"))
+        assert done.returncode == 0, done.stderr[-3000:]
+        return json.loads(done.stdout.strip().splitlines()[-1])
+
+    xla = compiled({"attention_impl": "xla"})
+    assert xla["seconds"] > 0 and xla["substituted"] == [] and xla["plan"]["split"] == 1
+    routed = compiled({})
+    assert any("flash ran as xla" in each for each in routed["substituted"]), routed
+
+
+def paired(rates: dict[str, list[float]], session: str = "s") -> dict[str, list[dict]]:
+    """The pairing's records of three arms (`qwen35_pair.ARMS`), a round each throughput, as each step
+    writes one: torch~aa a torch run, as torch."""
+    workload = load("qwen35", "tools/reference_runs").workload(17, 96, 32, 2, 8, smoke=True, warmup=3,
+                                                               steps=4)
+    pair = load("qwen35_pair", "tools/reference_runs")
+
+    def record(arm: str, rate: float) -> dict:
+        return {"framework": pair.framework_of(arm), "session": session, "smoke": True, "commit": "c",
+                "environment": {"packages": {"x": "1"}, "device": "cpu"},
+                "host": {"hostname": "h", "cuda_visible_devices": None},
+                "config": {**workload, "parameter_count": 1}, "work": {"flops": 1},
+                "memory": {"whole_peak_scope": load("qwen35", "tools/reference_runs").WHOLE_PEAK_SCOPE,
+                           "whole_peak_bytes": None},
+                "checks": {"finite_losses": True, "no_timing_window_compilation": True},
+                "steady": {"window_tokens_per_s": rate, "window_mfu": 0.5}}
+
+    return {arm: [record(arm, rate) for rate in values] for arm, values in rates.items()}
+
+
+def test_the_qwen_pair_judges_dew_against_torch_beside_torchs_own_a_a(gate):
+    """The pairing's verdict: each round's Dew over its torch, against its torch~aa over its torch (judged):
+    Dew slower past torch's A/A fails, within it is level, faster past it is faster; torch~aa is a torch run
+    whose record says torch, and an A/A record of another framework is refused."""
+    pair = load("qwen35_pair", "tools/reference_runs")
+    torch, alone = samples(512.0), samples(512.0, 516.0)
+    slower = pair.compare(paired({"dew": samples(448.0, 456.0), "torch": torch, "torch~aa": alone}), "s",
+                          smoke=True)
+    assert (slower["verdict"], slower["passed"], slower["rounds"]) == ("slower", False, 6)
+    assert slower["interval"] == [0.875, 0.890625] and slower["alone"] == [1.0, 1.0078125]
+    level = pair.compare(paired({"dew": samples(510.0, 514.0), "torch": torch, "torch~aa": alone}), "s",
+                         smoke=True)
+    assert (level["verdict"], level["passed"]) == ("level", True)
+    faster = pair.compare(paired({"dew": samples(576.0), "torch": torch, "torch~aa": alone}), "s", smoke=True)
+    assert faster["verdict"] == "faster" and faster["dew_over_torch"] == 1.125
+    wrong = paired({"dew": samples(512.0), "torch": torch, "torch~aa": alone})
+    wrong["torch~aa"][0]["framework"] = "dew"
+    with pytest.raises(ValueError, match="different framework"):
+        pair.compare(wrong, "s", smoke=True)
