@@ -1288,7 +1288,9 @@ class CausalSelfAttention(nn.Module):
         # The call's spans past its causal flag, window, mask and documents, as the kernel reads them: its
         # groups, and its real keys with the places its window counts.
         blocks, images = groups.block_groups, groups.image_groups
-        held = None if valid is None and runs is None else key_places
+        # A window counts the keys' places; with none the kernel reads none (`scaled_dot_product_attention`),
+        # and a call's keys may outnumber its queries (a canvas over its encoder's prefix, `_prefixed`).
+        held = None if (valid is None and runs is None) or window is None else key_places
         # The per-head maxima the QK-Clip reads. Computed only when a caller
         # opened the collection; the plain forward leaves it closed and its
         # leaves bitwise identical.
