@@ -610,7 +610,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_source_schedulers.py": {
-   "comparisons": 7,
+   "comparisons": 5,
    "lane": "Training"
   },
   "tests/test_speculative.py": {
