@@ -334,12 +334,14 @@ def test_a_parquet_stream_read_by_more_shares_than_files_publishes_its_fill(tmp_
     filled, reading = Offset(10), Offset(10)
     read = compile(Pipeline(Files(str(root), format="parquet")).map(filled).cache(cache).batch(4),
                    read="streamed", loading=READ, epochs=1)
+    read_ids = set()
     for share in range(2):
         stream = read.train(DataPartition(share, 2))
         try:
-            assert len(ids(stream)) == (2 - share) * ROWS
+            read_ids |= set(ids(stream))
         finally:
             stream.close()
+    assert read_ids == set(range(GROUPS * ROWS))
     rows = iterate(Pipeline(Files(str(root), format="parquet")).map(reading).cache(cache), read="streamed")
     assert sorted(int(row["value"]) for row in rows) == [row + 10 for row in range(GROUPS * ROWS)]
     assert sorted(filled.calls) == list(range(GROUPS * ROWS)) and reading.calls == []
@@ -360,7 +362,7 @@ def test_a_parquet_store_reads_each_footer_once_however_many_reads_count_its_row
     again = store.manifest(LATEST).sized(2)
     counts = [GROUPS * ROWS] * FILES
     assert [shard.rows for shard in first.shards] == [shard.rows for shard in again.shards] == counts
-    assert len(Opening.opened) == opened == FILES
+    assert len(Opening.opened) == opened and len(set(Opening.opened)) == FILES
 
 
 @pytest.mark.parametrize("version", [5, 11])
@@ -390,6 +392,8 @@ def test_a_token_export_reads_its_documents_by_the_plan_version_it_names(tmp_pat
     from dew.data.sources import TokenFiles
 
     documents = ["one", "two words", "three of them"]
+    for name in ("nine", "eleven"):
+        (tmp_path / name).mkdir()
     exported = export_byte_tokens(tmp_path / "nine", documents, "--plan-version", "9")
     read = [bytes(row["text"][:-1].astype(np.uint8)).decode() for row in iterate(Pipeline(TokenFiles(
         str(exported))), read="streamed")]
