@@ -37,6 +37,9 @@ class ReleaseParity:
     """The wire requests of each seed, `[[{state, questions: {id: wire}}, ...], ...]`."""
     gradients: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     """Each recorded `gradient.<name>`'s head parameter, by its path in the head's tree."""
+    every_slot: bool = False
+    """Whether the recording states its scores at every option slot `[R, Q, O]`, 0 past the real options,
+    rather than at the real ones alone."""
 
 
 def assert_answers_as_its_engine(parity: ReleaseParity, scratch: Path) -> None:
@@ -49,6 +52,14 @@ def assert_answers_as_its_engine(parity: ReleaseParity, scratch: Path) -> None:
     seeds = declared_seeds(parity.recording)[parity.site]
     draw, reference, truth = indexed_recording(recording(parity.recording), parity.site, seeds)
     requests = json.loads(parity.requests.read_text())
+
+    @jax.jit
+    def scored(inputs):
+        return task.model.logits(task.variables, inputs)
+
+    @jax.jit
+    def head_alone(inputs, states):
+        return task.model.head_logits(task.variables, states, inputs)
 
     @jax.jit
     def forward(inputs, probe):
@@ -81,7 +92,8 @@ def assert_answers_as_its_engine(parity: ReleaseParity, scratch: Path) -> None:
         for request in requests[int(index)]:
             questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
             rows.extend(task.layout.rows(task.tokenizer, task.specials, request["state"], questions))
-        laid = DecisionInputs.collate(rows, task.specials.pad, options=options.shape[2])
+        laid = DecisionInputs.collate(rows, task.specials.pad, questions=options.shape[1],
+                                      options=options.shape[2])
         mask = np.arange(held["tokens"].shape[1])[None] < held["lengths"][:, None]
         # Its rows read in blocks where Dew lays them so, as the engine numbered them; read whole, the
         # engine's numbering is unread.
@@ -96,12 +108,18 @@ def assert_answers_as_its_engine(parity: ReleaseParity, scratch: Path) -> None:
         inputs = replace(laid, tokens=jnp.asarray(held["tokens"]), segments=jnp.asarray(mask, jnp.int32),
                          positions=jnp.broadcast_to(jnp.arange(mask.shape[1]), mask.shape),
                          blocks=jnp.asarray(held["blocks"]) if blocked else None)
-        probe = np.zeros(options.shape, np.float32)
-        probe[options] = held["probe"]
-        result = forward(inputs, jnp.asarray(probe))
+        if "states" in held:
+            # The head alone over the engine's own states.
+            result = {"scores": head_alone(inputs, jnp.asarray(held["states"]))}
+        elif "probe" in held:
+            probe = np.zeros(options.shape, np.float32)
+            probe[options] = held["probe"]
+            result = forward(inputs, jnp.asarray(probe))
+        else:
+            result = {"scores": scored(inputs)}
         scores = np.asarray(result["scores"])
         assert np.isneginf(scores[~options]).all()
-        return {**result, "scores": scores[options]}
+        return {**result, "scores": np.where(options, scores, 0) if parity.every_slot else scores[options]}
 
     assert_as_exact(dew, reference, draw, f"{parity.name} as its engine answers", seeds=seeds,
                     truth_fn=truth)

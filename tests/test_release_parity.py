@@ -25,11 +25,22 @@ def slot_release(mode: str, attention: str):
     return written
 
 
+JOINT = Path(__file__).parent / "fixtures" / "joint_checkpoint" / "tiny"
+
+
+def joint_release(scratch: Path) -> Path:
+    """The tiny joint release, as its fixture holds it."""
+    return JOINT
+
+
 RELEASES = [
     *(ReleaseParity(f"slot {attention} {mode}", slot_release(mode, attention), SLOT / "reference.npz",
                     f"{attention}_{mode}", SLOT / "requests.json",
                     {"slot": ("slots",), "q.weight": ("q",), "k.weight": ("k",)} if mode == "head" else {})
       for mode in ("slot_lm", "head") for attention in ("causal", "block")),
+    *(ReleaseParity(f"joint {site}", joint_release, JOINT / "parity.npz", site, JOINT / "requests.json",
+                    every_slot=True)
+      for site in ("joint", "joint_head")),
 ]
 """Every release declared, at every site its engine's recording holds."""
 
