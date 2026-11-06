@@ -50,8 +50,9 @@ def test_a_chain_called_as_a_tree_reads_what_the_plain_cached_call_reads():
 
 
 def test_a_tree_is_refused_where_a_layer_cannot_read_it_or_the_call_cannot_carry_it():
-    """Lightning attention reads no tree (it would run the tokens as a chain), and an n-gram lookup reads the
-    call's tokens in their order, so each model refuses a tree call; a tree outside a cached call,
+    """Lightning attention reads no tree (it would run the tokens as a chain), an n-gram lookup reads the
+    call's tokens in their order and an indexed latent attention selects among every key before each query,
+    so each model refuses a tree call; a tree outside a cached call,
     without the key runs that mask its attention, of another length than the call's tokens, with a parent
     not before its child, or branching without its tokens' positions (coordinates of validity alone
     stating none) is refused."""
@@ -65,11 +66,15 @@ def test_a_tree_is_refused_where_a_layer_cannot_read_it_or_the_call_cannot_carry
     engram = CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, "dtype": "float32"}, engram=Engram(
         layer_ids=(0,), num_embeddings=(168,), max_ngram_size=3, vocab_size=VOCAB, n_heads=2, head_dim=4,
         compressed_vocab_size=VOCAB), hyper_connections=HyperConnections(hc_mult=2, head="weighted"))
+    indexed = CausalTransformer(
+        vocab_size=VOCAB, emb_features=32, num_layers=1, num_heads=2, head_dim=16, mlp_features=64,
+        max_seq_len=16, dtype="float32", mixer={"class": "mla", "fields": {
+            **MLA, "index_topk": 4, "index_n_heads": 2, "index_head_dim": 16}})
     decoder = CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, "dtype": "float32"})
     ids = jax.random.randint(jax.random.key(0), (2, PROMPT + BLOCK), 0, VOCAB)
     block, runs = ids[:, PROMPT:], chain_runs(2, PROMPT, BLOCK)
     placed = PROMPT + jnp.asarray([[0, 1, 1]] * 2)
-    for model in (lightning, engram, decoder):
+    for model in (lightning, engram, indexed, decoder):
         params = model.init(jax.random.key(1), ids)
         cache = {**params, "cache": cached(model, params, ids[:, :PROMPT])}
         tree = {"attention_tree": (-1, 0, 0), "attention_key_runs": runs, "rotary_positions": placed}
@@ -102,13 +107,19 @@ RECURRENT = {
 delta attention, Mamba-1 and -2, and LFM2's gated short convolution."""
 
 
-def hybrid_model(mixer: str) -> CausalTransformer:
+MLA = {"q_lora_rank": 8, "kv_lora_rank": 8, "qk_nope_head_dim": 8, "qk_rope_head_dim": 8, "v_head_dim": 8}
+"""DeepSeek's latent attention at toy size, dense (no indexer), as Kimi Linear's full-attention layers
+hold it."""
+
+
+def hybrid_model(mixer: str, attention: dict | None = None) -> CausalTransformer:
     """A hybrid stack at toy size: a recurrent `mixer`, whose memory and conv tail are each row's own
-    state, then full attention."""
+    state, then full attention, the standard layer's or the `attention` mixer's."""
     return CausalTransformer(
         vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8, mlp_features=32,
         max_seq_len=16, dtype="float32", layer_types=("linear_attention", "full_attention"),
-        kinds={"linear_attention": {"mixer": {"class": mixer, "fields": RECURRENT[mixer]}}})
+        kinds={"linear_attention": {"mixer": {"class": mixer, "fields": RECURRENT[mixer]}},
+               **({} if attention is None else {"full_attention": {"mixer": attention}})})
 
 
 def paths(tree: tuple[int, ...]) -> list[list[int]]:
@@ -148,7 +159,44 @@ def test_a_hybrids_tree_call_reads_each_token_as_its_path_decoded_alone(tree, mi
     from the float64 run's (check 1), its conv over its ancestors and past the root the cache's history,
     its recurrence from its parent's state; a one-token tree too, which takes the tree's path where a
     step would take a single token's."""
-    model = hybrid_model(mixer)
+    assert_reads_paths(hybrid_model(mixer), tree, f"{mixer} tree")
+
+
+@pytest.mark.parametrize("tree", [TREE, (-1,)], ids=["branching", "one-token"])
+def test_a_latent_attention_tree_call_reads_each_token_as_its_path_decoded_alone(tree):
+    """Kimi Linear's stack at toy size, delta attention then DeepSeek's latent attention (`MLAMixer`): its
+    tree call, the latent attention masked over its cache by the call's key runs and its rope heads turned
+    at each token's depth, reads each token as its path decoded alone, from the float64 run's (check 1)."""
+    model = hybrid_model("kimi_delta_attention", {"class": "mla", "fields": MLA})
+    assert_reads_paths(model, tree, "kimi linear tree")
+
+
+def test_a_latent_attention_cached_call_reads_by_its_runs_past_its_queries_validity():
+    """A latent attention's cached call that states its key runs reads by them alone, its queries' validity
+    replaced as the standard attention's is (`call_visibility`): a padded query reads the keys its runs
+    name that the cache holds, bit for bit as a real query at the same position whose runs name those
+    alone, rather than none."""
+    model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=16, dtype="float32",
+                              mixer={"class": "mla", "fields": MLA})
+    ids = jax.random.randint(jax.random.key(0), (2, PROMPT + BLOCK), 0, VOCAB)
+    params = model.init(jax.random.key(1), ids)
+    cache = {**params, "cache": cached(model, params, ids[:, :PROMPT])}
+    block, runs = ids[:, PROMPT:], chain_runs(2, PROMPT, BLOCK)
+    placed = jnp.broadcast_to(PROMPT + jnp.arange(BLOCK), (2, BLOCK))
+    padded, _ = model.apply(cache, block, decode=True, mutable=["cache"], attention_key_runs=runs,
+                            rotary_positions=placed, attention_mask=jnp.asarray([[1, 1, 0]] * 2, bool))
+    # The last query's runs without its own slot, which a padded token's call leaves unwritten.
+    narrowed = runs.at[:, BLOCK - 1, 0, 1].set(PROMPT + BLOCK - 1)
+    real, _ = model.apply(cache, block, decode=True, mutable=["cache"], attention_key_runs=narrowed,
+                          rotary_positions=placed)
+    np.testing.assert_array_equal(np.asarray(padded[:, -1]), np.asarray(real[:, -1]))
+
+
+def assert_reads_paths(model: CausalTransformer, tree: tuple[int, ...], label: str) -> None:
+    """`model`'s tree call over `tree` past a cached prompt, each token at its depth's position and its
+    attention's keys at theirs, on par with each token's root-to-token path decoded as a plain cached call
+    from the same cache, from the float64 run's (check 1), over drawn weights and ids."""
     wide = float64_twin(model)
     rows = 2
 
@@ -189,4 +237,4 @@ def test_a_hybrids_tree_call_reads_each_token_as_its_path_decoded_alone(tree, mi
             held = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params)
             return decoded(wide)(held, prompt, block)
 
-    assert_as_exact(tree_logits, decoded(model), draw, f"{mixer} tree", seeds=64, truth_fn=truth)
+    assert_as_exact(tree_logits, decoded(model), draw, label, seeds=64, truth_fn=truth)
