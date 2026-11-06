@@ -18,6 +18,7 @@ import pytest
 from jax.sharding import NamedSharding
 from placement_cases import LAYOUT, MIN_SHARD, TRAINED, cases, declared
 
+from dew.batch import unboxed
 from dew.distributed.placement import UNSPLIT_AXES, Layout
 from dew.mesh import FSDP_AXIS, SEQUENCE_AXIS, mesh_axes
 from dew.objectives.lm import LMObjective
@@ -42,7 +43,7 @@ def assert_placed(name: str, tree, placement, mesh, table=None) -> None:
     module declares (`declared`, read through `table` where the run's table names them), and a tree with a
     leaf past the floor splits at least one."""
     axes = declared(tree, table)
-    leaves = jax.tree_util.tree_leaves_with_path(tree)
+    leaves = jax.tree_util.tree_leaves_with_path(unboxed(tree))
     sharded = 0
     for (path, leaf), sharding in zip(leaves, jax.tree.leaves(placement), strict=True):
         where = f"{name} {jax.tree_util.keystr(path)} {tuple(leaf.shape)}"

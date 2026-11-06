@@ -157,8 +157,9 @@ def test_a_run_records_where_its_optimizers_split_sent_each_parameter():
         return record.groups, state.variables["params"]
 
     groups, params = started(OptimConfig(optimizer="muon", learning_rate=1e-2))
+    # Each parameter's dimension numbers whole, or None where Muon takes none.
     numbers = jax.tree_util.tree_leaves_with_path(muon_weight_dimension_numbers(params),
-                                                  is_leaf=lambda leaf: leaf is None)
+                                                  is_leaf=lambda leaf: not isinstance(leaf, Mapping))
     assert groups is not None
     muon = {jax.tree_util.keystr(path): leaf is not None for path, leaf in numbers}
     assert muon == {path: placed == "muon" for path, placed in groups.items()}
