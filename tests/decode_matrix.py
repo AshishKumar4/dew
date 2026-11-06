@@ -30,6 +30,10 @@ LENGTHS = (1, 63, 300, 512)
 """A step's rows, each over its own keys of a cache `CAPACITY` slots a row: one key, part of a page, part of
 several, every slot; a paged pool's pages `PAGE` slots each."""
 
+CHOICES = frozenset({"decode", "paged_decode"})
+"""The kernel choices (`generation.CHOICES`) its cells run: a dense cache's step's selector and a paged
+pool's."""
+
 CAP = 30.0
 SEEDS = 8
 HEADS = {"gqa-16-8": (16, 8), "mha-8": (8, 8)}
@@ -156,7 +160,13 @@ CASES = (
     for case in CASES], ids="-".join)
 def a_decode_step_is_on_par(case: tuple[str, ...]) -> None:
     """A decode step of `case` on its GPU, through its choice's route, on par with the reference path's
-    (check 1)."""
+    (check 1); its routes its layout's choice's (`CHOICES`)."""
     named = dict(zip(AXES["decode"], case, strict=True))
-    assert_as_exact(jax.jit(_step(named, reference=False)), jax.jit(_step(named, reference=True)),
-                    _drawn(named), "-".join(case), seeds=SEEDS, terms=_terms(named))
+    with generation.routes() as routes:
+        assert_as_exact(jax.jit(_step(named, reference=False)), jax.jit(_step(named, reference=True)),
+                        _drawn(named), "-".join(case), seeds=SEEDS, terms=_terms(named))
+    recorded = {(found.choice, found.kernel) for found in routes}
+    choice = "decode" if named["layout"] == "dense" else "paged_decode"
+    unnamed = sorted(pair for pair in recorded
+                     if pair[0] not in CHOICES and pair[1] not in ("xla", "reference"))
+    assert any(pair[0] == choice for pair in recorded) and not unnamed, (sorted(recorded), unnamed)
