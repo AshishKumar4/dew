@@ -85,7 +85,8 @@ def layouts(generation_name: str | None, dtype, rows: int | None = None) -> tupl
     device has, by the share of its rows they fill), where its family is qualified (`qualified`)."""
     if generation_name is None:
         return ()
-    return tuple(family for family in bundles.layouts(generation_name, dtype, rows) if qualified(family, rows))
+    return tuple(family for family in bundles.layouts(generation_name, dtype, rows)
+                 if qualified(family, rows))
 
 
 def query_rows(family: mosaic.Family, dtype, rows: int) -> int:
