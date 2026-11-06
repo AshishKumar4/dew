@@ -1,0 +1,8 @@
+16|8|2|70|formed|0|base
+64|8|2|70|formed|0|base
+16|64|2|70|formed|0|base
+16|8|1|70|formed|0|base
+16|8|2|64|formed|0|base
+16|8|2|70|plain|0|base
+16|8|2|70|formed|0|merge32
+16|8|2|70|formed|0|merge2
