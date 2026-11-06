@@ -10,6 +10,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
+from dew.interop.config_records import NativeFields
 from dew.interop.layouts import ConfigField, ConfigLayout, Table
 from dew.nn.dense import Dense
 from dew.nn.precision import float32_dot_general
@@ -186,7 +187,7 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Record:
         raise ValueError(
             f"vision_output_dim ({output_dim}) disagrees with projector_output_dim "
             f"({vision.get('projector_output_dim')}), the adapter's width")
-    return {"class": "llama4", "fields": _LLAMA4_CONFIG.read(vision, set(), {})}
+    return {"class": "llama4", "fields": _LLAMA4_CONFIG.read(vision, set(), NativeFields(Llama4Vision, {}))}
 
 
 _LLAMA4_CONFIG = ConfigLayout(

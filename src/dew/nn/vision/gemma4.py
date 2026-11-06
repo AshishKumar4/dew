@@ -18,6 +18,7 @@ from flax.typing import Dtype, Initializer, PrecisionLike
 from dew import _records
 from dew._model_types import SANDWICH_NORMS
 from dew.batch import Variables, coordinates
+from dew.interop.config_records import NativeFields
 from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Route, Table, mapped, one_of
 from dew.interop.unread import Stored
 from dew.interop.weights import placed
@@ -384,11 +385,11 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Record:
         raise ValueError(
             f"output_proj_dims ({vision['output_proj_dims']!r}) changes the "
             "projector width this record leaves to the text width")
-    return {"class": "gemma4", "fields": _GEMMA4_CONFIG.read(vision, set(), {})}
+    return {"class": "gemma4", "fields": _GEMMA4_CONFIG.read(vision, set(), NativeFields(Gemma4Vision, {}))}
 
 
 def _read_heads(vision: Mapping[str, object], used: set[str],
-                record: dict[str, object]) -> dict[str, object]:
+                record: NativeFields[Gemma4Vision]) -> NativeFields[Gemma4Vision]:
     """The key/value heads, the query heads' count where unstated, and each head's width, the trunk's
     over its heads where unstated."""
     used.update(("num_key_value_heads", "head_dim"))

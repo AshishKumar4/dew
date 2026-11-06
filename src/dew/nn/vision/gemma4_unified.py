@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from flax import linen as nn
 
 from dew import _records
+from dew.interop.config_records import NativeFields
 from dew.interop.layouts import ConfigField, ConfigLayout, Table
 from dew.nn.norms import LayerNorm
 from dew.registry import Record
@@ -50,7 +51,7 @@ def translate_gemma4_unified_vision_config(config: Mapping[str, object]) -> Reco
     """A Unified vision_config's embedding fields, each at Gemma4UnifiedVisionConfig's default where the
     config leaves it out. Its num_soft_tokens is the processor's budget, which this embedding never
     reads: Dew takes the processor's patches as they are."""
-    fields = _UNIFIED_CONFIG.read(config, set(), {})
+    fields = _UNIFIED_CONFIG.read(config, set(), NativeFields(Gemma4UnifiedVision, {}))
     width = fields["mm_embed_dim"]
     if _records.integer(config.get("output_proj_dims", width), "output_proj_dims") != width:
         raise ValueError("output_proj_dims must equal mm_embed_dim for the vision embedding projection")

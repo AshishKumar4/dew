@@ -44,7 +44,6 @@ from dew.batch import Variables
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_families import ENTRIES
 from dew.interop.decoder_parts import (
-    DECODER_FIELDS,
     NO_AUDIO,
     SLICED,
     AudioFields,
@@ -306,7 +305,7 @@ def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     """Read a Gemma 3 wrapper: SigLIP tower, avg-pool projector, decoder."""
     text = _wrapper_text(hf_config, used)
     tower = translate_siglip_vision_config(hf_config)
-    keys = WRAPPER_LAYOUTS["gemma3"].keys.read(hf_config, used, {})
+    keys = WRAPPER_LAYOUTS["gemma3"].keys.read(hf_config, used, _wrapper_keys())
     projector = translate_gemma_projector_config(
         tower["fields"], _records.integer(text.get("emb_features"), "emb_features"),
         keys["mm_tokens_per_image"])
@@ -321,8 +320,8 @@ def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     tower = translate_llama4_vision_config(hf_config)
     projector = translate_llama4_projector_config(
         _records.integer(text.get("emb_features"), "emb_features"))
-    image = _records.integer(WRAPPER_LAYOUTS["llama4"].keys.read(hf_config, used, {})["image_token_id"],
-                             "image_token_id")
+    keys = WRAPPER_LAYOUTS["llama4"].keys.read(hf_config, used, _wrapper_keys())
+    image = _records.integer(keys["image_token_id"], "image_token_id")
     vision = tower["fields"]
     grid = record_int(vision, "image_size") // record_int(vision, "patch_size")
     ratio = record_float(vision, "pixel_shuffle_ratio")
@@ -383,7 +382,7 @@ def _gemma4_placeholders(hf_config: Mapping[str, object], used: set[str]) -> tup
     default as Gemma4Config's and Gemma4UnifiedConfig's do, which agree (transformers 5.17.0,
     configuration_gemma4.py:349,352 and configuration_gemma4_unified.py:309,312), and both stay
     placeholders to the decoder whether or not a tower reads them."""
-    keys = ConfigLayout(*_GEMMA4_TOKENS).read(hf_config, used, {})
+    keys = ConfigLayout(*_GEMMA4_TOKENS).read(hf_config, used, _wrapper_keys())
     return (_records.integer(keys["image_token_id"], "image_token_id"),
             _records.integer(keys["video_token_id"], "video_token_id"),
             _records.integer(keys["audio_token_id"], "audio_token_id"))
@@ -424,7 +423,7 @@ def _gemma4_unified_wrapper(hf_config: Mapping[str, object], used: set[str]) -> 
 
 def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
     """Read a Qwen 3.5 wrapper: NaViT-style tower, merger, decoder."""
-    keys = _QWEN35_KEYS.read(hf_config, used, {})
+    keys = _QWEN35_KEYS.read(hf_config, used, _wrapper_keys())
     if keys['language_model_only'] is not False:
         refuse('language_model_only', 'the multimodal wrapper requires its vision component')
     family = _records.text(hf_config['model_type'], 'model_type')
@@ -534,6 +533,13 @@ def _token(key: str, field: str, *aliases: str, default: int | None = None,
     if default is None:
         return ConfigField(key, field, parse=_records.integer, value=value, aliases=aliases)
     return ConfigField(key, field, default, parse=_records.integer, value=value, aliases=aliases)
+
+
+def _wrapper_keys() -> "NativeFields[MultimodalTransformer]":
+    """An empty record of a wrapper's own keys, which its readers fill (`WrapperLayout.keys`)."""
+    from dew.nn.multimodal import MultimodalTransformer
+
+    return NativeFields(MultimodalTransformer, {})
 
 
 def _projected(field: str) -> Callable[["MultimodalTransformer"], int]:
@@ -1425,8 +1431,9 @@ def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
 
 
 def export_config(model) -> Mapping[str, object]:
-    """Write a CausalTransformer's fields back into HF vocabulary, refusing a model the config
-    would read back as another computation (`refuse_lossy_export`)."""
+    """Write a CausalTransformer's fields back into HF vocabulary as its family's config layout states
+    them (`DecoderFamily.config`, the one its reader reads), refusing a model the config would read back
+    as another computation (`refuse_lossy_export`)."""
     family = _family_of(model)
     exported = family.export_fields(model)
     chunked = sorted(name for name, kind in (model.kinds or {}).items() if kind.chunk is not None)
@@ -1436,15 +1443,11 @@ def export_config(model) -> Mapping[str, object]:
         raise ExportRefused(
             f"kinds {chunked} attend by chunk, which the {family.export_model_type} "
             f"config does not carry")
-    sandwich = bool(model.sandwich_norms)
     config: dict[str, object] = {
         'model_type': family.export_model_type,
         'architectures': [family.architecture],
         # The release's own code, which `PretrainedDecoder.from_model` writes beside the export.
         **({} if family.release_code is None else {'auto_map': dict(family.release_code.auto_map)}),
-        **DECODER_FIELDS.write(model),
-        'attention_bias': model.attention_bias,
-        'tie_word_embeddings': model.tie_embeddings,
         'use_cache': model.causal,
     }
     from dew.nn.mixers import AttentionMixer
@@ -1455,58 +1458,6 @@ def export_config(model) -> Mapping[str, object]:
             overrides[name] = "block_bidirectional"
     if overrides:
         config["modeling_overrides"] = {"attention": overrides}
-    types = model.per_layer_types
-    if any(layer != 'full_attention' for layer in types):
-        config['layer_types'] = list(types)
-    sliding = model.kind_of('sliding_attention') if 'sliding_attention' in types else None
-    local_theta = None if sliding is None or sliding.rope_theta == model.rope_theta else sliding.rope_theta
-    # Gemma3TextConfig and Olmo3Config give an unstated sliding base their
-    # own default rather than rope_theta (`RopeSpelling.local_theta`), so a
-    # sliding model of theirs states both bases.
-    if sliding is not None and family.export_model_type in ('gemma3_text', 'olmo3'):
-        local_theta = sliding.rope_theta or model.rope_theta
-    if local_theta is not None:
-        if sandwich:
-            config['rope_parameters'] = {
-                'full_attention': {'rope_type': 'default',
-                                   'rope_theta': model.rope_theta},
-                'sliding_attention': {'rope_type': 'default',
-                                      'rope_theta': local_theta},
-            }
-        else:
-            config['rope_theta'] = model.rope_theta
-            config['rope_local_base_freq'] = local_theta
-    else:
-        config['rope_theta'] = model.rope_theta
-    if sliding is not None and sliding.window is not None:
-        config['sliding_window'] = sliding.window
-    # A ramp, Llama 3's over the frequencies or a YaRN table in place of them,
-    # that the whole model shares writes flat beside rope_theta, which is
-    # where the single-table references read it (as Llama 3.1 ships it). A
-    # ramp that differs between the kinds is what Olmo3RotaryEmbedding
-    # builds, each kind's through its own ROPE_INIT_FUNCTIONS entry out of
-    # nested rope_parameters (modeling_olmo3.py:277-291, the spelling
-    # Olmo3Config.to_dict writes); a reference with one table for the whole
-    # model cannot say it, so that is refused naming the kinds.
-    tables = {kind: model.kind_of(kind).rope_scaling
-              for kind in sorted(set(types))}
-    ramped = {kind: table for kind, table in tables.items() if table is not None}
-    per_kind = bool(ramped) and (set(ramped) != set(tables)
-                                 or len(set(ramped.values())) > 1
-                                 or local_theta is not None)
-    if per_kind:
-        if not sandwich:
-            raise ExportRefused(
-                f"the rotary ramp differs between the layer kinds {sorted(tables)}, "
-                f"and the {family.export_model_type} reference rotates every layer "
-                "at one table; the model cannot be written back")
-        config['rope_parameters'] = {
-            kind: {**({'rope_type': 'default'} if table is None else dataclasses.asdict(table)),
-                   'rope_theta': model.kind_of(kind).rope_theta}
-            for kind, table in tables.items()}
-        config.pop('rope_local_base_freq', None)
-    elif ramped:
-        config['rope_scaling'] = dataclasses.asdict(next(iter(ramped.values())))
     defaulted = family.defaults.get('pad_token_id') is not None
     if family.padding_idx and (model.padding_idx is not None or defaulted):
         # An explicit null where the class defaults to a pad id, so that id takes no row the model trains.

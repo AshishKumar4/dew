@@ -24,6 +24,9 @@ from pathlib import Path as FilePath
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol
 
+from dew.interop.config_records import NativeFields
+from dew.registry import Configured, configured
+
 if TYPE_CHECKING:
     import numpy as np
 
@@ -439,10 +442,10 @@ class Rebased:
         return iter(())
 
 
-type ConfigRead = Callable[[Mapping[str, object], set[str], dict[str, object]], dict[str, object]]
+type ConfigRead[Model] = Callable[[Mapping[str, object], set[str], NativeFields[Model]], NativeFields[Model]]
 """A config part's read: the source config, the keys read so far (`used`, which it adds its own to), and the
-record its earlier parts filled, which it returns filled further (a reader of a whole record its own,
-typed as it builds it: `NativeFields`)."""
+model's record its earlier parts filled (`NativeFields`), which it returns filled further (a reader of a
+whole record its own, as it builds it)."""
 
 type ConfigWrite[Model] = Callable[[Model], Mapping[str, object]]
 """A config part's write: a model's keys in the family's config, refusing a model it cannot spell
@@ -456,11 +459,13 @@ class ConfigPart[Model]:
     records, its layer kinds. A family composes its parts (`ConfigLayout`), and its reader and its writer
     are theirs (`DecoderFamily.translate_config`, `export_fields`)."""
 
-    read: ConfigRead
+    read: ConfigRead[Model]
     write: ConfigWrite[Model]
 
 
 _MISSING = object()
+REQUIRED = _MISSING
+"""A key a config must state: its class has no default for it."""
 
 
 @dataclass(frozen=True, eq=False)
@@ -473,26 +478,104 @@ class ConfigField[Model]:
     key: str
     field: str
     default: object = _MISSING
-    parse: Callable[[object, str], object] | None = None
+    parse: Callable[[object, str], Configured] | None = None
     value: Callable[[Model], object] | None = None
     spell: Callable[[object], object] | None = None
     aliases: tuple[str, ...] = ()
     """Other keys a config may state it under, read where `key` is absent, in order; written as `key`."""
 
     def read(self, hf_config: Mapping[str, object], used: set[str],
-             record: dict[str, object]) -> dict[str, object]:
+             record: NativeFields[Model]) -> NativeFields[Model]:
         keys = (self.key, *self.aliases)
         used.update(keys)
         key = next((key for key in keys if key in hf_config), None)
         if key is None and self.default is _MISSING:
             raise KeyError(self.key)
         stated = self.default if key is None else hf_config[key]
-        record[self.field] = stated if self.parse is None else self.parse(stated, key or self.key)
+        record[self.field] = configured(stated) if self.parse is None else self.parse(stated, key or self.key)
         return record
 
     def write(self, model: Model) -> Mapping[str, object]:
         held = getattr(model, self.field) if self.value is None else self.value(model)
         return {self.key: held if self.spell is None else self.spell(held)}
+
+
+def constant[Model](field: str, *, value: Configured) -> ConfigPart[Model]:
+    """A field a family's reference fixes, which its config states nowhere: read as `value`, written as
+    nothing (the family matches only a model that holds it, `DecoderFamily.matches`)."""
+    def read(hf_config: Mapping[str, object], used: set[str],
+             record: NativeFields[Model]) -> NativeFields[Model]:
+        record[field] = value
+        return record
+    return ConfigPart(read, lambda model: {})
+
+
+def unread[Model](*keys: str) -> ConfigPart[Model]:
+    """Keys a family's config states that its reference reads to no effect (a version stamp, an
+    initializer's range), marked read and written as nothing."""
+    def read(hf_config: Mapping[str, object], used: set[str],
+             record: NativeFields[Model]) -> NativeFields[Model]:
+        used.update(keys)
+        return record
+    return ConfigPart(read, lambda model: {})
+
+
+@dataclass(frozen=True, eq=False)
+class Nested[Model, Part]:
+    """A record a model holds under one field (`field`: its routed experts, its mixer), its own config
+    keys `layout`'s: read into a record of `kind` beside the model's (`build` makes the field's value of
+    it, a registry record where the field holds one of several classes), written from the value the
+    model holds (`held`; nothing where it holds none)."""
+
+    field: str
+    kind: type[Part]
+    layout: ConfigLayout[Part]
+    held: Callable[[Model], Part | None]
+    build: Callable[[NativeFields[Part]], Configured] | None = None
+    present: Callable[[Mapping[str, object]], bool] | None = None
+    """Whether the source config builds one (a Qwen MoE whose schedule routes no layer builds none), its
+    keys then read as nothing; always where None."""
+
+    def read(self, hf_config: Mapping[str, object], used: set[str],
+             record: NativeFields[Model]) -> NativeFields[Model]:
+        if self.present is not None and not self.present(hf_config):
+            used.update(self.layout.keys())
+            record[self.field] = None
+            return record
+        part = self.layout.read(hf_config, used, NativeFields(self.kind, {}))
+        record[self.field] = part if self.build is None else self.build(part)
+        return record
+
+    def write(self, model: Model) -> Mapping[str, object]:
+        part = self.held(model)
+        return {} if part is None else self.layout.write(part)
+
+
+@dataclass(frozen=True, eq=False)
+class Restated[Model]:
+    """`layout` under a family's own keys: each shared key read from and written to the family's
+    (`keys`, shared to own), and the keys a family's class fixes (`fixed`, shared to value) read at their
+    value and written as nothing (DeepSeek's one key/value head of its latent attention)."""
+
+    layout: ConfigLayout[Model]
+    keys: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+    fixed: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
+
+    def read(self, hf_config: Mapping[str, object], used: set[str],
+             record: NativeFields[Model]) -> NativeFields[Model]:
+        view = dict(hf_config)
+        for shared, own in self.keys.items():
+            if own in view:
+                view[shared] = view[own]
+        view.update(self.fixed)
+        read: set[str] = set()
+        record = self.layout.read(view, read, record)
+        used.update(self.keys.get(key, key) for key in read if key not in self.fixed)
+        return record
+
+    def write(self, model: Model) -> Mapping[str, object]:
+        return {self.keys.get(key, key): value for key, value in self.layout.write(model).items()
+                if key not in self.fixed}
 
 
 @dataclass(frozen=True, eq=False)
@@ -501,16 +584,24 @@ class ConfigLayout[Model]:
     filling the record (`read`), and written, each stating its keys (`write`, a later part's keys over an
     earlier's)."""
 
-    parts: tuple[ConfigPart[Model] | ConfigField[Model] | ConfigLayout[Model], ...]
+    parts: tuple[ConfigPart[Model] | ConfigField[Model] | ConfigLayout[Model] | Nested[Model, object]
+                 | Restated[Model], ...]
 
-    def __init__(self, *parts: ConfigPart[Model] | ConfigField[Model] | ConfigLayout[Model]) -> None:
+    def __init__(self, *parts: ConfigPart[Model] | ConfigField[Model] | ConfigLayout[Model]
+                 | Nested[Model, object] | Restated[Model]) -> None:
         object.__setattr__(self, 'parts', parts)
 
     def read(self, hf_config: Mapping[str, object], used: set[str],
-             record: dict[str, object]) -> dict[str, object]:
+             record: NativeFields[Model]) -> NativeFields[Model]:
         for part in self.parts:
             record = part.read(hf_config, used, record)
         return record
+
+    def keys(self) -> tuple[str, ...]:
+        """The config keys its fields state, each under every spelling it reads."""
+        return tuple(key for part in self.parts
+                     for key in ((part.key, *part.aliases) if isinstance(part, ConfigField)
+                                 else part.keys() if isinstance(part, ConfigLayout) else ()))
 
     def write(self, model: Model) -> Mapping[str, object]:
         written: dict[str, object] = {}
@@ -627,7 +718,8 @@ def _decoder_layout(decoder: object) -> Mapping[str, object] | Unwritable:
     return written
 
 
-__all__ = ["INDEX", "Condition", "Config", "ConfigField", "ConfigLayout", "ConfigPart", "ConfigRead",
-           "ConfigWrite", "Copy", "Leaf", "Path", "Prefixed", "Rebased", "Renames", "Route", "Routes", "Slot",
-           "SourceLayout", "Spelled", "Table", "Unwritable", "When", "after", "mapped", "nested", "one_of",
-           "renamed", "source_layout"]
+__all__ = ["INDEX", "REQUIRED", "Condition", "Config", "ConfigField", "ConfigLayout", "ConfigPart",
+           "ConfigRead", "ConfigWrite", "Copy", "Leaf", "Nested", "Path", "Prefixed", "Rebased", "Renames",
+           "Restated", "Route", "Routes", "Slot", "SourceLayout", "Spelled", "Table", "Unwritable",
+           "Unwritten", "When", "after", "constant", "mapped", "nested", "one_of", "renamed",
+           "source_layout", "unread"]

@@ -9,6 +9,7 @@ from types import MappingProxyType
 from flax import linen as nn
 
 from dew import _records
+from dew.interop.config_records import NativeFields
 from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Route, Table, mapped
 from dew.nn.activations import HIDDEN_ACT
 from dew.registry import Record, towers
@@ -142,7 +143,8 @@ def _stated(key: str, parse) -> ConfigField:
                        parse=lambda value, key: default if value is None else parse(value, key))
 
 
-def _read_rope(vision: Mapping[str, object], used: set[str], record: dict[str, object]) -> dict[str, object]:
+def _read_rope(vision: Mapping[str, object], used: set[str],
+               record: NativeFields[Lfm3VlVision]) -> NativeFields[Lfm3VlVision]:
     """The axial rotary's base: LFM3-VL's trunk turns no other."""
     used.update(("rope_parameters", "rope_theta"))
     rope = _records.record(vision.get("rope_parameters") or {"rope_type": "axial"}, "rope_parameters")
@@ -173,7 +175,7 @@ def translate_lfm3_vl_vision_config(hf_config: Mapping[str, object]) -> Record:
     vision = _vision_section(hf_config)
     if vision.get("model_type", "lfm3_vl_vision") != "lfm3_vl_vision":
         raise ValueError(f"vision model_type {vision.get('model_type')!r} is not LFM3-VL's trunk")
-    fields = _LFM3_CONFIG.read(vision, set(), {})
+    fields = _LFM3_CONFIG.read(vision, set(), NativeFields(Lfm3VlVision, {}))
     record: Record = {"class": "lfm3_vl", "fields": fields}
     # Built here, so a config the value refuses (a cadence of another depth, an unknown kind) is refused
     # as it is read.

@@ -15,6 +15,7 @@ from flax import linen as nn
 
 from dew import _records
 from dew.batch import Variables
+from dew.interop.config_records import NativeFields
 from dew.interop.decoder_parts import read_rope_theta
 from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Route, Routes, Table
 from dew.interop.unread import Stored
@@ -88,16 +89,11 @@ class TowerLayout:
     shapes: StoredShapes | None = None
     config: ConfigLayout | None = None
     """The tower's vision_config, both ways (`dew.interop.layouts.ConfigLayout`): read into its fields
-    (`fields`), written from its value (`vision_config`); None for a tower whose config is read apart."""
+    (its reader), written from its value (`vision_config`); None for a tower whose config is read apart."""
     model_type: str | None = None
     """The vision_config's own model_type, which a written config states."""
 
-    def fields(self, vision: Mapping[str, object]) -> dict[str, object]:
-        """The tower's fields `vision`, its vision_config, states (`config`)."""
-        assert self.config is not None, "the tower reads its config apart"
-        return self.config.read(vision, set(), {})
-
-    def vision_config(self, tower: object) -> dict[str, object]:
+    def vision_config(self, tower: TowerBase) -> Mapping[str, object]:
         """The vision_config `tower` is written with, which `fields` reads back as it (`config`)."""
         assert self.config is not None, "the tower reads its config apart"
         return {**({} if self.model_type is None else {"model_type": self.model_type}),
@@ -414,7 +410,8 @@ class Rotary(Protocol):
 
 def rope_part(default: float, *, axial: bool = False) -> ConfigPart:
     """A trunk's plain rotary base (`rope_base`), written as its `rope_parameters`."""
-    def read(vision: Mapping[str, object], used: set[str], record: dict[str, object]) -> dict[str, object]:
+    def read(vision: Mapping[str, object], used: set[str],
+             record: NativeFields[Rotary]) -> NativeFields[Rotary]:
         used.update(("rope_parameters", "rope_theta"))
         record["rope_theta"] = rope_base(vision, default, axial=axial)
         return record

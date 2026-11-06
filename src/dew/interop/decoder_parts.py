@@ -15,7 +15,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, NamedTuple, NoReturn, NotRequired, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, NamedTuple, NoReturn, NotRequired, Protocol, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -27,6 +27,7 @@ from dew._model_types import SANDWICH_NORMS
 from dew.batch import unboxed
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.layouts import (
+    REQUIRED,
     Condition,
     Config,
     ConfigField,
@@ -34,16 +35,20 @@ from dew.interop.layouts import (
     ConfigPart,
     ConfigRead,
     Copy,
+    Nested,
     Rebased,
     Renames,
+    Restated,
     Route,
     Routes,
     Slot,
     Spelled,
     Table,
     after,
+    constant,
     nested,
     one_of,
+    unread,
 )
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.streaming import HostArray, WeightLayout
@@ -841,7 +846,7 @@ def context_lengths(hf_config: Mapping[str, object], default: int | None = None)
 
 
 def _read_heads(hf_config: Mapping[str, object], used: set[str],
-                record: dict[str, object]) -> dict[str, object]:
+                record: DecoderFields) -> DecoderFields:
     """The key/value heads, the query heads' count where unstated, and each head's width, the residual's
     over the heads where unstated."""
     used.update(('num_key_value_heads', 'head_dim'))
@@ -853,8 +858,8 @@ def _read_heads(hf_config: Mapping[str, object], used: set[str],
     return record
 
 
-def _read_activation(hf_config: Mapping[str, object], used: set[str], record: dict[str, object]
-                     ) -> dict[str, object]:
+def _read_activation(hf_config: Mapping[str, object], used: set[str], record: DecoderFields
+                     ) -> DecoderFields:
     """The gated MLP's activation, `hidden_act` (or Gemma's `hidden_activation`) as transformers names it,
     refused outside the ones the gated MLP computes (`ACTIVATIONS`)."""
     used.update(('hidden_act', 'hidden_activation'))
@@ -867,15 +872,15 @@ def _read_activation(hf_config: Mapping[str, object], used: set[str], record: di
     return record
 
 
-def _read_context(hf_config: Mapping[str, object], used: set[str], record: dict[str, object]
-                  ) -> dict[str, object]:
+def _read_context(hf_config: Mapping[str, object], used: set[str], record: DecoderFields
+                  ) -> DecoderFields:
     used.add('max_position_embeddings')
     record['max_seq_len'], record['context_length'] = context_lengths(hf_config)
     return record
 
 
-def _read_widths(hf_config: Mapping[str, object], used: set[str], record: dict[str, object]
-                 ) -> dict[str, object]:
+def _read_widths(hf_config: Mapping[str, object], used: set[str], record: DecoderFields
+                 ) -> DecoderFields:
     used.add('intermediate_size')
     record['mlp_features'] = _mlp_features(hf_config)
     return record
@@ -898,6 +903,234 @@ DECODER_FIELDS: ConfigLayout[CausalTransformer] = ConfigLayout(
 `base_config` reads them and `hf_decoders.export_config` writes them."""
 
 
+def _flag(key: str, field: str, *, default: bool) -> ConfigField[CausalTransformer]:
+    """A boolean the config states under `key`, its class's `default` where it states none or null
+    (`config_flag`)."""
+    return ConfigField(key, field, default, parse=lambda value, key: config_flag({key: value}, key,
+                                                                                  default=default))
+
+
+def inert(key: str, why: str, *, neutral: object = None) -> ConfigPart[CausalTransformer]:
+    """A key the reference reads to no effect at `neutral` (or absent, or null), refused at any other
+    value, saying `why`; written as nothing."""
+    def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+        used.add(key)
+        if hf_config.get(key) not in (None, neutral):
+            refuse(f"{key}={hf_config[key]!r}", why)
+        return record
+    return ConfigPart(read, lambda model: {})
+
+
+@dataclass(frozen=True)
+class DecoderSpelling:
+    """How a family's config class spells the decoder every family shares, both ways
+    (`decoder_layout`): its rotary (`rope`), the optional fields its reference reads (`reads`, of
+    `_OPTIONAL_FIELDS`; another stated at a value that computes nothing is accepted unread), the layer
+    pattern it cycles where the config states none (`pattern`), its ramps (`ramps`, None for every one
+    the rope utilities build), its tying where unstated (`tie_embeddings`), and what its reference fixes
+    beside them: q/k head norms (`qk_norm`) and a norm's scale applied after its cast
+    (`scale_after_cast`). `windowed` is a class whose every layer slides where its config states a
+    window (MistralConfig's, MinistralConfig's without layer_types)."""
+
+    rope: RopeSpelling = PLAIN_SPELLING
+    reads: frozenset[str] = frozenset({'layer_types', 'sliding_window', 'attention_bias'})
+    pattern: tuple[str, ...] | None = None
+    windowed: bool = False
+    keys: Mapping[str, str] = dataclasses.field(default_factory=lambda: MappingProxyType({}))
+    """The family's own keys for the shared geometry's (`Restated`: Qwen3.5-MoE's dense width is its
+    experts', `moe_intermediate_size`)."""
+    fixed: Mapping[str, object] = dataclasses.field(default_factory=lambda: MappingProxyType({}))
+    """Shared geometry the class fixes and states nowhere (`Restated`)."""
+    ramps: tuple[str, ...] | None = None
+    tie_embeddings: bool = False
+    qk_norm: bool = False
+    scale_after_cast: bool = True
+
+
+def _layer_kinds(spelling: DecoderSpelling) -> ConfigPart[CausalTransformer]:
+    """The layers' kinds and the sliding window, both ways: `layer_types` where the reference reads it,
+    else the pattern an earlier part of the family set (`record['layer_types']`) or the spelling's,
+    every layer full without either; the window where it reads one, refused for sliding layers without."""
+    reads = spelling.reads
+
+    def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+        for optional in _OPTIONAL_FIELDS - reads:
+            if optional in hf_config and _neutral(hf_config, optional):
+                used.add(optional)
+        preset = record.get('layer_types')
+        pattern = spelling.pattern if preset is None else _records.strings(preset, 'layer_types')
+        if pattern is None and spelling.windowed and hf_config.get('sliding_window') is not None:
+            pattern = ('sliding_attention',)
+        if 'layer_types' in reads:
+            layer_types = specified_layer_types(hf_config, used, pattern)
+        else:
+            layers = _records.integer(record['num_layers'], 'num_layers')
+            cycle = pattern or ('full_attention',)
+            layer_types = tuple(cycle[index % len(cycle)] for index in range(layers))
+        stated = hf_config.get('sliding_window') if 'sliding_window' in reads else None
+        if 'sliding_window' in reads:
+            used.add('sliding_window')
+        if 'sliding_attention' in layer_types and stated is None:
+            refuse("layer_types with sliding attention",
+                   "sliding_window is not set, so the window has no size")
+        window = _records.integer(stated, 'sliding_window') if 'sliding_attention' in layer_types else None
+        record['layer_types'] = layer_types
+        record['kinds'] = decoder_kinds(layer_types, window, None, None, None)
+        return record
+
+    def write(model: CausalTransformer) -> Mapping[str, object]:
+        types = model.per_layer_types
+        written: dict[str, object] = {}
+        if 'layer_types' in reads and any(layer != 'full_attention' for layer in types):
+            written['layer_types'] = list(types)
+        sliding = model.kind_of('sliding_attention') if 'sliding_attention' in types else None
+        if 'sliding_window' in reads and sliding is not None and sliding.window is not None:
+            written['sliding_window'] = sliding.window
+        return written
+    return ConfigPart(read, write)
+
+
+def place_ropes(record: DecoderFields, ropes: Ropes) -> None:
+    """Set a read rotary (`Ropes`) on `record`: the model's base and ramp, the sliding kind's own where
+    they differ. A ramp both kinds share is the model's; one the full layers alone carry (OLMo 3's
+    spelling) lands on the full kind, because a kind's None rides the model's value and cannot turn a
+    ramp off; where the kinds' ramps differ, each lands on its own kind (transformers dispatches each
+    kind's record on its own)."""
+    record['rope_theta'] = ropes.theta
+    kinds = kinds_of(record)
+    layer_types = _records.strings(record['layer_types'], 'layer_types')
+    if ropes.local_theta is not None and 'sliding_attention' in kinds:
+        kinds['sliding_attention']['rope_theta'] = ropes.local_theta
+    apart = ropes.scaling is not None and (ropes.full_only or ropes.local_scaling is not None)
+    if ropes.scaling is not None:
+        if apart and 'sliding_attention' in layer_types:
+            kinds.setdefault('full_attention', native_fields(LayerKind)())['rope_scaling'] = ropes.scaling
+        else:
+            record['rope_scaling'] = ropes.scaling
+    if ropes.local_scaling is not None:
+        kinds['sliding_attention']['rope_scaling'] = ropes.local_scaling
+    record['kinds'] = kinds
+
+
+def written_ropes(model: CausalTransformer, spelling: RopeSpelling) -> Mapping[str, object]:
+    """`place_ropes` backwards, as `spelling`'s class reads its records (`rope_records`): one base and
+    ramp flat (`rope_theta`, `rope_scaling`, as Llama 3.1 ships them), a sliding base under the class's
+    own field (Gemma 3's rope_local_base_freq), or a record per kind (`rope_parameters`, the spelling
+    Olmo3Config.to_dict writes), which a class with one table for the whole model cannot say: refused,
+    naming the kinds. A class with a default of its own for the sliding base states both bases."""
+    types = model.per_layer_types
+    sliding = model.kind_of('sliding_attention') if 'sliding_attention' in types else None
+    local_theta = None if sliding is None or sliding.rope_theta == model.rope_theta else sliding.rope_theta
+    if sliding is not None and spelling.local_theta is not None:
+        local_theta = sliding.rope_theta or model.rope_theta
+    tables = {kind: model.kind_of(kind).rope_scaling for kind in sorted(set(types))}
+    ramped = {kind: table for kind, table in tables.items() if table is not None}
+    per_kind = bool(ramped) and (set(ramped) != set(tables) or len(set(ramped.values())) > 1
+                                 or local_theta is not None)
+    if per_kind or (local_theta is not None and spelling.local_field is None):
+        if not spelling.per_kind:
+            raise ExportRefused(f"the rotary differs between the layer kinds {sorted(tables)}, and the "
+                                "reference rotates every layer at one table; the model cannot be written "
+                                "back")
+        return {'rope_parameters': {
+            kind: {**({'rope_type': 'default'} if table is None else dataclasses.asdict(table)),
+                   'rope_theta': model.kind_of(kind).rope_theta} for kind, table in tables.items()}}
+    written: dict[str, object] = {'rope_theta': model.rope_theta}
+    if local_theta is not None and spelling.local_field is not None:
+        written[spelling.local_field] = local_theta
+    if ramped:
+        written['rope_scaling'] = dataclasses.asdict(next(iter(ramped.values())))
+    return written
+
+
+def rope_part(spelling: RopeSpelling, *, ramps: tuple[str, ...] | None = None,
+              per_kind: bool = True) -> ConfigPart[CausalTransformer]:
+    """The rotary, both ways: read as `spelling`'s class resolves its records (`read_rope`) and placed
+    on the model and its kinds (`place_ropes`), written back as that class reads them
+    (`written_ropes`)."""
+    def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+        place_ropes(record, read_rope(hf_config, used, spelling, ramps=ramps, per_kind=per_kind))
+        return record
+    return ConfigPart(read, lambda model: written_ropes(model, spelling))
+
+
+def partial_rope_part(spelling: RopeSpelling = PLAIN_SPELLING, *, default_factor: float,
+                      layout: tuple[str, ...] = (), kind: str = 'default') -> ConfigPart[CausalTransformer]:
+    """A rotary turning a fraction of each head, both ways: read as its one record states it
+    (`read_partial_rope`: the record's fraction, else the config's flat one, else `default_factor`, the
+    class's), the ramp over the rotated width under the `kind` convention; written as its base, ramp and
+    fraction (`written_ropes`). `layout` names the record's fields that place the rotated pairs without
+    changing their angles (Qwen 3.5's mRoPE sections), which its wrapper reads (`hf_decoders`)."""
+    def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+        ropes, factor = read_partial_rope(hf_config, used, spelling, default_factor=default_factor,
+                                          layout=layout)
+        place_ropes(record, ropes)
+        record['partial_rotary_factor'] = factor
+        record['partial_rotary_type'] = kind
+        return record
+
+    def write(model: CausalTransformer) -> Mapping[str, object]:
+        return {**written_ropes(model, spelling), 'partial_rotary_factor': model.partial_rotary_factor or 1.0}
+    return ConfigPart(read, write)
+
+
+def kind_mixer[Mixer](kind: str, name: str, mixer: type[Mixer], layout: ConfigLayout[Mixer], *,
+                      fixed: Mapping[str, object] | None = None) -> ConfigPart[CausalTransformer]:
+    """The mixer the layers of `kind` hold (a hybrid's delta net, SSD or lightning attention), its keys
+    `layout`'s, both ways: read into the kind's record as the `mixers` registry's `name` beside what the
+    family's reference fixes of it (`fixed`), its keys read as nothing where no layer is of the kind;
+    written from the mixer the kind holds."""
+    def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+        if kind not in _records.strings(record['layer_types'], 'layer_types'):
+            used.update(layout.keys())
+            return record
+        fields = layout.read(hf_config, used, NativeFields(mixer, {}))
+        fields.update(fixed or {})
+        kinds = kinds_of(record)
+        kinds[kind] = NativeFields(LayerKind, {**kinds.get(kind, {}),
+                                               'mixer': {'class': name, 'fields': fields}})
+        record['kinds'] = kinds
+        return record
+
+    def write(model: CausalTransformer) -> Mapping[str, object]:
+        held = model.kind_of(kind).mixer if kind in model.per_layer_types else None
+        return layout.write(held) if isinstance(held, mixer) else {}
+    return ConfigPart(read, write)
+
+
+def kinds_among(kinds: tuple[str, ...], why: str) -> ConfigPart[CausalTransformer]:
+    """Refuse a layer of a kind outside `kinds`, saying `why`; written as nothing (`_layer_kinds`
+    writes the layers' kinds)."""
+    def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+        unknown = sorted(set(_records.strings(record['layer_types'], 'layer_types')) - set(kinds))
+        if unknown:
+            refuse(f"layer_types {unknown}", why)
+        return record
+    return ConfigPart(read, lambda model: {})
+
+
+PLAIN_DECODER = DecoderSpelling()
+"""The decoder as LlamaConfig's mixin spells it."""
+
+
+def decoder_layout(spelling: DecoderSpelling = PLAIN_DECODER, *,
+                   rope: ConfigPart[CausalTransformer] | None = None) -> ConfigLayout[CausalTransformer]:
+    """The decoder every family shares, both ways, as `spelling` states it: its geometry
+    (`DECODER_FIELDS`), its layers' kinds and window (`_layer_kinds`), its rotary (`rope`, the spelling's
+    `rope_part` where None: a family that reads its rotary otherwise, a partial one, declares its own),
+    the biases and tying its class declares, and what its reference fixes."""
+    reads = spelling.reads
+    geometry = (DECODER_FIELDS if not spelling.keys and not spelling.fixed
+                else Restated(DECODER_FIELDS, spelling.keys, spelling.fixed))
+    return ConfigLayout(
+        geometry, _layer_kinds(spelling),
+        rope_part(spelling.rope, ramps=spelling.ramps) if rope is None else rope,
+        *(_flag(name, name, default=False) if name in reads else constant(name, value=False)
+          for name in ('attention_bias', 'mlp_bias')),
+        _flag('tie_word_embeddings', 'tie_embeddings', default=spelling.tie_embeddings),
+        constant('qk_norm', spelling.qk_norm), constant('scale_after_cast', spelling.scale_after_cast))
+
+
 def base_config(hf_config: Mapping[str, object], used: set[str], *,
                  rope: Ropes | RopeSpelling,
                  layer_types: tuple[str, ...] | None = None,
@@ -918,9 +1151,9 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
     An unread field at the value it would compute anyway (a null window,
     attention_bias false, every layer full) is accepted.
     """
-    for unread in _OPTIONAL_FIELDS - reads:
-        if unread in hf_config and _neutral(hf_config, unread):
-            used.add(unread)
+    for optional in _OPTIONAL_FIELDS - reads:
+        if optional in hf_config and _neutral(hf_config, optional):
+            used.add(optional)
     shared = DECODER_FIELDS.read(hf_config, used, {})
 
     ropes = read_rope(hf_config, used, rope) if isinstance(rope, RopeSpelling) else rope
@@ -1000,25 +1233,32 @@ def softmax_top_k(hf_config: Mapping[str, object], used: set[str]) -> int:
     return _records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok')
 
 
-def _read_local_experts(hf_config: Mapping[str, object], used: set[str],
-                        record: dict[str, object]) -> dict[str, object]:
-    used.add('num_local_experts')
-    record['mixture'] = native_fields(Mixture)(
-        experts=_records.integer(hf_config['num_local_experts'], 'num_local_experts'),
-        top_k=softmax_top_k(hf_config, used))
-    return record
+def integer(key: str, field: str, default: object = REQUIRED, *aliases: str) -> ConfigField:
+    """A config key holding an integer field, its class's `default` where it states none (none where
+    REQUIRED), read under `aliases` where `key` is absent."""
+    return ConfigField(key, field, default, parse=_records.integer, aliases=aliases)
 
 
-def _write_local_experts(model: CausalTransformer) -> Mapping[str, object]:
-    mixture = model.mixture
-    if mixture is None:
-        refuse_export('mixture', 'this family routes every layer')
-    return {'num_local_experts': mixture.experts, 'num_experts_per_tok': mixture.top_k}
+def flag(key: str, field: str, *, default: bool) -> ConfigField:
+    """A boolean the config states under `key`, its class's `default` where it states none or null."""
+    return ConfigField(key, field, default,
+                       parse=lambda value, key: config_flag({key: value}, key, default=default))
 
 
-LOCAL_EXPERTS = ConfigPart(_read_local_experts, _write_local_experts)
+TRAINING_ROUTER = unread('output_router_logits', 'router_aux_loss_coef')
+"""A router's training controls, which a forward reads to no effect."""
+
+
+def experts(*fields: ConfigField | ConfigPart, present=None) -> Nested:
+    """A model's routed experts (`Mixture`), their keys `fields`, under its `mixture` (none where
+    `present`, of the source config, says the config routes no layer)."""
+    return Nested('mixture', Mixture, ConfigLayout(*fields), lambda model: model.mixture, present=present)
+
+
+LOCAL_EXPERTS = ConfigLayout(experts(integer('num_local_experts', 'experts'),
+                                     integer('num_experts_per_tok', 'top_k')), TRAINING_ROUTER)
 """Mixtral's routed experts, which GraniteMoE's share: `num_local_experts` softmax experts on every layer,
-the top `num_experts_per_tok` of them renormalized (`softmax_top_k`), both ways."""
+the top `num_experts_per_tok` of them renormalized, both ways."""
 
 
 def translated(hf_config: Mapping[str, object], family: "DecoderFamily") -> DecoderFields:
@@ -1324,9 +1564,9 @@ def spelled(renames: Renames, *, leaves: Leaves | None = None, layer_leaves: Lea
 def reads(translate: Callable[[Mapping[str, object], set[str]], DecoderFields]) -> ConfigRead:
     """A reader of a whole record (`translate`, the source config and the keys read) as a config part's
     read (`ConfigPart`)."""
-    def read(hf_config: Mapping[str, object], used: set[str], record: dict[str, object]) -> dict[str, object]:
-        # The reader's own record where it is the first part, kept typed as it builds it (`NativeFields`).
-        translated = cast(dict[str, object], translate(hf_config, used))
+    def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+        # The reader's own record where it is the first part, kept as it builds it.
+        translated = translate(hf_config, used)
         if not record:
             return translated
         record.update(translated)
@@ -1591,7 +1831,7 @@ DEEPSEEK_ROUTES = layer_depth_routes(DECODER_ROUTES)
 releases share."""
 
 
-def model_record(model: CausalTransformer) -> dict[str, object]:
+def model_record(model: CausalTransformer) -> Mapping[str, object]:
     """The record a family's routes read an export's conditions from, as a load reads them from the
     translated config (`DecoderFields`): the model's own fields, its layer kinds resolved
     (`per_layer_types`)."""
@@ -2294,7 +2534,7 @@ class DecoderFamily:
     def translate_config(self, hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
         """The record `hf_config`, the family's own spelling of its fields (`translated` reads its aliases,
         defaults and repeats first), states (`config`), each key read added to `used`."""
-        return cast(DecoderFields, self.config.read(hf_config, used, {}))
+        return self.config.read(hf_config, used, NativeFields(CausalTransformer, {}))
 
     def export_fields(self, model: CausalTransformer) -> Mapping[str, object]:
         """The family's own keys `model`'s fields state (`config`), beside the shared ones

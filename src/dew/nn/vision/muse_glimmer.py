@@ -10,6 +10,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
+from dew.interop.config_records import NativeFields
 from dew.interop.layouts import ConfigLayout, ConfigPart, Table
 from dew.nn.activations import HIDDEN_ACT
 from dew.nn.dense import Dense
@@ -146,7 +147,7 @@ def translate_muse_glimmer_vision_config(hf_config: Mapping[str, object]) -> Rec
     vision = _vision_section(hf_config)
     if vision.get("model_type", "muse_glimmer_vision") != "muse_glimmer_vision":
         raise ValueError(f"vision model_type {vision.get('model_type')!r} is not Muse Glimmer's trunk")
-    fields = _MUSE_CONFIG.read(vision, set(), {})
+    fields = _MUSE_CONFIG.read(vision, set(), NativeFields(MuseGlimmerVision, {}))
     unknown = sorted(set(_records.strings(fields["layer_types"], "layer_types"))
                      - {"full_attention", "window_attention"})
     if unknown:
@@ -154,7 +155,8 @@ def translate_muse_glimmer_vision_config(hf_config: Mapping[str, object]) -> Rec
     return {"class": "muse_glimmer", "fields": fields}
 
 
-def _read_kinds(vision: Mapping[str, object], used: set[str], record: dict[str, object]) -> dict[str, object]:
+def _read_kinds(vision: Mapping[str, object], used: set[str],
+                record: NativeFields[MuseGlimmerVision]) -> NativeFields[MuseGlimmerVision]:
     """Each layer's kind, the reference's cadence over the depth where unstated."""
     used.add("layer_types")
     layers = _records.integer(record["num_hidden_layers"], "num_hidden_layers")

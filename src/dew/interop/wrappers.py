@@ -15,12 +15,18 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import cast
+from typing import TYPE_CHECKING
 
 from dew import _records
 from dew.interop.decoder_parts import ExportRefused
 from dew.interop.layouts import ConfigLayout, SourceLayout, Unwritable
 from dew.interop.safetensors_io import LazyTensors
+
+if TYPE_CHECKING:
+    from dew.interop.decoder_parts import DecoderFields
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.multimodal import MultimodalTransformer
+    from dew.nn.vision.common import ProjectorLayout, TowerLayout
 
 type TextConfig = Mapping[str, object]
 
@@ -50,7 +56,7 @@ class WrapperLayout:
     (`tied_default`)."""
 
     architecture: str
-    keys: ConfigLayout
+    keys: ConfigLayout[MultimodalTransformer]
     root: str = "model."
     language: str = "language_model."
     nests_head: bool = False
@@ -60,7 +66,7 @@ class WrapperLayout:
     vision_type: str | None = None
     corrections: tuple[TextCorrection, ...] = ()
     tied_default: bool = True
-    vision_keys: ConfigLayout | None = None
+    vision_keys: ConfigLayout[MultimodalTransformer] | None = None
     """Keys the wrapper states in its vision_config beside its tower's own: its merger's, which the tower
     holds in its vision_config (Qwen 3.5's `out_hidden_size`)."""
 
@@ -73,7 +79,7 @@ class WrapperLayout:
         return name
 
 
-def corrected(layout: WrapperLayout, text_config: TextConfig, record: dict) -> None:
+def corrected(layout: WrapperLayout, text_config: TextConfig, record: DecoderFields) -> None:
     """Set each of `layout`'s corrections that `text_config` asks for on `record`, a text decoder's
     translated fields (`kinds_of`), merging its fields into the kinds' mixers."""
     from dew.interop import decoder_parts
@@ -84,7 +90,7 @@ def corrected(layout: WrapperLayout, text_config: TextConfig, record: dict) -> N
         fields = correction.read(text_config)
         if fields is None:
             continue
-        kinds = decoder_parts.kinds_of(cast(decoder_parts.DecoderFields, record)).copy()
+        kinds = decoder_parts.kinds_of(record).copy()
         names = correction.kinds or tuple(dict.fromkeys(_records.strings(record["layer_types"],
                                                                          "layer_types")))
         for name in names:
@@ -96,38 +102,39 @@ def corrected(layout: WrapperLayout, text_config: TextConfig, record: dict) -> N
         record["kinds"] = kinds
 
 
-def uncorrected(layout: WrapperLayout, language_model) -> tuple[object, list[tuple[TextCorrection, dict]]]:
+def uncorrected(layout: WrapperLayout, language_model: CausalTransformer
+                ) -> tuple[CausalTransformer, list[tuple[TextCorrection, Mapping[str, object]]]]:
     """`language_model` without what `layout`'s corrections added to its kinds' mixers (each field back
     at its mixer's default), the decoder its text family writes, and each correction it held with the
     fields it held, which the text_config states (`TextCorrection.write`). A correction whose fields the
     model holds at their defaults is none of it."""
+    from dew.nn.backbones.layer_plan import LayerKind
     from dew.nn.mixers import AttentionMixer
+    from dew.registry import record_fields
 
     kinds = dict(language_model.kinds or {})
     base = language_model.mixer or AttentionMixer()
-    held: list[tuple[TextCorrection, dict]] = []
+    held: list[tuple[TextCorrection, Mapping[str, object]]] = []
     for correction in layout.corrections:
         fields: dict[str, object] = {}
         for name in correction.kinds or tuple(dict.fromkeys(language_model.per_layer_types)):
-            kind = kinds.get(name, language_model.kind_of(name))
+            kind = kinds.get(name, LayerKind())
             mixer = kind.mixer or base
-            declared = {field.name: field for field in dataclasses.fields(mixer)}
-            stated = {field: getattr(mixer, field) for field in correction.fields if field in declared}
-            if all(value == _default(declared[field]) for field, value in stated.items()):
+            # The fields it holds off their defaults (`record_fields` leaves a default out).
+            stated = {field: value for field, value in record_fields(mixer, type(mixer)).items()
+                      if field in correction.fields}
+            if not stated:
                 continue
             fields.update(stated)
-            plain = dataclasses.replace(mixer, **{field: _default(declared[field]) for field in stated})
+            plain = mixer.clone(**{field: getattr(type(mixer)(), field) for field in stated})
             kinds[name] = dataclasses.replace(kind, mixer=None if plain == base else plain)
         if fields:
             held.append((correction, fields))
     return language_model.clone(kinds=kinds), held
 
 
-def _default(field: dataclasses.Field) -> object:
-    return None if field.default is dataclasses.MISSING else field.default
-
-
-def wrapper_layout(model, *, config: Mapping[str, object] | None = None) -> SourceLayout | Unwritable:
+def wrapper_layout(model: MultimodalTransformer, *,
+                   config: Mapping[str, object] | None = None) -> SourceLayout | Unwritable:
     """The release layout of `model`, a multimodal wrapper, as its family declares it (`WrapperLayout`),
     or what it cannot write (`Unwritable`): its config (`text_config` its language model's as its text
     family writes it, without what the wrapper adds to it, `vision_config` its tower's, and the wrapper's
@@ -171,7 +178,7 @@ def wrapper_layout(model, *, config: Mapping[str, object] | None = None) -> Sour
     return SourceLayout(stated, {}, tensors)
 
 
-def _text(layout: WrapperLayout, wrapper) -> tuple[object, dict]:
+def _text(layout: WrapperLayout, wrapper: MultimodalTransformer) -> tuple[CausalTransformer, TextConfig]:
     """The wrapper's language model as its text family writes it, and the text_config the wrapper states:
     the text family's config of it with what the wrapper adds written back (`uncorrected`), typed as the
     wrapper's text model, its head's tying stated at the wrapper's scope."""
@@ -187,7 +194,7 @@ def _text(layout: WrapperLayout, wrapper) -> tuple[object, dict]:
     return plain, {**text, "model_type": layout.text_type or f"{wrapper.family}_text"}
 
 
-def _refuse_lossy(wrapper, config: Mapping[str, object]) -> None:
+def _refuse_lossy(wrapper: MultimodalTransformer, config: Mapping[str, object]) -> None:
     """Refuse a wrapper config that reads back as another computation than `wrapper`: translated again as
     a load translates it, its language model compared field by field (`refuse_rebuilt`) and the rest by
     their records."""
@@ -215,7 +222,17 @@ def _refuse_lossy(wrapper, config: Mapping[str, object]) -> None:
                             f"{', '.join(f'{name}={theirs.get(name)!r}' for name in lost)}")
 
 
-def _tensors(layout: WrapperLayout, wrapper, language, tower, projector, variables, config):
+def _tree(tree: Mapping[str, object], name: str) -> Mapping[str, object]:
+    """The subtree `tree` holds under `name`."""
+    held = tree[name]
+    if not isinstance(held, Mapping):
+        raise TypeError(f"{name} is a {type(held).__name__}, not a tree")
+    return held
+
+
+def _tensors(layout: WrapperLayout, wrapper: MultimodalTransformer, language: CausalTransformer,
+             tower: TowerLayout, projector: ProjectorLayout, variables: Mapping[str, object],
+             config: Mapping[str, object]) -> LazyTensors:
     """The wrapper's tensors under its release's names: its language model's through its text family's
     routes under the wrapper's prefixes (`WrapperLayout.language_name`), its tower's and projector's
     through their layouts under theirs (`TowerLayout.tensors`, `ProjectorLayout.written`)."""
@@ -238,8 +255,8 @@ def _tensors(layout: WrapperLayout, wrapper, language, tower, projector, variabl
     media = (*(dataclasses.replace(held, name=layout.root + tower.prefix + held.name)
                for held in nested(tower.tensors(wrapper.vision, towers), 1, "tower")),
              *(dataclasses.replace(held, name=layout.root + prefix + held.name)
-               for held in nested(projector.written(variables["params"]["projector"]),
-                                                1, "projector")))
+               for held in nested(projector.written(_tree(_tree(variables, "params"), "projector")), 1,
+                                  "projector")))
     held = decoder_parts.layout_tensors({each.name: each for each in media}, variables)
     specs = {**{stored: tensor_specs(text)[name] for stored, name in names.items()}, **tensor_specs(held)}
     return LazyTensors(specs, lambda name: text[names[name]] if name in names else held[name])

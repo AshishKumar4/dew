@@ -9,6 +9,7 @@ from flax import linen as nn
 
 from dew import _records
 from dew._model_types import _QWEN35_VISION_TYPES
+from dew.interop.config_records import NativeFields
 from dew.interop.layouts import ConfigLayout, Table
 from dew.nn.text_encoders import TOWER_ACTIVATIONS
 from dew.registry import Record
@@ -128,7 +129,7 @@ def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Record:
         raise ValueError(
             f"num_position_embeddings ({table}) is not a square, this trunk "
             "resamples a square table")
-    return {"class": "qwen3_5", "fields": _QWEN35_CONFIG.read(vision, set(), {})}
+    return {"class": "qwen3_5", "fields": _QWEN35_CONFIG.read(vision, set(), NativeFields(Qwen35Vision, {}))}
 
 
 _QWEN35_CONFIG = ConfigLayout(

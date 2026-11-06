@@ -15,6 +15,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
 from dew.batch import Variables
+from dew.interop.config_records import NativeFields
 from dew.interop.layouts import ConfigLayout, ConfigPart, Table
 from dew.interop.unread import Stored, held
 from dew.interop.weights import checkpoint_array
@@ -176,7 +177,8 @@ def translate_siglip_vision_config(hf_config: Mapping[str, object]) -> Record:
     (`TOWER_ACTIVATIONS`) refuses with its name. Dropout, which the eval trunk
     never applies, is left unread.
     """
-    return {"class": "siglip", "fields": _SIGLIP_CONFIG.read(_vision_section(hf_config), set(), {})}
+    fields = _SIGLIP_CONFIG.read(_vision_section(hf_config), set(), NativeFields(SiglipVision, {}))
+    return {"class": "siglip", "fields": fields}
 
 
 _SIGLIP_CONFIG = ConfigLayout(
