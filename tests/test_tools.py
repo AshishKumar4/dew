@@ -1959,7 +1959,7 @@ def test_each_form_of_a_custom_derivative_is_a_seam():
     declaring builder's, its kind read from its first argument; a plain function is none."""
     import ast
 
-    lint = load("lint_slop")
+    rules = load("lint_derivatives")
     text = (
         "import functools\nimport jax\n"
         "@jax.custom_jvp\ndef a(x): return x\n"
@@ -1976,7 +1976,7 @@ def test_each_form_of_a_custom_derivative_is_a_seam():
         "@functools.partial(declared_tangent, KernelGlue(), tangent=rule)\n"
         "def k(x): return x\n"
         "def plain(x): return x\n")
-    assert {seam: maker for seam, maker, _, _ in lint.derivative_seams("m.py", ast.parse(text))} == {
+    assert {seam: maker for seam, maker, _, _ in rules.derivative_seams("m.py", ast.parse(text))} == {
         "m.py::a": "custom_jvp", "m.py::b": "custom_vjp", "m.py::c": "custom_jvp", "m.py::d": "custom_vjp",
         "m.py::outer.inner": "custom_vjp", "m.py::tangent.linear_tangent": "linear_tangent",
         "m.py::e": "surrogate", "m.py::f": "surrogate", "m.py::g": "declared_derivative:Surrogate",
