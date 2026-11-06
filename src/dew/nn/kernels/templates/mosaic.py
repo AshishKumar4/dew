@@ -1387,7 +1387,10 @@ class Issuer[Accumulator](abc.ABC):
 
         if width >= columns:
             return part(0, running)
-        return jnp.concatenate([part(start, running[:, start:start + width])
+        # Each part's add closes before the next part's product (an optimization barrier): the parts are
+        # independent, and the compiler otherwise issued both products before either add, both live beside
+        # the running sum (256 words a thread at 64 x 256 against 192, NSDBG3620-14).
+        return jnp.concatenate([lax.optimization_barrier(part(start, running[:, start:start + width]))
                                 for start in range(0, columns, width)], axis=1)
 
     def summed_columns(self, columns: int) -> int:
