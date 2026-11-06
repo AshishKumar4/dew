@@ -516,7 +516,8 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                               for rows_ in shares for depth in depths for programs in residencies
                               for stages in range(config.stages, 1, -1))
                     tile = next((tile for tile in staged
-                                 if tile is not None and launch.legal(ba, tile, target)), None)
+                                 if isinstance(tile, mosaic_gpu.Tiles) and launch.legal(ba, tile, target)),
+                                None)
                     if tile is not None:
                         configs[f"{name} x{consumers} {tile}"] = tile
             kernel = "dew_tgmm" if isinstance(launch, grouped_matmul.MosaicTgmm) else "dew_gmm"
@@ -530,11 +531,12 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
 
 
 def _replaced(config, **changes):
-    """`config` with `changes`, or None where its tile type refuses them (`mosaic_gpu.Tiles`' own checks)."""
+    """`config` with `changes`, or its tile type's refusal of them (`mosaic_gpu.Tiles`' own checks, a
+    `ValueError`), which a search passes over."""
     try:
         return dataclasses.replace(config, **changes)
-    except ValueError:
-        return None
+    except ValueError as refusal:
+        return refusal
 
 
 def _model(launch, ba, config) -> resources.RegisterModel:

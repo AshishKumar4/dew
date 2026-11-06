@@ -30,6 +30,7 @@ from gpu_flow import cell
 from jax.sharding import Mesh
 from kernel_matrix import AXES
 from reference_error import assert_as_exact, with_gradients
+from test_gemm_template import rms_norm
 
 from dew.nn.kernels import fused_gemm, generation
 
@@ -49,14 +50,6 @@ launches."""
 def _wide(x):
     """`x` in at least fp32."""
     return x.astype(jnp.promote_types(x.dtype, jnp.float32))
-
-
-def _rms_norm(x, weight, epsilon=1e-6):
-    """An RMS norm of the residual stream as a model writes it: statistics at least fp32 (float64 for the
-    float64 truth), one rounding."""
-    wide = _wide(x)
-    mean_square = jnp.mean(wide * wide, axis=-1, keepdims=True)
-    return (wide * jax.lax.rsqrt(mean_square + epsilon) * weight).astype(x.dtype)
 
 
 def _bias_cast(product, bias, dtype):
@@ -86,7 +79,7 @@ def _region(case: dict[str, str]):
     consumer = CONSUMERS[case["consumer"]]
 
     def region(x, w, *rest):
-        operand = _rms_norm(x, rest[0]) if _produced(case) else x
+        operand = rms_norm(x, rest[0]) if _produced(case) else x
         sizes = jnp.asarray(SIZES, jnp.int32)
         return consumer(fused_gemm.product(operand, w, sizes, out_dtype=jnp.float32), rest[-1], dtype)
 
@@ -107,7 +100,7 @@ def _plain(case: dict[str, str]):
     consumer = CONSUMERS[case["consumer"]]
 
     def plain(x, w, *rest):
-        operand = _rms_norm(x, rest[0]) if _produced(case) else x
+        operand = rms_norm(x, rest[0]) if _produced(case) else x
         return consumer(grouped_product(operand, w), rest[-1], x.dtype)
 
     return plain
