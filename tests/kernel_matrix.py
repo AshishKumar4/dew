@@ -91,6 +91,7 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "delta_decode": {
         "generation": ("sm90", "sm80"),
+        "layer": ("gated delta net", "kimi delta attention", "mamba2"),
         "kernel": ("fused", "step"),
         "state": ("float32", "bfloat16"),
     },
@@ -119,26 +120,25 @@ over three groups (one of them empty); the matrix stored N-major (`[depth, width
 (`transpose_rhs`, `[width, depth]`); no hook, a bias (a group's under a grouped call), a scale a row, or a
 paired gate and up product under SwiGLU; the operands' dtype. The fused GEMM's (the choices `gemm_epilogue`
 and `gemm_prologue`): the GPU; the stage a region fuses, its consumers into the epilogue, its producer (an RMS
-norm) into the prologue (its consumers
-after the product in XLA), or both; the consumers, a bias then a cast, or a SiLU of twice the product plus a
-residual; the operands' dtype. The joined projections' (the choices `gate_up` and `delta_gates`): the GPU; a
-gated MLP's gate and up projections joined, or a gated delta net's b and a; the MLP's activation, SwiGLU or
-GeGLU (`none` for the delta net, which has no gated product); projections with no bias or one; a gate times
-its multiplier or not (`plain` for the delta net); the operands' dtype. The adapted product's (the choice
-`low_rank`): the GPU; the adapter's rank; a projection with no bias or one; the operands' dtype. The
-recurrence's (the choices `gated_delta_rule` and `ssd`): the GPU; the form (tests/recurrence_matrix.py's
-`FORMS`); the kernel the call names (its form's port, fla's or mamba_ssm's, the reference); the operands'
-dtype; one sequence or packed
-documents. The short conv's: the GPU; a gated delta net's training shapes (Qwen3.5-0.8B's or 9B's); the
-operands' dtype; whole rows or packed documents. The selective scan's: the GPU; the recorded mamba_ssm case
-(tests/selective_support.py's `SEEDED_CASES`). The recurrent decode's: the GPU; the fused step or the step
-alone; the dtype its recurrent state is held in. The fused norms' and SiLU products' (the choices `rms_norm`
-and `swiglu`): the GPU; the RMS norm or the SwiGLU product; the norm's plain, stream (a residual stream and
-its norm) or gated form, or the product of a gate and an up projection apart or of one packed projection; the
-operands' dtype; the feature width, narrower than a warp, ragged, a whole row of a program, or past the norm's
-register tile (4096 and 16384 features: the norm refuses the last). The narrow copies' (the choice
-`narrow_copies`): the GPU; the dtype the decoder computes in; its layers plain or scanned; one microbatch an
-update, two accumulated, or one batch read in two parts."""
+norm) into the prologue (its consumers after the product in XLA), or both; the consumers, a bias then a cast,
+or a SiLU of twice the product plus a residual; the operands' dtype. The joined projections' (the choices
+`gate_up` and `delta_gates`): the GPU; a gated MLP's gate and up projections joined, or a gated delta net's b
+and a; the MLP's activation, SwiGLU or GeGLU (`none` for the delta net, which has no gated product);
+projections with no bias or one; a gate times its multiplier or not (`plain` for the delta net); the operands'
+dtype. The adapted product's (the choice `low_rank`): the GPU; the adapter's rank; a projection with no bias
+or one; the operands' dtype. The recurrence's (the choices `gated_delta_rule` and `ssd`): the GPU; the form
+(tests/recurrence_matrix.py's `FORMS`); the kernel the call names (its form's port, fla's or mamba_ssm's, the
+reference); the operands' dtype; one sequence or packed documents. The short conv's: the GPU; a gated delta
+net's training shapes (Qwen3.5-0.8B's or 9B's); the operands' dtype; whole rows or packed documents. The
+selective scan's: the GPU; the recorded mamba_ssm case (tests/selective_support.py's `SEEDED_CASES`). The
+recurrent decode's: the GPU; the layer (a gated delta net, Kimi delta attention, Mamba-2); the fused step or
+the step alone; the dtype its recurrent state is held in. The fused norms' and SiLU products' (the choices
+`rms_norm` and `swiglu`): the GPU; the RMS norm or the SwiGLU product; the norm's plain, stream (a residual
+stream and its norm) or gated form, or the product of a gate and an up projection apart or of one packed
+projection; the operands' dtype; the feature width, narrower than a warp, ragged, a whole row of a program, or
+past the norm's register tile (4096 and 16384 features: the norm refuses the last). The narrow copies' (the
+choice `narrow_copies`): the GPU; the dtype the decoder computes in; its layers plain or scanned; one
+microbatch an update, two accumulated, or one batch read in two parts."""
 
 SEEDED: dict[str, tuple[tuple[int, tuple[str, ...]], ...]] = {
     "attention": (
