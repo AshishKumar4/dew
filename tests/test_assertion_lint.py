@@ -103,7 +103,58 @@ uncaught error's, among them); one that asserts the state the refusal reports as
 own, or that a process ran (exit 0, its own checks inside it), is not."""
 
 
-CASES = [(code, *case) for table in (ROW_1878_LINTS, BANNED_ASSERTION_LINTS)
+IR_TEXT_LINTS = {
+    "SLOP011": ({
+        "src/sparx/graph.py": "def parse(text):\n    return text.split()\n",
+        "tests/test_graph.py": (
+            "import re\n"
+            "from pathlib import Path\n"
+            "import jax\n"
+            "import sparx.graph\n"
+            "from sparx.graph import parse\n"
+            "ROOT = Path(__file__).parents[1]\n"
+            "def test_source():\n"
+            "    text = (ROOT / 'src' / 'sparx' / 'graph.py').read_text()\n"
+            "    assert 'def parse' in text\n"
+            "def test_module_file():\n"
+            "    lines = Path(sparx.graph.__file__).read_text().splitlines()\n"
+            "    assert len(lines) > 1\n"
+            "def test_opened():\n"
+            "    with open(ROOT / 'src' / 'sparx' / 'graph.py') as handle:\n"
+            "        assert handle.read()\n"
+            "def test_jaxpr(f, x):\n"
+            "    assert 'dot_general' in str(jax.make_jaxpr(f)(x))\n"
+            "def test_lowered(f, x):\n"
+            "    program = jax.jit(f).lower(x).as_text()\n"
+            "    assert not re.findall(r'while', program)\n"
+            "def test_formatted(f, x):\n"
+            "    jaxpr = jax.make_jaxpr(f)(x)\n"
+            "    assert 'sin' in f'{jaxpr}'\n"
+            "def test_structure(f, x):\n"
+            "    jaxpr = jax.make_jaxpr(f)(x)\n"
+            "    assert 'sin' in {equation.primitive.name for equation in jaxpr.eqns}\n"
+            "def test_parsed(f, x):\n"
+            "    assert parse(jax.jit(f).lower(x).as_text())\n"
+            "def test_own_file():\n"
+            "    assert (ROOT / 'tests' / 'data.txt').read_text()\n"
+            "def test_rebound(f, x):\n"
+            "    program = jax.jit(f).lower(x).as_text()\n"
+            "    program = parse(program)\n"
+            "    assert program\n"
+            "def test_a_strings_case(name):\n"
+            "    mode = name.lower()\n"
+            "    assert f'{mode}' == 'x' and 'a' in str(re.compile('a'))\n"),
+    }, "tests/test_graph.py", (9, 12, 15, 17, 20, 23)),
+}
+"""Row 4512's case: SLOP011 on a test asserting on text it read from the package's source (a path under
+src/sparx/, joined from "src" and the package, or a module's `__file__`, read or opened) or from a program's
+IR (a jaxpr printed, a lowering's or compilation's `as_text()`), through the names it binds and the string
+operations it matches with (`lint_texts`). The program's structure read as objects, the text handed to the
+package's own parser, a file of the tests' own, a name bound again to something else, and a `lower` or
+`compile` of no program (a string's case, a regular expression) are not reported."""
+
+
+CASES = [(code, *case) for table in (ROW_1878_LINTS, BANNED_ASSERTION_LINTS, IR_TEXT_LINTS)
          for code, case in sorted(table.items())]
 """Every table's cases: a code may have one in each."""
 
