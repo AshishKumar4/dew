@@ -47,6 +47,12 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
         "consumer": ("bias-cast", "silu-residual"),
         "dtype": ("bfloat16", "float16"),
     },
+    "low_rank": {
+        "generation": ("sm90", "sm80"),
+        "rank": ("8", "16"),
+        "bias": ("none", "bias"),
+        "dtype": ("bfloat16", "float16", "float32"),
+    },
     "join": {
         "generation": ("sm90", "sm80"),
         "join": ("gate_up", "delta_gates"),
@@ -101,9 +107,11 @@ after the product in XLA), or both; the consumers, a bias then a cast, or a SiLU
 residual; the operands' dtype. The joined projections' (the choices `gate_up` and `delta_gates`): the GPU; a
 gated MLP's gate and up projections joined, or a gated delta net's b and a; the MLP's activation, SwiGLU or
 GeGLU (`none` for the delta net, which has no gated product); projections with no bias or one; a gate times
-its multiplier or not (`plain` for the delta net); the operands' dtype. The recurrence's (the choices
-`gated_delta_rule` and `ssd`): the GPU; the form (tests/recurrence_matrix.py's `FORMS`); the kernel the call
-names (its form's port, fla's or mamba_ssm's, the reference); the operands' dtype; one sequence or packed
+its multiplier or not (`plain` for the delta net); the operands' dtype. The adapted product's (the choice
+`low_rank`): the GPU; the adapter's rank; a projection with no bias or one; the operands' dtype. The
+recurrence's (the choices `gated_delta_rule` and `ssd`): the GPU; the form (tests/recurrence_matrix.py's
+`FORMS`); the kernel the call names (its form's port, fla's or mamba_ssm's, the reference); the operands'
+dtype; one sequence or packed
 documents. The short conv's: the GPU; a gated delta net's training shapes (Qwen3.5-0.8B's or 9B's); the
 operands' dtype; whole rows or packed documents. The selective scan's: the GPU; the recorded mamba_ssm case
 (tests/selective_support.py's `SEEDED_CASES`). The recurrent decode's: the GPU; the fused step or the step
@@ -127,6 +135,7 @@ CELLS: dict[str, tuple[str, str]] = {
     "gemm": ("gemm_matrix", "a_gemm_training_step_is_on_par"),
     "fused_gemm": ("fused_gemm_matrix", "a_fused_gemm_training_step_is_on_par"),
     "join": ("join_matrix", "a_joined_layers_training_step_is_on_par"),
+    "low_rank": ("low_rank_matrix", "an_adapted_projections_training_step_is_on_par"),
     "recurrence": ("recurrence_matrix", "a_recurrences_training_step_is_on_par"),
     "short_conv": ("short_conv_matrix", "a_short_convs_training_step_is_on_par"),
     "selective_scan": ("selective_matrix", "a_selective_scan_is_as_exact_as_mamba_ssm"),
@@ -141,6 +150,7 @@ FLOWS: tuple[str, ...] = (
     "tests/test_gpu_gemm.py::test_the_gemm_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_fused_gemm_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_join_matrix_holds_on_this_gpu",
+    "tests/test_gpu_gemm.py::test_the_low_rank_matrix_holds_on_this_gpu",
     "tests/test_gpu_recurrence.py::test_the_recurrence_matrix_holds_on_this_gpu",
     "tests/test_gpu_recurrence.py::test_the_short_conv_matrix_holds_on_this_gpu",
     "tests/test_gpu_recurrence.py::test_the_selective_scan_matrix_holds_on_this_gpu",
