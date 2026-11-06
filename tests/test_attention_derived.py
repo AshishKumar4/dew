@@ -592,8 +592,10 @@ def test_a_split_decodes_states_merge_and_finish_by_the_derived_forms():
             return decode_attention._combined(spec, sums, peaks, totals, axis=1)
 
     def exact(sums, peaks, totals):
-        # Base 2: the fold's logits (`spec.base2`), XLA's merge of the states in one sum.
-        weights = jnp.exp2(peaks - jnp.max(peaks, axis=1, keepdims=True))
+        # XLA's merge of the states in one sum, in base 2 (`spec.base2`): raw products' peaks (`spec.raw`)
+        # differ by the scale times log2(e).
+        factor = spec.scale * np.log2(np.e) if spec.raw else 1.0
+        weights = jnp.exp2((peaks - jnp.max(peaks, axis=1, keepdims=True)) * factor)
         return (jnp.sum(weights[..., None] * sums, axis=1)
                 / jnp.sum(weights * totals, axis=1)[..., None])
 

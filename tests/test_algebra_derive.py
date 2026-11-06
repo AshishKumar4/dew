@@ -310,13 +310,6 @@ def placed(q, k, v, rows, keys):
     return (p @ v) / jnp.sum(p, axis=-1)[:, None]
 
 
-def test_a_declaration_that_places_a_walked_value_derives_as_its_function():
-    """A declaration that places a walked value on a mesh (a sharding constraint, which leaves its values as
-    they are) derives, and its walk is on par with its function against the float64 truth (check 1)."""
-    forms = derive.derive(declared(placed), accurate=False, saturation=SATURATION)
-    assert_as_exact(jax.jit(walked_whole(forms)), jax.jit(whole(placed)), draw, "placed walk", seeds=16)
-
-
 def natural_exp(x, scale=1.0):
     """An exponential of the declaration's own, of `x` times `scale`: `exp` by way of `exp2` (a launch's
     lowering of it)."""
@@ -448,11 +441,15 @@ def floored(q, k, v, rows, keys):
     return jnp.sum(jnp.exp(s - jnp.maximum(jnp.max(s, axis=-1), floor)[:, None]), axis=-1)
 
 
-def test_a_merge_of_a_shift_that_reads_an_operand_computes_the_declared_function():
+@pytest.mark.parametrize(("function", "walk"), [(floored, "merged"), (placed, "walked")],
+                         ids=["a shift reading an operand, merged", "a walked value placed on a mesh"])
+def test_a_declaration_walks_as_its_function(function, walk):
     """A walk whose shift reads an operand of the queries beside the walked maximum, walked in two halves
-    and merged: on par with the whole-operand function (check 1)."""
-    forms = derive.derive(declared(floored), accurate=False, saturation=SATURATION)
-    assert_as_exact(jax.jit(merged_whole(forms)), jax.jit(whole(floored)), draw, "floored merged", seeds=16)
+    and merged, and one whose declaration places a walked value on a mesh (a sharding constraint, which
+    leaves its values as they are), walked: each on par with the whole-operand function (check 1)."""
+    forms = derive.derive(declared(function), accurate=False, saturation=SATURATION)
+    walked = {"merged": merged_whole, "walked": walked_whole}[walk](forms)
+    assert_as_exact(jax.jit(walked), jax.jit(whole(function)), draw, f"{function.__name__} {walk}", seeds=16)
 
 
 def with_a_count(q, k, v, rows, keys):
