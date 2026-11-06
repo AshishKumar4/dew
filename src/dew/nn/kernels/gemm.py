@@ -35,6 +35,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax.typing import PrecisionLike
 from jax.custom_derivatives import zero_from_primal
 from jax.extend import core as jax_core
@@ -219,14 +220,44 @@ program."""
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class NvFp4:
-    """An NVFP4 matrix `[depth, width]` as the GEMM stores it (row 3621): its E2M1 codes eight a uint32
-    along the depth in the stored layout (`words`, `[depth / 8, width]`, `bits.NVFP4_BFLOAT16_FORM.prepared`'s
-    words), each sixteen's E4M3 scale along the depth (`scales`, `[depth / 16, width]`), and the tensor's
-    fp32 scale (`scale`, a scalar): each value its code times its block's scale times the tensor's."""
+    """An NVFP4 matrix `[depth, width]` as the GEMM stores it (row 3621), K-major, each column's depths
+    along its row (as a Dense kernel read transposed): its E2M1 codes eight a uint32 in the GEMM's staged
+    depth order (`words`, `[width, depth / 8]`: `staged_rows`, each word the
+    `bits.NVFP4_BFLOAT16_FORM.prepared` word of its eight codes), each sixteen consecutive depths' E4M3
+    scale (`scales`, `[width, depth / 16]`, in the depths' own order), and the tensor's fp32 scale
+    (`scale`, a scalar): each value its code times its block's scale times the tensor's. Its depth is whole
+    stages (`NVFP4_STAGE`): the mainloop's stage decode reads each column's words and scales as rows a TMA
+    copy takes, at least 16 bytes."""
 
     words: jax.Array
     scales: jax.Array
     scale: jax.Array
+
+    @classmethod
+    def quantized(cls, x: jax.Array) -> "NvFp4":
+        """`x` (`[depth, width]`) quantized to NVFP4 (`bits.nvfp4_quantized`: its block scales and tensor
+        scale, each value rounded to E2M1), its codes packed in the staged order."""
+        words, scales, scale = bits.nvfp4_quantized(jnp.asarray(x, jnp.float32))
+        return cls.of(_codes(words), scales, scale)
+
+    @classmethod
+    def of(cls, codes: jax.Array, scales: jax.Array, scale) -> "NvFp4":
+        """The matrix of `codes` (`[depth, width]`, each an E2M1 value, in the depths' own order), its block
+        scales `scales` (`[depth / 16, width]` float8_e4m3fn) and its tensor scale `scale`: a checkpoint's
+        NVFP4 weight, its codes packed in the staged order, K-major."""
+        if codes.shape[0] % NVFP4_STAGE:
+            raise ValueError(f"an NVFP4 matrix's depth is whole {NVFP4_STAGE}s, not {codes.shape[0]}")
+        return cls(_staged_words(codes).T, scales.T, jnp.asarray(scale, jnp.float32))
+
+    def codes(self) -> jax.Array:
+        """Its codes' values (`[depth, width]` float32, each code's E2M1 value) in the depths' own order."""
+        return _codes(self.words.T, staged=True)
+
+    def decoded(self) -> jax.Array:
+        """Its values over `bits.NVFP4_OWED` and the tensor scale, exactly, in bfloat16 (`[depth, width]`):
+        each code times its block's scale over 2^8, as the mainloop's stage decode forms it."""
+        owed = self.scales.T.astype(jnp.float32) * jnp.float32(1 / bits.NVFP4_OWED)
+        return (self.codes() * jnp.repeat(owed, 16, axis=0)).astype(jnp.bfloat16)
 
     @property
     def factor(self) -> jax.Array:
@@ -235,14 +266,48 @@ class NvFp4:
         return jnp.float32(bits.NVFP4_OWED) * jax.lax.stop_gradient(jnp.asarray(self.scale, jnp.float32))
 
 
+NVFP4_GROUP = 128
+"""The depths an NVFP4 matrix's staged order groups (`staged_rows`): a group's sixteen word rows decode, code
+by code, into its eight sixteen-row depth slices."""
+NVFP4_STAGE = 256
+"""The depths a stage of the mainloop's NVFP4 decode reads: two groups, so each column's scales are a
+16-byte row (a TMA copy's least)."""
+
+
+def staged_rows(depth: int) -> np.ndarray:
+    """The depth each code of the staged order holds (`NvFp4`): within each `NVFP4_GROUP`-deep group, packed
+    row `8w + j` (word `w`'s code `j`) holds depth `16j + w`, so a stage's word rows decode, code by code,
+    into its sixteen-row depth slices, the block of one scale each (the mainloop's stage decode)."""
+    if depth % NVFP4_GROUP:
+        raise ValueError(f"an NVFP4 matrix's depth is whole {NVFP4_GROUP}-deep groups, not {depth}")
+    word, code = np.divmod(np.arange(NVFP4_GROUP), 8)
+    within = 16 * code + word
+    return (np.arange(0, depth, NVFP4_GROUP)[:, None] + within[None]).reshape(-1)
+
+
+def _codes(words: jax.Array, *, staged: bool = False) -> jax.Array:
+    """The codes' values of `words` (each its E2M1 value, float32 `[depth, width]`), in the depths' own order
+    where `staged` (`staged_rows`), else the words' own: `bits.nvfp4_decoded` at a block scale of 2^8."""
+    unit = jnp.full((words.shape[0] // 2, words.shape[1]), bits.NVFP4_OWED, jnp.float8_e4m3fn)
+    codes = bits.nvfp4_decoded(words, unit).astype(jnp.float32)
+    return codes[np.argsort(staged_rows(codes.shape[0]))] if staged else codes
+
+
+def _staged_words(codes: jax.Array) -> jax.Array:
+    """`codes` (values, `[depth, width]`, in the depths' own order) packed in the staged order (`NvFp4`)."""
+    ordered = codes[staged_rows(codes.shape[0])]
+    bits_ = jax.lax.bitcast_convert_type(ordered.astype(jnp.float32), jnp.uint32)
+    return bits.packed(bits.encoded(bits_, bits.E2M1).T, bits.E2M1).T
+
+
 def nvfp4_product(lhs: jax.Array, matrix: NvFp4, *, out_dtype, interpret_on_cpu: bool = False) -> jax.Array:
     """`lhs · W` of an NVFP4 matrix `W` (`NvFp4`), its weights frozen (a quantized checkpoint's): `lhs`
-    rounded to bfloat16, each value of `W` decoded exactly to bfloat16 (`bits.nvfp4_decoded`, its block's
+    rounded to bfloat16, each value of `W` decoded exactly to bfloat16 (`NvFp4.decoded`, its block's
     scale applied, 2^8 owed), the products summed in fp32 (`gemm`), and the accumulator times the deferred
     factor (`NvFp4.factor`) before the one rounding to `out_dtype`: the deferred factor is the epilogue's
     first operation, ahead of any output hook (PLAN piece 10). The decoded matrix is materialized once a call
     here; the mainloop's matrix-operand hook decodes each stage in place (row 3621's next form)."""
-    decoded = bits.nvfp4_decoded(matrix.words, matrix.scales)
+    decoded = matrix.decoded()
     # Each product of two bfloat16 values is exact in fp32, so the default precision is the exact product's,
     # whatever precision the program defaults to.
     summed = gemm(lhs.astype(jnp.bfloat16), decoded, None, out_dtype=jnp.float32,
