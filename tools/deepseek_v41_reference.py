@@ -971,12 +971,12 @@ def draft_clears(twin, ids: np.ndarray) -> bool:
             and float(np.min(top_margin(block[..., :-1, :], 1))) > MARGIN)
 
 
-def vision_draw(index: int) -> dict[str, np.ndarray]:
+def vision_draw(index: int, attempt: int = 0) -> dict[str, np.ndarray]:
     """The `index`-th image prompt (`vision_outputs`' form): pixels of GRID patches, bf16's values as the
     release's processor hands them (image_processor.py's `.to(torch.bfloat16)`), drawn text with the image's
     token span at IMAGE_START_AT, and its token types."""
     processor = importlib.import_module("image_processor")
-    generator = torch.Generator().manual_seed(0x5649 + index)
+    generator = torch.Generator().manual_seed(0x5649 + index + 1_000_003 * attempt)
     patch, ratio = VISION["vision_patch_size"], VISION["vision_downsample_ratio"]
     pixels = torch.randn(3, GRID[0] * patch, GRID[1] * patch, generator=generator).bfloat16().float()
     types = processor.image_token_types(-(-GRID[0] // ratio), -(-GRID[1] // ratio))
@@ -1014,37 +1014,48 @@ def release_vision(net, inputs: dict[str, np.ndarray]) -> np.ndarray:
     return torch.stack(found, 1).double().cpu().numpy()
 
 
-def dew_clears(ids: np.ndarray) -> bool:
-    """Whether Dew's float64 forward of the fixture as the release runs it (bf16's model, its quantizers on)
-    selects over `ids` clear of the gate's MARGIN by the gate's own reading of every selection
-    (`selection_margins.margin`: an indexer's top-k and its ties at zero agreement, its pooled blocks, a
-    router's groups and experts), which the release's top-k margins alone leave out; Dew's float64 run is
-    the release's to float64's rounding (tests/test_deepseek_v41.py holds its sketch to the recording's)."""
+def dew_clears(ids: np.ndarray, image: dict[str, np.ndarray] | None = None) -> bool:
+    """Whether Dew's float64 forward of the fixture as the release runs it (bf16's model, its quantizers on),
+    over `ids` or the image prompt `image` (`vision_draw`'s), selects clear of the gate's MARGIN by the
+    gate's own reading of every selection (`selection_margins.margin`: an indexer's top-k and its ties at
+    zero agreement, its pooled blocks, a router's groups and experts), which the release's top-k margins
+    alone leave out; Dew's float64 run is the release's to float64's rounding (tests/test_deepseek_v41.py
+    holds its sketch to the recording's)."""
     import jax
     import jax.numpy as jnp
     import selection_margins
     from model_support import float64_twin
 
-    loaded = _dew_release()
+    loaded = _dew_release(image is not None)
+    if image is None:
+        arguments, options = (jnp.asarray(ids),), {}
+    else:
+        media = image["token_types"] >= 0
+        arguments = (jnp.asarray(image["input_ids"]),)
+        options = {"image_indices": jnp.asarray(np.where(media, np.cumsum(media, -1) - 1, -1)),
+                   "conditioning": {"pixel_values": jnp.asarray(image["pixels"])[None, None]}}
     with jax.enable_x64(new_val=True):
         wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
                             if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf,
                             loaded.variables)
-        _, captured = selection_margins.capturing(float64_twin(loaded.model), wide, jnp.asarray(ids))
-    return selection_margins.margin(loaded.model_config, captured, "release rows") > selection_margins.MARGIN
+        _, captured = selection_margins.capturing(float64_twin(loaded.model), wide, *arguments, **options)
+    # The decoder's config reads its selections, a vision bundle's among them.
+    margin = selection_margins.margin(_dew_release().model_config, captured, "release rows")
+    return margin > selection_margins.MARGIN
 
 
 @functools.cache
-def _dew_release():
-    """The fixture loaded by Dew as the release runs it (`dew_clears`, its weights the release's)."""
+def _dew_release(vision: bool = False):
+    """The fixture loaded by Dew as the release runs it, its vision half with it where `vision`
+    (`dew_clears`, its weights the release's)."""
     import tempfile
 
     from deepseek_v41_numerics import as_released
 
     from dew.interop import Pretrained
 
-    return Pretrained.load(as_released(Path(tempfile.mkdtemp())), dtype="bfloat16", param_dtype="auto",
-                           attention_impl="reference")
+    return Pretrained.load(as_released(Path(tempfile.mkdtemp()), vision=vision), dtype="bfloat16",
+                           param_dtype="auto", attention_impl="reference")
 
 
 def write_release_recording():
@@ -1107,8 +1118,25 @@ def write_release_recording():
 
     prompts: dict[int, dict[str, np.ndarray]] = {}
 
+    def image_clears(prompt: dict[str, np.ndarray]) -> bool:
+        """Whether the release's float64 run of `prompt` and Dew's choose clear of the gate's MARGIN."""
+        from selection_margins import MARGIN
+
+        recorded = Record()
+        RECORDS[:] = [recorded]
+        with widened(twin_module):
+            release_vision(seeing_twin, prompt)
+        RECORDS.clear()
+        margins = [call["margin"] for call in recorded.calls.get("selection", [])]
+        return all(bool((margin > MARGIN).all()) for margin in margins) and dew_clears(None, prompt)
+
     def image_prompt(index: int) -> dict[str, np.ndarray]:
-        prompts.setdefault(index, vision_draw(index))
+        """The `index`-th image prompt, redrawn from its stream until it clears (`image_clears`)."""
+        if index not in prompts:
+            attempt = 0
+            while not image_clears(prompt := vision_draw(index, attempt)):
+                attempt += 1
+            prompts[index] = prompt
         return prompts[index]
 
     def seen(inputs):

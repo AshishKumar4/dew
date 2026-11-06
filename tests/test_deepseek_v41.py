@@ -29,7 +29,7 @@ import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
 from model_support import decode_through
 from quantized_basis import dequantized_in_own_basis
-from reference_error import GateFailure, Inconclusive, as_given, assert_as_exact, declared_seeds
+from reference_error import as_given, assert_as_exact, declared_seeds
 
 from dew.batch import coordinates
 from dew.interop import Pretrained
@@ -263,9 +263,7 @@ def recorded_rows(as_run):
         rows = stored["rows"]
     selecting = jax.jit(functools.partial(selection_margins.capturing, float64_twin(as_run.model)))
     with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
-                            if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf,
-                            as_run.variables)
+        wide = widened_tree(as_run.variables)
     for index, row in enumerate(rows):
         with jax.enable_x64(new_val=True):
             _, captured = selecting(wide, jnp.asarray(row))
@@ -273,6 +271,12 @@ def recorded_rows(as_run):
         assert smallest > selection_margins.MARGIN, (
             f"Dew's selections over recorded row {index} clear {smallest:.3g}, not MARGIN")
     return rows
+
+
+def widened_tree(variables):
+    """`variables` with every floating leaf float64 (inside x64)."""
+    return jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
+                        if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf, variables)
 
 
 def held_to_the_release(as_run, rows, site: str, start: int = 0):
@@ -284,9 +288,7 @@ def held_to_the_release(as_run, rows, site: str, start: int = 0):
 
     def twin(inputs):
         with jax.enable_x64(new_val=True):
-            held = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
-                                if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf,
-                                as_run.variables)
+            held = widened_tree(as_run.variables)
             return {"logits": wide(held, jnp.asarray(inputs["input_ids"]))[:, start:]}
 
     return recorded_site(RELEASE, site, lambda seed: {"input_ids": rows[int(seed)]}, twin)
@@ -373,21 +375,28 @@ def test_a_shifted_prompt_decodes_the_unshifted_rows_logits(as_run, recorded_row
 
 
 def test_the_candidate_pool_decides_the_logits(as_run, recorded_rows):
-    """Dropping the pool's restriction on the Reindex layers fails the release's check (check 1, a decided
-    failure, not Inconclusive), so the fixture exercises the hierarchical indexer."""
+    """Dropping the pool's restriction on the Reindex layers moves Dew's float64 logits over the recorded
+    rows past float64's rounding of the computation (the oracle rule fails it), so the rows the release is
+    held over exercise the hierarchical indexer: a sensitivity the release's bf16 rounding would hide from
+    check 1."""
+    from model_support import float64_twin
+    from reference_error import assert_computes_the_oracle, chain_roundings
+
     model = as_run.model
     kinds = dict(model.kinds)
     kinds["csa2_ratio_1_reindex"] = dataclasses.replace(
         kinds["csa2_ratio_1_reindex"], mixer=dataclasses.replace(
             kinds["csa2_ratio_1_reindex"].mixer, candidates=None, candidate_blocks=None,
             candidate_block_size=None))
-    unpooled = jax.jit(model.clone(kinds=flax.core.freeze(kinds)).apply)
-    draw, reference, truth, seeds = held_to_the_release(as_run, recorded_rows, "deepseek v41 release rows")
-    with pytest.raises(GateFailure) as failed:
-        assert_as_exact(as_given(lambda index, inputs: {"logits": unpooled(as_run.variables,
-                                                                           jnp.asarray(inputs["input_ids"]))}),
-                        reference, draw, "without the candidate pool", seeds=seeds, truth_fn=truth)
-    assert not isinstance(failed.value, Inconclusive)
+    pooled, unpooled = (jax.jit(float64_twin(net).apply)
+                        for net in (model, model.clone(kinds=flax.core.freeze(kinds))))
+    ids = jnp.asarray(recorded_rows[0])
+    with jax.enable_x64(new_val=True):
+        held = widened_tree(as_run.variables)
+        roundings = chain_roundings(jax.make_jaxpr(pooled)(held, ids))
+        with pytest.raises(AssertionError):
+            assert_computes_the_oracle(np.asarray(unpooled(held, ids)), np.asarray(pooled(held, ids)),
+                                       "without the candidate pool", roundings=roundings)
 
 
 @pytest.mark.parametrize("given", ["attention_mask", "coordinates"])
@@ -440,9 +449,7 @@ def test_dsparks_draft_is_the_releases(as_run, recorded_rows):
 
     def twin(inputs):
         with jax.enable_x64(new_val=True):
-            held = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
-                                if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf,
-                                as_run.variables)
+            held = widened_tree(as_run.variables)
             return wide(held, jnp.asarray(inputs["input_ids"]))
 
     draw, reference, truth, seeds = recorded_site(RELEASE, "deepseek v41 release draft",
@@ -451,11 +458,10 @@ def test_dsparks_draft_is_the_releases(as_run, recorded_rows):
                     reference, draw, "dspark's draft", seeds=seeds, truth_fn=truth)
 
 
-def held_to_the_release_images(model, variables, label: str, arm=None) -> None:
-    """`model` over `variables` (the vision bundle's), or over `arm`'s where given, on par with the
-    release's image prompts (check 1, the recording's 'deepseek v41 release vision'): every position's
-    logits from the prompt's last on, one forward with the image, the truth its float64 twin over
-    `variables`, held to the recording's sketch."""
+def held_to_the_release_images(model, variables, label: str) -> None:
+    """`model` over `variables` (the vision bundle's) on par with the release's image prompts (check 1, the
+    recording's 'deepseek v41 release vision'): every position's logits from the prompt's last on, one
+    forward with the image, the truth its float64 twin, held to the recording's sketch."""
     from model_support import float64_twin
     from reference_error import indexed_recording, recording
 
@@ -475,8 +481,7 @@ def held_to_the_release_images(model, variables, label: str, arm=None) -> None:
 
     def truth(inputs):
         with jax.enable_x64(new_val=True):
-            held = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
-                                if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf, variables)
+            held = widened_tree(variables)
             return logits(wide, held, inputs)
 
     site = "deepseek v41 release vision"
@@ -484,8 +489,7 @@ def held_to_the_release_images(model, variables, label: str, arm=None) -> None:
     draw, reference, truth = indexed_recording(
         recording(RELEASE), site, seeds, truth_fn=truth,
         inputs_of=lambda seed: {name: value[int(seed)] for name, value in prompts.items()})
-    held = variables if arm is None else arm
-    assert_as_exact(as_given(lambda index, inputs: logits(model, held, inputs)), reference, draw, label,
+    assert_as_exact(as_given(lambda index, inputs: logits(model, variables, inputs)), reference, draw, label,
                     seeds=seeds, truth_fn=truth)
 
 
@@ -584,8 +588,7 @@ def test_an_uncached_draft_reads_a_padded_context_at_its_real_positions(as_run, 
     @as_given
     def truth(ids):
         with jax.enable_x64(new_val=True):
-            held = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
-                                if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf, variables)
+            held = widened_tree(variables)
             return wide(held, jnp.asarray(ids))
 
     import selection_margins
@@ -608,8 +611,7 @@ def test_an_uncached_draft_reads_a_padded_context_at_its_real_positions(as_run, 
         """The float64 draft's choices, its block's greedy tokens and every selection of its trunk and
         drafter, clear of MARGIN, so both arms choose alike."""
         with jax.enable_x64(new_val=True):
-            held = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
-                                if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf, variables)
+            held = widened_tree(variables)
             block, captured = chosen(held, jnp.asarray(inputs[0]))
         smallest = float(np.min(selection_margins.top_margin(np.asarray(block)[..., :-1, :], 1)))
         for selections in captured:
@@ -946,7 +948,7 @@ def assert_scans_as_unrolled(fields: dict, label: str) -> None:
     def clears(inputs):
         variables, ids = inputs
         with jax.enable_x64(new_val=True):
-            captured = capture(jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables), ids)
+            captured = capture(widened_tree(variables), ids)
         return selection_margins.margin(fields, captured, label) > selection_margins.MARGIN
 
     draw = selection_margins.clearing(model_draw(unrolled, shape, unrolled.vocab_size), clears)
@@ -1067,19 +1069,37 @@ def test_a_quantized_bundle_loaded_text_only_is_its_quantized_text_checkpoint(tm
 
 
 def test_the_image_bias_and_the_dead_image_positions_decide_the_prefill(tmp_path):
-    """Routing the image span by the text bias fails the release's image prompts (check 1, a decided
-    failure, not Inconclusive), and the image positions change the n-gram ids of the text after them, so
-    the fixture exercises both."""
+    """Routing the image span by the text bias moves Dew's float64 logits of a recorded image prompt past
+    float64's rounding of the computation (the oracle rule fails it), a sensitivity the release's bf16
+    rounding would hide from check 1, and the image positions change the n-gram ids of the text after them,
+    so the fixture exercises both."""
+    from model_support import float64_twin
+    from reference_error import assert_computes_the_oracle, chain_roundings
+
     reference = np.load(TINY / "vision.npz")
     loaded = Pretrained.load(as_released(tmp_path, vision=True), dtype="bfloat16", param_dtype="auto",
                              attention_impl="reference")
     routers = flatten_dict(loaded.variables["moe"])
     routers.update({path: routers[(*path[:-1], "e_score_correction_bias")]
                     for path in routers if path[-1] == "media_bias"})
-    with pytest.raises(GateFailure) as failed:
-        held_to_the_release_images(loaded.model, loaded.variables, "the image span routed by the text bias",
-                                   arm={**loaded.variables, "moe": unflatten_dict(routers)})
-    assert not isinstance(failed.value, Inconclusive)
+    with np.load(TINY / "release_rows.npz") as stored:
+        prompt = {name: stored[f"vision_{name}"][0] for name in ("pixels", "input_ids", "token_types")}
+    media = prompt["token_types"] >= 0
+    wide = float64_twin(loaded.model)
+
+    @jax.jit
+    def logits(variables):
+        return wide.apply(variables, jnp.asarray(prompt["input_ids"]),
+                          image_indices=jnp.asarray(np.where(media, np.cumsum(media, -1) - 1, -1)),
+                          conditioning={"pixel_values": jnp.asarray(prompt["pixels"])[None, None]})
+
+    with jax.enable_x64(new_val=True):
+        held = widened_tree(loaded.variables)
+        moved = widened_tree({**loaded.variables, "moe": unflatten_dict(routers)})
+        with pytest.raises(AssertionError):
+            assert_computes_the_oracle(np.asarray(logits(moved)), np.asarray(logits(held)),
+                                       "the image span routed by the text bias",
+                                       roundings=chain_roundings(jax.make_jaxpr(logits)(held)))
     ids = jnp.asarray(reference["input_ids"])
     media = jnp.asarray(reference["token_types"] >= 0)
     language = {collection: tree["language_model"] for collection, tree in loaded.variables.items()}
