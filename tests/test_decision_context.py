@@ -18,7 +18,7 @@ from model_support import flat_tree
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, widened, without_ynn
 
-from dew.batch import FROZEN, thaw
+from dew.batch import FROZEN, thaw, unboxed
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, Decide, Example
@@ -247,8 +247,9 @@ def packed_arms(packed: DecisionObjective, alone: DecisionObjective, rows):
         return as_given(lambda variables: scored(objective, batches, variables))
 
     # A draw of every parameter, the backbone's too: `init` alone takes the objective's held checkpoint
-    # as its tree, the same at every seed (`Objective.init`), which leaves check 1 one rounding draw.
-    initialized = jax.jit(lambda key: packed.init(key, variables={}))
+    # as its tree, the same at every seed (`Objective.init`), which leaves check 1 one rounding draw; a
+    # draw's leaves are its arrays, unboxed of their axes, as a loaded tree's are.
+    initialized = jax.jit(lambda key: unboxed(packed.init(key, variables={})))
     wide = copy.copy(alone)
     wide.model = DecisionModel(alone.model.backbone.clone(dtype=jnp.float64),
                                alone.model.head.clone(dtype=jnp.float64), alone.model.context_encoder)
