@@ -17,6 +17,7 @@ generation, its selectors deciding (`recurrence_chunk.port_kernel`, `scan_kernel
 on the call and refusing what it does not take (`KernelRefused`).
 """
 
+import contextlib
 import dataclasses
 import functools
 
@@ -108,12 +109,13 @@ def _routed(case: tuple[tuple[str, str], ...], kernel: str) -> frozenset | None:
     generation, traced (`jax.eval_shape`), the route's own selectors deciding; None where a named kernel
     refuses it (`KernelRefused`)."""
     named = dict(case)
-    with generation.assumed(named["generation"]), generation.routes() as found:
-        try:
-            jax.eval_shape(_step(named, kernel), *_drawn(named, 0))
-        except KernelRefused:
-            return None
-    return frozenset((route.choice, route.kernel) for route in found)
+    traced = False
+    # A named kernel refusing the call serves it not: no routes.
+    with generation.assumed(named["generation"]), generation.routes() as found, \
+            contextlib.suppress(KernelRefused):
+        jax.eval_shape(_step(named, kernel), *_drawn(named, 0))
+        traced = True
+    return frozenset((route.choice, route.kernel) for route in found) if traced else None
 
 
 def _reference(case: dict[str, str]) -> str:

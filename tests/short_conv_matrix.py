@@ -17,7 +17,7 @@ from fla_gdn_support import CONV_SHAPES
 from gpu_flow import cell
 from kernel_matrix import AXES
 from reference_error import as_given, assert_as_exact
-from test_short_conv import TRAINING_SEEDS, cotangents, documents, operands, row_truth, run
+from test_short_conv import TRAINING_SEEDS, documents, row_truth, run, training_draw
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import KernelRefused
@@ -58,13 +58,7 @@ def _step(case: dict[str, str], kernel: str):
 def _drawn(case: dict[str, str]):
     """A draw of `case`'s two rows, taps and cotangents by seed (`test_short_conv.operands`)."""
     (_, length), parts = CONV_SHAPES[case["model"]]
-    dtype = jnp.dtype(case["dtype"])
-
-    def draw(seed: int):
-        x, weights, _, _ = operands(2, length, parts, dtype=dtype, seed=[1724, seed])
-        return x, weights, cotangents(x, parts, dtype, seed=[1725, seed])
-
-    return draw
+    return functools.partial(training_draw, length, parts, jnp.dtype(case["dtype"]))
 
 
 @functools.cache
