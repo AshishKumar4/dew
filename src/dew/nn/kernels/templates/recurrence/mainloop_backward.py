@@ -119,7 +119,8 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
                   max_segments: int | None = None, scale: float | None = None,
                   family: mosaic.Family | None = None, interpret: bool = False,
                   inverse=None, kept=None, delta: bool = True, floor: float | None = None,
-                  rounded: bool = False, ranged: bool = False, skip=None) -> tuple[tuple, "Kept | None"]:
+                  rounded: bool = False, ranged: bool = False,
+                  skip=None) -> tuple[tuple, "Kept | key_backward.KeyKept"]:
     """The fast backward of the gated delta rule, a decay a head (`forward`'s, `g` `[B, T, HV]`), in a 16-bit
     call, or of a `rounded` call without it (the SSD's under the run's fast forms, `fast_backward_form`):
     `(dq, dk, dv, dg, dbeta, dh0, dskip)` for the output's and final memory's gradients `do`, `dfinal`, fla's
@@ -133,8 +134,8 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
     gated, `u = v beta`, whose gradient `du` (the reverse walk's) gives `dv = du beta` and `dbeta = sum(v
     du)`, and the memory walks back with no `w^T dv`; a `skip` `[HV]` (Mamba2's `D`, `mainloop.forward`'s)
     adds `D do` to `dv`, its own gradient `sum(v do)` (`dskip`, None without a skip). Returns them with each
-    launch's outputs as stored (`Kept`), the forward's `kept_forward` beside it; a decay a key dimension's
-    (`key_backward`) keeps none yet."""
+    launch's outputs as stored (`Kept`; a decay a key dimension's, `key_backward.KeyKept`), the forward's
+    `kept_forward` beside it."""
     if not fast_backward_form(delta, rounded, jnp.result_type(q, k, v), per_key=g.ndim == 4):
         raise NotImplementedError("the fast backward takes the delta rule, or a rounded call without it "
                                   "under the run's fast forms, an fp32 call's under them alone")
@@ -146,9 +147,10 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
     laid_do = call.given.split(run.laid(zero_padded(do.astype(run.dtype), 3, columns)).reshape(rows, -1))
     dht = zero_padded(zero_padded(dfinal.astype(jnp.float32), 2, width), 3, columns).reshape(-1, columns)
     if call.per_key:
-        dq, dk, dv, dg, dbeta, dh0 = key_backward.gradients(run, laid_do, dht, tiles)
+        (dq, dk, dv, dg, dbeta, dh0), key_kept = key_backward.gradients(run, laid_do, dht, tiles)
         dg = run.unlaid(dg.reshape(rows, heads, width))[..., :run.key_width]
-        return (*_unlaid(run, (q, k, v, g, beta), dq, dk, dv, dg, run.unlaid(dbeta), dh0, starts), None), None
+        grads = _unlaid(run, (q, k, v, g, beta), dq, dk, dv, dg, run.unlaid(dbeta), dh0, starts)
+        return (*grads, None), key_kept
     local = _local_back(run.q, run.k, laid_do, run.hi, run.lo, run.taken, call, scale=run.scale)
     # Without the delta rule the walk gates the values where their columns are the call's own. Padded, it
     # read a padded copy of them (0.061 ms of Nemotron-H 4B's SSD training on an H100) and its gate took
