@@ -341,6 +341,11 @@ class MosaicForward(_Mainloop[Tiles]):
         if codes is not None and (config.deferred or not mosaic.converts(codes)):
             return False
         family = bundle_of(config, query.dtype)
+        # A P·V a step late (pinned: the derivation takes none, `derived`) where its walk takes one.
+        dropped = ba.arguments.get("drop") is not None
+        if config.deferred and not values_deferred(family, self.form, self.splits, query.dtype, dropped,
+                                                   self.parts):
+            return False
         # Its key tiles (the launch's, its natural rewalk's) split among the consumers that copy them
         # (`Transport.shares_rows`: two mma.sync consumers' cp.async in whole 64-row parts, so no 32-key tile
         # of two consumers, fs-qualified6).
@@ -407,17 +412,9 @@ class MosaicForward(_Mainloop[Tiles]):
                 break
         if config is None or chosen is None:
             return None
-        family = chosen
-        if values_deferred(family, self.form, self.splits, query.dtype, ba.arguments.get("drop") is not None,
-                           self.parts):
-            # The P·V a step late where its walk holds the carried weights at the same tiles, its scalars
-            # beside them below its budget: a walk of two products in flight pins their accumulators and the
-            # weights they read, and ptxas serialized one at its budget (C7512 and 96 bytes spilled, 228 of
-            # tiles and 12 scalars against 240 at 64 x 256, width 64, et-gate64).
-            deferred = dataclasses.replace(config, deferred=True)
-            if (self._launch_legal(ba, deferred, target) and self.registers(ba, deferred)
-                    + family.scalar_registers() < self.register_budget(deferred)):
-                config = deferred
+        # No P·V a step late (`values_deferred`, `Tiles.deferred`, reachable pinned): measured a loss on an
+        # H100 against the walk that issues each tile's P·V in turn, Qwen3-8B's causal forward 1.23x and
+        # full 1.11x the time, an 8k causal one 1.27x, the training step 1.05x (M-ET-1, W5-gh200-5).
         return self._relaunched(ba, config, target)
 
     def streaming(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> Tiles:
