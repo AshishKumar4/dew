@@ -7,11 +7,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
+import test_decision_laya as laya
 from decision_support import decision_rows
-from one_draw import assert_as_exact_as_the_reference
-from reference_error import as_given, assert_as_exact, dew_programs
+from reference_error import as_given, assert_as_exact, dew_programs, indexed_recording, recording
 from steady_state import steady_state
 
 from dew.artifacts import Decisions
@@ -30,7 +31,7 @@ from dew.decision import (
 )
 from dew.decision.calibration import softmax
 from dew.decision.metrics import Answered
-from dew.decision.task import decoded_images, trained_tree
+from dew.decision.task import Finalists, Knockout, decoded_images, trained_tree
 
 FIXTURES = Path(__file__).parent / "fixtures" / "laya"
 TINY = FIXTURES / "tiny"
@@ -169,22 +170,29 @@ def test_strict_answers_drop_the_extensions_and_hold_jevs_fields(decide):
 
 
 def test_a_small_budget_splits_passes_without_moving_a_logit(decide):
-    """Every question of every case at a budget of two rows a pass, held to
-    Laya's one-row logits under the float64 rule."""
+    """Every question of every case at a budget of two rows a pass, scored by the task's server over drawn
+    weights, as exact as Laya's float32 one-row run against its float64 run (check 1,
+    tests/test_decision_laya.py's recording)."""
     small = replace(decide, budget=Budget(tokens=256, rows=2))
-    rows, keys = [], []
-    for case, request in CASES.items():
-        laid = small._encoded(request["state"], {name: Question.from_wire(wire)
-                                                 for name, wire in request["questions"].items()})
-        rows.extend(laid)
-        keys.extend(f"sequential/{case}/{encoded.questions[0].name}" for encoded in laid)
-    found = [logits[0, :len(encoded.questions[0].options)]
-             for encoded, logits in zip(rows, small.logits(rows), strict=True)]
-    with np.load(TINY / "logits.npz") as reference:
-        assert_as_exact_as_the_reference(np.concatenate(found),
-                                         np.concatenate([reference[key] for key in keys]),
-                                         np.concatenate([reference[f"{key}/f64"] for key in keys]),
-                                         "budgeted logits")
+    laid = sorted(((f"sequential/{case}/{encoded.questions[0].name}", encoded)
+                   for case, request in CASES.items()
+                   for encoded in small._encoded(request["state"], {
+                       name: Question.from_wire(wire) for name, wire in request["questions"].items()})),
+                  key=lambda row: row[0])
+    rows = [encoded for _, encoded in laid]
+
+    def budgeted(index, inputs):
+        served = replace(small, variables=laya.variables_of(jnp.float32, inputs))
+        scored = zip(rows, served.logits(rows), strict=True)
+        return {"sequential": np.concatenate([logits[0, :len(encoded.questions[0].options)]
+                                              for encoded, logits in scored])}
+
+    def truth(inputs):
+        return {"sequential": laya.dew(jnp.float64, inputs)["sequential"]}
+    drawn, reference, truth = indexed_recording(recording(laya.FIXTURE), "laya", laya.LAYA_SEEDS,
+                                                inputs_of=laya.draw, leaves=("sequential",), truth_fn=truth)
+    assert_as_exact(as_given(budgeted), reference, drawn, "budgeted logits", seeds=laya.LAYA_SEEDS,
+                    truth_fn=truth)
 
 
 def drawn_about(variables):
@@ -246,7 +254,7 @@ def test_a_tournament_takes_each_group_winner_to_the_final(decide):
     request = CASES["many_options"]
     question = Question.from_wire(request["questions"]["intent"])
     assert isinstance(question, Choice)
-    final = decide.tournament(request["state"], {"intent": question}, group=4)["intent"]
+    final = decide.tournament(request["state"], {"intent": question}, rounds=Knockout(4))["intent"]
     options = list(question.options)
     groups = [options[part * 14 // 4:(part + 1) * 14 // 4] for part in range(4)]
     described = dict(zip(question.options, question.descriptions, strict=True))
@@ -267,12 +275,58 @@ def test_a_questions_tournament_is_its_own_beside_a_longer_one(decide):
     assert isinstance(question, Choice)
     described = dict(zip(question.options, question.descriptions, strict=True))
     short = Choice(question.instructions, {option: described[option] for option in question.options[:5]})
-    alone = decide.tournament(request["state"], {"short": short}, group=3)["short"]
-    beside = decide.tournament(request["state"], {"short": short, "intent": question}, group=3)
+    alone = decide.tournament(request["state"], {"short": short}, rounds=Knockout(3))["short"]
+    beside = decide.tournament(request["state"], {"short": short, "intent": question}, rounds=Knockout(3))
     assert len(alone.options) == 2
     assert beside["short"].options == alone.options
     assert len(beside["short"].probabilities) == len(alone.options)
     assert len(beside["intent"].options) <= 3
+
+
+def test_finalists_play_one_round_keep_each_groups_best_and_answer_over_every_option(decide):
+    """A released engine's knock-out (`Finalists`, StartLux-Decision a99977d93): fourteen options in groups
+    of at most four, the first ones longer (4, 4, 3, 3), asked together; each group's two best, in group
+    order; the five best of those eight by their group round; the final over them; and the answer over
+    every option, the finalists first as the final gave them 0.99 and the knocked-out after them sharing 0.01
+    by their group rounds, all over their total (the engine's `knockout_combine`), abstaining as the whole
+    question does."""
+    request = CASES["many_options"]
+    question = Question.from_wire(request["questions"]["intent"])
+    assert isinstance(question, Choice)
+    options, described = list(question.options), dict(zip(question.options, question.descriptions,
+                                                           strict=True))
+
+    def over(chosen):
+        return Choice(question.instructions, {option: described[option] for option in chosen})
+
+    groups = [options[0:4], options[4:8], options[8:11], options[11:14]]
+    rounds = decide(request["state"], {f"intent/{part}": over(group) for part, group in enumerate(groups)})
+    first, kept = {}, []
+    for part in range(len(groups)):
+        answer = rounds[f"intent/{part}"]
+        seen = dict(zip(answer.options, map(float, answer.probabilities), strict=True))
+        first |= seen
+        kept += sorted(answer.options, key=lambda option: -seen[option])[:2]
+    finalists = sorted(kept, key=lambda option: -first[option])[:5]
+    final = decide(request["state"], {"intent": over(finalists)})["intent"]
+    rest = [option for option in options if option not in finalists]
+    residual = 0.01
+    shared = {option: float(value) * (1 - residual)
+              for option, value in zip(final.options, final.probabilities, strict=True)}
+    shared |= {option: residual * first[option] / sum(first[each] for each in rest) for option in rest}
+    total = sum(shared.values())
+    rounds = Finalists(group=4, keep=2, final=5, residual=residual)
+    answer = decide.tournament(request["state"], {"intent": question}, rounds=rounds)["intent"]
+    assert answer.options == (*final.options, *rest)
+    assert answer.probabilities.tolist() == [shared[option] / total for option in answer.options]
+    assert answer.choice == final.choice
+    # It abstains as the whole question does: under a threshold the final round's top meets and the
+    # answer's, that top's share of 1 - residual, does not.
+    top = float(np.max(final.probabilities))
+    gated = replace(decide, calibration=replace(decide.calibration,
+                                                abstention=Abstention(default=top * (1 - residual / 2))))
+    assert not gated(request["state"], {"intent": over(finalists)})["intent"].abstained
+    assert gated.tournament(request["state"], {"intent": question}, rounds=rounds)["intent"].abstained
 
 
 def synthetic(temperature: float, count: int, options: int, seed: int) -> list[Scored]:

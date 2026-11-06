@@ -44,7 +44,10 @@ def normalize(x: jax.Array, axes: Sequence[int] | None = None, eps: float = 1e-4
 
     `axes` defaults to all but the last, which normalizes each output channel
     of a kernel, or each feature vector. `compensated` sums the squares with
-    `compensated_sum`, as a kernel's initialization does (`drawn_kernel`).
+    `compensated_sum`, as every kernel's normalization does (`drawn_kernel`,
+    `MPConv`, `forced_weight_normalization`): over a kernel's fan-in a plain
+    float32 sum left the kernels EDM2 trains 1.5 times as far from float64 as
+    EDM2's own (tests/test_edm2.py).
     """
     axes = tuple(range(x.ndim - 1)) if axes is None else tuple(axes)
     count = math.prod(x.shape[axis] for axis in axes)
@@ -148,7 +151,7 @@ class MPConv(nn.Module):
     def __call__(self, x: jax.Array, gain: jax.Array | float = 1.0) -> jax.Array:
         shape = (*self.kernel_size, x.shape[-1], self.features)
         weight = self.param(MP_KERNEL, lambda key: drawn_kernel(key, shape))
-        weight = normalize(weight.astype(at_least_fp32(x.dtype)))
+        weight = normalize(weight.astype(at_least_fp32(x.dtype)), compensated=True)
         weight = weight * (gain / math.sqrt(math.prod(shape[:-1])))
         weight = weight.astype(x.dtype)
         if not self.kernel_size:
@@ -188,7 +191,7 @@ def forced_weight_normalization() -> optax.GradientTransformation:
             last = path[-1]
             if not (isinstance(last, jax.tree_util.DictKey) and last.key == MP_KERNEL):
                 return change
-            return (normalize(value + change) - value).astype(change.dtype)
+            return (normalize(value + change, compensated=True) - value).astype(change.dtype)
 
         return jax.tree_util.tree_map_with_path(project, updates, params), state
 

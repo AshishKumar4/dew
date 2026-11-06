@@ -44,7 +44,7 @@ AUDIO_AT = (2, 9)
 
 SITES = {"lfm3-tiny": ("logits", "packed", "decode", "gradients", "update"), "lfm3-biased-tiny": ("biased",),
          "lfm3-vl-tiny": ("logits", "image", "video"),
-         "mimo-v2-tiny": ("logits",),
+         "mimo-v2-tiny": ("logits",), "mimo-v2-sliding-tiny": ("logits",),
          "mimo-v2-vl-tiny": ("logits", "image", "video", "frames", "audio", "mtp"),
          "dream-tiny": ("logits",), "llada-tiny": ("logits",)}
 """Each release fixture's sites: its logits over plain rows; LFM3's over a packed row, through the decode

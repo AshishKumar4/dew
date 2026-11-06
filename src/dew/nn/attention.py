@@ -20,7 +20,7 @@ import tokamax
 from flax.linen.dtypes import promote_dtype
 from jax.ad_checkpoint import checkpoint_name
 
-from dew.nn.derivatives import KernelGlue, declared_tangent
+from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 
 from .attention_kernels import ATTENTION, DECODE, TPU_BACKEND, AttentionCase, decodes
 from .attention_masks import (
@@ -776,7 +776,8 @@ def forward_differentiable(value, tangent, *arrays, precision: str | None = None
                                      tuple(tangents[index] for index in live))[1]
         return output, differentiated
 
-    attend = declared_tangent(KernelGlue(), attending, rule, symbolic_zeros=True)
+    attend = contracted("test_a_fused_attention_call_in_forward_mode_holds_every_order")(
+        declared_tangent(KernelGlue(), attending, rule, symbolic_zeros=True))
     return attend(*arrays)
 
 

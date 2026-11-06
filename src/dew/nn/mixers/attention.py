@@ -329,6 +329,10 @@ class CausalSelfAttention(nn.Module):
     rotary_pairs: Literal['half', 'adjacent'] = 'half'
     """The channels each angle turns (`dew.nn.rope.rotate`): the HF decoders'
     halves, or the adjacent pairs of Llama 4's vision tower."""
+    rotary_interleaved: bool = False
+    """Whether the `rotary_axes` take their angles in turn, pair by pair, where they otherwise
+    each turn their own run of pairs (`dew.nn.rope.axis_tables`): MoonViT's patch grid, a column's
+    pair beside a row's."""
     rotary_per_axis: bool = False
     """Whether each of the `rotary_axes` turns its own channels in halves,
     Gemma 4's vision rope (`apply_multidimensional_rope`), where Qwen 3.5's
@@ -743,7 +747,8 @@ class CausalSelfAttention(nn.Module):
             if rotary_positions is None or rotary_positions.ndim != 3:
                 raise ValueError(f"a rotary over {len(self.rotary_axes)} axes reads their ids "
                                  "[B, S, axes] from attention_metadata.rotary_positions")
-            return axis_tables(rotary_positions, self.rotary_axes, self.ctx.rope_theta, dtype=dtype)
+            return axis_tables(rotary_positions, self.rotary_axes, self.ctx.rope_theta, dtype=dtype,
+                               interleaved=self.rotary_interleaved)
         section = None
         if self.mrope_section is not None and rotary_positions is not None and rotary_positions.ndim == 3:
             if self.ctx.partial_rotary_type != "default":
