@@ -400,12 +400,12 @@ class FitRun:
 
     @contextlib.contextmanager
     def outside_window(self) -> Iterator[None]:
-        """A block of the work between two steps (an evaluation, a save, an observation, a cooldown
-        branch) run outside the open profile window's capture: it stops before the block and starts again
-        before the next step's read (`open_window`), so the window holds training steps alone, over a
-        capture of each run of them, and no capture ends empty. The log the run takes at its cadence stays
-        in it: the steps' own cost, which the run reads off the loop without waiting on them; work inside a
-        step's iteration (a rollout, a new shape's compile) stays too, as the step it serves."""
+        """A block of the work between two steps (an evaluation, a save, a cooldown branch) run outside the
+        open profile window's capture: it stops before the block and starts again before the next step's
+        read (`open_window`), so the window holds training steps alone, over a capture of each run of them,
+        and no capture ends empty. The log the run takes at its cadence and an observer's call stay in it:
+        the loop's own cadenced reads of its steps, which a profile of the loop shows; work inside a step's
+        iteration (a rollout, a new shape's compile) stays too, as the step it serves."""
         if self.window is not None and not self.window_paused:
             stop_capture(self.window, self.loss)
             self.window_paused = True

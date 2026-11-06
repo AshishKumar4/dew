@@ -569,11 +569,9 @@ def test_a_run_that_fails_after_its_profile_window_still_reports_the_window(tmp_
         trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=6, log_every=1,
                     observe=Observe(1, failing))
     (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileTraced"]
-    # The observer runs outside the window's capture (`FitRun.outside_window`): a capture of each step.
-    captures = sorted(tmp_path.glob("capture-*"))
-    assert window.steps == 2 and captures
-    assert all(json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
-               for capture in captures)
+    (capture,) = tmp_path.glob("capture-*")
+    assert window.steps == 2
+    assert json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
 
 
 def test_a_run_that_stops_inside_its_profile_window_stops_its_capture_and_reports_what_it_traced(tmp_path):

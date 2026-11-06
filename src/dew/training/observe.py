@@ -59,13 +59,9 @@ class Observe:
                                             available=missing):
             self.take(step, state)
 
-    def due(self, step: int) -> bool:
-        """Whether the cadence observes after `step`."""
-        return step % self.every == 0
-
     def at(self, step: int, state: TrainState) -> None:
-        """After `step`, where the cadence asks for it (`due`)."""
-        if self.due(step):
+        """After `step`, where the cadence asks for it."""
+        if step % self.every == 0:
             self.take(step, state)
 
     def last(self, step: int, state: TrainState) -> None:

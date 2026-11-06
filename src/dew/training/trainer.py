@@ -1386,8 +1386,8 @@ class Trainer(Generic[Loss, Effects]):
                 if run.first_step is None:
                     loss.block_until_ready()
                     run.first_step = time.perf_counter() - run.started
-            # The step row is complete once its scope exits, and the window holds the steps alone: the work
-            # between them runs outside its capture (`FitRun.outside_window`), the last one's after it closes.
+            # The step row is complete once its scope exits; the window's last step closes it before the work
+            # after it, whose evaluations, saves and cooldowns run outside it (`FitRun.outside_window`).
             if run.tracing and profile is not None:
                 run.traced += 1
                 if run.traced == profile.steps:
@@ -1724,7 +1724,7 @@ class Trainer(Generic[Loss, Effects]):
             self._saves(plan, run, interval, state, position, scores, evaluation_due=evaluation_due,
                         full=stopping)
         if plan.observe:
-            with run.outside_window() if plan.observe.due(current) else contextlib.nullcontext(), run.held():
+            with run.held():
                 plan.observe.at(current, state)
         if run.stopped:
             return True, state
