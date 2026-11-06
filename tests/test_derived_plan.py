@@ -69,6 +69,21 @@ def test_the_first_compile_is_at_the_least_recompute_rung_the_derivation_says_fi
     assert compiles.count == 1 and trainer.plan["probes"][0]["fits"]
 
 
+def test_a_candidate_the_derivation_read_compiles_with_the_footprint_it_traced(monkeypatch, tmp_path, room):
+    """The search's compile of a candidate the derivation read keeps the footprint it traced
+    (`FitSearch.footprints`): each candidate's gradient is traced once for its footprint, its compile
+    tracing none again, which was 22 of a Qwen3.5-4B step's 185 seconds of `compile_ahead` (row 4261)."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
+    free(monkeypatch, room)
+    trainer = deep()
+    with Compiles(None) as compiles:
+        compiled(trainer)
+    derivations = [program for program in compiles.programs
+                   if program.kind == "traced" and "dew/training/footprint.py" in program.where]
+    assert trainer.plan["probes"] and len(trainer.plan["derived"]) > 1
+    assert len(derivations) == len(trainer.plan["derived"])
+
+
 def test_a_derivation_that_fits_the_base_rung_or_cannot_judge_starts_the_search_there(monkeypatch, tmp_path):
     """With room for every rung, the derivation fits the base rung, which the search compiles first,
     as it did before any derivation: no rung above it is read. A device that states no memory leaves
@@ -174,13 +189,29 @@ def bare_search(objective):
     the test's to set (`judged_at`), and a compile it asks raises `Asked` naming the rung it asked at."""
     from dew.training.planning import FitSearch
 
-    def asked(split, narrow):
+    def asked(split, narrow, footprint=None):
         raise Asked(search.remat_rung())
 
     search = FitSearch(lower=asked, options=lambda candidate: None, objective=objective,
                        mesh=MeshSpec().build(jax.devices()[:1]), xla_defaults=False, narrow=False, base=None,
                        resumed=None, capacity=LIMIT)
     return search
+
+
+def test_a_step_lowered_afresh_past_a_spilled_kernel_traces_its_footprint_again():
+    """The search's first lowering of a candidate the derivation read keeps the footprint it traced; one
+    lowered afresh past a kernel that spilled traces its own (`FitSearch.relowering`), as the kernel's next
+    config can change the buffers its first held (review of row 4261)."""
+    from dew.training.footprint import Footprint
+
+    handed = []
+    search = bare_search(deep(split=None).objective)
+    search.lower = lambda split, narrow, footprint: handed.append(footprint)
+    derived = Footprint(residuals=1, gradients=2, held=3)
+    search.footprints[search.candidate_key(1, narrow=False)] = derived
+    search.lowering(1)
+    search.relowering(1)
+    assert handed == [derived, None]
 
 
 class Asked(Exception):
@@ -196,10 +227,30 @@ def test_a_compile_that_fits_past_the_derivations_corrected_refusal_lets_its_ref
     mib = 2**20
     for split, headroom in ((1, 0), (2, 50 * mib), (4, 100 * mib), (8, 150 * mib)):
         search.judged_at[search.candidate_key(split, narrow=False)] = headroom
-    search.learned(0, -200 * mib, fit=False)
+    search.learned(0, -200 * mib, fit=False, split=1, temporaries=None)
     assert search.refused(2) and search.refused(4)
-    search.learned(150 * mib, 100 * mib, fit=True)
+    search.learned(150 * mib, 100 * mib, fit=True, split=8, temporaries=None)
     assert not search.refused(2) and not search.refused(4)
+
+
+def test_a_miss_corrects_each_split_by_its_share_of_the_derived_temporaries():
+    """A compile's miss corrects the derivation at the other splits in proportion to their derived
+    temporaries (`FitSearch.shortfall`): a step of one microbatch derived at 1.2 MB of temporaries and
+    compiled 0.96 MB short corrects two microbatches derived at 0.6 MB by 0.48 MB, so one judged 0.95 MB to
+    spare is asked, where a shortfall taken whole refused it and the search compiled four (test_plan's
+    recorded run on a CPU, review of row 4089)."""
+    from dew.training.footprint import Footprint
+
+    search = bare_search(deep(split=None).objective)
+    kb = 1000
+    for split, headroom, temporaries in ((1, 357 * kb, 1229 * kb), (2, 953 * kb, 615 * kb),
+                                         (4, 1258 * kb, 307 * kb)):
+        key = search.candidate_key(split, narrow=False)
+        search.judged_at[key] = headroom
+        search.footprints[key] = Footprint(residuals=0, gradients=0, held=0, peak=temporaries)
+    search.learned(357 * kb, -606 * kb, fit=False, split=1, temporaries=1229 * kb)
+    assert not search.refused(2) and search.likely(2)
+    assert search.shortfall(2) == 963 * kb * 615 // 1229
 
 
 def test_a_split_the_derivation_refuses_is_still_asked_at_its_half_rung():
