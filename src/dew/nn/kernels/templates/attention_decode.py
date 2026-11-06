@@ -140,20 +140,20 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     tiles = math.ceil(query.shape[1] / (config.consumers * config.block_q))
     programs = query.shape[0] * query.shape[2] * tiles
     if programs >= processors:
-        return Plan(config, 1, False)
+        return Plan(config, 1, merges=False)
     if not bundle_of(config, query.dtype).fixes_up:
         walked = None if hooks is None else dataclasses.replace(hooks, initial=None)
         found = _streamed(query, key, value, spans, walked, scale=scale, target=target, table=table,
                           sources=sources, out_dtype=jnp.float32)
         if found is None:
-            return Plan(config, 1, False)
+            return Plan(config, 1, merges=False)
         config, op, ba = found
     longest = math.ceil(spans.keys / config.block_k) // (2 * config.stages)
     # The most slices whose programs the device holds at once, none past it: one program past them waits a
     # whole walk for a slot (ceil(132 / 8) = 17 slices of one row's 8 key heads is 136 programs, 4 of them a
     # second wave as long as the first), and a merging launch's every program resident.
     slices = max(1, min(processors * op.resident(ba, config, target) // programs, longest))
-    return Plan(config, slices, slices > 1 and bundle_of(config, query.dtype).fixes_up)
+    return Plan(config, slices, merges=slices > 1 and bundle_of(config, query.dtype).fixes_up)
 
 
 def _streamed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None,

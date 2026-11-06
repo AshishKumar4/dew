@@ -15,7 +15,10 @@ the tensor cores' truncating adds where IEEE sums are declared. Link 3: the recu
 delta rule with a decay a head, each record its launches store between them held inside its launch step's
 enclosure on the native records the step reads (`recurrence_witness`), its faults a dropped carry, a state
 rounded to bf16 where fp32 is held, the decay from rounded cumulative sums and an off-by-one chunk
-boundary."""
+boundary. Link 4: the attention template's Mosaic forward, each online-softmax state its certify launch
+stores after a key tile and its output held inside one plain step's enclosure on the state before it
+(`attention_witness`), its faults a dropped rescale, a maximum from the wrong tile, sums rounded to bf16
+and a mask off by one key."""
 
 import functools
 
@@ -25,6 +28,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 import recurrence_witness as rw
+from attention_witness import assert_faults_refused, assert_witnessed
 from gpu_flow import Cell, run_cells
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
@@ -32,6 +36,7 @@ from native_certificates import (
     LOST_SHARE,
     MOVED_SHARE,
     NARROW_SHARE,
+    PTX_EX2,
     SUBNORMAL_CASE,
     TF32_SHARES,
     TRUNCATED_SHARE,
@@ -540,12 +545,6 @@ def subnormal_operands_certify_natively_at_their_formats_least_normal(dtype, ker
             assert np.all(native_dot_holds(native, products, FLOAT32, flushes=False))
 
 
-PTX_EX2 = 2
-"""PTX ISA 9.4 §9.7.3.21: "The maximum ulp error is 2 ulp from correctly rounded result across the full
-range of inputs" of ex2.approx.f32, Mosaic GPU's `exp2` under `approx_math`, which the recurrence mainloop's
-launches compile with."""
-
-
 def mosaic_exp2(semantics: str):
     """Mosaic GPU's `exp2` under `approx_math` on fp32 operands, a multiple of 128 of them, in a kernel
     lowered with `semantics` (`plgpu.LoweringSemantics`' name: Lane, mma.sync's bundle's; Warpgroup,
@@ -617,6 +616,22 @@ def the_recurrence_witness_refuses_rounded_cumulative_sums_and_an_off_by_one_bou
         rw.assert_step_faults_refused(mosaic_lane(), heads=2)
 
 
+def the_attention_templates_states_certify_natively_a_step_at_a_time(generation_name, mask):
+    """Every online-softmax state the attention template's certify launch stores after a key tile, and its
+    output, lies inside its step's enclosure on the state before it, under a causal or a full `mask`
+    (`attention_witness.assert_witnessed`), at this GPU's `ex2` (PTX's reach)."""
+    with generation.assumed(generation_name):
+        assert_witnessed(0, mask == "causal", interpret=False)
+
+
+def the_attention_witness_refuses_its_faults_natively(generation_name):
+    """The attention step witness's faults, each refused where it lands natively
+    (`attention_witness.assert_faults_refused`): a dropped rescale, a maximum from the wrong tile, sums
+    rounded to bf16 and a mask off by one key."""
+    with generation.assumed(generation_name):
+        assert_faults_refused(interpret=False)
+
+
 GENERATIONS = ("sm80", "sm90")
 """The lanes' GPU generations, each cell run under its own (`gpu_flow.Cell`)."""
 SIGNED = (True, False)
@@ -663,5 +678,9 @@ def test_the_native_kernels_certify_on_this_gpu():
         *(cell(the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16_natively, g)
           for g in GENERATIONS),
         *(cell(the_recurrence_witness_refuses_rounded_cumulative_sums_and_an_off_by_one_boundary, g)
+          for g in GENERATIONS),
+        *(cell(the_attention_templates_states_certify_natively_a_step_at_a_time, g, mask)
+          for g in GENERATIONS for mask in ("causal", "full")),
+        *(cell(the_attention_witness_refuses_its_faults_natively, g)
           for g in GENERATIONS),
     ])

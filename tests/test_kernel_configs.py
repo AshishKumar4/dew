@@ -490,14 +490,26 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                 family = mosaic_gpu.family_of(config, jnp.bfloat16)
                 configs = {}
                 for consumers in sorted({1, family.consumers}):
-                    # Each consumer keeps its share of the derived tile's rows, at as many of its stages as
-                    # the block holds (a one-consumer tile's deeper ring past two consumers' rows); one
-                    # consumer runs alone, a cluster being two consumers' (`mosaic_gpu.Tiles`).
-                    rows_ = config.block_m // config.warpgroups * consumers
-                    staged = (dataclasses.replace(config, warpgroups=consumers, block_m=rows_, stages=stages,
-                                                  cluster=config.cluster if consumers > 1 else 1)
+                    # Each consumer keeps its share of the derived tile's rows, else the tile's rows split
+                    # among them where its registers hold no more (mma.sync's one-consumer tile, two of
+                    # whose shares no consumer holds), at as many of its stages as the block holds (a
+                    # one-consumer tile's deeper ring past two consumers' rows); one consumer runs alone, a
+                    # cluster being two consumers' (`mosaic_gpu.Tiles`).
+                    shares = dict.fromkeys((config.block_m // config.warpgroups * consumers, config.block_m))
+                    # As many programs a multiprocessor as the derived tile's, else one, whose registers its
+                    # consumers then share alone.
+                    residencies = dict.fromkeys((config.programs, 1))
+                    # At the derived step's depth, else twice it: two consumers each copy a share of a block's
+                    # first axis in whole 32-row parts (`Transport.shares_rows`), a transposed right
+                    # operand's its depth.
+                    depths = dict.fromkeys((config.block_k, 2 * config.block_k))
+                    staged = (_replaced(config, warpgroups=consumers, block_m=rows_, block_k=depth,
+                                        stages=stages, programs=programs,
+                                        cluster=config.cluster if consumers > 1 else 1)
+                              for rows_ in shares for depth in depths for programs in residencies
                               for stages in range(config.stages, 1, -1))
-                    tile = next((tile for tile in staged if launch.legal(ba, tile, target)), None)
+                    tile = next((tile for tile in staged
+                                 if tile is not None and launch.legal(ba, tile, target)), None)
                     if tile is not None:
                         configs[f"{name} x{consumers} {tile}"] = tile
             kernel = "dew_tgmm" if isinstance(launch, grouped_matmul.MosaicTgmm) else "dew_gmm"
@@ -508,6 +520,14 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                                                 {kernel: _model(launch, ba, config)},
                                                 required=launch.legal(ba, config, target)))
     return cases
+
+
+def _replaced(config, **changes):
+    """`config` with `changes`, or None where its tile type refuses them (`mosaic_gpu.Tiles`' own checks)."""
+    try:
+        return dataclasses.replace(config, **changes)
+    except ValueError:
+        return None
 
 
 def _model(launch, ba, config) -> resources.RegisterModel:
@@ -635,13 +655,23 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
 
 
 @functools.cache
+@functools.cache
+def _contract_cases(generation_name: str) -> list:
+    """Each launch form at each consumer count of a family's contract (`_gemm_mainloop_cases(
+    every_consumer_count=True)`), at the first projection whose rows give it a legal tile (two consumers'
+    rows past a few rows a MoE expert takes, mma.sync's)."""
+    found: dict = {}
+    for shape in GEMM_SHAPES:
+        for case in _gemm_mainloop_cases(generation_name, shape, every_consumer_count=True):
+            found.setdefault(case.name.split(" Tiles(")[0], case)
+    return list(found.values())
+
+
 def _family_cases(generation_name: str) -> list:
-    """The family contract's cases (`_gemm_mainloop_cases(every_consumer_count=True)` at the first
-    projection) the compile gate does not already hold (`_gate_cases`)."""
+    """The family contract's cases (`_contract_cases`) the compile gate does not already hold
+    (`_gate_cases`)."""
     held = {_kernel_of(case.name) for case in _gate_cases(generation_name)}
-    return [case for case in _gemm_mainloop_cases(generation_name, next(iter(GEMM_SHAPES)),
-                                                  every_consumer_count=True)
-            if _kernel_of(case.name) not in held]
+    return [case for case in _contract_cases(generation_name) if _kernel_of(case.name) not in held]
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
@@ -649,10 +679,10 @@ def test_each_family_emits_every_launch_form_at_each_consumer_count(generation_n
     """The whole contract a Mosaic GPU Family bundle offers its templates is present: every launch form it
     emits (`_emitted_forms`: plain and transposed right operands, 16-bit and fp32 stores, fixed and streamed
     side vectors and tiles, several outputs, the running sum) at one consumer and at the family's most
-    (`_gemm_mainloop_cases(every_consumer_count=True)`)."""
+    (`_contract_cases`)."""
     family = bundles.of(generation_name, jnp.bfloat16)
     assert family is not None
-    cases = _gemm_mainloop_cases(generation_name, next(iter(GEMM_SHAPES)), every_consumer_count=True)
+    cases = _contract_cases(generation_name)
     counts = sorted({1, family.consumers})
     expected = {f"{form} x{count}" for form in _emitted_forms(family) for count in counts}
     got = {case.name.split(" Tiles(")[0] for case in cases}
