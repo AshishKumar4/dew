@@ -119,8 +119,9 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
     def tile_of(self, ref) -> jax.Array:
         return ref[...]
 
-    def key_magnitudes(self, tile) -> jax.Array:
-        return jnp.max(jnp.abs(tile[...]), axis=1).astype(jnp.float32)
+    def key_magnitudes(self, tile, *parts) -> jax.Array:
+        values = sum((each[...].astype(jnp.float32) for each in parts), tile[...].astype(jnp.float32))
+        return jnp.max(jnp.abs(values), axis=1).astype(jnp.float32)
 
     def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
         del scratch, interpret

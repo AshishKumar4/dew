@@ -937,7 +937,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         if guard is not None:
             # Its keys' largest value magnitudes from the value tile it holds (`Family.key_magnitudes`).
             def largest():
-                return family.key_magnitudes(slots["values"])
+                tile = program.parted(slots["values"], tiles.block_k)
+                return family.key_magnitudes(*tile.refs) if program.parts > 1 else family.key_magnitudes(tile)
 
             keys = algebra.Keys(coords, logits, tile, dot, products=products, largest=largest)
             return algebra.plain_step(spec, carry, keys), accumulators
