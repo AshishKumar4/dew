@@ -603,7 +603,8 @@ def test_a_decode_steps_dense_product_runs_swapped_and_holds_check_1(generation_
 @pytest.mark.parametrize("transpose_rhs", [False, True])
 def test_a_swapped_dense_product_lowers_for_cuda(generation_name, transpose_rhs):
     """The swapped tile of a one-row dense product (an M=1 decode dot over a 2048 x 2048 matrix, row 483)
-    lowers for CUDA on the CPU on each family, the matrix stored either way."""
+    lowers for CUDA on the CPU on each family, the matrix stored either way; on mma.sync, its 16 output
+    tiles a fraction of a wave, it splits its depth (`mosaic_gpu.split_count`)."""
     rows, depth, width = 1, 2048, 2048
     launch = grouped_matmul.MosaicGmm()
     matrix = (1, width, depth) if transpose_rhs else (1, depth, width)
@@ -613,7 +614,7 @@ def test_a_swapped_dense_product_lowers_for_cuda(generation_name, transpose_rhs)
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
     with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
         tile = launch.derived(launch.bind(*args, **options), generation.gpu_target())
-        assert tile is not None and tile.swapped, tile
+        assert tile is not None and tile.swapped and (tile.splits > 1 or generation_name != "sm80"), tile
         jax.jit(functools.partial(launch.replace(config=tile), **options)).trace(*args).lower(
             lowering_platforms=("cuda",))
 
@@ -946,6 +947,38 @@ def test_a_dense_forwards_balanced_tail_holds_check_1_through_its_hooks(rows, de
     with generation.assumed(target):
         assert_as_exact(dew, jax.jit(plain), draw, f"balanced dense forward {rows}x{depth}x{width}",
                         seeds=SEEDS, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
+
+
+@INTERPRETS
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+@pytest.mark.parametrize("transpose_rhs", [False, True])
+def test_a_dense_products_depth_split_sums_its_partials_once(generation_name, transpose_rhs):
+    """A dense product whose depth splits (`Tiles.splits`, template push piece 4) walks every tile's first run
+    of steps, then every tile's second, in one launch, each run's fp32 partial its own output slice, the
+    partials summed in order and rounded once: over small integers, every product and sum exact, bitwise
+    the unsplit launch's, at two and three runs (the last shorter), on each family; a hooked call, or a
+    split leaving a run no step, is refused."""
+    rows, depth, width = 136, 320, 256
+    keys = jax.random.split(jax.random.key(4))
+    x = jax.random.randint(keys[0], (rows, depth), -3, 4).astype(jnp.bfloat16)
+    shape = (width, depth) if transpose_rhs else (depth, width)
+    w = jax.random.randint(keys[1], shape, -3, 4).astype(jnp.bfloat16)
+    tiles = (COOPERATIVE if generation_name == "sm90"
+             else mosaic_gpu.Tiles(128, 128, 64, 3, 1, family="mma.sync"))
+
+    def dew(splits, **hooks):
+        return mosaic_gpu.gmm(x, w[None], jnp.asarray([rows], jnp.int32),
+                              tiles=dataclasses.replace(tiles, splits=splits), transpose_rhs=transpose_rhs,
+                              out_dtype=jnp.bfloat16, multiprocessors=8, interpret=grouped_matmul.INTERPRETED,
+                              dense=True, **hooks)
+
+    with generation.assumed(generation_name):
+        whole = np.asarray(dew(1), np.float32)
+        for splits in (2, 3):
+            np.testing.assert_array_equal(np.asarray(dew(splits), np.float32), whole)
+        for refused in ({"splits": 2, "epilogue": lambda acc: acc * 2}, {"splits": 4}):
+            with pytest.raises(ValueError):
+                dew(refused.pop("splits"), **refused)
 
 
 def a_dense_products_exact_sums_survive_one_row_tile():
