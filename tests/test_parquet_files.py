@@ -2,6 +2,7 @@
 before the first record but the first file's, each file resumed within it, and a position saved under
 version 9 read by 9."""
 
+import dataclasses
 from typing import ClassVar
 
 import numpy as np
@@ -15,7 +16,7 @@ from dew.data import Loading
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Pipeline
-from dew.data.sources import Concatenate, Files
+from dew.data.sources import Concatenate, Files, Memory
 from dew.data.storage import Store
 
 READ = Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)
@@ -401,6 +402,19 @@ def test_a_read_by_a_plan_version_this_dew_reads_by_none_of_is_refused(version):
     publish(chain, cache, plan_version=10 if version > 10 else 8)
     with pytest.raises(ValueError):
         publish(chain, cache, plan_version=version)
+    # Refused before the read prepares anything: a memory read's steps, which it runs as it is compiled,
+    # run none (train 667's review, row 4659).
+    with pytest.raises(ValueError):
+        compile(Pipeline(Memory([{"id": 0}, {"id": 1}])).map(Unread()).batch(2), read="memory",
+                plan_version=version)
+
+
+@dataclasses.dataclass(frozen=True)
+class Unread:
+    """A step a read that refuses its plan version never runs."""
+
+    def __call__(self, row):
+        raise RuntimeError("a refused read ran its steps")
 
 
 def test_a_token_export_reads_its_documents_by_the_plan_version_it_names(tmp_path):
