@@ -18,7 +18,7 @@ import tokamax
 from dew._devices import deterministic_ops_requested
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
-from dew.nn.kernels.templates import attention_algebra as algebra, cost, mosaic, resources
+from dew.nn.kernels.templates import attention_algebra as algebra, cost, mosaic, product, resources
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     DKV_GRADS,
@@ -253,6 +253,10 @@ class MosaicForward(_Mainloop[Tiles]):
     initial state's among them (`attention_mosaic_forward._Merge`): its outputs the rows' whole, no merge in
     XLA after it. Legal on a family that waits across programs (`Family.fixes_up`) where every program of
     its grid is resident at once (`resident`), as its waits on the other slices need."""
+    parts: int = 1
+    """The bf16 parts each of an fp32 call's operands enters as (`product.EXACT_PARTS`, `product.formed`),
+    stacked along the batch axis, part `p`'s rows from `p·B`: every product its parts' (`product.terms`),
+    each 16-bit (attention.md 4b). One for a 16-bit call."""
 
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
              drop=None, table=None, sources=None, *, residuals: Kept, interpret: bool, config: Tiles,
@@ -272,7 +276,7 @@ class MosaicForward(_Mainloop[Tiles]):
                 return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
                                       out_dtype=self.out_dtype, masked=self.masked, splits=self.splits,
                                       table=table, sources=sources, subtracted=self.subtracted,
-                                      merges=self.merges, **form), None
+                                      merges=self.merges, parts=self.parts, **form), None
 
     def completed(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
         """A pin's or an explicit config's natural rewalk derived once where it names none (`_relaunched`,
@@ -360,7 +364,8 @@ class MosaicForward(_Mainloop[Tiles]):
         if config is None or chosen is None:
             return None
         family = chosen
-        if values_deferred(family, self.form, self.splits, query.dtype, ba.arguments.get("drop") is not None):
+        if values_deferred(family, self.form, self.splits, query.dtype, ba.arguments.get("drop") is not None,
+                           self.parts):
             # The P·V a step late where its walk holds the carried weights at the same tiles, its scalars
             # beside them below its budget: a walk of two products in flight pins their accumulators and the
             # weights they read, and ptxas serialized one at its budget (C7512 and 96 bytes spilled, 228 of
@@ -463,7 +468,7 @@ class MosaicForward(_Mainloop[Tiles]):
         out_dtype = None if self.out_dtype is None else jnp.dtype(self.out_dtype)
         allocations = _forward_allocations(family, config, width, value_width, query.dtype,
                                            ba.arguments.get("residuals") is Kept.SPLIT,
-                                           min(config.stages, steps), out_dtype=out_dtype)
+                                           min(config.stages, steps), out_dtype=out_dtype, parts=self.parts)
         # Its guarded launch reduces its keys' magnitudes across warps (`reducing`'s `guarded`).
         guarded = algebra.headroom(value.dtype) and ba.arguments.get("residuals") is not Kept.SPLIT
         return resources.shared_bytes(family, launch_scope(family, allocations, reducing(
@@ -488,7 +493,8 @@ class MosaicForward(_Mainloop[Tiles]):
         # (`Tiles.deferred`).
         deferred = config.deferred and residuals is not Kept.SPLIT
         return _forward_registers(family, config, value_width, query.dtype, residuals is Kept.SPLIT,
-                                  natural=natural, params=params, width=width, deferred=deferred)
+                                  natural=natural, params=params, width=width, deferred=deferred,
+                                  parts=self.parts)
 
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
@@ -497,6 +503,10 @@ class MosaicForward(_Mainloop[Tiles]):
                       ba.arguments["initial"], self.output_mod,
                       tuple(map(Param, ba.arguments["output_params"], self.output_kinds)),
                       ba.arguments["drop"])
+        if self.parts > 1 and (ba.arguments["table"] is not None or ba.arguments["sources"] is not None
+                               or ba.arguments["residuals"] is Kept.SPLIT or hooks.drop is not None):
+            return Refusal('dtype', "the Mosaic mainloop's fp32 parts walk an inference call over dense "
+                           "operands, no dropout")
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family)
 
 
@@ -550,7 +560,7 @@ def _anchor_registers(family: mosaic.Family, block_q: int, block_k: int) -> int:
 
 def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
                        natural: bool = False, params: tuple = (), width: int | None = None,
-                       deferred: bool = False) -> int:
+                       deferred: bool = False, parts: int = 1) -> int:
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
     sums `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A
     training forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the
@@ -571,12 +581,16 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     weights. A key tile whose indices do not fold (`Family.folds_indices`) holds the places its masks
     compare, the queries' and the keys', an int32 tile each. A walk that issues a tile's P·V a step late
     (`deferred`, `values_deferred`) carries the tile's weights across the next step, its logits read while
-    that product runs."""
+    that product runs. An fp32 call's `parts` (`MosaicForward.parts`) sum its logits' products apart
+    (`Family.apart`: the running sum beside each term's fresh accumulator, two fp32 tiles) and form the
+    weights' parts at once, `parts` tiles in the operands' dtype beside the fp32 weights."""
     block_q, block_k = tiles.block_q, tiles.block_k
     hooked, vectors = _hook_live(family, block_q, block_k, params)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
     bits = (block_q, block_k, jnp.int32)
     step = [logits, weights, *([weights] if residuals else [])]
+    if parts > 1:
+        step += [logits, logits, *[weights] * (parts - 1)]
     if residuals:
         step.append((block_q // 2, block_k, jnp.int32))
     if not family.folds_indices(block_k):
@@ -729,6 +743,13 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     """`forward`'s op and its arguments, a dropping call's draw among them, which its legality rule refuses
     (`refused`)."""
     hooks = Hooks() if hooks is None else hooks
+    fp32 = all(jnp.dtype(x.dtype) == jnp.dtype(jnp.float32) for x in (query, key, value))
+    parts = product.EXACT_PARTS if fp32 else 1
+    if parts > 1:
+        # fp32 operands as their bf16 parts, stacked along the batch axis (`MosaicForward.parts`); the
+        # output fp32, the call's.
+        query, key, value = (jnp.concatenate(product.formed(x, parts), axis=0) for x in (query, key, value))
+        out_dtype = jnp.float32 if out_dtype is None else out_dtype
     op = MosaicForward(score_mod=hooks.score_mod, output_mod=hooks.output_mod,
                        score_kinds=tuple(param.kind for param in hooks.score_params),
                        output_kinds=tuple(param.kind for param in hooks.output_params),
@@ -738,7 +759,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        scale=logit_scale(query.shape[3], scale), natural=natural,
                        out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name, masked=masked,
                        splits=splits, subtracted=subtracted, per_span=spans.per_span,
-                       merges=merges and splits > 1)
+                       merges=merges and splits > 1, parts=parts)
     return op, (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params),
                 tuple(param.value for param in hooks.output_params), hooks.initial, hooks.drop,

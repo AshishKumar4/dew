@@ -91,7 +91,8 @@ family without one (mma.sync's, until its thin mainloop) takes another mainloop 
 `MosaicBackward.eligible`)."""
 
 
-def values_deferred(family: mosaic.Family, form: str, splits: int, dtype, dropped: bool) -> bool:
+def values_deferred(family: mosaic.Family, form: str, splits: int, dtype, dropped: bool, parts: int = 1
+                    ) -> bool:
     """Whether a forward's plain walk issues each tile's P·V a step late
     (`attention_mosaic_forward._consumer`): half of FlashAttention 3's overlap within a consumer, its next
     `Q Kᵀ` and the step before's P·V in flight together (hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp's
@@ -100,9 +101,9 @@ def values_deferred(family: mosaic.Family, form: str, splits: int, dtype, droppe
     Where its family's products run asynchronously (`Issuer.products_overlap`) over a producer's loads (a
     loading consumer would wait on its own late release, `Transport.feeds_itself`), every program walks a key
     tile (a full or causal call's whole launch: no spans, no splits), and a tile's weights are one bf16
-    operand (no dropout's parts)."""
+    operand (no dropout's parts, no fp32 call's `parts`)."""
     return (family.products_overlap and not family.feeds_itself and form in ("full", "causal") and splits == 1
-            and jnp.dtype(dtype) == jnp.dtype(jnp.bfloat16) and not dropped)
+            and jnp.dtype(dtype) == jnp.dtype(jnp.bfloat16) and not dropped and parts == 1)
 
 
 def query_swizzle(family: mosaic.Family) -> int | None:
@@ -894,6 +895,17 @@ class _Program[T: (Tiles, BackwardTiles)]:
     per_span: int = 1
     """The queries each of a spans call's intervals holds (`KeySpans.per_span`): more than one, its programs
     read the intervals by position (`reach`, `bounds`)."""
+    parts: int = 1
+    """The bf16 parts each of an fp32 call's tiles is staged in, one above the other (`MosaicForward.parts`):
+    its products their parts' (`parted`)."""
+
+    def parted(self, tile, rows: int):
+        """`tile` as the parts its products take (`operands.Parts`, each `rows` rows of it, an fp32 tile's),
+        or itself where the call's operands are 16-bit."""
+        if self.parts == 1:
+            return tile
+        return operands.Parts(tuple(tile.at[pl.ds(part * rows, rows)] for part in range(self.parts)),
+                              jnp.float32)
 
     def split(self):
         """This program's slice of its query tile's keys (`splits`), 0 of one."""

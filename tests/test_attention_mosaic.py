@@ -1036,6 +1036,17 @@ def test_a_call_over_runs_is_on_par_interpreted(case, form):
 
 
 @INTERPRETS
+@pytest.mark.parametrize("score", [(), ("softcap",)], ids=["plain", "softcap"])
+@pytest.mark.parametrize("call", CALLS)
+def test_an_fp32_forward_walks_its_operands_bf16_parts_interpreted(call, score):
+    """An fp32 call's forward on the one mainloop (`MosaicForward.parts`): its operands as three bf16 parts
+    each, every product its parts' six (`product.terms`), on par with the reference path in fp32 (check
+    1), under no hook and a score hook."""
+    spans = template.spans(128, 128, 1, **CALLS[call])
+    _check_spans(f"{call} fp32 parts", spans, (1, 128, 2, 1), interpret=True, score=score, dtype=jnp.float32)
+
+
+@INTERPRETS
 @pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
 @pytest.mark.parametrize("call", CALLS)
 def test_a_call_of_whole_key_tiles_reads_no_padding_interpreted(call, backward):
