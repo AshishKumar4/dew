@@ -27,6 +27,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew.batch import Batch, Variables, unboxed
+from dew.inference.models import ModelSettings, ReleasesModel
 from dew.nn.kernels.options import program
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step, traced_update_flops
 from dew.rl.distributions import normal_entropy, normal_log_density, tanh_log_jacobian
@@ -95,7 +96,17 @@ def tanh_normal_entropy(location: jax.Array, scale: jax.Array, key: jax.Array) -
     return jnp.sum(normal_entropy(scale) + tanh_log_jacobian(raw), axis=-1)
 
 
-class ControlPPOObjective(Objective[Ratio]):
+@dataclass(frozen=True, kw_only=True)
+class ControlSettings(ModelSettings):
+    """What a released control policy is applied with that its model does not state: the width of the
+    observation it reads and, where observations are dicts, the entries it joins in order (`reads`), the
+    environment's observation policy; its action policy is the model's `action_size` and its squash."""
+
+    observation_size: int
+    reads: tuple[str, ...] = ()
+
+
+class ControlPPOObjective(ReleasesModel, Objective[Ratio]):
     """PPO over an `ActorCritic` (the module docstring). A batch holds sequences `[B, T]`: each step's
     `observation`, the pre-squash `raw_action` taken and its `log_prob` under the policy that took
     it, the `reward`, whether the step `terminated` or was `truncated`, and the `following`
@@ -121,6 +132,12 @@ class ControlPPOObjective(Objective[Ratio]):
         # A held tree enters plain: a draw's boxes (`nn.with_logical_partitioning`) are its table's.
         self.variables = unboxed(variables)
         self.reads = reads
+
+    settings = ControlSettings
+
+    def task_settings(self) -> ControlSettings:
+        """The observation policy a released policy reads (`ControlSettings`)."""
+        return ControlSettings(observation_size=self.observation_size, reads=self.reads)
 
     def seen(self, observation: Observation) -> jax.Array:
         """What the actor and critic read of an observation: its `reads` views joined, or it whole."""

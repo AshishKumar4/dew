@@ -34,6 +34,7 @@ from flax import linen as nn
 
 from dew.artifacts import Representations
 from dew.batch import Variables, dicts, part, thaw, unboxed, under
+from dew.inference.models import ReleasesModel
 from dew.inputs import Field, InputSpec, unit_range
 from dew.nn.backbones.decoder_stack import DecoderBank, nested_sites
 from dew.nn.inspection import INSPECTED
@@ -111,7 +112,7 @@ class _Scanned(Protocol):
     def scan_order(self) -> str: ...
 
 
-class JepaObjective(Objective[Ratio]):
+class JepaObjective(ReleasesModel, Objective[Ratio]):
     """Trains a JEPA encoder and predictor over images (B,H,W,C) or video (B,T,H,W,C).
 
     Evaluation returns the pooled target-encoder embeddings of a batch with
@@ -121,6 +122,8 @@ class JepaObjective(Objective[Ratio]):
     progress, a run bounded in examples that no plan counts ahead
     (`EMASpec.progressed`).
 
+    Its release is the encoder (`recorded_model`, `_model_part`) as a `SavedModel`, the target encoder's
+    average where the run kept one: the predictor trains the encoder and is no product of it.
     `encoder_variables` and `predictor_variables` are the trees each module
     starts from, as `model.init`, `Pretrained.load` or `LoRA.apply` return
     them; a module whose tree is None is initialized from the key. Every
@@ -171,6 +174,12 @@ class JepaObjective(Objective[Ratio]):
             select=under("params", CONTEXT_ENCODER),
             progressed=momentum_steps is None,
         )
+
+    _model_part = CONTEXT_ENCODER
+
+    def recorded_model(self) -> nn.Module:
+        """The encoder, the module a JEPA run releases."""
+        return self.encoder
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         """The encoder, which also runs as the target, then the predictor."""

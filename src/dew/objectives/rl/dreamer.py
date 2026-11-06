@@ -38,6 +38,7 @@ from flax import linen as nn, struct
 from flax.typing import Dtype
 
 from dew.batch import Batch, Variables, merge, under
+from dew.inference.models import ReleasesModel
 from dew.nn.categorical import kl_divergence
 from dew.nn.kernels.options import program
 from dew.nn.precision import at_least_fp32, divided
@@ -505,7 +506,7 @@ AUXILIARY_SCALE = 0.5
 """An auxiliary head's loss weight, FlyDreamer's `aux_state` and `aux_goal` (configs.yaml `loss_scales`)."""
 
 
-class DreamerV3Objective(Objective[Ratio]):
+class DreamerV3Objective(ReleasesModel, Objective[Ratio]):
     """DreamerV3 over a `WorldModel` (the module docstring). A batch holds replayed windows `[B, T]`
     of DreamerV3's steps (`Driven`): `observation`, the `action` taken at it, the `reward` that came
     with it, and whether it was its episode's `first`, `last` or `terminal`. The scales weigh the

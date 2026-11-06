@@ -91,12 +91,12 @@ def pipeline(
     root = epath.Path(source)
     if not root.is_dir():
         # A Hub source is read at the commit its metadata resolved; one holding
-        # a run (`HfApi().upload_folder`) is pulled whole and loads as the run.
+        # a run (`HfApi().upload_folder`) or a native model release is pulled whole and loads as it does.
         from huggingface_hub import snapshot_download
 
         from dew.interop import sources
         metadata = sources.snapshot(source, revision, weights=False)
-        if (metadata / RUN_FILE).is_file():
+        if (metadata / RUN_FILE).is_file() or released_model(epath.Path(metadata)):
             root, revision = epath.Path(snapshot_download(repo_id=source, revision=metadata.name)), None
         else:
             revision = metadata.name
@@ -118,12 +118,30 @@ def pipeline(
                          trust=trust)
     if step is not None:
         raise ValueError("step selects a run's checkpoint; a source checkpoint has one set of weights")
+    if root.is_dir() and released_model(root):
+        if revision is not None or (options is not None and options != SourceOptions()) or (
+                precision is not None):
+            raise ValueError("a native model release records its own model and numerics: `dtype` and "
+                             "`param_dtype` are what a load may set of them")
+        from dew.inference.models import SavedModel
+
+        return SavedModel.from_pretrained(str(root), mesh=mesh, layout=layout, dtype=dtype,
+                                          param_dtype=None if param_dtype == "auto" else param_dtype)
     if precision is not None and (dtype is not None or param_dtype is not None):
         raise ValueError("precision sets a source's dtype and param_dtype; pass the numerics or the dtypes, "
                          "not both")
     return _from_source(source, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype,
                         revision=revision, options=SourceOptions() if options is None else options,
                         precision=precision)
+
+
+def released_model(root: epath.Path) -> bool:
+    """Whether `root` holds a native model release (`SavedModel.save_pretrained`): a release record that
+    names the objective that trained it, which a source's own files never state."""
+    from dew.config.release import Release
+
+    release = Release.load(str(root))
+    return release is not None and release.task is not None and "objective" in release.task
 
 
 def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
