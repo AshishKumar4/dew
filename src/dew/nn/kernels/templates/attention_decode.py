@@ -163,13 +163,12 @@ def _streamed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale:
 def _spec(query: jax.Array, spans: KeySpans, hooks: Hooks, *, scale: float | None) -> algebra.Forward:
     """The call's form as the template's forward takes it (`attention_mosaic_forward._prepared`), its fold of
     raw products (`algebra.Forward.subtracted`): the units its finished rows' maxima are in
-    (`algebra.finished_rows`: raw products where its fold keeps them, else natural, a score hook's fold's
-    rewalk's, `algebra.unfolded`), which its merge takes."""
+    (`algebra.finished_form`), which its merge takes."""
     power, factor = prescale(query.dtype, query.shape[3], scale)
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=factor,
                            score_mod=hooks.score_mod, natural=False, initial=hooks.initial is not None,
                            prescale=power, subtracted=True)
-    return spec if spec.natural or spec.raw else algebra.unfolded(spec)
+    return algebra.finished_form(spec)
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,

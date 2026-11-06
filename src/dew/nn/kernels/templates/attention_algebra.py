@@ -490,6 +490,13 @@ once); `into` refs holding the plain launch's outputs, which it writes its rows 
 (`walked_launches`' `in_place`)."""
 
 
+def finished_form(spec: Forward) -> Forward:
+    """The form a walk's finished states merge in (`slice_state`, `merge`, `merged_slices`): the walk's own
+    where `finish` leaves its maxima in its units (natural, or a raw fold's products), else its fold's
+    natural form (`unfolded`), whose units a folded walk's finished maxima are in (`finished_rows`)."""
+    return spec if spec.natural or spec.raw else unfolded(spec)
+
+
 def slice_state(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.Array) -> Partial:
     """A finished slice of a row's keys as a state of their merge (`merge`, `merged`): its output `out`
     normalized (`finish`'s), its maximum (in `spec`'s units, `finished_rows`', raw products where its fold
@@ -517,8 +524,8 @@ def merged_slices(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.
     fold's `unfolded`, raw products where it keeps them) and denominators `[B, KV, S, Q]`, and the call's
     `initial` state `[B, KV, Q]` (its sums unnormalized): the rows' output `[B, Q, KV, Dv]` fp32, a row of
     no mass zero, as the reference's."""
-    if not (spec.natural or spec.raw):
-        raise ValueError("a split walk's merge takes natural states or a raw fold's")
+    if finished_form(spec) is not spec:
+        raise ValueError("a split walk's merge takes its finished form's states (`finished_form`)")
     state = slice_state(spec, out, *(jnp.transpose(array, (0, 2, 3, 1)) for array in (maximum, total)))
     if initial is not None:
         own = initial_state(spec, Partial(jnp.swapaxes(initial.acc, 1, 2), jnp.swapaxes(initial.m, 1, 2),
