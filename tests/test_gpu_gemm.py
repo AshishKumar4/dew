@@ -14,17 +14,18 @@ one process (`gpu_flow`), each cell its own file's property:
   path's, dense and grouped, each matrix layout, hook and dtype its served pairs name (gemm_matrix).
 - The fused GEMM's check-1 matrix (tests/kernel_matrix.py): a region's training step through the fuser's
   prologue and epilogue on par with the same region's stages in XLA (fused_gemm_matrix).
-- The joined gate and up projections' check-1 matrix (tests/kernel_matrix.py): a gated MLP's training step
-  with its projections run as one GEMM on par with the projections apart (gate_up_matrix).
+- The joined projections' check-1 matrix (tests/kernel_matrix.py): a gated MLP's gate and up projections, or a
+  gated delta net's b and a, run as one GEMM, the layer's training step on par with the projections apart
+  (join_matrix).
 """
 
 import functools
 
 import fused_gemm_matrix as fused_matrix
-import gate_up_matrix
 import gemm_matrix as matrix
 import jax
 import jax.numpy as jnp
+import join_matrix
 import numpy as np
 import pytest
 import test_gemm_blackwell as gemm_blackwell
@@ -148,8 +149,8 @@ def test_the_fused_gemm_matrix_holds_on_this_gpu():
     run_cells(cells_of(fused_matrix.a_fused_gemm_training_step_is_on_par))
 
 
-def test_the_gate_up_matrix_holds_on_this_gpu():
-    """The joined gate and up projections' check-1 matrix (tests/kernel_matrix.py): a gated MLP's training
-    step with its projections run as one GEMM on par with the projections apart at every pair of axis values
-    the join serves, each cell on its own GPU."""
-    run_cells(cells_of(gate_up_matrix.a_gated_mlps_training_step_is_on_par))
+def test_the_join_matrix_holds_on_this_gpu():
+    """The joined projections' check-1 matrix (tests/kernel_matrix.py): a layer's training step with two of
+    its projections run as one GEMM on par with the projections apart at every pair of axis values the join
+    serves, each cell on its own GPU."""
+    run_cells(cells_of(join_matrix.a_joined_layers_training_step_is_on_par))

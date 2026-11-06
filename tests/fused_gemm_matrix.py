@@ -7,9 +7,11 @@ consumers (a bias and a cast, or a SiLU and a residual). The forward and its rev
 output and the gradient of every differentiable input (`reference_error.with_gradients`, a drawn cotangent)
 held to the reference's (check 1), the same region with both stages and the product's launch forced to XLA
 (`generation.chosen(gemm_epilogue="xla", gemm_prologue="xla", grouped_matmul="xla")`), from the plain formula
-in float64. The cells run three `generation.CHOICES` entries: `gemm_epilogue` and `gemm_prologue`, each stage
-named `fused` where the case fuses it, so a stage the kernels cannot take raises rather than run XLA beside
-XLA, and `grouped_matmul`, the launch that runs the product, hooks and all, as its selector picks it.
+in float64. The cells run three `generation.CHOICES` entries: `gemm_epilogue` and `gemm_prologue`, the kernels
+under test, each stage named `fused` where the case fuses it, so a stage the kernels cannot take raises rather
+than run XLA beside XLA, and `grouped_matmul`, the launch that runs the product, hooks and all, as its
+selector picks it: it runs the template's launch there by design, the product the fused stages are launched
+in, so it is kept in the cells' `CHOICES` as a kernel under test, not named XLA.
 
 What the route serves is read from the fusion's own analysis (`fused_gemm.analysis`, `supported`): the region
 traced for its shapes as the case's generation, the stages named as the cell names them, each stage the case
@@ -35,9 +37,9 @@ SEEDS = 8
 REFERENCE = {"gemm_epilogue": "xla", "gemm_prologue": "xla", "grouped_matmul": "xla"}
 """The reference path's routes: both stages and the product's launch in XLA."""
 CHOICES = frozenset({"gemm_epilogue", "gemm_prologue", "grouped_matmul"})
-"""The `generation.CHOICES` entries the cells run (the module's docstring): each cell asserts that the routes
-it records lie in them and that it reaches the ones its case's region runs (`_reached`), which together are
-all."""
+"""The `generation.CHOICES` entries the cells run (the module's docstring): each cell asserts that its routes
+run the stages fused where the case fuses them (`_named`) and the product in a launch of the kernels', not
+XLA's, which together reach them all, and that no choice outside `CHOICES` is recorded."""
 
 
 def _wide(x):
@@ -162,12 +164,6 @@ def supported(case: dict[str, str]) -> bool:
     return found.refused is None and fused and found.launch is not None and found.launch.kernel != "xla"
 
 
-def _reached(case: dict[str, str]) -> frozenset[str]:
-    """The choices `case`'s region reports: its consumers' stage and its product's launch, and its producer's
-    stage where it has one."""
-    return frozenset({"gemm_epilogue", "grouped_matmul", *(["gemm_prologue"] if _produced(case) else [])})
-
-
 CASES = (
     ('sm90', 'epilogue', 'bias-cast', 'bfloat16'),
     ('sm90', 'prologue', 'silu-residual', 'float16'),
@@ -188,12 +184,15 @@ CASES = (
 def a_fused_gemm_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The fused region's training step of `case` on its GPU on par with the same region's stages in XLA
     (check 1): the output and the gradients of the rows, the matrices, the producer's weight and the
-    consumer's operand, from the plain formula in float64; the routes it records are within `CHOICES`, and
-    the ones its region runs among them (`_reached`)."""
+    consumer's operand, from the plain formula in float64; its routes run the stages the case fuses and the
+    product's launch in the kernels', nothing else (`CHOICES`)."""
     combination = dict(zip(AXES["fused_gemm"], case, strict=True))
     with generation.routes() as routes:
         assert_as_exact(jax.jit(with_gradients(_call(combination, _named(combination)))),
                         jax.jit(with_gradients(_call(combination, REFERENCE))), _drawn(combination),
                         "-".join(case), seeds=SEEDS, truth_fn=with_gradients(_plain(combination)))
-    recorded = {found.choice for found in routes}
-    assert _reached(combination) <= recorded <= CHOICES, (sorted(recorded), sorted(_reached(combination)))
+    recorded = {(found.choice, found.kernel) for found in routes}
+    fused = {(stage, "fused") for stage, kernel in _named(combination).items() if kernel == "fused"}
+    launched = any(choice == "grouped_matmul" and kernel != "xla" for choice, kernel in recorded)
+    assert fused <= recorded and launched, (sorted(recorded), sorted(fused))
+    assert {choice for choice, _ in recorded} <= CHOICES, sorted(recorded)
