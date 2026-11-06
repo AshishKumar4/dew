@@ -57,8 +57,8 @@ from dew.nn.kernels.chunked_launch import (
 )
 from dew.nn.kernels.fla_gdn import _dot, _weighted_values
 
-SUB = 16
-"""fla's BC: the sub-chunk the intra-chunk kernels build their 16 x 16 blocks over."""
+SUB = algebra.SUB
+"""fla's BC: the sub-chunk the intra-chunk kernels build their 16 x 16 blocks over, the algebra's own."""
 
 
 def _intra_rows_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, lo_ref, aqk_ref, akk_ref, *, chunk: int,

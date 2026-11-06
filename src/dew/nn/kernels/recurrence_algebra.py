@@ -645,7 +645,10 @@ def peeled_transition(key, w, u, grown, last, kept, token, *, delta: bool, issue
 # them as they are, so two mainloops at the same tiles compute the same values.
 
 SUB = 16
-"""Rows of a sub-chunk: the diagonal blocks the triangular inverse is built from (fla's BC)."""
+"""Rows of a sub-chunk: the diagonal blocks the triangular inverse is built from, the reduction contract's,
+not a tile's: fla's BC, whose substitution order the template's and the portable math's inverse take on every
+GPU and every family, so check 1 pairs their numbers with the port's and the mainloops with each other (a
+family's product rows set its tiles, not this: wgmma takes 64 rows, mma.sync 16)."""
 
 class Tile(Protocol):
     """A tile a mainloop holds in memory: an operand its products take as it is, transposed or read in
