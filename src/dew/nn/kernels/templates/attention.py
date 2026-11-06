@@ -36,8 +36,9 @@ import jax
 import jax.numpy as jnp
 
 from dew._hashing import fmix32
-from dew.nn.kernels import tuning
-from dew.nn.precision import at_least_fp32, float32_einsum
+from dew.nn.derivatives import Protected
+from dew.nn.kernels import generation, tuning
+from dew.nn.precision import at_least_fp32, compensated_sum, float32_einsum
 
 
 @jax.tree_util.register_dataclass
@@ -603,10 +604,25 @@ class Initial:
 
 def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
     """The `Initial` of one value-free logit a query head, `values` `[H]`, in fp32 or their own wider
-    dtype (`at_least_fp32`)."""
+    dtype (`at_least_fp32`), each head's gradient its rows' terms summed once rounded (`_spread_sinks`)."""
     wide = at_least_fp32(values.dtype)
-    m = jnp.broadcast_to(values.astype(wide)[None, :, None], (batch, values.shape[0], queries))
+    m = _spread_sinks((batch, values.shape[0], queries))(values.astype(wide))
     return Initial(m, jnp.ones_like(m), jnp.zeros((*m.shape, width), wide))
+
+
+@functools.cache
+def _spread_sinks(shape: tuple[int, int, int]) -> Callable:
+    """A head's sink, `[H]`, read by every batch row and query of `shape` `[B, H, Q]` (`sinks`),
+    differentiated at every order (`generation.linear_tangent`): reverse mode sums its rows' cotangents in
+    one compensated reduction, rounded once (`compensated_sum`), forward mode takes the broadcast's own
+    tangent. A sink's gradient sums a term a row, which XLA's float32 reduction left 1.4 times as far from
+    float64 as the sum rounded once, beside a reference whose sum YNNPACK's fusions take (row 4524)."""
+    def spread(values: jax.Array) -> jax.Array:
+        return jnp.broadcast_to(values[None, :, None], shape)
+
+    return generation.linear_tangent(lambda values: (spread(values), None),
+                                     lambda saved, operands, cotangent: (compensated_sum(cotangent, (0, 2)),),
+                                     spread, kind=Protected())
 
 
 @dataclasses.dataclass(frozen=True)
