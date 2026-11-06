@@ -650,7 +650,8 @@ def test_a_gpu_memory_read_where_no_device_states_its_peak_says_so_never_a_peak_
 def test_the_layout_parity_command_runs_its_main(tmp_path):
     """`python tools/layout_parity.py` runs the tool, which refuses `--prepare` with no `--references`
     directory to write, where a script whose entry point is gone exits 0 having checked nothing."""
-    command = [sys.executable, str(REPO_ROOT / "tools" / "layout_parity.py"), "--models", "jepa", "--prepare"]
+    command = [sys.executable, str(REPO_ROOT / "tools" / "layout_parity.py"), "--models", "jepa", "--seeds", "0",
+               "--prepare"]
     finished = subprocess.run(command, capture_output=True, text=True, timeout=600, cwd=tmp_path)
     # Its refusal is a SystemExit of its own, no traceback's error, and it wrote nothing.
     assert finished.returncode == 1 and not raised(finished) and not any(tmp_path.iterdir()), (
