@@ -729,7 +729,7 @@ def read_otherwise_at_10(saved: Mapping[str, object]) -> str | None:
     its files (`FILE_SHARDS`), so its shards' order, and the places a position names, are others."""
     order = record(saved.get("order", {}), "saved order")
     manifest = record(saved.get("manifest", {}), "saved data manifest")
-    if order.get("read") != "streamed" or not streams_parquet(manifest.get("source")):
+    if order.get("read") != "streamed" or not streams_parquet(json_value(manifest.get("source"), "source")):
         return None
     return ("version 9 streamed a Parquet store by its row groups, and version 10 by its files, so this "
             "position goes on only as 9 read it")
@@ -946,11 +946,13 @@ def streams_parquet(source: JSON) -> bool:
     """Whether `source`, a store's fingerprint as a plan records it (`Manifest.semantic`'s `source`), names
     a Parquet store at any depth (a selection's, a concatenation's part, a mixture's corpus): the stores
     whose streamed shards a plan version decides (`FILE_SHARDS`)."""
-    if isinstance(source, list):
-        return any(map(streams_parquet, source))
-    if not isinstance(source, Mapping):
-        return False
-    return source.get("store") == "parquet" or any(map(streams_parquet, source.values()))
+    match source:
+        case list():
+            return any(map(streams_parquet, source))
+        case dict():
+            return source.get("store") == "parquet" or any(map(streams_parquet, source.values()))
+        case _:
+            return False
 
 
 @dataclasses.dataclass(frozen=True)

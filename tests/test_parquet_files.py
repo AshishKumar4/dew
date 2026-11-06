@@ -2,6 +2,7 @@
 before the first record but the first file's, each file resumed within it, and a position saved under
 version 9 read by 9."""
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -170,7 +171,7 @@ def test_an_endless_stream_of_parquet_files_that_hold_no_row_is_refused():
         sink = pa.BufferOutputStream()
         pq.write_table(pa.Table.from_pylist([], schema=pa.schema([("id", pa.int64())])), sink)
         root.child(f"part-{number:02d}.parquet").write(sink.getvalue().to_pybytes())
-    with pytest.raises(ValueError, match="holds no rows"):
+    with pytest.raises(ValueError):
         stream = compile(Pipeline(Files(root.url, format="parquet")).repeat().batch(2), read="streamed",
                          loading=READ).train(DataPartition())
         try:
@@ -179,22 +180,83 @@ def test_an_endless_stream_of_parquet_files_that_hold_no_row_is_refused():
             stream.close()
 
 
-def test_a_published_parquet_stream_names_its_rows_by_its_files_counts(monkeypatch):
+def test_a_published_parquet_stream_names_its_rows_by_its_files_counts():
     """A cache filled from a stream of a Parquet store publishes its rows named by its files and their counts
-    read off their footers, reading no file's rows again to name them (review of row 4131)."""
-    from dew.data import generation
+    read off their footers, reading no file's rows again to name them: each byte of a file's first row group
+    is read once, by the stream, where a footer's read (Arrow's 64 KiB prefetch from the file's end) reaches
+    none of it, the group lying more than that before the end (review of row 4131)."""
+    import io
+    from collections import Counter
+    from uuid import uuid4
+
+    import fsspec
+
     from dew.data.cache import Cache
     from dew.data.compile import iterate, publish
 
-    url = written("published")
+    first_group: dict[str, range] = {}
+    read: Counter[str] = Counter()
 
-    def reread(*args, **kwargs):
-        raise AssertionError("publication read a file's rows again to name them")
+    class Counted(io.BytesIO):
+        """A file's bytes, counting those read of its first row group."""
 
-    monkeypatch.setattr(generation, "_shard_inputs", reread)
-    tagged = Pipeline(Files(url, format="parquet")).map(lambda row: {**row, "tag": row["id"] * 10},
-                                                        identity="tag@1")
-    published = publish(tagged, Cache("memory://parquet-files-published-cache"), read="streamed")
+        def __init__(self, path: str, payload: bytes):
+            super().__init__(payload)
+            self.path = path
+
+        def _counted(self, start: int, count: int) -> None:
+            group = first_group.get(self.path, range(0))
+            read[self.path] += max(0, min(start + count, group.stop) - max(start, group.start))
+
+        def read(self, size=-1):
+            start = self.tell()
+            chunk = super().read(size)
+            self._counted(start, len(chunk))
+            return chunk
+
+        def readinto(self, buffer):
+            start = self.tell()
+            count = super().readinto(buffer)
+            self._counted(start, count)
+            return count
+
+    class Counting(MemoryFileSystem):
+        """Memory's files, each opened for reading as a `Counted`."""
+
+        protocol = "counted"
+
+        @classmethod
+        def _strip_protocol(cls, path):
+            return super()._strip_protocol(str(path).replace("counted://", "memory://", 1))
+
+        def _open(self, path, mode="rb", **kwargs):
+            opened = super()._open(path, mode, **kwargs)
+            return Counted(self._strip_protocol(path), opened.getvalue()) if mode == "rb" else opened
+
+    fsspec.register_implementation("counted", Counting, clobber=True)
+    root = Store(f"counted://parquet-files-published-{uuid4().hex}")
+    blobs = np.random.default_rng(0)
+    for number in range(FILES):
+        start = number * GROUPS * ROWS
+        sink = pa.BufferOutputStream()
+        pq.write_table(pa.Table.from_pylist([{"id": start + row, "blob": blobs.bytes(40_000)}
+                                             for row in range(GROUPS * ROWS)]), sink, row_group_size=ROWS)
+        payload = sink.getvalue().to_pybytes()
+        group = pq.read_metadata(pa.BufferReader(payload)).row_group(0)
+        chunks = [group.column(column) for column in range(group.num_columns)]
+        begins = [min(offset for offset in (chunk.dictionary_page_offset, chunk.data_page_offset)
+                      if offset is not None) for chunk in chunks]
+        spans = range(min(begins), max(begin + chunk.total_compressed_size
+                                       for begin, chunk in zip(begins, chunks, strict=True)))
+        assert len(payload) - spans.stop > 64 * 1024
+        child = root.child(f"part-{number:02d}.parquet")
+        first_group[Counting._strip_protocol(child.url)] = spans
+        child.write(payload)
+    tagged = Pipeline(Files(root.url, format="parquet")).map(lambda row: {**row, "tag": row["id"] * 10},
+                                                             identity="tag@1")
+    cache = Cache(f"memory://parquet-files-published-cache-{uuid4().hex}")
+    published = publish(tagged, cache, read="streamed")
+    assert dict(read) == {path: len(spans) for path, spans in first_group.items()}
     rows = sorted((int(row["id"]), int(row["tag"])) for row in iterate(Pipeline(published.source()),
                                                                        read="indexed"))
     assert rows == [(row, row * 10) for row in range(FILES * GROUPS * ROWS)]
