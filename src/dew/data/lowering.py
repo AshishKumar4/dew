@@ -1932,7 +1932,6 @@ class _Build:
         elif isinstance(stage, Workers):
             # A column too small for a shared segment of its own crosses pickled (`SHARED_BYTES`).
             options = gx.DatasetOptions(min_shm_size=SHARED_BYTES)
-            # Each worker's position carries what its process's mirrors did (`WorkerMirrors`, row 4339).
             mirrored = WorkerMirrors(_as_iter(rows, self.loading))
             rows = gx.WithOptionsIterDataset(mirrored, options).mp_prefetch(
                 pygrain.MultiprocessingOptions(
