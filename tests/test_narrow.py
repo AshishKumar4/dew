@@ -438,8 +438,12 @@ def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads
     and under plain SGD the run lands on par with the parameters and losses of one without copies
     (check 1)."""
     free = 2 ** 39
-    monkeypatch.setattr(jax.Device, "memory_stats",
-                        lambda device: {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - free})
+
+    def stats(device):
+        # The float64 truth's wider arrays are planned in the whole memory: its plan is not the arms'.
+        held = 2 ** 39 if jax.config.read("jax_enable_x64") else free
+        return {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - held}
+    monkeypatch.setattr(jax.Device, "memory_stats", stats)
 
     def trained(*, copies, rows=8, longer=None, steps=0):
         return _trained(optax.sgd(0.5), copies=copies, steps=steps, accumulation=2, split=1, remat="full",
