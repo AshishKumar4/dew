@@ -27,7 +27,7 @@ from jax.core import ShapedArray, eval_jaxpr
 from jax.extend import core as jcore
 
 from dew._cache import ALGEBRA
-from dew.algebra import cost, extract, rules, terms
+from dew.algebra import cost, extract, fusion, rules, terms
 from dew.algebra.extract import Linear
 from dew.nn.derivatives import Algebra, KernelGlue, Surrogate, marked_call_p
 from dew.nn.kernels import generation
@@ -643,13 +643,16 @@ def _opens(equation: jcore.JaxprEqn) -> bool:
 
 def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcore.Jaxpr:
     """`closed`'s bodies rewritten in place (`_within`), then its own math (`_windowed`) with each Algebra
-    span's body opened into it (`_opened`), so a window reaches across the span's boundary; the program
-    with its spans kept as traced where no window's form lands (`closed` itself where no body changed
-    either)."""
+    span's body opened into it (`_opened`), so a window reaches across the span's boundary, then its
+    products fused with their consumers where the GEMM template takes them (`fusion.fused_program`); the
+    program with its spans kept as traced where no window's form lands (`closed` itself where nothing
+    changed)."""
     within = _within(closed, accurate, saturation)
     opened = _opened(within)
     made = _windowed(opened, accurate, saturation)
-    return within if made is opened else made
+    made = within if made is opened else made
+    # Each product and its consumers fused into the GEMM template's epilogue where it takes them.
+    return fusion.fused_program(made)
 
 
 def _opened(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
