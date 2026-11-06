@@ -76,7 +76,8 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     wide = generation.numerics().forms == 'accurate'
     config = _Config(scale, NATURAL or wide if natural is None else natural,
                      ACCURATE or wide if accurate is None else accurate,
-                     None if operand_dtype is None else jnp.dtype(operand_dtype).name)
+                     None if operand_dtype is None else jnp.dtype(operand_dtype).name,
+                     jax.config.jax_default_matmul_precision)
     return _attend(config, query, key, value, spans, hooks)
 
 
@@ -88,6 +89,10 @@ class _Config:
     natural: bool
     accurate: bool
     operand_dtype: str | None
+    precision: str | None
+    """The product precision configured at the call (`jax_default_matmul_precision`, a call's stated one
+    under `attention._attention_kernel`), which the products that state none read: the backward, traced
+    after the call's scope has closed, multiplies under it again."""
 
     def narrowed(self, query: jax.Array, key: jax.Array,
                  value: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -218,7 +223,8 @@ def _attend_backward(config: _Config, saved: tuple, dout: jax.Array) -> tuple:
     """The cotangents of the query, key, value and hooks, from the residuals, each in its primal's dtype;
     the spans take none."""
     query, key, value, spans, hooks, residuals = saved
-    grads = _backward(*config.narrowed(query, key, value), spans, hooks, dout, residuals, config)
+    with jax.default_matmul_precision(config.precision):
+        grads = _backward(*config.narrowed(query, key, value), spans, hooks, dout, residuals, config)
     return (grads.query.astype(query.dtype), grads.key.astype(key.dtype), grads.value.astype(value.dtype),
             None, _hooks_cotangent(hooks, grads))
 

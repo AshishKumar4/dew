@@ -332,15 +332,19 @@ def rounds_products() -> bool:
 
 def iteration_dtype() -> jnp.dtype:
     """The dtype an optimizer's matrix iteration (Muon's and M3's Newton-Schulz, `dew.newton_schulz`)
-    multiplies in under the run's numerics: its compute dtype in its fast forms (bfloat16 under
-    bf16-mixed, the measured default there: a Qwen3.5-4B decision step 844 ms against 1287 at TF32 and 4641
-    at IEEE float32 on an H100), at least float32 of it in its accurate ones; a float64 run iterates in
-    float64."""
+    multiplies in under the run's numerics: in its fast forms, bfloat16 for any 16-bit compute dtype (the
+    measured default under bf16-mixed: a Qwen3.5-4B decision step 844 ms against 1287 at TF32 and 4641 at
+    IEEE float32 on an H100) and its compute dtype otherwise; at least float32 of it in its accurate ones;
+    a float64 run iterates in float64. Never float16, whose range holds neither the iteration's Frobenius
+    norm past 256 nor optax's 1e-8 under it, which rounds to zero there, so a zero update (a zero-initialized
+    output projection's upstream matrices at the first step) divides zero by zero."""
     from dew.nn.kernels.generation import numerics
 
     held = numerics()
     compute = jnp.dtype(held.dtypes.compute)
-    return compute if held.forms == "fast" else jnp.promote_types(compute, jnp.float32)
+    if held.forms != "fast":
+        return jnp.promote_types(compute, jnp.float32)
+    return jnp.dtype(jnp.bfloat16) if compute.itemsize == 2 else compute
 
 
 def exact_products(precision: jax.lax.PrecisionLike, dtype: DTypeLike) -> bool:
