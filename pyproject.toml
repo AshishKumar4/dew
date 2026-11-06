@@ -12,6 +12,9 @@ authors = [
   { name="Ashish Kumar Singh", email="ashishkmr472@gmail.com" }
 ]
 dependencies = [
+    # Every requirement names its lower bound, and the package gate installs the
+    # wheel at those bounds and runs it (tools/smoke_wheel.py, uv's lowest-direct
+    # resolution), so a bound is never older than the code it runs (row 862).
     # flax.nnx imports on jax 0.12.0.1 from 0.12.10 on (jax.experimental.hijax's
     # HiPrim; qwix imports nnx); <0.13 so that a flax that changes linen or nnx
     # arrives through a bump the suite checks, as jax does below.
@@ -26,18 +29,19 @@ dependencies = [
     # checks docs/installation.md lists under "Bumping JAX" first: CI is
     # CPU-only.
     "jax>=0.12.0.1.post60,<0.12.1",
-    "optax>=0.2.2",
+    # optax.contrib.MuonDimensionNumbers, which dew.newton_schulz types, is 0.2.6's.
+    "optax>=0.2.6",
     "orbax-checkpoint>=0.12.4",
-    "numpy",
-    "pillow",
+    "numpy>=2.0",
+    "pillow>=10.1",
     # dew.data.images decodes, resizes and jitters every image record with it.
-    "opencv-python-headless",
-    "einops",
+    "opencv-python-headless>=4.9.0.80",
+    "einops>=0.8",
     # dew.nn.engram draws its bucket primes with sympy.nextprime.
-    "sympy",
+    "sympy>=1.12",
     # dew.nn.kv_cache's Hadamard rotation (scipy.linalg.hadamard) and dew.nn.mlp's
     # Gaussian cutoff (scipy.special.erfinv); jax already depends on scipy.
-    "scipy",
+    "scipy>=1.12",
     # dew.data.dataset's close budget holds grain's worker kill timeout
     # (GRAIN_KILL_SECONDS); 0.2.18 is the release that was tested.
     "grain>=0.2.18,<0.3",
@@ -45,12 +49,13 @@ dependencies = [
     # on rich, so this names a package every install has; 13 has the
     # progress columns the display uses.
     "rich>=13",
-    "tyro",
+    "tyro>=0.9",
     "typing_extensions>=4.14",
     "transformers>=5.16.1",
-    "jinja2",
-    "filelock",
-    "huggingface_hub",
+    "jinja2>=3.1",
+    "filelock>=3.13",
+    # dew.data.storage reads hf:// paths with parse_hf_uri, which 1.13 added.
+    "huggingface_hub>=1.13",
     "fsspec>=2026.6.0",
     # dew.data.sources.urls fetches HTTP(S) through fsspec's aiohttp session under aiohttp's total deadline.
     "aiohttp>=3.9",
@@ -62,7 +67,7 @@ dependencies = [
     # dew.nn.kernels.templates.report reads each Mosaic GPU kernel's binary from
     # the protobuf its executable serializes; grain and orbax-checkpoint already
     # depend on it.
-    "protobuf",
+    "protobuf>=5.26",
     # dew.nn.kernels.tuning: every Pallas launch is a tokamax Op, whose config
     # is measured per GPU model and shape. 0.0.13 and 0.0.14 pin
     # typeguard==2.13.3, which tyro excludes.
