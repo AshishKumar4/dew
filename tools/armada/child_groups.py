@@ -20,7 +20,7 @@ def _cleanup():
     """The module `dew._cleanup`: the process's own where it is loaded, else src/dew/_cleanup.py's file."""
     if "dew._cleanup" in sys.modules:
         return sys.modules["dew._cleanup"]
-    path = Path(__file__).resolve().parents[2] / "src" / "dew" / "cleanup.py"
+    path = Path(__file__).resolve().parents[2] / "src" / "dew" / "_cleanup.py"
     spec = importlib.util.spec_from_file_location("dew._cleanup", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
