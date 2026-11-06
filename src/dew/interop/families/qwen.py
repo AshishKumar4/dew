@@ -26,7 +26,9 @@ from dew.interop.decoder_parts import (
     Renames,
     Ropes,
     base_config,
+    decoder_tensors,
     dew_path,
+    hf_tensor_name,
     kind_mixers,
     kinds_of,
     native_layer_types,
@@ -399,6 +401,33 @@ QWEN3_NEXT = DecoderFamily(
     defaults={'max_position_embeddings': 32768},
 )
 
+def _qwen35_export(model: CausalTransformer) -> Mapping[str, object]:
+    """The `qwen3_5_text` fields of a model of this family the generic export writes none of: its delta
+    net's geometry (`LINEAR_FIELDS`, the layers' kinds going out as `layer_types`), its rotary's fraction,
+    which Qwen3_5TextConfig defaults to 0.25, and its prediction depth; a model whose layers hold more
+    than one delta net reads back as another and is refused (`refuse_lossy_export`)."""
+    delta = [mixer for mixer in (model.kind_of(kind).mixer for kind in dict.fromkeys(model.per_layer_types))
+             if isinstance(mixer, GatedDeltaNetMixer)]
+    return {**({name: getattr(delta[0], name) for name in LINEAR_FIELDS} if delta else {}),
+            'partial_rotary_factor': model.partial_rotary_factor or 1.0,
+            'mtp_num_hidden_layers': model.num_nextn_predict_layers}
+
+
+def _qwen35_name(dew_name: str, config: Mapping[str, object]) -> str | None:
+    """`_qwen35_path` backwards: a prediction layer's leaf under `mtp.` (`_QWEN_MTP_FIELDS`), its block's
+    under `mtp.layers.0.` as the trunk's layer 0's is named, any other's as `hf_tensor_name` names it."""
+    parts = dew_name.split('.')
+    if parts[0] != 'mtp_0':
+        return hf_tensor_name(dew_name, config)
+    own: dict[tuple[str, ...], str] = {path: name for name, path in _QWEN_MTP_FIELDS.items()}
+    if tuple(parts[1:]) in own:
+        return f'mtp.{own[tuple(parts[1:])]}'
+    if parts[1] != 'block':
+        raise ValueError(f"{dew_name!r} is not a Qwen3.5 prediction layer's parameter")
+    trunk = hf_tensor_name('.'.join(('layers_0', *parts[2:])), config)
+    return None if trunk is None else 'mtp.' + trunk.removeprefix('model.')
+
+
 QWEN3_5_MOE_TEXT = DecoderFamily(
     ('qwen3_5_moe_text',),
     _qwen35_moe_config,
@@ -422,8 +451,9 @@ QWEN3_5_TEXT = DecoderFamily(
     ),
     QWEN35,
     'Qwen3_5ForCausalLM',
-    lambda model: {},
-    weight_path=_qwen35_path, prediction_depth=qwen_mtp_depth,
+    _qwen35_export,
+    weight_path=_qwen35_path, prediction_depth=qwen_mtp_depth, export_weights=decoder_tensors,
+    export_path=_qwen35_name,
     preserve_source_layout=True,
     padding_idx=True,
     defaults={'max_position_embeddings': 32768},
