@@ -152,32 +152,41 @@ def draw(dtype, seed: int, *, rows: int, length: int, key_heads: int, value_head
     """A draw's operands from `seed`, its keys' and values' dimensions each permuted by an order the seed
     draws (an exact symmetry of every head's recurrence): unit queries and keys, normal values, a log decay a
     head in (-inf, 0) or a key dimension's in (`FLOOR`, 0) (Kimi delta attention's bounded gate), a write
-    gate in (0, 1), a memory entering; the queries, keys, values and write gate in `dtype`."""
-    keys = jax.random.split(jax.random.key(seed), 6)
+    gate in (0, 1), a memory entering; the queries, keys, values and write gate in `dtype`. Drawn in NumPy in
+    float64 and rounded once to fp32, the same bits on any host and jaxlib: drawn by JAX on the host CPU, a
+    GH200's and an A100 node's jaxlib drew the recorded sites' inputs apart from the recording's (their
+    digests differed, JS-DIGEST-sm90)."""
     rng = np.random.default_rng(seed)
     key_order, value_order = rng.permutation(key_width), rng.permutation(value_width)
+    normal = np.random.default_rng([seed, 1]).standard_normal
 
-    def unit(key):
-        x = jax.random.normal(key, (rows, length, key_heads, key_width))
-        return jnp.take(x / jnp.linalg.norm(x, axis=-1, keepdims=True), key_order, axis=-1)
+    def unit(shape):
+        x = normal(shape)
+        return (x / np.sqrt(np.sum(x * x, axis=-1, keepdims=True)))[..., key_order]
 
-    query, key = unit(keys[0]), unit(keys[1])
-    value = jax.random.normal(keys[2], (rows, length, value_heads, value_width))
-    decays = (rows, length, value_heads) + ((key_width,) if per_key else ())
-    log_decay = -jax.nn.softplus(jax.random.normal(keys[3], decays) - 1.0)
-    if per_key:
-        log_decay = FLOOR * jax.nn.sigmoid(jax.random.normal(keys[3], decays) - 1.0)
-        log_decay = jnp.take(log_decay, key_order, axis=-1)
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (rows, length, value_heads)))
-    state = 0.3 * jax.random.normal(keys[5], (rows, value_heads, key_width, value_width))
-    state = jnp.take(jnp.take(state, key_order, axis=2), value_order, axis=3)
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    query, key = unit((rows, length, key_heads, key_width)), unit((rows, length, key_heads, key_width))
+    value = normal((rows, length, value_heads, value_width))[..., value_order]
+    decays = normal((rows, length, value_heads) + ((key_width,) if per_key else ()))
+    log_decay = ((FLOOR * sigmoid(decays - 1.0))[..., key_order] if per_key
+                 else -np.logaddexp(0.0, decays - 1.0))
+    beta = sigmoid(normal((rows, length, value_heads)))
+    state = (0.3 * normal((rows, value_heads, key_width, value_width)))[:, :, key_order][..., value_order]
     starts = None
     if packed:
-        starts = jnp.zeros((rows, length), bool).at[0, jnp.array([0, 23, 40, 128, length - 10])].set(True)
+        starts = np.zeros((rows, length), bool)
+        starts[0, [0, 23, 40, 128, length - 10]] = True
         if rows > 1:
-            starts = starts.at[1, jnp.array([9, 64])].set(True)
-    return (Chunk(query.astype(dtype), key.astype(dtype), jnp.take(value, value_order, axis=-1).astype(dtype),
-                  log_decay=log_decay, beta=beta.astype(dtype), state=state, starts=starts),)
+            starts[1, [9, 64]] = True
+        starts = jnp.asarray(starts)
+
+    def taken(x, kind=jnp.float32):
+        return jnp.asarray(x.astype(np.float32)).astype(kind)
+
+    return (Chunk(taken(query, dtype), taken(key, dtype), taken(value, dtype), log_decay=taken(log_decay),
+                  beta=taken(beta, dtype), state=taken(state), starts=starts),)
 
 
 def template_call(given: Chunk, hooks: recurrence.Hooks):
