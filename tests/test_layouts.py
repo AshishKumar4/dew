@@ -11,6 +11,7 @@ import pytest
 from model_support import flat_tree
 
 from dew.interop import Pretrained, PretrainedDecoder, decoder_parts, hf_decoders
+from dew.interop.codecs import SIDECARS
 from dew.interop.decoder_families import ENTRIES
 from dew.interop.layouts import (
     ConfigField,
@@ -74,12 +75,24 @@ def test_every_tensor_a_family_reads_it_writes_back_under_a_name_it_reads_into_t
     from that leaf under a name its routes read back into it: a release's own spelling, or the one its
     family writes where it reads two (DeepSeek V4's beside transformers', a bare model's beside its LM's)."""
     config = json.loads((FIXTURES / name / "config.json").read_text())
-    family = hf_decoders.families()[config["model_type"]]
-    record = hf_decoders.translate_config(config)
     names = [tensor for weights in sorted((FIXTURES / name).glob("*.safetensors"))
              for tensor in header_specs(weights)]
     assert names
-    for stored in names:
+    if config["model_type"] == "diffusion_gemma":
+        # DiffusionGemma's denoiser holds its text decoder under its encoder and decoder, read by the text
+        # family's names as its loader takes them (`hf_decoders._denoiser_sources`).
+        from dew.interop.diffusion_gemma import text_config
+        from dew.interop.sources import load_shards
+
+        config = text_config(config)
+        names = list(hf_decoders._denoiser_sources(names, load_shards(FIXTURES / name).__getitem__,
+                                                   text_only=False)[0])
+    family = hf_decoders.families()[config["model_type"]]
+    record = hf_decoders.translate_config(config)
+    for named in names:
+        # A codec's sidecar (a weight's scales, its packed codes) is its weight's (`codecs.SIDECARS`).
+        sidecar = next((suffix for suffix in SIDECARS if named.endswith(suffix)), None)
+        stored = named if sidecar is None else named[:-len(sidecar)] + ".weight"
         packing = family.packing(stored)
         for part in ([stored] if packing is None
                      else [stored.removesuffix(packing.name) + piece for piece in packing.parts]):

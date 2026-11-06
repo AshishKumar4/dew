@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from dew import _records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
+    DECODER_ROUTES,
     DEEPSEEK_ROUTES,
     PLAIN_SPELLING,
     DecoderFamily,
@@ -27,6 +28,7 @@ from dew.interop.decoder_parts import (
     fixed_fields,
     kind_mixers,
     layer_depth,
+    layer_depth_routes,
     read_partial_rope,
     reads,
     record_float,
@@ -253,7 +255,8 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 GLM5_NEXT_ROUTES = Table(
-    DEEPSEEK_ROUTES,
+    # Its depths hold no copies of the trunk's embedding and head (`Glm5NextMTP`'s state dict).
+    layer_depth_routes(DECODER_ROUTES, copies=False),
     # transformers 5.16.1 ties the head only in the multimodal wrapper (modeling_glm5_next.py:2068), so a
     # reader of the text model alone takes it from its own tensor: a tied export writes it too.
     Copy(Route('lm_head.weight', 'params/embed_tokens/embedding', when=lambda config, slots: bool(
@@ -439,6 +442,7 @@ GLM_MOE_DSA = DecoderFamily(
     'GlmMoeDsaForCausalLM',
     routes=DEEPSEEK_ROUTES, prediction_depth=layer_depth,
     preserve_source_layout=True,
+    export_nulls=('q_lora_rank',),
     # The config class's norm epsilon.
     defaults={'max_position_embeddings': 202752, 'rms_norm_eps': 1e-5},
     padding_idx=True,
