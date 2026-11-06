@@ -22,7 +22,7 @@ import pytest
 from decision_support import decision_rows, drawn_weights
 from interop_support import allocated_bytes, written_tensors
 from PIL import Image
-from reference_error import as_given, assert_as_exact, indexed_recording, recording
+from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
 from reference_runs import assert_as_exact_as_recorded
 from safetensors.numpy import load_file
 
@@ -195,7 +195,7 @@ end, and the quickstart request with the backbone fixture's two images, the visi
 def recorded() -> tuple[Path, str, int]:
     """The recording the reference runs where Dew runs, its site and its seeds."""
     fixture, site = (FLA_FIXTURE, "joint-fla") if triton_runs() else (FIXTURE, SITE)
-    return fixture, site, int(recording(fixture)[f"{site}.seeds"])
+    return fixture, site, declared_seeds(fixture)[site]
 
 
 @functools.cache
