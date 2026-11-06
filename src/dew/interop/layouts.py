@@ -198,8 +198,15 @@ class Route:
         names = _PLACEHOLDER.findall(self.stored)
         if len(set(names)) != len(names):
             raise ValueError(f"{self.stored} holds a slot twice")
-        if self.leaf is not None and sorted(_PLACEHOLDER.findall(self.leaf)) != sorted(names):
-            raise ValueError(f"{self.stored} and {self.leaf} hold different slots")
+        if self.leaf is not None and not set(_PLACEHOLDER.findall(self.leaf)) <= set(names):
+            raise ValueError(f"{self.leaf} holds a slot {self.stored} does not")
+
+    @functools.cached_property
+    def _names_whole(self) -> bool:
+        """Whether the leaf holds every slot the name does, so a leaf names its tensor: a route whose
+        name holds more (a copy's index, `Copy`) reads, and writes only through what owns it."""
+        return self.leaf is not None and set(_PLACEHOLDER.findall(self.leaf)) == set(
+            _PLACEHOLDER.findall(self.stored))
 
     @functools.cached_property
     def _stored(self) -> re.Pattern[str]:
@@ -225,7 +232,7 @@ class Route:
         return Leaf(None if self.leaf is None else tuple(self.leaf.format(**held).split('/')))
 
     def write(self, path: Path, config: Config) -> str | None:
-        if self._leaf is None:
+        if self._leaf is None or not self._names_whole:
             return None
         match = self._leaf.fullmatch('/'.join(path))
         if match is None:
