@@ -520,11 +520,13 @@ def partial_rope(hf_config: Mapping[str, object], spelling: RopeSpelling | None,
 
 def plain_partial_rope(hf_config: Mapping[str, object], spelling: RopeSpelling | None, *,
                        default_factor: float | None, reference: str,
-                       layout: tuple[str, ...] = ()) -> tuple[float, float]:
-    """(rope_theta, partial_rotary_factor) of a config whose rotary is plain (`partial_rope`), with
-    `layout` the entry's fields that place the rotated pairs. A scaled type or any other field
-    refuses, naming `reference`'s rotary."""
-    theta, factor, rest = partial_rope(hf_config, spelling, default_factor=default_factor)
+                       layout: tuple[str, ...] = (), factor_field: str = 'partial_rotary_factor',
+                       theta_field: str = 'rope_theta') -> tuple[float, float]:
+    """(rope_theta, partial_rotary_factor) of a config whose rotary is plain (`partial_rope`, its flat
+    fields `factor_field` and `theta_field`), with `layout` the entry's fields that place the rotated
+    pairs. A scaled type or any other field refuses, naming `reference`'s rotary."""
+    theta, factor, rest = partial_rope(hf_config, spelling, default_factor=default_factor,
+                                       factor_field=factor_field, theta_field=theta_field)
     rope_type = rest.get('rope_type', rest.get('type', 'default'))
     if rope_type not in ('default', 'none'):
         refuse(f"rope_parameters (rope_type {rope_type!r})", f"{reference} is the plain rotary")
@@ -926,6 +928,29 @@ def inert(key: str, why: str, *, neutral: object = None) -> ConfigPart[CausalTra
     return ConfigPart(read, lambda model: {})
 
 
+def read_only(translate: Callable[[Mapping[str, object], set[str]], DecoderFields],
+              why: str) -> ConfigLayout[CausalTransformer]:
+    """The config of a family that is read and never written (`why`: a bundle read as its decoder, whose
+    model is written as the bundle): its whole record `translate`'s, any write of it refused."""
+    def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+        return translate(hf_config, used)
+
+    def write(model: CausalTransformer) -> Mapping[str, object]:
+        raise ExportRefused(why)
+    return ConfigLayout(ConfigPart(read, write))
+
+
+def expect(key: str, value: object, why: str) -> ConfigPart[CausalTransformer]:
+    """A key the family's reference computes only at `value` (its class's default where unstated),
+    refused at any other, saying `why`; written as nothing."""
+    def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+        used.add(key)
+        if hf_config.get(key, value) != value:
+            refuse(key, f'{why}; requires {value!r}')
+        return record
+    return ConfigPart(read, lambda model: {})
+
+
 @dataclass(frozen=True)
 class DecoderSpelling:
     """How a family's config class spells the decoder every family shares, both ways
@@ -948,6 +973,8 @@ class DecoderSpelling:
     """The key the class reads its activation under (Gemma 2's and later's `hidden_activation`)."""
     fixed: Mapping[str, object] = dataclasses.field(default_factory=lambda: MappingProxyType({}))
     """Shared geometry the class fixes and states nowhere (`Restated`)."""
+    defaults: Mapping[str, object] = dataclasses.field(default_factory=lambda: MappingProxyType({}))
+    """The shared geometry's defaults where the class's differ from the shared reader's (`Restated`)."""
     ramps: tuple[str, ...] | None = None
     tie_embeddings: bool = False
     qk_norm: bool = False
@@ -1081,6 +1108,27 @@ def partial_rope_part(spelling: RopeSpelling = PLAIN_SPELLING, *, default_factor
     return ConfigPart(read, write)
 
 
+def plain_rope_part(spelling: RopeSpelling | None = PLAIN_SPELLING, *, default_factor: float | None,
+                    reference: str, factor_field: str = 'partial_rotary_factor',
+                    theta_field: str = 'rope_theta', kind: str = 'default') -> ConfigPart[CausalTransformer]:
+    """A plain rotary turning a fraction of each head, both ways (`plain_partial_rope`): its base and
+    fraction under the family's flat fields (`theta_field`, `factor_field`; GPT-NeoX's `rotary_emb_base`
+    and `rotary_pct`) or its rope_parameters entry, the class's `default_factor` where unstated (None for
+    a class with none, whose config states it), the whole head none; written flat."""
+    def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+        used.update((theta_field, factor_field, 'rope_theta', 'rope_parameters', 'rope_scaling',
+                     'partial_rotary_factor'))
+        theta, factor = plain_partial_rope(hf_config, spelling, default_factor=default_factor,
+                                           reference=reference, factor_field=factor_field,
+                                           theta_field=theta_field)
+        record['rope_theta'] = theta
+        record['partial_rotary_factor'] = None if factor == 1 else factor
+        record['partial_rotary_type'] = kind
+        return record
+    return ConfigPart(read, lambda model: {theta_field: model.rope_theta,
+                                           factor_field: model.partial_rotary_factor or 1.0})
+
+
 def kind_mixer[Mixer](kind: str, name: str, mixer: type[Mixer], layout: ConfigLayout[Mixer], *,
                       fixed: Mapping[str, object] | None = None) -> ConfigPart[CausalTransformer]:
     """The mixer the layers of `kind` hold (a hybrid's delta net, SSD or lightning attention), its keys
@@ -1116,6 +1164,12 @@ def kinds_among(kinds: tuple[str, ...], why: str) -> ConfigPart[CausalTransforme
     return ConfigPart(read, lambda model: {})
 
 
+ROPE_APART: ConfigPart[CausalTransformer] = ConfigPart(lambda hf_config, used, record: record,
+                                                       lambda model: {})
+"""The shared decoder's rotary where its family reads and writes it in a part of its own (DeepSeek V4's two
+entries, a learned table in place of one)."""
+
+
 PLAIN_DECODER = DecoderSpelling()
 """The decoder as LlamaConfig's mixin spells it."""
 
@@ -1127,8 +1181,8 @@ def decoder_layout(spelling: DecoderSpelling = PLAIN_DECODER, *,
     `rope_part` where None: a family that reads its rotary otherwise, a partial one, declares its own),
     the biases and tying its class declares, and what its reference fixes."""
     reads = spelling.reads
-    geometry = (DECODER_FIELDS if not spelling.keys and not spelling.fixed
-                else Restated(DECODER_FIELDS, spelling.keys, spelling.fixed))
+    geometry = (DECODER_FIELDS if not spelling.keys and not spelling.fixed and not spelling.defaults
+                else Restated(DECODER_FIELDS, spelling.keys, spelling.fixed, spelling.defaults))
     return ConfigLayout(
         geometry, activation_part(spelling.activation), _layer_kinds(spelling),
         rope_part(spelling.rope, ramps=spelling.ramps) if rope is None else rope,

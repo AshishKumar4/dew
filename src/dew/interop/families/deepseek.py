@@ -26,34 +26,42 @@ from dew.interop.decoder_parts import (
     MOE_NAMES,
     NO_AUDIO,
     PLAIN_SPELLING,
+    ROPE_APART,
     SERIALIZED_ENCODER_FIELDS,
     SERIALIZED_TEXT_FIELDS,
+    TRAINING_ROUTER,
     DecoderFamily,
     DecoderFields,
+    DecoderSpelling,
     HyperConnectionsFields,
     KindFields,
     Leaves,
     MixtureFields,
     Ramp,
-    Ropes,
     RopeSpelling,
     WeightPreparer,
     WrapperFields,
-    base_config,
+    constant,
     declared_depths,
+    decoder_layout,
+    expect,
+    experts,
     in_trunk,
+    integer,
     layer_depth,
+    place_ropes,
     prediction_routes,
+    read_only,
     read_partial_rope,
-    read_rope,
-    reads,
     record_float,
     record_int,
     refuse,
     refuse_encoder_fields,
     refuse_export,
+    rope_part,
     spelled,
     translated,
+    written_ropes,
     yarn_record,
 )
 from dew.interop.layouts import (
@@ -68,6 +76,7 @@ from dew.interop.layouts import (
     Table,
     mapped,
     one_of,
+    unread,
 )
 from dew.interop.unread import Stored, held, valued
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -83,17 +92,43 @@ from dew.nn.vision.moonvit import translate_moonvit_config, translate_moonvit_pr
 _MINIMAX_M2_SPELLING = RopeSpelling(theta=5000000.0)
 
 
-def _minimax_m2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Read MiniMax-M2's projection norms, partial rotary and sigmoid MoE.
+def _minimax_rope(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+    """MiniMax-M2's partial rotary, read as its release states it: under rope_scaling, which transformers
+    reads as rope_parameters and MiniMaxM2RotaryEmbedding builds through its rope_type
+    (modeling_minimax_m2.py:150-165), over rotary_dim of each head (transformers 5.16.1 predates the
+    rotary_dim fix, issue 48241, PR 48486; 5.18.0 and the release rotate rotary_dim/head_dim of each
+    head)."""
+    head_dim = _records.integer(record['head_dim'], 'head_dim')
+    rotary_dim = _records.integer(hf_config.get('rotary_dim', head_dim), 'rotary_dim')
+    ropes, factor = read_partial_rope(hf_config, used, _MINIMAX_M2_SPELLING,
+                                      default_factor=rotary_dim / head_dim)
+    if 'rotary_dim' in hf_config and factor * head_dim != rotary_dim:
+        refuse('rotary_dim', 'it disagrees with partial_rotary_factor * head_dim')
+    if not 0 < factor <= 1 or int(head_dim * factor) % 2:
+        refuse('rotary_dim', 'partial rotary must rotate a positive even head slice')
+    used.add('rotary_dim')
+    place_ropes(record, ropes)
+    record.update(partial_rotary_factor=factor, partial_rotary_type='default')
+    return record
 
-    Transformers 5.16.1 predates the rotary_dim fix (issue 48241, PR 48486);
-    5.18.0 and the release rotate rotary_dim/head_dim of each head. The
-    selection-only bias and normalized sigmoid weights reuse DeepSeek's
-    router without groups, scaling or shared experts. MTP metadata is inert
-    because the released indexes ship no MTP weights; the weight path refuses
-    any MTP tensor instead of dropping a prediction block.
-    """
-    for name, expected, reason in (
+
+def _minimax_rope_written(model: CausalTransformer) -> Mapping[str, object]:
+    factor = model.partial_rotary_factor or 1.0
+    return {**written_ropes(model, _MINIMAX_M2_SPELLING), 'partial_rotary_factor': factor,
+            'rotary_dim': int(model.features_per_head * factor)}
+
+
+def _full_attention_everywhere(hf_config: Mapping[str, object], used: set[str], record: DecoderFields
+                               ) -> DecoderFields:
+    used.add('attn_type_list')
+    layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    if hf_config.get('attn_type_list', [1] * layers) != [1] * layers:
+        refuse('attn_type_list', 'MiniMax-M2 uses full attention in every layer')
+    return record
+
+
+MINIMAX_M2_CONFIG = ConfigLayout(
+    *(expect(name, expected, reason) for name, expected, reason in (
         ('use_qk_norm', True, 'MiniMax-M2 normalizes its query and key projections'),
         ('qk_norm_type', 'per_layer', 'MiniMax-M2 normalizes whole projections before splitting heads'),
         ('use_routing_bias', True, 'MiniMax-M2 selects experts with its balancing bias'),
@@ -102,41 +137,22 @@ def _minimax_m2_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
         ('router_jitter_noise', 0.0, 'training-time input jitter has no counterpart'),
         ('layernorm_full_attention_beta', 1.0, 'the full-attention norm has no extra multiplier'),
         ('layernorm_linear_attention_beta', 1.0, 'MiniMax-M2 has no linear-attention block'),
-        ('layernorm_mlp_beta', 1.0, 'the feed-forward norm has no extra multiplier'),
-    ):
-        used.add(name)
-        if hf_config.get(name, expected) != expected:
-            refuse(name, f'{reason}; requires {expected!r}')
-    used.add('attn_type_list')
-    layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
-    if hf_config.get('attn_type_list', [1] * layers) != [1] * layers:
-        refuse('attn_type_list', 'MiniMax-M2 uses full attention in every layer')
-    # These release fields are absent from the reference's config/modeling;
-    # none changes the forward pass or supplies weights in the released index.
-    used.update(('use_mtp', 'num_mtp_modules', 'mtp_transformer_layers',
-                 'mlp_intermediate_size', 'shared_moe_mode',
-                 'output_router_logits', 'router_aux_loss_coef'))
-    head_dim = _records.integer(hf_config.get('head_dim', 128), 'head_dim')
-    rotary_dim = _records.integer(hf_config.get('rotary_dim', head_dim), 'rotary_dim')
-    # The release states its rotary under rope_scaling, which transformers reads as rope_parameters
-    # and MiniMaxM2RotaryEmbedding builds through its rope_type (modeling_minimax_m2.py:150-165).
-    ropes, factor = read_partial_rope(hf_config, used, _MINIMAX_M2_SPELLING,
-                                      default_factor=rotary_dim / head_dim)
-    if 'rotary_dim' in hf_config and factor * head_dim != rotary_dim:
-        refuse('rotary_dim', 'it disagrees with partial_rotary_factor * head_dim')
-    if not 0 < factor <= 1 or int(head_dim * factor) % 2:
-        refuse('rotary_dim', 'partial rotary must rotate a positive even head slice')
-    used.add('rotary_dim')
-    config = base_config({**hf_config, 'head_dim': head_dim}, used, qk_norm=True,
-                          rope=ropes, reads=frozenset())
-    config.update(qk_norm_scope='projection', partial_rotary_factor=factor,
-                  partial_rotary_type='default')
-    config['mixture'] = native_fields(Mixture)(
-        experts=_records.integer(hf_config['num_local_experts'], 'num_local_experts'),
-        top_k=_records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok'),
-        score_function='sigmoid', bias=True)
-    used.update(('num_local_experts', 'num_experts_per_tok'))
-    return config
+        ('layernorm_mlp_beta', 1.0, 'the feed-forward norm has no extra multiplier'))),
+    ConfigPart(_full_attention_everywhere, lambda model: {}),
+    # These release fields are absent from the reference's config/modeling; none changes the forward pass
+    # or supplies weights in the released index, which ships no MTP weights: the weight path refuses any
+    # MTP tensor instead of dropping a prediction block.
+    unread('use_mtp', 'num_mtp_modules', 'mtp_transformer_layers', 'mlp_intermediate_size',
+           'shared_moe_mode'),
+    decoder_layout(DecoderSpelling(reads=frozenset(), qk_norm=True, defaults={'head_dim': 128}),
+                   rope=ConfigPart(_minimax_rope, _minimax_rope_written)),
+    constant('qk_norm_scope', value='projection'),
+    # The selection-only bias and normalized sigmoid weights reuse DeepSeek's router without groups,
+    # scaling or shared experts.
+    experts(integer('num_local_experts', 'experts'), integer('num_experts_per_tok', 'top_k'),
+            constant('score_function', value='sigmoid'), constant('bias', value=True)),
+    TRAINING_ROUTER)
+"""MiniMax-M2's config, both ways: projection norms, partial rotary and a sigmoid MoE."""
 
 
 # MiniMax's balancing bias, under either of its spellings, ahead of Mixtral's
@@ -293,28 +309,18 @@ def deepseek_layout(hf_config: Mapping[str, object], layers: int,
     )
 
 
-def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
-                     sparse: bool = False,
-                     mixture: Callable[[Mapping[str, object], int, set], MixtureFields]
-                     = deepseek_mixture) -> DecoderFields:
-    """Read a DeepSeek V2, V3 or V3.2 config into `CausalTransformer` fields.
+DEEPSEEK_DECODER = decoder_layout(rope=rope_part(PLAIN_SPELLING, ramps=('yarn', 'llama3'), per_kind=False))
+"""The shared decoder as DeepSeek V2's, V3's and V3.2's configs state it, both ways."""
 
-    `sparse` picks the V3.2 block, whose every layer is
-    deepseek_sparse_attention and whose `index` holds the lightning indexer's
-    geometry. `mixture` is the family's own MoE reader. The function builds
-    three things from the config: `layer_types`, one entry per layer; the MLA
-    `mixer` record; and the routed `mixture`.
-    """
-    ropes = read_rope(hf_config, used, PLAIN_SPELLING, ramps=('yarn', 'llama3'), per_kind=False)
-    config = base_config(hf_config, used, rope=ropes)
+
+def _read_mla(hf_config: Mapping[str, object], used: set[str], config: DecoderFields, *,
+              sparse: bool) -> DecoderFields:
+    """The MLA block of a DeepSeek V2, V3 or V3.2 config (`mla_export` writes it back): its layers
+    (`sparse` picks V3.2's, every layer deepseek_sparse_attention, its lightning indexer's geometry among
+    the mixer's) and the MLA `mixer` record."""
     layer_types = _records.strings(config.get('layer_types'), 'layer_types')
     model_type = hf_config['model_type']
     layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
-    # A schedule whose dense layers are all of them routes nothing, as the reference builds it, and the
-    # mixture's fields describe nothing it computes.
-    routed = deepseek_routed(hf_config, layers, used)
-    if not routed:
-        used.update((*LAYOUT_FIELDS, 'norm_topk_prob', 'topk_method', 'scoring_func'))
     sparse_name = ('deepseek_sparse_attention'
                    if sparse else 'full_attention')
     if hf_config.get('layer_types') is None:
@@ -392,9 +398,34 @@ def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
             'index_head_dim': (None if index is None
                                else index['index_head_dim']),
         }},
-        mixture=mixture(hf_config, layers, used) if routed else None,
     )
     return config
+
+
+def _read_experts(hf_config: Mapping[str, object], used: set[str], config: DecoderFields, *,
+                  mixture: Callable[[Mapping[str, object], int, set], MixtureFields]) -> DecoderFields:
+    """A DeepSeek MoE's routed experts (`mixture`, the family's own reader; `deepseek_moe_export` writes them
+    back): a schedule whose dense layers are all of them routes nothing, as the reference builds it, and
+    the mixture's fields then describe nothing it computes."""
+    layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    routed = deepseek_routed(hf_config, layers, used)
+    if not routed:
+        used.update((*LAYOUT_FIELDS, 'norm_topk_prob', 'topk_method', 'scoring_func'))
+    config['mixture'] = mixture(hf_config, layers, used) if routed else None
+    return config
+
+
+def deepseek_layout_of(*, sparse: bool = False,
+                       mixture: Callable[[Mapping[str, object], int, set], MixtureFields] = deepseek_mixture
+                       ) -> ConfigLayout[CausalTransformer]:
+    """A DeepSeek V2, V3 or V3.2 config, both ways: the shared decoder (`DEEPSEEK_DECODER`), the MLA block
+    and its prediction depths, and the routed experts (`mixture`, the family's reader)."""
+    return ConfigLayout(
+        DEEPSEEK_DECODER,
+        ConfigPart(partial(_read_mla, sparse=sparse),
+                   lambda model: {**mla_export(model),
+                                  'num_nextn_predict_layers': model.num_nextn_predict_layers}),
+        ConfigPart(partial(_read_experts, mixture=mixture), deepseek_moe_export))
 
 
 def deepseek_moe_export(model: CausalTransformer, *, scheduled: bool = True) -> Mapping[str, object]:
@@ -442,13 +473,6 @@ def mla_export(model: CausalTransformer) -> Mapping[str, object]:
             **({} if mixer.index_topk is None else {
                 'index_topk': mixer.index_topk, 'index_n_heads': mixer.index_n_heads,
                 'index_head_dim': mixer.index_head_dim})}
-
-
-def deepseek_export(model: CausalTransformer) -> Mapping[str, object]:
-    """`deepseek_config` backwards: the MLA block (`mla_export`), the routed experts (`deepseek_moe_export`)
-    and the prediction depths the release stores past the trunk."""
-    return {**mla_export(model), **deepseek_moe_export(model),
-            'num_nextn_predict_layers': model.num_nextn_predict_layers}
 
 
 # The text half of a Kimi K2.5 wrapper, by the model_type its text_config
@@ -874,8 +898,16 @@ def dspark_fields(text: Mapping[str, object], layers: int, ratios: Sequence[obje
             layer_type='sliding_attention', reads=reads)
 
 
-def _deepseek_v4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Read a DeepSeek-V4-Flash or V4-Pro config into `CausalTransformer` fields.
+def _v4_pattern(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+    """A DeepSeek V4 config's layers' kinds (`_v4_layer_types`), read before the shared decoder's."""
+    record['layer_types'] = _v4_layer_types(hf_config, record_int(hf_config, 'num_hidden_layers'), used)
+    return record
+
+
+def _deepseek_v4_config(hf_config: Mapping[str, object], used: set[str],
+                        config: DecoderFields) -> DecoderFields:
+    """Read a DeepSeek-V4-Flash or V4-Pro config's own fields beside the shared decoder's
+    (`DEEPSEEK_V4_CONFIG`).
 
     Every layer is mHC's stack of residual streams around one attention over a
     sliding window, with a low-rank query normed per head, one key/value head
@@ -915,14 +947,7 @@ def _deepseek_v4_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
         refuse(f"num_key_value_heads {kv_heads!r}",
                 "V4's attention projects one key/value head and broadcasts it "
                 "to every query head (modeling_deepseek_v4.py:749-751, :770)")
-    width = record_int(hf_config, 'moe_intermediate_size')
-    # V4 ships no dense feed-forward width and no key/value head count the
-    # attention reads: `intermediate_size` is an alias of the routed width
-    # (configuration_deepseek_v4.py:101-107) and the one shared head is the
-    # block's own.
-    config = base_config({**hf_config, 'intermediate_size': width,
-                           'num_key_value_heads': 1}, used,
-                          layer_types=layer_types, rope=Ropes(main_theta))
+    config['rope_theta'] = main_theta
     if config.get('attention_bias'):
         refuse("attention_bias=True",
                 "V4 builds every attention projection bias-free "
@@ -1218,7 +1243,7 @@ def v4_prepare(routes: Routes) -> WeightPreparer:
 
 MINIMAX_M2 = DecoderFamily(
     ('minimax_m2',),
-    ConfigLayout(ConfigPart(reads(_minimax_m2_config), lambda model: {})),
+    MINIMAX_M2_CONFIG,
     lambda fields: bool(fields.qk_norm and fields.qk_norm_scope == 'projection'
                         and fields.pre_norms and fields.mixture is not None),
     'minimax_m2',
@@ -1232,9 +1257,22 @@ MINIMAX_M2 = DecoderFamily(
 
 # V4's block is nothing another family builds: the mixer kind names its
 # window, its compressor and its grouped output projection at once.
+DEEPSEEK_V4_CONFIG = ConfigLayout(
+    ConfigPart(_v4_pattern, lambda model: {}),
+    # V4 ships no dense feed-forward width and no key/value head count the attention reads:
+    # `intermediate_size` is an alias of the routed width (configuration_deepseek_v4.py:101-107) and the
+    # one shared head is the block's own. Its two rotary entries are its own part's.
+    decoder_layout(DecoderSpelling(keys={'intermediate_size': 'moe_intermediate_size'},
+                                   fixed={'num_key_value_heads': 1}), rope=ROPE_APART),
+    # A V4 model is written as its release, whose config no exporter of Dew's states: it reads back
+    # refused (`refuse_lossy_export`).
+    ConfigPart(_deepseek_v4_config, lambda model: {}))
+"""DeepSeek V4's config: read beside the shared decoder; no V4 model is written."""
+
+
 DEEPSEEK_V4 = DecoderFamily(
     ('deepseek_v4',),
-    ConfigLayout(ConfigPart(reads(_deepseek_v4_config), lambda model: {})),
+    DEEPSEEK_V4_CONFIG,
     lambda fields: isinstance(fields.mixer, DeepseekV4Mixer),
     'deepseek_v4',
     'DeepseekV4ForCausalLM',
@@ -1248,7 +1286,7 @@ DEEPSEEK_V4 = DecoderFamily(
 
 DEEPSEEK_V32 = DecoderFamily(
     ('deepseek_v32',),
-    ConfigLayout(ConfigPart(reads(partial(deepseek_config, sparse=True)), deepseek_export)),
+    deepseek_layout_of(sparse=True),
     lambda fields: (isinstance(mixer := fields.mixer, MLAMixer) and mixer.index_topk is not None),
     'deepseek_v32',
     'DeepseekV32ForCausalLM',
@@ -1262,7 +1300,7 @@ DEEPSEEK_V32 = DecoderFamily(
 
 DEEPSEEK_V2 = DecoderFamily(
     ('deepseek_v2',),
-    ConfigLayout(ConfigPart(reads(partial(deepseek_config, mixture=_deepseek_v2_mixture)), deepseek_export)),
+    deepseek_layout_of(mixture=_deepseek_v2_mixture),
     lambda fields: (
         isinstance(fields.mixer, MLAMixer)
         and (mixture := fields.mixture) is not None
@@ -1289,7 +1327,7 @@ DEEPSEEK_V2 = DecoderFamily(
 # text_config (modeling_kimi_k25.py:586), and DeepSeek V3's reader reads it.
 KIMI_K25 = DecoderFamily(
     ('kimi_k25',),
-    ConfigLayout(ConfigPart(reads(_kimi_k25_config), lambda model: {})),
+    read_only(_kimi_k25_config, 'a Kimi K2.5 bundle is written whole, its decoder as Kimi K2'),
     lambda fields: False,
     'kimi_k25',
     'Kimi_K25ForConditionalGeneration',
@@ -1307,7 +1345,7 @@ KIMI_K25 = DecoderFamily(
 # exports as DeepSeek V3, the name `export_model_type` gives either source.
 DEEPSEEK_V3 = DecoderFamily(
     ('deepseek_v3', 'kimi_k2'),
-    ConfigLayout(ConfigPart(reads(deepseek_config), deepseek_export)),
+    deepseek_layout_of(),
     lambda fields: isinstance(fields.mixer, MLAMixer),
     'deepseek_v3',
     'DeepseekV3ForCausalLM',

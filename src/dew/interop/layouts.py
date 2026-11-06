@@ -560,10 +560,12 @@ class Restated[Model]:
     layout: ConfigLayout[Model]
     keys: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
     fixed: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
+    defaults: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
+    """Shared keys at the class's own default where the config states none."""
 
     def read(self, hf_config: Mapping[str, object], used: set[str],
              record: NativeFields[Model]) -> NativeFields[Model]:
-        view = dict(hf_config)
+        view = {**self.defaults, **hf_config}
         for shared, own in self.keys.items():
             if own in view:
                 view[shared] = view[own]
@@ -579,16 +581,35 @@ class Restated[Model]:
 
 
 @dataclass(frozen=True, eq=False)
+class Choice[Model]:
+    """One of two layouts a family's config takes, both ways: `routed` where the source config states it
+    (`reads`) and where the model holds it (`writes`), `plain` otherwise (LLaDA's dense release beside its
+    MoE one under one model_type)."""
+
+    reads: Callable[[Mapping[str, object]], bool]
+    writes: Callable[[Model], bool]
+    routed: ConfigLayout[Model]
+    plain: ConfigLayout[Model]
+
+    def read(self, hf_config: Mapping[str, object], used: set[str],
+             record: NativeFields[Model]) -> NativeFields[Model]:
+        return (self.routed if self.reads(hf_config) else self.plain).read(hf_config, used, record)
+
+    def write(self, model: Model) -> Mapping[str, object]:
+        return (self.routed if self.writes(model) else self.plain).write(model)
+
+
+@dataclass(frozen=True, eq=False)
 class ConfigLayout[Model]:
     """A family's config, its parts in order (`ConfigPart`, `ConfigField`, or another layout): read, each
     filling the record (`read`), and written, each stating its keys (`write`, a later part's keys over an
     earlier's)."""
 
     parts: tuple[ConfigPart[Model] | ConfigField[Model] | ConfigLayout[Model] | Nested[Model, object]
-                 | Restated[Model], ...]
+                 | Restated[Model] | Choice[Model], ...]
 
     def __init__(self, *parts: ConfigPart[Model] | ConfigField[Model] | ConfigLayout[Model]
-                 | Nested[Model, object] | Restated[Model]) -> None:
+                 | Nested[Model, object] | Restated[Model] | Choice[Model]) -> None:
         object.__setattr__(self, 'parts', parts)
 
     def read(self, hf_config: Mapping[str, object], used: set[str],
@@ -718,8 +739,8 @@ def _decoder_layout(decoder: object) -> Mapping[str, object] | Unwritable:
     return written
 
 
-__all__ = ["INDEX", "REQUIRED", "Condition", "Config", "ConfigField", "ConfigLayout", "ConfigPart",
-           "ConfigRead", "ConfigWrite", "Copy", "Leaf", "Nested", "Path", "Prefixed", "Rebased", "Renames",
-           "Restated", "Route", "Routes", "Slot", "SourceLayout", "Spelled", "Table", "Unwritable",
-           "Unwritten", "When", "after", "constant", "mapped", "nested", "one_of", "renamed",
+__all__ = ["INDEX", "REQUIRED", "Choice", "Condition", "Config", "ConfigField", "ConfigLayout",
+           "ConfigPart", "ConfigRead", "ConfigWrite", "Copy", "Leaf", "Nested", "Path", "Prefixed",
+           "Rebased", "Renames", "Restated", "Route", "Routes", "Slot", "SourceLayout", "Spelled", "Table",
+           "Unwritable", "Unwritten", "When", "after", "constant", "mapped", "nested", "one_of", "renamed",
            "source_layout", "unread"]
