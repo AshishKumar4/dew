@@ -102,7 +102,8 @@ class GatedShortConv(nn.Module):
             if not allocated:
                 # The allocation-only call (`open_kv_cache`'s dummy token) consumes nothing.
                 return self.out_proj(jnp.zeros_like(mixed))
-        tree = call_tree(call.metadata)
+        given = call.metadata  # A tree call's parents, and its attention's runs and places beside them.
+        tree = None if given is None else call_tree(given.tree_parents, given.key_runs, given.key_positions)
         if tree is not None:
             # Each token over its path, from the held history; the cache left as it was for the replay.
             if held is None:

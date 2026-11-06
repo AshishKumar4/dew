@@ -215,13 +215,14 @@ class KimiDeltaAttention(nn.Module):
         ported = S > 1 and kernel_routed(rows, keys, values, g, beta, floor=self.lower_bound, write_bound=1.0)
         heads = ((self.qkv_features, self.head_dim),) * 2 + ((self.qkv_features, None),)
         shards = sequence_shards()
-        tree = call_tree(attention_metadata)
+        given = attention_metadata  # A tree call's parents, and its attention's runs and places beside them.
+        tree = None if given is None else call_tree(given.tree_parents, given.key_runs, given.key_positions)
         if tree is not None:
-            def rule(convolved, g, beta, held):
+            def along(convolved, g, beta, held):
                 query, key, value = (part.reshape(B, 1, self.num_heads, self.head_dim) for part in convolved)
                 return decode_delta_rule(query, key, value, g, beta, held)
 
-            out = tree_scan(self, projected, taps, None, tree, rule, (g, beta), state='recurrent_state',
+            out = tree_scan(self, projected, taps, None, tree, along, (g, beta), state='recurrent_state',
                             state_dtype=wide, parts=heads, dtype=wide)
         elif shards > 1:
             if decode:

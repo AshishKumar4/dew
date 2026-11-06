@@ -414,17 +414,15 @@ def tree_conv(mixed, taps, bias, history, tree: tuple[int, ...], *, parts=None, 
     return tuple(piece[:, -1].reshape(batch, length, -1) for piece in convolved)
 
 
-def call_tree(metadata) -> tuple[int, ...] | None:
-    """A recurrent mixer's call's tree (`dew.nn.inputs.AttentionMetadata.tree_parents`), None for none: its
-    key runs and key positions are the tree's attention mask and the places a windowed attention layer
-    windows it over, which a recurrence following the parents has no use for; either without a tree is
-    refused, which it would run as if unset."""
-    tree = None if metadata is None else metadata.tree_parents
-    if tree is None and metadata is not None and (metadata.key_runs is not None
-                                                  or metadata.key_positions is not None):
+def call_tree(parents: tuple[int, ...] | None, key_runs, key_positions) -> tuple[int, ...] | None:
+    """A recurrent mixer's call's tree (`dew.nn.inputs.AttentionMetadata.tree_parents`), None for none: the
+    call's key runs and key positions are the tree's attention mask and the places a windowed attention
+    layer windows it over, which a recurrence following the parents has no use for; either without a
+    tree is refused, which it would run as if unset."""
+    if parents is None and (key_runs is not None or key_positions is not None):
         raise ValueError("a recurrent mixer reads key runs and key positions only beside a tree call's "
                          "tree, and would run them as if unset")
-    return tree
+    return parents
 
 
 def tree_scan(module: nn.Module, mixed, taps, bias, tree: tuple[int, ...], rule,
@@ -439,7 +437,7 @@ def tree_scan(module: nn.Module, mixed, taps, bias, tree: tuple[int, ...], rule,
     held = module.get_variable('cache', state)
     convolved = tree_conv(mixed, taps, bias, module.get_variable('cache', 'conv_state'), tree, parts=parts,
                           dtype=dtype)
-    pieces = tuple(convolved) if parts is not None else (convolved,)
+    pieces = convolved if isinstance(convolved, tuple) else (convolved,)
     count = len(pieces)
 
     def step(*operands):
@@ -1041,7 +1039,8 @@ class GatedDeltaNet(nn.Module):
         key_dim = self.key_features
         operand = mixed.dtype
         token, stepped = None, False
-        tree = call_tree(attention_metadata)
+        given = attention_metadata  # A tree call's parents, and its attention's runs and places beside them.
+        tree = None if given is None else call_tree(given.tree_parents, given.key_runs, given.key_positions)
         # A one-token tree takes the tree's path (`_tree`), whose output the common norm reads.
         if decode and S == 1 and tree is None:
             kernel = self._decode_kernel(x, operand)

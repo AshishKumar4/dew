@@ -202,7 +202,8 @@ class Mamba(nn.Module):
         # casts them, or in the model's own dtype where it is wider.
         wide = at_least_fp32(mixed.dtype)
         taps, bias = self.conv1d()
-        tree = call_tree(attention_metadata)
+        given = attention_metadata  # A tree call's parents, and its attention's runs and places beside them.
+        tree = None if given is None else call_tree(given.tree_parents, given.key_runs, given.key_positions)
         if tree is not None:
             def rule(convolved, held):
                 return self._scan(convolved, starts=None, valid=None, held=held)

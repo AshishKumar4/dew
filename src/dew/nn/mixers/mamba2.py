@@ -371,7 +371,8 @@ class Mamba2(nn.Module):
             state_size=self.state_size, chunk_size=self.chunk_size,
             time_step_limit=self.time_step_limit)
         shards = sequence_shards()
-        tree = call_tree(attention_metadata)
+        given = attention_metadata  # A tree call's parents, and its attention's runs and places beside them.
+        tree = None if given is None else call_tree(given.tree_parents, given.key_runs, given.key_positions)
         if tree is not None:
             def rule(convolved, step, held):
                 return scan(convolved, dt=step, heads=heads, held=held)
