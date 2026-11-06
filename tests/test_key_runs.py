@@ -117,10 +117,9 @@ PROMPT, CALL = 6, 4
 """A cached call of four tokens after a prompt of six."""
 
 
-@pytest.mark.parametrize("kinds, chunk", [({"full_attention": {}}, None),
-                                          ({"sliding_attention": {"window": 2}}, None),
-                                          ({"full_attention": {}}, 3)], ids=["full", "window", "chunk"])
-def test_a_cached_call_reads_its_runs_and_its_keys_validity_as_the_mask_they_mean(kinds, chunk):
+@pytest.mark.parametrize("kinds", [{"full_attention": {}}, {"sliding_attention": {"window": 2}},
+                                   {"chunked_attention": {"chunk": 3}}], ids=["full", "window", "chunk"])
+def test_a_cached_call_reads_its_runs_and_its_keys_validity_as_the_mask_they_mean(kinds):
     """A cached call's key runs, the prompt's keys in the cache and the call's own, whose key positions
     restart between the two runs, beside its keys' validity with a gap inside each run, computes what it
     computes under the mask the runs and the validity mean, as a pairwise mask beside that validity does,
@@ -133,7 +132,7 @@ def test_a_cached_call_reads_its_runs_and_its_keys_validity_as_the_mask_they_mea
 
     from dew.nn.kernels import generation
 
-    decoder = model(**kinds).clone(attention_chunk=chunk)
+    decoder = model(**kinds)
     rows, slots = 2, TINY_DECODER["max_seq_len"]
     prompt = jax.random.randint(jax.random.key(0), (rows, PROMPT), 0, VOCAB)
     block = jax.random.randint(jax.random.key(2), (rows, CALL), 0, VOCAB)
@@ -164,7 +163,7 @@ def test_a_cached_call_reads_its_runs_and_its_keys_validity_as_the_mask_they_mea
     np.testing.assert_array_equal(np.asarray(paired), np.asarray(masked))
     with pytest.raises(ValueError):
         read(decoder, attention_key_valid=jnp.asarray(valid))
-    if chunk is not None:
+    if "chunked_attention" in kinds:
         return
     template = decoder.clone(dtype=jnp.bfloat16, attention_impl="template")
     with generation.assumed("sm80"):
