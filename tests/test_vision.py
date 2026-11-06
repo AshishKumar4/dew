@@ -30,7 +30,9 @@ Tolerances and the differences actually observed, fp32 on CPU:
 """
 
 import dataclasses
+import fractions
 import json
+import math
 from pathlib import Path
 
 import jax
@@ -477,26 +479,87 @@ def test_a_moonvit_pools_frames_finitely_beside_a_padded_item():
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(gradient))
 
 
-@pytest.mark.parametrize("dtype", ["float32", "float64"])
+def exact_bicubic_weights(size_in: int, size_out: int, antialias: bool
+                          ) -> tuple[list[list[fractions.Fraction]], list[fractions.Fraction]]:
+    """The `[size_out][size_in]` weights of torch's bicubic resize along one axis (`align_corners=False`),
+    exactly, and each row's total before its normalization: without antialiasing the cubic of a = -3/4
+    on the four taps about each half-pixel source position, clamped at the border (each total 1); with
+    it the cubic of a = -1/2 over the support widened by the shrink, normalized
+    (`dew.nn.blocks.torch_bicubic_resize`, torch's upsample_bicubic2d)."""
+    scale = fractions.Fraction(size_in, size_out)
+    weights = [[fractions.Fraction(0)] * size_in for _ in range(size_out)]
+    totals = [fractions.Fraction(1)] * size_out
+    for row in range(size_out):
+        if antialias:
+            stretch, center = max(scale, 1), scale * (row + fractions.Fraction(1, 2))
+            low = max(math.floor(center - 2 * stretch + fractions.Fraction(1, 2)), 0)
+            high = min(math.floor(center + 2 * stretch + fractions.Fraction(1, 2)), size_in)
+            taps = {}
+            for tap in range(low, high):
+                x = abs((tap - center + fractions.Fraction(1, 2)) / stretch)
+                half = fractions.Fraction(1, 2)
+                taps[tap] = ((3 * half * x - 5 * half) * x * x + 1 if x < 1 else
+                             ((-x * half + 5 * half) * x - 4) * x + 2 if x < 2 else 0)
+            totals[row] = sum(taps.values())
+            for tap, weight in taps.items():
+                weights[row][tap] = weight / totals[row]
+            continue
+        a = fractions.Fraction(-3, 4)
+        source = scale * (row + fractions.Fraction(1, 2)) - fractions.Fraction(1, 2)
+        index = math.floor(source)
+        t = source - index
+        for tap, x in zip(range(index - 1, index + 3), (t + 1, t, 1 - t, 2 - t), strict=True):
+            near = ((a + 2) * x - (a + 3)) * x * x + 1
+            far = ((a * x - 5 * a) * x + 8 * a) * x - 4 * a
+            weights[row][min(max(tap, 0), size_in - 1)] += near if x <= 1 else far
+    return weights, totals
+
+
 @pytest.mark.parametrize("antialias", [False, True], ids=["plain", "antialiased"])
-def test_a_bicubic_resize_weighs_each_pixel_as_torch_does_in_its_inputs_dtype(dtype, antialias):
-    """A bicubic resize (`torch_bicubic_resize`, a vision tower's position table, REPA's and RAE's
-    preprocessing) weighs each source pixel as torch's `F.interpolate(mode="bicubic")` does, in the
-    dtype its input computes in, float64's for a float64 input: each unit image of seven rows (three
-    columns wide, which a resize to three columns weighs by one) resized to five and to eleven rows is
-    torch's same resize, bit for bit, its one nonzero row reading out that row's weight in each output
-    row, where float32 weights left a float64 resize rounded at 1e-8."""
-    import torch
+@pytest.mark.parametrize("size_out", [5, 11], ids=["shrinking", "growing"])
+def test_a_float64_bicubic_resize_weighs_each_pixel_in_float64(antialias, size_out):
+    """A float64 bicubic resize (`torch_bicubic_resize`, REPA's and RAE's preprocessing, a vision tower's
+    position table) weighs each source pixel in float64, as torch's resize of a float64 input does: each
+    unit image of seven rows (three columns wide, which a resize to three columns weighs by one, exactly)
+    resized to five or eleven rows reads out every weight of its row, each within the bound float64's
+    own roundings of its arithmetic leave of its exact value (`exact_bicubic_weights`). Weights built in
+    float32 sit near 1e-8 from it, some hundred thousand times the bound."""
+    from op_certificates import Format, gamma
 
     from dew.nn.blocks import torch_bicubic_resize
 
-    for size_out in (5, 11):
-        units = np.eye(7)[:, :, None, None].repeat(3, axis=2)
-        with jax.enable_x64(new_val=True):
-            ours = np.asarray(torch_bicubic_resize(jnp.asarray(units, dtype), size_out, 3,
-                                                   antialias=antialias))
-        theirs = torch.nn.functional.interpolate(
-            torch.tensor(units.transpose(0, 3, 1, 2), dtype=getattr(torch, dtype)), size=(size_out, 3),
-            mode="bicubic", align_corners=False, antialias=antialias).numpy().transpose(0, 2, 3, 1)
-        assert ours.dtype == theirs.dtype
-        np.testing.assert_array_equal(ours, theirs, err_msg=f"7 to {size_out}")
+    float64 = Format("float64", 53, -1022, 1023)
+
+    def rounded(terms: int) -> float:
+        return gamma(terms, float64)
+
+    size_in = 7
+    exact, totals = exact_bicubic_weights(size_in, size_out, antialias)
+    units = np.eye(size_in)[:, :, None, None].repeat(3, axis=2)
+    with jax.enable_x64(new_val=True):
+        ours = np.asarray(torch_bicubic_resize(jnp.asarray(units), size_out, 3, antialias=antialias))
+    assert ours.dtype == np.float64
+    if antialias:
+        # The center scale * (i + 1/2) rounded twice; each tap's argument (j - center + 1/2) / stretch
+        # three times more over terms at most 2 * size_in + 1, and by stretch's own rounding over an
+        # argument at most 3; the cubic of a = -1/2 Lipschitz 25/18 on [0, 2] and its Horner form's six
+        # roundings over terms at most 24; the total of at most `taps` of them, each at most 1, and the
+        # division by it.
+        taps = math.ceil(4 * max(size_in / size_out, 1)) + 2
+        argument = rounded(2) * size_in + rounded(3) * (2 * size_in + 1) + rounded(2) * 3
+        cubic = 25 / 18 * argument + rounded(6) * 24
+        total = float(min(totals))
+        drift = taps * cubic + rounded(taps) * taps
+        bound = (cubic + drift / total) / (total - drift) + rounded(1) / total
+    else:
+        # The source scale * (i + 1/2) - 1/2 rounded three times over terms at most size_in + 1, each tap's
+        # argument once more (at most 2); the cubic of a = -3/4 Lipschitz 27/20 on [0, 2] and its Horner
+        # form's six roundings over terms at most 36; a border entry the sum of up to four taps, their
+        # weights' magnitudes at most 2.
+        argument = rounded(3) * (size_in + 1) + rounded(1) * 2
+        bound = 4 * (27 / 20 * argument + rounded(6) * 36) + rounded(3) * 2
+    for pixel in range(size_in):
+        for row in range(size_out):
+            for column in range(3):
+                difference = abs(fractions.Fraction(float(ours[pixel, row, column, 0])) - exact[row][pixel])
+                assert difference <= bound, (pixel, row, float(difference), bound)
