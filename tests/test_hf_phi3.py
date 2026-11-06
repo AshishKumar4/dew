@@ -242,6 +242,36 @@ def test_phi3_dense_server_and_generate_share_the_per_row_crossing_rebuild():
         np.testing.assert_array_equal(served.lengths, alone.lengths)
 
 
+def test_a_banked_phi3_server_rebuilds_each_crossing_rows_cache_on_its_own_rows():
+    """Phi-3 scanning its layers over a banked store (`HeldBanks.place`), whose decode cache is banked as
+    its weights, the layers first: three rows of a dense server over its two layers cross the LongRoPE
+    switch at different steps, each rebuilding its own rows of every layer's cache, its rows past the
+    layers (`dew.nn.kv_cache.row_axis`), and each draws what its lone call over the same store draws."""
+    import jax
+
+    from dew.inference import TextGeneration
+    from dew.inference.banks import HeldBanks
+    from dew.inference.serving import Server
+    from dew.sampling import Sampling
+    from dew.training import MeshSpec
+
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=64,
+                             scan_layers=True)
+    banked = HeldBanks(loaded.variables).place(loaded.model, mesh=MeshSpec().build(jax.devices()[:1]))
+    task = TextGeneration(loaded.model, banked, sampling=Sampling(temperature=0, eos_token_ids=None))
+    ids = np.load(DIRECTORY / 'input_ids.npy').astype(np.int32)
+    prompts = (ids[0, :4], ids[1, :2], ids[0, :6])
+    server = Server.from_task(task, slots=3, capacity=64, admission=3)
+    tickets = [server.submit(prompt, 8, key=index) for index, prompt in enumerate(prompts)]
+    server.run()
+    assert 'layers_0_1' in server.cache
+    for index, (ticket, prompt) in enumerate(zip(tickets, prompts, strict=True)):
+        served = ticket.result().host()
+        alone = task(prompt[None], 8, key=index).host()
+        np.testing.assert_array_equal(served.tokens, alone.tokens)
+        np.testing.assert_array_equal(served.lengths, alone.lengths)
+
+
 def test_a_fused_projection_and_its_part_stored_apart_must_agree(tmp_path):
     """Phi-3 fuses gate and up as gate_up_proj, so a checkpoint that also
     stores the gate under its own name holds that part twice. An equal copy

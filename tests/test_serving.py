@@ -1503,18 +1503,19 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode
         assert_same_generation(ticket.result(), row)
 
 
-def banked_task(sampling: Sampling) -> TextGeneration:
+def banked_task(sampling: Sampling, *, layers: int = 4, devices: int = 1) -> TextGeneration:
     """A scanned MoE decoder's task over a banked store (`dew.inference.banks.HeldBanks.place`, the run's
-    weights one array a leaf, `layers_0_3`), on one device, as the task's lone calls run: a mesh over the
-    suite's devices splits the slots."""
+    `layers` weights one array a leaf, `layers_0_3`), on one device, as the task's lone calls run (a mesh
+    over the suite's devices splits the slots), or on a mesh of the last `devices` rows' devices."""
     def routed(*, scanned: bool) -> CausalTransformer:
-        return CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=4, num_heads=2, head_dim=8,
-                                 mlp_features=32, max_seq_len=128, dtype="float32", scan_layers=scanned,
-                                 mixture=Mixture(experts=4, top_k=2))
+        return CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=layers, num_heads=2,
+                                 head_dim=8, mlp_features=32, max_seq_len=128, dtype="float32",
+                                 scan_layers=scanned, mixture=Mixture(experts=4, top_k=2))
 
     scanned = routed(scanned=True)
     weights = routed(scanned=False).init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
-    banked = HeldBanks(weights).place(scanned, mesh=MeshSpec().build([jax.devices()[0]]))
+    mesh = MeshSpec(fsdp=devices).build(jax.devices()[-devices:] if devices > 1 else jax.devices()[:1])
+    banked = HeldBanks(weights).place(scanned, mesh=mesh)
     return TextGeneration(scanned, banked, RunProcessor(Digits()), sampling=sampling)
 
 
@@ -1533,6 +1534,41 @@ def test_a_server_over_a_banked_store_keeps_its_cache_banked_and_draws_what_the_
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), row)
 
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_banked_server_over_row_groups_seats_its_paged_prompts_in_every_layer_of_their_rows():
+    """A banked server whose slots split into two row groups, paged, prefills its prompts in a forward of
+    their own (`mixed_refusal`): each piece's page table and cursor land in its row of every layer of the
+    run's bank, its rows past the layers (`dew.nn.kv_cache.row_axis`), and each row draws what the task
+    over the one-device store draws alone."""
+    sampling = Sampling(temperature=0, eos_token_ids=EOS)
+    lone = banked_task(sampling)
+    alone = [lone(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    server, tickets = served_alongside(banked_task(sampling, devices=2),
+                                       kv_cache=KVCache(page_size=16, pages=12))
+    assert server.groups == 2 and server.mixed_refusal is not None and "layers_0_3" in server.cache
+    for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), row)
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_banked_server_that_prefills_on_a_mesh_of_its_own_moves_its_rows_past_the_banks_layers():
+    """A banked server that prefills on a mesh of its own, its bank three layers deep, which the decoding
+    mesh's two row groups do not divide: the prefilled rows move onto the decoding rows on their own axis
+    past the bank's layers (`dew.inference.serving_kernel.prefilled_shardings`), not split on the layers,
+    and every request draws what the task over the one-device store draws alone."""
+    sampling = Sampling(temperature=0, eos_token_ids=EOS)
+    lone = banked_task(sampling, layers=3)
+    alone = [lone(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    server = Server.from_task(banked_task(sampling, layers=3, devices=2), slots=4, capacity=128, admission=2,
+                              prefill_mesh=MeshSpec(fsdp=2).build(jax.devices()[:2]))
+    server, tickets = served_by(server)
+    assert "layers_0_2" in server.cache
+    for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), row)
 
 
 @pytest.mark.distributed
