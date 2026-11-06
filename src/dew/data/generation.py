@@ -17,7 +17,7 @@ import numpy as np
 
 from dew._records import JSON
 from dew.batch import Batch
-from dew.data.dataset import Records
+from dew.data.dataset import Loading, Records
 from dew.data.declared import Declared, Replaced
 from dew.data.pipeline import Record, Rejected
 from dew.data.plan import array_digest, filled_version
@@ -394,7 +394,8 @@ def _source_ids(source: Source, version: int, *, streamed: bool = False,
     if not streamed and (source.supports("indexed") or completed):
         yield from range(len(source.records("indexed" if source.supports("indexed") else "memory")))
         return
-    manifest = source.manifest(version)
+    # Counted off its store's footers, a default read's threads at once, where its shards state no rows.
+    manifest = source.manifest(version).sized(Loading().threads)
     if manifest.subdivide is not None:
         store_shards = {shard.id for shard in manifest.shards}
         if any(isinstance(row, list) and row[0] not in store_shards for row in map(json.loads, completed)):

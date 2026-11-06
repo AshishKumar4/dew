@@ -136,7 +136,7 @@ from dew.data.pipeline import (
 )
 from dew.data.plan import PLAN_VERSIONS, Manifest
 from dew.data.readers import _FillShare
-from dew.data.shards import bounded as shards_bounded, bounded_places, streamed
+from dew.data.shards import bounded as shards_bounded, bounded_places, cut, streamed
 from dew.data.sources.base import Read, Shard, ShardManifest, ShardOpener, Source, materialized
 from dew.data.sources.urls import Fetch
 from dew.data.steps.text import LayoutRule, ValidTargets, counted_window, recounted
@@ -438,8 +438,8 @@ class _PlacedShards:
         return self.reader(shard, options).map_with_index(_Placed(self.starts[shard.id]))
 
 
-def _positioned(manifest: ShardManifest, reads: int) -> ShardManifest:
-    manifest = manifest.sized(reads)  # Its shards' rows stated or counted, `reads` at once.
+def _positioned(manifest: ShardManifest, partition: DataPartition, loading: Loading) -> ShardManifest:
+    manifest = cut(manifest.sized(loading.threads), partition=partition, loading=loading)  # Those it reads.
     rows = [shard.rows for shard in manifest.shards if shard.rows is not None]
     if len(rows) != len(manifest.shards):
         raise ValueError("map_with_index over a streamed read needs every shard to state its rows")
@@ -1658,11 +1658,11 @@ class _Build:
         shards = source.manifest(self.version)
         if cache is not None:
             filled, manifest, prefix = _fill(pipeline, source, cache, self.read, self.version)
-            shards = _positioned(shards, self.stream_loading.threads) if 0 <= last < cache else shards
+            shards = _positioned(shards, partition, self.stream_loading) if 0 <= last < cache else shards
             reader = filled.streamed(shards.reader, manifest, transform=prefix, threads=prefix.threads,
                                      source=source, transparent=transparent)
             shards = dataclasses.replace(shards, reader=reader)
-        shards = _positioned(shards, self.stream_loading.threads) if last >= start else shards
+        shards = _positioned(shards, partition, self.stream_loading) if last >= start else shards
         written = stages[start : start if interleave is None else interleave]
         local = tuple(stage for stage in written if isinstance(stage, _LOCAL))
         steps = _ShardSteps(shards.reader, local, cache is not None, _name(pipeline), _label(pipeline),
