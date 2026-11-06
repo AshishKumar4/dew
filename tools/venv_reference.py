@@ -17,7 +17,6 @@ import importlib
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -67,16 +66,26 @@ unless named; `host` where its `dew` runs on the host as given (a pipeline's wal
 inside), and `outputs` where the recording keeps the outputs whole."""
 
 
-def main() -> None:
-    import jax
-    import jax.numpy as jnp
-    from recorded_references import provenance, record_case, save
-
-    site, python = sys.argv[1], sys.argv[2]
+def site_arms(site: str):
+    """`site`'s recording's fixture, draw, Dew run and leaves: its test's `FIXTURE`, `draw`, `dew` and
+    `OUTPUTS`, or its test's `pipeline_arms` of the site's `arms`."""
     known = SITES[site]
     test = importlib.import_module(known["test"])
-    fixture, draw, run, outputs = (test.pipeline_arms(known["arms"]) if "arms" in known
-                                   else (test.FIXTURE, test.draw, test.dew, test.OUTPUTS))
+    return (test.pipeline_arms(known["arms"]) if "arms" in known
+            else (test.FIXTURE, test.draw, test.dew, test.OUTPUTS))
+
+
+def recording(site: str, python: str, source: str | None, given=None) -> dict[str, np.ndarray]:
+    """`site`'s recording: each seed's draw run by the site's worker under `python` (`session`), its float32
+    run and its float64 truth, sized paired against Dew's float32 run (`record_case`), over the site's arms
+    (`site_arms`, or `given`, those already built)."""
+    import jax
+    import jax.numpy as jnp
+    from recorded_references import record_case
+    from reference_worker import arms, session
+
+    known = SITES[site]
+    _, draw, run, outputs = given or site_arms(site)
     if "distribution" in known:
         name, wanted = known["distribution"]
         held = subprocess.run([python, "-c", f"import importlib.metadata as m; print(m.version({name!r}))"],
@@ -84,30 +93,29 @@ def main() -> None:
         if held != wanted:
             raise SystemExit(f"the recording is of {name} {wanted}; {python} holds {held}")
     environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
-    environment |= {"JAX_PLATFORMS": "cpu", **({"PYTHONPATH": sys.argv[3]} if len(sys.argv) > 3 else {})}
-    worker = subprocess.Popen([python, str(ROOT / "tools" / known["worker"]), site], stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE, text=True, env=environment)
-    scratch = Path(tempfile.mkdtemp())
+    environment |= {"JAX_PLATFORMS": "cpu", **({} if source is None else {"PYTHONPATH": source})}
+    with session([python, str(ROOT / "tools" / known["worker"]), site], env=environment) as worker:
+        def evaluate(inputs):
+            answer = worker.ask({f"case.{key}": value for key, value in inputs.items()})
+            reference, truth = arms(answer, "case.")
+            return tuple({leaf: arm[leaf] for leaf in outputs} for arm in (reference, truth))
 
-    def evaluate(inputs):
-        given, out = scratch / "in.npz", scratch / "out.npz"
-        np.savez(given, **{f"case.{key}": value for key, value in inputs.items()})
-        worker.stdin.write(f"{given} {out}\n")
-        worker.stdin.flush()
-        if worker.stdout.readline().strip() != "done":
-            raise RuntimeError(f"{site}'s worker stopped")
-        with np.load(out) as answered:
-            return tuple({leaf: answered[f"case.{kind}.{leaf}"] for leaf in outputs}
-                         for kind in ("reference", "truth"))
+        dew = ((lambda inputs: run(jnp.float32, inputs)) if known.get("host")
+               else jax.jit(lambda inputs: run(jnp.float32, inputs)))
+        return record_case(site, draw, evaluate, store_inputs=False, summary=not known.get("outputs"),
+                           dew=dew)
 
-    dew = ((lambda inputs: run(jnp.float32, inputs)) if known.get("host")
-           else jax.jit(lambda inputs: run(jnp.float32, inputs)))
-    arrays = record_case(site, draw, evaluate, store_inputs=False, summary=not known.get("outputs"), dew=dew)
-    worker.stdin.close()
-    worker.wait()
-    written = save(fixture, {**arrays, "provenance": provenance(
+
+def main() -> None:
+    from recorded_references import provenance, save
+
+    site, python = sys.argv[1], sys.argv[2]
+    source = sys.argv[3] if len(sys.argv) > 3 else None
+    known, given = SITES[site], site_arms(site)
+    arrays = recording(site, python, source, given)
+    written = save(given[0], {**arrays, "provenance": provenance(
         known["reference"], "", known.get("device", "cpu"),
-        f"python tools/venv_reference.py {site} PYTHON{' SOURCE' if len(sys.argv) > 3 else ''}")},
+        f"python tools/venv_reference.py {site} PYTHON{' SOURCE' if source is not None else ''}")},
         reference=known["reference"], license=known["license"])
     print(f"{written}: {sorted(arrays)}")
 
