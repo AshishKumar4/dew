@@ -50,7 +50,7 @@ def test_a_chain_called_as_a_tree_reads_what_the_plain_cached_call_reads():
 
 
 def test_a_tree_is_refused_where_a_layer_cannot_read_it_or_the_call_cannot_carry_it():
-    """A Mamba-1 mixer reads no tree (it would run the tokens as a chain), and an n-gram lookup reads the
+    """Lightning attention reads no tree (it would run the tokens as a chain), and an n-gram lookup reads the
     call's tokens in their order, so each model refuses a tree call; a tree outside a cached call,
     without the key runs that mask its attention, of another length than the call's tokens, with a parent
     not before its child, or branching without its tokens' positions (coordinates of validity alone
@@ -58,11 +58,10 @@ def test_a_tree_is_refused_where_a_layer_cannot_read_it_or_the_call_cannot_carry
     from dew.nn.engram import Engram
     from dew.nn.hyper_connections import HyperConnections
 
-    mamba = CausalTransformer(
+    lightning = CausalTransformer(
         vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8, mlp_features=32,
-        max_seq_len=16, dtype="float32", layer_types=("mamba", "full_attention"),
-        kinds={"mamba": {"mixer": {"class": "mamba", "fields": {
-            "intermediate_size": 32, "state_size": 4, "time_step_rank": 2}}}})
+        max_seq_len=16, dtype="float32", layer_types=("linear_attention", "full_attention"),
+        kinds={"linear_attention": {"mixer": {"class": "lightning_attention", "fields": {"block_size": 4}}}})
     engram = CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, "dtype": "float32"}, engram=Engram(
         layer_ids=(0,), num_embeddings=(168,), max_ngram_size=3, vocab_size=VOCAB, n_heads=2, head_dim=4,
         compressed_vocab_size=VOCAB), hyper_connections=HyperConnections(hc_mult=2, head="weighted"))
@@ -70,7 +69,7 @@ def test_a_tree_is_refused_where_a_layer_cannot_read_it_or_the_call_cannot_carry
     ids = jax.random.randint(jax.random.key(0), (2, PROMPT + BLOCK), 0, VOCAB)
     block, runs = ids[:, PROMPT:], chain_runs(2, PROMPT, BLOCK)
     placed = PROMPT + jnp.asarray([[0, 1, 1]] * 2)
-    for model in (mamba, engram, decoder):
+    for model in (lightning, engram, decoder):
         params = model.init(jax.random.key(1), ids)
         cache = {**params, "cache": cached(model, params, ids[:, :PROMPT])}
         tree = {"attention_tree": (-1, 0, 0), "attention_key_runs": runs, "rotary_positions": placed}
@@ -95,8 +94,12 @@ TREE = (-1, 0, 0, 1, 2)
 RECURRENT = {
     "gated_delta_net": {"linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 6,
                         "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4},
-    "mamba2": {"num_heads": 4, "head_dim": 8, "state_size": 8, "n_groups": 1, "chunk_size": 4}}
-"""The recurrent mixers a tree call reads, at toy size: Qwen3.5's gated delta net and Mamba-2."""
+    "kimi_delta_attention": {"linear_num_heads": 2, "linear_head_dim": 8, "linear_conv_kernel_dim": 4},
+    "mamba": {"intermediate_size": 32, "state_size": 4, "time_step_rank": 2},
+    "mamba2": {"num_heads": 4, "head_dim": 8, "state_size": 8, "n_groups": 1, "chunk_size": 4},
+    "short_conv": {"conv_L_cache": 3}}
+"""The mixers holding row state that a tree call reads, at toy size: Qwen3.5's gated delta net, Kimi's
+delta attention, Mamba-1 and -2, and LFM2's gated short convolution."""
 
 
 def hybrid_model(mixer: str) -> CausalTransformer:
@@ -139,7 +142,8 @@ def tree_runs(rows: int, prompt: int, tree: tuple[int, ...]) -> jax.Array:
 @pytest.mark.parametrize("mixer", sorted(RECURRENT))
 @pytest.mark.parametrize("tree", [TREE, (-1,)], ids=["branching", "one-token"])
 def test_a_hybrids_tree_call_reads_each_token_as_its_path_decoded_alone(tree, mixer):
-    """A gated delta net's or Mamba-2's tree call (`dew.nn.linear.tree_scan`) beside attention's, each
+    """A recurrent mixer's tree call (`dew.nn.linear.tree_scan`, a convolution's `tree_conv`) beside
+    attention's, each
     token at its depth's position: each token's logits are on par with its root-to-token path decoded as
     a plain cached call from the same cache, from the float64 run's (check 1), its conv over its
     ancestors and past the root the cache's history, its recurrence from its parent's state; a one-token

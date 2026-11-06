@@ -398,16 +398,17 @@ def tree_windows(tree: tuple[int, ...], width: int) -> np.ndarray:
     return windows
 
 
-def tree_conv(mixed, taps, bias, history, tree: tuple[int, ...], *, parts=None, dtype=None):
+def tree_conv(mixed, taps, bias, history, tree: tuple[int, ...], *, parts=None, dtype=None,
+              activation: bool = True):
     """A tree call's causal conv (`dew.nn.inputs.AttentionMetadata.tree_parents`): each token of `mixed`
     `[B, S, D]` convolved over the `K-1` tokens before it on its path, its ancestors, and past the root
     the held `history` `[B, K-1, D]`, as `causal_conv1d` convolves the window it ends (`tree_windows`);
-    its `parts` and `dtype` are `causal_conv1d`'s."""
+    its `parts`, `dtype` and `activation` are `causal_conv1d`'s."""
     batch, length, features = mixed.shape
     width = taps.shape[1] - 1
     windows = jnp.concatenate([history.astype(mixed.dtype), mixed], axis=1)[:, tree_windows(tree, width)]
-    convolved = causal_conv1d(windows.reshape(batch * length, width + 1, features), taps, bias=bias,
-                              parts=parts, dtype=dtype)
+    convolved = causal_conv1d(windows.reshape(batch * length, width + 1, features), taps, activation,
+                              bias=bias, parts=parts, dtype=dtype)
     if parts is None:
         return convolved[:, -1].reshape(batch, length, -1)
     return tuple(piece[:, -1].reshape(batch, length, -1) for piece in convolved)

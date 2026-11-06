@@ -46,10 +46,12 @@ from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, kernel
 from .linear import (
     DepthwiseConv1d,
     RMSNormGated,
+    call_tree,
     decode_delta_rule,
     held_scan,
     over_sequence,
     split_delta_rule,
+    tree_scan,
 )
 from .mixer_base import DELTA_RULE_RESIDUALS, MixerBase, MixerContext
 from .precision import at_least_fp32, float32_dot_general
@@ -88,9 +90,9 @@ class KimiDeltaAttention(nn.Module):
     `chunk_kda`, fla-core 0.5.2, fla/ops/kda/gate.py:57-70).
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset()
-    """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): a recurrence reads every earlier token
-    of its document, with no mask or bias to narrow it."""
+    reads: ClassVar[frozenset[str]] = frozenset({"tree_parents", "key_runs"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's and the key runs that mask its
+    attention beside it (`dew.nn.linear.call_tree`): on a tree each token's path (`tree_scan`)."""
 
     emb_features: int
     num_heads: int
@@ -213,7 +215,15 @@ class KimiDeltaAttention(nn.Module):
         ported = S > 1 and kernel_routed(rows, keys, values, g, beta, floor=self.lower_bound, write_bound=1.0)
         heads = ((self.qkv_features, self.head_dim),) * 2 + ((self.qkv_features, None),)
         shards = sequence_shards()
-        if shards > 1:
+        tree = call_tree(attention_metadata)
+        if tree is not None:
+            def rule(convolved, g, beta, held):
+                query, key, value = (part.reshape(B, 1, self.num_heads, self.head_dim) for part in convolved)
+                return decode_delta_rule(query, key, value, g, beta, held)
+
+            out = tree_scan(self, projected, taps, None, tree, rule, (g, beta), state='recurrent_state',
+                            state_dtype=wide, parts=heads, dtype=wide)
+        elif shards > 1:
             if decode:
                 raise LayoutRefused(f"Kimi delta attention under a sequence axis of {shards} runs whole "
                                     f"training sequences; a decode step holds one state per row. Decode on a "
