@@ -92,6 +92,8 @@ def make(kind, variant):
                                               axis=-1)[:, 0])
             return jnp.sum(weights * losses)
         return with_gradients(loss)(variables, hidden, jnp.ones((), hidden.dtype))
+    if os.environ.get("EXACT_LAYOUT"):
+        return lambda *drawn: jax.lax.map(lambda example: jax.vmap(one)(*example), drawn)
     return jax.vmap(one)
 
 
@@ -113,7 +115,8 @@ programs = {name: unrewritten(program) if name[0] in ("literal", "equation") els
 truth_program = unrewritten(jax.jit(make(kind, "truth")))
 totals = {}
 for seed in range(count):
-    inputs = t.window_segments(kind, seed)
+    inputs = (t.stacked_windows(kind, seed) if os.environ.get("EXACT_LAYOUT") else
+              t.window_segments(kind, seed))
     with jax.enable_x64(True):
         truth = jax.device_get(truth_program(*widened(inputs)))
     with summed_as_run():
