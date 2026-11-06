@@ -101,6 +101,8 @@ from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
     ORDERS,
+    as_given,
+    assert_as_exact,
     assert_as_exact_over_orders,
     assert_computes_the_oracle,
     distance,
@@ -561,11 +563,16 @@ def test_a_failed_export_ends_with_its_own_error(tmp_path):
     assert run.returncode == 1, run.stderr[-2000:]
 
 
+FULL_ROTARY_SEEDS = 8
+"""The full-width rotary export's declared check-1 seeds against transformers' reading of it, sized by
+`seeds_for` paired."""
+
+
 def test_a_decoder_stating_a_full_width_rotary_exports_and_transformers_reads_it(tmp_path):
     """A Qwen3 decoder built with `partial_rotary_factor=1.0` rotates its whole head, as with none
     stated: written from the model and its variables alone (`PretrainedDecoder.from_model`), it
-    saves, reloads to its own logits, and transformers reads the export to logits Dew's are as
-    exact as, both from transformers' in float64."""
+    saves, reloads to its own logits, and transformers reads the export: over drawn rows Dew's logits
+    are on par with transformers' from its float64 run's (check 1)."""
     import jax.numpy as jnp
     import torch
     from transformers import AutoModelForCausalLM
@@ -582,15 +589,26 @@ def test_a_decoder_stating_a_full_width_rotary_exports_and_transformers_reads_it
     np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, jnp.asarray(ids))),
                                   expected)
 
-    def theirs(dtype):
+    def read(dtype):
         with float64() if dtype == torch.float64 else torch.no_grad():
-            reference = AutoModelForCausalLM.from_pretrained(tmp_path, attn_implementation="eager")
-            with torch.no_grad():
-                logits = reference.to(dtype).eval()(torch.from_numpy(ids).long(), use_cache=False).logits
-        return logits.double().numpy()
+            read = AutoModelForCausalLM.from_pretrained(tmp_path, attn_implementation="eager")
+            return read.to(dtype).eval()
 
-    assert_as_exact_as_the_reference(expected.astype(np.float64), theirs(torch.float32),
-                                     theirs(torch.float64), "full-width rotary export logits")
+    narrow, wide = read(torch.float32), read(torch.float64)
+
+    def theirs(reference):
+        @as_given
+        def logits(tokens):
+            with float64() if reference is wide else torch.no_grad(), torch.no_grad():
+                return reference(torch.from_numpy(np.asarray(tokens)).long(), use_cache=False).logits.numpy()
+        return logits
+
+    def draw(seed):
+        rng = np.random.default_rng([0x1563, seed])
+        return (rng.integers(0, model.vocab_size, ids.shape).astype(np.int32),)
+
+    assert_as_exact(jax.jit(lambda tokens: model.apply(loaded.variables, tokens)), theirs(narrow), draw,
+                    "full-width rotary export logits", seeds=FULL_ROTARY_SEEDS, truth_fn=theirs(wide))
 
 
 def test_a_policy_transformers_cannot_hold_is_refused_not_dropped():
