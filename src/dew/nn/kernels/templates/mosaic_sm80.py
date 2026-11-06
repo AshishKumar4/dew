@@ -57,8 +57,10 @@ def _join_swizzle(block: tuple, streams, name: str) -> int:
 
 def _joined(pieces: list, joined, interpret: bool):
     """A step's pieces (`Rows`' runs, each landed in a slot of its own) copied into its one tile, in order,
-    through registers a piece at a time: a sync first, so no warp still reads the last step's tile, and
-    after, so none reads a row not yet copied."""
+    through registers a piece at a time, a row's columns over a warp's lanes (`mosaic._row_layout`: the one
+    layout a plain piece's load and a swizzled tile's store both take on sm80, FS-PIECESV-1; each warp
+    writing every row alike): a sync first, so no warp still reads the last step's tile, and after, so none
+    reads a row not yet copied."""
     rows = pieces[0].shape[0]
     mosaic.synced(interpret)
     for each, piece in enumerate(pieces):
@@ -66,7 +68,8 @@ def _joined(pieces: list, joined, interpret: bool):
         if interpret:
             target[...] = piece[...]
         else:
-            mosaic.copied(piece, target)
+            layout = mosaic._row_layout(piece.shape, piece.dtype)
+            plgpu.store(target, plgpu.load(piece, layout=layout, optimized=False), optimized=False)
     mosaic.synced(interpret)
     return joined
 
