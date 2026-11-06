@@ -1759,8 +1759,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     out.write_text(json.dumps({"rows": rows + ran}))
     if coverage is None and not release and not (environ and check1_wire().CENSUS in environ):
         # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which runs
-        # under its requirement's overlay and on the whole suite's run alone, nor the census's (check 1's
-        # CENSUS).
+        # under its requirement's overlay and on the whole suite's run alone, nor the census's.
         record(python, ran, log, common, network, opened,
                set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set())
     return 0
