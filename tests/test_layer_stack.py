@@ -22,7 +22,7 @@ import pytest
 import selection_margins
 from arm_arithmetic import float64_held
 from flax import linen as nn
-from model_support import largest_difference, stepped_decode, steps_from
+from model_support import flat_tree, largest_difference, stepped_decode, steps_from
 from reference_error import (
     FEWEST_SEEDS,
     GateFailure,
@@ -584,36 +584,71 @@ def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_t
                     seeds=BANKED_EXPERT_SEEDS, truth_fn=truth)
 
 
+BANKED_DECODE_SEEDS = 8
+"""The banked decode's check-1 seeds, sized by `seeds_for` on armada."""
+
+
 def test_a_banked_decode_keeps_its_cache_banked_and_reads_its_layers_as_the_per_layer_cache():
     """A scanned MoE stack decoding over a banked store (`HeldBanks.place`) allocates its decode cache as
     the store holds the run's weights, the run's layers one array under the run's name, and every later
     call reads and writes that bank where it lies, each layer's keys and values at the call's own slots,
     rather than stacking the layers' caches into a bank and cutting them apart again each call. A prefill
-    and single-token steps over it decode bit for bit as the same stack's calls over the plain loop's
-    per-layer cache, which the stack stacks and unstacks each call, and each layer of the bank reads back
-    as that cache's layer, bit for bit."""
-    ids = jax.random.randint(jax.random.key(4), (2, 10), 0, VOCAB)
+    and single-token steps over it decode as the same stack's calls over the plain loop's per-layer cache,
+    which the stack stacks and unstacks each call: their logits and each layer's cached keys and values,
+    both from the plain loop's own float64 decode (check 1), two compiled programs being two orders of
+    sums; and each layer of the bank holds the per-layer cache's slots and cursor, exactly."""
     routed = {"experts": 4, "top_k": 2, "expert_features": 16, "layers": tuple(range(4))}
     scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True, mixture=routed)
-    variables = tiny(num_layers=4, max_seq_len=16, mixture=routed).init(jax.random.key(0), ids)
+    plain = tiny(num_layers=4, max_seq_len=16, mixture=routed)
+    variables = plain.init(jax.random.key(0), jnp.zeros((2, 10), jnp.int32))
     banked = HeldBanks(variables).place(scanned)
-
-    @jax.jit
-    def decoded(cache):
-        """A prefill of five tokens, then a token a call: every call's logits, and the cache they leave."""
-        prefilled, state = scanned.apply({**banked, "cache": cache}, ids[:, :5], decode=True,
-                                         mutable=["cache"])
-        steps, cache = steps_from(scanned, banked, state["cache"], ids[:, 5:])
-        return jnp.concatenate([prefilled, steps], axis=1), cache
-
-    allocated = scanned.apply(banked, ids[:, :1], decode=True, mutable=["cache"])[1]["cache"]
+    first = jnp.zeros((2, 1), jnp.int32)
+    allocated = scanned.apply(banked, first, decode=True, mutable=["cache"])[1]["cache"]
     assert "layers_0_3" in allocated and not any(f"layers_{index}" in allocated for index in range(4))
-    logits, held = decoded(allocated)
-    expected, layers = decoded(scanned.init(jax.random.key(0), ids[:, :1], decode=True)["cache"])
-    np.testing.assert_array_equal(np.asarray(logits), np.asarray(expected))
-    for index in range(4):
-        jax.tree.map(lambda bank, leaf, index=index: np.testing.assert_array_equal(
-            np.asarray(bank[index]), np.asarray(leaf)), held["layers_0_3"], layers[f"layers_{index}"])
+
+    def decoded(model, store, cache):
+        """A prefill of five tokens, then a token a call: every call's logits, and each layer's cache they
+        leave, a bank's by its rows, by the layer's leaf."""
+        @jax.jit
+        def run(ids):
+            prefilled, state = model.apply({**store, "cache": cache}, ids[:, :5], decode=True,
+                                           mutable=["cache"])
+            steps, left = steps_from(model, store, state["cache"], ids[:, 5:])
+            layers = ([jax.tree.map(lambda bank, index=index: bank[index], left["layers_0_3"])
+                       for index in range(4)] if "layers_0_3" in left
+                      else [left[f"layers_{index}"] for index in range(4)])
+            held = {f"layers_{index}.{path}": leaf for index, layer in enumerate(layers)
+                    for path, leaf in flat_tree(layer).items()}
+            return {"logits": jnp.concatenate([prefilled, steps], axis=1), **held}
+        return run
+
+    def floating(run):
+        """`run`'s floating outputs, which check 1 judges."""
+        return lambda ids: {name: value for name, value in run(ids).items()
+                            if jnp.issubdtype(value.dtype, jnp.floating)}
+
+    per_layer = scanned.init(jax.random.key(0), first, decode=True)["cache"]
+    bank, layers = decoded(scanned, banked, allocated), decoded(scanned, banked, per_layer)
+    def integral(run):
+        """`run`'s slots and cursors, which both arms hold exactly."""
+        return {name: np.asarray(value) for name, value in run(drawn_ids(0x4550, 10)(0)[0]).items()
+                if not jnp.issubdtype(value.dtype, jnp.floating)}
+
+    exact, held = integral(layers), integral(bank)
+    assert exact and held.keys() == exact.keys(), (sorted(held), sorted(exact))
+    for name, value in exact.items():
+        np.testing.assert_array_equal(held[name], value, err_msg=name)
+
+    @as_given
+    def truth(ids):
+        with jax.enable_x64(new_val=True):
+            wide = tiny(num_layers=4, max_seq_len=16, mixture=routed, dtype=jnp.float64)
+            cache = wide.init(jax.random.key(0), first, decode=True)["cache"]
+            return {name: np.asarray(value) for name, value in
+                    floating(decoded(wide, widened(variables), cache))(ids).items()}
+
+    assert_as_exact(floating(bank), floating(layers), drawn_ids(0x4550, 10), "banked decode",
+                    seeds=BANKED_DECODE_SEEDS, truth_fn=truth)
 
 
 SOURCE_SCAN_SEEDS = 8
