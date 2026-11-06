@@ -1182,11 +1182,17 @@ def assert_parts_witnessed(lane: Lane, heads: int = 1) -> None:
     assert_refusals(refusals(narrow, as_claimed, lane), PARTS_SHARES)
 
 
+WALK_HANDED_SHARE = 0.55
+"""The least share of the fp32 memory the walk's second chunk leaves at which its entering memory rounded to
+bf16 is refused: 0.597 of it interpreted at a8dccec7a (the training call's states launch, `HANDED_SHARE`,
+reads the stored memory too, which the walk never stores)."""
+
+
 def assert_walk_witnessed(lane: Lane, heads: int = 1) -> None:
     """The step witness of the fused inference walk (`walk_enclosures`, `mainloop._scan`): a bf16 call of
     three chunks no gradient follows, with the delta rule and without it (its keys taking the write gate, and
     unrounded), every record each keeps inside its step's enclosure; and the walk run from a memory rounded to
-    bf16 where fp32 is held refused (`handed_refusals`, `HANDED_SHARE`)."""
+    bf16 where fp32 is held refused (`handed_refusals`, `WALK_HANDED_SHARE`)."""
     operands = draw(0, "mild", heads=heads)
     for run in (recorded(*operands, walked=True), recorded(*operands, delta=False, walked=True),
                 recorded(*operands, delta=False, rounded=False, walked=True)):
@@ -1196,4 +1202,5 @@ def assert_walk_witnessed(lane: Lane, heads: int = 1) -> None:
     from native_certificates import assert_refused
 
     slow = draw(1, "slow", chunks=2, heads=heads)
-    assert_refused(*handed_refusals(slow, recorded(*slow, walked=True), 1, lane, walked=True), HANDED_SHARE)
+    assert_refused(*handed_refusals(slow, recorded(*slow, walked=True), 1, lane, walked=True),
+                   WALK_HANDED_SHARE)
