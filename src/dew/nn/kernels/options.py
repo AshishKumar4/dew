@@ -257,28 +257,22 @@ class OuterProgram:
         return jax.jit(self._rewriting, **self.arguments)
 
     @functools.cached_property
-    def _nested(self) -> jax.stages.Wrapped:
+    def _nested(self) -> dict[bool, jax.stages.Wrapped]:
         """Its jit within another trace, the enclosing program's own options the ones it compiles under, as
-        JAX takes compiler options on the outermost jit alone: as written where the enclosing program is
-        one of these, whose pass reads it whole (`_traced`); rewritten as it traces under any other, so a
-        transformation outside it (`jax.grad` of it within a plain `jax.jit`) reads the pass's program, the
-        templates' derivatives among it (row 3450)."""
+        JAX takes compiler options on the outermost jit alone, keyed by whether the pass reads the
+        enclosing program whole (`_PASSING`): as written where it does (one of these, `_traced`); rewritten
+        as it traces where it does not, so a transformation outside it (`jax.grad` of it within a plain
+        `jax.jit`) reads the pass's program, the templates' derivatives among it (row 3450)."""
         arguments = {name: value for name, value in self.arguments.items() if name != "compiler_options"}
-        return jax.jit(self._rewriting, **arguments)
-
-    @functools.cached_property
-    def _within(self) -> jax.stages.Wrapped:
-        """Its jit within a program the pass reads whole (`_nested`'s first case)."""
-        arguments = {name: value for name, value in self.arguments.items() if name != "compiler_options"}
-        return jax.jit(self.function, **arguments)
+        return {whole: jax.jit(self.function if whole else self._rewriting, **arguments)
+                for whole in (True, False)}
 
     def __call__(self, *args, **kwargs):
         # Within a staging trace the enclosing program compiles this one as part of its own, under its
-        # own options (`_nested`, or `_within` where its pass reads this one whole); under an eager
-        # transformation alone, or `jax.disable_jit`, its jit compiles itself with its options, or runs the
-        # function as Python.
+        # own options (`_nested`); under an eager transformation alone, or `jax.disable_jit`, its jit
+        # compiles itself with its options, or runs the function as Python.
         if staged():
-            return (self._within if _PASSING.get() else self._nested)(*args, **kwargs)
+            return self._nested[_PASSING.get()](*args, **kwargs)
         if not jax_core.trace_state_clean() or jax_config.disable_jit.value:
             return self._eager(*args, **kwargs)
         key, dynamic, named = self._keyed(args, kwargs)

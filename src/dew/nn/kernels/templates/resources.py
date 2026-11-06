@@ -277,7 +277,7 @@ def _barrier(leaf) -> bool:
 def _semaphore(leaf) -> bool:
     """Whether a scope's `leaf` is a semaphore (a TPU core's DMA or regular one, `pltpu.SemaphoreType`): an
     extended dtype held in the core's semaphore memory, no byte of its VMEM."""
-    return jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.extended)
+    return jnp.issubdtype(leaf.dtype, jax.dtypes.extended)
 
 
 def scratch_bytes(family: "Family", scope: Scope) -> int:
