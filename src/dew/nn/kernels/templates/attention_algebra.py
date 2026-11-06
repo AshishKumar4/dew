@@ -1931,12 +1931,13 @@ def _slotted(key: tuple, shapes: Mapping) -> tuple[str, ...]:
 
 def _stated(spec: Forward, state: Partial) -> tuple[tuple, dict]:
     """The derived forms a merge or a finish of `state` reads, and the walk's tiles it names them by: its
-    base's walk, queries first, over tiles of a key per query of fp32 values beside its rows: a merge's and a
-    finish's forms read the state alone, a maximum, a total and a row's sums a query, the same at any keys a
-    tile and any values' dtype (a product's fp32 sums, `softmax_of`), so the forms of any walk of the state's
-    are these, whatever walk came before (a hand-written step's, a dropping walk's, a supplied state)."""
+    base's walk, queries first, over tiles of a key per query of the state's own dtypes beside its rows (fp32
+    a kernel's; float64 a truth's run, its forms derived apart): a merge's and a finish's forms read the state
+    alone, a maximum, a total and a row's sums a query, the same at any keys a tile and any values' dtype (a
+    product's sums, `softmax_of`), so the forms of any walk of the state's are these, whatever walk came
+    before (a hand-written step's, a dropping walk's, a supplied state)."""
     rows, width = state.m.shape[-1], state.acc.shape[-1]
-    tiles = {"logits": ((rows, rows), jnp.float32), "values": ((rows, width), jnp.float32)}
+    tiles = {"logits": ((rows, rows), state.m.dtype), "values": ((rows, width), state.acc.dtype)}
     return (spec.base2, False, None, *_form_key(spec)), tiles
 
 
