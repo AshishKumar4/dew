@@ -46,8 +46,8 @@ def test_open_mpi_is_its_legacy_launchers_or_version_fives_as_jax_reads_it():
 
 
 def test_a_tpu_joins_by_jaxs_detection_on_a_tpu_vm_alone_and_leaves_its_place_to_jax():
-    """A Cloud TPU worker joins by JAX's detection, GKE's where the environment lists its slice's workers (in
-    JAX's order of sources) and GCE's otherwise, TPU_SKIP_MDS_QUERY unset; its place, its slices among it,
+    """A Cloud TPU worker joins by JAX's detection, GKE's by name where the environment lists its slice's
+    workers (in JAX's order of sources) and JAX's own order otherwise, TPU_SKIP_MDS_QUERY unset; its place
     is JAX's to read as it joins, so Dew states none. On a host JAX runs as no Cloud TPU VM (no libtpu or
     chip, no JAX_FORCE_TPU_INIT) the same variables are no TPU (review of 4480)."""
     gke = {"TPU_WORKER_HOSTNAMES": "w-0,w-1", "TPU_PROCESS_ADDRESSES": "a-0,a-1,a-2,a-3",
@@ -55,7 +55,10 @@ def test_a_tpu_joins_by_jaxs_detection_on_a_tpu_vm_alone_and_leaves_its_place_to
     forced = CloudTPU({**gke, "JAX_FORCE_TPU_INIT": "1"})
     assert forced.detected() and forced.joining() == Joining(detection="gketpu")
     assert forced.place() == Joining()
-    assert CloudTPU({"JAX_FORCE_TPU_INIT": "1"}).joining() == Joining(detection="gcetpu")
+    # Any other TPU VM joins in JAX's own order, which reads GCE's metadata and, where it names no worker,
+    # goes on to a Kubernetes Job's (review of the TPU's place).
+    assert CloudTPU({"JAX_FORCE_TPU_INIT": "1"}).detected()
+    assert CloudTPU({"JAX_FORCE_TPU_INIT": "1"}).joining() == Joining()
     assert _tpu_vm() or not CloudTPU(gke).detected()
     # An empty addresses path names no GKE worker list, as JAX reads it (`_get_worker_host_names_env_var`).
     assert not CloudTPU({"TPU_PROCESS_ADDRESSES_PATH": "", "JAX_FORCE_TPU_INIT": "1",
