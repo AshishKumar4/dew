@@ -188,18 +188,20 @@ def test_qwen35_logits_match_the_reference_implementation():
     assert difference < 5e-4, f"max |logit difference| {difference:.3e}"
 
 
+@pytest.mark.parametrize("fixture", ["qwen35-tiny", "qwen35-moe-native-tiny", "qwen3-next-tiny"])
 @pytest.mark.parametrize("depth", [0, 1], ids=["trunk", "prediction-layer"])
-def test_a_qwen35_model_written_without_its_source_states_its_hybrid_fields_and_reloads(depth, tmp_path):
-    """A Qwen3.5 model written from the model alone (`PretrainedDecoder.from_model`, a trained or scratch
-    one holding no source config) states its delta net's geometry, its rotary's fraction and its
-    prediction depth, which the generic export writes none of, and writes its delta net's tensors and
-    its prediction layer's under their own names (`mtp.*`); so it reloads to its own variables, logits
-    and prediction logits, bit for bit (ledger 4533). The prediction layer's case is a scratch model of
-    the fixture's geometry with one, drawn whole."""
+def test_a_hybrid_qwen_model_written_without_its_source_states_its_fields_and_reloads(fixture, depth,
+                                                                                     tmp_path):
+    """A hybrid Qwen model, Qwen3.5's, Qwen3.5-MoE's or Qwen3-Next's, written from the model alone
+    (`PretrainedDecoder.from_model`, a trained or scratch one holding no source config) states its delta
+    net's geometry, its rotary's fraction, its experts and the layers they route, and its prediction
+    depth, which the generic export writes none of, and writes its delta net's, its experts' and its
+    prediction layer's tensors under their own names (`mtp.*`); so it reloads to its own variables,
+    logits and prediction logits, bit for bit (ledgers 4533, 4562). The prediction layer's case is a
+    scratch model of the fixture's geometry with one, drawn whole."""
     from dew.interop.pretrained import PretrainedDecoder
 
-    loaded = Pretrained.load(FIXTURES / "qwen35-tiny", dtype="float32", attention_impl="reference",
-                             text_only=True)
+    loaded = Pretrained.load(FIXTURES / fixture, dtype="float32", attention_impl="reference", text_only=True)
     ids = jnp.arange(1, 9, dtype=jnp.int32)[None]
     model, variables = loaded.model, loaded.variables
     if depth:

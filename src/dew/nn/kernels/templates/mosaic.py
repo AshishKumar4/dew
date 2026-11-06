@@ -958,8 +958,8 @@ def synced(interpret: bool) -> None:
 
 
 MAGIC_INT, MAGIC_FLOAT = 0x4B400000, 12582912.0
-"""An integer below 2**22 in magnitude added to the first in integer arithmetic is the fp32 whose value less the
-second it is (2**23 + 2**22's exponent and mantissa: Family.converted's integer codes)."""
+"""An integer below 2**22 in magnitude added to the first in integer arithmetic is the fp32 whose value less
+the second it is (2**23 + 2**22's exponent and mantissa: Family.converted's integer codes)."""
 
 
 def converts(dtype) -> bool:
@@ -1794,11 +1794,17 @@ class Transport[Allocated, Opened](abc.ABC):
 
     def staging(self, name: str, shaped) -> dict:
         """The scoped allocations of each consumer's staging of each operand a tile reads whole (`shaped`:
-        its tile's shape and its operand), one for each of up to two consumers, and the completion of its
-        load (`loaded`'s barriers), as `{name}_smems` and `{name}_barriers`."""
+        its tile's shape and its operand), one for each of up to two consumers, in the memory a program
+        stages in (`staged_memory`), and the completion of its load (`loaded`'s barriers), as
+        `{name}_smems` and `{name}_barriers`."""
         shaped = list(shaped)
-        return {f'{name}_smems': [plgpu.SMEM((2, *shape), gmem.dtype) for shape, gmem in shaped],
+        return {f'{name}_smems': [self.staged_memory((2, *shape), gmem.dtype) for shape, gmem in shaped],
                 f'{name}_barriers': [self.load_barriers(2) for _ in shaped]}
+
+    def staged_memory(self, shape: tuple[int, ...], dtype):
+        """A scoped allocation of `shape` in the memory a program stages tiles in: a GPU's shared memory (a
+        TPU's VMEM)."""
+        return plgpu.SMEM(shape, dtype)
 
     def meeting(self, consumers: int):
         """The scoped allocation two consumers `meet` at: two barriers of `consumers` arrivals each."""

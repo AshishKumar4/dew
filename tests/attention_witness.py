@@ -157,10 +157,17 @@ def witnessed(query, key, value, kept, *, interpret: bool, records=None) -> dict
 
 def certified(query, key, value, spans, *, interpret: bool):
     """The certify launch's records (`attention_mosaic.certified`): interpreted, at a Hopper's tiles, the
-    target an interpreted launch derives its config for (`generation.assumed`)."""
+    target an interpreted launch derives its config for (`generation.assumed`); natively, on a device whose
+    mainloop runs the call, its test skipped with the mainloop's own reason where it declines it
+    (`attention_mosaic.forward_declined`: an Ampere's, whose family the mainloop does not yet qualify)."""
+    import pytest
+
     from dew.nn.kernels import generation
 
     if not interpret:
+        declined = attention_mosaic.forward_declined(query, key, value, spans)
+        if declined is not None:
+            pytest.skip(f"the Mosaic mainloop declines the witnessed call here: {declined}")
         return attention_mosaic.certified(query, key, value, spans)
     with generation.assumed("sm90"):
         return attention_mosaic.certified(query, key, value, spans, interpret=True)

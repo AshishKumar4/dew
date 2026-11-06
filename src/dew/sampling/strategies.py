@@ -592,8 +592,23 @@ def _beam_draws(done: Completed, start: StepState, prompts: int, n: int, budget:
                  (done.terminated[:, :n] & start.active[:, None]).reshape(prompts * n))
 
 
+class _Speculating:
+    """What a speculative strategy's call is, a chain's (`Speculative`) or a tree's (`TreeSpeculative`):
+    its drafter refused where the model has none (`refused`), then each continuation's loop of blocks
+    (`_speculate`)."""
+
+    def __call__(self, state: DecoderState, start: StepState, ops: DecodeOps,
+                 transform: Callable[[StepState, jax.Array], jax.Array],
+                 stopping: Callable[[StepState, jax.Array], Finish],
+                 budget: int, n: int) -> Draws:
+        assert isinstance(self, Speculative | TreeSpeculative)
+        self.refused(ops)
+        return continuations(start, n, lambda drawn: _speculate(
+            state, drawn, ops, transform, stopping, budget, self))
+
+
 @struct.dataclass
-class Speculative:
+class Speculative(_Speculating):
     """Drafts with the model's prediction depths or block drafter, and verifies with the model itself.
 
     The acceptance rule is algorithm 1 of arXiv 2211.17192, as
@@ -646,13 +661,9 @@ class Speculative:
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError("confidence is a probability")
 
-    def __call__(self, state: DecoderState, start: StepState, ops: DecodeOps,
-                 transform: Callable[[StepState, jax.Array], jax.Array],
-                 stopping: Callable[[StepState, jax.Array], Finish],
-                 budget: int, n: int) -> Draws:
+    def refused(self, ops: DecodeOps) -> None:
+        """Refuse a model with no draft or no verify (`refuse_undrafted`)."""
         refuse_undrafted(ops)
-        return continuations(start, n, lambda drawn: _speculate(
-            state, drawn, ops, transform, stopping, budget, self))
 
     @property
     def emits(self) -> int:
@@ -1000,7 +1011,8 @@ def _settled(state: DecoderState, step: StepState, terminated: jax.Array, ops: D
         following = dataclasses.replace(replayed, hidden=kept(carried[0], following.hidden), drafts=drafts)
     elif seen is not None:
         # The target's own state at each row's last emitted token, its last slot's past a short block; a
-        # row that emitted nothing keeps what it had.
+        # row that emitted nothing keeps what it had, a replay that returns states holding one (`run`).
+        assert state.hidden is not None, "a model that returns its states holds its last one"
         at_last = jnp.take_along_axis(seen, last[:, None, None], axis=1)[:, 0]
         hidden = jnp.where((count > 0)[:, None], at_last, state.hidden)
         following = dataclasses.replace(following, hidden=hidden)
@@ -1013,7 +1025,7 @@ def _settled(state: DecoderState, step: StepState, terminated: jax.Array, ops: D
 
 
 @struct.dataclass
-class TreeSpeculative:
+class TreeSpeculative(_Speculating):
     """Drafts a tree of candidates with the model's tree drafter (`DecodeOps.draft_tree`) and verifies the
     whole tree with the model itself in one pass (`dew.sampling.trees.TreeBlock`), keeping the longest
     path the target accepts (ledger 4527).
@@ -1032,13 +1044,9 @@ class TreeSpeculative:
 
     shape: TreeShape = struct.field(pytree_node=False)
 
-    def __call__(self, state: DecoderState, start: StepState, ops: DecodeOps,
-                 transform: Callable[[StepState, jax.Array], jax.Array],
-                 stopping: Callable[[StepState, jax.Array], Finish],
-                 budget: int, n: int) -> Draws:
+    def refused(self, ops: DecodeOps) -> None:
+        """Refuse a model with no tree drafter or no verify (`refuse_untreed`)."""
         refuse_untreed(ops)
-        return continuations(start, n, lambda drawn: _speculate(
-            state, drawn, ops, transform, stopping, budget, self))
 
     @property
     def emits(self) -> int:
