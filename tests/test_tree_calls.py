@@ -62,7 +62,7 @@ def test_a_tree_is_refused_where_a_layer_cannot_read_it_or_the_call_cannot_carry
         kinds={"mamba": {"mixer": {"class": "mamba2", "fields": {
             "num_heads": 4, "head_dim": 8, "state_size": 8, "n_groups": 1, "chunk_size": 4}}}})
     engram = CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, "dtype": "float32"}, engram=Engram(
-        layer_ids=(0,), num_embeddings=(88,), max_ngram_size=3, vocab_size=VOCAB, n_heads=2, head_dim=4,
+        layer_ids=(0,), num_embeddings=(168,), max_ngram_size=3, vocab_size=VOCAB, n_heads=2, head_dim=4,
         compressed_vocab_size=VOCAB))
     decoder = CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, "dtype": "float32"})
     ids = jax.random.randint(jax.random.key(0), (2, PROMPT + BLOCK), 0, VOCAB)
