@@ -482,7 +482,7 @@ class Decide(SavedRunTask, InItsForm):
             raise ValueError(f"Laya's head reads rows a QuestionLayout lays out, not a "
                              f"{type(self.layout).__name__}")
         LayaCheckpoint(self.model, self.variables, self.layout, self.tokenizer, self.specials,
-                       self.calibration).save(directory, max_shard_size=max_shard_size)
+                       self.calibration, self.precision).save(directory, max_shard_size=max_shard_size)
 
     def save(self, directory: str) -> None:
         """Write this task's calibration, budget and name into the run `directory`.

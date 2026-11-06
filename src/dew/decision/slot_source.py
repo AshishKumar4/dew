@@ -17,6 +17,7 @@ from dew.batch import Variables
 from dew.data.text import HFTokenizer
 from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
 from dew.interop.pretrained import Pretrained, with_overrides
+from dew.interop.release import computed_in
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors
 from dew.nn.attention import AttentionImpl
 from dew.registry import dtype_name, from_record, import_path
@@ -179,7 +180,8 @@ class SlotSource(SourceKind):
         # it is another than that prompt, and the calibration where the task has one.
         stated_release(root, None if layout == prompt else layout,
                        bundle.calibration if bundle.calibration != Calibration() else None,
-                       max_length=layout.max_len, numerics=bundle.numerics)
+                       max_length=layout.max_len, numerics=bundle.numerics,
+                       compute=computed_in(bundle.numerics, bundle.model, bundle.variables))
 
     @staticmethod
     def readout(bundle: PretrainedDecision) -> Mapping[str, np.ndarray]:

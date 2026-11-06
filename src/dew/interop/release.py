@@ -30,18 +30,26 @@ if TYPE_CHECKING:
 def release_record(settings: TaskSettings, numerics: Numerics | None, model: nn.Module,
                    variables: Variables) -> Release:
     """The release of a run's export: its task settings' record, its numerics and the dtype its
-    model computes in, the one it states (`ComputesIn`), else its parameters' (`variables`), which a
-    module stating none computes in; the parameters' own dtypes are the export's."""
+    model computes in (`computed_in`); the parameters' own dtypes are the export's."""
     from dew.config.release import Release
     from dew.inference.tasks import TaskSettings
 
+    return Release(task={"settings": to_record(settings, TaskSettings),
+                         "numerics": None if numerics is None else to_record(numerics, Numerics),
+                         "dtypes": {"compute": computed_in(numerics, model, variables)}})
+
+
+def computed_in(numerics: Numerics | None, model: nn.Module, variables: Variables) -> DtypeName:
+    """The dtype a released model computes in, by name: its numerics' compute where its task traces under
+    them (a run's precision, which a model stating no dtype of its own computes under), else the one the
+    model states (`ComputesIn`), else its parameters' (`variables`), which a module stating none computes
+    in. Every export's release states it, so its load computes as its run did (`load_settings`)."""
+    if numerics is not None:
+        return dtype_name(numerics.dtypes.compute)
     stated = model.dtype if isinstance(model, ComputesIn) else None
     held = jnp.result_type(*(leaf.dtype for leaf in jax.tree.leaves(unboxed(variables))
                              if jnp.issubdtype(leaf.dtype, jnp.floating)))
-    compute = held if stated is None else stated
-    return Release(task={"settings": to_record(settings, TaskSettings),
-                         "numerics": None if numerics is None else to_record(numerics, Numerics),
-                         "dtypes": {"compute": dtype_name(compute)}})
+    return dtype_name(held if stated is None else stated)
 
 
 def released(directory: Path) -> tuple[TaskSettings | None, Numerics | None, DtypeName | None]:
