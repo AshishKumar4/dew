@@ -1127,11 +1127,11 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
 
         def merged(running: algebra.Partial) -> None:
             if merge.initial is not None:
-                running = algebra.merge(form, running, algebra.initial_state(form, merge.initial()))
+                running = algebra.finished_merge(form, running, algebra.initial_state(form, merge.initial()))
             store(running, form, initial=True)
 
         family.fixed_up(own, merge.slots, merge.ready, slot, slot, merge.splits, merged,
-                        combine=functools.partial(algebra.merge, form))
+                        combine=functools.partial(algebra.finished_merge, form))
         return
     maximum, denominator = algebra.finished_rows(spec, state, initial=hooked.initial is not None)
     own, others_total, key = trained
