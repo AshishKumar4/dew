@@ -18,7 +18,7 @@ PROMPT, BLOCK = 5, 3
 
 def cached(decoder, params, prompt):
     """`decoder`'s cache after `prompt` `[B, P]`, prefilled in one cached call."""
-    _, made = decoder.apply(params, prompt, method=CausalTransformer.init_cache, mutable=["cache"])
+    _, made = decoder.apply(params, prompt.shape[0], method=CausalTransformer.init_cache, mutable=["cache"])
     _, state = decoder.apply({**params, "cache": made["cache"]}, prompt, decode=True, mutable=["cache"])
     return state["cache"]
 
@@ -63,11 +63,11 @@ def test_a_tree_is_refused_where_no_mixer_reads_it_or_the_call_cannot_carry_it()
     for model in (hybrid, decoder):
         params = model.init(jax.random.key(1), ids)
         cache = {**params, "cache": cached(model, params, ids[:, :PROMPT])}
-        refused = [dict(attention_tree=(-1, 0, 0), attention_key_runs=runs)] if model is hybrid else [
-            dict(decode=False, attention_tree=(-1, 0, 0), attention_key_runs=runs),
-            dict(attention_tree=(-1, 0, 0)),
-            dict(attention_tree=(-1, 0), attention_key_runs=runs),
-            dict(attention_tree=(-1, 2, 0), attention_key_runs=runs)]
+        refused = [{"attention_tree": (-1, 0, 0), "attention_key_runs": runs}] if model is hybrid else [
+            {"decode": False, "attention_tree": (-1, 0, 0), "attention_key_runs": runs},
+            {"attention_tree": (-1, 0, 0)},
+            {"attention_tree": (-1, 0), "attention_key_runs": runs},
+            {"attention_tree": (-1, 2, 0), "attention_key_runs": runs}]
         for options in refused:
             with pytest.raises(ValueError):
                 model.apply(cache, block, mutable=["cache"], **{"decode": True, **options})
