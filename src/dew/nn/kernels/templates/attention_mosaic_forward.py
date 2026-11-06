@@ -1273,16 +1273,16 @@ def _written_views(block: _Block, written: tuple, stages: tuple, *, training: bo
     return status, out_view, finished, residuals, certify, merging
 
 
-def _merging_of(block: _Block, written: tuple, finishes: bool, columns_at, ready, place: tuple, splits: int
+def _merging_of(block: _Block, written: tuple, finishes: bool, columns_at, ready, place: tuple, tile
                 ) -> tuple:
     """A consumer's views in a launch that merges its slices (`_Block.merging`), a block of the columns'
     slots at `columns_at` where the launch walks one, and its semaphores, a slice each (`_Merge`): at
-    `place`, its batch row, the grid's head (a head's block of the columns) and the consumer."""
+    `place`, its batch row, the grid's head (a head's block of the columns) and the consumer, its query
+    tile `tile` (its program's along the grid's query tiles over the slices)."""
     status, out_view, finished, slots = block.merging(written, finishes)
     if columns_at is not None:
         slots = slots._replace(acc=slots.acc.at[:, :, columns_at])
     row, axis, index = place
-    tile = lax.div(lax.axis_index("q_tiles"), splits)
     return status, out_view, finished, (slots, None if ready is None else ready.at[row, axis, tile, index])
 
 
@@ -1791,8 +1791,9 @@ def _entry(program: _Program, layout: "_Layout", body: Callable, allocations: tu
         scoped_body()
     else:
         assert walk_rows is not None, "a masked launch states its walks' granule"
-        head = lax.div(lax.axis_index("heads"), column_blocks)
-        pl.when(_walked_program(program, walks, lax.axis_index("batch"), head, queries, walk_rows))(
+        head = lax.div(program.family.program_index("heads"), column_blocks)
+        pl.when(_walked_program(program, walks, program.family.program_index("batch"), head, queries,
+                                walk_rows))(
             scoped_body)
 
 @tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
@@ -1846,7 +1847,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     def body(*refs, streams):
         refs = layout.unpacked(*refs)
         read = refs.read
-        row, axis = lax.axis_index("batch"), lax.axis_index("heads")
+        row, axis = family.program_index("batch"), family.program_index("heads")
         # A launch of several column blocks a program a block along its heads' axis.
         if column_blocks > 1:
             head, column = lax.div(axis, column_blocks), lax.rem(axis, column_blocks)
@@ -1883,7 +1884,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
             status, out_view, finished, residuals, certify, merging = _written_views(
                 block, written, tuple(stage.at[index] for stage in refs.stages), training=training,
                 finishes=finishes, columns_at=columns_at, certified=certified,
-                merges=(ready, (row, axis, index), splits) if merges else None)
+                merges=((ready, (row, axis, index), lax.div(family.program_index("q_tiles"), splits))
+                        if merges else None))
             q_view = _query_view(refs.q, row, pl.ds(block.first, block_q), head, batch=batch, parts=parts)
             _consumer(program, spec, index, q_view, out_view,
                       status, *stages, refs.out_smem.at[index], refs.row_smem.at[index], streams, views, turn,
