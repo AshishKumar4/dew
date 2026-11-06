@@ -618,10 +618,12 @@ def test_a_joint_release_reads_images_as_its_own_model_does(tmp_path):
 def test_a_joint_release_exports_with_the_layout_and_calibration_it_was_given(tmp_path):
     """The joint head's files state no layout, so a release whose layout is not its default (a window of
     its own, a framing of its rows) exports it beside them (`dew.config.Release`) and reads it back,
-    answering as it did; its calibration goes with it where it has one (row 4310). The Qwen3.5 backbone's
-    bundle writes through its source's own config (a trained task's export of one is row 4525)."""
+    answering as it did; its calibration goes with it where it has one (row 4310), and the numerics its task
+    traces under, which the release's files state none of. The Qwen3.5 backbone's bundle writes through its
+    source's own config (a trained task's export of one is row 4525)."""
     from dew.decision.calibration import Abstention
     from dew.decision.layout import Framing
+    from dew.nn.precision import ACCURATE
 
     release = tmp_path / "release"
     release.mkdir()
@@ -631,10 +633,12 @@ def test_a_joint_release_exports_with_the_layout_and_calibration_it_was_given(tm
     layout = replace(bundle.layout, max_len=2048, framing=Framing(system="Decide from the schema.",
                                                                    prefill="", thinking=False))
     chosen = replace(bundle, layout=layout, calibration=replace(bundle.calibration,
-                                                                abstention=Abstention(default=0.99)))
+                                                                abstention=Abstention(default=0.99)),
+                     numerics=ACCURATE)
     chosen.save(tmp_path / "saved")
     restored = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="xla")
     assert restored.layout == layout and restored.calibration == chosen.calibration
+    assert Decide.of(restored, name="release").precision == ACCURATE
     request = CASES["quickstart"]
     assert (Decide.of(restored, name="release").systemone(request, details=True)
             == Decide.of(chosen, name="release").systemone(request, details=True))

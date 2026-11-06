@@ -106,6 +106,14 @@ def test_a_dreamer_run_exports_its_world_model_and_agent_whole(tmp_path):
     again = pipeline(str(tmp_path / "agent"))
     assert isinstance(again, SavedModel) and again.model == loaded.model
     assert_same(again.variables, loaded.variables)
+    # Stored in bfloat16, its parameters are, and the returns' percentiles keep the dtype written, as a
+    # load of the run's own checkpoint keeps them.
+    half = pipeline(str(tmp_path / "agent"), param_dtype="bfloat16")
+    direct = SavedModel.from_saved(run, ema=False, param_dtype="bfloat16")
+    assert {leaf.dtype for leaf in jax.tree.leaves(half.variables["params"])} == {jnp.dtype(jnp.bfloat16)}
+    assert ({leaf.dtype for leaf in jax.tree.leaves(half.variables["returns"])}
+            == {leaf.dtype for leaf in jax.tree.leaves(direct.variables["returns"])}
+            == {leaf.dtype for leaf in jax.tree.leaves(loaded.variables["returns"])})
 
 
 def test_a_native_release_loads_in_the_dtype_asked_and_refuses_a_source_it_is_not(tmp_path):
@@ -123,6 +131,14 @@ def test_a_native_release_loads_in_the_dtype_asked_and_refuses_a_source_it_is_no
             if jnp.issubdtype(leaf.dtype, jnp.floating)} == {jnp.dtype(jnp.bfloat16)}
     with pytest.raises(ValueError):
         pipeline(str(tmp_path / "policy"), dtype="bfloat16")
+    # Its parameters' storage is no compute of its: exported again, it states none, and reloaded it acts
+    # on float32 observations in float32.
+    half.save_pretrained(tmp_path / "again")
+    assert json.loads((tmp_path / "again" / RELEASE_FILE).read_text())["task"]["dtypes"] == {}
+    again = pipeline(str(tmp_path / "again"))
+    observation = jnp.ones((2, again.settings.observation_size), jnp.float32)
+    assert {leaf.dtype for leaf in jax.tree.leaves(again.model.apply(again.variables, observation))
+            if jnp.issubdtype(leaf.dtype, jnp.floating)} == {jnp.dtype(jnp.float32)}
     (tmp_path / "source").mkdir()
     Release(max_length=64).write(tmp_path / "source")
     with pytest.raises(ValueError):
