@@ -541,11 +541,14 @@ class MosaicForward(_Mainloop[Tiles]):
             family, config.consumers, self.score_mod, self.output_mod, guarded=guarded)))
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles, *, peaks: bool = False,
-                  columns: int | None = None) -> int:
+                  columns: int | None = None) -> int | None:
         """A consumer's registers at `config`: its walk's (`_forward_registers`) over the values' columns
         its launch walks (`columns`, a block of them; the config's own by default), or its peak walk's
-        (`peaks`, `_peaks_registers`), which a training call takes first."""
+        (`peaks`, `_peaks_registers`), which a training call takes first; None on a family that budgets
+        none (`Family.budgets_registers`: a TPU core's values spill to VMEM), which holds every config."""
         family = bundle_of(config, ba.arguments["query"].dtype)
+        if not family.budgets_registers:
+            return None
         query, value = ba.arguments["query"], ba.arguments["value"]
         natural = config.natural_form or self._natural(ba.arguments["query"])
         width = _width(query.shape[-1], family, query.dtype)
@@ -1267,7 +1270,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             layout, tiles.consumers, self.score_mod), reduces=reduces))
             for layout, tiles, allocations, reduces in launches)
 
-    def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int:
+    def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int | None:
+        # None on a family that budgets none (`Family.budgets_registers`), which holds every config.
+        if not bundle_of(config, ba.arguments["query"].dtype).budgets_registers:
+            return None
         dq, dkv = self._launch_registers(ba, config)
         return dkv if config.fused else max(dq, dkv)
 
@@ -1291,7 +1297,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         return counts[0], counts[1]
 
     def _held(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> bool:
-        # Each launch's registers within its own layout's budget (`Family.registers`).
+        # Each launch's registers within its own layout's budget (`Family.registers`); every config where
+        # the family budgets none (`Family.budgets_registers`).
+        if not bundle_of(config, ba.arguments["query"].dtype).budgets_registers:
+            return True
         dq, dkv = self._launch_registers(ba, config)
         held = dkv <= self.register_budget(config.dkv)
         return held and (config.fused or dq <= self.register_budget(config))
