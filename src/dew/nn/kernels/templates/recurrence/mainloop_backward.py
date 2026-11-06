@@ -592,12 +592,14 @@ def _gradient_stored(call: Call, kind: str, block: int, grad, *, weights: Sequen
     and keys' ('dq', 'dk') to `sums[kind]` summed over the key head's value heads in fp32, stored at the
     first (`first`) and added at the rest (`Family.added`: a TMA reduction, or whole rows through
     registers), each through its launch's landing tiles. A value split's (`apart`) weights' gradient is its
-    split's own part of it, fp32, which XLA adds."""
+    split's own part of it, fp32, which XLA adds, stored as the queries' and keys' split sums are, through
+    their landing tile: through a tile of its own an H100 landed its stores at places its programs did not
+    own (marks of other programs' and foreign values, the same store interpreted exact; M-JS-8, row 4346)."""
     del block
     family = call.family
     if kind == "dw":
         if apart:
-            family.stored([grad], weights, smem=landing["weights"])
+            family.stored([grad], weights, smem=landing["sums"])
             return
         pieces = product.formed(grad.astype(jnp.float32), call.held.parts) if call.held.parts > 1 else (grad,)
         family.stored([piece.astype(call.held.stored) for piece in pieces], weights, smem=landing["weights"])
@@ -641,11 +643,13 @@ def _query_key_held(call: Call) -> Held:
 
 
 def _query_key_landing(call: Call, splits: int) -> dict:
-    """`_query_key`'s stores' tiles at `splits` value splits: the weights' gradient with the delta rule (fp32
-    where there are two splits or more) and the queries' and keys' sums."""
+    """`_query_key`'s stores' tiles at `splits` value splits: the weights' gradient with the delta rule, its
+    own where a launch takes whole rows (a split's lands through the sums', `_gradient_stored`), and the
+    queries' and keys' sums."""
     held = dataclasses.replace(call.held, rows=call.rows)
-    weights = held.landing(CHUNK, call.block) if splits == 1 else ((CHUNK, call.block), jnp.float32)
-    return {**({"weights": weights} if call.delta else {}), "sums": ((CHUNK, call.block), jnp.float32)}
+    own = call.delta and splits == 1
+    return {**({"weights": held.landing(CHUNK, call.block)} if own else {}),
+            "sums": ((CHUNK, call.block), jnp.float32)}
 
 
 def _query_key_launched(call: Call, vq: int) -> tuple[dict, tuple]:
