@@ -811,10 +811,18 @@ WIDE_HYBRID = HybridSite(vocab=512, width=64, budget=16, seeds=256)
 users' are (ledger 1698) leave their scores' paired ratio unresolved within 512 seeds, which 512 words, 64
 wide and 16 draws a request resolve at 256 (armada, rows/1698-serving-hybrid)."""
 NARROW_HYBRID, NARROW_HYBRID_TAILED = HybridSite(seeds=256), HybridSite(seeds=512)
+SHORT_HYBRID = HybridSite(seeds=256, budget=4)
+"""NARROW_HYBRID's model drawing 4 tokens a request, so a request of 7 to 9 prompt tokens holds 3 or 4
+pages and a pool of 6 or 8 runs the segment's host cases."""
 """The sites at 256 words, 16 wide and 8 draws, sized paired by `seeds_for` on armada (11-03, at
 0fccb01d79): every-page's and restores-past-admission's resolve at 256, evicted's and
 one-entry-booked-twice's at 512."""
 
+
+SEGMENT_HOST = {"slots": 2, "admission": 2, "kv_cache": KVCache(page_size=4, pages=6), "host_pages": 2,
+                "prefix_states": 4}
+"""A pool whose host tier keeps a segment's pages: two rows at once over 6 pages of 4 tokens, 2 host slots
+and 4 states."""
 
 SEGMENT = (Served(12, shared=6), Served(12, flipped=(7,), shared=6), Served(12, flipped=(6,), shared=6))
 """A segment of 6 tokens three prompts declare shared (a decision's state, each question past it its own
@@ -837,9 +845,16 @@ the later ones wait for the first to write it."""
      {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 1,
       "prefix_states": 4}, (0, 0, 0, 0), None, NARROW_HYBRID),
     (SEGMENT, {}, (0, 6, 12), None, NARROW_HYBRID),
-    (SEGMENT, {}, (12,), (3,), NARROW_HYBRID)],
+    (SEGMENT, {}, (12,), (3,), NARROW_HYBRID),
+    ((Served(7, shared=6), Served(7, flipped=(0,)), Served(7, flipped=(0, 1)),
+      Served(7, flipped=(6,), shared=6), Served(7, shared=6)), SEGMENT_HOST, (0, 0, 12), (1, 2, 2),
+     SHORT_HYBRID),
+    ((Served(9, flipped=(0,)), Served(7, shared=6), Served(9, flipped=(0, 1)),
+      Served(7, flipped=(6,), shared=6), Served(9, flipped=(0,))),
+     {**SEGMENT_HOST, "kv_cache": KVCache(page_size=4, pages=8)}, (0, 0, 6, 14), (1, 1, 2, 1), SHORT_HYBRID)],
     ids=["by-default", "in-pieces", "every-page", "restores-past-admission", "from-the-host",
-         "from-one-host-slot", "a-shared-segment", "a-shared-segment-asked-at-once"])
+         "from-one-host-slot", "a-shared-segment", "a-shared-segment-asked-at-once",
+         "a-segment-uploaded-and-copied-at-once", "a-segment-copied-into-a-spilled-page"])
 @pytest.mark.check1_shards(seeds=256, per_task=64)
 def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(requests, options, hits, rounds,
                                                                              site):
@@ -882,7 +897,11 @@ def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
     alone, where the store holds the state after the deepest page only, so the repeat reads nothing back.
     A segment three prompts declare shared, ending inside a page (`SEGMENT`), is read by each later one
     from the state kept at its end, its last page copied into the prompt's own, one a round or all asked
-    at once. Each request
+    at once. With a host tier (`SEGMENT_HOST`): a segment two other prompts spill to the host, its page
+    named by the segment alone, comes back for two prompts seated together, the first uploading it and the
+    second copying it from there after the upload lands; and a prompt copying a segment into a page the
+    pool reclaims from a cached prefix spills that prefix first, which its repeat reads back. Each
+    request
     draws what it draws alone and scores it as a full
     forward does (check 1)."""
     # A vocabulary of 256 at least and eight draws a request, so each request's scores spread enough to
