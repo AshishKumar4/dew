@@ -1813,8 +1813,9 @@ def suite_step(tmp_path: Path, ref: str, proven: str, policy: str, verdict: int,
     (bin_dir / "armada").chmod(0o755)
     subprocess.run(["bash", "-c", script], cwd=ROOT, capture_output=True, text=True, timeout=120,
                    env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "PROVEN": proven,
-                        "DEW_TEST_CACHE": policy, "GITHUB_REF_NAME": ref, "BACKGROUND_POOL": "",
-                        "DEW_WHOLE_SUITE": "1" if whole else "",
+                        "DEW_TEST_CACHE": policy, "GITHUB_REF_NAME": ref,
+                        # As ci.yml's expressions give them: the whole run's bounded share and its mode.
+                        "BACKGROUND_POOL": "48" if whole else "", "DEW_WHOLE_SUITE": "1" if whole else "",
                         "RUNNER_TEMP": str(tmp_path), "ARMADA_URL": "http://127.0.0.1:9", "ARMADA_TOKEN": ""})
     return [line.split() for line in calls.read_text().splitlines()] if calls.exists() else []
 
@@ -1950,6 +1951,11 @@ def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priorit
     # tip's test.
     assert run_options(tmp_path, "main", "off", "--priority", whole=True) == ["--priority=-15"]
     assert priority("main") == ["--priority=5"]
+    # Below every lane's, it waits for capacity within its deadlines: the suite's and its gangs' a background
+    # run's (train 663's review), on its bounded share.
+    calls = suite_step(tmp_path / "whole-deadlines", "main", "", "off", 2, whole=True)
+    assert {word for call in calls for word in call if word.startswith(("--deadline", "--pool=48"))} == {
+        "--deadline=6000", "--pool=48"}
 
 
 def test_a_test_past_the_group_target_is_flagged_and_a_new_one_fails(ci, tmp_path, monkeypatch, capsys):
