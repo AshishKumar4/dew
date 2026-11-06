@@ -311,7 +311,10 @@ def profiled(case: dict, out: Path, repo: Path) -> None:
             variables = {**os.environ, **arm.get("env", {}),
                          "PYTHONPATH": os.pathsep.join([str(tree / "src"), str(tree), str(tree / "tools")]),
                          "DEW_TIMING_SETUP": arm.get("setup") or ""}
-            subprocess.run(["ncu", "-k", f"regex:{profile['kernel']}", "-c", str(profile.get("count", 1)),
+            # Profiling off until the worker's `once` starts it around its second call, so no compile,
+            # autotuning or warm-up launch is what ncu captures.
+            subprocess.run(["ncu", "--profile-from-start", "off", "-k", f"regex:{profile['kernel']}",
+                            "-c", str(profile.get("count", 1)),
                             *sections, *sampling, "-o", str(report), sys.executable, str(TOOLS / "timing.py"),
                             "worker", "--clock", "wall"],
                            input=request + "\n" + json.dumps({"op": "quit"}) + "\n", text=True,
