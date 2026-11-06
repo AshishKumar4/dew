@@ -9,7 +9,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels.templates import resources
-from dew.nn.kernels.templates.mosaic import Ring, RingFamily
+from dew.nn.kernels.templates.mosaic import Ring, RingFamily, viewed
 
 
 @dataclasses.dataclass(frozen=True)
