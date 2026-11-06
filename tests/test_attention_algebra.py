@@ -906,4 +906,5 @@ def test_finished_slices_merged_at_a_large_maximum_keep_each_ones_mass(merge):
                                                                         strict=True)))
         merged = algebra.finished_merged(spec, stacked, axis=0)
     out = algebra.finish(spec, merged, initial=True, normalized=True)[0]
-    np.testing.assert_allclose(np.asarray(out), np.full((1, 1), 1.0 / 3.0, np.float32), rtol=2 ** -22)
+    # Each slice's share of the mass a third, rounded once: the output fp32's third exactly.
+    assert out.item() == np.float32(1.0 / 3.0), out.item()

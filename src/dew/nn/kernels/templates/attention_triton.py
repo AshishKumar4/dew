@@ -140,18 +140,24 @@ def _key_steps(queries: int, keys: int, block_q: int, block_k: int, *, causal: b
     return sum(min(keys, (block + 1) * block_q) / block_k for block in range(blocks)) / blocks
 
 
+def _call_extents(ba: tokamax.BoundArguments, config) -> tuple:
+    """A call's extents as the modelled times read them (`_forward_seconds`, `_backward_seconds`): its batch,
+    query heads, head widths, element bytes, `config`'s blocks, and its queries and keys padded to `BLOCK`."""
+    query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
+    batch, queries, heads, width = query.shape
+    padded = tuple(-(-count // BLOCK) * BLOCK for count in (queries, key.shape[1]))
+    return (batch, heads, width, value.shape[-1], jnp.dtype(query.dtype).itemsize,
+            (config.block_q, config.block_k), padded)
+
+
 def _forward_seconds(launch: "TritonForward", ba: tokamax.BoundArguments, config: Tiles,
                      target: generation.GpuTarget) -> float:
     """The forward's modelled time at `config` (`_walk_seconds`): a program a query block and head, each step
     its logits' and weighted values' products, its weights' exponentials and its key and value tiles read
     from shared memory, one reduction each of its maximum and its denominator; its keys and values streamed
     from device memory once a program."""
-    query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
-    batch, queries, heads, width = query.shape
-    keys, value_width = key.shape[1], value.shape[-1]
-    size = jnp.dtype(query.dtype).itemsize
-    block_q, block_k = config.block_q, config.block_k
-    padded_q, padded_k = -(-queries // BLOCK) * BLOCK, -(-keys // BLOCK) * BLOCK
+    batch, heads, width, value_width, size, blocks, padded = _call_extents(ba, config)
+    (block_q, block_k), (padded_q, padded_k) = blocks, padded
     steps = _key_steps(padded_q, padded_k, block_q, block_k, causal=launch.form == "causal")
     step = cost.Work(flops=2 * block_q * block_k * (width + value_width), exponentials=block_q * block_k,
                      shared_bytes=block_k * (width + value_width) * size, span=2)
@@ -818,12 +824,8 @@ def _backward_seconds(launch: "TritonBackward", ba: tokamax.BoundArguments, conf
     dV's, its queries and output gradients streamed; each step its weights' exponentials and its tiles read
     from shared memory, one reduction of its cotangents' row sums; every step walked (the op states no form:
     its spans are arrays)."""
-    query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
-    batch, queries, heads, width = query.shape
-    keys, value_width = key.shape[1], value.shape[-1]
-    size = jnp.dtype(query.dtype).itemsize
-    block_q, block_k = config.block_q, config.block_k
-    padded_q, padded_k = -(-queries // BLOCK) * BLOCK, -(-keys // BLOCK) * BLOCK
+    batch, heads, width, value_width, size, blocks, padded = _call_extents(ba, config)
+    (block_q, block_k), (padded_q, padded_k) = blocks, padded
     tile = block_q * block_k
     seconds = 0.0
     for dq in (True, False):
