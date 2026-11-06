@@ -44,9 +44,11 @@ TOOLS = Path(__file__).resolve().parent
 INSTRUMENT = TOOLS.parent / "src/dew/telemetry/benchmark.py"
 """The window's own device timer, which every arm's process loads by its path (`instrument`), never its
 tree's: one instrument for every arm, whatever the arm's commit holds."""
-ROUNDS = 5
-"""A case's rounds unless it names its own: an arm's range and the A/A band are its rounds' ratios, which
-three leave coarse enough for one outlier round to set the band."""
+ROUNDS = 6
+"""A case's rounds unless it names its own: an arm's verdict is its rounds' ratios judged against the A/A's
+at `LEVEL` (`dew.telemetry.benchmark.judged`), and six rounds are the fewest whose ratios reach an interval
+at 0.95 (five reach 0.9375 at most); the rounds, not the calls within one, are a window's independent
+pairs."""
 WARMUP = 1
 """A case's warm-up rounds unless it names its own, before its `ROUNDS` (the measurement lane's harness proof,
 2026-11-06, A100: the A/A's round ratios ran 0.797-1.002, a first round holding an arm's cold work)."""
@@ -336,12 +338,13 @@ LEVEL = 0.95
 def summarized(manifest: dict, out: Path) -> None:
     """The window's verdict, out/summary.json and its table out/summary.md, from its rows, so every window
     decides alike. Per case, cell and arm: the median of its measure (device ms, or wall ms where the case's
-    clock is the wall's); its ratio to the reference call by call past the warm-up (each of its calls over the
-    reference's of the same round and repeat), judged against the A/A arm's at the case's level by Dew's one
-    judgment (`dew.telemetry.benchmark.judged`: the ratios' median and interval beside the A/A's, the
-    window's noise band, `differs` where neither chance nor the band accounts for it); each round's median
-    ratio in order beside it; and whether its digest is the reference's. A window with too few calls to reach
-    an interval at its level says so in place of a verdict. Beside them, the window's run order (each
+    clock is the wall's); its paired ratio to the reference each round past the warm-up (the arm's round
+    median over the reference's: a round's calls share its state, its clocks and its neighbours, so a
+    round, not a call, is one pair), each round's in order, judged against the A/A arm's at the case's level
+    by Dew's one judgment (`dew.telemetry.benchmark.judged`: the ratios' median and interval beside the
+    A/A's, the window's noise band, `differs` where neither chance nor the band accounts for it); and whether
+    its digest is the reference's. A window of too few rounds to reach an interval at its level says so in
+    place of a verdict. Beside them, the window's run order (each
     `order`'s case, cell and arm) and each round's GPU."""
     import statistics
 
@@ -362,29 +365,27 @@ def summarized(manifest: dict, out: Path) -> None:
             mine = [row for row in rows if row["case"] == case["name"] and row["cell"] == cell
                     and not row["warmup"]]
 
-            def calls(arm: str, mine: list[dict] = mine, measure: str = measure) -> dict:
-                """`arm`'s timed calls, by their round and repeat."""
-                return {(row["round"], row["repeat"]): row[measure] for row in mine
-                        if row["arm"] == arm and row[measure] is not None}
+            def by_round(arm: str, mine: list[dict] = mine, measure: str = measure) -> dict[int, float]:
+                """`arm`'s median call each round."""
+                found: dict[int, list[float]] = {}
+                for row in mine:
+                    if row["arm"] == arm and row[measure] is not None:
+                        found.setdefault(row["round"], []).append(row[measure])
+                return {round_: statistics.median(values) for round_, values in found.items()}
 
-            def paired(arm: str, base: dict) -> dict[tuple[int, int], float]:
-                """`arm`'s calls each over the reference's of its round and repeat."""
-                return {call: value / base[call] for call, value in sorted(calls(arm).items())
-                        if call in base}
+            def paired(arm: str, base: dict[int, float]) -> list[float]:
+                """`arm`'s round medians each over the reference's of its round, in round order."""
+                rounds = by_round(arm)
+                return [rounds[round_] / base[round_] for round_ in sorted(rounds) if round_ in base]
 
-            base = calls(reference)
-            alone = list(paired(f"{reference}~aa", base).values())
+            base = by_round(reference)
+            alone = paired(f"{reference}~aa", base)
             digest = next(row["digest"] for row in mine if row["arm"] == reference)
             band, why = None, None
             arms = []
             for arm in [found["name"] for found in arms_of(case)]:
-                each_call = paired(arm, base)
-                ratios = list(each_call.values())
-                rounds: dict[int, list[float]] = {}
-                for (round_, _), ratio in each_call.items():
-                    rounds.setdefault(round_, []).append(ratio)
-                by_round = [statistics.median(rounds[round_]) for round_ in sorted(rounds)]
-                values = list(calls(arm).values())
+                ratios = paired(arm, base)
+                values = [row[measure] for row in mine if row["arm"] == arm and row[measure] is not None]
                 judgment = None
                 # The reference and its A/A are the band's own ends, never judged against it.
                 if arm not in (reference, f"{reference}~aa") and ratios and alone:
@@ -398,12 +399,12 @@ def summarized(manifest: dict, out: Path) -> None:
                 arms.append({"arm": arm, "median": statistics.median(values) if values else None,
                              "ratio_median": statistics.median(ratios) if ratios else None,
                              "ratio_interval": list(judgment.interval) if judgment else None,
-                             "ratios": by_round, "differs": judgment.differs if judgment else None,
+                             "ratios": ratios, "differs": judgment.differs if judgment else None,
                              "digest_is_reference": same})
                 interval = f"{judgment.interval[0]:.4f}-{judgment.interval[1]:.4f}" if judgment else "-"
                 median = f"{arms[-1]['median']:.4f}" if values else "-"
                 ratio = f"{arms[-1]['ratio_median']:.4f}" if ratios else "-"
-                each = " ".join(f"{value:.4f}" for value in by_round) or "-"
+                each = " ".join(f"{value:.4f}" for value in ratios) or "-"
                 verdict = "-" if judgment is None else "yes" if judgment.differs else "no"
                 lines.append(f"| {index}: {json.dumps(cell)} | {arm} | {median} | {ratio} | {interval} | "
                              f"{each} | {verdict} | {'same' if same else 'differs'} |")

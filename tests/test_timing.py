@@ -28,9 +28,10 @@ def test_a_window_times_every_arm_in_reversed_rounds_beside_its_a_a_each_revisio
         tmp_path):
     """Two cells, three arms (two implementations in the window's tree, and the first again at an earlier
     commit whose builder differs), and the reference's A/A: each arm built once (its output's digest kept,
-    the A/A's the reference's, the earlier commit's its own), then timed a warm-up round and 2 rounds of 2
+    the A/A's the reference's, the earlier commit's its own), then timed a warm-up round and 6 rounds of 2
     calls, the arms in one order each round and the reverse the next, every row naming its tree. The warm-up's
-    rows are kept, marked, and decide nothing: the verdict's ratios are the 2 rounds', each printed."""
+    rows are kept, marked, and decide nothing: the verdict judges the 6 rounds' ratios, each printed, against
+    the A/A's by Dew's one judgment (dew.telemetry.benchmark.judged)."""
     repo, origin = tmp_path / "repo", tmp_path / "origin.git"
     (repo / "src").mkdir(parents=True)
     git(tmp_path, "init", "-q", "--bare", str(origin))
@@ -46,7 +47,7 @@ def test_a_window_times_every_arm_in_reversed_rounds_beside_its_a_a_each_revisio
     git(repo, "push", "-q", "origin", "HEAD:refs/heads/work")
     git(repo, "fetch", "-q", "origin")
     manifest = {"clock": "wall", "cases": [{
-        "name": "cells", "builder": "cells:built", "cells": [{"size": 8}, {"size": 16}], "rounds": 2,
+        "name": "cells", "builder": "cells:built", "cells": [{"size": 8}, {"size": 16}], "rounds": 6,
         "repeats": 2, "draws": 3,
         "arms": [{"name": "sin", "tree": None, "implementation": "sin"},
                  {"name": "cos", "tree": None, "implementation": "cos"},
@@ -56,9 +57,9 @@ def test_a_window_times_every_arm_in_reversed_rounds_beside_its_a_a_each_revisio
                     str(tmp_path / "out")], cwd=repo, check=True)
     rows = [json.loads(line) for line in (tmp_path / "out/timing.jsonl").read_text().splitlines()]
     arms = ["sin", "cos", "sin-earlier", "sin~aa"]
-    assert len(rows) == 3 * 2 * len(arms) * 2
+    assert len(rows) == 7 * 2 * len(arms) * 2
     assert {row["round"] for row in rows if row["warmup"]} == {-1}
-    assert {row["round"] for row in rows if not row["warmup"]} == {0, 1}
+    assert {row["round"] for row in rows if not row["warmup"]} == set(range(6))
     for cell in (8, 16):
         warm = [row["arm"] for row in rows if row["round"] == -1 and row["cell"]["size"] == cell][::2]
         assert warm == arms[::-1]
@@ -74,6 +75,8 @@ def test_a_window_times_every_arm_in_reversed_rounds_beside_its_a_a_each_revisio
     assert [row["order"] for row in rows][::2] == sorted({row["order"] for row in rows})
     # Its verdict: each arm's ratios to the reference against the A/A's band, and whether its output is the
     # reference's; the run order and each round's GPU beside them.
+    from dew.telemetry import benchmark
+
     summary = json.loads((tmp_path / "out/summary.json").read_text())
     (case,) = summary["cases"]
     assert case["measure"] == "wall_ms" and case["reference"] == "sin" and len(case["cells"]) == 2
@@ -82,13 +85,15 @@ def test_a_window_times_every_arm_in_reversed_rounds_beside_its_a_a_each_revisio
         assert len(arms) == 4
         # The reference is the band's own end, never judged against it.
         assert arms["sin"]["ratio_median"] == 1.0 and arms["sin"]["differs"] is None
-        assert all(len(arm["ratios"]) == 2 for arm in arms.values())
+        assert all(len(arm["ratios"]) == 6 for arm in arms.values())
         assert arms["sin~aa"]["digest_is_reference"] and not arms["cos"]["digest_is_reference"]
-        # Four calls an arm reach no interval at the window's level (dew.telemetry.benchmark.judged): said so,
-        # and no arm is judged.
-        assert "take more" in cell["unjudged"] and cell["noise_band"] is None
-        assert all(arm["differs"] is None for arm in arms.values())
-    assert len(summary["run_order"]) == 3 * 2 * 4
+        # The other arms judged, their rounds' interval against the A/A's, the band the A/A's own interval.
+        judgment = benchmark.judged(arms["cos"]["ratios"], arms["sin~aa"]["ratios"])
+        assert arms["cos"]["ratio_interval"] == list(judgment.interval) and cell["noise_band"] == list(
+            judgment.alone)
+        assert arms["cos"]["differs"] is judgment.differs and arms["sin~aa"]["differs"] is None
+        assert cell["unjudged"] is None
+    assert len(summary["run_order"]) == 7 * 2 * 4
     # A revision held here and pushed nowhere is refused before any arm is built.
     (repo / "src/cells.py").write_text(BUILDER.format(sign=2.0))
     git(repo, "commit", "-qam", "unpushed")
