@@ -1792,6 +1792,7 @@ def test_a_tools_init_added_or_a_helper_of_a_shadowing_name_reruns_the_rows_whos
     from it, and its removal again (train 672's review: no row's key held tools' own lookup); a helper
     under tests/ of a module's name, which shadows it as tests/ leads sys.path, reruns each row that imported
     that name, and one of another name reruns none."""
+    (tmp_path / "tools").mkdir(exist_ok=True)
     (tmp_path / "tools/helper.py").write_text("def value(): return 1\n")
     written(tmp_path, {
         "test_tooled.py": "import sys\nsys.path.insert(0, '.')\n\n\ndef test_tooled():\n"
