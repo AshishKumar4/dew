@@ -571,8 +571,7 @@ class Pretrained:
             dduf_file=dduf_file, placed=placed, streaming=streaming or not weights, weights=weights,
             dtype=loading.dtype, param_dtype=loading.param_dtype, attention_impl=attention_impl,
             max_seq_len=loading.max_seq_len, overrides=modeling_overrides,
-            trust_remote_code=trust_remote_code,
-            text_only=text_only, prediction_depths=prediction_depths)
+            trust_remote_code=trust_remote_code, text_only=text_only, prediction_depths=prediction_depths)
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
