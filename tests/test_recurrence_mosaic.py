@@ -1095,7 +1095,8 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
         value_width = RESOURCE_SHAPES[name][3]
         two = (template.MOSAIC._staged(bound, derived.block_v, facts, walkers=2,
                                        wide=derived.block_o or derived.block_v)
-               if family.consumers >= 2 and not packed and value_width // derived.block_v % 2 == 0 else None)
+               if template.walk_roles(family) >= 2 and not packed and value_width // derived.block_v % 2 == 0
+               else None)
         walked = [] if two is None else [(two, 'two roles ')]
         if variant == TWO_ROLES:
             return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)

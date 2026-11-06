@@ -148,6 +148,9 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
         scoped.append(plgpu.SMEM((consumers, block_q), jnp.int32))
     if certified:
         scoped.append(plgpu.SMEM((consumers, block_q, value_width), jnp.float32))
+    if relays(family, tiles, peaks=peaks):
+        # The weights' way to the values' product where the family's warps split them (`Family.relaying`).
+        scoped.append(mosaic.plain((consumers, block_q, block_k), dtype))
     scoped += [family.load_barriers(consumers), family.schedule(consumers)]
     blocks = {"keys": ((block_k, width), dtype)}
     if not peaks:
@@ -155,6 +158,13 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     # The logits' product reads the keys transposed.
     return scoped, family.streams(blocks, stages, consumers, swizzles=transposed_swizzles(tiles, "keys"),
                                   copies=dict.fromkeys(blocks, pieces))
+
+
+def relays(family: mosaic.Family, tiles: Tiles, *, peaks: bool = False) -> bool:
+    """Whether a forward launch's weights `[block_q, block_k]`, the logits' accumulator, reach the values'
+    product through shared memory (`Family.relay_bytes`): a decode step's 16-row mma.sync tile, its warps
+    along the keys (`attention_mosaic_program.few_rows`); a peak walk takes no values' product."""
+    return not peaks and family.relay_bytes(tiles.block_q, tiles.block_k) > 0
 
 
 def guarded_columns(family: mosaic.Family, value_width: int, dtype) -> int:
@@ -212,7 +222,9 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
         return live <= arranged.registers(candidate.consumers)
 
     blocks = [block for block in walked_extents(family, dtype, tiles.block_k) if tiles.block_k % block == 0]
-    queries = [rows for rows in extents(family, dtype, tiles.block_q) if tiles.block_q % rows == 0]
+    # A plain tile of fewer rows than a role's guards at its own rows (`few_rows`).
+    queries = [rows for rows in extents(family, dtype, tiles.block_q) if tiles.block_q % rows == 0] or [
+        tiles.block_q]
     # Its key blocks copied by its consumers together where its family's copies split them
     # (`Transport.shares_rows`: two mma.sync consumers' cp.async in whole 64-row parts).
     candidates = (dataclasses.replace(tiles, block_q=rows, block_k=block, consumers=consumers, narrow=narrow)
@@ -684,6 +696,7 @@ class _Refs(NamedTuple):
     stages: tuple
     q_loaded: Any
     schedule: Any
+    relay: Any = None
 
 
 class _Layout(NamedTuple):
@@ -693,15 +706,18 @@ class _Layout(NamedTuple):
     outputs: int
     arrays: int
     reuse: bool
+    relays: bool = False
 
     def unpacked(self, q_ref, k_ref, v_ref, *refs) -> _Refs:
-        """A program's refs, its kernel's then its scoped allocations'."""
+        """A program's refs, its kernel's then its scoped allocations', the weights' relay tile last where
+        the launch `relays` them (`relays`)."""
         read, refs = refs[:self.treedef.num_leaves], refs[self.treedef.num_leaves:]
         written, refs = refs[:self.outputs], refs[self.outputs:]
         (q_smem, row_smem, *stages), (q_loaded, schedule) = refs[:self.arrays], refs[self.arrays:]
+        relay = stages.pop() if self.relays else None
         out_smem, stages = (q_smem, stages) if self.reuse else (stages[0], stages[1:])
         return _Refs(q_ref, k_ref, v_ref, self.treedef.unflatten(read), tuple(written), q_smem, row_smem,
-                     out_smem, tuple(stages), q_loaded, schedule)
+                     out_smem, tuple(stages), q_loaded, schedule, relay)
 
     def read(self, refs: tuple) -> _Read:
         """What a kernel's entry `refs` (its three operands first) read."""
@@ -795,7 +811,8 @@ class _Residuals(NamedTuple):
 
 def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, spans: _Spans | None,
             hooked: _Hooked, place: tuple, whole, turn, *, hooks: Hooks, drawn: bool,
-            held: tuple | None = None, product: Callable[[], jax.Array] | None = None) -> tuple:
+            held: tuple | None = None, product: Callable[[], jax.Array] | None = None,
+            interpret: bool = False) -> tuple:
     """A key tile's first key, coordinates and logits under the score hook (batch row and head `place`, its
     queries from `first`), and their products where the logits are a factor of them (`algebra.logits_of`),
     every walk's (`_consumer`'s, `_peak_consumer`'s), so a peak walk's logits are the training walk's to the
@@ -806,7 +823,10 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
     row, head = place
     family, tiles = program.family, program.tiles
     shape = (tiles.block_q, tiles.block_k)
-    s = family.product(q, slots["keys"].transpose((1, 0)), shape, turn) if product is None else product()
+    if product is None:
+        s = family.product(q, slots["keys"].transpose((1, 0)), shape, turn, interpret=interpret)
+    else:
+        s = product()
     slots.release("keys")
     k_first = index * tiles.block_k
     # The tile's places formed a step, not held across the walk beside its sums (`_coords`).
@@ -836,7 +856,12 @@ def _empty(family: mosaic.Family, shape: tuple[int, int], live: jax.Array | None
     headroomed at the guard's `live` rows."""
     rows = shape[0]
     start = algebra.Partial(family.zeros(shape), family.full((rows,), algebra.LEAST), family.zeros((rows,)))
-    return start if live is None else algebra.headroomed(start, live)
+    if live is None:
+        return start
+    # No key weighed yet: no shift and no reach, `algebra.headroom_of`'s of an empty state, stated rather than
+    # reduced from its zero sums (Mosaic reduces no constant tile: a 16-row mma.sync walk's `[16, 32]`).
+    nothing = family.zeros((rows,))
+    return start._replace(guard=algebra.Guard(nothing, nothing, start.acc, start.total, live))
 
 
 def _value_tile(shape: tuple, dtype, turn, slots) -> algebra.Operand:
@@ -857,7 +882,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
               spans: _Spans | None, hooked: _Hooked, guard: _Guard | None, place: tuple, *, hooks: Hooks,
               residuals: _Residuals | None, anchors: tuple | None = None, interpret: bool,
               finished: tuple | None = None, certified: tuple | None = None, kept=None,
-              merging: tuple | None = None):
+              merging: tuple | None = None, relay=None):
     """A consumer's query block (batch row, head and key head `place`): its walk of the key tiles it reads
     through the family's streams (`algebra.plain_step` a step) from the hooks' initial state, the score hook
     on each tile, passing those of the program's `streamed` range its partner alone reads; then its output
@@ -872,9 +897,13 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     walk stores its state after each key tile (`certified_walk`). With `kept` (a launch into the plain
     launch's outputs, `_Read.kept`), it writes its rows `kept` alone, every other row of its views as it was
     (`_kept_rows`). With `merging` (a split launch that merges its slices: their states' slots and its
-    semaphores, `_merge`), its output is its slices' merge, the last slice's program's."""
+    semaphores, `_merge`), its output is its slices' merge, the last slice's program's. With `relay` (its
+    own tile, `relays`), its weights reach the values' product through it."""
     row, head, _ = place
     family, tiles = program.family, program.tiles
+    if relay is not None:
+        # Its weights reach the values' product through its own tile (`relays`).
+        family = family.relaying(relay)
     lo, hi, whole = program.reach(first, spans, row)
     family.loaded(((q_view, q_smem, q_loaded),))
     q = family.held(q_smem)
@@ -893,7 +922,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
 
     def scored(index, slots, product=None):
         return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
-                       hooks=hooks, drawn=hooked.drop is not None, held=held, product=product)
+                       hooks=hooks, drawn=hooked.drop is not None, held=held, product=product,
+                       interpret=interpret)
 
     values = functools.partial(_value_tile, (tiles.block_k, value_width), views["values"][0].dtype, turn)
 
@@ -1301,7 +1331,7 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
     def step(index, slots, arg, accumulators):
         # The peak walk's logits draw no dropout.
         _, coords, logits, _ = _scored(program, spec, q, index, slots, first, spans, hooked, place, whole,
-                                       turn, hooks=hooks, drawn=False, held=held)
+                                       turn, hooks=hooks, drawn=False, held=held, interpret=interpret)
         # The partner's turn, as a training step's value product would take it.
         turn(wait=False)
         turn(arrive=False)
@@ -1482,7 +1512,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     in_place = read.into is not None
     if in_place:
         out_type = (out_type[0], *out_type[-2:]) if merges else out_type[:1]
-    layout = _Layout(treedef, len(out_type), len(scoped) - 2, peaks or (reuse and not training))
+    layout = _Layout(treedef, len(out_type), len(scoped) - 2, peaks or (reuse and not training),
+                     relays(family, tiles, peaks=peaks))
 
     def body(*refs, streams):
         refs = layout.unpacked(*refs)
@@ -1528,7 +1559,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                       streamed, block.first, read.spans, read.hooked, read.guard,
                       (row, head, lax.div(head, group)), hooks=hooks, residuals=residuals,
                       anchors=read.anchors, interpret=interpret, finished=finished, certified=certify,
-                      kept=read.kept, merging=merging)
+                      kept=read.kept, merging=merging,
+                      relay=None if refs.relay is None else refs.relay.at[index])
 
         def producer():
             family.stream(streams, views, *streamed)

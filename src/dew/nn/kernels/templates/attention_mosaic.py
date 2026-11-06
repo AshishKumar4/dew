@@ -64,6 +64,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     extents,
     launch_scope,
     layouts,
+    query_rows,
     query_swizzle,
     reducing,
     refused,
@@ -80,24 +81,27 @@ from dew.nn.kernels.templates.base import Template, Unfitted
 def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held: int, walked: int,
                                                 tiles: Callable[[int, int, int], Config],
                                                 fits: Callable[[Config], bool], *,
-                                                overlapped: bool) -> Config | None:
+                                                overlapped: bool, walks: Callable = extents) -> Config | None:
     """A launch's config from its family's facts and the call's extents (design §7), no space ranked: its
     consumers the family's (`Family.consumers`) where its step `overlapped` (a softmax between its products,
     which runs under its partner's products as the consumers take turns, FlashAttention-3's), else one (a
     step issuing its products back to back, which turns only make wait); fewer where the `held` rows a
     consumer accumulates (a forward's queries, a dK/dV launch's keys) fill fewer of the family's units; each
     consumer's rows the family's unit (`_extents`' least: the rows its products cover, `Family.role_rows`, in
-    whole swizzled rows); the tile it walks the largest of its extents (`walked_extents`: a product's depth,
-    in whole swizzled rows) within the `walked` extent whose live set a consumer's registers hold and
+    whole swizzled rows); the tile it walks the largest of its extents (`walks`: a backward's the family's
+    unit, `extents`, its walked tiles' weights and cotangents feeding products from registers, which at fewer
+    rows than the unit cross warps (fs-backward-specialized: mma.sync at 32-row shares, no relayout lowers);
+    a forward's `walked_extents`, a product's depth in whole swizzled rows) within the `walked` extent whose
+    live set a consumer's registers hold and
     whose two stages the block holds (`fits`), two the ring's busy depth, a slot loading while one is read;
     where its family's products read operands from registers, a tile its transposed streams staged at the
     family's own swizzle do not fit fits them staged narrowest (`Tiles.narrow`), a wide stage's bandwidth
     traded for the larger tile; fewer consumers where no tile of the family's count holds the block (a GPU
     of a smaller one). `tiles(rows, walked, consumers)` builds the config. None where no tile fits."""
-    rows = extents(family, dtype, held)[-1]
+    rows = query_rows(family, dtype, held)
     most = family.consumers if overlapped else 1
     for consumers in range(max(1, min(most, -(-held // rows))), 0, -1):
-        for extent in walked_extents(family, dtype, walked):
+        for extent in walks(family, dtype, walked):
             for narrow in stagings(family):
                 config = dataclasses.replace(tiles(rows, extent, consumers), narrow=narrow)
                 if fits(config):
@@ -155,7 +159,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         process (`grouped_matmul._Mosaic.eligible`: the interpreter's callbacks are ordered effects, which a
         GPU process's lowering cannot carry), or no config fits the device (`derived`)."""
         name = generation.family(target.generation)
-        family = bundle(target.generation, ba.arguments["query"].dtype)
+        query = ba.arguments["query"]
+        family = bundle(target.generation, query.dtype, query.shape[1])
         if family is None:
             return Refusal('family', f"the Mosaic mainloop has no bundle for {name or target.generation} yet")
         if (reason := self.refusal(ba, family)) is not None:
@@ -179,13 +184,18 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         # and the fused one, each consumer its own keys over the stream they walk whole. The forward on it
         # has no use the producer's layout does not serve, and deadlocked (row 2599): it is no config.
         walks_whole = not isinstance(config, Tiles) and config.queries_first
-        return (family is not None and (walks_whole or not split_queries(family))
+        # A decode step's 16-row tile on mma.sync's fed layout (an H100's, `few_rows`): one consumer feeding
+        # its own rings, no turns between consumers, whose dropped turns hung the two-consumer fed forward.
+        alone = (family is not None and isinstance(config, Tiles) and config.consumers == 1
+                 and config.block_q < family.role_rows)
+        return (family is not None and (walks_whole or alone or not split_queries(family))
                 and whole_tiles(family, config) and self.refusal(ba, family) is None
                 and super().legal(ba, config, target))
 
     def _family(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mosaic.Family | None:
         """The target's family's bundle where the launch takes the call there, else None."""
-        family = bundle(target.generation, ba.arguments["query"].dtype)
+        query = ba.arguments["query"]
+        family = bundle(target.generation, query.dtype, query.shape[1])
         return None if family is None or self.refusal(ba, family) is not None else family
 
     WALKED: ClassVar[str] = "block_k"
@@ -199,8 +209,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         family = bundle_of(config, query.dtype)
         walked = getattr(config, self.WALKED)
         reach = max(walked * 2, query.shape[1], _keys(ba))
-        sizes = [size for size in walked_extents(family, query.dtype, reach)
-                 if size in (walked // 2, walked * 2)]
+        walks = walked_extents if isinstance(config, Tiles) else extents  # `_derived`'s `walks`
+        sizes = [size for size in walks(family, query.dtype, reach) if size in (walked // 2, walked * 2)]
         changes = [*({self.WALKED: size} for size in sizes),
                    {"stages": config.stages - 1}, {"stages": config.stages + 1},
                    {"consumers": config.consumers - 1}, {"consumers": config.consumers + 1}]
@@ -210,7 +220,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
 
     def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Config:
         target = generation.gpu_target()
-        family = bundle(target.generation, ba.arguments["query"].dtype)
+        query = ba.arguments["query"]
+        family = bundle(target.generation, query.dtype, query.shape[1])
         if family is not None and (reason := self.refusal(ba, family)):
             raise NotImplementedError(reason)
         config = self.derived(ba, target)
@@ -360,7 +371,8 @@ class MosaicForward(_Mainloop[Tiles]):
                 return Tiles(rows, walked, 2, consumers, family.name)
 
             config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles,
-                              lambda config: self._launch_legal(ba, config, target), overlapped=True)
+                              lambda config: self._launch_legal(ba, config, target), overlapped=True,
+                              walks=walked_extents)
             if config is not None:
                 chosen = family
                 break
