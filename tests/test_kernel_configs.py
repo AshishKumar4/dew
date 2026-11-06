@@ -973,6 +973,31 @@ def test_an_hoppers_blockwise_fp8_kernel_gradient_runs_the_template_named_for_it
     assert route_failures(cases, compile_mosaic_kernels(cases, "sm90")) == []
 
 
+def _mx_projection():
+    """An MX MoE projection (`gemm.mxfp8_product`: 2048 deep, 768 wide, eight experts of whole 128-row
+    blocks) through the template named."""
+    from dew.nn.kernels import gemm
+
+    def product(rows, matrices):
+        with generation.chosen(mxfp8="mosaic_gpu"):
+            return gemm.mxfp8_product(gemm.MxFp8.quantized(rows), gemm.MxFp8.quantized(matrices),
+                                      jnp.asarray([4, 12, 8, 4, 4, 8, 8, 16]), out_dtype=jnp.bfloat16)
+
+    f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
+    return product, (f32((8192, 2048)), f32((8, 768, 2048)))
+
+
+def test_a_blackwells_mx_product_runs_the_template_named_for_it():
+    """An MX MoE projection, the template named, compiled for a compile-only B200: its program launches the
+    template's grouped product (`kernel_compile.Expected`, its route evidence), each 32 depths of its FP8
+    operands scaled in the block-scaled tensor cores' products (row 4519)."""
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    expected = Expected(axes=(("data", 1),), specs=(None,) * 2, launches=frozenset({"dew_gmm"}))
+    cases = [support.KernelCase("mx projection", _mx_projection, expected=expected)]
+    assert route_failures(cases, compile_mosaic_kernels(cases, "sm100")) == []
+
+
 def test_each_triton_call_needs_a_launch_of_its_own():
     """A program's Triton calls, one named as another begins and one made twice, compiled for a compile-only
     A100: with every launch line XLA writes, the gate reads their shared bytes; without one of the two

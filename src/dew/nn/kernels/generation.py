@@ -81,8 +81,8 @@ def _facts(value: Hashable | Mapping | list) -> Hashable:
 
 CHOICES = frozenset({'attention', 'attention_mainloop', 'blockwise_fp8', 'decode', 'delta_decode',
                      'delta_gates', 'gate_up', 'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue',
-                     'grouped_matmul', 'low_rank', 'narrow_copies', 'nvfp4', 'paged_decode', 'rms_norm',
-                     'selective_scan', 'short_conv', 'ssd', 'swiglu'})
+                     'grouped_matmul', 'low_rank', 'mxfp8', 'narrow_copies', 'nvfp4', 'paged_decode',
+                     'rms_norm', 'selective_scan', 'short_conv', 'ssd', 'swiglu'})
 """The choices a dispatch reports (`route`), and so the ones `chosen` may name (`chosen_kernel`): every one a
 selector serves (`selection.Op`, which refuses a choice this does not hold as it is built) or a site reads
 (`chosen_kernel`, likewise)."""
@@ -1266,19 +1266,6 @@ def gpu_placed() -> bool:
     GPU host, so it makes none."""
     import jax
     return assumption() is None and jax.default_backend() == 'gpu' and placed_platform() == 'gpu'
-
-
-def cuda_lowered() -> bool:
-    """Whether a library's CUDA call lowers here for the call's target: on this process's own GPU
-    (`gpu_placed`), or within `assumed` on a GPU host whose own GPU is the assumed generation's, where a
-    compile ahead's program for that GPU's compile-only devices lowers it as for its own (an FFI target
-    the library registered, and the facts it reads of the GPU: FlashAttention's, dew_flash_attn)."""
-    import jax
-    if gpu_placed():
-        return True
-    found = assumption()
-    return (found is not None and jax.default_backend() == 'gpu'
-            and _generation(jax.local_devices()[0]) == found.generation)
 
 
 def backend() -> str:

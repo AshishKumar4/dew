@@ -48,7 +48,7 @@ from ..precision import at_least_fp32, rounded_operand
 from ..programs import equations
 from . import generation, selection, tuning
 from .generation import INHERENT
-from .templates import base, bundles, mosaic, report, resources, tail as tail_of
+from .templates import base, bundles, mosaic, report, resources
 from .templates.axes import GROUPS, held as held_axes
 from .templates.gemm import mosaic_gpu, mosaic_tpu
 from .templates.product import EIGHT, Product
@@ -950,6 +950,8 @@ class MosaicGmm(_Mosaic):
     FP8: ClassVar[bool] = True
     STEP_SCALED: ClassVar[bool] = False
     """Whether its kernel streams a step's rows' scales beside its ring (`MosaicStepScaledGmm`)."""
+    BLOCK_SCALED: ClassVar[bool] = False
+    """Whether its kernel streams an MX product's block scales beside its rings (`MosaicMxGmm`)."""
 
     def output_sides(self, ba) -> tuple[int, int]:
         return _product_sides(ba)
@@ -963,7 +965,8 @@ class MosaicGmm(_Mosaic):
             epilogue_axes=hooks.epilogue_axes,
             epilogue_dtypes=tuple(side.dtype for side in ba.arguments.get('epilogue_operands', ())),
             dtypes=hooks.out_dtypes or (ba.arguments['out_dtype'],),
-            paired=ba.arguments.get('paired') is not None, step_scaled=self.STEP_SCALED)
+            paired=ba.arguments.get('paired') is not None, step_scaled=self.STEP_SCALED,
+            block_scaled=self.BLOCK_SCALED)
 
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
         # A group's rows on average over the call's groups, which a stack read from its `first` matrix
@@ -1175,10 +1178,11 @@ class MosaicTgmm(_Mosaic):
         if not (ba.arguments['dense'] and not ba.arguments['exact_sums'] and family.fixes_up):
             return False
         depth, _, width = self._generated_extents(ba)
-        tiles = depth // tile.block_m * (width // tile.block_n)
-        steps = -(-ba.arguments['tokens'].shape[0] // tile.block_k)
-        return tail_of.balanced(tiles, steps, _multiprocessors(target),
-                                handoff_steps=mosaic_gpu.handoff_steps(tile, target)) is not None
+        tokens, cotangent = ba.arguments['tokens'], ba.arguments['cotangent']
+        steps = -(-tokens.shape[0] // tile.block_k)
+        return mosaic_gpu.balanced_tail(tile, (depth // tile.block_m, width // tile.block_n), steps,
+                                        (tokens.dtype.itemsize, cotangent.dtype.itemsize), target,
+                                        _multiprocessors(target) * tile.programs) is not None
 
     def _splits(self, ba, tile: mosaic_gpu.Tiles, target) -> int:
         depth, _, width = self._generated_extents(ba)
@@ -1193,10 +1197,23 @@ class MosaicTgmm(_Mosaic):
     def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         if config.splits > 1 and ba.arguments['exact_sums']:
             return False
-        if ba.arguments['exact_sums'] and config.stages > WINDOWED_STAGES and (
-                mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype).summed_window(config.block_k) > 1):
+        if self._windowed(ba, config) and config.stages > WINDOWED_STAGES:
             return False
         return super().legal(ba, config, target)
+
+    def launch_of(self, ba, config: mosaic_gpu.Tiles) -> resources.Launch:
+        # The derivation sizes a windowed kernel gradient's ring no deeper than `legal` takes it (sized to
+        # sm89's deepest, it derived a tile `legal` refused, and the call fitted none, row 4331).
+        launch = super().launch_of(ba, config)
+        if not self._windowed(ba, config):
+            return launch
+        return dataclasses.replace(launch, most=min(launch.most, WINDOWED_STAGES))
+
+    def _windowed(self, ba, config: mosaic_gpu.Tiles) -> bool:
+        """Whether `config` runs `ba` as an exactly summed kernel gradient whose sums promote a window at a
+        time (`mosaic.Issuer.summed_window`), its ring at most `WINDOWED_STAGES` deep."""
+        family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
+        return bool(ba.arguments['exact_sums']) and family.summed_window(config.block_k) > 1
 
     def _partials(self, ba):
         """The call `ba` writing fp32 partials, as a split's slices do (`mosaic_gpu.tgmm`)."""
@@ -1280,6 +1297,31 @@ class MosaicStepScaledGmm(MosaicGmm):
         # Beside the exact product's live set, a step's column scales in its accumulator's column layout.
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
         return super().registers(ba, config) + family.column_registers(config.block_n, jnp.float32)
+
+
+@dataclasses.dataclass(frozen=True)
+class MosaicMxGmm(MosaicGmm):
+    """`MosaicGmm` of an MX product (`gemm.mxfp8_product`, row 4519), planned on the call it is: FP8 rows
+    times a K-major FP8 matrix, each 32 depths of each scaled by its E8M0 scale in the products
+    (`mosaic_gpu.gmm`'s `mx_scales`, `mosaic.Issuer.scaled_products`), its block scales streamed beside its
+    rings (`gmm_allocations`' `block_scaled`) on a family whose products take them (tcgen05's), its tiles
+    whole 128s of rows, columns and depth, and no split, swap, hook or exact sums."""
+
+    BLOCK_SCALED: ClassVar[bool] = True
+
+    def _fp8(self, ba, dtype, family: mosaic.Family | None) -> bool:
+        # Its products scale each block in the instruction, which sums in fp32 itself: no step promoted.
+        return (jnp.dtype(dtype) in EIGHT and family is not None and family.takes_block_scales
+                and ba.arguments['trans_rhs'] and ba.arguments['hooks'] == NO_HOOKS
+                and ba.arguments.get('paired') is None and not ba.arguments.get('exact_sums'))
+
+    def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
+        whole = all(extent % 128 == 0 for extent in (config.block_m, config.block_n, config.block_k))
+        return config.splits == 1 and not config.swapped and whole and super().candidate(ba, config, target)
+
+    def _swapped(self, ba, target):
+        # Its scales are its rows' and columns': no swapped orientation reads them.
+        del ba, target
 
 
 @dataclasses.dataclass(frozen=True)

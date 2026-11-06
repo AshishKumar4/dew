@@ -293,7 +293,7 @@ deprecated==1.3.1
     #   deltalake
 dew-cutlass-cu13==0.1.0
     # via dewml (pyproject.toml)
-dew-flash-attn-cu13==0.3.7
+dew-flash-attn-cu13==0.3.8
     # via dewml (pyproject.toml)
 diffusers==0.39.0
     # via dewml (pyproject.toml)
@@ -625,7 +625,7 @@ jaraco-functools==4.6.0
     # via
     #   cheroot
     #   keyring
-jax==0.12.0.1.post61
+jax==0.12.0.1.post62
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)

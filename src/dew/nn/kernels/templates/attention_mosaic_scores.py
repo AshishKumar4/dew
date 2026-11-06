@@ -87,7 +87,7 @@ def _relay_tiles(family: mosaic.Family, consumers: int, rows: int, depth: int, d
     (`Family.relay_bytes`: a family arranged by fewer rows than a role's, `bundle_of`); none elsewhere."""
     if not family.relay_bytes(rows, depth):
         return []
-    return [mosaic.plain((consumers, rows, depth), dtype)]
+    return [family.staged_memory((consumers, rows, depth), dtype, mosaic.UNSWIZZLED)]
 
 
 def _relayed(walk: _Backward, relay: list, index) -> _Backward:
@@ -222,7 +222,7 @@ def _query_program(program: _Program, streams, k_ref, v_ref, spans, *, heads: in
     consumers' first query (`_Program.query_tile`, a tile each) and the key tiles any of them reads
     (`_Program.reach`, `_streamed`)."""
     block_q = program.tiles.block_q
-    row, head = lax.axis_index("batch"), lax.axis_index("heads")
+    row, head = program.family.program_index("batch"), program.family.program_index("heads")
     views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads))
     streams = program.family.opened(streams, views)
     pair = consumers * block_q

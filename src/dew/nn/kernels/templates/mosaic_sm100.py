@@ -343,6 +343,33 @@ class CommittedRing(mosaic.Ring):
         plgpu.tcgen05_commit_arrive(self.consumed.at[mosaic.opaque(turn.slot)])
 
 
+SCALES = jnp.dtype(jnp.float8_e8m0fnu)
+"""A block-scale stream's dtype (`Tcgen05Rings.streams`): an MX product's E8M0 scales, tiled in shared memory
+as `tcgen05.scales_layout` lays them out, `[rows / 128, depth / 128, 32, 16]` a step's block."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ScaleRing(CommittedRing):
+    """A block-scale stream's ring (`SCALES`): each slot's shared-memory tiles paired with the tensor memory
+    its products read them from (`Tcgen05Issuer.scaled_products`), a slot's columns of `tmem`. A slot's
+    scales are copied to its tensor memory by the product warp before its products (tcgen05.cp then
+    tcgen05.mma, pipelined in issue order: PTX ISA 9.7.18.6.2), and again only once its products' commit has
+    released the slot and the producer refilled it, so no copy overwrites scales a product still reads."""
+
+    tmem: Any = None
+
+    def acquire(self, turn: mosaic.Turn):
+        return super().acquire(turn), self._scales(turn)
+
+    def slot(self, turn: mosaic.Turn):
+        return super().slot(turn), self._scales(turn)
+
+    def _scales(self, turn: mosaic.Turn):
+        """`turn`'s slot's tensor memory: its columns of `tmem`."""
+        columns = self.tmem.shape[1] // self.smem.shape[0]
+        return self.tmem.at[:, pl.ds(mosaic.opaque(turn.slot) * columns, columns)]
+
+
 CHUNK_COLUMNS = 64
 """The accumulator columns an epilogue reads out of tensor memory at once: 64 fp32 registers a thread of its
 warpgroup, the GEMM epilogue's chunk (`chunk_columns`)."""
@@ -366,6 +393,8 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
     counts_hooks = False  # its model is an epilogue chunk's accumulator alone (`chunk_columns`)
 
     takes_pairs = False
+
+    takes_block_scales = True
 
     operands_in_registers = False
 
@@ -468,6 +497,19 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
         plgpu.tcgen05_mma(_tensor_memory(acc), left, rhs, accumulate=acc.accumulate if accumulate else False)
         return dataclasses.replace(acc, accumulate=True)
 
+    def scaled_products(self, acc: Accumulator, lhs, rhs, scales: tuple, interpret: bool) -> Accumulator:
+        """`products` of block-scaled operands (an MX product's: each 32 depths of `lhs`'s rows and `rhs`'s
+        columns times its E8M0 scale), `scales` the step's two `ScaleRing` slots, each its shared-memory tiles
+        and their tensor memory: both copied in, then the products read them (`tcgen05_mma`'s `a_scale`,
+        `b_scale`)."""
+        del interpret  # Mosaic GPU's interpreter models scaled tcgen05 products
+        (a_tiles, a_scale), (b_tiles, b_scale) = scales
+        plgpu.async_copy_scales_to_tmem(a_tiles, a_scale)
+        plgpu.async_copy_scales_to_tmem(b_tiles, b_scale)
+        plgpu.tcgen05_mma(_tensor_memory(acc), lhs, rhs, a_scale=a_scale, b_scale=b_scale,
+                          accumulate=acc.accumulate)
+        return dataclasses.replace(acc, accumulate=True)
+
     def settled(self, pending: int = 0) -> None:
         # The walk's release of a step's slots is its products' commit (`CommittedRing`): nothing to await.
         del pending
@@ -518,13 +560,21 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         if multicast:
             raise NotImplementedError("tcgen05's pair of CTAs shares a product, not a multicast ring "
                                       "(`Topology`; not yet a stream of this bundle's)")
-        return {name: mosaic.ring(shape, dtype, stages, swizzle=(swizzles or {}).get(name),
-                                  copies=(copies or {}).get(name, 1), released_by_products=True)
-                for name, (shape, dtype) in blocks.items()}
+        streams = {name: mosaic.ring(shape, dtype, stages, swizzle=(swizzles or {}).get(name),
+                                     copies=(copies or {}).get(name, 1), released_by_products=True)
+                   for name, (shape, dtype) in blocks.items()}
+        # A block-scale stream's slots each pair with the tensor memory its products read them from: its
+        # block's rows (`[rows / 128, depth / 128, 32, 16]`) by its depth's scales, a slot's columns each.
+        for name, (shape, dtype) in blocks.items():
+            if jnp.dtype(dtype) == SCALES:
+                streams[name]['tmem'] = plgpu.TMEM((shape[0] * 128, stages * shape[1] * 4), SCALES,
+                                                   layout=plgpu.TMEMLayout.SCALES_LAYOUT)
+        return streams
 
     def opened(self, allocated: dict, views: dict | None = None) -> dict:
         del views
-        return {name: CommittedRing(**scoped) for name, scoped in allocated.items()}
+        return {name: ScaleRing(**scoped) if 'tmem' in scoped else CommittedRing(**scoped)
+                for name, scoped in allocated.items()}
 
     def roles_of(self, table: tuple, *, load: Callable[[], None], products: Callable[[], None]) -> None:
         """Each of a program's warpgroups its role (`mosaic.tabled`): the template's `table`, `(count,

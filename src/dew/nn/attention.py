@@ -22,7 +22,7 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 
-from .attention_kernels import ATTENTION, DECODE, TPU_BACKEND, AttentionCase, decodes
+from .attention_kernels import ATTENTION, DECODE, TPU_BACKEND, AttentionCase, decodes, flash_target
 from .attention_masks import (
     combined_attention_mask,
     key_spans,
@@ -188,6 +188,8 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
     runs per shard (`on_attention_shards`). What it takes is its requirements'
     (`attention_kernels.FLASH_SUPPORTS`), which the selector holds a call to before it runs here."""
     flash = importlib.import_module('dew_flash_attn')
+    # The GPU the call lowers for, an assumed one's where a step compiles ahead (`flash_lowered`).
+    flash.targeting(flash_target)
     window = (-1, -1) if sliding_window is None else window_sides(causal, sliding_window)
 
     def local(query, key, value, sinks=None, segment_ids=None, key_segment_ids=None):

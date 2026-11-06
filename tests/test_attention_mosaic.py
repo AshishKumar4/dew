@@ -35,6 +35,8 @@ from dew.nn.kernels.templates import (
     attention_mosaic_program,
     attention_portable,
     attention_triton,
+    bundles,
+    mosaic_sm90,
     resources,
 )
 
@@ -65,6 +67,8 @@ output gate, and all at once; each `(score hooks, gate)`."""
 HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False),
               "bfloat16-natural": (jnp.bfloat16, True), "float16-natural": (jnp.float16, True)}
 """The hooked forward's dtypes and forms: the fold and natural logits over both 16-bit dtypes."""
+WGMMA = mosaic_sm90.WGMMA.name
+"""An H100's warpgroup MMA layout with a producer, the tiles' family where a site states its own."""
 FED = {"dkv_family": "wgmma.fed", "dkv_consumers": 2}
 """The dK/dV launch on an H100's layout whose consumers feed their rings, its two consumers splitting each
 slot's queries (`attention_mosaic_program.split_queries`), as the derivation takes it."""
@@ -98,24 +102,25 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | No
     their score cotangents exchanged for a shared dQ (`fused-shared-dq`, FlashAttention 3's width 128), its
     producer adding it (`fused-producer-dq`)."""
     if form == "fused":
-        return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True)
+        return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True, family=WGMMA)
     if form == "fused-shared-keys":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family=FED["dkv_family"],
                                                      shared_keys=True)
     if form in ("fused-shared-dq", "fused-producer-dq"):
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True, dkv_family="wgmma",
                                                      dkv_consumers=2, shared_dq=True, staged_logits=True,
-                                                     producer_dq=form == "fused-producer-dq")
+                                                     producer_dq=form == "fused-producer-dq", family=WGMMA)
     if form == "fused-keys-first":
-        return False, attention_mosaic.BackwardTiles(128, 64, 2, 1, fused=True, **FED)
+        return False, attention_mosaic.BackwardTiles(128, 64, 2, 1, fused=True, family=WGMMA, **FED)
     if form == "accurate":
         # Its derivation's: two launches, its dK/dV programs' column shares its dQ's two sums' choice.
         return True, None
     columns = 2 if form == "accurate-halves" else 1
-    return form != "default", attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=columns, **FED)
+    return form != "default", attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=columns, family=WGMMA,
+                                                             **FED)
 
 
-FORM_TILES = attention_mosaic.Tiles(64, 64, 2, 2)
+FORM_TILES = attention_mosaic.Tiles(64, 64, 2, 2, family=WGMMA)
 """The call forms' tiles: the template core's 100 queries over 96 keys (`test_attention_template.CASES`) in a
 pair of query blocks over two key tiles, so a block's spans begin and end within the keys it streams."""
 HEAD_WIDTHS = ((64, 128), (128, 64), (80, 48))
@@ -471,6 +476,34 @@ def test_the_forward_is_on_par_interpreted(call, dtype):
     _check_forward(call, dtype, SHAPES["interpreted"], natural=False, interpret=True)
 
 
+TPU_PASSES = {"fold": {"natural": False}, "natural": {"natural": True},
+              "sinks": {"natural": False, "sinks": True},
+              "training": {"natural": False, "training": template.Kept.SPLIT}}
+"""The forward passes a TPU core's launches run (`mosaic_tpu.MXU`): the base-2 fold, the natural form, an
+initial state, and the training forward's output beside its residuals."""
+
+
+@INTERPRETS
+@pytest.mark.parametrize("forward", TPU_PASSES)
+@pytest.mark.parametrize("call", CALLS)
+def test_a_tpu_cores_forward_is_on_par_interpreted(call, forward):
+    """The forward on a v5e's MXU (`mosaic_tpu.MXU`), the one mainloop's launches through the family's
+    seams (its staging, reads, grid coordinates and turns), in each pass, under Pallas TPU's interpreter: on
+    par with the reference (check 1)."""
+    _check_forward(call, jnp.bfloat16, SHAPES["interpreted"], interpret=True,
+                   target=generation.gpu_target("v5e"), **TPU_PASSES[forward])
+
+
+@INTERPRETS
+@pytest.mark.parametrize("call", CALLS)
+def test_a_tpu_cores_backward_is_on_par_interpreted(call):
+    """The backward on a v5e's MXU, its fused launch's dQ adds each program's in turn on the core's one
+    TensorCore (`mosaic_tpu.VmemRings.added`), under Pallas TPU's interpreter: every gradient on par with
+    the reference (check 1)."""
+    _check_backward(call, SHAPES["interpreted"], form=None, interpret=True,
+                    target=generation.gpu_target("v5e"))
+
+
 @INTERPRETS
 @pytest.mark.parametrize("call", CALLS)
 def test_a_dropping_backward_is_on_par_over_every_call_interpreted(call):
@@ -742,7 +775,7 @@ def test_the_training_forwards_overflowed_rows_keep_their_form_and_every_other_r
     # Head 0's logits, 128 * 128 * 64 / 8, past the fold's reach; its values overflow a sum of two or not.
     query, key = (array.at[:, :, 0].set(128.0) for array in (query, key))
     query, key, dout = (array.astype(jnp.bfloat16) for array in (query, key, dout))
-    tiles = attention_mosaic.Tiles(64, 64, 2, 1)
+    tiles = attention_mosaic.Tiles(64, 64, 2, 1, family=WGMMA)
 
     def trained(value):
         with _device(interpret=True), _pinned(tiles):
@@ -939,7 +972,7 @@ def test_a_guarded_launch_walks_its_own_key_tiles():
     keys from its own block map, not the plain launch's, and every row's output is on par with jax's own
     attention, which normalizes its weights before their product (bf16 values near their largest, equal
     logits)."""
-    tiles = attention_mosaic.Tiles(64, 128, 2, 1)
+    tiles = attention_mosaic.Tiles(64, 128, 2, 1, family=WGMMA)
     rows, queries, heads, kv_heads = 1, 256, 2, 1
     documents = jnp.repeat(jnp.arange(1, 5, dtype=jnp.int32), queries // 4)[None]
     spans = template.spans(queries, queries, rows, segment_ids=documents)
@@ -1035,16 +1068,6 @@ def test_a_call_over_runs_is_on_par_interpreted(case, form):
     of its queries' runs (`algebra.seen`), the forward and the backward in each form."""
     backward = form != "forward"
     _check_call_form(case, interpret=True, backward=backward, form=form if backward else "default")
-
-
-@INTERPRETS
-@pytest.mark.parametrize("call", CALLS)
-def test_an_fp32_training_forward_walks_its_operands_bf16_parts_interpreted(call):
-    """An fp32 call's training forward on the one mainloop (`MosaicForward.parts`): its peak walk and its
-    training walk over its operands' three bf16 parts, its anchor's value row read from the parts summed;
-    its output on par with the reference path in fp32 (check 1), under the interpreter."""
-    _check_forward(call, jnp.float32, SHAPES["interpreted"], natural=False, interpret=True,
-                   training=template.Kept.SPLIT)
 
 
 @INTERPRETS
@@ -1178,7 +1201,7 @@ def test_a_backward_whose_dkv_launch_holds_more_keys_than_its_dq_launch_writes_e
     dQ consumer (`dkv_consumers=2` on a producer's layout), over 192 keys, under the interpreter: the dK/dV
     launch's last program holds a partial key block, and every key's gradients are written, on par with the
     reference (check 1)."""
-    config = attention_mosaic.BackwardTiles(64, 64, 2, 1, dkv_family="wgmma", dkv_consumers=2)
+    config = attention_mosaic.BackwardTiles(64, 64, 2, 1, dkv_family="wgmma", dkv_consumers=2, family=WGMMA)
     _check_backward("full", (1, 192, 2, 1), form=None, config=config, interpret=True, width=64)
 
 
@@ -1188,7 +1211,7 @@ def test_a_causal_backward_whose_consumers_stage_shared_logits_walks_each_query_
     logits tile (`staged_logits`), over 128 causal queries and keys, under the interpreter: each consumer's
     query walk is its own block's, and the gradients are on par with the reference (check 1)."""
     config = attention_mosaic.BackwardTiles(64, 64, 2, 1, dkv_family="wgmma", dkv_consumers=2,
-                                            staged_logits=True)
+                                            staged_logits=True, family=WGMMA)
     _check_backward("causal", (1, 128, 2, 1), form=None, config=config, interpret=True, width=64)
 
 
@@ -1628,8 +1651,8 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
 
     # The training forward recomputes its walk's `Q K^T`; the fast backward its `S` beside its four.
     product = issued // 2
-    pins = (attention_mosaic.Tiles(block, block, 2, consumers),
-            attention_mosaic.BackwardTiles(block, block, 2, consumers, fused=True))
+    pins = (attention_mosaic.Tiles(block, block, 2, consumers, family=WGMMA),
+            attention_mosaic.BackwardTiles(block, block, 2, consumers, fused=True, family=WGMMA))
     with _pinned(*pins):
         plain = _counted(lambda q, k, v: attention_mosaic.forward(q, k, v, spans), query, key, key)
     assert plain == (forward, issued)
@@ -1645,7 +1668,7 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
 
     with _pinned(*pins):
         whole = weighed(lambda q, k, v: attention_mosaic.forward(q, k, v, spans))
-    with _pinned(attention_mosaic.Tiles(block, block, 2, consumers, columns=width // 2)):
+    with _pinned(attention_mosaic.Tiles(block, block, 2, consumers, family=WGMMA, columns=width // 2)):
         blocked = weighed(lambda q, k, v: attention_mosaic.forward(q, k, v, spans))
     assert blocked == (whole[0], whole[1] + product)
     with _pinned(*pins):
@@ -1713,9 +1736,9 @@ def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
     assert not failures(found), "\n".join(failures(found))
 
 
-GATED = ("sm90",)
+GATED = ("sm90", "sm80")
 """The GPUs whose families the mainloop qualifies (`attention_mosaic_program.QUALIFIED`): an H100's
-wgmma."""
+wgmma and an A100's mma.sync."""
 
 BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name in GATED
                  for width in (64, 128, 256) for accurate in (False, True)]
@@ -1753,13 +1776,6 @@ def _gated_backward(generation_name: str, width: int, accurate: bool, hooks: str
                                                    natural=attention_mosaic.NATURAL)
         ba = op.bind(*args, interpret=False)
         return op, ba, op.derived(ba, generation.gpu_target())
-
-
-@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
-def test_an_a100_derives_no_mosaic_backward(accurate):
-    """The mma.sync family is not one this mainloop qualifies (`attention_mosaic_program.QUALIFIED`, row
-    2078): an A100's backward derives no config, so the route takes another mainloop there."""
-    assert _gated_backward("sm80", 128, accurate)[2] is None
 
 
 FORWARD_GATE = [(generation_name, width, training, "none") for generation_name in GATED
@@ -1829,7 +1845,7 @@ def test_an_a100_forward_counts_the_shared_memory_its_lowering_asks_for(dtype, k
         op, args = attention_mosaic._forward_call(query, key, key, spans, None, scale=None,
                                                   natural=attention_mosaic.NATURAL)
         ba = op.bind(*args, residuals=kept, interpret=False)
-        config = attention_mosaic.Tiles(64, 64, 2, 1, "mma.sync", narrow=True, relaunch_k=64,
+        config = attention_mosaic.Tiles(64, 64, 2, 1, family="mma.sync", narrow=True, relaunch_k=64,
                                         relaunch_consumers=1, relaunch_columns=128)
         target = generation.gpu_target()
         shared = op.staged_bytes(ba, config, target)
@@ -1902,10 +1918,16 @@ def _forward_kernels(op, ba, config) -> dict:
     return found
 
 
+DECODE_GATE = [(generation_name, width, stored) for generation_name in GATED for width in (64, 128)
+               for stored in ("bfloat16", "int8", "float32")
+               if stored != "float32" or bundles.of(generation_name, jnp.bfloat16).pieces_of_views]
+"""The decode gate's cases: each GPU whose family the mainloop qualifies, both widths, each cache; a float32
+query's parts where its family loads a block's pieces of any view (`mosaic.Transport.pieces_of_views`: not
+cp.async's, where an fp32 decode takes XLA by legality)."""
+
+
 @COMPILES_ON_CPU
-@pytest.mark.parametrize("stored", ["bfloat16", "int8", "float32"])
-@pytest.mark.parametrize("width", [64, 128])
-@pytest.mark.parametrize("generation_name", GATED)
+@pytest.mark.parametrize(("generation_name", "width", "stored"), DECODE_GATE)
 def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, width, stored):
     """A decode step (`attention_decode.attend`: its plain launch at the plan's streaming key tile and
     slices, `MosaicForward.streaming`, and its masked rewalk's launches), 32 query heads over 8 key heads
@@ -1980,14 +2002,12 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, w
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize("training", [template.Kept.NONE, template.Kept.SPLIT], ids=["inference", "training"])
 @pytest.mark.parametrize("width", [64, 128])
 @pytest.mark.parametrize("generation_name", ["sm90"])
-def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_name, width, training):
-    """An fp32 call's inference forward or training forward (`MosaicForward.parts`: its operands bf16
-    parts; the training forward's peak and split-sum walks) at its derived tiles of a causal call `width`
-    wide, lowered and compiled by ptxas for `generation_name` on this CPU: every launch within its shared
-    memory, spilling nothing, its register model's decision ptxas's."""
+def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_name, width):
+    """An fp32 call's inference forward (`MosaicForward.parts`: its operands bf16 parts) at its derived tiles
+    of a causal call `width` wide, lowered and compiled by ptxas for `generation_name` on this CPU: every
+    launch within its shared memory, spilling nothing, its register model's decision ptxas's."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -1997,13 +2017,13 @@ def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_nam
     key = jax.ShapeDtypeStruct((1, queries, 2, width), jnp.float32)
 
     def forward(query, key, value):
-        return attention_mosaic.forward(query, key, value, spans, None, residuals=training)
+        return attention_mosaic.forward(query, key, value, spans, None)
 
     with generation.assumed(generation_name):
         zeros = [jnp.zeros(array.shape, array.dtype) for array in (query, key, key)]
         op, args = attention_mosaic._forward_call(*zeros, spans, None, scale=None,
                                                   natural=attention_mosaic.NATURAL)
-        ba = op.bind(*args, residuals=training, interpret=False)
+        ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
         config = op.derived(ba, generation.gpu_target())
         assert config is not None, f"the Mosaic forward derives no fp32 config {width} wide"
         found = compile_mosaic_kernels(
