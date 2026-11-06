@@ -99,7 +99,7 @@ class HF(Dataset):
             raise ValueError(f"{self.describe()} is an IterableDataset, read only as a stream")
         return arrow_rows(self.dataset)
 
-    def manifest(self) -> ShardManifest:
+    def manifest(self, version: int) -> ShardManifest:
         from datasets import Dataset as Arrow
 
         if isinstance(self.dataset, Arrow):

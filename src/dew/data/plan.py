@@ -723,10 +723,23 @@ def read_otherwise_at_9(saved: Mapping[str, object], plan: Plan) -> str | None:
             "position goes on only as 8 read it")
 
 
+def read_otherwise_at_10(saved: Mapping[str, object]) -> str | None:
+    """Why version 10 reads a version 9 data plan's order otherwise, None where it reads it alike: where its
+    read streams a Parquet store (`streams_parquet`), whose shards 9 made of its row groups and 10 makes of
+    its files (`FILE_SHARDS`), so its shards' order, and the places a position names, are others."""
+    order = record(saved.get("order", {}), "saved order")
+    manifest = record(saved.get("manifest", {}), "saved data manifest")
+    if order.get("read") != "streamed" or not streams_parquet(json_value(manifest.get("source"), "source")):
+        return None
+    return ("version 9 streamed a Parquet store by its row groups, and version 10 by its files, so this "
+            "position goes on only as 9 read it")
+
+
 def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object]:
     """`saved`, a data plan a saved position records, as `plan`, this run's, reads it (`Plan.check`): the
-    position's one translation, where a reader's `set_state` decodes it. A plan of version 7 reads as 8, and
-    one of 8 as 9, where the later reads its order alike (`read_otherwise_at_8`, `read_otherwise_at_9`). A
+    position's one translation, where a reader's `set_state` decodes it. A plan of version 7 reads as 8, one
+    of 8 as 9 and one of 9 as 10, where the later reads its order alike (`read_otherwise_at_8`,
+    `read_otherwise_at_9`, `read_otherwise_at_10`). A
     token store a Dew before row 3028
     named without saying how its documents are read is named as today's names it where that Dew read the
     same documents of it (`_named_as_today`); its derived order holds today's lengths (`plan`'s) of each
@@ -735,8 +748,10 @@ def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object
     1.0 (ledger 1552)."""
     if saved.get("version") == 7 and plan.version >= 8 and read_otherwise_at_8(saved) is None:
         saved = {**saved, "version": 8}
-    if saved.get("version") == 8 and plan.version == 9 and read_otherwise_at_9(saved, plan) is None:
+    if saved.get("version") == 8 and plan.version >= 9 and read_otherwise_at_9(saved, plan) is None:
         saved = {**saved, "version": 9}
+    if saved.get("version") == 9 and plan.version == FILE_SHARDS and read_otherwise_at_10(saved) is None:
+        saved = {**saved, "version": FILE_SHARDS}
     # A plan of another version is refused as it is (`Plan.check`), so nothing of it is read here.
     if saved.get("version") != plan.version:
         return saved
@@ -905,12 +920,39 @@ def _steps_grown(saved: dict[str, JSON] | list[JSON] | str | int | float | bool 
         for before, after in zip(saved, current, strict=True))
 
 
-PLAN_VERSIONS = (8, 9)
+FILE_SHARDS = 10
+"""The plan version from which a streamed Parquet store's shards are its files, each file's row groups read
+as its reader reaches them and its footer read as it opens, cut into its row groups only where readers and
+workers outnumber its files (`dew.data.sources.files.Files.manifest`): 9's shards were its row groups,
+numbered across every file, so a stream read every file's footer before its first record (FineWeb-Edu's
+default configuration's 2410 files, 196 s, row 4131)."""
+
+PLAN_VERSIONS = (8, 9, FILE_SHARDS)
 """The versions this Dew reads a plan into rows by, the latest a new run's: 9 folds a corpus's key, its name
 in the mixture that reads it or a named chain's own, into each shuffle of its own, so corpora of one length
 shuffled by one seed read in orders of their own and a named corpus reads one order mixed or alone (row
-3840), where 8 read them in one permutation; a run saved under 8 reads by 8 (carried to 1.0, ledger
-1552)."""
+3840), where 8 read them in one permutation; 10 streams a Parquet store by its files (`FILE_SHARDS`). A run
+saved under an earlier version reads by it (carried to 1.0, ledger 1552)."""
+
+
+def filled_version(fill: Mapping[str, object]) -> int:
+    """The plan version whose shards a streamed fill numbers its rows by, from its cache key's `fill`
+    (`Manifest.fill`): `FILE_SHARDS` where it names a Parquet store's shards its files, the version before it
+    otherwise, as every other store's shards are alike at both (`dew.data.sources.files.Files.manifest`)."""
+    return FILE_SHARDS if fill.get("shards") == "files" else FILE_SHARDS - 1
+
+
+def streams_parquet(source: JSON) -> bool:
+    """Whether `source`, a store's fingerprint as a plan records it (`Manifest.semantic`'s `source`), names
+    a Parquet store at any depth (a selection's, a concatenation's part, a mixture's corpus): the stores
+    whose streamed shards a plan version decides (`FILE_SHARDS`)."""
+    match source:
+        case list():
+            return any(map(streams_parquet, source))
+        case dict():
+            return source.get("store") == "parquet" or any(map(streams_parquet, source.values()))
+        case _:
+            return False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -996,7 +1038,8 @@ class Plan:
         current = self.record()
         if current["version"] != saved.get("version"):
             otherwise = (read_otherwise_at_8(saved) if saved.get("version") == 7 else
-                         read_otherwise_at_9(saved, self) if saved.get("version") == 8 else None)
+                         read_otherwise_at_9(saved, self) if saved.get("version") == 8 else
+                         read_otherwise_at_10(saved) if saved.get("version") == 9 else None)
             raise ValueError(
                 f"the saved data position was written under data plan version {saved.get('version')!r}, "
                 f"and this read is of version {current['version']!r}, which makes other rows or "
