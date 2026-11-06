@@ -29,11 +29,11 @@ from flax import linen as nn
 from dew.batch import FROZEN, PROBES, Batch, Variables
 from dew.inputs import InputSpec
 from dew.nn import categorical
-from dew.nn.inspection import INSPECTED
 from dew.nn.precision import at_least_fp32
 from dew.nn.progress import progressed
 from dew.nn.protocols import Lacks
 from dew.objectives.base import Aux, Objective, Ratio, Source, Step, model_rngs
+from dew.objectives.routing import refuse_fixed_router
 
 type Outputs = jax.Array | tuple[Outputs, ...] | list[Outputs] | Mapping[str, Outputs]
 """What a model returns: an array, or a tree of them."""
@@ -83,6 +83,7 @@ class Supervised(Objective[Ratio]):
             raise ValueError(f"the metrics' names {sorted(named)} repeat or include loss; each reports under "
                              "its own name")
         self.model = self.bind_model(model)
+        refuse_fixed_router(self.model, None, self.variables)
         self.criterion = loss
         self.metrics: Mapping[str, Criterion] = named
         self.field = inputs if isinstance(inputs, str) else inputs.sample.key
@@ -125,7 +126,7 @@ class Supervised(Objective[Ratio]):
                                             rngs=model_rngs(step.key, training=step.training),
                                             mutable=step.sown(*held), method="__call__", **mode,
                                             **progressed(self.model, self.progress(step)))
-        sown = dict(updates).get(INSPECTED, {}) if step.watched is not None else None
+        qk, sown = step.observed(dict(updates))
         updates = {name: value for name, value in updates.items() if name in held}
         losses = self.criterion(outputs, batch)
         if jnp.ndim(losses) == 0:
@@ -133,7 +134,7 @@ class Supervised(Objective[Ratio]):
                              "takes the mean over the batch's rows itself")
         metrics = {name: self.row_mean(metric(outputs, batch), batch).mean()[0]
                    for name, metric in self.metrics.items()}
-        aux = Aux(metrics, variables=dict(updates) if held else None, inspected=sown)
+        aux = Aux(metrics, variables=dict(updates) if held else None, qk_stats=qk, inspected=sown)
         return self.row_mean(losses, batch), aux, losses
 
 

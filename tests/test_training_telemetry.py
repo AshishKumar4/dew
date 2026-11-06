@@ -314,6 +314,43 @@ def test_a_runs_wandb_name_is_its_own_and_its_checkpoints_keep_the_runs(tmp_path
     assert (tmp_path / 'kept').is_dir()
 
 
+def test_a_shared_wandb_run_opens_as_its_primary_writer_and_another_attaches_on_its_own_axis(tmp_path,
+                                                                                          monkeypatch):
+    """A run whose W&B config is shared opens its run in W&B's shared mode as its primary writer, its rows on
+    `train/step`; a second writer attaches to the run's id with x_primary=False, logs its metrics on its own
+    step and leaves the run's state to the primary, the settings W&B keeps a second writer's rows under (two
+    processes on one run: 30 rows and 0 plainly, 30 and 3 shared, wandb 0.31.0). The installed wandb takes
+    each setting (`wandb.Settings`); W&B's server, which shared mode writes through, is recorded here."""
+    import wandb
+    from test_publish import TrackedRun
+
+    opened = []
+
+    def init(**given):
+        opened.append((given, TrackedRun()))
+        return opened[-1][1]
+
+    monkeypatch.setattr(wandb, 'init', init)
+    config = RunConfig(trainer=TrainerConfig(
+        name='shared', steps=2, checkpoint_dir=str(tmp_path), log_every=1, eval_every=None,
+        checkpoint_every=None, wandb=Wandb('dew', shared=True)))
+    monkeypatch.chdir(tmp_path)
+    config.train(Squared(), targets([1., 3.]), name='shared')
+    with WandbTracker('dew', id='run-0', shared=True, primary=False, label='forecast') as forecaster:
+        forecaster.log({'forecast/loss': 0.5}, step=3)
+    (primary, trained), (secondary, forecast) = opened
+    assert (primary['settings'].mode, primary['settings'].x_primary, primary['settings'].x_label) == (
+        'shared', True, 'train')
+    assert (secondary['id'], secondary['settings'].x_primary, secondary['settings'].x_label,
+            secondary['settings'].x_update_finish_state) == ('run-0', False, 'forecast', False)
+    assert any('train/loss' in row and 'train/step' in row for row in trained.history)
+    assert forecast.history == [{'forecast/loss': 0.5, 'forecast/step': 3}]
+    with pytest.raises(ValueError):
+        WandbTracker('dew', shared=True, offline=True)
+    with pytest.raises(ValueError):
+        WandbTracker('dew', shared=True, primary=False)
+
+
 def test_wandb_counts_each_new_step_shape_once(monkeypatch):
     import wandb
     from test_publish import TrackedRun

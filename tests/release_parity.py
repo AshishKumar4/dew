@@ -66,7 +66,7 @@ def assert_answers_as_its_engine(parity: ReleaseParity, scratch: Path) -> None:
 
     @jax.jit
     def head_alone(inputs, states):
-        return task.model.head_logits(task.variables, states, inputs)
+        return task.model.head_logits(task.variables, states, inputs)[0]
 
     @jax.jit
     def forward(inputs, probe):
@@ -77,7 +77,7 @@ def assert_answers_as_its_engine(parity: ReleaseParity, scratch: Path) -> None:
             # The head over `hidden` as the model calls it (`DecisionModel.head_logits`), its parameters
             # these; the probe's sum over the real options.
             variables = {**held, "params": {**held["params"], "head": params}}
-            scores = task.model.head_logits(variables, hidden, inputs)
+            scores, _ = task.model.head_logits(variables, hidden, inputs)
             return jnp.sum(jnp.where(inputs.options, scores, 0) * probe)
 
         gradient, hidden = jax.grad(observed, (0, 1))(part(task.variables, "head").get("params", {}), states)

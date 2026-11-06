@@ -101,21 +101,18 @@ def workflow(dtype: torch.dtype):
 def workflow_outputs(model, reference, dtype: torch.dtype) -> dict[str, np.ndarray]:
     """The three forwards tools/diffusion_gemma_reference.py stores, from its
     own stored inputs."""
-    from transformers.models.gemma4.image_processing_pil_gemma4 import convert_image_to_patches
+    from diffusion_gemma_reference import media_inputs
 
     prompt, canvas = (torch.from_numpy(reference[key]) for key in ("prompt", "canvas"))
     previous = torch.from_numpy(reference["previous"]).to(dtype)
-    patches = torch.from_numpy(np.stack([convert_image_to_patches(image, 2)
-                                         for image in reference["pixels"][:, 0]])).to(dtype)
-    positions = torch.tensor([[[0, 0], [1, 0], [0, 1], [1, 1]]]).expand(2, -1, -1)
+    media = media_inputs(torch.from_numpy(reference["pixels"]).to(dtype))
     image_prompt = torch.from_numpy(reference["image_prompt"])
     with torch.no_grad():
         outputs = {
             "bare": model(input_ids=prompt, decoder_input_ids=canvas).logits,
             "conditioned": model(input_ids=prompt, decoder_input_ids=canvas,
                                  self_conditioning_logits=previous).logits,
-            "image_logits": model(input_ids=image_prompt, decoder_input_ids=canvas,
-                                  pixel_values=patches, image_position_ids=positions).logits,
+            "image_logits": model(input_ids=image_prompt, decoder_input_ids=canvas, **media).logits,
         }
     return {key: value.to(torch.float64).numpy() for key, value in outputs.items()}
 

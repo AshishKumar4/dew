@@ -1550,7 +1550,9 @@ class Checkpoints:
                 # one layer of a frozen base; the part is read through the same partial
                 # restore a step's own leaves take, and only a whole read can check the
                 # content against the digest the step recorded.
-                whole = template is None or (jax.tree.structure(template) == jax.tree.structure(stored))
+                # By its leaves' paths: Orbax's metadata holds a tuple's elements in a list
+                # (`orbax.checkpoint.tree.serialize_tree`), the same leaves at the same paths.
+                whole = template is None or _paths(template) == _paths(stored)
                 if template is not None and not whole:
                     from dew.inference.banks import narrowed
                     kept = narrowed(template, stored)
@@ -1558,6 +1560,9 @@ class Checkpoints:
                     stored, template = narrowed(stored, template), kept
                 if template is not None:
                     _refuse_reshaped(template, stored, f"{path} ({name})")
+                    # Read into the template's containers: a sown collection's tuples (Flax's `sow`), which
+                    # the metadata lists.
+                    stored = ocp.tree.from_flat_dict(ocp.tree.to_flat_dict(stored), target=template)
                 restore_args = (
                     jax.tree.map(lambda meta: _read(None, meta.dtype), stored) if template is None
                     else jax.tree.map(lambda meta, want: _read(want, meta.dtype), stored, template))

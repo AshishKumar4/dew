@@ -22,6 +22,29 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   `Decide.save_pretrained` writes the format its head is released in (`Head.release_format`: Laya's, the joint
   head's or the slot readout's), where only Laya's was written, so a task of any layout it trained with
   exports and loads as the task it is.
+- A streamed Parquet store reads file by file: its shards are its files, each read row group by row group,
+  its footer read as its reader reaches it, so a stream's first record waits for one file's footer, where it
+  waited for every one's (FineWeb-Edu's default configuration, 2410 files on the Hub: 196 s). This is data
+  plan version 10; a run saved under 9 resumes by 9, and `compile(..., plan_version=9)` reads such a
+  position. A raw Parquet store no longer states its row count in its facts, which took reading every
+  file's footer: a configured step reading `facts["rows"]` off one finds none. Its count is
+  `sum(shard.rows for shard in source.manifest(version).sized(threads).shards)`, read off the footers
+  then, and a Dew export (`dew data export`) states its count as before.
+- A decision tournament takes its round rule as a typed policy (`Decide.tournament(rounds=)`): `Knockout(group)`,
+  Laya's groups whose winners meet in a final, or `Finalists`, a released engine's one round of near-equal
+  groups whose best go to a final, the answer over every option with the knocked-out sharing a residual.
+  `tournament(group=n)` is now `tournament(rounds=Knockout(n))`.
+- A question row's segments write what released decision models write: a summary of the request in each
+  question's row (`RequestSummary`), the question again past a long state (`Again`), a conversation state turn
+  by turn (`State(turns=Turns(...))`), and value policies (`Values`: a long list indexed, an empty value
+  substituted, option names normalized). Training and serving summarize the whole request alike.
+- `Wandb(shared=True)` (`--trainer.wandb.shared`) opens a run's W&B run in shared mode as its primary writer, so other
+  processes log into it on axes of their own (`WandbTracker(..., shared=True, primary=False, label=...)`), whose
+  rows W&B drops from a run opened plainly. It needs wandb 0.19.9 or later and W&B Server 0.68 or later.
+- `dew.clusters` names the scheduler a run's processes start under: `ClusterEnvironment` (a `name`, `detected()` and
+  `joining()`), with Open MPI, Slurm, Cloud TPU, Kubernetes and `dew launch`'s pool built in. `prepare_process(cluster=...)`
+  joins a scheduler's pool without `dew launch`, a scheduler of your own among them; `dew launch` reads the same
+  environments, through public `jax.distributed.initialize` alone.
 - The `cuda12` and `cuda13` extras install `dew-cutlass` 0.1.0 (`dew-cutlass-cu12` or `dew-cutlass-cu13`, on
   Linux x86_64 and aarch64), Dew's build of CUTLASS's grouped GEMMs, whose kernels are Hopper's. On an sm90
   GPU (an H100, an H200 or a GH200) a mixture of experts' projection now runs CUTLASS on the two grouped cells
@@ -61,7 +84,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   lower and took twice as long. A template declaration can ask for exact extraction
   (`derive.Reduction(exact=True)`), and the test suite checks every derivation's greedy choice against the exact
   optimum.
-- Dew requires its JAX build 0.12.0.1.post55: Pallas Mosaic GPU's `multiple_of` lowers in a warp's code
+- Dew requires its JAX build 0.12.0.1.post56: `lax.ragged_all_to_all` lowers on a CPU, as one padded `all_to_all`
+  of each peer's run and of the offsets each sender states, so an expert exchange runs the collective a GPU
+  runs on every platform; post55: Pallas Mosaic GPU's `multiple_of` lowers in a warp's code
   (`plgpu.warp_map`), so a persistent kernel's load or product warp aligns a slice start, as a tcgen05 GEMM's
   TMA rows do; post54: a program's compilation cache key reads each serialized kernel in
   an MLIR context of its own, so threads keying programs at once key them alike (two concurrent compiles of a
@@ -77,7 +102,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   refused its kernels; and a Pallas kernel's body may call a call primitive, a span Dew marks, which lowers as
   its body on every Pallas backend and is checked within its body under `checkify`; and a step compiled ahead
   for an A100 on a host with no GPU lowers its Mosaic kernels for the A100, not an H100 (docs/installation.md
-  lists each fix). The `cuda12` and `cuda13` extras keep the post45 CUDA and PJRT plugins: post46 to post55
+  lists each fix). The `cuda12` and `cuda13` extras keep the post45 CUDA and PJRT plugins: post46 to post56
   changed Python alone, and their native code is the same.
 - FlashAttention's wrapper, `dew-flash-attn` 0.3.7, folds a mapped kernel call (`jax.vmap` over attention,
   as a batched model's step maps it) into the kernel's own batch, one launch a group of calls within its

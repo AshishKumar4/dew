@@ -341,6 +341,87 @@ def test_a_pool_reads_its_own_shards_of_a_host_resident_bank(tmp_path):
         assert any(value["shard"] != value["shape"] for value in banks.values())
 
 
+def test_a_banked_store_packed_for_serving_or_adapted_exports_as_its_layers_do(tmp_path):
+    """A scanned decoder's banked store (`HeldBanks.place`) exports as the plain decoder's per-layer tree
+    does, tensor for tensor: packed for serving (`inference_projections`, its q, k and v one kernel a bank's
+    row splits back as it is written, `StoredRow.split`), and under a LoRA adapter the export merges into
+    its kernels as it writes them (`Adapter.merge` over a bank's rows, `Deferred`, ledger 4103), and the
+    adapter's own save writes its factors as the plain decoder's adapter does (ledger 4566)."""
+    from safetensors.numpy import load_file
+
+    from dew.batch import thaw
+    from dew.inference.projections import inference_projections
+    from dew.interop.pretrained import PretrainedDecoder
+    from dew.lora import LoRA
+
+    plain, scanned, variables, _ = pair(num_layers=3)
+    banked = HeldBanks(variables).place(scanned, layout=DEVICE)
+
+    def written(model, tree, name):
+        PretrainedDecoder.from_model(model, tree).save(tmp_path / name)
+        return load_file(tmp_path / name / "model.safetensors")
+
+    expected = written(plain, variables, "plain")
+    packed = written(scanned, inference_projections(scanned, banked), "packed")
+    assert packed.keys() == expected.keys()
+    for key, tensor in expected.items():
+        np.testing.assert_array_equal(packed[key], tensor, err_msg=key)
+    # Factors drawn whole, so each merge moves its kernel (a fresh adapter's B is zero), the base and the
+    # factors one collection, as the bank holds them.
+    spec = LoRA(rank=2, modules=("q_proj", "v_proj"))
+    lone = PretrainedDecoder.from_model(plain, variables).adapt(spec, key=1)
+    stacked = PretrainedDecoder.from_model(scanned, variables).adapt(spec, key=1)
+    rng = np.random.default_rng(4103)
+    tuned = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jnp.asarray(rng.normal(size=leaf.shape) / 4, leaf.dtype)
+        if str(getattr(path[-1], "key", "")) == "lora_B" else leaf, thaw(lone.variables))
+    lone.save(tmp_path / "lone", variables=tuned)
+    stacked.save(tmp_path / "adapted", variables=HeldBanks(tuned).place(stacked.model, layout=DEVICE))
+    merged, adapted = (load_file(tmp_path / name / "model.safetensors") for name in ("lone", "adapted"))
+    assert adapted.keys() == merged.keys()
+    for key, tensor in merged.items():
+        np.testing.assert_array_equal(adapted[key], tensor, err_msg=key)
+    # The adapter's own save reads its factors by their layers' names too, a bank's rows read home as they
+    # are written (ledger 4566).
+    assert lone.adapter is not None and stacked.adapter is not None
+    lone.adapter.save(tuned, tmp_path / "factors")
+    stacked.adapter.save(HeldBanks(tuned).place(stacked.model, layout=DEVICE), tmp_path / "banked_factors")
+    factors, banked = (load_file(tmp_path / name / "adapter_model.safetensors")
+                       for name in ("factors", "banked_factors"))
+    assert banked.keys() == factors.keys()
+    for key, tensor in factors.items():
+        np.testing.assert_array_equal(banked[key], tensor, err_msg=key)
+
+
+class RecordedBank:
+    """A bank that records the shape of each piece of it read to the host (`np.asarray`), its pieces taken
+    by indexing as an array's are."""
+
+    def __init__(self, held: np.ndarray, read: list):
+        self.held, self.read = held, read
+        self.shape, self.dtype = held.shape, held.dtype
+
+    def __getitem__(self, key):
+        return RecordedBank(self.held[key], self.read)
+
+    def __array__(self, dtype=None, copy=None):
+        self.read.append(self.held.shape)
+        return self.held if dtype is None else self.held.astype(dtype)
+
+
+def test_a_packed_rows_members_each_read_home_their_own_share():
+    """A bank's packed row split into its members (`StoredRow.split`, a packed projection's q, k and v) has
+    each member sliced where the bank lies and read home alone, its own width of the row, so a row's
+    members read it home once between them rather than once each (ledger 4574), each as the row holds it."""
+    from dew.nn.backbones.layer_names import StoredRow
+
+    held, read = np.arange(2 * 3 * 7, dtype=np.float32).reshape(2, 3, 7), []
+    members = StoredRow(RecordedBank(held, read), (1,)).split([2, 4, 1])
+    for member, (start, stop) in zip(members, ((0, 2), (2, 6), (6, 7)), strict=True):
+        np.testing.assert_array_equal(np.asarray(member), held[1][..., start:stop])
+    assert read == [(3, 2), (3, 4), (3, 1)]
+
+
 @pytest.mark.parametrize("kind", ["root", "multimodal"])
 def test_synthetic_banks_keep_namespace_values_across_bank_sizes(kind):
     from bank_support import SelectedReads, fixture, host_layout, identical, scores, unpack

@@ -102,6 +102,7 @@ def test_a_pack_places_documents_whole_and_refuses_one_its_window_cannot_hold(tm
     from dew.data.compile import _prepared
     from dew.data.packing import plan_name, plan_windows
     from dew.data.pipeline import Mixture, Pack, Phases
+    from dew.data.plan import PLAN_VERSIONS
 
     source = Memory(tuple({"text": "x" * size} for size in SIZES))
     prefix = Pipeline(source).map(Tokenize())
@@ -126,7 +127,8 @@ def test_a_pack_places_documents_whole_and_refuses_one_its_window_cannot_hold(tm
     (prepared,) = _prepared((prefix,), "indexed", provision=False)
     pinned = prepared.source
     assert not isinstance(pinned, (Mixture, Phases))
-    generation = filled.publish(_cache_manifest(pinned, prepared.stages, "indexed"), pinned, plan=cut)
+    keyed = _cache_manifest(pinned, prepared.stages, "indexed", PLAN_VERSIONS[-1])
+    generation = filled.publish(keyed, pinned, plan=cut)
     with pytest.raises(ValueError):
         compile(prefix.cache(generation).pack(9, bins=3).repeat().batch(4), read="indexed",
                 loading=READ)

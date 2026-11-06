@@ -28,6 +28,7 @@ from PIL import Image
 from transformers import CLIPTextConfig, CLIPTokenizer, FlaxCLIPTextModel, FlaxCLIPTextModelWithProjection
 from transformers.models.clip.tokenization_clip import bytes_to_unicode
 
+import flax_precision
 from reference_releases import require
 
 
@@ -141,26 +142,14 @@ def bundle(root, destination):
           kept=lambda name: not name.endswith(".bin"))
 
 
-class Float64Numpy:
-    """jax.numpy with its float32 read as float64, for a module that names float32."""
-
-    def __getattr__(self, name):
-        return getattr(jnp, "float64" if name == "float32" else name)
-
-
-def widened_modules():
-    """The pipeline, scheduler and model modules whose float32 the truth reads as float64."""
-    import importlib
-
-    names = ["diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion",
-             "diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion_img2img",
-             "diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion_inpaint",
-             "diffusers.pipelines.stable_diffusion_xl.pipeline_flax_stable_diffusion_xl",
-             "diffusers.schedulers.scheduling_ddim_flax", "diffusers.schedulers.scheduling_utils_flax",
-             "diffusers.models.embeddings_flax", "diffusers.models.attention_flax", "diffusers.models.resnet_flax",
-             "diffusers.models.vae_flax", "diffusers.models.unets.unet_2d_blocks_flax",
-             "diffusers.models.unets.unet_2d_condition_flax", "transformers.models.clip.modeling_flax_clip"]
-    return [importlib.import_module(name) for name in names]
+WIDENED = ("diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion",
+           "diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion_img2img",
+           "diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion_inpaint",
+           "diffusers.pipelines.stable_diffusion_xl.pipeline_flax_stable_diffusion_xl",
+           "diffusers.schedulers.scheduling_ddim_flax", "diffusers.schedulers.scheduling_utils_flax",
+           *flax_precision.MODELS, "transformers.models.clip.modeling_flax_clip")
+"""The pipeline, scheduler, model and text tower modules whose float32 the truth reads as float64
+(`flax_precision.float64`)."""
 
 
 def truth(root, destination):
@@ -181,11 +170,7 @@ def truth(root, destination):
                             else x, tree)
 
     arrays = {}
-    patches = [patch.object(module, "jnp", Float64Numpy()) for module in widened_modules()]
-    patches.append(patch.object(FlaxDiagonalGaussianDistribution, "sample", sample))
-    for item in patches:
-        item.start()
-    try:
+    with flax_precision.float64(WIDENED), patch.object(FlaxDiagonalGaussianDistribution, "sample", sample):
         for task in ("sd", "xl", "img2img", "inpaint"):
             directory = Path(root) / task
             reference = np.load(directory / "reference.npz")
@@ -239,9 +224,6 @@ def truth(root, destination):
                     for name in arrays if name.startswith(task + "/")}
             print(json.dumps({"task": task, "float32_from_float64": gaps,
                               "dtypes": sorted({str(arrays[name].dtype) for name in arrays if name.startswith(task)})}))
-    finally:
-        for item in patches:
-            item.stop()
     np.savez_compressed(destination, **arrays)
 
 

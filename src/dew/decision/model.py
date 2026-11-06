@@ -175,18 +175,35 @@ class DecisionModel(HeadedModel):
                         rngs: dict[str, jax.Array] | None = None, progress: Progress = END,
                         opened: Sequence[str] = ()) -> tuple[jax.Array, Variables]:
         """The option logits (`logits`), and what the row's pass sowed into the `opened` collections
-        (`dew.objectives.base.Step.sown`)."""
+        (`dew.objectives.base.Step.sown`): the backbone's, and the attention logit maxima (`qk`) of the
+        backbone and the head each under its own parameters' name, which each applies apart, so a
+        QK-Clip finds every layer's maxima where it finds its weights (row 1608)."""
         states, spanned, sown = self._read(variables, inputs, media=media, train=train, rngs=rngs,
                                            progress=progress, opened=opened)
-        return self.head_logits(variables, states, inputs, spanned, train=train, rngs=rngs), sown
+        logits, head_sown = self.head_logits(variables, states, inputs, spanned, train=train, rngs=rngs,
+                                             opened=opened)
+        if "qk" in opened:
+            sown = {**sown, "qk": {"backbone": sown.get("qk", {}), "head": head_sown.get("qk", {})}}
+        return logits, sown
 
     def head_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
                     spanned: jax.Array | None = None, *, train: bool = False,
-                    rngs: dict[str, jax.Array] | None = None) -> jax.Array:
+                    rngs: dict[str, jax.Array] | None = None,
+                    opened: Sequence[str] = ()) -> tuple[jax.Array, Variables]:
         """The head's option logits `[B, Q, K]` over the backbone's `states`, -inf past each question's
-        options: the head's part of `observed_logits`, which reads its questions' spans from `spanned`, the
-        pass that holds them, where the head pools them."""
+        options, and what it sowed into the `opened` collections: the head's part of `observed_logits`,
+        which reads its questions' spans from `spanned`, the pass that holds them, where the head pools
+        them."""
         head = thaw(part(variables, "head"))
+        clipped = "qk" in opened
+        head_sown: dict = {}
+
+        def applied(*args, **kwargs) -> jax.Array:
+            if not clipped:
+                return _array(self.head.apply(head, *args, **kwargs))
+            out, held = self.head.apply(head, *args, mutable=["qk"], **kwargs)
+            head_sown.update(held)
+            return _array(out)
         # The questions' spans are pooled from the pass that holds them: the context's, where it holds
         # them. A head that pools none reads a question in its context through the cross-attention alone.
         spans = spanned if self.head.pools_spans else None
@@ -197,16 +214,15 @@ class DecisionModel(HeadedModel):
             # A head drawn from the vocabulary rows reads no table after its draw.
             table = None if self.head.draws_from_rows else self.output_table(variables)
             logits = _array(
-                self.head.apply(head, states, inputs, table, tied=tied, train=train, rngs=rngs)
+                applied(states, inputs, table, tied=tied, train=train, rngs=rngs)
                 if spans is None else
-                self.head.apply(head, states, inputs, table, tied=tied, spanned=spans, train=train,
-                                rngs=rngs))
+                applied(states, inputs, table, tied=tied, spanned=spans, train=train, rngs=rngs))
         else:
             table = self.table(variables) if self.head.reads_table else None
             logits = _array(
-                self.head.apply(head, states, inputs, table, train=train, rngs=rngs) if spans is None
-                else self.head.apply(head, states, inputs, table, spanned=spans, train=train, rngs=rngs))
-        return jnp.where(inputs.options, logits, -jnp.inf)
+                applied(states, inputs, table, train=train, rngs=rngs) if spans is None
+                else applied(states, inputs, table, spanned=spans, train=train, rngs=rngs))
+        return jnp.where(inputs.options, logits, -jnp.inf), head_sown
 
     def readout_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
                        labels: tuple[tuple[int, ...], ...]) -> jax.Array:
