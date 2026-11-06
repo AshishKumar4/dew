@@ -537,6 +537,18 @@ def _refuse_generation(model: nn.Module) -> None:
         raise ValueError(refusal)
 
 
+def _step_places(state: DecoderState, width: int, tree: TreeBlock | None, capacity: int | None
+                 ) -> tuple[dict[str, jax.Array], jax.Array | None]:
+    """A decode step's attention visibility and its tokens' places: a tree's tokens each read the row's prefix
+    and their own ancestors, at their depths' places (`TreeBlock`); a chain's each its predecessors, at the
+    places the rows reach. A windowed layer windows the runs over the keys' places (`call_visibility`): the
+    prefix's slots' as the chain's cache reads them, a node's its depth past the root's."""
+    if tree is not None:
+        return ({"attention_key_runs": tree.runs(), "attention_key_positions": tree.key_positions(capacity)},
+                tree.positions())
+    return {}, None if state.positions is None else state.positions[:, None] + jnp.arange(width)[None, :]
+
+
 def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | None,
                progress: Progress = END) -> DecodeOps:
     """The model operations a strategy may run, bound to these weights.
@@ -574,15 +586,7 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     def run(state: DecoderState, tokens: jax.Array, valid: jax.Array, *, rebuilds: bool = True,
             tree: TreeBlock | None = None) -> tuple[DecoderState, jax.Array, jax.Array | None]:
         width = tokens.shape[1]
-        # A tree's tokens each read the row's prefix and their own ancestors, at their depths' places
-        # (`TreeBlock`); a chain's each its predecessors, at the places the rows reach.
-        # A windowed layer windows the runs over the keys' places (`call_visibility`): the prefix's slots'
-        # as the chain's cache reads them, a node's its depth past the root's.
-        visibility = ({} if tree is None else
-                      {"attention_key_runs": tree.runs(),
-                       "attention_key_positions": tree.key_positions(capacity)})
-        places = (tree.positions() if tree is not None else None if state.positions is None else
-                  state.positions[:, None] + jnp.arange(width)[None, :])
+        visibility, places = _step_places(state, width, tree, capacity)
 
         def append(valid):
             # The step's tokens laid out once (`Coordinates`): the real ones, at their places.

@@ -4,7 +4,6 @@ import json
 import logging
 import math
 import os
-import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
