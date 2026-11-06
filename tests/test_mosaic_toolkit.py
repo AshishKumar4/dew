@@ -126,6 +126,16 @@ def a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100(consumers):
     np.testing.assert_array_equal(np.asarray(summed), _expected(x))
 
 
+def _multiplying(family, lhs: str, rhs: str, interpret):
+    """A walk's step that multiplies its `lhs` slot by its `rhs` slot into its one accumulator."""
+    def step(index, slots, carry, accumulators):
+        del index
+        (acc,) = accumulators
+        return carry, (family.products(acc, slots[lhs], slots[rhs], interpret),)
+
+    return step
+
+
 FED_STEPS = 5
 FED_ROWS, FED_WIDTH = 64, 128
 
@@ -545,12 +555,7 @@ def _persisted_products(x, w, *, family, interpret, rows: int | None = None, res
             def issue(wg, tile, walk, *, active):
                 del wg, tile, active
 
-                def step(index, slots, carry, accumulators):
-                    del index
-                    (acc,) = accumulators
-                    return carry, (family.products(acc, slots['x'], slots['w'], interpret),)
-
-                return walk(step, None, (shape,))[1]
+                return walk(_multiplying(family, 'x', 'w', interpret), None, (shape,))[1]
 
             def finish(wg, tile, accs, store, *, active):
                 del wg, active
@@ -967,11 +972,7 @@ def _paged_products(p, pool, table, *, interpret):
             views = {'p': (p_gmem, lambda j: (0, j)),
                      'x': (pool_gmem, lambda j: mosaic.Rows(table_gmem, j * pieces, (0,), PAGE))}
 
-            def step(at, slots, carry, accumulators):
-                del at
-                (acc,) = accumulators
-                return carry, (family.products(acc, slots['p'], slots['x'], interpret),)
-
+            step = _multiplying(family, 'p', 'x', interpret)
             return family.walk(family.opened(streams, views), ((step, 0, PAGED_STEPS),), (),
                                ((FED_ROWS, FED_WIDTH),), interpret)[1][0]
 

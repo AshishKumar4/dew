@@ -1373,8 +1373,9 @@ class Issuer[Accumulator](abc.ABC):
         fp32 sum of its products, times `scale(start, columns)` where given (its columns' multiplier from
         `start`: a blockwise-scaled FP8 product's, `mosaic_gpu.gmm`'s `step_scales`), added into `running`
         by an IEEE add."""
-        fresh = self.product(lhs, rhs, running.shape, interpret=interpret)
-        return running + (fresh if scale is None else fresh * scale(0, running.shape[1]))
+        rows, columns = running.shape
+        fresh = self.product(lhs, rhs, (rows, columns), interpret=interpret)
+        return running + (fresh if scale is None else fresh * scale(0, columns))
 
     @abc.abstractmethod
     def products(self, acc: Accumulator, lhs, rhs, interpret: bool, *, accumulate: bool = True
