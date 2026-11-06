@@ -1022,21 +1022,23 @@ def key_block(call: Call, held: Callable[[int], Held], staged: Callable[[int], t
 
 
 def _intra_held(call: Call, block: int, outputs: int = 1) -> Held:
-    """`_intra_walk`'s consumer thread at key block `block` forming `outputs` pairs' sums: each sum carried
-    across the key blocks; the block's prefix scan (its running pair, a shifted pair and the decay); then the
-    factors every output shares beside the block's tiles: its prefix halves, the rows' gate down and the keys
-    gated up (`algebra.key_block_pairs`), a pair's decay's two terms (`between`: the exp2 of the fractions'
-    difference and the scale of the wholes'), a sub-chunk's middle factor and its laid references, each
-    output's gated rows, their masks, and one product's operands, its right a key sub-chunk's."""
+    """`_intra_walk`'s consumer thread at key block `block` forming `outputs` pairs' sums, which shared memory
+    carries across the key blocks, one output's formed and added at a time: the block's prefix scan (its
+    running pair, a shifted pair and the decay); then the factors every output shares beside the block's
+    tiles: its prefix halves, the rows' gate down and the keys gated up (`algebra.key_block_pairs`), a pair's
+    decay's two terms (`between`: the exp2 of the fractions' difference and the scale of the wholes'), a
+    sub-chunk's middle factor and its laid references, each output's gated rows, their masks, and one
+    product's operands, its right a key sub-chunk's."""
     pairing = _pairing_operand(call)
-    # Live at once beside the sums: the prefix halves and their separated pair, the rows' grid, the keys
-    # and the queries as read, each output's rows and their gated form, the keys gated up, the gate down, a
-    # sub-chunk's middle factor and the masked keys. Counted as one gated output's (seven and the rows), the
-    # merged launch's spilled 336 to 424 bytes at 32 keys a block on an A100 and an H100 (jsf-scan4 at
-    # d54ec6b02).
-    return Held(carried=[f32(CHUNK, CHUNK)] * outputs, phases=(
+    # Live at once: the prefix halves and their separated pair, the rows' grid, the keys and the queries as
+    # read, one output's rows and their gated form, the keys gated up, the gate down, a sub-chunk's middle
+    # factor and the masked keys; the output's pairs and its sum read back. Its sums held in registers across
+    # the key blocks, both outputs' at once, the merged launch spilled 336 to 424 bytes at 32 keys a block on
+    # an A100 and an H100 (jsf-scan4 at d54ec6b02).
+    del outputs
+    return Held(carried=[], phases=(
         [f32(CHUNK, block)] * 5,
-        [f32(CHUNK, block)] * (10 + 2 * outputs) + masks(CHUNK, block) * 2
+        [f32(CHUNK, block)] * 12 + [f32(CHUNK, CHUNK)] * 2 + masks(CHUNK, block) * 2
         + fragments(call, (pairing, CHUNK, block), (pairing, algebra.SUB, block))))
 
 
@@ -1103,12 +1105,13 @@ def _intra(q, k, g, beta, taken, call: Call, *, scale: float, solves: bool):
     inverts, and the decay's prefix halves (`call.gates`, `algebra.prefix`'s pair) from the laid decay `g`
     `[R, HV * Dk]` fp32, which every later launch reads. Each pair's decay factored over the chunk's
     sub-chunks (`algebra.key_block_pairs`, which the call's declared floor bounds), their products on the
-    tensor cores (fla_kda's intra rows); the scores and the system share every factor where the family's
-    products read their operands from shared memory and the pairs factor (`Call.factored`). Where they read
-    registers (mma.sync's), or each sub-chunk's own pairs take their own decays besides, each is a launch of
-    its own: both sums held at once with their factors spilled 336 to 408 bytes at every key block on an A100,
-    and without a declared floor on an H100 (jsf-scan5 at 81b757791, jsf-scan6 at 713ce5cb5)."""
-    if solves and (call.family.operands_in_registers or not call.factored):
+    tensor cores (fla_kda's intra rows); the scores and the system share every factor, their sums in shared
+    memory, one output's formed at a time (`_intra_walk`): on every family where the pairs factor
+    (`Call.factored`). Held in registers, both sums with their factors spilled 336 to 408 bytes at every key
+    block on an A100, whose mma.sync then ran them as two launches of 0.87 ms each (M-JS-7). Where the pairs
+    do not factor, each sub-chunk's own pairs taking their own decays besides, each output is a launch of its
+    own (no model calls one: every model's Kimi delta attention declares its floor)."""
+    if solves and not call.factored:
         scores, hi, lo = _intra_walk(q, k, g, beta, taken, call, scale=scale, products=("scores",))
         (system,) = _intra_walk(q, k, g, beta, taken, call, scale=scale, products=("system",))
         return scores, system, hi, lo
@@ -1118,12 +1121,29 @@ def _intra(q, k, g, beta, taken, call: Call, *, scale: float, solves: bool):
 
 def _shifted_keys(call: Call, tiles, keys: jax.Array, prefix: tuple):
     """A key block's keys and separated prefix staged in `tiles` below `SUB` rows of any values (a pair they
-    reach is masked), each offset's reads its loads shifted by it (`algebra.Shifted`)."""
+    reach is masked), each offset's reads its loads shifted by it (`algebra.Shifted`); each row's columns
+    the block's, `PAD` words past them."""
+    width = keys.shape[1]
     mosaic.synced(call.interpret)
     for i, value in enumerate((keys, *algebra.separated(*prefix))):
-        plgpu.store(tiles.at[i, pl.ds(algebra.SUB, CHUNK)], value, optimized=False)
+        plgpu.store(tiles.at[i, pl.ds(algebra.SUB, CHUNK), pl.ds(0, width)], value, optimized=False)
     mosaic.synced(call.interpret)
-    return lambda e: tuple(call.family.tile_of(tiles.at[i, pl.ds(algebra.SUB - e, CHUNK)]) for i in range(3))
+    return lambda e: tuple(call.family.tile_of(tiles.at[i, pl.ds(algebra.SUB - e, CHUNK), pl.ds(0, width)])
+                           for i in range(3))
+
+
+def _intra_summed(call: Call, found: jax.Array, at, *, first, strict: bool, scale: float, diagonal) -> None:
+    """A key block's pairs `found` of an output added to its sum in shared memory `at` (written at the first
+    block), before the next output's are formed: below the diagonal where `strict` (the system), else on and
+    below it and scaled (the scores); where the pairs do not factor, each sub-chunk's own pairs besides
+    (`diagonal`, `algebra.key_diagonal_pairs` given its strictness)."""
+    if diagonal is not None:
+        found = found + diagonal(strict=strict)
+    lag = algebra._lags((CHUNK, CHUNK))
+    found = jnp.where(lag > 0, found, 0.0) if strict else jnp.where(lag >= 0, found, 0.0) * scale
+    total = jnp.where(first, found, call.family.tile_of(at) + found)
+    mosaic.synced(call.interpret)
+    plgpu.store(at, total, optimized=False)
 
 
 def _intra_sums_stored(call: Call, products: tuple[str, ...], totals: tuple, sums, landing: dict, *, row,
@@ -1165,8 +1185,12 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                              decays=gates.views(g_ref, row, CHUNK, h * width, width),
                              **({"queries": call.given.views(q_ref, row, CHUNK, keyed, width)} if scored
                                 else {}))
-        pairing, scanned, *padded = staging
+        pairing, scanned, summed_at, *padded = staging
         sums, prefixes = outs[:outputs], outs[outputs:]
+
+        def half_at(half, rows):
+            """The scan's `half` at `rows`, its row's `keys` columns (past them its `PAD`)."""
+            return scanned.at[half, rows, pl.ds(0, keys)]
 
         def step(index, slots, totals, accumulators):
             slots.acquire_all()
@@ -1177,14 +1201,14 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                 # again, and the writes made visible before they are read (`mosaic.synced`).
                 mosaic.synced(call.interpret)
                 for half, value in enumerate(pair):
-                    plgpu.store(scanned.at[half, pl.ds(CHUNK, CHUNK)], value, optimized=False)
+                    plgpu.store(half_at(half, pl.ds(CHUNK, CHUNK)), value, optimized=False)
                 mosaic.synced(call.interpret)
-                return lambda shift: tuple(family.tile_of(scanned.at[half, pl.ds(CHUNK - shift, CHUNK)])
+                return lambda shift: tuple(family.tile_of(half_at(half, pl.ds(CHUNK - shift, CHUNK)))
                                            for half in (0, 1))
 
             mosaic.synced(call.interpret)
             for half in (0, 1):
-                plgpu.store(scanned.at[half, pl.ds(0, CHUNK)], family.zeros((CHUNK, keys)), optimized=False)
+                plgpu.store(half_at(half, pl.ds(0, CHUNK)), family.zeros((CHUNK, keys)), optimized=False)
             prefix = algebra.scanned_prefix(stream_tile(slots, "decays", gates).value(), stage, chunk=CHUNK)
             stage(prefix)
             for half, ref in zip(prefix if scored else (), prefixes, strict=True):
@@ -1193,7 +1217,7 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
 
             def at_token(token):
                 """The prefix halves at the chunk's `token`, a column's vectors, from the staged scan."""
-                return tuple(family.columns_of(scanned.at[half, CHUNK + token]) for half in (0, 1))
+                return tuple(family.columns_of(half_at(half, CHUNK + token)) for half in (0, 1))
 
             def operand(name):
                 return stream_tile(slots, name, call.given).value().astype(jnp.float32)
@@ -1203,32 +1227,34 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                 return _shifted_keys(call, padded[0], operand("keys"), prefix)
 
             # The scores' rows the queries; the system's each key scaled by its write strength, its pairs
-            # strict.
-            rows = [operand("queries") if name == "scores"
-                    else operand("keys") * family.rows_of(beta_ref.at[h, span])[:, None] for name in products]
-            strict = [name == "system" for name in products]
-            keyed, *gated = pairing
+            # strict; each formed as its products are.
+            def rows(name):
+                if name == "scores":
+                    return operand("queries")
+                return operand("keys") * family.rows_of(beta_ref.at[h, span])[:, None]
 
-            pairs = algebra.key_block_pairs(rows, operand("keys"), prefix, at_token,
+            keyed, *gated = pairing
+            pairs = algebra.key_block_pairs([functools.partial(rows, name) for name in products],
+                                            operand("keys"), prefix, at_token,
                                             Issuer(call, {"pairs": gated}).summed,
                                             lambda up: staged_parts(family, up, keyed), chunk=CHUNK,
                                             diagonal=call.factored)
-            if not call.factored:
-                pairs = [found + algebra.key_diagonal_pairs(lambda c, row=row: row, shifted, 1,
-                                                            lambda c: prefix, chunk=CHUNK, strict=apart)
-                         for found, row, apart in zip(pairs, rows, strict, strict=True)]
-            lag = algebra._lags((CHUNK, CHUNK))
-            totals = tuple(total + (jnp.where(lag > 0, found, 0.0) if apart
-                                    else jnp.where(lag >= 0, found, 0.0) * scale)
-                           for total, found, apart in zip(totals, pairs, strict, strict=True))
+            for o, (name, found) in enumerate(zip(products, pairs, strict=True)):
+                diagonal = None if call.factored else functools.partial(
+                    algebra.key_diagonal_pairs, lambda c, name=name: rows(name), shifted, 1, lambda c: prefix,
+                    chunk=CHUNK)
+                _intra_summed(call, found, summed_at.at[o, :, pl.ds(0, CHUNK)], first=index == 0,
+                              strict=name == "system", scale=scale, diagonal=diagonal)
 
-            pl.when(index == steps - 1)(functools.partial(_intra_sums_stored, call, products, totals, sums,
-                                                          landing, row=row, head=h))
+            @pl.when(index == steps - 1)
+            def _():
+                mosaic.synced(call.interpret)
+                totals = tuple(family.tile_of(summed_at.at[o, :, pl.ds(0, CHUNK)]) for o in range(outputs))
+                _intra_sums_stored(call, products, totals, sums, landing, row=row, head=h)
 
             return totals, accumulators
 
-        zero = family.as_tile(family.zeros((CHUNK, CHUNK)))
-        return mosaic.Walk(views, step, steps=steps, carry=(zero,) * outputs)
+        return mosaic.Walk(views, step, steps=steps)
 
     blocks = _intra_streamed(call, keys, queries=scored)
     formed = [held if name == "scores" else _systems(call) for name in products]
@@ -1257,20 +1283,29 @@ def _intra_streamed(call: Call, keys: int, *, queries: bool) -> dict:
                          **({"queries": ((CHUNK, keys), call.given)} if queries else {}))
 
 
+PAD = 8
+"""Words past each row of the intra walk's plain shared tiles: an accumulator fragment's warp writes 2 words
+at each of 4 columns of 8 rows a store, and rows a multiple of 32 words apart put all 8 in the same banks
+(3.4 bank conflicts a shared store in Kimi delta attention's intra launch, kda-stalls-h100 at 11704365b);
+rows 8 words past one apart, each half-warp's 16 lanes take 16 bank pairs."""
+
+
 def _intra_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
     """`_intra_walk`'s staging tiles and landings at key block `keys` forming `products`: the pairs' operands
-    (`_pairing`), the prefix scan's halves below as many zero rows (`algebra.scanned_prefix`'s shifts), and
-    the stores' landings: the scores' square and a block of the prefix halves where it forms the scores, the
-    system's where it forms the system."""
+    (`_pairing`), the prefix scan's halves below as many zero rows (`algebra.scanned_prefix`'s shifts), each
+    output's sum across the key blocks, each row `PAD` words past its columns, and the stores' landings: the
+    scores' square and a block of the prefix halves where it forms the scores, the system's where it forms the
+    system."""
     landing = {**({"square": dataclasses.replace(call.held, rows=call.rows).landing(CHUNK, CHUNK),
                    "prefix": call.gates.landing(CHUNK, keys)} if "scores" in products else {}),
                **({"system": _systems(call).landing(CHUNK, CHUNK)} if "system" in products else {})}
     # Where the call's pairs do not factor (`Call.factored`), a key block's keys and prefix halves below a
     # sub-chunk's rows (`algebra.key_diagonal_pairs`' shifted reads).
     # Both read at row offsets no tiling divides (the scan's shifts, the sub-chunks' references), so plain.
-    padded = () if call.factored else (mosaic.plain((3, algebra.SUB + CHUNK, keys), jnp.float32),)
-    scanned = mosaic.plain((2, 2 * CHUNK, keys), jnp.float32)
-    return (_pairing(call, keys), scanned, *padded), landing
+    padded = () if call.factored else (mosaic.plain((3, algebra.SUB + CHUNK, keys + PAD), jnp.float32),)
+    scanned = mosaic.plain((2, 2 * CHUNK, keys + PAD), jnp.float32)
+    sums = mosaic.plain((len(products), CHUNK, CHUNK + PAD), jnp.float32)
+    return (_pairing(call, keys), scanned, sums, *padded), landing
 
 
 def _pairing_operand(call: Call) -> Operand:
