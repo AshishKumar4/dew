@@ -69,7 +69,7 @@ Nothing in the user's code refers to kernels or the algebra engine. A model buil
 
 ## The compile point
 
-Dew compiles its programs at one seam. Every program is an `OuterProgram`, whose `_jitted` jits `algebra.rewritten(function)`, so the algebra pass sits on that seam. The resident training step is one: `Trainer._jitted` returns `owned_program(step, in_shardings=…, out_shardings=…, donate_argnums=0)`. So are a host-master step's phases, an evaluation, a load, a sampler, a serving step and an RL rollout. A lint rule (SLOP025) keeps it that way: the one other jit in the library, `dew.nn.nested`, only marks a sub-program inside an enclosing trace and compiles nothing at the top level.
+Dew compiles its programs at one seam. Every program is an `OuterProgram`, whose `_jitted` jits `algebra.rewritten(function)`, so the algebra pass sits on that seam. The resident training step is one: `dew.training._candidates.step_program` returns `owned_program(step, in_shardings=…, out_shardings=…, donate_argnums=0)`. So are a host-master step's phases, an evaluation, a load, a sampler, a serving step and an RL rollout. A lint rule (SLOP025) keeps it that way: the one other jit in the library, `dew.nn.nested`, only marks a sub-program inside an enclosing trace and compiles nothing at the top level.
 
 - `options.program(function, *models, step=None, **jit_arguments)`: The process-wide factory: one `OuterProgram` per function, compiler options and jit arguments, cached, so every call with the same inputs reuses it. Its compiler options come from the models it runs (`compiler_options`) and, for part of a training step, the step's own.
 - `owned_program(...)`: The same program, kept by no cache of Dew's. A closure or bound method that a run makes, such as the training step, its placement's programs or its host phases, takes this form, because a process-wide cache would keep the trainer it closes over alive for good.
@@ -109,7 +109,7 @@ Autodiff and plain code produce correct math, but not always cheap math. The spe
 
 > **Where the code and the spec part.** The spec names a `reuse` set the code does not have; the identities it builds and the ones it leaves to XLA are the spec's ([algebra §1.4](algebra.md#14-facts-and-rules)), and extraction is egglog's greedy DAG with Dew's exact MILP oracle beside it ([algebra §6.5](algebra.md#65-cost-and-extraction)). The spec says the planner's memory trace goes through the pass; in the code, `footprint` traces the loss without it, so the planner prices the unrewritten program.
 
-*Where it lives: `dew.nn.kernels.options` (`program`, `owned_program`, `OuterProgram`), `dew.training.trainer.Trainer._jitted`, `dew.training.transaction.Transaction.step`, `dew.algebra.program` (`rewritten`, `rewrite`, `_windowed`, `_region`, `_splices`), `dew.algebra.terms`, `dew.algebra.rules`, `dew.algebra.cost`, `dew._cache.ALGEBRA`.*
+*Where it lives: `dew.nn.kernels.options` (`program`, `owned_program`, `OuterProgram`), `dew.training._candidates.step_program`, `dew.training.transaction.Transaction.step`, `dew.algebra.program` (`rewritten`, `rewrite`, `_windowed`, `_region`, `_splices`), `dew.algebra.terms`, `dew.algebra.rules`, `dew.algebra.cost`, `dew._cache.ALGEBRA`.*
 
 ## Kernel routing
 

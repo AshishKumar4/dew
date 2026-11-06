@@ -161,6 +161,37 @@ def test_a_shard_map_over_one_device_holds_what_it_would_inline():
             through(layer), params, (rows,), platform="gpu", workspace=workspace)
 
 
+def test_a_loop_of_one_turn_holds_what_its_body_inline_does():
+    """A scan of one turn is its body run inline in the program XLA compiles, which removes a loop of one
+    trip (`TryRemoveWhileLoop`, xla/service/while_loop_simplifier.cc): what the loop read from memory, its
+    zero carry and the weights it casts outside it, its body's own equations fuse, its stacked operand read
+    as its one slice and its stacked result that slice's stack. A tiled head whose rows are one tile was
+    derived holding both beside the loop: Qwen3.5-4B's fused tiled head at four microbatches, 14.4 GiB of
+    temporaries against XLA's 8.1 (row 4089)."""
+    weights = jax.ShapeDtypeStruct((1024, 4096), jnp.float32)
+    rows = jax.ShapeDtypeStruct((1, 64, 1024), jnp.bfloat16)
+
+    def turn(narrow):
+        def run(gradient, tile):
+            logits = (tile @ narrow).astype(jnp.float32)
+            return gradient + tile.T.astype(jnp.float32) @ logits, jnp.sum(logits, axis=-1)
+        return run
+
+    def scanned(weights, rows):
+        return jax.lax.scan(turn(weights.astype(jnp.bfloat16)), jnp.zeros(weights.shape, jnp.float32), rows)
+
+    def inline(weights, rows):
+        gradient, sums = turn(weights.astype(jnp.bfloat16))(jnp.zeros(weights.shape, jnp.float32),
+                                                            jax.lax.squeeze(rows, (0,)))
+        return gradient, jax.lax.reshape(sums, (1, *sums.shape))
+
+    def peak(function):
+        return peak_bytes(compiled(jax.make_jaxpr(function)(weights, rows).jaxpr, "cuda"), "gpu",
+                          Workspace(0, 0))
+
+    assert peak(scanned) == peak(inline)
+
+
 def test_a_pallas_kernel_holds_what_its_lowering_holds():
     """A native Pallas kernel is one custom call to XLA, `__gpu$xla.gpu.triton`, whose results are the
     kernel's outputs alone (`pallas_call_lowering`, jax/_src/pallas/triton/pallas_call_registration.py):
@@ -255,7 +286,10 @@ def test_a_compile_only_gpus_gemm_holds_the_workspace_its_deviceless_compile_giv
     from dew.training.ahead import compile_only_gpus
 
     (gpu,) = compile_only_gpus(generation, 1, 1 << 30)
-    weights, rows = jax.ShapeDtypeStruct((64, 64), jnp.float32), jax.ShapeDtypeStruct((512, 64), jnp.float32)
+    # A gradient larger than the product its operand is computed from, which that operand's fusion frees
+    # (`dying`), so the gradient's product, its workspace beside it, is the step's peak.
+    weights = jax.ShapeDtypeStruct((1024, 64), jnp.float32)
+    rows = jax.ShapeDtypeStruct((512, 1024), jnp.float32)
 
     def loss(weights, rows):
         return jnp.sum((rows @ weights) ** 2), ()
