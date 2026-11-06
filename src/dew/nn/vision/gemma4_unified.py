@@ -11,11 +11,11 @@ from collections.abc import Mapping
 from flax import linen as nn
 
 from dew import _records
-from dew.interop.weights import in_params
+from dew.interop.layouts import Table
 from dew.nn.norms import LayerNorm
 from dew.registry import Record
 
-from .common import TowerBase, TowerGeometry, TowerLayout
+from .common import TowerBase, TowerGeometry, TowerLayout, tensor_routes
 from .gemma4 import AxialPatchEmbedding
 
 
@@ -61,10 +61,4 @@ _TENSORS = {
 }
 
 
-def vision_path(name: str) -> tuple[str, ...]:
-    if name not in _TENSORS:
-        raise ValueError(f"unknown unified vision tensor {name!r}")
-    return _TENSORS[name]
-
-
-Gemma4UnifiedVision.checkpoint = TowerLayout("vision_embedder.", in_params(vision_path))
+Gemma4UnifiedVision.checkpoint = TowerLayout("vision_embedder.", Table(*tensor_routes(_TENSORS)))

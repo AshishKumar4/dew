@@ -16,24 +16,25 @@ modeling_qwen4_exp.py:1535) and builds and runs none of.
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping
+from types import MappingProxyType
 
-import jax
 import numpy as np
 
 from dew import _records
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
+    DELTA_NET_ROUTES,
     LINEAR_FIELDS,
     DecoderFamily,
     DecoderFields,
+    ExportRefused,
     Renames,
-    decoder_tensors,
+    in_layer,
     kinds_of,
+    reads,
     refuse,
-    renamed_name,
-    renamed_path,
+    spelled,
 )
 from dew.interop.families.qwen import (
     _QWEN_MOE_LEAVES,
@@ -42,7 +43,7 @@ from dew.interop.families.qwen import (
     _qwen_moe_mixture,
     qwen_hybrid_export,
 )
-from dew.interop.safetensors_io import LazyTensors
+from dew.interop.layouts import ConfigLayout, ConfigPart, Route, Slot, Table, one_of
 from dew.interop.unread import Stored, equal
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
@@ -77,9 +78,6 @@ _HEAD = {**{f'model.hyper_connection_mixer.{name}.weight': ('hc_head', name, 'ke
          'model.hyper_connection_mixer.hc_norm.weight': ('hc_head', 'hc_norm', 'scale')}
 """The model's head, the gated read without its inject."""
 
-_SHARD = re.compile(r'^model\.layers\.(?P<layer>\d+)\.ple\.ple_embedding\.ngram_embedding'
-                    r'\.shard_(?P<index>\d+)\.weight$')
-_TABLE = re.compile(r'^layers_(?P<layer>\d+)\.engram\.shards\.embed\.embedding$')
 _BUFFERS = ('layer_multipliers', 'ngram_heads_vocab_sizes', 'ngram_heads_offsets')
 
 
@@ -156,22 +154,35 @@ def _qwen4_exp_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields
     return config
 
 
+def _lookups(config: Mapping[str, object]) -> dict[str, np.ndarray]:
+    """Each n-gram table's buffers by their names (`_BUFFERS`), as the record's lookups derive them
+    (`Engram.multipliers`, `Engram.primes`): transformers' class holds them, so a release stores them; a
+    load checks them (`_qwen4_exp_prepare`) and an export writes them (`DecoderFamily.derived`)."""
+    engram = config.get('engram')
+    if engram is None:
+        return {}
+    spec = engram if isinstance(engram, Engram) else from_record(Engram, _records.record(engram, 'engram'))
+    lookups = {}
+    for index, layer in enumerate(spec.layer_ids):
+        primes = np.asarray(spec.primes[index], np.int64).reshape(-1)
+        stem = f'model.layers.{layer}.ple.ple_embedding'
+        lookups.update({f'{stem}.layer_multipliers': np.asarray(spec.multipliers[index], np.int64),
+                        f'{stem}.ngram_heads_vocab_sizes': primes,
+                        f'{stem}.ngram_heads_offsets': np.concatenate([[0], np.cumsum(primes)[:-1]])})
+    return lookups
+
+
 def _qwen4_exp_prepare(tensors: Mapping[str, Stored], config: Mapping[str, object] | None = None
                        ) -> dict[str, Stored]:
-    """The checkpoint as stored, its n-gram buffers checked against the translated lookups
-    (`Engram.multipliers`, `Engram.primes`): no leaf takes them, so they are written back as stored."""
-    spec = (None if config is None or config.get('engram') is None
-            else from_record(Engram, _records.record(config['engram'], 'engram')))
-    for name, tensor in tensors.items():
-        if _buffer(name):
-            if spec is None:
-                raise ValueError(f'{name} needs the translated n-gram lookups to check it against')
-            layer = spec.layer_ids.index(int(name.split('.')[2]))
-            primes = np.asarray(spec.primes[layer]).reshape(-1)
-            expected = {'layer_multipliers': spec.multipliers[layer], 'ngram_heads_vocab_sizes': primes,
-                        'ngram_heads_offsets': np.concatenate([[0], np.cumsum(primes)[:-1]])}
-            if not equal(tensor, np.asarray(expected[name.rsplit('.', 1)[-1]], tensor.dtype)):
-                raise ValueError(f'{name} is not the layout the config derives')
+    """The checkpoint as stored, its n-gram buffers checked against the translated lookups (`_lookups`):
+    no leaf takes them."""
+    buffers = [name for name in tensors if _buffer(name)]
+    if buffers and (config is None or config.get('engram') is None):
+        raise ValueError(f'{buffers[0]} needs the translated n-gram lookups to check it against')
+    expected = _lookups(config) if buffers and config is not None else {}
+    for name in buffers:
+        if name not in expected or not equal(tensors[name], expected[name].astype(tensors[name].dtype)):
+            raise ValueError(f'{name} is not the layout the config derives')
     return dict(tensors)
 
 
@@ -180,25 +191,18 @@ def _buffer(name: str) -> bool:
     return '.ple.ple_embedding.' in name and name.rsplit('.', 1)[-1] in _BUFFERS
 
 
-def _qwen4_exp_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """Each tensor's leaf: a table's row shard its slice of the stacked table (`ShardedTable`); none
-    for the table's buffers and the prediction layer, which are written back as stored."""
-    if name.startswith('mtp.') or _buffer(name):
-        return None
-    found = _SHARD.match(name)
-    if found is not None:
-        layer = f"layers_{found['layer']}"
-        return ('params', layer, 'engram', 'shards', found['index'], 'embed', 'embedding')
-    return renamed_path(_NAMES, name, config, leaves=_HEAD, layer_leaves=_LEAVES)
-
-
-def _qwen4_exp_name(name: str, config: Mapping[str, object]) -> str | None:
-    """Each leaf's source name, a stacked table's the whole table's (`_qwen4_exp_export_weights` writes it
-    back shard by shard)."""
-    found = _TABLE.match(name)
-    if found is not None:
-        return f"model.layers.{found['layer']}.ple.ple_embedding.ngram_embedding.weight"
-    return renamed_name(_NAMES, name, config, leaves=_HEAD, layer_leaves=_LEAVES)
+_ROUTES = Table(
+    # The prediction layer, which transformers reads nowhere, and the tables' buffers (`_lookups`): no
+    # leaf, written back as stored.
+    Route('mtp.{rest}', None, MappingProxyType({'rest': Slot(r'.+')})),
+    in_layer('ple.ple_embedding.{buffer}', None, {'buffer': one_of(*_BUFFERS)}),
+    # A table's row shard, its slice of the stacked table (`ShardedTable`).
+    in_layer('ple.ple_embedding.ngram_embedding.shard_{index}.weight',
+             'engram/shards/{index}/embed/embedding'),
+    # Its hyper-connected linear layers hold a delta net, under the delta net's names.
+    *DELTA_NET_ROUTES,
+    spelled(_NAMES, leaves=_HEAD, layer_leaves=_LEAVES))
+"""Qwen4-Exp's names: the hybrid Qwen block's, its streams' and its n-gram tables' (`_LEAVES`, `_HEAD`)."""
 
 
 def _qwen4_exp_constants(directory, record: Mapping[str, object]) -> Mapping[str, object]:
@@ -221,8 +225,8 @@ def _qwen4_exp_export(model: CausalTransformer) -> Mapping[str, object]:
     # The hybrid block's own fields (`qwen_hybrid_export`), its delta net's and its rotary's fraction.
     hybrid = qwen_hybrid_export(model)
     if len(qsa) + len(delta) != len(mixers) or len(qsa) > 1 or len(delta) > 1 or mixture is None:
-        raise ValueError("a qwen4_exp_text config states one QSA attention, one gated delta net and routed "
-                         f"experts in every layer; this model's layers are {list(mixers.values())}")
+        raise ExportRefused("a qwen4_exp_text config states one QSA attention, one gated delta net and "
+                            f"routed experts in every layer; this model's layers are {list(mixers.values())}")
     fields: dict[str, object] = {
         'layer_types': ['qwen_sparse_attention' if isinstance(mixers[kind], QSAAttentionMixer)
                         else 'linear_attention' for kind in model.per_layer_types],
@@ -249,49 +253,15 @@ def _qwen4_exp_export(model: CausalTransformer) -> Mapping[str, object]:
     return fields
 
 
-def _qwen4_exp_export_weights(family: DecoderFamily, model: CausalTransformer,
-                              variables: Mapping[str, object], config: Mapping[str, object]) -> LazyTensors:
-    """Every leaf under its name (`decoder_tensors`), each n-gram table shard by shard as the release
-    stores it, and each table's buffers, which transformers' class holds and a load checks
-    (`_qwen4_exp_prepare`)."""
-    tensors = decoder_tensors(family, model, variables, config)
-    engram, added, tables = model.engram, {}, {}
-    for index, layer in enumerate(() if engram is None else engram.layer_ids):
-        assert engram is not None
-        primes = np.asarray(engram.primes[index], np.int64).reshape(-1)
-        stem = f'model.layers.{layer}.ple.ple_embedding'
-        added.update({f'{stem}.layer_multipliers': engram.multipliers[index].astype(np.int64),
-                      f'{stem}.ngram_heads_vocab_sizes': primes,
-                      f'{stem}.ngram_heads_offsets': np.concatenate([[0], np.cumsum(primes)[:-1]])})
-        tables[f'{stem}.ngram_embedding.weight'] = stem
-    specs = {name: spec for name, spec in tensors.specs.items() if name not in tables}
-    for whole, stem in tables.items():
-        shape, dtype = tensors.specs[whole].shape, tensors.specs[whole].dtype
-        for shard in range(shape[0]):
-            specs[f'{stem}.ngram_embedding.shard_{shard}.weight'] = jax.ShapeDtypeStruct(shape[1:], dtype)
-    specs.update({name: jax.ShapeDtypeStruct(value.shape, value.dtype) for name, value in added.items()})
-
-    def tensor(name: str):
-        found = _SHARD.match(name)
-        if found is not None:
-            return tensors[f"model.layers.{found['layer']}.ple.ple_embedding.ngram_embedding.weight"][
-                int(found['index'])]
-        return added[name] if name in added else tensors[name]
-
-    return LazyTensors(specs, tensor)
-
-
 QWEN4_EXP_TEXT = DecoderFamily(
     ('qwen4_exp_text',),
-    _qwen4_exp_config,
+    ConfigLayout(ConfigPart(reads(_qwen4_exp_config), _qwen4_exp_export)),
     lambda fields: bool(fields.hyper_connections is not None and fields.hyper_connections.gated),
     'qwen4_exp_text',
     'Qwen4ExpForCausalLM',
-    _qwen4_exp_export,
-    weight_path=_qwen4_exp_path,
-    export_path=_qwen4_exp_name,
-    export_weights=_qwen4_exp_export_weights,
+    routes=_ROUTES,
     prepare=_qwen4_exp_prepare,
+    derived=_lookups,
     constants=_qwen4_exp_constants,
     packed=FUSED_EXPERTS,
     prediction_counts=('mtp_num_hidden_layers',),

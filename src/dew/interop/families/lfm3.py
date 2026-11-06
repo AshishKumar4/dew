@@ -25,15 +25,15 @@ from dew.interop.decoder_parts import (
     Ropes,
     SourceCode,
     base_config,
-    decoder_tensors,
     kind_mixers,
     kinds_of,
     read_rope_theta,
+    reads,
     refuse,
-    renamed_name,
-    renamed_path,
     specified_layer_types,
+    spelled,
 )
+from dew.interop.layouts import ConfigLayout, ConfigPart, Table, When
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.mixers.short_conv import ShortConvMixer
@@ -62,18 +62,12 @@ before each feed-forward."""
 
 
 
-def lfm3_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """A source tensor's path, by the model's fields record (its `sandwich_norms`)."""
-    return renamed_path(_SANDWICH if config.get('sandwich_norms') else _PLAIN, name, config,
-                        layer_leaves=SHORT_CONV_LEAVES)
-
-
-def lfm3_export_path(name: str, config: Mapping[str, object]) -> str | None:
-    """A leaf's source name, by the source config it exports beside (its `use_sandwich_norm`, true
-    where it is omitted, as Lfm3Config's default)."""
-    sandwich = bool(config.get('use_sandwich_norm', True))
-    return renamed_name(_SANDWICH if sandwich else _PLAIN, name, config, layer_leaves=SHORT_CONV_LEAVES,
-                        sandwich_norms=sandwich)
+LFM3_ROUTES = Table(
+    When(lambda config: bool(config.get('sandwich_norms')),
+         spelled(_SANDWICH, layer_leaves=SHORT_CONV_LEAVES)),
+    When(lambda config: not config.get('sandwich_norms'), spelled(_PLAIN, layer_leaves=SHORT_CONV_LEAVES)))
+"""LFM3's names, by the record's `sandwich_norms`: its convolution layers' (`SHORT_CONV_LEAVES`) beside the
+shared decoder's."""
 
 
 _ROPE = {'full_attention': {'rope_type': 'default', 'rope_theta': 1_000_000.0, 'partial_rotary_factor': 0.5},
@@ -186,15 +180,12 @@ def _export(model: CausalTransformer) -> Mapping[str, object]:
 
 LFM3 = DecoderFamily(
     ('lfm3',),
-    lfm3_config,
+    ConfigLayout(ConfigPart(reads(lfm3_config), _export)),
     lambda fields: any(isinstance(mixer, ShortConvMixer) for mixer in kind_mixers(fields)),
     'lfm3',
     'Lfm3ForCausalLM',
-    _export,
-    weight_path=lfm3_path,
-    export_path=lfm3_export_path,
+    routes=LFM3_ROUTES,
     # The path map names every leaf of the convolution layers, so the shared writer writes it whole.
-    export_weights=decoder_tensors,
     preserve_source_layout=True,
     padding_idx=True,
     aliases={'norm_eps': 'rms_norm_eps'},

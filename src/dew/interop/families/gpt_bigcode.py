@@ -2,19 +2,18 @@
 queries, keys and values fused in one `c_attn`, multi-query by default."""
 
 from collections.abc import Mapping
-from functools import partial
 
 from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
-    decoder_tensors,
     grouped_qkv,
     hf_ungated,
+    reads,
     refuse,
-    renamed_name,
-    renamed_path,
+    spelled,
 )
 from dew.interop.families.gpt2 import GPT2_NAMES, gpt2_config, gpt2_export
+from dew.interop.layouts import ConfigLayout, ConfigPart
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
@@ -47,10 +46,10 @@ def _gpt_bigcode_export(model: CausalTransformer) -> Mapping[str, object]:
 
 # A multi-head GPTBigCode computes GPT-2's model, which exports as GPT-2.
 GPT_BIGCODE = DecoderFamily(
-    ('gpt_bigcode',), _gpt_bigcode_config,
+    ('gpt_bigcode',), ConfigLayout(ConfigPart(reads(_gpt_bigcode_config), _gpt_bigcode_export)),
     lambda fields: fields.position_embedding == 'learned' and fields.kv_heads == 1 < fields.num_heads,
-    'gpt_bigcode', 'GPTBigCodeForCausalLM', _gpt_bigcode_export,
-    weight_path=partial(renamed_path, GPT2_NAMES), export_path=partial(renamed_name, GPT2_NAMES),
-    packed=grouped_qkv('.attn.c_attn'), export_weights=decoder_tensors, preserve_source_layout=False,
+    'gpt_bigcode', 'GPTBigCodeForCausalLM',
+    routes=spelled(GPT2_NAMES),
+    packed=grouped_qkv('.attn.c_attn'), preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
 )

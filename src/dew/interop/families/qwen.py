@@ -9,11 +9,12 @@ layer the MTP checkpoints carry past `num_hidden_layers`.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 
 from dew import _records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
+    DECODER_ROUTES,
     FUSED_EXPERTS,
     LINEAR_FIELDS,
     MOE_SHARED,
@@ -26,23 +27,21 @@ from dew.interop.decoder_parts import (
     Renames,
     Ropes,
     base_config,
-    decoder_tensors,
-    dew_path,
-    hf_tensor_name,
+    declared_depths,
     kind_mixers,
     kinds_of,
     native_layer_types,
-    prediction_name,
-    prediction_path,
+    prediction_routes,
     read_partial_rope,
     read_rope,
+    reads,
     record_int,
     refuse,
-    renamed_name,
-    renamed_path,
     softmax_top_k,
     specified_layer_types,
+    spelled,
 )
+from dew.interop.layouts import ConfigLayout, ConfigPart, Routes, Table
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -173,6 +172,21 @@ def _qwen_moe_mixture(hf_config: Mapping[str, object], used: set[str], sparse: t
     return mixture
 
 
+def _qwen3_moe_export(model: CausalTransformer) -> Mapping[str, object]:
+    """`_qwen3_moe_config` backwards: its window (`_qwen3_export`) and its routed experts and the layers they
+    route (`_qwen_moe_export`)."""
+    return {**_qwen3_export(model), **_qwen_moe_export(model, scheduled=True)}
+
+
+def _qwen2_moe_export(model: CausalTransformer) -> Mapping[str, object]:
+    """`_qwen2_moe_config` backwards: its q/k/v bias as `qkv_bias`, its window switched on where a layer
+    slides (the layers' kinds go out as `layer_types`), and its routed experts and shared expert and the
+    layers they route (`_qwen_moe_export`)."""
+    return {'qkv_bias': model.attention_bias,
+            'use_sliding_window': 'sliding_attention' in model.per_layer_types,
+            **_qwen_moe_export(model, scheduled=True)}
+
+
 def _qwen2_moe_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
     """Read Qwen2-MoE's softmax experts beside a sigmoid-gated shared MLP.
 
@@ -265,7 +279,9 @@ def _qwen_moe_export(model: CausalTransformer, *, scheduled: bool) -> Mapping[st
     routed = set(model.sparse_layers)
     return {'num_experts': mixture.experts, 'num_experts_per_tok': mixture.top_k,
             'moe_intermediate_size': mixture.expert_features,
-            'shared_expert_intermediate_size': mixture.shared_features,
+            # Qwen3-MoE's config states no shared expert, which its model holds none of.
+            **({'shared_expert_intermediate_size': mixture.shared_features}
+               if mixture.shared_features else {}),
             **({'norm_topk_prob': mixture.norm_topk_prob, 'decoder_sparse_step': 1,
                 'mlp_only_layers': [index for index in range(model.num_layers) if index not in routed]}
                if scheduled else {})}
@@ -366,38 +382,21 @@ _QWEN_MTP_FIELDS = {
     "pre_fc_norm_hidden.weight": ("hnorm", "scale"),
     "norm.weight": ("final_norm", "scale"),
 }
-def _qwen_mtp_path(
-    name: str,
-    config: Mapping[str, object],
-    block_path: Callable[[str, Mapping[str, object]], tuple[str, ...] | None],
-) -> tuple[str, ...] | None:
-    """Return the variables-tree path for one Qwen MTP tensor name.
 
-    The names are vLLM qwen3_5_mtp.py's, for the shared-embedding single
-    prediction layer: its own leaves under `mtp.`, its block under
-    `mtp.layers.0.`, which `block_path` maps as the trunk's layer 0's.
-    """
-    def block(tail: str) -> tuple[str, ...] | None:
-        if not tail.startswith("layers.0."):
-            raise ValueError(f"unknown Qwen MTP tensor {name!r}")
-        return block_path("model." + tail, config)
 
-    return prediction_path(name, "mtp", qwen_mtp_depth(name, config),
-                           record_int(config, "num_nextn_predict_layers", 0),
-                           name.removeprefix("mtp."), _QWEN_MTP_FIELDS, block)
+def qwen_mtp_routes(block: Routes) -> Table:
+    """The routes of a Qwen single shared-embedding prediction layer (vLLM qwen3_5_mtp.py's names): its own
+    leaves under `mtp.`, its block under `mtp.layers.0.`, which `block` names as the trunk's layer 0's;
+    then the trunk's, `block`'s."""
+    return Table(prediction_routes('mtp.', 'mtp', _QWEN_MTP_FIELDS, block, block_stored='mtp.layers.0.',
+                                   when=declared_depths()),
+                 block)
 
 
 def qwen_mtp_depth(name: str, config: Mapping[str, object]) -> int | None:
     """The prediction depth of a Qwen tensor: 0 for any of its single prediction layer's `mtp.*`
-    (`_qwen_mtp_path`), None for the trunk's."""
+    (`qwen_mtp_routes`), None for the trunk's."""
     return 0 if name.startswith("mtp.") else None
-
-
-def _qwen35_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    if name.startswith("mtp."):
-        return _qwen_mtp_path(name, config, dew_path)
-    return dew_path(name, config)
-
 
 
 _QWEN_MOE_NAMES: Renames = (('mlp.shared_expert', 'mlp.shared_experts'),)
@@ -408,11 +407,9 @@ _QWEN_MOE_LEAVES: Leaves = {
 """Qwen3-Next's and Qwen3.5-MoE's experts, each projection one tensor over
 every expert with no `.weight`, and the shared expert's gate."""
 
-
-def qwen35_moe_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    if name.startswith("mtp."):
-        return _qwen_mtp_path(name, config, qwen35_moe_path)
-    return renamed_path(_QWEN_MOE_NAMES, name, config, layer_leaves=_QWEN_MOE_LEAVES)
+QWEN_MOE_ROUTES = qwen_mtp_routes(spelled(_QWEN_MOE_NAMES, layer_leaves=_QWEN_MOE_LEAVES))
+"""Qwen2-MoE's, Qwen3-Next's and Qwen3.5-MoE's names: the shared expert's, the fused experts' and the
+prediction layer's beside the shared decoder's."""
 
 
 def _qwen35_moe_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -431,38 +428,15 @@ def _qwen3_next_export(model: CausalTransformer) -> Mapping[str, object]:
             'num_nextn_predict_layers': model.num_nextn_predict_layers}
 
 
-def _qwen_mtp_name(dew_name: str, config: Mapping[str, object],
-                   trunk_name: Callable[[str, Mapping[str, object]], str | None]) -> str | None:
-    """`_qwen_mtp_path` backwards (`prediction_name`): a prediction layer's leaf under `mtp.`
-    (`_QWEN_MTP_FIELDS`), its block's under `mtp.layers.0.` as `trunk_name` names the trunk's layer 0's."""
-    def block(path: tuple[str, ...]) -> str | None:
-        trunk = trunk_name('.'.join(('layers_0', *path)), config)
-        return None if trunk is None else trunk.removeprefix('model.')
-
-    _, tail = prediction_name(dew_name, 'mtp', _QWEN_MTP_FIELDS, block)
-    return None if tail is None else f'mtp.{tail}'
-
-
-def _qwen35_moe_name(dew_name: str, config: Mapping[str, object]) -> str | None:
-    """`qwen35_moe_path` backwards: a prediction layer's leaf by `_qwen_mtp_name`, any other's in the
-    family's names (`_QWEN_MOE_NAMES`, `_QWEN_MOE_LEAVES`)."""
-    def named(name: str, config: Mapping[str, object]) -> str | None:
-        return renamed_name(_QWEN_MOE_NAMES, name, config, layer_leaves=_QWEN_MOE_LEAVES)
-
-    return _qwen_mtp_name(dew_name, config, named) if dew_name.startswith('mtp_') else named(dew_name, config)
-
-
 QWEN3_NEXT = DecoderFamily(
     ('qwen3_next',),
-    _qwen3_next_config,
+    ConfigLayout(ConfigPart(reads(_qwen3_next_config), _qwen3_next_export)),
     lambda fields: any(
         isinstance(mixer, GatedDeltaNetMixer) and mixer.fused_in_proj for mixer in kind_mixers(fields)
     ),
     'qwen3_next',
     'Qwen3NextForCausalLM',
-    _qwen3_next_export,
-    weight_path=qwen35_moe_path, prediction_depth=qwen_mtp_depth, export_weights=decoder_tensors,
-    export_path=_qwen35_moe_name,
+    routes=QWEN_MOE_ROUTES, prediction_depth=qwen_mtp_depth,
     packed=FUSED_EXPERTS,
     preserve_source_layout=True,
     padding_idx=True,
@@ -475,22 +449,13 @@ def _qwen35_export(model: CausalTransformer) -> Mapping[str, object]:
     return {**qwen_hybrid_export(model), 'mtp_num_hidden_layers': model.num_nextn_predict_layers}
 
 
-def _qwen35_name(dew_name: str, config: Mapping[str, object]) -> str | None:
-    """`_qwen35_path` backwards: a prediction layer's leaf by `_qwen_mtp_name`, any other's as
-    `hf_tensor_name` names it."""
-    return (_qwen_mtp_name(dew_name, config, hf_tensor_name) if dew_name.startswith('mtp_')
-            else hf_tensor_name(dew_name, config))
-
-
 QWEN3_5_MOE_TEXT = DecoderFamily(
     ('qwen3_5_moe_text',),
-    _qwen35_moe_config,
+    ConfigLayout(ConfigPart(reads(_qwen35_moe_config), _qwen35_moe_export)),
     lambda fields: bool(fields.output_gate and fields.mixture is not None),
     'qwen3_5_moe_text',
     'Qwen3_5MoeForCausalLM',
-    _qwen35_moe_export,
-    weight_path=qwen35_moe_path, prediction_depth=qwen_mtp_depth, export_weights=decoder_tensors,
-    export_path=_qwen35_moe_name,
+    routes=QWEN_MOE_ROUTES, prediction_depth=qwen_mtp_depth,
     packed=FUSED_EXPERTS,
     preserve_source_layout=True,
     padding_idx=True,
@@ -500,15 +465,13 @@ QWEN3_5_MOE_TEXT = DecoderFamily(
 
 QWEN3_5_TEXT = DecoderFamily(
     (QWEN35,),
-    _qwen35_config,
+    ConfigLayout(ConfigPart(reads(_qwen35_config), _qwen35_export)),
     lambda fields: bool(
         fields.output_gate or 'linear_attention' in (fields.layer_types or ())
     ),
     QWEN35,
     'Qwen3_5ForCausalLM',
-    _qwen35_export,
-    weight_path=_qwen35_path, prediction_depth=qwen_mtp_depth, export_weights=decoder_tensors,
-    export_path=_qwen35_name,
+    routes=qwen_mtp_routes(DECODER_ROUTES), prediction_depth=qwen_mtp_depth,
     preserve_source_layout=True,
     padding_idx=True,
     defaults={'max_position_embeddings': 32768},
@@ -517,20 +480,15 @@ QWEN3_5_TEXT = DecoderFamily(
 
 QWEN3_MOE = DecoderFamily(
     ('qwen3_moe',),
-    _qwen3_moe_config,
+    ConfigLayout(ConfigPart(reads(_qwen3_moe_config), _qwen3_moe_export)),
     lambda fields: bool(fields.qk_norm and fields.mixture is not None),
     'qwen3_moe',
     'Qwen3MoeForCausalLM',
-    _qwen3_export,
     preserve_source_layout=True,
     # Qwen3MoeConfig's defaults for the fields its decoder reads.
     defaults={'max_position_embeddings': 32768},
     padding_idx=True,
 )
-
-def _fused_moe_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    return renamed_path((), name, config, layer_leaves=_QWEN_MOE_LEAVES)
-
 
 def _qwen3_vl_moe_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
     """Read a Qwen3-VL-MoE text config as Qwen3-MoE's (`_qwen3_moe_config`), its router renormalizing its
@@ -542,14 +500,13 @@ def _qwen3_vl_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Dec
 
 QWEN3_VL_MOE_TEXT = DecoderFamily(
     ('qwen3_vl_moe_text',),
-    _qwen3_vl_moe_config,
+    ConfigLayout(ConfigPart(reads(_qwen3_vl_moe_config), _qwen3_export)),
     # A text decoder read from a Qwen3-VL-MoE release (`hf_decoders.TEXT_FAMILIES`), never the family a
     # model exports as: it exports as Qwen3-MoE.
     lambda fields: False,
     'qwen3_moe',
     'Qwen3MoeForCausalLM',
-    _qwen3_export,
-    weight_path=_fused_moe_path,
+    routes=spelled((), layer_leaves=_QWEN_MOE_LEAVES),
     packed=FUSED_EXPERTS,
     preserve_source_layout=True,
     # Qwen3VLMoeTextConfig's defaults for the fields its decoder reads.
@@ -561,11 +518,10 @@ expert in one fused tensor (`FUSED_EXPERTS`)."""
 
 QWEN3 = DecoderFamily(
     ('qwen3',),
-    _qwen3_config,
+    ConfigLayout(ConfigPart(reads(_qwen3_config), _qwen3_export)),
     lambda fields: bool(fields.qk_norm),
     'qwen3',
     'Qwen3ForCausalLM',
-    _qwen3_export,
     preserve_source_layout=False,
     # Qwen3Config's defaults for the fields its decoder reads.
     defaults={'num_key_value_heads': 32, 'head_dim': 128, 'max_position_embeddings': 32768},
@@ -574,13 +530,12 @@ QWEN3 = DecoderFamily(
 
 QWEN2_MOE = DecoderFamily(
     ('qwen2_moe',),
-    _qwen2_moe_config,
+    ConfigLayout(ConfigPart(reads(_qwen2_moe_config), _qwen2_moe_export)),
     lambda fields: bool(not fields.qk_norm and fields.mixture is not None
                         and fields.mixture.shared_gate),
     'qwen2_moe',
     'Qwen2MoeForCausalLM',
-    lambda model: {},
-    weight_path=qwen35_moe_path, prediction_depth=qwen_mtp_depth,
+    routes=QWEN_MOE_ROUTES, prediction_depth=qwen_mtp_depth,
     packed=FUSED_EXPERTS,
     preserve_source_layout=True,
     # Qwen2MoeConfig's defaults for the fields its decoder reads.
@@ -590,11 +545,10 @@ QWEN2_MOE = DecoderFamily(
 
 QWEN2 = DecoderFamily(
     ('qwen2',),
-    qwen2_config,
+    ConfigLayout(ConfigPart(reads(qwen2_config), _qwen3_export)),
     lambda fields: bool(fields.attention_bias and fields.o_proj_bias is False),
     'qwen2',
     'Qwen2ForCausalLM',
-    _qwen3_export,
     preserve_source_layout=False,
     # Qwen2Config's defaults for the fields its decoder reads.
     defaults={'num_key_value_heads': 32, 'max_position_embeddings': 32768},

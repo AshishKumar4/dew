@@ -25,8 +25,10 @@ from dew.interop.decoder_parts import (
     hf_activation,
     kinds_of,
     read_rope,
+    reads,
     refuse,
 )
+from dew.interop.layouts import ConfigLayout, ConfigPart
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import NormSpec
 from dew.nn.backbones.layer_plan import LayerKind
@@ -87,13 +89,11 @@ def _muse_text_export(model: CausalTransformer) -> Mapping[str, object]:
 
 MUSE_GLIMMER_TEXT = DecoderFamily(
     ('muse_glimmer_text',),
-    _muse_text_config,
+    ConfigLayout(ConfigPart(reads(_muse_text_config), _muse_text_export)),
     lambda fields: bool(fields.output_gate and fields.sandwich_norms and fields.embedding_norm
                         and fields.embedding_norm_reads == 'lookup'),
     'muse_glimmer_text',
     'MuseGlimmerTextModel',
-    _muse_text_export,
-    sandwich_norms=True,
     preserve_source_layout=True,
     # MuseGlimmerTextConfig's defaults for the fields its decoder reads.
     defaults={'rms_norm_eps': 1e-5, 'tie_word_embeddings': False, 'num_key_value_heads': 2, 'head_dim': 128,
