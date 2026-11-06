@@ -3,9 +3,9 @@ each native kernel's output held element by element to the exact products of its
 that compiles it, never to another implementation's error. Link 1: the grouped GEMM template's plain
 forward and input gradient, each a sum of exact 16-bit products a tensor core accumulates in fp32 by
 truncating adds and rounds once to its output (`native_dot_holds`). Link 2: the rest of the
-template's native launches, Mosaic GPU's and Triton's (CUTLASS's wheel is not installed on the lanes'
-GPUs): the kernel gradient; fp32 operands at the default precision, whose products are of their TF32
-values (`tf32_operand`); and the exact sums a precision above the default declares for an fp32
+template's native launches, Mosaic GPU's and Triton's, and the vendored CUTLASS grouped GEMM's products
+on Hopper (the dew-cutlass wheel's, row 2084 (a)): the kernel gradient; fp32 operands at the default
+precision, whose products are of their TF32 values (`tf32_operand`); and the exact sums a precision above the default declares for an fp32
 output, held a depth step at a time (`promoted_step_holds`), each step's output the launch's own
 on its operands zeroed from the next step on. The rule's validation: its nulls (Gaussian and same-sign
 draws certify) and its faults, each refused where it lands: a lost block of products, a row read under the
@@ -94,6 +94,10 @@ sums (Mosaic GPU's forward takes none)."""
 EXACT = launches(("mosaic_gpu", "sm90"), ("triton", "sm80"), ("triton", "sm90"))
 """The launches of a kernel gradient's exact sums: Triton's, and Mosaic GPU's on Hopper alone (Ampere's
 bundle counts no running sum in its registers, `mosaic.Family.counts_hooks`, so it refuses them)."""
+CUTLASS = launches(("cutlass", "sm90"))
+"""The vendored CUTLASS grouped GEMM's launch (`grouped_matmul.CutlassGmm`, the dew-cutlass wheel's): bf16
+operands on Hopper, its one tile, no exact sums or steps of its own, so its products' cell alone (row 2084
+(a)); a GPU whose installed wheel holds no sm90 kernels refuses it."""
 GRADIENTS = {"mosaic_gpu": grouped_matmul.MosaicTgmm, "triton": grouped_matmul.Tgmm}
 """Each kernel's kernel-gradient launch."""
 STEPS = {grouped_matmul.MosaicTgmm: ("block_k", True), grouped_matmul.Tgmm: ("block_m", False),
@@ -704,7 +708,7 @@ def test_the_native_kernels_certify_on_this_gpu():
     cell's failure kept and all raised together."""
     run_cells([
         *(cell(the_grouped_gemm_templates_products_certify_natively, k, g, s)
-          for k, g in PLAIN for s in SIGNED),
+          for k, g in (*PLAIN, *CUTLASS) for s in SIGNED),
         *(cell(fp32_operands_certify_natively_as_products_of_their_tf32_values, k, g, s)
           for k, g in TRITON for s in SIGNED),
         *(cell(a_depth_step_of_exact_zeros_leaves_the_native_accumulator_bit_identical, k, g)
