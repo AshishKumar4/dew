@@ -1911,8 +1911,9 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, w
     slices, `MosaicForward.streaming`, and its masked rewalk's launches), 32 query heads over 8 key heads
     `width` wide, two rows of 4096 keys, its cache bf16, int8 codes with their scales (each slot converted
     in registers, `_Codes`) or float32 under a float32 query (its parts, `MosaicForward.parts`), lowered
-    and compiled by ptxas for `generation_name` on this CPU (tests/kernel_compile.py): every launch within its shared memory and spilling nothing (`mosaic_failures`),
-    where the forward gate's prefill calls derive their own tiles."""
+    and compiled by ptxas for `generation_name` on this CPU (tests/kernel_compile.py): every launch within
+    its shared memory and spilling nothing (`mosaic_failures`), where the forward gate's prefill calls
+    derive their own tiles."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
