@@ -2,6 +2,7 @@
 
 import collections
 import dataclasses
+import difflib
 import json
 import os
 import re
@@ -18,6 +19,9 @@ from test_decision_streams import LETTERED, examples, in_streams
 def test_diagnostic():
     packed, alone = in_streams(LETTERED, segments=3), in_streams(LETTERED, segments=1)
     dew, reference, draw, truth = context.packed_arms(packed, alone, examples(LETTERED))
+    if os.environ.get("DBG_FIXED"):
+        initialized = jax.jit(packed.init)
+        draw = lambda seed: (context.opened(initialized(jax.random.key(seed))),)
     variables = draw(0)
     print("DRAWS", {seed: all(np.array_equal(a, b) for a, b in
           zip(jax.tree.leaves(variables), jax.tree.leaves(draw(seed)), strict=True))
@@ -27,6 +31,7 @@ def test_diagnostic():
     for mode in os.environ.get("DBG_MODES", "off,on").split(","):
         context.COMPILED.clear()
         seen = set()
+        programs = {}
 
         def compile(fn, **options):
             objective = fn.__closure__[0].cell_contents
@@ -45,7 +50,7 @@ def test_diagnostic():
                     dots = collections.Counter(
                         re.sub(r"dot\(.*?\)", "dot(operands)", line.strip().split(", metadata=")[0]
                                .split(" = ")[1])
-                        for line in hlo.splitlines() if re.search(r" = f\d+\[.*\] dot\(", line))
+                        for line in hlo.splitlines() if re.search(r" = f\d+\[.*\].* dot\(", line))
                     operations = collections.Counter(
                         re.search(r'op_name="([^"]+)"', line).group(1).split("/")[-1]
                         if 'op_name="' in line else "unnamed-dot" for line in lines)
@@ -53,6 +58,14 @@ def test_diagnostic():
                         print("HLO", mode, arm_name, json.dumps({
                             "inputs": [str(x.shape) for x in jax.tree.leaves(args[1])],
                             "fusions": dict(operations), "dots": dict(dots)}), flush=True)
+                        programs[arm_name] = "\n".join(
+                            re.sub(r", metadata=\{[^}]*\}", "", line)
+                            for line in hlo.splitlines() if not line.startswith("HloModule"))
+                        if "packed" in programs and "alone" in programs:
+                            difference = list(difflib.unified_diff(programs["packed"].splitlines(),
+                                                                 programs["alone"].splitlines()))
+                            print("HLO_DIFF", mode, "identical", not difference,
+                                  json.dumps(difference[:30]), flush=True)
                 return compiled(*args)
             return run
 
