@@ -525,7 +525,7 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
     def added_into(self, acc, value, interpret: bool):
         raise NotImplementedError(f"{self._HOME}; nothing adds a register tile into one")
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None):
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False):
         raise NotImplementedError(f"{self._HOME}; a fresh product takes the launch's, not its own")
 
     def registers_product(self, lhs, rhs, interpret: bool):

@@ -927,8 +927,8 @@ def _laid_references(reference: Callable[[int, int], tuple], c, index: jax.Array
 
 
 def key_block_pairs(rows: Sequence[jax.Array], keys: jax.Array, prefix: tuple, at: Callable[[int], tuple],
-                    summed: Callable[..., jax.Array], *, chunk: int, diagonal: bool,
-                    sub: int = SUB) -> list[jax.Array]:
+                    summed: Callable[..., jax.Array], staged: Callable[[jax.Array], Callable], *, chunk: int,
+                    diagonal: bool, sub: int = SUB) -> list[jax.Array]:
     """A chunk's pairs' products under a decay a key dimension, one key block's for each of `rows` (the
     queries, the write-gated keys; fp32) against the same `keys` (fp32), its prefix halves `prefix`,
     unmasked `[C, C]` fp32 each, their factors formed once for all of them: `sum_k r_ik k_jk exp2(g_ik -
@@ -938,10 +938,13 @@ def key_block_pairs(rows: Sequence[jax.Array], keys: jax.Array, prefix: tuple, a
     start and the keys up to their own's end, each one tile's exponentials whatever the outputs; the
     middle factor a key's vector a pair of sub-chunks (`between` of `at(token)`, the prefix halves at a
     token as a column's vectors), laid over the rows of `s`; one product a key sub-chunk `t` and output,
-    the keys of `t` against every row ('pairs', `summed`, an iterable of `(name, lhs, rhs)` into one
-    accumulator). Every exponent is at most zero but the diagonal's middle factor, `G_s - E_s` within a
-    sub-chunk's range, which a declared floor bounds (`factored_range`; without one the diagonal is
-    `key_diagonal_pairs`'). Kimi delta attention's two intra launches gated their keys up once a
+    the keys of `t` against every row into the columns of `t` alone ('pairs', `summed`, an iterable of
+    `(name, lhs, rhs)` into an accumulator of a `shape`), the keys gated up staged once for every output's
+    (`staged(up)(start, count)`, the right operand of keys `start` to `start + count`): masked to their
+    sub-chunk, each product's right operand a whole chunk of keys, four products a chunk's width each and
+    the keys staged again for each. Every exponent is at most zero but the diagonal's middle factor,
+    `G_s - E_s` within a sub-chunk's range, which a declared floor bounds (`factored_range`; without one the
+    diagonal is `key_diagonal_pairs`'). Kimi delta attention's two intra launches gated their keys up once a
     sub-chunk, ten tile exponentials a key block, 72% of their instructions fp32 (kda-stalls-h100 at
     11704365b)."""
     whole = separated(*prefix)
@@ -960,7 +963,7 @@ def key_block_pairs(rows: Sequence[jax.Array], keys: jax.Array, prefix: tuple, a
     ends = [separated(*at(s * sub + sub - 1)) for s in range(blocks)]
     down = between(whole, laid(starts.__getitem__))
     gated = [row * down for row in rows]
-    up = keys * between(laid(ends.__getitem__), whole)
+    up = staged(keys * between(laid(ends.__getitem__), whole))
 
     def middle(t: int) -> jax.Array:
         """`exp2(G_s - E_t)` on the rows of each sub-chunk `s` from `t` (past it without the diagonal), zero
@@ -971,14 +974,11 @@ def key_block_pairs(rows: Sequence[jax.Array], keys: jax.Array, prefix: tuple, a
             factor = jnp.where(index >= s * sub, between(starts[s], ends[t])[None, :], factor)
         return factor
 
-    def products(row: jax.Array):
-        for t in range(blocks):
-            within = (index >= t * sub) & (index < t * sub + sub)
-            # Each operand formed as its product stages it (`summed` calls it), so one is live at a time.
-            yield ("pairs", lambda t=t: row * middle(t),
-                   lambda within=within: Transposed(jnp.where(within, up, 0.0)))
+    def columns(row: jax.Array, t: int) -> jax.Array:
+        # The left operand formed as its product stages it (`summed` calls it), so one is live at a time.
+        return summed([("pairs", lambda: row * middle(t), up(t * sub, sub))], shape=(chunk, sub))
 
-    return [summed(products(row), shape=(chunk, chunk)) for row in gated]
+    return [jnp.concatenate([columns(row, t) for t in range(blocks)], axis=1) for row in gated]
 
 
 Shifted = Callable[[int], Callable[[jax.Array], tuple]]
@@ -1215,8 +1215,8 @@ def key_system_back(d_system, lower: Tile, dtype, issue: Issue) -> jax.Array:
 
 def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.Array], columns: int,
                            gates: Callable[[int], tuple], reference: Callable[[int, int], tuple],
-                           summed: Callable[..., jax.Array], *, chunk: int,
-                           emit: Callable[[str, int, int, jax.Array], None], sub: int = SUB,
+                           summed: Callable[..., jax.Array], staged: Callable[[jax.Array], object], *,
+                           chunk: int, emit: Callable[[str, int, int, jax.Array], None], sub: int = SUB,
                            shifted: "Shifted | None" = None,
                            lower: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
                            d_loads: list | None = None) -> None:
@@ -1228,10 +1228,12 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
     `[C, BK]` fp32. Each sub-chunk `s` takes its first token's prefix as the common point, as the forward
     did: `dP` against the keys gated up from it to its end (`k exp2(g_ref - g)`), kept on the rows of `s`
     and gated down by `exp2(g - g_ref)`; `dP^T` against the rows of `s` gated down to it, each key's then
-    gated up from it, zero past its end ('pairs'). The sub-chunks are a rolled loop, the rows' and keys'
-    gradients carried across it, the gated rows formed as their product stages them and the keys' products
-    into one accumulator (`summed`): unrolled, every sub-chunk's tiles at once, an H100's launch spilled
-    1756 bytes a thread (kda-gate3 at ee3734584).
+    gated up from it, zero past its end ('pairs'): the pairs' gradients' rows of `s` against the gated
+    rows' own, each pairs' rows gated down staged once a key block (`staged(value)`; `d_pairs` staged as
+    they come), each a tile whose `rows(start, count)` a product takes, so the keys' products' depth is a
+    sub-chunk's, not the chunk's of masked rows. The sub-chunks are a rolled loop, the rows' and keys'
+    gradients carried across it, the keys' products into one accumulator (`summed`): unrolled, every
+    sub-chunk's tiles at once, an H100's launch spilled 1756 bytes a thread (kda-gate3 at ee3734584).
 
     Where `shifted` is given (no declared floor, `factored_range`), the factored products take the keys
     before each sub-chunk alone and each sub-chunk's own pairs are each their own decay
@@ -1242,8 +1244,9 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
         index, _ = _grid(prefix[0].shape)
         down = between(prefix, _laid_references(reference, c, index, chunk, sub))
         key = keys(c)
+        gated_rows = [staged(row(c) * down) for row in rows]
 
-        def turn(s, carried, c=c, prefix=prefix, index=index, down=down, key=key):
+        def turn(s, carried, c=c, prefix=prefix, index=index, key=key, gated_rows=gated_rows):
             d_rows, d_keys = carried
             place = s * sub
             whole, fraction = separated(*reference(s, c))
@@ -1254,8 +1257,9 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
             raised_keys = key * up
             d_rows = tuple(total + jnp.where(within, summed([("pairs", d_pair, raised_keys)]), 0.0)
                            for total, d_pair in zip(d_rows, d_pairs, strict=True))
-            gated = summed([("pairs", d_pair.T, lambda row=row: jnp.where(within, row(c) * down, 0.0))
-                            for d_pair, row in zip(d_pairs, rows, strict=True)], shape=index.shape)
+            gated = summed([("pairs", d_pair.rows(place, sub).T, down_rows.rows(place, sub))
+                            for d_pair, down_rows in zip(d_pairs, gated_rows, strict=True)],
+                           shape=index.shape)
             return d_rows, d_keys + up * gated
 
         zero = jnp.zeros(index.shape, jnp.float32)
