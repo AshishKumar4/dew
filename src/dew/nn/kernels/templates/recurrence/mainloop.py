@@ -1141,9 +1141,17 @@ def _intra_summed(call: Call, found: jax.Array, at, *, first, strict: bool, scal
         found = found + diagonal(strict=strict)
     lag = algebra._lags((CHUNK, CHUNK))
     found = jnp.where(lag > 0, found, 0.0) if strict else jnp.where(lag >= 0, found, 0.0) * scale
-    total = jnp.where(first, found, call.family.tile_of(at) + found)
     mosaic.synced(call.interpret)
-    plgpu.store(at, total, optimized=False)
+
+    # The first block's written, the rest added, in branches: a scalar condition laid over a tile
+    # (`jnp.where`) is no broadcast Mosaic GPU's warpgroup semantics lower.
+    @pl.when(first)
+    def _():
+        plgpu.store(at, found, optimized=False)
+
+    @pl.when(jnp.logical_not(first))
+    def _():
+        plgpu.store(at, call.family.tile_of(at) + found, optimized=False)
 
 
 def _intra_sums_stored(call: Call, products: tuple[str, ...], totals: tuple, sums, landing: dict, *, row,
