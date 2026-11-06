@@ -1035,12 +1035,14 @@ def _two_roles(name: str, bound, derived, family, facts, *, packed: bool) -> lis
     """The walks at two consumer roles a program (`Tiles.walkers`) as a gate case's tiles, which the
     derivation gives a call whose walks fill more than a wave and `RESOURCE_SHAPES` never do: a role's
     registers are its share of the program's; none where the family's walks take one role
-    (`template.walk_roles`), packed documents' or a value width of an odd number of blocks."""
+    (`template.walk_roles`), packed documents', a value width of an odd number of blocks, or two roles' tiles
+    past the GPU's resources (`Mosaic._staged` None)."""
     value_width = RESOURCE_SHAPES[name][3]
     if template.walk_roles(family) < 2 or packed or value_width // derived.block_v % 2:
         return []
-    return [(template.MOSAIC._staged(bound, derived.block_v, facts, walkers=2,
-                                     wide=derived.block_o or derived.block_v), 'two roles ')]
+    two = template.MOSAIC._staged(bound, derived.block_v, facts, walkers=2,
+                                  wide=derived.block_o or derived.block_v)
+    return [] if two is None else [(two, 'two roles ')]
 
 
 def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: tuple | None = None) -> list:
