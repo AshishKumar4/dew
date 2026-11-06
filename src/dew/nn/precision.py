@@ -68,8 +68,8 @@ __all__ = [
     "activation_and_slope",
     "added_to",
     "asks_default_precision",
-    "at_default_precision",
     "at_least_fp32",
+    "at_precision",
     "bf16_dot_general",
     "bf16_einsum",
     "bf16_logits",
@@ -332,15 +332,19 @@ def rounds_products() -> bool:
 
 def iteration_dtype() -> jnp.dtype:
     """The dtype an optimizer's matrix iteration (Muon's and M3's Newton-Schulz, `dew.newton_schulz`)
-    multiplies in under the run's numerics: its compute dtype in its fast forms (bfloat16 under
-    bf16-mixed, the measured default there: a Qwen3.5-4B decision step 844 ms against 1287 at TF32 and 4641
-    at IEEE float32 on an H100), at least float32 of it in its accurate ones; a float64 run iterates in
-    float64."""
+    multiplies in under the run's numerics: in its fast forms, bfloat16 for any 16-bit compute dtype (the
+    measured default under bf16-mixed: a Qwen3.5-4B decision step 844 ms against 1287 at TF32 and 4641 at
+    IEEE float32 on an H100) and its compute dtype otherwise; at least float32 of it in its accurate ones;
+    a float64 run iterates in float64. Never float16, whose range holds neither the iteration's Frobenius
+    norm past 256 nor optax's 1e-8 under it, which rounds to zero there, so a zero update (a zero-initialized
+    output projection's upstream matrices at the first step) divides zero by zero."""
     from dew.nn.kernels.generation import numerics
 
     held = numerics()
     compute = jnp.dtype(held.dtypes.compute)
-    return compute if held.forms == "fast" else jnp.promote_types(compute, jnp.float32)
+    if held.forms != "fast":
+        return jnp.promote_types(compute, jnp.float32)
+    return jnp.dtype(jnp.bfloat16) if compute.itemsize == 2 else compute
 
 
 def exact_products(precision: jax.lax.PrecisionLike, dtype: DTypeLike) -> bool:
@@ -776,19 +780,26 @@ def configurable_precision(precision: jax.lax.PrecisionLike) -> bool:
     return len(precision_names(precision)) <= 1 and not isinstance(precision, jax.lax.DotAlgorithm)
 
 
-def configured_precision(precision: jax.lax.PrecisionLike):
-    """A context in which a product that takes no precision of its own (jax.nn's xla attention)
-    multiplies at `precision`, through `jax.default_matmul_precision`; an unset or default
-    precision changes nothing. A precision no config names (`configurable_precision`) is
-    refused."""
+def _configured_name(precision: jax.lax.PrecisionLike) -> str | None:
+    """The name `jax.default_matmul_precision` takes `precision` by, the default's 'default' among them;
+    None for an unset one. A precision no config names (`configurable_precision`) is refused."""
     if not configurable_precision(precision):
         raise ValueError(f"precision={precision} has no jax_default_matmul_precision name")
     names = precision_names(precision)
-    if names <= {'DEFAULT'}:
-        return contextlib.nullcontext()
+    if not names:
+        return None
     (name,) = names
-    preset = name in jax.lax.DotAlgorithmPreset.__members__
-    return jax.default_matmul_precision(name if preset else name.lower())
+    # A level's lower-case name (DotAlgorithmPreset has a DEFAULT of its own, which no config names).
+    return name.lower() if name in jax.lax.Precision.__members__ else name
+
+
+def configured_precision(precision: jax.lax.PrecisionLike):
+    """A context in which a product that takes no precision of its own (jax.nn's xla attention)
+    multiplies at `precision`, through `jax.default_matmul_precision`; an unset or default
+    precision changes nothing, a floor the configured one meets. A precision no config names
+    (`configurable_precision`) is refused."""
+    name = _configured_name(precision)
+    return contextlib.nullcontext() if name in (None, 'default') else jax.default_matmul_precision(name)
 
 
 def operand_precision(dtype: Dtype | None, precision: jax.lax.PrecisionLike = None) -> jax.lax.PrecisionLike:
@@ -1382,32 +1393,42 @@ def _bf16_product(lhs: jax.Array, rhs: jax.Array, dimension_numbers, precision=N
     return product if out_sharding is None else jax.sharding.reshard(product, out_sharding)
 
 
-def at_default_precision[Output](fn: Callable[..., Output]) -> Callable[..., Output]:
-    """`fn` traced, forward and backward, under the default matmul precision.
+def at_precision[Output](precision: jax.lax.PrecisionLike
+                         ) -> Callable[[Callable[..., Output]], Callable[..., Output]]:
+    """`fn` traced, forward and backward, at `precision`, the default included: a product that takes no
+    precision of its own (a Pallas dot, jax.nn's xla attention) reads it from the configuration at trace
+    time (`jax.default_matmul_precision`), and a custom derivative's backward is traced after the forward
+    returns, so it is held under the same setting by hand. An unset precision is the configured one, which
+    forward and backward read alike: `fn` itself. A precision no config names (`configurable_precision`)
+    is refused.
 
-    Mosaic's TPU kernels refuse a 16-bit matmul at HIGHEST ("Bad lhs type"),
-    and Pallas dots read the precision from the configuration at trace time.
-    16-bit dots are exact at any precision; an fp32 dot takes one bf16 pass on
-    a TPU, so splash's P·V rounds P to bf16 as every default-precision run
-    does. The kernels take no per-dot precision, so there is no other setting.
-    The backward is traced after the forward returns, so it is held under the
-    same setting by hand."""
-    def forward(*args):
-        with jax.default_matmul_precision('default'):
-            return jax.vjp(fn, *args)
+    A fused attention route under a call's stated precision (`attention._attention_kernel`), and Mosaic's
+    TPU kernels at the default: they refuse a 16-bit matmul at HIGHEST ("Bad lhs type"); 16-bit dots are
+    exact at any precision, and an fp32 dot takes one bf16 pass on a TPU, so splash's P·V rounds P to
+    bf16 as every default-precision run does (`attention_tpu`)."""
+    name = _configured_name(precision)
 
-    def backward(pullback, cotangent):
-        with jax.default_matmul_precision('default'):
-            return pullback(cotangent)
+    def held(fn: Callable[..., Output]) -> Callable[..., Output]:
+        if name is None:
+            return fn
 
-    # A protected span: the precision it holds is the kernels' own, which no rewrite may change.
-    @contracted("test_a_default_precision_call_holds_every_order_it_takes")
-    @functools.partial(declared_derivative, Protected(), forward=forward, backward=backward)
-    def run(*args):
-        with jax.default_matmul_precision('default'):
-            return fn(*args)
+        def forward(*args):
+            with jax.default_matmul_precision(name):
+                return jax.vjp(fn, *args)
 
-    return run
+        def backward(pullback, cotangent):
+            with jax.default_matmul_precision(name):
+                return pullback(cotangent)
+
+        # A protected span: the precision it holds is the kernels' own, which no rewrite may change.
+        @contracted("test_a_default_precision_call_holds_every_order_it_takes")
+        @functools.partial(declared_derivative, Protected(), forward=forward, backward=backward)
+        def run(*args):
+            with jax.default_matmul_precision(name):
+                return fn(*args)
+
+        return run
+    return held
 
 
 def sqrt_or_zero(square):
