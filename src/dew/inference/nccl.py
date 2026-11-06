@@ -348,8 +348,9 @@ class NCCLPush:
         library = self._opened(target, ordinal)
         began = time.perf_counter()
         # The first chunk read and placed before any replica pauses: a pause spans the transfers and the
-        # reads they overlap alone (`_broadcast`).
-        first = jax.device_put([exported[name] for name in chunks[0]], target)
+        # reads they overlap alone. Held in a list `_broadcast` takes it from, so none of these frames
+        # keeps it past its broadcast.
+        first = [jax.device_put([exported[name] for name in chunks[0]], target)]
         _vllm_publication(self.engines, version, self.timeout,
                           lambda: self._deliver(library, target, exported, specs, chunks, first, version),
                           stamped=True)
@@ -357,7 +358,7 @@ class NCCLPush:
 
     def _deliver(self, library: Collectives, target: SingleDeviceSharding, exported: Mapping[str, np.ndarray],
                  specs: Mapping[str, jax.ShapeDtypeStruct], chunks: Sequence[Sequence[str]],
-                 first: Sequence[jax.Array], version: int) -> Mapping[str, BaseException]:
+                 first: list[list[jax.Array]], version: int) -> Mapping[str, BaseException]:
         """Load `tensors` into every paused replica over its group and finish the update under `version`.
 
         Each replica's `/update_weights` waits for the broadcast this side
@@ -430,12 +431,12 @@ class NCCLPush:
 
     def _broadcast(
         self, library: Collectives, target: SingleDeviceSharding, exported: Mapping[str, np.ndarray],
-        chunks: Sequence[Sequence[str]], first: Sequence[jax.Array],
+        chunks: Sequence[Sequence[str]], first: list[list[jax.Array]],
         receives: Sequence[Future[httpx.Response]],
     ) -> None:
-        """Broadcast the `exported` tensors `chunks` name, in order, to every group, `first` the first
-        chunk's placed, a chunk of at most `chunk` bytes read and resident at a time beside the one
-        sending.
+        """Broadcast the `exported` tensors `chunks` name, in order, to every group, the first chunk's
+        placed taken from `first` (which it empties, so the chunk is released once it has sent), a chunk
+        of at most `chunk` bytes read and resident at a time beside the one sending.
 
         The next chunk is read and its copies issued on a reader thread while
         the current chunk broadcasts, so the reads and host-to-device copies
@@ -450,7 +451,7 @@ class NCCLPush:
             return jax.device_put([exported[name] for name in chunk], target)
 
         groups = list(self._groups.values())
-        placed = first
+        placed = first.pop()
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="dew-weight-read") as reader:
             for index in range(len(chunks)):
                 following = (reader.submit(contextvars.copy_context().run, placed_chunk, chunks[index + 1])

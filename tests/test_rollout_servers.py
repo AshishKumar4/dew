@@ -17,6 +17,7 @@ import itertools
 import json
 import math
 import threading
+import weakref
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from importlib import import_module
 from pathlib import Path
@@ -871,7 +872,8 @@ def a_push_delivers_every_tensor_to_each_replica_on_another_device(fixture, libr
 
 def test_a_push_reads_its_export_a_chunk_ahead_of_what_it_sends():
     """A push's publication is a table read as it is sent (row 4370): its listing and its chunks come
-    from the tensors' specs before any tensor is read, the first chunk read before the broadcast, and
+    from the tensors' specs before any tensor is read, the first chunk read before the broadcast and
+    released once it has sent (no chunk of it alive by the time the second chunk settles), and
     the broadcast reads each next chunk on its reader thread while the one before it sends (a read
     overlapping a send, row 4439: the second chunk's read waits for the first chunk's send to begin, and
     that send for the read to begin, which a push reading the chunk before or after the send leaves to
@@ -931,12 +933,16 @@ def test_a_push_reads_its_export_a_chunk_ahead_of_what_it_sends():
 
         def settled(self, groups, receives):
             events.append(("settled", 0))
+            if len([event for event in events if event[0] == "settled"]) == 2:
+                released.append(all(reference() is None for reference in held))
 
     push = NCCLPush(source, ("http://replica",), lambda ordinal: Recording(), chunk=chunk)
     push._groups["http://replica"] = 0
     target = SingleDeviceSharding(jax.devices()[0])
-    first = jax.device_put([Reading()[name] for name in chunks[0]], target)
+    first = [jax.device_put([Reading()[name] for name in chunks[0]], target)]
+    held, released = [weakref.ref(array) for array in first[0]], []
     push._broadcast(Recording(), target, Reading(), chunks, first, [])
+    assert released == [True] and first == []
     sent = [event for event in events if event[0] == "send"]
     assert len(sent) == len(names) and len(chunks) > 2
     assert overlapped == [True, True]
