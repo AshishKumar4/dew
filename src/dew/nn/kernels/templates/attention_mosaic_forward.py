@@ -355,40 +355,40 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
         # `walked_launches` reads the plain launch's maxima and overflows.
         return (out, *finished), jnp.zeros(live.shape, jnp.float32), jnp.zeros_like(live)
 
-    def kept(live: jax.Array, guarded: tuple, plain: tuple) -> tuple:
-        # The rewalk's outputs at its rows (its output, and a masked launch's finished rows), the plain
-        # launch's elsewhere and past them; a merged walk's a row's, live where any of its slices is.
-        live = (jnp.any(live.reshape(*live.shape[:2], splits, -1), axis=2) if merges
-                else _whole_rows(live, splits))
-        taken = (jnp.where(jnp.swapaxes(live, 1, 2)[..., None], guarded[0], plain[0]),
-                 *(jnp.where(live, mine, theirs)
-                   for mine, theirs in zip(guarded[1:], plain[1:], strict=False)))
-        return (*taken, *plain[len(guarded):])
+    return (spec, launch, functools.partial(_kept, splits=splits, merges=merges),
+            functools.partial(_walked_outputs, queries=call.queries, width=value.shape[3], rows=rows,
+                              splits=splits, merges=merges))
 
-    def finished(walked: tuple):
-        out, *rows_of = walked
-        if merges:
-            out = out[:, :call.queries, :, :value.shape[3]]
-            if not rows:
-                return out
-            maximum, total = (array[:, :, :call.queries] for array in rows_of[0])
-            return out, maximum, total
-        if splits > 1:
-            # A split launch's slices along the query axis (`_launch`'s `splits`): `[B, S, Q, H, Dv]`, its
-            # rows `[B, H, S, Q]`, each slice's maxima and denominators its own, for a merge
-            # (`attention_decode`).
-            out = out.reshape(out.shape[0], splits, -1, *out.shape[2:])
-            out = out[:, :, :call.queries, :, :value.shape[3]]
-            maximum, total = (array.reshape(*array.shape[:2], splits, -1)[..., :call.queries]
-                              for array in rows_of[0])
-            return out, maximum, total
-        out = out[:, :call.queries, :, :value.shape[3]]
-        if not rows:
-            return out
-        maximum, total = (array[:, :, :call.queries] for array in rows_of[0])
-        return out, maximum, total, jnp.full(maximum.shape, -1, jnp.int32), output_split(out)
 
-    return spec, launch, kept, finished
+def _kept(live: jax.Array, guarded: tuple, plain: tuple, *, splits: int, merges: bool) -> tuple:
+    """The inference walk's outputs from its rewalk's and its plain launch's (`_inference_walk`'s `kept`):
+    the rewalk's at its `live` rows (its output, and a masked launch's finished rows), the plain launch's
+    elsewhere and past them; a merged walk's a row's, live where any of its slices is."""
+    live = (jnp.any(live.reshape(*live.shape[:2], splits, -1), axis=2) if merges
+            else _whole_rows(live, splits))
+    taken = (jnp.where(jnp.swapaxes(live, 1, 2)[..., None], guarded[0], plain[0]),
+             *(jnp.where(live, mine, theirs) for mine, theirs in zip(guarded[1:], plain[1:], strict=False)))
+    return (*taken, *plain[len(guarded):])
+
+
+def _walked_outputs(walked: tuple, *, queries: int, width: int, rows: bool, splits: int, merges: bool):
+    """The inference walk's outputs from its launches' (`_inference_walk`'s `finished`), unpadded to the
+    call's `queries` and value `width`: the output, and with `rows` its finished maxima and denominators, an
+    anchor key of none and the output as the split sums. An unmerged split launch's are its slices along the
+    query axis (`_launch`'s `splits`): `[B, S, Q, H, Dv]`, its rows `[B, H, S, Q]`, each slice's maxima and
+    denominators its own, for a merge (`attention_decode`); a merging one's the rows' whole, theirs alone."""
+    out, *rows_of = walked
+    if splits > 1 and not merges:
+        out = out.reshape(out.shape[0], splits, -1, *out.shape[2:])[:, :, :queries, :, :width]
+        maximum, total = (array.reshape(*array.shape[:2], splits, -1)[..., :queries] for array in rows_of[0])
+        return out, maximum, total
+    out = out[:, :queries, :, :width]
+    if not rows:
+        return out
+    maximum, total = (array[:, :, :queries] for array in rows_of[0])
+    if merges:
+        return out, maximum, total
+    return out, maximum, total, jnp.full(maximum.shape, -1, jnp.int32), output_split(out)
 
 
 def _column_blocks(value: jax.Array, hooked: _Hooked, columns: int | None, *, whole: bool = True
@@ -764,6 +764,19 @@ def _empty(family: mosaic.Family, shape: tuple[int, int], live: jax.Array | None
     return start if live is None else algebra.headroomed(start, live)
 
 
+def _value_tile(shape: tuple, dtype, turn, slots) -> algebra.Operand:
+    """A step's value tile of `shape` and `dtype` from its `slots` (`_consumer`'s): its type beside its slot's
+    acquisition, which the step defers to the form reading it, the slot taken once the partner's products
+    are issued (its turn on the tensor cores is over when this one's come)."""
+    def slot():
+        turn(wait=False)
+        value = slots["values"]
+        turn(arrive=False)
+        return value
+
+    return algebra.Operand(shape, dtype, slot)
+
+
 def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_view, status_views, q_smem,
               q_loaded, out_smem, row_smem, streams, views: dict, turn, streamed: tuple, first,
               spans: _Spans | None, hooked: _Hooked, guard: _Guard | None, place: tuple, *, hooks: Hooks,
@@ -807,18 +820,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
                        hooks=hooks, drawn=hooked.drop is not None, held=held, product=product)
 
-    def value_of(slots):
-        # The value slot, once the partner's products are issued: its turn on the tensor cores is over when
-        # this one's come.
-        turn(wait=False)
-        slot = slots["values"]
-        turn(arrive=False)
-        return slot
-
-    def values(slots) -> algebra.Operand:
-        # The value tile's type beside its slot's acquisition, which the step defers to the form reading it.
-        return algebra.Operand((tiles.block_k, value_width), views["values"][0].dtype,
-                               functools.partial(value_of, slots))
+    values = functools.partial(_value_tile, (tiles.block_k, value_width), views["values"][0].dtype, turn)
 
     def dot(lhs, rhs):
         return family.registers_product(lhs, rhs, interpret)
@@ -889,6 +891,29 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         merge = _Merge(slots, ready, program.split(), program.splits, initial)
     _stored_walk(program, spec, state, trained, hooked, (row, head, first), hooks=hooks, residuals=residuals,
                  out=(out_view, out_smem), rows=(finished, row_smem), keep=keep, merge=merge)
+
+
+def _written_views(block: _Block, written: tuple, stages: tuple, *, training: bool, finishes: bool,
+                   columns_at, certified: bool, merges: tuple | None) -> tuple:
+    """A consumer's views of its launch's outputs `written` (`_launched`'s), its `stages` its scratch:
+    a training launch's status and residuals; an inference launch's status, output (its block of the
+    columns, `columns_at`) and finished rows, a merging launch's merge (`_merging_of`, `merges` its
+    semaphores, place and slices) and a certified launch's certificate. None for each it does not write."""
+    out_view = finished = residuals = certify = merging = None
+    if training:
+        status_ref, rows_ref, keys_ref, others_ref = written
+        residuals = _Residuals(tuple(rows_ref.at[place, *block.state] for place in range(5)),
+                               keys_ref.at[block.state], others_ref.at[block.state], stages[0])
+        return block.status(status_ref), out_view, finished, residuals, certify, merging
+    if merges is not None:
+        status, out_view, finished, merging = _merging_of(block, written, finishes, columns_at, *merges)
+    else:
+        status, out_view, finished = block.inference(written, finishes)
+        if certified:
+            certify = (*block.certified(written), stages[-1])
+    if columns_at is not None:
+        out_view = out_view.at[:, columns_at]
+    return status, out_view, finished, residuals, certify, merging
 
 
 def _merging_of(block: _Block, written: tuple, finishes: bool, columns_at, ready, place: tuple, splits: int
@@ -1407,27 +1432,14 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                streamed, block.first, read.spans, read.hooked, (row, head), hooks=hooks,
                                interpret=interpret)
                 return
-            out_view = finished = residuals = certify = merging = None
             written = (refs.written[0], *read.into, *refs.written[1:]) if in_place else refs.written
-            if training:
-                status_ref, rows_ref, keys_ref, others_ref = written
-                status = block.status(status_ref)
-                residuals = _Residuals(tuple(rows_ref.at[place, *block.state] for place in range(5)),
-                                       keys_ref.at[block.state], others_ref.at[block.state],
-                                       refs.stages[0].at[index])
-            else:
-                # A block of the columns writes its own of the output's, the whole call's in place.
-                columns_at = (pl.ds(column * value_width, value_width)
-                              if column is not None and (column_blocks > 1 or in_place) else None)
-                if merges:
-                    status, out_view, finished, merging = _merging_of(block, written, finishes, columns_at,
-                                                                      ready, (row, axis, index), splits)
-                else:
-                    status, out_view, finished = block.inference(written, finishes)
-                    if certified:
-                        certify = (*block.certified(written), refs.stages[-1].at[index])
-                if columns_at is not None:
-                    out_view = out_view.at[:, columns_at]
+            # A block of the columns writes its own of the output's, the whole call's in place.
+            columns_at = (pl.ds(column * value_width, value_width)
+                          if column is not None and (column_blocks > 1 or in_place) else None)
+            status, out_view, finished, residuals, certify, merging = _written_views(
+                block, written, tuple(stage.at[index] for stage in refs.stages), training=training,
+                finishes=finishes, columns_at=columns_at, certified=certified,
+                merges=(ready, (row, axis, index), splits) if merges else None)
             _consumer(program, spec, index, refs.q.at[row, pl.ds(block.first, block_q), head], out_view,
                       status, *stages, refs.out_smem.at[index], refs.row_smem.at[index], streams, views, turn,
                       streamed, block.first, read.spans, read.hooked, read.guard,
