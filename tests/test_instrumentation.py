@@ -305,8 +305,7 @@ def test_a_loop_bounded_by_a_counter_beside_a_predicate_counts_at_most_its_trips
                                   (taken, values))[1]
 
     arguments = (jnp.ones((width, width)), jnp.ones((rows, width)), jnp.ones((), bool))
-    assert compiled_flops(jax.jit(counted).lower(*arguments).compile()) == pytest.approx(
-        2 * rows * width * width)
+    assert compiled_flops(jax.jit(counted).lower(*arguments).compile()) == 2 * rows * width * width
     assert compiled_flops(jax.jit(uncounted).lower(*arguments).compile()) is None
 
 
