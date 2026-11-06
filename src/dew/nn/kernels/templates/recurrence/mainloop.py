@@ -1142,12 +1142,14 @@ def _intra_merges(call: Call) -> bool:
 
 def _shifted_keys(call: Call, tiles, keys: jax.Array, prefix: tuple):
     """A key block's keys and separated prefix staged in `tiles` below `SUB` rows of any values (a pair they
-    reach is masked), each offset's reads its loads shifted by it (`algebra.Shifted`)."""
+    reach is masked), each offset's reads its loads shifted by it (`algebra.Shifted`); each row's columns
+    the block's, its row `_row`'s words."""
+    width = keys.shape[1]
     mosaic.synced(call.interpret)
     for i, value in enumerate((keys, *algebra.separated(*prefix))):
-        plgpu.store(tiles.at[i, pl.ds(algebra.SUB, CHUNK)], value, optimized=False)
+        plgpu.store(tiles.at[i, pl.ds(algebra.SUB, CHUNK), pl.ds(0, width)], value, optimized=False)
     mosaic.synced(call.interpret)
-    return lambda e: tuple(call.family.tile_of(tiles.at[i, pl.ds(algebra.SUB - e, CHUNK)])
+    return lambda e: tuple(call.family.tile_of(tiles.at[i, pl.ds(algebra.SUB - e, CHUNK), pl.ds(0, width)])
                            for i in range(3))
 
 
@@ -1216,8 +1218,8 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
         sums, prefixes = outs[:outputs], outs[outputs:]
 
         def half_at(half, rows):
-            """The scan's `half` at `rows`, its row's `keys` columns."""
-            return scanned.at[half, rows]
+            """The scan's `half` at `rows`, its row's `keys` columns (of `_row`'s words)."""
+            return scanned.at[half, rows, pl.ds(0, keys)]
 
         def step(index, slots, totals, accumulators):
             slots.acquire_all()
@@ -1270,13 +1272,13 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                 diagonal = None if call.factored else functools.partial(
                     algebra.key_diagonal_pairs, lambda c, name=name: rows(name), shifted, 1, lambda c: prefix,
                     chunk=CHUNK)
-                _intra_summed(call, found, summed_at.at[o], first=index == 0,
+                _intra_summed(call, found, summed_at.at[o, :, pl.ds(0, CHUNK)], first=index == 0,
                               strict=name == "system", scale=scale, diagonal=diagonal)
 
             @pl.when(index == steps - 1)
             def _():
                 mosaic.synced(call.interpret)
-                totals = tuple(family.tile_of(summed_at.at[o]) for o in range(outputs))
+                totals = tuple(family.tile_of(summed_at.at[o, :, pl.ds(0, CHUNK)]) for o in range(outputs))
                 _intra_sums_stored(call, products, totals, sums, landing, row=row, head=h)
 
             return totals, accumulators
@@ -1310,10 +1312,22 @@ def _intra_streamed(call: Call, keys: int, *, queries: bool) -> dict:
                          **({"queries": ((CHUNK, keys), call.given)} if queries else {}))
 
 
+def _row(width: int) -> int:
+    """The words a row of `width` columns (a whole number of 16) takes in the intra walk's plain shared tiles:
+    16 past a multiple of 32. An accumulator fragment's warp stores 2 words at each of 4 columns of 8 rows an
+    instruction; rows a multiple of 32 words apart put all 8 rows in the same 8 banks, 4 times a store's
+    least wavefronts (3.4 bank conflicts a shared store in Kimi delta attention's intra launch,
+    kda-stalls-h100 at 11704365b), and rows 16 past one apart halve that, alternate rows the other 16 banks.
+    8 past would clear it, a stride no tiled register layout's transfer takes (Mosaic GPU's layout
+    inference: a row a whole number of its 16-column tiles, "Stride 24 is not divisible by 16",
+    jsf-kdaintra5)."""
+    return width + 16 * (width % 32 == 0)
+
+
 def _intra_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
     """`_intra_walk`'s staging tiles and landings at key block `keys` forming `products`: the pairs' operands
     (`_pairing`), the prefix scan's halves below as many zero rows (`algebra.scanned_prefix`'s shifts), each
-    output's sum across the key blocks, and the stores' landings: the
+    output's sum across the key blocks, each row `_row`'s words, and the stores' landings: the
     scores' square and a block of the prefix halves where it forms the scores, the system's where it forms the
     system."""
     landing = {**({"square": dataclasses.replace(call.held, rows=call.rows).landing(CHUNK, CHUNK),
@@ -1321,13 +1335,10 @@ def _intra_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
                **({"system": _systems(call).landing(CHUNK, CHUNK)} if "system" in products else {})}
     # Where the call's pairs do not factor (`Call.factored`), a key block's keys and prefix halves below a
     # sub-chunk's rows (`algebra.key_diagonal_pairs`' shifted reads).
-    # Both read at row offsets no tiling divides (the scan's shifts, the sub-chunks' references), so plain:
-    # rows padded past a multiple of 32 words, against a fragment store's bank conflicts, are strides no
-    # tiled register layout's transfer takes (Mosaic GPU's layout inference: "Stride 24 is not divisible by
-    # 16", jsf-kdaintra5).
-    padded = () if call.factored else (mosaic.plain((3, algebra.SUB + CHUNK, keys), jnp.float32),)
-    scanned = mosaic.plain((2, 2 * CHUNK, keys), jnp.float32)
-    sums = mosaic.plain((len(products), CHUNK, CHUNK), jnp.float32)
+    # Both read at row offsets no tiling divides (the scan's shifts, the sub-chunks' references), so plain.
+    padded = () if call.factored else (mosaic.plain((3, algebra.SUB + CHUNK, _row(keys)), jnp.float32),)
+    scanned = mosaic.plain((2, 2 * CHUNK, _row(keys)), jnp.float32)
+    sums = mosaic.plain((len(products), CHUNK, _row(CHUNK)), jnp.float32)
     return (_pairing(call, keys), scanned, sums, *padded), landing
 
 
