@@ -235,8 +235,8 @@ def _sampled(sharpness: float):
             tokens, log_q = [], []
             for node, parent in enumerate(shape.parents):
                 logq = jax.nn.log_softmax(held[parent + 1].logits.astype(jnp.float32) * sharpness, axis=-1)
-                token = jax.vmap(lambda key, row: jax.random.categorical(jax.random.fold_in(key, node), row))(
-                    keys, logq).astype(jnp.int32)
+                token = jax.vmap(lambda key, row, node=node: jax.random.categorical(
+                    jax.random.fold_in(key, node), row))(keys, logq).astype(jnp.int32)
                 tokens.append(token)
                 log_q.append(logq)
                 held.append(ops.advance(held[parent + 1], token, every))
