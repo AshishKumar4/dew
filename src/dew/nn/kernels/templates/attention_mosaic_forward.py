@@ -661,7 +661,9 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     operands = tuple(_columns(array, unit) for array in (call.query, call.key, call.value))
     hooked = _hooked_of(hooks, call, unit)
     if scales is not None:
-        keys = -(-scales[0].shape[-1] // tiles.block_k) * tiles.block_k
+        # As long as the call's padded keys (a paged call's slots), which every walk's tiles lie within.
+        keys = call.key.shape[1] if call.table is None else call.table.shape[1] * call.page
+        keys = max(keys, -(-scales[0].shape[-1] // tiles.block_k) * tiles.block_k)
         hooked = hooked._replace(scales=tuple(
             jnp.pad(array.astype(jnp.float32), ((0, 0), (0, 0), (0, keys - array.shape[-1])))
             for array in scales))
@@ -833,10 +835,18 @@ class _Residuals(NamedTuple):
     keys_smem: object
 
 
-def _codes_of(query: jax.Array, key: jax.Array):
-    """A call's keys' and values' storage dtype where it is quantized (int8 or an FP8 under a 16-bit query,
-    read through `_Codes`), else None."""
-    return None if key.dtype == query.dtype else key.dtype
+CODES = frozenset(map(jnp.dtype, (jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2)))
+"""The quantized codes a call's keys and values may be stored as (`_codes_of`)."""
+
+
+def _codes_of(key: jax.Array, scales: tuple | None):
+    """A quantized call's keys' and values' storage dtype, the call's with `scales` (read through `_Codes`),
+    else None; codes of another dtype refused."""
+    if scales is None:
+        return None
+    if jnp.dtype(key.dtype) not in CODES:
+        raise ValueError(f"a quantized call's codes are int8 or an FP8, not {key.dtype}")
+    return key.dtype
 
 
 class _Codes(NamedTuple):
@@ -844,7 +854,9 @@ class _Codes(NamedTuple):
     converted into its own 16-bit tile (`Family.converted`), the values' rows scaled by their keys' scales as
     they are (`row_scale`), and the keys' scales a key tile's columns, which its logits take before their
     scale and hooks (`_scored`), so the fold's reach and the guards read the logits the dequantized keys
-    give."""
+    give. The values' tile is one buffer a consumer, written each step: the step's rescale waits on its last
+    P·V before the next conversion, so a walk that defers or overlaps P·V takes no codes
+    (`MosaicForward._launch_legal`)."""
     keys: Callable
     values: Callable
     key_scales: Callable
@@ -1570,7 +1582,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     pieces = block_k // page if page is not None and page < block_k else 1
     scoped, rings = _forward_allocations(family, tiles, width, value_width, query.dtype, training,
                                          program.stages, peaks=peaks, out_dtype=out_dtype, pieces=pieces,
-                                         certified=certified, codes=_codes_of(query, key))
+                                         certified=certified, codes=_codes_of(key, read.hooked.scales))
     out_type = _out_types(batch, queries, heads, value_width * column_blocks, out_dtype, splits=splits,
                           peaks=peaks, training=training, finishes=finishes,
                           certified=steps if certified else 0, merges=merges, flags=flags)
@@ -1580,7 +1592,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     if in_place:
         out_type = (out_type[0], *out_type[-2:]) if merges else out_type[:1]
     layout = _Layout(treedef, len(out_type), len(scoped) - 2, peaks or (reuse and not training),
-                     relays(family, tiles, peaks=peaks), _codes_of(query, key) is not None)
+                     relays(family, tiles, peaks=peaks), _codes_of(key, read.hooked.scales) is not None)
 
     def body(*refs, streams):
         refs = layout.unpacked(*refs)
