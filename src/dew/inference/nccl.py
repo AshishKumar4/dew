@@ -33,6 +33,7 @@ groups of at most `dew._coordination.GATHER_BYTES`.
 from __future__ import annotations
 
 import base64
+import contextvars
 import ctypes
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -46,10 +47,11 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import SingleDeviceSharding
 
-from dew._coordination import agreed, byte_groups
+from dew._coordination import agreed, byte_groups, reading_home
+from dew._devices import primary_context
 from dew._records import JSON
 from dew.batch import Variables
-from dew.devices import primary_context
+from dew.interop.safetensors_io import tensor_specs
 from dew.nn.inputs import mesh_of
 
 from .rollouts import _on_every, _post, _published, _vllm_publication
@@ -235,6 +237,14 @@ def _world(root: str, timeout: float) -> int:
     return size
 
 
+def _read_along(exported: Mapping[str, np.ndarray], chunks: Sequence[Sequence[str]]) -> None:
+    """Read every chunk of `exported` in the order the sending process reads it, each tensor home by the
+    pool together (`reading_home`), as a process that sends none takes part in each read."""
+    for chunk in chunks:
+        for name in chunk:
+            exported[name]
+
+
 @dataclass
 class NCCLPush:
     """Publishes a policy version to vLLM replicas by NCCL broadcast from a trainer GPU.
@@ -246,26 +256,27 @@ class NCCLPush:
 
     - `source` is the `Pretrained` the replicas were launched from; its
       `export` gives the tensors, of the trained tree and of every other tree
-      the source exports (a decision release's readout), each gathered from
-      the pool to process 0 first.
+      the source exports (a decision release's readout), each read home by
+      the pool as process 0 sends it (`reading_home`).
     - `engines` are the replicas' root URLs, not their `/v1` API URLs.
     - `library` is the engine's own libnccl.so.2, because NCCL refuses a
       peer of another version when the group opens; or a maker of the
       push's `Collectives` from the sending device's CUDA ordinal, which
       makes its calls instead (an emulation of NCCL over the host).
     - `chunk` bounds the bytes of tensors placed on the sender device beside
-      the trainer's state. The next chunk is copied over while the current
-      one broadcasts, so a push holds at most two chunks there, or two of its
-      largest tensor.
+      the trainer's state. The first chunk is read before any replica
+      pauses, and each next one is read and copied over on a reader thread
+      while the current one broadcasts, so a push holds at most two chunks
+      there, or two of its largest tensor.
 
     Floating-point leaves are cast to `dtype` before the push, and `timeout`
     bounds each HTTP call in seconds. Groups open on the first push and stay
     open until `close`. Every process of a pool calls the push.
 
-    `timings` holds the seconds each phase of the last push took: `gather`
-    (the cast and the gather to process 0's host, on every process), and on
-    process 0, which sends, `export`, `send` (copies and broadcasts until
-    every replica has loaded the tensors) and `total`.
+    `timings` holds the seconds each phase of the last push took: `export`
+    (the publication's specs and chunks, before any tensor is read, on every
+    process), and on process 0, which sends, `send` (reads, copies and
+    broadcasts until every replica has loaded the tensors) and `total`.
     """
 
     source: Pretrained
@@ -291,11 +302,30 @@ class NCCLPush:
         # Process 0 holds the gathered policy, so it sends, from its first device of the mesh.
         sender = jax.local_devices()[0] if mesh is None else next(
             device for device in mesh.devices.flat if device.process_index == 0)
-        # Every tree the source exports, a decision release's readout beside the trained backbone.
-        published = _published(self.source, variables, jnp.dtype(self.dtype), phase="weight push gather")
-        self.timings["gather"] = time.perf_counter() - began
-        agreed("weight push", lambda: None if published is None else self._push(
-            published, SingleDeviceSharding(sender), sender.local_hardware_id, version))
+        # Each chunk's tensors read home by the pool together (`reading_home`), in the same order on every
+        # process, as process 0 sends them; the others read along and send none. A tree a release reads
+        # whole as it exports (a decision release's readout) reads there too.
+        sending = jax.process_index() == 0
+        with reading_home("weight push", writes=sending):
+            # Every tree the source exports, a decision release's readout beside the trained backbone, a
+            # table read as it is sent (`Pretrained.export`): its names, dtypes and shapes before any
+            # tensor.
+            exported = _published(self.source, variables, jnp.dtype(self.dtype)).export()
+            names = sorted(exported)
+            specs = tensor_specs(exported)
+            # Named before any replica pauses for the update, which a dtype the collectives cannot carry
+            # would leave paused.
+            uncarried = sorted({str(specs[name].dtype) for name in names} - _DTYPES.keys())
+            if uncarried:
+                raise ValueError(f"an NCCL push carries {sorted(_DTYPES)}; the publication exports "
+                                 f"{uncarried}")
+            chunks = [[names[index] for index in group] for group in byte_groups(
+                [specs[name] for name in names], self.chunk,
+                nbytes=lambda spec: int(np.prod(spec.shape)) * np.dtype(spec.dtype).itemsize)] or [[]]
+            self.timings["export"] = time.perf_counter() - began
+            agreed("weight push", lambda: self._push(
+                exported, specs, chunks, SingleDeviceSharding(sender), sender.local_hardware_id, version)
+                if sending else _read_along(exported, chunks))
         self.timings["total"] = time.perf_counter() - began
 
     def close(self) -> None:
@@ -312,25 +342,23 @@ class NCCLPush:
                 self._library.abort(comm)
         self._groups.clear()
 
-    def _push(self, published: Pretrained, target: SingleDeviceSharding, ordinal: int, version: int) -> None:
-        began = time.perf_counter()
-        exported = published.export()
-        names = sorted(exported)
-        tensors = [exported[name] for name in names]
-        # Named before any replica pauses for the update, which a dtype the collectives cannot carry
-        # would leave paused.
-        uncarried = sorted({str(tensor.dtype) for tensor in tensors} - _DTYPES.keys())
-        if uncarried:
-            raise ValueError(f"an NCCL push carries {sorted(_DTYPES)}; the publication exports {uncarried}")
-        self.timings["export"] = time.perf_counter() - began
+    def _push(self, exported: Mapping[str, np.ndarray], specs: Mapping[str, jax.ShapeDtypeStruct],
+              chunks: Sequence[Sequence[str]], target: SingleDeviceSharding, ordinal: int,
+              version: int) -> None:
         library = self._opened(target, ordinal)
         began = time.perf_counter()
+        # The first chunk read and placed before any replica pauses: a pause spans the transfers and the
+        # reads they overlap alone. Held in a list `_broadcast` takes it from, so none of these frames
+        # keeps it past its broadcast.
+        first = [jax.device_put([exported[name] for name in chunks[0]], target)]
         _vllm_publication(self.engines, version, self.timeout,
-                          lambda: self._deliver(library, target, names, tensors, version), stamped=True)
+                          lambda: self._deliver(library, target, exported, specs, chunks, first, version),
+                          stamped=True)
         self.timings["send"] = time.perf_counter() - began
 
-    def _deliver(self, library: Collectives, target: SingleDeviceSharding, names: Sequence[str],
-                 tensors: Sequence[np.ndarray], version: int) -> Mapping[str, BaseException]:
+    def _deliver(self, library: Collectives, target: SingleDeviceSharding, exported: Mapping[str, np.ndarray],
+                 specs: Mapping[str, jax.ShapeDtypeStruct], chunks: Sequence[Sequence[str]],
+                 first: list[list[jax.Array]], version: int) -> Mapping[str, BaseException]:
         """Load `tensors` into every paused replica over its group and finish the update under `version`.
 
         Each replica's `/update_weights` waits for the broadcast this side
@@ -347,18 +375,20 @@ class NCCLPush:
         failures = _on_every(self.engines, start)
         if failures:
             return failures
+        names = [name for chunk in chunks for name in chunk]
         listing: JSON = {
             "update_info": {
                 "names": list(names),
-                "dtype_names": [str(tensor.dtype) for tensor in tensors],
-                "shapes": [[int(size) for size in tensor.shape] for tensor in tensors],
+                "dtype_names": [str(specs[name].dtype) for name in names],
+                "shapes": [[int(size) for size in specs[name].shape] for name in names],
             }
         }
         with ThreadPoolExecutor(max_workers=len(self.engines), thread_name_prefix="dew-weight-push") as pool:
             receives = [(root, pool.submit(_post, root, "/update_weights", listing, self.timeout))
                         for root in self.engines]
             try:
-                self._broadcast(library, target, tensors, [receive for _, receive in receives])
+                self._broadcast(library, target, exported, chunks, first,
+                                [receive for _, receive in receives])
             except BaseException:
                 self.close()
                 raise
@@ -400,28 +430,38 @@ class NCCLPush:
         return library
 
     def _broadcast(
-        self, library: Collectives, target: SingleDeviceSharding, tensors: Sequence[np.ndarray],
+        self, library: Collectives, target: SingleDeviceSharding, exported: Mapping[str, np.ndarray],
+        chunks: Sequence[Sequence[str]], first: list[list[jax.Array]],
         receives: Sequence[Future[httpx.Response]],
     ) -> None:
-        """Broadcast `tensors` in order to every group, `chunk` bytes resident at a time.
+        """Broadcast the `exported` tensors `chunks` name, in order, to every group, the first chunk's
+        placed taken from `first` (which it empties, so the chunk is released once it has sent), a chunk
+        of at most `chunk` bytes read and resident at a time beside the one sending.
 
-        The next chunk's copies are issued before the current chunk broadcasts,
-        so the host-to-device copies overlap the transfers; a chunk is released
-        only after the default stream has finished with it, or a replica's
-        receive (`receives`) has failed. Each tensor goes to every group, and
-        the next waits until each group has issued it (`_Library.ready`).
+        The next chunk is read and its copies issued on a reader thread while
+        the current chunk broadcasts, so the reads and host-to-device copies
+        overlap the transfers, the reads home in the caller's scope
+        (`reading_home`) and in the order every process reads them; a chunk is
+        released only after the default stream has finished with it, or a
+        replica's receive (`receives`) has failed. Each tensor goes to every
+        group, and the next waits until each group has issued it
+        (`_Library.ready`).
         """
-        chunks = [[tensors[index] for index in group]
-                  for group in byte_groups(tensors, self.chunk, nbytes=lambda tensor: tensor.nbytes)] or [[]]
+        def placed_chunk(chunk: Sequence[str]) -> list[jax.Array]:
+            return jax.device_put([exported[name] for name in chunk], target)
+
         groups = list(self._groups.values())
-        placed = jax.device_put(chunks[0], target)
-        for index in range(len(chunks)):
-            following = jax.device_put(chunks[index + 1], target) if index + 1 < len(chunks) else None
-            for buffer in jax.block_until_ready(placed):
-                for comm in groups:
-                    library.broadcast(comm, buffer.unsafe_buffer_pointer(), buffer.size, str(buffer.dtype))
-                library.ready(groups, receives)
-            library.settled(groups, receives)
-            if following is not None:
-                placed = following
+        placed = first.pop()
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="dew-weight-read") as reader:
+            for index in range(len(chunks)):
+                following = (reader.submit(contextvars.copy_context().run, placed_chunk, chunks[index + 1])
+                             if index + 1 < len(chunks) else None)
+                for buffer in jax.block_until_ready(placed):
+                    for comm in groups:
+                        library.broadcast(comm, buffer.unsafe_buffer_pointer(), buffer.size,
+                                          str(buffer.dtype))
+                    library.ready(groups, receives)
+                library.settled(groups, receives)
+                if following is not None:
+                    placed = following.result()
 

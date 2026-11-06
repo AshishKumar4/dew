@@ -7,12 +7,52 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- The `cuda12` and `cuda13` extras install `dew-cutlass` 0.1.0 (`dew-cutlass-cu12` or `dew-cutlass-cu13`, on
+  Linux x86_64 and aarch64), Dew's build of CUTLASS's grouped GEMMs, whose kernels are Hopper's. On an sm90
+  GPU (an H100, an H200 or a GH200) a mixture of experts' projection now runs CUTLASS on the two grouped cells
+  declared for it, the forward and the input gradient, where Dew's Mosaic GPU template ran them: on an H100
+  the template took 1.019x CUTLASS's time on the forward and 1.018x on the input gradient (geomean of seven
+  MoE rows). Hopper's grouped kernel gradient stays on the template, every other cell keeps the route it had,
+  and a call CUTLASS cannot run (operands that are not bf16, a width that is not a multiple of 8, a fused hook,
+  exact sums) takes the selector's next route, as before.
+- A served GRPO rollout (`RolloutScheduler.served`, `--rollout.served`) runs over several processes: one
+  server spans the trainer's mesh, each process's rows seated on its own devices, and every process steps
+  it together on the run's thread as each call admits its groups (`NativeRolloutServer.waited`), where
+  such a run was refused. Its draws run between the trainer's steps, not beside them.
+- An adapter set's model (`dew.lora.AdapterSet`) names each row's adapter as its call's `adapters` field
+  (`model.apply(variables, tokens, adapters=rows)`), which a decode carries for each row
+  (`DecoderState.adapters`); the context `dew.lora.selected` is gone.
+- A checkpoint step is Orbax items: `model` (the counters, variables and EMA), `profiles` (the post-hoc EMA
+  averages) and `resume` (the rest). Each kept step keeps what its retention keeps it for:
+  `Keep(weights_only=True)` keeps its periodic, interval and predicate steps past the latest as their model
+  alone, a step a weights-only ranking keeps loses the rest once it falls out of the latest, and a post-hoc
+  EMA snapshot kept for nothing else keeps its averages alone. `kept()` reports such steps as `"weights"` or
+  `"profiles"`. A step an earlier Dew wrote reads as before. A step saved between two updates no longer holds
+  the accumulation window, whose gradient sum no resume reads (about a third of a 9B run's checkpoint).
+- A DiLoCo run's post-hoc EMA profiles, which its groups' optimizers keep, are recorded, retained and
+  restored; `posthoc_ema` returns the groups' mean of each group's own reconstruction. Its groups' collections
+  other than `params` go to the content-addressed store, and their EMA is stored as its difference from their
+  weights, as the outer model's are.
+- `Decide.save` writes the average's model alone.
+- An environment run's record moves from `dew.objectives.rl.config` to `dew.config.env`, beside the other
+  run kinds' records: `EnvRunConfig`, `EnvConfig`, `RolloutConfig`, `TeacherConfig`, `EpisodesConfig` and
+  `idle`, with no alias left, so the objectives import no configuration. A record names its kind as before.
+- Dew's support modules are private: `dew.accuracy`, `dew.builds`, `dew.cache`, `dew.cleanup`, `dew.devices`,
+  `dew.files`, `dew.logging`, `dew.pool`, `dew.position` and `dew.cli` are now `dew._accuracy` and so on, with
+  no alias left, and the API reference no longer lists `dew.cache`. `CPUOnlyJax`, which a run raises where JAX
+  opened on the CPU of a GPU machine, is `dew.training.CPUOnlyJax`. The `dew` command is unchanged.
 - `dew.algebra.extract` adds exact DAG extraction, an integer program over the e-graph's nodes with each shared
   node priced once. egglog's greedy DAG extraction stays the default: the exact one priced no template's forms
   lower and took twice as long. A template declaration can ask for exact extraction
   (`derive.Reduction(exact=True)`), and the test suite checks every derivation's greedy choice against the exact
   optimum.
-- Dew requires its JAX build 0.12.0.1.post51: Mosaic GPU's layout inference computes each
+- Dew requires its JAX build 0.12.0.1.post54: a program's compilation cache key reads each serialized kernel in
+  an MLIR context of its own, so threads keying programs at once key them alike (two concurrent compiles of a
+  model's steps had failed on an unregistered dialect); Mosaic GPU's `emit_pipeline` runs collectively over a
+  thread axis; and a pre-Hopper pipeline's copy after a warpgroup barrier, and the GPU dialect's index reads,
+  take no automatic barrier (post53: an A100 GEMM kernel's gradient 8% faster); under `vmap`, a staged
+  `custom_jvp` call with a mapped input is batched alike in its primal and its JVP, and JAX takes as its CUDA root
+  only a package that holds `ptxas` (post52). Earlier, post51: Mosaic GPU's layout inference computes each
   shared-memory-to-registers transfer check once, and a Pallas Mosaic GPU scratch ref can state that it is
   plain (`plgpu.PlainTransform()`), so Kimi delta attention's kernels lower and compile for sm90 in seconds
   where the layout search had run past ten minutes; and a step compiled ahead for an H100 on a host with
@@ -20,7 +60,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   refused its kernels; and a Pallas kernel's body may call a call primitive, a span Dew marks, which lowers as
   its body on every Pallas backend and is checked within its body under `checkify`; and a step compiled ahead
   for an A100 on a host with no GPU lowers its Mosaic kernels for the A100, not an H100 (docs/installation.md
-  lists each fix). The `cuda12` and `cuda13` extras keep the post45 CUDA and PJRT plugins: post46 to post51
+  lists each fix). The `cuda12` and `cuda13` extras keep the post45 CUDA and PJRT plugins: post46 to post54
   changed Python alone, and their native code is the same.
 - FlashAttention's wrapper, `dew-flash-attn` 0.3.7, folds a mapped kernel call (`jax.vmap` over attention,
   as a batched model's step maps it) into the kernel's own batch, one launch a group of calls within its
@@ -85,7 +125,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   the run's directory and a step the run pins as it starts). The run derives the tokenizer's frame from its
   clips and the dynamics' widths from the tokenizer and the clips' actions, and the objectives read uint8
   clips as the frames in [-1, 1] they encode (`dew.objectives.world_model.unit_frames`). The idle loader of
-  an environment run is public (`dew.objectives.rl.config.idle`), an episodic split flies the policy's draws
+  an environment run is public (`dew.config.env.idle`), an episodic split flies the policy's draws
   in place of its mean with `drawn` (`EpisodesConfig`), the acceptance runs of PPO and DreamerV3
   (`tools/rl_acceptance.py`) train as environment runs, DreamerV3's `return` scored by its draws and its
   `greedy_return` beside it, and `LocalTracker.timed` reads a journal's reports with the second each was
@@ -173,11 +213,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   (127 to 154): those three with IPython and its stack (jedi, parso, prompt-toolkit, pexpect, stack-data,
   traitlets) and ipywidgets, jupyterlab-widgets, widgetsnbextension and comm.
 - On a host of two or more GPUs, XLA's pool leaves NCCL's communicators their measured full-speed room:
-  the share the run names (`dew.devices.pool_bound`) is the pool's upper bound, a child process measures
+  the share the run names (`dew._devices.pool_bound`) is the pool's upper bound, a child process measures
   the communicators, all-to-all and permute connections once per configuration into Dew's cache, and a
   program whose communicators need more than the room left is refused at Dew's one compile point, naming
   the bytes (`dew.communicators`). `import dew` sets `NCCL_RUNTIME_CONNECT=0`. A host's GPUs are counted
-  through its CUDA driver, so a container without nvidia-smi counts them too (`dew.pool.local_gpu_count`).
+  through its CUDA driver, so a container without nvidia-smi counts them too (`dew._pool.local_gpu_count`).
 - Dew requires its JAX build 0.12.0.1.post45, and its `cuda12` and `cuda13` extras install Dew's builds of
   the CUDA plugins and their PJRT plugins, which Dew's package index serves: Mosaic GPU honours a kernel's
   register raises (`setmaxnreg`) and a stated minimum of resident blocks per SM, copies untiled CP_ASYNC
@@ -194,7 +234,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   after the failure; a first run that succeeds logs each GPU's free bytes there at the check and after.
 - Dew no longer wraps JAX's `xla_bridge.backends`. XLA parses `XLA_FLAGS` once per runtime it loads,
   possibly before a backend opens, so a flag holds for certain where `XLA_FLAGS` carried it before the
-  process loaded jaxlib (`dew.devices.flags_hold`). `import dew` sets its own flags before anything it
+  process loaded jaxlib (`dew._devices.flags_hold`). `import dew` sets its own flags before anything it
   imports loads jaxlib; `dew train`, `dew profile` and `dew inspect` run again from their start with a
   run's `trainer.xla_flags` set where they do not hold yet; `prepare_process` warns that flags it sets
   after jaxlib loaded are unproven, and still refuses flags asked for after the backend opened.

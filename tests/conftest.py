@@ -10,6 +10,7 @@ import threading
 import urllib.parse
 from datetime import timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 import lane_environment
 
@@ -22,7 +23,7 @@ import pytest
 import remote_cache
 from tool_support import load
 
-from dew.cache import default_compilation_cache_dir, enable_compilation_cache
+from dew._cache import default_compilation_cache_dir, enable_compilation_cache
 
 # The suite's Hypothesis profile (docs/design/testing.md): the same examples on every run, so a red
 # reproduces anywhere; no example database; 50 generated examples, each under a soft 2 s deadline. A test
@@ -40,7 +41,7 @@ hypothesis.settings.load_profile("dew")
 # cost; the numbers in docs/performance.md were taken with it set.
 _remote = None
 if os.environ.get("DEW_TEST_NO_CACHE"):
-    # JAX's own switch, which a run's setup reads too (`dew.cache.persist_compilations`), for this
+    # JAX's own switch, which a run's setup reads too (`dew._cache.persist_compilations`), for this
     # process and the processes its tests start.
     os.environ["JAX_ENABLE_COMPILATION_CACHE"] = "false"
     jax.config.update("jax_enable_compilation_cache", val=False)
@@ -165,31 +166,55 @@ def pytest_terminal_summary(terminalreporter):
         terminalreporter.write_line(_remote.summary())
 
 
-def release_unheld(requirement: str) -> str | None:
-    """Why this interpreter cannot run a test marked release_env(`requirement`), a release's own code
-    under the package it pins apart from the suite's, or None where it holds that package: the overlay CI's
-    release task runs it under (tools/armada/ci.py `released`) named, where the release's own loader
-    would fail opaquely in its subprocess (row 3576)."""
+class Unheld(NamedTuple):
+    """A release test this interpreter cannot run (`release_unheld`): the package its mark pins, the one it
+    holds (None where it holds none), and the command that runs the test as CI's release task does."""
+
+    requirement: str
+    package: str
+    held: str | None
+    command: tuple[str, ...]
+
+    def __str__(self) -> str:
+        return (f"this release's own code runs under {self.requirement}, and this interpreter holds "
+                f"{self.package} {self.held or 'not at all'}: run it as CI's release task does, under "
+                f"that overlay: {' '.join(self.command)}")
+
+
+def release_unheld(requirement: str, test: str) -> Unheld | None:
+    """Why this interpreter cannot run `test`, marked release_env(`requirement`): a release's own code under
+    the package it pins apart from the suite's, a requirement or a wheel's path as CI's release task hands
+    it to its overlay (tools/armada/ci.py `pytest_command`); or None where it holds that package. The reason
+    names CI's own release operation, which runs the test's file under that overlay, where the release's
+    own loader would fail opaquely in its subprocess (row 3576)."""
     from importlib.metadata import PackageNotFoundError, version
 
     from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_version, parse_wheel_filename
 
-    pinned = Requirement(requirement)
+    if requirement.endswith(".whl"):
+        name, wheel, _, _ = parse_wheel_filename(Path(requirement).name)
+        pinned, wanted = str(name), canonicalize_version(wheel)
+    else:
+        parsed = Requirement(requirement)
+        pinned, wanted = parsed.name, parsed.specifier
     try:
-        held = version(pinned.name)
+        held = version(pinned)
     except PackageNotFoundError:
         held = None
-    if held is not None and pinned.specifier.contains(held, prereleases=True):
+    if held is not None and (canonicalize_version(held) == wanted if isinstance(wanted, str)
+                             else wanted.contains(held, prereleases=True)):
         return None
-    return (f"this release's own code runs under {requirement}, and this interpreter holds {pinned.name} "
-            f"{held or 'not at all'}: run it under that overlay, as CI's release task does: "
-            f"uv run --with '{requirement}' -- python -m pytest <test>")
+    python = ".".join(map(str, sys.version_info[:2]))
+    return Unheld(requirement, pinned, held, (
+        "python", "tools/armada/ci.py", "release", f"--python={python}", f"--requirement={requirement}",
+        f"--tests={test.split('::', 1)[0]}", "--out=<rows.json>"))
 
 
 def pytest_runtest_setup(item):
     released = item.get_closest_marker("release_env")
-    if released is not None and (unheld := release_unheld(released.args[0])) is not None:
-        pytest.fail(unheld, pytrace=False)
+    if released is not None and (unheld := release_unheld(released.args[0], item.nodeid)) is not None:
+        pytest.fail(str(unheld), pytrace=False)
     marker = item.get_closest_marker("mesh")
     needed = marker.kwargs.get("devices", lane_environment.MESH_DEVICES) if marker else 0
     if jax.device_count() < needed:
@@ -203,10 +228,10 @@ def pytest_runtest_setup(item):
 
 @pytest.fixture(autouse=True)
 def exact_oracle():
-    """Each template derivation's greedy extraction held to the exact optimum (`dew.cache.Passes.checked`):
+    """Each template derivation's greedy extraction held to the exact optimum (`dew._cache.Passes.checked`):
     a declaration greedy prices dearer is refused (`dew.algebra.extract.Dearer`) until it is extracted
     exactly (`dew.algebra.derive.Reduction.exact`)."""
-    from dew.cache import ALGEBRA
+    from dew._cache import ALGEBRA
 
     with ALGEBRA(dataclasses.replace(ALGEBRA.value, checked=True)):
         yield
@@ -292,7 +317,7 @@ def with_deterministic_ops(monkeypatch):
 def caplog(caplog):
     """Capture Dew's logger as well as the application's root logger. Dew's records reach the
     capture once, through a handler of their own that does not pass them on to the root, whether
-    or not the run's setup configured the logger (`dew.logging.configure`), which then leaves it."""
+    or not the run's setup configured the logger (`dew._logging.configure`), which then leaves it."""
     logger = logging.getLogger("dew")
     propagated = logger.propagate
     logger.addHandler(caplog.handler)

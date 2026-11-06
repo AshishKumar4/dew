@@ -85,7 +85,7 @@ def test_a_conditional_s3_write_is_the_filesystems_own_request():
 @pytest.mark.parametrize("publish", ["write", "put_if_absent"])
 def test_a_local_publication_has_a_plain_writes_mode_and_a_failed_one_leaves_nothing(tmp_path, monkeypatch,
                                                                                        publish):
-    """A local write, plain or conditional, publishes by one rename (dew.files.write_atomically): the file
+    """A local write, plain or conditional, publishes by one rename (dew._files.write_atomically): the file
     has the mode a plain write gives under the umask, not a temporary file's private one, and a write
     that fails leaves no temporary beside its target."""
     target = tmp_path / "value"
@@ -443,6 +443,20 @@ def test_distinct_transport_misses_download_concurrently_within_the_shared_budge
     with ThreadPoolExecutor(2) as pool:
         assert list(pool.map(read, paths)) == [path.encode() for path in paths]
     assert cache.metrics()["downloaded_bytes"] == sum(len(path) for path in paths)
+    # A run's data metrics report its process's mirrors beside its corpora's (row 4299).
+    from dew.data import Loading, Memory
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+    from dew.data.pipeline import Pipeline
+
+    loader = compile(Pipeline(Memory([{"id": 0}])).repeat(1).batch(1), read="indexed",
+                     loading=Loading(workers=0, threads=1, read_buffer=1))
+    reader = loader.train(DataPartition())
+    try:
+        list(reader)
+    finally:
+        reader.close()
+    assert loader.statistics()["data/mirror/downloaded_bytes"] >= sum(len(path) for path in paths)
 
 
 def test_url_chain_reads_and_writes_memory(tmp_path):

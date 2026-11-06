@@ -56,6 +56,7 @@ from flax.linen.dtypes import promote_dtype
 from flax.linen.module import Interceptor
 from flax.nnx import bridge
 
+from dew._cache import INTERCEPTED
 from dew._records import finite
 from dew.batch import (
     FROZEN,
@@ -69,7 +70,6 @@ from dew.batch import (
     thaw,
     unboxed,
 )
-from dew.cache import INTERCEPTED
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_names import group_layers, stored_layers
@@ -575,8 +575,9 @@ class Adapter:
 @dataclass(frozen=True, eq=False)
 class AdapterSet:
     """Several adapters of one model, served over its one copy of the base weights by name: each row of a
-    call runs under its own adapter (`selected`), as vLLM and S-LoRA serve many adapters over one base
-    and one cache, and a request names its adapter (`dew.inference.Server.submit`).
+    call runs under its own adapter, which the call names (`apply(..., adapters=rows)`, `rows` `[B]` int32
+    holding each row's place in `names`, -1 for the base model alone), as vLLM and S-LoRA serve many
+    adapters over one base and one cache, and a request names its adapter (`dew.inference.Server.submit`).
 
     Each target's factors stack along an adapter axis, before the factor's own axes, each adapter's rank
     zero-padded to the largest, which adds exact zeros, and its scale held apart (`_Bound.scales`); an
@@ -590,7 +591,7 @@ class AdapterSet:
 
     @property
     def names(self) -> tuple[str, ...]:
-        """The adapters, in the order a row's index names them (`selected`)."""
+        """The adapters, in the order a row's index names them (the call's `adapters`)."""
         return adapter_names(self.model)
 
     def index(self, name: str | None) -> int:
@@ -764,15 +765,14 @@ _SELECTED: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("de
 
 
 @contextlib.contextmanager
-def selected(rows: jax.Array) -> Iterator[None]:
-    """Run an adapter set's model (`AdapterSet`) with each row of the call's batch under its own adapter:
-    `rows` `[B]` int32 holds each row's adapter's place in `AdapterSet.names`, -1 for the base model
-    alone. A served row's adapter is its request's (`dew.inference.Server.submit`).
-
-    Enter it inside the traced program, with `rows` one of the program's traced arguments, as the
-    server's step programs do (`dew.inference.serving_kernel`): a jit cache keys on a program's arguments
-    and never sees a context variable, so rows set around a jitted call would be baked into its first
-    trace and every later call with other rows would reuse it."""
+def _selected_rows(rows: jax.Array | None) -> Iterator[None]:
+    """Each row of a call to an adapter set's model under its own adapter (`AdapterSet`), as the call names
+    them (its `adapters`), for the adapted projections the call reaches (`_Branch`): entered by the
+    model's `apply` around the call it runs, so the rows are the call's own, traced where it is traced.
+    None names none."""
+    if rows is None:
+        yield
+        return
     token = _SELECTED.set(rows)
     try:
         yield
@@ -877,13 +877,13 @@ class _Branch:
 
 
     def _selected(self, module: nn.Module, x: jax.Array) -> tuple[jax.Array, jax.Array]:
-        """An adapter set's rows at `module` (`AdapterSet`), as `selected` names them, and the target's
-        scale, adapter by adapter: each row of `x` runs its own adapter's factors."""
+        """An adapter set's rows at `module` (`AdapterSet`), as the call names them (`_selected_rows`), and
+        the target's scale, adapter by adapter: each row of `x` runs its own adapter's factors."""
         where = "/".join((*self.root, *module.path))
         rows = _SELECTED.get()
         if rows is None:
-            raise ValueError(f"{where} adds each row's adapter of a set, and this call names none: run it "
-                             "under dew.lora.selected(rows)")
+            raise ValueError(f"{where} adds each row's adapter of a set, and this call names none: name each "
+                             "row's adapter as its `adapters` (`apply(..., adapters=rows)`)")
         if x.shape[0] != rows.shape[0]:
             raise ValueError(f"{where} receives {x.shape[0]} rows, not the {rows.shape[0]} the call's "
                              "adapters name, so its rows' adapters are unknown")
@@ -1061,8 +1061,9 @@ def _adapted(model: nn.Module, bound: _Bound) -> nn.Module:
         def _dew_wrapper() -> AdapterRecord:
             return _record(bound)
 
-        def apply(self, variables, *args, **kwargs):
-            with INTERCEPTED(new_value=True), nn.intercept_methods(branch):
+        def apply(self, variables, *args, adapters: jax.Array | None = None, **kwargs):
+            # An adapter set's call names each row's adapter (`AdapterSet`), which its projections read.
+            with INTERCEPTED(new_value=True), nn.intercept_methods(branch), _selected_rows(adapters):
                 return super().apply(thaw(variables), *args, **kwargs)
 
         def init_with_output(self, *args, **kwargs):
@@ -1571,4 +1572,4 @@ class AdaptedClass(Protocol):
 
 
 __all__ = ["Adapter", "AdapterRecord", "AdapterSet", "LoRA", "PeftConfig", "Target", "adapter_names",
-           "selected", "unadapted"]
+           "unadapted"]

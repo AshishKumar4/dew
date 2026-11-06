@@ -4,6 +4,7 @@ each side's gradient from its own loss, and a run config over a saved
 teacher."""
 
 import dataclasses
+import functools
 from pathlib import Path
 
 import jax
@@ -14,9 +15,8 @@ import pytest
 from diffusion_stubs import batch_for
 from diffusion_support import TanhLayer, images_of, saved_after_one_step
 from flax import linen as nn
-from float64_terms import float64_terms
-from one_draw import assert_as_exact_as_the_reference
-from reference_error import widened
+from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
+from tool_support import run_from
 
 import dew
 from dew.config import ObjectiveConfig, TrainerConfig
@@ -62,7 +62,15 @@ def test_a_head_is_stylegan_ts_at_grid_height_one():
         assert not np.allclose(np.asarray(updated[SPECTRAL]["cls"]["u"]), HEAD["cls.u"])
 
 
-STEP = np.load(Path(__file__).resolve().parent / "fixtures" / "ladd" / "step.npz")
+SEEDS = Path(__file__).resolve().parent / "fixtures" / "ladd" / "seeds.npz"
+
+
+@functools.cache
+def generator():
+    """tools/ladd_reference.py, whose seeded draw the recorded inputs are drawn again by, loaded as a
+    script from its directory."""
+    with run_from("ladd_reference", "tools") as module:
+        return module
 
 
 class Tokens(nn.Module):
@@ -84,17 +92,47 @@ class Tokens(nn.Module):
         return (layer_b @ head).reshape(x.shape)
 
 
-def unflattened(prefix: str) -> dict:
-    """The fixture's arrays under `prefix/` as a nested tree."""
-    tree: dict = {}
-    for key in STEP.files:
-        if key.startswith(prefix + "/"):
-            *path, leaf = key[len(prefix) + 1:].split("/")
-            node = tree
-            for name in path:
-                node = node.setdefault(name, {})
-            node[leaf] = jnp.asarray(STEP[key], jnp.float32)
-    return tree
+def one_step(dtype, inputs) -> dict[str, jax.Array]:
+    """Dew's LADD step at `dtype` on a seed's inputs (tools/ladd_reference.py's `draw`), what check 1
+    judges of it (the generator's `judged`): its loss, every gradient and the kept `u`s."""
+    from flax.traverse_util import flatten_dict
+
+    from dew.inputs import Field, InputSpec
+
+    reference = generator()
+    settings = reference.SETTINGS
+
+    def tree(prefix):
+        return jax.tree.map(lambda value: jnp.asarray(value, dtype), reference.nested(inputs, prefix))
+
+    pixels = inputs["pixels"]
+    layers = {name: {"kernel": tree("teacher")[name]} for name in ("layer_a", "layer_b")}
+    task = AdversarialDistillationObjective(
+        Tokens(settings["width"]), Flow()(), InputSpec(Field("image", pixels.shape[1:])),
+        feature_layers=settings["layers"], student_times=settings["student_times"],
+        renoise_times=tuple(settings["renoise_times"]), distillation_weight=settings["distillation_weight"],
+        r1_weight=settings["r1_weight"], cmap_dim=settings["cmap_dim"], kernel_size=(1, 1),
+        variables={TEACHER: {"params": tree("teacher") | layers}}, time_features=settings["time_features"],
+        ema_decay=None)
+    variables = {**task.init(jax.random.PRNGKey(0)), SPECTRAL: tree("initial")}
+    student = tree("student") | {name: {"kernel": tree("student")[name]} for name in ("layer_a", "layer_b")}
+    # The step reads the oracle's own draws (`Step.tape`): each row's student time, its noise, its
+    # renoising level and noise.
+    tape = {"student times": inputs["draws/indices"], "noise": jnp.asarray(inputs["draws/noise"], dtype),
+            "renoise times": jnp.asarray(inputs["draws/level"], dtype),
+            "renoise": jnp.asarray(inputs["draws/renoise"], dtype)}
+    step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None, tape=tape)
+
+    def loss(params):
+        return task.scalar_loss({**variables, "params": params}, {"image": pixels}, step)
+
+    (value, aux), gradient = jax.value_and_grad(loss, has_aux=True)(
+        {**student, DISCRIMINATOR: tree("heads")})
+    flat = {"loss": value, **{f"grad/student/{name}": leaf["kernel"] if name.startswith("layer") else leaf
+                              for name, leaf in gradient.items() if name != DISCRIMINATOR}}
+    for prefix, held in (("grad/heads", gradient[DISCRIMINATOR]), ("spectral", aux.variables[SPECTRAL])):
+        flat |= {f"{prefix}/{key}": leaf for key, leaf in flatten_dict(held, sep="/").items()}
+    return reference.judged(flat, jnp.concatenate)
 
 
 def test_one_step_is_the_papers_equations_on_stylegan_ts_heads():
@@ -106,71 +144,19 @@ def test_one_step_is_the_papers_equations_on_stylegan_ts_heads():
     every head's logits, R1 at its real input, ADD's (1 - s)-weighted
     distillation, and the heads' spectral norms at Dew's documented cadence
     (the real pass iterates and keeps its `u`; the held, fake and R1 passes
-    iterate from it and keep nothing). The loss within 1e-6 of the oracle's
-    float64 run; every gradient, the student's through the fake pass and the
-    distillation and the heads' through the hinge and R1, and the kept
-    `u`s held to it by the float64 rule. The residual block's kernel is 1
-    here, as one token is all a stand-in's grid holds;
-    test_a_head_is_stylegan_ts_at_grid_height_one holds the kernel of 9."""
-    import json
-
-    from dew.inputs import Field, InputSpec
-
-    settings = json.loads(str(STEP["settings"]))
-    pixels = STEP["pixels"]
-    layers = {name: {"kernel": jnp.asarray(STEP[f"teacher/{name}"], jnp.float32)}
-              for name in ("layer_a", "layer_b")}
-    teacher = {"params": unflattened("teacher") | layers}
-    model = Tokens(settings["width"])
-    task = AdversarialDistillationObjective(
-        model, Flow()(), InputSpec(Field("image", pixels.shape[1:])), feature_layers=settings["layers"],
-        student_times=settings["student_times"], renoise_times=tuple(settings["renoise_times"]),
-        distillation_weight=settings["distillation_weight"], r1_weight=settings["r1_weight"],
-        cmap_dim=settings["cmap_dim"], kernel_size=(1, 1), variables={TEACHER: teacher},
-        time_features=settings["time_features"], ema_decay=None)
-    variables = task.init(jax.random.PRNGKey(0))
-    student = unflattened("student")
-    for name in ("layer_a", "layer_b"):
-        student[name] = {"kernel": student[name]}
-    params = {**student, DISCRIMINATOR: unflattened("heads")}
-    variables = {**variables, SPECTRAL: unflattened("initial")}
-    # The step reads the oracle's own draws (`Step.tape`): each row's student time, its noise, its
-    # renoising level and noise.
-    tape = {"student times": STEP["draws/indices"], "noise": STEP["draws/noise"],
-            "renoise times": STEP["draws/level"], "renoise": STEP["draws/renoise"]}
-    step = Step(step=jnp.asarray(0), key=jax.random.key(settings["key"]), ema=None, tape=tape)
-
-    def loss(params):
-        return task.scalar_loss({**variables, "params": params}, {"image": pixels}, step)
-
-    (value, aux), gradient = jax.value_and_grad(loss, has_aux=True)(params)
-    np.testing.assert_allclose(float(value), float(STEP["loss_f64"]), rtol=1e-6)
-    # Dew's own step in float64 on the CPU: each entry's terms, what its sums add (`float64_terms`).
-    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
-        _, ((_, aux_terms), gradient_terms) = float64_terms(jax.value_and_grad(loss, has_aux=True),
-                                                            widened(params))
-
-    def student(gradient):
-        return {name: gradient[name]["kernel"] if name.startswith("layer") else gradient[name]
-                for name in ("embed", "time", "head", "layer_a", "layer_b")}
-
-    def vector(tree):
-        return np.concatenate([np.ravel(leaf) for leaf in jax.tree.leaves(tree)])
-
-    # Each tree is held whole, its leaves in one vector: a few entries' root
-    # mean square is no estimate of rounding, and the two biases a batch norm
-    # follows have a gradient of exactly zero, rounding alone in both runs.
-    for label, tree, summed, prefix in (
-            ("student", student(gradient), student(gradient_terms), "grad/student"),
-            *((f"head {index}", gradient[DISCRIMINATOR][f"head_{index}"],
-               gradient_terms[DISCRIMINATOR][f"head_{index}"], f"grad/heads/head_{index}")
-              for index in (0, 1)),
-            ("spectral u", aux.variables[SPECTRAL], aux_terms.variables[SPECTRAL], "spectral")):
-        keys = ["/".join([prefix, *(entry.key for entry in path)])
-                for path, _ in jax.tree_util.tree_flatten_with_path(tree)[0]]
-        assert_as_exact_as_the_reference(
-            vector(tree), np.concatenate([np.ravel(STEP[key]) for key in keys]),
-            np.concatenate([np.ravel(STEP[f"{key}_f64"]) for key in keys]), label, terms=vector(summed))
+    iterate from it and keep nothing). Over drawn inputs, weights and draws,
+    the loss, every gradient, the student's through the fake pass and the
+    distillation and the heads' through the hinge and R1, and the kept `u`s
+    as exact as the oracle's float32 run against its float64 run, recorded
+    (check 1).
+    The residual block's kernel is 1 here, as one token is all a stand-in's
+    grid holds; test_a_head_is_stylegan_ts_at_grid_height_one holds the
+    kernel of 9."""
+    seeds = declared_seeds(SEEDS)["ladd"]
+    drawn, reference, truth = indexed_recording(recording(SEEDS), "ladd", seeds, inputs_of=generator().draw)
+    compiled = jax.jit(lambda inputs: one_step(jnp.float32, inputs))
+    assert_as_exact(as_given(lambda index, inputs: compiled(inputs)), reference, drawn, "one LADD step",
+                    seeds=seeds, truth_fn=truth)
 
 
 @pytest.fixture(scope="module")

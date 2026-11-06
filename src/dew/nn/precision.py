@@ -235,47 +235,22 @@ def broadcast_summed(value: jax.Array, shape: tuple[int, ...], dimensions: tuple
     return spread_value.astype(value.dtype if dtype is None else dtype)
 
 
-def _doubled(value: jax.Array, shape: tuple[int, ...], axes: tuple[int, ...]) -> jax.Array:
-    """`value` broadcast to `shape` over its size-one `axes` by doubling: along each axis each entry is
-    paired with itself until the axis is covered, then cut to it, so JAX's transpose at any order sums a
-    cotangent over that axis pairwise, neighbours added level by level, and a cotangent split into
-    blocks over devices adds within each until a block is one entry. The broadcast's transpose is
-    XLA's reduction, which a CPU sums in an order up to twice torch's error at a few hundred rows of
-    16 channels (ledger 1698's Z-Image bias); the pairs' tree is under torch's at every size measured,
-    in the reduction's time."""
-    for axis in axes:
-        count = shape[axis]
-        while value.shape[axis] < count:
-            paired = jnp.stack([value, value], axis=axis + 1)
-            # The doubled axis keeps the value's placement, an Explicit axis's on a size-one one among it.
-            doubled = (*value.shape[:axis], 2 * value.shape[axis], *value.shape[axis + 1:])
-            value = jax.lax.reshape(paired, doubled, out_sharding=explicit_spec(value))
-        value = jax.lax.slice_in_dim(value, 0, count, axis=axis)
-    return value
-
-
 def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
     """`value` broadcast to `shape`, whose transpose, the sum of a cotangent over every position the
     value spread over (a bias's gradient), a CPU running wide arithmetic (`WIDE_CPU_ARITHMETIC`, Dew's
     tests) takes in float64 and rounds once, as it sums a float32 product (`accumulated`): there the
-    broadcast is the outer product of ones and the value, whose transpose is a product. Elsewhere,
-    or where `accumulated` leaves a product its own sum, a CPU spreads a floating value by doubling
-    (`_doubled`), so its transpose sums pairwise in the value's dtype, and an accelerator broadcasts
-    it, whose transpose JAX sums in the value's dtype. A value an Explicit axis places along an axis it
-    spreads over (never a bias, whose leading axes `biased` adds) is broadcast: neither form keeps that
-    placement on a dropped or doubled size-one axis."""
+    broadcast is the outer product of ones and the value, whose transpose is a product. Everywhere
+    else, and where `accumulated` leaves a product its own sum (`FP32_SUMS`, a quantized model's
+    trace), it is the broadcast, whose transpose JAX sums in the value's dtype, as a user's process
+    sums it on every platform (ledger 3197). A value an Explicit axis places along an axis it spreads
+    over (never a bias, whose leading axes `biased` adds) is broadcast: the outer product does not keep
+    that placement on a dropped size-one axis."""
     axes = tuple(axis for axis, (size, total) in enumerate(zip(value.shape, shape, strict=True))
                  if size == 1 and total != 1)
     placed = explicit_spec(value)
-    if not axes or (placed is not None and any(placed.spec[axis] is not None for axis in axes)):
+    if (not axes or (placed is not None and any(placed.spec[axis] is not None for axis in axes))
+            or not _sums_in_float64(value)):
         return jnp.broadcast_to(value, shape)
-    if not _sums_in_float64(value):
-        if not jnp.issubdtype(value.dtype, jnp.floating):
-            return jnp.broadcast_to(value, shape)
-        # A CPU sums the transpose pairwise (`_doubled`); an accelerator's reduction is a tree already.
-        return jax.lax.platform_dependent(
-            value, cpu=functools.partial(_doubled, shape=tuple(shape), axes=axes),
-            default=functools.partial(jnp.broadcast_to, shape=tuple(shape)))
     kept = tuple(axis for axis in range(len(shape)) if axis not in axes)
 
     def outer(value: jax.Array) -> jax.Array:
@@ -338,8 +313,8 @@ def products_dtype(*operands) -> jnp.dtype | None:
 
 def _intercepted() -> bool:
     """Whether this thread traces a quantized model's method, whose products Qwix owns
-    (`dew.cache.QUANTIZED_TRACE`, which jit's cache keys on)."""
-    from dew.cache import QUANTIZED_TRACE
+    (`dew._cache.QUANTIZED_TRACE`, which jit's cache keys on)."""
+    from dew._cache import QUANTIZED_TRACE
 
     return QUANTIZED_TRACE.value is not None
 

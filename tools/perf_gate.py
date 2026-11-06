@@ -403,7 +403,7 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
 
 
 def run(args: argparse.Namespace) -> int:
-    from dew.files import write_atomically
+    from dew._files import write_atomically
 
     trees = dict(spec.split("=", 1) for spec in (args.base, args.head))
     (base, base_path), (head, head_path) = ((name, Path(path)) for name, path in trees.items())

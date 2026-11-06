@@ -820,8 +820,15 @@ one-entry-booked-twice's at 512."""
       Served(12, flipped=(6,))), {}, (0, 8, 16, 16, 24, 24), None, WIDE_HYBRID),
     ((Served(12), Served(12), Served(12, flipped=(9,))), {"chunk": 3}, (0, 8, 16), None, WIDE_HYBRID),
     ((Served(12), Served(12, flipped=(6,))), {"prefix_state_every": 1}, (0, 4), None, NARROW_HYBRID),
-    ((Served(12), Served(12), Served(12)), {"admission": 1}, (0, 16), (1, 2), NARROW_HYBRID)],
-    ids=["by-default", "in-pieces", "every-page", "restores-past-admission"])
+    ((Served(12), Served(12), Served(12)), {"admission": 1}, (0, 16), (1, 2), NARROW_HYBRID),
+    ((Served(12), Served(12, flipped=(0,)), Served(12)),
+     {"slots": 1, "kv_cache": KVCache(page_size=4, pages=6), "host_pages": 8, "prefix_states": 4},
+     (0, 0, 8), None, NARROW_HYBRID),
+    ((Served(9), Served(12, flipped=(0,)), Served(12, flipped=(0, 1)), Served(9)),
+     {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 1,
+      "prefix_states": 4}, (0, 0, 0, 0), None, NARROW_HYBRID)],
+    ids=["by-default", "in-pieces", "every-page", "restores-past-admission", "from-the-host",
+         "from-one-host-slot"])
 @pytest.mark.check1_shards(seeds=256, per_task=64)
 def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(requests, options, hits, rounds,
                                                                              site):
@@ -857,7 +864,13 @@ def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
     store of one entry evicts the first prompt's state for the next one's and its reuse with it. Two
     prompts admitted together into a store of one entry keep one state, the later booking's, which the
     next round's repeat of it reads; two repeats seated together each restore their state, past the
-    one prompt piece a call admits. Each request draws what it draws alone and scores it as a full
+    one prompt piece a call admits. A pool of six pages with a host tier spills the first prompt's pages
+    while another prompt runs, its state kept in a store of four entries, and its repeat reads its pages
+    back (a pool without the tier reads none: its other prompt takes the pages); in a pool of eight pages
+    two other prompts reclaim a prompt's two shared pages, and a tier of one host slot keeps one of them
+    alone, where the store holds the state after the deepest page only, so the repeat reads nothing back.
+    Each request
+    draws what it draws alone and scores it as a full
     forward does (check 1)."""
     # A vocabulary of 256 at least and eight draws a request, so each request's scores spread enough to
     # measure: at 64, fp32 sums as users' are (ledger 2468) leave the ratio unresolved within 512 seeds.
@@ -908,6 +921,86 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
         assert_same_generation(ticket.result(), lone)
     # "1234567" keeps its last token to prefill: one full page of four is shared.
     assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
+
+
+def test_a_host_tier_reads_back_a_prefix_whose_upload_reclaims_the_last_device_pages():
+    """A pool of two pages and one host slot: a prompt's one shared page goes to the slot when another
+    prompt's two named pages take the pool, and the first prompt reads it back while its fresh pages reclaim
+    the other prompt's, which the full slot cannot keep: its upload reads the slot as the spill left it. A
+    reserve released before its copies are made leaves its upload's page cached, and a prompt that takes
+    that page back finds the slot still holding the first prompt's page, not the device page the upload
+    never wrote (`dew.inference.pages.Pages`, ledger 874)."""
+    from dew.inference.pages import Pages
+
+    pages = Pages(2, 4, prefix_cache=True, host=1)
+    first, other = np.arange(1, 6), np.arange(20, 28)
+
+    def ran(prompt):
+        held, prefilled, _, _ = pages.reserve(prompt, 8)
+        pages.publish(prompt, held)
+        pages.release(held)
+        return held, prefilled
+
+    def spilled():
+        held, _ = ran(first)
+        ran(other)
+        assert pages.drained().spills == [(held[0], 0)]
+
+    spilled()
+    held, prefilled, _, _ = pages.reserve(first, 8)
+    owed = pages.drained()
+    assert (prefilled, owed.spills, owed.uploads) == (4, [], [(0, held[0])])
+    pages.release(held)
+    spilled()
+    held, prefilled, _, _ = pages.reserve(first, 8)
+    assert prefilled == 4
+    pages.release(held)
+    pages.reserve(other, 8)
+    owed = pages.drained()
+    assert (owed.spills, owed.uploads, pages.shared(first)) == ([], [], [-1])
+
+
+@pytest.mark.distributed
+def test_a_pooled_servers_host_tier_reads_each_processs_prefix_back_from_its_own_slots(tmp_path):
+    """One server over a mesh that spans two processes, a group of rows a process, with a host tier: each
+    process's prompt is cached, its group's pages taken by two other prompts, which spill the prompt's pages
+    to the process's host slots, and served again, reading them back into fresh pages; every request draws
+    what one process serving them all draws, and each process reads its prompt's 8 tokens from its slots
+    (ledger 874)."""
+    from pathlib import Path
+
+    from process_support import run_pool, run_worker
+
+    worker = Path(__file__).with_name("serving_worker.py")
+    reports = run_pool("pooled_host_tier", tmp_path / "pool", 2, script=worker, devices=1, fsdp_size=2,
+                       timeout=300)
+    single = run_worker("pooled_host_tier", tmp_path / "single.json", script=worker, fsdp_size=1, devices=1)
+    assert {**reports[0]["drawn"], **reports[1]["drawn"]} == single["drawn"]
+    assert [report["shared"] for report in reports] == [8, 8]
+
+
+@pytest.mark.parametrize("host_pages, hits", [(0, 0), (1, 4), (8, 8)], ids=["device", "one-slot", "host"])
+def test_a_host_tier_keeps_prefix_pages_the_pool_reclaims(host_pages, hits):
+    """A prefix cache of eight pages of four tokens, one slot: a prompt's two shared pages are cached as it
+    ends, then two other prompts take the pool's pages and it reclaims them. With a host tier the reclaimed
+    pages go to host memory and the prompt again reads its 8 tokens back from there, or its first 4 where
+    one host slot keeps the page reclaimed last; without one it prefills them again. Every request draws
+    what its lone call draws (ledger 874); a hybrid stack's host tier is `assert_reads_a_shared_prefix`'s
+    `from-the-host` and `from-one-host-slot` sites, judged by check 1."""
+    bound = task(Sampling(temperature=1.0))
+    shared, others, budget = "123456781", ["987654329876", "555544443333"], 6
+    requests = [shared, *others, shared]
+    alone = [bound(held, budget, key=index) for index, held in enumerate(requests)]
+    server = Server.from_task(bound, slots=1, capacity=64, admission=1, prefix_cache=True,
+                              kv_cache=KVCache(page_size=4, pages=8), host_pages=host_pages)
+    drawn = []
+    for index, held in enumerate(requests):
+        ticket = server.submit(held, budget, key=index)
+        server.run()
+        drawn.append(ticket.result())
+    assert server.prefix_hits == hits
+    for generation, lone in zip(drawn, alone, strict=True):
+        assert_same_generation(generation, lone)
 
 
 def test_samples_of_one_prompt_prefill_it_once_and_each_draws_what_it_draws_alone():
@@ -1025,6 +1118,55 @@ def test_a_server_over_a_pool_draws_what_each_request_draws_alone(tmp_path, page
     assert (reports[1]["shared"] > 0) == paged
 
 
+def drawn_adapter(model, variables, module: str, key: int, layouts=None):
+    """A rank-2 adapter of `module` over `model`, its B drawn from `key` (its init holds B at zero, which
+    adapts nothing), as the adapter-set sites draw each of theirs."""
+    from dew.lora import LoRA
+
+    adapter = LoRA(rank=2, modules=(module,)).apply(model, variables, key=key, layouts=layouts)
+    factors = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: (jax.random.normal(jax.random.key(key), leaf.shape, leaf.dtype)
+                            if jax.tree_util.keystr(path).endswith("'lora_B']") else leaf),
+        adapter.variables["params"])
+    return dataclasses.replace(adapter, variables={**adapter.variables, "params": factors})
+
+
+def test_a_speculating_server_over_an_adapter_set_reseeds_its_depths_under_each_rows_adapter():
+    """A speculating server (`Speculative`) over an adapter set whose adapters adapt the stream's input
+    map (`project_in`, which reseeding a block's prediction depths reads, `DecodeOps.embed`) draws each
+    request at zero temperature as the greedy walk under its own adapter, or the base, each block's
+    reseeding under the row's adapter (row 4222's review)."""
+    from dew.lora import AdapterSet
+    from dew.sampling import Sampling, Speculative
+
+    model = decoder().clone(max_seq_len=32, num_nextn_predict_layers=1, embedding_features=8)
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+
+    adapters = AdapterSet.of({"first": drawn_adapter(model, params, "project_in", 1),
+                              "second": drawn_adapter(model, params, "project_in", 2)})
+    served = TextGeneration(adapters.model, adapters.variables, RunProcessor(Digits()),
+                            sampling=Sampling(temperature=0), strategy=Speculative(block=3))
+    server = Server.from_task(served, slots=3, capacity=32)
+    prompts, names = ([1, 2, 3], [7, 8, 9], [4, 5, 6]), ("first", None, "second")
+    tickets = [server.submit(np.asarray([prompt]), 6, key=0, adapter=name)
+               for prompt, name in zip(prompts, names, strict=True)]
+    server.run()
+    walks = []
+    for ticket, prompt, index in zip(tickets, prompts, (0, -1, 1), strict=True):
+        walked = np.asarray([prompt], np.int32)
+        for _ in range(6):
+            scores = adapters.model.apply(adapters.variables, jnp.asarray(walked),
+                                          adapters=jnp.asarray([index], jnp.int32))[:, -1]
+            walked = np.concatenate([walked, np.asarray(scores).argmax(-1)[:, None].astype(np.int32)], axis=1)
+        held = ticket.result().host()
+        # The prompt and the response it drew, which an end of sequence may stop short of six.
+        drawn_to = 3 + int(np.asarray(held.lengths)[0])
+        np.testing.assert_array_equal(np.asarray(held.tokens)[0, :drawn_to], walked[0, :drawn_to])
+        walks.append(walked[0, 3:])
+    # The adapters move the walk: the rows' adapters are what the draws read.
+    assert len({tuple(walk) for walk in walks}) > 1
+
+
 @pytest.mark.parametrize("cache", [None, KVCache(page_size=2, pages=64)], ids=["dense", "paged"])
 def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(tmp_path, cache):
     """One server over an adapter set (`dew.lora.AdapterSet`) of a published decoder: the fixture's PEFT
@@ -1118,19 +1260,14 @@ def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own
     from reference_error import as_given, assert_as_exact, seeds_for
 
     from dew.interop.pretrained import Pretrained
-    from dew.lora import AdapterSet, LoRA, selected
+    from dew.lora import AdapterSet
 
     decoder = Pretrained.load(Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny",
                               dtype="float32", attention_impl="reference")
 
     def drawn(layer: int, key: int):
-        adapter = LoRA(rank=2, modules=(f"layers.{layer}.self_attn.q_proj",)).apply(
-            decoder.model, decoder.variables, key=key, layouts=decoder.layouts)
-        factors = jax.tree_util.tree_map_with_path(
-            lambda path, leaf: (jax.random.normal(jax.random.key(key), leaf.shape, leaf.dtype)
-                                if jax.tree_util.keystr(path).endswith("'lora_B']") else leaf),
-            adapter.variables["params"])
-        return dataclasses.replace(adapter, variables={**adapter.variables, "params": factors})
+        return drawn_adapter(decoder.model, decoder.variables, f"layers.{layer}.self_attn.q_proj", key,
+                             layouts=decoder.layouts)
 
     first, second = drawn(0, 1), drawn(1, 2)
     adapters = AdapterSet.of({"first": first, "second": second})
@@ -1140,8 +1277,8 @@ def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own
 
     @as_given
     def served(tokens):
-        with selected(jnp.asarray([0, 1], jnp.int32)):
-            return np.asarray(adapters.model.apply(adapters.variables, jnp.asarray(tokens)))
+        return np.asarray(adapters.model.apply(adapters.variables, jnp.asarray(tokens),
+                                               adapters=jnp.asarray([0, 1], jnp.int32)))
 
     def alone(dtype):
         @as_given
@@ -1163,12 +1300,12 @@ def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own
 
 
 def test_a_row_of_an_adapter_sets_base_computes_the_base_bit_for_bit():
-    """A row naming no adapter of a set (`dew.lora.selected`'s -1) takes no branch: beside a row whose
+    """A row naming no adapter of a set (-1 in the call's `adapters`) takes no branch: beside a row whose
     adapter's factors overflow its update to inf, its logits are the base model's, bit for bit."""
     from pathlib import Path
 
     from dew.interop.pretrained import Pretrained
-    from dew.lora import AdapterSet, LoRA, selected
+    from dew.lora import AdapterSet, LoRA
 
     fixtures = Path(__file__).resolve().parent / "fixtures"
     decoder = Pretrained.load(fixtures / "hf" / "llama-tiny", dtype="float32", attention_impl="reference")
@@ -1178,11 +1315,54 @@ def test_a_row_of_an_adapter_sets_base_computes_the_base_bit_for_bit():
         lambda leaf: leaf * 1e30, fixture.variables["params"])})
     adapters = AdapterSet.of({"huge": huge})
     tokens = jnp.asarray([[1, 5, 9, 13], [2, 4, 6, 8]], jnp.int32)
-    with selected(jnp.asarray([0, -1], jnp.int32)):
-        served = adapters.model.apply(adapters.variables, tokens)
+    served = adapters.model.apply(adapters.variables, tokens, adapters=jnp.asarray([0, -1], jnp.int32))
     base = decoder.model.apply(decoder.variables, tokens)
     assert not np.isfinite(np.asarray(served[0])).all()
     np.testing.assert_array_equal(np.asarray(served[1]), np.asarray(base[1]))
+
+
+def test_an_adapter_sets_decode_carries_each_rows_adapter_through_a_reindex():
+    """An adapter set's decode carries each row's adapter in its state (`DecoderState.adapters`, int32):
+    four prompts prefilled under the set's two adapters and the base (-1), their rows reordered,
+    duplicated and one dropped (`DecodeOps.reindex`, as a fork of a row's draws moves them) and advanced a
+    token, each row's logits are those of its prompt prefilled in that place under its own adapter and
+    advanced alike, bit for bit (row 4222)."""
+    from pathlib import Path
+
+    from dew.interop.pretrained import Pretrained
+    from dew.lora import AdapterSet
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling.text import decode_ops, prefill_state
+
+    decoder = Pretrained.load(Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny",
+                              dtype="float32", attention_impl="reference")
+
+    def drawn(layer: int, key: int):
+        return drawn_adapter(decoder.model, decoder.variables, f"layers.{layer}.self_attn.q_proj", key,
+                             layouts=decoder.layouts)
+
+    adapters = AdapterSet.of({"first": drawn(0, 1), "second": drawn(1, 2)})
+    model, variables = adapters.model, adapters.variables
+    prompts = jnp.asarray([[1, 5, 9, 13], [2, 4, 6, 8], [3, 7, 11, 15], [6, 2, 9, 4]], jnp.int32)
+    rows = np.asarray([0, 1, -1, 1], np.int64)
+    order = jnp.asarray([2, 0, 0, 3], jnp.int32)
+    following, active = jnp.asarray([17, 19, 21, 23], jnp.int32), jnp.ones((4,), bool)
+    ops = decode_ops(model, variables, 0, None)
+
+    def advanced(tokens, held):
+        return ops.advance(prefill_state(model, variables, ModelInputs(tokens), ops, adapters=held)[0],
+                           following, active)
+
+    state = prefill_state(model, variables, ModelInputs(prompts), ops, adapters=rows)[0]
+    assert state.adapters is not None and state.adapters.dtype == jnp.int32
+    moved = ops.reindex(state, order)
+    assert moved.adapters is not None and moved.adapters.tolist() == [-1, 0, 0, 1]
+    stepped = ops.advance(moved, following, active)
+    expected = advanced(prompts[order], rows[np.asarray(order)])
+    np.testing.assert_array_equal(np.asarray(stepped.logits), np.asarray(expected.logits))
+    # The rows' adapters change what they compute: the base row's prompt under the first adapter differs.
+    under = advanced(prompts[order], np.asarray([0, 0, 0, 1]))
+    assert not np.array_equal(np.asarray(under.logits[0]), np.asarray(stepped.logits[0]))
 
 
 @pytest.mark.mesh(devices=4)
@@ -1239,6 +1419,7 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
                                           lone.raw_log_probs[0, lone.lengths[0]:])
         return likelihoods(rows_served)
 
+    @as_given
     def truth(seed):
         """The float64 model's raw log-likelihood of each lone row's tokens, teacher-forced."""
         bound, alone, _ = drawn(int(seed))
@@ -1299,6 +1480,54 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), row)
 
+
+
+@pytest.mark.distributed
+def test_a_pooled_server_that_prefills_on_a_mesh_of_its_own_draws_what_one_process_draws(tmp_path):
+    """A server over two processes that decodes on a mesh of each process's first device and prefills on a
+    mesh of each process's second: the weights, each admission and its prefilled rows move between the two
+    meshes over the pool's hosts, and every request draws what one process serving them all draws, decoding
+    on one device and prefilling on another (ledger 875)."""
+    from pathlib import Path
+
+    from process_support import run_pool, run_worker
+
+    worker = Path(__file__).with_name("serving_worker.py")
+    reports = run_pool("pooled_prefill_apart", tmp_path / "pool", 2, script=worker, devices=2, timeout=300)
+    single = run_worker("pooled_prefill_apart", tmp_path / "single.json", script=worker, devices=2)
+    assert {**reports[0]["drawn"], **reports[1]["drawn"]} == single["drawn"]
+
+
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("decoding", [2, 1, 0], ids=["two", "one", "unmeshed"])
+def test_a_server_that_prefills_on_a_mesh_of_its_own_draws_what_one_mesh_draws(decoding):
+    """Disaggregated serving: the prompts prefill on two devices of their own and their rows' decoder state
+    moves to the decoding devices, a mesh of two or of one or one device with no mesh, where they decode;
+    every request, a prompt arriving while others decode among them, draws what its lone call draws, and
+    a reload reaches the prefill mesh's copy as the decoding one's (ledger 875)."""
+    from dew.training import Layout, MeshSpec
+
+    devices = jax.devices()[:4]
+    bound = task(Sampling(temperature=1.0))
+    layout = Layout(min_shard=1, tolerance=1.0)
+    with boxed(decoder_axes(bound.model)):
+        decoded = (place(bound.variables, MeshSpec(fsdp=decoding).build(devices[4 - decoding:]), layout)
+                   if decoding else jax.device_put(bound.variables, jax.devices()[0]))
+    served = dataclasses.replace(bound, variables=decoded)
+    alone = [bound(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    # Two devices apart from the decoding ones.
+    prefilling = MeshSpec(fsdp=2).build(devices[:2] if decoding else devices[1:3])
+    server = Server.from_task(served, slots=4, capacity=128, admission=2, prefill_mesh=prefilling)
+    server, tickets = served_by(server)
+    for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), row)
+    moved = jax.tree.map(lambda leaf: leaf * 0.5, bound.variables)
+    server.reload(moved)
+    ticket = server.submit(PROMPTS[0], BUDGETS[0], key=0)
+    server.run()
+    assert_same_generation(ticket.result(), dataclasses.replace(bound, variables=moved)(
+        PROMPTS[0], BUDGETS[0], key=0))
 
 
 @pytest.mark.mesh(devices=4)

@@ -18,14 +18,14 @@ dependencies = [
     "flax>=0.12.10,<0.13",
     # Dew's JAX build: 0.12.0.1 with the fixes no release has yet (constraints.txt
     # names them), which only Dew's package index serves, pypi.dewml.dev. The
-    # first build with every fix is post52; a release sorts below it, so an
+    # first build with every fix is post54; a release sorts below it, so an
     # install from PyPI alone stops at resolving jax rather than running on a
     # jax without them (docs/installation.md). The CUDA and PJRT plugins the
     # cuda12 and cuda13 extras name are Dew's builds of its native code,
-    # post45's, which post46's to post52's Python fixes left as it was. A bump runs the GPU
+    # post45's, which post46's to post54's Python fixes left as it was. A bump runs the GPU
     # checks docs/installation.md lists under "Bumping JAX" first: CI is
     # CPU-only.
-    "jax>=0.12.0.1.post52,<0.12.1",
+    "jax>=0.12.0.1.post54,<0.12.1",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",
     "numpy",
@@ -100,7 +100,7 @@ Issues = "https://github.com/AshishKumar4/dew/issues"
 Changelog = "https://github.com/AshishKumar4/dew/blob/main/CHANGELOG.md"
 
 [project.scripts]
-dew = "dew.cli.main:main"
+dew = "dew._cli.main:main"
 
 [project.optional-dependencies]
 # FlashAttention-2 (kernels/flash_attn), which attention_impl 'auto' runs on an
@@ -269,10 +269,10 @@ augment = ["albumentations>=2"]
 # streams the checkpoint by name and holds no copy of the model on the host.
 torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922", "accelerate>=1.15"]
 # tests/kernel_compile.py compiles every declared Pallas kernel config for each GPU generation with the
-# compiler the GPU runs, XLA's CUDA backend of this jaxlib for a compile-only device (the Triton jaxlib
-# bundles, CUDA's libdevice and ptxas from the nvcc wheel, which Mosaic GPU's kernels compile through
-# too), and each Mosaic TPU kernel with libtpu for a compile-only TPU, on a host with no accelerator:
-# locks/cpu.txt takes this extra, and a GPU host's lock has its own CUDA plugin already
+# compiler the GPU runs, XLA's CUDA backend of Dew's PJRT plugin (jax-cuda12-pjrt) for a compile-only
+# device (the Triton it builds, CUDA's libdevice and ptxas from the nvcc wheel, which Mosaic GPU's kernels
+# compile through too), and each Mosaic TPU kernel with libtpu for a compile-only TPU, on a host with no
+# accelerator: locks/cpu.txt takes this extra, and a GPU host's lock has its own CUDA plugin already
 # (tools/lock_environment.sh).
 kernel-compile = ["jax-cuda12-plugin==0.12.0.1.post45; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "jax-cuda12-pjrt==0.12.0.1.post45; sys_platform == 'linux' and platform_machine == 'x86_64'",
@@ -364,7 +364,7 @@ markers = [
     "tpu(reason): tests only a tpu runs; tests/conftest.py skips them on any other backend, and the TPU tier (dew-ops' dewops.node.tpu, a Colab TPU at main's tip after each train) runs them with -m tpu",
     "torchax: tests whose code imports torchax, which renames torch's privateuse1 backend process-wide; CI runs these files in tasks of their own (tools/armada/ci.py)",
     "release_env(requirement): a release's own code checked under a requirement pinned apart from the suite's (2173), which CI runs on the whole suite's run alone, under uv's overlay of it (tools/armada/ci.py `released`)",
-    "whole_suite: tests too long for a train's run of what changed, which CI runs on the whole suite's run alone (DEW_WHOLE_SUITE, set on ci/full-whole-* branches) and sets aside on every other run, a policy-off train's too (tools/armada/ci.py)",
+    "whole_suite: tests too long for a train's run of what changed, which CI runs on the whole suite's run alone (DEW_WHOLE_SUITE, set on the daily run and on the whole dispatch the land queue makes every fifth publish: .github/workflows/ci.yml) and sets aside on every other run, a policy-off train's too (tools/armada/ci.py)",
     "check1_shards(seeds, per_task, conditioning, conditioning_per_task): a check-1 site too long for one task, which CI runs as armada's map and judge: its (1 + REDRAW) times seeds draws sharded across map tasks of per_task each, a weighed check's (1 + REDRAW) times conditioning units in later map tasks of conditioning_per_task each (both declared where the site weighs, neither otherwise), and one judge that pools them and reports the site's row; written on the test's own decorator, of literal counts, as the plan reads it (tools/armada/ci.py `sites`)",
     "shards(units, per_task): a test's work of units too long for one task, split as check1_shards splits a check-1 site: its units 0 to units sharded across map tasks of per_task each, given them by the same environment (DEW_CHECK1_DRAWS, DEW_CHECK1_RECORDS, DEW_CHECK1_POOL), and one judge that pools them and reports the test's row; written on the test's own decorator, of literal counts, as the plan reads it (tools/armada/ci.py `sites`)",
     "shared_setup(name): tests that share one expensive setup (a module- or class-scoped fixture's making), kept in one group where CI splits their file so it is paid once; written on each test's own decorator, of a literal name, as the plan reads it (tools/armada/session.py `shared_setups`); never for a fixture that only cleans up or one every test takes",

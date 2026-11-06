@@ -18,8 +18,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from one_draw import assert_as_exact_as_the_reference
-from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, with_gradients
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    declared_seeds,
+    indexed_recording,
+    recording,
+    with_gradients,
+)
 from rl_support import Published, ScriptedSource, TinyHead, TinyLogits, clipped_surrogate, token_mean
 from steady_state import steady_state
 
@@ -212,19 +218,61 @@ def test_a_rollout_after_the_first_reuses_its_programs_and_reads_only_what_it_sc
     assert all(rows[IDS_KEY].shape == (4, PROMPT_WIDTH + RESPONSE_WIDTH) for rows in rolled)
 
 
+def test_a_filled_prompt_batchs_repeats_are_neither_admitted_nor_trained_on():
+    """A prompt batch a stream filled out with repeats of its own rows (`FilledBatch`, its last partial
+    batch: `VALID_ROWS` marks the real ones) rolls out and admits a group of each real row alone, where the
+    repeats' groups were admitted and trained on too (row 4408): the scheduler's record counts the real
+    rows' groups, the packed rows hold their responses alone, and a batch of no real row admits none and
+    packs no response."""
+    from dew.batch import VALID_ROWS
+
+    objective = GRPOObjective(TinyHead(vocab_size=VOCAB), PROMPT_WIDTH + RESPONSE_WIDTH - 1, beta=0.01)
+    state = SimpleNamespace(variables=nn.unbox(objective.init(jax.random.key(0))), step=0, updates=0)
+    records = []
+    rollout = RolloutScheduler.sampled(objective, lambda *args: float(len(args[0]) % 3), groups=2,
+                                       max_new_tokens=RESPONSE_WIDTH, sampling=Sampling(temperature=1.0),
+                                       log=records.append)
+    info = len("other")
+    prompts = (np.arange(PROMPT_WIDTH, dtype=np.int32)[None] + np.arange(2)[:, None]) % (VOCAB - 1) + 1
+    filled = np.asarray([0, 1, 0, 1])
+    batch = {PROMPT_KEY: prompts[filled], LENGTH_KEY: np.full(4, PROMPT_WIDTH, np.int32),
+             SOURCE_KEY: np.stack([_utf8("rule", info)] * 4), TRUTH_KEY: np.stack([_utf8("1", info)] * 4),
+             INFO_KEY: np.stack([_utf8("", info)] * 4)}
+    real = np.asarray([True, True, False, False])
+    rolled = rollout(state, {**batch, VALID_ROWS: real}, jax.random.key(1))
+    whole = rollout(state, batch, jax.random.key(1))
+    assert [record.groups for record in records] == [2, 4]
+    responses = [int(np.asarray(rows[RESPONSE_MASK_KEY]).any(axis=1).sum()) for rows in (rolled, whole)]
+    assert responses == [2 * 2, 4 * 2]
+    none = rollout(state, {**batch, VALID_ROWS: np.zeros(4, bool)}, jax.random.key(2))
+    assert records[-1].groups == 0 and not np.asarray(none[RESPONSE_MASK_KEY]).any()
+
+
+K3_SEEDS = 8
+"""Check 1's seeds for the k3 estimate at small log ratios, sized by `seeds_for` paired."""
+
+
 def test_a_small_log_ratios_k3_estimate_keeps_its_leading_term():
     """The k3 estimate `exp(d) - d - 1` of a log ratio `d` near zero is `d**2 / 2` to leading order. In
     float32 `exp(d)` rounds to a spacing of `2**-24` about 1, which `- 1` leaves standing: at `d` of 1e-6
     the estimate is off by most of itself. Through `expm1` (`dew.rl.surrogate.sampled_kl`) the estimate
-    is on par with NumPy's float32 `expm1(d) - d` from float64's (check 1)."""
+    is on par with NumPy's float32 `expm1(d) - d` from float64's (check 1), over log ratios drawn
+    log-uniformly from 1e-7 to 1 in size, of either sign, rows of 64."""
     from dew.rl.surrogate import sampled_kl
 
-    log_ratio = np.asarray([1e-6, -1e-6, 3e-5, -2e-4, 0.1, -0.5], np.float32)
-    estimate = np.asarray(k3_kl(jnp.zeros_like(log_ratio), jnp.asarray(log_ratio)))
-    wide = log_ratio.astype(np.float64)
-    assert_as_exact_as_the_reference(estimate, np.expm1(log_ratio) - log_ratio, np.expm1(wide) - wide,
-                                     "k3 at small log ratios")
-    np.testing.assert_array_equal(np.asarray(sampled_kl(jnp.asarray(log_ratio))), estimate)
+    def draw(seed):
+        rng = np.random.default_rng([4096, seed])
+        size = 10.0 ** rng.uniform(-7, 0, (16, 64))
+        return (np.float32(size * rng.choice([-1.0, 1.0], size.shape)),)
+
+    def reference(log_ratio):
+        return np.expm1(log_ratio) - log_ratio
+
+    assert_as_exact(lambda log_ratio: k3_kl(jnp.zeros_like(log_ratio), log_ratio), as_given(reference), draw,
+                    "k3 at small log ratios", seeds=K3_SEEDS)
+    (log_ratio,) = draw(0)
+    np.testing.assert_array_equal(np.asarray(sampled_kl(jnp.asarray(log_ratio))),
+                                  np.asarray(k3_kl(jnp.zeros_like(log_ratio), jnp.asarray(log_ratio))))
 
 
 def test_a_synchronous_collection_refuses_a_ratio_read_at_another_temperature():

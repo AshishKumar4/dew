@@ -32,11 +32,11 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
+from dew._cleanup import attempted
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON, boolean, json_value, record
 from dew.batch import CLOSES_WINDOW, FROZEN, Batch, owned_dicts, select, unboxed
 from dew.checkpoints import Checkpoints, Envelope, Ranking, Resume
-from dew.cleanup import attempted
 from dew.data.compile import Handed
 from dew.data.dataset import (
     Closeable,
@@ -975,10 +975,13 @@ class Trainer(Generic[Loss, Effects]):
             # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`).
             raise Lowered(target, *routed(lambda: self._lowered_for(state, batch, target)))
         split, unaligned = divmod(int(state.window_size), self.accumulation)
-        if unaligned or (state.window is not None and self._split not in (None, split)):
+        # A state pools its windows' microbatches where it holds a window, or saved between updates, where
+        # its checkpoint holds none (`dew.state.without_empty_window`), at a split past one.
+        pools = state.window is not None or split > 1
+        if unaligned or (pools and self._split not in (None, split)):
             raise ValueError(f"the state pools windows of {int(state.window_size)} microbatches, and this "
                              f"run updates every {self.accumulation} steps of {self._split} microbatches")
-        if state.window is not None:
+        if pools:
             self._split = split
         if (state.scale is not None) != self.dynamic_scale:
             raise ValueError("checkpoint dynamic-scaler configuration differs from this trainer")

@@ -369,6 +369,99 @@ def test_ranked_loss_and_periodic_retention(tmp_path):
     assert {entry.step for entry in checkpoints.kept()} == {2, 4, 5}
 
 
+def _items(directory, step) -> list[str]:
+    """The items of a run's state the step at `step` holds on disk (docs/guides/checkpoints.md), Orbax's
+    own metrics item aside."""
+    return sorted(entry.name for entry in (directory / str(step)).iterdir()
+                  if entry.is_dir() and entry.name in ('model', 'profiles', 'resume', 'default'))
+
+
+def test_older_kept_steps_hold_their_model_alone_and_the_latest_resumes(tmp_path):
+    """`Keep(weights_only=True)` keeps the steps its other rules keep, beyond the latest, as their model
+    alone (row 4311), as a best step a weights-only ranking keeps is: the newest step stays whole, the one a
+    resume reads; an older one holds its counters, variables and EMA, which a model's readers read, and none
+    of the optimizer state or position a resume needs, so a resume is refused it."""
+    directory = tmp_path / 'run'
+    run = trainer(directory, keep=Keep(latest=1, every=2, weights_only=True))
+    state = run.fit(dataclasses.replace(data(), val=None), steps=1, log_every=1)
+    checkpoints = run.checkpoints
+    for step, loss in [(2, .5), (3, .1), (4, .7), (5, .8)]:
+        checkpoints.save(step, state.replace(step=jnp.int32(step)), None,
+                         ranking=Ranking('train/loss', loss, weights_only=True))
+        checkpoints.wait()
+
+    keep = Keep(latest=1, every=2, weights_only=True)
+    for reopened in (checkpoints, Checkpoints(str(directory), keep=keep)):
+        assert {kept.step: kept.kind for kept in reopened.kept()} == {2: 'weights', 3: 'weights',
+                                                                       4: 'weights', 5: 'state'}
+        assert reopened.latest == 5 and reopened.best == 3
+    assert [_items(directory, step) for step in (2, 3, 4, 5)] == [['model']] * 3 + [['model', 'resume']]
+    model = {'step', 'microstep', 'updates', 'variables', 'ema'}
+    assert set(checkpoints.stored(2)) == model
+    saved, _ = checkpoints.restore(None, 4)
+    assert int(saved['step']) == 4
+    np.testing.assert_array_equal(np.asarray(saved['variables']['params']['w']),
+                                  np.asarray(state.variables['params']['w']))
+    with pytest.raises(ValueError):
+        checkpoints.restore(run.initial_state(), 4)
+    with pytest.raises(ValueError):
+        checkpoints.position(4, DataPartition(0, 1))
+    resumed, _ = checkpoints.restore(run.initial_state())
+    assert int(resumed.step) == 5
+    for held, expected in zip(jax.tree.leaves(resumed.opt_state), jax.tree.leaves(state.opt_state),
+                              strict=True):
+        np.testing.assert_array_equal(np.asarray(held), np.asarray(expected))
+
+
+def test_a_step_cut_at_its_own_save_is_read_as_cut(tmp_path):
+    """A step its retention cuts the moment its save lands (no latest kept whole) is read as cut by every
+    selector at once: a resume reads the step a rule keeps whole (the fit's own, the run's best by its
+    training loss), and a model's reader the newest model, the cut step's."""
+    directory = tmp_path / 'run'
+    run = trainer(directory, keep=Keep(latest=0, every=1, weights_only=True))
+    state = run.fit(dataclasses.replace(data(), val=None), steps=1, log_every=1)
+    checkpoints = run.checkpoints
+    checkpoints.save(2, state.replace(step=jnp.int32(2)), None)
+    checkpoints.wait()
+    assert {kept.step: kept.kind for kept in checkpoints.kept()} == {1: 'state', 2: 'weights'}
+    assert checkpoints.latest == 1
+    assert checkpoints.pinned() == 2
+    resumed, _ = checkpoints.restore(run.initial_state())
+    assert int(resumed.step) == 1
+
+
+def test_a_step_whose_projection_was_cut_short_reads_as_projected_and_finishes_later(tmp_path, monkeypatch):
+    """A step's dropped payload is recorded beside it before it is deleted, so a process killed between the
+    two leaves a step every reader takes as projected, the deletion finishing at the next save."""
+    directory = tmp_path / 'run'
+    keep = Keep(latest=1, every=2, weights_only=True)
+    run = trainer(directory, keep=keep)
+    state = run.fit(dataclasses.replace(data(), val=None), steps=1, log_every=1)
+    checkpoints = run.checkpoints
+    checkpoints.save(2, state.replace(step=jnp.int32(2)), None)
+    checkpoints.wait()
+    import shutil
+    rmtree = shutil.rmtree
+    monkeypatch.setattr(shutil, 'rmtree', lambda path, *args, **kwargs: (_ for _ in ()).throw(
+        OSError('killed before the deletion')))
+    checkpoints.save(3, state.replace(step=jnp.int32(3)), None)
+    with pytest.raises(OSError):
+        checkpoints.wait()
+    monkeypatch.setattr(shutil, 'rmtree', rmtree)
+    assert 'resume' in _items(directory, 2)
+
+    # Step 1, the fit's own save, is the run's best by its training loss, kept whole.
+    reopened = Checkpoints(str(directory), keep=keep)
+    assert {kept.step: kept.kind for kept in reopened.kept()} == {1: 'state', 2: 'weights', 3: 'state'}
+    assert reopened.latest == 3
+    with pytest.raises(ValueError):
+        reopened.restore(run.initial_state(), 2)
+    reopened.save(4, state.replace(step=jnp.int32(4)), None)
+    reopened.wait()
+    assert _items(directory, 2) == ['model']
+    assert {kept.step: kept.kind for kept in reopened.kept()} == {1: 'state', 2: 'weights', 4: 'state'}
+
+
 def test_ranked_ties_keep_the_older_steps(tmp_path):
     """A ranking's best `top` steps are Orbax's `BestN` over the steps it scored: of tied scores the
     older steps are kept, and a step the ranking never scored is not among them. The run's own first

@@ -22,6 +22,7 @@ import numpy as np
 from flax import linen as nn
 from matrix_support import MATRIX_RECORDS, matrix_prefix, published_matrix
 from process_support import serve_mode, worker_parser
+from rl_support import pooled_rollout, rollout_prompts
 
 from dew.data import Loading
 from dew.data.dataset import Loader
@@ -636,7 +637,7 @@ def mode_schedule_fit(args) -> dict:
     """`--steps` of `token_trainer` on a schedule of `--tokens` read in two orders, the first stage for
     60 committed tokens (`dew.data.schedule`): the step the run reached, the record its first stage
     ended at in the saved position, and the parameters beside the report."""
-    from dew import position
+    from dew import _position
     from dew.data import presets, schedule
     from dew.data.sources.tokens import TokenFiles
 
@@ -648,7 +649,7 @@ def mode_schedule_fit(args) -> dict:
     state = trainer.fit(schedule([(ordered(0), 60), (ordered(1), None)]).batch(BATCH), steps=args.steps)
     dump_params(args.out.with_suffix(".npz"), state.variables)
     _, saved = restored_state(trainer)
-    completed = [] if saved is None else position.read(saved.encode()).completed
+    completed = [] if saved is None else _position.read(saved.encode()).completed
     return {"step": int(as_numpy(state.step)), "stage_ends": [end for _, end in completed]}
 
 
@@ -1495,23 +1496,6 @@ def mode_replicated_rollout(args) -> dict:
             "handed": {name: value.tolist() for name, value in handed.items()}}
 
 
-def rollout_prompts() -> dict:
-    """Eight left-padded prompts whose lengths and EOS timing differ by rank.
-
-    Rows 0-3 belong to process zero and rows 4-7 to process one under the
-    trainer's halving. Process zero holds one real length, process one holds
-    three, so the ranks would run different bucket counts on their own, and
-    the ranks stop at different steps. Eight rows split over the eight-device
-    mesh.
-    """
-    prompts = np.array([[3, 4, 5, 6], [9, 10, 5, 6], [1, 2, 3, 4], [7, 8, 9, 1],
-                        [0, 0, 0, 2], [0, 0, 7, 8], [0, 6, 5, 4], [0, 3, 8, 1]], np.int32)
-    return {"prompt": prompts, "prompt_length": np.array([4, 4, 4, 4, 1, 2, 3, 3], np.int32),
-            "data_source": np.full((8, 1), 97, np.int32),
-            "ground_truth": np.full((8, 1), 49, np.int32),
-            "extra_info": np.zeros((8, 1), np.int32)}
-
-
 def _rejected_inputs(model, state, local, rollout, sampling, inputs_for, rank) -> dict:
     """Each rank-local invalid input the pool must refuse on every rank (a
     token past the vocabulary, a zero prompt length, a split key, a
@@ -1585,24 +1569,17 @@ def mode_rollout(args) -> dict:
     sampling proves both ranks returned before the update runs.
     """
     import jax
-    import jax.numpy as jnp
     import optax
     from jax.experimental import multihost_utils
 
     from dew.data.dataset import Loader
-    from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.rl import GRPOObjective, RolloutScheduler
     from dew.sampling import Sampling, generate
     from dew.training import Layout, MeshSpec, Trainer
 
     rank, processes = jax.process_index(), jax.process_count()
-    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
-                              head_dim=8, mlp_features=32, max_seq_len=12,
-                              dtype="float32", attention_impl="xla")
-    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
-    batch = rollout_prompts()
-    rows = len(batch["prompt"]) // processes
-    local = {name: value[rank * rows:(rank + 1) * rows] for name, value in batch.items()}
+    model, params, batch, local = pooled_rollout()
+    rows = len(local["prompt"])
     # Select a real first token as EOS; other rows reach it at different steps.
     from rl_support import prompt_inputs
 
@@ -2370,12 +2347,14 @@ def matrix_data(read: str, cached: str, rejecting: bool, packed: bool, cache_dir
 
 def mode_decision_publish(args) -> dict:
     """The slot release at `--release`, placed over the pool's devices with its readout partitioned
-    across the processes (`Layout(min_shard=1)`), published as both publishers gather it: written by
-    `SafetensorsReload` into `--run-dir`, and exported as `NCCLPush` sends it, into the `.npz` beside
-    the report. Every process takes part; process 0 writes both."""
+    across the processes (`Layout(min_shard=1)`), published as both publishers read it: written by
+    `SafetensorsReload` into `--run-dir`, and exported as `NCCLPush` sends it, a tensor at a time read
+    home by the pool together (`reading_home`), into the `.npz` beside the report. Every process takes
+    part; process 0 writes both, the others read along."""
     import jax
     import jax.numpy as jnp
 
+    from dew._coordination import reading_home
     from dew.inference import rollouts
     from dew.interop import Pretrained
     from dew.training import Layout, MeshSpec
@@ -2385,9 +2364,11 @@ def mode_decision_publish(args) -> dict:
                              layout=Layout(min_shard=1, tolerance=1.0))
     written = rollouts.SafetensorsReload(placed, Path(args.run_dir), (), "vllm", dtype="float32")
     written.write(placed.variables)
-    published = rollouts._published(placed, placed.variables, jnp.dtype("float32"), phase="push gather")
-    if published is not None:
-        np.savez(args.out.with_suffix(".npz"), **published.export())
+    with reading_home("push export", writes=jax.process_index() == 0):
+        exported = rollouts._published(placed, placed.variables, jnp.dtype("float32")).export()
+        tensors = {name: exported[name] for name in sorted(exported)}
+    if jax.process_index() == 0:
+        np.savez(args.out.with_suffix(".npz"), **tensors)
     leaves = jax.tree.leaves(placed.head_variables)
     return {"partitioned": any(not leaf.is_fully_addressable for leaf in leaves)}
 

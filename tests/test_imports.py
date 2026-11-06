@@ -196,35 +196,38 @@ print(json.dumps(sorted(sys.modules)))
 
 
 FEATURES = ("dew.nn", "dew.data", "dew.inputs", "dew.objectives", "dew.training", "dew.inference",
-            "dew.interop", "dew.rl", "dew.decision", "dew.cli", "dew.config", "dew.checkpoints",
+            "dew.interop", "dew.rl", "dew.decision", "dew._cli", "dew.config", "dew.checkpoints",
             "dew.diffusion", "dew.sampling", "dew.eval", "dew.lora", "dew.quantization", "dew.telemetry",
-            "dew.io", "dew.cleanup", "dew.figures")
+            "dew.io", "dew._cleanup", "dew.figures")
 """Dew's feature packages, which the layers below them import none of."""
 
 LAYERS: dict[str, tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = {
     "conditioning inputs import no objective or trainer": (
         ("dew.inputs",), (), ("dew.objectives", "dew.training", "dew.inference", "dew.rl", "dew.decision",
-                              "dew.cli", "dew.config", "dew.checkpoints", "dew.sampling", "dew.eval",
-                              "dew.lora", "dew.quantization", "dew.io", "dew.cleanup", "dew.figures")),
+                              "dew._cli", "dew.config", "dew.checkpoints", "dew.sampling", "dew.eval",
+                              "dew.lora", "dew.quantization", "dew.io", "dew._cleanup", "dew.figures")),
+    "the data layer imports no feature package": (
+        ("dew.data",), (), tuple(name for name in FEATURES if name != "dew.data")),
     "telemetry imports nothing above the network layer": (
         ("dew.telemetry",), (), tuple(name for name in FEATURES if name not in ("dew.nn", "dew.telemetry"))),
-    "training imports no front end": (("dew.training",), (), ("dew.cli", "dew.decision")),
+    "training imports no front end": (("dew.training",), (), ("dew._cli", "dew.decision")),
     "checkpoints import no front end or configuration": (
-        ("dew.checkpoints",), (), ("dew.cli", "dew.decision", "dew.config")),
+        ("dew.checkpoints",), (), ("dew._cli", "dew.decision", "dew.config")),
     # A run's source is loaded as its record states it, so inference reads the run record's own types
     # (`SourceOptions`, dew.config): the contract allows dew.config (row 4268, Serving & RL).
     "inference imports no trainer or front end": (
-        ("dew.inference",), (), ("dew.training", "dew.cli", "dew.decision", "dew.io")),
+        ("dew.inference",), (), ("dew.training", "dew._cli", "dew.decision", "dew.io")),
     "reinforcement learning imports no trainer": (("dew.rl",), (), ("dew.training",)),
+    # An environment run's record is the configuration's (`dew.config.env`), not the objectives' (row 4267).
+    "objectives import no trainer, configuration or front end": (
+        ("dew.objectives",), (), ("dew.training", "dew.config", "dew.checkpoints", "dew._cli")),
     "only the reinforcement-learning packages import dew.rl": (
         ("dew",), ("dew.rl", "dew.objectives.rl"), ("dew.rl",)),
 }
 """The layering contracts (docs/design/architecture.md; row 1557): each one's modules, those among them it
 leaves out, and the packages none of them imports directly (absolute, relative, function-local or under
-TYPE_CHECKING). Each contract here holds on main; a layer whose crossings are still open (models reading
-weight interop, the registry's lazy family table, objectives' RL run config, interop reading the decision
-front end, the kernel report reading training, the data layer's block steps reading the network layer)
-joins when its owner settles them (rows 4264-4271)."""
+TYPE_CHECKING). Each contract here holds on main; a layer whose crossings are still open joins when its
+owner settles them (rows 4264-4270, records/themes.md's RT07)."""
 
 
 def _within(name: str, prefix: str) -> bool:

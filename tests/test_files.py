@@ -1,4 +1,4 @@
-"""A file written through dew.files is the old one or the new one, never part of one."""
+"""A file written through dew._files is the old one or the new one, never part of one."""
 
 import concurrent.futures
 import os
@@ -6,7 +6,7 @@ import stat
 
 import pytest
 
-from dew.files import published, replacing, staged, write_atomically
+from dew._files import published, replacing, staged, write_atomically
 
 
 def test_a_write_that_fails_leaves_the_old_file_and_no_temporary(tmp_path):

@@ -28,11 +28,11 @@ import numpy as np
 from jax.core import ShapedArray
 
 from dew import algebra
+from dew._devices import xla_flag
 from dew._records import JSON
 from dew.algebra.terms import parameter_key, parameters_key
 from dew.batch import Batch
 from dew.data.dataset import rows_of
-from dew.devices import xla_flag
 from dew.distributed.placement import placed_bytes
 from dew.mesh import DATA_AXIS, FSDP_AXIS, row_axes
 from dew.nn.kernels.generation import _compute_capability, gpu_target

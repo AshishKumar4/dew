@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.batch import BLOCKS_FIELD, coordinates, document_starts, prefix_max, prefix_min, prefix_sum
+from dew.batch import BLOCKS_FIELD, prefix_blocks, prefix_max, prefix_min, prefix_sum
 
 
 def windowed(query, key, window: int, *, causal: bool):
@@ -84,50 +84,6 @@ def same_group(query_groups, key_groups):
     """Whether a key is in the query's block (broadcast): both carry one group id, -1 being none, as an
     image's tokens (`AttentionMetadata.image_groups`) or a prompt's blocks (`block_groups`) do."""
     return (query_groups == key_groups) & (query_groups >= 0)
-
-
-def prefix_blocks(segments, places, prefix: int, *, xp=jnp):
-    """The block each token of a row is under a prefix run of `prefix` tokens: the first `prefix` places of
-    each document, numbered by the document's segment id, -1 for the rest and for padding (segment 0). The
-    `[B, S]` `segments` number a row's documents from 1, and `places` is each token's place in its document.
-    The data stage `Blocks` and a served prompt (`prompt_blocks`) read this one rule."""
-    return xp.where((segments > 0) & (places < prefix), segments, -1).astype(xp.int32)
-
-
-def role_blocks(segments, roles, assistant: int, *, starts=None, xp=jnp):
-    """Each document's tokens before its first `assistant` token as one block, numbered by the document's
-    segment id, -1 for the rest and for padding (segment 0): a chat row's prompt, which a prefix run of
-    "prompt" reads whole. `segments` and `roles` are `[B, S]`. A document opens at each of `starts`, where a
-    caller's documents run on across holes (`dew.batch.document_starts`), else wherever `segments`
-    changes. The data stage `Blocks` and the loss of a batch without blocks (`LMObjective`) read this rule."""
-    places = xp.broadcast_to(xp.arange(segments.shape[-1], dtype=xp.int32), segments.shape)
-    opens = starts if starts is not None else xp.concatenate(
-        [xp.ones_like(segments[..., :1], bool), segments[..., 1:] != segments[..., :-1]], axis=-1)
-    last = segments.ndim - 1
-    start = prefix_max(xp.where(opens, places, 0), last, xp=xp)
-    spoken = prefix_max(xp.where((segments > 0) & (roles == assistant), places, -1), last, xp=xp) >= start
-    return xp.where((segments > 0) & ~spoken, segments, -1).astype(xp.int32)
-
-
-def prefix_groups(documents, real, prefix: int | Literal["prompt"], *, positions=None, roles=None,
-                  assistant: int = -1, xp=jnp):
-    """The blocks a prefix run of `prefix` reads in rows `[B, S]`: each document's first `prefix` places
-    (`prefix_blocks`), or under "prompt" its tokens before its first `assistant` token by the rows'
-    `roles` (`role_blocks`). `documents` number each row's documents and `real` marks its real tokens: a
-    document runs on across a hole in its validity, its starts and its places, where no `positions` give
-    them, counted over its real tokens as the decoder's coordinates count them (`document_starts`,
-    `coordinates`). The data stage `Blocks` and the loss of a batch without blocks (`LMObjective`) read
-    this one rule."""
-    documents = xp.asarray(documents).astype(xp.int32)
-    segments = xp.where(real, documents, 0).astype(xp.int32)
-    if prefix == "prompt":
-        starts = document_starts(documents, real, xp=xp)
-        return role_blocks(segments, xp.asarray(roles), assistant, starts=starts, xp=xp)
-    if positions is None:
-        places = coordinates(segments.shape, segments=documents, valid=real, xp=xp).positions
-    else:
-        places = xp.broadcast_to(xp.asarray(positions), segments.shape)
-    return prefix_blocks(segments, places, prefix, xp=xp)
 
 
 def prompt_blocks(valid, prefix: int | Literal["prompt"], *, xp=jnp):

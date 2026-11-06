@@ -28,8 +28,8 @@ from typing import TYPE_CHECKING
 import ml_dtypes
 import numpy as np
 
-from dew.cache import dew_cache_dir
-from dew.files import staged, stat_identity
+from dew._cache import dew_cache_dir
+from dew._files import staged, stat_identity
 from dew.interop.safetensors_io import WEIGHTS_FILE, own, write_file, write_index
 
 if TYPE_CHECKING:
@@ -53,7 +53,7 @@ def converted(directory: Path, shards: Sequence[str]) -> Path:
     The first call for these files converts them, which needs torch: the
     `pickles` extra. One shard becomes model.safetensors. Several become
     numbered shards and an index. The folder is published whole, by one
-    rename of a folder written beside it (`dew.files.staged`), so a folder
+    rename of a folder written beside it (`dew._files.staged`), so a folder
     that is there is a finished conversion that no later call changes:
     processes converting the same files at once each write their own, and the
     first published stands. Where they wrote one folder file by file, a

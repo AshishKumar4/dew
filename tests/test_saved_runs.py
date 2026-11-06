@@ -20,6 +20,7 @@ from pathlib import Path
 
 import jax
 import pytest
+from process_support import assert_exits_cleanly
 from reference_error import recording
 from saved_run_kinds import SAVED_KINDS, answered, computed
 from saved_run_products import unpacked
@@ -204,6 +205,73 @@ def test_a_run_an_earlier_main_saved_resumes_when_its_command_runs_again(tmp_pat
     assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
 
 
+@pytest.mark.parametrize("named", [None, "another"])
+@pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
+def test_a_run_an_earlier_main_saved_resumes_through_its_python_train(tmp_path, monkeypatch, recorded, kind,
+                                                                      named):
+    """A kind's run saved at an earlier main resumes from its last checkpoint as a Python experiment trains
+    it: its objective and data built, then handed to `RunConfig.train` with the run naming no data plan
+    version, as one written in Python does. The train resolves it itself, the saved run's (`resumed`, which
+    `readied` asks), so the resume compares alike and fits the one step past its checkpoint, and the record
+    it writes names the version it read by (train 589's review: a run trained so read by this Dew's version
+    and recorded none, so a saved run's resume was refused). The run it resumes is the one `train` is
+    given the name of, whatever its trainer names, none or another (`named`)."""
+    run, last, built = rebuilt(tmp_path, monkeypatch, recorded, kind)
+    prepared = built.prepare()
+    python = dataclasses.replace(prepared, run=dataclasses.replace(
+        prepared.run, data_plan_version=None, trainer=dataclasses.replace(prepared.run.trainer, name=named)))
+    python.train(kind)
+    records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
+    started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
+    assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
+    assert RunConfig.load(str(run)).data_plan_version == 8
+
+
+@pytest.mark.parametrize(("landed", "version"), [(9, 9), (None, 9)])
+def test_a_run_saved_while_its_version_was_data_plan_loads_and_resumes_by_it(tmp_path, monkeypatch, landed,
+                                                                             version):
+    """A run a Dew saved while a run's data plan version was its field `data_plan` (main 1af304d0, before
+    the field was `data_plan_version`, train 589's review) records the version it compiled at, or None
+    where it was trained in Python, which that Dew compiled at this Dew's, 9: it loads by that version and
+    resumes when its command runs again (row 4107)."""
+    recorded, kind = next((recorded, kind) for recorded, kind in SAVED if kind == "lm")
+    run, last, built = rebuilt(tmp_path, monkeypatch, recorded, kind)
+    record = json.loads((run / "run.json").read_text())
+    fields = {name: value for name, value in record["fields"].items() if name != "data_plan_version"}
+    (run / "run.json").write_text(json.dumps({**record, "fields": {**fields, "data_plan": landed}}))
+    assert RunConfig.load(str(run)).data_plan_version == version
+    built.prepare().train(kind)
+    records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
+    started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
+    assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
+
+
+def test_reading_a_saved_run_opens_no_device_before_its_process_is_prepared(tmp_path):
+    """`dew train run.json` reads the run before it prepares its process (`RunConfig.run`'s
+    `prepare_process`, which joins a pool of processes before any device is opened), so reading a saved
+    decision run's record opens none, whatever its record leaves to its checkpoints: the writing a run saved
+    before row 3867 left to its layout is read where the run resumes (`resumed`, `check_resumed`), after
+    the process is prepared, in a fresh interpreter (train 589's review)."""
+    # A saved decision run's record as main before row 3867 wrote it, its writing left to its layout.
+    run = extracted(tmp_path, *next((recorded, kind) for recorded, kind in SAVED if kind == "decision"))
+    record = json.loads((run / "run.json").read_text())
+    (run / "run.json").write_text(json.dumps({**record, "fields": {**record["fields"], "option_text": None}}))
+    assert_exits_cleanly(f"""
+import socket
+
+import jax
+from dew.config import RunConfig
+
+RunConfig.load({str(run)!r})
+# A pool of one process joined after the read, as `prepare_process` joins one: refused once a device is open.
+with socket.socket() as free:
+    free.bind(("localhost", 0))
+    port = free.getsockname()[1]
+jax.distributed.initialize(f"localhost:{{port}}", num_processes=1, process_id=0)
+jax.distributed.shutdown()
+""")
+
+
 def test_a_run_that_sets_another_option_text_than_its_saved_run_trained_is_refused(tmp_path, monkeypatch):
     """A field a run leaves to its build takes the saved run's value only where the run leaves it None: a
     lettered decision run saved before its option text was a field wrote its options named, and its
@@ -228,8 +296,10 @@ def test_a_decision_run_this_dew_saves_resumes_when_its_command_runs_again_or_fr
     """A decision run saved by this Dew, its option text left to its layout (a release's named, a fresh
     lettered head's described), records the writing its build resolved, as a pinned source's step is, so
     a later Dew's default writes none of its rows otherwise (row 3867); it resumes when its command runs
-    again and when read back from its record. A record a Dew before that wrote holds None, which a resume
-    reads off its checkpoint's layout (`dew.config.earlier_option_writing`), and it resumes either way."""
+    again and when read back from its record. A record a Dew before that wrote holds None, which reading
+    it leaves (no checkpoint is read before its process is prepared, train 589's review) and its resume
+    reads off its checkpoint's layout (`resumed`, `dew.config.earlier_option_writing`), and it resumes
+    either way."""
     from run_kinds import trained
 
     from dew.decision.config import DecisionRunConfig
@@ -245,7 +315,7 @@ def test_a_decision_run_this_dew_saves_resumes_when_its_command_runs_again_or_fr
     for steps in (2, 3):
         (directory / "run.json").write_text(unresolved)
         loaded = DecisionRunConfig.load(str(directory))
-        assert loaded.option_text == written
+        assert loaded.option_text is None and loaded.resumed().option_text == written
         run = first if steps == 2 else loaded
         trained(run, tmp_path, kind, trainer={"name": kind, "steps": steps, "checkpoint_final": True})
         assert str(steps) in {path.name for path in directory.iterdir()}
