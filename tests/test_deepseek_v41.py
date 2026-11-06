@@ -406,6 +406,46 @@ def test_a_shifted_prompt_decodes_the_unshifted_rows_logits(as_run, recorded_row
                     recorded, draw, "a shifted cached walk", seeds=seeds, truth_fn=truth)
 
 
+DRAFTED = (7, 9, 11, 13)
+"""The prompts after whose cached step the release drafted (the tool's `DRAFTED`)."""
+
+
+def test_dsparks_draft_is_the_releases(as_run, recorded_rows):
+    """DSpark's draft from each row's next token after a history of each length of DRAFTED plus one, its
+    block's logits (the Markov bias included) and confidence, uncached, on par with the release's after
+    that history's prefill and one cached step (each closing every ratio-2 group, so the release computes
+    the paper's) from its float64 run's (check 1, the recording's: row 354), over rows whose trunk's,
+    drafter's and drafts' choices both float64 runs clear `selection_margins.MARGIN` by."""
+    from model_support import float64_twin, recorded_site
+
+    def drafted(model, variables, ids):
+        logits, confidence = [], []
+        for prompt in DRAFTED:
+            _, trunk = model.apply(variables, ids[:, :prompt + 1], mutable=["prediction_inputs"])
+            whole = model.apply(variables, trunk["prediction_inputs"], method="draft_context")
+            _, block, sure = model.apply(variables, whole, ids[:, prompt + 1],
+                                         method=lambda module, whole, token: module.draft(whole, token,
+                                                                                          decode=False))
+            logits.append(block)
+            confidence.append(sure)
+        return {"logits": jnp.stack(logits, 1), "confidence": jnp.stack(confidence, 1)}
+
+    run = jax.jit(functools.partial(drafted, as_run.model))
+    wide = jax.jit(functools.partial(drafted, float64_twin(as_run.model)))
+
+    def twin(inputs):
+        with jax.enable_x64(new_val=True):
+            held = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
+                                if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf,
+                                as_run.variables)
+            return wide(held, jnp.asarray(inputs["input_ids"]))
+
+    draw, reference, truth, seeds = recorded_site(RELEASE, "deepseek v41 release draft",
+                                                  lambda seed: {"input_ids": recorded_rows[int(seed)]}, twin)
+    assert_as_exact(as_given(lambda index, inputs: run(as_run.variables, jnp.asarray(inputs["input_ids"]))),
+                    reference, draw, "dspark's draft", seeds=seeds, truth_fn=truth)
+
+
 def test_an_image_prompt_computes_the_releases_logits(tmp_path):
     """The vision half as the release runs it (its ViT, aligner, span vectors and every router's image
     bias, bf16 with its activation quantizers): over drawn image prompts, every position's logits from

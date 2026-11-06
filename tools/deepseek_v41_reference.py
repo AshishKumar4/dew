@@ -1096,6 +1096,46 @@ def release_rows(net, ids: torch.Tensor) -> np.ndarray:
     return torch.stack(found, 1).double().cpu().numpy()
 
 
+DRAFTED = (7, 9, 11, 13)
+"""The prompts after whose cached step the release drafts (`release_draft`): odd, so the step closes every
+ratio-2 group and its Full layers publish the index keys its Reindex layers read, as a prefill does
+(model.py:537-548); the draft starts from the row's next token, inside LENGTH."""
+
+
+def release_draft(net, ids: torch.Tensor) -> dict[str, np.ndarray]:
+    """DSpark's draft as the release drives it (`Transformer.forward_spec`, model.py:1274-1282), after each
+    prompt of DRAFTED: the prompt's prefill, its drafter's window seeded (start 0, which reads the trunk's
+    states alone), one cached step, and the draft from the row's next token: its block's logits and
+    confidence."""
+    logits, confidence = [], []
+    with torch.no_grad():
+        for prompt in DRAFTED:
+            reset(net)
+            _, _, hidden = forward(net, ids[:, :prompt])
+            draft(net, ids[:, prompt], hidden, 0)
+            _, _, hidden = forward(net, ids[:, prompt:prompt + 1], prompt)
+            _, block, sure = draft(net, ids[:, prompt + 1], hidden, prompt)
+            logits.append(block)
+            confidence.append(sure)
+    return {"logits": torch.stack(logits, 1).double().cpu().numpy(),
+            "confidence": torch.stack(confidence, 1).double().cpu().numpy()}
+
+
+def draft_clears(twin, ids: np.ndarray) -> bool:
+    """Whether the release's float64 drafts over `ids` (`release_draft`) choose clear of the gate's MARGIN:
+    each block's greedy token, which the next position's Markov bias reads, and every top-k the trunk's
+    steps and the drafter's routers make on the way."""
+    from selection_margins import MARGIN, top_margin
+
+    recorded = Record()
+    RECORDS[:] = [recorded]
+    block = release_draft(twin, torch.from_numpy(ids.astype(np.int64)).to(DEVICE))["logits"]
+    RECORDS.clear()
+    margins = [call["margin"] for call in recorded.calls.get("selection", [])]
+    return (all(bool((margin > MARGIN).all()) for margin in margins)
+            and float(np.min(top_margin(block[..., :-1, :], 1))) > MARGIN)
+
+
 def vision_draw(index: int) -> dict[str, np.ndarray]:
     """The `index`-th image prompt (`vision_outputs`' form): pixels of GRID patches, bf16's values as the
     release's processor hands them (image_processor.py's `.to(torch.bfloat16)`), drawn text with the image's
@@ -1206,10 +1246,14 @@ def write_release_recording():
     install_selection_probe()
     rows: dict[int, np.ndarray] = {}
 
+    def clears(ids: np.ndarray) -> bool:
+        with widened(twin_module):
+            return draft_clears(twin, ids) and dew_clears(ids)
+
     def draw(index: int) -> dict[str, np.ndarray]:
         if index not in rows:
             with widened(twin_module):
-                rows[index] = clearing_rows(twin, TINY["vocab_size"], index, dew_clears)
+                rows[index] = clearing_rows(twin, TINY["vocab_size"], index, clears)
         return {"input_ids": rows[index]}
 
     @functools.cache
@@ -1237,8 +1281,16 @@ def write_release_recording():
         with widened(twin_module):
             return {"logits": found}, {"logits": release_vision(seeing_twin, inputs)}
 
-    # Every position's, those a cached walk computes after its prompt's prefill, and an image prompt's.
+    def drafted(inputs):
+        ids = torch.from_numpy(inputs["input_ids"].astype(np.int64)).to(DEVICE)
+        found = release_draft(net, ids)
+        with widened(twin_module):
+            return found, release_draft(twin, ids)
+
+    # Every position's, those a cached walk computes after its prompt's prefill, the drafts, and an image
+    # prompt's.
     arrays = {**record_case("deepseek v41 release rows", draw, evaluated(0), summary=True),
+              **record_case("deepseek v41 release draft", draw, drafted, summary=True),
               **record_case("deepseek v41 release walk", draw, evaluated(PROMPT - 1), summary=True),
               **record_case("deepseek v41 release vision", image_prompt, seen, summary=True)}
     import tilelang
