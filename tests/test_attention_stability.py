@@ -1163,10 +1163,12 @@ def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, f
                     truth_fn=_reference(family, anchored=True))
 
 
-TEMPLATE_DECODED = [family for family, form in DECODED if form == "default"
-                    and jnp.dtype(FAMILIES[family].dtype).itemsize == 2 and not FAMILIES[family].decode_only]
-"""The decode steps the template's decode takes (`attention_decode.attend`): 16-bit operands in the default
-form, its raw fold's; a decode step's alone (`Family.decode_only`) too long for its interpreted mainloop."""
+TEMPLATE_DECODED = list(dict.fromkeys(family for family, _ in DECODED
+                                     if jnp.dtype(FAMILIES[family].dtype).itemsize == 2
+                                     and not FAMILIES[family].decode_only))
+"""The decode steps the template's decode takes (`attention_decode.attend`), in its one form, the raw fold
+(no fold's reach, as the decode kernel's): 16-bit operands; a decode step's alone (`Family.decode_only`) too
+long for its interpreted mainloop."""
 
 
 @pytest.mark.skipif(not INTERPRETED and generation.device_generation() != "sm90",
