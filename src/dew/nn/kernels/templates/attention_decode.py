@@ -138,7 +138,9 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     config, op, ba = found
     processors = target.multiprocessors or 1
     tiles = math.ceil(query.shape[1] / (config.consumers * config.block_q))
-    programs = query.shape[0] * query.shape[2] * tiles
+    # Its launch's programs: a float32 call's operands as their parts stack along the rows
+    # (`MosaicForward.parts`), as many programs again each (a merging launch's every one resident).
+    programs = op.parts * query.shape[0] * query.shape[2] * tiles
     if programs >= processors:
         return Plan(config, 1, merges=False)
     if not bundle_of(config, query.dtype).fixes_up:
