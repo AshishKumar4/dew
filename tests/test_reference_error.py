@@ -307,6 +307,26 @@ def test_the_gate_compiles_two_dew_arms_without_ynnpack_and_one_beside_a_given_a
     assert_as_exact(dew, host, draw, "a NumPy arm as given", seeds=8)
 
 
+def test_a_declaration_around_a_window_loop_runs_as_the_loop_inside_it():
+    """An arm declared to vary run to run around a window loop (`run_to_run(over_windows(f))`) runs as
+    the loop of the declared arm does: a given NumPy reference within it stays given, and the Dew arm is
+    compiled, not called eagerly on the stacked draw and refused as a NumPy arm (row 4586)."""
+    from reference_error import as_given, assert_as_exact, over_windows, run_to_run, windows
+
+    def dew(x):
+        return jnp.asarray(x) * 2
+
+    def numpy(x):
+        return np.asarray(x, np.float64) * 2
+
+    def draw(seed):
+        return (np.random.default_rng([4586, seed]).standard_normal(8).astype(np.float32),)
+
+    assert_as_exact(run_to_run(over_windows(dew), "atomic adds"),
+                    run_to_run(over_windows(as_given(numpy)), "atomic adds"), windows(draw, 3),
+                    "a declared window loop", seeds=8)
+
+
 def test_a_numpy_arm_is_refused_unless_it_is_given_and_windows_keep_their_arms_policy():
     """An arm the gate would compile that returns NumPy values is refused (a NumPy reference compiled
     would compute in JAX); passed `as_given` it runs as given. A window loop of a given arm is
