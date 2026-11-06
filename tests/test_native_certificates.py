@@ -625,6 +625,15 @@ def the_recurrence_witness_holds_a_write_gate_on_the_keys_side_natively(generati
         rw.assert_keys_gated_witnessed(mosaic_lane(), heads=2)
 
 
+def the_recurrence_witness_holds_values_passed_in_parts_natively(generation_name):
+    """The native step witness where the launches hold the values they pass in parts
+    (`recurrence_witness.assert_parts_witnessed`): native fp32 calls with the delta rule and without it, and a
+    bf16 call without it unrounded, of two value heads, every record inside its step's enclosure, and the fp32
+    call run in bf16 refused."""
+    with generation.assumed(generation_name):
+        rw.assert_parts_witnessed(mosaic_lane(), heads=2)
+
+
 def the_recurrence_witness_holds_a_decay_a_key_dimension_natively(generation_name):
     """The native step witness under a decay a key dimension
     (`recurrence_witness.assert_key_decays_witnessed`): a native bf16 call of two value heads, every record
@@ -698,6 +707,7 @@ def test_the_native_kernels_certify_on_this_gpu():
           for g in GENERATIONS),
         *(cell(the_recurrence_witness_holds_a_decay_a_key_dimension_natively, g) for g in GENERATIONS),
         *(cell(the_recurrence_witness_holds_a_write_gate_on_the_keys_side_natively, g) for g in GENERATIONS),
+        *(cell(the_recurrence_witness_holds_values_passed_in_parts_natively, g) for g in GENERATIONS),
         *(cell(the_attention_templates_states_certify_natively_a_step_at_a_time, g, mask)
           for g in GENERATIONS for mask in ("causal", "full")),
         *(cell(the_attention_witness_refuses_its_faults_natively, g)

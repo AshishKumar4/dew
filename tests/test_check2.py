@@ -780,6 +780,15 @@ def test_the_recurrence_step_witness_holds_a_write_gate_on_the_keys_side_and_ref
 
 
 @INTERPRETS
+def test_the_recurrence_step_witness_holds_values_passed_in_parts_and_refuses_them_rounded():
+    """The step witness (row 2084 (c), (d), (e)) where the launches hold the values they pass in parts
+    (`rw.assert_parts_witnessed`): an fp32 call with the delta rule and without it, and a bf16 call without it
+    unrounded (Lightning's), every record each keeps inside its step's enclosure; the fp32 call run in bf16
+    refused."""
+    rw.assert_parts_witnessed(rw.interpreted_lane())
+
+
+@INTERPRETS
 def test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16():
     """The step witness's faults on the interpreted mainloop, each refused where it lands
     (`rw.assert_carry_faults_refused`): a dropped carry and a state rounded to bf16 where fp32 is held."""
