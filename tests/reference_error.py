@@ -64,7 +64,6 @@ rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
 import dataclasses
-import fractions
 import functools
 import hashlib
 import itertools
@@ -622,28 +621,6 @@ def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
     error = np.abs(np.asarray(dew, np.float64) - np.asarray(reference, np.float64))
     bound = reduction_bound(magnitudes, terms)
     assert within(error, bound), (float(error.max()), float(bound.max()))
-
-
-def assert_within_rounding(computed, exact, magnitudes, roundings: int, dtype, label: str) -> None:
-    """`computed`, `exact`'s value computed in `dtype` through at most `roundings` roundings a value, each
-    of a quantity within `magnitudes`, is within gamma_n of them of the exact value (n the roundings, u
-    `dtype`'s unit roundoff; half `reduction_bound`'s two-sided bound): a bound derived from the arithmetic
-    alone, for a claim no float64 reference can hold, a float64 computation's own accuracy. `exact` is the
-    exact value (each a `fractions.Fraction`, or a float64 that holds it exactly)."""
-    # The error and its comparison exact, nothing rounded on the way: rounding the exact value would add half
-    # its ulp to the error, and rounding the error could put it on the bound.
-    found = np.ravel(np.asarray(computed, np.float64))
-    bound = np.ravel(np.broadcast_to(reduction_bound(magnitudes, roundings, dtype) / 2, np.shape(exact)))
-    error = [abs(fractions.Fraction(value) - fractions.Fraction(truth)) if np.isfinite(value) else None
-             for value, truth in zip(found, np.ravel(exact), strict=True)]
-    past = [index for index, (wrong, allowed) in enumerate(zip(error, bound, strict=True))
-            if wrong is None or not np.isfinite(allowed) or wrong > fractions.Fraction(float(allowed))]
-    worst = max(past, key=lambda index: float("inf") if error[index] is None else float(error[index]),
-                default=None)
-    assert worst is None, (f"{label}: {len(past)} values past gamma_{roundings} of their magnitudes in "
-                           f"{np.dtype(dtype).name}, the worst {found[worst]!r} off by "
-                           f"{float('nan') if error[worst] is None else float(error[worst]):.3e} against "
-                           f"{float(bound[worst]):.3e}")
 
 
 RESOLUTION = 1024 * float(np.finfo(np.float64).eps)
