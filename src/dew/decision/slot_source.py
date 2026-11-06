@@ -104,6 +104,14 @@ def _labels(tokenizer: HFTokenizer, count: int) -> tuple[Labels, tuple[tuple[int
     return labels, labels.ids(tokenizer, len(names))
 
 
+
+def _one_variant(mode: str, labels: Labels) -> None:
+    """Refuse a pointer head (`mode` "head", a `SlotReadout`) labels of more than one variant: it reads one
+    label id a slot, so the others its layout writes it could not read."""
+    if mode == "head" and len(labels.variants) != 1:
+        raise ValueError(f"the slot pointer head reads one label id a slot, and its layout's labels are "
+                         f"written {len(labels.variants)} ways")
+
 @dataclasses.dataclass(frozen=True)
 class SlotHeadSource(HeadComponent):
     def build(self, backbone: Pretrained | None, dtype: str, attention_impl: AttentionImpl, *,
@@ -151,10 +159,11 @@ class SlotSource(SourceKind):
         # layout over where its labels are others; the readout reads the layout's own.
         canonical, _ = _labels(bundle.decision_tokenizer, len(ids))
         prompt = SlotSource.layout(max_len=layout.max_len, labels=canonical, blocks=layout.blocks)
+        _one_variant(mode, layout.labels)
         picked = layout.labels.ids(bundle.decision_tokenizer, len(ids))
         actual = (tuple(_records.integers(group, "label_ids") for group in ids) if mode == "slot_lm"
                   else tuple((_records.integer(value, "label_ids"),) for value in ids))
-        if actual != (picked if mode == "slot_lm" else tuple(row[:1] for row in picked)):
+        if actual != picked:
             raise ValueError("the slot readout reads the labels its layout writes, in the layout's order")
         root = Path(directory)
         bundle.backbone().save(root, max_shard_size=max_shard_size)
@@ -274,6 +283,7 @@ class SlotSource(SourceKind):
             directory, SlotSource.layout(max_len=released_length(directory, SLOT_WINDOW), labels=labels,
                                          blocks=blocks), Calibration(), kind=QuestionLayout)
         read = layout.labels or labels
+        _one_variant(mode, read)
         ids = read.ids(tokenizer, min(count, read.capacity(tokenizer)))
         head = (SlotHeadSource({"class": import_path(LabelReadout), "fields": {
                     "label_ids": [list(row) for row in ids]}}, _path)
