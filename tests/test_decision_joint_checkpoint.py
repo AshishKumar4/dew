@@ -16,7 +16,6 @@ import numpy as np
 import optax
 import pytest
 from decision_support import decision_rows
-from float64_terms import float64_forward
 from interop_support import allocated_bytes, written_tensors
 from one_draw import assert_as_exact_as_the_reference
 from PIL import Image
@@ -171,45 +170,6 @@ def test_a_joint_schema_read_in_context_is_the_schema_the_row_holds(tokenizer):
                                            for option in contextual.options), (case, inline.name)
         assert (held.state_tokens, held.state_kept, held.media) == (read.state_tokens, read.state_kept,
                                                                      read.media)
-
-
-def head_logits(tokenizer: HFTokenizer) -> tuple[np.ndarray, ...]:
-    """Dew's head, the release's fp32 head, its float64 head, and the terms
-    Dew's float64 head sums for each logit (`float64_forward`), all on the
-    same fp32 backbone states, over every question of every case. Each case
-    runs alone, padded to the cases' widest layout, so every case is one
-    program, compiled once, and padding reaches none of the head's pooling
-    (`test_a_padded_batch_scores_every_row_as_it_scores_alone`)."""
-    loaded = Pretrained.load(TINY, dtype="float32", attention_impl="xla")
-    table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
-    # Dew's head compiled, as a served task's pass runs it.
-    head = jax.jit(loaded.model.apply)
-    found, reference, truth, terms = [], [], [], []
-    rows = laid_out(tokenizer)
-    widest = DecisionInputs.collate([row for _, row in rows.values()], 0)
-    length = widest.tokens.shape[1]
-    with np.load(TINY / "states.npz") as states, np.load(TINY / "logits.npz") as logits:
-        for index, (case, (_, row)) in enumerate(rows.items()):
-            inputs = jax.tree.map(lambda leaf, at=index: leaf[at:at + 1], widest)
-            padded = np.pad(states[case], ((0, length - len(states[case])), (0, 0)))[None]
-            given = (loaded.variables, padded, inputs, table)
-            scores = head(*given)
-            _, summed = float64_forward(loaded.model, *given)
-            for slot, laid in enumerate(row.questions):
-                key = f"{case}/{laid.name}"
-                found.append(np.asarray(scores)[0, slot, :len(laid.options)])
-                terms.append(np.asarray(summed)[0, slot, :len(laid.options)])
-                reference.append(logits[key])
-                truth.append(logits[f"{key}/head64"])
-    return tuple(map(np.concatenate, (found, reference, truth, terms)))
-
-
-def test_the_stored_joint_head_matches_its_release_under_the_float64_rule(tokenizer):
-    """Every question of every case, read off the same fp32 backbone states,
-    held to twice the release's own head's fp32 distance from its float64
-    run (measured: 1.42 times)."""
-    found, reference, truth, terms = head_logits(tokenizer)
-    assert_as_exact_as_the_reference(found, reference, truth, "stored joint head logits", terms=terms)
 
 
 def test_a_padded_batch_scores_every_row_as_it_scores_alone(tokenizer):

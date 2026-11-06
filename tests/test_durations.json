@@ -11984,7 +11984,6 @@
 "tests/test_decision_joint_checkpoint.py::test_a_transformers_tokenizer_gives_the_special_tokens_its_dew_wrapper_gives": 8.955,
 "tests/test_decision_joint_checkpoint.py::test_any_tokenizer_holding_the_special_tokens_gives_them": 0.014,
 "tests/test_decision_joint_checkpoint.py::test_the_joint_layout_lays_out_what_the_release_does": 0.094,
-"tests/test_decision_joint_checkpoint.py::test_the_stored_joint_head_matches_its_release_under_the_float64_rule": 6.749,
 "tests/test_decision_joint_checkpoint.py::test_two_joint_release_runs_average_into_a_task_that_reloads": 37.236,
 "tests/test_decision_laya.py::test_laya_logits_match_laya_under_the_float64_rule": 31.863,
 "tests/test_decision_laya.py::test_padded_rows_score_as_they_do_alone": 32.697,
