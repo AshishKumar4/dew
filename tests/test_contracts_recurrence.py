@@ -14,9 +14,8 @@ from contract_support import EDGES, FORWARD_ORDERS, REVERSE_ONLY, assert_contrac
 from ssd_support import stepwise_scan
 
 from dew.algebra import SATURATION, forms as algebra_forms, scan
-from dew.nn.kernels import fla_gdn, fla_kda, mamba_ssd, recurrence, recurrence_chunk, short_conv, ssd
-from dew.nn.kernels.templates import mosaic_sm90
-from dew.nn.kernels.templates.recurrence import mainloop, selective, template
+from dew.nn.kernels import generation, recurrence, recurrence_chunk, short_conv
+from dew.nn.mixers.mamba2 import chunk_ssd
 
 DELTA_RULE_EDGES = {"normal": 1.0, "the largest its chunk holds": 2.0**62, "near the largest": 2.0**63,
                     "near the least normal": 2.0**-63}
@@ -95,6 +94,11 @@ in one case took 127 to 156 s near float32's largest, each order's program compi
 4433)."""
 
 
+def outside(taken: str) -> tuple[str, ...]:
+    """The orders outside `taken`'s set (`ORDER_SETS`), which its case leaves to the others."""
+    return tuple(name for orders in ORDER_SETS.values() for name in orders if name not in ORDER_SETS[taken])
+
+
 @pytest.mark.parametrize("taken", list(ORDER_SETS))
 @pytest.mark.parametrize(("packed", "edge"), list(itertools.product((False, True), DELTA_RULE_EDGES)),
                          ids=lambda value: {False: "one sequence", True: "packed"}.get(value, value))
@@ -139,9 +143,8 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge, taken):
     accepted = packed and scale >= 2.0**62
     # Each order one program (`jax.jit`): run op by op, an order's eager dispatch compiled 2,570 programs of
     # one or two ops, 109 of the case's 156 s near float32's largest (cProfile on armada, row 4433).
-    others = tuple(name for orders in ORDER_SETS.values() for name in orders if name not in ORDER_SETS[taken])
     assert_contract(jax.jit(rule), primals, direction, cotangent, f"the chunked delta rule {edge}",
-                    truth_fn=jax.jit(recurrence), plain_fn=jax.jit(plain), without=others,
+                    truth_fn=jax.jit(recurrence), plain_fn=jax.jit(plain), without=outside(taken),
                     held=PACKED_OVERFLOW_ORDERS if accepted else None)
 
 
@@ -217,43 +220,46 @@ def test_a_split_convs_bias_holds_its_orders(edge):
 
 # The ports near float32's largest: their reverse derivatives are NaN at entries the recurrence keeps finite,
 # the gated delta rule's where fla's own chunked form keeps them too (ledger 2656).
+@pytest.mark.parametrize("taken", list(ORDER_SETS))
 @pytest.mark.parametrize("per_key", [False, True], ids=["fla_gdn", "fla_kda"])
 @pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
-def test_the_delta_rule_ports_hold_their_orders(per_key, edge):
+def test_the_delta_rule_ports_hold_their_orders(per_key, edge, taken):
     """fla's chunked gated delta rule and Kimi delta attention on the ported kernels
     (`fla_gdn.chunk_gated_delta_rule`, `fla_kda.chunk_kda`, custom VJPs over Triton kernels, interpreted off a
-    GPU), from a zero memory: the primal and reverse derivative of the output finite wherever float64 is a
-    normal float32 and the delta rule a token at a time is (`plain_delta_rule`, in float64 the truth), at
-    queries, keys and values whose products near float32's least normal. Forward mode and reverse over
-    reverse do not run (`REVERSE_ONLY`)."""
+    GPU) as every caller reaches them: the delta rule's op with the port named
+    (`recurrence_chunk.chunk_gated_delta_rule`), whose products' wrapper takes every order through the
+    portable math (`_per_product`, row 2655), from a zero memory: each order of `taken`'s set finite
+    wherever float64 is a normal float32 and the delta rule a token at a time is (`plain_delta_rule`, in
+    float64 the truth), at queries, keys and values whose products near float32's least normal."""
     (query, key, value, g, beta, _), direction, _ = delta_rule_draw(
         2661 + per_key, EDGES[edge], key_heads=2, value_heads=2, width=64, length=64, per_key=per_key)
     (cotangent,) = normal_draw(2663, value.shape)
     memory = jnp.zeros((1, 2, 64, 64), jnp.float32)
-    scale = 64 ** -0.5
-    port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
 
     def ported(*operands):
-        return port(*operands, memory, None, scale, 64, INTERPRETED)[0]
+        with generation.chosen(gated_delta_rule="fla"):
+            return recurrence_chunk.chunk_gated_delta_rule(*operands, memory)[0]
 
     def recurrent(*operands):
-        return plain_delta_rule(*operands, memory.astype(operands[0].dtype), scale)[0]
+        return plain_delta_rule(*operands, memory.astype(operands[0].dtype), 64 ** -0.5)[0]
 
-    assert_contract(ported, (query, key, value, g, beta), direction[:5], cotangent,
-                    f"the {'kda' if per_key else 'gdn'} port {edge}", truth_fn=recurrent, plain_fn=recurrent,
-                    without=REVERSE_ONLY)
+    assert_contract(jax.jit(ported), (query, key, value, g, beta), direction[:5], cotangent,
+                    f"the {'kda' if per_key else 'gdn'} port {edge}", truth_fn=jax.jit(recurrent),
+                    plain_fn=jax.jit(recurrent), without=outside(taken))
 
 
 # The template rule near float32's largest: its reverse derivative is NaN at entries fla's chunked form keeps
 # finite (ledger 2656).
+@pytest.mark.parametrize("taken", list(ORDER_SETS))
 @pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
-def test_the_template_rule_holds_its_orders(edge):
+def test_the_template_rule_holds_its_orders(edge, taken):
     """The recurrence template's chunked rule (`template.mosaic_rule`, a custom VJP over the
-    mainloop's launches, interpreted off a GPU), a 16-bit call with its chunk inverse's declared bound (keys
-    of unit norm, sigmoid write gates: its domain), from a zero memory: the primal and reverse derivative of
-    the output finite wherever float64 is a normal float32 and the delta rule a token at a time is
-    (`plain_delta_rule`), at queries and values whose products near float32's least normal. Forward mode and
-    reverse over reverse do not run (`REVERSE_ONLY`)."""
+    mainloop's launches, interpreted off a GPU) as every caller reaches it: the delta rule's op with the
+    template named, whose products' wrapper takes every order through the portable math (`_per_product`, row
+    2655), a 16-bit call with its chunk inverse's declared bound (keys of unit norm, write gates at most one:
+    its domain), from a zero memory: each order of `taken`'s set finite wherever float64 is a normal float32
+    and the delta rule a token at a time is (`plain_delta_rule`), at queries and values whose products near
+    float32's least normal."""
     (query, key, value, g, beta, _), direction, _ = delta_rule_draw(
         2664, EDGES[edge], key_heads=1, value_heads=1, width=64, length=64, per_key=False, unit_keys=True)
     primals = (query.astype(jnp.bfloat16), key.astype(jnp.bfloat16), value.astype(jnp.bfloat16), g,
@@ -262,24 +268,26 @@ def test_the_template_rule_holds_its_orders(edge):
     (cotangent,) = normal_draw(2665, value.shape)
 
     def rule(*operands):
-        return template.mosaic_rule(*operands, tiles=mainloop.Tiles(32, 1), bound=1.0)[0]
+        with generation.chosen(gated_delta_rule="mosaic_gpu"):
+            return recurrence_chunk.chunk_gated_delta_rule(*operands, write_bound=1.0)[0]
 
     def recurrent(*operands):
         operands = tuple(x.astype(jnp.promote_types(x.dtype, jnp.float32)) for x in operands)
         return plain_delta_rule(*operands, jnp.zeros((1, 1, 64, 64), operands[0].dtype), 64 ** -0.5)[0]
 
-    assert_contract(rule, primals, direction, cotangent, f"the template rule {edge}", truth_fn=recurrent,
-                    plain_fn=recurrent, without=REVERSE_ONLY)
+    assert_contract(jax.jit(rule), primals, direction, cotangent, f"the template rule {edge}",
+                    truth_fn=jax.jit(recurrent), plain_fn=jax.jit(recurrent), without=outside(taken))
 
 
+@pytest.mark.parametrize("taken", list(ORDER_SETS))
 @pytest.mark.parametrize("edge", EDGES)
-def test_the_selective_scan_holds_its_orders(edge):
+def test_the_selective_scan_holds_its_orders(edge, taken):
     """Mamba's selective scan on the recurrence template (`selective.selective_scan`, a custom VJP over its
-    forward and backward launches, interpreted off a GPU by the wgmma bundle), fp32 over one block of 128
-    channels and 16 states from no state: the primal and reverse derivative of its output finite wherever
-    float64 is a normal float32 and the portable scan is (`dew.nn.mixers.mamba.selective_scan`, in float64
-    the truth), at inputs and skips scaled to the edge. Forward mode and reverse over reverse do not run
-    (`REVERSE_ONLY`, ledger 2655)."""
+    forward and backward launches, interpreted off a GPU) as every caller reaches it: the scan's route with
+    the template named (`recurrence_chunk.selective_scan`), whose products' wrapper takes every order through
+    the portable scan (`_per_product`, row 2655), fp32 over one block of 128 channels and 16 states from no
+    state: each order of `taken`'s set finite wherever float64 is a normal float32 and the portable scan is
+    (`dew.nn.mixers.mamba.selective_scan`, in float64 the truth), at inputs and skips scaled to the edge."""
     from dew.nn.mixers.mamba import selective_scan as portable
 
     scale = EDGES[edge]
@@ -291,13 +299,14 @@ def test_the_selective_scan_holds_its_orders(edge):
     (cotangent,) = normal_draw(2979, x.shape)
 
     def scanned(*operands):
-        return selective.selective_scan(*operands, family=mosaic_sm90.WGMMA, interpret=INTERPRETED)[0]
+        with generation.chosen(selective_scan="mosaic_gpu"):
+            return recurrence_chunk.selective_scan(*operands, None, None, portable=portable)[0]
 
     def plain(*operands):
         return portable(*operands, None, None, chunk_size=32)[0]
 
-    assert_contract(scanned, primals, direction, cotangent, f"the selective scan {edge}", truth_fn=plain,
-                    plain_fn=plain, without=REVERSE_ONLY)
+    assert_contract(jax.jit(scanned), primals, direction, cotangent, f"the selective scan {edge}",
+                    truth_fn=jax.jit(plain), plain_fn=jax.jit(plain), without=outside(taken))
 
 
 @pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
@@ -378,42 +387,45 @@ def ssd_draw(seed: int, scale: float):
 
 # mamba_ssm's port near float32's largest: no transcription of mamba_ssm's chunked form to hold it to yet
 # (ledger 2656).
+@pytest.mark.parametrize("taken", list(ORDER_SETS))
 @pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
-def test_the_ssd_port_holds_its_orders(edge):
+def test_the_ssd_port_holds_its_orders(edge, taken):
     """Mamba2's chunked scan on the port of mamba_ssm's kernels (`mamba_ssd.ssd_scan`, a custom VJP over
-    Triton kernels, interpreted off a GPU): its primal and reverse derivative finite wherever float64 is a
-    normal float32 and the recurrence a token at a time is (`plain_ssd`), at inputs, gates and states whose
-    products near float32's least normal. Forward mode and reverse over reverse do not run
-    (`REVERSE_ONLY`)."""
+    Triton kernels, interpreted off a GPU) as every caller reaches it: Mamba-2's scan with the port named
+    (`mamba2.chunk_ssd`), whose products' wrapper takes every order through the portable math
+    (`_per_product`, row 2655): each order of `taken`'s set finite wherever float64 is a normal float32 and
+    the recurrence a token at a time is (`plain_ssd`), at inputs, gates and states whose products near
+    float32's least normal."""
     primals, direction, cotangent = ssd_draw(2674, EDGES[edge])
 
     def ported(*operands):
-        return mamba_ssd.ssd_scan(*operands, None, 64, INTERPRETED)
+        with generation.chosen(ssd="pallas"):
+            return chunk_ssd(*operands, chunk_size=64)
 
-    assert_contract(ported, primals, direction, cotangent, f"the ssd port {edge}", truth_fn=plain_ssd,
-                    plain_fn=plain_ssd, without=REVERSE_ONLY)
+    assert_contract(jax.jit(ported), primals, direction, cotangent, f"the ssd port {edge}",
+                    truth_fn=jax.jit(plain_ssd), plain_fn=jax.jit(plain_ssd), without=outside(taken))
 
 
 # A TPU's scan near float32's largest is out of its contract: at the 2^63 draw 23 of the 731 outputs float64
 # puts past 2^127 are infinite, the least 2^126.9 (a chunk's two terms summed past float32's largest), where
 # mamba_ssm's own chunked scan leaves 55 of the same draw's outputs non-finite (row 2656).
+@pytest.mark.parametrize("taken", list(ORDER_SETS))
 @pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
-def test_the_tpu_ssd_scan_holds_its_orders(edge):
-    """Mamba2's chunked scan on a TPU's Pallas kernel (`ssd.ssd_chunk_scan`, a custom VJP, interpreted off a
-    TPU), its operands the inputs scaled by their steps, each head's gates and each step's decay `A dt`: its
-    primal and reverse derivative finite wherever float64 is a normal float32 and the recurrence a token at a
-    time is (`ssd_support.stepwise_scan`), at inputs, gates and states whose products near float32's least
-    normal. Forward mode and reverse over reverse do not run (`REVERSE_ONLY`)."""
-    (x, steps, decay, b, c, _, state), direction, cotangent = ssd_draw(2677, EDGES[edge])
+def test_the_tpu_ssd_scan_holds_its_orders(edge, taken):
+    """Mamba2's chunked scan on a TPU's Pallas kernel (`ssd._chunk_scan`, a custom VJP, interpreted off a
+    TPU) as every caller reaches it: Mamba-2's scan with the kernel named on a TPU (`mamba2.chunk_ssd`,
+    `generation.assumed`), whose products' wrapper takes every order through the portable math
+    (`_per_product`, row 2655): each order of `taken`'s set finite wherever float64 is a normal float32 and
+    the recurrence a token at a time is (`plain_ssd`), at inputs, gates and states whose products near
+    float32's least normal."""
+    primals, direction, cotangent = ssd_draw(2677, EDGES[edge])
 
-    def tpu(x, b, c, a, state):
-        return ssd.ssd_chunk_scan(x, b, c, a, state, 64, "tpu")
+    def tpu(*operands):
+        with generation.assumed("v5e"), generation.chosen(ssd="tpu"):
+            return chunk_ssd(*operands, chunk_size=64)
 
-    heads = tuple(jnp.repeat(t, 2, axis=2) for t in (b, c))
-    primals = (x * steps[..., None], *heads, steps * decay, state)
-    along = (direction[0], *(jnp.repeat(t, 2, axis=2) for t in direction[3:5]), direction[1], direction[6])
-    assert_contract(tpu, primals, along, cotangent, f"the TPU ssd scan {edge}", truth_fn=stepwise_scan,
-                    plain_fn=stepwise_scan, without=REVERSE_ONLY)
+    assert_contract(jax.jit(tpu), primals, direction, cotangent, f"the TPU ssd scan {edge}",
+                    truth_fn=jax.jit(plain_ssd), plain_fn=jax.jit(plain_ssd), without=outside(taken))
 
 
 @pytest.mark.parametrize("edge", EDGES)

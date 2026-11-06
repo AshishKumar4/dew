@@ -164,7 +164,7 @@ ON_A_TPU = pytest.mark.tpu(reason="the layer as a TPU runs it, its scan the Pall
                                   pytest.param("layer_bf16", marks=ON_A_TPU, id="layer_bf16-tpu")])
 def test_the_layer_on_a_tpu_matches_mamba2_mixer(seeded_reference, site):
     """The mixer's forward on a TPU, its scan the route's (`recurrence_chunk.SCAN`: the Pallas kernel,
-    `ssd.ssd_chunk_scan`), against transformers' recorded mixer, the truth the float64 twin on the host (check
+    `ssd._chunk_scan`), against transformers' recorded mixer, the truth the float64 twin on the host (check
     1): the step a TPU runs, not its lowering's printed calls (row 678)."""
     assert_recorded_as_exact(seeded_reference, site)
 
