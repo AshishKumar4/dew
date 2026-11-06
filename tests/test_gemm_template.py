@@ -1784,6 +1784,28 @@ def test_an_ampere_kernel_gradient_at_a_two_row_warp_step_holds_check_1(generati
                         seeds=SEEDS, truth_fn=lambda x, dy: _kernel_gradient(x, dy, SIZES))
 
 
+def test_an_ampere_fp32_kernel_gradient_promotes_its_sums_a_window_at_a_time():
+    """On an A100, interpreted, an fp32 kernel gradient through the template at 32-row steps, its sums
+    promoted a 128-deep window at a time (`mosaic_sm80.MmaIssuer.summed_window`: four steps, the tensor
+    cores' sum of each added into the running sum at the window's end; M-FS-4): groups of three steps (a
+    short window), five (a whole one and a step) and four (one whole), an empty one and one of a row among
+    them (`SIZES`), on par with XLA's over the draws (check 1), truth float64's."""
+    tiles = mosaic_gpu.Tiles(64, 64, 32, 2, 1, warpgroups=1, family="mma.sync")
+
+    def ampere(x, dy):
+        return gemm.gemm_t(x, dy, jnp.asarray(SIZES), out_dtype=jnp.float32, precision="default",
+                           interpret_on_cpu=True)
+
+    def plain(x, dy):
+        with jax.default_matmul_precision("default"):
+            return _kernel_gradient(x, dy, SIZES)
+
+    with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic_gpu"), \
+            tuning.pinned({grouped_matmul.MosaicTgmm: tiles}):
+        assert_as_exact(ampere, jax.jit(plain), _gradient_rows_draw, "ampere fp32 kernel gradient, windows",
+                        seeds=SEEDS, truth_fn=lambda x, dy: _kernel_gradient(x, dy, SIZES))
+
+
 def _gradient_rows_draw(seed):
     """Rows and a cotangent for a kernel gradient, both bf16."""
     rng = np.random.default_rng(seed + 4)
