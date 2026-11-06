@@ -9,7 +9,7 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 Open themes from the full audits of 2026-11-04 to 2026-11-06, each finding re-checked by a second reviewer, grouped by shared cause so each theme lands as one change. The 2026-10-27 audit's themes have all landed.
 
 - Make native recurrence match its reference on H100, and draw recorded inputs independently of JAX. [3961, 3962]
-- Prove behaviour, not wording, signatures, fixed bounds or private inventories: record-text pins, the host placement scan bound, selective-scan route pins, a stray GPU marker, the sampler paths, `show`'s output, DiLoCo's replica state, the gate's prose, a derived dot count and the validation-trace test. [3950, 3954, 3964, 3973, 4406, 4642, 4644, 4645, 4648]
+- Prove behaviour, not wording, signatures, fixed bounds or private inventories: record-text pins, the host placement scan bound, selective-scan route pins, a stray GPU marker, the sampler paths, `show`'s output, DiLoCo's replica state and the validation-trace test. [3950, 3954, 3964, 3973, 4406, 4642, 4644, 4645]
 - Count only real rows in training's FLOPs and MFU, and give a frozen language conditioner's weights their declared axes. [4403, 4407]
 - Release every run in a task-preserving native form: JEPA and environment-policy runs, and a slot release's accepted maximum length. [4313, 4315]
 - Read packed decode spans as their query rows, one per query and group, in the shared readers. [4487]
@@ -148,8 +148,6 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 
   - Training, sampling and objectives: [651–654, 657, 658, 667, 679, 680, 686–688, 692, 695, 698, 701, 702, 707, 708].
   - Recurrences and looped models: [659–662, 664, 665, 678, 706, 711].
-- Judge layout parity through the shared gate, its own order policy and floor deleted. [1186]
 - Make float32 numpy references independent of the worker's OpenBLAS kernels, which round differently on x86-64-v3 and v4, without pinning the weaker one. [744]
 - Dew requires its own JAX build, installed from pypi.dewml.dev, with no stock-JAX routes or version gates. The fork AshishKumar4/jax follows upstream releases and carries Dew's Python-only patch stack: the compilation cache-key fixes, the CPU host-read guard, Pallas Triton's 16-bit floats and the Mosaic GPU fixes. Each build is published only after its full stack check passes.
-- Judge an image model's layout parity under a sequence split, where its gradients' sums over spatial positions reassociate (edm2's sequence-split cell). [827]
 
