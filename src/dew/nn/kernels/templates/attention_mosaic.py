@@ -124,10 +124,12 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     """Whether an inference walk's fold takes its logits as a difference of raw products scaled after it is
     taken (`algebra.Forward.subtracted`: no fold's reach, no natural rewalk), a decode step's
     (`attention_decode`), whose walk the memory bounds."""
+    per_span: int = 1
+    """The queries each of the spans' intervals holds (`KeySpans.per_span`)."""
 
     def spans(self, start, end, query_ids, key_ids) -> KeySpans:
-        """The call's spans from its arrays and the op's static form and key count."""
-        return KeySpans(start, end, query_ids, key_ids, self.keys, self.form)
+        """The call's spans from its arrays and the op's static form, key count and queries an interval."""
+        return KeySpans(start, end, query_ids, key_ids, self.keys, self.form, self.per_span)
 
     def padded(self, ba: tokamax.BoundArguments, config: Config) -> float | None:
         """The share of the score grid, each head's queries by its keys, that the launch's blocks pad
@@ -705,7 +707,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        output_width=power_of_two(value.shape[3]), form=spans.form, keys=spans.keys,
                        scale=logit_scale(query.shape[3], scale), natural=natural,
                        out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name, masked=masked,
-                       splits=splits, subtracted=subtracted)
+                       splits=splits, subtracted=subtracted, per_span=spans.per_span)
     return op, (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params),
                 tuple(param.value for param in hooks.output_params), hooks.initial, hooks.drop,

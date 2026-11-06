@@ -57,6 +57,17 @@ class KeySpans:
     key_ids: jax.Array | None
     keys: int = dataclasses.field(metadata={"static": True})
     form: str = dataclasses.field(default="spans", metadata={"static": True})
+    per_span: int = dataclasses.field(default=1, metadata={"static": True})
+    """The consecutive queries each interval of a call of one run and no documents holds, `start` and `end`
+    then `[B, Q // per_span]`: a key head's packed rows of one position (`attention_decode.packed`), which a
+    program reads by position (`per_query` repeats them)."""
+
+    def per_query(self) -> "KeySpans":
+        """These spans an interval a query (`per_span` 1)."""
+        if self.per_span == 1:
+            return self
+        start, end = (jnp.repeat(bound, self.per_span, axis=1) for bound in (self.start, self.end))
+        return KeySpans(start, end, self.query_ids, self.key_ids, self.keys, self.form)
 
 
 def within(keys: jax.Array, start: jax.Array, end: jax.Array,
@@ -1064,6 +1075,9 @@ class PaddedCall:
     `table[b, s // page]`), its `key` and `value` its pools flattened, `[KV, P·page, D]`."""
     page: int | None = None
     """A paged call's keys a page: its pools' `[KV, P, page, D]`, their own."""
+    per_span: int = 1
+    """The queries each of `start`'s and `end`'s intervals holds (`KeySpans.per_span`), unpadded where more
+    than one: a program reads them by position."""
 
     @property
     def key_rows(self) -> int:
@@ -1114,12 +1128,14 @@ def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
         padded_key, padded_value = pool(key, padded_d), pool(value, padded_dv)
     else:
         padded_key, padded_value = pad(key, padded_k, padded_d), pad(value, padded_k, padded_dv)
-    return PaddedCall(pad(query, padded_q, padded_d), padded_key, padded_value,
-                   pad_rows(spans.start, padded_q), pad_rows(spans.end, padded_q),
+    # Intervals each of several queries' (a decode step's packed positions) stay a position each.
+    start, end = ((spans.start, spans.end) if spans.per_span > 1
+                  else (pad_rows(spans.start, padded_q), pad_rows(spans.end, padded_q)))
+    return PaddedCall(pad(query, padded_q, padded_d), padded_key, padded_value, start, end,
                    pad_ids(spans.query_ids, padded_q), pad_ids(spans.key_ids, padded_k),
                    tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.score_params),
                    tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.output_params),
-                   queries, keys, table, page)
+                   queries, keys, table, page, spans.per_span)
 
 
 def kept_dtype(dtype) -> str:

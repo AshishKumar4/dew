@@ -284,7 +284,7 @@ def test_packing_a_calls_heads_into_its_rows_is_undone_by_unpacking():
     rows, row_spans, _ = attention_decode.packed(query, spans, 2)
     assert rows.shape == (2, 12, 2, 16)
     np.testing.assert_array_equal(template.ungrouped_rows(rows, 8), query)
-    np.testing.assert_array_equal(row_spans.start, np.repeat(np.asarray(spans.start), 4, axis=1))
+    np.testing.assert_array_equal(row_spans.per_query().start, np.repeat(np.asarray(spans.start), 4, axis=1))
 
 
 def _states(logits: jax.Array, values: jax.Array, cuts) -> tuple[jax.Array, jax.Array, jax.Array]:

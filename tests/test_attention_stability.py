@@ -38,6 +38,7 @@ from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
+    attention_decode,
     attention_mosaic,
     attention_portable,
     attention_triton,
@@ -960,10 +961,11 @@ HOOKLESS_FAMILIES = [family for family in MOSAIC_FAMILIES if FAMILIES[family].dr
 GPU_TRITON_FAMILIES = ("a small weight on a large value, bfloat16",
                        "a small column beside an overflowing one",
                        "a cotangent on a small column beside an overflowing one",
-                       "a column near fp32's least normal beside an overflowing one")
+                       "a column near fp32's least normal beside an overflowing one",
+                       "a resumed state beside an overflowing column")
 """The families whose Pallas-Triton default-form check runs on a GPU alone, compiled as its route runs it
-(tests/test_gpu_attention.py): their draws interpreted take past the CPU suite's 120 s target (137 to 257
-s, rows 1849, 2193; `GPU_ONLY`)."""
+(tests/test_gpu_attention.py): their draws interpreted take past the CPU suite's 120 s target (123 to 257
+s, rows 1849, 2193, 4344; `GPU_ONLY`)."""
 
 
 @pytest.mark.parametrize("family", [
@@ -1159,6 +1161,40 @@ def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, f
     assert_as_exact(jax.jit(decoded), as_given(jax.jit(_reference(family, anchored=False))), forward,
                     f"decode {form} {family.dtype}", seeds=seeds,
                     truth_fn=_reference(family, anchored=True))
+
+
+TEMPLATE_DECODED = list(dict.fromkeys(family for family, _ in DECODED
+                                     if jnp.dtype(FAMILIES[family].dtype).itemsize == 2
+                                     and not FAMILIES[family].decode_only))
+"""The decode steps the template's decode takes (`attention_decode.attend`), in its one form, the raw fold
+(no fold's reach, as the decode kernel's): 16-bit operands; a decode step's alone (`Family.decode_only`) too
+long for its interpreted mainloop."""
+
+
+@pytest.mark.skipif(not INTERPRETED and generation.device_generation() != "sm90",
+                    reason="the template's decode runs on warpgroup MMA's Mosaic mainloop")
+@pytest.mark.parametrize("family", TEMPLATE_DECODED)
+def test_the_template_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family):
+    """The template's decode (`attention_decode.attend`: packed rows, sliced keys, merged), interpreted on a
+    CPU as an H100 runs it and compiled on an H100, each row's keys its first `K`: check 1 over the family's
+    draws, as the decode kernel it replaces is held (testing.md: decode holds the default's claims)."""
+    seeds, family = SEEDS[family], FAMILIES[family]
+    lengths = family.spans.get("lengths")
+
+    def decoded(query, key, value, sinks):
+        count = np.full(query.shape[0], key.shape[1]) if lengths is None else lengths
+        spans = template.spans(1, key.shape[1], query.shape[0], lengths=jnp.asarray(count, jnp.int32))
+        hooks = (None if sinks is None
+                 else template.Hooks(initial=template.sinks(sinks, query.shape[0], 1, value.shape[-1])))
+        target = generation.assumed("sm90") if INTERPRETED else contextlib.nullcontext()
+        with target:
+            return attention_decode.attend(query, key, value, spans, hooks, interpret=INTERPRETED)
+
+    def forward(seed):
+        return _cast(family, family.draw)(seed)[:4]
+
+    assert_as_exact(jax.jit(decoded), as_given(jax.jit(_reference(family, anchored=False))), forward,
+                    f"template decode {family.dtype}", seeds=seeds, truth_fn=_reference(family, anchored=True))
 
 def test_a_decode_steps_logits_past_the_folds_reach_weigh_as_the_references():
     """bf16, the default form: one query over two keys whose products are 2^30 and 2^30 + 128, an fp32 ulp

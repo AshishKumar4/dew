@@ -181,10 +181,10 @@ def _carry_priced(region: terms.Region, schedule) -> DagCostModel[Priced]:
 
 
 class Split(NamedTuple):
-    """A function of a carried state split (`split`): `prepare(*operands)` the values its carry and its
-    emitted outputs read that read no state, `carry(prepared, state, issue=None)` its carried outputs and
-    `emit(prepared, state, issue=None)` its others, each a tuple in the function's order, each product a
-    mainloop's own where it gives one (`issue(role, lhs, rhs)`, `CARRY_ROLES`, `EMIT_ROLES`)."""
+    """A function of a carried state split (`split`): `prepare(*operands, issue=None)` the values its carry
+    and its emitted outputs read that read no state, `carry(prepared, state, issue=None)` its carried
+    outputs and `emit(prepared, state, issue=None)` its others, each a tuple in the function's order, each
+    product a mainloop's own where it gives one (`issue(role, lhs, rhs)`, `CARRY_ROLES`, `EMIT_ROLES`)."""
 
     prepare: Callable
     carry: Callable
@@ -230,11 +230,20 @@ def split(function: Callable, state, operands: Sequence, carried: Sequence[int],
     emit_forms, _ = program.extracted(graph, others, cost.model(region, schedule), checked=checked)
     prepared = list({terms.key(term): term for form in (*carry_forms, *emit_forms)
                      for term in _free(form, reading)}.values())
+    # Each prepared value's products named by the forms that read it: an emitted output's a local readout's,
+    # every other the carry's write.
+    emitted = {terms.key(term) for form in emit_forms for term in _free(form, reading)}
     consts = list(closed.consts)
 
-    def prepare(*values):
+    def prepare(*values, issue=None):
         leaves = [*consts, None, *values]
-        return tuple(forms.evaluated(region, term, leaves, {}) for term in prepared)
+
+        def evaluated(term: Term):
+            role = EMIT_ROLES[1] if terms.key(term) in emitted else CARRY_ROLES[1]
+            named = None if issue is None else lambda left, right: role
+            return forms.evaluator(region, leaves, {}, product=issue, named=named)(term)
+
+        return tuple(evaluated(term) for term in prepared)
 
     state = terms.key(Term.leaf(i64(first)))
 
