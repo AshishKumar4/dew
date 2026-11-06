@@ -23,6 +23,7 @@ from dew.batch import (
     TOKEN_LAYOUT_FIELDS,
     VALIDITY_FIELD,
     Coordinates,
+    Entered,
     coordinates,
     document_firsts,
     document_ranks,
@@ -619,8 +620,13 @@ class AttentionMetadata:
     def right_padded(self) -> bool:
         return self.coordinates is not None and self.coordinates.right_padded
 
+    @property
+    def entered(self) -> Entered | None:
+        """The documents that continue another (`Coordinates.entered`), None where none does."""
+        return None if self.coordinates is None else self.coordinates.entered
 
-MIXING = ("pairwise_mask", "key_positions", "key_runs", "position_bias", "admitted")
+
+MIXING = ("pairwise_mask", "key_positions", "key_runs", "position_bias", "admitted", "entered")
 """The `AttentionMetadata` fields that say which tokens a mixer lets each token
 read, or how much: a call's own mask, or its keys' runs, and the key positions
 it is read by, an additive bias, a server's mixed layout. A mixer runs a call that sets one only
