@@ -346,6 +346,7 @@ def test_a_banked_store_packed_for_serving_or_adapted_exports_as_its_layers_do(t
     its kernels as it writes them (`Adapter.merge` over a bank's rows, `Deferred`, ledger 4103)."""
     from safetensors.numpy import load_file
 
+    from dew.batch import thaw
     from dew.inference.projections import inference_projections
     from dew.interop.pretrained import PretrainedDecoder
     from dew.lora import LoRA
@@ -362,16 +363,18 @@ def test_a_banked_store_packed_for_serving_or_adapted_exports_as_its_layers_do(t
     assert packed.keys() == expected.keys()
     for key, tensor in expected.items():
         np.testing.assert_array_equal(packed[key], tensor, err_msg=key)
-    # Factors drawn whole, so each merge moves its kernel (a fresh adapter's B is zero).
+    # Factors drawn whole, so each merge moves its kernel (a fresh adapter's B is zero), the base and the
+    # factors one collection, as the bank holds them.
     spec = LoRA(rank=2, modules=("q_proj", "v_proj"))
-    lone = spec.apply(plain, variables, key=1)
+    lone = PretrainedDecoder.from_model(plain, variables).adapt(spec, key=1)
+    stacked = PretrainedDecoder.from_model(scanned, variables).adapt(spec, key=1)
     rng = np.random.default_rng(4103)
     tuned = jax.tree_util.tree_map_with_path(
         lambda path, leaf: jnp.asarray(rng.normal(size=leaf.shape) / 4, leaf.dtype)
-        if str(getattr(path[-1], "key", "")) == "lora_B" else leaf, lone.variables)
-    stacked = spec.apply(scanned, variables, key=1).model
-    merged = written(lone.model, tuned, "lone")
-    adapted = written(stacked, HeldBanks(tuned).place(stacked, layout=DEVICE), "adapted")
+        if str(getattr(path[-1], "key", "")) == "lora_B" else leaf, thaw(lone.variables))
+    lone.save(tmp_path / "lone", variables=tuned)
+    stacked.save(tmp_path / "adapted", variables=HeldBanks(tuned).place(stacked.model, layout=DEVICE))
+    merged, adapted = (load_file(tmp_path / name / "model.safetensors") for name in ("lone", "adapted"))
     assert adapted.keys() == merged.keys()
     for key, tensor in merged.items():
         np.testing.assert_array_equal(adapted[key], tensor, err_msg=key)
