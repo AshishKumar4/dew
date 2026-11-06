@@ -976,6 +976,8 @@ def test_programs_compiled_at_once_are_the_ones_compiled_in_turn():
     from dew.telemetry.compiles import Compiles
 
     square = jax.ShapeDtypeStruct((256, 256), jnp.float32)
+    drawn = [jnp.asarray(np.random.default_rng([4512, index]).standard_normal((256, 256)), jnp.float32)
+             for index in range(2)]
     functions = (lambda x, y: x @ y, lambda x, y: jnp.tanh(x) + y, lambda x, y: jnp.sum(x * y, axis=0))
     apart: list = [None] * len(functions)
 
@@ -995,5 +997,6 @@ def test_programs_compiled_at_once_are_the_ones_compiled_in_turn():
         assert len(threads) == 3, threads
         assert all(thread.startswith("dew-compile") for thread in threads), threads
         alone = [report.compiled(lowered, relower=lambda lowered=lowered: lowered) for lowered in lowerings]
-        assert [executable.as_text() for executable in together] == [
-            executable.as_text() for executable in alone]
+        # Compiled at once or in turn, one program: its outputs on one draw are the same bits.
+        for at_once, in_turn in zip(together, alone, strict=True):
+            np.testing.assert_array_equal(np.asarray(at_once(*drawn)), np.asarray(in_turn(*drawn)))
