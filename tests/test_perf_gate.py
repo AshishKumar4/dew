@@ -755,3 +755,45 @@ def test_the_qwen_pairs_smoke_runs_whichever_arm_a_round_draws_first(gate, tmp_p
     assert {arm: len(records) for arm, records in result["records"].items()} == {"dew": 6, "torch": 6,
                                                                                 "torch~aa": 6}
     assert result["comparison"]["verdict"] == "level" and result["comparison"]["rounds"] == 6
+
+
+def test_a_runs_step_rows_read_the_steps_their_trees_prepare_compiled_ahead(gate, tmp_path, monkeypatch):
+    """`run --ahead` hands each tree's step rows the steps its prepare compiled ahead (`ahead`, a directory
+    by the tree's name), so the GPU compiles none of a step that is that program; a tree with none runs as
+    before, its rows handed nothing."""
+    from types import SimpleNamespace
+
+    _, rows = standing_in_environments(gate, monkeypatch)
+    trees = {name: locked_tree(tmp_path / name) for name in ("main", "head")}
+    (tmp_path / "ahead" / "head").mkdir(parents=True)
+    args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", rounds=1,
+                           only=["step lm-dense 4x1024"], claim=False, model="unused", flowers="unused",
+                           torch_python="", out=str(tmp_path / "gate.json"),
+                           environments=str(tmp_path / "environments"), ahead=str(tmp_path / "ahead"))
+    assert gate.run(args) == 0
+    stepped = [(tree.name, command) for tree, command, _ in rows
+               if len(command) > 1 and Path(command[1]).name == "benchmark_step.py"]
+    assert {tree for tree, _ in stepped} == {"main", "head"}
+    for tree, command in stepped:
+        handed = command[command.index("--ahead") + 1] if "--ahead" in command else None
+        assert handed == (str(tmp_path / "ahead" / "head") if tree == "head" else None), (tree, command)
+
+
+def test_a_steps_compiled_ahead_on_a_host_with_no_gpu_are_named_for_their_cases(tmp_path):
+    """benchmark_step --compile-ahead, a GPU node's prepare on its CPU: each case's step planned and compiled
+    for one compile-only GPU of the generation named, saved under the name its run's `--ahead` reads
+    (`ahead_name`), and nothing measured."""
+    import os
+
+    from lane_environment import outside_suite
+
+    step = load("benchmark_step", "tools")
+    environ = {**outside_suite(os.environ), "PYTHONPATH": f"{ROOT / 'src'}:{ROOT / 'tools'}"}
+    done = subprocess.run([sys.executable, str(ROOT / "tools" / "benchmark_step.py"),
+                           "--cases", json.dumps([TINY]),
+                           "--attention-impl", "xla", "--compile-ahead", str(tmp_path / "ahead"),
+                           "--generation", "sm90", "--capacity-gib", "1"], cwd=ROOT, env=environ,
+                          capture_output=True, text=True, timeout=900, check=False)
+    assert done.returncode == 0, done.stderr[-3000:]
+    [case] = step.cases_from_json(json.dumps([TINY]))
+    assert [path.name for path in (tmp_path / "ahead").iterdir()] == [step.ahead_name(case)]

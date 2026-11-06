@@ -1085,11 +1085,11 @@ def _floors(graph: EGraph, region: terms.Region, reductions: Sequence[Term]) -> 
     carries its maximum floored from the least finite value)."""
     places = {terms.key(reduction): index for index, reduction in enumerate(reductions)
               if _role(reduction) == "max"}
-    floors: dict[int, object] = {}
+    floors: dict[int, float] = {}
     barred = {places[terms.key(term)] for term in region.outputs
               if term is not None and terms.key(term) in places}
 
-    def literal_of(term: Term):
+    def literal_of(term: Term) -> float | None:
         if (args := get_callable_args(term, Term.literal)) is None:
             return None
         value = np.asarray(region.literals[terms.integer(args[0])])
