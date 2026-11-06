@@ -1263,13 +1263,15 @@ MINIMAX_M2 = DecoderFamily(
 
 # V4's block is nothing another family builds: the mixer kind names its
 # window, its compressor and its grouped output projection at once.
+V4_DECODER = decoder_layout(DecoderSpelling(keys={'intermediate_size': 'moe_intermediate_size'},
+                                            fixed={'num_key_value_heads': 1}), rope=ROPE_APART)
+"""The shared decoder as DeepSeek V4's block states it, which V4.1's keeps: V4 ships no dense feed-forward
+width and no key/value head count the attention reads (`intermediate_size` is an alias of the routed width,
+configuration_deepseek_v4.py:101-107, and the one shared head is the block's own), and its rotary entries
+are its own part's."""
+
 DEEPSEEK_V4_CONFIG = ConfigLayout(
-    ConfigPart(_v4_pattern, lambda model: {}),
-    # V4 ships no dense feed-forward width and no key/value head count the attention reads:
-    # `intermediate_size` is an alias of the routed width (configuration_deepseek_v4.py:101-107) and the
-    # one shared head is the block's own. Its two rotary entries are its own part's.
-    decoder_layout(DecoderSpelling(keys={'intermediate_size': 'moe_intermediate_size'},
-                                   fixed={'num_key_value_heads': 1}), rope=ROPE_APART),
+    ConfigPart(_v4_pattern, lambda model: {}), V4_DECODER,
     ConfigPart(_deepseek_v4_config, unwritten("a V4 model is written as its release, whose config no "
                                               "exporter of Dew's states").write))
 """DeepSeek V4's config: read beside the shared decoder; no V4 model is written."""

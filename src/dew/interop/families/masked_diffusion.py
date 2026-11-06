@@ -81,7 +81,7 @@ _LLADA_ALIASES = (
 
 
 def _llada_geometry(hf_config: Mapping[str, object]) -> Mapping[str, object]:
-    """Rewrite LLaDA's own config spellings under the standard names `base_config` reads.
+    """Rewrite LLaDA's own config spellings under the standard names the shared decoder reads.
 
     The first present spelling in each alias group wins, even when its
     value is null, as the release's nested get calls do.

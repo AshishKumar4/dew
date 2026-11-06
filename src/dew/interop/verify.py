@@ -5,7 +5,7 @@ against a pinned transformers release. A `model_type` Dew does not register
 loads here as the first registered family whose convention it follows: its
 config reads as that family reads one and every tensor name maps as that
 family maps it. The candidates (`CONVENTIONS`) are the Llama convention,
-which reads every field the families share (`hf_decoders.base_config`), and
+which reads every field the families share (`decoder_parts.PLAIN_DECODER`), and
 then every registered causal family in `decoder_families.ENTRIES` order.
 The fields a candidate does not read are not trusted by name. Before any
 weight downloads, the installed transformers builds its own class for the

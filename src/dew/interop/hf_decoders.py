@@ -1412,8 +1412,8 @@ def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
     The family owns collection packing and any fused tensor geometry. A
     wrapper adds only its naming envelope after this shared inverse.
 
-    A config that carries `tie_word_embeddings` is read exactly as
-    `base_config` reads it, an explicit null included; only an absent key
+    A config that carries `tie_word_embeddings` is read exactly as the
+    shared decoder reads it (`decoder_layout`), an explicit null included; only an absent key
     asks the family for its own default. A derived config therefore reaches
     its weight encoder without translating geometry that encoder may not
     support.

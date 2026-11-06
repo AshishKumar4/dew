@@ -22,9 +22,7 @@ from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     KindFields,
-    Ropes,
     WrapperFields,
-    base_config,
     in_trunk,
     kind_mixers,
     read_only,
@@ -35,6 +33,7 @@ from dew.interop.decoder_parts import (
 )
 from dew.interop.families.deepseek import (
     DSPARK_LEAVES,
+    V4_DECODER,
     V4_SCORES,
     dspark_fields,
     dspark_kept,
@@ -44,6 +43,7 @@ from dew.interop.families.deepseek import (
     v4_routes,
 )
 from dew.interop.layouts import Route, mapped, one_of
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.deepseek_v4 import DeepseekV4Mixer
@@ -195,11 +195,8 @@ def _v41_decoder(hf_config: Mapping[str, object], used: set[str], *, media_bias:
     kinds, layer_types, shared = _v41_kinds(text, layers, ratios[:layers], modes, fields,
                                           compressed, index, seen)
     moe = record_int(text, 'moe_intermediate_size')
-    base_used: set[str] = set()
-    config = base_config({**text, 'intermediate_size': moe, 'num_key_value_heads': 1,
-                           'tie_word_embeddings': text.get('tie_word_embeddings', False)},
-                          base_used, layer_types=tuple(layer_types), rope=Ropes(main_theta))
-    seen.update(base_used - {'intermediate_size'})
+    config = V4_DECODER.read(text, seen, NativeFields(CausalTransformer, {'layer_types': tuple(layer_types)}))
+    config['rope_theta'] = main_theta
     scoring = text.get('scoring_func', 'sqrtsoftplus')
     if scoring not in V4_SCORES:
         refuse(f"scoring_func {scoring!r}", f"the router scores with one of {sorted(V4_SCORES)}")

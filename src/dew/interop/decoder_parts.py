@@ -1,6 +1,6 @@
 """The parts a decoder family is built from, which imports no family.
 
-The config readers (`base_config`, `translated`), the shared decoder's tensor
+The config's shared parts (`decoder_layout`, `translated`), the shared decoder's tensor
 names both ways (`DECODER_ROUTES`, `spelled`, `prediction_routes`; a family's
 own through `dew.interop.layouts`), tensors a checkpoint stores packed (`Packed`),
 the shared export writer (`decoder_tensors`, `leaf_layouts`) and the entry type
@@ -33,7 +33,6 @@ from dew.interop.layouts import (
     ConfigField,
     ConfigLayout,
     ConfigPart,
-    ConfigRead,
     Copy,
     Nested,
     Rebased,
@@ -394,8 +393,8 @@ def folder_name(folder: str, name: str) -> str:
 
 
 def kinds_of(config: DecoderFields) -> dict[str, KindFields]:
-    """Return the kind records of a translated config, which `base_config` always
-    sets, for a family that adds its own to them."""
+    """Return the kind records of a translated config, which the shared decoder's layer kinds always
+    set (`decoder_layout`), for a family that adds its own to them."""
     kinds = config.get('kinds')
     if kinds is None:
         refuse('kinds', 'the shared decoder fields carry one record per named kind')
@@ -528,8 +527,8 @@ def partial_rope(hf_config: Mapping[str, object], spelling: RopeSpelling | None,
     `rope_parameters` entry's values, else the flat fields under the family's spellings (GPT-NeoX's
     `rotary_emb_base` and `rotary_pct`), else the config class's defaults: its `spelling`'s base, as
     `rope_records` reads it, and `default_factor`. A None default is a class that has none, whose
-    config states the value or is refused. The rest is the entry without its factor, which a family
-    whose rotary may scale hands `base_config`'s rope reader."""
+    config states the value or is refused. The rest is the entry without its factor, which
+    `plain_partial_rope` holds to the plain rotary."""
     entry = _records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
 
     def stated(key: str, field: str, default: float | None) -> float:
@@ -849,9 +848,9 @@ def _mlp_features(hf_config: Mapping[str, object]) -> int | tuple[int, ...]:
 
 _OPTIONAL_FIELDS = frozenset({'layer_types', 'sliding_window', 'rope_local_base_freq', 'attention_bias',
                               'mlp_bias'})
-"""Fields `base_config` reads for a family whose reference reads them, and
-accepts unread at a value that computes nothing. rope_local_base_freq is
-read by the families whose class reads it, through their `RopeSpelling`."""
+"""Fields the shared decoder reads for a family whose reference reads them (`DecoderSpelling.reads`),
+and accepts unread at a value that computes nothing. rope_local_base_freq is read by the families whose
+class reads it, through their `RopeSpelling`."""
 
 
 def _neutral(hf_config: Mapping[str, object], field: str) -> bool:
@@ -1240,87 +1239,6 @@ def decoder_layout(spelling: DecoderSpelling = PLAIN_DECODER, *,
         constant('qk_norm', spelling.qk_norm), constant('scale_after_cast', spelling.scale_after_cast))
 
 
-def base_config(hf_config: Mapping[str, object], used: set[str], *,
-                 rope: Ropes | RopeSpelling,
-                 layer_types: tuple[str, ...] | None = None,
-                 qk_norm: bool = False, scale_after_cast: bool = True,
-                 tie_embeddings: bool = False,
-                 reads: frozenset[str] = frozenset({'layer_types', 'sliding_window', 'attention_bias'})
-                 ) -> DecoderFields:
-    """Read the projection geometry and decoder fields every family shares.
-
-    A ramp both kinds share is the model's; a ramp the full layers alone
-    carry (OLMo 3's spelling) lands on the full kind, because a kind's None
-    rides the model's value and cannot turn a ramp off.
-
-    `reads` names the `_OPTIONAL_FIELDS` the family's reference reads.
-    LlamaConfig, for one, declares neither layer_types nor sliding_window,
-    and LlamaAttention attends every key, so a Llama config that states a
-    window is refused rather than read as one transformers never applies.
-    An unread field at the value it would compute anyway (a null window,
-    attention_bias false, every layer full) is accepted.
-    """
-    for optional in _OPTIONAL_FIELDS - reads:
-        if optional in hf_config and _neutral(hf_config, optional):
-            used.add(optional)
-    shared = _read_activation(hf_config, used, DECODER_FIELDS.read(hf_config, used, {}))
-
-    ropes = read_rope(hf_config, used, rope) if isinstance(rope, RopeSpelling) else rope
-    rope_theta, rope_local_theta = ropes.theta, ropes.local_theta
-    if 'layer_types' in reads:
-        layer_types = specified_layer_types(hf_config, used, layer_types)
-    elif layer_types is None:
-        layer_types = ("full_attention",) * _records.integer(
-            hf_config["num_hidden_layers"], "num_hidden_layers"
-        )
-    stated_window = hf_config.get('sliding_window') if 'sliding_window' in reads else None
-    if 'sliding_window' in reads:
-        used.add('sliding_window')
-    if 'sliding_attention' in layer_types and stated_window is None:
-        refuse("layer_types with sliding attention",
-                "sliding_window is not set, so the window has no size")
-    sliding_window = (_records.integer(stated_window, 'sliding_window')
-                      if 'sliding_attention' in layer_types else None)
-
-    kinds = decoder_kinds(layer_types, sliding_window, rope_local_theta, None, None)
-    config: DecoderFields = NativeFields(CausalTransformer, dict(
-        **shared,
-        rope_theta=rope_theta,
-        layer_types=layer_types,
-        kinds={},
-        # LlamaRMSNorm, Qwen3RMSNorm and DeepseekV3RMSNorm multiply the scale
-        # into the activations after casting them (modeling_qwen3.py:61-64,
-        # modeling_deepseek_v3.py:47-52); Gemma3's, Gemma4's and Qwen3.5's
-        # norms scale in fp32 and cast the product (modeling_gemma3.py:147-150,
-        # modeling_gemma4.py:197-215, modeling_qwen3_5.py:732-737).
-        scale_after_cast=scale_after_cast,
-        qk_norm=qk_norm,
-        attention_bias='attention_bias' in reads and config_flag(hf_config, 'attention_bias', default=False),
-        mlp_bias='mlp_bias' in reads and config_flag(hf_config, 'mlp_bias', default=False),
-        # Gemma3TextConfig ties by default, and so does Gemma4TextConfig; the
-        # others do not, so a config that omits the field (gemma-3-1b-pt
-        # does) takes its family's default.
-        tie_embeddings=config_flag(hf_config, 'tie_word_embeddings', default=tie_embeddings),
-    ))
-    config['kinds'] = kinds
-    used.add('tie_word_embeddings')
-    used.update(reads & {'attention_bias', 'mlp_bias'})
-
-    # A ramp both kinds share is the model's. Where the kinds' ramps differ, each lands on its own
-    # kind: a kind inherits the model's ramp, so a model-level one beside a kind's own would give
-    # that kind two (transformers dispatches each kind's record on its own).
-    apart = ropes.scaling is not None and (ropes.full_only or ropes.local_scaling is not None)
-    if ropes.scaling is not None:
-        if apart and 'sliding_attention' in layer_types:
-            full = kinds.setdefault('full_attention', native_fields(LayerKind)())
-            full['rope_scaling'] = ropes.scaling
-        else:
-            config['rope_scaling'] = ropes.scaling
-    if ropes.local_scaling is not None:
-        kinds['sliding_attention']['rope_scaling'] = ropes.local_scaling
-    return config
-
-
 def nested_ramp(ramp: Ramp | None) -> Ramp | None:
     """A ramp read from one layer type's record of nested rope_parameters, as transformers 5.16.1
     computes it: its YaRN truncation is the config's top-level `rope_parameters.get("truncate", True)`
@@ -1669,19 +1587,6 @@ def spelled(renames: Renames, *, leaves: Leaves | None = None, layer_leaves: Lea
     decoder's, `DECODER_ROUTES`, by default)."""
     return Spelled(renames, Table(*own_routes(leaves or {}, layer=False), *own_routes(layer_leaves or {}),
                                   DECODER_ROUTES if routes is None else routes))
-
-
-def reads(translate: Callable[[Mapping[str, object], set[str]], DecoderFields]) -> ConfigRead:
-    """A reader of a whole record (`translate`, the source config and the keys read) as a config part's
-    read (`ConfigPart`)."""
-    def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
-        # The reader's own record where it is the first part, kept as it builds it.
-        translated = translate(hf_config, used)
-        if not record:
-            return translated
-        record.update(translated)
-        return record
-    return read
 
 
 def declared_depths(field: str = 'num_nextn_predict_layers') -> Condition:

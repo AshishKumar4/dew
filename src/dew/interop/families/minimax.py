@@ -26,15 +26,18 @@ no release has, is refused by name.
 from collections.abc import Mapping
 
 from dew import _records
-from dew.interop.config_records import native_fields
+from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     MOE_NAMES,
+    ROPE_APART,
     DecoderFamily,
     DecoderFields,
+    DecoderSpelling,
     RopeSpelling,
-    base_config,
+    decoder_layout,
     kind_mixers,
     kinds_of,
+    place_ropes,
     read_only,
     read_partial_rope,
     refuse,
@@ -115,6 +118,11 @@ def _layer_types(hf: Mapping[str, object], used: set[str], layers: int) -> tuple
     return types
 
 
+_DECODER = decoder_layout(DecoderSpelling(reads=frozenset()), rope=ROPE_APART)
+"""The shared decoder as MiniMax's classes declare it, none of its optional fields, its partial rotary read
+apart (`_minimax_config`)."""
+
+
 def _minimax_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     layers = _records.integer(hf['num_hidden_layers'], 'num_hidden_layers')
     types = _layer_types(hf, used, layers)
@@ -144,7 +152,9 @@ def _minimax_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     if factor * head_dim != rotary_dim or rotary_dim % 2 or not 0 < rotary_dim <= head_dim:
         refuse(f'rotary_dim {rotary_dim}', f'it turns an even part of each {head_dim}-wide head, '
                f'{factor} of it as the rotary states')
-    config = base_config({**hf, 'head_dim': head_dim}, used, rope=ropes, layer_types=types, reads=frozenset())
+    config = _DECODER.read({**hf, 'head_dim': head_dim}, used,
+                           NativeFields(CausalTransformer, {'layer_types': types}))
+    place_ropes(config, ropes)
     activation = _records.text(hf.get('hidden_act', 'silu'), 'hidden_act')
     if 'linear_attention' in types and activation not in ACTIVATIONS:
         refuse(f'hidden_act {activation!r}', f'the lightning projection takes {sorted(ACTIVATIONS)}')
