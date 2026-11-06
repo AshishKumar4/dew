@@ -1353,13 +1353,13 @@ class BackRun(NamedTuple):
         last = n == run.chunks - 1
         grad = point(self.dfinal[head]) if last else held_cell(self.dh[n, head], lane)
         # Where the keys take the gate, the corrected values are the values as given.
-        corrected = run.v[n, head] if run.write == "keys" else run.c[n, head]
+        corrected = run.step(n, head).v if run.write == "keys" else run.c[n, head]
         # Without the delta rule there are no weights' gradients, which nothing then reads.
         dw = records["dw"][n, head] if "dw" in records else np.zeros_like(run.w[n, head])
-        return BackStep(run.q[n, head], run.k[n, head], run.v[n, head], run.g[n, head], run.beta[n, head],
-                        run.a[n, head], run.w[n, head], corrected, run.h[n, head], self.do[n, head],
-                        grad, self.dh[n, head], records["local"][n, head], records["dv"][n, head],
-                        records["ds"][n, head], dw)
+        forward = run.step(n, head)
+        return BackStep(forward.q, forward.k, forward.v, forward.g, forward.beta, forward.a, forward.w,
+                        corrected, forward.h, self.do[n, head], grad, self.dh[n, head],
+                        records["local"][n, head], records["dv"][n, head], records["ds"][n, head], dw)
 
 
 def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True) -> BackRun:
@@ -1414,9 +1414,11 @@ def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True) -> 
             "the certify build is the production program"
     _, length, heads, value_width = v.shape
     key_width, chunks = k.shape[-1], run.chunks
-    laid = np.shape(saved.dh)[0] // (heads * key_width)
+    # The chunks the launches lay, of the memories' rows a part (`Run.held` of them stacked).
+    laid = np.shape(saved.dh)[0] // (run.held * heads * key_width)
 
     def chunked(x, width):
+        """A record's stacked parts summed exactly, laid `[N, H, C, width]`."""
         rows = np.asarray(x, np.float64).reshape(-1, laid * CHUNK, heads * width).sum(0)
         return rows.reshape(laid, CHUNK, heads, width).transpose(0, 2, 1, 3)[:chunks]
 
@@ -1427,7 +1429,7 @@ def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True) -> 
                   "values": (saved.values, value_width), "keys": (saved.keys, key_width)}
     records = {name: chunked(x, width) for name, (x, width) in named.items()}
     dtypes = {name: jnp.dtype(x.dtype) for name, (x, _) in named.items()}
-    dh = np.asarray(saved.dh, np.float64).reshape(laid, heads, key_width, value_width)[:chunks]
+    dh = np.asarray(saved.dh, np.float64).reshape(-1, laid, heads, key_width, value_width).sum(0)[:chunks]
     dtypes["entering"] = jnp.dtype(saved.dh.dtype)
     hosted_do = _laid(np.asarray(do, np.float64)[0], laid_chunks(length, None, None))
     return BackRun(run, hosted_do.reshape(chunks, CHUNK, heads, value_width).transpose(0, 2, 1, 3),
@@ -1675,11 +1677,12 @@ def key_back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
         for head in range(run.heads):
             last = n == run.chunks - 1
             grad = point(back.dfinal[head]) if last else held_cell(back.dh[n, head], lane)
-            step = KeyBackStep(run.q[n, head], run.k[n, head], run.v[n, head], run.g[n, head],
-                               run.beta[n, head], records["scores"][n, head], run.a[n, head],
-                               records["kg"][n, head], run.c[n, head], run.h[n, head], back.do[n, head], grad,
-                               back.dh[n, head], records["local"][n, head], records["dv"][n, head],
-                               records["d_scores"][n, head], records["d_system"][n, head])
+            forward = run.step(n, head)
+            step = KeyBackStep(forward.q, forward.k, forward.v, forward.g, forward.beta,
+                               records["scores"][n, head], forward.a, records["kg"][n, head], forward.c,
+                               forward.h, back.do[n, head], grad, back.dh[n, head], records["local"][n, head],
+                               records["dv"][n, head], records["d_scores"][n, head],
+                               records["d_system"][n, head])
             enclosed_ = key_back_enclosures(step, run.scale, lane)
             for name in KEY_BACK_RECORDS:
                 if name == "entering":
