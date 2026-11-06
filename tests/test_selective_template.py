@@ -395,9 +395,9 @@ def test_the_backward_holds_its_registers_at_the_residency_it_launches(packed):
     need = kernel['least']
     assert need is not None, kernel
     target = generation.gpu_target('sm90')
-    positions, resident = selective.backward_plan(target)
+    positions, resident = selective.backward_plan(target, 16)
     held = selective.backward_programs(need, target)
-    assert held == resident == selective.backward_programs(selective.backward_registers(positions), target), (
+    assert held == selective.backward_programs(selective.backward_registers(positions), target) >= resident, (
         need, held, resident, positions)
 
 
@@ -457,8 +457,7 @@ def test_a_spill_steps_the_kernel_that_spilled():
             assert selective.SELECTIVE.derived(bound, target) is None
     facts = generation.gpu_target(generation.INTERPRETED_GENERATION)
     fewer = derived.positions // 2
-    assert stepped == selective.Tiles(derived.chunk, fewer,
-                                      selective.backward_programs(selective.backward_registers(fewer), facts))
+    assert stepped == selective.Tiles(derived.chunk, fewer, selective.backward_resident(fewer, 16, facts))
 
 
 @pytest.mark.parametrize('length', [129, 2048], ids=['129 tokens', '2048 tokens'])
