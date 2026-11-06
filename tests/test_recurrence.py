@@ -319,3 +319,40 @@ def test_a_step_reads_its_updated_state(delta):
     out, updated = recurrence.update(state, query, key, value, decay, write, delta=delta)
     np.testing.assert_array_equal(updated, state.at[0, 0].set(1.0))
     np.testing.assert_array_equal(out, jnp.full((1, width), 2.0 ** 80, jnp.float32))
+
+
+@pytest.mark.parametrize("local", [True, False], ids=["per-shard", "partitioned"])
+def test_a_decode_tokens_launch_runs_per_shard_moving_nothing(local):
+    """A gated delta rule's decode token (`recurrence.step`, the template's step) over four rows split over two
+    compile-only H100s and compiled for them: run per shard (`manual_map`), its program launches the step
+    once, each call reading its shard's two rows of the state, and moves nothing (`kernel_compile.Expected`,
+    its route evidence). Left to the partitioner (the launch called on the whole batch), the same evidence
+    refuses the program: its operands gathered to every device."""
+    from jax.sharding import PartitionSpec
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    from dew.nn.kernels.templates import bundles
+    from dew.nn.kernels.templates.recurrence import step as template
+
+    hooks = recurrence.Hooks(decay='scalar')
+    rows, heads, width = 4, 4, 128
+
+    def call():
+        def token(state, query, key, value, log_decay, beta):
+            given = recurrence.Step(state, query=query, key=key, value=value, log_decay=log_decay, beta=beta)
+            if local:
+                return recurrence.step(hooks, given)
+            return template.step(hooks, given, dtype=None, family=bundles.of('sm90', jnp.float32))
+
+        f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
+        return token, (f32((rows, heads, width, width)), *(f32((rows, heads, width)),) * 3,
+                       f32((rows, heads)), f32((rows, heads)))
+
+    expected = Expected(axes=(("data", 2),), specs=(PartitionSpec("data"),) * 6,
+                        launches=frozenset({"recurrence_step"}),
+                        shards={"recurrence_step": (rows // 2, heads, width, width)})
+    from fla_gdn_support import KernelCase
+
+    cases = [KernelCase("decode token", call, expected=expected)]
+    failed = route_failures(cases, compile_mosaic_kernels(cases, "sm90"))
+    assert (failed == []) == local, failed

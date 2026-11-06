@@ -36,7 +36,7 @@ from dew.nn.precision import (
     stochastic_bf16,
 )
 
-from ..sharding import explicit_spec
+from ..sharding import explicit_spec, grouped_heads, manual_map
 from . import chunked_launch, short_conv
 from .generation import linear_tangent
 
@@ -471,7 +471,9 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
 
 def _launched(hooks: Hooks, operands: Step, *, dtype):
     """`step`'s launch on its operands: the recurrence template's decode step on Mosaic GPU
-    (`templates.recurrence.step`), interpreted off a GPU; a one-tap conv's token taken as a scale first."""
+    (`templates.recurrence.step`), interpreted off a GPU, on each shard of the rows (`manual_map`): a launch
+    left to the partitioner gathers its operands to every device; a one-tap conv's token taken as a scale
+    first."""
     from .templates import bundles
     from .templates.recurrence import mainloop, step as template
 
@@ -479,8 +481,20 @@ def _launched(hooks: Hooks, operands: Step, *, dtype):
     if hooks.conv is not None and given['held'].shape[1] == 0:
         return _one_tap(hooks, hooks.conv, operands, given, dtype)
     family = mainloop.family_of(jnp.float32)
-    return template.step(hooks, operands, dtype=dtype, family=family or bundles.INTERPRETED,
-                         interpret=family is None)
+    launch = functools.partial(template.step, hooks, dtype=dtype, family=family or bundles.INTERPRETED,
+                               interpret=family is None)
+    batch, heads, _, width = operands.state.shape
+    rows, _ = grouped_heads((batch, 1, heads, width), 1)
+    names = [field.name for field in dataclasses.fields(Step) if getattr(operands, field.name) is not None]
+    P = jax.sharding.PartitionSpec
+    specs = [P(rows) if field.metadata.get('rows') else P() for field in dataclasses.fields(Step)
+             if field.name in names]
+
+    def local(*arrays):
+        return launch(dataclasses.replace(operands, **dict(zip(names, arrays, strict=True))))
+
+    moved = P(rows) if hooks.conv is not None else None
+    return manual_map(local, specs, (P(rows), moved, P(rows)))(*(getattr(operands, name) for name in names))
 
 
 def _cumsum_kernel(chunk_ref, s_ref, o_ref, *rest, chunk: int, aligned: bool, scale: float | None,
