@@ -208,9 +208,8 @@ class CheckpointBanks(LayerBanks):
 
     def __post_init__(self):
         with self._reader() as checkpoints:
-            step = checkpoints.latest if self.step is None else self.step
-            if step is None:
-                raise FileNotFoundError(f"{self.directory} holds no checkpoint")
+            # The newest step that holds a model where none is named, one kept for its model alone among them.
+            step = checkpoints.pinned(self.step)
             object.__setattr__(self, "step", step)
             object.__setattr__(self, "stored", checkpoints.stored(step))
 

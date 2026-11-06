@@ -121,7 +121,7 @@ class TrainState:
     updates: jax.Array = struct.field(metadata=REPLICA)
     variables: Variables = struct.field(metadata={'variables': True, **REPLICA})
     opt_state: optax.OptState = struct.field(metadata=REPLICA)
-    ema: Variables | None = struct.field(metadata={'variables': True, **REPLICA})
+    ema: Variables | None = struct.field(metadata={'variables': True, 'averages': 'variables', **REPLICA})
     key: jax.Array
     scale: DynamicScale | None = struct.field(metadata=REPLICA)
     window_size: jax.Array
@@ -193,6 +193,24 @@ class TrainState:
         return dataclasses.replace(self, inner=dataclasses.replace(self.inner, accumulation=window))
 
 
+def without_empty_window(state: TrainState) -> TrainState:
+    """`state` as a checkpoint holds it: its window (`window`) left out where it holds no microbatch, at
+    an update's boundary, under DiLoCo every group's. A commit clears every field of the window but its
+    gradient sum, which the next window's first microbatch replaces unread (`dew.training.transaction`),
+    so the empty window a resume allocates (`Trainer._initialize_accumulation`) is the same window, and
+    the sum, a trainable-size float32 tree, is no checkpoint's (row 4309: ~36 GB of a 9B run's ~112 GB).
+    A window part filled is saved whole."""
+    if state.window is None:
+        return state
+    from dew._coordination import collective_host
+
+    size = int(state.window_size)
+    # The groups' clocks are stacked over the groups, which a pool's processes split.
+    clocks = collective_host(state.microstep if state.inner is None else state.inner.microstep,
+                             phase="checkpoint window")
+    return state.with_window(None) if int(jnp.max(jnp.asarray(clocks) % size)) == 0 else state
+
+
 CHECKPOINTED = tuple(field.name for field in dataclasses.fields(TrainState)
                      if field.metadata.get('checkpointed', True))
 """The train-state fields a checkpoint holds, by their names; a field its
@@ -224,6 +242,13 @@ VARIABLE_FIELDS = tuple(field.name for field in dataclasses.fields(TrainState)
 """The train-state fields that each hold a variables tree, keyed by collection (`params`,
 `FROZEN`, ...), as their declarations mark them; the optimizer's state mirrors the trained
 parameters' paths instead."""
+
+AVERAGES: Mapping[str, str] = MappingProxyType({
+    field.name: field.metadata['averages'] for field in dataclasses.fields(TrainState)
+    if 'averages' in field.metadata})
+"""Each train-state field that averages another's leaves, by name, to the field it averages: the EMA of
+the variables, which a checkpoint stores as its difference from them (`dew.checkpoints`), the run's and
+each DiLoCo group's."""
 
 
 def drawn_in[LossT, EffectsT](variables: Variables, dtype: DTypeLike | None,

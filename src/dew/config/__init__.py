@@ -1117,11 +1117,11 @@ def earlier_option_writing(record: Mapping[str, object], checkpoints: Checkpoint
     if named is None or "option_text" not in named[1] or named[1]["option_text"] is not None:
         return record
     from dew.decision.layout import Layout, layout_writing
-    from dew.inference.tasks import earlier_shapes
+    from dew.inference.tasks import saved_artifact
 
     step = checkpoints.latest
-    artifact = None if step is None else checkpoints.artifact(step)
-    laid = earlier_shapes(artifact).get("layout") if isinstance(artifact, Mapping) else None
+    artifact = None if step is None else saved_artifact(checkpoints, step)
+    laid = None if artifact is None else artifact.get("layout")
     if not isinstance(laid, Mapping):
         return record
     writing = layout_writing(registry.from_record(Layout, laid))
