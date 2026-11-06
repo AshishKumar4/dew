@@ -318,7 +318,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_host_training.py": {
-   "comparisons": 4,
+   "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
   "tests/test_image_metrics.py": {
