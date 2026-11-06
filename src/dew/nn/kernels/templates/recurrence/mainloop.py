@@ -593,6 +593,15 @@ def _inverse_flops() -> float:
     return 4 * CHUNK ** 3 * (int(math.log2(CHUNK)) - 1)
 
 
+def issued_flops(call: Call, flops: float, left: Operand | None = None,
+                 right: Operand | None = None) -> float:
+    """`flops` of products of `left` by `right` (the model's `2 m k n` each) as their issuer takes them: once
+    for each pair of the operands' parts it issues (`product.terms`), each operand the call's held one
+    where None."""
+    left, right = left or call.held, right or call.held
+    return flops * len(product.terms(left.parts, right.parts))
+
+
 def walk_stores(family: mosaic.Family, stores: int):
     """A walk step's `stores` stores, each through its own landing tile and left in flight (`wait=False`):
     `before()` ahead of each waits until at most `stores - 1` of the thread's stores still read their tiles,
@@ -657,13 +666,13 @@ def _laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, t
     return _planned_launch(call, scope, registers, floor=floor, most=most, consumers=consumers), tiles
 
 
-def _stated(work: Work, tiles: int, pairs: int, arrays, out_type) -> pl.CostEstimate:
+def _stated(work: Work, tiles: int, hardware: float, arrays, out_type) -> pl.CostEstimate:
     """A launch's work over its `tiles` as it states it to XLA and to Dew's FLOP count
-    (`templates.cost.estimate`), the hardware's: the model's products times the part `pairs` each issues
-    (`product.terms`: an fp32 operand's bf16 parts), its exponentials, and its operands' and outputs' bytes
+    (`templates.cost.estimate`), the hardware's: its products as issued (`hardware` a tile, `issued_flops`:
+    an fp32 operand's bf16 parts each a product), its exponentials, and its operands' and outputs' bytes
     once (row 1895's kernel report: unstated, the recurrence made MFU a lower bound). The model's share,
     `work.flops` a tile, the launch declares apart (`Family.kernel`'s `model_flops`)."""
-    return estimate(work.flops * pairs * tiles, *arrays, *jax.tree.leaves(out_type),
+    return estimate(hardware * tiles, *arrays, *jax.tree.leaves(out_type),
                     transcendentals=work.exponentials * tiles)
 
 
@@ -679,7 +688,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                   work: Work, held: Held, staging: tuple = (), once: dict | None = None,
                   landing: dict | None = None, persistent: bool = False, reduces: bool = True,
                   after: tuple = (), consumers: int = 1, swizzles: dict[str, int] | None = None,
-                  name: str | None = None):
+                  name: str | None = None, hardware: float | None = None):
     """`program(at, *refs, streams, staging, landing)` as a kernel over `grid`, `at` a tile's indices by the
     grid's axis names, run where `live(at, refs)` holds (a laid call's chunks and sequences are as many as its
     worst case, most of them empty): its streams' allocations (of `blocks`, `stages` deep, and of `once`'s
@@ -688,7 +697,8 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     given). The program returns its walk (`mosaic.Walk`), which the kernel runs (`Transport.run`), or None
     where it runs its own roles (`sequence_walk`'s). `held` is what a consumer thread holds in registers
     (`Held`). Where `template.planned` collects launches, the launch's record (`Launch`, its
-    `work`) and zeros.
+    `work`) and zeros. `work` states the model's products a tile, `hardware` their FLOPs as issued
+    (`issued_flops`, the held operand's pairs where None), which its cost and Dew's FLOP count state.
 
     A `persistent` launch runs `grid`'s tiles on as many programs as the device's multiprocessors hold at
     once, its streams' rings running on across them (`_planned_launch`): the family's `persist` takes each
@@ -706,8 +716,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                                                              reduces=reduces,
                                                              after=after)
     tiles = math.prod(grid)
-    # The products the issuer takes for its parts (`product.terms`), each a pair of the model's product.
-    pairs = len(product.terms(call.held.parts, call.held.parts))
+    hardware = issued_flops(call, work.flops) if hardware is None else hardware
     threads = 128 * family.warpgroups(consumers)
 
     found, programs = _laid(call, scope, registers, tiles, stages=None if persistent else stages,
@@ -727,7 +736,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
             stepped = sum(math.prod(shape) * jnp.dtype(dtype).itemsize for shape, dtype in blocks.values())
             # A persistent program's work is its tiles' (`work` is a tile's), the most any program takes.
             each = -(-tiles // programs)
-            flops = work.flops * pairs * each
+            flops = hardware * each
             collected.append(Launch(name, programs, threads, resources.shared_bytes(family, scope(stages)),
                                     registers, work.span * each, stages, stepped, flops,
                                     work.exponentials * each, moved, found.programs if found else 0,
@@ -790,7 +799,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
         # At its plan's residency (`resources.LaunchPlan.programs`), which its registers fit and its roles
         # raise to the share of (two query/key programs where one held, FS-WHY3-h100).
         return family.kernel(entry, out_type=out_type, **laid, consumers=consumers, interpret=call.interpret,
-                             name=name, cost=_stated(work, tiles, pairs, arrays, out_type),
+                             name=name, cost=_stated(work, tiles, hardware, arrays, out_type),
                              model_flops=int(work.flops * tiles),
                              resident=found.programs if found else 1)(*arrays)
 
@@ -821,6 +830,12 @@ def _solved_resources(call: Call, *, keeps: bool, applies: bool, narrow: bool) -
     # The keys' products and the inverse's doubling, then the inverse against each key and value block.
     work = Work(flops=2 * CHUNK * CHUNK * width + _inverse_flops()
                 + 2 * CHUNK * CHUNK * (width + value_width), span=1)
+    # As issued: the keys' products of the operands as given, the doubling's merges in their own form
+    # (`_merged`: a ranged 16-bit call's fp32 parts), the inverse's application to the given keys and values.
+    merged = _merged(call)
+    hardware = (issued_flops(call, 2 * CHUNK * CHUNK * width, call.given, call.given)
+                + issued_flops(call, _inverse_flops(), merged, merged)
+                + issued_flops(call, 2 * CHUNK * CHUNK * (width + value_width), held, call.given))
     # The keys' products' sum and the system's pairs; then the doubling's inverse, power and product, beside
     # the masks (an fp32 call's merges split the inverse and the power into their parts); then the inverse
     # held beside a block's product, its decay and its keys or values.
@@ -844,7 +859,7 @@ def _solved_resources(call: Call, *, keeps: bool, applies: bool, narrow: bool) -
         landing["block"] = held.landing(CHUNK, call.block)
     if narrow:
         landing["values"] = held.landing(CHUNK, call.value_block)
-    return work, held_tiles, staging, landing
+    return work, hardware, held_tiles, staging, landing
 
 
 @lowered_once
@@ -936,7 +951,8 @@ def _solved(k, v, hi, lo, beta, taken, call: Call, *, keeps: bool = True, applie
     out_type = (held.shape(call.heads * width), held.shape(call.heads * value_width)) if applies else ()
     if keeps:
         out_type = (held.shape(call.heads * CHUNK), *out_type)
-    work, held_tiles, staging, landing = _solved_resources(call, keeps=keeps, applies=applies, narrow=narrow)
+    work, hardware, held_tiles, staging, landing = _solved_resources(call, keeps=keeps, applies=applies,
+                                                                     narrow=narrow)
     solved = launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                            grid_names=("chunks", "heads"),
                            blocks=stream_blocks(keys=((CHUNK, width), call.given),
@@ -944,7 +960,7 @@ def _solved(k, v, hi, lo, beta, taken, call: Call, *, keeps: bool = True, applie
                                                                call.given)} if applies else {}))
                            | vector_blocks(call, "gate", "low", "write", "column_gate", "column_low"),
                            stages=1, live=chunk_liveness(7), work=work, held=held_tiles, staging=staging,
-                           landing=landing,
+                           landing=landing, hardware=hardware,
                            persistent=True, reduces=False)(k, v, hi, lo, beta, hi, lo, taken)
     return solved if keeps else (None, *solved)
 
@@ -1072,6 +1088,7 @@ def _intra_solve(system, taken, call: Call):
                          grid_names=("chunks", "heads"),
                          blocks=stream_blocks(system=((CHUNK, CHUNK), systems)),
                          stages=2, live=chunk_liveness(1), work=Work(flops=_inverse_flops(), span=1),
+                         hardware=issued_flops(call, _inverse_flops(), *(_merged(call),) * 2),
                          held=Held(phases=(_doubling_held(call),)),
                          staging=_merges(call), landing={"square": held.landing(CHUNK, CHUNK)},
                          persistent=True)(
@@ -1213,6 +1230,7 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=blocks, stages=(1, 2),
                          live=chunk_liveness(4), work=work,
+                         hardware=issued_flops(call, work.flops, *(_pairing_operand(call),) * 2),
                          held=_intra_held(call, keys, outputs), staging=staging, landing=landing,
                          name="recurrence_intra" if scored else "recurrence_intra_system",
                          # Each stream staged at its key block's row: a tile slices only whole swizzle rows.
@@ -1375,6 +1393,8 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: Call):
                          grid_names=("chunks", "heads"), blocks=_weighted_streamed(call, keyed),
                          stages=(1, 2) if call.per_key else 1, live=chunk_liveness(6),
                          work=dataclasses.replace(work, span=steps), held=_weighted_held(call, keyed),
+                         # The inverse applied to the given keys and values.
+                         hardware=issued_flops(call, work.flops, held, call.given),
                          staging=staging, landing=landing,
                          # A key block's walk a program a tile; a decay a head's one step a tile, persistent.
                          persistent=not call.per_key,
