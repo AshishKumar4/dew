@@ -51,6 +51,7 @@ from dew.nn.kernels.options import program
 from dew.nn.kv_cache import (
     gather_cache_rows,
     refuse_unassigned,
+    row_axis,
     with_rounding_keys,
     with_rounding_keys_of,
     write_cache,
@@ -536,6 +537,18 @@ def _refuse_generation(model: nn.Module) -> None:
         raise ValueError(refusal)
 
 
+def _step_places(state: DecoderState, width: int, tree: TreeBlock | None, capacity: int | None
+                 ) -> tuple[dict[str, jax.Array], jax.Array | None]:
+    """A decode step's attention visibility and its tokens' places: a tree's tokens each read the row's prefix
+    and their own ancestors, at their depths' places (`TreeBlock`); a chain's each its predecessors, at the
+    places the rows reach. A windowed layer windows the runs over the keys' places (`call_visibility`): the
+    prefix's slots' as the chain's cache reads them, a node's its depth past the root's."""
+    if tree is not None:
+        return ({"attention_key_runs": tree.runs(), "attention_key_positions": tree.key_positions(capacity)},
+                tree.positions())
+    return {}, None if state.positions is None else state.positions[:, None] + jnp.arange(width)[None, :]
+
+
 def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | None,
                progress: Progress = END) -> DecodeOps:
     """The model operations a strategy may run, bound to these weights.
@@ -573,15 +586,7 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     def run(state: DecoderState, tokens: jax.Array, valid: jax.Array, *, rebuilds: bool = True,
             tree: TreeBlock | None = None) -> tuple[DecoderState, jax.Array, jax.Array | None]:
         width = tokens.shape[1]
-        # A tree's tokens each read the row's prefix and their own ancestors, at their depths' places
-        # (`TreeBlock`); a chain's each its predecessors, at the places the rows reach.
-        # A windowed layer windows the runs over the keys' places (`call_visibility`): the prefix's slots'
-        # as the chain's cache reads them, a node's its depth past the root's.
-        visibility = ({} if tree is None else
-                      {"attention_key_runs": tree.runs(),
-                       "attention_key_positions": tree.key_positions(capacity)})
-        places = (tree.positions() if tree is not None else None if state.positions is None else
-                  state.positions[:, None] + jnp.arange(width)[None, :])
+        visibility, places = _step_places(state, width, tree, capacity)
 
         def append(valid):
             # The step's tokens laid out once (`Coordinates`): the real ones, at their places.
@@ -611,8 +616,14 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
                 # A crossing row's tokens up to the change answer at the short table, the rest rebuilt.
                 answer, context = jax.tree.map(lambda fresh, held: _chosen(before, held, fresh),
                                                (fresh[0], fresh[3]), (ordinary[0], ordinary[3]))
-                return jax.tree.map(lambda fresh, held: _chosen(crossing, fresh, held),
-                                    (answer, fresh[1], fresh[2], context), ordinary)
+                answer, drafts, context = jax.tree.map(lambda fresh, held: _chosen(crossing, fresh, held),
+                                                       (answer, fresh[2], context),
+                                                       (ordinary[0], ordinary[2], ordinary[3]))
+                # A crossing row's cache, its rows past a run's bank's layers (`row_axis`).
+                cache = jax.tree_util.tree_map_with_path(
+                    lambda path, fresh, held: _chosen(crossing, fresh, held, row_axis(path)), fresh[1],
+                    ordinary[1])
+                return answer, cache, drafts, context
 
             answer, cache, drafts, context = (jax.lax.cond(jnp.any(crossing), rebuild, lambda: ordinary)
                                               if rebuilds else ordinary)
@@ -702,9 +713,11 @@ def _rebuilt(model: nn.Module, params: Variables, ops: DecodeOps, state: Decoder
     return jax.tree.map(lambda leaf: leaf[rows, slots], answer), reseeded.cache, reseeded.drafts, context
 
 
-def _chosen(where: jax.Array, chosen: jax.Array, otherwise: jax.Array) -> jax.Array:
-    """`chosen` where `where` holds over its leading axes, else `otherwise`."""
-    return jnp.where(where.reshape(*where.shape, *(1,) * (chosen.ndim - where.ndim)), chosen, otherwise)
+def _chosen(where: jax.Array, chosen: jax.Array, otherwise: jax.Array, axis: int = 0) -> jax.Array:
+    """`chosen` where `where` holds over its axes from `axis` (a cache leaf's rows, `row_axis`), else
+    `otherwise`."""
+    mask = where.reshape(*(1,) * axis, *where.shape, *(1,) * (chosen.ndim - axis - where.ndim))
+    return jnp.where(mask, chosen, otherwise)
 
 
 def _drafting(model: nn.Module, params: Variables, pad_id: int):

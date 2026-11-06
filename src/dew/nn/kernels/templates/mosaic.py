@@ -375,9 +375,13 @@ class Rows:
 def viewed(view: tuple, block: tuple, step):
     """Step `step`'s tile of a stream's view `(ref, index_map)` (`Family.opened`): the `block`-shaped tile of
     `ref` at the block indices `index_map(step)` gives, as a `BlockSpec`'s index map does; where it gives
-    `Rows`, each run's view at its table's entry."""
+    `Rows`, each run's view at its table's entry; where `ref` is `Pieces` of refs (an fp32 operand's bf16
+    parts, each its own array's), each one's tile at the indices, its share of the block's rows, in order."""
     ref, index_map = view
     indices = index_map(step)
+    if isinstance(ref, Pieces):
+        share = (block[0] // len(ref), *block[1:])
+        return Pieces(viewed((each, index_map), share, step) for each in ref)
 
     def at(indices, block):
         return ref.at[tuple(pl.ds(index * extent, extent)
@@ -957,6 +961,11 @@ def synced(interpret: bool) -> None:
     plgpu.inline_mgpu()(lambda ctx: mgpu_utils.warpgroup_barrier())()
 
 
+MAGIC_INT, MAGIC_FLOAT = 0x4B400000, 12582912.0
+"""An integer below 2**22 in magnitude added to the first in integer arithmetic is the fp32 whose value less
+the second it is (2**23 + 2**22's exponent and mantissa: Family.converted's integer codes)."""
+
+
 def converts(dtype) -> bool:
     """Whether the current device converts quantized codes of `dtype` to 16 bits in registers
     (`Family.converted`): integer codes on any, FP8 codes where its tensor instructions take 8-bit operands
@@ -1362,10 +1371,15 @@ class Issuer[Accumulator](abc.ABC):
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
         """`lhs @ rhs` into a fresh fp32 accumulator, `lhs` in registers (16-bit), its value."""
 
-    def summed_apart(self, running: jax.Array, lhs, rhs, interpret: bool) -> jax.Array:
+    def summed_apart(self, running: jax.Array, lhs, rhs, interpret: bool, scale: Callable | None = None
+                     ) -> jax.Array:
         """`running` plus `lhs @ rhs` summed apart (exact sums, `templates.product.promoted`): the step's own
-        fp32 sum of its products, added into `running` by an IEEE add."""
-        return running + self.product(lhs, rhs, running.shape, interpret=interpret)
+        fp32 sum of its products, times `scale(start, columns)` where given (its columns' multiplier from
+        `start`: a blockwise-scaled FP8 product's, `mosaic_gpu.gmm`'s `step_scales`), added into `running`
+        by an IEEE add."""
+        rows, columns = running.shape
+        fresh = self.product(lhs, rhs, (rows, columns), interpret=interpret)
+        return running + (fresh if scale is None else fresh * scale(0, columns))
 
     @abc.abstractmethod
     def products(self, acc: Accumulator, lhs, rhs, interpret: bool, *, accumulate: bool = True
@@ -1562,9 +1576,10 @@ class Transport[Allocated, Opened](abc.ABC):
     (`grouped_matmul._Mosaic.fitting`); None where cp.async moves a block (mma.sync's)."""
 
     copies_in_pieces: bool = True
-    """Whether a step's block may arrive in several copies, each into its own rows of the slot (`streams`'
-    `copies`, `Pieces`: TMA's, each awaited at the slot's one barrier), where cp.async's pipeline copies a
-    step's block whole from one view: a paged call's key tile of several pages takes a copy a page."""
+    """Whether a step's block may arrive in several copies (`streams`' `copies`, `Pieces`): TMA's each into
+    its own rows of the slot, awaited at the slot's one barrier; cp.async's each a block of its pipeline's
+    own, joined into one tile through registers (`mosaic_sm80.CpAsync.walk`): a paged call's key tile of
+    several pages takes a copy a page."""
 
     copies_vectors: bool = True
     """Whether its copies move a one-dimensional block untiled (TMA's), where cp.async spreads a copy over a
@@ -1789,11 +1804,17 @@ class Transport[Allocated, Opened](abc.ABC):
 
     def staging(self, name: str, shaped) -> dict:
         """The scoped allocations of each consumer's staging of each operand a tile reads whole (`shaped`:
-        its tile's shape and its operand), one for each of up to two consumers, and the completion of its
-        load (`loaded`'s barriers), as `{name}_smems` and `{name}_barriers`."""
+        its tile's shape and its operand), one for each of up to two consumers, in the memory a program
+        stages in (`staged_memory`), and the completion of its load (`loaded`'s barriers), as
+        `{name}_smems` and `{name}_barriers`."""
         shaped = list(shaped)
-        return {f'{name}_smems': [plgpu.SMEM((2, *shape), gmem.dtype) for shape, gmem in shaped],
+        return {f'{name}_smems': [self.staged_memory((2, *shape), gmem.dtype) for shape, gmem in shaped],
                 f'{name}_barriers': [self.load_barriers(2) for _ in shaped]}
+
+    def staged_memory(self, shape: tuple[int, ...], dtype):
+        """A scoped allocation of `shape` in the memory a program stages tiles in: a GPU's shared memory (a
+        TPU's VMEM)."""
+        return plgpu.SMEM(shape, dtype)
 
     def meeting(self, consumers: int):
         """The scoped allocation two consumers `meet` at: two barriers of `consumers` arrivals each."""
@@ -1945,12 +1966,16 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
                 value = value * row_scale[:, None]
         else:
             # Read in the accumulator's layout, whose rows a row vector broadcasts along (`as_row`); an 8-bit
-            # stage takes no ldmatrix. Integer codes by way of int32: Mosaic's packed int8-to-16-bit
-            # conversion assembles to sm_90's sub.bf16x2 (an A100's ptxas refused it, dd-quant4's q4).
+            # stage takes no ldmatrix. Integer codes to fp32 by the exponent's magic number in integer
+            # arithmetic (exact below 2**22), no integer-to-float conversion: an int-to-fp32 cast and the
+            # cast to 16 bits after it folded into Mosaic's packed int8-to-bf16 conversion, sm_90's
+            # sub.bf16x2, which an A100's ptxas refused (dd-q8).
             loaded = plgpu.load(codes, layout=self.layout, optimized=False)
             if jnp.issubdtype(codes.dtype, jnp.integer):
-                loaded = loaded.astype(jnp.int32)
-            value = loaded.astype(jnp.float32)
+                biased = loaded.astype(jnp.int32) + jnp.int32(MAGIC_INT)
+                value = lax.bitcast_convert_type(biased, jnp.float32) - jnp.float32(MAGIC_FLOAT)
+            else:
+                value = loaded.astype(jnp.float32)
             if row_scale is not None:
                 value = value * self.as_row(row_scale)[:, None]
         if interpret:

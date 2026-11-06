@@ -45,6 +45,18 @@ def git(root: Path, *arguments: str) -> str:
                                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}).stdout
 
 
+def linted(root: Path, files: dict[str, str]) -> list[tuple[str, int, str]]:
+    """`files` written into a sparx checkout at `root`, each finding tools/lint_slop.py reports in it as
+    (path, line, code)."""
+    lint = load("lint_slop")
+    for relative, text in files.items():
+        (root / relative).parent.mkdir(parents=True, exist_ok=True)
+        (root / relative).write_text(text)
+    modules = list(lint.collect(["src/sparx", "tests", "tools"], root, "sparx"))
+    return sorted((finding.path, finding.line, finding.code)
+                  for module in modules for finding in lint.check(module))
+
+
 def lint_module(lint: ModuleType, root: Path, parts: tuple[str, ...], body: str):
     """`body` written at `parts` under `root`, a checkout of that one file, as `lint` (tools/lint_slop.py)
     collects it."""

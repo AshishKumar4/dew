@@ -47,8 +47,8 @@ from dew.nn.moe import (
 from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Objective, Ratio
 
-__all__ = ["ExpertBalance", "RoutedStatistics", "apply_routed", "reduce_routed", "router_counts",
-           "router_moments", "router_scores", "router_z_terms"]
+__all__ = ["ExpertBalance", "RoutedStatistics", "apply_routed", "reduce_routed", "refuse_fixed_router",
+           "router_counts", "router_moments", "router_scores", "router_z_terms"]
 
 
 @struct.dataclass
@@ -232,6 +232,30 @@ class ExpertBalance:
         balanced = {path: _updated_bias(biases[path], count, self.balance_rate)
                     for path, count in leaves_by_path(effects).items()}
         return {EXPERT_BIAS_COLLECTION: merge(moe, unflatten_dict(balanced))}
+
+
+def refuse_fixed_router(model: object, balance: ExpertBalance | None, variables: Variables | None) -> None:
+    """Refuse a run that would train routers no term of its loss reaches: a model's routers whose expert
+    weights are fixed (`ExpertRouted.fixed_routers`, a softmax top-1 router renormalized over its one expert),
+    with no balance loss or z-loss to train them, one among the parameters the run trains (a parameter
+    of its in held `variables`' `params`; a tree drawn later trains them all). Its routers would keep
+    their draw, silently; the chosen expert's softmax score weighs its output where `norm_topk_prob=False`,
+    as Switch Transformer's router does, and a router learns through it."""
+    from dew.nn.protocols import ExpertRouted
+
+    fixed = dict(model.fixed_routers()) if isinstance(model, ExpertRouted) else {}
+    if not fixed or (balance is not None and (balance.aux_loss_alpha is not None or balance.router_z_loss)):
+        return
+    if variables is not None:
+        trained = [tuple(map(str, path)) for path in leaves_by_path(variables.get("params", {}))]
+        fixed = {name: owns for name, owns in fixed.items() if any(map(owns, trained))}
+        if not fixed:
+            return
+    raise ValueError(f"{' and '.join(fixed)} renormalize{'s' if len(fixed) == 1 else ''} one chosen expert's "
+                     "softmax score over itself, a weight of 1 whatever the router scores, so no loss term "
+                     "reaches the router: set norm_topk_prob=False, which weighs the expert by its score, or "
+                     "train the router by a balance loss or z-loss (ExpertBalance(aux_loss_alpha=..., "
+                     "router_z_loss=...))")
 
 
 def reduce_routed(balance: ExpertBalance | None,

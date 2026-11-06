@@ -66,20 +66,25 @@ def stored(layout, keys, values=None, dtype=jnp.float32):
 def test_a_head_that_serves_as_keys_and_values_is_kept_once_where_its_layout_stores_it_as_given(layout, once):
     """A store whose values are its keys (DeepSeek V4's window head and its drafter's context,
     `keys_as_values`) reads back what a store holding the head twice reads, keys and values alike, and
-    holds fewer bytes where its layout stores keys as given, full precision or float8, where both were
-    allocated and written (ledger 1921); int8's keys are rotated, not the values' layout, so it keeps
-    both (`KVCache.key_rotation`)."""
+    holds the twice-held store's leaves but its values' where its layout stores keys as given, full
+    precision or float8 (ledger 1921): each the same shape and dtype. int8's keys are rotated, not the
+    values' layout, so it keeps every leaf (`KVCache.key_rotation`)."""
     keys = jax.random.normal(jax.random.key(0), (2, 8, 1, 16))
 
     def kept(holder):
         cache = holder.init(jax.random.key(0), keys, keys)["cache"]
         read, written = holder.apply({"cache": cache}, keys, keys, mutable=["cache"])
-        return read, sum(np.asarray(leaf).nbytes for leaf in jax.tree.leaves(written))
+        leaves = jax.tree_util.tree_flatten_with_path(written)[0]
+        return read, {jax.tree_util.keystr(path): (np.shape(leaf), np.asarray(leaf).dtype)
+                      for path, leaf in leaves}
 
-    (shared, shared_bytes), (separate, separate_bytes) = (kept(Holder(layout, keys_as_values=flag))
-                                                         for flag in (True, False))
+    (shared, shared_leaves), (separate, separate_leaves) = (kept(Holder(layout, keys_as_values=flag))
+                                                           for flag in (True, False))
     jax.tree.map(np.testing.assert_array_equal, shared, separate)
-    assert (shared_bytes < separate_bytes) == once and shared_bytes <= separate_bytes
+    values = ("cached_value", "value_scale")
+    assert shared_leaves == {path: held for path, held in separate_leaves.items()
+                             if not (once and path.endswith(tuple(f"['{name}']" for name in values)))}
+    assert any(path.endswith("['cached_value']") for path in separate_leaves)
 
 
 def outlier_keys(seed=0):
@@ -327,6 +332,50 @@ def test_a_grouped_pools_decode_reads_each_group_s_pages_through_the_template_in
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "grouped pool's template decode", seeds=8)
 
+
+
+@INTERPRETS
+@pytest.mark.parametrize("page", [16, None], ids=["paged", "dense"])
+@pytest.mark.parametrize("stored", ["int8", "float8_e4m3fn"])
+def test_a_quantized_pools_decode_reads_its_codes_through_the_template_interpreted(stored, page):
+    """An int8 or FP8 cache (`KVCache.quantized`), paged or dense, decoded on an H100 by the attention
+    template's decode (`PAGED`'s template kernel), its codes read as they lie and dequantized in the walk by
+    their scales (`template_quantized`, ledger 3624): on par with the reference path over the keys and
+    values the cache dequantizes to, an int8 cache's keys and the query in its rotation (check 1)."""
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.templates import attention as template
+    from dew.nn.kv_cache import dequantize, quantize, rotated
+
+    rows, capacity, kv_heads, width = 4, 128, 2, 64
+    lengths = jnp.asarray([128, 70, 9, 101], jnp.int32)
+    layout = KVCache(page_size=page, quantized=stored)
+    decoder = Decoder(layout, capacity)
+    positions = jnp.broadcast_to(jnp.arange(capacity), (rows, capacity))
+    rotation = layout.key_rotation(width)
+
+    def ours(key, value, query):
+        with generation.assumed("sm90"):
+            cache = decoder.init(jax.random.key(0), key, value, positions, query, lengths)["cache"]
+            # The query in the keys' rotation, as the layer takes it into the store's (`KVStore.rotation`).
+            turned = query if rotation is None else rotated(query, rotation)
+            return decoder.apply({"cache": cache}, key, value, positions, turned, lengths,
+                                 mutable=["cache"])[0]
+
+    def reference(key, value, query):
+        if rotation is not None:
+            key, query = rotated(key, rotation), rotated(query, rotation)
+        key, value = (dequantize(*quantize(array, stored), query.dtype) for array in (key, value))
+        spans = template.spans(1, capacity, rows, lengths=lengths)
+        return template.reference(query[:, None], key, value, spans)[:, 0]
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        key, value = (jax.random.normal(stream, (rows, capacity, kv_heads, width), jnp.bfloat16)
+                      for stream in streams[:2])
+        return key, value, jax.random.normal(streams[2], (rows, 2 * kv_heads, width), jnp.bfloat16)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"{stored} {page} cache's template decode",
+                    seeds=8)
 
 @pytest.mark.parametrize("mixed", [False, True], ids=["rectangular", "mixed"])
 def test_a_paged_write_past_its_rows_pages_drops_and_leaves_their_slots(mixed):

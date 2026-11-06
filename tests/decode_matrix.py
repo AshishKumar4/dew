@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 from attention_oracle import attention_terms
 from gpu_flow import cell
-from kernel_matrix import AXES
+from kernel_matrix import AXES, head_shapes
 from reference_error import assert_as_exact
 
 from dew.nn import attention_kernels
@@ -50,11 +50,6 @@ SEEDS = 8
 HEADS = {"gqa-16-8": (16, 8), "mha-8": (8, 8)}
 
 
-def _case(case: dict[str, str]):
-    heads, kv_heads = HEADS[case["heads"]]
-    return heads, kv_heads, int(case["width"]), jnp.dtype(case["dtype"])
-
-
 def _hooks(case: dict[str, str], sinks):
     return {"softcap": CAP if case["hook"] == "softcap" else None,
             "sinks": sinks if case["hook"] == "sinks" else None}
@@ -64,7 +59,7 @@ def supported(case: dict[str, str]) -> bool:
     """Whether its choice's selector serves `case` on its GPU at its kernel (tests/kernel_matrix.py): the
     decode selector takes a dense step (`decodes`), the paged selector a paged one, each by the kernel named
     (`selection.select`), which takes it."""
-    heads, kv_heads, width, dtype = _case(case)
+    heads, kv_heads, width, dtype = head_shapes(case, HEADS)
     with generation.assumed(case["generation"]):
         if case["layout"] == "dense":
             query = jnp.zeros((ROWS, 1, heads, width), dtype)
@@ -76,7 +71,7 @@ def supported(case: dict[str, str]) -> bool:
         else:
             op = PAGED
             called = PagedCase(heads=heads, kv_heads=kv_heads, head_dim=width, value_dim=width, dtype=dtype,
-                               pool=dtype, page_size=PAGE, quantized=False, groups=1, head_shards=1,
+                               pool=dtype, page_size=PAGE, quantized=None, groups=1, head_shards=1,
                                softcap=CAP if case["hook"] == "softcap" else None, arithmetic=False,
                                named="auto", sinks=case["hook"] == "sinks")
         if called is None or case["kernel"] not in KERNELS[_choice(case)]:
@@ -151,7 +146,7 @@ def _terms(case: dict[str, str]):
 
 def _drawn(case: dict[str, str]):
     """A draw of `case`'s operands by seed: unit Gaussians in its dtype, the sinks fp32."""
-    heads, kv_heads, width, dtype = _case(case)
+    heads, kv_heads, width, dtype = head_shapes(case, HEADS)
 
     def draw(seed: int):
         streams = jax.random.split(jax.random.key(seed), 5)

@@ -59,7 +59,7 @@ from dew.batch import (
     unboxed,
 )
 from dew.distributed.placement import Layout, RefinesLayout
-from dew.nn.derivatives import surrogate
+from dew.nn.derivatives import contracted, surrogate
 from dew.nn.inspection import INSPECTED, Watched, watching
 from dew.nn.kernels.options import Held, Option, compiler_options, owned_program
 from dew.nn.precision import (
@@ -277,6 +277,14 @@ def stream(name: str) -> int:
     return fold
 
 
+QK = "qk"
+"""The collection a model's attention sows its logit maxima in, where a step opens it (`Step.qk_stats`)."""
+
+OBSERVED = (QK, INSPECTED)
+"""The collections a model call sows what a step observes in (`Step.observed`): its attention logit maxima
+and its watched activations, each a pass's own, which no state holds (`Objective.init`)."""
+
+
 @struct.dataclass
 class Step:
     """What the trainer tells an objective about the current step.
@@ -343,8 +351,18 @@ class Step:
         objective reads, and those the step asks for, `qk` where the optimizer clips by it and
         `inspected` where the step watches activations. A call opening none returns an empty mapping
         beside its output."""
-        return [*collections, *(["qk"] if self.qk_stats else []),
+        return [*collections, *([QK] if self.qk_stats else []),
                 *([INSPECTED] if self.watched is not None else [])]
+
+    def observed(self, sown: Variables) -> tuple[Variables | None, Variables | None]:
+        """What a model call that opened `sown()` sowed for the step: the attention logit maxima where
+        the optimizer clips by them (`Aux.qk_stats`), each layer's at its weights' path, and the watched
+        activations (`Aux.inspected`). Each is None where the step asked for none: every objective that
+        opens them returns them, as a run whose optimizer clips by the maxima refuses a step returning
+        none (row 1608: a decision, supervised or continuous diffusion run under 'muonclip' took no
+        update)."""
+        return (sown.get(QK, {}) if self.qk_stats else None,
+                sown.get(INSPECTED, {}) if self.watched is not None else None)
 
     def places(self, rows: int) -> tuple[jax.Array, int]:
         """The places among the update's examples of a batch's `rows` rows (`examples`) and how many
@@ -688,7 +706,8 @@ def _ruled_tangent(primals, tangents, _value) -> jax.Array:
                              zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
 
 
-_ruled = surrogate(lambda value, rule, params: value, _ruled_tangent)
+_ruled = contracted("test_a_ruled_loss_holds_every_order")(
+    surrogate(lambda value, rule, params: value, _ruled_tangent))
 """`value`, whose derivative in `params` is `rule` (`Objective.with_gradients`): a surrogate
 (`dew.nn.derivatives.surrogate`), the loss's own derivative replaced by a learning rule's."""
 
@@ -997,7 +1016,8 @@ class Objective(ABC, Generic[Loss, Effects]):
     pipeline's frozen towers) rather than a starting tree, which holds `params`."""
 
     def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
-        """Return the whole variables tree, every collection, from one key.
+        """Return the whole variables tree, every collection but those a pass observes (`OBSERVED`), from
+        one key.
 
         It must be pure, because the trainer traces it once for shapes and
         once for values. `variables` is the held tree the caller supplies,
@@ -1026,7 +1046,14 @@ class Objective(ABC, Generic[Loss, Effects]):
             raise ValueError("variables is the variables dict ({'params': ...}) that "
                              "Pretrained.load and model.init return")
         tree = self.complete_variables(key, tree)
-        return with_projected(tree, functools.partial(self.projected, updated=True))
+        # What a pass observes is that pass's own, never the state's: a module that sows its maxima or its
+        # watched activations as it initializes leaves none for a step to read before its own (`OBSERVED`).
+        tree = with_projected({name: part for name, part in tree.items() if name not in OBSERVED},
+                              functools.partial(self.projected, updated=True))
+        if not held:
+            # The draw `parameter_axes` reads, the names its boxes carry static under any trace.
+            self.__dict__.setdefault("_drawn_axes", boxed_axes(tree))
+        return tree
 
     @functools.cached_property
     def parameter_axes(self) -> dict[tuple[str, ...], LogicalAxes]:
@@ -1037,12 +1064,17 @@ class Objective(ABC, Generic[Loss, Effects]):
         held one alike. A held tree's leaves are held to the draw's shapes, a leaf of another shape
         refused by its path: its axes would name another parameter's dimensions. An objective that draws
         no fresh tree (`fresh_variables`' `NotImplementedError`, its documented answer) holds no draw to
-        read: its held tree is placed by its shapes (`dew.inference.place`), its towers by their tables."""
+        read: its held tree is placed by its shapes (`dew.inference.place`), its towers by their tables.
+        An objective that holds no tree reads the draw its `init` made first, which the trainer traces for
+        its state's shapes (`_drawn_axes`), where another trace of it was seconds of a Qwen3.5-4B step's
+        compile (row 4260)."""
+        held = self.held_variables()
+        if held is None and (drawn_axes := self.__dict__.get("_drawn_axes")) is not None:
+            return {**self.tower_axes(), **drawn_axes}
         try:
             drawn = abstract(functools.partial(self.init, variables={}), jax.random.key(0))
         except NotImplementedError:
             return self.tower_axes()
-        held = self.held_variables()
         if held is not None and "params" in held:
             shapes = {jax.tree_util.keystr(path): np.shape(leaf)
                       for path, leaf in jax.tree_util.tree_leaves_with_path(unboxed(dict(drawn)))}

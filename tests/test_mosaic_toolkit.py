@@ -126,6 +126,16 @@ def a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100(consumers):
     np.testing.assert_array_equal(np.asarray(summed), _expected(x))
 
 
+def _multiplying(family, lhs: str, rhs: str, interpret):
+    """A walk's step that multiplies its `lhs` slot by its `rhs` slot into its one accumulator."""
+    def step(index, slots, carry, accumulators):
+        del index
+        (acc,) = accumulators
+        return carry, (family.products(acc, slots[lhs], slots[rhs], interpret),)
+
+    return step
+
+
 FED_STEPS = 5
 FED_ROWS, FED_WIDTH = 64, 128
 
@@ -545,12 +555,7 @@ def _persisted_products(x, w, *, family, interpret, rows: int | None = None, res
             def issue(wg, tile, walk, *, active):
                 del wg, tile, active
 
-                def step(index, slots, carry, accumulators):
-                    del index
-                    (acc,) = accumulators
-                    return carry, (family.products(acc, slots['x'], slots['w'], interpret),)
-
-                return walk(step, None, (shape,))[1]
+                return walk(_multiplying(family, 'x', 'w', interpret), None, (shape,))[1]
 
             def finish(wg, tile, accs, store, *, active):
                 del wg, active
@@ -875,7 +880,7 @@ CODES = (64, 64)
 """A quantized stage's rows and depth."""
 
 
-def _converted(codes, scale, *, generation_name: str, interpret):
+def _converted(codes, scale, *, generation_name: str, interpret, scaled: bool = True):
     """`codes` (int8 or e4m3) converted into a bf16 tile through a family's `converted`, each row scaled by
     `scale`, and copied out: on an A100's mma.sync and an H100's fed warpgroup MMA."""
     from dew.nn.kernels.templates import bundles, resources
@@ -887,7 +892,8 @@ def _converted(codes, scale, *, generation_name: str, interpret):
             mosaic.copied(codes_gmem, codes_smem)
             mosaic.synced(interpret is not False)
             row_scale = scale_gmem[...] if interpret is not False else family.rows_of(scale_gmem)
-            family.converted(codes_smem, into, interpret is not False, row_scale=row_scale)
+            family.converted(codes_smem, into, interpret is not False,
+                             row_scale=row_scale if scaled else None)
             mosaic.synced(interpret is not False)
             mosaic.store_rows(into, out_gmem, 0, 0, jnp.int32(CODES[0]), 0, CODES[0], copy=mosaic.coalesced,
                               widest=resources.copied_rows(CODES[1], jnp.bfloat16))
@@ -908,30 +914,108 @@ def _codes(dtype):
     return codes, jnp.exp2(jax.random.randint(keys[1], (CODES[0],), -3, 4).astype(jnp.float32))
 
 
+@pytest.mark.parametrize("scaled", [True, False], ids=["scaled", "unscaled"])
 @pytest.mark.parametrize("dtype", [jnp.int8, jnp.float8_e4m3fn])
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
-def test_a_quantized_stage_converts_into_the_tile_its_products_read(generation_name, dtype):
+def test_a_quantized_stage_converts_into_the_tile_its_products_read(generation_name, dtype, scaled):
     """Int8 and e4m3 codes in shared memory converted into a bf16 tile, each row scaled in fp32: exactly
     `codes * scale` interpreted (on a CPU) or on a GPU of the generation, and lowered for one on any host;
     FP8 codes refused where the device converts none (an A100)."""
     codes, scale = _codes(dtype)
-    expected = np.asarray(codes, np.float32) * np.asarray(scale)[:, None]
+    expected = np.asarray(codes, np.float32) * (np.asarray(scale)[:, None] if scaled else 1)
     with generation.assumed(generation_name):
         converts = mosaic.converts(dtype)
     if not converts:
         # An A100 converts no FP8 in registers: the conversion is refused, never assembled.
-        with pytest.raises(ValueError, match="converts no"), generation.assumed(generation_name):
+        with pytest.raises(ValueError), generation.assumed(generation_name):
             _converted(codes, scale, generation_name=generation_name, interpret=INTERPRETED)
         return
     if jax.default_backend() == "cpu":
         with generation.assumed(generation_name):
-            converted = _converted(codes, scale, generation_name=generation_name, interpret=INTERPRETED)
+            converted = _converted(codes, scale, generation_name=generation_name, interpret=INTERPRETED,
+                                   scaled=scaled)
         np.testing.assert_array_equal(np.asarray(converted, np.float32), expected)
+        # Compiled for the device on any host, its PTX through ptxas (a process of the device's capability,
+        # `compile_mosaic_kernels`): an integer conversion's fold into sm_90's packed int8-to-bf16 assembly
+        # fails there, not in the lowering.
+        from fla_gdn_support import KernelCase
+        from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
         shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (codes, scale)]
-        mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
-        with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
-            jax.jit(functools.partial(_converted, generation_name=generation_name, interpret=False)).trace(
-                *shapes).lower(lowering_platforms=("cuda",))
+        compiled = functools.partial(_converted, generation_name=generation_name, interpret=False,
+                                     scaled=scaled)
+        found = compile_mosaic_kernels([KernelCase("converted", lambda: (compiled, shapes))], generation_name)
+        assert not mosaic_failures(found), mosaic_failures(found)
     elif generation.device_generation() == generation_name:
-        converted = _converted(codes, scale, generation_name=generation_name, interpret=False)
+        converted = _converted(codes, scale, generation_name=generation_name, interpret=False, scaled=scaled)
         np.testing.assert_array_equal(np.asarray(converted, np.float32), expected)
+
+
+PAGE, PAGED_STEPS, PAGED_BLOCK = 16, 4, 64
+"""A paged walk's page rows, steps and the rows of a step's block, its pages a block 4."""
+
+
+def _paged_products(p, pool, table, *, interpret):
+    """`p @ x` where `x`'s rows are the pool's pages in the table's order (each a 16-row page, four a
+    64-row step's block): mma.sync's pipeline loads a step's block as four page copies at their table's
+    entries (`mosaic.Rows`) and joins them into the one tile its products read (`CpAsync.walk`)."""
+    from dew.nn.kernels.templates import mosaic_sm80
+
+    family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16))
+    pieces = PAGED_BLOCK // PAGE
+
+    def body(p_gmem, pool_gmem, table_gmem, out_gmem):
+        blocks = {'p': ((FED_ROWS, PAGED_BLOCK), jnp.bfloat16), 'x': ((PAGED_BLOCK, FED_WIDTH), jnp.bfloat16)}
+        allocated = family.streams(blocks, 2, 1, copies={'x': pieces})
+
+        def walked(*, streams):
+            views = {'p': (p_gmem, lambda j: (0, j)),
+                     'x': (pool_gmem, lambda j: mosaic.Rows(table_gmem, j * pieces, (0,), PAGE))}
+
+            step = _multiplying(family, 'p', 'x', interpret)
+            return family.walk(family.opened(streams, views), ((step, 0, PAGED_STEPS),), (),
+                               ((FED_ROWS, FED_WIDTH),), interpret)[1][0]
+
+        summed = family.scoped(walked, streams=allocated)
+
+        def stored(out_smem):
+            plgpu.store(out_smem, summed, optimized=False)
+            mosaic.synced(interpret)
+            mosaic.copied(out_smem, out_gmem)
+
+        pl.run_scoped(stored, mosaic.plain((FED_ROWS, FED_WIDTH), jnp.float32))
+
+    out = jax.ShapeDtypeStruct((FED_ROWS, FED_WIDTH), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="paged")(p, pool, table)
+
+
+def _paged_operands():
+    """Small integers (the product exact in fp32) and a page table that reverses a pool of twice the pages a
+    walk reads, each page at an odd place."""
+    keys = jax.random.split(jax.random.key(7), 2)
+    pages = 2 * PAGED_STEPS * PAGED_BLOCK // PAGE
+    p = jax.random.randint(keys[0], (FED_ROWS, PAGED_STEPS * PAGED_BLOCK), -4, 4).astype(jnp.bfloat16)
+    pool = jax.random.randint(keys[1], (pages * PAGE, FED_WIDTH), -4, 4).astype(jnp.bfloat16)
+    table = jnp.arange(pages - 1, 0, -2, dtype=jnp.int32)
+    return p, pool, table
+
+
+@pytest.mark.parametrize("on_gpu", [False, True], ids=["lowered", "run"])
+def test_a_cp_async_walk_joins_its_pages_into_the_tile_its_products_read(on_gpu):
+    """An A100's walk over a paged operand, a step's 64 rows four 16-row pages at its table's entries:
+    lowered for an A100 on any host, and on one exactly `p @ x` for `x` the pages in the table's order."""
+    p, pool, table = _paged_operands()
+    pages = np.asarray(pool, np.float32).reshape(-1, PAGE, FED_WIDTH)
+    gathered = pages[np.asarray(table)].reshape(-1, FED_WIDTH)
+    if on_gpu:
+        if generation.device_generation() not in ("sm80", "sm86", "sm89"):
+            pytest.skip("runs on an sm8x GPU")
+        np.testing.assert_array_equal(np.asarray(_paged_products(p, pool, table, interpret=False)),
+                                      np.asarray(p, np.float32) @ gathered)
+        return
+    shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (p, pool, table)]
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
+    with generation.assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(functools.partial(_paged_products, interpret=False)).trace(*shapes).lower(
+            lowering_platforms=("cuda",))

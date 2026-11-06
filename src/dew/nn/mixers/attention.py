@@ -341,6 +341,10 @@ class CausalSelfAttention(nn.Module):
     rotary_pairs: Literal['half', 'adjacent'] = 'half'
     """The channels each angle turns (`dew.nn.rope.rotate`): the HF decoders'
     halves, or the adjacent pairs of Llama 4's vision tower."""
+    rotary_interleaved: bool = False
+    """Whether the `rotary_axes` take their angles in turn, pair by pair, where they otherwise
+    each turn their own run of pairs (`dew.nn.rope.axis_tables`): MoonViT's patch grid, a column's
+    pair beside a row's."""
     rotary_per_axis: bool = False
     """Whether each of the `rotary_axes` turns its own channels in halves,
     Gemma 4's vision rope (`apply_multidimensional_rope`), where Qwen 3.5's
@@ -755,7 +759,8 @@ class CausalSelfAttention(nn.Module):
             if rotary_positions is None or rotary_positions.ndim != 3:
                 raise ValueError(f"a rotary over {len(self.rotary_axes)} axes reads their ids "
                                  "[B, S, axes] from attention_metadata.rotary_positions")
-            return axis_tables(rotary_positions, self.rotary_axes, self.ctx.rope_theta, dtype=dtype)
+            return axis_tables(rotary_positions, self.rotary_axes, self.ctx.rope_theta, dtype=dtype,
+                               interleaved=self.rotary_interleaved)
         section = None
         if self.mrope_section is not None and rotary_positions is not None and rotary_positions.ndim == 3:
             if self.ctx.partial_rotary_type != "default":
@@ -1295,7 +1300,9 @@ class CausalSelfAttention(nn.Module):
         # The call's spans past its causal flag, window, mask and documents, as the kernel reads them: its
         # groups, and its real keys with the places its window counts.
         blocks, images = groups.block_groups, groups.image_groups
-        held = None if valid is None and runs is None else key_places
+        # A window counts the keys' places; with none the kernel reads none (`scaled_dot_product_attention`),
+        # and a call's keys may outnumber its queries (a canvas over its encoder's prefix, `_prefixed`).
+        held = None if (valid is None and runs is None) or window is None else key_places
         # The per-head maxima the QK-Clip reads. Computed only when a caller
         # opened the collection; the plain forward leaves it closed and its
         # leaves bitwise identical.
@@ -1491,8 +1498,10 @@ class CausalSelfAttention(nn.Module):
         """Whether a decode step's query `[rows, heads, head_dim]` reads the paged pool `store` through
         its device's paged kernel (`KVStore.decode`), as the paged selector chooses it (`PAGED`), rather
         than the gathered rows through the layer's attention; a compact cache keeps no pages. A
-        `windowed` step reads each row from its window's first key; a `sunk` one has sinks."""
-        if store.layout.page_size is None:
+        `windowed` step reads each row from its window's first key; a `sunk` one has sinks. A compact
+        quantized cache's codes read as they lie where the template's decode takes them
+        (`template_quantized`), no dequantized copy of the cache a step."""
+        if store.layout.page_size is None and store.layout.quantized is None:
             return False
         case = store.case(query, value_dim=self.value_dim, softcap=self.ctx.attn_logit_softcap,
                           arithmetic=reference_only(query, self.ctx.dtype, self.ctx.precision,

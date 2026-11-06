@@ -123,14 +123,6 @@
    "tool": "tools/laya_reference.py",
    "sources": [{"repo": "NandhaKishorM/laya", "version": "a4a8921afebfd852bba0000475cfb6ab737a124c", "runs": "laya"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "hf/diffusion-gemma-window-tiny/logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/diffusion-gemma-window-tiny/logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "attention_bf16.npz": {
    "tool": "tools/numerics_reference.py",
    "sources": [
@@ -464,7 +456,7 @@
    "sources": [
     {
      "repo": "huggingface/diffusers",
-     "version": "0.34.0",
+     "version": "0.39.0",
      "runs": "diffusers"
     }
    ],
@@ -479,50 +471,18 @@
      "runs": "diffusers"
     }
    ],
-   "note": "The rounding mode with copies=32. Four pointwise source_schedulers cases use independent initial states and replayed per-step JAX noise on (2, 3, 128), both precisions over the same float32 inputs (the fifth, edm.exponential_v_threshold, moved to source_seeds.npz and its arrays left this file). CFG epsilon uses 52 pixel orders of the original (2, 3, 4) input and cotangent; each float64 VJP commutes with its order within 1e-12 relative RMS, and order zero reproduces the original float32 gradient bit for bit. Original source_schedulers arrays are unchanged. Torch 2.14.0+cpu, JAX 0.11.2.post3."
+   "note": "The rounding mode: CFG epsilon's 52 pixel orders of the original (2, 3, 4) input and cotangent; each float64 VJP commutes with its order within 1e-12 relative RMS, and order zero reproduces the original float32 gradient bit for bit. The four pointwise cases its copies held moved to source_seeds.npz. Original source_schedulers arrays are unchanged. Torch 2.14.0+cpu, JAX 0.11.2.post3."
   },
   "diffusers/source_seeds.npz": {
    "tool": "tools/diffusers_source_reference.py",
    "sources": [
     {
      "repo": "huggingface/diffusers",
-     "version": "0.34.0",
+     "version": "0.39.0",
      "runs": "diffusers"
     }
    ],
-   "note": "The seeds mode: edm.exponential_v_threshold's trajectory gradient over check 1's recorded seeds (tools/recorded_references.py's record_case), each seed's initial state at init_noise_sigma and its cotangent drawn by torch's generator, the float32 VJP and the float64 one with the per-step JAX noise of key 0 replayed in both. Torch 2.14.1+cpu, torchsde 0.2.6."
-  },
-  "diffusers_handoff.npz": {
-   "tool": "tools/diffusers_handoff_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/diffusers",
-     "version": "0.34.0",
-     "runs": "diffusers"
-    },
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "transformers"
-    }
-   ],
-   "note": "Over tiny_diffusers.tar.xz's xl (PyTorch twins: UNet, VAE, both CLIP towers, DDIM) and refiner: StableDiffusionXLPipeline with denoising_end=0.5 to latents, then StableDiffusionXLImg2ImgPipeline with denoising_start=0.5 from them, 'cat' against 'dog' at guidance 3, four steps, from xl's reference noise; float32 and float64 (models via diffusers_wan_reference.float64, DDIM tables via float64_scheduler). Torch 2.14.0+cpu."
-  },
-  "diffusers_pipeline_schedulers.npz": {
-   "tool": "tools/diffusers_scheduler_pipeline_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/diffusers",
-     "version": "0.34.0",
-     "runs": "diffusers"
-    },
-    {
-     "repo": "huggingface/transformers",
-     "version": "4.49.0",
-     "runs": "transformers"
-    }
-   ],
-   "note": "Official Flax UNet/text predictions feed official Torch schedulers; output path is caller-supplied."
+   "note": "The seeds mode: every pointwise case's trajectory gradient over check 1's recorded seeds (tools/recorded_references.py's record_case, confirmed paired with Dew's walk), each seed's (8, 3, 32) initial state at init_noise_sigma and its cotangent drawn by torch's generator, a thresholding case's draw clear of its clip by selection_margins.MARGIN, DDIM's thresholding over two steps (SEEDED_STEPS), the float32 VJP and the float64 one with the per-step JAX noise of key 0 replayed in both. Torch 2.14.1+cpu, torchsde 0.2.6."
   },
   "distillation": {
    "tool": "tools/distillation_reference.py",
@@ -555,7 +515,7 @@
      "runs": "fetched"
     }
    ],
-   "note": "Executes fetched official networks_edm2 with pickling/constructor stubs and float64-retargeted casts: unet.npz in eval mode, train.npz in train mode under torch's SGD (--train)."
+   "note": "Executes fetched official networks_edm2 with pickling/constructor stubs and float64-retargeted casts over seeded draws of its weights and inputs (seeds.npz, `draw`; layout.json the state's names and shapes): the output in eval mode, and train mode under torch's SGD."
   },
   "edm_loss": {
    "tool": "tools/edm_loss_reference.py",
@@ -678,7 +638,7 @@
      "runs": "torch"
     }
    ],
-   "note": "Executes the Flux DreamBooth script's noising and loss statements (v0.34.0) with compute_loss_weighting_for_sd3, around a stand-in velocity network, on Dew's draws; FlowMatchEulerDiscreteScheduler(shift=3)'s sigma grid."
+   "note": "The Flux DreamBooth script's noising and loss statements (v0.34.0), which the test executes with compute_loss_weighting_for_sd3 around a stand-in velocity network on Dew's draws, with that network's pixels and weights; FlowMatchEulerDiscreteScheduler(shift=3)'s sigma grid."
   },
   "flow/resolution_shift.npz": {
    "tool": "tools/flux_shift_reference.py",
@@ -977,38 +937,6 @@
     }
    ],
    "note": "The release's own inference/kernel.py (tilelang 0.1.8, torch 2.10.0+cu128) run on an RTX 4080 by --kernels: act_quant and fp4_act_quant in place on bf16 rows, sparse_attn and hc_split_sinkhorn; inputs and outputs as bits."
-  },
-  "hf/diffusion-gemma-denoise-tiny/numerics.npz": {
-   "tool": "tools/numerics_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "transformers"
-    }
-   ]
-  },
-  "hf/diffusion-gemma-denoise-tiny/ref_bare.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "transformers"
-    }
-   ],
-   "note": "transformers 5.16.1 recomputes it bit for bit from the committed weights and inputs."
-  },
-  "hf/diffusion-gemma-denoise-tiny/ref_conditioned.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "transformers"
-    }
-   ],
-   "note": "transformers 5.16.1 recomputes it bit for bit from the committed weights and inputs."
   },
   "hf/diffusion-gemma-sc-tiny/ref.npy": {
    "tool": "tools/hf_reference.py",
@@ -2983,7 +2911,7 @@
      "runs": "torch"
     }
    ],
-   "note": "Diffusion._loss (SUBS, continuous time, antithetic times floored at 1e-3) and _ddpm_update's categorical, around a hidden @ head stand-in backbone; rows, weights and uniforms are inputs."
+   "note": "Diffusion._loss (SUBS, continuous time, antithetic times floored at 1e-3) and _ddpm_update's categorical, around a hidden @ head stand-in backbone; rows, weights and uniforms are inputs. The same loss over seeded draws of rows, weights and uniforms is seeds.npz (`draw`)."
   },
   "meanflow": {
    "tool": "tools/meanflow_reference.py",
@@ -3053,6 +2981,141 @@
    ],
    "note": "Executes data/shakespeare_char/prepare.py as published on the first 20,000 characters of char-rnn's tinyshakespeare (train.bin, val.bin), then train.py's get_batch as published for eight batches of each split, recording the offsets it draws and its x and y."
   },
+  "native_diffusion/grid-pndm-prk.npz": {
+   "tool": "tools/venv_reference.py native-grid-pndm-prk",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved SD pipeline's Flax UNet walked by Diffusers' pndm-prk scheduler (tools/diffusers_scheduler_pipeline_reference.py's walk) from check 1's drawn noise (tools/check_native_diffusion.py's draw_for(\"grid\")), in float32 and float64, sized paired with Dew's walk."
+  },
+  "native_diffusion/grid-pndm-plms.npz": {
+   "tool": "tools/venv_reference.py native-grid-pndm-plms",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved SD pipeline's Flax UNet walked by Diffusers' pndm-plms scheduler (tools/diffusers_scheduler_pipeline_reference.py's walk) from check 1's drawn noise (tools/check_native_diffusion.py's draw_for(\"grid\")), in float32 and float64, sized paired with Dew's walk."
+  },
+  "native_diffusion/grid-lms.npz": {
+   "tool": "tools/venv_reference.py native-grid-lms",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved SD pipeline's Flax UNet walked by Diffusers' lms scheduler (tools/diffusers_scheduler_pipeline_reference.py's walk) from check 1's drawn noise (tools/check_native_diffusion.py's draw_for(\"grid\")), in float32 and float64, sized paired with Dew's walk."
+  },
+  "native_diffusion/grid-lms-v.npz": {
+   "tool": "tools/venv_reference.py native-grid-lms-v",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved SD pipeline's Flax UNet walked by Diffusers' lms-v scheduler (tools/diffusers_scheduler_pipeline_reference.py's walk) from check 1's drawn noise (tools/check_native_diffusion.py's draw_for(\"grid\")), in float32 and float64, sized paired with Dew's walk."
+  },
+  "native_diffusion/grid-lms-karras.npz": {
+   "tool": "tools/venv_reference.py native-grid-lms-karras",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved SD pipeline's Flax UNet walked by Diffusers' lms-karras scheduler (tools/diffusers_scheduler_pipeline_reference.py's walk) from check 1's drawn noise (tools/check_native_diffusion.py's draw_for(\"grid\")), in float32 and float64, sized paired with Dew's walk."
+  },
+  "native_diffusion/grid-euler.npz": {
+   "tool": "tools/venv_reference.py native-grid-euler",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved SD pipeline's Flax UNet walked by Diffusers' euler scheduler (tools/diffusers_scheduler_pipeline_reference.py's walk) from check 1's drawn noise (tools/check_native_diffusion.py's draw_for(\"grid\")), in float32 and float64, sized paired with Dew's walk."
+  },
+  "native_diffusion/grid-dpm.npz": {
+   "tool": "tools/venv_reference.py native-grid-dpm",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved SD pipeline's Flax UNet walked by Diffusers' dpm scheduler (tools/diffusers_scheduler_pipeline_reference.py's walk) from check 1's drawn noise (tools/check_native_diffusion.py's draw_for(\"grid\")), in float32 and float64, sized paired with Dew's walk."
+  },
+  "native_diffusion/sd-prompt.npz": {
+   "tool": "tools/venv_reference.py native-sd-prompt",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved sd pipeline's own Diffusers call (tools/native_diffusion_worker.py) on check 1's drawn prompts, noise and pixels (tools/check_native_diffusion.py's draw_for), its prompt group's leaves (hidden) in float32 and float64, whole, sized paired with Dew's computation of them."
+  },
+  "native_diffusion/sd-autoencoder.npz": {
+   "tool": "tools/venv_reference.py native-sd-autoencoder",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved sd pipeline's own Diffusers call (tools/native_diffusion_worker.py) on check 1's drawn prompts, noise and pixels (tools/check_native_diffusion.py's draw_for), its autoencoder group's leaves (encoded, decoded) in float32 and float64, whole, sized paired with Dew's computation of them."
+  },
+  "native_diffusion/sd-walk.npz": {
+   "tool": "tools/venv_reference.py native-sd-walk",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved sd pipeline's own Diffusers call (tools/native_diffusion_worker.py) on check 1's drawn prompts, noise and pixels (tools/check_native_diffusion.py's draw_for), its walk group's leaves (images) in float32 and float64, whole, sized paired with Dew's computation of them."
+  },
+  "native_diffusion/xl-prompt.npz": {
+   "tool": "tools/venv_reference.py native-xl-prompt",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved xl pipeline's own Diffusers call (tools/native_diffusion_worker.py) on check 1's drawn prompts, noise and pixels (tools/check_native_diffusion.py's draw_for), its prompt group's leaves (hidden, pooled) in float32 and float64, whole, sized paired with Dew's computation of them."
+  },
+  "native_diffusion/xl-autoencoder.npz": {
+   "tool": "tools/venv_reference.py native-xl-autoencoder",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved xl pipeline's own Diffusers call (tools/native_diffusion_worker.py) on check 1's drawn prompts, noise and pixels (tools/check_native_diffusion.py's draw_for), its autoencoder group's leaves (encoded, decoded) in float32 and float64, whole, sized paired with Dew's computation of them."
+  },
+  "native_diffusion/xl-walk.npz": {
+   "tool": "tools/venv_reference.py native-xl-walk",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved xl pipeline's own Diffusers call (tools/native_diffusion_worker.py) on check 1's drawn prompts, noise and pixels (tools/check_native_diffusion.py's draw_for), its walk group's leaves (images) in float32 and float64, whole, sized paired with Dew's computation of them."
+  },
+  "native_diffusion/img2img-prompt.npz": {
+   "tool": "tools/venv_reference.py native-img2img-prompt",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved img2img pipeline's own Diffusers call (tools/native_diffusion_worker.py) on check 1's drawn prompts, noise and pixels (tools/check_native_diffusion.py's draw_for), its prompt group's leaves (hidden) in float32 and float64, whole, sized paired with Dew's computation of them."
+  },
+  "native_diffusion/img2img-autoencoder.npz": {
+   "tool": "tools/venv_reference.py native-img2img-autoencoder",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved img2img pipeline's own Diffusers call (tools/native_diffusion_worker.py) on check 1's drawn prompts, noise and pixels (tools/check_native_diffusion.py's draw_for), its autoencoder group's leaves (encoded, decoded) in float32 and float64, whole, sized paired with Dew's computation of them."
+  },
+  "native_diffusion/img2img-walk.npz": {
+   "tool": "tools/venv_reference.py native-img2img-walk",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved img2img pipeline's own Diffusers call (tools/native_diffusion_worker.py) on check 1's drawn prompts, noise and pixels (tools/check_native_diffusion.py's draw_for), its walk group's leaves (images) in float32 and float64, whole, sized paired with Dew's computation of them."
+  },
+  "native_diffusion/inpaint-prompt.npz": {
+   "tool": "tools/venv_reference.py native-inpaint-prompt",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved inpaint pipeline's own Diffusers call (tools/native_diffusion_worker.py) on check 1's drawn prompts, noise and pixels (tools/check_native_diffusion.py's draw_for), its prompt group's leaves (hidden) in float32 and float64, whole, sized paired with Dew's computation of them."
+  },
+  "native_diffusion/inpaint-autoencoder.npz": {
+   "tool": "tools/venv_reference.py native-inpaint-autoencoder",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved inpaint pipeline's own Diffusers call (tools/native_diffusion_worker.py) on check 1's drawn prompts, noise and pixels (tools/check_native_diffusion.py's draw_for), its autoencoder group's leaves (encoded, decoded) in float32 and float64, whole, sized paired with Dew's computation of them."
+  },
+  "native_diffusion/inpaint-walk.npz": {
+   "tool": "tools/venv_reference.py native-inpaint-walk",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved inpaint pipeline's own Diffusers call (tools/native_diffusion_worker.py) on check 1's drawn prompts, noise and pixels (tools/check_native_diffusion.py's draw_for), its walk group's leaves (images) in float32 and float64, whole, sized paired with Dew's computation of them."
+  },
+  "native_diffusion/xl-img2img-prompt.npz": {
+   "tool": "tools/venv_reference.py native-xl-img2img-prompt",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved xl-img2img pipeline's own Diffusers call (tools/native_diffusion_worker.py) on check 1's drawn prompts, noise and pixels (tools/check_native_diffusion.py's draw_for), its prompt group's leaves (hidden, pooled) in float32 and float64, whole, sized paired with Dew's computation of them."
+  },
+  "native_diffusion/xl-img2img-walk.npz": {
+   "tool": "tools/venv_reference.py native-xl-img2img-walk",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved xl-img2img pipeline's own Diffusers call (tools/native_diffusion_worker.py) on check 1's drawn prompts, noise and pixels (tools/check_native_diffusion.py's draw_for), its walk group's leaves (start, final_latents, images) in float32 and float64, whole, sized paired with Dew's computation of them."
+  },
+  "native_diffusion/xl-inpaint-prompt.npz": {
+   "tool": "tools/venv_reference.py native-xl-inpaint-prompt",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved xl-inpaint pipeline's own Diffusers call (tools/native_diffusion_worker.py) on check 1's drawn prompts, noise and pixels (tools/check_native_diffusion.py's draw_for), its prompt group's leaves (hidden, pooled) in float32 and float64, whole, sized paired with Dew's computation of them."
+  },
+  "native_diffusion/xl-inpaint-walk.npz": {
+   "tool": "tools/venv_reference.py native-xl-inpaint-walk",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved xl-inpaint pipeline's own Diffusers call (tools/native_diffusion_worker.py) on check 1's drawn prompts, noise and pixels (tools/check_native_diffusion.py's draw_for), its walk group's leaves (final_latents, images) in float32 and float64, whole, sized paired with Dew's computation of them."
+  },
+  "native_diffusion/refiner-prompt.npz": {
+   "tool": "tools/venv_reference.py native-refiner-prompt",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved refiner pipeline's own Diffusers call (tools/native_diffusion_worker.py) on check 1's drawn prompts, noise and pixels (tools/check_native_diffusion.py's draw_for), its prompt group's leaves (hidden, pooled) in float32 and float64, whole, sized paired with Dew's computation of them."
+  },
+  "native_diffusion/refiner-walk.npz": {
+   "tool": "tools/venv_reference.py native-refiner-walk",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved refiner pipeline's own Diffusers call (tools/native_diffusion_worker.py) on check 1's drawn prompts, noise and pixels (tools/check_native_diffusion.py's draw_for), its walk group's leaves (final_latents, images) in float32 and float64, whole, sized paired with Dew's computation of them."
+  },
+  "native_diffusion/safety-walk.npz": {
+   "tool": "tools/venv_reference.py native-safety-walk",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved safety pipeline's own Diffusers call (tools/native_diffusion_worker.py) on check 1's drawn prompts, noise and pixels (tools/check_native_diffusion.py's draw_for), its walk group's leaves (images) in float32 and float64, whole, sized paired with Dew's computation of them."
+  },
+  "native_diffusion/safety-checker.npz": {
+   "tool": "tools/venv_reference.py native-safety-checker",
+   "sources": [{"repo": "huggingface/diffusers", "version": "0.39.0", "runs": "diffusers"}, {"repo": "huggingface/transformers", "version": "4.49.0", "runs": "transformers"}],
+   "note": "The saved safety pipeline's own Diffusers call (tools/native_diffusion_worker.py) on check 1's drawn prompts, noise and pixels (tools/check_native_diffusion.py's draw_for), its checker group's leaves (checker_pixels, checker_embeddings) in float32 and float64, whole, sized paired with Dew's computation of them."
+  },
   "native_diffusion_edges.tar.xz": {
    "tool": "tools/native_diffusion_edges_reference.py",
    "sources": [
@@ -3066,16 +3129,6 @@
   },
   "native_unet_geometry.tar.xz": {
    "tool": "tools/native_unet_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/diffusers",
-     "version": "0.34.0",
-     "runs": "diffusers"
-    }
-   ]
-  },
-  "native_unet_float64.npz": {
-   "tool": "tools/native_unet_reference.py --float64",
    "sources": [
     {
      "repo": "huggingface/diffusers",
@@ -3606,7 +3659,7 @@
      "runs": "torch"
     }
    ],
-   "note": "AutoencoderKL(...).encoder at tests/test_models.py's encoder geometry, parameters moved off init; moments and image/parameter VJPs at batch 1 and 4, float32 and float64 (widened)."
+   "note": "AutoencoderKL(...).encoder at tests/test_models.py's encoder geometry, parameters moved off init and rounded to bfloat16-representable values; the weights alone, which the test runs Diffusers' encoder on."
   },
   "vae/sd3-tiny": {
    "tool": "tools/vae_reference.py",
@@ -3623,13 +3676,13 @@
    "sources": [
     {
      "repo": "huggingface/diffusers",
-     "version": "0.34.0",
-     "runs": "diffusers-0.34"
+     "version": "0.39.0",
+     "runs": "diffusers-wan"
     },
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "diffusers-0.34"
+     "version": "5.17.0",
+     "runs": "diffusers-wan"
     }
    ],
    "note": "Includes UMT5 prompt states and pipeline walks (final latents and decoded frames), each in float32 as the pipeline runs and in float64 (diffusers_wan_reference.float64), and float32/float64 UniPC scheduler replays."
@@ -3944,7 +3997,6 @@
     "hf/deepseek-v32-tiny/model.safetensors",
     "hf/diffusion-gemma-denoise-tiny/canvas.npy",
     "hf/diffusion-gemma-denoise-tiny/model.safetensors",
-    "hf/diffusion-gemma-denoise-tiny/prev_logits.npy",
     "hf/diffusion-gemma-denoise-tiny/prompt.npy",
     "hf/diffusion-gemma-sc-tiny/inputs.npy",
     "hf/diffusion-gemma-sc-tiny/model.safetensors",

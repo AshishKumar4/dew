@@ -36,6 +36,7 @@ from process_support import (
     free_port,
     report_of,
     run_pool,
+    run_pools,
     run_worker,
     serving,
     spawn,
@@ -769,12 +770,11 @@ def test_a_pool_resumes_every_process_at_its_own_position(tmp_path, pool_checkpo
     nobody stopped lands, at the same final position with the same
     parameters.
     """
-    resumed = run_pool("fit", tmp_path / "resumed", 2, name="pool",
-                       run_dir=pool_checkpoint["checkpoints"].parent, fsdp_size=2,
-                       steps=2 * POOL_STEPS, records=RECORDS)
-    whole = run_pool("fit", tmp_path / "whole", 2, name="whole",
-                     run_dir=tmp_path / "whole-run", fsdp_size=2,
-                     steps=2 * POOL_STEPS, records=RECORDS)
+    shared = {"fsdp_size": 2, "steps": 2 * POOL_STEPS, "records": RECORDS}
+    resumed, whole = run_pools(
+        ("fit", tmp_path / "resumed", 2, {"name": "pool", "run_dir": pool_checkpoint["checkpoints"].parent,
+                                          **shared}),
+        ("fit", tmp_path / "whole", 2, {"name": "whole", "run_dir": tmp_path / "whole-run", **shared}))
     for index, report in enumerate(resumed):
         assert report["restored_step"] == POOL_STEPS
         assert report["restored_dataset_state"] == pool_checkpoint["reports"][index]["dataset_state"]
@@ -984,10 +984,9 @@ def test_an_elastic_filtered_stream_resumes_on_another_process_count(tmp_path, r
     parameters, since both read the batches one process reads."""
     directory = tmp_path / "resumed-run"
     shutil.copytree(replicated_checkpoint, directory)
-    resumed = run_pool("fit", tmp_path / "resumed", processes,
-                       **replicated_flags(directory, 2 * POOL_STEPS))
-    whole = run_pool("fit", tmp_path / "whole", processes,
-                     **replicated_flags(tmp_path / "whole-run", 2 * POOL_STEPS))
+    resumed, whole = run_pools(
+        ("fit", tmp_path / "resumed", processes, replicated_flags(directory, 2 * POOL_STEPS)),
+        ("fit", tmp_path / "whole", processes, replicated_flags(tmp_path / "whole-run", 2 * POOL_STEPS)))
     for index, report in enumerate(resumed):
         assert report["restored_step"] == POOL_STEPS
         assert report["step"] == 2 * POOL_STEPS
@@ -1045,10 +1044,9 @@ def test_a_packed_pool_position_resumes_on_another_process_count(tmp_path,
     flags = {"name": "packed", "fsdp_size": 1, "steps": 2 * POOL_STEPS,
              "tokens": packed_checkpoint["corpus"].train, "seq_len": PACKED_SEQ_LEN}
 
-    resumed = run_pool("packed_fit", tmp_path / "resumed", processes,
-                       run_dir=directory, **flags)
-    whole = run_pool("packed_fit", tmp_path / "whole", processes,
-                     run_dir=tmp_path / "whole-run", **flags)
+    resumed, whole = run_pools(
+        ("packed_fit", tmp_path / "resumed", processes, {"run_dir": directory, **flags}),
+        ("packed_fit", tmp_path / "whole", processes, {"run_dir": tmp_path / "whole-run", **flags}))
 
     for index, report in enumerate(resumed):
         assert report["restored_step"] == POOL_STEPS
@@ -1326,9 +1324,8 @@ def test_a_killed_pool_resumes_from_the_newer_local_checkpoint(tmp_path, killed_
     persistent = worker.checkpoint_dir(directory / "run", "local")
     assert committed_steps(persistent) == [SAVE_EVERY, 2 * SAVE_EVERY]
     before = persistent_bytes(persistent)
-    whole = run_pool("fit", tmp_path / "whole", 2, **local_flags(tmp_path / "whole-run"))
-
-    resumed = run_pool("fit", tmp_path / "resumed", 2, **local_flags(directory))
+    whole, resumed = run_pools(("fit", tmp_path / "whole", 2, local_flags(tmp_path / "whole-run")),
+                               ("fit", tmp_path / "resumed", 2, local_flags(directory)))
 
     for index, report in enumerate(resumed):
         assert report["restored_step"] == LOCAL_KILL_AFTER
@@ -1361,9 +1358,8 @@ def test_a_process_that_lost_its_local_copy_recovers_it_from_a_replica(tmp_path,
     directory = tmp_path / "lost"
     shutil.copytree(killed_local_pool, directory)
     shutil.rmtree(directory / "local" / "process1")
-    whole = run_pool("fit", tmp_path / "whole", 2, **local_flags(tmp_path / "whole-run"))
-
-    resumed = run_pool("fit", tmp_path / "resumed", 2, **local_flags(directory))
+    whole, resumed = run_pools(("fit", tmp_path / "whole", 2, local_flags(tmp_path / "whole-run")),
+                               ("fit", tmp_path / "resumed", 2, local_flags(directory)))
 
     assert [report["restored_step"] for report in resumed] == [LOCAL_KILL_AFTER] * 2
     assert resumed[0]["restored_from"] == str(directory / "local" / "process0")
@@ -1443,15 +1439,16 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
     single = run_worker("rollout", tmp_path / "single.json", fsdp_size=1)
 
     assert [report["arrivals"] for report in reports] == [[0, 1], [0, 1]]
-    for report in reports:
-        assert "vocabulary" in report["invalid_errors"]["token"]
-        assert "prompt_length" in report["invalid_errors"]["length"]
-        assert "single JAX PRNG key" in report["invalid_errors"]["key"]
-        assert "memory address" in report["invalid_errors"]["component"]
+    # Every rank refuses each rank-local invalid input, both returning from it (the worker fails on one
+    # accepted), by its category whatever its words: rank 1, whose input it is, as invalid, and rank 0 as
+    # its peer's failure.
+    faults = ("token", "length", "key", "component")
+    assert [report["invalid_errors"] for report in reports] == [dict.fromkeys(faults, "PeerFailure"),
+                                                              dict.fromkeys(faults, "ValueError")]
     # Over weights on no mesh, rank 1's zero prompt length is its own refusal
     # and rank 0 samples its rows without hearing of it.
     assert reports[0]["meshless"] == {"rows": 2 * len(reports[0]["prompt_lengths"])}
-    assert "prompt_length" in reports[1]["meshless"]["refused"]
+    assert reports[1]["meshless"] == {"refused": "ValueError"}
     assert all(report["sampled_seconds"] < 300 for report in reports)
     for report in reports:
         assert report["process_count"] == 2
@@ -1694,7 +1691,8 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
         assert first[event]["scores"] == second[event]["scores"]
     assert first["normal"]["scores"]["val/mean"] == first["repeat"]["scores"]["val/mean"]
     assert first["normal"]["scores"]["val/mean"] == first["untracked"]["scores"]["val/mean"]
-    for report in reports:
+    # Reports come in rank order (`run_pool`).
+    for rank, report in enumerate(reports):
         events = report["results"]["normal"]["events"]
         scoring = [key for kind, key in events if kind == "score"]
         preview = [key for kind, key in events if kind == "preview"]
@@ -1707,11 +1705,18 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
         # Process 0 holds one batch and process 1 two: process 0 covers the
         # second with its first's rows marked repeats, so the pass reads all 12.
         assert report["results"]["uneven"]["scores"]["evaluation/counts/val/coordinated_batches"] == 2
-        for phase in ("metric", "preview", "finalize", "log", "render", "construct", "next"):
-            assert "error" in report["results"][phase], (phase, report)
+        # Each injected failure keeps its category on the rank it was injected on, which raises it noted;
+        # its peer raises the agreement's own refusal of it (row 4506).
+        for phase, injected, at in (("metric", "InjectedValueError", 0), ("preview", "InjectedValueError", 0),
+                                    ("finalize", "InjectedValueError", 0), ("log", "InjectedValueError", 0),
+                                    ("render", "InjectedValueError", 0), ("construct", "InjectedOSError", 1),
+                                    ("next", "InjectedOSError", 1)):
+            failed = report["results"][phase]
+            # The injected failure itself on its own rank; the agreement's refusal, or a peer's, on the other.
+            allowed = {(injected, True)} if rank == at else {("RuntimeError", False), ("PeerFailure", False)}
+            assert (failed["error"], failed["own"]) in allowed, (phase, report)
             if phase != "construct":
                 assert phase in report["closed"]
-        assert "iterator next failed" in report["results"]["next"]["error"]
         assert report["results"]["empty"] == {"scores": {}, "events": []}
         assert report["results"]["no_consumer"] == {"scores": {}, "events": []}
         assert "no_consumer" not in report["closed"]
@@ -1720,10 +1725,15 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
         for invalid in ("mismatch", "duplicates"):
             assert "error" in report["results"][invalid]
             assert report["results"][invalid]["events"] == []
+        # A resource rank 0 deleted fails there, as the deleted array's own error, and its peer by the
+        # agreement; a gather plan the ranks differ on is refused on every rank, each its own refusal.
         for failure in ("deleted_first", "deleted_later", "deleted_batch", "deleted_preview"):
-            assert "deleted" in report["results"][failure]["error"]
+            failed = report["results"][failure]
+            allowed = ((("RuntimeError", True),) if rank == 0
+                       else (("RuntimeError", False), ("PeerFailure", False)))
+            assert (failed["error"], failed["own"]) in allowed, (failure, report)
             assert failure in report["closed"]
-        assert "gather plan differs between the processes" in report["results"]["mismatched_plan"]["error"]
+        assert report["results"]["mismatched_plan"]["error"] == "ValueError", report
 
 
 @pytest.mark.distributed

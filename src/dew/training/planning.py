@@ -620,7 +620,7 @@ class FitSearch[LossT, EffectsT]:
     that keeps its residuals in pinned host memory ('minimal_offloaded') keeps as many on the device as
     'full' does (`tests/test_remat_rungs.py`' `_saved`: a decoder's 107,720 bytes both, 'save_dot_except_mlp'
     132,296), so it fits nowhere 'full' does not, and a run takes it by its own remat."""
-    lower: Callable[[int, bool], Candidate]
+    lower: Callable[[int, bool, Footprint | None], Candidate]
     options: Callable[[Candidate], jax.stages.CompilerOptions | None]
     objective: Objective[LossT, EffectsT]
     mesh: Mesh
@@ -659,9 +659,19 @@ class FitSearch[LossT, EffectsT]:
     orders the compiles (`likely`), a compile's measure correcting it (`under`)."""
     copies_at: dict[tuple[str, int], bool] = dataclasses.field(default_factory=dict)
     """Whether each candidate the derivation read keeps narrow copies (`Candidate.copies`)."""
+    footprints: dict[tuple[str, int], Footprint | None] = dataclasses.field(default_factory=dict)
+    """The footprint of each candidate the derivation read, which its lowering keeps (`lowering`): traced
+    again there, it was 22 of a Qwen3.5-4B step's 185 seconds of `compile_ahead` (row 4261). A spill's
+    refusal, which changes the configs its kernels take, clears it (`measured`)."""
     under: dict[str, int] = dataclasses.field(default_factory=dict)
     """By remat rung (`remat_rung`), the most bytes a compile there needed past its derived headroom: a
-    candidate there is judged to fit only where its derived headroom holds that much more."""
+    candidate there is judged to fit only where its derived headroom holds that much more, in proportion
+    to its derived temporaries (`missed_at`, `shortfall`)."""
+    missed_at: dict[str, int] = dataclasses.field(default_factory=dict)
+    """By remat rung, the derived temporaries of the compile that set its `under`: what the derivation
+    misses grows with what it derives, a step's activations with its microbatch, so a split of half the
+    rows misses about half as much (a 64-token test step on a CPU: 963 KB short at one microbatch, 0.6 MB
+    to spare at two, which a shortfall taken whole judged short and compiled four)."""
     overstated: set[str] = dataclasses.field(default_factory=set)
     """The remat rungs (`remat_rung`) a compile fit at that the derivation judged short: its refusals
     there rule no compile out (`refused`)."""
@@ -808,7 +818,19 @@ class FitSearch[LossT, EffectsT]:
             self.derived.append({**self.current(), "narrow": narrow, "split": split, "headroom": headroom,
                                  "label": label, "terms": None if footprint is None else footprint.record()})
             self.judged_at[key], self.copies_at[key] = headroom, bool(candidate.copies)
+            self.footprints[key] = footprint
         return self.judged_at[key]
+
+    def lowering(self, split: int) -> Candidate:
+        """The step at `split` at the objective's rung and the search's `narrow`, lowered, with the
+        footprint the derivation traced of it where it read it (`footprints`)."""
+        return self.lower(split, self.narrow, self.footprints.get(self.candidate_key(split, self.narrow)))
+
+    def relowering(self, split: int) -> Candidate:
+        """The step at `split` lowered afresh past a kernel that spilled (`Relowered`), its footprint traced
+        again: the kernel's next config can change the buffers the derivation traced at its first (a
+        Triton attention backward's partial gradients, a block of queries each)."""
+        return self.lower(split, self.narrow, None)
 
     def candidate_key(self, split: int, narrow: bool) -> tuple[str, int]:
         """The step at `split` and `narrow` at the objective's rung, as the derivation's judgments keep it."""
@@ -857,18 +879,36 @@ class FitSearch[LossT, EffectsT]:
         """Whether the step at `split` at the objective's rung is likely to fit, which orders the compiles
         past a miss (`planned`): as the derivation judges it, corrected by what the compiles measured;
         as the compiles' forecast guesses where the derivation cannot judge (`judged_likely`)."""
-        return judged_likely(self.judgment(split), self.under.get(self.remat_rung(), 0),
+        return judged_likely(self.judgment(split), self.shortfall(split),
                              forecast=self.forecast.likely(self.rung(), split))
 
-    def learned(self, foreseen: int | None, measured: int | None, fit: bool) -> None:
-        """What a compile at the objective's remat teaches the derivation's next judgments there: the
-        headroom it `measured` short of the one `foreseen` corrects them (`under`), and a compile that fit
-        where the derivation, so corrected, judged it short rules its refusals out (`overstated`)."""
+    def shortfall(self, split: int) -> int:
+        """The bytes a step at `split` at the objective's remat is judged to need past its derived headroom
+        (`under`): the most a compile there missed, scaled by the step's derived temporaries against that
+        compile's (`missed_at`), or whole where either is not derived."""
         rung = self.remat_rung()
-        if foreseen is not None and fit and foreseen - self.under.get(rung, 0) < 0:
+        under, missed = self.under.get(rung, 0), self.missed_at.get(rung)
+        footprint = self.footprints.get(self.candidate_key(split, self.narrow))
+        temporaries = None if footprint is None else footprint.temporaries
+        if not under or not missed or temporaries is None:
+            return under
+        return under * temporaries // missed
+
+    def learned(self, foreseen: int | None, measured: int | None, *, fit: bool, split: int,
+                temporaries: int | None) -> None:
+        """What a compile at the objective's remat at `split` teaches the derivation's next judgments there:
+        the headroom it `measured` short of the one `foreseen` corrects them (`under`), in proportion to the
+        derived `temporaries` it was short of (`missed_at`), and a compile that fit where the derivation, so
+        corrected, judged it short rules its refusals out (`overstated`)."""
+        rung = self.remat_rung()
+        if foreseen is not None and fit and foreseen - self.shortfall(split) < 0:
             self.overstated.add(rung)
-        if foreseen is not None and measured is not None and foreseen > measured:
-            self.under[rung] = max(self.under.get(rung, 0), foreseen - measured)
+        if foreseen is not None and measured is not None and foreseen - measured > self.under.get(rung, 0):
+            self.under[rung] = foreseen - measured
+            if temporaries:
+                self.missed_at[rung] = temporaries
+            else:
+                self.missed_at.pop(rung, None)
 
     def refused(self, split: int) -> bool:
         """Whether the derivation judges the step at `split` short past a miss, corrected by what a compile
@@ -879,7 +919,7 @@ class FitSearch[LossT, EffectsT]:
         if rung in self.overstated:
             return False
         derived = self.judgment(split)
-        return derived is not None and derived - self.under.get(rung, 0) < 0
+        return derived is not None and derived - self.shortfall(split) < 0
 
     def judging(self) -> bool:
         """Whether every process's devices judge a derived footprint (`memory.judged`) at the search's
@@ -934,18 +974,29 @@ class FitSearch[LossT, EffectsT]:
         (`ahead`); the candidate its executable compiled from, lowered afresh where a kernel spilled
         (`compiled_if_it_fits`, `Relowered`); and the measure of its fit (`Probe`), the search's state
         else untouched. A run that inspects compiles the candidate's sampled step too
-        (`Candidate.sampled`), or takes the one compiled ahead with the step (`AheadOfTime.sampled`), which
+        (`Candidate.sampled`), at once with the step (`report.attempts`), or takes the one compiled ahead
+        with the step (`AheadOfTime.sampled`), which
         must fit as the step must, so a rung fits only where both do; it is `sampled` until the next
         measure."""
         options = self.compiled_options(candidate)
         taken, ahead = self.ahead is not None, self.ahead
         began = time.perf_counter()
+        early, firsts, relowered = None, [], None
         if ahead is not None:
             executable, self.ahead = ahead.taken(candidate.lowered), None
         else:
-            relowered = Relowered(lambda: self.lower(split, self.narrow))
-            executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered)
+            # A run that inspects compiles its sampled step beside the step, at once (`report.attempts`),
+            # its compile kept only where the step fits, as the step's own is kept first.
+            early = None if candidate.sampled is None else candidate.sampled()
+            firsts = report.attempts([(candidate.lowered, options)]
+                                     + ([] if early is None else [(early, options)]))
+            relowered = Relowered(lambda: self.relowering(split))
+            executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered,
+                                             first=firsts[0])
             candidate = relowered.candidate(candidate)
+            if relowered.last is not None:
+                # A spill's refusal changes the configs every derivation traced: each is traced again.
+                self.footprints.clear()
         fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
         self.sampled = None
         if fit and candidate.sampled is not None and ahead is not None and ahead.sampled is not None:
@@ -955,15 +1006,21 @@ class FitSearch[LossT, EffectsT]:
                 sampled = candidate.sampled()
             self.sampled = SampledStep(ahead.sampled.program, ahead.sampled.taken(sampled, jax.devices()))
         elif fit and candidate.sampled is not None:
-            lowered = [candidate.sampled()]
+            # The one compiled beside the step's, but where the step was lowered afresh past a spill, which
+            # its sampled step is then too, as one lowered after the step's compile would be.
+            beside = early if relowered is not None and relowered.last is None else None
+            lowered = [candidate.sampled() if beside is None else beside]
 
             def resampled() -> jax.stages.Lowered:
                 """The sampled step lowered afresh, its launches derived past a spilled one's config."""
-                again = self.lower(split, self.narrow).sampled
+                again = self.lowering(split).sampled
                 assert again is not None
                 lowered.append(again())
                 return lowered[-1]
-            compiled = compiled_if_it_fits(lowered[0], options, self.refusals, relower=resampled)
+            compiled = compiled_if_it_fits(lowered[0], options, self.refusals, relower=resampled,
+                                           first=None if beside is None else firsts[1])
+            if len(lowered) > 1:
+                self.footprints.clear()
             self.sampled = None if compiled is None else SampledStep(program_of(lowered[-1]), compiled)
             fit, headroom = step_fits(compiled, self.mesh, candidate.held, self.capacity, candidate.built)
         seconds = time.perf_counter() - began
@@ -971,7 +1028,8 @@ class FitSearch[LossT, EffectsT]:
         foreseen = pooled_headroom(None if candidate.footprint is None else derived_headroom(
             candidate.footprint, local_devices(self.mesh), self.capacity, candidate.built))
         probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, derived_headroom=foreseen)
-        self.learned(foreseen, pooled_headroom(headroom), fit)
+        self.learned(foreseen, pooled_headroom(headroom), fit=fit, split=split,
+                     temporaries=None if candidate.footprint is None else candidate.footprint.temporaries)
         if foreseen is not None and (foreseen >= 0) != fit:
             # A derived peak bounded from below (`Footprint.exact`) admits provisionally: its miss names
             # the need the compile found, which a sourced rule is to reach.
@@ -999,7 +1057,7 @@ class FitSearch[LossT, EffectsT]:
             # A step compiled ahead, its first compile, is lowered as its own compile lowered it (`handed`):
             # within its refusals, for its GPU; every other compile within this process's, for this GPU.
             with handed(self.ahead):
-                self.lowered[key] = self.lower(split, self.narrow)
+                self.lowered[key] = self.lowering(split)
         self.chosen, candidate, executable, probe = self.measured(split, self.lowered[key])
         self.lowered[key] = candidate
         fit, headroom = probe.fits, probe.headroom

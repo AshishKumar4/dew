@@ -7,7 +7,7 @@ and each tile's coordinates (`_Program`, `_Spans`, `_coords`), its hooks' parame
 import dataclasses
 import functools
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import NamedTuple
 
 import jax
@@ -116,7 +116,8 @@ family without one (mma.sync's, until its thin mainloop) takes another mainloop 
 `MosaicBackward.eligible`)."""
 
 
-def values_deferred(family: mosaic.Family, form: str, splits: int, dtype, dropped: bool) -> bool:
+def values_deferred(family: mosaic.Family, form: str, splits: int, dtype, dropped: bool, parts: int = 1
+                    ) -> bool:
     """Whether a forward's plain walk issues each tile's P·V a step late
     (`attention_mosaic_forward._consumer`): half of FlashAttention 3's overlap within a consumer, its next
     `Q Kᵀ` and the step before's P·V in flight together (hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp's
@@ -125,9 +126,9 @@ def values_deferred(family: mosaic.Family, form: str, splits: int, dtype, droppe
     Where its family's products run asynchronously (`Issuer.products_overlap`) over a producer's loads (a
     loading consumer would wait on its own late release, `Transport.feeds_itself`), every program walks a key
     tile (a full or causal call's whole launch: no spans, no splits), and a tile's weights are one bf16
-    operand (no dropout's parts)."""
+    operand (no dropout's parts, no fp32 call's `parts`)."""
     return (family.products_overlap and not family.feeds_itself and form in ("full", "causal") and splits == 1
-            and jnp.dtype(dtype) == jnp.dtype(jnp.bfloat16) and not dropped)
+            and jnp.dtype(dtype) == jnp.dtype(jnp.bfloat16) and not dropped and parts == 1)
 
 
 def query_swizzle(family: mosaic.Family) -> int | None:
@@ -308,6 +309,18 @@ def issued_into(family: mosaic.Family, acc, parts, rhs, interpret: bool):
     issuer = operands.Issuer(_Issuing(family, interpret), {"part": 1}, restored=algebra.restored)
     right = operands.Parts((rhs,), rhs.dtype)
     return issuer.summed((("part", part, right) for part in parts), into=acc)
+
+
+def issued_pairs(family: mosaic.Family, acc, pairs: Iterable, interpret: bool, *,
+                 shape: tuple[int, int] | None = None):
+    """`acc`, or a fresh fp32 accumulator of `shape` where None, with each of `pairs`' products (a left
+    operand in registers and a tile in shared memory, each formed as it is taken) issued into it in place,
+    in order, none read before the last (`operands.Issuer.summed`): an fp32 call's parts' products
+    (`attention_mosaic_forward._parted_products`), one accumulator where a product apiece copied each in and
+    out (et-fp32regs2: the guarded launch 248 registers and 24 bytes spilled where its bf16 one held 168)."""
+    issuer = operands.Issuer(_Issuing(family, interpret), {"part": 1}, restored=algebra.restored)
+    products = (("part", lhs, operands.Parts((rhs,), rhs.dtype)) for lhs, rhs in pairs)
+    return issuer.summed(products, shape) if acc is None else issuer.summed(products, into=acc)
 
 
 def _block(config: Tiles | BackwardTiles) -> int:
@@ -717,6 +730,9 @@ class _Hooked(NamedTuple):
     output: tuple[jax.Array, ...]
     initial: tuple[jax.Array, jax.Array, jax.Array] | None
     drop: Dropout | None = None
+    scales: tuple[jax.Array, jax.Array] | None = None
+    """A call over quantized keys and values' scales, the keys' and the values' `[B, Hk, Kp]` fp32, one a key
+    and key head in its row's key order (`attention_decode.attend`'s `scales`); None for 16-bit keys."""
 
 
 def _hooked_of(hooks: Hooks, call: PaddedCall, unit: int) -> _Hooked:
@@ -736,9 +752,12 @@ def _hooked_of(hooks: Hooks, call: PaddedCall, unit: int) -> _Hooked:
 class _Guard(NamedTuple):
     """A guarded launch's arrays (`algebra.walked_launches`): the rows that shift, `live` `[B, H, Qp]` (int32,
     nonzero where live); its keys' value magnitudes, which a step's `algebra.room` reads, come from the value
-    tiles it walks (`Family.key_magnitudes`)."""
+    tiles it walks (`Family.key_magnitudes`), or an fp32 call's from `magnitudes` `[B, KV, Kp]` fp32, each
+    key's largest over all its values' columns (`MosaicForward.parts`: its value blocks fewer columns than a
+    transposed load's rows take)."""
 
     live: jax.Array
+    magnitudes: jax.Array | None = None
 
 
 def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_first=None, *,
@@ -919,6 +938,17 @@ class _Program[T: (Tiles, BackwardTiles)]:
     per_span: int = 1
     """The queries each of a spans call's intervals holds (`KeySpans.per_span`): more than one, its programs
     read the intervals by position (`reach`, `bounds`)."""
+    parts: int = 1
+    """The bf16 parts each of an fp32 call's tiles is staged in, one above the other (`MosaicForward.parts`):
+    its products their parts' (`parted`)."""
+
+    def parted(self, tile, rows: int):
+        """`tile` as the parts its products take (`operands.Parts`, each `rows` rows of it, an fp32 tile's),
+        or itself where the call's operands are 16-bit."""
+        if self.parts == 1:
+            return tile
+        return operands.Parts(tuple(tile.at[pl.ds(part * rows, rows)] for part in range(self.parts)),
+                              jnp.float32)
 
     def split(self):
         """This program's slice of its query tile's keys (`splits`), 0 of one."""

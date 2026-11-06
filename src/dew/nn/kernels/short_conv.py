@@ -49,7 +49,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import pallas as pl
 
-from dew.nn.derivatives import KernelGlue
+from dew.nn.derivatives import KernelGlue, contracted
 from dew.nn.kernels import launches
 
 from . import generation, tuning
@@ -551,6 +551,7 @@ def conv(x, taps, bias, valid, documents, parts, *, activation: bool, eps: float
         return xla_conv1d(x, taps, activation, bias, valid=valid, segments=documents, parts=parts,
                           dtype=dtype)
 
-    return generation.linear_tangent(forward, backward, portable,
-                                     kind=KernelGlue())(x, taps, bias, valid, documents)
+    return contracted("test_the_short_conv_holds_every_order")(
+        generation.linear_tangent(forward, backward, portable,
+                                  kind=KernelGlue()))(x, taps, bias, valid, documents)
 

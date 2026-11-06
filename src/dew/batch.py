@@ -708,6 +708,20 @@ def without(tree: Variables, paths: Sequence[Sequence[str]]) -> Variables:
     return kept
 
 
+def at_path(tree, path: Sequence[str]):
+    """The subtree of `tree` at `path`, or None where `tree` holds none."""
+    for key in path:
+        tree = tree.get(key) if isinstance(tree, Mapping) else None
+    return tree
+
+
+def placed_at(tree, path: Sequence[str], value):
+    """`tree` with `value` at `path`, its spine copied and missing nodes made."""
+    if not path:
+        return value
+    return {**tree, path[0]: placed_at(tree.get(path[0], {}), path[1:], value)}
+
+
 PARAMETER_ROOTS = (("params",), (FROZEN,))
 """The collections of a variables tree that hold a model's parameters, which a run's loaders read
 and a storage dtype casts: the trained ones and the frozen."""

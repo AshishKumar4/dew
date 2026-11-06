@@ -22,8 +22,7 @@ What lands, beside each fixture's own files:
   `<forward>_bf16`, the reference with weights and activations in float64
   and in bfloat16 (stored as float32, which holds every bfloat16 exactly), for
   the three denoiser forwards in its reference.npz (`bare`, `conditioned`,
-  `image_logits`), and in diffusion-gemma-denoise-tiny for `ref_bare` and
-  `ref_conditioned`. The float64 run is the truth both precisions are
+  `image_logits`). The float64 run is the truth both precisions are
   measured from, with every float32 pin of the model widened
   (`torch_precision.float64`). tests/test_bf16_reference.py runs the
   denoiser's bfloat16 reference in the test.
@@ -102,21 +101,18 @@ def workflow(dtype: torch.dtype):
 def workflow_outputs(model, reference, dtype: torch.dtype) -> dict[str, np.ndarray]:
     """The three forwards tools/diffusion_gemma_reference.py stores, from its
     own stored inputs."""
-    from transformers.models.gemma4.image_processing_pil_gemma4 import convert_image_to_patches
+    from diffusion_gemma_reference import media_inputs
 
     prompt, canvas = (torch.from_numpy(reference[key]) for key in ("prompt", "canvas"))
     previous = torch.from_numpy(reference["previous"]).to(dtype)
-    patches = torch.from_numpy(np.stack([convert_image_to_patches(image, 2)
-                                         for image in reference["pixels"][:, 0]])).to(dtype)
-    positions = torch.tensor([[[0, 0], [1, 0], [0, 1], [1, 1]]]).expand(2, -1, -1)
+    media = media_inputs(torch.from_numpy(reference["pixels"]).to(dtype))
     image_prompt = torch.from_numpy(reference["image_prompt"])
     with torch.no_grad():
         outputs = {
             "bare": model(input_ids=prompt, decoder_input_ids=canvas).logits,
             "conditioned": model(input_ids=prompt, decoder_input_ids=canvas,
                                  self_conditioning_logits=previous).logits,
-            "image_logits": model(input_ids=image_prompt, decoder_input_ids=canvas,
-                                  pixel_values=patches, image_position_ids=positions).logits,
+            "image_logits": model(input_ids=image_prompt, decoder_input_ids=canvas, **media).logits,
         }
     return {key: value.to(torch.float64).numpy() for key, value in outputs.items()}
 
@@ -136,62 +132,6 @@ def write_workflow() -> None:
     np.savez(directory / "numerics.npz", **arrays)
     for key in f64:
         report(f"workflow {key}", reference[key], arrays[f"{key}_bf16"], f64[key])
-
-
-def denoiser(dtype: torch.dtype):
-    """The model tools/hf_reference.py `write_diffusion_denoiser_tiny` built,
-    holding the text weights it saved. Its vision tower is left at its
-    initialisation: none of the stored forwards has an image in it."""
-    from hf_reference import DIFFUSION_DENOISER_TEXT
-    from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
-        DiffusionGemmaConfig,
-        DiffusionGemmaTextConfig,
-    )
-    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
-    from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
-
-    text = DiffusionGemmaTextConfig(**{key: value for key, value in DIFFUSION_DENOISER_TEXT.items()
-                                       if key != "model_type"})
-    vision = Gemma4VisionConfig(
-        hidden_size=32, intermediate_size=64, num_hidden_layers=1,
-        num_attention_heads=2, num_key_value_heads=2, head_dim=16, patch_size=8,
-        pooling_kernel_size=2, position_embedding_size=64)
-    model = DiffusionGemmaForBlockDiffusion(DiffusionGemmaConfig(
-        text_config=text, vision_config=vision, canvas_length=4, tie_word_embeddings=False))
-    saved = load_file(FIXTURES / "diffusion-gemma-denoise-tiny" / "model.safetensors")
-    missing, unexpected = model.load_state_dict(saved, strict=False)
-    if unexpected or any(not name.startswith("model.encoder.vision_tower.")
-                         and not name.startswith("model.encoder.embed_vision.") for name in missing):
-        raise SystemExit(f"denoiser weights do not fit: missing {missing}, unexpected {unexpected}")
-    return eager(model.to(dtype))
-
-
-def denoiser_outputs(model, dtype: torch.dtype) -> dict[str, np.ndarray]:
-    directory = FIXTURES / "diffusion-gemma-denoise-tiny"
-    prompt = torch.from_numpy(np.load(directory / "prompt.npy")).long()
-    canvas = torch.from_numpy(np.load(directory / "canvas.npy")).long()
-    previous = torch.from_numpy(np.load(directory / "prev_logits.npy")).to(dtype)
-    with torch.no_grad():
-        bare = model(input_ids=prompt, decoder_input_ids=canvas).logits
-        conditioned = model(input_ids=prompt, decoder_input_ids=canvas,
-                            self_conditioning_logits=previous).logits
-    return {"ref_bare": bare.to(torch.float64).numpy(),
-            "ref_conditioned": conditioned.to(torch.float64).numpy()}
-
-
-def write_denoiser() -> None:
-    directory = FIXTURES / "diffusion-gemma-denoise-tiny"
-    with float64():
-        f64 = denoiser_outputs(denoiser(torch.float64), torch.float64)
-    for key, value in denoiser_outputs(denoiser(torch.float32), torch.float32).items():
-        assert_same_artifact(value.astype(np.float32), np.load(directory / f"{key}.npy"), f64[key],
-                             f"denoiser {key}")
-    bf16 = denoiser_outputs(denoiser(torch.bfloat16), torch.bfloat16)
-    arrays = {f"{key}_f64": value for key, value in f64.items()}
-    arrays.update({f"{key}_bf16": value.astype(np.float32) for key, value in bf16.items()})
-    np.savez(directory / "numerics.npz", **arrays)
-    for key in f64:
-        report(f"denoiser {key}", np.load(directory / f"{key}.npy"), arrays[f"{key}_bf16"], f64[key])
 
 
 def prompts(vocab: int) -> tuple[np.ndarray, np.ndarray]:
@@ -311,7 +251,6 @@ def main() -> None:
 
     require("transformers")
     write_workflow()
-    write_denoiser()
     for name in GENERATORS:
         write_generation(name)
     write_attention()

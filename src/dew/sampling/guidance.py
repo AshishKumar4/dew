@@ -44,7 +44,7 @@ from flax import linen as nn, struct
 from dew.batch import Variables
 from dew.diffusion.process import Denoiser
 from dew.diffusion.schedules import expand
-from dew.nn.derivatives import surrogate
+from dew.nn.derivatives import contracted, surrogate
 from dew.nn.precision import at_least_fp32, compensated_add, two_product
 from dew.sampling.solvers.common import given
 
@@ -199,7 +199,8 @@ def _guided_derivative(primals, tangents, value):
     return predicted + along
 
 
-_guided = surrogate(_guided_value, _guided_derivative)
+_guided = contracted("test_a_guided_prediction_holds_every_order")(
+    surrogate(_guided_value, _guided_derivative))
 """`guide`'s value (`_guided_value`), differentiated as the affine combination at every scale
 (`_guided_derivative`): a derivative of the guidance rule's, not the value's own at its endpoints."""
 

@@ -17,6 +17,7 @@ lands one fp32 ulp (4.8e-7) from torch's; `LOSS` is two.
 import contextlib
 import copy
 import dataclasses
+import functools
 import json
 import math
 import shutil
@@ -939,6 +940,7 @@ def a_float32_forwards_logits_and_its_output_tables_are_as_exact_as_torchs(tmp_p
             return {"forward": logits, "output table": logits}
         return as_given(both)
 
+    @as_given
     def truth(ids):
         with float64(), torch.no_grad():
             return wide(torch.from_numpy(np.asarray(ids, np.int64))).logits.numpy()
@@ -1059,6 +1061,8 @@ SLOT_TOKENIZER = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
 SLOT_HEAD = 8
 SLOT_SEEDS = 128
 """The tier-3 slot release's declared check-1 seeds, sized by `seeds_for` on armada."""
+PASS_ROWS = 16
+"""The seeds' rows the tier-3 slot release's task scores a pass."""
 SLOT_WORDS = ("refund", "late", "order", "broken", "account", "charge", "screen", "login")
 
 
@@ -1100,7 +1104,9 @@ def test_a_slot_release_over_a_tier_3_backbone_scores_and_serves_by_transformers
     over it: each option's score is the release's law (`SlotReadout`: `<slot_i, h> + <q h, k m_i> /
     sqrt(head_dim)`, `h` the answer cue's state, `m_i` the mean over option i's line) over transformers'
     own final states of the row, as exact as transformers' float32 from its float64 twin (check 1), and
-    the scoring server answers a request as the task does alone."""
+    the scoring server answers a request as the task does alone. The task scores the seeds' rows sixteen
+    a pass (`DecisionTask.scored`), each row scored as it is alone, as a server packs them: a pass of one
+    row computes its whole declared shape, and 128 of them took a minute of the case (ledger 4375)."""
     from dew.decision import Question
     from dew.inference import ScoringServer
 
@@ -1121,10 +1127,13 @@ def test_a_slot_release_over_a_tier_3_backbone_scores_and_serves_by_transformers
         [laid] = task.layout.rows(task.tokenizer, task.specials, request["state"], asked(request))
         return laid
 
+    @functools.cache
+    def passed(block: int) -> list[np.ndarray]:
+        return task.scored([row(seed) for seed in range(block * PASS_ROWS, (block + 1) * PASS_ROWS)])
+
     @as_given
     def ours(seed):
-        encoded = row(seed)
-        [scores] = task.scored([encoded])
+        encoded, scores = row(seed), passed(int(seed) // PASS_ROWS)[int(seed) % PASS_ROWS]
         return {"scores": np.asarray(scores[0, :len(encoded.questions[0].options)], np.float64)}
 
     def theirs(source, dtype):
@@ -1143,6 +1152,7 @@ def test_a_slot_release_over_a_tier_3_backbone_scores_and_serves_by_transformers
             return {"scores": scores.double().numpy()}
         return as_given(run)
 
+    @as_given
     def truth(seed):
         with float64():
             return theirs(wide, torch.float64)(seed)

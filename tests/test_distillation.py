@@ -27,12 +27,14 @@ import pytest
 from flax import linen as nn
 from flax.traverse_util import unflatten_dict
 from reference_error import as_given, assert_as_exact, widened
+from test_model_flops import forward_products
 
 from dew.batch import TEXT_KEY
+from dew.data import Memory
 from dew.data.dataset import DataPartition, Loader, replayed
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives import DistillationObjective
-from dew.objectives.base import Step
+from dew.objectives.base import EMASpec, Step
 from dew.objectives.distillation import PROJECTIONS, TEACHER
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
@@ -452,6 +454,51 @@ def test_the_teacher_never_moves_and_the_student_learns(tmp_path):
                                jax.tree.leaves(resumed.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(straight), np.asarray(again))
     assert Checkpoints(str(tmp_path / "distill")).latest == 5
+
+
+def test_a_wrapped_student_averages_on_the_runs_progress_as_it_does_alone():
+    """A student whose EMA follows the run's progress (`EMASpec.progressed`), its decay falling from 1 to 0
+    over it, keeps that clock once distilled: in a run bounded to 16 rows, two updates of 8, the second
+    update, at progress 8/16, averages each of its leaves half and half with the update's weights, exactly,
+    where an update count would read 1 and take the weights whole (row 4404)."""
+    arrays = fixture()
+    objective, _ = fixture_objective(arrays)
+    objective.student.ema = EMASpec(lambda progress: 1 - progress, progressed=True)
+    objective = DistillationObjective(objective.student, objective.teacher, alpha=META["alpha"],
+                                      temperature=META["temperature"], beta=META["beta"],
+                                      features=[tuple(pair) for pair in META["pairs"]])
+    trainer = Trainer(objective, optax.sgd(0.1), key=0)
+    start = jax.tree.map(np.asarray, trainer.initial_state().ema["params"])
+    rows = Memory({TEXT_KEY: np.tile(arrays["tokens"], (8, 1))})
+    # Streamed, so no plan counts its steps ahead and the run reads its progress off its examples clock.
+    state = trainer.fit(rows.read("streamed").batch(8), examples=16, log_every=1, checkpoint_final=False)
+    assert int(state.updates) == 2
+    half = np.float32(0.5)
+    for averaged, began, now in zip(jax.tree.leaves(state.ema["params"]), jax.tree.leaves(start),
+                                    jax.tree.leaves(state.variables["params"]), strict=True):
+        np.testing.assert_array_equal(np.asarray(averaged), half * began + half * np.asarray(now))
+
+
+def test_a_distillations_work_is_its_models_and_every_product_it_adds():
+    """The distilled step's forward work (`model_flops`) is its student's and its frozen teacher's, each as
+    that model's own objective counts it, plus every product the distillation's loss traces beyond theirs
+    (the feature projections); its training work the student's forward and backward, the projections' three
+    passes and the teacher's forward alone, whose collection takes no gradient (row 776: it reported
+    none). Each model's own count stands on its own tests (test_model_flops)."""
+    arrays = fixture()
+    objective, params = fixture_objective(arrays)
+    tokens = np.random.default_rng(776).integers(1, VOCAB, arrays["tokens"].shape, dtype=np.int32)
+    batch = {TEXT_KEY: jnp.asarray(tokens)}
+
+    def traced(scored, tree):
+        return forward_products(lambda value: scored.scalar_loss(value, batch, step_at())[0], tree)
+
+    student, teacher = objective.student.model_flops(None, batch), objective.teacher.model_flops(None, batch)
+    added = (traced(objective, params) - traced(objective.student, objective.student_variables(params))
+             - traced(objective.teacher, params[TEACHER]))
+    assert added > 0 and objective.model_flops(None, batch) == student + teacher + added
+    assert objective.training_flops(None, batch) == (objective.student.training_flops(None, batch) + teacher
+                                                     + 3 * added)
 
 
 def test_the_student_tree_is_what_a_plain_student_run_reads():

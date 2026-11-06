@@ -126,6 +126,9 @@ class TowerGeometry:
     times any frame reduction after them."""
     position_size: int | None = None
     retains_patch_slots: bool = False
+    pools_frames: bool = False
+    """Whether an item's frames pool into one frame's tokens (MoonViT's `tpool_patch_merger`): its tokens
+    are its first frame's merge blocks, wherever it holds more."""
 
 
 class TowerBase:

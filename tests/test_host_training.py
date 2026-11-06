@@ -28,7 +28,8 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_names import group_layers
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import Aux, EMASpec, Objective, Ratio
+from dew.objectives.base import TEACHER, Aux, EMASpec, Objective, Ratio
+from dew.objectives.distillation import DistillationObjective
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 from dew.training import Layout, Trainer
@@ -547,6 +548,120 @@ def test_streamed_banks_train_a_mixed_frozen_root_decoder_like_the_resident_stac
     equal(prefix, restored)
     resumed = updated(objective(), batch, HOST, checkpoints=Checkpoints(str(tmp_path / "mixed")))
     equal(resumed, updated(objective(), batch, HOST, steps=2))
+
+
+class Watched(LMObjective):
+    """A teacher keeping, for each forward it traces, the memory each leaf of its variables is read from."""
+    reads: list
+
+    def predict(self, params, *args, **kwargs):
+        self.reads.append({tuple(entry.key for entry in path): jax.typeof(leaf).memory_space
+                           for path, leaf in jax.tree_util.tree_leaves_with_path(params)})
+        return super().predict(params, *args, **kwargs)
+
+
+def distillation(teacher=None, dtype=jnp.float32):
+    """A two-layer student distilled from a three-layer teacher (`Watched`), wider than it, or from
+    `teacher`, a teacher's (model, variables), in `dtype`."""
+    model, variables = teacher or (decoder(emb_features=12, num_layers=3, mlp_features=24, dtype=dtype), None)
+    watched = Watched(model, 8, head_chunks=1, ema_decay=None,
+                      variables=None if variables is None else jax.tree.map(np.asarray, variables))
+    watched.reads = []
+    return DistillationObjective(LMObjective(decoder(dtype=dtype), 8, head_chunks=1, ema_decay=None), watched)
+
+
+def lora_teacher():
+    """A three-layer teacher adapted by LoRA, its base its frozen split beside the factors, whose module
+    names the base's share."""
+    from dew.lora import LoRA
+
+    base = decoder(emb_features=12, num_layers=3, mlp_features=24)
+    adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(
+        base, nn.unbox(base.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32))), key=2)
+    return adapter.model, adapter.variables
+
+
+def stacked_reads(read):
+    """The memory spaces a forward read each leaf of its layer stack from, and every other leaf from."""
+    layers = {keys: space for keys, space in read.items() if group_layers(keys[1])}
+    assert any(len(group_layers(keys[1])) > 1 for keys in layers)
+    return set(layers.values()), {space for keys, space in read.items() if keys not in layers}
+
+
+DISTILLED_SEEDS = 8
+"""Check 1's declared seeds for the host distilled step against the device one."""
+
+
+def test_a_host_distillation_steps_as_the_device_layout_does():
+    """A distilled run's step under a host layout, its frozen teacher banked beside the accelerator and
+    read from there a layer at a time (`run_stack`, row 4405), is the device layout's step: its loss and
+    the student's update, plain SGD's and so its gradient, on par from float64 with the device layout's
+    over drawn token rows (check 1), the truth the same step in float64."""
+    from reference_error import as_given, assert_as_exact, widened
+
+    from dew.objectives.base import Step
+
+    def arm(layout):
+        """A layout's step from the run's start over a draw's rows, and the objective it steps."""
+        objective, compiled = distillation(), []
+        trainer = Trainer(objective, optax.sgd(.1), key=jax.random.key(5), layout=layout)
+
+        def run(text):
+            state, _, _ = trainer.place()
+            batch = {"text": jnp.asarray(text)}
+            compiled[:] = compiled or [trainer.compile(state, batch)]
+            state, loss, *_ = compiled[0](state, batch)
+            return {"loss": np.asarray(loss), "student": jax.device_get(state.variables["params"])}
+        return run, objective
+
+    start = jax.device_get(
+        Trainer(distillation(), optax.sgd(.1), key=jax.random.key(5)).initial_state().variables)
+
+    def truth(text):
+        wide, variables = distillation(dtype=jnp.float64), widened(start)
+        batch, at = {"text": jnp.asarray(text)}, Step(jnp.asarray(0), jax.random.key(0), None)
+
+        def mean(params):
+            loss, _ = wide.loss({**variables, "params": params}, batch, at)
+            return loss.total / loss.mass
+        loss, gradient = jax.value_and_grad(mean)(variables["params"])
+        return {"loss": np.asarray(loss),
+                "student": jax.tree.map(lambda leaf, slope: np.asarray(leaf - .1 * slope),
+                                        variables["params"], gradient)}
+
+    def draw(seed):
+        return (np.random.default_rng([4405, seed]).integers(1, 16, tokens()["text"].shape, dtype=np.int32),)
+
+    (host, objective), (device, _) = arm(HOST), arm(DEVICE)
+    assert_as_exact(as_given(host), as_given(device), draw, "a host distilled step", seeds=DISTILLED_SEEDS,
+                    truth_fn=as_given(truth))
+    assert stacked_reads(objective.teacher.reads[-1]) == ({jax.memory.Space.Host}, {jax.memory.Space.Device})
+
+
+def test_a_host_distillations_frozen_teacher_stays_the_arrays_it_was_placed_as(tmp_path):
+    """A host distilled run's teacher split by LoRA, its base frozen beside its factors under one
+    module's names, is banked whole beside the accelerator (row 4405's review): its forward reads both
+    collections' layers from there and the rest from the device, and the step's commit, compiled for
+    the host, reads none of it, so after two steps the teacher is the very arrays it was placed as.
+    The banked teacher saves and restores as it is held."""
+    objective = distillation(lora_teacher())
+    trainer = Trainer(objective, optax.sgd(.1), key=jax.random.key(5), layout=HOST)
+    state, _, _ = trainer.place()
+    assert {"params", FROZEN} <= set(state.variables[TEACHER])
+    placed = jax.tree.leaves(state.variables[TEACHER])
+    step = trainer.compile(state, tokens())
+    for _ in range(2):
+        state, *_ = step(state, tokens())
+    assert all(after is before for after, before in zip(jax.tree.leaves(state.variables[TEACHER]), placed,
+                                                        strict=True))
+    assert stacked_reads(objective.teacher.reads[-1]) == ({jax.memory.Space.Host}, {jax.memory.Space.Device})
+
+    checkpoints = Checkpoints(str(tmp_path / "distilled"))
+    checkpoints.save(int(state.step), state, None)
+    checkpoints.wait()
+    restored, _, _ = Trainer(distillation(lora_teacher()), optax.sgd(.1), key=jax.random.key(5), layout=HOST,
+                             checkpoints=Checkpoints(str(tmp_path / "distilled"))).place()
+    equal(state, restored)
 
 
 def test_a_cpu_owned_lora_run_loads_through_the_pipeline_in_a_fresh_process(tmp_path):

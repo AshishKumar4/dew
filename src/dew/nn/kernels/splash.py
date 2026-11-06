@@ -54,7 +54,7 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 )
 
 from dew.nn.attention_kernels import SPLASH_BLOCK, SPLASH_LANES
-from dew.nn.derivatives import KernelGlue, declared_derivative
+from dew.nn.derivatives import KernelGlue, contracted, declared_derivative
 from dew.nn.kernels import generation, launches
 from dew.nn.kernels.options import program
 from dew.nn.precision import compensated_sum
@@ -1168,8 +1168,9 @@ def _attention_bwd(blocks: BlockSizes, call: _Call, residuals: tuple, do: jax.Ar
 
 
 # Dew: one declared derivative of a kernel's glue (`dew.nn.derivatives`), its `blocks` and `call` static.
-_attention = declared_derivative(KernelGlue(), _attending, _attention_fwd, _attention_bwd,
-                                 nondiff_argnums=(8, 9))
+_attention = contracted("test_a_fused_attention_kernel_holds_its_reverse_orders")(
+    declared_derivative(KernelGlue(), _attending, _attention_fwd, _attention_bwd,
+                        nondiff_argnums=(8, 9)))
 
 
 def _collapsed(mask_info: mask_info_lib.MaskInfo) -> mask_info_lib.MaskInfo:

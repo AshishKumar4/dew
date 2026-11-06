@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
 
-from dew.nn.derivatives import Algebra
+from dew.nn.derivatives import Algebra, contracted
 from dew.nn.kernels.generation import linear_tangent
 from dew.nn.precision import L2NORM_EPS, at_least_fp32
 
@@ -85,9 +85,10 @@ def stepped(residual: jax.Array, branch: jax.Array, alpha: jax.Array, scale: flo
     the cotangents, where JAX's own transpose takes each unit norm apart, a reduction and a scaling
     each (ledger 1308: 4 ms of Dory 4B's step on an H100); forward mode differentiates the formula
     (`linear_tangent`)."""
-    return linear_tangent(functools.partial(_stepped_forward, scale),
-                          functools.partial(_stepped_backward, scale),
-                          functools.partial(_stepped, scale), kind=Algebra())(residual, branch, alpha)
+    return contracted("test_ngpts_join_and_normed_hidden_hold_every_order")(
+        linear_tangent(functools.partial(_stepped_forward, scale),
+                       functools.partial(_stepped_backward, scale),
+                       functools.partial(_stepped, scale), kind=Algebra()))(residual, branch, alpha)
 
 
 def _squares(x: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -168,10 +169,11 @@ def normed_hidden(gate: jax.Array, up: jax.Array, gate_gain: jax.Array, up_gain:
     dtype (dory.py:188-194). Its reverse reads the rows twice, from the sum of squares its forward keeps
     a row (`_hidden_backward`): once for the norm's inner product, once for the cotangents and the
     gains'; forward mode differentiates the formula (`linear_tangent`)."""
-    return linear_tangent(functools.partial(_hidden_forward, factor, product),
-                          functools.partial(_hidden_backward, factor, product),
-                          functools.partial(_hidden, factor, product),
-                          kind=Algebra())(gate, up, gate_gain, up_gain)
+    return contracted("test_ngpts_join_and_normed_hidden_hold_every_order")(
+        linear_tangent(functools.partial(_hidden_forward, factor, product),
+                       functools.partial(_hidden_backward, factor, product),
+                       functools.partial(_hidden, factor, product),
+                       kind=Algebra()))(gate, up, gate_gain, up_gain)
 
 
 def _gated(factor: float, gate, up, gate_gain, up_gain):

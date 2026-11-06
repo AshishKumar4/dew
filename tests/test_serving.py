@@ -27,6 +27,7 @@ from steady_state import guarded, steady_state
 from tool_policy import ToolPolicy
 
 from dew.inference import RunProcessor, TextGeneration
+from dew.inference.banks import HeldBanks
 from dew.inference.loading import place
 from dew.inference.serving import Server
 from dew.interop.decoder_parts import decoder_axes
@@ -810,9 +811,25 @@ WIDE_HYBRID = HybridSite(vocab=512, width=64, budget=16, seeds=256)
 users' are (ledger 1698) leave their scores' paired ratio unresolved within 512 seeds, which 512 words, 64
 wide and 16 draws a request resolve at 256 (armada, rows/1698-serving-hybrid)."""
 NARROW_HYBRID, NARROW_HYBRID_TAILED = HybridSite(seeds=256), HybridSite(seeds=512)
+SHORT_HYBRID = HybridSite(seeds=256, budget=4)
+"""NARROW_HYBRID's model drawing 4 tokens a request, so a request of 7 to 9 prompt tokens holds 3 or 4
+pages and a pool of 6 or 8 runs the segment's host cases."""
 """The sites at 256 words, 16 wide and 8 draws, sized paired by `seeds_for` on armada (11-03, at
 0fccb01d79): every-page's and restores-past-admission's resolve at 256, evicted's and
 one-entry-booked-twice's at 512."""
+
+
+SEGMENT_HOST = {"slots": 2, "admission": 2, "kv_cache": KVCache(page_size=4, pages=6), "host_pages": 2,
+                "prefix_states": 4}
+"""A pool whose host tier keeps a segment's pages: two rows at once over 6 pages of 4 tokens, 2 host slots
+and 4 states."""
+
+SEGMENT = (Served(12, shared=6), Served(12, flipped=(7,), shared=6), Served(12, flipped=(6,), shared=6))
+"""A segment of 6 tokens three prompts declare shared (a decision's state, each question past it its own
+request), ending inside their second page: past it they differ before any kept page boundary, so each
+later one reads the first's first page and its segment's 2 tokens of the second, copied into its own,
+starting from the state kept at the segment's end (`dew.inference.pages.segment_hash`); asked at once,
+the later ones wait for the first to write it."""
 
 
 @pytest.mark.parametrize("requests, options, hits, rounds, site", [
@@ -826,9 +843,21 @@ one-entry-booked-twice's at 512."""
      (0, 0, 8), None, NARROW_HYBRID),
     ((Served(9), Served(12, flipped=(0,)), Served(12, flipped=(0, 1)), Served(9)),
      {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 1,
-      "prefix_states": 4}, (0, 0, 0, 0), None, NARROW_HYBRID)],
+      "prefix_states": 4}, (0, 0, 0, 0), None, NARROW_HYBRID),
+    ((Served(9), Served(9, flipped=(0,)), Served(9)),
+     {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 2,
+      "prefix_states": 1}, (0, 0, 8), None, NARROW_HYBRID),
+    (SEGMENT, {}, (0, 6, 12), None, NARROW_HYBRID),
+    (SEGMENT, {}, (12,), (3,), NARROW_HYBRID),
+    ((Served(7, shared=6), Served(7, flipped=(0,)), Served(7, flipped=(0, 1)),
+      Served(7, flipped=(6,), shared=6), Served(7, shared=6)), SEGMENT_HOST, (0, 0, 12), (1, 2, 2),
+     SHORT_HYBRID),
+    ((Served(9, flipped=(0,)), Served(7, shared=6), Served(9, flipped=(0, 1)),
+      Served(7, flipped=(6,), shared=6), Served(9, flipped=(0,))),
+     {**SEGMENT_HOST, "kv_cache": KVCache(page_size=4, pages=8)}, (0, 0, 6, 14), (1, 1, 2, 1), SHORT_HYBRID)],
     ids=["by-default", "in-pieces", "every-page", "restores-past-admission", "from-the-host",
-         "from-one-host-slot"])
+         "from-one-host-slot", "a-state-from-the-host", "a-shared-segment", "a-shared-segment-asked-at-once",
+         "a-segment-uploaded-and-copied-at-once", "a-segment-copied-into-a-spilled-page"])
 @pytest.mark.check1_shards(seeds=256, per_task=64)
 def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(requests, options, hits, rounds,
                                                                              site):
@@ -868,10 +897,16 @@ def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
     while another prompt runs, its state kept in a store of four entries, and its repeat reads its pages
     back (a pool without the tier reads none: its other prompt takes the pages); in a pool of eight pages
     two other prompts reclaim a prompt's two shared pages, and a tier of one host slot keeps one of them
-    alone, where the store holds the state after the deepest page only, so the repeat reads nothing back.
-    Each request
-    draws what it draws alone and scores it as a full
-    forward does (check 1)."""
+    alone, where the store holds the state after the deepest page only, so the repeat reads nothing back;
+    a store of one entry sends a prompt's state to the host tier when another prompt's takes the entry,
+    and its repeat reads it back with its pages (`dew.inference.pages.States`). A segment three prompts
+    declare shared, ending inside a page (`SEGMENT`), is read by each later one from the state kept at
+    its end, its last page copied into the prompt's own, one a round or all asked at once. With a host
+    tier (`SEGMENT_HOST`): a segment two other prompts spill to the host, its page named by the segment
+    alone, comes back for two prompts seated together, the first uploading it and the second copying it
+    from there after the upload lands; and a prompt copying a segment into a page the pool reclaims from
+    a cached prefix spills that prefix first, which its repeat reads back. Each request draws what it
+    draws alone and scores it as a full forward does (check 1)."""
     # A vocabulary of 256 at least and eight draws a request, so each request's scores spread enough to
     # measure: at 64, fp32 sums as users' are (ledger 2468) leave the ratio unresolved within 512 seeds.
     model = hybrid_model(vocab_size=site.vocab, width=site.width)
@@ -880,6 +915,20 @@ def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
     assert_served_as_exact(task, requests, f"hybrid shared prefix {hits}",
                            serving={**HYBRID_SHARED, **options}, hits=hits, rounds=rounds, budget=site.budget,
                            seeds=(site.seeds, site.seeds))
+
+
+def test_a_shared_segment_is_refused_where_no_server_keeps_it_or_it_splits_its_prompt():
+    """A declared shared segment (`Server.submit`'s `shared`) is kept by a paged server with a prefix cache
+    alone and holds some of the prompt's tokens but not its last: a dense server's, an empty one and a
+    whole prompt are refused."""
+    bound = hybrid_task()
+    prompt = np.arange(1, 9, dtype=np.int32)
+    with pytest.raises(ValueError):
+        Server.from_task(bound, slots=2, capacity=64).submit(prompt, 2, key=0, shared=4)
+    server = Server.from_task(bound, **HYBRID_SHARED)
+    for shared in (0, 8):
+        with pytest.raises(ValueError):
+            server.submit(prompt, 2, key=0, shared=shared)
 
 
 def served_alongside(bound, slots=4, admission=2, **options):
@@ -999,6 +1048,27 @@ def test_a_host_tier_keeps_prefix_pages_the_pool_reclaims(host_pages, hits):
         server.run()
         drawn.append(ticket.result())
     assert server.prefix_hits == hits
+    for generation, lone in zip(drawn, alone, strict=True):
+        assert_same_generation(generation, lone)
+
+
+def test_a_banked_servers_host_tier_reads_back_the_prefix_pages_its_pool_reclaimed():
+    """`test_a_host_tier_keeps_prefix_pages_the_pool_reclaims`'s host case over a banked store, whose paged
+    pool holds its run's layers first (`dew.nn.kv_cache.row_axis`): the reclaimed pages go to host memory
+    a page at a time, every layer of each, and come back into fresh pages where the prompt reads its 8
+    tokens, every request drawing what its lone call draws."""
+    bound = banked_task(Sampling(temperature=1.0))
+    shared, others, budget = "123456781", ["987654329876", "555544443333"], 6
+    requests = [shared, *others, shared]
+    alone = [bound(held, budget, key=index) for index, held in enumerate(requests)]
+    server = Server.from_task(bound, slots=1, capacity=64, admission=1, prefix_cache=True,
+                              kv_cache=KVCache(page_size=4, pages=8), host_pages=8)
+    drawn = []
+    for index, held in enumerate(requests):
+        ticket = server.submit(held, budget, key=index)
+        server.run()
+        drawn.append(ticket.result())
+    assert "layers_0_3" in server.cache and server.prefix_hits == 8
     for generation, lone in zip(drawn, alone, strict=True):
         assert_same_generation(generation, lone)
 
@@ -1174,7 +1244,9 @@ def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(t
     and loaded by directory. Requests naming either adapter, or none, share the server's steps and its
     one copy of the base, and each draws what a task over its adapter alone (or the base) draws, on par
     with that task against its float64 twin (check 1), over a dense cache and over a paged one sharing
-    prompt pages, where one prompt under two adapters shares none (ledger 870)."""
+    prompt pages, where one prompt under two adapters shares none (ledger 870). An adapter bound over
+    other weights than the set's base is refused, which the set would run over the first's (ledger
+    4494)."""
     from pathlib import Path
 
     from arm_arithmetic import widened
@@ -1199,6 +1271,11 @@ def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(t
     second.save(second.variables, tmp_path / "set" / "second")
     adapters = AdapterSet.load(decoder.model, decoder.variables, tmp_path / "set", layouts=decoder.layouts)
     assert adapters.names == ("fixture", "second")
+    # An adapter over other weights than the set's base would run over the first adapter's: refused.
+    moved = jax.tree.map(lambda leaf: leaf * 0.5, decoder.variables)
+    elsewhere = LoRA(rank=2, modules=("q_proj",)).apply(decoder.model, moved, key=0, layouts=decoder.layouts)
+    with pytest.raises(ValueError):
+        AdapterSet.of({"fixture": fixture, "elsewhere": elsewhere})
     sampling = Sampling(temperature=1.0)
     served = dataclasses.replace(decoder, model=adapters.model, variables=adapters.variables
                                  ).text_generation(sampling=sampling)
@@ -1480,6 +1557,73 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), row)
 
+
+def banked_task(sampling: Sampling, *, layers: int = 4, devices: int = 1) -> TextGeneration:
+    """A scanned MoE decoder's task over a banked store (`dew.inference.banks.HeldBanks.place`, the run's
+    `layers` weights one array a leaf, `layers_0_3`), on one device, as the task's lone calls run (a mesh
+    over the suite's devices splits the slots), or on a mesh of the last `devices` rows' devices."""
+    def routed(*, scanned: bool) -> CausalTransformer:
+        return CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=layers, num_heads=2,
+                                 head_dim=8, mlp_features=32, max_seq_len=128, dtype="float32",
+                                 scan_layers=scanned, mixture=Mixture(experts=4, top_k=2))
+
+    scanned = routed(scanned=True)
+    weights = routed(scanned=False).init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    mesh = MeshSpec(fsdp=devices).build(jax.devices()[-devices:] if devices > 1 else jax.devices()[:1])
+    banked = HeldBanks(weights).place(scanned, mesh=mesh)
+    return TextGeneration(scanned, banked, RunProcessor(Digits()), sampling=sampling)
+
+
+@pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=16, pages=12)}],
+                         ids=["dense", "paged"])
+def test_a_server_over_a_banked_store_keeps_its_cache_banked_and_draws_what_the_task_draws(options):
+    """A scanned MoE decoder over a banked store keeps its resident cache banked as its weights are, the
+    run's layers one array under the run's name, which every step reads and writes where it lies: an
+    admitted prompt lands in its row of every layer of it, dense or paged, and each row draws what the task
+    over the same store draws alone."""
+    bound = banked_task(Sampling(temperature=0, eos_token_ids=EOS))
+    alone = [bound(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    server, tickets = served_alongside(bound, **options)
+    assert "layers_0_3" in server.cache and not any(f"layers_{index}" in server.cache for index in range(4))
+    for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), row)
+
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_banked_server_over_row_groups_seats_its_paged_prompts_in_every_layer_of_their_rows():
+    """A banked server whose slots split into two row groups, paged, prefills its prompts in a forward of
+    their own (`mixed_refusal`): each piece's page table and cursor land in its row of every layer of the
+    run's bank, its rows past the layers (`dew.nn.kv_cache.row_axis`), and each row draws what the task
+    over the one-device store draws alone."""
+    sampling = Sampling(temperature=0, eos_token_ids=EOS)
+    lone = banked_task(sampling)
+    alone = [lone(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    server, tickets = served_alongside(banked_task(sampling, devices=2),
+                                       kv_cache=KVCache(page_size=16, pages=12))
+    assert server.groups == 2 and server.mixed_refusal is not None and "layers_0_3" in server.cache
+    for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), row)
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_banked_server_that_prefills_on_a_mesh_of_its_own_moves_its_rows_past_the_banks_layers():
+    """A banked server that prefills on a mesh of its own, its bank three layers deep, which the decoding
+    mesh's two row groups do not divide: the prefilled rows move onto the decoding rows rows first, a bank's
+    past its layers moved before them (`dew.inference.serving_kernel._rows_first`), not split on the
+    layers, and every request draws what the task over the one-device store draws alone."""
+    sampling = Sampling(temperature=0, eos_token_ids=EOS)
+    lone = banked_task(sampling, layers=3)
+    alone = [lone(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    server = Server.from_task(banked_task(sampling, layers=3, devices=2), slots=4, capacity=128, admission=2,
+                              prefill_mesh=MeshSpec(fsdp=2).build(jax.devices()[:2]))
+    server, tickets = served_by(server)
+    assert "layers_0_2" in server.cache
+    for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), row)
 
 
 @pytest.mark.distributed
