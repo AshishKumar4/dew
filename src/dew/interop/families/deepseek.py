@@ -128,7 +128,7 @@ def _full_attention_everywhere(hf_config: Mapping[str, object], used: set[str], 
 
 
 MINIMAX_M2_CONFIG = ConfigLayout(
-    *(expect(name, expected, reason) for name, expected, reason in (
+    *(expect(name, reason, value=expected) for name, expected, reason in (
         ('use_qk_norm', True, 'MiniMax-M2 normalizes its query and key projections'),
         ('qk_norm_type', 'per_layer', 'MiniMax-M2 normalizes whole projections before splitting heads'),
         ('use_routing_bias', True, 'MiniMax-M2 selects experts with its balancing bias'),

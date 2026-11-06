@@ -11,44 +11,44 @@ from dew.interop.decoder_parts import (
     PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
+    DecoderSpelling,
     Renames,
-    base_config,
+    constant,
+    decoder_layout,
     fixed_attention_buffer,
+    flag,
     grouped_qkv,
-    hf_ungated,
-    partial_rope,
-    reads,
+    plain_rope_part,
     spelled,
-    ungated_mlp,
+    ungated,
 )
-from dew.interop.layouts import ConfigLayout, ConfigPart, Route, Slot, Table, one_of
+from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Route, Slot, Table, one_of, unread
 from dew.interop.unread import Stored, equal
-from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.rope import inverse_frequencies
 
 
-def _gpt_neox_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
-    theta, partial, rope = partial_rope(hf, PLAIN_SPELLING, default_factor=.25, factor_field='rotary_pct',
-                                        theta_field='rotary_emb_base')
-    activation = _records.text(hf.get('hidden_act', 'gelu'), 'hidden_act')
-    mlp = ungated_mlp(activation, ('gelu', 'gelu_new', 'gelu_pytorch_tanh', 'relu'), 'hidden_act', 'GPT-NeoX')
-    config = base_config({**hf, 'hidden_act': 'gelu', 'rope_theta': theta,
-                           'rope_parameters': rope or None}, used, rope=PLAIN_SPELLING,
-                         reads=frozenset({'attention_bias'}))
-    used.update(('rotary_pct', 'rotary_emb_base', 'use_parallel_residual', 'layer_norm_eps',
-                 'hidden_dropout', 'classifier_dropout', 'is_decoder'))
-    config.update({
-        'mlp': mlp, 'mlp_bias': True,
-        'norm_type': 'layer', 'norm_bias': True,
-        'norm_eps': _records.number(hf.get('layer_norm_eps', 1e-5), 'layer_norm_eps'),
-        'scale_after_cast': False, 'attention_bias': bool(hf.get('attention_bias', True)),
-        'partial_rotary_factor': partial, 'partial_rotary_type': 'default',
-        'parallel_residual': bool(hf.get('use_parallel_residual', True)),
-        'dropout_rate': _records.number(hf.get('hidden_dropout', 0.), 'hidden_dropout'),
-        'embedding_dropout_rate': _records.number(hf.get('hidden_dropout', 0.), 'hidden_dropout'),
-        'attention_dropout_rate': _records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
-    })
-    return config
+def _embedding_dropout(hf_config: Mapping[str, object], used: set[str], record: DecoderFields
+                       ) -> DecoderFields:
+    """GPT-NeoX drops its embeddings at the residual's rate (`hidden_dropout`)."""
+    record['embedding_dropout_rate'] = _records.number(hf_config.get('hidden_dropout', 0.), 'hidden_dropout')
+    return record
+
+
+GPT_NEOX_CONFIG = ConfigLayout(
+    decoder_layout(DecoderSpelling(reads=frozenset(), scale_after_cast=False, activation=None,
+                                   keys={'rms_norm_eps': 'layer_norm_eps'}, defaults={'layer_norm_eps': 1e-5},
+                                   undeclared=frozenset({'num_key_value_heads', 'head_dim'})),
+                   rope=plain_rope_part(PLAIN_SPELLING, default_factor=.25, reference='GPT-NeoX rotary',
+                                        factor_field='rotary_pct', theta_field='rotary_emb_base')),
+    ungated('hidden_act', ('gelu', 'gelu_new', 'gelu_pytorch_tanh', 'relu'), 'GPT-NeoX', default='gelu'),
+    flag('attention_bias', 'attention_bias', default=True), flag('use_parallel_residual', 'parallel_residual',
+                                                                 default=True),
+    ConfigField('hidden_dropout', 'dropout_rate', 0.0, parse=_records.number),
+    ConfigPart(_embedding_dropout, lambda model: {}),
+    ConfigField('attention_dropout', 'attention_dropout_rate', 0.0, parse=_records.number),
+    constant('mlp_bias', value=True), constant('norm_type', value='layer'), constant('norm_bias', value=True),
+    unread('classifier_dropout', 'is_decoder'))
+"""GPT-NeoX's config, both ways: a parallel biased-LayerNorm block, a quarter of each head rotated."""
 
 
 def _gpt_neox_buffers(tensors: Mapping[str, Stored],
@@ -92,21 +92,9 @@ _GPT_NEOX_ROUTES = Table(
 """GPT-NeoX's names (`_GPT_NEOX_NAMES`) onto the shared decoder's."""
 
 
-def _gpt_neox_export(model: CausalTransformer) -> Mapping[str, object]:
-    fields: dict[str, object] = {
-        'layer_norm_eps': model.norm_eps, 'use_parallel_residual': model.parallel_residual,
-        'hidden_act': hf_ungated(model.mlp, 'GPT-NeoX'),
-        'hidden_dropout': model.dropout_rate, 'attention_dropout': model.attention_dropout_rate,
-        'rope_parameters': {'rope_type': 'default', 'rope_theta': model.rope_theta,
-                            'partial_rotary_factor': model.partial_rotary_factor or 1.},
-    }
-    fields.update(dict.fromkeys(('rms_norm_eps', 'rope_theta', 'num_key_value_heads', 'head_dim')))
-    return fields
-
-
 GPT_NEOX = DecoderFamily(
     ('gpt_neox',),
-    ConfigLayout(ConfigPart(reads(_gpt_neox_config), _gpt_neox_export)),
+    GPT_NEOX_CONFIG,
     lambda fields: bool(
         fields.norm_type == 'layer'
         and fields.norm_bias

@@ -972,7 +972,7 @@ def unwritten(why: str) -> ConfigPart[CausalTransformer]:
     return ConfigPart(lambda hf_config, used, record: record, write)
 
 
-def expect(key: str, value: object, why: str) -> ConfigPart[CausalTransformer]:
+def expect(key: str, why: str, *, value: object) -> ConfigPart[CausalTransformer]:
     """A key the family's reference computes only at `value` (its class's default where unstated),
     refused at any other, saying `why`; written as nothing."""
     def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
