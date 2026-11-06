@@ -9,6 +9,7 @@ holds no JAX: each side's forward imports its framework where it runs.
 import dataclasses
 import functools
 from collections.abc import Callable
+from typing import TypedDict
 
 import numpy as np
 
@@ -64,30 +65,72 @@ processor packs it; and MiMo-V2.6's over a row whose video frames' placeholders 
 plain rows (`mtp`)."""
 
 
-def vocabulary(config: dict) -> int:
+class TextConfig(TypedDict):
+    """A wrapper's text decoder's config, the field a draw reads."""
+
+    vocab_size: int
+
+
+class VisionConfig(TypedDict, total=False):
+    """A wrapper's vision tower's config, the fields a media draw reads: its patches' geometry, its
+    channels under the name its ViT gives them (MiMo-V2.6's `in_chans`)."""
+
+    spatial_merge_size: int
+    in_channels: int
+    in_chans: int
+    temporal_patch_size: int
+    patch_size: int
+
+
+class ProcessorConfig(TypedDict):
+    """MiMo-V2.6's audio processing, as its config states it (`processor_config`)."""
+
+    audio_segment_size: int
+    audio_kernel_size: int
+    audio_stride_size: int
+    audio_avg_pooler: int
+    audio_group_size: int
+    audio_n_mels: int
+
+
+class FixtureConfig(TypedDict, total=False):
+    """A release fixture's config.json, the fields a site's draw reads: its vocabulary (its own, or a
+    wrapper's text decoder's), and a wrapper's towers, placeholder ids and audio processing."""
+
+    vocab_size: int
+    text_config: TextConfig
+    vision_config: VisionConfig
+    processor_config: ProcessorConfig
+    image_token_id: int
+    video_token_id: int
+    audio_token_id: int
+
+
+def vocabulary(config: FixtureConfig) -> int:
     """The token ids a fixture's `config` reads: its own `vocab_size`, or its text decoder's (a wrapper's)."""
-    return int(config.get("text_config", config)["vocab_size"])
+    text = config.get("text_config")
+    return text["vocab_size"] if text is not None else config["vocab_size"]
 
 
-def draw(site: str, seed: int, config: dict) -> dict[str, np.ndarray]:
+def draw(site: str, seed: int, config: FixtureConfig) -> dict[str, np.ndarray]:
     """`site`'s inputs at `seed` over the fixture's `config` (`SITE_FORMS`' `inputs`), from a generator
     seeded by the site and the seed."""
     return SITE_FORMS[site].inputs(np.random.default_rng([sum(map(ord, site)), seed]), config)
 
 
-def _tokens(rng: np.random.Generator, config: dict, rows: int = ROWS) -> dict[str, np.ndarray]:
+def _tokens(rng: np.random.Generator, config: FixtureConfig, rows: int = ROWS) -> dict[str, np.ndarray]:
     """`rows` rows of `LENGTH` token ids."""
     return {"ids": rng.integers(0, vocabulary(config), (rows, LENGTH)).astype(np.int32)}
 
 
-def _cotangent(rng: np.random.Generator, config: dict) -> dict[str, np.ndarray]:
+def _cotangent(rng: np.random.Generator, config: FixtureConfig) -> dict[str, np.ndarray]:
     """Rows with a cotangent on the logits of float32 normals."""
     inputs = _tokens(rng, config)
     inputs["cotangent"] = rng.normal(size=(ROWS, LENGTH, vocabulary(config))).astype(np.float32)
     return inputs
 
 
-def _padded(rng: np.random.Generator, config: dict) -> dict[str, np.ndarray]:
+def _padded(rng: np.random.Generator, config: FixtureConfig) -> dict[str, np.ndarray]:
     """Rows whose second row's first `PADDED` slots are padding (`attention_mask` 0 there)."""
     inputs = _tokens(rng, config)
     mask = np.ones((ROWS, LENGTH), np.int32)
@@ -96,7 +139,7 @@ def _padded(rng: np.random.Generator, config: dict) -> dict[str, np.ndarray]:
     return inputs
 
 
-def _media(rng: np.random.Generator, config: dict, *, site: str) -> dict[str, np.ndarray]:
+def _media(rng: np.random.Generator, config: FixtureConfig, *, site: str) -> dict[str, np.ndarray]:
     """An `image`, `video` or `frames` site's row: one row, drawn below its placeholder ids, its
     placeholders at `IMAGE_AT` or `VIDEO_AT` (a video's frames each a run of their own, or side by side in
     one, `frames`, at `FRAMES_AT`) beside a normal image's or video's patch vectors (`pixel_values`,
@@ -123,7 +166,7 @@ def _media(rng: np.random.Generator, config: dict, *, site: str) -> dict[str, np
             f"{kind}_grid_thw": np.asarray([grid], np.int64)}
 
 
-def audio_tokens(frames: int, processing: dict) -> int:
+def audio_tokens(frames: int, processing: ProcessorConfig) -> int:
     """The placeholders a clip of `frames` mel frames fills, as MiMo-V2.6's processing states it (its
     config's `processor_config`): each segment of `audio_segment_size` frames convolved, halved and pooled
     to its codes, a clip's codes in groups of `audio_group_size`."""
@@ -139,7 +182,7 @@ def audio_tokens(frames: int, processing: dict) -> int:
     return -(-held // processing["audio_group_size"])
 
 
-def _audio(rng: np.random.Generator, config: dict) -> dict[str, np.ndarray]:
+def _audio(rng: np.random.Generator, config: FixtureConfig) -> dict[str, np.ndarray]:
     """An `audio` site's row, drawn below every placeholder id: its clips' mel frames, normals,
     padded to the longest with their valid-frame mask (`input_features`, `input_features_mask`), each
     clip's placeholders at `AUDIO_AT`."""
@@ -418,7 +461,7 @@ class Site:
     release, to a draw's outputs by leaf) and the release's own (`released`: its torch module, a draw and
     the fixture's name, to the same leaves)."""
 
-    inputs: Callable[[np.random.Generator, dict], dict[str, np.ndarray]]
+    inputs: Callable[[np.random.Generator, FixtureConfig], dict[str, np.ndarray]]
     dew: Callable
     released: Callable
 
