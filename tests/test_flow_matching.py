@@ -244,15 +244,10 @@ def test_the_flow_loss_and_its_gradient_are_diffusers_flux_trainings(case):
     objective = DiffusionObjective(Velocity(), presets.Flow(shift=shift)(),
                                    InputSpec(Field("image", pixels.shape[1:])), guidance=None, solver=Euler(),
                                    steps=2, unconditional_prob=0.0, ema_decay=None)
-    import types
-
     import torch
-    from diffusers.training_utils import compute_loss_weighting_for_sd3
-
-    from tools.torch_precision import float_as, replaced
 
     with run_from("flow_loss_reference", "tools") as generator:
-        velocity = generator.velocity
+        published_loss = generator.published_loss
 
     variables = objective.init(jax.random.PRNGKey(0))
     schedule = objective.process.schedule
@@ -279,20 +274,8 @@ def test_the_flow_loss_and_its_gradient_are_diffusers_flux_trainings(case):
         @as_given
         def run(times, noise, sigmas):
             # Diffusers' loss statements as published (the fixture's, read from the script).
-            x = (pixels.astype(np.float32) - np.float32(127.5)) / np.float32(127.5)
-            parameters = torch.tensor(LOSS["weights"], dtype=dtype, requires_grad=True)
-            scope = {"torch": torch, "compute_loss_weighting_for_sd3": compute_loss_weighting_for_sd3,
-                     "args": types.SimpleNamespace(weighting_scheme="logit_normal"),
-                     "model_input": torch.tensor(x, dtype=dtype),
-                     "noise": torch.tensor(np.asarray(noise), dtype=dtype),
-                     "sigmas": torch.tensor(np.asarray(sigmas), dtype=dtype).reshape(-1, 1, 1, 1)}
-            with replaced(float_as(dtype)):
-                exec(str(LOSS["noising"]), scope)
-                scope["model_pred"] = velocity(parameters, scope["noisy_model_input"],
-                                               scope["sigmas"].flatten() * 1000)
-                exec(str(LOSS["loss_lines"]), scope)
-                scope["loss"].backward()
-            return {"loss": scope["loss"].detach().numpy(), "gradient": parameters.grad.numpy()}
+            return published_loss((str(LOSS["noising"]), str(LOSS["loss_lines"])), LOSS["weights"], pixels,
+                                  noise, sigmas, dtype)
         return run
 
     assert_as_exact(dew, diffusers(torch.float32), draw, f"flow loss at shift {shift}",
