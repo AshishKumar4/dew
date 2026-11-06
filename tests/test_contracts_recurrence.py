@@ -127,8 +127,11 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge):
     # A packed row's second orders through its gradient from 2^62: the owner's accuracy-for-speed acceptance
     # (ledger 2470, 10-30).
     accepted = packed and scale >= 2.0**62
-    assert_contract(rule, primals, direction, cotangent, f"the chunked delta rule {edge}",
-                    truth_fn=recurrence, plain_fn=plain, held=PACKED_OVERFLOW_ORDERS if accepted else None)
+    # Each order one program (`jax.jit`): run op by op, an order's eager dispatch compiled 2,570 programs of
+    # one or two ops, 109 of the case's 156 s near float32's largest (cProfile on armada, row 4433).
+    assert_contract(jax.jit(rule), primals, direction, cotangent, f"the chunked delta rule {edge}",
+                    truth_fn=jax.jit(recurrence), plain_fn=jax.jit(plain),
+                    held=PACKED_OVERFLOW_ORDERS if accepted else None)
 
 
 def plain_delta_rule(query, key, value, g, beta, state, scale):
