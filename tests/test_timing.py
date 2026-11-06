@@ -8,7 +8,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
 from tool_support import git, load
 
 TIMING = Path(__file__).resolve().parents[1] / "tools/timing.py"
@@ -112,11 +111,12 @@ def test_a_windows_verdict_pairs_each_arms_round_with_the_references_and_leaves_
     and greatest round, rank 1): here a fast warm-up round of the arm, which judged would hold 1, decides
     nothing, and the arm's rounds lie apart from 1 and from the A/A's."""
     timing = load("timing")
-    measured = {"ref": [10.0] * 7, "ref~aa": [10.0, 9.9, 10.1, 10.0, 10.2, 9.8, 10.0],
-                "arm": [5.0, 12.0, 12.2, 11.9, 12.1, 12.4, 12.3]}
+    # Values a binary float holds exactly, so every ratio is its literal: the reference 8 ms each round, the A/A
+    # about it, the arm about 10, its warm-up round (index 0) at 4.
+    measured = {"ref": [8.0] * 7, "ref~aa": [8.0, 8.0, 7.5, 8.5, 8.0, 9.0, 7.0],
+                "arm": [4.0, 10.0, 10.5, 9.5, 11.0, 12.0, 10.0]}
     rows = [{"case": "c", "cell": {"n": 1}, "arm": arm, "round": index - 1, "warmup": index == 0,
-             "repeat": repeat, "order": index, "wall_ms": value + repeat / 1000, "device_ms": None,
-             "digest": "d", "gpu": "cpu"}
+             "repeat": repeat, "order": index, "wall_ms": value, "device_ms": None, "digest": "d", "gpu": "cpu"}
             for arm, values in measured.items() for index, value in enumerate(values) for repeat in (0, 1)]
     (tmp_path / "timing.jsonl").write_text("\n".join(json.dumps(row) for row in rows))
     manifest = {"clock": "wall", "cases": [{"name": "c", "cells": [{"n": 1}], "reference": "ref",
@@ -124,9 +124,9 @@ def test_a_windows_verdict_pairs_each_arms_round_with_the_references_and_leaves_
     timing.summarized(manifest, tmp_path)
     (cell,) = json.loads((tmp_path / "summary.json").read_text())["cases"][0]["cells"]
     arms = {found["arm"]: found for found in cell["arms"]}
-    assert arms["arm"]["ratios"] == pytest.approx([1.2, 1.22, 1.19, 1.21, 1.24, 1.23], abs=1e-3)
-    assert arms["arm"]["ratio_interval"] == pytest.approx([1.19, 1.24], abs=1e-3)
-    assert cell["noise_band"] == pytest.approx([0.98, 1.02], abs=1e-3) and arms["arm"]["differs"] is True
+    assert arms["arm"]["ratios"] == [1.25, 1.3125, 1.1875, 1.375, 1.5, 1.25]
+    assert arms["arm"]["ratio_interval"] == [1.1875, 1.5] and cell["noise_band"] == [0.875, 1.125]
+    assert arms["arm"]["differs"] is True
     assert arms["ref"]["differs"] is None and cell["unjudged"] is None
 
 
