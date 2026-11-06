@@ -797,7 +797,7 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     assert not mosaic_failures([record])
     for past in ({"shared": 4096}, {"tmem": 513}, {"spilled": 40}):
         assert mosaic_failures([{**record, "kernels": [{**within, **past}]}])
-    overestimated = resources.RegisterModel(200, 168, 2, 1, 8, 168, shared=1024)
+    overestimated = resources.RegisterModel(200, 168, 2, 1, 8, 168, shared=1024, file=65536)
     disagreement = {**record, "models": {"k": overestimated.record()},
                     "kernels": [{**within, "need": 160}]}
     assert not mosaic_failures([disagreement])
@@ -841,7 +841,7 @@ def test_a_gate_holding_its_models_fails_a_spill_free_disagreement_and_an_unmode
               "spilled": 0, "need": need}
 
     def judged(most: int) -> list[str]:
-        model = resources.RegisterModel(96, 255, 1, most, 8, 0, shared=1024)
+        model = resources.RegisterModel(96, 255, 1, most, 8, 0, shared=1024, file=65536)
         record = {"name": "forward", "generation": "sm120", "limit": 101376, "tmem_limit": 0,
                   "models": {}, "lowered_models": {"dew_gmm": model.record()}, "kernels": [kernel]}
         assert not mosaic_failures([record])
@@ -863,8 +863,8 @@ def test_a_kernel_is_judged_by_the_model_its_launch_lowered_not_the_cases_declar
     residency against the lowered launch's need)."""
     from kernel_compile import _register_evidence
 
-    declared = resources.RegisterModel(112, 255, 1, 4, 8, 0, shared=49232)
-    lowered = resources.RegisterModel(112, 255, 1, 2, 8, 0, shared=49232)
+    declared = resources.RegisterModel(112, 255, 1, 4, 8, 0, shared=49232, file=65536)
+    lowered = resources.RegisterModel(112, 255, 1, 2, 8, 0, shared=49232, file=65536)
     need = {"admitted": True, "programs": 2, "budget": 255, "refusal_holds": True, "refusal_programs": 2,
             "caps": [{"cap": 255, "registers": 96, "spilled": 0, "compiled": True, "holds": True}]}
     kernel = {"kernel": "dew_tgmm", "launch": None, "unread": [], "shared": 49232, "tmem": 0,
