@@ -37,6 +37,8 @@ SEEDS = 8
 CHOICES = frozenset({"low_rank"})
 """The `generation.CHOICES` entries the cells run: each cell asserts that the routes it records run `low_rank`
 `fused` and every choice outside `CHOICES` at XLA."""
+KERNELS = {"low_rank": frozenset({"fused"})}
+"""The kernels under test of each choice the cells run: the adapted product's fused form."""
 XLA = {"grouped_matmul": "xla"}
 """The projection's other choice, named XLA in every cell."""
 
