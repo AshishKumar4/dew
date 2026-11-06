@@ -400,10 +400,12 @@ class FitRun:
 
     @contextlib.contextmanager
     def outside_window(self) -> Iterator[None]:
-        """A block of work beside the steps (an evaluation, a save, a compile, an observer, a cooldown
+        """A block of the work between two steps (an evaluation, a save, an observation, a cooldown
         branch) run outside the open profile window's capture: it stops before the block and starts again
         before the next step's read (`open_window`), so the window holds training steps alone, over a
-        capture of each run of them, and no capture ends empty."""
+        capture of each run of them, and no capture ends empty. The log the run takes at its cadence stays
+        in it: the steps' own cost, which the run reads off the loop without waiting on them; work inside a
+        step's iteration (a rollout, a new shape's compile) stays too, as the step it serves."""
         if self.window is not None and not self.window_paused:
             stop_capture(self.window, self.loss)
             self.window_paused = True
@@ -467,13 +469,10 @@ class FitRun:
             batch = drained(batch, interval.consumed, examples)
         return closes_window(batch, examples, last=last), position
 
-    @contextlib.contextmanager
-    def held(self) -> Iterator[None]:
-        """A block of device work beside the steps: the training stream's placements held
-        (`DevicePrefetchIterator.held`), none to hold once the stream is closed, and run outside the
-        profile window's capture (`outside_window`)."""
-        with self.outside_window(), contextlib.nullcontext() if self.train is None else self.train.held():
-            yield
+    def held(self) -> contextlib.AbstractContextManager[None]:
+        """The training stream's placements held for a block of device work beside the steps
+        (`DevicePrefetchIterator.held`), none to hold once the stream is closed."""
+        return contextlib.nullcontext() if self.train is None else self.train.held()
 
     def further(self, interval: Interval) -> Callable[[], Batch | None]:
         """A read of the training stream's next batch for a rollout that draws past its step's

@@ -1690,7 +1690,7 @@ class Trainer(Generic[Loss, Effects]):
         ranked = bool((plan.validation or plan.best or plan.stop) and run.checkpoint_due)
         if not ending and (evaluation_due or ranked):
             self._read_taken(run)
-            with run.held(), region("evaluate"):
+            with run.outside_window(), run.held(), region("evaluate"):
                 # A checkpoint that ranks the steps reads every suite's score.
                 names = None if ranked else due
                 run.evaluation = self._evaluation(plan, state, shardings, run.training, names,
@@ -1724,7 +1724,7 @@ class Trainer(Generic[Loss, Effects]):
             self._saves(plan, run, interval, state, position, scores, evaluation_due=evaluation_due,
                         full=stopping)
         if plan.observe:
-            with run.held():
+            with run.outside_window() if plan.observe.due(current) else contextlib.nullcontext(), run.held():
                 plan.observe.at(current, state)
         if run.stopped:
             return True, state
@@ -2099,7 +2099,7 @@ class Trainer(Generic[Loss, Effects]):
             # a program whose collectives its peers' never meet.
             agreed_same("training batch layout", lambda: batch_layout(batch))
             began = time.perf_counter()
-            with run.held(), region("compile"):
+            with region("compile"), run.held():
                 compiled[signature] = (self.compile(state, batch, trials), self.step_flops)
             seconds = time.perf_counter() - began
             links = {axis: AxisLink(link.bytes_per_second, link.spread)
@@ -2138,7 +2138,7 @@ class Trainer(Generic[Loss, Effects]):
         envelope = self._checkpoint_envelope(state, position, interval, run, weights_only=weights_only)
         write = functools.partial(checkpoints.save, step, metrics=metadata, ranking=ranking,
                                   weights_only=weights_only, **envelope)
-        with run.held():
+        with run.outside_window(), run.held():
             self._report(CheckpointRequested(checkpoints.directory), step, write)
         interval.saved(step, resumable=not weights_only)
         self._display.status("")
@@ -2164,7 +2164,7 @@ class Trainer(Generic[Loss, Effects]):
         self._display.status("writing a local checkpoint")
         write = functools.partial(checkpoints.save_local, step,
                                   **self._checkpoint_envelope(state, position, interval, run))
-        with run.held():
+        with run.outside_window(), run.held():
             self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step, write)
         self._display.status("")
         return time.perf_counter() - paused
