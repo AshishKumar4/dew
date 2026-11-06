@@ -451,6 +451,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
 
+    pieces_of_views = False  # its pieces are a table's runs (`_run`), a paged call's pages alone
+
     adds_vectors = False  # its atomic adds take no layout replicating a vector's entries (a [bk] key sum's)
 
     adds_through_shared = False  # `added`'s atomic adds go from registers (`red.global`), its `smem` unread

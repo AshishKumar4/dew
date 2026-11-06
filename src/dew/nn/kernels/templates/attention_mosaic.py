@@ -574,9 +574,10 @@ class MosaicForward(_Mainloop[Tiles]):
                                or hooks.drop is not None):
             return Refusal('dtype', "the Mosaic mainloop's fp32 parts walk a call over dense operands, no "
                            "dropout")
-        if self.parts > 1 and family.feeds_itself:
+        if self.parts > 1 and (family.feeds_itself or not family.pieces_of_views):
             # Its parts a copy each into a slot's rows (`mosaic.Pieces`), which a producer's loads take and
-            # a consumer's own pipeline does not (`mosaic_sm80.Mma.streams`).
+            # neither a consumer's own ring nor cp.async's pipeline, whose pieces are a table's runs
+            # (`mosaic.Transport.pieces_of_views`), does.
             return Refusal('dtype', f"the Mosaic mainloop's fp32 parts load in pieces, which {family.name}'s "
                            "pipeline does not")
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family)
