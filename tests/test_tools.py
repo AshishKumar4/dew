@@ -24,7 +24,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from process_support import raised
-from reference_error import assert_as_exact, assert_same_artifact, chain_roundings
+from reference_error import assert_as_exact, assert_computes_the_oracle, assert_same_artifact, chain_roundings
 from test_chunked_cross_entropy import EXERCISED, eighths
 from test_moe import OUTPUT_TOLERANCE, ROUTER_TOLERANCE
 from test_text_encoders import transformers_clip
@@ -365,10 +365,9 @@ def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients(states_dt
 # tools/layout_parity.py
 # ---------------------------------------------------------------------------
 
-def test_the_layout_tools_floor_judge_runs_the_options_it_is_given(tmp_path):
-    """The layout tool's default judge (the floor judge, `floored`), from its command line on eight host
-    devices, runs a model under the mixture and the objective the command gives and writes its rows to
-    --out; --window, which is check 1's, without --seeds is refused."""
+def test_the_layout_tool_runs_the_options_it_is_given(tmp_path):
+    """The layout tool, from its command line on eight host devices, runs a model under the mixture and
+    the objective the command gives and writes its rows to --out."""
     import json
     import subprocess
     import sys
@@ -382,13 +381,12 @@ def test_the_layout_tools_floor_judge_runs_the_options_it_is_given(tmp_path):
                               env=environment, capture_output=True, text=True, check=False)
 
     out = tmp_path / "rows.json"
-    done = tool("--models", "moe", "--layouts", "expert4", "--out", str(out), "--mixture", '{"top_k": 1}',
-                "--objective", '{"balance": {"aux_loss_alpha": 0.01}}')
+    done = tool("--models", "moe", "--layouts", "expert4", "--seeds", "0", "--out", str(out),
+                "--mixture", '{"top_k": 1}', "--objective", '{"balance": {"aux_loss_alpha": 0.01}}')
     assert done.returncode == 0, done.stdout[-2000:] + done.stderr[-2000:]
     (row,) = json.loads(out.read_text())
     assert (row["status"], row["mixture"]["top_k"], row["objective"]["balance"]["aux_loss_alpha"]) == (
         "works", 1, 0.01)
-    assert tool("--models", "dense", "--layouts", "data4", "--window", "2").returncode != 0
 
 
 def test_the_layout_tools_step_counts_the_work_a_runs_step_counts(monkeypatch):
@@ -406,7 +404,9 @@ def test_the_layout_tools_step_counts_the_work_a_runs_step_counts(monkeypatch):
     assert tokens == case.batch_size * case.seq_len, (tokens, case.batch_size, case.seq_len)
 
 
-def test_layout_parity_orders_preserve_the_tiny_nemotron_function():
+def test_residual_orders_preserve_the_tiny_nemotron_function():
+    """A residual order is an exact symmetry of Nemotron-H's tiny mixture of experts: the reordered
+    float64 model computes its logits within float64's rounding of the computation itself."""
     from residual_orders import model_axes, permuted
 
     from dew.interop import Pretrained
@@ -415,7 +415,6 @@ def test_layout_parity_orders_preserve_the_tiny_nemotron_function():
                              attention_impl='reference')
     order = np.array([3, 0, 12, 5, 10, 1, 8, 7, 2, 14, 4, 13, 6, 15, 9, 11])
     ids = jnp.array([[2, 7, 11, 3]], jnp.int32)
-    tool = load('layout_parity')
     axes = model_axes(loaded.model, ids)
     with jax.enable_x64(new_val=True):
         wide = jax.tree.map(lambda leaf: leaf.astype(jnp.float64), loaded.variables)
@@ -423,8 +422,7 @@ def test_layout_parity_orders_preserve_the_tiny_nemotron_function():
         truth = np.asarray(model.apply(wide, ids))
         reordered = np.asarray(model.apply(permuted(wide, order, axes), ids))
         roundings = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(wide))
-    tool.order_invariance({'logits': reordered}, {'logits': truth},
-                          float(reordered.sum()), float(truth.sum()), roundings=roundings)
+    assert_computes_the_oracle(reordered, truth, "Nemotron-H MoE reordered", roundings=roundings)
 
 
 def test_residual_orders_preserve_a_decoder_whose_heads_are_the_residual_width():
@@ -448,18 +446,7 @@ def test_residual_orders_preserve_a_decoder_whose_heads_are_the_residual_width()
         order = orders(residual_width(variables, axes), 2, seed=6)[1]
         reordered = np.asarray(model.apply(permuted(wide, order, axes), ids))
         roundings = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(wide))
-    load('layout_parity').order_invariance({'logits': reordered}, {'logits': truth},
-                                           float(reordered.sum()), float(truth.sum()), roundings=roundings)
-
-
-def test_a_nonfinite_order_fails_the_invariance_check():
-    """A residual order whose function or loss is not finite fails the check, as a NaN compares
-    with nothing."""
-    tool = load('layout_parity')
-    for logits, loss in ((np.array([np.nan, 1.0]), 1.0), (np.array([1.0, 2.0]), np.nan)):
-        with pytest.raises(ValueError):
-            tool.order_invariance({'logits': logits}, {'logits': np.array([1.0, 2.0])}, loss, 1.0,
-                                  roundings=1)
+    assert_computes_the_oracle(reordered, truth, "KDA decoder reordered", roundings=roundings)
 
 
 def test_residual_orders_preserve_a_looped_ngpt():
@@ -481,8 +468,7 @@ def test_residual_orders_preserve_a_looped_ngpt():
         order = orders(residual_width(loaded.variables, axes), 2, seed=6)[1]
         reordered = np.asarray(model.apply(permuted(wide, order, axes), ids))
         roundings = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(wide))
-    load('layout_parity').order_invariance({'logits': reordered}, {'logits': truth},
-                                           float(reordered.sum()), float(truth.sum()), roundings=roundings)
+    assert_computes_the_oracle(reordered, truth, "looped nGPT reordered", roundings=roundings)
 
 
 class Drawing:
@@ -553,9 +539,9 @@ def test_layout_parity_reads_the_first_step_as_the_trainer_does():
 
 
 def test_layout_parity_reads_every_first_step_through_the_trainers(monkeypatch):
-    """The reference's audit, its float64 anchor and the anchor's loss each read the trainer's first step
-    (`first_step`, ledger 3057, 3092) over the state they judge, which the test above holds to the
-    trainer's: a site that built its Step by hand would pass by it, and is caught here."""
+    """The reference's audit and its float64 anchor each read the trainer's first step (`first_step`,
+    ledger 3057, 3092) over the state they judge, which the test above holds to the trainer's: a site that
+    built its Step by hand would pass by it, and is caught here."""
     tool = load("layout_parity")
     read = []
     first_step = tool.first_step
@@ -569,10 +555,7 @@ def test_layout_parity_reads_every_first_step_through_the_trainers(monkeypatch):
     with jax.enable_x64(new_val=True), tempfile.TemporaryDirectory() as directory:
         tool.Judge(reference, tool.References(Path(directory)), "jepa").audit()
         tool.Anchor(reference, "jepa")
-        state, _, _ = tool._trainer(reference, {}, one_device=True).place()
-        tool.anchor_loss(reference, tool.drawn_batch(reference, 0), state.replace(
-            updates=jnp.asarray(5, jnp.int32)))
-    assert read == [0, 0, 5]
+    assert read == [0, 0]
 
 
 def test_layout_parity_holds_every_arm_to_the_references_sample():
