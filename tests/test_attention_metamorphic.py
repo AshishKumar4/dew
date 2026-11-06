@@ -21,6 +21,7 @@ from reference_error import assert_as_exact
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
+    attention_algebra as algebra,
     attention_decode,
     attention_mosaic,
     attention_portable,
@@ -144,7 +145,7 @@ def test_a_far_short_rows_slices_merge_through_its_masked_rewalk_interpreted():
                     rows, key, value, row_spans, template.Hooks(), scale=None, natural=False,
                     residuals=Kept.OUTPUT, interpret=True, out_dtype=jnp.float32, masked=True, splits=8)[:3]
             spec = attention_decode._spec(rows, row_spans, template.Hooks(), scale=None)
-            merged = attention_decode.merged(spec, out, maximum, total)
+            merged = algebra.merged_slices(spec, out, maximum, total)
             return template.ungrouped_rows(merged, DECODE_HEADS).astype(query.dtype)
 
     assert_as_exact(jax.jit(sliced), jax.jit(lambda q, k, v: template.reference(q, k, v, spans)), far,
@@ -170,7 +171,7 @@ def _sliced_step(query, key, value, lengths, *, slices: int):
             # One slice's launch gives its rows without a slices axis.
             out, maximum, total = out[:, None], maximum[:, :, None], total[:, :, None]
         spec = attention_decode._spec(rows, row_spans, template.Hooks(), scale=None)
-        merged = attention_decode.merged(spec, out, maximum, total)
+        merged = algebra.merged_slices(spec, out, maximum, total)
         return template.ungrouped_rows(merged, DECODE_HEADS).astype(query.dtype)
 
 
@@ -185,7 +186,7 @@ def _whole_step(query, key, value, lengths):
 @hypothesis.given(lengths=st.tuples(st.integers(1, DECODE_KEYS), st.integers(1, DECODE_KEYS)))
 def test_a_decode_steps_keys_cut_into_any_slice_count_merge_to_its_attention_interpreted(slices, lengths):
     """A decode step's keys cut into `slices` slices a row (`attention_mosaic.forward`'s `splits` at the
-    decode plan's config, a program a slice), the slices merged (`attention_decode.merged`), rows of their own
+    decode plan's config, a program a slice), the slices merged (`algebra.merged_slices`), rows of their own
     lengths: on par with the step walked whole."""
     lengths = jnp.asarray(lengths, jnp.int32)
     assert_as_exact(lambda q, k, v: _sliced_step(q, k, v, lengths, slices=slices),

@@ -488,6 +488,44 @@ once); `into` refs holding the plain launch's outputs, which it writes its rows 
 (`walked_launches`' `in_place`)."""
 
 
+def slice_state(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.Array) -> Partial:
+    """A finished slice of a row's keys as a state of their merge (`merge`, `merged`): its output `out`
+    normalized (`finish`'s), its maximum (in `spec`'s units, `finished_rows`', raw products where its fold
+    keeps them) and its denominator folded into its maximum (`m + log(total)`, in those units) and its mass
+    1 where it saw a key, so no output multiplied back by its denominator passes fp32's largest; a slice of
+    no key the walk's start (`LEAST`), its mass 0. A row or a launch's block of rows alike."""
+    seen = total > 0
+    units = spec.scale if spec.raw else 1.0
+    folded = jnp.where(seen, maximum + jnp.log(jnp.where(seen, total, 1.0)) / units, LEAST)
+    return Partial(out, folded, seen.astype(jnp.float32))
+
+
+def initial_state(spec: Forward, initial: Partial) -> Partial:
+    """A call's initial state (its sums unnormalized, its maximum natural) as a finished slice's
+    (`slice_state`): normalized where it holds mass, its maximum in `spec`'s units."""
+    held = initial.total > 0
+    out = jnp.where(held[..., None], initial.acc / jnp.where(held, initial.total, 1.0)[..., None], 0.0)
+    return slice_state(spec, out, initial.m / spec.scale if spec.raw else initial.m, initial.total)
+
+
+def merged_slices(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.Array,
+                  initial: Partial | None = None) -> jax.Array:
+    """A split walk's slices merged (`merged` of `slice_state`s, then `finish`): their outputs `out`
+    `[B, S, Q, KV, Dv]` (fp32, each normalized), maxima (in natural `spec`'s units, `finished_rows`', a
+    fold's `unfolded`, raw products where it keeps them) and denominators `[B, KV, S, Q]`, and the call's
+    `initial` state `[B, KV, Q]` (its sums unnormalized): the rows' output `[B, Q, KV, Dv]` fp32, a row of
+    no mass zero, as the reference's."""
+    if not (spec.natural or spec.raw):
+        raise ValueError("a split walk's merge takes natural states or a raw fold's")
+    state = slice_state(spec, out, *(jnp.transpose(array, (0, 2, 3, 1)) for array in (maximum, total)))
+    if initial is not None:
+        own = initial_state(spec, Partial(jnp.swapaxes(initial.acc, 1, 2), jnp.swapaxes(initial.m, 1, 2),
+                                          jnp.swapaxes(initial.total, 1, 2)))
+        state = Partial(*(jnp.concatenate([mine, theirs[:, None]], axis=1)
+                          for mine, theirs in zip(state[:3], own[:3], strict=True)))
+    return finish(spec, merged(spec, state, axis=1), initial=True)[0]
+
+
 def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Array, O, O], O], *,
                        masked: bool = False, in_place: bool = False) -> O:
     """`walked`'s guards over whole launches, for a mainloop whose program walks its keys once (a producer
