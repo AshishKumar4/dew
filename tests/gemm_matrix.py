@@ -101,15 +101,19 @@ def _call(case: dict[str, str], kernel: str | None):
     return call
 
 
+def grouped_product(x, matrix):
+    """Each row's product with its group's matrix `[groups, depth, width]` (`SIZES`), by a mask over the
+    groups: the grouped product as written, for the matrices' float64 truths."""
+    return jnp.einsum("rg,rk,gkn->rn", jax.nn.one_hot(_groups(), len(SIZES), dtype=x.dtype), x, matrix)
+
+
 def _plain(case: dict[str, str]):
     """`case`'s call as the plain formula: each row's product with its group's matrix, by a mask over the
     groups (a dense call's one matrix whole), then the hook. Its operands are the draws' own dtype's values,
     so a float64 run of it needs no rounding first."""
     def product(x, matrix):
         matrix = jnp.swapaxes(matrix, -1, -2) if case["matrix"] == "k-major" else matrix
-        if case["form"] == "dense":
-            return x @ matrix
-        return jnp.einsum("rg,rk,gkn->rn", jax.nn.one_hot(_groups(), len(SIZES), dtype=x.dtype), x, matrix)
+        return x @ matrix if case["form"] == "dense" else grouped_product(x, matrix)
 
     def plain(x, matrix, *extras):
         out = product(x, matrix)
