@@ -4,8 +4,9 @@ against the reference path over the untransformed one, its float64 truth the ref
 property holds of whatever form the route runs. Hypothesis draws each transformation (the suite's derandomized
 profile, docs/design/testing.md): a full call's keys and values permuted together, a causal call against its
 own first queries, query heads permuted with the key heads they read, and a decode step's keys cut into each
-slice count its work list takes (every count a case, Hypothesis drawing the rows' lengths; a paged cache's
-pages permuted with its table are `test_attention_decode_template`'s paged cells). The plain-JAX mainloop runs
+slice count its work list takes (every count a case, each draw's rows of lengths of their own, both ends
+among them; a paged cache's pages permuted with its table are `test_attention_decode_template`'s paged
+cells). The plain-JAX mainloop runs
 the dense properties on this CPU; the decode one runs the Mosaic mainloop interpreted, as an H100 runs it."""
 
 import functools
@@ -36,11 +37,6 @@ ROWS, QUERIES, KEYS, HEADS, KV_HEADS, WIDTH = 2, 48, 48, 4, 2, 32
 DENSE = hypothesis.settings(max_examples=30, deadline=None)
 """Each dense property's draws: the plain-JAX mainloop's check 1 a draw, about 0.5 s on armada's CPU (six
 draws' tests took 3.1 s in CI), about 15 s a property."""
-
-INTERPRETED = hypothesis.settings(max_examples=8, deadline=None)
-"""Each interpreted case's draws: the Mosaic mainloop interpreted, about 2.7 s a draw (three draws' test took
-7.95 s in CI), about 22 s a slice count."""
-
 
 def _dense_draw(seed: int, queries: int = QUERIES):
     streams = jax.random.split(jax.random.key(seed), 3)
@@ -240,16 +236,25 @@ def _whole_step(query, key, value, lengths):
     return template.reference(query, key, value, _decode_spans(lengths))
 
 
+def _lengths_draw(seed: int):
+    """`_decode_draw`'s step and its rows' lengths: one row of a single key beside one of every key, then the
+    other way round, then lengths drawn from 1 to every key, so a slice of no key, a short row's first and a
+    full row's last are each among a case's draws."""
+    if seed < 2:
+        lengths = jnp.asarray((1, DECODE_KEYS) if seed == 0 else (DECODE_KEYS, 1), jnp.int32)
+    else:
+        lengths = jax.random.randint(jax.random.key(seed + 1000), (DECODE_ROWS,), 1, DECODE_KEYS + 1)
+    return (*_decode_draw(seed), lengths)
+
+
 @INTERPRETS
-@INTERPRETED
 @pytest.mark.parametrize("slices", [1, 2, 4, 8])
-@hypothesis.given(lengths=st.tuples(st.integers(1, DECODE_KEYS), st.integers(1, DECODE_KEYS)))
-def test_a_decode_steps_keys_cut_into_any_slice_count_merge_to_its_attention_interpreted(slices, lengths):
+def test_a_decode_steps_keys_cut_into_any_slice_count_merge_to_its_attention_interpreted(slices):
     """A decode step's keys cut into `slices` slices a row (`attention_mosaic.forward`'s `splits` at the
     decode plan's config, a program a slice), the slices merged in the launch (`MosaicForward.merges`), rows
-    of their own lengths: on par with the step walked whole."""
-    lengths = jnp.asarray(lengths, jnp.int32)
-    assert_as_exact(lambda q, k, v: _sliced_step(q, k, v, lengths, slices=slices),
-                    lambda q, k, v: _whole_step(q, k, v, lengths), _decode_draw,
+    of their own lengths, each draw's (`_lengths_draw`): on par with the step walked whole. The lengths an
+    operand, one program judges every draw (row 4640: Hypothesis's eight lengths a case, each over eight
+    draws, took the eight-slice case 124 s)."""
+    assert_as_exact(functools.partial(_sliced_step, slices=slices), _whole_step, _lengths_draw,
                     f"decode step cut into {slices} slices", seeds=SEEDS)
 

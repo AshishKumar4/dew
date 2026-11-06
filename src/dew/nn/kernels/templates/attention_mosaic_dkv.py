@@ -10,7 +10,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew._devices import deterministic_ops_requested
 from dew.nn.kernels import tuning
@@ -32,22 +31,30 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     stated,
     transposed_swizzles,
 )
-from dew.nn.kernels.templates.attention_mosaic_scores import _Backward, _dq_added, _score_params, _scores
+from dew.nn.kernels.templates.attention_mosaic_scores import (
+    _Backward,
+    _dq_added,
+    _relay_tiles,
+    _relayed,
+    _score_params,
+    _scores,
+)
 
 
 def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
                      stages: int, columns: int = 1, tiled: bool = False) -> tuple[list, dict]:
-    """The dK/dV program's allocations as `Family.scoped` takes them, in `_dkv_launch`'s order: its
-    consumers' resident keys and values; dK's output stage and dV's (the one stage where the widths agree),
-    fp32, each its program's share of the `columns`; each consumer's stage for its key gradients' sums; the
-    two loads' barriers; a fused launch's (`BackwardTiles.fused`) staged score cotangents and dQ tile each
-    consumer's; where its logits' queries are staged (`BackwardTiles.staged_logits`) one slot's of them and
-    their two turns; where a score hook's tile parameter is `tiled`, each consumer's stage for its tile
-    gradients' adds (`Family.added`); and its query and output-cotangent streams, and its logits' queries'
-    unless staged, in `stages` slots (`Family.streams`). On a layout whose consumers feed their rings
-    (`split_queries`) the consumers share one key block, held once, and each takes its share of a slot's
-    queries: every block a product of theirs reads staged at the swizzle their share's contraction takes
-    (`mosaic.swizzle_for`)."""
+    """The dK/dV program's allocations as `Family.scoped` takes them, in `_dkv_launch`'s order: its consumers'
+    resident keys and values; dK's output stage and dV's (the one stage where the widths agree), fp32, each
+    its program's share of the `columns`; each consumer's stage for its key gradients' sums; the two loads'
+    barriers; a fused launch's (`BackwardTiles.fused`) staged score cotangents and dQ tile each consumer's;
+    where its logits' queries are staged (`BackwardTiles.staged_logits`) one slot's of them and their two
+    turns; where a score hook's tile parameter is `tiled`, each consumer's stage for its tile gradients' adds
+    (`Family.added`); each consumer's relay tile where its weights and score cotangents reach dV's and dK's
+    products through shared memory (`Family.relay_bytes`, `_relayed`); and its query and output-cotangent
+    streams, and its logits' queries' unless staged, in `stages` slots (`Family.streams`). On a layout whose
+    consumers feed their rings (`split_queries`) the consumers share one key block, held once, and each takes
+    its share of a slot's queries: every block a product of theirs reads staged at the swizzle their share's
+    contraction takes (`mosaic.swizzle_for`)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     split = split_queries(family)
     holders, rows = (1, block_q // consumers) if split else (consumers, block_q)
@@ -59,12 +66,12 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     out_width = (mosaic.staged_columns(width // columns, (jnp.float32,)) if config.shared_dq
                  else width // columns)
     outputs = [] if split else [
-        plgpu.SMEM((holders, max(block_q, block_k), out_width), jnp.float32),
+        family.staged_memory((holders, max(block_q, block_k), out_width), jnp.float32),
         *([] if value_width == width
-          else [plgpu.SMEM((holders, block_k, value_width // columns), jnp.float32)]),
-        plgpu.SMEM((holders, block_k), jnp.float32)]
-    scoped = [mosaic.staged((holders, block_k, width), dtype, swizzle),
-              mosaic.staged((holders, block_k, value_width), dtype, swizzle), *outputs,
+          else [family.staged_memory((holders, block_k, value_width // columns), jnp.float32)]),
+        family.staged_memory((holders, block_k), jnp.float32)]
+    scoped = [family.staged_memory((holders, block_k, width), dtype, swizzle),
+              family.staged_memory((holders, block_k, value_width), dtype, swizzle), *outputs,
               family.load_barriers(holders), family.load_barriers(holders)]
     blocks: dict[str, tuple] = {"queries": ((block_q, width), dtype),
                                 "douts": ((block_q, value_width), dtype)}
@@ -76,20 +83,21 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
         share = width // consumers if config.shared_dq else width
         # Its dQ stage the producer's outbox where the producer adds it (`BackwardTiles.producer_dq`).
         stage = (mosaic.outbox((rows, share), jnp.float32, consumers) if config.producer_dq
-                 else [plgpu.SMEM((consumers, rows, share), jnp.float32)])
-        scoped += [plgpu.SMEM((consumers, block_k, rows), dtype), *stage,
+                 else [family.staged_memory((consumers, rows, share), jnp.float32)])
+        scoped += [family.staged_memory((consumers, block_k, rows), dtype), *stage,
                    *(family.exchange(consumers) if config.shared_dq else [])]
     if config.staged_logits:
         # One slot's queries taken by the power, which the first consumer stages for every consumer's share,
         # and the two turns that order its writes against their products' reads (`_staged_logits`): the
         # logits' product reads that stage transposed, at the swizzle a transposed read takes.
         staged = transposed_swizzles(config, "logits").get("logits", swizzle) if swizzle is None else swizzle
-        scoped += [mosaic.staged((block_q, width), dtype, staged), family.schedule(consumers),
+        scoped += [family.staged_memory((block_q, width), dtype, staged), family.schedule(consumers),
                    family.schedule(consumers)]
     else:
         blocks["logits"] = ((block_q, width), dtype)
     if tiled:
-        scoped.append(plgpu.SMEM((consumers, block_k, rows), jnp.float32))
+        scoped.append(family.staged_memory((consumers, block_k, rows), jnp.float32))
+    scoped += _relay_tiles(family, consumers, block_k, rows, dtype)
     if config.shared_dq:
         # Its queries' statistics streamed beside them, read from their stage where a step uses each
         # (FlashAttention 3's LSE and dPsum): held a step in registers they took 80 of a consumer's.
@@ -423,13 +431,13 @@ def _dkv_refs(refs, treedef, leaves: int, graded: list[Kind], groups: tuple, *, 
                   for wanted in DKV_GRADS)
     return inputs, unflattened, (dq_ref, dk_ref, dv_ref), _dkv_scoped(refs, widths=widths, split=split), keyed
 
-def _shared_views(outputs, grad_refs, graded: list[Kind], block_k: int) -> tuple:
+def _shared_views(family: mosaic.Family, outputs, grad_refs, graded: list[Kind], block_k: int) -> tuple:
     """dK's and dV's views (`outputs`, the dK/dV launch's) and each key gradient's (`grad_refs`, at the place
     it holds for the program's row and head, `shared_place`) at the program's key block, the one its
     consumers share (`split_queries`)."""
     dk_ref, dv_ref = outputs
-    row, head = lax.axis_index("batch"), lax.axis_index("heads")
-    keys = pl.ds(lax.axis_index("k_tiles") * block_k, block_k)
+    row, head = family.program_index("batch"), family.program_index("heads")
+    keys = pl.ds(family.program_index("k_tiles") * block_k, block_k)
     key_views = [ref.at[*shared_place(ref.shape, row, head), keys]
                  for ref, kind in zip(grad_refs, graded, strict=True) if kind == Kind.KEY]
     return dk_ref.at[row, keys, head], dv_ref.at[row, keys, head], *key_views
@@ -453,8 +461,8 @@ def _summed_stored(family: mosaic.Family, sums: tuple, views: tuple, consumers: 
             mosaic.summed_across(value, scratch, lax.axis_index("wg"), consumers,
                                  lambda summed: written(summed, stage))
 
-        pl.run_scoped(total, plgpu.SMEM(value.shape, jnp.float32), **mosaic.summing(value.shape, consumers),
-                      collective_axes="wg")
+        pl.run_scoped(total, family.staged_memory(value.shape, jnp.float32),
+                      **mosaic.summing(value.shape, consumers), collective_axes="wg")
 
 def _dkv_scoped(refs, *, widths: bool, split: bool) -> tuple:
     """The dK/dV program's allocations (`_dkv_allocations`) by role: its resident keys and values, dK's output
@@ -568,16 +576,18 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
         dq_ref, dk_ref, dv_ref = outputs
         q_ref, k_ref, v_ref, do_ref, *stat_refs = inputs
         k_smem, v_smem, out_smem, dv_smem, rows_smem, k_loaded, v_loaded, *rest = held
+        relayed = family.relay_bytes(block_k, count) > 0
+        relay, rest = (rest[-1:], rest[:-1]) if relayed else ([], rest)
         tile_stage, rest = (rest[-1], rest[:-1]) if tiled else (None, rest)
         tiles = program.tiles
         fused = 2 + 2 * tiles.shared_dq + 2 * tiles.producer_dq if walk.fused else 0
         fused_stages, logits_stages = rest[:fused], rest[fused:]
-        row, head = lax.axis_index("batch"), lax.axis_index("heads")
+        row, head = family.program_index("batch"), family.program_index("heads")
 
         named = {"queries": q_ref, "douts": do_ref, **({} if l_ref is None else {"logits": l_ref})}
         views = _dkv_views(named, stat_refs, positions_ref, (row, head), shared_dq=tiles.shared_dq)
         streams = family.opened(streams, views)
-        pair_first = lax.axis_index("k_tiles") * pair
+        pair_first = family.program_index("k_tiles") * pair
         holders = 1 if split else consumers
         streamed = _streamed([program.readers(pair_first + index * block_k, q_steps, spans_of, row)[:2]
                               for index in range(holders)])
@@ -599,7 +609,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                       else program.readers(k_first, q_steps, spans_of, row)[:2])
             part = (index * count, count) if split else (0, block_q)
             stage = _logits_stage(family, consumers, logits_stages, index)
-            step = _consumer_step(walk, (row, head), k_first, index, holder, part, stage, shares,
+            step = _consumer_step(_relayed(walk, relay, index), (row, head), k_first, index, holder, part,
+                                  stage, shares,
                                   refs=(tile_refs, tile_stage, spans_of, drop_of, score_refs, k_smem, v_smem,
                                         dq_ref, fused_stages),
                                   statistics=None if program.tiles.shared_dq else rows_of)
@@ -636,7 +647,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             first = 9 + len(leaves) + walk.fused
             grads = mosaic.stacked_views(refs[first:first + len(groups)], groups)
             outputs = refs[first + len(groups):first + len(groups) + 2]
-            _summed_stored(family, summed, _shared_views(outputs, grads, graded, block_k), consumers,
+            _summed_stored(family, summed, _shared_views(family, outputs, grads, graded, block_k), consumers,
                            walk.interpret)
 
     launch = _dkv_kernel(walk, entry, graded, query, key, value, dout, shares, name)

@@ -92,7 +92,7 @@ from ..precision import (
     rounded_to,
     two_product,
 )
-from ..sharding import automatic_axes, manual_map, on_shards
+from ..sharding import automatic_axes, manual_map, on_shards, varying_like
 from . import generation, tuning
 from .generation import INHERENT, device_generation
 from .selection import Kernel, Op, Requirement, select
@@ -269,16 +269,34 @@ def _runs(case) -> bool:
 
 
 def _placed(axes, operands, *, whole_last: bool) -> bool:
-    """Whether the kernel can run on its `operands`' shards: none varies in a
-    `shard_map` that checks varying axes, and on a split mesh the caller
-    names the first one's logical axes (`axes`), which with `whole_last`
-    leave its last axis whole."""
-    if any(jax.typeof(operand).mat.varying for operand in operands if operand is not None):
+    """Whether the kernel can run on its `operands`' shards: on a split mesh
+    the caller names the first one's logical axes (`axes`), which with
+    `whole_last` leave its last axis whole, or every axis splitting it is
+    explicit, its type its placement (`_shard_spec`). In a `shard_map` checking varying
+    axes, each shard its own, the launch states its outputs' varying type
+    (`_varying`) where a GPU compiles it; Pallas's interpreter evaluates the
+    kernel's body on the shards' varying values, whose gathers by unvarying
+    indices JAX refuses, so an interpreted call runs XLA's arithmetic there."""
+    if not generation.triton_runs() and any(
+            jax.typeof(operand).mat.varying for operand in operands if operand is not None):
         return False
     if not automatic_axes():
         return True
-    first = operands[0]
-    return axes is not None and (not whole_last or len(logical_spec(axes, first.shape)) < first.ndim)
+    spec = _shard_spec(axes, operands[0])
+    return spec is not None and (not whole_last or len(spec) < operands[0].ndim or spec[-1] is None)
+
+
+def _shard_spec(axes, first) -> jax.sharding.PartitionSpec | None:
+    """How a split mesh places the `first` operand: as the logical `axes` the caller names, else as its
+    own type states where every axis splitting it is explicit (`jax.typeof(first).sharding`), None where
+    neither tells (an automatic axis XLA's partitioner places)."""
+    if axes is not None:
+        return logical_spec(axes, first.shape)
+    mesh = jax.sharding.get_abstract_mesh()
+    if any(mesh.axis_types[mesh.axis_names.index(name)] != jax.sharding.AxisType.Explicit
+           for name in automatic_axes()):
+        return None
+    return jax.typeof(first).sharding.spec
 
 
 def _per_shard(local, axes, operands, replicated):
@@ -289,7 +307,7 @@ def _per_shard(local, axes, operands, replicated):
     if not automatic_axes():
         return local(*operands)
     whole = {index for index, replicated in enumerate(replicated) if replicated}
-    return on_shards(local, logical_spec(axes, operands[0].shape), operands, whole)
+    return on_shards(local, _shard_spec(axes, operands[0]), operands, whole)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -357,9 +375,8 @@ NORM_SUPPORTS: tuple[Requirement[NormCase], ...] = (
     Requirement('gate', lambda case: case.gate_fits, "a gate must match the normalized input's shape",
                 row=INHERENT),
     Requirement('placement', lambda case: case.placed,
-                "a mesh splits RMSNorm's operands by axes the caller does not name or across its features, "
-                "or a shard_map that checks varying axes holds them, and a Pallas call states no varying "
-                "type", row='ledger 822'),
+                "a mesh splits RMSNorm's operands by automatic axes the caller does not name, or across "
+                "its features", row='ledger 822'),
 )
 """The fused norms' requirements: a plain, stream and gated RMSNorm over fp32 or bf16 rows of at most
 8192 features, with fp32 statistics, a vector weight, and operands placed as the kernel reads them."""
@@ -438,8 +455,7 @@ SWIGLU_SUPPORTS: tuple[Requirement[SwigluCase], ...] = (
                 "SwiGLU needs nonempty equal shapes, not broadcasting, or a packed [..., 2, H] gate and up",
                 row=INHERENT),
     Requirement('placement', lambda case: case.placed,
-                "a mesh splits SwiGLU's operands by axes the caller does not name, or a shard_map that "
-                "checks varying axes holds them, and a Pallas call states no varying type",
+                "a mesh splits SwiGLU's operands by automatic axes the caller does not name",
                 row='ledger 822'),
 )
 """The fused SiLU products' requirements: fp32 or bf16 operands of one shape, apart or packed, placed
@@ -643,6 +659,36 @@ def _scale_sum(partial, correction):
     return compensated_total(pair, jnp.sum(partial, axis=0))
 
 
+def _varying(operands: tuple, outputs):
+    """`operands` (None where a call has none) each varying over every manual axis any varies over
+    (`sharding.varying_like`), and `outputs` (`jax.ShapeDtypeStruct`s, None where a call has none) of
+    their varying type: a Pallas call states its outputs' types, which a checked `shard_map` reads."""
+    present = [operand for operand in operands if operand is not None]
+    if not any(jax.typeof(operand).mat.varying for operand in present):
+        return operands, outputs
+    lifted = tuple(None if operand is None else varying_like(operand, *present) for operand in operands)
+    mat = jax.typeof(next(operand for operand in lifted if operand is not None)).mat
+    return lifted, jax.tree.map(
+        lambda shape: jax.ShapeDtypeStruct(shape.shape, shape.dtype, manual_axis_type=mat), outputs)
+
+
+def _typed(backward):
+    """`backward(saved, operands, cotangents)` with each operand's cotangent of the operand's varying type:
+    summed over each manual axis it varies over and its operand does not (a weight replicated in a checked
+    `shard_map`, whose shards' partial gradients its varying cast's transpose sums: `_varying`)."""
+    def typed(saved, operands, cotangents):
+        gradients = backward(saved, operands, cotangents)
+        return tuple(gradient if gradient is None or operand is None else _summed_to(gradient, operand)
+                     for gradient, operand in zip(gradients, operands, strict=True))
+    return typed
+
+
+def _summed_to(gradient: jax.Array, operand: jax.Array) -> jax.Array:
+    """`gradient` summed over each manual axis it varies over that `operand` does not."""
+    axes = tuple(sorted(jax.typeof(gradient).mat.varying - jax.typeof(operand).mat.varying))
+    return jax.lax.psum(gradient, axes) if axes else gradient
+
+
 class _Norm(NamedTuple):
     """One fused norm's static arithmetic: everything but its operands. The
     weight reaches the kernels in fp32, `stored` its own dtype, in which the
@@ -662,7 +708,10 @@ def _launched(*operands, kernel, name: str, outputs, grid: tuple[int, ...], warp
               arithmetic: tuple[tuple[str, Hashable], ...]):
     """`kernel` launched over `operands` (None where a call has none) with its `arithmetic`'s keyword
     arguments, lowered once a configuration (`tuning.lowered_once`): its outputs' shapes and dtypes, its grid,
-    warps and arithmetic static."""
+    warps and arithmetic static. In a `shard_map` checking varying axes, its operands are made varying over
+    every axis any of them varies over and its outputs vary over them too, as an elementwise primitive's do
+    (row 822)."""
+    operands, outputs = _varying(operands, outputs)
     return launches.pallas_call(
         functools.partial(kernel, interpret=interpret, **dict(arithmetic)), grid=grid, out_shape=outputs,
         compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=1),
@@ -827,7 +876,7 @@ def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after
         return dstream, dstream, dscale
 
     local = contracted("test_the_fused_norms_and_products_hold_every_order")(
-        generation.linear_tangent(forward, backward, _stored(portable, norm, 2), kind=KernelGlue()))
+        generation.linear_tangent(forward, _typed(backward), _stored(portable, norm, 2), kind=KernelGlue()))
     return _per_shard(local, axes, (x, branch, _widened(scale)), (False, False, True))
 
 
@@ -848,7 +897,7 @@ def rms_norm(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool, po
         return dx, dscale
 
     local = contracted("test_the_fused_norms_and_products_hold_every_order")(
-        generation.linear_tangent(forward, backward, _stored(portable, norm, 1), kind=KernelGlue()))
+        generation.linear_tangent(forward, _typed(backward), _stored(portable, norm, 1), kind=KernelGlue()))
     return _per_shard(local, axes, (x, _widened(scale)), (False, True))
 
 
@@ -868,7 +917,7 @@ def gated_rms_norm(x, gate, scale, epsilon: float, dtype, activation: str, porta
         return _rms_backward_call(x, scale, gate, mean_square, dy, None, norm)
 
     local = contracted("test_the_fused_norms_and_products_hold_every_order")(
-        generation.linear_tangent(forward, backward, _stored(portable, norm, 2), kind=KernelGlue()))
+        generation.linear_tangent(forward, _typed(backward), _stored(portable, norm, 2), kind=KernelGlue()))
     return _per_shard(local, axes, (x, gate, _widened(scale)), (False, False, True))
 
 
@@ -1047,7 +1096,7 @@ def swiglu(gate, up, portable, *, axes=None):
     interpret = not generation.triton_runs()
     local = contracted("test_the_fused_norms_and_products_hold_every_order")(
         generation.linear_tangent(lambda gate, up: (_swiglu(gate, up, interpret), ()),
-                                  lambda saved, operands, dy: _swiglu_bwd(interpret, operands, dy),
+                                  _typed(lambda saved, operands, dy: _swiglu_bwd(interpret, operands, dy)),
                                   portable, kind=KernelGlue()))
     return _per_shard(local, axes, (gate, up), (False, False))
 
@@ -1060,7 +1109,7 @@ def packed_swiglu(gate_up, portable, *, axes=None):
     interpret = not generation.triton_runs()
     local = contracted("test_the_fused_norms_and_products_hold_every_order")(
         generation.linear_tangent(lambda gate_up: (_packed(gate_up, interpret), ()),
-                                  lambda saved, operands, dy: _packed_bwd(interpret, operands[0], dy),
+                                  _typed(lambda saved, operands, dy: _packed_bwd(interpret, operands[0], dy)),
                                   portable, kind=KernelGlue()))
 
     if not automatic_axes():

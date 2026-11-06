@@ -49,7 +49,7 @@ from dew.nn.kernels.templates import axes as side_axes_of, mosaic
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import mosaic_gpu, rows_padded
 from dew.nn.kernels.templates.product import declared
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, refuse_recipe
 from dew.nn.sharding import seen_whole
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
@@ -456,13 +456,14 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
     blockwise FP8 product (1 x 128 activation tiles, 128 x 128 weight blocks; row 4518). Its forward alone:
     a recipe's gradients are their own FP8 products of requantized operands (row 2513). Its selector
     (`BLOCKWISE_FP8`) runs the template's exactly summed walk where named, else XLA's."""
-    launch = grouped_matmul.MosaicGmm()
+    launch = grouped_matmul.MosaicStepScaledGmm()
     abstract = jax.ShapeDtypeStruct
     bound = launch.bind(abstract(lhs.shape, lhs.dtype), abstract(kernel.shape, kernel.dtype),
                         abstract(group_sizes.shape, jnp.int32), out_dtype='float32', trans_rhs=True,
                         interpret=interpret_on_cpu, exact_sums=True)
-    target = generation.gpu_target()
-    tile = _step_scaled_tile(launch, bound, target, kernel.shape[1], column_scales.shape[-1])
+    per = kernel.shape[1] // column_scales.shape[-1]
+    # A column scale covers each column, or whole weight blocks of them, which a column tile falls within.
+    tile = _planned(launch, bound) if per == 1 or per % mosaic_gpu.STEP_SCALE_DEPTH == 0 else None
     if selection.select(BLOCKWISE_FP8, BlockwiseCase(tile)).kernel == 'mosaic_gpu':
         assert tile is not None, "the selector names the template where it plans a tile"
         summed = mosaic_gpu.gmm(lhs, kernel, group_sizes.astype(jnp.int32), tiles=tile, transpose_rhs=True,
@@ -470,6 +471,7 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
                                 multiprocessors=launch._launched(tile, interpret_on_cpu),
                                 interpret=grouped_matmul.INTERPRETED if interpret_on_cpu else False,
                                 exact_sums=True, step_scales=(row_scales, column_scales))
+        assert isinstance(summed, jax.Array), "an unpaired product has one output"
     else:
         # Each product of two FP8 values is exact in bfloat16's range and in fp32.
         matrices = jnp.swapaxes(kernel, 1, 2).astype(jnp.bfloat16)
@@ -490,10 +492,17 @@ def blockwise_fp8_kernel_gradient(lhs_t: jax.Array, rhs_t: jax.Array, group_bloc
     contiguous layout), so no block straddles groups. Its selector (`BLOCKWISE_FP8`) runs the template's
     rows-contiguous kernel gradient where named (`mosaic_gpu.tgmm`'s `k_major`), else XLA's."""
     sizes = (group_blocks * grouped_matmul.SCALE_DEPTH).astype(jnp.int32)
-    tile = _gradient_tile(lhs_t, rhs_t, sizes, interpret_on_cpu)
+    launch = grouped_matmul.MosaicStepScaledTgmm()
+    rows = lhs_t.shape[1]
+    # Bound as the call it is, its operands' rows first as a kernel gradient states them (`k_major` lays
+    # them out rows-contiguous).
+    tile = _planned(launch, launch.bind(jax.ShapeDtypeStruct((rows, lhs_t.shape[0]), lhs_t.dtype),
+                                        jax.ShapeDtypeStruct((rows, rhs_t.shape[0]), rhs_t.dtype),
+                                        jax.ShapeDtypeStruct(sizes.shape, jnp.int32), out_dtype='float32',
+                                        interpret=interpret_on_cpu, exact_sums=True))
     if selection.select(BLOCKWISE_FP8, BlockwiseCase(tile)).kernel == 'mosaic_gpu':
         assert tile is not None, "the selector names the template where it plans a tile"
-        launched = grouped_matmul.MosaicTgmm()._launched(tile, interpret_on_cpu)
+        launched = launch._launched(tile, interpret_on_cpu)
         summed = mosaic_gpu.tgmm(lhs_t, rhs_t, sizes, tiles=tile, out_dtype=jnp.float32,
                                  multiprocessors=launched,
                                  interpret=grouped_matmul.INTERPRETED if interpret_on_cpu else False,
@@ -514,6 +523,55 @@ def blockwise_fp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array
     quantized product's derivative (straight through each rounding). Group `g` holds `group_blocks[g]` whole
     128-row blocks, in order: `rows` is 128 times their sum (a recipe pads each group's rows)."""
     return _blockwise_projection(x, w, group_blocks, jnp.dtype(out_dtype), interpret_on_cpu)
+
+
+def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None = None, *,
+                      out_dtype, bias: jax.Array | None = None) -> jax.Array | None:
+    """`rows @ matrix` in the run's low-precision recipe (`dew.nn.precision.recipe_role`), where the
+    projection's role takes it: a dense projection's (`matrix` `[in, out]`, every row its one group's) or
+    experts' (`[groups, in, out]`, `group_sizes` counting each group's leading rows, any past their sum
+    outside every group), each group's rows padded with zero rows to whole 128-row blocks, multiplied by
+    `blockwise_fp8_projection` and the padding dropped, a row outside every group zero; `bias`, each group's
+    `[groups, out]`, added to its rows after. None where the run trains in no recipe or the recipe does not
+    take the projection: its role keeps the run's dtypes (a router's, a head's) or its widths hold no whole
+    128-wide blocks, each such projection's route reported with the reason."""
+    from dew.nn.precision import recipe_role
+
+    held = recipe_role()
+    if held is None:
+        return None
+    recipe, role = held
+    edge = grouped_matmul.SCALE_DEPTH
+    depth, width = matrix.shape[-2:]
+    refusal = (None if role in recipe.roles else
+               selection.Refusal("kept_role", f"a {role or 'role-less'} projection keeps the run's dtypes "
+                                 f"under {recipe.recipe}", kind="handoff"))
+    if refusal is None and (depth % edge or width % edge):
+        refusal = selection.Refusal("block_shape", f"a {depth} x {width} projection holds no whole "
+                                    f"{edge}-wide blocks", kind="handoff")
+    if refusal is not None:
+        generation.route("blockwise_fp8", kernel="unquantized", preferred=recipe.recipe, refusal=refusal)
+        return None
+    stacked = matrix if matrix.ndim == 3 else matrix[None]
+    groups, count = stacked.shape[0], rows.shape[0]
+    sizes = (jnp.full((1,), count, jnp.int32) if group_sizes is None
+             else jnp.asarray(group_sizes, jnp.int32))
+    # Each row's group (`groups` past their sum) and its place in its group's padded run of whole blocks.
+    ends = jnp.cumsum(sizes)
+    group = jnp.searchsorted(ends, jnp.arange(count), side="right")
+    blocks = -(-sizes // edge)
+    padded = -(-(count + groups * (edge - 1)) // edge) * edge
+    held_group = jnp.minimum(group, groups - 1)
+    place = jnp.where(group < groups, (jnp.cumsum(blocks) - blocks)[held_group] * edge
+                      + jnp.arange(count) - (ends - sizes)[held_group], padded)
+    laid = jnp.zeros((padded, depth), rows.dtype).at[place].set(rows, mode="drop")
+    # The run's slack, zero rows, as the last group's further blocks: the recipe's rows are whole blocks.
+    group_blocks = blocks.at[-1].add(padded // edge - blocks.sum())
+    product = blockwise_fp8_projection(laid, stacked, group_blocks, out_dtype=out_dtype)
+    out = product.at[place].get(mode="fill", fill_value=0)
+    if bias is not None:
+        out = jnp.where((group < groups)[:, None], out + bias[held_group].astype(out.dtype), out)
+    return out
 
 
 def rows_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -571,24 +629,11 @@ _blockwise_projection = contracted("test_a_blockwise_fp8_projection_holds_every_
                         nondiff_argnums=(3, 4)))
 
 
-def _gradient_tile(lhs_t, rhs_t, sizes, interpret: bool) -> mosaic_gpu.Tiles | None:
-    """The template's tile for a blockwise kernel gradient (`blockwise_fp8_kernel_gradient`): the exactly
-    summed kernel gradient's derived tile for 16-bit operands of its shapes, at a 128-row step, where the
-    16-bit tile is legal at a 64-row one (an FP8 128-row step's bytes, the shared memory and registers it
-    holds: the launch takes no FP8 kernel gradient to plan, and a 16-bit step is at most a swizzled row's 64
-    elements); None where it plans none."""
-    launch = grouped_matmul.MosaicTgmm()
-    rows = lhs_t.shape[1]
-    bound = launch.bind(jax.ShapeDtypeStruct((rows, lhs_t.shape[0]), jnp.bfloat16),
-                        jax.ShapeDtypeStruct((rows, rhs_t.shape[0]), jnp.bfloat16),
-                        jax.ShapeDtypeStruct(sizes.shape, jnp.int32), out_dtype='float32',
-                        interpret=interpret, exact_sums=True)
+def _planned(launch, bound) -> mosaic_gpu.Tiles | None:
+    """The tile `launch` plans for the call it is `bound` to on the target (its derived tile, its allocations
+    its kernel's), None where it takes none."""
     target = generation.gpu_target()
-    if not launch.eligible(bound, target) or (tile := launch.derived(bound, target)) is None:
-        return None
-    if not launch.legal(bound, dataclasses.replace(tile, block_k=mosaic_gpu.STEP_SCALE_DEPTH // 2), target):
-        return None
-    return dataclasses.replace(tile, block_k=mosaic_gpu.STEP_SCALE_DEPTH)
+    return launch.derived(bound, target) if launch.eligible(bound, target) else None
 
 
 def _blocks_summed(lhs_t, rhs_t, group_blocks, row_scales, column_scales) -> jax.Array:
@@ -611,27 +656,6 @@ def _blocks_summed(lhs_t, rhs_t, group_blocks, row_scales, column_scales) -> jax
     return jax.lax.fori_loop(0, blocks, block, jnp.zeros((groups, depth, width), jnp.float32))
 
 
-def _step_scaled_tile(launch, bound, target, width: int, scaled: int) -> mosaic_gpu.Tiles | None:
-    """The tile the template's launch plans for a blockwise-scaled product (`blockwise_fp8_product`): its
-    derived FP8 tile at a 128-deep step, its columns the derived tile's, else the columns one column scale
-    covers (`width / scaled`, where each column has none of its own), the first legal of them whose columns
-    divide a scale's; None where it plans none (a 192-column FP8 tile at Qwen3-30B-A3B's 768-wide experts
-    plans 128, a whole scale's)."""
-    if not launch.eligible(bound, target) or (tile := launch.derived(bound, target)) is None:
-        return None
-    per = width // scaled
-    widths = (tile.block_n,) if per == 1 else tuple(each for each in dict.fromkeys((tile.block_n, per))
-                                                    if per % each == 0)
-    # A stage fewer than the derived ring's: its rows' scales stream beside it (`mosaic_gpu.gmm`'s
-    # `row_scales`, 4 bytes a row a stage, at most 4 KB), which the launch's planner does not count and a
-    # derived ring fills the block without (Qwen3-30B-A3B's projection asked past the H100's); one FP8
-    # stage (at least 32 KB at a 128-deep step) holds them.
-    stages = max(2, tile.stages - 1)
-    planned = (dataclasses.replace(tile, block_k=mosaic_gpu.STEP_SCALE_DEPTH, block_n=each, stages=stages)
-               for each in widths)
-    return next((each for each in planned if launch.legal(bound, each, target)), None)
-
-
 def low_rank(lhs: jax.Array, kernel: jax.Array, a: jax.Array, b: jax.Array, scale, *, out_dtype,
              precision: PrecisionLike = None, interpret_on_cpu: bool = False) -> jax.Array:
     """`lhs · kernel + scale · (lhs · a) · b`, LoRA's adapted product (Appendix C row 26, strategy (b)), as
@@ -644,7 +668,9 @@ def low_rank(lhs: jax.Array, kernel: jax.Array, a: jax.Array, b: jax.Array, scal
     `u = scale · (dy · bᵀ)` rounded once; the factors' gradients are `lhsᵀ · (scale · (dy · bᵀ))` and `tᵀ ·
     dy`, the rank-wide kernel gradients; each operand's only where it is differentiated (a frozen kernel's,
     `lhsᵀ · dy`, never). The concatenations are copies, a materialized strategy (b); a mainloop walking the
-    appended pair in place is row 1304's next form."""
+    appended pair in place is row 1304's next form. A projection the run's low-precision recipe takes by
+    its role is refused (`refuse_recipe`): the adapted product does not take the recipe."""
+    refuse_recipe("an adapter's fused product (`gemm.low_rank`)")
     return _low_rank(lhs, kernel, a, b, jnp.asarray(scale, jnp.float32), out_dtype, precision,
                      interpret_on_cpu)
 
@@ -728,7 +754,8 @@ _low_rank = contracted("test_an_adapted_product_holds_every_reverse_order")(
 
 
 def dot_general(xla):
-    """`xla`, a layer's product (a `jax.lax.dot_general`, as flax's `Dense` takes one), through the
+    """`xla`, a layer's product (a `jax.lax.dot_general`, as flax's `Dense` takes one), in the run's
+    low-precision recipe where its role takes the matrix product (`recipe_projection`), else through the
     template's dense product (`gemm` of one group) where the call is a matrix product (`lhs`'s last axis
     against a matrix's first, no batch axes, both of one dtype) and a launch takes any of its products: the
     forward, the input gradient or the kernel gradient (`_launched`). A call no launch takes is `xla`'s own
@@ -737,12 +764,15 @@ def dot_general(xla):
     before wherever the template declares XLA faster; every other product is `xla`'s."""
     def product(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None, **kwargs):
         (contracted, against), batch = dimension_numbers
+        out_dtype = jnp.dtype(preferred_element_type or lhs.dtype)
+        # The run's low-precision recipe takes the product where the projection's role takes it.
+        if not kwargs and (recipe := _recipe_general(lhs, rhs, dimension_numbers, out_dtype)) is not None:
+            return recipe
         plain = (not kwargs and jnp.ndim(rhs) == 2 and lhs.dtype == rhs.dtype
                  and tuple(contracted) == (lhs.ndim - 1,) and tuple(against) == (0,)
                  and tuple(map(tuple, batch)) == ((), ()))
         if plain:
             rows = lhs.reshape(-1, lhs.shape[-1])
-            out_dtype = jnp.dtype(preferred_element_type or lhs.dtype)
             if _launched(rows, rhs, out_dtype, precision):
                 product = gemm(rows, rhs, out_dtype=out_dtype, precision=precision)
                 return product.reshape(*lhs.shape[:-1], rhs.shape[1])
@@ -750,6 +780,29 @@ def dot_general(xla):
                    preferred_element_type=preferred_element_type, **kwargs)
 
     return product
+
+
+def _recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype) -> jax.Array | None:
+    """A layer's product (`jax.lax.dot_general`'s `dimension_numbers`) in the run's low-precision recipe
+    (`recipe_projection`), as matrices: a dense projection's free rows against its kernel's contracted
+    axes, a batched one's (a grouped output projection's, DeepSeek V4's `o_a_proj`) each batch member a
+    group of rows against its own matrix, the result in `dot_general`'s order (batch, `lhs`'s free axes,
+    `rhs`'s); None where `recipe_projection` takes none of it."""
+    (contracted, against), (batched, batched_rhs) = (tuple(map(tuple, pair)) for pair in dimension_numbers)
+    free = [axis for axis in range(lhs.ndim) if axis not in contracted + batched]
+    free_rhs = [axis for axis in range(rhs.ndim) if axis not in against + batched_rhs]
+    groups = math.prod(lhs.shape[axis] for axis in batched)
+    count = math.prod(lhs.shape[axis] for axis in free)
+    depth = math.prod(lhs.shape[axis] for axis in contracted)
+    width = math.prod(rhs.shape[axis] for axis in free_rhs)
+    rows = jnp.transpose(lhs, (*batched, *free, *contracted)).reshape(groups * count, depth)
+    matrices = jnp.transpose(rhs, (*batched_rhs, *against, *free_rhs)).reshape(groups, depth, width)
+    out = (recipe_projection(rows, matrices, jnp.full((groups,), count, jnp.int32), out_dtype=out_dtype)
+           if batched else recipe_projection(rows, matrices[0], out_dtype=out_dtype))
+    if out is None:
+        return None
+    return out.reshape(*(lhs.shape[axis] for axis in (*batched, *free)),
+                       *(rhs.shape[axis] for axis in free_rhs))
 
 
 def _launched(rows: jax.Array, matrix: jax.Array, out_dtype, precision: PrecisionLike) -> bool:

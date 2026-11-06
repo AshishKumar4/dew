@@ -483,13 +483,11 @@ def reached(maxima: jax.Array, *, unseen: bool) -> jax.Array:
 
 
 type Launch[O, F] = Callable[..., tuple[O, jax.Array, jax.Array] | tuple[O, None, F]]
-"""A whole launch of a call in a form (`walked_launches`), `launch(form, live, again=False, into=None)`: its
-outputs, each row's running maximum and whether its weighted values overflowed; or, a launch whose programs
-state their rows' rewalk flags themselves (`F`, its mainloop's own), its outputs, no maxima and those flags,
-which it takes back as `live`; `again` a plain launch run
-once more inside the guard's rare branch, a recomputation (its kernel named apart, its products counted
-once); `into` refs holding the plain launch's outputs, which it writes its rows `live` into in place
-(`walked_launches`' `in_place`)."""
+"""A whole launch of a call in a form (`walked_launches`), `launch(form, live, into=None)`: its outputs, each
+row's running maximum and whether its weighted values overflowed; or, a launch whose programs state their
+rows' rewalk flags themselves (`F`, its mainloop's own), its outputs, no maxima and those flags, which it
+takes back as `live`; `into` refs holding the plain launch's outputs, which it writes its rows `live` into
+in place (`walked_launches`' `in_place`)."""
 
 
 def finished_form(spec: Forward) -> Forward:
@@ -502,13 +500,12 @@ def finished_form(spec: Forward) -> Forward:
 def slice_state(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.Array) -> Partial:
     """A finished slice of a row's keys as a state of their merge (`finished_merged`): its output `out`
     normalized (`finish`'s), its maximum (in `spec`'s units, `finished_rows`', raw products where its fold
-    keeps them) and its denominator folded into its maximum (`m + log(total)`, in those units) and its mass
-    1 where it saw a key, so no output multiplied back by its denominator passes fp32's largest; a slice of
-    no key the walk's start (`LEAST`), its mass 0. A row or a launch's block of rows alike."""
+    keeps them) and its denominator its mass, kept apart: folded into the maximum (`m + log(total)`) it
+    rounded away at a large one (row 4646: at 2^30, fp32's spacing 128, slices of denominators 128 and 64
+    merged half and half). A slice of no key the walk's start (`LEAST`), its mass 0. A row or a launch's
+    block of rows alike."""
     seen = total > 0
-    units = spec.scale if spec.raw else 1.0
-    folded = jnp.where(seen, maximum + jnp.log(jnp.where(seen, total, 1.0)) / units, LEAST)
-    return Partial(out, folded, seen.astype(jnp.float32))
+    return Partial(out, jnp.where(seen, maximum, LEAST), jnp.where(seen, total, 0.0))
 
 
 def initial_state(spec: Forward, initial: Partial) -> Partial:
@@ -544,10 +541,14 @@ def finished_merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     program's registers hold them (the in-launch merge's, `attention_mosaic_forward._Merge`)."""
     m = jnp.maximum(first.m, second.m)
     a, b = carried(spec, first.m, m) * first.total, carried(spec, second.m, m) * second.total
-    total = a + b
-    over = 1.0 / jnp.where(total > 0, total, 1.0)
+    # Each weight over the larger, so their sum is at most two whatever the masses (an initial state's may
+    # be any finite one).
+    largest = jnp.maximum(a, b)
+    safe = jnp.where(largest > 0, largest, 1.0)
+    a, b = a / safe, b / safe
+    over = 1.0 / jnp.where(a + b > 0, a + b, 1.0)
     out = expand(a * over, first.acc) * first.acc + expand(b * over, second.acc) * second.acc
-    return Partial(out, m, total)
+    return Partial(out, m, largest * (a + b))
 
 
 def finished_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
@@ -560,10 +561,13 @@ def finished_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     (`finish`'s `normalized`); a state of no key adds nothing."""
     m = jnp.max(stacked.m, axis=axis)
     weights = carried(spec, stacked.m, jnp.expand_dims(m, axis)) * stacked.total
-    total = jnp.sum(weights, axis=axis)
-    shares = weights * jnp.expand_dims(1.0 / jnp.where(total > 0, total, 1.0), axis)
+    # Each weight over the largest, so their sum is at most the states' count whatever the masses.
+    largest = jnp.max(weights, axis=axis)
+    weights = weights / jnp.expand_dims(jnp.where(largest > 0, largest, 1.0), axis)
+    summed = jnp.sum(weights, axis=axis)
+    shares = weights * jnp.expand_dims(1.0 / jnp.where(summed > 0, summed, 1.0), axis)
     out = jnp.sum(expand(shares, stacked.acc) * stacked.acc, axis=axis)
-    return Partial(out, m, total)
+    return Partial(out, m, largest * summed)
 
 
 def rewalks(spec: Forward, maxima: jax.Array, over: jax.Array) -> tuple[jax.Array, Forward]:
@@ -608,10 +612,13 @@ def walked_launches[O, F](spec: Forward, launch: Launch[O, F], kept: Callable[[j
 
     `in_place` walks so, masked, every call, its rewalk written into the plain launch's outputs held in refs
     (`launch(form, live, into=refs)`: the launch writes its rows `live` and leaves every other row's bits),
-    no branch and no `kept` over them: the branch's common side copied the plain launch's outputs into its
-    result every call (ET-MEMCPY-h100: the output and its rows, 45 us of Qwen3-8B's causal forward on an
-    H100), and the masked launch's `kept` selected over them every call; its empty launch costs its
-    prologue."""
+    no rare walk and no `kept` over them, which the masked launch selected over them every call; its empty
+    launch costs its prologue.
+
+    Elsewhere each rare walk is a loop of at most one trip (`once`), which takes the plain launch's outputs
+    as its carry in their own buffer: a branch's common side copied them into its result every call
+    (ET-MEMCPY-h100: the output and its rows, 45 us of Qwen3-8B's causal forward on an H100; a training
+    forward's split sums besides)."""
     if masked or in_place:
         plain = launch(spec, None)
         outputs = plain[0]
@@ -630,20 +637,17 @@ def walked_launches[O, F](spec: Forward, launch: Launch[O, F], kept: Callable[[j
         return kept(live, launch(form, live)[0], outputs)
 
     def plain_launch(form: Forward) -> tuple[O, jax.Array, jax.Array]:
-        result = launch(form, None)
-        assert result[1] is not None, "a launch states its rows' rewalk flags in a masked walk alone"
-        return result
+        launched = launch(form, None)
+        assert launched[1] is not None, "a launch states its rows' rewalk flags in a masked walk alone"
+        return launched
 
-    def guarded_launch(form: Forward, outputs: O, over: jax.Array) -> O:
+    def guarded_launch(form: Forward, outputs: O, over: jax.Array, taken: jax.Array | bool = True) -> O:
+        # The rows that overflowed walked again shifting, where some did and the call walked in `form`
+        # (`taken`).
         if not form.headroom:
             return outputs
-        # The rows kept plain read from the plain launch run again inside the rare branch (`again`), so the
-        # plain launch's outputs reach one branch alone, whose result their buffer then is: read by both,
-        # XLA copied them in the common branch (ET-GUARDHLO-h100: `copy.7`, the whole output, 0.047 ms of
-        # Qwen3-8B's 0.66 ms causal forward).
-        return jax.lax.cond(jnp.max(over.astype(jnp.int32)) > 0,
-                            lambda: kept(over, launch(form, over)[0], launch(form, None, again=True)[0]),
-                            lambda: outputs)
+        return once(taken & (jnp.max(over.astype(jnp.int32)) > 0),
+                    lambda plain: kept(over, launch(form, over)[0], plain), outputs)
 
     outputs, maxima, over = plain_launch(spec)
     if not spec.reaches:
@@ -651,13 +655,29 @@ def walked_launches[O, F](spec: Forward, launch: Launch[O, F], kept: Callable[[j
     # The call's own rows alone: a padded query's maximum is -inf, a row that reads nothing (`seen`).
     reach = reach_of(maxima if spec.queries is None else maxima[..., :spec.queries],
                      unseen=spec.form == "spans")
-    natural = unfolded(spec)
+    natural, unfolding = unfolded(spec), reach >= FOLD_REACH
 
-    def unfolded_launch() -> O:
-        unfolded_outputs, _, unfolded_over = plain_launch(natural)
-        return guarded_launch(natural, unfolded_outputs, unfolded_over)
+    def natural_launch(folded: tuple[O, jax.Array]) -> tuple[O, jax.Array]:
+        # The natural form's plain launch in the folded one's place, its outputs and overflows.
+        launched, _, overflowed = plain_launch(natural)
+        return launched, overflowed
 
-    return jax.lax.cond(reach >= FOLD_REACH, unfolded_launch, lambda: guarded_launch(spec, outputs, over))
+    # Where some row's maximum passes the fold's reach (`FOLD_REACH`).
+    outputs, over = once(unfolding, natural_launch, (outputs, over))
+    outputs = guarded_launch(natural, outputs, over, unfolding)
+    return guarded_launch(spec, outputs, over, ~unfolding)
+
+
+def once[C](taken: jax.Array, body: Callable[[C], C], carried: C) -> C:
+    """`body(carried)` where `taken`, else `carried`: a loop of at most one trip, whose carry XLA keeps in its
+    operand's buffer, the rare side of a branch (`walked_launches`' rare walks) with no copy on the common
+    one, whose identity a branch copies into its result (ET-MEMCPY-h100). Its trips counted from 0 below 1,
+    beside `taken`, so a step's FLOP count bounds its body as it bounds a branch's (`instrumentation`'s
+    counted trips)."""
+    def trip(state):
+        return state[0] + 1, body(state[1])
+
+    return jax.lax.while_loop(lambda state: (state[0] < 1) & taken, trip, (jnp.int32(0), carried))[1]
 
 
 NATURAL_EXPONENT_REACH = 150.0
@@ -1771,6 +1791,10 @@ def _scaled(x: jax.Array, rows: bool = False) -> tuple[jax.Array, jax.Array]:
     has no form of (Mosaic GPU's: "Scalars must be represented by non-vector types", ET-FP16-h100)."""
     top = jnp.max(jnp.abs(x), axis=-1) if rows else jnp.max(jnp.abs(x))
     exponent = jnp.where(top > 0, jnp.ceil(jnp.log2(jnp.where(top > 0, top, 1.0))), 0.0)
+    # A GPU's approximate log2 flushes a subnormal largest to zero, its exponent -inf: scaled by 2^381
+    # (`power2`'s reach) the part passed fp32's largest and its remainder was inf - inf, NaN (row 4464, an
+    # fp16 row whose keys weigh subnormal beside a state near fp32's largest). Such a part takes no scale.
+    exponent = jnp.where(finite(exponent), exponent, 0.0)
     return power2(x, expand(14.0 - exponent, x) if rows else 14.0 - exponent), exponent - 14.0
 
 

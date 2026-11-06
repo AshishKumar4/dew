@@ -153,10 +153,11 @@ def _seeded(form: _Seeded, name: str, args, signed: bool, equation):
 def _z3_step(op: BitOp, operands: list, immediate, table) -> z3.BitVecRef:
     """`op`'s value over bit-vector `operands`, its `immediate` and `table` bit-vectors (`bits._run`'s)."""
     zero, word = z3.BitVecVal(0, 32), z3.BitVecVal(bits.WORD, 32)
-    first = operands[0] if operands else zero
-    second = operands[1] if len(operands) > 1 else immediate
+    read = bits.operands(op, operands, immediate)
+    first = read[0] if read else zero
+    second = read[1] if len(read) > 1 else immediate
     if op is BitOp.LOGIC:
-        values = [*operands, immediate, immediate][:3]
+        values = read
         value = zero
         for minterm in range(8):
             term = z3.BitVecVal(MASK, 32)
@@ -190,8 +191,13 @@ def _z3_step(op: BitOp, operands: list, immediate, table) -> z3.BitVecRef:
         code = z3.Extract(2, 0, table)
         lt = z3.If(signed, first < second, z3.ULT(first, second))
         le = z3.If(signed, first <= second, z3.ULE(first, second))
-        holds = z3.If(code == 0, lt, z3.If(code == 1, le, z3.If(code == 2, z3.Not(le), z3.If(
-            code == 3, z3.Not(lt), z3.If(code == 4, first == second, first != second)))))
+        predicates = {"lt": lt, "le": le, "gt": z3.Not(le), "ge": z3.Not(lt), "eq": first == second,
+                      "ne": first != second}
+        # Each code its predicate (`bits.COMPARISONS`); a code past them is no instruction, which `_cegis`
+        # admits none of.
+        holds = predicates[bits.COMPARISONS[-1]]
+        for index, name in reversed(list(enumerate(bits.COMPARISONS[:-1]))):
+            holds = z3.If(code == index, predicates[name], holds)
         return z3.If(holds, z3.BitVecVal(1, 32), zero)
     if op is BitOp.SEL:
         return z3.If(first != zero, operands[1], operands[2])
@@ -328,9 +334,11 @@ def _cegis(shape, symbols, target, inputs: int):
             expected = z3.substitute(target, *zip(symbols, values, strict=True))
             solver.add(program == expected)
         solver.add(*_bounded(program_unknowns, inputs))
-        for (op, _), (immediate, _, _, _) in zip(shape, program_unknowns, strict=True):
+        for (op, _), (immediate, table, _, _) in zip(shape, program_unknowns, strict=True):
             if op in _SHIFTS:
                 solver.add(z3.ULT(immediate, z3.BitVecVal(bits.WORD, 32)))
+            if op is BitOp.CMP:
+                solver.add(z3.ULT(z3.Extract(2, 0, table), z3.BitVecVal(len(bits.COMPARISONS), 3)))
             if op is BitOp.PRMT:
                 # Literal byte selection alone: no nibble's sign-replicating bit, no bits past four nibbles.
                 solver.add(immediate & z3.BitVecVal(0xFFFF8888, 32) == 0)

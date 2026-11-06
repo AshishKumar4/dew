@@ -240,17 +240,27 @@ def served(config: Config) -> dict[str, str]:
     return answers
 
 
-LANGUAGE = ("tokens", "tasks", "harness_limit", "prompt", "max_new_tokens", "sequence_length", "batch_size")
-"""The options only a language run reads."""
+LANGUAGE = ("tokens", "tasks", "harness_limit", "sequence_length", "batch_size")
+"""The options only a language run reads; the prompt and its length a served endpoint reads too."""
+
+
+def dropped(config: Config) -> list[str]:
+    """The options `config` gives that nothing it scores reads: with a diffusion run and no language run,
+    those only a language run reads, the prompt and its length among them unless a served endpoint reads
+    them (`served`)."""
+    if config.run is not None or config.image_run is None:
+        return []
+    endpoint = config.openai_base_url is not None or config.ollama_host is not None
+    language = LANGUAGE if endpoint else (*LANGUAGE, "prompt", "max_new_tokens")
+    defaults = Config()
+    return [f"--{name.replace('_', '-')}" for name in language
+            if getattr(config, name) != getattr(defaults, name)]
 
 
 def main(config: Config) -> Path:
-    if config.run is None and config.image_run is not None:
-        given = [name for name in LANGUAGE if getattr(config, name) != getattr(Config(), name)]
-        if given:
-            flags = ", ".join(f"--{name.replace('_', '-')}" for name in given)
-            raise ValueError(f"{flags} score a language run, which --run names; --image-run alone scores the "
-                             f"diffusion run")
+    if unread := dropped(config):
+        raise ValueError(f"{', '.join(unread)} score a language run, which --run names; --image-run alone "
+                         "scores the diffusion run")
     if config.smoke:
         config.out.mkdir(parents=True, exist_ok=True)
         config = replace(config, sequence_length=32, batch_size=2, prompt="to be", max_new_tokens=8,

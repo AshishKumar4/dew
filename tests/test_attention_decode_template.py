@@ -325,6 +325,7 @@ def test_a_decode_step_over_a_quantized_cache_is_on_par_interpreted(device, page
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
                     f"quantized decode {layout} {page} {stored} {device}", seeds=SEEDS)
 
+
 def test_packing_a_calls_heads_into_its_rows_is_undone_by_unpacking():
     """A key head's group of query heads as its rows (`packed`) and back (`template.ungrouped_rows`): the
     query as it was, each packed row's keys its query's."""
