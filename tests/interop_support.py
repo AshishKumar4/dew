@@ -505,12 +505,11 @@ def assert_decodes_as_it_scores(loaded, label: str, *, seeds: int, prefill: int,
     full forward at each step's width (`as_stepped`) over its declared `seeds`; the truth its float64
     build's one full pass. A decoder that selects draws rows that clear its selections
     (`clearing_selections`), so the runs select alike. Both arms are host loops over Dew's programs,
-    compiled as the gate compiles two Dew arms (`without_ynn`) and run as given."""
+    compiled as Dew's users compile them and run as given."""
     from model_support import as_stepped, decode_logits, decode_steps
-    from reference_error import without_ynn
 
     model, variables = loaded.model, loaded.variables
-    steps, forward = decode_steps(model, without_ynn), without_ynn(model.apply)
+    steps, forward = decode_steps(model), jax.jit(model.apply)
 
     def decoded(ids):
         return decode_logits(model, variables, ids[:, :prefill], ids[:, prefill:], steps, prefilled=True)

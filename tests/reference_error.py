@@ -210,35 +210,6 @@ def _one_draws_program(fn, arguments):
     return fn.fn, jax.tree.map(lambda leaf: leaf[0], arguments)
 
 
-WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
-"""XLA:CPU's compiler options with every YNNPACK fusion off (dots, reductions, element-wise and layout
-ops alike), so that a program runs on XLA's own code, compiled for the host's instruction set with no
-dispatch at run time. YNNPACK picks its microkernels at run time by that instruction set, and both
-the interpreted SSD kernel and XLA's scan fuse parts of themselves to it by default, which moved
-check 1 between the two across PARITY by host; without the fusions the verdicts held on two hosts
-of different instruction sets, though the bits still part with the host (docs/performance.md, "The
-SSD kernel's host check 1 without YNNPACK"). The empty list, not the documented `-individual_dot`,
-because compiler options take no such spelling and that one leaves a scan's reductions fused."""
-
-
-def without_ynn(fn, **jit_options):
-    """`fn` jitted with WITHOUT_YNN on the CPU lane, the process's default backend
-    (`jax.default_backend()`), and plain `jax.jit` elsewhere: how the gate compiles both arms of a
-    check 1 between two Dew paths (`_arms`), such as an interpreted kernel and the XLA program it
-    replaces, so that the two run the same kind of code on any host. A program Dew's users run compiles
-    with the fusions, as they do. On the CPU lane its compiler options refuse to be nested in another
-    jit, differentiated through or batched, so the gate compiles an arm whole; a site passes its arms
-    as functions and never calls this. A caller's own compiler options take precedence over
-    WITHOUT_YNN's; `fn` already compiled so is returned as it is."""
-    if getattr(fn, "without_ynn", False):
-        return fn
-    if jax.default_backend() == "cpu":
-        jit_options["compiler_options"] = {**WITHOUT_YNN, **(jit_options.get("compiler_options") or {})}
-    compiled = jax.jit(fn, **jit_options)
-    compiled.without_ynn = True
-    return compiled
-
-
 def as_given(fn):
     """`fn`, an arm the gate runs as it is given and never compiles: a torch or NumPy reference, or a Dew
     arm that runs whole programs of its own (a trainer's fit, a placement on a mesh and the program
@@ -253,12 +224,8 @@ def as_given(fn):
 
 def dew_programs(fn):
     """`fn`, a Dew arm that runs Dew's own compiled programs (a trainer's step, a task's forward, a
-    server's decode), which the gate cannot compile but which take their XLA options from Dew's one
-    seam (`dew.nn.kernels.options.compiler_options`). Beside another Dew arm, the gate runs it with
-    that seam holding WITHOUT_YNN open (`compiled_with`), so the programs it compiles go without
-    YNNPACK's fusions as the gate's own compile of its other arm does; beside an arm `as_given`, as it
-    is, with the fusions. A program it compiled before its check, or compiles by a bare `jax.jit`
-    outside the seam, keeps its own options."""
+    server's decode), which the gate cannot compile and runs as it is, its programs compiled as Dew
+    compiles them for its users."""
     @functools.wraps(fn)
     def programs(*inputs, **options):
         return fn(*inputs, **options)
@@ -303,127 +270,21 @@ def _refuse_numpy_arms(draw, *arms) -> None:
                             f"values unconverted")
 
 
-def _compiled(fn, compile, pairing=None, *, reference: bool = False):
-    """`fn` as the gate runs it: as given (`_given`), as it is where it is a `without_ynn` program already
-    (another jit around it would nest its compiler options), or compiled by `compile`, a window loop's arm
-    within it (`over_windows`), without YNNPACK's fusions, paired by `pairing` (`_Paired`); a `reference`
-    unrewritten (`arm_arithmetic.unrewritten`)."""
+def _compiled(fn, *, reference: bool = False):
+    """`fn` as the gate runs it: as given (`_given`), as it is where it is compiled already or runs Dew's own
+    programs (`dew_programs`), or compiled as Dew's users compile it (`jax.jit`), a window loop's arm within
+    it (`over_windows`); a `reference` unrewritten (`arm_arithmetic.unrewritten`)."""
     run = unrewritten if reference else _as_is
-    if _given(fn) or getattr(fn, "without_ynn", False):
+    if _given(fn) or getattr(fn, "dew_programs", False) or hasattr(fn, "lower"):
         return run(fn)
-    if getattr(fn, "dew_programs", False):
-        return run(fn) if compile is jax.jit else _Paired(pairing, run(_with_ynn_off(fn)), run(fn))
     if isinstance(fn, _Windowed):
-        return _Windowed(_compiled(fn.fn, compile, pairing, reference=reference))
-    return run(compile(fn)) if compile is jax.jit else _Paired(pairing, run(compile(fn)), run(jax.jit(fn)))
+        return _Windowed(_compiled(fn.fn, reference=reference))
+    return run(jax.jit(fn))
 
 
 def _as_is(fn):
     """`fn` itself: a candidate arm, run as its users run it."""
     return fn
-
-
-@dataclasses.dataclass(eq=False)
-class _Pairing:
-    """Whether a check's paired arms (`_Paired`) run with YNNPACK's fusions, decided once a site before it
-    draws (`_ynn_decided`): `refused`, XLA:CPU's refusal of an arm without them where it gave one."""
-
-    decided: bool = False
-    refused: str | None = None
-
-    @property
-    def with_ynn(self) -> bool:
-        return self.refused is not None
-
-
-@dataclasses.dataclass(frozen=True)
-class _Paired:
-    """An arm of a check between two Dew paths (`_arms`): `without`, the arm without YNNPACK's fusions,
-    unless its site's arms were decided otherwise, then `plain`, the arm as Dew's users compile it
-    (`_ynn_decided`): where XLA:CPU cannot compile an arm of the check without the fusions and can with
-    them, every arm of it takes them, so the two still run the same kind of code, here the kind whose
-    microkernels the host picks."""
-
-    pairing: _Pairing
-    without: Callable
-    plain: Callable
-
-    @property
-    def without_ynn(self) -> bool:
-        """Whether the arm runs without YNNPACK's fusions (`without_ynn`'s mark)."""
-        return not self.pairing.with_ynn
-
-    def __call__(self, *inputs, **options):
-        return (self.plain if self.pairing.with_ynn else self.without)(*inputs, **options)
-
-
-def _paired_arms(arms) -> list[_Paired]:
-    """The paired arms among `arms`, a window loop's inner arm for it."""
-    return [arm for arm in (arm.fn if isinstance(arm, _Windowed) else arm for arm in arms)
-            if isinstance(arm, _Paired)]
-
-
-SWITCHED: list[dict] = []
-"""The sites decided onto YNNPACK's fusions (`_ynn_decided`) since the last test's report took them: each its
-label and XLA:CPU's refusal, which tests/conftest.py reports as the test's JUnit property `ynn_switched`."""
-
-
-@functools.cache
-def _ynn_option_held() -> None:
-    """Raise unless XLA:CPU compiles a trivial program with WITHOUT_YNN's options, once a process: where an
-    XLA release refuses the options themselves, every paired site would otherwise move onto the fusions
-    and pass (`_ynn_decided`)."""
-    try:
-        without_ynn(lambda x: x * 2)(jnp.zeros((2, 2), jnp.float32))
-    except jax.errors.JaxRuntimeError as error:
-        raise RuntimeError(f"XLA:CPU refuses WITHOUT_YNN's options {WITHOUT_YNN} on a trivial program: "
-                           f"{str(error).splitlines()[0]}; no check may move its arms onto the fusions"
-                           ) from error
-
-
-def _ynn_decided(label: str, arms, inputs) -> None:
-    """The mode of a site's paired arms (`_Paired`), decided once before its draws: each compiled ahead on
-    its first draw's `inputs` without YNNPACK's fusions; where XLA:CPU refuses one so and compiles it with
-    them (its algebraic simplifier forms a dot of no contracting dimension from a contraction of length
-    one, which only YNNPACK's fusion runs: attention's XLA backward over a single key), every paired arm
-    of the site takes the fusions, logged in its stages' lines (`_logged`), reported (`SWITCHED`) and named in
-    its findings (`_with_mode`). One the fusions refuse too raises, and so does a process whose XLA refuses
-    the options themselves (`_ynn_option_held`). An arm running Dew's own programs through Dew's
-    seam (`dew_programs`) compiles at its call, without them, as does a window loop's arm, whose program
-    takes each window's slices and not the draw (`over_windows`)."""
-    pairings = {arm.pairing for arm in _paired_arms(arms)}
-    if not pairings or all(pairing.decided for pairing in pairings):
-        return
-    _ynn_option_held()
-    refused = None
-    for arm in arms:
-        if not isinstance(arm, _Paired) or not hasattr(arm.without, "lower"):
-            continue
-        try:
-            arm.without.lower(*inputs).compile()
-        except jax.errors.JaxRuntimeError as error:
-            arm.plain.lower(*inputs).compile()
-            refused = refused or str(error).splitlines()[0]
-    for pairing in pairings:
-        pairing.decided, pairing.refused = True, refused
-    if refused is not None:
-        SWITCHED.append({"label": label, "refused": refused})
-
-
-def _mode_of(arms) -> str | None:
-    """XLA:CPU's refusal that moved a site's arms onto YNNPACK's fusions (`_ynn_decided`), or None."""
-    return next((arm.pairing.refused for arm in _paired_arms(arms) if arm.pairing.refused), None)
-
-
-def _with_mode(findings: list, arms) -> list:
-    """`findings`, each naming its site's arms' YNNPACK mode where they were decided onto the fusions
-    (`_ynn_decided`), so a failure says which code its arms ran."""
-    refused = _mode_of(arms)
-    if refused is None:
-        return findings
-    return [dataclasses.replace(finding, message=f"{finding.message} (both arms with YNNPACK's fusions: "
-                                                 f"XLA:CPU refused one without, {refused!r})")
-            for finding in findings]
 
 
 def _truth_program(fn):
@@ -440,56 +301,21 @@ def _truth_program(fn):
     return Truth(fn)
 
 
-def _with_ynn_off(fn):
-    """`fn` run with Dew's compile seam holding WITHOUT_YNN open on the CPU lane (`dew_programs`)."""
-    from dew.nn.kernels.options import compiled_with
-
-    @functools.wraps(fn)
-    def run(*inputs, **options):
-        with compiled_with(WITHOUT_YNN if jax.default_backend() == "cpu" else {}):
-            return fn(*inputs, **options)
-    return run
-
-
 def _arms(dew_fn, reference_fn):
     """The two arms of a check as the gate runs them (docs/design/testing.md, "the numerical contract"):
-    where both are Dew paths, each without YNNPACK's fusions (`without_ynn`), whose microkernels the host's
-    instruction set picks at run time, so the two run the same kind of code on any host: a plain function
-    the gate compiles so, an arm that runs Dew's own programs (`dew_programs`) with them compiled so through
-    Dew's seam; where one runs as it is given (`as_given`: torch, NumPy, a recording, a host loop over
-    programs of its own), the other as Dew's users run it, with the fusions (`jax.jit`). A site passes plain
-    functions; the gate compiles them, so no site can compile one arm otherwise than its other. The
-    reference runs unrewritten (`_compiled`), so one function as both arms compiles twice. A program XLA:CPU
-    cannot compile without the fusions turns both arms over to them, decided once a site (`_ynn_decided`)."""
-    compile, pairing = (jax.jit if _given(dew_fn) or _given(reference_fn) else without_ynn), _Pairing()
-    _refuse_owned_policies(compile, dew_fn, reference_fn)
-    return _compiled(dew_fn, compile, pairing), _compiled(reference_fn, compile, pairing, reference=True)
+    each as Dew's users run it, a plain function compiled by `jax.jit`, with XLA's default options (on the
+    CPU, YNNPACK's fusions among them: row 4471), one run as given (`as_given`: torch, NumPy, a recording,
+    a host loop) or running Dew's own programs (`dew_programs`) as it is. A site passes plain functions; the
+    gate compiles them, so no site can compile one arm otherwise than its other. The reference runs
+    unrewritten (`_compiled`), so one function as both arms compiles twice."""
+    return _compiled(dew_fn), _compiled(reference_fn, reference=True)
 
 
-def _arms_with(dew_fn, reference_fn, further: list, label: str):
-    """A site's arms and each further reference's, compiled as `_arms` pairs them, Dew's once beside all:
-    refused where, beside a plain Dew arm, a further reference is not of the reference's kind (plain or
-    as given), as no one compilation of Dew's pairs with both."""
-    if not _given(dew_fn) and any(_given(fn) != _given(reference_fn) for fn in further):
-        raise ValueError(f"{label}: beside a plain Dew arm each further reference is of the reference's "
-                         f"kind, plain or as given, so one compilation of Dew's pairs with all")
+def _arms_with(dew_fn, reference_fn, further: list):
+    """A site's arms and each further reference's, compiled as `_arms` compiles them, Dew's once beside
+    all."""
     dew, reference = _arms(dew_fn, reference_fn)
-    return dew, reference, [_arms(dew_fn, fn)[1] for fn in further]
-
-
-def _refuse_owned_policies(compile, *arms) -> None:
-    """Refuse an arm compiled with a policy the gate does not own (row 2287): a `without_ynn` program,
-    which `_compiled` runs as it is, beside an arm run `as_given`, where the gate compiles Dew's arm as
-    its users run it, with the fusions (`jax.jit`) — it would run without them, unseen. A plain
-    `jax.jit` arm the gate's own compile nests, which applies the gate's options; a jit with compiler
-    options of its own refuses that nesting itself (`compiler_options` only at top level). Pass the
-    function plain and the gate compiles it as the pairing asks."""
-    for fn in arms:
-        inner = fn.fn if isinstance(fn, _Windowed) else fn
-        if compile is jax.jit and getattr(inner, "without_ynn", False) and not _given(inner):
-            raise TypeError(f"{getattr(inner, '__qualname__', repr(inner))} is compiled without YNNPACK's "
-                            f"fusions, beside an arm run as given, where the gate compiles Dew's arm with "
-                            f"them: pass it plain, and the gate compiles it as the pairing asks")
+    return dew, reference, [_compiled(fn, reference=True) for fn in further]
 
 
 def with_gradients(fn, *, has_aux: bool = False):
@@ -1016,10 +842,6 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         inputs = draw(seed)
         if not at:
             _of_its_seed(label, draw, seed, inputs)
-        # The site's arms' mode, decided on its first draw's inputs before any arm runs, no draw of its own,
-        # on the programs the arms run (their scope, `summed_as_run`).
-        with summed_as_run():
-            _ynn_decided(label, [dew_fn, *arms], inputs)
         truth, terms = truth_and_terms(inputs)
         if reference_seeds is None:
             their_inputs, their_truth, their_terms = inputs, truth, terms
@@ -1394,7 +1216,7 @@ verdict and its leaves of narrow rows (NARROW_FACTORS) to, one JSON line (`_logg
 site's stage-two rate from, every attempt counted, and which sites' local errors rest on check 2."""
 
 
-def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str], ynn: str | None = None) -> None:
+def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str]) -> None:
     import json
     import os
 
@@ -1403,7 +1225,7 @@ def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str], ynn:
         with open(path, "a", encoding="utf-8") as log:
             log.write(json.dumps({"site": os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0],
                                   "label": label, "stage": stage, "verdict": verdict,
-                                  "narrow_leaves": narrow_leaves, "ynn": ynn}) + "\n")
+                                  "narrow_leaves": narrow_leaves}) + "\n")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1481,21 +1303,21 @@ def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn,
     return terms_fn, dict(also or {})
 
 
-def _recorded(label: str, drawn_for, references: int, arms, upto: int | None = None,
+def _recorded(label: str, drawn_for, references: int, upto: int | None = None,
               weighed: dict | None = None, offset: int = 0) -> bool:
     """A map task's draws (`record_units`): each of a site's `references` draws over its range, up to
-    `upto` where given, with its arms' YNNPACK mode (`_mode_of`) and, weighed, its classes' digest
+    `upto` where given, with, weighed, its classes' digest
     (`Conditioning.digest`), the seconds its weighing took beside its draws'. False where the process is
     no map task."""
     def payload(start, stop):
         draws = [drawn_for(index)(start, stop) for index in range(references)]
         held = (weighed or {}).get("of")
-        return {"draws": draws, "refused": _mode_of(arms), "heavy": None if held is None else held.digest()}
+        return {"draws": draws, "heavy": None if held is None else held.digest()}
     return record_units(label, payload, upto=upto, offset=offset,
                         phases=lambda: {"weighing": (weighed or {}).get("seconds", 0.0)})
 
 
-def _pooled_draws(label: str, references: int, arms):
+def _pooled_draws(label: str, references: int):
     """A judge's draws (`pooled_units`): `drawn_for(index)` over its map tasks' records of this site,
     `drawn(start, stop)` the pooled draws of those seeds, refused past the seeds the records hold from seed
     0 on; the site's arms take the mode the map tasks ran them in, which must be one. None where the
@@ -1504,19 +1326,9 @@ def _pooled_draws(label: str, references: int, arms):
     if pieces is None:
         return None
     held = pieces[-1][1]
-    modes = {payload["refused"] for _, _, payload in pieces}
-    if len(modes) > 1:
-        raise PoolRefused(f"{label}: the map tasks ran the arms in different modes: "
-                          f"{sorted(map(str, modes))}", held)
-    refused = modes.pop()
     if len({payload.get("heavy") for _, _, payload in pieces}) > 1:
         raise PoolRefused(f"{label}: the map tasks weighed by different classes (`Conditioning.digest`)",
                           held)
-    pairings = {arm.pairing for arm in _paired_arms(arms)}
-    for pairing in pairings:
-        pairing.decided, pairing.refused = True, refused
-    if pairings and refused is not None:
-        SWITCHED.append({"label": label, "refused": refused})
     pooled = [functools.reduce(_Draws.joined, (payload["draws"][index] for _, _, payload in pieces))
               for index in range(references)]
 
@@ -1553,8 +1365,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     output dtype it closes over). A draw may be an orbit's: the same values under an exact symmetry
     the seed picks. `seeds` is the site's declared count, sized by `seeds_for` so the reference
     compared with itself resolves PARITY, or, where the arms share their upstream rounding, so Dew
-    paired with the reference does. The gate compiles the two functions (`_arms`), once for every seed:
-    two Dew paths without YNNPACK's fusions, a Dew arm beside an arm run `as_given` with them.
+    paired with the reference does. The gate compiles the two functions (`_arms`), once for every seed,
+    as Dew's users compile them.
 
     Where a computation has an orbit of summation orders, `orders(inputs)` lists a draw's inputs at K
     of them, the draw itself first: an exact symmetry of the result (a batch's rows in another order
@@ -1589,9 +1401,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
 
     `also` names further references Dew is held to on the same draws, each judged by its own check 1
     as the reference is (its label `label`, against its name), Dew and the truth evaluated once a draw
-    for them all (`_drawn`): one Dew arm against several references, the truth as above. Each compiles
-    paired with Dew's arm (`_arms`), and a plain Dew arm,
-    whose compilation its pairing decides, takes references of one kind, plain or `as_given`.
+    for them all (`_drawn`): one Dew arm against several references, the truth as above, each compiled
+    as `_arms` compiles a reference.
 
     `examples` declares that every leaf's first axis stacks independent examples, each its own draw of the
     site's geometry: a leaf its pooled ratio leaves inconclusive is then judged by its examples' paired
@@ -1674,7 +1485,7 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
     terms_fn = _site_terms(terms_fn, terms, draw, truth_fn if truth_fn is not None else reference_fn,
                            truth_program)
     narrow_leaves: list[str] = []
-    compiled = _arms_with(dew_fn, reference_fn, list(also.values()), label)
+    compiled = _arms_with(dew_fn, reference_fn, list(also.values()))
     _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),
                        *also.values())
     dew_fn, reference_fn, further = compiled
@@ -1705,15 +1516,14 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
             return ranges[start, stop][index]
         return drawn
 
-    arms = [dew_fn, reference_fn, *([] if library_fn is None else [library_fn]), *further]
     # A map task of the site's draws, or their judge (DRAWS, POOL).
-    if _recorded(label, drawn_for, 1 + len(further), arms, upto, weighed, offset):
+    if _recorded(label, drawn_for, 1 + len(further), upto, weighed, offset):
         return
-    pooled = _pooled_draws(label, 1 + len(further), arms)
+    pooled = _pooled_draws(label, 1 + len(further))
     if pooled is not None:
         drawn_for = pooled
         narrow_leaves[:] = _narrow(drawn_for(0)(0, 1))
-    _verdicts(drawn_for, seeds, [label, *(f"{label}, against {name}" for name in also)], narrow_leaves, arms)
+    _verdicts(drawn_for, seeds, [label, *(f"{label}, against {name}" for name in also)], narrow_leaves)
 
 
 def _site_terms(terms_fn, terms, draw, truth, truth_program):
@@ -1734,20 +1544,20 @@ def _narrow(draws: _Draws) -> list[str]:
     return [name for name, width in zip(draws.names, draws.widths, strict=True) if width in NARROW_FACTORS]
 
 
-def _verdicts(drawn_for, seeds: int, labels: list[str], narrow_leaves: list[str], arms) -> None:
+def _verdicts(drawn_for, seeds: int, labels: list[str], narrow_leaves: list[str]) -> None:
     """Each reference's check 1 over its draws (`_staged`, `drawn_for(index)` the draws against reference
     `index`, judged under `labels[index]`), each logged (STAGES_LOG); a GateFailure where any leaf is
     over, else an Inconclusive where any is left unresolved."""
     overs, unresolveds = [], []
     for index, named in enumerate(labels):
         over, unresolved, stage = _staged(drawn_for(index), seeds, named)
-        _logged(named, stage, _verdict(over, unresolved), narrow_leaves, _mode_of(arms))
+        _logged(named, stage, _verdict(over, unresolved), narrow_leaves)
         overs += over
         unresolveds += unresolved
     if overs:
-        raise GateFailure(_with_mode(overs + unresolveds, arms))
+        raise GateFailure(overs + unresolveds)
     if unresolveds:
-        raise Inconclusive(_with_mode(unresolveds, arms))
+        raise Inconclusive(unresolveds)
 
 
 def _moved(draws: _Draws, stage: int) -> tuple[list[str], list[str], bool]:

@@ -21,7 +21,7 @@ import pytest
 import selection_margins
 from flax import linen as nn
 from model_support import largest_difference
-from reference_error import as_given, assert_as_exact, without_ynn
+from reference_error import as_given, assert_as_exact
 
 from dew.checkpoints import Checkpoints
 from dew.distributed.batches import shard_batch
@@ -271,7 +271,7 @@ def test_recomputed_pipeline_preserves_updates_and_sown_values(shape, scan):
 
     def placed(step):
         # Both arms are Dew's programs, each compiled once as the gate compiles two Dew arms (row 1801).
-        compiled = without_ynn(committed(step))
+        compiled = jax.jit(committed(step))
 
         @as_given
         def on_mesh(variables, state, tokens, key):

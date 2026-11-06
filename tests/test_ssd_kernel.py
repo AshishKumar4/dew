@@ -6,9 +6,8 @@ computes. The kernel is written for TPU (a GPU runs mamba_ssm's own kernels,
 `pallas_call(interpret=True)`, which checks shapes, dtypes, resets and state gradients. Check 1 holds
 every geometry's numbers on a TPU, compiled, and the host geometries' on the CPU lane too, interpreted.
 
-Interpreted, the kernel and XLA's scan are two Dew paths on the CPU, each compiled without
-XLA:CPU's YNNPACK fusions (`without_ynn`), whose microkernels follow the host's instruction set, so
-that the host geometries' verdicts do not.
+Interpreted, the kernel and XLA's scan are two Dew paths on the CPU, each compiled as Dew's users
+compile it.
 
 One driver (`assert_kernel_parity`) holds every case to the same rule: the
 kernel's forward, final state and all five gradients finite and, by
@@ -29,7 +28,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, with_gradients, without_ynn
+from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, with_gradients
 from ssd_support import ssd_orbit, stepwise_scan
 
 from dew.algebra.scan import RESET_DECAY
@@ -160,10 +159,10 @@ def evaluated(scan, operands, seeded):
 def parity_functions(chunk_size: int, roundings: int, platform: str = "tpu"):
     """The kernel's output, final state and all five gradients for `platform` (interpreted off it),
     XLA's, and XLA's independently checked float64 truth. The kernel and the scan, two Dew paths,
-    compile without YNNPACK fusions on the CPU lane (`without_ynn`)."""
-    mine = without_ynn(lambda operands, seeded: evaluated(
+    each compiled as Dew's users compile it."""
+    mine = jax.jit(lambda operands, seeded: evaluated(
         lambda *o: ssd_chunk_scan(*o, chunk_size, platform), operands, seeded))
-    xla = without_ynn(lambda operands, seeded: evaluated(
+    xla = jax.jit(lambda operands, seeded: evaluated(
         lambda *o: xla_chunk_scan(*o, chunk_size), operands, seeded))
     recurrence = jax.jit(lambda operands, seeded: evaluated(stepwise_scan, operands, seeded))
 

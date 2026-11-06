@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 from arm_arithmetic import float64_held
 from jax.sharding import NamedSharding, PartitionSpec as P
-from reference_error import as_given, assert_as_exact, without_ynn
+from reference_error import as_given, assert_as_exact
 
 from dew.diffusion.process import DenoisingCondition
 from dew.mesh import batch_axes
@@ -139,11 +139,11 @@ def pulled(model, call):
 def on_mesh(spec: MeshSpec, devices: int, model, variables, call, microbatches=None):
     """`pulled` on `spec`'s mesh over the first `devices` devices, the variables placed by the layout
     and the rows of the inputs and the cotangent over the batch's axes, with the pipeline's
-    microbatches in context as a trainer's step puts them there, compiled once (`without_ynn`)."""
+    microbatches in context as a trainer's step puts them there, compiled once."""
     mesh = spec.build(jax.devices()[:devices])
     placed = jax.device_put(variables, Layout(min_shard=TINY_SHARD).shardings(mesh, variables))
     rows = NamedSharding(mesh, P(batch_axes(mesh)))
-    compiled = without_ynn(pulled(model, call))
+    compiled = jax.jit(pulled(model, call))
 
     @as_given
     def run(inputs, cotangent):

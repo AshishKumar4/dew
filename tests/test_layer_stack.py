@@ -23,15 +23,7 @@ import selection_margins
 from arm_arithmetic import float64_held
 from flax import linen as nn
 from model_support import largest_difference, stepped_decode
-from reference_error import (
-    FEWEST_SEEDS,
-    GateFailure,
-    as_given,
-    assert_as_exact,
-    equations,
-    widened,
-    without_ynn,
-)
+from reference_error import FEWEST_SEEDS, GateFailure, as_given, assert_as_exact, equations, widened
 from sharded import assert_sharded
 from token_support import token_rows
 
@@ -264,8 +256,7 @@ class ScanCase:
 
     def measured(self, model, forward, trained):
         """The logits under `forward`, and the loss with its gradients under `trained` and the draw's
-        cotangent (as `with_gradients` gives them), compiled as both arms of a check between Dew's paths
-        are (`without_ynn`)."""
+        cotangent (as `with_gradients` gives them), compiled as the gate compiles an arm (`jax.jit`)."""
         def run(ids, cotangent):
             def loss(params):
                 logits = model.apply({**trained, "params": params}, ids)
@@ -275,7 +266,7 @@ class ScanCase:
             value, pull = jax.vjp(loss, trained["params"])
             gradients, = pull(cotangent)
             return {"logits": model.apply(forward, ids), "loss": value, "gradients": gradients}
-        return without_ynn(run)
+        return jax.jit(run)
 
     def arms(self):
         """The scanned stack's measured run and the plain loop's, and the plain loop's float64 truth."""
@@ -701,11 +692,10 @@ def layer_states(model, variables, ids):
 
 def layer_states_on(spec, model, variables, microbatches=None):
     """`layer_states` on `spec`'s mesh as a function of token rows, the weights and the rows placed as
-    a step places them, with the pipeline's schedule of `microbatches` in context, compiled once
-    (`without_ynn`)."""
+    a step places them, with the pipeline's schedule of `microbatches` in context, compiled once."""
     mesh = spec.build()
     placed = jax.device_put(variables, Layout(min_shard=TINY_SHARD).shardings(mesh, variables))
-    compiled = without_ynn(lambda tree, rows: layer_states(model, tree, rows))
+    compiled = jax.jit(lambda tree, rows: layer_states(model, tree, rows))
 
     @as_given
     def states(ids):
@@ -908,7 +898,7 @@ def test_a_scanned_glm5_next_computes_its_unrolled_forward():
 
 def fetched_layer_states():
     """The host-fetched (dew) and resident (reference) layer-state functions of one scanned model's
-    weights and its float64 truth, each arm compiled once (`without_ynn`)."""
+    weights and its float64 truth, each arm compiled once."""
     model = tiny(scan_layers=True, attention_impl="reference")
     variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
     assert any(count > 1 for _, count in model.bind(variables).groups)
@@ -916,7 +906,7 @@ def fetched_layer_states():
     layers = {name: jax.device_put(tree, host) for name, tree in variables["params"].items()
               if name.startswith("layers_")}
     on_host = {**variables, "params": {**variables["params"], **layers}}
-    compiled = without_ynn(lambda tree, ids: layer_states(model, tree, ids))
+    compiled = jax.jit(lambda tree, ids: layer_states(model, tree, ids))
     # Each arm runs the compiled program on its own weights, the host-resident ones kept in host memory.
     return (as_given(lambda ids: compiled(on_host, ids)), as_given(lambda ids: compiled(variables, ids)),
             float64_layer_states(model, variables))

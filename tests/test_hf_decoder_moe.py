@@ -28,7 +28,6 @@ from reference_error import (
     indexed_recording,
     recording,
     widened,
-    without_ynn,
 )
 from test_hf_decoders import (
     GEMMA4_MOE,
@@ -833,7 +832,7 @@ def test_deepseek_v4_cached_chunks_match_transformers():
     reference.eval()
     reference.set_attn_implementation('eager')
 
-    made, step = decode_steps(model, without_ynn)
+    made, step = decode_steps(model)
 
     @as_given
     def cached(ids):

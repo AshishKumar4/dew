@@ -19,7 +19,7 @@ import pytest
 from flax import linen as nn
 from generation_support import interpreted_projection
 from jax.sharding import NamedSharding, PartitionSpec as P
-from reference_error import as_given, assert_as_exact, with_gradients, without_ynn
+from reference_error import as_given, assert_as_exact, with_gradients
 from scipy.special import erfc
 from tuned import each_config, taken
 
@@ -650,9 +650,9 @@ def test_both_dispatches_carry_the_same_tangents(activation):
         return run
 
     def dispatched(dispatch):
-        """The bf16 layer's JVP under `dispatch` on the mesh, compiled as the gate compiles two Dew arms
-        (`without_ynn`) and run as given."""
-        compiled = without_ynn(jvp(model.clone(dispatch=dispatch)), out_shardings=(tokens, tokens))
+        """The bf16 layer's JVP under `dispatch` on the mesh, compiled as Dew's users compile
+        it and run as given."""
+        compiled = jax.jit(jvp(model.clone(dispatch=dispatch)), out_shardings=(tokens, tokens))
 
         @as_given
         def placed(*inputs):

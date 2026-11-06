@@ -22,7 +22,6 @@ from reference_error import (
     distance,
     indexed_recording,
     recording,
-    without_ynn,
 )
 
 from dew.sampling import DPMSolverSDE, sample
@@ -395,6 +394,6 @@ def test_the_brownian_walk_descends_every_level_as_levys_construction_unrolled()
         return construction
 
     for depth in (1, MAX_BROWNIAN_DEPTH):
-        assert_as_exact(without_ynn(walked(depth)), without_ynn(unrolled(depth)), draw,
+        assert_as_exact(jax.jit(walked(depth)), jax.jit(unrolled(depth)), draw,
                         f"the Brownian walk at depth {depth}", seeds=BROWNIAN_SEEDS,
                         truth_fn=jax.jit(unrolled(depth)))

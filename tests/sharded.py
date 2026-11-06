@@ -28,7 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 from arm_arithmetic import summed_as_run
 from jax.sharding import NamedSharding, PartitionSpec
-from reference_error import as_given, assert_as_exact, without_ynn
+from reference_error import as_given, assert_as_exact
 
 from dew.distributed.placement import parameter_axes
 from dew.telemetry.instrumentation import custom_call_kind, hlo_instructions
@@ -139,14 +139,14 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
     copy or transpose at a kernel call's edge (`boundary_copies`). `donate` names the arguments `fn`
     takes in place, as its callers donate them (a kernel that aliases its state into its output): a
     call that keeps them would make XLA copy each before the kernel overwrites it. Both arms are Dew's
-    programs, compiled here as the gate compiles two Dew arms (`without_ynn`) and run as given: the
+    programs, compiled here as Dew's users compile them and run as given: the
     split one is the executable whose collectives the contract reads. `arm`, when given, is the arm the
     split is compared with in place of `fn` on one device: a call whose rounding depends on the shapes it
     runs at is compared with the shapes its shards run. A caller passing `arm` also asserts the split
     against the reference path (check 1 against float64), so the comparison with `arm` alone is not the
     whole contract: `also`, `(label, arm)`, is that second arm, compared with the same split runs (each
     draw's split run once, `assert_as_exact`'s further references)."""
-    run = without_ynn(fn, donate_argnums=donate)
+    run = jax.jit(fn, donate_argnums=donate)
     compiled = split_executable(run, draw(0), specs, mesh)
     text = compiled.as_text()
     moved = [(op, shapes) for op, shapes in collectives(text) if op in MOVES and op not in moves]

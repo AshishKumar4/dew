@@ -6,7 +6,6 @@ import numpy as np
 import pytest
 from arm_arithmetic import summed_as_run
 from jax.sharding import AxisType, PartitionSpec
-from reference_error import without_ynn
 from sharded import placed_on, split_executable
 
 from dew.nn import precision
@@ -19,7 +18,7 @@ def test_the_split_executable_runs_each_shard_as_the_gate_runs_its_arms():
     `summed_as_run`), as the one-device arm traced in that scope does, not as the suite's wide CPU
     arithmetic would have, frozen into an executable compiled outside it (ledger 4393): each shard's rows
     are bit for bit one device's product over those rows in the scope, each compiled as the gate compiles
-    a Dew arm (`without_ynn`), and that product differs from the
+    a Dew arm (`jax.jit`), and that product differs from the
     wide sum, which this case tells apart."""
     mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Auto,), devices=jax.devices()[:2])
     rng = np.random.default_rng(0x4393)
@@ -30,7 +29,7 @@ def test_the_split_executable_runs_each_shard_as_the_gate_runs_its_arms():
     def product(x, w):
         return precision.accumulated(jnp.dot, x, w)
 
-    run = without_ynn(product)
+    run = jax.jit(product)
     compiled = split_executable(run, (x, w), specs, mesh)
     with jax.set_mesh(mesh):
         split = np.asarray(compiled(*placed_on((x, w), specs, mesh)))

@@ -16,7 +16,7 @@ import pytest
 from decision_support import decision_rows
 from model_support import flat_tree
 from recording import RecordingTracker
-from reference_error import as_given, assert_as_exact, widened, without_ynn
+from reference_error import as_given, assert_as_exact, widened
 
 from dew.batch import FROZEN, thaw
 from dew.data.dataset import DataPartition
@@ -84,15 +84,14 @@ def in_float64(task: Decide) -> Decide:
 
 
 COMPILED = {}
-"""Each model's forward (`DecisionModel.logits`), compiled once without YNNPACK's fusions
-(`without_ynn`): the numerical checks here compare two Dew programs."""
+"""Each model's forward (`DecisionModel.logits`), compiled once."""
 
 
 def scored(task: Decide, asked: Sequence[tuple[str, str | None]], images=()) -> np.ndarray:
     """The real options' logits of `asked`'s requests, each a state and a context, laid out by `task`
     and collated into one pass (each request's images beside it where given, one request a pass),
     through its model compiled without YNNPACK's fusions."""
-    forward = COMPILED.setdefault(id(task.model), without_ynn(task.model.logits))
+    forward = COMPILED.setdefault(id(task.model), jax.jit(task.model.logits))
     if images:
         [(state, context)] = asked
         assert task.processor is not None and task.layout.images
@@ -222,7 +221,7 @@ def packed_arms(packed: DecisionObjective, alone: DecisionObjective, rows):
 
     def scored(objective, batches, variables) -> dict[str, np.ndarray]:
         """Each row's real options' logits, keyed by its tokens' text."""
-        forward = COMPILED.setdefault((id(objective.model), "packed"), without_ynn(
+        forward = COMPILED.setdefault((id(objective.model), "packed"), jax.jit(
             lambda variables, inputs: objective.model.logits(variables, inputs)))
         logits = {}
         for batch in batches:

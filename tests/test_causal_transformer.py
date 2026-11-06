@@ -35,7 +35,6 @@ from reference_error import (
     torch_with_gradients,
     widened,
     with_gradients,
-    without_ynn,
 )
 
 from dew.batch import coordinates
@@ -215,7 +214,7 @@ def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
         assert jax.tree.structure(jax.jit(forward_and_gradient(model))(params, held["ids"])) == \
             jax.tree.structure(before.call(params, held["ids"]))
     # The two arms are two Dew programs, compiled alike (testing.md: both without YNNPACK's fusions).
-    current, exported = without_ynn(forward_and_gradient(model)), without_ynn(before.call)
+    current, exported = jax.jit(forward_and_gradient(model)), jax.jit(before.call)
 
     def draw(seed):
         ids = np.random.default_rng([0x0D, seed]).integers(0, 17, held["ids"].shape)

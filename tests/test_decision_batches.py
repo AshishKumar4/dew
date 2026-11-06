@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from PIL import Image
-from reference_error import as_given, assert_as_exact, widened, without_ynn
+from reference_error import as_given, assert_as_exact, widened
 
 from dew.decision import Decide
 from dew.decision.images import Images
@@ -101,7 +101,7 @@ def test_a_batchs_probabilities_are_each_bodys_alone(decide):
         bodies = bodies_of(seed)
         asked = [(body["state"], {name: Question.from_wire(wire)
                                   for name, wire in body["questions"].items()}) for body in bodies]
-        forward = forwards.setdefault(id(task.model), without_ynn(task.model.logits))
+        forward = forwards.setdefault(id(task.model), jax.jit(task.model.logits))
         passes = [[row for own in task.rows(asked) for row in own]] if together else task.rows(asked)
         found = []
         for rows in passes:
@@ -261,7 +261,7 @@ def test_two_requests_of_alike_images_join_one_pass_each_scored_as_alone(tmp_pat
         """One pass over `rows` of images (`Images.joined`), its model compiled without YNNPACK's fusions:
         both arms are Dew's."""
         decide = reading.decide
-        forward = forwards.setdefault(id(decide.model), without_ynn(decide.model.logits))
+        forward = forwards.setdefault(id(decide.model), jax.jit(decide.model.logits))
         encoded = [row.encoded for row in rows]
         inputs = DecisionInputs.collate(encoded, decide.specials.pad)
         scores = np.asarray(forward(held, inputs, media=Images.joined(

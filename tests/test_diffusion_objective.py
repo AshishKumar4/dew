@@ -322,7 +322,7 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
     rows, images and prompts, its weights moved from the fixture's, and its step's key, which draws
     the times, the noise and the dropped rows. The two routes are two programs, which round
     otherwise."""
-    from reference_error import as_given, assert_as_exact, widened, without_ynn
+    from reference_error import as_given, assert_as_exact, widened
 
     source, variables, _, step = conditional_mmdit
     dropped = DiffusionObjective(source.model, source.process, source.inputs,
@@ -375,9 +375,8 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
     def through(objective, values, rows, at):
         return jax.value_and_grad(lambda values: objective.scalar_loss(values, rows, at)[0])(values)
 
-    # Both arms are Dew's, so both compile without YNNPACK's fusions (`without_ynn`).
-    through_dropped = without_ynn(lambda values, rows, at: through(dropped, values, rows, at))
-    through_explicit = without_ynn(lambda values, rows, at: through(conditional, values, rows, at))
+    through_dropped = jax.jit(lambda values, rows, at: through(dropped, values, rows, at))
+    through_explicit = jax.jit(lambda values, rows, at: through(conditional, values, rows, at))
 
     def dew(values, rows, seed):
         return trained(through_dropped(values, rows, stepped(seed)))

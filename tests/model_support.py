@@ -63,10 +63,9 @@ def with_logit_cotangent(draw, vocab: int, salt: int):
 
 
 @functools.cache
-def decode_steps(model, compiled=jax.jit):
-    """`model`'s decode cache made for a count of rows, and its decode step from a cache, each one
-    program `compiled` compiles (`jax.jit`, or the gate's `without_ynn` for a check between two Dew
-    arms): `made(variables, rows)` the cache, `step(variables, cache, ids)` the logits and the cache
+def decode_steps(model):
+    """`model`'s decode cache made for a count of rows, and its decode step from a cache, each one program
+    (`jax.jit`): `made(variables, rows)` the cache, `step(variables, cache, ids)` the logits and the cache
     after them."""
     def made(variables, rows):
         _, made = model.apply(variables, rows, method=CausalTransformer.init_cache, mutable=['cache'])
@@ -75,7 +74,7 @@ def decode_steps(model, compiled=jax.jit):
     def step(variables, cache, ids):
         logits, mutated = model.apply({**variables, 'cache': cache}, ids, decode=True, mutable=['cache'])
         return logits, mutated['cache']
-    return compiled(made, static_argnums=1), compiled(step)
+    return jax.jit(made, static_argnums=1), jax.jit(step)
 
 
 def decode_logits(model, params, prompt, rest, steps=None, *, prefilled: bool = False):

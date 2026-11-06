@@ -22,7 +22,6 @@ from reference_error import (
     recording,
     widened,
     with_gradients,
-    without_ynn,
 )
 from sharded import assert_runs_per_shard
 from ssd_support import mamba_ssd_draw, mamba_ssd_operands, mamba_ssd_xla, ssd_value_and_grad
@@ -259,7 +258,7 @@ def test_a_mamba2_layer_on_the_port_matches_it_on_xla(dtype):
         def run(params, x, cotangent):
             with row_names_port(port=port):
                 return forward(layer)(params, x, cotangent)
-        return without_ynn(run)
+        return jax.jit(run)
 
     ported, xla = on(port=True), on(port=False)
 

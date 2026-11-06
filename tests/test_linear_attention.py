@@ -38,7 +38,7 @@ import pytest
 from delta_rule_support import fused_step, recurrence, through
 from flax import linen as nn
 from model_support import as_stepped, decode_through, float64_twin
-from reference_error import as_given, assert_as_exact, widened, without_ynn
+from reference_error import as_given, assert_as_exact, widened
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
@@ -527,9 +527,9 @@ def test_a_bf16_layer_decodes_its_state_in_bf16_on_par_with_its_prefill(referenc
     draw = decoded_draw(recorded)
 
     def at_default(run):
-        """`run` compiled as the gate compiles two Dew arms (`without_ynn`) at the default matmul
+        """`run` compiled as Dew's users compile it, at the default matmul
         precision, as a bf16 layer's users run it, and run as given."""
-        compiled = without_ynn(run)
+        compiled = jax.jit(run)
 
         @as_given
         def ran(hidden):
