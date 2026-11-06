@@ -12,7 +12,7 @@ import signal
 import subprocess
 from collections.abc import Mapping, Sequence
 
-from dew.clusters import COORDINATOR, ClusterEnvironment
+from dew.clusters import COORDINATOR, ClusterEnvironment, Scheduler
 
 _log = logging.getLogger(__name__)
 
@@ -28,8 +28,8 @@ def joins_pool(multi_host: bool | None, environment: ClusterEnvironment | None) 
     (multi_host=True), or the environment declares one (a scheduler's `environment`, `dew launch`'s among
     them, or a coordinator). A Slurm step of one task forms none unless the run asks, nor any run asking
     for none."""
-    one_task = (multi_host is None and environment is not None and environment.name == "slurm"
-                and environment.joining().process_count == 1)
+    one_task = (multi_host is None and isinstance(environment, Scheduler) and environment.name == "slurm"
+                and environment.place().process_count == 1)
     if multi_host is False or one_task:
         return False
     return multi_host is True or environment is not None or COORDINATOR in os.environ

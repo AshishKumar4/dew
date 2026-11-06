@@ -41,13 +41,13 @@ class MyScheduler:
 
     def joining(self) -> Joining:
         return Joining(os.environ["MY_COORDINATOR"], int(os.environ["MY_WORLD_SIZE"]),
-                       int(os.environ["MY_RANK"]), fills=False)
+                       int(os.environ["MY_RANK"]), detection="deactivate")
 
 
 prepare_process(cluster=MyScheduler())
 ```
 
-`fills=False` says the environment states the pool whole, so JAX detects nothing more. Leave it at its default, and leave a field None, where JAX's own detection of the same scheduler fills it, as the built-in Slurm and Open MPI environments leave the coordinator's address to JAX.
+`detection="deactivate"` says the environment states the pool whole, so JAX detects nothing more. A scheduler JAX detects itself is named there instead (`"slurm"`, `"ompi"`, `"gcetpu"`, `"gketpu"`), and JAX fills every field left None, as the built-in environments leave every fact to JAX.
 
 ## dew launch
 

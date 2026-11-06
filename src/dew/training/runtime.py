@@ -36,7 +36,7 @@ from dew._devices import (
 )
 from dew._logging import configure as configure_logging
 from dew._pool import PREEMPTED_EXIT, joins_pool, refuse_idle_gpus, runs_on_gpu, slurm_tasks_here
-from dew.clusters import ClusterEnvironment, Joining, detected_environment
+from dew.clusters import ClusterEnvironment, Joining, Scheduler, detected_environment
 
 _log = logging.getLogger(__name__)
 
@@ -187,12 +187,12 @@ def _raise_limits() -> None:
 def _join_process_pool(environment: ClusterEnvironment | None, joins: bool) -> None:
     """Join the JAX process pool `environment` describes, where the process `joins` one.
 
-    The environment states its scheduler's facts and leaves the rest to JAX's
-    own detection of it (`dew.clusters.Joining`): a Slurm step's or an Open
-    MPI run's coordinator, a Cloud TPU's whole place. `dew launch` states its
-    pool whole, and JAX's detection is turned off for it: the launcher placed
-    its processes, and a Slurm step around it would otherwise pin each to the
-    GPU at SLURM_LOCALID. A process that joins none (no scheduler, no
+    A scheduler JAX detects joins by JAX's detection of it, named
+    (`dew.clusters.Joining.detection`), which derives every fact JAX's way;
+    an environment of the user's own states what it knows. `dew launch`
+    states its pool whole, and JAX's detection is turned off for it: the
+    launcher placed its processes, and a Slurm step around it would otherwise
+    pin each to the GPU at SLURM_LOCALID. A process that joins none (no scheduler, no
     coordinator a launcher set) runs alone without asking JAX; every failure
     to join a pool propagates, since a pod run would otherwise continue on
     one host. A Slurm step of one task forms no pool unless the run asks for
@@ -202,23 +202,22 @@ def _join_process_pool(environment: ClusterEnvironment | None, joins: bool) -> N
     node than the GPUs its task sees is refused: JAX gives each task the GPU
     at its SLURM_LOCALID, and the others would sit idle.
     """
-    joining = None if environment is None else environment.joining()
+    place = environment.place() if isinstance(environment, Scheduler) else None
     tasks = slurm_tasks_here()
-    if (environment is not None and environment.name == "slurm" and joining is not None
-            and (joining.process_count or 0) > 1 and tasks is not None and runs_on_gpu(os.environ)):
+    if (place is not None and environment is not None and environment.name == "slurm"
+            and (place.process_count or 0) > 1 and tasks is not None and runs_on_gpu(os.environ)):
         # Before joining: a pool whose ranks see GPUs they will not use
         # trains on fewer than it was given, and nothing reports it.
         gpus = communicators.local_gpus()
         refuse_idle_gpus(tasks, None if gpus is None else len(gpus), "this slurm step")
     if not joins:
         return
-    joining = joining or Joining()
+    joining = Joining() if environment is None else environment.joining()
     jax.distributed.initialize(
         coordinator_address=joining.coordinator_address, num_processes=joining.process_count,
         process_id=joining.process_id,
         local_device_ids=None if joining.local_device_ids is None else list(joining.local_device_ids),
-        # JAX's detection fills what the environment leaves None, or detects nothing where it states all.
-        cluster_detection_method=None if joining.fills else "deactivate")
+        cluster_detection_method=joining.detection)
     _joined()
 
 

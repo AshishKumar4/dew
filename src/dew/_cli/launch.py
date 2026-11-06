@@ -49,7 +49,7 @@ from dew._pool import (
     slurm_tasks_here,
     visible_gpus,
 )
-from dew.clusters import LOCAL_DEVICES, SCHEDULERS, ClusterEnvironment, Launched, detected_environment
+from dew.clusters import LOCAL_DEVICES, SCHEDULERS, Launched, Scheduler, detected_environment
 
 VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 """What an `--env` name may be: it lands unquoted in the remote shell line."""
@@ -185,9 +185,11 @@ class Launch:
             raise ValueError(f"{self.hostfile} names no hosts")
         if hosts:
             return self.start(self.pool(hosts))
-        # The schedulers alone: a pool this launcher declares it starts again (`Launched`).
+        # The schedulers alone: a pool this launcher declares it starts again (`Launched`). One whose size
+        # it cannot tell without JAX (a Kubernetes Job's, which JAX reads off its API) runs in place, as
+        # JAX places each of its processes.
         cluster = detected_environment(SCHEDULERS)
-        count = None if cluster is None else cluster.joining().process_count
+        count = None if cluster is None else cluster.place().process_count
         if cluster is not None and (count is None or count > 1):
             return self.in_place(cluster)
         if cluster is None and "SLURM_JOB_ID" in os.environ:
@@ -204,7 +206,7 @@ class Launch:
             ("--devices-per-process", self.devices_per_process),
             ("--port", self.port), ("--coordinator", self.coordinator)) if value is not None]
 
-    def in_place(self, cluster: ClusterEnvironment) -> int:
+    def in_place(self, cluster: Scheduler) -> int:
         """Run the program as this process: whatever started it on every
         node already set what jax reads. A Slurm step with fewer tasks on
         this node than the GPUs its task sees is refused, as srun is."""
@@ -215,12 +217,12 @@ class Launch:
         tasks = slurm_tasks_here()
         if cluster.name == "slurm" and tasks is not None and runs_on_gpu(os.environ):
             refuse_idle_gpus(tasks, local_gpu_count(), "this slurm step")
-        place = cluster.joining()
+        place = cluster.place()
         process = "a process" if place.process_id is None else f"process {place.process_id}"
         of = "" if place.process_count is None else f" of {place.process_count}"
         emit(f"{cluster.name}: {process}{of}, placed by the cluster; running {shlex.join(self.command)}")
-        if cluster.name == "tpu" and place.process_id in (None, 0) and place.process_count != 1:
-            emit("every worker has to run it; `dew launch --tpu NAME` starts them all")
+        if cluster.name == "tpu" and place.process_id == 0 and (place.process_count or 0) > 1:
+            emit(f"every worker has to run it; `dew launch --tpu NAME` starts all {place.process_count}")
         return self.execute(self.command)
 
     def srun(self) -> int:
