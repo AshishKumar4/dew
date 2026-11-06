@@ -555,7 +555,7 @@
      "runs": "fetched"
     }
    ],
-   "note": "Executes fetched official networks_edm2 with pickling/constructor stubs and float64-retargeted casts: unet.npz in eval mode, train.npz in train mode under torch's SGD (--train)."
+   "note": "Executes fetched official networks_edm2 with pickling/constructor stubs and float64-retargeted casts over seeded draws of its weights and inputs (seeds.npz, `draw`; layout.json the state's names and shapes): the output in eval mode, and train mode under torch's SGD."
   },
   "edm_loss": {
    "tool": "tools/edm_loss_reference.py",
