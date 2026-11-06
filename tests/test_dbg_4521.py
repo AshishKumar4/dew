@@ -17,6 +17,9 @@ def test_diagnostic():
     packed, alone = in_streams(LETTERED, segments=3), in_streams(LETTERED, segments=1)
     dew, reference, draw, truth = context.packed_arms(packed, alone, examples(LETTERED))
     variables = draw(0)
+    print("DRAWS", {seed: all(np.array_equal(a, b) for a, b in
+          zip(jax.tree.leaves(variables), jax.tree.leaves(draw(seed)), strict=True))
+          for seed in (1, 7, 39)}, flush=True)
     original = context.without_ynn
     outputs = {}
     for mode in os.environ.get("DBG_MODES", "off,on").split(","):
@@ -24,21 +27,30 @@ def test_diagnostic():
         seen = set()
 
         def compile(fn, **options):
+            objective = fn.__closure__[0].cell_contents
+            arm_name = "packed" if objective is packed else "alone" if objective is alone else "truth"
             compiler_options = {"xla_cpu_experimental_ynn_fusion_type": ""} if mode == "off" else {}
             if mode.startswith("fusion:"):
                 compiler_options = {"xla_cpu_experimental_ynn_fusion_type": mode.split(":", 1)[1]}
             compiled = jax.jit(fn, compiler_options=compiler_options, **options)
 
             def run(*args):
-                identity = tuple((tuple(x.shape), str(x.dtype)) for x in jax.tree.leaves(args))
+                identity = (arm_name, tuple((tuple(x.shape), str(x.dtype)) for x in jax.tree.leaves(args)))
                 if identity not in seen:
                     seen.add(identity)
                     hlo = compiled.lower(*args).compile().as_text()
                     lines = [line for line in hlo.splitlines() if 'kind=kCustom' in line]
-                    short = [re.sub(r', metadata=.*', '', line.strip()) for line in lines]
-                    if os.environ.get("DBG_HLO"):
-                        print("HLO", mode, [x.shape for x in jax.tree.leaves(args[1])],
-                              json.dumps(short)[:6000], flush=True)
+                    dots = collections.Counter(
+                        re.sub(r"dot\(.*?\)", "dot(operands)", line.strip().split(", metadata=")[0]
+                               .split(" = ")[1])
+                        for line in hlo.splitlines() if re.search(r" = f\d+\[.*\] dot\(", line))
+                    operations = collections.Counter(
+                        re.search(r'op_name="([^"]+)"', line).group(1).split("/")[-1]
+                        if 'op_name="' in line else "unnamed-dot" for line in lines)
+                    if os.environ.get("DBG_HLO") and arm_name != "truth":
+                        print("HLO", mode, arm_name, json.dumps({
+                            "inputs": [str(x.shape) for x in jax.tree.leaves(args[1])],
+                            "fusions": dict(operations), "dots": dict(dots)}), flush=True)
                 return compiled(*args)
             return run
 
