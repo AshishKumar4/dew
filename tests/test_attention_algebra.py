@@ -27,6 +27,7 @@ from test_attention_triton import (
     score_hooks,
 )
 
+from dew.algebra import forms
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
@@ -216,6 +217,23 @@ def test_a_plain_call_of_no_keys_reads_its_initial_state_or_zero_in_both_mainloo
                              jnp.full((1, 2, 3, 32), 3.0))
     for out in forwards(query, empty, empty, spans, template.Hooks(initial=state)):
         np.testing.assert_array_equal(np.asarray(out), 1.5)
+
+
+@pytest.mark.parametrize("derived", [False, True], ids=["hand", "derived"])
+def test_a_state_at_fp32s_least_maximum_keeps_its_mass(derived):
+    """A state whose maximum is fp32's least, a real one (a hook's mask by fp32's least, as transformers'
+    are), merged with a state of no keys keeps its own output and its finished rows its maximum, in both
+    forms of the merge: a row of no keys is one of no denominator, never one at fp32's least (row 4486)."""
+    least = float(np.finfo(np.float32).min)
+    spec = algebra.Forward("spans", 64, ids=False, scale=0.125)
+    real = algebra.Partial(jnp.full((4, 8), 3.0), jnp.full((4,), least), jnp.full((4,), 2.0))
+    with forms.derived(derived):
+        merged = algebra.merge(spec, algebra.empty(4, 8), real)
+        out, _, total = algebra.finish(spec, merged, initial=True)
+        rows = algebra.finished_rows(spec, real)
+    np.testing.assert_array_equal(np.asarray(out), 1.5)
+    np.testing.assert_array_equal(np.asarray(total), 2.0)
+    np.testing.assert_array_equal(np.asarray(rows[0]), spec.naturalized(jnp.full((4,), least)))
 
 
 @pytest.mark.parametrize("form", ["full", "causal"])
