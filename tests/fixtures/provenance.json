@@ -2473,14 +2473,20 @@
      "repo": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD",
      "version": "6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8",
      "runs": "fetched"
-    },
-    {
-     "repo": "pytorch/audio",
-     "version": "2.11.0",
-     "runs": "torchaudio"
     }
    ],
-   "note": "AudioTokenizerEncoder's pooled features and codes (tokenize_audio_batch, in one batch and in batches bounded at 30 frames) and MiMoAudioEncoder's embeddings, fp32 and float64 (model.npz); torchaudio's MelSpectrogram at MiMo-Audio-Tokenizer's mel_spectrogram settings, fp32 and float64 (mel.npz)."
+   "note": "AudioTokenizerEncoder's pooled features and codes (tokenize_audio_batch, in one batch and in batches bounded at 30 frames) and MiMoAudioEncoder's embeddings, fp32 and float64 (model.npz)."
+  },
+  "hf/mimo-audio-tiny/mel.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "pytorch/audio",
+     "revision": "2.11.0",
+     "runs": "torchaudio.transforms.MelSpectrogram"
+    }
+   ],
+   "note": "torchaudio's MelSpectrogram at MiMo-Audio-Tokenizer's mel_spectrogram settings, its log floored at 1e-7, run by tools/torchaudio_mel_worker.py mimo-mel on the CPU (torch and torchaudio 2.11.0+cpu, the filters and window built in the dtype computed in) over each seed's drawn half second of waveform, in float32 and float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
   },
   "hf/mimo-vision-tiny": {
    "tool": "tools/mimo_reference.py",
