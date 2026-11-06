@@ -755,10 +755,11 @@ def test_the_step_gated_hook_over_packed_documents_is_as_exact_as_the_recurrence
 
 
 @pytest.mark.parametrize('hooks', [FORMED[4], FORMED[5]], ids=['scan', 'with its output norm'])
-@pytest.mark.check1_shards(seeds=64, per_task=32)
+@pytest.mark.check1_shards(seeds=64, per_task=16)
 def test_the_rated_hook_over_packed_documents_is_as_exact_as_the_recurrence_interpreted(hooks):
     """`every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token` at the rated scan,
-    and with its output norm, over packed documents (`LONG_HOOK_CELLS`)."""
+    and with its output norm, over packed documents (`LONG_HOOK_CELLS`), sixteen draws a task: 32 took 192 to
+    235 s a task for the two (jsf-slow5 at c8f5a12e7)."""
     every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(hooks, packed=True)
 
 
