@@ -932,7 +932,8 @@ class _Program[T: (Tiles, BackwardTiles)]:
     def _positions(self, first, spans: _Spans, row) -> list[tuple[jax.Array, jax.Array, jax.Array]]:
         """The positions a query block from `first` holds rows of, in a call whose intervals each hold
         `per_span` queries (`KeySpans.per_span`): each one's index, its interval `[start, end)` (batch row
-        `row`'s, read once) and whether the block holds its rows; as many as the block can hold, statically."""
+        `row`'s, read once) and whether the block holds its rows; as many as the block can hold,
+        statically."""
         positions = spans.start.shape[1]
         held = min(positions, self.tiles.block_q // self.per_span + 1)
         at = lax.div(first, self.per_span)
