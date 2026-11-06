@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping, Sequence
-from functools import cached_property
+import functools
+from collections.abc import Iterable, Mapping, Sequence
 
 import grain.python as grain
 import numpy as np
@@ -98,23 +98,45 @@ class Concatenate(Dataset):
         measured = [length for length in lengths if length is not None]
         return np.concatenate(measured) if len(measured) == len(lengths) else None
 
-    @cached_property
-    def _manifests(self) -> tuple[ShardManifest, ...]:
-        return tuple(source.manifest() for source in self.sources)
+    def manifest(self, version: int) -> ShardManifest:
+        """Each store's shards at `version`, one store after another: their index order where each
+        store's is, as `records` joins them; their rows counted (`ShardManifest.sized`) where every
+        store's are stated or counted."""
+        manifests = tuple(source.manifest(version) for source in self.sources)
+        ordered = all(manifest.index_ordered for manifest in manifests)
+        countable = any(manifest.counted is not None for manifest in manifests) and all(
+            manifest.counted is not None or all(shard.rows is not None for shard in manifest.shards)
+            for manifest in manifests)
+        divisible = any(manifest.subdivide is not None for manifest in manifests)
+        return ShardManifest(_joined(manifest.shards for manifest in manifests),
+                             functools.partial(_read_joined, manifests), index_ordered=ordered,
+                             subdivide=functools.partial(_subdivided, manifests) if divisible else None,
+                             counted=functools.partial(_counted, manifests) if countable else None)
 
-    @cached_property
-    def _shards(self) -> Mapping[str, tuple[ShardManifest, Shard]]:
-        return {f"{index}/{shard.id}": (manifest, shard)
-                for index, manifest in enumerate(self._manifests) for shard in manifest.shards}
 
-    def manifest(self) -> ShardManifest:
-        """Each store's shards, one store after another: their index order where each store's is,
-        as `records` joins them."""
-        ordered = all(manifest.index_ordered for manifest in self._manifests)
-        return ShardManifest(tuple(dataclasses.replace(shard, id=identifier)
-                                   for identifier, (_, shard) in self._shards.items()), self._reader,
-                             index_ordered=ordered)
+def _joined(shards: Iterable[Iterable[Shard]]) -> tuple[Shard, ...]:
+    """The shards of a concatenation's stores, one store's after another, each named by its store's
+    place among them and its own name in it, which `_read_joined` reads it by."""
+    return tuple(dataclasses.replace(shard, id=f"{index}/{shard.id}")
+                 for index, held in enumerate(shards) for shard in held)
 
-    def _reader(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
-        manifest, original = self._shards[shard.id]
-        return manifest.reader(original, options)
+
+def _read_joined(manifests: Sequence[ShardManifest], shard: Shard,
+                 options: grain.ReadOptions | None = None) -> grain.IterDataset:
+    """Shard `shard` of a concatenation, its store's own or a part of one (`_subdivided`), read by its
+    store's reader as the store names it."""
+    index, _, own = shard.id.partition("/")
+    return manifests[int(index)].reader(dataclasses.replace(shard, id=own), options)
+
+
+def _subdivided(manifests: Sequence[ShardManifest], count: int) -> tuple[Shard, ...]:
+    """A concatenation's shards for `count` readers and workers: each store's parts for them where it
+    cuts its own (`ShardManifest.subdivide`), its shards where it cuts none, one store's after another."""
+    return _joined(manifest.shards if manifest.subdivide is None or len(manifest.shards) >= count
+                   else manifest.subdivide(count) for manifest in manifests)
+
+
+def _counted(manifests: Sequence[ShardManifest], reads: int) -> tuple[int, ...]:
+    """The rows of each shard of the stores `manifests` name, one store after another, each store's as it
+    counts them, `reads` at once (`ShardManifest.sized`)."""
+    return tuple(int(shard.rows or 0) for manifest in manifests for shard in manifest.sized(reads).shards)

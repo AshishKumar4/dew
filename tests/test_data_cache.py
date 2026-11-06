@@ -20,9 +20,12 @@ from storage_support import moto_bucket
 
 from dew.data.cache import Abandoned, Cache
 from dew.data.pipeline import Rejected
-from dew.data.plan import Manifest, StepIdentity
+from dew.data.plan import PLAN_VERSIONS, Manifest, StepIdentity
 from dew.data.sources import Memory
 from dew.data.storage import Store
+
+LATEST = PLAN_VERSIONS[-1]
+"""The data plan version a new run reads by, whose shards a manifest here names."""
 
 
 def _key(source: object = "memory", *, revision: str = "test", clean: bool = True,
@@ -351,7 +354,7 @@ def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
 def test_stream_completions_use_physical_shards_and_resume_without_rekeying():
     source = Memory([{"id": index} for index in range(8)], shard_rows=2)
     cache, key = _cache(), _key()
-    manifest = source.manifest()
+    manifest = source.manifest(LATEST)
     reader = cache.streamed(manifest.reader, key)
     for shard in reversed(manifest.shards):
         iterator = iter(reader(shard))
@@ -1492,7 +1495,7 @@ def test_an_optional_streamed_fill_with_no_room_stops_once_for_its_key(tmp_path,
         source = Memory([{"id": index} for index in range(records)], shard_rows=1)
         budgets = {"spool_bytes": 1, "keep_local_bytes": 1} if full == "spool" else {"evicts": False}
         cache = Cache(str(tmp_path / str(records)), shard_bytes=1, optional=True, **budgets)
-        manifest = source.manifest()
+        manifest = source.manifest(LATEST)
         reader = cache.streamed(manifest.reader, _key(f"halted-{uuid4().hex}"), source=source)
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="dew.data.cache"):
@@ -1512,7 +1515,7 @@ def test_a_stream_into_a_root_with_room_for_one_shard_seals_it_and_writes_no_mor
 
     source = Memory([{"id": index} for index in range(4)], shard_rows=1)
     cache = Cache(str(tmp_path), keep_local_bytes=250_000, shard_bytes=1, optional=True, evicts=False)
-    manifest = source.manifest()
+    manifest = source.manifest(LATEST)
     reader = cache.streamed(manifest.reader, _key(f"one-shard-{uuid4().hex}"), source=source)
     with caplog.at_level(logging.WARNING, logger="dew.data.cache"):
         rows = [row for shard in manifest.shards for row in reader(shard)]
@@ -1994,7 +1997,7 @@ def test_a_worker_reads_a_part_of_a_generation_without_its_store():
     generation = publish(_tagged(Pipeline(source)), _cache(), read="memory")
     trained, _ = Pipeline(source).holdout(0.25)
     part = _promoted(_tagged(trained).cache(generation)).source
-    assert len(pickle.dumps(part.manifest().reader)) * 100 < len(pickle.dumps(source))
+    assert len(pickle.dumps(part.manifest(LATEST).reader)) * 100 < len(pickle.dumps(source))
 
 
 @pytest.mark.parametrize("store", ["grain", "arrow"])

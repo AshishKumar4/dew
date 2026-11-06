@@ -61,7 +61,7 @@ from dew.data.pipeline import (
     Windows,
     accounts,
 )
-from dew.data.plan import fingerprint
+from dew.data.plan import PLAN_VERSIONS, fingerprint
 from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _uncounted
 from dew.data.steps.text import CountRule, CountTargets, LayoutRule, ValidTargets, counted_window
 
@@ -123,7 +123,7 @@ class _Memory(View[Source]):
                                minlength=len(sizes))
         return tuple(int(size) for size in selected), remote
 
-    def manifest(self) -> ShardManifest:
+    def manifest(self, version: int) -> ShardManifest:
         raise ValueError("materialized records are read by index")
 
 
@@ -162,7 +162,8 @@ def _memory_inputs(
         # by input, as no map expands one (`dew.data.compile._automatic`).
         stage = pipeline.stages[artifact_at]
         automatic = isinstance(stage, Artifact) and stage.automatic
-        filled, manifest, prefix = _fill(pipeline, source, artifact_at, "memory")
+        # A memory read's fill keys its rows by place, which no plan version decides.
+        filled, manifest, prefix = _fill(pipeline, source, artifact_at, "memory", PLAN_VERSIONS[-1])
         cached = filled.mapped(_cache_inputs(source, stored), manifest, transform=prefix, source=source)
         try:
             if prefix.threads is None:
