@@ -21,7 +21,6 @@ from reference_error import (
     widened,
 )
 
-from dew.algebra import forms as algebra_forms
 from dew.nn.kernels import generation, recurrence, recurrence_algebra as algebra, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.precision import float32_einsum, l2norm
@@ -86,9 +85,11 @@ def chunk_on(kernel: str, hooks, *args, **kwargs):
     """`chunk` on `kernel`, which `generation.chosen` names for the delta rule's selector where it runs it,
     and for the rated scan's where that runs it: the portable math ('xla') and the recurrence template
     ('mosaic_gpu') both, the port of mamba_ssm's kernels ('pallas') the scan's alone, the rated scan's
-    reference under the fast forms (test_recurrence_template_stability's `reference_arm`)."""
+    reference under the fast forms (test_recurrence_template_stability's `reference_arm`), and the portable
+    math's derived forms ('derived') the delta rule's, the rated scan on its portable math."""
     named = {**({} if kernel == 'pallas' else {'gated_delta_rule': kernel}),
-             **({'ssd': kernel} if kernel in ('xla', 'mosaic_gpu', 'pallas') else {})}
+             **({'ssd': kernel} if kernel in ('xla', 'mosaic_gpu', 'pallas') else {}),
+             **({'ssd': 'xla'} if kernel == 'derived' else {})}
     with generation.chosen(**named):
         return chunk(hooks, *args, **kwargs)
 """A row of one sequence, and of packed documents."""
@@ -208,15 +209,10 @@ scan without the delta rule (Mamba2's SSD, the scan's own op)."""
 @pytest.mark.parametrize('hooks', DERIVED, ids=str)
 def test_the_derived_forms_are_as_exact_as_the_recurrence_token_by_token(hooks, packed):
     """The forms derived from the token update (`recurrence_chunk.derived_rule`, `dew.algebra.scan`), the
-    portable math's behind the switch (`dew.algebra.forms.derived`), against the same recurrence a token at
-    a time, output and final memory, on the portable math's draws of one sequence or of packed documents,
-    each document's first token its forms' reset (check 1): the accuracy check the derived forms are taken
-    behind."""
-    def derived(*args, **kwargs):
-        with algebra_forms.derived():
-            return chunk_on('xla', hooks, *args, chunk_size=CHUNK, **kwargs)
-
-    dew = jax.jit(derived)
+    delta rule's kernel a call names 'derived', against the same recurrence a token at a time, output and
+    final memory, on the portable math's draws of one sequence or of packed documents, each document's first
+    token its forms' reset (check 1): the accuracy check the derived forms are taken behind."""
+    dew = jax.jit(functools.partial(chunk_on, 'derived', hooks, chunk_size=CHUNK))
     reference = jax.jit(functools.partial(token_by_token, hooks))
     assert_as_exact(dew, reference, lambda seed: draw(hooks, packed=packed, seed=seed), f'{hooks} derived',
                     seeds=SEEDS[hooks, packed])
@@ -742,9 +738,9 @@ def test_a_rated_scan_traced_for_a_jvp_on_a_tpu_gives_its_tangent():
 @pytest.mark.parametrize("replicated", [(), (2, 5)], ids=["every operand split", "values and memory whole"])
 @pytest.mark.parametrize("entering", [False, True], ids=["zero memory", "a memory entering"])
 def test_the_derived_rule_runs_in_a_shard_map_that_checks_varying_axes(entering, replicated):
-    """The portable math's forms derived from the token update behind the switch
-    (`dew.algebra.forms.derived`, `recurrence_chunk.derived_rule`) inside a `shard_map` that checks varying
-    axes over operands that vary by row, or with the values and the entering memory whole beside split keys
+    """The portable math's forms derived from the token update, named (`recurrence_chunk.derived_rule`,
+    `generation.chosen(gated_delta_rule='derived')`) inside a `shard_map` that checks varying axes over
+    operands that vary by row, or with the values and the entering memory whole beside split keys
     and gates, from a zero memory and from one that enters: its carries vary as its operands do, and its
     outputs and gradients are finite."""
     keys = jax.random.split(jax.random.key(2911), 7)
@@ -766,7 +762,7 @@ def test_the_derived_rule_runs_in_a_shard_map_that_checks_varying_axes(entering,
     specs = tuple(P() if index in replicated else rows for index in range(len(operands)))
     mapped = jax.shard_map(rule, mesh=Mesh(np.asarray(jax.devices()[:2]), ("data",)), in_specs=specs,
                            out_specs=rows, check_vma=True)
-    with algebra_forms.derived():
+    with generation.chosen(gated_delta_rule='derived'):
         got = jax.jit(jax.value_and_grad(lambda *given: jnp.sum(mapped(*given) * do),
                                          argnums=range(len(operands))))(*operands)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(got))
