@@ -574,8 +574,8 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round_and_refuses_a_
 
 
 TINY = {"architecture": "causal_transformer", "dtype": "bfloat16", "batch_size": 1, "seq_len": 1024,
-        "config": {"vocab_size": 96, "emb_features": 128, "num_layers": 1, "num_heads": 2, "mlp_features": 128,
-                   "max_seq_len": 1024}}
+        "config": {"vocab_size": 96, "emb_features": 128, "num_layers": 1, "num_heads": 2,
+                   "mlp_features": 128, "max_seq_len": 1024}}
 """A step small enough to plan and compile ahead in a test, its heads 64 wide over 1024 tokens as lm-dense's
 are, which a GPU routes to FlashAttention."""
 
