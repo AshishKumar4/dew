@@ -92,8 +92,8 @@ def _gathered(group: list[jax.Array], held: bool) -> list[np.ndarray] | None:
         return [np.asarray(multihost_utils.process_allgather(group[0], tiled=True))]
     replicated = NamedSharding(mesh, PartitionSpec())
     outputs = program(_identity, out_shardings=(replicated,) * len(group))(*group)
+    jax.block_until_ready(outputs)
     if not held:
-        jax.block_until_ready(outputs)
         return None
     whole = [output.addressable_data(0) for output in outputs]
     for value in whole:
