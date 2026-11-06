@@ -24,6 +24,7 @@ import numpy as np
 from dew import _records
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
+    DELTA_NET_ROUTES,
     LINEAR_FIELDS,
     DecoderFamily,
     DecoderFields,
@@ -198,6 +199,8 @@ _ROUTES = Table(
     # A table's row shard, its slice of the stacked table (`ShardedTable`).
     in_layer('ple.ple_embedding.ngram_embedding.shard_{index}.weight',
              'engram/shards/{index}/embed/embedding'),
+    # Its hyper-connected linear layers hold a delta net, under the delta net's names.
+    *DELTA_NET_ROUTES,
     spelled(_NAMES, leaves=_HEAD, layer_leaves=_LEAVES))
 """Qwen4-Exp's names: the hybrid Qwen block's, its streams' and its n-gram tables' (`_LEAVES`, `_HEAD`)."""
 

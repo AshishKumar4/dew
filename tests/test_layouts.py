@@ -78,15 +78,16 @@ def test_every_tensor_a_family_reads_it_writes_back_under_a_name_it_reads_into_t
     names = [tensor for weights in sorted((FIXTURES / name).glob("*.safetensors"))
              for tensor in header_specs(weights)]
     assert names
-    if config["model_type"] == "diffusion_gemma":
+    if config["model_type"] in ("diffusion_gemma", "diffusion_gemma_text"):
         # DiffusionGemma's denoiser holds its text decoder under its encoder and decoder, read by the text
         # family's names as its loader takes them (`hf_decoders._denoiser_sources`).
         from dew.interop.diffusion_gemma import text_config
         from dew.interop.sources import load_shards
 
-        config = text_config(config)
+        whole = config["model_type"] == "diffusion_gemma"
+        config = text_config(config) if whole else config
         names = list(hf_decoders._denoiser_sources(names, load_shards(FIXTURES / name).__getitem__,
-                                                   text_only=False)[0])
+                                                   text_only=not whole)[0])
     family = hf_decoders.families()[config["model_type"]]
     record = hf_decoders.translate_config(config)
     for named in names:
