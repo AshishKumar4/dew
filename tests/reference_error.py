@@ -258,7 +258,7 @@ CENSUS = "DEW_GATE_CENSUS"
 empty), as CPU users compile them: the census the whole suite runs every fifth publish, each red it finds
 filed and judged Dew's or XLA:CPU's (row 4471; docs/design/testing.md, "the YNNPACK switch")."""
 
-WITHOUT_YNN = {} if os.environ.get(CENSUS) else {"xla_cpu_experimental_ynn_fusion_type": ""}
+WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
 """XLA:CPU's compiler options with every YNNPACK fusion off (dots, reductions, element-wise and layout
 ops alike), so that a program runs on XLA's own code, compiled for the host's instruction set with no
 dispatch at run time. YNNPACK picks its microkernels at run time by that instruction set, and both
@@ -268,7 +268,14 @@ of different instruction sets, though the bits still part with the host (docs/pe
 SSD kernel's host check 1 without YNNPACK"); and XLA:CPU's own fusion choices (a reduction split across
 devices taking XLA's, one device's YNNPACK's, row 4520; YNNPACK's narrow dot without FMA, 4522) are not
 Dew's arithmetic. The empty list, not the documented `-individual_dot`, because compiler options take no
-such spelling and that one leaves a scan's reductions fused. The census (`CENSUS`) runs without it."""
+such spelling and that one leaves a scan's reductions fused. The census (`CENSUS`) compiles without it
+(`switched_off`)."""
+
+
+def switched_off() -> dict:
+    """The compiler options the gate compiles a check between two Dew paths with: WITHOUT_YNN, but under
+    the census (`CENSUS`), read when the gate compiles, none."""
+    return {} if os.environ.get(CENSUS) else WITHOUT_YNN
 
 
 def without_ynn(fn, **jit_options):
@@ -283,7 +290,7 @@ def without_ynn(fn, **jit_options):
     if getattr(fn, "without_ynn", False):
         return fn
     if jax.default_backend() == "cpu":
-        jit_options["compiler_options"] = {**WITHOUT_YNN, **(jit_options.get("compiler_options") or {})}
+        jit_options["compiler_options"] = {**switched_off(), **(jit_options.get("compiler_options") or {})}
     compiled = jax.jit(fn, **jit_options)
     compiled.without_ynn = True
     return compiled
@@ -499,7 +506,7 @@ def _with_ynn_off(fn):
 
     @functools.wraps(fn)
     def run(*inputs, **options):
-        with compiled_with(WITHOUT_YNN if jax.default_backend() == "cpu" else {}):
+        with compiled_with(switched_off() if jax.default_backend() == "cpu" else {}):
             return fn(*inputs, **options)
     return run
 
