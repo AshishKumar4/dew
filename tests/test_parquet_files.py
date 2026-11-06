@@ -150,7 +150,8 @@ def test_a_concatenation_of_parquet_files_reads_through_more_shares_than_files()
         pq.write_table(pa.Table.from_pylist(rows), sink, row_group_size=ROWS)
         root.child("part-00.parquet").write(sink.getvalue().to_pybytes())
         stores.append(Files(root.url, format="parquet"))
-    read = compile(Pipeline(Concatenate(tuple(stores))).batch(2), read="streamed", loading=READ, epochs=1)
+    # A batch of four, one row of it each share's.
+    read = compile(Pipeline(Concatenate(tuple(stores))).batch(4), read="streamed", loading=READ, epochs=1)
     seen = []
     for share in range(4):
         stream = read.train(DataPartition(share, 4))
