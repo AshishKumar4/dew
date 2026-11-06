@@ -57,6 +57,7 @@ from dew.nn.attention_kernels import SPLASH_BLOCK, SPLASH_LANES
 from dew.nn.derivatives import KernelGlue, declared_derivative
 from dew.nn.kernels import generation, launches
 from dew.nn.kernels.options import program
+from dew.nn.precision import compensated_sum
 
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
 NUM_LANES = 128
@@ -431,7 +432,8 @@ def _forward_step(
     m_prev, l_prev = m_scratch_ref[...], l_scratch_ref[...]
     assert m_prev.shape == (bq, NUM_LANES)
     assert l_prev.shape == (bq, NUM_LANES)
-    qk = lax.dot_general(q_ref[...], k_ref[slice_k, :], NT_DIM_NUMBERS, preferred_element_type=jnp.float32)
+    qk = lax.dot_general(q_ref[...], k_ref[slice_k, :], NT_DIM_NUMBERS, preferred_element_type=jnp.float32,
+                         precision=_precision(q_ref.dtype, k_ref.dtype))
     assert qk.shape == (bq, bkv_compute)
     assert isinstance(slice_k, pl.Slice)
     # Where the iteration space is shrunk (local attention), a key block's program id is not its place:
@@ -464,7 +466,8 @@ def _forward_step(
     alpha = jnp.exp(m_prev - m_next)
     l_next = l_curr + alpha * l_prev
     m_scratch_ref[...], l_scratch_ref[...] = m_next, l_next
-    o_curr = lax.dot_general(s_curr, v_ref[slice_k, :].astype(jnp.float32), NN_DIM_NUMBERS)
+    o_curr = lax.dot_general(s_curr, v_ref[slice_k, :].astype(jnp.float32), NN_DIM_NUMBERS,
+                             precision=_precision(v_ref.dtype))
     alpha_o = jnp.tile(alpha, (1, pl.cdiv(head_dim_v, NUM_LANES)))[..., : o_scratch_ref.shape[-1]]
     o_scratch_ref[:] = alpha_o * o_scratch_ref[:] + o_curr
 
@@ -708,7 +711,8 @@ def _dq_kernel(
         k, v = k_ref[...], v_ref[...]
         logsumexp = jnp.expand_dims(logsumexp_ref[0], -1)
         do = do_ref[...]
-        qk_uncapped = lax.dot_general(q_ref[...], k, NT_DIM_NUMBERS, preferred_element_type=jnp.float32)
+        qk_uncapped = lax.dot_general(q_ref[...], k, NT_DIM_NUMBERS, preferred_element_type=jnp.float32,
+                                      precision=_precision(q_ref.dtype, k.dtype))
         k_slice = pl.ds(0, bkv)
         assert isinstance(k_slice, pl.Slice)
         qk = _apply_mask_and_soft_cap(
@@ -726,7 +730,8 @@ def _dq_kernel(
             mask_function=mask_function,
         )
         p = jnp.exp(qk - logsumexp)
-        dp = lax.dot_general(do.astype(v.dtype), v, NT_DIM_NUMBERS, preferred_element_type=jnp.float32)
+        dp = lax.dot_general(do.astype(v.dtype), v, NT_DIM_NUMBERS, preferred_element_type=jnp.float32,
+                             precision=_precision(v.dtype))
         if delta:
             # Dew: the block's share of the query's delta, sum_k p * dp, lane-broadcast.
             dq_scratch_ref[...] += jnp.broadcast_to(
@@ -735,7 +740,8 @@ def _dq_kernel(
             return
         ds = _through_soft_cap((dp - jnp.expand_dims(di_ref[0], -1)) * p, qk_uncapped, attn_logits_soft_cap)
         dq_scratch_ref[...] += lax.dot_general(
-            ds.astype(k.dtype), k, NN_DIM_NUMBERS, preferred_element_type=jnp.float32
+            ds.astype(k.dtype), k, NN_DIM_NUMBERS, preferred_element_type=jnp.float32,
+            precision=_precision(k.dtype)
         )
 
     @pl.when(j == grid_width - 1)
@@ -881,7 +887,8 @@ def _dkv_step(
     logsumexp = logsumexp_ref[:1, :]
     do = do_ref[...]
     di = di_ref[:1, :]
-    qk_uncapped = lax.dot_general(k, q, NT_DIM_NUMBERS, preferred_element_type=jnp.float32)
+    qk_uncapped = lax.dot_general(k, q, NT_DIM_NUMBERS, preferred_element_type=jnp.float32,
+                                  precision=_precision(k.dtype, q.dtype))
     assert isinstance(slice_k, pl.Slice)
     qk = _apply_mask_and_soft_cap(
         qk_uncapped,
@@ -899,11 +906,13 @@ def _dkv_step(
         mask_function=mask_function,
     )
     p = jnp.exp(qk - logsumexp)
-    dv = lax.dot(p.astype(do.dtype), do, preferred_element_type=jnp.float32)
+    dv = lax.dot(p.astype(do.dtype), do, preferred_element_type=jnp.float32, precision=_precision(do.dtype))
     dv_scratch_ref[slice_k, :] = dv.astype(dv_scratch_ref.dtype) + dv_scratch_ref[slice_k, :]
-    dp = lax.dot_general(v, do, NT_DIM_NUMBERS, preferred_element_type=jnp.float32)
+    dp = lax.dot_general(v, do, NT_DIM_NUMBERS, preferred_element_type=jnp.float32,
+                         precision=_precision(v.dtype, do.dtype))
     ds = _through_soft_cap((dp - di) * p, qk_uncapped, attn_logits_soft_cap)
-    dk = lax.dot_general(ds.astype(do.dtype), q, NN_DIM_NUMBERS, preferred_element_type=jnp.float32)
+    dk = lax.dot_general(ds.astype(do.dtype), q, NN_DIM_NUMBERS, preferred_element_type=jnp.float32,
+                         precision=_precision(do.dtype, q.dtype))
     dk_scratch_ref[slice_k, :] = dk.astype(dk_scratch_ref.dtype) + dk_scratch_ref[slice_k, :]
 
 
@@ -1101,6 +1110,13 @@ def _dkv(
 _NONDIFF = ("blocks", "call")
 
 
+def _precision(*dtypes) -> lax.Precision | None:
+    """Dew: a product of float32 operands at full float32 precision, a narrower one at the default: a TPU's
+    default runs a float32 product as one bf16 pass, which left splash's float32 output 5.1e-4 rms from
+    float64 against 1.9e-7 and its sinks' gradient 0.104 against 5.8e-4 (row 1331)."""
+    return lax.Precision.HIGHEST if all(jnp.dtype(dtype) == jnp.float32 for dtype in dtypes) else None
+
+
 def _attending(
     fwd_mask_info: mask_info_lib.MaskInfo,
     dq_mask_info: mask_info_lib.MaskInfo,
@@ -1144,8 +1160,10 @@ def _attention_bwd(blocks: BlockSizes, call: _Call, residuals: tuple, do: jax.Ar
     if sinks is not None:
         # Dew: each query's D is di, the dQ kernel's own sum_k p * dp, not the rounded output's
         # rowsum(o * do).
+        # Dew: summed over its queries once rounded (`compensated_sum`), as the reference's softmax VJP
+        # sums them closer than one float32 reduction (row 1331).
         sinks_exp = -jnp.exp(sinks[..., None].astype(jnp.float32) - logsumexp.astype(jnp.float32))
-        dsinks = jnp.sum(sinks_exp * di, axis=-1).astype(sinks.dtype)
+        dsinks = compensated_sum(sinks_exp * di, (sinks_exp.ndim - 1,)).astype(sinks.dtype)
     return None, None, None, dq, dk, dv, None, dsinks
 
 
