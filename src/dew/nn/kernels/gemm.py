@@ -49,7 +49,7 @@ from dew.nn.kernels.templates import axes as side_axes_of, mosaic
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import mosaic_gpu, rows_padded
 from dew.nn.kernels.templates.product import declared
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, refuse_recipe
 from dew.nn.sharding import seen_whole
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
@@ -517,6 +517,55 @@ def blockwise_fp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array
     return _blockwise_projection(x, w, group_blocks, jnp.dtype(out_dtype), interpret_on_cpu)
 
 
+def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None = None, *,
+                      out_dtype, bias: jax.Array | None = None) -> jax.Array | None:
+    """`rows @ matrix` in the run's low-precision recipe (`dew.nn.precision.recipe_role`), where the
+    projection's role takes it: a dense projection's (`matrix` `[in, out]`, every row its one group's) or
+    experts' (`[groups, in, out]`, `group_sizes` counting each group's leading rows, any past their sum
+    outside every group), each group's rows padded with zero rows to whole 128-row blocks, multiplied by
+    `blockwise_fp8_projection` and the padding dropped, a row outside every group zero; `bias`, each group's
+    `[groups, out]`, added to its rows after. None where the run trains in no recipe or the recipe does not
+    take the projection: its role keeps the run's dtypes (a router's, a head's) or its widths hold no whole
+    128-wide blocks, each such projection's route reported with the reason."""
+    from dew.nn.precision import recipe_role
+
+    held = recipe_role()
+    if held is None:
+        return None
+    recipe, role = held
+    edge = grouped_matmul.SCALE_DEPTH
+    depth, width = matrix.shape[-2:]
+    refusal = (None if role in recipe.roles else
+               selection.Refusal("kept_role", f"a {role or 'role-less'} projection keeps the run's dtypes "
+                                 f"under {recipe.recipe}", kind="handoff"))
+    if refusal is None and (depth % edge or width % edge):
+        refusal = selection.Refusal("block_shape", f"a {depth} x {width} projection holds no whole "
+                                    f"{edge}-wide blocks", kind="handoff")
+    if refusal is not None:
+        generation.route("blockwise_fp8", kernel="unquantized", preferred=recipe.recipe, refusal=refusal)
+        return None
+    stacked = matrix if matrix.ndim == 3 else matrix[None]
+    groups, count = stacked.shape[0], rows.shape[0]
+    sizes = (jnp.full((1,), count, jnp.int32) if group_sizes is None
+             else jnp.asarray(group_sizes, jnp.int32))
+    # Each row's group (`groups` past their sum) and its place in its group's padded run of whole blocks.
+    ends = jnp.cumsum(sizes)
+    group = jnp.searchsorted(ends, jnp.arange(count), side="right")
+    blocks = -(-sizes // edge)
+    padded = -(-(count + groups * (edge - 1)) // edge) * edge
+    held_group = jnp.minimum(group, groups - 1)
+    place = jnp.where(group < groups, (jnp.cumsum(blocks) - blocks)[held_group] * edge
+                      + jnp.arange(count) - (ends - sizes)[held_group], padded)
+    laid = jnp.zeros((padded, depth), rows.dtype).at[place].set(rows, mode="drop")
+    # The run's slack, zero rows, as the last group's further blocks: the recipe's rows are whole blocks.
+    group_blocks = blocks.at[-1].add(padded // edge - blocks.sum())
+    product = blockwise_fp8_projection(laid, stacked, group_blocks, out_dtype=out_dtype)
+    out = product.at[place].get(mode="fill", fill_value=0)
+    if bias is not None:
+        out = jnp.where((group < groups)[:, None], out + bias[held_group].astype(out.dtype), out)
+    return out
+
+
 def rows_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     """`x` (`[..., n]`) as E4M3 codes a 1 x 128 tile at a time along its last axis and each tile's
     power-of-two scale (`[..., n / 128]` fp32)."""
@@ -645,7 +694,9 @@ def low_rank(lhs: jax.Array, kernel: jax.Array, a: jax.Array, b: jax.Array, scal
     `u = scale · (dy · bᵀ)` rounded once; the factors' gradients are `lhsᵀ · (scale · (dy · bᵀ))` and `tᵀ ·
     dy`, the rank-wide kernel gradients; each operand's only where it is differentiated (a frozen kernel's,
     `lhsᵀ · dy`, never). The concatenations are copies, a materialized strategy (b); a mainloop walking the
-    appended pair in place is row 1304's next form."""
+    appended pair in place is row 1304's next form. A projection the run's low-precision recipe takes by
+    its role is refused (`refuse_recipe`): the adapted product does not take the recipe."""
+    refuse_recipe("an adapter's fused product (`gemm.low_rank`)")
     return _low_rank(lhs, kernel, a, b, jnp.asarray(scale, jnp.float32), out_dtype, precision,
                      interpret_on_cpu)
 
@@ -729,7 +780,8 @@ _low_rank = contracted("test_an_adapted_product_holds_every_reverse_order")(
 
 
 def dot_general(xla):
-    """`xla`, a layer's product (a `jax.lax.dot_general`, as flax's `Dense` takes one), through the
+    """`xla`, a layer's product (a `jax.lax.dot_general`, as flax's `Dense` takes one), in the run's
+    low-precision recipe where its role takes the matrix product (`recipe_projection`), else through the
     template's dense product (`gemm` of one group) where the call is a matrix product (`lhs`'s last axis
     against a matrix's first, no batch axes, both of one dtype) and a launch takes any of its products: the
     forward, the input gradient or the kernel gradient (`_launched`). A call no launch takes is `xla`'s own
@@ -738,12 +790,15 @@ def dot_general(xla):
     before wherever the template declares XLA faster; every other product is `xla`'s."""
     def product(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None, **kwargs):
         (contracted, against), batch = dimension_numbers
+        out_dtype = jnp.dtype(preferred_element_type or lhs.dtype)
+        # The run's low-precision recipe takes the product where the projection's role takes it.
+        if not kwargs and (recipe := _recipe_general(lhs, rhs, dimension_numbers, out_dtype)) is not None:
+            return recipe
         plain = (not kwargs and jnp.ndim(rhs) == 2 and lhs.dtype == rhs.dtype
                  and tuple(contracted) == (lhs.ndim - 1,) and tuple(against) == (0,)
                  and tuple(map(tuple, batch)) == ((), ()))
         if plain:
             rows = lhs.reshape(-1, lhs.shape[-1])
-            out_dtype = jnp.dtype(preferred_element_type or lhs.dtype)
             if _launched(rows, rhs, out_dtype, precision):
                 product = gemm(rows, rhs, out_dtype=out_dtype, precision=precision)
                 return product.reshape(*lhs.shape[:-1], rhs.shape[1])
@@ -751,6 +806,29 @@ def dot_general(xla):
                    preferred_element_type=preferred_element_type, **kwargs)
 
     return product
+
+
+def _recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype) -> jax.Array | None:
+    """A layer's product (`jax.lax.dot_general`'s `dimension_numbers`) in the run's low-precision recipe
+    (`recipe_projection`), as matrices: a dense projection's free rows against its kernel's contracted
+    axes, a batched one's (a grouped output projection's, DeepSeek V4's `o_a_proj`) each batch member a
+    group of rows against its own matrix, the result in `dot_general`'s order (batch, `lhs`'s free axes,
+    `rhs`'s); None where `recipe_projection` takes none of it."""
+    (contracted, against), (batched, batched_rhs) = (tuple(map(tuple, pair)) for pair in dimension_numbers)
+    free = [axis for axis in range(lhs.ndim) if axis not in contracted + batched]
+    free_rhs = [axis for axis in range(rhs.ndim) if axis not in against + batched_rhs]
+    groups = math.prod(lhs.shape[axis] for axis in batched)
+    count = math.prod(lhs.shape[axis] for axis in free)
+    depth = math.prod(lhs.shape[axis] for axis in contracted)
+    width = math.prod(rhs.shape[axis] for axis in free_rhs)
+    rows = jnp.transpose(lhs, (*batched, *free, *contracted)).reshape(groups * count, depth)
+    matrices = jnp.transpose(rhs, (*batched_rhs, *against, *free_rhs)).reshape(groups, depth, width)
+    out = (recipe_projection(rows, matrices, jnp.full((groups,), count, jnp.int32), out_dtype=out_dtype)
+           if batched else recipe_projection(rows, matrices[0], out_dtype=out_dtype))
+    if out is None:
+        return None
+    return out.reshape(*(lhs.shape[axis] for axis in (*batched, *free)),
+                       *(rhs.shape[axis] for axis in free_rhs))
 
 
 def _launched(rows: jax.Array, matrix: jax.Array, out_dtype, precision: PrecisionLike) -> bool:

@@ -27,6 +27,7 @@ scope and contracted with the taps as one 2D product (stride 1 train 3.9 times, 
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import dataclasses
 import functools
 import math
@@ -56,14 +57,19 @@ from dew.nn.sharding import explicit_spec
 __all__ = [
     "ACCURATE",
     "DTYPE_PRESETS",
+    "FP8",
     "FP32_SUMS",
     "L2NORM_EPS",
+    "LOW_PRECISION_RECIPES",
     "MATMUL_PRECISIONS",
     "NUMERICS_PRESETS",
+    "PROJECTION_ROLES",
     "ROUNDING_STREAM",
     "WIDE_CPU_ARITHMETIC",
     "Dtypes",
+    "LowPrecision",
     "Numerics",
+    "RecipeRefused",
     "accumulated",
     "activation_and_slope",
     "added_to",
@@ -99,6 +105,9 @@ __all__ = [
     "paired_sum",
     "precision_names",
     "products_dtype",
+    "projection_role",
+    "recipe_role",
+    "refuse_recipe",
     "rms_statistics",
     "rms_weighted",
     "rounded_operand",
@@ -657,6 +666,80 @@ MATMUL_PRECISIONS = ("default", "high", "highest")
 on a GPU and one bf16 pass on a TPU, "highest" IEEE float32."""
 
 
+PROJECTION_ROLES = ("mixer", "mlp", "experts", "router", "shared_gate")
+"""The roles a model's projections play, which a low-precision recipe chooses among (`LowPrecision`): a
+token mixer's (attention's queries, keys, values and output, a linear mixer's), a dense feed-forward's, the
+routed experts', a router's scores, a shared expert's gate. A projection that plays none of them, a head's
+or an embedding's, keeps the run's dtypes under every recipe."""
+
+LOW_PRECISION_RECIPES = ("blockwise_fp8",)
+"""The low-precision recipes a run's projections train in: DeepSeek-V3's blockwise FP8, each product's
+operands E4M3 by 1 x 128 activation tiles and 128 x 128 weight blocks, power-of-two scales, fp32 sums, and
+its gradients FP8 products of requantized operands (`dew.nn.kernels.gemm.blockwise_fp8_projection`)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class LowPrecision:
+    """A low-precision training recipe for a run's projections by role (row 2513): `recipe`
+    (`LOW_PRECISION_RECIPES`) multiplies the projections whose role is among `roles` (`PROJECTION_ROLES`),
+    each where its widths take the recipe's blocks; every other product keeps the run's dtypes, the routers,
+    norms, embeddings and heads among them, as every published low-precision recipe keeps them."""
+
+    recipe: str = "blockwise_fp8"
+    roles: tuple[str, ...] = ("mixer", "mlp", "experts")
+
+    def __post_init__(self):
+        if self.recipe not in LOW_PRECISION_RECIPES:
+            raise ValueError(f"a low-precision recipe is one of {LOW_PRECISION_RECIPES}, not {self.recipe!r}")
+        object.__setattr__(self, "roles", tuple(self.roles))
+        unknown = sorted(set(self.roles) - set(PROJECTION_ROLES))
+        if unknown:
+            raise ValueError(f"a recipe's roles are among {PROJECTION_ROLES}, not {unknown}")
+
+
+_ROLE: contextvars.ContextVar[str | None] = contextvars.ContextVar("dew_projection_role", default=None)
+"""The role of the projections a trace is in (`projection_role`), None outside any."""
+
+
+@contextlib.contextmanager
+def projection_role(role: str):
+    """Within the block, the projections a model traces play `role` (`PROJECTION_ROLES`), which the run's
+    low-precision recipe reads (`recipe_role`): a block sets its mixer's and its feed-forward's, a mixture
+    its router's and its experts', the innermost holding."""
+    if role not in PROJECTION_ROLES:
+        raise ValueError(f"a projection's role is one of {PROJECTION_ROLES}, not {role!r}")
+    token = _ROLE.set(role)
+    try:
+        yield
+    finally:
+        _ROLE.reset(token)
+
+
+def recipe_role() -> tuple[LowPrecision, str | None] | None:
+    """The run's low-precision recipe and the role of the projection being traced (None for a projection of
+    no role), or None where the run trains in no recipe (`Numerics.low_precision`)."""
+    from dew.nn.kernels.generation import numerics
+
+    recipe = numerics().low_precision
+    return None if recipe is None else (recipe, _ROLE.get())
+
+
+class RecipeRefused(ValueError):
+    """A projection the run's low-precision recipe takes by its role holds another owner's product
+    (`refuse_recipe`)."""
+
+
+def refuse_recipe(owner: str) -> None:
+    """Refuse a projection the run's low-precision recipe takes by its role (`recipe_role`) whose product
+    `owner` holds instead (a quantizer's product class, a wrapper's interception, an adapter's fused
+    product), which would train it unquantized, silently: the recipe and a product wrapper compose nowhere
+    yet."""
+    held = recipe_role()
+    if held is not None and held[1] in held[0].roles:
+        raise RecipeRefused(f"the run's {held[0].recipe} recipe takes this {held[1]} projection, whose "
+                            f"product {owner} holds: train it in the recipe or under the wrapper, not both")
+
+
 @dataclasses.dataclass(frozen=True)
 class Numerics:
     """A run's numerics, set once and recorded with it, which its model, optimizer and trainer read: its
@@ -672,6 +755,8 @@ class Numerics:
     dtypes: Dtypes = dataclasses.field(default_factory=Dtypes)
     matmul: str | jax.lax.DotAlgorithmPreset = "default"
     forms: Literal["fast", "accurate"] = "fast"
+    low_precision: LowPrecision | None = None
+    """The recipe the run's projections train in by role (`LowPrecision`), None for none."""
 
     def __post_init__(self):
         if isinstance(self.dtypes, str):
@@ -694,7 +779,12 @@ ACCURATE = Numerics(DTYPE_PRESETS["32-true"], matmul="highest", forms="accurate"
 """Accurate, scientific work at its cost: float32 throughout, every product that states no precision in
 IEEE float32 and each op's accurate form."""
 
-NUMERICS_PRESETS = {"accurate": ACCURATE}
+FP8 = Numerics(DTYPE_PRESETS["bf16-mixed"], low_precision=LowPrecision())
+"""DeepSeek-V3's FP8 training on Hopper: bf16-mixed, the token mixers', dense feed-forwards' and routed
+experts' projections in blockwise FP8 (`LowPrecision`), the routers, norms, embeddings and head in the run's
+dtypes."""
+
+NUMERICS_PRESETS = {"accurate": ACCURATE, "fp8": FP8}
 """The named run numerics beside the default (`Numerics()`)."""
 
 

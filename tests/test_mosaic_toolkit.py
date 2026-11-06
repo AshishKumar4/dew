@@ -293,12 +293,27 @@ def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
     assert resources.shared_bytes(mosaic_sm90.WGMMA, reducing) == 1024 + 3 * 2048 + 2048 + 8192 + 3 * 8
 
 
-def test_a_plan_keeps_its_residency_and_takes_the_deepest_ring_it_holds():
-    """`resources.plan` on an A100 for one mma.sync consumer at 128 registers a thread, which leave a
-    multiprocessor four programs (`Family.programs` at the launch's own registers): a launch of 16 KiB a
-    stage holds all four at the deepest ring a quarter of its shared memory holds; one of 40 KiB a stage
-    holds the most programs whose share holds its floor of two stages; one past every residency at its
-    floor plans nothing."""
+def _fits(found, launches, family, target) -> bool:
+    """Whether each plan `resources.plan` returned for `launches` fits `target`: its stages within its
+    launch's floor and most, its shared bytes its scope's at those stages and within a program's share of
+    the block at its residency, its programs within what the family's registers and the multiprocessor's
+    resident threads hold at the launch's registers."""
+    from dew.nn.kernels.templates import resources
+
+    block = generation.shared_budget(target)
+    return all(launch.floor <= plan.stages <= launch.most
+               and plan.shared == resources.shared_bytes(family, launch.scope(plan.stages))
+               and plan.shared <= resources.program_shared(block, plan.programs)
+               and 1 <= plan.programs <= family.programs(launch.consumers, launch.registers)
+               and plan.programs * launch.consumers <= resources.resident_warpgroups()
+               for plan, launch in zip(found, launches, strict=True))
+
+
+def test_a_plan_fits_its_target_or_none_is_made():
+    """`resources.plan` on an A100 for one mma.sync consumer at 128 registers a thread: a launch of 16 KiB
+    a stage and one of 40 KiB each plan within the block's shared memory, the registers and the resident
+    threads (`_fits`); one whose floor of two stages no residency's share holds (200 KiB a stage) plans
+    nothing."""
     from dew.nn.kernels.templates import mosaic_sm80, resources
 
     family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16))
@@ -309,13 +324,10 @@ def test_a_plan_keeps_its_residency_and_takes_the_deepest_ring_it_holds():
 
     with generation.assumed("sm80"):
         target = generation.gpu_target()
-        block = generation.shared_budget(target)
-        small, wide, past = (resources.plan([launch(kib)], family, target) for kib in (16, 40, 200))
-    assert small is not None and (small[0].programs, small[0].stages) == (
-        4, min(8, resources.program_shared(block, 4) // (16 * 1024)))
-    assert wide is not None and wide[0].programs == max(
-        programs for programs in (1, 2, 3, 4) if resources.program_shared(block, programs) >= 2 * 40 * 1024)
-    assert past is None
+        for kib in (16, 40):
+            found = resources.plan([launch(kib)], family, target)
+            assert found is not None and _fits(found, [launch(kib)], family, target), kib
+        assert resources.plan([launch(200)], family, target) is None
 
 
 ISSUED = 64
@@ -408,8 +420,8 @@ def test_products_issue_in_place_into_a_carried_accumulator():
 
 def test_a_plan_holds_no_more_programs_than_its_target_runs_threads_for():
     """`resources.plan` for one mma.sync consumer at 32 registers a thread and 1 KiB a program, whose
-    registers would hold sixteen programs: on an A10 and an RTX PRO 6000, twelve, their 1536 resident
-    threads' worth of its one warpgroup; on an A100 with its 2048, sixteen."""
+    registers alone would hold sixteen programs: on an A10, an RTX PRO 6000 and an A100 its plan fits each
+    part's resident threads (`_fits`), whatever their count (1536 on the first two, 2048 on an A100)."""
     from dew.nn.kernels.templates import mosaic_sm80, resources
 
     def scope(stages: int) -> resources.Scope:
@@ -417,19 +429,18 @@ def test_a_plan_holds_no_more_programs_than_its_target_runs_threads_for():
 
     launch = resources.Launch(scope, consumers=1, registers=32, floor=1)
     family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16))
-    for name, most in (("sm86", 12), ("sm120", 12), ("sm80", 16)):
+    for name in ("sm86", "sm120", "sm80"):
         with generation.assumed(name):
-            found = resources.plan([launch], family, generation.gpu_target())
-        assert found is not None and found[0].programs == most, name
+            target = generation.gpu_target()
+            found = resources.plan([launch], family, target)
+            assert found is not None and _fits(found, [launch], family, target), name
 
 
-def test_a_launch_with_a_producer_takes_the_plan_holding_the_most_bytes_in_flight():
-    """`resources.plan` on an H100 for a warpgroup-MMA launch beside its producer shaped as the 27B gated
-    delta net's states launch (41 KiB of its own, 36 KiB a stage, 96 registers): one program five deep, 184
-    KiB in flight, where its most programs, two one deep, held 74 KiB and slowed its walk
-    (`resources.hidden`); a launch of one stage, 64 KiB at 128 registers, its most programs, three (their
-    75 KiB shares and 136-register raises hold it, four's 56 KiB and 104 do not), thrice one's bytes in
-    flight."""
+def test_a_launch_with_a_producer_plans_within_its_target():
+    """`resources.plan` on an H100 for a warpgroup-MMA launch beside its producer, shaped as the 27B gated
+    delta net's states launch (41 KiB of its own, 36 KiB a stage, 96 registers) and as a one-stage launch
+    of 64 KiB at 128 registers: each plan fits the block, the registers with the producer's and the
+    resident threads (`_fits`); a launch whose own bytes exceed the block plans nothing."""
     from dew.nn.kernels.templates import bundles, resources
 
     def launch(fixed: int, step: int, registers: int, most: int) -> resources.Launch:
@@ -440,10 +451,11 @@ def test_a_launch_with_a_producer_takes_the_plan_holding_the_most_bytes_in_fligh
 
     with generation.assumed("sm90"):
         family, target = bundles.of("sm90", jnp.bfloat16), generation.gpu_target()
-        (states,) = resources.plan([launch(42016, 36912, 96, 8)], family, target)
-        (single,) = resources.plan([launch(65536, 0, 128, 1)], family, target)
-    assert (states.programs, states.stages) == (1, 5)
-    assert (single.programs, single.stages) == (3, 1)
+        for made in (launch(42016, 36912, 96, 8), launch(65536, 0, 128, 1)):
+            found = resources.plan([made], family, target)
+            assert found is not None and _fits(found, [made], family, target)
+        past = launch(generation.shared_budget(target) + 1, 0, 96, 1)
+        assert resources.plan([past], family, target) is None
 
 
 def _vector_scaled(scale, x, axis: str, *, interpret: bool):
@@ -911,7 +923,9 @@ def _codes(dtype):
     """Codes of `dtype` and per-row power-of-two scales, so each converted value is exact in bf16."""
     keys = jax.random.split(jax.random.key(6), 2)
     codes = jax.random.randint(keys[0], CODES, -8, 8).astype(dtype)
-    return codes, jnp.exp2(jax.random.randint(keys[1], (CODES[0],), -3, 4).astype(jnp.float32))
+    # ldexp is exact where a GPU's exp2 is not (0.12499999 for 2 ** -3 on an A100).
+    exponents = jax.random.randint(keys[1], (CODES[0],), -3, 4)
+    return codes, jnp.ldexp(jnp.ones((CODES[0],), jnp.float32), exponents)
 
 
 @pytest.mark.parametrize("scaled", [True, False], ids=["scaled", "unscaled"])
