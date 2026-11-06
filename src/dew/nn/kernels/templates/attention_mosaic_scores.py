@@ -81,6 +81,24 @@ class _Backward:
         program writes."""
         return tuple(kind in DQ_GRADS for kind in self.kinds)
 
+def _relay_tiles(family: mosaic.Family, consumers: int, rows: int, depth: int, dtype) -> list:
+    """A backward launch's relay tiles, one a consumer, where its register left operands of `rows` x `depth`
+    (its score cotangents and weights, a step's accumulators) cross warps on their way to a product's layout
+    (`Family.relay_bytes`: a family arranged by fewer rows than a role's, `bundle_of`); none elsewhere."""
+    if not family.relay_bytes(rows, depth):
+        return []
+    return [mosaic.plain((consumers, rows, depth), dtype)]
+
+
+def _relayed(walk: _Backward, relay: list, index) -> _Backward:
+    """`walk` whose family relays its register left operands through consumer `index`'s tile of `relay`
+    (`_relay_tiles`' allocation, `Family.relaying`); itself where the launch allocates none."""
+    if not relay:
+        return walk
+    family = walk.program.family.relaying(relay[0].at[index])
+    return dataclasses.replace(walk, program=dataclasses.replace(walk.program, family=family))
+
+
 def _score_params(family: mosaic.Family, refs, kinds: tuple[Kind, ...], row, head, first, like,
                   k_first=None, *, keys_first: bool = False) -> tuple:
     """A tile's score hook parameters (`_param`), one per kind of `kinds`, read from their refs."""

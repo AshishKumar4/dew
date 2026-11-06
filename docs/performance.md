@@ -278,50 +278,67 @@ need separate hosts (`tests/test_multihost.py`), not training.
 ## The performance gate, 2026-10-07
 
 CI checks correctness, and `tools/perf_gate.py` checks speed. It runs one fixed
-battery on two Dew trees on one machine, in alternating rounds (base then head,
-then head then base). The battery is the training step of a 359.8M dense
+battery on two Dew trees on one machine, in three arms: the base, the head, and
+the base again (its A/A), six rounds of them, each round's arms in an order drawn
+at random and kept with the results. The battery is the training step of a 359.8M dense
 decoder and a 321.8M MoE decoder at 4 x 1024 tokens, SimpleDiT-B and an MM-DiT
 of its size at batch 32, and FLUX.2 and Wan 2.1 at their head width over a few
 blocks; the forward pass of the SigLIP-400M, Qwen3.5 and Gemma 4 vision towers
 and the SD VAE's decoder at their released sizes, with random weights;
 Qwen3-0.6B served at 32 and 128 slots; the warm compiles of a 16-slot server over Dory 1.0 4B as released,
-its construction's decode step and each admission width's prefill (each gated as a compile); causal attention forward and backward
+its construction's decode step and each admission width's prefill (each gated as a compile, every
+sample a cold compile, as the tool keeps no compile cache); causal attention forward and backward
 (cudnn and xla, 2048 tokens, 128-wide heads); the Oxford Flowers input pipeline;
-the save and restore of lm-dense's training state; a full AdamW fine-tune's step, a 4B
+the save and restore of lm-dense's training state; and a full AdamW fine-tune's step, a 4B
 decoder at Qwen3-4B's shape on an H100 and a 1.7B one at Qwen3-1.7B's on an A100 (1 x 2048 tokens, each
-row of either not measured on the other device); and each step's compile time (gated at a
-25% change: compile time is performance). Each step's MFU is a row of its own, read from the invocation
-that times it, higher the better. Each tree keeps its programs in a compile cache of its own
-for the run: its first round compiles cold, which the compile rows time, and its later rounds load,
-so the timed rounds cost no compile; the table ends with the two budgets apart. Each row runs in a
-process of its own, in the tree's own environment (its `locks/<build>.txt` for
-this machine's CUDA build, built once per lock by `tools/environments.py`),
-with the tree's own copy of the tool where it has one. A row
-regresses when the head's median is worse than the base's by more than either
-tree's spread across rounds (at least 2%), and the two trees' ranges do not
-overlap. With three rounds each, samples separate by chance 1 time in 20 when
-nothing changed, and the band lowers that further. A row's band is also its
-sensitivity: it cannot see a change smaller than its own noise. A row the base
-cannot run in any round (a tree older than its tool, or than the locks) is not
-compared. A row the base runs and the head runs in no round is broken, a row neither runs leaves the
-battery incomplete, and a row either tree measured in only some rounds, or as
-NaN, an infinity or zero, is partial and not judged on the rounds that ran; all
-three fail the gate, as a regression does. `report` writes the table and exits 1
-on any of them. `report --calibration <file>` takes each row's null noise, how far one tree's median
-moved against itself (`{"noise": {row: fraction}}`), as the least band the row is judged by; a row whose
-noise passes its floor is marked *insensitive*, since it cannot see a change of its floor's size, and a
-change past its noise still regresses it. `report --verdicts <file>` writes each row's state and numbers
-as JSON, and with `--anchors <file>` (`{"rows": {row: samples}}`, a run's samples kept as the row's anchor)
-each row's head judged against its anchor too, by the same rule. The battery runs once for each release candidate on a Colab
-A100, and as an A/B, base against head, for a deliberate change to a hot path
-(a kernel, the trainer's step, the input pipeline); a promotion to main does
-not run it. Each table is kept in
-`tools/measurements/perf_gate/<head>-vs-<base>.md`:
+row of either not measured on the other device). Each step's peak and MFU are rows of their own, read
+from the invocation that times it, MFU higher the better. Each arm keeps its programs in a compile
+cache of its own for the run, and its measured peaks' processes another: its first round compiles
+cold and its later rounds load, so the timed rounds cost no compile; the table ends with the two
+budgets apart. Each row runs in a process of its own, in the tree's own environment (its
+`locks/<build>.txt` for this machine's CUDA build, built once per lock by `tools/environments.py`),
+with the tree's own copy of the tool where it has one.
+
+`report` judges each row by Dew's one judgment of a time against another
+(`dew.telemetry.benchmark.judged`): each round's head over that round's base is a ratio, and so is
+each round's A/A over its base; the head's ratios' median and its interval at 0.95 (six rounds'
+least and greatest: the fewest rounds that reach 0.95, at 0.96875) beside the A/A's, this run's own
+noise, say whether the head differs. A row that differs and whose median ratio is worse than 1 by
+more than its floor regresses, better by more is faster, and one that differs by less is
+*different, below floor*, which passes: the floor (2%, a compile's 25%: compile time is
+performance) is the change the gate acts on, not a noise allowance. A row whose A/A interval
+reaches past its floor is marked *insensitive*, as it cannot see a change of that size. The
+interval holds the median where the rounds' ratios are independent draws of one distribution,
+which the random order supports and does not prove. A row the base cannot run in any round (a tree
+older than its tool, or than the locks) is not compared. A row the base runs and the head runs in
+no round is broken, a row no arm runs leaves the battery incomplete, a row any arm measured in only
+some rounds, or as NaN, an infinity or zero, is partial and not judged on the rounds that ran, and
+too few rounds are unjudged; all fail the gate, as a regression does. `report` writes the table and
+exits 1 on any of them; `report --verdicts <file>` writes each row's state and numbers as JSON.
+
+Each step's compile is judged ahead of its run, on any host (`perf_gate.py compile`): the step
+planned and compiled for one compile-only GPU of a kind's generation and memory (an A100's sm80 at
+40 GiB, an H100's sm90 at 80 GiB; `dew.training.ahead.compile_ahead`), XLA's autotuning off as no
+GPU is attached, in the environment of the lock the GPU run used, every arm's every round a process
+of its own with an empty compile cache, judged as above against its 25% floor. The attention route a
+GPU takes, FlashAttention's custom call or the template, lowers on no compile-only GPU yet (ledger
+4616), so every arm compiles its step with XLA's attention in its place: the row, named `(xla
+attention)`, is the step's compile without its attention kernel's, the same program in every arm, until
+that route lowers without a device. Its row is the planner's seconds, every compile included, for the
+unchanged step, whatever plan each arm selects; each arm's selected configuration (its split, rows,
+rematerialization and head tiling) stays beside the verdict. A step whose program still substituted a
+kernel this host cannot lower (cuDNN with no GPU attached) is *unsupported*, never judged. The
+battery runs once for each release candidate on a Colab A100, and as an A/B, base against head, for
+a deliberate change to a hot path (a kernel, the trainer's step, the input pipeline); a promotion
+to main does not run it. Each table is kept in `tools/measurements/perf_gate/<head>-vs-<base>.md`:
 
 ```
-python tools/perf_gate.py run --base main=<tree> --head head=<tree> --rounds 3 \
+python tools/perf_gate.py run --base main=<tree> --head head=<tree> \
     --model <Qwen3-0.6B snapshot> --flowers <TFDS oxford_flowers102 dir> --out gate.json
 python tools/perf_gate.py report gate.json --table gate.md
+python tools/perf_gate.py compile --base main=<tree> --head head=<tree> --kind a100 --lock cuda12 \
+    --out compile.json
+python tools/perf_gate.py report compile.json --table compile.md
 ```
 
 A setting is measured the same way: one tree as both base and head, with
@@ -342,7 +359,7 @@ torch 2.10.0 / transformers 5.3.0 environment printed by
 
 ```
 python tools/reference_runs/qwen35_pair.py --torch-python /content/torch-reference/bin/python \
-    --rounds 2 --claim --out /content/qwen35-pair.json
+    --claim --out /content/qwen35-pair.json
 ```
 
 Both processes load Qwen/Qwen3.5-0.8B at
@@ -350,13 +367,15 @@ Both processes load Qwen/Qwen3.5-0.8B at
 fixed synthetic unpadded causal tokens, bf16 compute, fp32 master weights and
 AdamW state, no checkpointing or accumulation, and a squared fixed scalar
 projection of final hidden states (no vocabulary head or cross entropy).
-They use identical seeded token and projection bytes. Each round starts fresh
-processes, torch followed immediately by Dew. Compilation and 20 warmup steps
-are excluded from the 200-step window; both sides synchronize only at its
-endpoints. The ratio uses median **window throughput** across rounds. Its
-tolerance is the larger relative min-max window spread, with no fixed noise
-floor. A deficit beyond that spread exits 1. A result inside it is *level*,
-not evidence of a speedup. Torch's CUDA-event step samples and Dew's later
+They use identical seeded token and projection bytes. Each of six rounds starts
+fresh processes for three arms, Dew, torch and torch again (torch's A/A, a torch
+run that records itself as torch), in an order drawn at random and kept.
+Compilation and 20 warmup steps are excluded from the 200-step window; both sides
+synchronize only at its endpoints. Each round's Dew **window throughput** over its
+torch's is judged against each round's torch A/A over its torch, by the gate's
+judgment (`dew.telemetry.benchmark.judged`). Dew slower, the judgment differing
+below 1, exits 1. A result that does not differ is *level*: no difference found,
+not parity proven, nor evidence of a speedup. Torch's CUDA-event step samples and Dew's later
 synchronized per-step pass are diagnostics only and never set the ratio.
 
 The comparison record retains both commits, environments, input hashes,
@@ -367,7 +386,8 @@ records its separately reset steady-window peak. JAX cannot reset its
 `peak_bytes_in_use`. Even with matched scopes the two allocators account
 memory differently, so their peaks are not a device-wide free-memory measure.
 
-The battery includes this as a hardware-qualified row. Pass `--torch-python`
+The battery includes this as a hardware-qualified row, which runs once a gate, in the head's
+first round: the pairing is a judged session of its own. Pass `--torch-python`
 to `perf_gate.py run` and `--claim` to require every reference row on its hardware even under
 `--only`; `report --claim` also refuses missing required rows. A fine-tune's rows are limited to their
 device too, but a claim does not require them. On other

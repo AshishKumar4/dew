@@ -22,7 +22,7 @@ from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import launches
-from dew.nn.kernels.templates import mosaic, report, resources
+from dew.nn.kernels.templates import mosaic, product, report, resources
 
 
 def _staging(block: tuple, swizzle: int | None) -> tuple:
@@ -396,6 +396,13 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
 
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
         return self.products(self.zeros((lhs.shape[0], rhs.shape[1])), lhs, rhs, interpret)
+
+    def summed_window(self, block_k: int) -> int:
+        # Its accumulator is a value, carried across a window's steps and added into the running sum at
+        # the window's end: a partial a step cost the A100's fp32 kernel gradients 2.13-2.26x their plain
+        # sums on 13 dense shapes (M-FS-4, W13-a100-1). A window is `product.SUMMED_DEPTH` deep, its
+        # truncating in-order adds no deeper than a promoted FP8 product's step.
+        return max(1, product.SUMMED_DEPTH // block_k)
 
     def summed_apart(self, running: jax.Array, lhs, rhs, interpret: bool, scale: Callable | None = None
                      ) -> jax.Array:
