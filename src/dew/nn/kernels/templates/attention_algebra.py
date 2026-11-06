@@ -35,7 +35,7 @@ import numpy as np
 from dew.algebra import derive, rewritten
 from dew.algebra.forms import Accumulated, Added, Merged, Operand
 from dew.nn.kernels.templates import layout, product
-from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Capped, Draw, within
+from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Capped, Draw, Initial, within
 from dew.nn.precision import float32_einsum, two_product, two_sum
 
 
@@ -520,7 +520,7 @@ def initial_state(spec: Forward, initial: Partial) -> Partial:
 
 
 def merged_slices(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.Array,
-                  initial: Partial | None = None) -> jax.Array:
+                  initial: Initial | None = None) -> jax.Array:
     """A split walk's slices merged (`merged` of `slice_state`s, then `finish`): their outputs `out`
     `[B, S, Q, KV, Dv]` (fp32, each normalized), maxima (in natural `spec`'s units, `finished_rows`', a
     fold's `unfolded`, raw products where it keeps them) and denominators `[B, KV, S, Q]`, and the call's
@@ -532,8 +532,9 @@ def merged_slices(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.
     if initial is not None:
         own = initial_state(spec, Partial(jnp.swapaxes(initial.acc, 1, 2), jnp.swapaxes(initial.m, 1, 2),
                                           jnp.swapaxes(initial.total, 1, 2)))
-        state = Partial(*(jnp.concatenate([mine, theirs[:, None]], axis=1)
-                          for mine, theirs in zip(state[:3], own[:3], strict=True)))
+        acc, m, total = (jnp.concatenate([mine, theirs[:, None]], axis=1)
+                         for mine, theirs in zip(state[:3], own[:3], strict=True))
+        state = Partial(acc, m, total)
     return finish(spec, finished_merged(spec, state, axis=1), initial=True, normalized=True)[0]
 
 
