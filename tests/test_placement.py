@@ -124,13 +124,9 @@ def _lm_loss(module, params, tokens):
     return jax.value_and_grad(loss)(params)
 
 
-@pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize("name", TRAINED)
-def test_a_step_placed_by_the_layout_trains_on_par_with_one_device(name):
-    """A step whose parameters the layout places over fsdp, expert and tensor computes the loss and every
-    gradient as exactly as the same step on one device, each against the step in float64 (check 1): the
-    placement moves only where the work runs."""
-    from reference_error import assert_as_exact
+def parity_arms(name: str):
+    """The loss and gradients of `name`'s next-token step with its parameters placed by the layout, on one
+    device, and in float64, and the draw of one seed's parameters and tokens they take."""
     from tiny_models import build_model
 
     mesh, _, args, _, placement = placed_case(name)
@@ -144,8 +140,24 @@ def test_a_step_placed_by_the_layout_trains_on_par_with_one_device(name):
     replicated = NamedSharding(mesh, jax.P())
     sharded = jax.jit(functools.partial(_lm_loss, module), in_shardings=(placement, replicated))
     alone = jax.jit(functools.partial(_lm_loss, module))
-    truth = jax.jit(functools.partial(_lm_loss, wide))
-    assert_as_exact(sharded, alone, draw, f"{name} placed over the layout", seeds=16, truth_fn=truth)
+    return sharded, alone, jax.jit(functools.partial(_lm_loss, wide)), draw
+
+
+PARITY_SEEDS = {"causal_transformer": 16, "causal_transformer+moe": 16}
+"""Each trained case's seeds, as `seeds_for` sized them on its paired arms."""
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("name", TRAINED)
+def test_a_step_placed_by_the_layout_trains_on_par_with_one_device(name):
+    """A step whose parameters the layout places over fsdp, expert and tensor computes the loss and every
+    gradient as exactly as the same step on one device, each against the step in float64 (check 1): the
+    placement moves only where the work runs."""
+    from reference_error import assert_as_exact
+
+    sharded, alone, truth, draw = parity_arms(name)
+    assert_as_exact(sharded, alone, draw, f"{name} placed over the layout", seeds=PARITY_SEEDS[name],
+                    truth_fn=truth)
 
 
 @pytest.mark.mesh(devices=8)
