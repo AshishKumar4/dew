@@ -140,7 +140,7 @@ class DecisionModel(HeadedModel):
                 raise ValueError("a row in streams reads as its layout's reads say, which blocks and "
                                  "parallel options say otherwise")
             # Each token reads the streams its record says, as runs over its document's (`stream_runs`).
-            runs = stream_runs(inputs.streams, inputs.segments, inputs.reads, inputs.fragments)
+            runs = stream_runs(inputs.streams, jnp.ones_like(inputs.segments), inputs.reads, inputs.fragments)
             states, sown = applied(inputs.tokens, train=train, coordinates=laid, attention_key_runs=runs,
                                    attention_key_positions=inputs.positions, method=states_method,
                                    conditioning=conditioning, rngs=rngs, **stepped)
