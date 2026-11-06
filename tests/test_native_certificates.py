@@ -32,6 +32,7 @@ from native_certificates import (
     LOST_SHARE,
     MOVED_SHARE,
     NARROW_SHARE,
+    PTX_EX2,
     SUBNORMAL_CASE,
     TF32_SHARES,
     TRUNCATED_SHARE,
@@ -538,12 +539,6 @@ def subnormal_operands_certify_natively_at_their_formats_least_normal(dtype, ker
             native = forward_of(case, matrices, SIZES, jnp.float32, dtype=dtype)
             products = forward_products(case, matrices, SIZES, fmt)
             assert np.all(native_dot_holds(native, products, FLOAT32, flushes=False))
-
-
-PTX_EX2 = 2
-"""PTX ISA 9.4 §9.7.3.21: "The maximum ulp error is 2 ulp from correctly rounded result across the full
-range of inputs" of ex2.approx.f32, Mosaic GPU's `exp2` under `approx_math`, which the recurrence mainloop's
-launches compile with."""
 
 
 def mosaic_exp2(semantics: str):

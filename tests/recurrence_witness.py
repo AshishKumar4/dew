@@ -176,16 +176,22 @@ def aligned(iv: Iv, fmt: Format) -> np.ndarray:
     return np.maximum(at(iv.lo, fmt), at(iv.hi, fmt))
 
 
-def dot(a: Iv, b: Iv, lane: Lane, fmt: Format = BFLOAT16) -> Iv:
+def dot(a: Iv, b: Iv, lane: Lane, fmt: Format = BFLOAT16, into: Iv | None = None) -> Iv:
     """`a @ b` (`[M, K] @ [K, N]`) as one product the tensor cores accumulate in fp32: each term's exact range
     (products of 16-bit values of `fmt`), summed within the native-dot contract's bound
     (`native_certificates.native_dot_holds`: gamma_n at a truncating add's unit, n the terms that may be
     nonzero, an add of an exact zero exact), the float64 sums within n 2^-52 of their own. The bound's
     magnitudes are the terms' as the tensor cores align them (`aligned`): a subnormal operand's at `fmt`'s
-    least normal, the exponent its field holds."""
+    least normal, the exponent its field holds. With `into`, the product accumulated into fp32 registers
+    holding values within it (a tensor core's accumulate-in-place): one more term of the sum."""
     terms = mul(Iv(a.lo[:, None, :], a.hi[:, None, :]), Iv(b.lo.T[None, :, :], b.hi.T[None, :, :]))
+    if into is not None:
+        terms = Iv(np.concatenate([terms.lo, into.lo[..., None]], -1),
+                   np.concatenate([terms.hi, into.hi[..., None]], -1))
     live = ((terms.lo != 0) | (terms.hi != 0)).sum(-1)
     magnitude = (aligned(a, fmt)[:, None, :] * aligned(b, fmt).T[None, :, :]).sum(-1) * (1 + 2.0 ** -50)
+    if into is not None:
+        magnitude = magnitude + np.maximum(np.abs(into.lo), np.abs(into.hi)) * (1 + 2.0 ** -50)
     # The native-dot contract's allowance, and the float64 interval sums' own roundings beside it.
     slack = (allowance(magnitude, live, TRUNCATING["float32"], truncating_underflow(lane.flushes))
              + (live + 1) * 2.0 ** -52 * magnitude)
@@ -369,13 +375,15 @@ def stored_memory(iv: Iv, lane: Lane) -> Iv:
     return staged(iv)
 
 
-def exp2_reach(native) -> int:
+def exp2_reach(native, low: float = -2.0, high: float = 2.0) -> int:
     """The most steps of the fp32 grid `native(x)`, an fp32 `exp2` of fp32 operands, lies from `2^x` correctly
-    rounded (`op_certificates.exp2_rounded`), over the fractions `algebra.raised` and `algebra.decayed` take,
-    (-2, 2): 2^17 of them, densely and drawn, the integers there (exact cases) among them."""
+    rounded (`op_certificates.exp2_rounded`), over the operands a mainloop takes, (`low`, `high`): by
+    default the fractions `algebra.raised` and `algebra.decayed` take, (-2, 2); 2^17 of them, densely and
+    drawn, the integers there (exact cases) among them."""
     rng = np.random.default_rng(2084)
-    x = np.concatenate([np.linspace(-2, 2, 1 << 16, dtype=np.float32), np.arange(-2, 3, dtype=np.float32),
-                        rng.uniform(-2, 2, (1 << 16) - 5).astype(np.float32)])
+    whole = np.arange(np.ceil(low), np.floor(high) + 1, dtype=np.float32)
+    x = np.concatenate([np.linspace(low, high, 1 << 16, dtype=np.float32), whole,
+                        rng.uniform(low, high, (1 << 16) - len(whole)).astype(np.float32)])
     found = grid_index(np.asarray(native(x), np.float64))
     return int(np.max(np.abs(found - grid_index(exp2_rounded(x, FLOAT32)))))
 
