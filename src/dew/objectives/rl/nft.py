@@ -165,7 +165,8 @@ class DiffusionNFTObjective(DiffusionObjective):
             raise ValueError("DiffusionNFT's old policy is its EMA slot, which this step does not carry")
         rows, trained = times.shape
         r = self.optimality(advantages)
-        given = self.encoded_conditions(variables, batch)
+        # An inpainting model's masked-image inputs, as the rollout encoded them (`NFTRollout`).
+        given = {**self.encoded_conditions(variables, batch), **batch.get("spatial", {})}
         live = self.denoiser(variables, given, None)
         old = self.denoiser(merge(variables, jax.tree.map(jax.lax.stop_gradient, step.ema)), given, None)
         base = (None if self.kl == 0 else
@@ -226,7 +227,7 @@ class NFTRollout(GroupedRollout):
             raise ValueError("a reward group needs at least two samples")
         if not 1 <= self.train_steps < self.steps:
             raise ValueError("train_steps must select between one and steps-1 times of the sampler's grid")
-        reserved = {"latents", "timesteps", ADVANTAGES_KEY, REWARDS_KEY}
+        reserved = {"latents", "timesteps", "spatial", ADVANTAGES_KEY, REWARDS_KEY}
         if any(condition.field in reserved for condition in self.objective.inputs.conditions.values()):
             raise ValueError("conditioning fields must not overwrite DiffusionNFT's sample fields")
 
@@ -234,7 +235,9 @@ class NFTRollout(GroupedRollout):
         return state.averaged
 
     def _generate_impl(self, params: Variables, batch: Batch, key: jax.Array):
-        """One clean sample per row, unguided, over the rollout's grid, and its decoded image."""
+        """One clean sample per row, unguided, over the rollout's grid, its decoded image, and the
+        masked-image inputs an inpainting model read (`_spatial`), which its loss reads again, as
+        `FlowRollout` records them."""
         objective = self.objective
         # The training process's grid, in the times its denoiser and forward map read, never a loaded
         # pipeline's table coordinates.
@@ -244,12 +247,14 @@ class NFTRollout(GroupedRollout):
         noise_key, sample_key = jax.random.split(key)
         count = _source(objective.inputs, batch).shape[0]
         x_T = process.noise(noise_key, (count, *objective.latent_shape))
-        denoise = objective.denoiser(params, objective.encoded_conditions(params, batch), None, process)
+        spatial = objective._spatial(params, batch, key)
+        denoise = objective.denoiser(params, {**objective.encoded_conditions(params, batch), **spatial}, None,
+                                     process)
         autoencoder, published = objective.published_autoencoder(params)
         images, latents = walk_and_decode(denoise, autoencoder, published, x_T, solver=objective.solver,
                                           guidance=None, key=sample_key, times=np.asarray(times),
                                           final_denoise=objective.final_denoise)
-        return (latents, jnp.asarray(times)), images, {}
+        return (latents, jnp.asarray(times)), images, spatial
 
     def _training_rows(self, generated, context: Batch, spatial: Mapping[str, np.ndarray],
                        rewards: np.ndarray, owned: slice | np.ndarray) -> Batch:
@@ -275,6 +280,8 @@ class NFTRollout(GroupedRollout):
             REWARDS_KEY: rewards[owned],
             VALID_ROWS: real[owned],
         })
+        if spatial:
+            prepared["spatial"] = {name: np.asarray(value)[owned] for name, value in spatial.items()}
         return prepared
 
 
