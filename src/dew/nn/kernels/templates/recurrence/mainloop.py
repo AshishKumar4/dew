@@ -1321,10 +1321,11 @@ def _intra_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
                **({"system": _systems(call).landing(CHUNK, CHUNK)} if "system" in products else {})}
     # Where the call's pairs do not factor (`Call.factored`), a key block's keys and prefix halves below a
     # sub-chunk's rows (`algebra.key_diagonal_pairs`' shifted reads).
-    # Both read at row offsets no tiling divides (the scan's shifts, the sub-chunks' references), so plain:
-    # rows padded past a multiple of 32 words, against a fragment store's bank conflicts, are strides no
-    # tiled register layout's transfer takes (Mosaic GPU's layout inference: "Stride 24 is not divisible by
-    # 16", jsf-kdaintra5).
+    # Both read at row offsets no tiling divides (the scan's shifts, the sub-chunks' references), so plain.
+    # Unpadded: a tile read in the accumulator's layout takes a row stride a whole number of its tiling's
+    # columns (Mosaic GPU's layout inference refused 24 at a 16-column tiling and 80 at a 64-column one,
+    # jsf-kdaintra5 and 9), a multiple of 32 words at 32 columns or more, so no stride it takes moves a
+    # fragment store's rows off one another's banks.
     padded = () if call.factored else (mosaic.plain((3, algebra.SUB + CHUNK, keys), jnp.float32),)
     scanned = mosaic.plain((2, 2 * CHUNK, keys), jnp.float32)
     sums = mosaic.plain((len(products), CHUNK, CHUNK), jnp.float32)
