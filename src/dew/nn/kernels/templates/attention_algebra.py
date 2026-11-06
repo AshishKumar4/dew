@@ -483,13 +483,11 @@ def reached(maxima: jax.Array, *, unseen: bool) -> jax.Array:
 
 
 type Launch[O, F] = Callable[..., tuple[O, jax.Array, jax.Array] | tuple[O, None, F]]
-"""A whole launch of a call in a form (`walked_launches`), `launch(form, live, again=False, into=None)`: its
-outputs, each row's running maximum and whether its weighted values overflowed; or, a launch whose programs
-state their rows' rewalk flags themselves (`F`, its mainloop's own), its outputs, no maxima and those flags,
-which it takes back as `live`; `again` a plain launch run
-once more inside the guard's rare branch, a recomputation (its kernel named apart, its products counted
-once); `into` refs holding the plain launch's outputs, which it writes its rows `live` into in place
-(`walked_launches`' `in_place`)."""
+"""A whole launch of a call in a form (`walked_launches`), `launch(form, live, into=None)`: its outputs, each
+row's running maximum and whether its weighted values overflowed; or, a launch whose programs state their
+rows' rewalk flags themselves (`F`, its mainloop's own), its outputs, no maxima and those flags, which it
+takes back as `live`; `into` refs holding the plain launch's outputs, which it writes its rows `live` into
+in place (`walked_launches`' `in_place`)."""
 
 
 def finished_form(spec: Forward) -> Forward:
@@ -614,10 +612,13 @@ def walked_launches[O, F](spec: Forward, launch: Launch[O, F], kept: Callable[[j
 
     `in_place` walks so, masked, every call, its rewalk written into the plain launch's outputs held in refs
     (`launch(form, live, into=refs)`: the launch writes its rows `live` and leaves every other row's bits),
-    no branch and no `kept` over them: the branch's common side copied the plain launch's outputs into its
-    result every call (ET-MEMCPY-h100: the output and its rows, 45 us of Qwen3-8B's causal forward on an
-    H100), and the masked launch's `kept` selected over them every call; its empty launch costs its
-    prologue."""
+    no rare walk and no `kept` over them, which the masked launch selected over them every call; its empty
+    launch costs its prologue.
+
+    Elsewhere each rare walk is a loop of at most one trip (`once`), which takes the plain launch's outputs
+    as its carry in their own buffer: a branch's common side copied them into its result every call
+    (ET-MEMCPY-h100: the output and its rows, 45 us of Qwen3-8B's causal forward on an H100; a training
+    forward's split sums besides)."""
     if masked or in_place:
         plain = launch(spec, None)
         outputs = plain[0]
@@ -640,16 +641,13 @@ def walked_launches[O, F](spec: Forward, launch: Launch[O, F], kept: Callable[[j
         assert launched[1] is not None, "a launch states its rows' rewalk flags in a masked walk alone"
         return launched
 
-    def guarded_launch(form: Forward, outputs: O, over: jax.Array) -> O:
+    def guarded_launch(form: Forward, outputs: O, over: jax.Array, taken: jax.Array | bool = True) -> O:
+        # The rows that overflowed walked again shifting, where some did and the call walked in `form`
+        # (`taken`).
         if not form.headroom:
             return outputs
-        # The rows kept plain read from the plain launch run again inside the rare branch (`again`), so the
-        # plain launch's outputs reach one branch alone, whose result their buffer then is: read by both,
-        # XLA copied them in the common branch (ET-GUARDHLO-h100: `copy.7`, the whole output, 0.047 ms of
-        # Qwen3-8B's 0.66 ms causal forward).
-        return jax.lax.cond(jnp.max(over.astype(jnp.int32)) > 0,
-                            lambda: kept(over, launch(form, over)[0], launch(form, None, again=True)[0]),
-                            lambda: outputs)
+        return once(taken & (jnp.max(over.astype(jnp.int32)) > 0),
+                    lambda plain: kept(over, launch(form, over)[0], plain), outputs)
 
     outputs, maxima, over = plain_launch(spec)
     if not spec.reaches:
@@ -657,13 +655,27 @@ def walked_launches[O, F](spec: Forward, launch: Launch[O, F], kept: Callable[[j
     # The call's own rows alone: a padded query's maximum is -inf, a row that reads nothing (`seen`).
     reach = reach_of(maxima if spec.queries is None else maxima[..., :spec.queries],
                      unseen=spec.form == "spans")
-    natural = unfolded(spec)
+    natural, unfolding = unfolded(spec), reach >= FOLD_REACH
 
-    def unfolded_launch() -> O:
-        unfolded_outputs, _, unfolded_over = plain_launch(natural)
-        return guarded_launch(natural, unfolded_outputs, unfolded_over)
+    def natural_launch(folded: tuple[O, jax.Array]) -> tuple[O, jax.Array]:
+        # The natural form's plain launch in the folded one's place, its outputs and overflows.
+        launched, _, overflowed = plain_launch(natural)
+        return launched, overflowed
 
-    return jax.lax.cond(reach >= FOLD_REACH, unfolded_launch, lambda: guarded_launch(spec, outputs, over))
+    # Where some row's maximum passes the fold's reach (`FOLD_REACH`).
+    outputs, over = once(unfolding, natural_launch, (outputs, over))
+    outputs = guarded_launch(natural, outputs, over, unfolding)
+    return guarded_launch(spec, outputs, over, ~unfolding)
+
+
+def once[C](taken: jax.Array, body: Callable[[C], C], carried: C) -> C:
+    """`body(carried)` where `taken`, else `carried`: a loop of at most one trip, whose carry XLA keeps in its
+    operand's buffer, the rare side of a branch (`walked_launches`' rare walks) with no copy on the common
+    one, whose identity a branch copies into its result (ET-MEMCPY-h100)."""
+    def trip(state):
+        return jnp.zeros((), bool), body(state[1])
+
+    return jax.lax.while_loop(lambda state: state[0], trip, (jnp.asarray(taken), carried))[1]
 
 
 NATURAL_EXPONENT_REACH = 150.0

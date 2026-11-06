@@ -346,7 +346,7 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
                     sources: jax.Array | None = None, subtracted: bool = False, merges: bool = False,
                     flagged: bool = False, scales: tuple[jax.Array, jax.Array] | None = None,
                     parts: int = 1):
-    """The inference walk's launches: its spec, `launch(form, live, again)` and `kept` as
+    """The inference walk's launches: its spec, `launch(form, live, into)` and `kept` as
     `algebra.walked_launches` takes them and `finished`, its outputs from the walk's: `MosaicForward`'s launch
     without residuals, at `tiles`, under the default's guards over whole launches (`algebra.walked_launches`).
     The guarded launch (`_Guard`) runs a block of the family's swizzled value columns at a time: its walk
@@ -382,8 +382,7 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
     # `table`).
     paged = None if call.table is None or call.page is None else (call.table, call.page)
 
-    def launch(form: algebra.Forward, live: "jax.Array | _Flags | None", again: bool = False,
-               into: tuple | None = None
+    def launch(form: algebra.Forward, live: "jax.Array | _Flags | None", into: tuple | None = None
                ) -> "tuple[tuple, jax.Array, jax.Array] | tuple[tuple, None, _Flags]":
         q, form = _rewalked(spec, form, raw, taken)
         # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
@@ -394,12 +393,11 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
         # the live ones, the rest of its outputs left as the plain launch wrote them (`_Read.into`).
         # An in-place rewalk is of live rows (`algebra.walked_launches`).
         in_place = {"into": into, "keeping": flags.rows} if into is not None and flags is not None else {}
-        stated = flagged and live is None and into is None and not again
+        stated = flagged and live is None and into is None
         walk = _InferenceWalk(family, spec, call, hooks, hooked, k, v, interpret, rows, out_dtype, masked,
                               splits, paged, sources, merges, computed, parts)
         if flags is None or not form.headroom:
-            return _plain_launches(walk, q, form, at, at_spans, flags, in_place, stated=stated, again=again,
-                                   into=into)
+            return _plain_launches(walk, q, form, at, at_spans, flags, in_place, stated=stated, into=into)
         return _guarded_launches(walk, q, form, at, flags, in_place, into=into)
 
     return (spec, launch, functools.partial(_kept, splits=splits, merges=merges),
@@ -432,7 +430,7 @@ class _InferenceWalk(NamedTuple):
 
 
 def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, at: Tiles, at_spans,
-                    flags: "_Flags | None", in_place: dict, *, stated: bool, again: bool, into: tuple | None
+                    flags: "_Flags | None", in_place: dict, *, stated: bool, into: tuple | None
                     ) -> "tuple[tuple, jax.Array, jax.Array] | tuple[tuple, None, _Flags]":
     """An inference walk's plain launch, or a masked rewalk of sums that cannot overflow, at tiles `at` in
     `form` (`_inference_walk`'s `launch`): a launch a block of the value columns where its tiles walk a
@@ -450,8 +448,8 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
                         held._replace(output=()) if split else held, None,
                         spec=form, hooks=_unhooked(hooks) if split else hooks, tiles=at,
                         family=family, training=False, interpret=interpret, parts=parts,
-                        counted=form.natural == spec.natural and not again, kept=again,
-                        finishes=rows, columns=first, splits=splits, table=paged, sources=sources,
+                        counted=form.natural == spec.natural, finishes=rows, columns=first, splits=splits,
+                        table=paged, sources=sources,
                         out_dtype=jnp.float32 if split else out_dtype, walks=walks,
                         shared_by=len(blocks),
                         column_width=(values.shape[-1] if into is not None and first is not None
@@ -648,20 +646,20 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     value_width = value.shape[3]
     out_dtype = jnp.float32 if parts > 1 else query.dtype
 
-    def launch(form: algebra.Forward, live: jax.Array | None, again: bool = False):
+    def launch(form: algebra.Forward, live: jax.Array | None):
         q, form = _rewalked(spec, form, raw, taken)
         if live is None:
-            counted = form.natural == spec.natural and not again
+            counted = form.natural == spec.natural
             # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
             at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
             found = _launch(q, k, v, at_spans, hooked, None, spec=form, hooks=hooks, tiles=at,
                             family=family, training=False, interpret=interpret, peaks=True, counted=counted,
-                            kept=again, parts=parts)
+                            parts=parts)
             # A training launch a block of the value columns where its tiles walk a block (`Tiles.columns`,
             # row 2526), each block's split sums side by side, their rows alike.
             launched = [_launch(q, k, values, at_spans, held, None, spec=form, hooks=hooks, tiles=at,
                                 family=family, training=True, interpret=interpret, anchors=found,
-                                counted=counted, kept=again, columns=first, parts=parts)
+                                counted=counted, columns=first, parts=parts)
                         for first, values, held in _column_blocks(v, hooked, at.columns)]
             status, rows, anchors, _ = launched[0]
             others = jnp.concatenate([block[3] for block in launched], axis=-1)
@@ -1673,7 +1671,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
             spec: algebra.Forward, hooks: Hooks, tiles: Tiles, family: mosaic.Family, training: bool,
             interpret: bool, columns: int | None = None, peaks: bool = False,
             anchors: tuple[jax.Array, jax.Array] | None = None, out_dtype=None, counted: bool = False,
-            kept: bool = False, finishes: bool = False, splits: int = 1,
+            finishes: bool = False, splits: int = 1,
             table: tuple[jax.Array, int] | None = None, column_width: int | None = None,
             walks: "_Flags | None" = None, sources: jax.Array | None = None, shared_by: int = 1,
             column_blocks: int = 1, certified: bool = False, into: tuple | None = None,
@@ -1720,7 +1718,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     # lowering, `_launched`: named by its first column, a width 256 compiled four, train 505's review).
     kind = "peaks" if peaks else "training" if training else "forward"
     block_width = column_width or value.shape[-1]
-    name = (f"attention_{kind}{'_natural' if spec.natural else ''}{'_kept' if kept else ''}"
+    name = (f"attention_{kind}{'_natural' if spec.natural else ''}"
             f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{block_width}'}"
             f"{'_certified' if certified else ''}{'_merged' if merges else ''}")
     # The hooks' functions and their arrays' shapes and dtypes static, their arrays the programs' operands.
