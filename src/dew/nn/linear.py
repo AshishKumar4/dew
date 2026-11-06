@@ -380,6 +380,56 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
     return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
 
 
+def tree_windows(tree: tuple[int, ...], width: int) -> np.ndarray:
+    """Each tree token's conv window, `[S, width + 1]` indices into the held history then the call's tokens
+    (`tree_conv`): its `width` predecessors on its path, oldest first, its ancestors and past the tree's
+    root the history's last columns, then itself."""
+    windows = np.zeros((len(tree), width + 1), np.int32)
+    for token, parent in enumerate(tree):
+        path, behind = [width + token], width - 1
+        while len(path) <= width:
+            if parent >= 0:
+                path.append(width + parent)
+                parent = tree[parent]
+            else:
+                path.append(behind)
+                behind -= 1
+        windows[token] = path[::-1]
+    return windows
+
+
+def tree_conv(mixed, taps, bias, history, tree: tuple[int, ...], *, parts=None, dtype=None):
+    """A tree call's causal conv (`dew.nn.inputs.AttentionMetadata.tree`): each token of `mixed` `[B, S, D]`
+    convolved over the `K-1` tokens before it on its path, its ancestors, and past the root the held
+    `history` `[B, K-1, D]`, as `causal_conv1d` convolves the window it ends (`tree_windows`); its
+    `parts` and `dtype` are `causal_conv1d`'s."""
+    batch, length, features = mixed.shape
+    width = taps.shape[1] - 1
+    windows = jnp.concatenate([history.astype(mixed.dtype), mixed], axis=1)[:, tree_windows(tree, width)]
+    convolved = causal_conv1d(windows.reshape(batch * length, width + 1, features), taps, bias=bias,
+                              parts=parts, dtype=dtype)
+    if parts is None:
+        return convolved[:, -1].reshape(batch, length, -1)
+    return tuple(piece[:, -1].reshape(batch, length, -1) for piece in convolved)
+
+
+def tree_rule(rule, tree: tuple[int, ...], operands: Sequence[jax.Array], held: jax.Array):
+    """A tree call's recurrence: each token advanced by `rule(*its operands [B, 1, ...], state)` from its
+    parent's state, the held `held` past the root, in tree order: its outputs `[B, S, ...]`. The tokens'
+    own states are not kept: a verify replays its accepted path into the cache it was called on."""
+    parents = jnp.asarray(tree, jnp.int32)
+
+    def advance(states, token):
+        parent = parents[token]
+        prior = jnp.where(parent >= 0, states[jnp.maximum(parent, 0)], held)
+        out, final = rule(*(jax.lax.dynamic_slice_in_dim(operand, token, 1, 1) for operand in operands),
+                          prior)
+        return states.at[token].set(final.astype(held.dtype)), out[:, 0]
+
+    _, outs = jax.lax.scan(advance, jnp.zeros((len(tree), *held.shape), held.dtype), jnp.arange(len(tree)))
+    return jnp.moveaxis(outs, 0, 1)
+
+
 def over_sequence(local, shards: int, tokens: tuple, whole: tuple):
     """`local(*tokens, *whole)` in a `manual_map` that splits the rows and the sequence of each of `tokens`
     (`[B, S, ...]` or None) as the rule table places a `[batch, length, ...]` activation, `whole` on every

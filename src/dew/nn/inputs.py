@@ -604,6 +604,11 @@ class AttentionMetadata:
     context: CrossContext | None = None
     progress: jax.Array | None = None
     routing_block: int | None = struct.field(pytree_node=False, default=None)
+    tree: tuple[int, ...] | None = struct.field(pytree_node=False, default=None)
+    """A cached call over a tree of candidate tokens (tree speculative decoding's verify block): each call
+    token's parent among the call's tokens, earlier than it, -1 for the row's last cached token. A token
+    reads its ancestors' keys and states alone; attention takes its mask in `key_runs`, a recurrent mixer
+    advances each token from its parent's state, and a mixer that reads no tree refuses one (`MIXING`)."""
     whole_blocks: bool = struct.field(pytree_node=False, default=False)
     """Whether each block of `block_groups` is its document's whole run of real tokens, as its producer
     states it (a decision row read whole, `QuestionLayout.split` 'whole'): a layer that reads blocks
@@ -620,15 +625,15 @@ class AttentionMetadata:
         return self.coordinates is not None and self.coordinates.right_padded
 
 
-MIXING = ("pairwise_mask", "key_positions", "key_runs", "position_bias", "admitted")
+MIXING = ("pairwise_mask", "key_positions", "key_runs", "position_bias", "admitted", "tree")
 """The `AttentionMetadata` fields that say which tokens a mixer lets each token
 read, or how much: a call's own mask, or its keys' runs, and the key positions
-it is read by, an additive bias, a server's mixed layout. A mixer runs a call that sets one only
-where it reads it (`MixerCall`). The rest describe the tokens themselves, which
-a mixer reads as far as its form uses them: their coordinates, rotary
-positions, and image and block groups, which only attention that sees an image
-or a block whole reads, and the ids the block reads for its feed-forward and
-n-gram lookup."""
+it is read by, an additive bias, a server's mixed layout, a tree's parents. A
+mixer runs a call that sets one only where it reads it (`MixerCall`). The rest
+describe the tokens themselves, which a mixer reads as far as its form uses
+them: their coordinates, rotary positions, and image and block groups, which
+only attention that sees an image or a block whole reads, and the ids the block
+reads for its feed-forward and n-gram lookup."""
 
 TOKENWISE = frozenset(MIXING)
 """The `MIXING` fields a mixer that reads no other token holds to: every one,
