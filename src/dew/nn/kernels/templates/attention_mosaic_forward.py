@@ -1870,8 +1870,10 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
         def consumer(index):
             block = _Block.of(program, row, head, pair_first + index * block_q, queries)
             stages = (refs.q_smem.at[index], _query_barriers(refs.q_loaded, index, parts))
+            # The query block's view, an fp32 call's its parts' (`_query_view`).
+            q_view = _query_view(refs.q, row, pl.ds(block.first, block_q), head, batch=batch, parts=parts)
             if peaks:
-                _peak_consumer(program, spec, index, refs.q.at[block.rows],
+                _peak_consumer(program, spec, index, q_view,
                                tuple(ref.at[block.state] for ref in refs.written), *stages,
                                refs.row_smem.at[index], refs.stages[0].at[index], streams, views, turn,
                                streamed, block.first, read.spans, read.hooked, (row, head), hooks=hooks,
@@ -1886,7 +1888,6 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                 finishes=finishes, columns_at=columns_at, certified=certified,
                 merges=((ready, (row, axis, index), lax.div(family.program_index("q_tiles"), splits))
                         if merges else None))
-            q_view = _query_view(refs.q, row, pl.ds(block.first, block_q), head, batch=batch, parts=parts)
             _consumer(program, spec, index, q_view, out_view,
                       status, *stages, refs.out_smem.at[index], refs.row_smem.at[index], streams, views, turn,
                       streamed, block.first, read.spans, read.hooked, read.guard,

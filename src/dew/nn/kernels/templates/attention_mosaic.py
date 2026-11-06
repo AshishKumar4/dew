@@ -355,9 +355,10 @@ class MosaicForward(_Mainloop[Tiles]):
         if config.deferred and not values_deferred(family, self.form, self.splits, query.dtype, dropped,
                                                    self.parts):
             return False
-        # A tile of fewer rows than a role's lays its warps along its keys, 32 key columns each (Mosaic's
-        # layouts take whole such tiles a warp: a 96-key tile's three refused, dd-q5p4).
-        if config.block_q < family.role_rows and config.block_k % (WARPGROUP_WARPS * 32):
+        # A tile of fewer rows than a role's lays its warps along its keys, a whole 16-key product's columns
+        # each (Mosaic's layouts take whole such tiles a warp: a 96-key tile's 24 refused, dd-q5p4; 64-key
+        # tiles lower at widths 64 to 256 on sm80 and sm90, dd-k16b).
+        if config.block_q < family.role_rows and config.block_k % (WARPGROUP_WARPS * 16):
             return False
         # Its key tiles (the launch's, its natural rewalk's) split among the consumers that copy them
         # (`Transport.shares_rows`: two mma.sync consumers' cp.async in whole 64-row parts, so no 32-key tile
