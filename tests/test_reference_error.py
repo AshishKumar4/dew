@@ -2429,3 +2429,33 @@ def test_check_1_holds_an_arm_to_a_bitwise_repeat_only_where_one_is_promised(
         null_runs(bits_apart(), a_product_draw, label, seeds=8, runs=1, truth_fn=jnp.matmul)
 
 
+
+
+def test_a_float64_computation_is_held_within_its_own_roundings():
+    """`assert_within_rounding` holds a computation to gamma_n of its magnitudes in its own dtype: the sum of
+    a thousand thirds in float64, exact by Fraction, passes at its thousand roundings, and the same sum
+    rounded to float32 at its last step, a float32 result, fails there."""
+    from fractions import Fraction
+
+    from reference_error import assert_within_rounding
+
+    thirds = [Fraction(1, 3) * (1 + index % 7) for index in range(1000)]
+    exact = np.asarray([sum(thirds, Fraction(0))], object)
+    magnitudes = np.asarray([float(sum(thirds, Fraction(0)))])
+    computed = np.asarray([sum(float(value) for value in thirds)], np.float64)
+    assert_within_rounding(computed, exact, magnitudes, 1000, np.float64, "a float64 sum")
+    with pytest.raises(AssertionError):
+        assert_within_rounding(computed.astype(np.float32), exact, magnitudes, 1000, np.float64, "float32")
+    # The error is the exact one: a value just past the midpoint above 1 rounds up to 1 + 2^-52, and a result
+    # four roundings below it (1 - 3 2^-53, 4 2^-53 + 2^-120 from it) is within gamma_4, though five of
+    # 2^-53 from the exact value's float64 rounding.
+    exact = Fraction(1) + Fraction(1, 2**53) + Fraction(1, 2**120)
+    assert_within_rounding(np.asarray([1 - 3 * 2.0**-53]), np.asarray([exact], object), np.asarray([1.0]), 4,
+                           np.float64, "below the midpoint's rounding")
+    # An error past the bound by less than its own ulp fails, compared exactly.
+    from dew._accuracy import reduction_bound
+
+    bound = float(reduction_bound(np.asarray([1.0]), 2, np.float64)[0] / 2)
+    beyond = np.asarray([Fraction(1) - Fraction(bound) - Fraction(1, 2**200)], object)
+    with pytest.raises(AssertionError):
+        assert_within_rounding(np.asarray([1.0]), beyond, np.asarray([1.0]), 2, np.float64, "just past")
