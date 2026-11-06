@@ -77,7 +77,16 @@ from dew.data.pipeline import (
     runs,
     with_children,
 )
-from dew.data.plan import Manifest, StepIdentity, _changed, _semantic, identified
+from dew.data.plan import (
+    FILE_SHARDS,
+    Manifest,
+    StepIdentity,
+    _changed,
+    _semantic,
+    filled_version,
+    identified,
+    streams_parquet,
+)
 from dew.data.sources.base import (
     READS,
     SAME_ROWS,
@@ -214,7 +223,7 @@ def _measures(stages: Sequence[Stage]) -> tuple[Measuring, ...]:
     return tuple(found.values())
 
 
-def _prefix_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Manifest:
+def _prefix_manifest(source: Source, prefix: Sequence[Stage], read: Read, version: int) -> Manifest:
     """The manifest of what a cache after `prefix` over `source` holds, as a
     publication records it (`dew.data.compile.publish`): the source as `read`
     consumes it, and the configured steps bound to the facts it states."""
@@ -223,7 +232,7 @@ def _prefix_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Man
     if any(isinstance(stage, Configured) for stage in prefix):
         stated = _stated(consumed, read, _measures(prefix))[1]
         pipeline = _configured(pipeline, stated, read, stated=stated)
-    return _cache_manifest(consumed, pipeline.stages, read)
+    return _cache_manifest(consumed, pipeline.stages, read, version)
 
 
 def _in_place(generation: Generation, source: Source | Mixture | Phases,
@@ -262,7 +271,9 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
     if unkeyed:
         return None, (f"steps ({', '.join(unkeyed)} bind to one run's facts or have no "
                       "identity='name@version', which no generation holds)",)
-    changed = _changed(_semantic(dependency), _prefix_manifest(stored, prefix, read).semantic())
+    # Keyed as the fill was, by the shards it numbered its rows by (`filled_version`).
+    version = filled_version(fill)
+    changed = _changed(_semantic(dependency), _prefix_manifest(stored, prefix, read, version).semantic())
     if changed:
         return None, changed
     if not selections:
@@ -278,7 +289,7 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
     placing: Read = ("streamed" if read == "streamed"
                      else "indexed" if placed.supports("indexed") else "memory")
     if (placing == "streamed" and any(isinstance(selection, RecordSlice) for selection in selections)
-            and not placed.manifest().index_ordered):
+            and not placed.manifest(version).index_ordered):
         raise ValueError(
             f"a records holdout numbers its inputs by index, and generation {generation.url} numbers them by "
             f"the shards a stream of {placed.describe()} read, which it doesn't state is the index order; "
@@ -619,12 +630,12 @@ def _manifest(
     return Manifest.of(snapshot, steps, ran=ran, fill=fill)
 
 
-def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Manifest:
-    """The key of a cache of `prefix` over `source`: the source's content and the record steps,
-    without the views of its inputs (`_VIEWS`), which order or select what it holds and make none of
-    it. A store given no name states no content (`Manifest.exact`), and its cache would serve any
-    other's rows."""
-    manifest = _cache_key(source, prefix, read)
+def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read, version: int) -> Manifest:
+    """The key of a cache of `prefix` over `source` read by data plan `version`: the source's content and
+    the record steps, without the views of its inputs (`_VIEWS`), which order or select what it holds and
+    make none of it. A store given no name states no content (`Manifest.exact`), and its cache would serve
+    any other's rows."""
+    manifest = _cache_key(source, prefix, read, version)
     if manifest is None:
         raise ValueError(f"a cache keys its store's content, which {source.describe()} doesn't "
                          "state: name it (from_grain(..., identity=), from_iter(..., identity=), "
@@ -632,8 +643,10 @@ def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Mani
     return manifest
 
 
-def _cache_key(source: Source, prefix: Sequence[Stage], read: Read) -> Manifest | None:
-    """`_cache_manifest`, or None where `source` states no content of its own to key."""
+def _cache_key(source: Source, prefix: Sequence[Stage], read: Read, version: int) -> Manifest | None:
+    """`_cache_manifest`, or None where `source` states no content of its own to key. A stream's fill
+    numbers its rows by its shards, which a Parquet store's are its files from `FILE_SHARDS` and its row
+    groups before (`filled_version`), so the two fill caches of their own."""
     stated = source.fingerprint()
     if not identified(json_value(stated, "source")):
         return None
@@ -641,7 +654,9 @@ def _cache_key(source: Source, prefix: Sequence[Stage], read: Read) -> Manifest 
         stated,
         (source,),
         tuple(_identity(stage, cache=True) for stage in _cache_steps(prefix)),
-        fill={"read": read, "row_ids": "sharded" if read == "streamed" else "indexed"},
+        fill={"read": read, "row_ids": "sharded" if read == "streamed" else "indexed",
+              **({"shards": "files"} if read == "streamed" and version >= FILE_SHARDS
+                 and streams_parquet(json_value(stated, "source")) else {})},
     )
 
 

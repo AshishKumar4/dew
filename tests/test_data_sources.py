@@ -29,10 +29,14 @@ from token_support import export_byte_tokens
 
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
+from dew.data.plan import PLAN_VERSIONS
 from dew.data.shards import streamed
 from dew.data.sinks import export
 from dew.data.sources import Files, Memory
 from dew.data.storage import Store
+
+LATEST = PLAN_VERSIONS[-1]
+"""The data plan version a new run reads by, whose shards a manifest here names."""
 
 
 def test_memory_columns_snapshot_changes_with_content():
@@ -40,7 +44,7 @@ def test_memory_columns_snapshot_changes_with_content():
     changed = Memory({"x": np.arange(5) + 1, "y": np.arange(5) * 3}, shard_rows=2)
     assert first.fingerprint() != changed.fingerprint()
     assert first.supports("streamed")
-    rows = [row for shard in first.manifest().shards for row in first.manifest().reader(shard)]
+    rows = [row for shard in first.manifest(LATEST).shards for row in first.manifest(LATEST).reader(shard)]
     assert [row["x"] for row in rows] == list(range(5))
     assert Memory([{"x": np.int16(4)}]).fingerprint() != Memory([{"x": np.int32(4)}]).fingerprint()
     assert Memory([{"x": 1}], shard_rows=1).fingerprint() != Memory([{"x": 1}], shard_rows=2).fingerprint()
@@ -148,17 +152,17 @@ def test_jsonl_ranges_cover_rows_once_even_at_line_boundaries():
     files = Files(root.url, shard_bytes=67)
     assert not files.supports("indexed")
     assert files.supports("streamed")
-    actual = [row for shard in files.manifest().shards for row in files.manifest().reader(shard)]
+    actual = [row for shard in files.manifest(LATEST).shards for row in files.manifest(LATEST).reader(shard)]
     assert actual == rows
     files.provision()
     assert files.supports("indexed")
     indexed = files.records("indexed")
     assert [indexed[index] for index in range(len(indexed))] == rows
-    reader = iter(files.manifest().reader(files.manifest().shards[0]))
+    reader = iter(files.manifest(LATEST).reader(files.manifest(LATEST).shards[0]))
     next(reader)
     state = reader.get_state()
     expected = list(reader)
-    resumed = iter(files.manifest().reader(files.manifest().shards[0]))
+    resumed = iter(files.manifest(LATEST).reader(files.manifest(LATEST).shards[0]))
     resumed.set_state(state)
     assert list(resumed) == expected
 
@@ -186,7 +190,7 @@ def test_a_json_file_reads_and_resumes_as_datasets_reads_it(tmp_path, held, suff
                                      cache_dir=str(tmp_path / "datasets")).to_list()
     files = Files(str(path))
     assert list(files.records("memory")) == expected
-    manifest = files.manifest()
+    manifest = files.manifest(LATEST)
     (shard,) = manifest.shards
     reader = iter(manifest.reader(shard))
     assert [next(reader) for _ in range(5)] == expected[:5]
@@ -212,7 +216,7 @@ def test_compressed_jsonl_reads_and_resumes_in_every_read_mode(tmp_path, extensi
     file.write(compressed)
     url = root.url if discovery == "directory" else file.url
     files = Files(url, format=None if discovery == "inferred" else "jsonl", shard_bytes=7)
-    manifest = files.manifest()
+    manifest = files.manifest(LATEST)
     assert len(manifest.shards) == 1
     reader = iter(manifest.reader(manifest.shards[0]))
     try:
@@ -241,8 +245,8 @@ def test_csv_quoted_newlines_are_never_byte_split():
     root = Store(f"memory://csv-{uuid4().hex}/rows.csv")
     root.write(b'id,text\n0,"two\nlines"\n1,"last"\n')
     files = Files(root.url, shard_bytes=2)
-    assert len(files.manifest().shards) == 1
-    assert list(files.manifest().reader(files.manifest().shards[0])) == [
+    assert len(files.manifest(LATEST).shards) == 1
+    assert list(files.manifest(LATEST).reader(files.manifest(LATEST).shards[0])) == [
         {"id": "0", "text": "two\nlines"},
         {"id": "1", "text": "last"},
     ]
@@ -272,7 +276,8 @@ def test_csv_large_quoted_fields_survive_streaming_and_offset_provisioning():
     # A field past Python's default limit reads under the limit its caller raises (`Files`).
     previous = csv.field_size_limit(len(text) + 1)
     try:
-        assert list(files.manifest().reader(files.manifest().shards[0])) == [{"id": "0", "text": text}]
+        manifest = files.manifest(LATEST)
+        assert list(manifest.reader(manifest.shards[0])) == [{"id": "0", "text": text}]
         files.provision()
         assert files.records("indexed")[0] == {"id": "0", "text": text}
     finally:
@@ -296,7 +301,7 @@ def test_arrow_discovers_hive_partitions_and_pushes_projection_and_predicate():
     )
     files = Files(root.url, format="parquet", columns=("value", "split"), where=ds.field("value") >= 15)
     assert not files.supports("indexed")
-    actual = [row for shard in files.manifest().shards for row in files.manifest().reader(shard)]
+    actual = [row for shard in files.manifest(LATEST).shards for row in files.manifest(LATEST).reader(shard)]
     assert actual == [{"value": index, "split": "held"} for index in range(15, 20)]
     indexed = Files(root.url, format="parquet").records("indexed")
     assert len(indexed) == 20
@@ -311,7 +316,8 @@ def test_a_predicate_held_in_memory_keeps_the_rows_it_selects(tmp_path):
     pq.write_table(pa.table({"x": [0, 1, 2, 3]}), tmp_path / "rows.parquet", row_group_size=2)
     for where, kept in ((ds.field("x") > 0, [1, 2, 3]), (ds.field("x") > 1, [2, 3])):
         files = Files(str(tmp_path / "rows.parquet"), where=where)
-        streamed_rows = [row for shard in files.manifest().shards for row in files.manifest().reader(shard)]
+        manifest = files.manifest(LATEST)
+        streamed_rows = [row for shard in manifest.shards for row in manifest.reader(shard)]
         assert [row["x"] for row in files.records("memory")] == [row["x"] for row in streamed_rows] == kept
 
 
@@ -326,7 +332,7 @@ def test_a_projected_line_source_reads_only_its_columns_in_every_read_mode(tmp_p
     Files(str(path)).provision()
     projected = Files(str(path), columns=("id",))
     expected = [{"id": row["id"]} for row in rows]
-    manifest = projected.manifest()
+    manifest = projected.manifest(LATEST)
     assert [row for shard in manifest.shards for row in manifest.reader(shard)] == expected
     assert list(projected.records("memory")) == expected
     indexed = projected.records("indexed")
@@ -443,7 +449,7 @@ def test_shard_root_is_disjoint_across_real_workers_and_shares():
     all_rows = []
     for share in range(2):
         rows = streamed(
-            values.manifest(),
+            values.manifest(LATEST),
             partition=DataPartition(share, 2),
             seed=4,
             cycle_length=2,
@@ -475,7 +481,7 @@ def test_exports_are_committed_and_readable_at_memory_urls(format):
     assert manifest["rows"] == 13
     assert Store(root + "/_SUCCESS").read()
     files = Files(root, format=format)
-    actual = [row for shard in files.manifest().shards for row in files.manifest().reader(shard)]
+    actual = [row for shard in files.manifest(LATEST).shards for row in files.manifest(LATEST).reader(shard)]
     assert actual == rows
     with pytest.raises(ValueError):
         Files(root, format="jsonl").records("memory")
@@ -495,8 +501,8 @@ def test_a_source_exports_the_records_its_pipeline_exports():
         root = f"memory://export-{uuid4().hex}"
         export(values, root, rows_per_shard=2)
         files = Files(root, format="parquet")
-        return [np.asarray(row["id"]).tolist() for shard in files.manifest().shards
-                for row in files.manifest().reader(shard)]
+        return [np.asarray(row["id"]).tolist() for shard in files.manifest(LATEST).shards
+                for row in files.manifest(LATEST).reader(shard)]
 
     assert exported(stored) == exported(stored._chain()) == [[2 * index, 2 * index + 1] for index in range(5)]
 
@@ -572,16 +578,16 @@ def test_one_small_file_streams_to_every_reader_each_reading_its_own_lines(tmp_p
     path = tmp_path / f"rows.{'jsonl' if kind == 'jsonl' else 'txt'}"
     path.write_text("".join(line + "\n" for line in lines))
     files = Files(str(path), format=kind)
-    assert len(files.manifest().shards) == 1
+    assert len(files.manifest(LATEST).shards) == 1
     shares = []
     for share in range(4):
-        rows = streamed(files.manifest(), partition=DataPartition(share, 4), loading=Loading(workers=0))
+        rows = streamed(files.manifest(LATEST), partition=DataPartition(share, 4), loading=Loading(workers=0))
         shares.append([row["id"] if kind == "jsonl" else json.loads(row["text"])["id"] for row in rows])
     assert all(shares)
     assert sorted(itertools.chain(*shares)) == list(range(40))
     (tmp_path / "two.jsonl").write_text(lines[0] + "\n" + lines[1] + "\n")
     with pytest.raises(ValueError):
-        streamed(Files(str(tmp_path / "two.jsonl")).manifest(), partition=DataPartition(0, 4),
+        streamed(Files(str(tmp_path / "two.jsonl")).manifest(LATEST), partition=DataPartition(0, 4),
                  loading=Loading(workers=0))
 
 
@@ -641,7 +647,7 @@ def ids_per_reader(path: Path, readers: int, kind: str = "jsonl") -> list[list[i
     shares = []
     for share in range(readers):
         partition = DataPartition(share, readers)
-        rows = streamed(stored.manifest(), partition=partition, loading=Loading(workers=0))
+        rows = streamed(stored.manifest(LATEST), partition=partition, loading=Loading(workers=0))
         shares.append([row["id"] if kind == "jsonl" else json.loads(row["text"])["id"] for row in rows])
     return shares
 
@@ -713,12 +719,12 @@ def test_export_manifest_cannot_reference_an_object_outside_its_root():
     that leaves the root is refused."""
     root = Store(f"memory://escaping-export-{uuid4().hex}/dataset")
     export(Memory([{"id": 1}]), root.url)
-    assert len(Files(root.url).manifest().shards) == 1
+    assert len(Files(root.url).manifest(LATEST).shards) == 1
     manifest = json.loads(root.child("_dew_manifest.json").read())
     manifest["files"][0]["path"] = "../" + manifest["files"][0]["path"]
     root.child("_dew_manifest.json").write(json.dumps(manifest).encode())
     with pytest.raises(ValueError):
-        Files(root.url).manifest()
+        Files(root.url).manifest(LATEST)
 
 
 def test_webdataset_groups_members_and_restores_inside_shard():
@@ -733,7 +739,7 @@ def test_webdataset_groups_members_and_restores_inside_shard():
     root = Store(f"memory://tar-{uuid4().hex}/data.tar")
     root.write(buffer.getvalue())
     files = Files(root.url)
-    iterator = iter(files.manifest().reader(files.manifest().shards[0]))
+    iterator = iter(files.manifest(LATEST).reader(files.manifest(LATEST).shards[0]))
     assert next(iterator) == {"__key__": "0", "txt": b"0-txt", "jpg": b"0-jpg"}
     state = iterator.get_state()
     expected = list(iterator)
@@ -753,7 +759,8 @@ def test_text_preserves_exact_line_terminators_through_byte_tokenization(read):
     if read == "indexed":
         files.provision()
     if read == "streamed":
-        records = [row for shard in files.manifest().shards for row in files.manifest().reader(shard)]
+        manifest = files.manifest(LATEST)
+        records = [row for shard in manifest.shards for row in manifest.reader(shard)]
     else:
         indexed = files.records(read)
         records = [indexed[index] for index in range(len(indexed))]
@@ -1591,7 +1598,7 @@ def test_from_iter_closes_the_native_file_before_restoring_and_on_close(tmp_path
     options = ({"state": lambda it: it.file.tell(), "load_state": lambda it, saved: it.file.seek(saved)}
                if native_state else {"replay": True})
     source = from_iter(Native, identity="native-file@1", **options)
-    manifest = source.manifest()
+    manifest = source.manifest(LATEST)
     reader = iter(manifest.reader(manifest.shards[0]))
     try:
         assert next(reader) == {"id": 0}
@@ -1675,7 +1682,7 @@ def test_from_iter_forwards_a_native_stop_request():
             stopped.append(True)
 
     source = from_iter(Native, identity="stoppable@1")
-    manifest = source.manifest()
+    manifest = source.manifest(LATEST)
     reader = iter(manifest.reader(manifest.shards[0]))
     try:
         assert next(reader) == {"id": 0}
@@ -1925,7 +1932,7 @@ def test_a_pass_reads_its_rows_after_any_run_of_empty_shards():
     for number in range(4097):
         # A blank line is a shard that holds no row.
         root.child(f"{number:05d}.jsonl").write(b'{"id": 7}\n' if number == 4096 else b"\n")
-    dataset = streamed(Files(root.url, format="jsonl").manifest(), partition=DataPartition(), epochs=1,
+    dataset = streamed(Files(root.url, format="jsonl").manifest(LATEST), partition=DataPartition(), epochs=1,
                        cycle_length=1, loading=Loading(workers=0, threads=1, read_buffer=1))
     assert list(dataset) == [{"id": 7}]
 
@@ -1933,7 +1940,7 @@ def test_a_pass_reads_its_rows_after_any_run_of_empty_shards():
 def test_an_endless_read_of_a_store_that_states_it_holds_no_row_is_refused():
     """A store whose every shard states it holds no row would read nothing forever endlessly, which
     is refused; read once, it is a pass that yields nothing."""
-    manifest = Memory([], shard_rows=4).manifest()
+    manifest = Memory([], shard_rows=4).manifest(LATEST)
     loading = Loading(workers=0, threads=1, read_buffer=1)
     assert list(streamed(manifest, partition=DataPartition(), epochs=1, loading=loading)) == []
     with pytest.raises(ValueError):
@@ -1962,8 +1969,8 @@ class _StreamOnly:
     def records(self, read):
         return self.memory.records(read)
 
-    def manifest(self):
-        return self.memory.manifest()
+    def manifest(self, version):
+        return self.memory.manifest(version)
 
     def metadata(self):
         return self.memory.metadata()
@@ -2056,9 +2063,9 @@ def test_an_exports_files_of_one_place_shard_apart(tmp_path):
             writing.write(str(value).encode())
         writing.close()
     files = Files(str(root), format="array_record").provision()
-    assert len({shard.id for shard in files.manifest().shards}) == 2
+    assert len({shard.id for shard in files.manifest(LATEST).shards}) == 2
     for source in (files, Concatenate((files,))):
-        manifest = source.manifest()
+        manifest = source.manifest(LATEST)
         read = sorted(bytes(row) for shard in manifest.shards for row in manifest.reader(shard))
         assert read == [b"0", b"1", b"2", b"3"]
 
@@ -2119,7 +2126,7 @@ def test_an_indexed_source_streams_as_bounded_shards_of_its_records(tmp_path, ki
     record, wherever the source is; a shard reads that slice of the indexed records, and the
     manifest pickles, reader and all, for Grain's worker processes."""
     source, expected = _indexed_source(kind, tmp_path)
-    manifest = source.manifest()
+    manifest = source.manifest(LATEST)
     named = [(shard.id, shard.uri, shard.start, shard.stop, shard.rows) for shard in manifest.shards]
     assert named == expected
     reopened = pickle.loads(pickle.dumps(manifest))

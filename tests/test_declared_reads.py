@@ -22,9 +22,13 @@ from storage_support import moto_bucket
 from token_support import export_byte_tokens
 
 from dew.data.declared import Replaced
+from dew.data.plan import PLAN_VERSIONS
 from dew.data.sinks import export
 from dew.data.sources import Files, Memory
 from dew.data.storage import Store
+
+LATEST = PLAN_VERSIONS[-1]
+"""The data plan version a new run reads by, whose shards a manifest here names."""
 
 
 @contextlib.contextmanager
@@ -60,7 +64,7 @@ def test_a_shard_replaced_under_its_exports_manifest_is_refused_where_it_is_read
 
         def rows(source):
             if read == "streamed":
-                manifest = source.manifest()
+                manifest = source.manifest(LATEST)
                 return [row["id"] for part in manifest.shards for row in manifest.reader(part)]
             records = source.records("indexed")
             return [records[index]["id"] for index in range(len(records))]
@@ -99,7 +103,7 @@ def test_a_declared_line_file_replaced_under_its_facts_is_refused_where_it_is_re
     def rows():
         source = Files((root.url,), format="jsonl", index=index, file_info=facts)
         if read == "streamed":
-            manifest = source.manifest()
+            manifest = source.manifest(LATEST)
             return [row["id"] for part in manifest.shards for row in manifest.reader(part)]
         records = source.records("indexed")
         return [records[position]["id"] for position in range(len(records))]
@@ -131,7 +135,7 @@ def test_a_declared_archive_replaced_under_its_facts_is_refused_where_it_is_read
 
     def rows():
         files = Files((root.url,), format="webdataset", file_info=facts)
-        return list(files.manifest().reader(files.manifest().shards[0]))
+        return list(files.manifest(LATEST).reader(files.manifest(LATEST).shards[0]))
 
     assert rows() == [{"__key__": "0", "txt": b"held"}]
     root.write(archive("swap"))
@@ -385,7 +389,7 @@ def test_a_hub_export_read_by_its_branch_reads_every_file_at_the_commit_it_named
     # Its manifest read, none of its files yet, as a run's identity is taken before its reads.
     assert source.committed is not None
     branch["main"] = "1" * 40
-    manifest = source.manifest()
+    manifest = source.manifest(LATEST)
     assert [row["id"] for part in manifest.shards for row in manifest.reader(part)] == [0, 1]
 
 
@@ -395,7 +399,7 @@ def test_a_declaration_without_a_digest_or_a_version_is_refused_where_it_is_read
     root = Store(f"memory://undeclared-{uuid4().hex}/rows.jsonl")
     root.write(b'{"id":0}\n')
     source = Files((root.url,), format="jsonl", file_info={root.url: {"bytes": len(root.read())}})
-    manifest = source.manifest()
+    manifest = source.manifest(LATEST)
     with pytest.raises(ValueError):
         list(manifest.reader(manifest.shards[0]))
 
@@ -472,7 +476,7 @@ def test_an_http_line_file_read_on_its_published_etag_is_refused_once_replaced()
 
         def rows():
             source = Files((location,), format="jsonl", file_info=facts, storage_options=options)
-            manifest = source.manifest()
+            manifest = source.manifest(LATEST)
             return [row["id"] for part in manifest.shards for row in manifest.reader(part)]
 
         assert rows() == [0, 1]
@@ -493,7 +497,7 @@ def test_a_version_only_array_record_shard_is_refused_where_its_reader_needs_its
         url = root.child(entry["path"]).url
         source = Files((url,), format="array_record", storage_options=options,
                        file_info={url: {"bytes": entry["bytes"], "stored": entry["stored"]}})
-        manifest = source.manifest()
+        manifest = source.manifest(LATEST)
         with pytest.raises(ValueError):
             list(manifest.reader(manifest.shards[0]))
 
