@@ -185,6 +185,13 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
         # 64 still spills 40 bytes counted apart, its decode path the Triton mainloop's until it does not).
         magnitudes = [logits[0], (columns, block, jnp.float32)]
         live = resources.live_registers(family, carried, logits + sums, magnitudes, *fragments)
+        if family.operands_in_registers:
+            # Its products' fragments loaded beside the step's tiles, which they read (mma.sync: priced
+            # apart, the guarded launch at 64 x 64 on two consumers, width 128, held 244 and spilled 208 to
+            # 248 bytes on an A100 under every hook, FS-GUARD80-2; beside them it prices 372, so no
+            # 64-column tile of its holds it there and the plain launch is illegal at width 128).
+            live = max(live, *(resources.live_registers(family, carried, logits + sums + phase)
+                               for phase in fragments))
         return live <= family.registers(candidate.consumers)
 
     blocks = [block for block in extents(family, dtype, tiles.block_k) if tiles.block_k % block == 0]
