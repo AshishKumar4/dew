@@ -875,7 +875,7 @@ CODES = (64, 64)
 """A quantized stage's rows and depth."""
 
 
-def _converted(codes, scale, *, generation_name: str, interpret):
+def _converted(codes, scale, *, generation_name: str, interpret, scaled: bool = True):
     """`codes` (int8 or e4m3) converted into a bf16 tile through a family's `converted`, each row scaled by
     `scale`, and copied out: on an A100's mma.sync and an H100's fed warpgroup MMA."""
     from dew.nn.kernels.templates import bundles, resources
@@ -887,7 +887,8 @@ def _converted(codes, scale, *, generation_name: str, interpret):
             mosaic.copied(codes_gmem, codes_smem)
             mosaic.synced(interpret is not False)
             row_scale = scale_gmem[...] if interpret is not False else family.rows_of(scale_gmem)
-            family.converted(codes_smem, into, interpret is not False, row_scale=row_scale)
+            family.converted(codes_smem, into, interpret is not False,
+                             row_scale=row_scale if scaled else None)
             mosaic.synced(interpret is not False)
             mosaic.store_rows(into, out_gmem, 0, 0, jnp.int32(CODES[0]), 0, CODES[0], copy=mosaic.coalesced,
                               widest=resources.copied_rows(CODES[1], jnp.bfloat16))
@@ -908,14 +909,15 @@ def _codes(dtype):
     return codes, jnp.exp2(jax.random.randint(keys[1], (CODES[0],), -3, 4).astype(jnp.float32))
 
 
+@pytest.mark.parametrize("scaled", [True, False], ids=["scaled", "unscaled"])
 @pytest.mark.parametrize("dtype", [jnp.int8, jnp.float8_e4m3fn])
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
-def test_a_quantized_stage_converts_into_the_tile_its_products_read(generation_name, dtype):
+def test_a_quantized_stage_converts_into_the_tile_its_products_read(generation_name, dtype, scaled):
     """Int8 and e4m3 codes in shared memory converted into a bf16 tile, each row scaled in fp32: exactly
     `codes * scale` interpreted (on a CPU) or on a GPU of the generation, and lowered for one on any host;
     FP8 codes refused where the device converts none (an A100)."""
     codes, scale = _codes(dtype)
-    expected = np.asarray(codes, np.float32) * np.asarray(scale)[:, None]
+    expected = np.asarray(codes, np.float32) * (np.asarray(scale)[:, None] if scaled else 1)
     with generation.assumed(generation_name):
         converts = mosaic.converts(dtype)
     if not converts:
@@ -925,13 +927,20 @@ def test_a_quantized_stage_converts_into_the_tile_its_products_read(generation_n
         return
     if jax.default_backend() == "cpu":
         with generation.assumed(generation_name):
-            converted = _converted(codes, scale, generation_name=generation_name, interpret=INTERPRETED)
+            converted = _converted(codes, scale, generation_name=generation_name, interpret=INTERPRETED,
+                                   scaled=scaled)
         np.testing.assert_array_equal(np.asarray(converted, np.float32), expected)
+        # Compiled for the device on any host, its PTX through ptxas (a process of the device's capability,
+        # `compile_mosaic_kernels`): an integer conversion's fold into sm_90's packed int8-to-bf16 assembly
+        # fails there, not in the lowering.
+        from fla_gdn_support import KernelCase
+        from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
         shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (codes, scale)]
-        mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
-        with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
-            jax.jit(functools.partial(_converted, generation_name=generation_name, interpret=False)).trace(
-                *shapes).lower(lowering_platforms=("cuda",))
+        compiled = functools.partial(_converted, generation_name=generation_name, interpret=False,
+                                     scaled=scaled)
+        found = compile_mosaic_kernels([KernelCase("converted", lambda: (compiled, shapes))], generation_name)
+        assert not mosaic_failures(found), mosaic_failures(found)
     elif generation.device_generation() == generation_name:
-        converted = _converted(codes, scale, generation_name=generation_name, interpret=False)
+        converted = _converted(codes, scale, generation_name=generation_name, interpret=False, scaled=scaled)
         np.testing.assert_array_equal(np.asarray(converted, np.float32), expected)
