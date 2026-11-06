@@ -380,6 +380,56 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
     return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
 
 
+def tree_windows(tree: tuple[int, ...], width: int) -> np.ndarray:
+    """Each tree token's conv window, `[S, width + 1]` indices into the held history then the call's tokens
+    (`tree_conv`): its `width` predecessors on its path, oldest first, its ancestors and past the tree's
+    root the history's last columns, then itself."""
+    windows = np.zeros((len(tree), width + 1), np.int32)
+    for token, parent in enumerate(tree):
+        path, behind = [width + token], width - 1
+        while len(path) <= width:
+            if parent >= 0:
+                path.append(width + parent)
+                parent = tree[parent]
+            else:
+                path.append(behind)
+                behind -= 1
+        windows[token] = path[::-1]
+    return windows
+
+
+def tree_conv(mixed, taps, bias, history, tree: tuple[int, ...], *, parts=None, dtype=None):
+    """A tree call's causal conv (`dew.nn.inputs.AttentionMetadata.tree_parents`): each token of `mixed`
+    `[B, S, D]` convolved over the `K-1` tokens before it on its path, its ancestors, and past the root
+    the held `history` `[B, K-1, D]`, as `causal_conv1d` convolves the window it ends (`tree_windows`);
+    its `parts` and `dtype` are `causal_conv1d`'s."""
+    batch, length, features = mixed.shape
+    width = taps.shape[1] - 1
+    windows = jnp.concatenate([history.astype(mixed.dtype), mixed], axis=1)[:, tree_windows(tree, width)]
+    convolved = causal_conv1d(windows.reshape(batch * length, width + 1, features), taps, bias=bias,
+                              parts=parts, dtype=dtype)
+    if parts is None:
+        return convolved[:, -1].reshape(batch, length, -1)
+    return tuple(piece[:, -1].reshape(batch, length, -1) for piece in convolved)
+
+
+def tree_rule(rule, tree: tuple[int, ...], operands: Sequence[jax.Array], held: jax.Array):
+    """A tree call's recurrence: each token advanced by `rule(*its operands [B, 1, ...], state)` from its
+    parent's state, the held `held` past the root, in tree order: its outputs `[B, S, ...]`. The tokens'
+    own states are not kept: a verify replays its accepted path into the cache it was called on."""
+    parents = jnp.asarray(tree, jnp.int32)
+
+    def advance(states, token):
+        parent = parents[token]
+        prior = jnp.where(parent >= 0, states[jnp.maximum(parent, 0)], held)
+        out, final = rule(*(jax.lax.dynamic_slice_in_dim(operand, token, 1, 1) for operand in operands),
+                          prior)
+        return states.at[token].set(final.astype(held.dtype)), out[:, 0]
+
+    _, outs = jax.lax.scan(advance, jnp.zeros((len(tree), *held.shape), held.dtype), jnp.arange(len(tree)))
+    return jnp.moveaxis(outs, 0, 1)
+
+
 def over_sequence(local, shards: int, tokens: tuple, whole: tuple):
     """`local(*tokens, *whole)` in a `manual_map` that splits the rows and the sequence of each of `tokens`
     (`[B, S, ...]` or None) as the rule table places a `[batch, length, ...]` activation, `whole` on every
@@ -733,9 +783,11 @@ class GatedDeltaNet(nn.Module):
     `fix_query_key_value_ordering` does (modeling_qwen3_next.py:540-586).
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset()
-    """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): a recurrence reads every earlier token
-    of its document, with no mask or bias to narrow it."""
+    reads: ClassVar[frozenset[str]] = frozenset({"tree_parents", "key_runs"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's alone, and the key runs that
+    mask its attention beside it: a recurrence reads every earlier token of its document, with no mask
+    or bias to narrow it, and on a tree its path's (`tree_conv`, `tree_rule`). Key runs without a tree
+    are refused."""
 
     emb_features: int
     num_k_heads: int
@@ -931,6 +983,19 @@ class GatedDeltaNet(nn.Module):
 
         return token
 
+    def _tree(self, mixed, g, beta, tree: tuple[int, ...], heads, widths, wide):
+        """A tree call's convolved tokens and recurrence (`tree_conv`, `tree_rule`): each token on its path,
+        from the row's held history and state past the root, the cache left as it was."""
+        if not self.has_variable('cache', 'recurrent_state'):
+            raise ValueError("a tree call reads a row's cache, which a decode call allocates first")
+        history = self.get_variable('cache', 'conv_state')
+        held = self.get_variable('cache', 'recurrent_state').astype(wide)
+        convolved = tree_conv(mixed, self.conv1d()[0], None, history, tree, parts=heads, dtype=wide)
+        query, key, value = (self._split_heads(part, width)
+                             for part, width in zip(convolved, widths, strict=True))
+        query, key = (repeat_kv_heads(x, self.num_v_heads) for x in (query, key))
+        return tree_rule(recurrent_gated_delta_rule, tree, (query, key, value, g, beta), held)
+
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):
         decode, attention_metadata = call.decode, call.metadata
@@ -997,7 +1062,13 @@ class GatedDeltaNet(nn.Module):
         stored, conv = self._stored(operand)
         heads = ((key_dim, self.head_k_dim), (key_dim, self.head_k_dim), (self.value_features, None))
         shards = sequence_shards()
-        if shards > 1:
+        tree = None if attention_metadata is None else attention_metadata.tree_parents
+        if tree is None and attention_metadata is not None and attention_metadata.key_runs is not None:
+            raise ValueError("a gated delta net reads key runs only as a tree call's attention mask, and "
+                             "would run them as if unset")
+        if tree is not None:
+            out = self._tree(mixed, g, beta, tree, heads, widths, wide)
+        elif shards > 1:
             if decode:
                 raise LayoutRefused(f"a gated delta net under a sequence axis of {shards} runs whole "
                                     f"training sequences; a decode step holds one state per row. Decode on "
