@@ -46,6 +46,31 @@ def test_declared_banks_preserve_canonical_values_layout_and_model_reads(kind):
                             for site in sites for first, count in site.view.groups]
 
 
+def test_a_distillations_source_banks_its_student_and_reads_its_teacher_whole():
+    """A source places a distillation's store as its student's runs banked and its frozen teacher's
+    tree as it is stored, deeper than the student's: the nested model's stacks are training's host
+    execution's to bank (`DecoderBank.root`), and nothing of the student's is read under it."""
+    from flax import linen as nn
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.base import TEACHER
+    from dew.objectives.distillation import DistillationObjective
+    from dew.objectives.lm import LMObjective
+
+    def decoder(layers):
+        return CausalTransformer(vocab_size=16, emb_features=8, num_layers=layers, num_heads=2,
+                                 mlp_features=16, max_seq_len=8, scan_layers=True)
+
+    objective = DistillationObjective(LMObjective(decoder(2), 8, ema_decay=None),
+                                      LMObjective(decoder(3), 8, ema_decay=None))
+    variables = nn.unbox(objective.init(jax.random.key(0)))
+    placed = HeldBanks(variables).place(objective, layout=DEVICE)
+    student = objective.student.bank_sites(objective.student_variables(variables))
+    identical(placed[TEACHER], variables[TEACHER])
+    identical(unpack(objective.student_variables(placed), student, objective.student_variables(variables)),
+              objective.student_variables(variables))
+
+
 @dataclass(frozen=True)
 class DeclaredOwners:
     sites: tuple[DecoderBank, ...]
