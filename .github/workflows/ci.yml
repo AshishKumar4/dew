@@ -282,9 +282,10 @@ jobs:
         # release checks (tools/armada/ci.py `selected`, `plan`, `release-plan`).
         DEW_WHOLE_SUITE: ${{ (github.event_name == 'schedule' || inputs.whole) && '1' || '' }}
         PROVEN: ${{ needs.proven.outputs.run }}
-        # Background work's bounded share: main's whole run 96 containers, a base push 48 (Main, 2026-11-06).
+        # Background work's bounded share: main's whole run, once a day, and a base push, 48 containers each (owner,
+        # 2026-11-06).
         BACKGROUND_POOL: >-
-          ${{ ((github.event_name == 'schedule' || inputs.whole) && '96')
+          ${{ ((github.event_name == 'schedule' || inputs.whole) && '48')
           || ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels') && '48') || '' }}
       # tools/ci/suite.sh, which this step reads from the ref, holds what the run takes. A base/<producer>
       # promote and a push to base/kernels run no gangs: main's trains run them. A train's jobs (ci/batch-*,
