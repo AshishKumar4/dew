@@ -11,7 +11,6 @@ have to be the reference's.
 """
 
 import concurrent.futures
-import itertools
 import json
 import os
 import re
@@ -26,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from lane_environment import outside_any_cluster
+from process_support import raised
 
 from dew.distributed.placement import parameter_axes
 from dew.training import MeshSpec
@@ -69,19 +69,6 @@ def finished(process: subprocess.Popen, timeout: float = 600) -> subprocess.Comp
         stdout, stderr = process.communicate(timeout=60)
         pytest.fail(f"the pool was still running after {timeout}s\n{stdout}{stderr}")
     return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
-
-
-def raised(done: subprocess.CompletedProcess) -> set[str]:
-    """The exception types the processes of `done` raised, each the type a traceback's closing line names
-    (Python's `Type: ...` after its frames), from stdout and stderr, a chained one's cause among them; none
-    where none was raised."""
-    lines = (done.stdout + "\n" + done.stderr).splitlines()
-    found = set()
-    for previous, line in itertools.pairwise(lines):
-        named = line.partition(":")[0].strip()
-        if previous.startswith("  ") and re.fullmatch(r"[\w.]+(Error|Exception|Failure|Exit)", named):
-            found.add(named)
-    return found
 
 
 def launch(*arguments: str, devices: int, timeout: float = 600) -> subprocess.CompletedProcess:
@@ -408,7 +395,8 @@ def test_a_pool_forms_and_fails_together_after_orbaxs_public_multihost_loads():
     done = launch("--processes-per-host", "2", "--", sys.executable, "-c",
                   "import orbax.checkpoint.multihost\n"
                   + stepping_pool("raise RuntimeError('injected failure')"), devices=1, timeout=600)
-    assert done.returncode == 1, done.stdout + done.stderr
+    # It ended with rank 1's own failure, past the pool's forming, not with an error of its start.
+    assert "injected failure" in raised(done).get("RuntimeError", []), done.stdout + done.stderr
 
 
 @pytest.mark.mesh(devices=2)
@@ -727,7 +715,7 @@ def test_a_rank_whose_leaf_cannot_be_read_reports_at_the_gather_preflight():
                "coordination.collective_host(tree, phase='t')\n")
     done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=1, timeout=300)
     # Rank 1 ends with its own error, rank 0 with its peer's: neither waits in the gather.
-    assert {"RuntimeError", "dew._coordination.PeerFailure"} <= raised(done), done.stdout + done.stderr
+    assert {"RuntimeError", "dew._coordination.PeerFailure"} <= raised(done).keys(), done.stdout + done.stderr
 
 
 def a_rank_that_holds_nothing_copies_none_of_the_tree_to_its_host():

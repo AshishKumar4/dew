@@ -3,8 +3,10 @@
 import argparse
 import contextlib
 import http.server
+import itertools
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -253,6 +255,20 @@ def logged_losses(run_directory) -> list[float]:
 
     reports = LocalTracker(Path(run_directory) / "tracking").scalars()
     return [values["train/loss"] for _, values in reports if "train/loss" in values]
+
+
+def raised(done: subprocess.CompletedProcess) -> dict[str, list[str]]:
+    """The errors the processes of `done` ended with, by type, each with its messages: every traceback's
+    closing line (Python's `Type: message` after its frames, a chained error's cause among them), read from
+    stdout and stderr with a rank's `[N] ` prefix (`dew launch`'s) taken off; none where no traceback was
+    printed. A refusal's test reads its error here, where its exit status alone a crash would pass."""
+    lines = [re.sub(r"^\[\d+\] ", "", line) for line in (done.stdout + "\n" + done.stderr).splitlines()]
+    found: dict[str, list[str]] = {}
+    for previous, line in itertools.pairwise(lines):
+        named, _, message = line.partition(": ")
+        if previous.startswith("  ") and re.fullmatch(r"[\w.]+(Error|Exception|Failure|Exit)", named):
+            found.setdefault(named, []).append(message)
+    return found
 
 
 def running(pid: int) -> bool:
