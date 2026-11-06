@@ -830,8 +830,9 @@ class Trainer(Generic[Loss, Effects]):
             weak_type=aval.weak_type), jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals))
 
     def _loss_shape(self, state: TrainState, batch: Batch, window: int, split: int = 1):
+        """The loss's program (`footprint.traced_loss`, which narrow copies read) and its shapes."""
         loss, (variables, *rest) = traced_loss(self.objective, state, window, split)
-        return jax.eval_shape(loss, variables, self._model_shapes(batch), *rest)
+        return jax.make_jaxpr(loss, return_shape=True)(variables, self._model_shapes(batch), *rest)
 
     def _initialize_accumulation(self, state: TrainState, batch: Batch, shapes, *, window: int,
                                  shape_only=False):
@@ -1207,14 +1208,15 @@ class Trainer(Generic[Loss, Effects]):
         `narrow` is off."""
         window = split * self.accumulation
         with group_of(state, batch) as (view, rows):
-            shapes = None if self.step is not None else self._loss_shape(view, rows, window, split)
+            traced, shapes = (None, None) if self.step is not None else self._loss_shape(
+                view, rows, window, split)
         if shapes is not None:
             self._staging.refuse_unpipelined(schedule, self.objective)
         prepared = windowed(lambda state, rows, *, shape_only: self._initialize_accumulation(
             state, rows, shapes, window=window, shape_only=shape_only), state, batch)
         # DiLoCo's groups read their own parameters, which no narrow copy shadows.
         copies = (narrow_copies(self.objective, state, batch, self._model_batch, window=window, split=split,
-                                composed=self.step is None and not self.dynamic_scale)
+                                composed=self.step is None and not self.dynamic_scale, traced=traced)
                   if (self._narrow if narrow is None else narrow) and self.diloco is None else {})
         prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
             lambda variables: narrowed(variables, copies), prepared.variables) if copies else None)
@@ -1279,7 +1281,7 @@ class Trainer(Generic[Loss, Effects]):
                                   stack_sites(self.objective, state.variables), device=self._device)
         cpu_batch = transfer(batch, batch_shardings(cpu, batch))
         with self._traced_on(cpu) as schedule:
-            shapes = self._loss_shape(state, cpu_batch, self.accumulation)
+            _, shapes = self._loss_shape(state, cpu_batch, self.accumulation)
             self._staging.refuse_unpipelined(schedule, self.objective)
             prepared = self._initialize_accumulation(state, cpu_batch, shapes, window=self.accumulation,
                                                      shape_only=True)

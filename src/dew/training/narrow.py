@@ -127,15 +127,25 @@ def narrowed_paths(loss, params: Variables, *rest) -> dict[tuple[str, ...], jnp.
     """The paths under `params` (relative to it) whose one use in
     `loss(params, *rest)` is a cast to a narrower float dtype, with that
     dtype. The arguments may be shapes alone."""
-    closed = jax.make_jaxpr(loss)(params, *rest)
-    leaves = jax.tree_util.tree_flatten_with_path(params)[0]
-    weights = frozenset(closed.jaxpr.invars[:len(leaves)])
+    return cast_paths(jax.make_jaxpr(loss)(params, *rest), params)
+
+
+def cast_paths(closed: core.ClosedJaxpr, tree: Variables, within: tuple[str, ...] = ()
+               ) -> dict[tuple[str, ...], jnp.dtype]:
+    """The paths of `tree`'s leaves under `within` (relative to it) whose one use in `closed`, a program
+    whose first inputs are `tree`'s leaves, is a cast to a narrower float dtype, with that dtype: those
+    leaves' casts alone, the program's other inputs read as it reads them."""
+    leaves = jax.tree_util.tree_flatten_with_path(tree)[0]
+    held = [(tuple(key.key for key in path)[len(within):], leaf, var)
+            for (path, leaf), var in zip(leaves, closed.jaxpr.invars[:len(leaves)], strict=True)
+            if tuple(key.key for key in path)[:len(within)] == within]
+    weights = frozenset(var for _, _, var in held)
     paths = {}
-    for (path, leaf), var in zip(leaves, closed.jaxpr.invars[:len(leaves)], strict=True):
+    for path, leaf, var in held:
         if isinstance(var, core.Var) and jnp.issubdtype(leaf.dtype, jnp.floating):
             dtype = _cast_once(var, closed.jaxpr, weights)
             if dtype is not None:
-                paths[tuple(key.key for key in path)] = dtype
+                paths[path] = dtype
     return paths
 
 
@@ -153,14 +163,16 @@ def forward_variables(variables: Variables, compute: Variables | None) -> Variab
 
 
 def narrow_copies(objective, state, batch, model_batch, *, composed: bool, window: int = 1,
-                  split: int = 1) -> dict:
+                  split: int = 1, traced: core.ClosedJaxpr | None = None) -> dict:
     """The parameters a step reads through narrow copies, by path under `params` (`narrowed_paths`):
     on every GPU but one whose row measured them off, for a step the trainer composes (`composed`),
     without a loss scale, whose state holds no frozen collection. `model_batch` is the trainer's
     batch as the model reads it; the loss is the one its first attempt reads (`attempt_step`), its
     update a `window` of microbatches, each step read in `split`, its committed updates among its
     inputs, so a parameter the step computes on before its cast (a DEX lambda's anneal) is not
-    copied."""
+    copied. `traced` is that loss as the trainer traced it for its shapes (`footprint.traced_loss`, the
+    state's variables its first inputs), whose casts are read in place of a trace of its own: a trace of
+    a Qwen3.5-4B step's loss is seconds of its compile (row 4260)."""
     from dew.nn.kernels.generation import backend, chosen_kernel
     from dew.training.transaction import attempt_step
 
@@ -168,6 +180,8 @@ def narrow_copies(objective, state, batch, model_batch, *, composed: bool, windo
             or not composed or FROZEN in state.variables):
         return {}
     variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
+    if traced is not None:
+        return cast_paths(traced, variables, ("params",))
 
     def loss(params, rest, batch, microstep, key, step, ema, updates):
         # As the trainer's loss shape traces it, the averaged weights the step hands the objective
