@@ -79,6 +79,12 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
          "mimo-mel": {"test": "test_mimo_audio", "arms": "mel", "worker": "torchaudio_mel_worker.py",
                       "reference": "pytorch/audio 2.11.0 MelSpectrogram", "license": "BSD-2-Clause",
                       "distribution": ("torchaudio", "2.11.0+cpu"), "host": True},
+         **{f"multimodal-{family}": {"test": "test_multimodal_model", "arms": family,
+                                     "worker": "multimodal_worker.py",
+                                     "reference": "huggingface/transformers 5.16.1",
+                                     "license": "Apache-2.0", "distribution": ("transformers", "5.16.1"),
+                                     "host": True}
+            for family in ("gemma4", "qwen35", "llama4", "gemma3n")},
          **{f"native-{name}": {"test": "check_native_diffusion", "arms": arms,
                                "worker": "native_diffusion_worker.py", "reference": NATIVE_PIPELINES,
                                "license": "Apache-2.0",
