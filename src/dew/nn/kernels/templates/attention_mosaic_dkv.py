@@ -432,13 +432,13 @@ def _dkv_refs(refs, treedef, leaves: int, graded: list[Kind], groups: tuple, *, 
                   for wanted in DKV_GRADS)
     return inputs, unflattened, (dq_ref, dk_ref, dv_ref), _dkv_scoped(refs, widths=widths, split=split), keyed
 
-def _shared_views(outputs, grad_refs, graded: list[Kind], block_k: int) -> tuple:
+def _shared_views(family: mosaic.Family, outputs, grad_refs, graded: list[Kind], block_k: int) -> tuple:
     """dK's and dV's views (`outputs`, the dK/dV launch's) and each key gradient's (`grad_refs`, at the place
     it holds for the program's row and head, `shared_place`) at the program's key block, the one its
     consumers share (`split_queries`)."""
     dk_ref, dv_ref = outputs
-    row, head = lax.axis_index("batch"), lax.axis_index("heads")
-    keys = pl.ds(lax.axis_index("k_tiles") * block_k, block_k)
+    row, head = family.program_index("batch"), family.program_index("heads")
+    keys = pl.ds(family.program_index("k_tiles") * block_k, block_k)
     key_views = [ref.at[*shared_place(ref.shape, row, head), keys]
                  for ref, kind in zip(grad_refs, graded, strict=True) if kind == Kind.KEY]
     return dk_ref.at[row, keys, head], dv_ref.at[row, keys, head], *key_views
@@ -583,12 +583,12 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
         tiles = program.tiles
         fused = 2 + 2 * tiles.shared_dq + 2 * tiles.producer_dq if walk.fused else 0
         fused_stages, logits_stages = rest[:fused], rest[fused:]
-        row, head = lax.axis_index("batch"), lax.axis_index("heads")
+        row, head = family.program_index("batch"), family.program_index("heads")
 
         named = {"queries": q_ref, "douts": do_ref, **({} if l_ref is None else {"logits": l_ref})}
         views = _dkv_views(named, stat_refs, positions_ref, (row, head), shared_dq=tiles.shared_dq)
         streams = family.opened(streams, views)
-        pair_first = lax.axis_index("k_tiles") * pair
+        pair_first = family.program_index("k_tiles") * pair
         holders = 1 if split else consumers
         streamed = _streamed([program.readers(pair_first + index * block_k, q_steps, spans_of, row)[:2]
                               for index in range(holders)])
@@ -648,7 +648,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             first = 9 + len(leaves) + walk.fused
             grads = mosaic.stacked_views(refs[first:first + len(groups)], groups)
             outputs = refs[first + len(groups):first + len(groups) + 2]
-            _summed_stored(family, summed, _shared_views(outputs, grads, graded, block_k), consumers,
+            _summed_stored(family, summed, _shared_views(family, outputs, grads, graded, block_k), consumers,
                            walk.interpret)
 
     launch = _dkv_kernel(walk, entry, graded, query, key, value, dout, shares, name)

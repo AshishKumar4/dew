@@ -218,7 +218,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         # The output stage where the walks' adds read it; else the epilogue's own, scoped after the walks.
         k_smem, v_smem, staged, *out_smem, k_loaded, v_loaded = refs
         out_smem = out_smem[0] if out_smem else None
-        row, head = lax.axis_index("batch"), lax.axis_index("heads")
+        row, head = family.program_index("batch"), family.program_index("heads")
         key_head = lax.div(head, group)
         statistics, rows_of = _statistics(family, stat_refs, row, head, block_q, streamed=stats_streamed)
         dq_ready, dkv_ready = _turns(family, walk.interpret, (batch, heads, q_steps),
@@ -226,7 +226,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                                      grouped=grouped)
         views = {**_views_of({"queries": q_ref, "douts": do_ref}, row, head), **statistics}
         streams = family.opened(streams, views)
-        pair_first = lax.axis_index("k_tiles") * pair
+        pair_first = family.program_index("k_tiles") * pair
         streamed = _streamed([program.readers(pair_first + index * block_k, q_steps, spans_of, row)[:2]
                               for index in range(consumers)])
 

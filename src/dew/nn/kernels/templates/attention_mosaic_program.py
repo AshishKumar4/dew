@@ -972,7 +972,7 @@ class _Program[T: (Tiles, BackwardTiles)]:
 
     def split(self):
         """This program's slice of its query tile's keys (`splits`), 0 of one."""
-        return lax.rem(lax.axis_index("q_tiles"), self.splits) if self.splits > 1 else jnp.int32(0)
+        return lax.rem(self.family.program_index("q_tiles"), self.splits) if self.splits > 1 else jnp.int32(0)
 
     def padded(self, first) -> jax.Array | bool:
         """Whether the query tile from `first` holds padding rows past the call's queries, some or all of
@@ -985,7 +985,7 @@ class _Program[T: (Tiles, BackwardTiles)]:
         """This program's query tile of the grid's `count`: a causal call's longest first (its last query
         tiles see the most keys), so the grid's tail holds its shortest programs, as FlashAttention-3's
         scheduler orders them; a full call's in order."""
-        index = lax.axis_index("q_tiles")
+        index = self.family.program_index("q_tiles")
         if self.splits > 1:
             index = lax.div(index, self.splits)
         return count - 1 - index if self.causal else index
