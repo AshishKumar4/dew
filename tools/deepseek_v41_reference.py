@@ -1161,10 +1161,15 @@ def dew_clears(ids: np.ndarray) -> bool:
 
 @functools.cache
 def _dew_release():
-    """The fixture loaded by Dew as the release runs it (`dew_clears`)."""
+    """The fixture loaded by Dew as the release runs it (`dew_clears`, its weights the release's)."""
+    import tempfile
+
+    from deepseek_v41_numerics import as_released
+
     from dew.interop import Pretrained
 
-    return Pretrained.load(FIXTURE, dtype="bfloat16", attention_impl="reference")
+    return Pretrained.load(as_released(Path(tempfile.mkdtemp())), dtype="bfloat16", param_dtype="auto",
+                           attention_impl="reference")
 
 
 def write_release_recording():
@@ -1176,13 +1181,17 @@ def write_release_recording():
     which the test reads its inputs from: its own draw would run the release's processor): the reference
     tests/test_deepseek_v41.py holds Dew's forward, its variants and its cached walk to (row 354)."""
     from recorded_references import provenance, record_case, save
-    from safetensors.torch import load_file
+    from safetensors.torch import load_file, save_file
 
     stored = {**load_file(FIXTURE / "model.safetensors"), **load_file(FIXTURE / "vision.safetensors")}
     native = release_model("deepseek_v41_release", official_kernels())
     engram_module = importlib.import_module("engram")
     net = release_net(native, engram_module, stored)
     seeing = release_net(native, engram_module, stored, vision=True)
+    # The weights as the release holds them, its decoder's and its vision half's, in the dtypes it keeps
+    # each in (bf16 but its head, norms and mixes): what Dew's runs of the release read (row 354).
+    save_file({name: tensor.contiguous().cpu() for name, tensor in seeing.state_dict().items()
+               if name in stored}, FIXTURE / "release.safetensors", metadata={"format": "pt"})
     twin_module = release_model("deepseek_v41_release_float64",
                                 importlib.import_module("tools.deepseek_v41_kernels"))
     # The twin's engram lookup widened with the rest: the release rounds it to bf16 (model.py:320), one of

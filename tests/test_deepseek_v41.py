@@ -57,7 +57,7 @@ from dew.nn.sharding import down_projection
 from dew.nn.visibility import visible
 from dew.registry import models
 from dew.sampling import Sample, Sampling, Speculative, generate
-from tools.deepseek_v41_numerics import QUANTIZERS, unquantized, vision_bundle, vision_run
+from tools.deepseek_v41_numerics import QUANTIZERS, as_released, unquantized, vision_bundle, vision_run
 
 ROOT = Path(__file__).parent / "fixtures" / "hf"
 TINY = ROOT / "deepseek-v41-tiny"
@@ -264,7 +264,7 @@ def test_an_uncached_left_padded_row_pools_its_windows_over_its_own_tokens(sourc
 
 RELEASE = TINY / "release.npz"
 """The release as released (row 354): its inference/model.py at the pinned revision, nothing of it
-replaced, in bf16 over its own tilelang kernels and activation quantizers on an H100, its logits at every
+replaced, over the weights it holds (release.safetensors), in bf16 over its own tilelang kernels and activation quantizers on an H100, its logits at every
 position (each prefix's prefill, the paper's arithmetic: a cached step of the release that closes no
 ratio-2 group reads another layer's index keys, which Dew does not reproduce), from position zero and
 from a walk's prompt on, and their float64 truth (the same code over the stand-ins kernels.npz holds to
@@ -274,10 +274,11 @@ tools/deepseek_v41_reference.py --release)."""
 
 
 @pytest.fixture(scope="module")
-def as_run():
-    """The fixture as the release runs it: bf16, its activation quantizers on (the family's `kv_qat`, as
-    the release rounds every forward)."""
-    return Pretrained.load(TINY, dtype="bfloat16", attention_impl="reference")
+def as_run(tmp_path_factory):
+    """The fixture as the release runs it: bf16, over the weights the release holds (`as_released`), its
+    activation quantizers on (the family's `kv_qat`, as the release rounds every forward)."""
+    return Pretrained.load(as_released(tmp_path_factory.mktemp("released")), dtype="bfloat16",
+                           param_dtype="auto", attention_impl="reference")
 
 
 @pytest.fixture(scope="module")
@@ -412,7 +413,8 @@ def test_an_image_prompt_computes_the_releases_logits(tmp_path):
     from model_support import float64_twin
     from reference_error import indexed_recording, recording
 
-    loaded = Pretrained.load(vision_bundle(tmp_path), dtype="bfloat16", attention_impl="reference")
+    loaded = Pretrained.load(as_released(tmp_path, vision=True), dtype="bfloat16", param_dtype="auto",
+                             attention_impl="reference")
     model, variables = loaded.model, loaded.variables
 
     with np.load(TINY / "release_rows.npz") as stored:

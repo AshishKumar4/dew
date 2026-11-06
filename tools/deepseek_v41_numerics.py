@@ -395,6 +395,26 @@ def vision_bundle(directory: Path) -> Path:
     return directory
 
 
+def as_released(directory: Path, *, vision: bool = False) -> Path:
+    """The fixture in `directory` with the weights the release holds (release.safetensors: bf16 but its
+    head, norms and mixes, as tools/deepseek_v41_reference.py's `--release` keeps them), its vision half
+    with them where `vision` (vision_config inside config.json, as `vision_bundle`): loaded with
+    `param_dtype="auto"`, the parameters the release computes with (row 354)."""
+    from dew.interop.safetensors_io import read_file, write_file
+
+    for name in ("tokenizer.json", "tokenizer_config.json", "generation_config.json"):
+        shutil.copy(TINY / name, directory / name)
+    config = json.loads((TINY / "config.json").read_text())
+    if vision:
+        config["vision_config"] = json.loads((TINY / "vision_config.json").read_text())
+    (directory / "config.json").write_text(json.dumps(config))
+    held, _ = read_file(TINY / "release.safetensors")
+    seeing, _ = read_file(TINY / "vision.safetensors")
+    write_file({name: value for name, value in held.items() if vision or name not in seeing},
+               directory / "model.safetensors", {"format": "pt"})
+    return directory
+
+
 def vision_run(model, variables, reference) -> tuple[jax.Array, jax.Array, np.ndarray]:
     """The span the fixture's image fills, the prefill's logits with it and
     the text steps' after it, with the quantizers off as the reference ran.
