@@ -1622,10 +1622,15 @@ class Transport[Allocated, Opened](abc.ABC):
     consumer walks every step, so a template may split a step's work between them (attention's dK and dV:
     a key block shared, each slot's queries split) where with a producer each takes steps of its own."""
 
+    budgets_registers: bool = True
+    """Whether a kernel budgets its threads' registers (`registers`): a GPU's families; a TPU core's does
+    not (`mosaic_tpu.VmemRings`: its compiler spills values to VMEM), so a launch on it states no registers
+    (`base.TemplateOp.registers` None) and a core runs one program of it (`resources.register_programs`)."""
+
     @abc.abstractmethod
     def registers(self, consumers: int, programs: int = 1) -> int:
         """The registers a thread of each of `consumers` consumer roles may hold, `programs` programs a
-        multiprocessor at once."""
+        multiprocessor at once; asked of a family that budgets them alone (`budgets_registers`)."""
 
     def warpgroups(self, consumers: int) -> int:
         """The warpgroups a program of `consumers` compute roles runs: theirs, and a producer's where the
