@@ -1150,8 +1150,8 @@ def write_release_recording():
     from safetensors.torch import load_file
 
     stored = {**load_file(FIXTURE / "model.safetensors"), **load_file(FIXTURE / "vision.safetensors")}
-    engram_module = importlib.import_module("engram")
     native = release_model("deepseek_v41_release", official_kernels())
+    engram_module = importlib.import_module("engram")
     net = release_net(native, engram_module, stored)
     seeing = release_net(native, engram_module, stored, vision=True)
     twin_module = release_model("deepseek_v41_release_float64",
