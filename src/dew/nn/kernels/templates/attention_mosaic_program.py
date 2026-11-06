@@ -397,8 +397,9 @@ def reducing(family: mosaic.Family, consumers: int, *hooks, guarded: bool = Fals
     reserving its share of Mosaic GPU's reduction scratch (`Family.kernel`'s `reducing_warpgroups`): a hook's
     unit row, which the fork selects by a reduction across warps (ledger 1428), and a `guarded` launch's
     keys' value magnitudes, its tile's columns reduced across the warps holding them
-    (`Family.key_magnitudes`), so every warpgroup of a launch that runs a hook (`hooks`, its score and
-    output hooks, None where it has none) or guards; none otherwise."""
+    (`Family.key_magnitudes`), or a launch's rows reduced to their block's flag (`guarded` too: the plain
+    launch that flags its rows, `attention_mosaic_forward._Flags`), so every warpgroup of a launch that runs a
+    hook (`hooks`, its score and output hooks, None where it has none) or guards; none otherwise."""
     if guarded or any(hook is not None for hook in hooks):
         return family.warpgroups(consumers)
     return 0
