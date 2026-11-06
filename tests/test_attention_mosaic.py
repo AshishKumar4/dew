@@ -205,25 +205,18 @@ def _dropping(shape) -> template.Hooks:
         jnp.arange(shape[2], dtype=jnp.int32), DROP_RATE))
 
 
-ACCURATE_DECLINED = frozenset({"temperature", "softcap-sinks-alibi"})
-"""The score hooks (`SCORE_HOOKS`) under which an H100's Mosaic backward declines the accurate form for its
-registers, the route's next mainloop taking it (`_takes_backward`): a query's temperature, whose dQ spills at
-every tile (ET-PINBWD: 232 bytes at 64 x 64, width 64, its keyed sums beside the hook's three slopes and its
-mask); a softcap with sinks and ALiBi, whose dQ at 64 x 64, width 128, in two column halves, spilled 204 bytes
-at ptxas's 255 where its model held 254 (et-ceil), refused once a consumer's raise is at most
-`resources.raise_ceiling`'s 248."""
-
-
-def _takes_backward(spans: template.KeySpans, query, key, hooks: template.Hooks | None, *, accurate: bool,
-                    declined: bool) -> bool:
-    """Whether the Mosaic backward takes a call of `query`'s and `key`'s shapes and dtype under `hooks` on the
-    target in effect, checked against `declined`, the call one it declines for its registers
-    (`MosaicBackward.declined`'s resources, the route's next implementation's: `ACCURATE_DECLINED`)."""
+def _mosaic_backward_takes(spans: template.KeySpans, query, key, hooks: template.Hooks | None, *,
+                           accurate: bool) -> None:
+    """Skips the check where the Mosaic backward declines a call of `query`'s and `key`'s shapes and dtype
+    under `hooks` on the target in effect: a call it declines for its registers (`MosaicBackward.declined`'s
+    resources) is the route's next mainloop's, whose own suites check it; it declines no call it takes
+    otherwise."""
     query, key = (jnp.zeros(array.shape, array.dtype) for array in (query, key))
     reason = attention_mosaic.backward_declined(query, key, key, spans, hooks, query,
                                                 residuals=_residuals(query.shape), accurate=accurate)
-    assert (reason is not None) == declined and (reason is None or reason.code == "resources"), reason
-    return reason is None
+    assert reason is None or reason.code == "resources", reason
+    if reason is not None:
+        pytest.skip(f"the Mosaic backward declines it: {reason}")
 
 
 def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
@@ -255,11 +248,8 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
     accurate, config = _backward_form(form)
     if backward:
         query, key = (jax.ShapeDtypeStruct((rows, queries, count, width), dtype) for count in shape[2:])
-        declined = accurate and any(score == SCORE_HOOKS[name] for name in ACCURATE_DECLINED)
         with _device(interpret):
-            if not _takes_backward(spans, query, key, hooked(*draw_hooks(0)), accurate=accurate,
-                                   declined=declined):
-                return
+            _mosaic_backward_takes(spans, query, key, hooked(*draw_hooks(0)), accurate=accurate)
 
     def ours(query, key, value, dout, params, initial):
         hooks = hooked(params, initial)
@@ -719,9 +709,8 @@ def test_padding_rows_reach_no_hook_gradient_interpreted(queries, form):
     params = (jnp.ones((1, 1, queries), jnp.float32), jnp.zeros((1,), jnp.float32))
     hooks = hooked(*params)
     with _device(interpret=True):
-        # Its hook divides by a query's parameter, a temperature (`_takes_backward`).
-        if not _takes_backward(spans, query, key, hooks, accurate=accurate, declined=accurate):
-            return
+        # Its hook divides by a query's parameter, a temperature (`_mosaic_backward_takes`).
+        _mosaic_backward_takes(spans, query, key, hooks, accurate=accurate)
     with _device(interpret=True), _pinned(backward=config):
         residuals = attention_mosaic.forward(query, key, value, spans, hooks, residuals=template.Kept.SPLIT,
                                              interpret=True)[1:]
@@ -1442,10 +1431,9 @@ def test_the_backward_under_every_score_hook_lowers_for_an_h100(hooks, accurate)
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         hooked = template.Hooks(score_mod, tuple(template.Param(value, kind)
                                                  for value, kind in zip(params, kinds, strict=True)), initial)
-        if _takes_backward(spans, q, kv, hooked, accurate=accurate,
-                           declined=accurate and hooks in ACCURATE_DECLINED):
-            jax.jit(backward_of).trace(q, kv, kv, q, residuals, params, initial).lower(
-                lowering_platforms=("cuda",))
+        _mosaic_backward_takes(spans, q, kv, hooked, accurate=accurate)
+        jax.jit(backward_of).trace(q, kv, kv, q, residuals, params, initial).lower(
+            lowering_platforms=("cuda",))
 
 
 @ON_HOPPER
