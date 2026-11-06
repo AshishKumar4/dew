@@ -729,6 +729,7 @@ def fused_token(hooks: recurrence.Hooks, taps, *, heads: tuple[int, int, int], w
     # Each channel's place in the shards' order: by shard, then piece in the conv's order, then the
     # piece's heads there.
     shapes = dict(zip('qkv', zip(heads, widths, strict=True), strict=True))
+    assert hooks.conv is not None, "a fused token's hooks take its conv, the step's prologue"
     pieces = [shapes[name] for name in hooks.conv.order]
     first = np.cumsum([0, *(h * w for h, w in pieces)])
     order = np.concatenate([first[i] + np.arange(shard * h * w // shards, (shard + 1) * h * w // shards)

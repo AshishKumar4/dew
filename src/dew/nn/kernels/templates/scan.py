@@ -130,6 +130,13 @@ def summed(values: jax.Array, exchanged, *, interpret: bool = False) -> jax.Arra
     return total(values, exchanged)
 
 
+def inverse_norm(values: jax.Array, eps: float, exchanged, *, interpret: bool = False) -> jax.Array:
+    """`1 / sqrt(sum(values^2) + eps)` of a block's `values` (`summed`'s), the l2 norm's scale, its root and
+    quotient each rounded once (rsqrt's approximation is 2 ulp off): the decode step's queries and keys
+    and the short conv's heads alike."""
+    return 1.0 / jnp.sqrt(summed(values * values, exchanged, interpret=interpret) + eps)
+
+
 def _summed(x: fa.FragmentedArray, exchanged):
     """`summed` in Mosaic GPU's terms: the array's own reduction, its warps' aggregates through a row of
     `exchanged`."""
