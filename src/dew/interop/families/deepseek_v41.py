@@ -27,7 +27,7 @@ from dew.interop.decoder_parts import (
     base_config,
     in_trunk,
     kind_mixers,
-    reads,
+    read_only,
     record_float,
     record_int,
     refuse,
@@ -43,7 +43,7 @@ from dew.interop.families.deepseek import (
     v4_prepare,
     v4_routes,
 )
-from dew.interop.layouts import ConfigLayout, ConfigPart, Route, mapped, one_of
+from dew.interop.layouts import Route, mapped, one_of
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.deepseek_v4 import DeepseekV4Mixer
@@ -369,7 +369,9 @@ def _deepseek_v41_constants(directory, record: Mapping[str, object]) -> Mapping[
 # V4.1 is V4's block under CSA2's compressor, which names the family; the
 # hub's table registers it.
 DEEPSEEK_V41 = DecoderFamily(
-    ('deepseek_v41',), ConfigLayout(ConfigPart(reads(_deepseek_v41_config), lambda model: {})),
+    ('deepseek_v41',),
+    read_only(_deepseek_v41_config, "a V4.1 model is written as its release, whose text_config no exporter "
+              "of Dew's states"),
     lambda fields: any(isinstance(mixer, DeepseekV4Mixer) and mixer.compressor == 'csa2'
                        for mixer in kind_mixers(fields)),
     'deepseek_v41', 'DeepseekV41ForCausalLM',

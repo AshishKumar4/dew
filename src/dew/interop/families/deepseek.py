@@ -61,6 +61,7 @@ from dew.interop.decoder_parts import (
     rope_part,
     spelled,
     translated,
+    unwritten,
     written_ropes,
     yarn_record,
 )
@@ -1269,9 +1270,8 @@ DEEPSEEK_V4_CONFIG = ConfigLayout(
     # one shared head is the block's own. Its two rotary entries are its own part's.
     decoder_layout(DecoderSpelling(keys={'intermediate_size': 'moe_intermediate_size'},
                                    fixed={'num_key_value_heads': 1}), rope=ROPE_APART),
-    # A V4 model is written as its release, whose config no exporter of Dew's states: it reads back
-    # refused (`refuse_lossy_export`).
-    ConfigPart(_deepseek_v4_config, lambda model: {}))
+    ConfigPart(_deepseek_v4_config, unwritten("a V4 model is written as its release, whose config no "
+                                              "exporter of Dew's states").write))
 """DeepSeek V4's config: read beside the shared decoder; no V4 model is written."""
 
 
