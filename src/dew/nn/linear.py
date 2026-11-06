@@ -52,7 +52,7 @@ from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
 from .joined import joined_dense, joins
 from .kernels import generation
-from .kernels.generation import INHERENT, triton_runs
+from .kernels.generation import INHERENT
 from .kernels.recurrence_chunk import (
     CHUNK_SIZE,
     chunk_gated_delta_rule,
@@ -142,13 +142,13 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
         out = _per_row_shard(x, kernel, activation, bias, valid, segments, parts, dtype, rows)
     else:
         pieces = ((x.shape[-1], None),) if parts is None else tuple(parts)
-        case = short_conv.ConvCase(placed=triton_runs(), whole=seen_whole(x), shape=x.shape,
+        case = short_conv.ConvCase(placed=_template_runs(), whole=seen_whole(x), shape=x.shape,
                                    dtype=jnp.dtype(x.dtype), out=dtype, taps=kernel.shape[-1], parts=pieces)
-        if select(short_conv.CONV, case).kernel == 'pallas':
+        if select(short_conv.CONV, case).kernel == 'mosaic_gpu':
             out = short_conv.conv(x, kernel, bias, None if valid is None else jnp.asarray(valid, jnp.int8),
                                   None if segments is None else jnp.asarray(segments, jnp.int32),
                                   pieces, activation=activation, eps=L2NORM_EPS, dtype=dtype,
-                                  interpret=not generation.triton_runs())
+                                  interpret=generation.backend() != 'gpu')
             out = out[0] if parts is None else out
         else:
             out = xla_conv1d(x, kernel, activation, bias, valid=valid, segments=segments, parts=parts,

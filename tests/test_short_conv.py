@@ -30,7 +30,9 @@ from dew.nn.linear import causal_conv1d, xla_conv1d
 
 pytestmark = pytest.mark.kernel
 
-DELTA = ((32, 16), (32, 16), (32, None))
+DELTA = ((128, 128), (128, 128), (128, None))
+"""A delta rule's pieces at a warpgroup's widths (`templates.recurrence.conv.fits`): queries and keys of one
+128-wide head each, l2-normalised, and values."""
 SHARDED_SEEDS = 8
 """The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized by
 `seeds_for`: the fewest for which one device compared with itself resolves the factor."""
@@ -101,7 +103,7 @@ def test_the_kernels_take_forward_mode_however_a_caller_stages_them(staged):
     (`short_conv.conv`'s `generation.linear_tangent`), on par with XLA's from float64 (check 1). Its
     selector once routed by whether it saw a JVP tracer, which a remat hides, and there the kernels' custom
     VJP raised (row 2395)."""
-    parts = ((64, 32), (64, None))
+    parts = ((128, 128), (128, None))
 
     def draw(seed):
         x, weights, shift, _ = operands(1, 40, parts, dtype=jnp.float32, bias=True, seed=seed)
@@ -154,11 +156,11 @@ def row_truth(x, weights, parts, grads, segments):
     ((2, 37), DELTA, 4, False, False, False),
     ((2, 37), DELTA, 4, False, True, False),
     ((2, 37), DELTA, 4, False, False, True),
-    ((1, 700), ((64, None),), 4, True, False, False),
-    ((1, 700), ((64, None),), 4, True, False, True),
-    ((2, 19), ((32, 32), (32, 32), (64, None)), 3, True, True, False),
-    ((2, 19), ((32, 32), (32, 32), (64, None)), 3, True, True, True),
-    ((2, 9), ((48, None),), 2, True, False, False),
+    ((1, 700), ((128, None),), 4, True, False, False),
+    ((1, 700), ((128, None),), 4, True, False, True),
+    ((2, 19), ((128, 128), (128, 128), (256, None)), 3, True, True, False),
+    ((2, 19), ((128, 128), (128, 128), (256, None)), 3, True, True, True),
+    ((2, 9), ((128, None),), 2, True, False, False),
 ])
 def test_the_kernels_compute_causal_conv1d(dtype, out, shape, parts, taps, bias, valid, packed):
     """Each piece and the gradients of the projection, the taps and the bias, as XLA computes them, at
