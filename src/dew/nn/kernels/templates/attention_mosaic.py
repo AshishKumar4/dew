@@ -330,7 +330,7 @@ class MosaicForward(_Mainloop[Tiles]):
         rewalks at its own tiles, which must hold (rows 2621, 2647)."""
         if not self._launch_legal(ba, config, target):
             return False
-        if config.natural_form or self._unrewalked(ba.arguments["query"]):
+        if config.natural_form or self._unrewalked(ba):
             return True
         relaunch = config.relaunch
         return (config.block_k % relaunch.block_k == 0 and relaunch.consumers <= config.consumers
@@ -467,7 +467,7 @@ class MosaicForward(_Mainloop[Tiles]):
         tiles it spilled 2 KB at width 64); a call that keeps its logits natural rewalks nothing. None where
         no tile holds the rewalk."""
         config = dataclasses.replace(config, relaunch_k=None, relaunch_consumers=None, relaunch_columns=None)
-        if self._unrewalked(ba.arguments["query"]):
+        if self._unrewalked(ba):
             return config
         query, value = ba.arguments["query"], ba.arguments["value"]
         family = bundle_of(config, query.dtype)
@@ -503,17 +503,21 @@ class MosaicForward(_Mainloop[Tiles]):
         power, scale = prescale(query.dtype, query.shape[3], self.scale)
         return not algebra.folds(scale, power, natural=self.natural, score_mod=self.score_mod)
 
-    def _unrewalked(self, query: jax.Array) -> bool:
-        """Whether the call of `query` walks no natural rewalk: its logits natural (`_natural`), or a fold no
-        logit's reach passes (`algebra.Forward.reaches`: a subtracted fold's raw products), at the scale its
-        launch takes (`attention_mosaic_forward._prepared`)."""
+    def _unrewalked(self, ba: tokamax.BoundArguments) -> bool:
+        """Whether the call walks no natural rewalk: its logits natural (`_natural`), or a fold no logit's
+        reach passes (`algebra.Forward.reaches`: an inference walk's subtracted fold of raw products, which a
+        training forward does not take: its natural rewalk at tiles derived for it, an fp32 call's parts'
+        at width 128 a block of the value columns, where the fold's whole width staged 280,672 bytes),
+        at the scale its launch takes (`attention_mosaic_forward._prepared`)."""
+        query = ba.arguments["query"]
         if self._natural(query):
             return True
         power, scale = prescale(query.dtype, query.shape[3], self.scale)
         taken = power if self.form != "spans" else 1.0
+        subtracted = self.subtracted and ba.arguments.get("residuals") is not Kept.SPLIT
         return not algebra.Forward(self.form, self.keys, ids=False, scale=scale * taken,
                                    score_mod=self.score_mod, natural=self.natural, prescale=power / taken,
-                                   subtracted=self.subtracted).reaches
+                                   subtracted=subtracted).reaches
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         """The program's shared memory (`_forward_allocations`, `resources.shared_bytes`), at the call's
