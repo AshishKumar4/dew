@@ -167,8 +167,12 @@ def test_a_checkpoint_reads_back_through_orbaxs_own_manager(tmp_path):
                                          "step": state.step})
     trainer.checkpoints.save(3, state, None)
     trainer.checkpoints.wait()
-    stock = ocp.CheckpointManager(tmp_path / "run", item_handlers=ocp.PyTreeCheckpointHandler())
-    restored = stock.restore(3, args=ocp.args.PyTreeRestore())
+    # A step's items, its model and the rest of its state (docs/guides/checkpoints.md).
+    items = ("model", "resume")
+    stock = ocp.CheckpointManager(tmp_path / "run", item_handlers={
+        name: ocp.PyTreeCheckpointHandler() for name in items})
+    read = stock.restore(3, args=ocp.args.Composite(**{name: ocp.args.PyTreeRestore() for name in items}))
+    restored = {name: value for item in items for name, value in dict(read[item]).items()}
     for name, tree in expected.items():
         leaves = jax.tree.leaves(tree)
         held = jax.tree.leaves(restored[name])

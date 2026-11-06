@@ -19,6 +19,7 @@ Observed against the references, all under the 1e-4 bound:
 """
 
 import dataclasses
+import functools
 import json
 import tarfile
 from pathlib import Path
@@ -32,10 +33,10 @@ from affine_run import Replaying
 from flax import linen as nn
 from interop_support import extract_fixture, fixture_ids, hub_cache, peft_twin, transformers_arms
 from model_support import flat_tree
-from one_draw import assert_as_exact_as_the_reference
-from reference_error import as_given, assert_as_exact, dew_programs, widened
+from reference_error import as_given, assert_as_exact, dew_programs, indexed_recording, recording, widened
 from safetensors.numpy import load_file
 from test_joined import row_joins
+from tool_support import run_from
 from torch_layout import node
 
 from dew import lora
@@ -1280,11 +1281,6 @@ def test_a_tuned_pipeline_saves_its_adapter_and_its_merged_weights(family, pipel
 EXPORTS = ROOT / "tests" / "fixtures" / "lora_exports"
 
 
-def _recorded(name: str) -> dict[str, np.ndarray]:
-    with np.load(EXPORTS / f"{name}.npz") as data:
-        return {key: data[key] for key in data if key != "meta"}
-
-
 def _layout(directory: Path) -> dict:
     """Each file of an adapter as its reader parses it, values aside: a safetensors file's metadata
     and every tensor's name, dtype and shape, a JSON file's contents."""
@@ -1373,8 +1369,8 @@ def test_diffusers_reads_the_adapter_dew_writes_at_dews_prediction(family, pipel
     """The pipelines' counterpart: Diffusers 0.34.0's `load_lora_weights`
     reads the file a case writes (rsLoRA on FLUX), every tensor lands in the
     denoiser, and its adapted and `fuse_lora` predictions are recorded in
-    float32 and float64. Dew's adapted and merged predictions hold the
-    float64 rule against them. The tiny SD source declares Flax classes,
+    float32 and float64 over check 1's seeds of inputs. Dew's adapted and
+    merged predictions are on par with them (check 1). The tiny SD source declares Flax classes,
     whose pipeline loads no adapter; its PyTorch UNet reads the file, so
     Dew's runs as that UNet (`torch_unet`)."""
     from tools.lora_export_reference import CASES, export_case
@@ -1382,24 +1378,32 @@ def test_diffusers_reads_the_adapter_dew_writes_at_dews_prediction(family, pipel
     source = pipelines[family]
     _, written = export_case(CASES[family], source, tmp_path)
     adapter = _written_as_read(family, source, written, tmp_path)
-    variables, arrays = adapter.variables, _recorded(family)
+    variables = adapter.variables
     model = torch_unet(source.model) if family == "sd" else source.model
     if family == "sd":
         adapter = _rebound(adapter, model)
     own = {name: tree for name, tree in variables.items() if name not in ("encoders", "autoencoder")}
-    guidance = jnp.asarray(arrays["guidance"]) if arrays.get("guidance", np.zeros(0)).size else None
-    condition = DenoisingCondition(jnp.asarray(arrays["context"]),
-                                   jnp.asarray(arrays["pooled"]) if "pooled" in arrays else None,
-                                   guidance=guidance)
-    latent, times = jnp.asarray(arrays["latent"]), jnp.asarray(arrays["times"])
-    # The UNet takes its condition by keyword alone.
-    adapted = adapter.model.apply(own, latent, times, conditioning=condition)
-    merged = model.apply(adapter.merge(own), latent, times, conditioning=condition)
-    assert np.abs(arrays["fp32.adapted"] - arrays["fp32.base"]).max() > 0.1
-    assert_as_exact_as_the_reference(np.asarray(adapted), arrays["fp32.adapted"], arrays["fp64.adapted"],
-                                     f"{family} adapted")
-    assert_as_exact_as_the_reference(np.asarray(merged), arrays["fp32.merged"], arrays["fp64.merged"],
-                                     f"{family} merged")
+    merged_variables = adapter.merge(own)
+    recorded = recording(EXPORTS / f"{family}.npz")
+    seeds = int(recorded["prediction.seeds"])
+
+    def predictions(inputs, adapted_variables, merged_variables, adapted_model):
+        guidance = jnp.asarray(inputs["guidance"]) if inputs.get("guidance", np.zeros(0)).size else None
+        condition = DenoisingCondition(jnp.asarray(inputs["context"]),
+                                       jnp.asarray(inputs["pooled"]) if "pooled" in inputs else None,
+                                       guidance=guidance)
+        latent, times = jnp.asarray(inputs["latent"]), jnp.asarray(inputs["times"])
+        # The UNet takes its condition by keyword alone.
+        return {"adapted": adapted_model.apply(adapted_variables, latent, times, conditioning=condition),
+                "merged": model.apply(merged_variables, latent, times, conditioning=condition)}
+
+    with run_from("lora_export_reference", "tools") as generator, \
+            generator.source_directory(family) as directory:
+        draw, reference, truth = indexed_recording(
+            recorded, "prediction", seeds,
+            inputs_of=functools.partial(generator.pipeline_inputs, directory, family))
+        assert_as_exact(lambda index, inputs: predictions(inputs, own, merged_variables, adapter.model),
+                        reference, draw, f"{family} adapted and merged", seeds=seeds, truth_fn=truth)
 def _recipe_run(tmp_path, image_size, *args):
     """A diffusion recipe run from argv as a user types it: two steps on the
     TFDS image fixture, with `args` ending in the run's LoRA flags
