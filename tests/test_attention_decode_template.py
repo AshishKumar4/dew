@@ -45,11 +45,11 @@ def _hooks(hook: str, heads: int, positions: int, sinks: jax.Array) -> template.
     return None
 
 
-def _drawn(positions: int, heads: int, kv_heads: int, dtype):
+def _drawn(positions: int, heads: int, kv_heads: int, dtype, width: int = 64):
     def draw(seed: int):
         streams = jax.random.split(jax.random.key(seed), 4)
-        query = jax.random.normal(streams[0], (len(LENGTHS), positions, heads, 64), dtype)
-        key, value = (jax.random.normal(stream, (len(LENGTHS), KEYS, kv_heads, 64), dtype)
+        query = jax.random.normal(streams[0], (len(LENGTHS), positions, heads, width), dtype)
+        key, value = (jax.random.normal(stream, (len(LENGTHS), KEYS, kv_heads, width), dtype)
                       for stream in streams[1:3])
         sinks = jax.random.normal(streams[3], (heads,), jnp.float32)
         return query, key, value, sinks
@@ -78,6 +78,26 @@ def test_a_decode_step_through_the_template_is_on_par_interpreted(call, hook, dt
     assert_as_exact(jax.jit(ours), jax.jit(reference), _drawn(positions, heads, kv_heads, dtype),
                     f"template decode {call} {hook} {jnp.dtype(dtype).name}", seeds=SEEDS)
 
+
+
+@INTERPRETS
+def test_a_256_wide_decode_step_whose_split_launch_does_not_fit_is_on_par_interpreted():
+    """A 256-wide bf16 decode step (Qwen3.5-0.8B's heads: 8 query heads over 2 key heads) on an H100, whose
+    split launch's fp32 slices and the query's stage pass its shared memory, runs a slice a row through the
+    template (`attention_decode.plan`), on par with the reference path (check 1)."""
+    spans = _spans(1)
+
+    def ours(query, key, value, sinks):
+        del sinks
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, value, spans, None, interpret=True)
+
+    def reference(query, key, value, sinks):
+        del sinks
+        return template.reference(query, key, value, spans, None)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), _drawn(1, 8, 2, jnp.bfloat16, 256),
+                    "template decode 256 wide bfloat16", seeds=SEEDS)
 
 @INTERPRETS
 @pytest.mark.parametrize("call", ["one-query", "verify-four"])
@@ -264,8 +284,19 @@ def test_packing_a_calls_heads_into_its_rows_is_undone_by_unpacking():
     rows, row_spans, _ = attention_decode.packed(query, spans, 2)
     assert rows.shape == (2, 12, 2, 16)
     np.testing.assert_array_equal(template.ungrouped_rows(rows, 8), query)
-    np.testing.assert_array_equal(row_spans.start, np.repeat(np.asarray(spans.start), 4, axis=1))
+    np.testing.assert_array_equal(row_spans.per_query().start, np.repeat(np.asarray(spans.start), 4, axis=1))
 
+
+
+def test_a_packed_steps_spans_mean_its_rows_own_to_every_reader():
+    """A decode step's packed rows keep one interval a position (`KeySpans.per_span`); every mainloop and the
+    reference read them as each row's own: the reference over the packed rows and spans is the reference over
+    the same rows with an interval a row, bit for bit (row 4487)."""
+    query, key, value, _ = _drawn(4, 8, 2, jnp.float32)(0)
+    rows, packed_spans, _ = attention_decode.packed(query, _spans(4), 2)
+    assert packed_spans.per_span == 4
+    np.testing.assert_array_equal(template.reference(rows, key, value, packed_spans),
+                                  template.reference(rows, key, value, packed_spans.per_query()))
 
 def _states(logits: jax.Array, values: jax.Array, cuts) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Each slice's softmax state over its keys `cuts[s]` to `cuts[s + 1]`, and one more of no key: its output
@@ -297,7 +328,7 @@ def test_merging_a_rows_slices_and_its_initial_state_is_its_whole_softmax(slices
         initial = template.Initial(sink, jnp.ones_like(sink), jnp.zeros((*sink.shape, values.shape[-1])))
         spec = algebra.Forward("spans", 40, ids=False, scale=1.0, natural=True, initial=True)
         out, maximum, total = _states(logits, values, cuts)
-        return attention_decode.merged(spec, out, maximum, total, initial)
+        return algebra.merged_slices(spec, out, maximum, total, initial)
 
     def whole(logits, values, sink):
         scores = jnp.concatenate([logits, jnp.transpose(sink, (0, 2, 1))[..., None]], axis=-1)
@@ -310,3 +341,4 @@ def test_merging_a_rows_slices_and_its_initial_state_is_its_whole_softmax(slices
                 jax.random.normal(streams[1], (2, 3, 1, 40, 8)), jax.random.normal(streams[2], (2, 1, 3)))
 
     assert_as_exact(jax.jit(ours), jax.jit(whole), draw, f"decode merge over {slices} slices", seeds=SEEDS)
+

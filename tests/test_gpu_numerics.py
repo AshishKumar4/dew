@@ -15,11 +15,16 @@ process (`gpu_flow`), each cell its own file's property:
   the seeds it needs (test_chunked_cross_entropy).
 - A Dense layer's float64 terms on a GPU host are its inputs' placement's own, CPU or GPU, in either order
   (test_float64_terms).
+- The fused norms' and SiLU products' check-1 matrix (tests/kernel_matrix.py): a training step through each
+  entry on par with its XLA arithmetic, at every pair of axis values the Pallas kernels serve
+  (norm_swiglu_matrix).
 """
 
 import functools
 
 import jax.numpy as jnp
+import narrow_copies_matrix
+import norm_swiglu_matrix
 import pytest
 import test_audio as audio
 import test_chunked_cross_entropy as chunked_cross_entropy
@@ -29,7 +34,7 @@ import test_lowering as lowering
 import test_moe_precision as moe_precision
 import test_norm_swiglu as norm_swiglu_tests
 import test_precision_policy as precision_policy
-from gpu_flow import Cell, isolated, run_cells, when
+from gpu_flow import Cell, cells_of, isolated, run_cells, when
 
 from dew.nn.kernels import grouped_matmul, norm_swiglu
 from dew.nn.kernels.generation import triton_runs
@@ -97,3 +102,18 @@ def test_a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses(without_determinis
              functools.partial(norm_swiglu_tests.a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses,
                                without_deterministic_ops, implementation))
         for implementation in ("auto", "pallas")])
+
+
+def test_the_norm_swiglu_matrix_holds_on_this_gpu():
+    """The fused norms' and SiLU products' check-1 matrix (tests/kernel_matrix.py): a training step through
+    the RMS norm's plain, stream and gated entries and the SwiGLU product's apart and packed ones, the Pallas
+    kernel on par with XLA's arithmetic at every pair of axis values the kernels serve, each cell on its own
+    GPU."""
+    run_cells(cells_of(norm_swiglu_matrix.a_fused_entrys_training_step_is_on_par))
+
+
+def test_the_narrow_copies_matrix_holds_on_this_gpu():
+    """The narrow copies' check-1 matrix (tests/kernel_matrix.py): a decoder's training run through the copies
+    of its weights the update writes on par with the forward's own casts at every pair of axis values the
+    copies serve, each cell on its own GPU."""
+    run_cells(cells_of(narrow_copies_matrix.a_narrow_copy_training_run_is_on_par))

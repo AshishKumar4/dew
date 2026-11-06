@@ -40,6 +40,10 @@ CHOICES = frozenset({"gemm_epilogue", "gemm_prologue", "grouped_matmul"})
 """The `generation.CHOICES` entries the cells run (the module's docstring): each cell asserts that its routes
 run the stages fused where the case fuses them (`_named`) and the product in a launch of the kernels', not
 XLA's, which together reach them all, and that no choice outside `CHOICES` is recorded."""
+KERNELS = {"gemm_epilogue": frozenset({"fused"}), "gemm_prologue": frozenset({"fused"}),
+           "grouped_matmul": frozenset({"mosaic_gpu"})}
+"""The kernels under test of each choice the cells run: each stage fused, the product the template's
+launches."""
 
 
 def _wide(x):

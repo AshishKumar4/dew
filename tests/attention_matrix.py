@@ -26,6 +26,14 @@ from test_attention_mosaic import FED, _residuals
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route
 
+MAINLOOP = "attention_mainloop"
+"""The choice of the mainloop the route's passes run on (`attention_route.MAINLOOP`)."""
+CHOICES = frozenset({MAINLOOP})
+"""The `generation.CHOICES` entries the cells run (tests/test_kernel_matrix.py's union, row 184); the public
+op's kernels, the template's among them, are tests/attention_kernels_matrix.py's."""
+KERNELS = {MAINLOOP: frozenset({"mosaic", "triton"})}
+"""The mainloops the cells run under test (row 4513): each cell asserts its passes take them, the Mosaic one
+where it pins the backward's launch form; which takes an unpinned pass is the route's to derive."""
 LENGTH = 1024
 DOCUMENTS = 4
 CAP = 2.0
@@ -243,7 +251,8 @@ support change)."""
     for case in CASES], ids="-".join)
 def a_routes_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The route's training step of `case` on its GPU on par with the reference path's (check 1), its launch
-    form pinned (`pin_of`)."""
+    form pinned (`pin_of`): its passes on the Mosaic mainloop where it pins one, and on none but the GPU's
+    mainloops (`KERNELS`)."""
     named = dict(zip(AXES["attention"], case, strict=True))
     heads, _, _, _, spans, keep = _case(named)
     config = pin_of(named)
@@ -256,6 +265,9 @@ def a_routes_training_step_is_on_par(case: tuple[str, ...]) -> None:
 
     terms = terms_of(keep, heads, kind=BIAS.get(named["hook"]),
                      softcap=CAP if named["hook"] == "softcap" else None)
-    assert_as_exact(jax.jit(ours), jax.jit(_step(named, spans, reference=True)), _drawn(named),
-                    "-".join(case), seeds=SEEDS, terms=terms)
+    with generation.routes() as routes:
+        assert_as_exact(jax.jit(ours), jax.jit(_step(named, spans, reference=True)), _drawn(named),
+                        "-".join(case), seeds=SEEDS, terms=terms)
+    recorded = {found.kernel for found in routes if found.choice == MAINLOOP}
+    assert recorded <= KERNELS[MAINLOOP] and (config is None or "mosaic" in recorded), sorted(recorded)
 

@@ -119,29 +119,39 @@ def _pattern(tile: tuple[int, ...]) -> tuple[tuple[int, ...], ...]:
     return tuple(tuple(index for index, other in enumerate(tile) if other == extent) for extent in tile)
 
 
-SMALL = tuple(sorted(itertools.product((2, 3, 4, 5), (2,), (2, 3, 4, 5)), key=lambda tile: (sum(tile), tile)))
-"""A witness's candidate tiles, (rows, keys, width): the walked axis 2 (a law's maxima compare every key of
-two tiles), every axis past one (an axis of one broadcasts as a kept axis does), smallest first."""
+WALKED = (2, 3)
+"""The walked extents each structure is proven at: two, where a law's maxima compare every key of two tiles,
+and three, so a step that holds its laws at two elements a tile and breaks them at more (a sum as its
+maximum plus its minimum) shares no kernel's certificate (row 3518)."""
 
 
-def witness(declaration, shapes, kernel_tile: tuple[int, int, int], found: tuple) -> tuple[int, int, int]:
-    """The smallest tile whose extents are equal and unequal as the kernel tile's are (an unused axis, 0,
-    apart) and whose forms' structure is `found`, the kernel tile's."""
-    for rows, keys, width in SMALL:
+def small(walked: int) -> tuple[tuple[int, int, int], ...]:
+    """A witness's candidate tiles at `walked` keys a tile, (rows, keys, width): every other axis past one (an
+    axis of one broadcasts as a kept axis does), smallest first."""
+    return tuple(sorted(itertools.product((2, 3, 4, 5), (walked,), (2, 3, 4, 5)),
+                        key=lambda tile: (sum(tile), tile)))
+
+
+def witness(declaration, shapes, kernel_tile: tuple[int, int, int], found: tuple,
+            walked: int = 2) -> tuple[int, int, int]:
+    """The smallest tile of `walked` keys whose extents are equal and unequal as the kernel tile's are (an
+    unused axis, 0, apart) and whose forms' structure is `found`, the kernel tile's."""
+    for rows, keys, width in small(walked):
         tile = (rows, keys, width if kernel_tile[2] else 0)
         if _pattern(tile) == _pattern(kernel_tile) and laws.skeletons(declaration, shapes(*tile)) == found:
             return tile
     raise AssertionError(f"no small tile takes the structure and the equal extents of {kernel_tile}")
 
 
-def _certify_every_structure(declaration, shapes, tiles) -> None:
+def _certify_every_structure(declaration, shapes, tiles, walked: tuple[int, ...] = WALKED) -> None:
     """Each distinct structure `declaration`'s forms take over the kernel `tiles`, with each pattern of equal
-    extents it takes it at, certified at its witness."""
+    extents it takes it at, certified at its witness of each of `walked` keys a tile."""
     structures: dict = {}
     for tile in tiles:
         structures.setdefault((laws.skeletons(declaration, shapes(*tile)), _pattern(tile)), tile)
     for (found, _), tile in structures.items():
-        laws.certified(declaration, shapes(*witness(declaration, shapes, tile, found)))
+        for keys in walked:
+            laws.certified(declaration, shapes(*witness(declaration, shapes, tile, found, keys)))
 
 
 KERNEL_TILES = tuple(itertools.product(ROWS, KEYS, WIDTHS))
@@ -171,15 +181,17 @@ def _certified_in_shards(label: str, cases: tuple, units: int, certify) -> None:
     sharded(label, certified, units)
 
 
-@pytest.mark.shards(units=60, per_task=1)
+@pytest.mark.shards(units=120, per_task=1)
 def test_every_structure_of_the_forward_is_certified():
     """The forward's softmax walk (`attention_algebra.declaration`), in either base, queries or keys first,
-    over its formed logits or its raw products and each regime of their factor, at every dtype: each case
-    40 s to 55 s, one a map task: two took 100 s to 127 s a task on armada (b376a92ee3)."""
-    def certify(base2, keys_first, dtype, factor):
-        _certify_every_structure(*_forward(base2, keys_first, dtype, factor), KERNEL_TILES)
+    over its formed logits or its raw products and each regime of their factor, at every dtype, each case's
+    structures at each walked extent (`WALKED`) a unit of its own: a case 40 s to 55 s at two keys and two
+    to three times that at three (armada, laws-extent2), one unit a map task."""
+    def certify(base2, keys_first, dtype, factor, keys):
+        _certify_every_structure(*_forward(base2, keys_first, dtype, factor), KERNEL_TILES, (keys,))
 
-    _certified_in_shards("the forward's structures", FORWARD_CASES, 60, certify)
+    _certified_in_shards("the forward's structures", tuple((*case, keys) for case in FORWARD_CASES
+                                                           for keys in WALKED), 120, certify)
 
 
 @pytest.mark.shards(units=120, per_task=4)
@@ -227,6 +239,30 @@ def test_a_form_that_breaks_a_law_is_refused():
         laws.certify(init=forms.init, step=forms.step, merge=kept, finish=forms.finish,
                      declared=declaration.function, shapes=shapes(3, 2, 4), walked={"logits": 1, "values": 0})
     assert raised.value.law == "identity"
+
+
+def test_a_step_lawful_at_two_keys_a_tile_alone_is_refused_at_three():
+    """A sum's walk whose step reduces each tile by its maximum plus its minimum, its sum at two keys a tile
+    and at no more, is refused by its certificate at its witness of three keys (`WALKED`), which a law proven
+    at two would share with a kernel's tile (row 3518)."""
+    def summed(values):
+        return jnp.sum(values, axis=0)
+
+    declaration = derive.Reduction(summed, {"values": ("keys", "width")}, walked="keys", exponent="e")
+    forms = derive.derive(declaration, accurate=False, saturation=SATURATION)
+
+    def two_only(state, tiles):
+        values = tiles["values"]
+        return (state[0] + jnp.max(values, axis=0) + jnp.min(values, axis=0),)
+
+    def certified(keys):
+        return laws.certify(init=forms.init, step=two_only, merge=forms.merge, finish=forms.finish,
+                            declared=declaration.function, shapes={"values": ((keys, 2), jnp.float32)},
+                            walked={"values": 0})
+
+    certified(min(WALKED))
+    with pytest.raises(laws.Unlawful):
+        certified(max(WALKED))
 
 
 def _biased(start: int):

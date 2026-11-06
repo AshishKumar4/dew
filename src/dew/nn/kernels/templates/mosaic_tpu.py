@@ -150,7 +150,8 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
         del interpret
         return acc + value.astype(jnp.float32)
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False) -> jax.Array:
+        del interpret
         if then is not None:
             then()
         return _product(lhs, rhs)
@@ -362,7 +363,8 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
             smem[...] = part.astype(smem.dtype)
             pltpu.sync_copy(smem, view)
 
-    def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:
+    def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:
+        del pending
         raise NotImplementedError("a TPU core adds into HBM by no atomic: a split contraction's partial "
                                   "sums take a place each")
 

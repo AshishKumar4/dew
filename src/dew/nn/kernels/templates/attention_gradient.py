@@ -32,7 +32,6 @@ from dew.nn.kernels.templates.attention_algebra import (
     power2,
     split_output,
     summed_products,
-    unseen,
     value_operands,
     weights_parts,
 )
@@ -132,7 +131,7 @@ def off_anchor_start(peak0: jax.Array, total0: jax.Array, maximum: jax.Array, wi
     mean's product with the cotangent (`off_anchor_delta`), never `acc0 · dO`, which overflows where the
     state's sums are near fp32's largest."""
     # The fold's maximum is the state's taken to base 2 and back, which may round it an ulp below.
-    carried = jnp.where(unseen(peak0), 0.0, jnp.exp(jnp.minimum(peak0 - maximum, 0.0)))
+    carried = jnp.where(peak0 == -jnp.inf, 0.0, jnp.exp(jnp.minimum(peak0 - maximum, 0.0)))
     state_total = total0 * carried
     nothing = jnp.zeros_like(total0)
     first = OffAnchor(power2(state_total, -shift), jnp.zeros((total0.shape[0], width), jnp.float32),
@@ -452,7 +451,7 @@ def safe_peak(peak: jax.Array) -> jax.Array:
     -inf), so each of its weights is exp(-inf) = 0 whatever its logit, a row's select in place of each
     entry's clamp (the fast backward's dQ launch: FMNMX 128 to 64 of 2080 instructions, its dK/dV's 48 to
     32, at Qwen3-8B's widths, ptxas 12.9 sm90a)."""
-    return jnp.where(unseen(peak), jnp.inf, peak)
+    return jnp.where(peak == -jnp.inf, jnp.inf, peak)
 
 
 def below(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN, *, safe: bool = False) -> jax.Array:
@@ -558,7 +557,7 @@ def refinement(residual: jax.Array, mass: jax.Array, peak0: jax.Array, shares: t
     keys' weights `mass`) is D's rounding. Moving D by it over the weights' total lets dK/dV, the initial
     state's gradients and the head and query parameters' take the D whose cotangents do. The state's
     weight is taken whole before any product, so a state whose sums are near fp32's largest stays finite."""
-    carried = jnp.where(unseen(peak0), 0.0, jnp.exp(jnp.minimum(peak0 - peak, 0.0)))
+    carried = jnp.where(peak0 == -jnp.inf, 0.0, jnp.exp(jnp.minimum(peak0 - peak, 0.0)))
     weight = (shares[0] * carried) * inverse(total)
     whole_residual = residual + (shares[1] - (anchor + delta)) * weight
     whole_mass = mass + weight
