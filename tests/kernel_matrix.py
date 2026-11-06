@@ -36,7 +36,8 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
         "kernel": ("decode", "cudnn", "triton", "template"),
     },
     "gemm": {
-        "generation": ("sm90", "sm80"),
+        "generation": ("sm90", "sm80", "v5e"),
+        "kernel": ("mosaic_gpu", "triton", "cutlass", "mosaic_tpu"),
         "form": ("dense", "grouped"),
         "matrix": ("n-major", "k-major"),
         "hook": ("plain", "bias", "row-scale", "paired"),
@@ -99,11 +100,12 @@ parameters of one shape added to the logits (two in-place gradients of one shape
 the backward in one launch, two, or one whose consumers share a key block; the operands' dtype; the fast or
 the accurate form. Decode's (the choices `decode` and `paged_decode`): the GPU; a dense cache's step or a
 paged pool's; 16 query heads over 8 key heads, or 8 over 8; no hook, attention sinks, or a softcap; the
-operands' dtype; the head width. GEMM's: the GPU; a dense product or one over three groups (one of them
-empty); the matrix stored N-major (`[depth, width]`) or K-major (`transpose_rhs`, `[width, depth]`); no hook,
-a bias (a group's under a grouped call), a scale a row, or a paired gate and up product under SwiGLU; the
-operands' dtype. The fused GEMM's (the choices `gemm_epilogue` and `gemm_prologue`): the GPU; the stage a
-region fuses, its consumers into the epilogue, its producer (an RMS norm) into the prologue (its consumers
+operands' dtype; the head width. GEMM's: the GPU or TPU; the grouped matmul's kernel; a dense product or one
+over three groups (one of them empty); the matrix stored N-major (`[depth, width]`) or K-major
+(`transpose_rhs`, `[width, depth]`); no hook, a bias (a group's under a grouped call), a scale a row, or a
+paired gate and up product under SwiGLU; the operands' dtype. The fused GEMM's (the choices `gemm_epilogue`
+and `gemm_prologue`): the GPU; the stage a region fuses, its consumers into the epilogue, its producer (an RMS
+norm) into the prologue (its consumers
 after the product in XLA), or both; the consumers, a bias then a cast, or a SiLU of twice the product plus a
 residual; the operands' dtype. The joined projections' (the choices `gate_up` and `delta_gates`): the GPU; a
 gated MLP's gate and up projections joined, or a gated delta net's b and a; the MLP's activation, SwiGLU or

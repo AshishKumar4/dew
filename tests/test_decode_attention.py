@@ -308,7 +308,7 @@ def a_decode_steps_sinks_take_their_gradient_and_tangent_through_the_dispatch(so
 
 
 def decode_step(lengths):
-    """fp32 attention of a decode step's grouped query (`decode_attention.grouped_query`) over key
+    """fp32 attention of a decode step's grouped query (`decode_geometry.grouped_query`) over key
     lengths through the decode kernel, chosen for the decode selector (`attention_kernels.DECODE`),
     which takes it on a GPU (`decode_attention.SUPPORTS`), and the folded attention it stands in for
     over the prefix those lengths mean."""
@@ -361,7 +361,7 @@ def test_attention_the_decode_kernel_takes_lowers_for_the_gpu_differentiated_in_
 def test_a_grouped_query_in_its_own_layout_reaches_the_decode_kernel(generation):
     """A decode step's query of 4 heads over 2 key heads, called in the layer's own `[B, 1, N, D]`
     layout with key lengths: the core reads each key head's query heads as its query positions
-    (`decode_attention.grouped_query`), so the decode kernel takes it, lowered for the GPU on this CPU."""
+    (`decode_geometry.grouped_query`), so the decode kernel takes it, lowered for the GPU on this CPU."""
     from dew.nn.kernels.generation import assumed, gpu_mesh
 
     query = jax.ShapeDtypeStruct((2, 1, 4, 64), jnp.bfloat16)

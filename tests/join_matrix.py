@@ -48,6 +48,8 @@ CHOICES = frozenset({"gate_up", "delta_gates"})
 """The `generation.CHOICES` entries the cells run, a cell its case's join: each cell asserts that the routes
 it records run that join `joined` and that every choice outside `CHOICES` runs at XLA, which together reach
 them all."""
+KERNELS = {"gate_up": frozenset({"joined"}), "delta_gates": frozenset({"joined"})}
+"""The kernels under test of each choice the cells run: the join's projections as one."""
 XLA = dict.fromkeys(("grouped_matmul", "swiglu", "rms_norm", "short_conv", "gated_delta_rule"), "xla")
 """The layers' other choices, named XLA in every cell."""
 
