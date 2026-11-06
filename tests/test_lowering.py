@@ -1074,6 +1074,31 @@ def test_a_gpu_target_takes_the_clocks_bandwidth_and_l2_its_driver_reports():
     assert (undriven.clock_hz, undriven.memory_bandwidth, undriven.l2_bytes) == (1830e6, 3350e9, 50 * 2 ** 20)
 
 
+def test_a_parts_gpu_facts_are_the_facts_its_kernels_read():
+    """`dew.gpu_facts` reads the target Dew's kernels resolve, for a named part (by generation, device kind or
+    alias alike) and for this process's device within `assumed`; its peaks read-only, a part Dew knows
+    nothing of and a process whose device is no GPU refused."""
+    import dew
+    from dew.nn.kernels import generation
+
+    target = generation.gpu_target("sm90")
+    facts = dew.gpu_facts("sm90")
+    assert facts == dew.gpu_facts(target.device_kind)
+    assert dew.gpu_facts("sm80") == dew.gpu_facts("a100")
+    assert (facts.multiprocessors, facts.clock_hz, facts.memory_bandwidth, facts.l2_bytes,
+            facts.shared_per_block, facts.registers, facts.instruction_families) == (
+        target.multiprocessors, target.clock_hz, target.memory_bandwidth, target.l2_bytes,
+        generation.shared_budget(target), target.multiprocessor.registers, ("wgmma", "mma.sync"))
+    with generation.assumed("sm80"):
+        assert dew.gpu_facts() == dew.gpu_facts("sm80")
+    with pytest.raises(TypeError):
+        facts.dense_peaks["bf16"] = 0.0
+    with pytest.raises(ValueError):
+        dew.gpu_facts("not a gpu")
+    with pytest.raises(ValueError):
+        dew.gpu_facts()
+
+
 def a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it():
     """The default device's shared memory a block and multiprocessors come from JAX's device: a bare
     target of its generation, holding none of the table's resources, takes the same ones the

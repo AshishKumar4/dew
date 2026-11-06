@@ -862,6 +862,66 @@ def device_target(device) -> GpuTarget:
     return _resolved(device, _generation(device), device.platform == 'gpu')
 
 
+@dataclasses.dataclass(frozen=True)
+class GpuFacts:
+    """The facts Dew's kernels read of a GPU, read-only (`gpu_facts`): its part (the device kind), CUDA
+    `generation` and compute `capability`, its `multiprocessors`, their clock (`clock_hz`), its memory's
+    bandwidth (bytes a second) and L2 cache (`l2_bytes`), the shared memory a block may stage
+    (`shared_per_block`, bytes), a multiprocessor's 32-bit `registers`, the most a thread holds
+    (`thread_registers`) and the most threads and blocks resident on it at once, the dense tensor peaks by
+    dtype (`dense_peaks`, FLOP a second), and the matrix instruction families it issues and the kernel
+    bundles Dew's templates compose there (`bundles`, for bf16 operands). A fact no source states is None."""
+
+    part: str
+    generation: str
+    capability: tuple[int, int] | None
+    multiprocessors: int | None
+    clock_hz: float | None
+    memory_bandwidth: float | None
+    l2_bytes: int | None
+    shared_per_block: int
+    registers: int | None
+    thread_registers: int | None
+    resident_threads: int | None
+    resident_blocks: int | None
+    dense_peaks: Mapping[str, float]
+    instruction_families: tuple[str, ...]
+    bundles: tuple[str, ...]
+
+
+def gpu_facts(part: str | None = None) -> GpuFacts:
+    """The facts Dew's kernels read of a GPU (`GpuFacts`), read from the target they resolve, never a copy
+    of it: this process's GPU's where `part` is None, what its driver reports of itself (multiprocessors,
+    shared memory, clocks and L2, `runtime_facts`), or, within `assumed`, the assumed part's; else a named
+    part's, by generation ('sm90'), device kind ('NVIDIA H100 80GB HBM3') or alias ('a100'). Raises
+    `ValueError` for a process whose device is not a GPU and for a part Dew knows nothing of."""
+    from types import MappingProxyType
+
+    import jax
+
+    from dew.nn.kernels.templates import bundles
+
+    if part is None and assumption() is None and jax.local_devices()[0].platform != 'gpu':
+        raise ValueError(f"this process's device is a {jax.local_devices()[0].platform}, not a GPU; "
+                         f"name a part to read its facts")
+    target = gpu_target(part)
+    if capability(target.generation) is None:
+        raise ValueError(f"Dew knows no GPU named {part!r}")
+    resources = target.architecture.multiprocessor
+    return GpuFacts(
+        part=target.device_kind, generation=target.generation, capability=capability(target.generation),
+        multiprocessors=target.multiprocessors, clock_hz=target.clock_hz,
+        memory_bandwidth=target.memory_bandwidth, l2_bytes=target.l2_bytes,
+        shared_per_block=shared_budget(target),
+        registers=resources and resources.registers,
+        thread_registers=resources and resources.thread_registers,
+        resident_threads=resources and resources.resident_threads,
+        resident_blocks=resources and resources.resident_blocks,
+        dense_peaks=MappingProxyType(dict(target._part(target.dense_peaks) or {})),
+        instruction_families=issuers(target.generation),
+        bundles=tuple(bundle.name for bundle in bundles.layouts(target.generation, 'bfloat16')))
+
+
 def _resolved(device, generation: str, real: bool) -> GpuTarget:
     """`device`'s target within `generation`: its kind picks the SKU's peaks within it, and where the table
     names no SKU of that kind of the generation, a `real` device keeps its own kind, so its peaks stay

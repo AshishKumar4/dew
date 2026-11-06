@@ -605,6 +605,28 @@ Training batches hold uint8 NHWC images and `source.inputs.tokenize(captions)`. 
 
 Prepared `DenoisingInputs` can supply encoded native conditions and initial latents. Explicit grids pass to `sample(times=..., final_denoise=False)` when the last latent is the result; without an explicit grid, the existing `steps` and final clean-prediction convention remain unchanged. Published tabulated PRK grids own their integer half-interval rule; ordinary native grids retain exact half-intervals.
 
+## GPU facts
+
+`dew.gpu_facts(part=None)` returns the facts Dew's kernels read of a GPU, as a frozen `dew.GpuFacts`. They
+come from the same target the kernel templates resolve, read at each call, never a separate copy:
+
+```python
+import dew
+
+h100 = dew.gpu_facts("sm90")       # a named part: a generation, a device kind, or an alias ("a100")
+print(h100.multiprocessors, h100.l2_bytes, h100.shared_per_block, h100.instruction_families)
+```
+
+`dew.gpu_facts()`, with no `part`, describes this process's first GPU: the multiprocessors, shared memory per block, clocks
+and L2 its CUDA driver reports, and Dew's table for the rest. Inside `dew.nn.kernels.generation.assumed(...)`
+it describes the assumed part. A named part reads the table alone. The fields are the part (its device
+kind), its CUDA generation and compute capability, the multiprocessor count and clock, memory bandwidth in
+bytes a second, L2 bytes, the shared memory a block may stage, a multiprocessor's registers, the most a
+thread holds, the most threads and blocks resident on it, the dense tensor peaks by dtype (a read-only
+mapping, FLOP a second), the matrix instruction families it issues and the kernel bundles Dew's templates
+compose there. A fact no source states is `None`. A process whose device isn't a GPU, and a part Dew
+doesn't know, raise `ValueError`.
+
 ## Configuration and registries
 
 Code builds every model, preset, solver, dataset and metric from its class. A record names a class by its import path, `{"class": "dew.nn.backbones.dit:SimpleDiT", "fields": {...}}`, and a function as `{"function": "optax:adamw"}`; `RunConfig.from_dict` and `ModelConfig.build` import what a record names. Where a person writes a record or a flag, `dew.registry` maps short aliases (`simple_dit`) to those paths.
