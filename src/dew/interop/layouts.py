@@ -300,16 +300,19 @@ class Table:
         object.__setattr__(self, 'entries', entries)
 
     def read(self, name: str, config: Config) -> Leaf | None:
-        return next((found for entry in self.entries if (found := entry.read(name, config)) is not None),
-                    None)
+        return _first(entry.read(name, config) for entry in self.entries)
 
     def write(self, path: Path, config: Config) -> str | None:
-        return next((name for entry in self.entries if (name := entry.write(path, config)) is not None),
-                    None)
+        return _first(entry.write(path, config) for entry in self.entries)
 
     def copies(self, config: Config) -> Iterator[tuple[str, Path]]:
         for entry in self.entries:
             yield from entry.copies(config)
+
+
+def _first[Found](found: Iterator[Found | None]) -> Found | None:
+    """The first of `found` that is not None, None where none is: the first entry of a table that routes."""
+    return next((one for one in found if one is not None), None)
 
 
 @dataclass(frozen=True, eq=False)
