@@ -30,6 +30,7 @@ cotangents through `gemm` and `gemm_t` and the hooks' through their VJPs in XLA,
 accumulator only where the epilogue's VJP reads it.
 """
 
+import dataclasses
 import functools
 
 import jax
@@ -39,6 +40,7 @@ from jax.custom_derivatives import zero_from_primal
 from jax.extend import core as jax_core
 
 from dew import _cache
+from dew.algebra import bits
 from dew.nn.derivatives import KernelGlue, declared_derivative, declared_tangent
 from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.templates import mosaic
@@ -212,6 +214,40 @@ LOW_RANK: selection.Op[None] = selection.Op('low_rank', (
 the rank extends (`low_rank`) where named (`generation.chosen(low_rank='fused')`), which passes the
 measured requirement no receipt has met yet; else its base product and its update apart, the adapter's own
 program."""
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class NvFp4:
+    """An NVFP4 matrix `[depth, width]` as the GEMM stores it (row 3621): its E2M1 codes eight a uint32
+    along the depth in the stored layout (`words`, `[depth / 8, width]`, `bits.NVFP4_BFLOAT16_FORM.prepared`'s
+    words), each sixteen's E4M3 scale along the depth (`scales`, `[depth / 16, width]`), and the tensor's
+    fp32 scale (`scale`, a scalar): each value its code times its block's scale times the tensor's."""
+
+    words: jax.Array
+    scales: jax.Array
+    scale: jax.Array
+
+    @property
+    def factor(self) -> jax.Array:
+        """The factor its decode defers to the product's accumulator (`bits.NVFP4_OWED` times the tensor's
+        scale): `bits.nvfp4_decoded` keeps each value within bfloat16's normal range by owing 2^8."""
+        return jnp.float32(bits.NVFP4_OWED) * jax.lax.stop_gradient(jnp.asarray(self.scale, jnp.float32))
+
+
+def nvfp4_product(lhs: jax.Array, matrix: NvFp4, *, out_dtype, interpret_on_cpu: bool = False) -> jax.Array:
+    """`lhs · W` of an NVFP4 matrix `W` (`NvFp4`), its weights frozen (a quantized checkpoint's): `lhs`
+    rounded to bfloat16, each value of `W` decoded exactly to bfloat16 (`bits.nvfp4_decoded`, its block's
+    scale applied, 2^8 owed), the products summed in fp32 (`gemm`), and the accumulator times the deferred
+    factor (`NvFp4.factor`) before the one rounding to `out_dtype`: the deferred factor is the epilogue's
+    first operation, ahead of any output hook (PLAN piece 10). The decoded matrix is materialized once a call
+    here; the mainloop's matrix-operand hook decodes each stage in place (row 3621's next form)."""
+    decoded = bits.nvfp4_decoded(matrix.words, matrix.scales)
+    # Each product of two bfloat16 values is exact in fp32, so the default precision is the exact product's,
+    # whatever precision the program defaults to.
+    summed = gemm(lhs.astype(jnp.bfloat16), decoded, None, out_dtype=jnp.float32,
+                  precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu)
+    return (summed * matrix.factor).astype(out_dtype)
 
 
 def low_rank(lhs: jax.Array, kernel: jax.Array, a: jax.Array, b: jax.Array, scale, *, out_dtype,
