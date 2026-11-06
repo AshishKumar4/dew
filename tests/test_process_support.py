@@ -192,7 +192,7 @@ def test_raised_names_each_error_a_process_ended_with_whatever_its_names_capital
                "try:\n"
                "    json.loads('{')\n"
                "finally:\n"
-               "    raise OSError(2, 'gone')\n")
+               "    raise OSError('gone')\n")
     done = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=60,
                           check=False)
     assert {"json.decoder.JSONDecodeError", "OSError"} <= raised(done).keys(), done.stderr
