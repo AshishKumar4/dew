@@ -287,8 +287,9 @@ def test_finalists_play_one_round_keep_each_groups_best_and_answer_over_every_op
     """A released engine's knock-out (`Finalists`, StartLux-Decision a99977d93): fourteen options in groups
     of at most four, the first ones longer (4, 4, 3, 3), asked together; each group's two best, in group
     order; the five best of those eight by their group round; the final over them; and the answer over
-    every option, the finalists sharing 0.99 as the final gave it them and the knocked-out 0.01 by their
-    group rounds, all over their total (the engine's `knockout_combine`)."""
+    every option, the finalists first as the final gave them 0.99 and the knocked-out after them sharing 0.01
+    by their group rounds, all over their total (the engine's `knockout_combine`), abstaining as the whole
+    question does."""
     request = CASES["many_options"]
     question = Question.from_wire(request["questions"]["intent"])
     assert isinstance(question, Choice)
@@ -314,11 +315,18 @@ def test_finalists_play_one_round_keep_each_groups_best_and_answer_over_every_op
               for option, value in zip(final.options, final.probabilities, strict=True)}
     shared |= {option: residual * first[option] / sum(first[each] for each in rest) for option in rest}
     total = sum(shared.values())
-    answer = decide.tournament(request["state"], {"intent": question},
-                               rounds=Finalists(group=4, keep=2, final=5, residual=residual))["intent"]
-    assert answer.options == question.options
-    assert answer.probabilities.tolist() == [shared[option] / total for option in options]
+    rounds = Finalists(group=4, keep=2, final=5, residual=residual)
+    answer = decide.tournament(request["state"], {"intent": question}, rounds=rounds)["intent"]
+    assert answer.options == (*final.options, *rest)
+    assert answer.probabilities.tolist() == [shared[option] / total for option in answer.options]
     assert answer.choice == final.choice
+    # It abstains as the whole question does: under a threshold the final round's top meets and the
+    # answer's, that top's share of 1 - residual, does not.
+    top = float(np.max(final.probabilities))
+    gated = replace(decide, calibration=replace(decide.calibration,
+                                                abstention=Abstention(default=top * (1 - residual / 2))))
+    assert not gated(request["state"], {"intent": over(finalists)})["intent"].abstained
+    assert gated.tournament(request["state"], {"intent": question}, rounds=rounds)["intent"].abstained
 
 
 def synthetic(temperature: float, count: int, options: int, seed: int) -> list[Scored]:

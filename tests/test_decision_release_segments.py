@@ -61,6 +61,23 @@ def test_a_summary_of_the_request_is_written_in_each_questions_row(qwen):
         layout.encode(qwen, SPECIALS, TEAM, qwen.encode(STATE, add_special_tokens=False), name="team")
 
 
+
+def test_a_training_read_writes_the_summary_a_server_writes_for_its_request(qwen):
+    """A request's labelled question, encoded as a run trains on it, holds the summary of every question its
+    request asks, its unlabelled one among them: the row a server writes for that request (review of row
+    4482: a training read summarized the questions it laid out alone)."""
+    from dew.decision import Example
+    from dew.decision.layout import RequestSummary
+    from dew.decision.rows import Encoding
+
+    first, state, closing, *question = release().segments
+    summary = RequestSummary(line="{index}. {name} ({kind}): {instructions}")
+    layout = layout_of((first, state, closing, summary, Text("\n\n"), *question))
+    example = Example(STATE, {"team": TEAM, "urgency": URGENCY}, {"team": "billing"})
+    trained = Encoding(layout, qwen, SPECIALS, width=4, shuffle=False)(example, ["team"], None)
+    served = layout.rows(qwen, SPECIALS, STATE, {"team": TEAM, "urgency": URGENCY})[0]
+    assert list(trained["tokens"]) == list(served.tokens)
+
 def question_first(over: int) -> QuestionLayout:
     """The question, the state, then the question once more where the state holds `over` tokens or more."""
     from dew.decision.layout import Again
