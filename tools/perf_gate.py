@@ -531,6 +531,15 @@ admitted record), kept with their own values beside each compile's seconds: a he
 it."""
 
 
+def compiled_sample(printed: str) -> tuple[float | str, dict]:
+    """A compile ahead's printed result (`COMPILED`) as a row's sample and its plan: the planner's seconds,
+    or, where it lowered a kernel in place of the target's, why the row is unsupported (`verdict`)."""
+    compiled = json.loads(printed.strip().splitlines()[-1])
+    substituted = compiled["substituted"]
+    sample = f"{UNSUPPORTED}{'; '.join(substituted)}" if substituted else float(compiled["seconds"])
+    return sample, compiled["plan"]
+
+
 def compile_battery(args: argparse.Namespace) -> int:
     """Each step of `--kind`'s planned and compiled ahead of its run, for one compile-only GPU of its
     generation (`COMPILE_TARGETS`), XLA's autotuning off as no GPU is attached to time a candidate
@@ -580,10 +589,7 @@ def compile_battery(args: argparse.Namespace) -> int:
                 if done.returncode != 0:
                     taken[name] = f"not run: {done.stderr[-400:]}"
                     continue
-                compiled = json.loads(done.stdout.strip().splitlines()[-1])
-                plans[name] = compiled["plan"]
-                taken[name] = (f"{UNSUPPORTED}{'; '.join(compiled['substituted'])}" if compiled["substituted"]
-                               else float(compiled["seconds"]))
+                taken[name], plans[name] = compiled_sample(done.stdout)
             results["plans"][arm].append(plans)
             return taken
 

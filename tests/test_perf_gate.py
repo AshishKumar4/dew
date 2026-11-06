@@ -593,20 +593,42 @@ TINY = {"architecture": "causal_transformer", "dtype": "bfloat16", "batch_size":
 are, which a GPU routes to FlashAttention."""
 
 
-def test_a_step_is_planned_and_compiled_ahead_for_an_absent_gpu_with_the_gates_attention(gate, tmp_path):
-    """The compile ahead's own process (`COMPILED`), run as `compile` runs it: a decoder's step planned and
-    compiled for one compile-only sm90 GPU of a stated memory, here with no GPU attached, with XLA's
-    attention (`AHEAD_ATTENTION`, which lowers here: ledger 4616), its planner's seconds reported, nothing
-    substituted, and every selected field of its plan with its own value. A compile that substituted a
-    kernel is the gate's unsupported row (`compile`'s test, at its process boundary)."""
+def test_a_step_compiled_ahead_for_an_absent_gpu_is_judged_and_one_that_substituted_a_kernel_is_not(
+        gate, tmp_path):
+    """The compile ahead's own process (`COMPILED`), run as `compile` runs it, outside the suite's settings as
+    a node's prepare runs it: a decoder's step planned and compiled for one compile-only sm90 GPU of a stated
+    memory, here with no GPU attached. With the gate's XLA attention (`AHEAD_ATTENTION`, which lowers here:
+    ledger 4616), its planner's seconds are its sample and every selected field of its plan keeps its own
+    value. With cuDNN's attention asked for, which runs as XLA's with no GPU attached, the program it names
+    as substituted is the gate's unsupported row, failing the gate, never a time."""
+    import os
+    from types import SimpleNamespace
+
+    from lane_environment import outside_suite
+
     script = gate._script(tmp_path / "compiled.json", gate.COMPILED)
-    selected = ",".join(gate.SELECTED)
-    argv = [str(script), json.dumps(TINY), "sm90", str(1 << 30), gate.AHEAD_ATTENTION, selected]
-    done = gate._run(ROOT, Path(sys.executable), "", argv, ROOT / "tools", 900, tmp_path / "compiles")
-    assert done.returncode == 0, done.stderr[-3000:]
-    ahead = json.loads(done.stdout.strip().splitlines()[-1])
-    assert ahead["seconds"] > 0 and ahead["substituted"] == [] and ahead["plan"]["split"] == 1
-    assert set(ahead["plan"]) == set(gate.SELECTED)
+    environ = {**outside_suite(os.environ), "PYTHONPATH": f"{ROOT / 'src'}:{ROOT / 'tools'}"}
+
+    def compiled(attention: str) -> tuple[float | str, dict]:
+        argv = [str(script), json.dumps(TINY), "sm90", str(1 << 30), attention, ",".join(gate.SELECTED)]
+        done = subprocess.run([sys.executable, *argv], cwd=ROOT, env=environ, capture_output=True, text=True,
+                              timeout=900, check=False)
+        assert done.returncode == 0, done.stderr[-3000:]
+        return gate.compiled_sample(done.stdout)
+
+    seconds, plan = compiled(gate.AHEAD_ATTENTION)
+    assert isinstance(seconds, float) and seconds > 0
+    assert set(plan) == set(gate.SELECTED) and plan["split"] == 1
+    substituted, _ = compiled("cudnn")
+    assert isinstance(substituted, str) and substituted.startswith(gate.UNSUPPORTED)
+    row = gate.Row("compile tiny 1x1024 (xla attention)", "s", "", floor=gate.COMPILE_FLOOR)
+    results = tmp_path / "compile.json"
+    results.write_text(json.dumps({"base": "main", "head": "head", "alone": "main~aa", "rounds": 1,
+                                   "rows": [row.__dict__],
+                                   "samples": {arm: [{row.name: substituted}] for arm in gate.ARMS}}))
+    verdicts = tmp_path / "verdicts.json"
+    assert gate.report(SimpleNamespace(results=results, table=None, claim=False, verdicts=str(verdicts))) == 1
+    assert json.loads(verdicts.read_text())["rows"][row.name]["state"] == "unsupported"
 
 
 def paired(rates: dict[str, list[float]], session: str = "s") -> dict[str, list[dict]]:
