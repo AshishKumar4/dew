@@ -744,8 +744,13 @@ class KVStore:
             selected(PAGED, case, 'triton' if backend() == "gpu" else 'tpu')
 
         def local(query, key, value, lengths, table, *extras):
-            # The optional operands as `decode` gave them: the window's starts, then the sinks.
-            starts, sinks = (extras[0] if given else None), (extras[-1] if sunk else None)
+            # The optional operands as `decode` gave them: the window's starts, the sinks, then a quantized
+            # pool's scales.
+            starts = extras[0] if given else None
+            sinks = extras[len(given)] if sunk else None
+            if kernel == 'template' and scaled:
+                return template_quantized(query, key, value, table, lengths, *extras[-2:], starts,
+                                          sinks if sunk else None, softcap=softcap)
             if kernel == 'template':
                 return template_paged(softcap)(query, key, value, table, lengths, starts, sinks)
             if kernel == 'triton':
@@ -759,13 +764,16 @@ class KVStore:
         given = () if starts is None else (starts,)
         sunk = () if sinks is None else (sinks,)
         pools = [self._get(name) for name, _ in self.payloads]
+        # A quantized pool's codes and their scales `[KV, P, page]`, which the template reads as they are.
+        scaled = kernel == 'template' and self.layout.quantized is not None
+        scales = (tuple(self._get(scale) for _, scale in self.payloads) * 2)[:2] if scaled else ()
         arrays = (query, pools[0], pools[-1], lengths, self._absolute(self._get(TABLE)),
-                  *given, *sunk)
+                  *given, *sunk, *scales)
         queries = logical_spec(DECODE_QUERY, query.shape)
         # A spec leaves off trailing whole dimensions.
         rows, heads = (*queries, None, None)[:2]
         specs = (queries, P(heads), P(heads), P(rows), P(rows), *(P(rows) for _ in given),
-                 *(P(heads) for _ in sunk))
+                 *(P(heads) for _ in sunk), *(P(heads) for _ in scales))
         return manual_map(local, specs, queries)(*arrays)
 
 
@@ -859,12 +867,10 @@ def _template_tiles(case: PagedCase) -> bool:
 
 TEMPLATE_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
     Requirement('pages', lambda case: case.page_size is not None, "the cache keeps no pages", row=INHERENT),
-    Requirement('quantized', lambda case: not case.quantized,
-                "the template's decode reads 16-bit pages; a quantized pool is read through the gather",
-                row='ledger 3624'),
-    Requirement('dtype', lambda case: case.dtype == case.pool and case.pool in (jnp.bfloat16, jnp.float16),
-                lambda case: f"the template's decode reads a 16-bit query over pages of its dtype, not "
-                             f"{case.dtype} over {case.pool}", row='ledger 3624'),
+    Requirement('dtype', lambda case: case.dtype in (jnp.bfloat16, jnp.float16)
+                and (case.quantized or case.pool == case.dtype),
+                lambda case: f"the template's decode reads a 16-bit query over pages of its dtype or of "
+                             f"codes it dequantizes, not {case.dtype} over {case.pool}", row='ledger 3624'),
     Requirement('tiles', _template_tiles,
                 lambda case: f"the attention template's decode reads no key tile of pages of "
                              f"{case.page_size} keys on this GPU", row='ledger 3648'),
@@ -878,7 +884,8 @@ TEMPLATE_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
 """The attention template's decode over the pages (`attention_decode.attend`'s `table`): a GPU's paged
 step where Dew's Pallas kernel turns the pool down (its values narrower than its keys, a 16-bit query of
 fp16, a pool split into groups, read through its table's pages past each group's part's start,
-`KVStore._absolute`), its derivatives at every order the gathered attention's (`template_paged`)."""
+`KVStore._absolute`, a quantized pool's codes dequantized in its walk, `template_quantized`), its derivatives
+at every order the gathered attention's (`template_paged`)."""
 
 TPU_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
     Requirement('capability', lambda case: generation.backend() == 'tpu',
@@ -990,7 +997,8 @@ def _paged(forward: Callable, softcap: float | None) -> Callable:
                                   functools.partial(_gathered_tangent, softcap=softcap), kind=KernelGlue()))
 
 
-def _template_forward(query, key, value, table, lengths, starts=None, sinks=None, *, softcap=None):
+def _template_forward(query, key, value, table, lengths, starts=None, sinks=None, *, softcap=None,
+                      scales=None):
     """The attention template's decode over the pages (`attention_decode.attend`): one query a row over its
     keys from `starts` (a window's first, where given) to `lengths`, under the `softcap` and the `sinks`
     `[heads]` the layer has. An inactive row reads one slot."""
@@ -1004,8 +1012,23 @@ def _template_forward(query, key, value, table, lengths, starts=None, sinks=None
     # Interpreted where the arrays lie off a GPU (Mosaic GPU compiles on one alone), whatever GPU the step
     # is chosen for (`generation.assumed`).
     out = attention_decode.attend(query[:, None], key, value, spans, hooks, table=table,
-                                  interpret=generation.placed_platform() != "gpu")
+                                  interpret=generation.placed_platform() != "gpu", scales=scales)
     return out[:, 0], ()
+
+
+def template_quantized(query, key, value, table, lengths, key_scale, value_scale, starts=None, sinks=None, *,
+                       softcap=None):
+    """The attention template's decode over a quantized pool's pages (`_template_forward`'s): its codes `key`
+    and `value` `[KV, P, page, D]` read as they are and dequantized in the walk by their scales `[KV, P,
+    page]` (`attention_decode.attend`'s `scales`, each row's in its key order by its table, ledger 3624)."""
+    rows, (kv_heads, _, page) = table.shape[0], key_scale.shape
+
+    def ordered(scale):
+        # `[KV, P, page]` at each row's pages: `[rows, KV, keys]`.
+        return jnp.moveaxis(scale[:, table], 1, 0).reshape(rows, kv_heads, table.shape[1] * page)
+
+    return _template_forward(query, key, value, table, lengths, starts, sinks, softcap=softcap,
+                             scales=(ordered(key_scale), ordered(value_scale)))[0]
 
 
 @functools.cache
