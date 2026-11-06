@@ -25,10 +25,11 @@ from dew.nn.attention import attention_case, scaled_dot_product_attention
 from dew.nn.kernels import generation, selection
 from dew.nn.kv_cache import PAGED, KVCache, KVStore, PagedCase
 
-ROWS, CAPACITY, PAGE = 4, 512, 64
+ROWS, CAPACITY, PAGE = 4, 512, 16
 LENGTHS = (1, 63, 300, 512)
 """A step's rows, each over its own keys of a cache `CAPACITY` slots a row: one key, part of a page, part of
-several, every slot; a paged pool's pages `PAGE` slots each."""
+several, every slot; a paged pool's pages `PAGE` slots each, which both paged kernels read (the Pallas kernel's
+pages at most its `BLOCK`, the template's several to a key tile)."""
 
 CHOICES = frozenset({"decode", "paged_decode", "attention_mainloop"})
 """The kernel choices (`generation.CHOICES`) its cells run: a dense cache's step's selector and a paged
