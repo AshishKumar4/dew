@@ -221,15 +221,26 @@ def run_worker(mode: str, out: Path, **flags) -> dict:
 def run_pool(mode: str | Path, directory: Path, processes: int, *, timeout: float = 600,
              start: Callable[..., subprocess.Popen[str]] = spawn, **flags) -> list[dict]:
     """Launch each rank and return reports in rank order, retaining all failure logs."""
-    directory.mkdir(parents=True, exist_ok=True)
-    coordinator = f"127.0.0.1:{free_port()}"
-    outs = [directory / f"process{index}.json" for index in range(processes)]
-    with ProcessGroup() as pool:
-        for index, out in enumerate(outs):
-            pool.running.append(start(mode, out, processes=processes, process_id=index,
-                                      coordinator=coordinator, **flags))
-        return [report_of(process, out, timeout=timeout, pool=pool.running)
-                for process, out in zip(pool.running, outs, strict=True)]
+    return run_pools((mode, directory, processes, flags), timeout=timeout, start=start)[0]
+
+
+def run_pools(*pools: tuple[str | Path, Path, int, Mapping], timeout: float = 600,
+              start: Callable[..., subprocess.Popen[str]] = spawn) -> list[list[dict]]:
+    """Each pool `(mode, directory, processes, flags)` launched at once, each its own coordinator, and
+    each one's reports in rank order (`run_pool`): runs that read nothing of one another's, as a resumed
+    run and the run nobody stopped that it is compared with, take the longer one's time, not the sum."""
+    with ProcessGroup() as group:
+        launched = []
+        for mode, directory, processes, flags in pools:
+            directory.mkdir(parents=True, exist_ok=True)
+            coordinator = f"127.0.0.1:{free_port()}"
+            outs = [directory / f"process{index}.json" for index in range(processes)]
+            for index, out in enumerate(outs):
+                group.running.append(start(mode, out, processes=processes, process_id=index,
+                                           coordinator=coordinator, **flags))
+            launched.append((group.running[-processes:], outs))
+        return [[report_of(process, out, timeout=timeout, pool=group.running)
+                 for process, out in zip(started, outs, strict=True)] for started, outs in launched]
 
 
 def assert_exits_cleanly(program: str) -> None:
