@@ -110,10 +110,10 @@ dew = "dew._cli.main:main"
 # jaxlib is the release's own. Named here, not through jax's own `cuda12` extra, which pins the release's
 # plugins (jaxlib's version).
 cuda12 = ["jax-cuda12-plugin[with-cuda]==0.12.0.1.post45", "jax-cuda12-pjrt==0.12.0.1.post45", "jaxlib==0.12.0.1",
-          "dew-flash-attn-cu12~=0.3.7; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+          "dew-flash-attn-cu12~=0.3.8; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
           "dew-cutlass-cu12~=0.1.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
 cuda13 = ["jax-cuda13-plugin[with-cuda]==0.12.0.1.post45", "jax-cuda13-pjrt==0.12.0.1.post45", "jaxlib==0.12.0.1",
-          "dew-flash-attn-cu13~=0.3.7; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+          "dew-flash-attn-cu13~=0.3.8; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
           "dew-cutlass-cu13~=0.1.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
 tpu = ["libtpu==0.0.50.*", "requests"]
 # dew.telemetry.profile reads XProf's native converters, the same in 2.23.1
@@ -274,12 +274,16 @@ torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922", "accelerate>=1.15
 # device (the Triton it builds, CUDA's libdevice and ptxas from the nvcc wheel, which Mosaic GPU's kernels
 # compile through too), and each Mosaic TPU kernel with libtpu for a compile-only TPU, on a host with no
 # accelerator: locks/cpu.txt takes this extra, and a GPU host's lock has its own CUDA plugin already
-# (tools/lock_environment.sh).
+# (tools/lock_environment.sh). FlashAttention's build and the CUDA runtime its library loads are here too, so
+# a host with no GPU lowers its call for the GPU it states (`targeting`, row 4616) and a step compiled ahead
+# there is the program the GPU runs.
 kernel-compile = ["jax-cuda12-plugin==0.12.0.1.post45; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "jax-cuda12-pjrt==0.12.0.1.post45; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-nvcc-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-nvcc==13.4.92; sys_platform == 'linux' and platform_machine == 'x86_64'",
-                  "libtpu==0.0.50.*; sys_platform == 'linux' and platform_machine == 'x86_64'"]
+                  "libtpu==0.0.50.*; sys_platform == 'linux' and platform_machine == 'x86_64'",
+                  "dew-flash-attn-cu12~=0.3.8; sys_platform == 'linux' and platform_machine == 'x86_64'",
+                  "nvidia-cuda-runtime-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 # The test suite's one environment: every package a test file imports, so no test skips for want
 # of one. CI's jobs, armada's (tools/armada/install.sh), the GPU nodes' and dew-ops' GPU jobs install
 # it under constraints.txt, locked in locks/ (tools/lock_environment.sh).
