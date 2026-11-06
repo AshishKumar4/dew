@@ -35,7 +35,7 @@ from typing_extensions import TypeVar as DefaultTypeVar
 from dew._cleanup import attempted
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON, boolean, json_value, record
-from dew.batch import CLOSES_WINDOW, FROZEN, Batch, owned_dicts, select, unboxed
+from dew.batch import CLOSES_WINDOW, FROZEN, Batch, at_path, owned_dicts, placed_at, select, unboxed
 from dew.checkpoints import Checkpoints, Envelope, Ranking, Resume
 from dew.data.compile import Handed
 from dew.data.dataset import (
@@ -523,7 +523,7 @@ class Trainer(Generic[Loss, Effects]):
             return grouped(self._shardings, state)
         params, frozen = dict(state.variables), ()
         if self.host_master:
-            from dew.training.execution import frozen_trees, placed_at, stack_sites
+            from dew.training.execution import frozen_trees, stack_sites
             frozen = tuple(frozen_trees(params, stack_sites(self.objective, params)))
             for path, _, _ in frozen:
                 params = placed_at(params, path, {})
@@ -596,7 +596,7 @@ class Trainer(Generic[Loss, Effects]):
         if self.host_master:
             # A CPU-owned run's frozen banks, read as the layers the layout placed.
             from dew.inference.banks import row_sharding, shape_rows, spread
-            from dew.training.execution import at_path, frozen_trees, placed_at, stack_sites
+            from dew.training.execution import frozen_trees, stack_sites
             for path, tree, _ in tuple(frozen_trees(variables, stack_sites(self.objective, variables))):
                 variables = placed_at(variables, path, spread(tree, shape_rows))
                 placement = placed_at(placement, path, spread(
@@ -785,7 +785,7 @@ class Trainer(Generic[Loss, Effects]):
         leaves = jax.tree.leaves(frozen)
         if leaves and all(isinstance(leaf, jax.Array) for leaf in leaves):
             return jax.tree.map(lambda leaf: leaf.sharding, frozen)
-        from dew.training.execution import at_path, placed_at, resident
+        from dew.training.execution import resident
         rows = self.layout.shardings(
             self.state_mesh,
             dataclasses.replace(state, variables=placed_at({}, path, frozen), accumulation=None))
@@ -1113,10 +1113,11 @@ class Trainer(Generic[Loss, Effects]):
 
     def _compile_host(self, state: TrainState, batch: Batch) -> CompiledStep:
         from dew.distributed.host import transfer
-        from dew.training.execution import HostExecution, stack_sites
+        from dew.training.execution import HostExecution, frozen_trees, stack_sites
         cpu = self.state_mesh
-        execution = HostExecution(self.objective, self.layout, self.device_mesh, cpu,
-                                  stack_sites(self.objective, state.variables), device=self._device)
+        sites = stack_sites(self.objective, state.variables)
+        execution = HostExecution(self.objective, self.layout, self.device_mesh, cpu, sites,
+                                  device=self._device)
         cpu_batch = transfer(batch, batch_shardings(cpu, batch))
         with self._traced_on(cpu) as schedule:
             _, shapes = self._loss_shape(state, cpu_batch, self.accumulation)
@@ -1126,7 +1127,8 @@ class Trainer(Generic[Loss, Effects]):
             placement = self.shardings(prepared)
             transaction = Transaction(self.objective, self.optimizer, self.accumulation, shapes,
                                       record=self.record, examples=self._examples)
-            body = transaction.step(realize=execution.realize, host=True)
+            body = transaction.step(realize=execution.realize, host=True,
+                                    frozen=tuple(path for path, _, _ in frozen_trees(state.variables, sites)))
 
         def run(current, batch, sampled: bool = False):
             # A host-master run inspects nothing (`compile` refuses it), so no step of it is sampled.

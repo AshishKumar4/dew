@@ -35,7 +35,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from dew.batch import FROZEN, merge, select, thaw
+from dew.batch import FROZEN, at_path, merge, placed_at, select, thaw
 from dew.distributed.batches import batch_shardings
 from dew.distributed.host import transfer
 from dew.inference.banks import (
@@ -108,30 +108,18 @@ def _within(sites, collection: str) -> tuple[DecoderBank, ...]:
                  for site in sites if site.root[:1] == (collection,))
 
 
-def at_path(tree, path: tuple[str, ...]):
-    """The subtree of `tree` at `path`, or None where `tree` holds none."""
-    for key in path:
-        tree = tree.get(key) if isinstance(tree, Mapping) else None
-    return tree
-
-
-def placed_at(tree, path: tuple[str, ...], value):
-    """`tree` with `value` at `path`, its spine copied and missing nodes made."""
-    if not path:
-        return value
-    return {**tree, path[0]: placed_at(tree.get(path[0], {}), path[1:], value)}
-
-
 def frozen_trees(variables, sites):
     """The frozen trees of `variables` a host layout places beside the accelerator, each as its path, the
-    tree, and the `sites` over it seen from it: the run's frozen collection, and the `params` of each
-    nested model that trains nothing at its root (`DecoderBank.root`), a distillation's teacher whole.
-    A root `variables` does not hold has none: an EMA averages the student alone."""
+    tree, and the `sites` over it seen from it: the run's frozen collection, and both collections of each
+    nested model that trains nothing at its root (`DecoderBank.root`), a distillation's teacher whole,
+    its own frozen split (a LoRA base) beside its params. A root `variables` does not hold has none: an
+    EMA averages the student alone."""
     for root in dict.fromkeys(((), *(site.root for site in sites))):
-        path = (*root, "params") if root else (FROZEN,)
-        tree = at_path(variables, path)
-        if tree is not None:
-            yield path, tree, tuple(dataclasses.replace(site, root=()) for site in sites if site.root == root)
+        held = tuple(dataclasses.replace(site, root=()) for site in sites if site.root == root)
+        for path in ((*root, "params"), (*root, FROZEN)) if root else ((FROZEN,),):
+            tree = at_path(variables, path)
+            if tree is not None:
+                yield path, tree, held
 
 
 def bank_bytes(tree, sites) -> int:
