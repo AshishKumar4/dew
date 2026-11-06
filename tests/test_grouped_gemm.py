@@ -288,6 +288,25 @@ def cutlass_runs_a_mapped_projection_as_exactly_as_xla_where_chosen(shared):
                     truth_fn=mapped("xla", jnp.float64))
 
 
+@pytest.mark.parametrize("generation_name", ["sm90", "sm100"])
+def test_tritons_tile_counts_every_stage_where_its_mma_reads_shared_memory_asynchronously(generation_name):
+    """Pallas Triton's pipeline holds all its stages where the MMA reads shared memory asynchronously
+    (Hopper's wgmma, Blackwell's tcgen05), so the dense fp32 product of the exact-sums cell (64 rows, depth
+    4096, 128 columns, at the highest precision) derives a tile whose `stages` steps fit the device's shared
+    memory: a B200 refused 262,160 bytes for the tile counted at `stages - 1` (row 4449)."""
+    launch = grouped_matmul.Gmm()
+    f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
+    with generation.assumed(generation_name):
+        target = generation.gpu_target()
+        ba = launch.bind(f32((64, 4096)), f32((1, 4096, 128)), jax.ShapeDtypeStruct((1,), jnp.int32),
+                         out_dtype="float32", trans_rhs=False, interpret=False, dense=True, exact_sums=True)
+        tile = launch.derived(ba, target)
+        assert tile is not None
+        step = launch.loaded(tile) * 4
+        assert launch.staged_bytes(ba, tile, target) >= tile.stages * step
+        assert tile.stages * step <= generation.shared_budget(target)
+
+
 def ragged_draw(seed):
     """The ragged sizes' rows, matrices and cotangent in bf16, at a seed (`operands`)."""
     x, w, dy, _ = operands(SIZES["ragged"], jnp.bfloat16, seed)
