@@ -341,6 +341,47 @@ def test_a_pool_reads_its_own_shards_of_a_host_resident_bank(tmp_path):
         assert any(value["shard"] != value["shape"] for value in banks.values())
 
 
+def test_a_banked_store_packed_for_serving_or_adapted_exports_as_its_layers_do(tmp_path):
+    """A scanned decoder's banked store (`HeldBanks.place`) exports as the plain decoder's per-layer tree
+    does, tensor for tensor: packed for serving (`inference_projections`, its q, k and v one kernel a bank's
+    row splits back as it is written, `StoredRow.split`), and under a LoRA adapter the export merges into
+    its kernels as it writes them (`Adapter.merge` over a bank's rows, `Deferred`, ledger 4103)."""
+    from safetensors.numpy import load_file
+
+    from dew.batch import thaw
+    from dew.inference.projections import inference_projections
+    from dew.interop.pretrained import PretrainedDecoder
+    from dew.lora import LoRA
+
+    plain, scanned, variables, _ = pair(num_layers=3)
+    banked = HeldBanks(variables).place(scanned, layout=DEVICE)
+
+    def written(model, tree, name):
+        PretrainedDecoder.from_model(model, tree).save(tmp_path / name)
+        return load_file(tmp_path / name / "model.safetensors")
+
+    expected = written(plain, variables, "plain")
+    packed = written(scanned, inference_projections(scanned, banked), "packed")
+    assert packed.keys() == expected.keys()
+    for key, tensor in expected.items():
+        np.testing.assert_array_equal(packed[key], tensor, err_msg=key)
+    # Factors drawn whole, so each merge moves its kernel (a fresh adapter's B is zero), the base and the
+    # factors one collection, as the bank holds them.
+    spec = LoRA(rank=2, modules=("q_proj", "v_proj"))
+    lone = PretrainedDecoder.from_model(plain, variables).adapt(spec, key=1)
+    stacked = PretrainedDecoder.from_model(scanned, variables).adapt(spec, key=1)
+    rng = np.random.default_rng(4103)
+    tuned = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jnp.asarray(rng.normal(size=leaf.shape) / 4, leaf.dtype)
+        if str(getattr(path[-1], "key", "")) == "lora_B" else leaf, thaw(lone.variables))
+    lone.save(tmp_path / "lone", variables=tuned)
+    stacked.save(tmp_path / "adapted", variables=HeldBanks(tuned).place(stacked.model, layout=DEVICE))
+    merged, adapted = (load_file(tmp_path / name / "model.safetensors") for name in ("lone", "adapted"))
+    assert adapted.keys() == merged.keys()
+    for key, tensor in merged.items():
+        np.testing.assert_array_equal(adapted[key], tensor, err_msg=key)
+
+
 @pytest.mark.parametrize("kind", ["root", "multimodal"])
 def test_synthetic_banks_keep_namespace_values_across_bank_sizes(kind):
     from bank_support import SelectedReads, fixture, host_layout, identical, scores, unpack
