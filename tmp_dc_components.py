@@ -34,7 +34,20 @@ sums=np.zeros(4)
 for seed in range(80):
     vals=(*t.deep_draw(seed),*t.cotangents_of(seed,(128,32),(16,32)))
     wide=tuple(v.astype(j.float64) for v in vals)
-    a=np.asarray(dc(*vals),np.float64);exact=np.asarray(dc(*wide))
+    xx,dt,bb,cc,yy,dh=map(lambda v:np.asarray(v,np.float64),vals)
+    state=np.zeros((16,32))
+    local=np.zeros((16,32))
+    locals_,memories=[],[]
+    for i in range(128):
+        if i%32==0:local[:]=0
+        write=bb[i,:,None]*(xx[i]*dt[i])[None,:]
+        state=np.exp(dt[i]*t.RATE)*state+write
+        local=np.exp(dt[i]*t.RATE)*local+write
+        locals_.append(local@yy[i])
+        memories.append((state-local)@yy[i])
+    exact={"local":np.asarray(locals_),"memory":np.asarray(memories),
+           "base":np.asarray(locals_)+np.asarray(memories)}[mode]
+    a=np.asarray(dc(*vals),np.float64)
     tok=np.asarray(tc(*vals),np.float64);truth=np.asarray(tc(*wide))
     sums+=np.array([np.sum((a-exact)**2),np.sum((tok-truth)**2),np.sum(a*a),np.sum(exact*exact)])
 print("K component",mode,"RMS",np.sqrt(sums/(80*128*16)).tolist(),"ratio",np.sqrt(sums[0]/sums[1]))

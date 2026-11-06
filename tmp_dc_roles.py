@@ -55,9 +55,9 @@ def tc(x,dt,B,C,dy,dh):
     return jax.vjp(t.tokenwise,x,dt,B,C)[1]((dy,dh))[3]
 dc,tc=without_ynn(dc),without_ynn(tc)
 errs=np.zeros(2)
-for seed in range(16):
+for seed in range(80):
     vals=(*t.deep_draw(seed),*t.cotangents_of(seed,(128,32),(16,32)))
     truth=np.asarray(tc(*(x.astype(j.float64) for x in vals)))
     for i,fn in enumerate((dc,tc)):
         errs[i]+=np.sum((np.asarray(fn(*vals),np.float64)-truth)**2)
-print("K mode",mode,"rms",np.sqrt(errs/(16*128*16)).tolist(),"ratio",np.sqrt(errs[0]/errs[1]))
+print("K mode",mode,"target",target,"rms",np.sqrt(errs/(80*128*16)).tolist(),"ratio",np.sqrt(errs[0]/errs[1]))
