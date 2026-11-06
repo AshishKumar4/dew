@@ -736,16 +736,25 @@ def test_a_multimodal_model_serves_over_its_language_models_cache(options):
         np.testing.assert_array_equal(served.host().tokens[:, :walked.shape[1]], walked)
 
 
-def hybrid_model(vocab_size: int = VOCAB, width: int = 16) -> CausalTransformer:
-    """Qwen3.5's stack at toy size: two gated-delta-net layers, whose recurrent memory and conv
-    tail are each row's own state, and one full-attention layer, whose keys a paged server pages."""
+DELTA_NET = {"linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 6,
+             "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}
+"""`hybrid_model`'s gated delta net's fields."""
+
+THIN_DELTA_NET = {"linear_num_key_heads": 1, "linear_num_value_heads": 1, "linear_key_head_dim": 4,
+                  "linear_value_head_dim": 4, "linear_conv_kernel_dim": 2}
+"""A delta net of one 4-by-4 value head and a two-tap convolution: a row state of 224 bytes, under half
+a page of four tokens' keys (512 bytes), so a host tier holds more states than pages."""
+
+
+def hybrid_model(vocab_size: int = VOCAB, width: int = 16, delta_net: dict = DELTA_NET) -> CausalTransformer:
+    """Qwen3.5's stack at toy size: two gated-delta-net layers (`delta_net`'s fields), whose recurrent
+    memory and conv tail are each row's own state, and one full-attention layer, whose keys a paged server
+    pages."""
     return CausalTransformer(
         vocab_size=vocab_size, emb_features=width, num_layers=3, num_heads=2, num_kv_heads=2, head_dim=8,
         mlp_features=2 * width, max_seq_len=128, dtype="float32",
         layer_types=("linear_attention",) * 2 + ("full_attention",),
-        kinds={"linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {
-            "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 6,
-            "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}}})
+        kinds={"linear_attention": {"mixer": {"class": "gated_delta_net", "fields": delta_net}}})
 
 
 def parallel_hybrid_model(vocab_size: int = VOCAB, width: int = 16) -> CausalTransformer:
@@ -939,27 +948,14 @@ def test_a_hybrid_servers_host_states_fit_the_bytes_of_its_host_pages(host_pages
     assert part.states.host.slots * entry <= budget < (part.states.host.slots + 1) * entry
 
 
-def thin_hybrid_model(vocab_size: int = VOCAB, width: int = 16) -> CausalTransformer:
-    """`hybrid_model` with a delta net of one 4-by-4 value head and a two-tap convolution: a row state of
-    224 bytes, under half a page of four tokens' keys (512 bytes), so a host tier holds more states than
-    pages."""
-    return CausalTransformer(
-        vocab_size=vocab_size, emb_features=width, num_layers=3, num_heads=2, num_kv_heads=2, head_dim=8,
-        mlp_features=2 * width, max_seq_len=128, dtype="float32",
-        layer_types=("linear_attention",) * 2 + ("full_attention",),
-        kinds={"linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {
-            "linear_num_key_heads": 1, "linear_num_value_heads": 1, "linear_key_head_dim": 4,
-            "linear_value_head_dim": 4, "linear_conv_kernel_dim": 2}}}})
-
-
 @pytest.mark.check1_shards(seeds=256, per_task=64)
 def test_a_host_tier_of_more_states_than_pages_reads_each_state_back():
     """A hybrid stack whose row state is smaller than a page keeps more states on the host than pages
-    (`thin_hybrid_model`: four states in two pages' bytes), each in its own slot: three prompts send
+    (`THIN_DELTA_NET`: four states in two pages' bytes), each in its own slot: three prompts send
     their states there as a store of one entry gives way, the third to the slot past the pages' count,
     and their repeats read each back with its own prefix (ledger 4602's review), each request drawing
     what it draws alone and scoring it as a full forward does (check 1)."""
-    model = thin_hybrid_model(256)
+    model = hybrid_model(256, delta_net=THIN_DELTA_NET)
     # It draws greedily to its budget alone, no end token, as the check scores every draw.
     task = TextGeneration(model, nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))),
                           sampling=Sampling(temperature=0, pad_token_id=0))
