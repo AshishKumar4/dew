@@ -29,5 +29,12 @@ def _cleanup():
     return module
 
 
-_owner = _cleanup()
-start, stop = _owner.start, _owner.stop
+def start(command, **options):
+    """`dew._cleanup.start`, the module loaded at the first group's start, so a process that starts none (CI's
+    planner, in a checkout of tools and tests alone) never reads src/."""
+    return _cleanup().start(command, **options)
+
+
+def stop(process, **options):
+    """`dew._cleanup.stop`."""
+    return _cleanup().stop(process, **options)
