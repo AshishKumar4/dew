@@ -772,6 +772,14 @@ def test_the_recurrence_step_witness_holds_a_decay_a_key_dimension_and_refuses_o
 
 
 @INTERPRETS
+def test_the_recurrence_step_witness_holds_a_write_gate_on_the_keys_side_and_refuses_one_dropped():
+    """The step witness (row 2084 (e)) where the write gate takes the keys' side, Mamba2's SSD under the fast
+    forms (`rw.assert_keys_gated_witnessed`): every record a bf16 call of three chunks keeps inside its step's
+    enclosure, and a kernel reading every write gate as one refused."""
+    rw.assert_keys_gated_witnessed(rw.interpreted_lane())
+
+
+@INTERPRETS
 def test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16():
     """The step witness's faults on the interpreted mainloop, each refused where it lands
     (`rw.assert_carry_faults_refused`): a dropped carry and a state rounded to bf16 where fp32 is held."""
