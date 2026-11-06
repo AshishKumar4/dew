@@ -1654,32 +1654,47 @@ def handoff_steps(tiles: Tiles, target) -> float:
     return 0.0 if step is None or handoff is None else handoff / step
 
 
-def split_count(tiles: Tiles, *, groups: int, rows: int, depth: int, width: int, multiprocessors: int,
-                step_seconds: float | None, bandwidth: float | None, launch_seconds: float | None) -> int:
-    """Dew: the slices a kernel gradient's contraction splits into at `tiles` (`Tiles.splits`, `tgmm`),
-    from the call's extents and the device's facts. Over a wave (`multiprocessors` x `tiles.programs`)
-    and `rows` in steps a group (on average), the busiest program walks ceil(tiles x s / wave) output
-    tiles of ceil(steps / s) steps at s slices. The split is the least s whose walk, with the time its
-    fp32 partials take written and read back (2s + 1 passes over the output at `bandwidth`, in steps of
-    `step_seconds`) and the launch their sum adds (`launch_seconds`, the part's measured launch in a
-    program, row 3613; none where unmeasured), is shorter than the unsplit walk, each slice keeping at
-    least the ring's stages and one more; one where none is, or where the device states no rate. A bounded
-    comparison over the facts, no table, no timing: Key's 2560 x 1024 gradient over 24,576 rows on an H100
-    splits in three, 2 x 128 steps against 384."""
-    if step_seconds is None or bandwidth is None:
-        return 1
+def split_count(tiles: Tiles, *, groups: int, rows: int, depth: int, width: int, itemsizes: tuple[int, int],
+                multiprocessors: int, step_seconds: float | None, bandwidth: float | None,
+                launch_seconds: float | None) -> int:
+    """Dew: the slices a contraction of `rows` splits into at `tiles` (`Tiles.splits`: a kernel gradient's,
+    `tgmm`, and a swapped decode product's, `gmm`), from the call's extents and the device's facts. Over a
+    wave (`multiprocessors` x `tiles.programs`) and `rows` in steps a group (on average), the busiest program
+    walks ceil(tiles x s / wave) output tiles of ceil(steps / s) steps at s slices, and streams as many
+    shares of the operands (`rows` of `depth` and of `width` at `itemsizes` bytes, each read once) at its
+    share of `bandwidth` (that of the multiprocessors the programs keep busy, over the programs in flight);
+    the walk takes the longer of the two. A split adds the time its fp32 partials take written and read back
+    (2s + 1 passes over the output at `bandwidth`, in steps of `step_seconds`) and the launch their sum adds
+    (`launch_seconds`, the part's measured launch in a program, row 3613; none where unmeasured). The split
+    is the s of the shortest walk, the least of equal ones, each slice keeping at least the ring's stages and
+    one more on average and some steps (`split_runs`, as `gmm`'s runs share them); one where the device
+    states no rate or the call no whole tile. A bounded comparison over the facts, no table, no timing:
+    Key's 2560 x 1024 gradient over 24,576 rows on an H100 splits in three, 2 x 128 steps against 384. Its
+    steps priced at their MMA alone, a decode product's few tiles walked unsplit: an A100's 2048 x 2048 input
+    gradient at 1-32 rows ran 12 programs on 108 multiprocessors, 2.8-3.0x XLA's 128 (M-NS-12, row 483),
+    where its matrix's stream is the walk."""
     wave = multiprocessors * tiles.programs
     output = groups * (depth // tiles.block_m) * (width // tiles.block_n)
+    if step_seconds is None or bandwidth is None or output == 0:
+        return 1
     steps = -(-rows // max(groups, 1) // tiles.block_k)
+    operand_bytes = rows * (depth * itemsizes[0] + width * itemsizes[1])
 
     def walk(splits: int) -> float:
+        programs = output * splits
+        waves = -(-programs // wave)
+        busiest = waves * -(-steps // splits)
+        # A program's share of the operands, at its share of the memory's rate.
+        rate = bandwidth * min(programs, multiprocessors) / multiprocessors / min(programs, wave)
+        streamed = waves * operand_bytes / programs / rate / step_seconds
         passes = 0 if splits == 1 else 2 * splits + 1
         partials = passes * groups * depth * width * 4 / bandwidth / step_seconds
         # A split runs its partials' launch and XLA's sum of them where the unsplit call runs one launch.
         launches = 0 if splits == 1 or launch_seconds is None else launch_seconds / step_seconds
-        return -(-output * splits // wave) * -(-steps // splits) + partials + launches
+        return max(busiest, streamed) + partials + launches
 
-    return next((splits for splits in range(2, steps // (tiles.stages + 1) + 1) if walk(splits) < walk(1)), 1)
+    candidates = range(1, max(steps // (tiles.stages + 1), 1) + 1)
+    return min((splits for splits in candidates if split_runs(steps, splits)), key=walk)
 
 
 def _sliced(group_sizes: jax.Array, block_k: int, splits: int) -> jax.Array:
