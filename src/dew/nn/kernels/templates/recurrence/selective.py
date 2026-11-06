@@ -310,7 +310,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
     holds in their order, adding plainly: the atomic adds of the channels sharing a buffer land in any
     order, and a step repeated on the same schedule differed in B's and C's gradients' last bits (row
     4392)."""
-    rows, channels, length = x.shape
+    _, channels, length = x.shape
     states, positions = b.shape[1], block_positions(length, scan.positions)
     blocks = length // positions
     interpret = scan.interpret
@@ -390,11 +390,23 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
 
         lax.fori_loop(0, turns, walked, None)
 
+    return _backward_launched(entry, x, dt, b, c, parameters, entered, resets, dy, dfinal, scan,
+                              programs=channels // turns, partials=partials)
+
+
+
+def _backward_launched(entry, x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, *,
+                       programs: int, partials: int):
+    """`backward`'s launch of its program `entry`, a row's `programs` a program each, and its outputs:
+    `(dx, ddt, db, dc, dA, dD, dstate)`, B's and C's gradients summed over their `partials` buffers."""
+    rows, channels, _ = x.shape
+    states, positions = b.shape[1], block_positions(x.shape[2], scan.positions)
+    interpret = scan.interpret
     sized = jax.ShapeDtypeStruct
     out_type = (sized(x.shape, jnp.float32), sized(x.shape, jnp.float32),
                 sized((rows, states, channels), jnp.float32), sized((rows, channels), jnp.float32),
                 sized((rows, states, channels), jnp.float32))
-    launched = mosaic.kernel(entry, out_type=out_type, grid=(rows, channels // turns),
+    launched = mosaic.kernel(entry, out_type=out_type, grid=(rows, programs),
                              grid_names=("rows", "channels"),
                              warpgroups=1, interpret=interpret, family=scan.family.name,
                              name="selective_scan_backward", resident=scan.resident,
@@ -415,7 +427,6 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
              *(jnp.zeros(t.shape, t.dtype) for t in out_type))
     dbc, dx, ddt, da, dd, dstate = pl.run_state(accumulated)(zeros)
     return dx, ddt, dbc[0].sum(0), dbc[1].sum(0), da, dd, dstate
-
 
 CHUNK = 32
 """The fewest tokens a forward chunk takes, a ring stage of its operands whose entering state the forward
