@@ -63,6 +63,33 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
 
 
 @pytest.mark.mesh(devices=8)
+def test_a_lettered_run_over_a_qwen35_backbone_exports_a_release_a_run_starts_from(tmp_path, monkeypatch):
+    """`dew export` of a lettered decision run over a Qwen3.5 text backbone (qwen3_5_text, its delta
+    nets' geometry and its rotary's fraction the generic export writes none of) writes a release that
+    loads: a run started from it lands every leaf as a run started from the saved run does, one step from
+    each, bit for bit (ledger 4533's repro through its public path, row 4563)."""
+    from saved_run_kinds import lettered
+
+    monkeypatch.chdir(Path(__file__).resolve().parents[1])
+    first = lettered(tmp_path, drawn=False)
+    trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
+    source = tmp_path / "runs" / "first"
+    exported = tmp_path / "exported"
+    export_run(SavedRun.pinned(str(source)), exported)
+    assert json.loads((exported / "config.json").read_text())["model_type"] == "qwen3_5_text"
+
+    def started(pretrained, name: str, *flags: str):
+        run = DecisionRunConfig.cli(["--pretrained", str(pretrained), *flags], default=first)
+        return trained(run, tmp_path, name, trainer={"checkpoint_final": True})[0]
+
+    # The saved run and its release are each the run's decision task whole, a composite, whose backbone
+    # no wrapper holds: a run from either reads it as it is (`SourceOptions.text_only` off).
+    whole = ("--source.text_only", "false")
+    leaves_alike(started(source, "from_run", "--source.step", "latest", *whole).variables,
+                 started(exported, "from_export", *whole).variables)
+
+
+@pytest.mark.mesh(devices=8)
 def test_a_run_started_from_a_saved_run_resumes_its_step_after_that_run_trains_on(tmp_path):
     """A named run started from a saved Dew run (`--pretrained <run>`) at the step its selection names by
     default (a diffusion run's, its latest) records that step; when the saved run has trained on, so that
