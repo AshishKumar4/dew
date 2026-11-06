@@ -382,8 +382,9 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
     # `table`).
     paged = None if call.table is None or call.page is None else (call.table, call.page)
 
-    def launch(form: algebra.Forward, live: jax.Array | None, again: bool = False, into: tuple | None = None
-               ) -> tuple[tuple, jax.Array, jax.Array]:
+    def launch(form: algebra.Forward, live: "jax.Array | _Flags | None", again: bool = False,
+               into: tuple | None = None
+               ) -> "tuple[tuple, jax.Array, jax.Array] | tuple[tuple, None, _Flags]":
         q, form = _rewalked(spec, form, raw, taken)
         # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
         at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
@@ -432,7 +433,7 @@ class _InferenceWalk(NamedTuple):
 
 def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, at: Tiles, at_spans,
                     flags: "_Flags | None", in_place: dict, *, stated: bool, again: bool, into: tuple | None
-                    ) -> tuple[tuple, jax.Array | None, jax.Array]:
+                    ) -> "tuple[tuple, jax.Array, jax.Array] | tuple[tuple, None, _Flags]":
     """An inference walk's plain launch, or a masked rewalk of sums that cannot overflow, at tiles `at` in
     `form` (`_inference_walk`'s `launch`): a launch a block of the value columns where its tiles walk a
     block (`Tiles.columns`), the blocks' outputs side by side, their rows' statistics alike; an output hook
@@ -459,7 +460,7 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
                 for first, values, held in blocks]
     if into is not None:
         assert flags is not None, "an in-place rewalk is of live rows"
-        return (), None, flags.rows
+        return (), None, flags
     status, _, *finished = launched[0][:-2] if merges else launched[0]
     out = _output_whole(jnp.concatenate([block[1] for block in launched], axis=-1), hooks, hooked,
                         out_dtype or q.dtype, split)
@@ -472,7 +473,7 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
 
 def _guarded_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, at: Tiles,
                       flags: "_Flags", in_place: dict, *, into: tuple | None
-                      ) -> tuple[tuple, jax.Array | None, jax.Array]:
+                      ) -> "tuple[tuple, jax.Array, jax.Array] | tuple[tuple, None, _Flags]":
     """An inference walk's guarded rewalk of its `flags`' rows in `form` (`_inference_walk`'s `launch`), at
     the guarded tiles beside `at` (`guarded_tiles`), a block of the value columns a launch or all of them in
     one."""
@@ -535,11 +536,11 @@ def _guarded_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward,
         # Every block's rows alike: its logits are the row's whole.
         finished = finished or tuple(block_rows)
     if into is not None:
-        return (), None, flags.rows
+        return (), None, flags
     out = _output_whole(jnp.concatenate(blocks, axis=-1), hooks, hooked, out_dtype or q.dtype,
                         hooked_blocks)
-    # `walked_launches` reads the plain launch's maxima and overflows.
-    return (out, *finished), None, flags.rows
+    # `walked_launches` reads the plain launch's maxima and overflows, a rewalk's outputs alone.
+    return (out, *finished), None, flags
 
 
 def _kept(live: jax.Array, guarded: tuple, plain: tuple, *, splits: int, merges: bool) -> tuple:
@@ -762,7 +763,8 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     hooked = _hooked_of(hooks, call, unit)
     if scales is not None:
         # As long as the call's padded keys (a paged call's slots), which every walk's tiles lie within.
-        keys = call.key.shape[1] if call.table is None else call.table.shape[1] * call.page
+        keys = (call.key.shape[1] if call.table is None or call.page is None
+                else call.table.shape[1] * call.page)
         keys = max(keys, -(-scales[0].shape[-1] // tiles.block_k) * tiles.block_k)
         hooked = hooked._replace(scales=tuple(
             jnp.pad(array.astype(jnp.float32), ((0, 0), (0, 0), (0, keys - array.shape[-1])))

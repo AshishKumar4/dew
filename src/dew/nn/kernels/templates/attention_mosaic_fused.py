@@ -26,6 +26,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     launch_scope,
     modelled,
     part_count,
+    reducing,
     stated,
 )
 from dew.nn.kernels.templates.attention_mosaic_scores import _Backward, _dq_added, _tile_scores
@@ -37,54 +38,57 @@ STATISTICS = {"peak": jnp.float32, "total": jnp.float32, "anchor": jnp.float32, 
 its delta, and the anchor keys."""
 
 
-def streams_statistics(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int) -> bool:
+def streams_statistics(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int, *,
+                       reduced: int) -> bool:
     """Whether the fused launch at `config` streams its query tiles' statistics (`STATISTICS`) beside them:
     where its copies move a vector (`Transport.copies_vectors`) and its block holds their rings beside its
     own allocations (the GPU's `shared_limit`, `launch_scope`); else a step reads them from global memory
     (`_rows`). At width 128 their rings' 2,560 bytes put FlashAttention 3's 64 x 64 launch on two consumers
-    past an H100's 232,448, where the derivation then took one consumer (et-bwdderive)."""
+    past an H100's 232,448, where the derivation then took one consumer (et-bwdderive). `reduced` the
+    launch's warpgroups reserving reduction scratch (`reducing`: a score hook's)."""
     if not family.copies_vectors:
         return False
     limit = generation.gpu_target().shared_limit
-    allocations = _fused_allocations(family, config, width, dtype, stages, streamed=True)
+    allocations = _fused_allocations(family, config, width, dtype, stages, streamed=True, reduced=reduced)
     return limit is None or resources.shared_bytes(
-        family, launch_scope(family, allocations, 0, reduces=False)) <= limit
+        family, launch_scope(family, allocations, reduced, reduces=False)) <= limit
 
 
 def stores_typed(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int, *,
-                 grouped: bool) -> bool:
+                 grouped: bool, reduced: int) -> bool:
     """Whether the fused launch at `config` stores dK and dV in the operands' `dtype` (`_fused_allocations`'
     `typed`): where no key head is shared (not `grouped`, whose adds sum fp32) and its block holds the typed
     stage beside its own allocations (the GPU's `shared_limit`, `launch_scope`: on a layout whose stage is
     held across the walks, beside it, 32 KB at 64 x 64 and width 128 past an H100's 232,448 bytes,
     fa9dbcf122);
-    else it stores fp32 and XLA converts them after the launch (11-06: 35 us of a step's glue)."""
+    else it stores fp32 and XLA converts them after the launch (11-06: 35 us of a step's glue). `reduced`
+    as `streams_statistics` takes it."""
     if grouped:
         return False
     limit = generation.gpu_target().shared_limit
-    allocations = _fused_allocations(family, config, width, dtype, stages, typed=True)
+    allocations = _fused_allocations(family, config, width, dtype, stages, typed=True, reduced=reduced)
     return limit is None or resources.shared_bytes(
-        family, launch_scope(family, allocations, 0, reduces=False)) <= limit
+        family, launch_scope(family, allocations, reduced, reduces=False)) <= limit
 
 
 def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int, *,
-                       streamed: bool | None = None, typed: bool = False) -> tuple[list, dict, list]:
+                       reduced: int, streamed: bool | None = None, typed: bool = False
+                       ) -> tuple[list, dict, list]:
     """The fused launch's allocations as `Family.scoped` takes them, in `_fused_launch`'s order: its
     consumers' resident keys and values; a tile's weights and score cotangents staged for the transposed
     products' left operands and dQ's; dK's and dV's output stage (fp32, the head widths equal,
     `MosaicBackward.legal`), held across the walks where a tile's dQ adds read it
     (`Transport.adds_through_shared`); the two loads' barriers; its query and output-cotangent streams in
-    `stages` slots (`Family.streams`), and where it streams them (`streamed`, `streams_statistics` by
-    default) its query tiles' per-row statistics (`STATISTICS`) a stream each beside them, which a step
-    reads from shared memory (elsewhere from global memory, `_rows`), loaded ahead with its tile as
-    FlashAttention 3's
-    producer loads LSE and dPsum (hopper/mainloop_bwd_sm90_tma_gmma_ws.hpp's `smem_lse`, `smem_dpsum`), not
-    from global memory once the step starts (ET-TPLPROF-h100: the fused launch stalled on long scoreboards
-    46.2k against FlashAttention 3's 21.8k); and the output stage scoped after the walks where no add reads
-    it,
-    the walks' slots its memory (`Family.scoped`'s `after_walks`: two mma.sync consumers' 64 x 64 launch
-    then fits an A100, FS-4324-TWO2's 229,424 bytes held whole against its 166,912); where dK and dV leave
-    `typed` (`stores_typed`), in `dtype` through a stage of their own after the walks, rounded once there."""
+    `stages` slots (`Family.streams`), and where it streams them (`streamed`, `streams_statistics` by default,
+    its warpgroups reserving `reduced` reduction scratch) its query tiles' per-row statistics (`STATISTICS`) a
+    stream each beside them, which a step reads from shared memory (elsewhere from global memory, `_rows`),
+    loaded ahead with its tile as FlashAttention 3's producer loads LSE and dPsum
+    (hopper/mainloop_bwd_sm90_tma_gmma_ws.hpp's `smem_lse`, `smem_dpsum`), not from global memory once the
+    step starts (ET-TPLPROF-h100: the fused launch stalled on long scoreboards 46.2k against FlashAttention
+    3's 21.8k); and the output stage scoped after the walks where no add reads it, the walks' slots its memory
+    (`Family.scoped`'s `after_walks`: two mma.sync consumers' 64 x 64 launch then fits an A100, FS-4324-TWO2's
+    229,424 bytes held whole against its 166,912); where dK and dV leave `typed` (`stores_typed`), in `dtype`
+    through a stage of their own after the walks, rounded once there."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     stage = plgpu.SMEM((consumers, max(block_q, block_k), width), jnp.float32)
     held = family.adds_through_shared
@@ -92,7 +96,7 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
               plgpu.SMEM((consumers, 2, block_q, block_k), dtype), *([stage] if held else []),
               family.load_barriers(consumers), family.load_barriers(consumers)]
     if streamed is None:
-        streamed = streams_statistics(family, config, width, dtype, stages)
+        streamed = streams_statistics(family, config, width, dtype, stages, reduced=reduced)
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype),
               **({name: ((block_q,), kind) for name, kind in STATISTICS.items()} if streamed else {})}
     out = plgpu.SMEM((consumers, block_k, width), dtype) if typed else stage
@@ -267,10 +271,12 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         family.roles(consumers, consumer, producer)
 
     stages = min(program.tiles.stages, q_steps)
-    stats_streamed = streams_statistics(family, program.tiles, width, query.dtype, stages)
-    typed = stores_typed(family, program.tiles, width, query.dtype, stages, grouped=grouped)
+    # A score hook's warpgroups reserve their reduction scratch (`reducing`).
+    reduced = reducing(family, consumers, walk.spec.score_mod)
+    stats_streamed = streams_statistics(family, program.tiles, width, query.dtype, stages, reduced=reduced)
+    typed = stores_typed(family, program.tiles, width, query.dtype, stages, grouped=grouped, reduced=reduced)
     scoped, rings, after = _fused_allocations(family, program.tiles, width, query.dtype, stages,
-                                              streamed=stats_streamed, typed=typed)
+                                              reduced=reduced, streamed=stats_streamed, typed=typed)
 
     def entry(*refs):
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings, after_walks=tuple(after))
@@ -280,7 +286,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     launch = family.kernel(
         entry, out_type=() if grouped else gradients, grid=(heads, keys_padded // pair, batch),
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
-        approx_math=walk.approx_math, name="attention_dkv_fused",
+        approx_math=walk.approx_math, name="attention_dkv_fused", reducing_warpgroups=reduced,
         # The products this launch issues (`stated`): its `S` recomputed, dP's, dV's, and each part of dK's
         # and of dQ's (`part_count`); the model's of them it owns (`modelled`): dQ's, dK's, dV's and dP's.
         cost=stated(walk.spec, batch, heads,

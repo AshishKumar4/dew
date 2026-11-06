@@ -931,6 +931,28 @@ def _nvfp4_projected():
     return product, (jax.ShapeDtypeStruct((64, 4096), jnp.bfloat16),)
 
 
+def _nvfp4_decode_projection():
+    """An NVFP4 projection at a decode step's 16 rows (`gemm.nvfp4_product`, Llama-3-8B's up), its kernel the
+    selector's."""
+    from dew.nn.kernels import gemm
+
+    matrix = gemm.NvFp4.of(jnp.zeros((4096, 14336), jnp.float32), jnp.ones((256, 14336), jnp.float8_e4m3fn),
+                           1.0)
+    return (lambda rows: gemm.nvfp4_product(rows, matrix, out_dtype=jnp.bfloat16),
+            (jax.ShapeDtypeStruct((16, 4096), jnp.bfloat16),))
+
+
+def test_an_amperes_nvfp4_decode_runs_the_packed_kernel_its_receipt_declares():
+    """An NVFP4 projection at a decode step's rows on a compile-only A100, no kernel named: its program
+    launches the template's packed product (`kernel_compile.Expected`, route evidence of `gemm.NVFP4_CELLS`'
+    A100 decode cell, receipt W13-a100-4-M-NS-8b-a100: 2.6-3.6x the matrix decoded once a call)."""
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    expected = Expected(axes=(("data", 1),), specs=(None,), launches=frozenset({"dew_gmm"}))
+    cases = [support.KernelCase("nvfp4 decode", _nvfp4_decode_projection, expected=expected)]
+    assert route_failures(cases, compile_mosaic_kernels(cases, "sm80")) == []
+
+
 def test_an_amperes_nvfp4_product_compiles_its_packed_kernel():
     """An NVFP4 projection, its packed kernel named, compiled for a compile-only A100: its program launches
     the template's product (`kernel_compile.Expected`, its route evidence), which ptxas compiles: its E4M3

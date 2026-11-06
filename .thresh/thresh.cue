@@ -171,6 +171,16 @@ seams: "join-cells": {
 	}
 }
 
+seams: "nvfp4-cells": {
+	kind:    "declared-set"
+	purpose: "each cell runs an NVFP4 product's packed kernel on a receipt that shows it faster than decoding the matrix once a call"
+	paths:   ["src/dew/nn/kernels/gemm.py"]
+	entries: "NVFP4_CELLS"
+	declared: {
+		"(sm80, decode)": "the packed kernel at 1-64 rows on an A100 (PACKED_FASTER, W13-a100-4-M-NS-8b-a100)"
+	}
+}
+
 seams: "norm-cells": {
 	kind:    "declared-set"
 	purpose: "each cell routes the RMS norm to its fused kernel on a receipt that shows it faster than XLA's"
