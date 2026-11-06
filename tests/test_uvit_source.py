@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_runs import assert_as_exact_as_recorded
-from torch_layout import QKV, dew_leaf, join_qkv, leaf, split_qkv, torch_leaf
+from torch_layout import QKV, dew_leaf, join_qkv, node, split_qkv, torch_leaf
 
 from dew.nn.backbones.uvit import UViT
 from dew.nn.dit import TextContext
@@ -85,8 +85,8 @@ def from_dew(name: str, tree) -> np.ndarray:
     """The inverse of `to_dew`: a Dew gradient back in U-ViT's layout."""
     path = dew_path(name)
     if path[-1] == "qkv":
-        return join_qkv([leaf(tree, (*path[:-1], part, "kernel")) for part in QKV])
-    return torch_leaf(path, leaf(tree, path))
+        return join_qkv([node(tree, (*path[:-1], part, "kernel")) for part in QKV])
+    return torch_leaf(path, node(tree, path))
 
 
 def state_shapes(config: dict) -> dict[str, tuple[int, ...]]:
