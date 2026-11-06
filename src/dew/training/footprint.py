@@ -204,9 +204,8 @@ def simplified(program: jcore.Jaxpr, platform: str, lowering: str | None = None)
     """`program` as XLA compiles it for `platform`, as JAX lowers it for `lowering` (`compiled`;
     `platform`'s own name where none is given, a GPU's CUDA's), each equation that repeats another one
     (`deduplicated`), each sum into a scatter (`folded`) and, on a GPU, each sum a product computes
-    (`biased`) as XLA's simplifiers and its GPU GEMM rewriter make them (a CPU's dot computes no sum, so a
-    CPU step derived so held 1.2 MB of a test step's 2.2), in every program it runs, a loop's body among
-    them, as XLA's passes run over every computation (`throughout`)."""
+    (`biased`) as XLA's simplifiers and its GEMM rewriter make them, the rewriter a GPU's alone, in every
+    program it runs, a loop's body among them, as XLA's passes run over every computation (`throughout`)."""
     gemm = biased if platform == "gpu" else (lambda each: each)
     return throughout(lambda each: gemm(folded(deduplicated(each))),
                       compiled(program, lowering or LOWERED.get(platform, platform)))
