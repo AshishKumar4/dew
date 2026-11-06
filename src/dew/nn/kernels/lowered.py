@@ -6,6 +6,7 @@ its launches, which the kernel reports (`templates.report`), the compile gates a
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 from collections import Counter
@@ -17,7 +18,7 @@ from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import stablehlo
 
 from dew.nn.kernels.templates import report
-from dew.telemetry.instrumentation import call_weights, counted_trips, custom_call_kind
+from dew.telemetry.instrumentation import MODEL_FLOPS, call_weights, counted_trips, custom_call_kind
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,12 @@ class KernelCall:
     config: str
     flops: float | None
     launch: str | None = None
+    model_flops: float | None = None
+    """The model's share of `flops` a Mosaic GPU kernel declares (`instrumentation.MODEL_FLOPS`, its launch's
+    `model_flops`), None where it declares none."""
+    operands: tuple[tuple[int, ...], ...] = ()
+    """The shapes of the arrays the call reads, as its program reads them: a device's shard's where the
+    call runs per shard (within a `shard_map`), the whole array's otherwise."""
 
 
 @dataclass(frozen=True)
@@ -188,18 +195,22 @@ def operations(lowered: jax.stages.Lowered) -> list[str]:
     return [name for name, _ in _read(lowered, lambda operation: operation.name)]
 
 
+def _ranked(values) -> list:
+    """The ranked tensor types of `values`, in order."""
+    return [ir.RankedTensorType(value.type) for value in values
+            if isinstance(value.type, ir.RankedTensorType)]
+
+
+def _shapes(values) -> tuple[tuple[int, ...], ...]:
+    """The shapes of `values`' ranked tensors, in order."""
+    return tuple(tuple(kind.shape) for kind in _ranked(values))
+
+
 def custom_calls(lowered: jax.stages.Lowered) -> list[CustomCall]:
     """Every custom call a lowered program makes, as lowered (`_read`), each once."""
-    def ranked(values):
-        return [ir.RankedTensorType(value.type) for value in values
-                if isinstance(value.type, ir.RankedTensorType)]
-
-    def shapes(values) -> tuple[tuple[int, ...], ...]:
-        return tuple(tuple(kind.shape) for kind in ranked(values))
-
     return [call for call, _ in _read_calls(lowered, lambda target, operation: CustomCall(
-        target, shapes(operation.operands), shapes(operation.results),
-        tuple(str(kind.element_type) for kind in ranked(operation.operands))))]
+        target, _shapes(operation.operands), _shapes(operation.results),
+        tuple(str(kind.element_type) for kind in _ranked(operation.operands))))]
 
 
 def kernel_calls(lowered: jax.stages.Lowered, *, unrun: bool = False) -> list[KernelCall]:
@@ -217,7 +228,10 @@ def kernel_launches(lowered: jax.stages.Lowered, *, unrun: bool = False) -> list
     around it states no static count."""
     def read(target: str, operation: ir.Operation) -> KernelCall | None:
         kind = custom_call_kind(target)
-        return None if kind == "no_matmul" else _kernel_call(kind, target, operation)
+        if kind == "no_matmul":
+            return None
+        called = _kernel_call(kind, target, operation)
+        return dataclasses.replace(called, operands=_shapes(operation.operands))
 
     return _read_calls(lowered, read, unrun=unrun)
 
@@ -238,12 +252,21 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
         named = _kernel_name(operation.location)
         # A call whose location names no kernel is named by its kernel's hash, apart from every other.
         return KernelCall(kind, named[0] if named else hashed, ir.StringAttr(config["module"]).value_bytes,
-                          hashed, stated.get("flops"), named[1] if named else None)
+                          hashed, stated.get("flops"), named[1] if named else None, _model_flops(attributes))
     if kind == "mosaic_tpu":
         config = json.loads(ir.StringAttr(attributes["backend_config"]).value)["custom_call_config"]
         return KernelCall(kind, ir.StringAttr(attributes["kernel_name"]).value, config["body"].encode(), "",
                           config.get("cost_estimate", {}).get("flops"))
     return KernelCall(kind, target, b"", "", None)
+
+
+def _model_flops(attributes) -> float | None:
+    """The model's FLOPs a call's frontend attributes declare (`instrumentation.MODEL_FLOPS`), None where
+    they declare none."""
+    if "mhlo.frontend_attributes" not in attributes:
+        return None
+    frontend = ir.DictAttr(attributes["mhlo.frontend_attributes"])
+    return float(ir.StringAttr(frontend[MODEL_FLOPS]).value) if MODEL_FLOPS in frontend else None
 
 
 def _kernel_name(location: ir.Location) -> tuple[str, str | None] | None:
