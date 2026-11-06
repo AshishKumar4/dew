@@ -12,7 +12,6 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import pytest
 from generation_support import lowers
 from reference_error import (
@@ -137,25 +136,6 @@ def test_the_template_holds_its_hardest_regimes_interpreted(regime):
                     jax.jit(with_gradients(scanned(portable, starts))), draws,
                     f"the selective template under {regime}", seeds=FEWEST_SEEDS,
                     truth_fn=jax.jit(with_gradients(scanned(portable, starts))))
-
-
-@pytest.mark.gpu(reason="a GPU's programs run in its own order, which an interpreter fixes")
-def test_the_backward_repeats_its_gradients_bit_for_bit():
-    """The template's backward over 512 channels, several to each partial buffer (`selective.partials_of`):
-    every gradient bit for bit the same over repeated runs of one compiled step, as check 1's pairing of an
-    arm's draws takes it. With every channel adding atomically into 32 buffers, B's gradient differed in its
-    last bits between two runs on an H100 (rows 4392, 4448)."""
-    shape = (1, 256, 512, 16)
-    family = bundles.of(generation.device_generation(), jnp.float32)
-    template = functools.partial(selective.selective_scan, family=family)
-    inputs, starts, dy = draw(jnp.float32, 0, *shape, packed=False)
-    step = jax.jit(with_gradients(scanned(template, starts)))
-    first = jax.block_until_ready(step(*inputs, dy))
-    for _ in range(4):
-        again = jax.block_until_ready(step(*inputs, dy))
-        pairs = zip(jax.tree.leaves(first), jax.tree.leaves(again), strict=True)
-        for leaf, (one, other) in enumerate(pairs):
-            assert np.array_equal(np.asarray(one), np.asarray(other)), leaf
 
 
 SEEDED = Path(__file__).resolve().parent / "fixtures" / "mamba" / "selective_mamba_ssm_seeded.npz"
@@ -395,9 +375,9 @@ def test_the_backward_holds_its_registers_at_the_residency_it_launches(packed):
     need = kernel['least']
     assert need is not None, kernel
     target = generation.gpu_target('sm90')
-    positions, resident = selective.backward_plan(target, 16)
+    positions, resident = selective.backward_plan(target)
     held = selective.backward_programs(need, target)
-    assert held == selective.backward_programs(selective.backward_registers(positions), target) >= resident, (
+    assert held == resident == selective.backward_programs(selective.backward_registers(positions), target), (
         need, held, resident, positions)
 
 
@@ -457,7 +437,8 @@ def test_a_spill_steps_the_kernel_that_spilled():
             assert selective.SELECTIVE.derived(bound, target) is None
     facts = generation.gpu_target(generation.INTERPRETED_GENERATION)
     fewer = derived.positions // 2
-    assert stepped == selective.Tiles(derived.chunk, fewer, selective.backward_resident(fewer, 16, facts))
+    assert stepped == selective.Tiles(derived.chunk, fewer,
+                                      selective.backward_programs(selective.backward_registers(fewer), facts))
 
 
 @pytest.mark.parametrize('length', [129, 2048], ids=['129 tokens', '2048 tokens'])
