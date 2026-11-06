@@ -512,8 +512,7 @@ from dew.training.ahead import compile_ahead, compile_only_gpus
 case = Case(**json.loads(sys.argv[1]))
 generation, capacity, attention = sys.argv[2], int(sys.argv[3]), sys.argv[4]
 trainer = build_trainer(case, attention)
-trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus(generation, trainer.device_mesh.devices.size,
-                                                                capacity)))
+trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus(generation, 1, capacity)))
 ahead = compile_ahead(trainer, global_batch(case), capacity)
 print(json.dumps({"seconds": ahead.planned_seconds, "substituted": list(ahead.substituted),
                   "plan": {key: value for key, value in (ahead.plan or {}).items()
@@ -660,7 +659,7 @@ def verdict(row: Row, base: list, head: list, alone: list) -> tuple[str, dict]:
         return "unjudged", {**numbers, "why": str(few)}
     worse = (lambda ratio: ratio < 1) if row.unit in HIGHER_IS_BETTER else (lambda ratio: ratio > 1)
     low, high = judged.interval
-    material = abs(judged.ratio - 1) > row.floor
+    material = not 1 - row.floor <= judged.ratio <= 1 + row.floor
     state = ("level" if not judged.differs else "different, below floor" if not material
              else "regressed" if worse(low) and worse(high) else "faster")
     insensitive = judged.alone[0] < 1 - row.floor or judged.alone[1] > 1 + row.floor
