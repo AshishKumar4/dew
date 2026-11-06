@@ -543,16 +543,19 @@ class Trainer(Generic[Loss, Effects]):
         mesh = self.state_mesh
         if state.inner is not None:  # DiLoCo's groups' copies, each on its own devices (`grouped`)
             return grouped(self._shardings, state)
-        params = dict(state.variables)
-        frozen = params.pop(FROZEN, None) if self.host_master else None
+        params, frozen = dict(state.variables), ()
+        if self.host_master:
+            from dew.training.execution import frozen_trees, placed_at, stack_sites
+            frozen = tuple(frozen_trees(params, stack_sites(self.objective, params)))
+            for path, _, _ in frozen:
+                params = placed_at(params, path, {})
         placed = self.layout.shardings(mesh, dataclasses.replace(state, variables=params, accumulation=None))
         placed = dataclasses.replace(placed, **{
             field: jax.tree.map(lambda s: s.with_memory_kind("pinned_host"), getattr(placed, field))
             for field in (() if self.host_master else self.layout.host)})
-        if frozen is not None:
-            placed = dataclasses.replace(
-                placed, variables={**placed.variables, FROZEN: self._frozen_shardings(state, frozen)}
-            )
+        for path, tree, sites in frozen:
+            placed = dataclasses.replace(placed, variables=placed_at(
+                placed.variables, path, self._frozen_shardings(state, path, tree, sites)))
         accumulation = state.accumulation
         if accumulation is None:
             return placed
@@ -612,12 +615,14 @@ class Trainer(Generic[Loss, Effects]):
         refuse_wide_floats(state, self.device_mesh)
         shardings = self.shardings(state)
         variables, placement = state.variables, shardings.variables
-        if self.host_master and FROZEN in variables:
+        if self.host_master:
             # A CPU-owned run's frozen banks, read as the layers the layout placed.
             from dew.inference.banks import row_sharding, shape_rows, spread
-            variables = {**variables, FROZEN: spread(variables[FROZEN], shape_rows)}
-            placement = {**placement, FROZEN: spread(
-                placement[FROZEN], lambda sharding, count: [row_sharding(sharding)] * count)}
+            from dew.training.execution import at_path, frozen_trees, placed_at, stack_sites
+            for path, tree, _ in tuple(frozen_trees(variables, stack_sites(self.objective, variables))):
+                variables = placed_at(variables, path, spread(tree, shape_rows))
+                placement = placed_at(placement, path, spread(
+                    at_path(placement, path), lambda sharding, count: [row_sharding(sharding)] * count))
         with self._declared():
             self._staging.check(self.layout, variables, placement, self.device_mesh)
         self.validation = self._validation(placed_shapes(dataclasses.replace(state, variables=variables),
@@ -679,12 +684,11 @@ class Trainer(Generic[Loss, Effects]):
                                     self.state_mesh, self.device_mesh, shardings), shardings, None)
             return (placed_start(self._staged_start, initializer, key, abstract, shardings, start.through,
                                  self.device_mesh), shardings, None)
-        if self.host_master and FROZEN in abstract.variables:
+        if self.host_master:
             from dew.training.execution import banked_frozen
-            abstract = dataclasses.replace(abstract, variables={
-                **abstract.variables, FROZEN: banked_frozen(
-                    self.objective, abstract.variables,
-                    lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
+            abstract = dataclasses.replace(abstract, variables=banked_frozen(
+                self.objective, abstract.variables,
+                lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype)))
         share = DataPartition.of(self.device_mesh) if positioned else None
         state, position = self._staging.restore(checkpoints, placed_shapes(abstract, shardings), resume,
                                                share, served=self.objective.served_groups(abstract.variables))
@@ -792,21 +796,22 @@ class Trainer(Generic[Loss, Effects]):
         self._resumed_rung = self._rung()
 
 
-    def _frozen_shardings(self, state: TrainState, frozen):
-        """Return where the frozen collection sits for a CPU-owned run.
+    def _frozen_shardings(self, state: TrainState, path: tuple[str, ...], frozen, sites):
+        """Return where a frozen tree at `path` of the variables (`execution.frozen_trees`), with the
+        stacks `sites` over it, sits for a CPU-owned run.
 
         Before placement the layout names each row's shards, and `resident` moves the stack's rows to bank
-        memory, a scanned run's shared rows as one bank. Once placed, the collection holds those banks,
+        memory, a scanned run's shared rows as one bank. Once placed, the tree holds those banks,
         whose leading layer axis the layout's rules do not name, and its arrays say where they sit.
         """
         leaves = jax.tree.leaves(frozen)
         if leaves and all(isinstance(leaf, jax.Array) for leaf in leaves):
             return jax.tree.map(lambda leaf: leaf.sharding, frozen)
-        from dew.training.execution import resident, stack_sites
+        from dew.training.execution import at_path, placed_at, resident
         rows = self.layout.shardings(
-            self.state_mesh, dataclasses.replace(state, variables={FROZEN: frozen}, accumulation=None))
-        sites = stack_sites(self.objective, {**state.variables, FROZEN: frozen})
-        return resident(rows.variables[FROZEN], sites, self.device_mesh)
+            self.state_mesh,
+            dataclasses.replace(state, variables=placed_at({}, path, frozen), accumulation=None))
+        return resident(at_path(rows.variables, path), sites, self.device_mesh)
 
     # ------------------------------------------------------------------ The step
     # ------------------------------------------------------------------

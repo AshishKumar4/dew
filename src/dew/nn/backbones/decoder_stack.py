@@ -1064,6 +1064,11 @@ class DecoderBank:
     every layer's copy to the front and the whole stack is on the device at
     once. A host layout therefore refuses a plain loop
     (`dew.training.execution.resident`)."""
+    root: tuple[str, ...] = ()
+    """The collections from the run's variables to the tree the stack lies in, empty for the run's own.
+    A nested model that trains nothing holds its variables under a collection of the run's, a
+    distillation's frozen teacher under `teacher`, and a host layout banks its stacks there
+    (`dew.training.execution.frozen_trees`)."""
 
 
 def _on_stage_axis(leaf):

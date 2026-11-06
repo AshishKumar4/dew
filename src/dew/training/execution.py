@@ -68,6 +68,13 @@ layer of it at a time as it reaches it (`run_stack`). The CPU backend has
 the space too, so a CPU-only run exercises the same fetching loop."""
 
 
+def _without_banks(variables, sites):
+    """`variables` without the banks the stacks of `sites` store, at every root (`without_banks`)."""
+    return {**without_banks(variables, _own(sites)),
+            **{collection: _without_banks(variables[collection], _within(sites, collection))
+               for collection in _nested(sites) if collection in variables}}
+
+
 def _in_stack(path: tuple[str, ...], sites) -> bool:
     """Whether a `params`-relative leaf path is one of a declared stack's layers."""
     return any(path[:len(site.namespace)] == site.namespace
@@ -83,6 +90,48 @@ def stack_sites(objective, variables) -> tuple[DecoderBank, ...]:
     model's own scan agree on every run."""
     store = thaw(variables)
     return bank_sites(objective, store) if objective.bank_sites(store) else ()
+
+
+def _own(sites) -> tuple[DecoderBank, ...]:
+    """The `sites` in the run's own tree, at no nested root (`DecoderBank.root`)."""
+    return tuple(site for site in sites if not site.root)
+
+
+def _nested(sites) -> tuple[str, ...]:
+    """The collections holding a nested root's stacks of `sites`, each once."""
+    return tuple(dict.fromkeys(site.root[0] for site in sites if site.root))
+
+
+def _within(sites, collection: str) -> tuple[DecoderBank, ...]:
+    """The `sites` below `collection`, seen from the variables it holds."""
+    return tuple(dataclasses.replace(site, root=site.root[1:])
+                 for site in sites if site.root[:1] == (collection,))
+
+
+def at_path(tree, path: tuple[str, ...]):
+    """The subtree of `tree` at `path`, or None where `tree` holds none."""
+    for key in path:
+        tree = tree.get(key) if isinstance(tree, Mapping) else None
+    return tree
+
+
+def placed_at(tree, path: tuple[str, ...], value):
+    """`tree` with `value` at `path`, its spine copied and missing nodes made."""
+    if not path:
+        return value
+    return {**tree, path[0]: placed_at(tree.get(path[0], {}), path[1:], value)}
+
+
+def frozen_trees(variables, sites):
+    """The frozen trees of `variables` a host layout places beside the accelerator, each as its path, the
+    tree, and the `sites` over it seen from it: the run's frozen collection, and the `params` of each
+    nested model that trains nothing at its root (`DecoderBank.root`), a distillation's teacher whole.
+    A root `variables` does not hold has none: an EMA averages the student alone."""
+    for root in dict.fromkeys(((), *(site.root for site in sites))):
+        path = (*root, "params") if root else (FROZEN,)
+        tree = at_path(variables, path)
+        if tree is not None:
+            yield path, tree, tuple(dataclasses.replace(site, root=()) for site in sites if site.root == root)
 
 
 def bank_bytes(tree, sites) -> int:
@@ -208,10 +257,11 @@ class HostExecution:
                  device: tuple[DeviceStep, ...] = ()):
         self.objective, self.layout = objective, layout
         self.accelerator, self.cpu = accelerator, cpu
-        # The trainer's banks over the state it owns (`stack_sites`), the runs its frozen banks keep.
-        self.sites = sites
+        # The trainer's banks over the state it owns (`stack_sites`), the runs its frozen banks keep;
+        # a gradient reaches the run's own stacks alone, a nested root (a teacher) training nothing.
+        self.sites, self.own = sites, _own(sites)
         self.device = device
-        self.unstack = functools.partial(program(logical, static_argnames="sites"), sites=self.sites)
+        self.unstack = functools.partial(program(logical, static_argnames="sites"), sites=self.own)
 
     def forward(self, step: Mapping[str, Option]):
         """The loss and its pullback, compiled for the objective's modules as they are now, under the
@@ -253,7 +303,14 @@ class HostExecution:
         # The layout names a leaf's axes as its module declares them, which a
         # bank's leading layer axis is not; a bank is already placed, so the
         # placement is asked about everything but the banks.
-        placement = self.layout.shardings(self.accelerator, without_banks(variables, self.sites))
+        placement = self.layout.shardings(self.accelerator, _without_banks(variables, self.sites))
+        return self._assembled(variables, placement, self.sites)
+
+    def _assembled(self, variables, placement, sites):
+        """`snapshot` of `variables` placed by `placement`: the stacks of `sites` in their own tree as
+        banks, each nested root's (`DecoderBank.root`) assembled the same way in the collection holding
+        it, and everything else as it is stored."""
+        nested, own = _nested(sites), _own(sites)
         whole, placement = thaw(variables), thaw(placement)
         weights = {"params": whole["params"]}
         places = {"params": placement["params"]}
@@ -261,7 +318,7 @@ class HostExecution:
         # router effects, for example, match per-layer sows to per-layer bias.
         # Only model weights adopt execution banks.
         entries = {**{collection: tree for collection, tree in whole.items()
-                      if collection != "params"}, **entry_tree(weights, self.sites)}
+                      if collection != "params" and collection not in nested}, **entry_tree(weights, own)}
         store = transfer(entries, narrowed(placement, entries))
 
         def bank(site, first: int, count: int, name: str):
@@ -280,7 +337,10 @@ class HostExecution:
             return merge(held, jax.tree_util.tree_map_with_path(
                 lambda path, sharding, *leaves: self._stack_rows(leaves, sharding), spread, *rows))
 
-        return merge(store, assembled(self.sites, bank))
+        return {**merge(store, assembled(own, bank)),
+                **{collection: self._assembled(variables[collection], placement[collection],
+                                               _within(sites, collection))
+                   for collection in nested if collection in variables}}
 
     def _stack_rows(self, rows, sharding):
         """Stack the rows of one bank leaf into the bank's placement.
@@ -360,19 +420,25 @@ class HostExecution:
                 # int8 backward (`Quantization.bwd_qtype`) on the options that ask for it.
                 pulled = program(_trainable_cotangent, *self.objective.towers(), step=options,
                                  static_argnames=("sites", "paths", "layout"))
-                gradient = pulled(back, self.on_accelerator(cotangent), sites=self.sites, paths=moving,
+                gradient = pulled(back, self.on_accelerator(cotangent), sites=self.own, paths=moving,
                                   layout=layout)
             return self.on_cpu(gradient)
         return Realization(stats, aux, pullback)
 
 
 def banked_frozen(objective, variables, stack, release=None):
-    """Stack each scanned run's shared leaves of the frozen collection of `variables` into one bank
-    (`dew.inference.banks.banked`), the runs `objective`'s stack declares (`stack_sites`).
+    """`variables` with each scanned run's shared leaves of every frozen tree (`frozen_trees`) stacked
+    into one bank (`dew.inference.banks.banked`), the runs `objective`'s stacks declare (`stack_sites`):
+    `stack(rows, path)` is given each bank's path from the root of `variables`, and
+    `release(tree, namespace, index, keys, bank)` the path of the frozen tree a row left.
 
     That is the shape a placement and a checkpoint template take, and the
     arrays the state holds."""
-    return banked(variables[FROZEN], stack_sites(objective, variables), stack, release)
+    for path, tree, sites in tuple(frozen_trees(variables, stack_sites(objective, variables))):
+        variables = placed_at(variables, path, banked(
+            tree, sites, lambda rows, keys, path=path: stack(rows, (*path, *keys)),
+            None if release is None else functools.partial(release, path)))
+    return variables
 
 
 def placed_host(objective, fresh: Callable[[], TrainState], state_mesh: Mesh, device_mesh: Mesh,
@@ -392,35 +458,31 @@ def placed_host(objective, fresh: Callable[[], TrainState], state_mesh: Mesh, de
     held = objective.held_variables()
     with jax.default_device(state_mesh.local_devices[0]):
         state = fresh()
-        if FROZEN in state.variables:
-            sites = stack_sites(objective, state.variables)
-            check_bank_pool(bank_bytes(state.variables[FROZEN], sites), device_mesh)
+        trees = tuple(frozen_trees(state.variables, stack_sites(objective, state.variables)))
+        if trees:
+            check_bank_pool(sum(bank_bytes(tree, sites) for _, tree, sites in trees), device_mesh)
             # A scanned run's frozen rows become its bank here and the bank lands where it stays
             # resident before the next is stacked, so the host holds one bank in transit, not the
             # stack; the rows' pages are let go as it lands and the held tree holds the placed bank
             # where each row was. An objective placed this way holds banks at its rows afterwards and
             # does not seed a second trainer.
-            targets = shardings.variables[FROZEN]
-
             def stack(rows, path):
-                target = targets
-                for component in path:
-                    target = target[component]
-                bank = place_leaf(jnp.stack(rows), target)
+                bank = place_leaf(jnp.stack(rows), at_path(shardings.variables, path))
                 for row in rows:
                     evict(np.asarray(row))
                 return bank
 
-            def release(namespace, index, keys, bank):
-                # The rows sit under the held tree's own frozen split
-                # when it came split, or under its params when init split it.
-                node = None if held is None else held.get(FROZEN, held.get("params"))
+            def release(tree, namespace, index, keys, bank):
+                # The rows sit under the held tree's own frozen split when it came split, or under its
+                # params when init split it; a nested model's, under its own params (`frozen_trees`).
+                node = (None if held is None else held.get(FROZEN, held.get("params")) if tree == (FROZEN,)
+                        else at_path(held, tree))
                 for component in (*namespace, f"layers_{index}", *keys[:-1]):
                     node = node.get(component) if isinstance(node, dict) else None
                 if isinstance(node, dict) and keys[-1] in node:
                     node[keys[-1]] = bank
-            frozen = banked_frozen(objective, state.variables, stack, release)
-            state = dataclasses.replace(state, variables={**state.variables, FROZEN: frozen})
+            state = dataclasses.replace(
+                state, variables=banked_frozen(objective, state.variables, stack, release))
     params = stream(state.variables, shardings.variables, held)
     ema = None if state.ema is None else stream(state.ema, shardings.ema)
     rest = dataclasses.replace(state, variables=None, ema=None)

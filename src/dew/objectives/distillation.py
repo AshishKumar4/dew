@@ -300,6 +300,14 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
             tree["params"] = {**tree["params"], PROJECTIONS: projections}
         return tree
 
+    def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]:
+        """The student's stacks over its own tree, and the frozen teacher's below its collection
+        (`DecoderBank.root`), which a host layout banks where they lie, so the teacher's layers reach the
+        device one at a time as the student's do."""
+        return (*self.student.bank_sites(self.student_variables(store)),
+                *(replace(site, root=(TEACHER, *site.root))
+                  for site in self.teacher.bank_sites(store[TEACHER])))
+
     def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
         """The student's runs a pipeline over `stages` stacks (`Objective.stage_sites`), which its tree,
         the run's without the teacher and the projections, holds where the run's does: the teacher reads
