@@ -1588,7 +1588,7 @@ _CANONICAL = decoder_parts.spelled((), layer_leaves={
 """The canonical names' routes, the shared decoder's and the parts' own leaves beside them."""
 
 _DEPTH_COPIES = Table(*decoder_parts.prediction_copies('model.layers.{depth}.',
-                                                        {'depth': decoder_parts.DEPTH}))
+                                                        {'depth': decoder_parts.DEPTH}, declared=False))
 """A release's prediction depths' copies of the trunk's table and head (`decoder_parts.prediction_copies`)."""
 
 
