@@ -1943,12 +1943,17 @@ derivatives module's functions, which it is not."""
 def test_a_construct_built_outside_its_owner_module_is_reported(tmp_path, code, site, packages, lines, owner):
     """SLOP025 and SLOP026: a construct one module of `src/<package>` owns (the compile point's
     `OuterProgram`, JAX's custom derivatives) is reported wherever its site builds it in any package but
-    that module, and not in the owner, the tests or the tools."""
+    that module, and not in the owner, the tests or the tools. Its findings alone: a custom derivative's site
+    is SLOP028's too, which reads whether it declares its contract."""
+    def found(root, files: dict[str, str]) -> list[tuple[str, int, str]]:
+        return [entry for entry in linted(root, files) if entry[2] == code]
+
     for package in packages:
-        assert_reported(tmp_path / package, f"src/sparx/{package}/site.py", site, code, lines)
+        path = f"src/sparx/{package}/site.py"
+        assert found(tmp_path / package, {path: site}) == [(path, line, code) for line in lines]
     path, text = owner
-    assert linted(tmp_path / "owner", {path: text}) == []
-    assert linted(tmp_path / "suite", {"tests/test_site.py": site, "tools/site.py": site}) == []
+    assert found(tmp_path / "owner", {path: text}) == []
+    assert found(tmp_path / "suite", {"tests/test_site.py": site, "tools/site.py": site}) == []
 
 
 def test_each_form_of_a_custom_derivative_is_a_seam():
