@@ -107,10 +107,9 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                                         for name, array in (("query", call.query), ("key", call.key),
                                                             ("value", call.value))})
 
-    def launch(form: algebra.Forward, live: jax.Array | None, again: bool = False):
+    def launch(form: algebra.Forward, live: jax.Array | None):
         if live is None:
-            return _forward(call.query, call.key, call.value, spec=form, tiles=tiles, interpret=interpret,
-                            kept=again)
+            return _forward(call.query, call.key, call.value, spec=form, tiles=tiles, interpret=interpret)
         # The rows whose weighted values overflowed, rewalked shifting on the plain-JAX mainloop over the
         # same padded call (the rare launch, `algebra.walked_launches`); its maxima and overflows are not
         # read.
@@ -353,7 +352,7 @@ def _correction(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward
     mosaic.stored((m, over), (maxima_ref.at[places], over_ref.at[places]), smem=scratch.l_smem)
 
 
-def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpret: bool, kept: bool = False):
+def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpret: bool):
     """The launch at `tiles`: the output `[B, Qp, H, Dv]` and each row's running maximum in the walk's units
     and whether its weighted values overflowed, `[B, H, Qp]` each (`algebra.walked_launches`' plain
     launch)."""
@@ -413,8 +412,7 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
                           rows_type),
         grid=(heads, queries // rows, batch), grid_names=("heads", "q_blocks", "batch"), scratch=scratch,
         interpret=mosaic.interpreted(interpret), warpgroups=WARPGROUPS,
-        # A name a form (the default's fold and its natural rewalk compile apart), and the guard's rerun of
-        # the plain launch its own (`algebra.walked_launches`' `again`).
-        name="attention_forward_tcgen05" + ("_natural" if spec.natural else "") + ("_kept" if kept else ""),
+        # A name a form (the default's fold and its natural rewalk compile apart).
+        name="attention_forward_tcgen05" + ("_natural" if spec.natural else ""),
     )(query, key, value)
     return out, maxima, over > 0

@@ -393,8 +393,13 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
                     sample.update({name: reason for name, reason in unsupported.items()
                                    if reason is not None})
                     continue
-                done = _run(tree, python, probe.tool, probe.arguments(args, out), newer, 3600, cache,
-                            settings)
+                # A step this tree's prepare compiled ahead (`ahead_battery`) runs as its first step, so the
+                # GPU compiles none of it.
+                handed = Path(getattr(args, "ahead", None) or "/nonexistent") / tree.name
+                stepped = probe.tool == "benchmark_step.py" and handed.is_dir()
+                handoff = ["--ahead", str(handed)] if stepped else []
+                done = _run(tree, python, probe.tool, [*probe.arguments(args, out), *handoff], newer, 3600,
+                            cache, settings)
                 if done.returncode != 0 and not external:
                     raise RuntimeError(f"{probe.tool} exited {done.returncode}: {done.stderr[-1500:]}")
                 values = probe.read(done.stdout, out)
@@ -511,13 +516,10 @@ UNSUPPORTED = "unsupported: "
 COMPILED = """
 import json, sys
 from benchmark_cases import Case
-from benchmark_models import build_trainer, global_batch
-from dew.training.ahead import compile_ahead, compile_only_gpus
+from benchmark_models import ahead_of
 case = Case(**json.loads(sys.argv[1]))
 generation, capacity, attention = sys.argv[2], int(sys.argv[3]), sys.argv[4]
-trainer = build_trainer(case, attention)
-trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus(generation, 1, capacity)))
-ahead = compile_ahead(trainer, global_batch(case), capacity)
+ahead = ahead_of(case, generation, capacity, attention)
 print(json.dumps({"seconds": ahead.planned_seconds, "substituted": list(ahead.substituted),
                   "plan": {key: (ahead.plan or {}).get(key) for key in sys.argv[5].split(",")}}))
 """
@@ -538,6 +540,31 @@ def compiled_sample(printed: str) -> tuple[float | str, dict]:
     substituted = compiled["substituted"]
     sample = f"{UNSUPPORTED}{'; '.join(substituted)}" if substituted else float(compiled["seconds"])
     return sample, compiled["plan"]
+
+
+def ahead_battery(args: argparse.Namespace) -> int:
+    """Each step of `--kind`'s compiled ahead of its run (benchmark_step --compile-ahead, for one
+    compile-only GPU of the kind, `COMPILE_TARGETS`), in each tree's environment of `--lock`, into
+    `--out`/<the tree's directory name>: what `run --ahead` hands each arm's step rows, so the GPU compiles
+    none of a step that is the program compiled ahead (dew-ops' perf jobs, in their GPU-free prepare). A
+    tree that compiles none ahead (one older than the handoff) runs as before, its GPU compiling."""
+    generation, gib, device = COMPILE_TARGETS[args.kind]
+    trees = dict(spec.split("=", 1) for spec in (args.base, args.head))
+    head_path = Path(trees[args.head.split("=", 1)[0]])
+    pythons, unbuilt = environments(tuple((name, Path(path)) for name, path in trees.items()), args.lock,
+                                    args.environments)
+    cases = [case for name, case in STEP_CASES.items()
+             if (not args.only or any(word in name for word in args.only))
+             and device in STEP_HARDWARE.get(name, device)]
+    for name, path in trees.items():
+        if name in unbuilt or not cases:
+            continue
+        done = _run(Path(path), pythons[name], "benchmark_step.py",
+                    ["--cases", json.dumps(cases), "--compile-ahead", str(Path(args.out) / Path(path).name),
+                     "--generation", generation, "--capacity-gib", str(gib)], head_path / "tools", 3600)
+        said = f"into {args.out}" if done.returncode == 0 else f"not: {done.stderr[-400:]}"
+        print(f"{name}: steps compiled ahead {said}", flush=True)
+    return 0
 
 
 def compile_battery(args: argparse.Namespace) -> int:
@@ -761,6 +788,7 @@ def main() -> int:
     running.add_argument("--base", required=True, help="name=path of the tree to compare against")
     running.add_argument("--head", required=True, help="name=path of the tree under test")
     running.add_argument("--rounds", type=int, default=ROUNDS)
+    running.add_argument("--ahead", help="the steps each tree's prepare compiled ahead (`ahead`), by tree")
     running.add_argument("--model", required=True, help="a local Qwen3-0.6B snapshot")
     running.add_argument("--flowers", required=True, help="the TFDS oxford_flowers102 directory")
     running.add_argument("--out", required=True)
@@ -794,9 +822,17 @@ def main() -> int:
                            help="where each tree's locked environment is built (environments.py's cache)")
     compiling.add_argument("--only", nargs="*", default=[],
                            help="compile only the steps whose names hold one of these words")
+    aheading = operations.add_parser("ahead", help="each step compiled ahead of its run, into a directory "
+                                                   "`run --ahead` hands its step rows (`ahead_battery`)")
+    for flag in ("--base", "--head", "--kind", "--lock", "--out"):
+        aheading.add_argument(flag, required=True, **({"choices": sorted(COMPILE_TARGETS)} if flag == "--kind"
+                                                       else {}))
+    aheading.add_argument("--environments", default="")
+    aheading.add_argument("--only", nargs="*", default=[])
     args = parser.parse_args()
     with contextlib.suppress(BrokenPipeError):
-        return {"run": run, "compile": compile_battery, "report": report}[args.operation](args)
+        return {"run": run, "compile": compile_battery, "ahead": ahead_battery,
+                "report": report}[args.operation](args)
     return 0
 
 

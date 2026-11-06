@@ -1,7 +1,9 @@
 // Render tutorials/*.ipynb into pages: Markdown cells as written, code cells
 // highlighted, and every recorded output below its cell. Images become WebP
-// files served from /tutorials/. The build fails on a notebook that is not
-// executed top to bottom, or that recorded an error it did not declare.
+// files served from /tutorials/. The build fails on a notebook that recorded an
+// error it did not declare; a cell that recorded no output is shown without one,
+// and said in the build's log, so one missing output never holds the rest of the
+// site's deploy (the owner, 2026-11-06).
 
 import { readdir, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
@@ -103,7 +105,7 @@ for (const file of files) {
 		const skipped = (cell.metadata?.tags ?? []).includes('skip-execution');
 		const install = /^\s*[%!]pip\s/.test(text);
 		if (cell.execution_count == null && !skipped && !install) {
-			throw new Error(`${source}: code cell ${index} was never executed; commit the notebook executed top to bottom`);
+			console.warn(`${source}: code cell ${index} was never executed: shown without its output`);
 		}
 		const allowErrors = (cell.metadata?.tags ?? []).includes('raises-exception');
 		// What the landing page can quote: the cell's code, its stdout and its images.
@@ -119,7 +121,7 @@ for (const file of files) {
 		block.push('', '</div>');
 		parts.push(block.join('\n'));
 	}
-	if (outputs === 0) throw new Error(`${source}: no recorded outputs; commit the notebook executed`);
+	if (outputs === 0) console.warn(`${source}: no recorded outputs: its page shows the code alone`);
 
 	const live = runsLive(accelerator, liveCells.map(({ code }) => code));
 	if (live) {

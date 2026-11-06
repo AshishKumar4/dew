@@ -142,11 +142,16 @@ def norm_backward(summed):
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="YNNPACK's fusions are XLA:CPU's")
-def test_a_node_xla_cpu_compiles_only_with_ynnpacks_fusions_moves_both_sides_onto_them():
+def test_a_node_xla_cpu_compiles_only_with_ynnpacks_fusions_moves_both_sides_onto_them(monkeypatch):
     """The gate compiles each node's sides by check 1's policy (`_compiled_alike`), its mode decided once
     on the node's parents: attention's XLA backward over a single key in bf16, which XLA:CPU compiles
-    only with YNNPACK's fusions, moves both sides onto them, recorded in SWITCHED, and passes (3113)."""
+    only with YNNPACK's fusions, moves both sides onto them, recorded in SWITCHED, and passes (3113). The
+    gate's switch held whatever the run: a census pass (`CENSUS`) compiles every program with the fusions,
+    the switch's subject absent (row 4663)."""
+    from check1_wire import CENSUS
     from reference_error import SWITCHED, without_ynn
+
+    monkeypatch.delenv(CENSUS, raising=False)
 
     def backward(query, key, value):
         out, pull = jax.vjp(lambda q, k, v: jax.nn.dot_product_attention(q, k, v, implementation="xla"),

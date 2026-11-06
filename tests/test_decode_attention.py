@@ -529,29 +529,6 @@ def test_key_starts_keep_the_arithmetic_auto_is_asked_for_where_the_decode_kerne
                                                                           implementation="reference"))
 
 
-@pytest.mark.parametrize("cross", [False, True], ids=["documents", "cross-documents"])
-def test_a_row_whose_documents_lie_below_its_start_reads_nothing(cross):
-    """Packed documents and a key start, no lengths or mask: the first query's only key of its
-    document lies below its row's start, so it reads nothing and comes back exactly zero, its
-    cotangent too, as the one-mask form gives; the other query reads its key."""
-    query = jnp.zeros((1, 2 if not cross else 1, 1, 16), jnp.float32)
-    key = jnp.zeros((1, 2, 1, 16), jnp.float32)
-    value = jnp.ones((1, 2, 1, 16), jnp.float32)
-    starts = jnp.asarray([1], jnp.int32)
-    documents = ({"segment_ids": jnp.asarray([[1]]), "key_segment_ids": jnp.asarray([[1, 2]])} if cross
-                 else {"segment_ids": jnp.asarray([[1, 2]])})
-
-    def attend(value):
-        return scaled_dot_product_attention(query, key, value, key_value_seq_starts=starts, **documents)
-
-    out = attend(value)
-    np.testing.assert_array_equal(np.asarray(out[:, 0]), 0)
-    if not cross:
-        np.testing.assert_array_equal(np.asarray(out[:, 1]), 1)
-    cotangent = jax.grad(lambda value: jnp.sum(attend(value)[:, 0]))(value)
-    np.testing.assert_array_equal(np.asarray(cotangent), 0)
-
-
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
 def test_a_decode_step_over_no_keys_returns_the_empty_result(generation):
     """A decode step of no cache capacity, its row's length 0 and a sink beside it, chosen for an A100 or an

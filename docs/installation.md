@@ -307,4 +307,4 @@ pnpm build
 pnpm preview
 ```
 
-`pnpm build` fails on a broken link, a notebook that was not executed top to bottom, a public module without an API page, or a model family the supported-models page does not list. `pnpm dev` serves the site with live reload.
+`pnpm build` fails on a broken link, a notebook that records an error it does not declare, a public module without an API page, or a model family the supported-models page does not list; a notebook cell that recorded no output is shown without one, and named in the build's log. `pnpm dev` serves the site with live reload.

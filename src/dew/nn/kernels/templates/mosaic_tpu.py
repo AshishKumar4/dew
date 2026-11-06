@@ -169,7 +169,8 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
         return acc + sum(_product(part, rhs) for part in parts)
 
     def rescaled_products(self, acc: jax.Array, scale, parts, rhs, interpret: bool) -> jax.Array:
-        return self.register_products(acc * scale, parts, rhs, interpret)
+        # `scale` the factor's function of the held value (`Issuer.rescaled_products`), not a factor.
+        return self.register_products(scale(acc), parts, rhs, interpret)
 
 
 class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
@@ -345,6 +346,13 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
             carry = lax.fori_loop(lo, hi, body, carry)
         return carry
 
+    def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
+                    walk: Callable[..., R], *, between=None) -> R:
+        # One role a core: no partner reads a step it passes, so it walks its own steps alone.
+        del views, wg, between
+        lo, hi = own
+        return walk(streams, lo, hi, streamed[0])
+
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         # Its walk copies only the steps it reads: a passed step loads nothing.
         del streams, lo, hi, first
@@ -360,9 +368,11 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
     def load_barriers(self, count: int):
         return pltpu.SemaphoreType.DMA((count,))
 
-    def staged_memory(self, shape: tuple[int, ...], dtype):
+    def staged_memory(self, shape: tuple[int, ...], dtype, swizzle: int | None = None):
         # Its one role's staging in VMEM (`staging` keeps the GPU's up to two roles' shape, so a template
-        # indexes it alike), its copies' DMA semaphores its `load_barriers`.
+        # indexes it alike), its copies' DMA semaphores its `load_barriers`; its compiler lays the tile
+        # out, no swizzle.
+        del swizzle
         return pltpu.VMEM(shape, dtype)
 
     def meet(self, halves) -> None:
