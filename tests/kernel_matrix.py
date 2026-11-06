@@ -26,12 +26,21 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
         "dtype": ("bfloat16", "float16", "float32"),
         "form": ("fast", "accurate"),
     },
+    "recurrence": {
+        "generation": ("sm90", "sm80"),
+        "form": ("gated delta net", "kimi delta attention", "write gate", "rated scan"),
+        "kernel": ("mosaic_gpu", "port", "xla", "derived"),
+        "dtype": ("bfloat16", "float32"),
+        "documents": ("one", "packed"),
+    },
 }
 """Each family's axes and their values. Attention's: the GPU; the head width; 8 query heads over 8 key heads,
 2, or 4; a causal, a full or a causal call over three documents and padding; no hook, two key or two tile
 parameters of one shape added to the logits (two in-place gradients of one shape, row 3180's), or a softcap;
 the backward in one launch, two, or one whose consumers share a key block; the operands' dtype; the fast or
-the accurate form."""
+the accurate form. The recurrence's: the GPU; the form (tests/recurrence_matrix.py's `FORMS`); the kernel
+the call names (the port fla's or mamba_ssm's by the form); the operands' dtype; one sequence or packed
+documents."""
 
 SEEDED: dict[str, tuple[tuple[int, tuple[str, ...]], ...]] = {
     "attention": (
@@ -43,11 +52,13 @@ whatever the covering takes besides (`covering`), so the row's own case proves i
 
 CELLS: dict[str, tuple[str, str]] = {
     "attention": ("attention_matrix", "a_routes_training_step_is_on_par"),
+    "recurrence": ("recurrence_matrix", "a_recurrences_training_step_is_on_par"),
 }
 """Each family's matrix cell function, by its module and name (`gpu_flow.cell`)."""
 
 FLOWS: tuple[str, ...] = (
     "tests/test_gpu_attention.py::test_the_attention_matrix_holds_on_this_gpu",
+    "tests/test_gpu_recurrence.py::test_the_recurrence_matrix_holds_on_this_gpu",
 )
 """The flows that run the matrices' cells, by pytest node id."""
 
