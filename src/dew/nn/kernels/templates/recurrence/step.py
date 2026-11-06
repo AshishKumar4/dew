@@ -93,9 +93,9 @@ def step(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: m
 
     def entry(active_ref, *refs):
         inputs = dict(zip(names, refs[:len(names)], strict=True))
-        state_out, *moved, out_ref, vectors, values, exchanged = refs[len(names):]
+        state_out, *moved, out_ref, vectors, exchanged = refs[len(names):]
         _program(hooks, inputs, active_ref, state_out, moved[0] if moved else None, out_ref,
-                 (vectors, values, exchanged), block=block, group=value_heads // key_heads,
+                 (vectors, exchanged), block=block, group=value_heads // key_heads,
                  key_heads=key_heads, interpret=interpret)
 
     history = ((jax.ShapeDtypeStruct(given['held'].shape, given['held'].dtype),) if hooks.conv is not None
@@ -106,8 +106,7 @@ def step(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: m
                              grid=(rows, value_heads // block.heads, value_width // block.columns),
                              grid_names=("rows", "heads", "columns"), warpgroups=1, interpret=interpret,
                              family=family.name, name="recurrence_step",
-                             scratch=(plgpu.SMEM((block.heads, 3, key_width), jnp.float32),
-                                      plgpu.SMEM((block.heads, block.columns), jnp.float32), scan.scratch()))
+                             scratch=(plgpu.SMEM((block.heads, 3, key_width), jnp.float32), scan.scratch()))
     state_out, *moved, out = launched(active, *given.values())
     return out, moved[0] if moved else None, state_out
 
@@ -157,7 +156,7 @@ def _program(hooks, inputs, active_ref, state_out, moved, out_ref, scratch, *, b
     """A program's token (`step`): its queries, keys and values (the conv's, `_Conv`, where the prologue
     takes one), each head's key vectors staged, its block of the state stepped, its output and state stored,
     and the conv's history moved; an idle row's state and history copied and its output zeros."""
-    vectors, values, exchanged = scratch
+    vectors, exchanged = scratch
     first = lax.axis_index("heads") * block.heads
     heads = tuple(first + index for index in range(block.heads))
     token = _Token(lax.axis_index("rows"), first, heads, tuple(head // group for head in heads),
@@ -177,11 +176,9 @@ def _program(hooks, inputs, active_ref, state_out, moved, out_ref, scratch, *, b
             windows = conv.windows()
             convolved = conv.convolved(windows)
             conv.write([window[1:] for window in windows])
-            # The conv's values the block's heads' vector, laid as the block through shared memory.
-            plgpu.store(values.reshape(block.heads * block.columns), convolved[0], optimized=False)
-            mosaic.synced(interpret)
             keyed = [convolved[1 + 2 * p:3 + 2 * p] for p in range(block.heads)]
-            value = plgpu.load(values, layout=block.layout, optimized=False)
+            # The block's heads' values, a thread a channel as the block lays them (`_Block.layout`).
+            value = convolved[0].reshape(block.heads, block.columns)
         writes = [_staged(hooks, inputs, token, p, *keyed[p], vectors, exchanged, interpret=interpret)
                   for p in range(block.heads)]
         mosaic.synced(interpret)
@@ -236,7 +233,9 @@ class _Conv:
         block = self.token.block
         whole = recurrence.conv_pieces(self.conv, self.key_heads, self.value_heads, self.key_width,
                                        self.value_width)
-        values = (whole['v'][0] + self.token.first * self.value_width, block.heads * self.value_width)
+        # The token's columns of its heads: a block of narrower heads takes each whole.
+        values = (whole['v'][0] + self.token.first * self.value_width + self.token.columns.start,
+                  block.heads * block.columns)
         return (values, *((whole[name][0] + keyed * self.key_width, self.key_width)
                           for keyed in self.token.keyed for name in 'qk'))
 
