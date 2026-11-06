@@ -21,6 +21,7 @@ from reference_error import (
     declared_seeds,
     indexed_recording,
     recording,
+    run_to_run,
     with_gradients,
 )
 from selective_support import selective_draw, selective_xla
@@ -40,6 +41,11 @@ INTERPRETED = jax.default_backend() != "gpu"
 SHAPES = {"interpreted": (1, 70, 256, 16), "falcon-mamba-7b": (2, 2048, 8192, 16)}
 """Each case's rows, tokens, channels and states: a ragged chunk over two channel blocks, and Falcon Mamba
 7B's widths."""
+
+
+ATOMIC = "the selective scan's B and C gradients sum by atomic adds (4448)"
+"""Why the template's arms vary run to run on a GPU (`reference_error.run_to_run`): its backward adds B's and
+C's gradients atomically, the one path (row 4448: deterministic orders 2 to 2.7 times the step)."""
 
 
 def draw(dtype, seed: int, rows: int, length: int, channels: int, states: int, packed: bool):
@@ -93,7 +99,7 @@ def the_template_is_as_exact_as_the_portable_scan(case: str, packed: bool, dtype
         return (*inputs, dy)
 
     starts = draw(dtype, 0, *shape, packed)[1]
-    assert_as_exact(jax.jit(with_gradients(scanned(template, starts))),
+    assert_as_exact(run_to_run(jax.jit(with_gradients(scanned(template, starts))), ATOMIC),
                     jax.jit(with_gradients(scanned(portable, starts))), draws,
                     f"the selective template, {case}{', packed' if packed else ''}", seeds=FEWEST_SEEDS,
                     truth_fn=jax.jit(with_gradients(scanned(portable, starts))))
@@ -132,7 +138,7 @@ def test_the_template_holds_its_hardest_regimes_interpreted(regime):
         return (*inputs, dy)
 
     starts = regime_draw(regime, jnp.float32, 0, *shape)[1]
-    assert_as_exact(jax.jit(with_gradients(scanned(template, starts))),
+    assert_as_exact(run_to_run(jax.jit(with_gradients(scanned(template, starts))), ATOMIC),
                     jax.jit(with_gradients(scanned(portable, starts))), draws,
                     f"the selective template under {regime}", seeds=FEWEST_SEEDS,
                     truth_fn=jax.jit(with_gradients(scanned(portable, starts))))
@@ -161,7 +167,8 @@ def the_template_is_as_exact_as_mamba_ssm(case: str):
         with generation.chosen(selective_scan="mosaic_gpu"):
             return selective_xla(arrays, dtype, scan=scan)
 
-    assert_as_exact(jax.jit(run), as_given(reference), draw, f"the selective template against mamba_ssm, "
+    assert_as_exact(run_to_run(jax.jit(run), ATOMIC), as_given(reference), draw,
+                    f"the selective template against mamba_ssm, "
                     f"{case}", seeds=seeds, truth_fn=as_given(truth))
 
 
@@ -243,7 +250,7 @@ def the_layer_is_as_exact_under_the_template(packed: bool, held: str | None, *, 
         return variables, x, jax.random.normal(keys[1], out).astype(dtype)
 
     truth = layer.clone(dtype=jnp.float64)
-    assert_as_exact(jax.jit(with_gradients(run(layer, template=True))),
+    assert_as_exact(run_to_run(jax.jit(with_gradients(run(layer, template=True))), ATOMIC),
                     jax.jit(with_gradients(run(layer, template=False))), draws,
                     f"a Mamba layer under the template{', packed' if packed else ''}"
                     f"{f', a held state {held}' if held else ''}",
@@ -316,7 +323,8 @@ def test_the_selective_scan_through_its_dispatch_is_as_exact_as_the_portable_sca
     def reference(x, dt, a, b, c, skip):
         return portable(x, dt, a, b, c.astype(jnp.float32), skip, None, None)[0]
 
-    assert_as_exact(jax.jit(with_gradients(dispatched(forms, named=True, c_dtype=c_dtype))),
+    assert_as_exact(run_to_run(jax.jit(with_gradients(dispatched(forms, named=True, c_dtype=c_dtype))),
+                               ATOMIC),
                     jax.jit(with_gradients(reference)), draws,
                     f"the selective scan's dispatch, the template named, under the {forms} forms, C in "
                     f"{jnp.dtype(c_dtype).name}",
