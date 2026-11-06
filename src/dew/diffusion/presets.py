@@ -16,8 +16,11 @@ from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import (
+    CosineContinuousNoiseScheduler,
+    CosineGeneralNoiseScheduler,
     CosineNoiseScheduler,
     EDMNoiseScheduler,
+    ExpNoiseScheduler,
     FlowMatchingScheduler,
     KarrasVENoiseScheduler,
     SqrtContinuousNoiseScheduler,
@@ -25,6 +28,7 @@ from dew.diffusion.schedules import (
 from dew.diffusion.schedules.flow import Density, token_mu
 from dew.diffusion.transforms import (
     DirectPredictionTransform,
+    EpsilonPredictionTransform,
     FlowMatchPredictionTransform,
     KarrasPredictionTransform,
     MinSNR,
@@ -170,6 +174,63 @@ class Cosine:
                 p2_loss_weight_k=self.p2_loss_weight_k,
                 p2_loss_weight_gamma=self.p2_loss_weight_gamma),
             prediction=VPredictionTransform(),
+            weighting=_weighting(self.min_snr_gamma))
+
+
+@dataclass(frozen=True)
+class CosineContinuous:
+    """FlaxDiff's continuous cosine schedule (`CosineContinuousNoiseScheduler`) with v-prediction, as
+    FlaxDiff pairs its cosine schedule (inference_prototype.ipynb at 15c55b001)."""
+
+    min_snr_gamma: float | None = None
+
+    def __call__(self) -> Process:
+        return Process(
+            schedule=CosineContinuousNoiseScheduler(),
+            prediction=VPredictionTransform(),
+            weighting=_weighting(self.min_snr_gamma))
+
+
+@dataclass(frozen=True)
+class CosineGeneral:
+    """FlaxDiff's tangent grid of sigmas (`CosineGeneralNoiseScheduler`), variance exploding, with the EDM
+    preconditioning at its `sigma_data`, as FlaxDiff pairs its variance-exploding schedules. `kappa`
+    scales the grid's tangent: with another than 1 it runs from sigma_min / kappa^2 to
+    sigma_max / kappa^2."""
+
+    sigma_min: float = 0.02
+    sigma_max: float = 80.0
+    kappa: float = 1.0
+    sigma_data: float = 1.0
+    min_snr_gamma: float | None = None
+
+    def __call__(self) -> Process:
+        return Process(
+            schedule=CosineGeneralNoiseScheduler(
+                sigma_min=self.sigma_min, sigma_max=self.sigma_max, kappa=self.kappa,
+                sigma_data=self.sigma_data),
+            prediction=KarrasPredictionTransform(sigma_data=self.sigma_data),
+            weighting=_weighting(self.min_snr_gamma))
+
+
+@dataclass(frozen=True)
+class Exp:
+    """FlaxDiff's exponential beta table (`ExpNoiseScheduler`) with epsilon prediction, FlaxDiff's
+    trainer's default (`GeneralDiffusionTrainer`, flaxdiff/trainer at 15c55b001). The P2 weight
+    arguments are those of `Cosine`."""
+
+    timesteps: int = 1000
+    beta_end: float = 0.999
+    p2_loss_weight_k: float = 1.0
+    p2_loss_weight_gamma: float = 1.0
+    min_snr_gamma: float | None = None
+
+    def __call__(self) -> Process:
+        return Process(
+            schedule=ExpNoiseScheduler(
+                self.timesteps, beta_end=self.beta_end, p2_loss_weight_k=self.p2_loss_weight_k,
+                p2_loss_weight_gamma=self.p2_loss_weight_gamma),
+            prediction=EpsilonPredictionTransform(),
             weighting=_weighting(self.min_snr_gamma))
 
 
@@ -321,6 +382,9 @@ class Sqrt:
 __all__ = [
     "EDM",
     "Cosine",
+    "CosineContinuous",
+    "CosineGeneral",
+    "Exp",
     "Flow",
     "JiT",
     "Karras",
