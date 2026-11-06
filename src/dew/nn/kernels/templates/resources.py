@@ -143,7 +143,10 @@ def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int]
 def program_shared(block: int, programs: int) -> int:
     """The shared memory each of `programs` programs a multiprocessor runs at once may stage, on a GPU whose
     block holds `block` bytes: the multiprocessor's (the block's and one reservation,
-    `Multiprocessor.reserved_shared`) split between them, less each one's own reservation."""
+    `Multiprocessor.reserved_shared`) split between them, less each one's own reservation; one program's
+    the whole block (a TPU core's, whose scoped VMEM no reservation shares)."""
+    if programs == 1:
+        return block
     reserved = facts().reserved_shared
     return (block + reserved) // programs - reserved
 
