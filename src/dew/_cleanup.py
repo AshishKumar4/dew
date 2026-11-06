@@ -119,22 +119,24 @@ def members(group: int) -> list[int]:
 
 GATE = ("import os, signal, sys\n"
         "held, failed = int(sys.argv[1]), int(sys.argv[2])\n"
+        "signal.pthread_sigmask(signal.SIG_SETMASK, [int(n) for n in filter(None, sys.argv[4].split(','))])\n"
         "os.set_inheritable(failed, False)\n"
         "for name in filter(None, sys.argv[3].split(',')):\n"
         "    signal.signal(getattr(signal, name), signal.SIG_DFL)\n"
         "if os.read(held, 1):\n"
         "    os.close(held)\n"
         "    try:\n"
-        "        os.execvp(sys.argv[4], sys.argv[5:])\n"
+        "        os.execvp(sys.argv[5], sys.argv[6:])\n"
         "    except OSError as error:\n"
         "        os.write(failed, str(error.errno).encode())\n"
         "os._exit(127)\n")
 """What a `start`ed group's leader runs before its command, as the same process: it waits for its owner's
 release, given once the lifeline holds its id, then executes the command, or writes the error its
 execution raised; an owner gone before it released the command (its pipe closed with nothing written)
-leaves it to exit having run nothing. It sets the signals it is given (`_restored`) to their defaults
-first, as Popen leaves them in the process it executes, so the command meets them so, a pipe's writer
-ending by its SIGPIPE."""
+leaves it to exit having run nothing. It sets its signal mask back to its owner's (`start` blocks every
+signal while it starts the group) and the signals it is given (`_restored`) to their defaults first, as
+Popen leaves them in the process it executes, so the command meets them so, a pipe's writer ending by its
+SIGPIPE."""
 
 
 def start(command: Sequence[str], **options) -> subprocess.Popen:
@@ -154,6 +156,14 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
     program = options.pop("executable", command[0])
     defaults = ",".join(_restored(options.pop("restore_signals", True)))
     passed = options.pop("pass_fds", ())
+    # Every signal waits while the start opens descriptors, starts its processes and hands the owner pipe to
+    # `_LIFELINES`, and while it undoes them: an interruption (a handler that raises, KeyboardInterrupt's)
+    # landing between a descriptor's creation and `owned`'s holding it, or inside Popen's own, would leak
+    # it. It lands once the group's every descriptor is held, before the command is released, or as the
+    # start leaves. The lifeline and the gate set the caller's mask back first (`mask`), so the command runs
+    # under it. The caller's mask is read before any is blocked, so whatever raises leaves it as it was.
+    caller = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+    mask = ",".join(str(int(number)) for number in caller)
     # The descriptors this start holds, each closed once it is done with, or handed to `_LIFELINES` (the
     # owner pipe's write end): what is left here when it raises is closed then.
     owned: list[int] = []
@@ -161,11 +171,12 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
     unheld: subprocess.Popen | None = None
     process = None
     try:
+        signal.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals())
         owned.extend(os.pipe2(os.O_CLOEXEC))
         read, write = owned
         # Isolated (-I): run as a script, this file's own directory would otherwise lead sys.path, where
         # dew's io.py and logging.py stand in for the standard library's.
-        line = subprocess.Popen([sys.executable, "-I", __file__, str(read)], pass_fds=(read,),
+        line = subprocess.Popen([sys.executable, "-I", __file__, str(read), mask], pass_fds=(read,),
                                 start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
         unheld = line
@@ -174,7 +185,7 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
         owned.extend(os.pipe2(os.O_CLOEXEC))
         held, release, told, failed = owned[1:]
         process = subprocess.Popen([sys.executable, "-I", "-S", "-c", GATE, str(held), str(failed), defaults,
-                                    program, *command], start_new_session=True,
+                                    mask, program, *command], start_new_session=True,
                                    pass_fds=(*passed, held, failed), **options)
         _close(owned, held)
         _close(owned, failed)
@@ -184,12 +195,15 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
             _LIFELINES[process.pid] = (write, line)
             owned.remove(write)
             unheld = None
+        # Every descriptor held: an interruption waiting lands here, or as the command executes.
+        signal.pthread_sigmask(signal.SIG_SETMASK, caller)
         os.write(release, b"1")
         # Closed by the command's execution, or written with its error.
         number = b"".join(iter(lambda: os.read(told, 64), b""))
         if number:
             raise OSError(int(number), os.strerror(int(number)), program)
     except BaseException:
+        signal.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals())
         if process is not None:
             # Its lifeline too, where the table holds it.
             stop(process)
@@ -205,6 +219,8 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
     finally:
         for end in owned:
             os.close(end)
+        # A start that raised before releasing its command lets a waiting interruption land as it leaves.
+        signal.pthread_sigmask(signal.SIG_SETMASK, caller)
     return process
 
 
@@ -339,4 +355,6 @@ def lifeline(owner: int) -> None:
 
 
 if __name__ == "__main__":
+    # The owner's signal mask, which its `start` blocked every signal around.
+    signal.pthread_sigmask(signal.SIG_SETMASK, [int(number) for number in sys.argv[2].split(",") if number])
     lifeline(int(sys.argv[1]))
