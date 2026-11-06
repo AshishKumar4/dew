@@ -505,9 +505,14 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                     # As many programs a multiprocessor as the derived tile's, else one, whose registers its
                     # consumers then share alone.
                     residencies = dict.fromkeys((config.programs, 1))
-                    staged = (_replaced(config, warpgroups=consumers, block_m=rows_, stages=stages,
-                                        programs=programs, cluster=config.cluster if consumers > 1 else 1)
-                              for rows_ in shares for programs in residencies
+                    # At the derived step's depth, else twice it: two consumers each copy a share of a block's
+                    # first axis in whole 32-row parts (`Transport.shares_rows`), a transposed right
+                    # operand's its depth.
+                    depths = dict.fromkeys((config.block_k, 2 * config.block_k))
+                    staged = (_replaced(config, warpgroups=consumers, block_m=rows_, block_k=depth,
+                                        stages=stages, programs=programs,
+                                        cluster=config.cluster if consumers > 1 else 1)
+                              for rows_ in shares for depth in depths for programs in residencies
                               for stages in range(config.stages, 1, -1))
                     tile = next((tile for tile in staged
                                  if tile is not None and launch.legal(ba, tile, target)), None)
