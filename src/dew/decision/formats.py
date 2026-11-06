@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 from dew.decision.calibration import Calibration
 from dew.decision.release import decision_envelope
-from dew.interop.release import computed_in
+from dew.interop.release import computed_in, released
 from dew.interop.releases import Assets, HeadFiles, Placed, ReleasePlan, bundle_plan
 
 if TYPE_CHECKING:
@@ -112,9 +112,12 @@ def decision_plan(bundle: PretrainedDecision) -> ReleasePlan | Unwritable:
     assets = Assets(tokenizer=bundle.decision_tokenizer, folder=chosen.tokenizer_folder,
                     generation_config=backbone.assets.generation_config if chosen.generation else None)
     layout, max_length, calibration = chosen.stated(bundle)
-    # Every bundle states the dtype it computes in, a task's and one read from a release alike, so a load of
-    # what it writes computes as it does.
-    compute = computed_in(bundle.numerics, bundle.model, bundle.variables)
+    # A task's bundle states the dtype it computes in, and one read from a release whose record stated one
+    # restates it, as the bundle computes, so a load of what it writes computes as it does; a source whose
+    # record states none (an external release's) leaves its files' own.
+    stated = (bundle.source is None or bundle.numerics is not None
+              or released(bundle.source)[2] is not None)
+    compute = computed_in(bundle.numerics, bundle.model, bundle.variables) if stated else None
     envelope = decision_envelope(backbone.envelope, layout, calibration, max_length=max_length,
                                  numerics=bundle.numerics, compute=compute)
     return ReleasePlan(placed, chosen.head(bundle), assets, envelope)

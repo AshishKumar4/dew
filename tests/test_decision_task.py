@@ -678,6 +678,20 @@ def test_a_laya_tasks_release_bundle_saves_and_exports_the_tasks_release(decide,
         np.testing.assert_array_equal(np.asarray(exported[name]), tensor, err_msg=name, strict=True)
 
 
+def test_a_laya_release_loaded_and_saved_again_states_the_dtype_its_task_computed_in(decide, tmp_path):
+    """A Laya task's release states the dtype the task computes in; loaded and saved again, its bundle
+    restates it, so the second release loads computing as the task did, where its record dropped it and a
+    load took BF16 (EX02's review)."""
+    from dew.config.release import Release
+    from dew.interop.pretrained import Pretrained
+
+    decide.save_pretrained(tmp_path / "task")
+    Pretrained.load(tmp_path / "task").save(tmp_path / "again")
+    first, again = Release.load(tmp_path / "task"), Release.load(tmp_path / "again")
+    assert first is not None and again is not None and first.task is not None
+    assert again.task == first.task
+
+
 def test_a_task_under_lora_saves_its_factors_merged_and_reads_back_the_same(decide, tmp_path):
     """A ModernBERT task whose backbone runs under LoRA, its factors moved off
     zero, saves in Laya's layout with the factors merged into their kernels
