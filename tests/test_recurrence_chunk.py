@@ -19,6 +19,7 @@ from reference_error import (
     assert_fp32_reduction_bound,
     chain_roundings,
     widened,
+    with_gradients,
 )
 
 from dew.nn.kernels import generation, recurrence, recurrence_algebra as algebra, recurrence_chunk
@@ -198,6 +199,80 @@ def test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(hooks, pack
     reference = jax.jit(functools.partial(token_by_token, hooks))
     assert_as_exact(dew, reference, functools.partial(draw, hooks, packed), f'{hooks} packed={packed}',
                     seeds=SEEDS[hooks, packed])
+
+
+DOCUMENTS = ((0, 23, 40), (0, 9, 48))
+"""Each row's packed documents' first tokens under `draw`'s `packed`."""
+
+ENTERED = ((2, 0, 1), (3, 1, 2))
+"""The slot each row's document enters (one-based, zero a zero memory): a row's slots each entered once
+but the second row's first, and its third entered twice, so the slot's gradient sums two documents'."""
+
+
+def entered_draw(hooks, seed: int):
+    """`draw`'s packed operands, each document entering its `ENTERED` slot's memory of three a row, and
+    cotangents of the output and each document's final memory."""
+    (operands,) = draw(hooks, packed=True, seed=seed)
+    keys = jax.random.split(jax.random.fold_in(jax.random.key(seed), 9), 3)
+    slots = 0.3 * jax.random.normal(keys[0], (ROWS, 3, *operands.state.shape[1:]))
+    out = jax.random.normal(keys[1], operands.value.shape)
+    final = jax.random.normal(keys[2], slots.shape)
+    # The documents' bounds and slots are the call's structure, which the arms close over: no gradient.
+    return dataclasses.replace(operands, state=slots, starts=None), (out, final)
+
+
+
+
+def _documents(operands):
+    """`operands` with `draw`'s packed documents, each entering its `ENTERED` slot."""
+    starts = jnp.zeros(operands.value.shape[:2], bool)
+    for row, begins in enumerate(DOCUMENTS):
+        starts = starts.at[row, jnp.asarray(begins)].set(True)
+    return dataclasses.replace(operands, starts=starts, entered=jnp.asarray(ENTERED, jnp.int32))
+
+
+def document_by_document(hooks, operands):
+    """Each document of `operands` a sequence of its own from its slot's memory through `token_by_token`,
+    its outputs back in place and its final memory its own `[B, D, Hv, Dk, Dv]`."""
+    tokens = ('query', 'key', 'value', 'log_decay', 'gate', 'beta', 'z')
+    outs, finals = [], []
+    for row, (begins, entered) in enumerate(zip(DOCUMENTS, ENTERED, strict=True)):
+        ends = (*begins[1:], operands.value.shape[1])
+        pieces, kept = [], []
+        for begin, end, slot in zip(begins, ends, entered, strict=True):
+            state = (operands.state[row, slot - 1] if slot else jnp.zeros_like(operands.state[row, 0]))
+            fields = {name: getattr(operands, name)[row:row + 1, begin:end] for name in tokens
+                      if getattr(operands, name) is not None}
+            piece = dataclasses.replace(operands, **fields, state=state[None], starts=None, entered=None)
+            out, final = token_by_token(hooks, piece)
+            pieces.append(out[0])
+            kept.append(final[0])
+        outs.append(jnp.concatenate(pieces))
+        finals.append(jnp.stack(kept))
+    return jnp.stack(outs), jnp.stack(finals)
+
+
+@pytest.mark.check1_shards(seeds=80, per_task=16)
+@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[9], HOOKS[6], FORMED[0]], ids=str)
+def test_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hooks):
+    """80 draws, 16 a task: at 40 a skip's and a gated decay's bias's gradients, two entries a head, were
+    inconclusive (intervals 1.58 and 1.56 wide, pooled 1.09 and 0.95; jsf-1506b), and 40 took up to 115 s.
+    Packed documents each entering a memory of its own (`Chunk.entered`, a request's shared prefix's
+    final memory for each of its questions): the portable math's output, each document's final memory and
+    every operand's gradient, the slots' memories' included (a slot entered twice summing both documents'),
+    against each document a sequence of its own from its slot's memory, the recurrence a token at a time
+    from float64."""
+    def ours(operands):
+        out, final = chunk_on('xla', hooks, _documents(operands), chunk_size=CHUNK)
+        return out.astype(jnp.float32), final.astype(jnp.float32)
+
+    def theirs(operands):
+        out, final = document_by_document(hooks, operands)
+        return out.astype(jnp.promote_types(out.dtype, jnp.float32)), final
+
+    assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(theirs)),
+                    functools.partial(entered_draw, hooks),
+                    f'{hooks} documents entering their own memories', seeds=80)
 
 
 def edge_draw(hooks, seed: int):
