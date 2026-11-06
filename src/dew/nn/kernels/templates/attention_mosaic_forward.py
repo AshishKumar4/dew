@@ -235,8 +235,11 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
     at once and their magnitudes summed, 64 x 64 at width 64 spilled 1,820 bytes on an H100)."""
     def held(candidate: Tiles) -> bool:
         rows, block = candidate.block_q, candidate.block_k
-        # Priced in the layout the guarded launch takes at its share (`guarded_family`).
+        # Priced in the layout the guarded launch takes at its share (`guarded_family`); every tile where
+        # the family budgets no registers (`Family.budgets_registers`: a TPU core's values spill to VMEM).
         arranged = guarded_family(family, rows, block, columns)
+        if not arranged.budgets_registers:
+            return True
         carried = [(rows, columns, jnp.float32)] * 2 + [(rows, 4 * GUARD_ROWS, jnp.float32)]
         logits, sums = [(rows, block, jnp.float32)] * 2, [(rows, columns, jnp.float32)] * 2
         fragments = _products(arranged, dtype, (rows, width, block, logits, False, True),
