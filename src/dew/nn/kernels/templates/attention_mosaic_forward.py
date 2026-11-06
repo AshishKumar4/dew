@@ -212,7 +212,9 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
         return live <= arranged.registers(candidate.consumers)
 
     blocks = [block for block in walked_extents(family, dtype, tiles.block_k) if tiles.block_k % block == 0]
-    queries = [rows for rows in extents(family, dtype, tiles.block_q) if tiles.block_q % rows == 0]
+    # A plain tile of fewer rows than a role's guards at its own rows (`few_rows`).
+    queries = [rows for rows in extents(family, dtype, tiles.block_q) if tiles.block_q % rows == 0] or [
+        tiles.block_q]
     # Its key blocks copied by its consumers together where its family's copies split them
     # (`Transport.shares_rows`: two mma.sync consumers' cp.async in whole 64-row parts).
     candidates = (dataclasses.replace(tiles, block_q=rows, block_k=block, consumers=consumers, narrow=narrow)

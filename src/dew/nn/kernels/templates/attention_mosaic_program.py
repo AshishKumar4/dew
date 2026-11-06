@@ -50,26 +50,50 @@ QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name})
 """The bundles the attention mainloop is qualified on: wgmma's, with a producer and with consumers that
 feed their own rings (`mosaic_sm90.FED`). mma.sync's (an A100's) joins once every launch it derives
 compiles spill-free (the resource gate's sm80 cases, `GATED`; row 2078: check 1 held there,
-ET-2078-A100CHECK3)."""
+ET-2078-A100CHECK3); before that it takes a launch of fewer rows than a role's (`few_rows`)."""
 
 
-def bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
-    """The bundle the attention mainloop runs on a device of `generation_name` for operands of `dtype`: the
-    shared registry's (`bundles.of`) where attention is qualified on its family (`QUALIFIED`); None elsewhere,
-    whose calls another mainloop takes by legality."""
+def few_rows(family: mosaic.Family, rows: int | None) -> bool:
+    """Whether a launch of `rows` rows takes `family` at tiles of fewer rows than a role's products cover: a
+    decode step's few packed rows (row 4042) on a family whose warps then lie along its tiles' columns
+    (`Family.specialized`: mma.sync's one warp of 16 rows, the four along its keys), its query tile the
+    issuer's rows (`query_rows`)."""
+    if rows is None or rows >= family.role_rows:
+        return False
+    padded = -(-rows // family.rows) * family.rows
+    return family.specialized(padded, family.role_rows) != family
+
+
+def qualified(family: mosaic.Family, rows: int | None = None) -> bool:
+    """Whether the attention mainloop runs a launch of `rows` rows on `family`: a qualified bundle
+    (`QUALIFIED`), or one taking them at tiles of fewer rows than its role's (`few_rows`)."""
+    return family.name in QUALIFIED or few_rows(family, rows)
+
+
+def bundle(generation_name: str | None, dtype, rows: int | None = None) -> mosaic.Family | None:
+    """The bundle the attention mainloop runs on a device of `generation_name` for operands of `dtype` and a
+    launch of `rows` rows: the shared registry's (`bundles.of`) where attention is qualified on it
+    (`qualified`); None elsewhere, whose calls another mainloop takes by legality."""
     family = None if generation_name is None else bundles.of(generation_name, dtype)
-    return family if family is not None and family.name in QUALIFIED else None
+    return family if family is not None and qualified(family, rows) else None
 
 
 def layouts(generation_name: str | None, dtype, rows: int | None = None) -> tuple[mosaic.Family, ...]:
     """The bundles a launch of the attention mainloop takes on a device of `generation_name` for operands of
     `dtype`, in preference order (`bundles.layouts`: a producer's layout, then on warpgroup MMA the layout
     whose consumers feed their own rings, `mosaic_sm90.FED`; given the launch's `rows`, each issuer the
-    device has, by the share of its rows they fill), where its family is qualified (`bundle`)."""
-    if generation_name is None or bundle(generation_name, dtype) is None:
+    device has, by the share of its rows they fill), where its family is qualified (`qualified`)."""
+    if generation_name is None:
         return ()
-    return tuple(family for family in bundles.layouts(generation_name, dtype, rows)
-                 if family.name in QUALIFIED)
+    return tuple(family for family in bundles.layouts(generation_name, dtype, rows) if qualified(family, rows))
+
+
+def query_rows(family: mosaic.Family, dtype, rows: int) -> int:
+    """The least query tile a launch of `rows` rows takes on `family`: a role's whole swizzled rows
+    (`extents`), or the issuer's rows where the launch's rows are fewer than a role's (`few_rows`)."""
+    if few_rows(family, rows):
+        return -(-rows // family.rows) * family.rows
+    return extents(family, dtype, rows)[-1]
 
 
 def bundle_of(tiles: "Tiles | BackwardTiles", dtype) -> mosaic.Family:
