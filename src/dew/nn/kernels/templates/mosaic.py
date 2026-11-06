@@ -842,8 +842,26 @@ class Ring:
             return
         rows = self.block[0] // len(view)
         for index, piece in enumerate(view):
-            plgpu.copy_gmem_to_smem(piece, self.smem.at[slot, pl.ds(index * rows, rows)], self.full.at[slot],
-                                    collective_axes=self.multicast)
+            for source, destination in self.parts(slot, index * rows, piece):
+                plgpu.copy_gmem_to_smem(source, destination, self.full.at[slot],
+                                        collective_axes=self.multicast)
+
+    def parts(self, slot, start: int, piece) -> list[tuple]:
+        """A piece's copies into `slot`'s rows from `start` (`load`), each a source and its destination: the
+        slot's rows as its transforms index them, where they are whole tiles of rows (`TILE_ROWS`) or the slot
+        is plain; else, a row's alone (a gathered stream's, `Rows` of one row), each of its tiles' columns
+        into the slot's physical row at the slot's swizzle. TMA swizzles a row by its shared-memory address
+        (the CUDA programming guide's swizzle pointer offset: a 128-byte-aligned row swizzled as the row of
+        the pattern it lies at), so the row lands as its tile's row does."""
+        rows = piece.shape[0]
+        match getattr(self.smem, "transforms", ()):
+            case (plgpu_core.UnswizzleRef() as unswizzled, plgpu_core.UntilingTransform(tiling=(tile, width)),
+                  ) if rows % tile:
+                physical = state_types.TransformedRef(self.smem.ref, (unswizzled,))
+                return [(piece.at[pl.ds(row, 1), pl.ds(column * width, width)],
+                         physical.at[slot, (start + row) // tile, column, pl.ds((start + row) % tile, 1)])
+                        for row in range(rows) for column in range(self.block[1] // width)]
+        return [(piece, self.smem.at[slot, pl.ds(start, rows)])]
 
     def acquire(self, turn: Turn):
         """A consumer's wait for `turn`'s load: its slot. Each load is waited for by each consumer, as every
@@ -1616,6 +1634,11 @@ class Transport[Allocated, Opened](abc.ABC):
     """Whether a block's pieces (`copies_in_pieces`) may be pieces of any view (a TMA ring's: an fp32
     operand's parts, `Pieces`), where cp.async's are a table's runs alone (`mosaic.Rows`, a paged call's
     pages: `mosaic_sm80._run`)."""
+
+    gathers_rows: bool = False
+    """Whether its producer warpgroup gathers a step's rows from a table (a gathered stream's `Rows` of one
+    row: `GatheredRing`, its threads' cp.async copies; a ring family's); where not (mma.sync's pipeline, no
+    producer of its own), a gathered call is not its launch's."""
 
     copies_vectors: bool = True
     """Whether its copies move a one-dimensional block untiled (TMA's), where cp.async spreads a copy over a
