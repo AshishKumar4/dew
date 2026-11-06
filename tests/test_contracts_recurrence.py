@@ -446,14 +446,15 @@ def test_the_short_conv_holds_every_order(edge):
     float64 is a normal float32 and the causal depthwise conv as its definition sums it is, at inputs and
     taps whose products near float32's ends."""
     scale = EDGES[edge]
-    x, taps, bias = normal_draw(2677, (1, 12, 16), (16, 4), (16,))
+    # A warpgroup's channels, the kernels' block (`templates.recurrence.conv.fits`).
+    x, taps, bias = normal_draw(2677, (1, 12, 128), (128, 4), (128,))
     primals = (x * scale, taps, bias * scale)
     direction = tuple(along * (scale if at != 1 else 1.0)
                       for at, along in enumerate(normal_draw(2678, x.shape, taps.shape, bias.shape)))
     (cotangent,) = normal_draw(2679, x.shape)
 
     def kernel(x, taps, bias):
-        return short_conv.conv(x, taps, bias, None, None, ((16, None),), activation=True, eps=1e-6,
+        return short_conv.conv(x, taps, bias, None, None, ((128, None),), activation=True, eps=1e-6,
                                dtype=x.dtype, interpret=INTERPRETED)[0]
 
     def plain(x, taps, bias):
