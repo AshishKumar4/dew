@@ -1161,26 +1161,35 @@ def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
         assert np.linalg.norm(updated) < np.linalg.norm(before)
 
 
-class Attending(nn.Module):
-    """A denoiser of one attention layer over its pixels, which sows its per-head logit maxima where the `qk`
-    collection is open, as Dew's attention does (`max_logits`, `kv_heads`, `head_dim`), its query and key
-    projections named as QK-Clip finds them (`dew.optim.QK_PROJECTIONS`)."""
+class Attention(nn.Module):
+    """One attention layer that sows its per-head logit maxima where the `qk` collection is open, as Dew's
+    attention does (`max_logits`, `kv_heads`, `head_dim`), its query and key projections named as QK-Clip
+    finds them (`dew.optim.QK_PROJECTIONS`)."""
 
     heads: int = 2
     width: int = 4
 
     @nn.compact
-    def __call__(self, sample, time, *, train=False, **_):
-        rows = sample.shape[0]
-        tokens = nn.Dense(8)(sample.reshape(rows, -1, sample.shape[-1])) + nn.Dense(8)(time[:, None, None])
+    def __call__(self, tokens):
+        rows = tokens.shape[0]
         query, key, value = (nn.Dense(self.heads * self.width, name=name)(tokens).reshape(
             rows, -1, self.heads, self.width) for name in ("q_proj", "k_proj", "v_proj"))
         logits = jnp.einsum("bqhd,bkhd->bhqk", query, key) / np.sqrt(self.width)
         self.sow("qk", "max_logits", jnp.max(logits, axis=(2, 3)).astype(jnp.float32))
         self.sow("qk", "kv_heads", jnp.asarray(self.heads))
         self.sow("qk", "head_dim", jnp.asarray(self.width))
-        attended = jnp.einsum("bhqk,bkhd->bqhd", jax.nn.softmax(logits), value).reshape(rows, -1, 8)
-        return nn.Dense(sample.shape[-1])(attended).reshape(sample.shape)
+        attended = jnp.einsum("bhqk,bkhd->bqhd", jax.nn.softmax(logits), value)
+        return attended.reshape(rows, -1, self.heads * self.width)
+
+
+class Attending(nn.Module):
+    """A denoiser of one attention layer over its pixels (`Attention`)."""
+
+    @nn.compact
+    def __call__(self, sample, time, *, train=False, **_):
+        rows = sample.shape[0]
+        tokens = nn.Dense(8)(sample.reshape(rows, -1, sample.shape[-1])) + nn.Dense(8)(time[:, None, None])
+        return nn.Dense(sample.shape[-1])(Attention(name="attention")(tokens)).reshape(sample.shape)
 
 
 @pytest.mark.parametrize("kind", ["decision", "supervised", "diffusion"])
@@ -1222,7 +1231,7 @@ def test_every_objective_carries_live_qk_statistics_to_muonclip(kind, tmp_path):
                                        inputs=InputSpec(Field("image", (4, 4, 3))), ema_decay=None,
                                        guidance=None)
         batch = {"image": np.random.default_rng(9).integers(0, 256, (8, 4, 4, 3), dtype=np.uint8)}
-        clipped = ()
+        clipped = ("attention",)
     optimizer = OptimConfig(optimizer="muonclip", learning_rate=0., optimizer_opts={"qk_clip_threshold": .01})
     trainer = Trainer(objective, optimizer.build(2), key=jax.random.key(0))
     initial = trainer.initial_state()
@@ -1232,7 +1241,7 @@ def test_every_objective_carries_live_qk_statistics_to_muonclip(kind, tmp_path):
     observed = compact_qk(aux.qk_stats)
     for name in clipped:
         observed = observed[name]
-    sown = observed["self_attn"]["max_logits"][0] if kind != "diffusion" else observed["max_logits"][0]
+    sown = (observed["self_attn"] if kind != "diffusion" else observed)["max_logits"][0]
     assert np.max(np.asarray(sown)) > .01
     final, *_ = trainer.compile(initial, batch)(initial, batch)
     assert int(final.updates) == 1
