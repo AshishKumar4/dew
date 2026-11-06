@@ -11,7 +11,7 @@ from .attention_kernels import SPLASH_LANES
 from .attention_masks import repeat_kv_heads, structural_mask
 from .attention_parallel import four_dimensional, on_attention_shards, shard_heads
 from .documents import document_ids
-from .precision import at_default_precision
+from .precision import at_precision
 from .sharding import SCORES
 from .visibility import window_sides
 
@@ -79,8 +79,8 @@ def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
         # Mosaic multiplies 16-bit operands at the default precision only.
         # Their products are exact and accumulate in fp32; splash's fp32 P·V
         # takes one bf16 pass, as at any default-precision run
-        # (`at_default_precision`).
-        return at_default_precision(attend)(query, key, value, bias, sinks)
+        # (`at_precision`).
+        return at_precision('default')(attend)(query, key, value, bias, sinks)
     return attend(query, key, value, bias, sinks)
 
 
