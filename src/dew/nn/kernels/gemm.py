@@ -32,6 +32,7 @@ accumulator only where the epilogue's VJP reads it.
 
 import dataclasses
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -762,15 +763,15 @@ def dot_general(xla):
     before wherever the template declares XLA faster; every other product is `xla`'s."""
     def product(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None, **kwargs):
         (contracted, against), batch = dimension_numbers
+        out_dtype = jnp.dtype(preferred_element_type or lhs.dtype)
+        # The run's low-precision recipe takes the product where the projection's role takes it.
+        if not kwargs and (recipe := _recipe_general(lhs, rhs, dimension_numbers, out_dtype)) is not None:
+            return recipe
         plain = (not kwargs and jnp.ndim(rhs) == 2 and lhs.dtype == rhs.dtype
                  and tuple(contracted) == (lhs.ndim - 1,) and tuple(against) == (0,)
                  and tuple(map(tuple, batch)) == ((), ()))
         if plain:
             rows = lhs.reshape(-1, lhs.shape[-1])
-            out_dtype = jnp.dtype(preferred_element_type or lhs.dtype)
-            # The run's low-precision recipe takes the product where the projection's role takes it.
-            if (recipe := recipe_projection(rows, rhs, out_dtype=out_dtype)) is not None:
-                return recipe.reshape(*lhs.shape[:-1], rhs.shape[1])
             if _launched(rows, rhs, out_dtype, precision):
                 product = gemm(rows, rhs, out_dtype=out_dtype, precision=precision)
                 return product.reshape(*lhs.shape[:-1], rhs.shape[1])
@@ -778,6 +779,29 @@ def dot_general(xla):
                    preferred_element_type=preferred_element_type, **kwargs)
 
     return product
+
+
+def _recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype) -> jax.Array | None:
+    """A layer's product (`jax.lax.dot_general`'s `dimension_numbers`) in the run's low-precision recipe
+    (`recipe_projection`), as matrices: a dense projection's free rows against its kernel's contracted
+    axes, a batched one's (a grouped output projection's, DeepSeek V4's `o_a_proj`) each batch member a
+    group of rows against its own matrix, the result in `dot_general`'s order (batch, `lhs`'s free axes,
+    `rhs`'s); None where `recipe_projection` takes none of it."""
+    (contracted, against), (batched, batched_rhs) = (tuple(map(tuple, pair)) for pair in dimension_numbers)
+    free = [axis for axis in range(lhs.ndim) if axis not in contracted + batched]
+    free_rhs = [axis for axis in range(rhs.ndim) if axis not in against + batched_rhs]
+    groups = math.prod(lhs.shape[axis] for axis in batched)
+    count = math.prod(lhs.shape[axis] for axis in free)
+    depth = math.prod(lhs.shape[axis] for axis in contracted)
+    width = math.prod(rhs.shape[axis] for axis in free_rhs)
+    rows = jnp.transpose(lhs, (*batched, *free, *contracted)).reshape(groups * count, depth)
+    matrices = jnp.transpose(rhs, (*batched_rhs, *against, *free_rhs)).reshape(groups, depth, width)
+    out = (recipe_projection(rows, matrices, jnp.full((groups,), count, jnp.int32), out_dtype=out_dtype)
+           if batched else recipe_projection(rows, matrices[0], out_dtype=out_dtype))
+    if out is None:
+        return None
+    return out.reshape(*(lhs.shape[axis] for axis in (*batched, *free)),
+                       *(rhs.shape[axis] for axis in free_rhs))
 
 
 def _launched(rows: jax.Array, matrix: jax.Array, out_dtype, precision: PrecisionLike) -> bool:

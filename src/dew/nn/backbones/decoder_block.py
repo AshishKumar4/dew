@@ -1046,7 +1046,13 @@ class DecoderBlock(nn.Module):
                 raise ValueError(f"this layer's mixer ({type(self.self_attn).__name__}) has no attention of "
                                  "its own for its cross-attention block to read a context through")
             layer = {"layer": LayerReads(self._attention_input, self.self_attn, progress)}
-        cross = functools.partial(self.cross_attention, decode=decode, train=train, **layer)
+        joined = functools.partial(self.cross_attention, decode=decode, train=train, **layer)
+
+        def cross(*arguments, **options):
+            # Its attention's projections are a mixer's, its feed-forward's a feed-forward's.
+            with projection_role("mixer"):
+                return joined(*arguments, **options)
+
         if isinstance(state, _Plain):
             return state._replace(x=constrain(cross(state.x, context), RESIDUAL))
         if isinstance(state, _Streams):
