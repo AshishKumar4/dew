@@ -1336,10 +1336,10 @@ def _key_views(named: dict, row, head, sources, table, *, page: int | None, bloc
     block = column_block
 
     def at_columns(j):
-        # A paged tile's pages each at the column block (`mosaic.Pieces`).
+        # A paged tile's pages each at the column block (`mosaic.Rows`).
         indices = tile(j)
-        if isinstance(indices, mosaic.Pieces):
-            return mosaic.Pieces((piece[0], block) for piece in indices)
+        if isinstance(indices, mosaic.Rows):
+            return dataclasses.replace(indices, rest=(block,))
         return indices[0], block
     return {**views, "values": (ref, at_columns)}
 
@@ -1348,13 +1348,13 @@ def _paged_views(refs: dict, table, row, head, page: int, block_k: int) -> dict:
     """A paged call's streams' views (`_views_of`): each pool `[KV, P·page, D]`'s `[P·page, D]` at key head
     `head`, step `j` its key tile `j` where row `row`'s table maps it: of a page of several tiles, the
     tile's page `table[row, j // per]` and its place in it `j % per` (`per` tiles a page); of a tile of
-    several pages (`count` a tile), each page's rows from its own (`mosaic.Pieces`)."""
+    several pages (`count` a tile), each page's rows from its own (`mosaic.Rows`, a run a page)."""
     per, count = max(1, page // block_k), max(1, block_k // page)
 
     def tile(j):
         if count == 1:
             return (table[row, lax.div(j, per)] * per + lax.rem(j, per), 0)
-        return mosaic.Pieces((table[row, j * count + piece], 0) for piece in range(count))
+        return mosaic.Rows(table.at[row], j * count, (0,), page)
 
     return {name: (ref.at[head], tile) for name, ref in refs.items()}
 
