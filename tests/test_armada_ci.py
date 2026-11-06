@@ -1442,10 +1442,10 @@ def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, mon
 def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_changes(
         ci, tmp_path, monkeypatch, cache_worker):
     """A file's green row is kept across a change its tests never meet, the plan's own code (ci.py, which
-    runs outside every test process), another test module, or a change to a fixture it never opens (its
-    openers' input alone); it runs again once what its test process runs or reads changes: a plugin loaded
-    into it, a Python file added that can change what an import finds (a conftest.py, a top-level package
-    under src/), or the process group it runs as."""
+    runs outside every test process), another test module, a change to a fixture it never opens (its
+    openers' input alone), or a comment in a module its process runs (row 2730); it runs again once what its
+    test process runs or reads changes: a plugin's code loaded into it, a Python file added that can change
+    what an import finds (a conftest.py, a top-level package under src/), or the process group it runs as."""
     (tmp_path / "tests/test_kept.py").write_text(
         "from pathlib import Path\n"
         "def test_kept():\n"
@@ -1462,11 +1462,12 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
     (tmp_path / "tests/fixtures/data.json").write_text("{}\n")
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     changes = [(None, "", 1), ("tools/armada/ci.py", "# the plan's own code\n", 1),
-               ("tools/armada/executed.py", "# a plugin loaded into it\n", 2),
+               ("tools/armada/executed.py", "# a plugin loaded into it, what it says alone\n", 1),
+               ("tools/armada/executed.py", "LOADED = 1\n", 2),
                ("tests/fixtures/data.json", "{}\n", 2), ("tests/conftest.py", "VALUE = 1\n", 3),
                ("src/package/__init__.py", "", 4), ("tests/more/test_added.py", "VALUE = 2\n", 4),
-               ("tools/armada/child_groups.py", "# its process group\n", 5),
-               (str(owner), "# the group's lifetime\n", 6)]
+               ("tools/armada/child_groups.py", "GROUP = 1\n", 5),
+               (str(owner), "LIFETIME = 1\n", 6)]
     for path, text, runs in changes:
         if path:
             (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
@@ -1989,8 +1990,8 @@ def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priorit
     assert {word for call in calls for word in call if word.startswith(("--deadline", "--pool=48"))} == {
         "--deadline=6000", "--pool=48"}
     # A base push, below lanes too and on the pool armada gives it, keeps the background deadline.
-    assert run_options(tmp_path, "base/kernels", "on", "--deadline") == ["--deadline=6000"]
-    assert run_options(tmp_path, "base/kernels", "on", "--pool") == []
+    assert run_options(tmp_path / "base-deadline", "base/kernels", "on", "--deadline") == ["--deadline=6000"]
+    assert run_options(tmp_path / "base-pool", "base/kernels", "on", "--pool") == []
 
 
 def test_a_test_past_the_group_target_is_flagged_and_a_new_one_fails(ci, tmp_path, monkeypatch, capsys):
