@@ -161,9 +161,13 @@ def update(state, query, key, value, decay, write, *, delta: bool):
     2^-80 (rows 1859 and 1962). The write gate scales the key before the write's outer product (`beta k`,
     as the chunk form and fla write it), so the write's transpose, `(beta k) . q` against the output's
     cotangent, takes the gate before the sum: after it, `k . q` past fp32's largest at keys and queries of
-    2^63 put an infinite value gradient where the chunk form's was finite (ledger 2470)."""
+    2^63 put an infinite value gradient where the chunk form's was finite (ledger 2470). The write formed
+    `[Dv, Dk]` and transposed, so its second order's sum over the keys runs along their last axis: formed
+    `[Dk, Dv]`, a grad of grad's value gradient summed 128 keys past fp32's largest at its prefix (4.4e38)
+    where float64's sum was 3.0e38 (the decode step's contract near the largest, 128-wide heads)."""
     corrected = value - jnp.sum((key * decay)[..., :, None] * state, axis=-2) if delta else value
-    updated = state * decay[..., :, None] + (key * write)[..., :, None] * corrected[..., None, :]
+    written = corrected[..., :, None] * (key * write)[..., None, :]
+    updated = state * decay[..., :, None] + jnp.swapaxes(written, -1, -2)
     return jnp.sum(query[..., :, None] * updated, axis=-2), updated
 
 
