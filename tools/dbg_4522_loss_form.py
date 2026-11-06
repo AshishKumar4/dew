@@ -48,13 +48,14 @@ def make(kind, variant):
 
 
 kind = sys.argv[1] if len(sys.argv) > 1 else "documents"
+count = int(sys.argv[2]) if len(sys.argv) > 2 else 256
 variants = ("literal", "token-categorical", "batch-categorical", "batch-logsoftmax")
 programs = {(variant, mode): jax.jit(make(kind, variant), compiler_options=(
     {} if mode == "on" else {"xla_cpu_experimental_ynn_fusion_type": ""}))
     for variant in variants for mode in ("on", "off")}
 truth_program = jax.jit(make(kind, "truth"))
 totals = {}
-for seed in range(16):
+for seed in range(count):
     inputs = t.window_segments(kind, seed)
     with jax.enable_x64(True):
         truth = jax.device_get(truth_program(*widened(inputs)))
@@ -67,6 +68,9 @@ for seed in range(16):
             exact = np.asarray(exact)
             actual = np.asarray(actual)
             if exact.ndim < 2:
+                if key[0] == "0":
+                    errors = np.sqrt(np.mean(np.square(actual.astype(np.float64) - exact)))
+                    totals.setdefault(key, []).append(float(errors))
                 continue
             width = exact.shape[-1]
             exact = exact.reshape(len(exact), -1, width)
