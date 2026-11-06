@@ -342,7 +342,7 @@ because its Python API is still marked as subject to change.
 | `dew.algebra.program` | The compile-time pass (`rewritten`), its switch (`passes`) and its report |
 | `dew.algebra.derive` | A monoid walk's declaration (`Reduction`) and its derived forms; the derivation context every derivation keys on (`context`) |
 | `dew.algebra.scan`, `dew.algebra.carry` | A recurrence's declaration (`Scan`) and its chunk forms, split into what every chunk computes at once and what its carry runs in sequence |
-| `dew.algebra.forms` | What every derivation shares: the derived forms (`Derived`), their refusal, their evaluation, and the switch the templates take them behind (`derived`) |
+| `dew.algebra.forms` | What every derivation shares: the derived forms (`Derived`), their refusal and their evaluation |
 | `dew.algebra.generate` | Parked (§6.11): the dev-time generator and its `--check` |
 | `dew.algebra.bits` | Bit-level forms (§7): a declared GF(2)-linear transform of a stored word, its cheapest instruction form over the integer pipes and its proof |
 
@@ -769,12 +769,12 @@ state's anchor), each comparison decided both ways and each maximum by each orde
 the two sides' difference zero as a rational function of exponentials. A declaration that carries no state
 (a tile's) is certified tile by tile. Extraction is priced, so a declaration's forms can take another
 structure at another tile. The suite enumerates every tile the mainloops' derivations emit for an A100, an
-H100 and an RTX PRO 6000 and certifies each distinct structure at a small tile of it, each axis's extent
-past one and the kernel tile's equal extents equal (tests/test_algebra_laws.py). No proof runs at trace
-time.
+H100 and an RTX PRO 6000 and certifies each distinct structure at a small tile of it, at two and at three
+walked elements, each other axis's extent past one and the kernel tile's equal extents equal
+(tests/test_algebra_laws.py). No proof runs at trace time.
 
-Behind the one switch (`dew.algebra.forms.derived`, in JAX's trace context), the templates take their derived
-forms where the declarations state the walk:
+The templates compute by their derived forms where the declarations state the walk; each hand-written form a
+derived one replaced is deleted with it, check 1 holding the derived forms to XLA's reference:
 
 - The attention forward. Every mainloop's step, merge and finish take the declaration's forms, with the sums
   in the mainloop's own accumulator and every product through its own issuer. The declaration covers
@@ -875,10 +875,10 @@ def derive_scan(declaration: Scan, *, saturation: Saturation, splits_held: int =
 - `step` takes the walk's tile as the template forms it: logits scaled, coordinates, and the mask and score
   hook applied. Places and tile layouts are the schedule's, not the algebra's.
 - The hand-written forms (`attention_algebra`, `recurrence_algebra`) are adapted to the same coarse interface.
-  The derived and hand-written forms then swap behind one switch, which check 1 drives both ways.
 - A generated form replaces the hand-written one when it meets both bars of §4: bible §4's efficiency on every
   scoreboard row and GPU type the route serves, and bible §6's stability suite and accuracy gate against the
-  float64 truth. Its internals need not decompose into the hand-written functions.
+  float64 truth. Its internals need not decompose into the hand-written functions. The replacement deletes
+  what it replaces in the same change: no switch keeps a hand form beside its derived one.
 - The rule sets derivation needs beside §6.4's:
   - `decoupled`: dependent reductions split with correction terms; a running maximum chosen by `range`;
     log-sum-exp and moment merges;

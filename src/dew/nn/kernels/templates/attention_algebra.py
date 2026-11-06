@@ -33,7 +33,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.algebra import derive, rewritten
-from dew.algebra.forms import Accumulated, Added, Merged, Operand, derived_on
+from dew.algebra.forms import Accumulated, Added, Merged, Operand
 from dew.nn.kernels.templates import layout, product
 from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Capped, Draw, within
 from dew.nn.precision import float32_einsum, two_product, two_sum
@@ -1287,13 +1287,13 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     """The state after a tile `keys`: its softmax and the product of its weights with its values, the
     mainloop's own running sums taking it where it holds them (`Keys.accumulate`, the state's `acc` in its
     form). A tile held keys first (`Coords.keys_first`, a decode program's `K Qᵀ`) takes its sums so: the
-    mainloop's, `[Dv, bq]`, its queries their columns, on the plain walk. Behind the switch, the derived
-    forms' (`dew.algebra.forms.derived`, `_derived_step`), but for a dropping call's: the derivation narrows a
+    mainloop's, `[Dv, bq]`, its queries their columns, on the plain walk. The derived forms'
+    (`_derived_step`), but for a dropping call's: the derivation narrows a
     dropped weight unnormalized, past fp16's largest at a rate near 1 (a multiplier of 2^16), where this
     step's scaled parts (`weights_parts`) keep it, a representation the declaration states none of."""
     # A compensated or guarded walk's step takes its dropped roundings and its shifts through the derived
     # step's own hook (`_derived_step`).
-    if derived_on() and keys.coords.drop is None:
+    if keys.coords.drop is None:
         return _derived_step(spec, state, keys)
     m, factor, p, value, held = _softmax(spec, state, keys)
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
@@ -1636,18 +1636,9 @@ def split_output(others: jax.Array, own: jax.Array, anchor_value: jax.Array) -> 
 def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     """Two states over disjoint keys as one, `first`'s keys before `second`'s: each taken to the larger
     maximum and summed, in that order. Either may hold no key whatever the call (a slice past a row's
-    keys), so `empty` is its identity under every spec. Behind the switch, the derived forms'
-    (`dew.algebra.forms.derived`, `_derived_merge`), a guarded state's join of its sums the template's
-    (`_guarded_merge`) over the factors they evaluate."""
-    if derived_on():
-        return _derived_merge(spec, first, second)
-    m = jnp.maximum(first.m, second.m)
-    factors = carried(spec, first.m, m), carried(spec, second.m, m)
-    if first.guard is None and second.guard is None:
-        a, b = factors
-        acc = expand(a, first.acc) * first.acc + expand(b, second.acc) * second.acc
-        return Partial(acc, m, a * first.total + b * second.total)
-    return _guarded_merge(first, second, m, factors)
+    keys), so `empty` is its identity under every spec. The derived forms' (`_derived_merge`), a guarded
+    state's join of its sums the template's (`_guarded_merge`) over the factors they evaluate."""
+    return _derived_merge(spec, first, second)
 
 
 def _guarded_merge(first: Partial, second: Partial, m: jax.Array, factors: tuple[jax.Array, jax.Array]
@@ -1691,31 +1682,7 @@ def merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     another order, no less accurately. A slice of no key (a maximum of -inf) adds nothing. On the guarded
     path the sums join at the largest shift, and a row whose join overflows shifts as its natural sums
     need, as `merge` shifts them. Behind the switch, the derived forms' (`_derived_merged`)."""
-    if derived_on():
-        return _derived_merged(spec, stacked, axis)
-    m = jnp.max(stacked.m, axis=axis)
-    factors = carried(spec, stacked.m, jnp.expand_dims(m, axis))
-    if stacked.guard is None:
-        acc = jnp.sum(expand(factors, stacked.acc) * stacked.acc, axis=axis)
-        return Partial(acc, m, jnp.sum(factors * stacked.total, axis=axis))
-    guard = stacked.guard
-    reach = jnp.max(guard.reach, axis=axis)
-    natural = jnp.sum(power2(factors * stacked.total, guard.shift), axis=axis)
-
-    def joined(shift):
-        # Each state's factor, then its shift's change as a power of two on the product (`carry_factor`).
-        drops = guard.shift - jnp.expand_dims(shift, axis)
-        acc = power2(expand(factors, stacked.acc) * stacked.acc, expand(drops, stacked.acc))
-        return jnp.sum(acc, axis=axis), jnp.sum(power2(factors * stacked.total, drops), axis=axis)
-
-    plain = jnp.sum(expand(factors, guard.plain) * guard.plain, axis=axis)
-    plain_total = jnp.sum(factors * guard.plain_total, axis=axis)
-    held = jnp.max(guard.shift, axis=axis)
-    acc, _ = joined(held)
-    live = overflowed(acc) | jnp.any(guard.live, axis=axis)
-    shift = jnp.where(live, jnp.maximum(held, needed(natural, reach)), held)
-    acc, total = joined(shift)
-    return Partial(acc, m, total, Guard(shift, reach, plain, plain_total, live))
+    return _derived_merged(spec, stacked, axis)
 
 
 def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool) -> jax.Array:
@@ -1747,17 +1714,13 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
            ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The block's output `[bq, Dv]` fp32 (its weighted values over its denominator, zero for a query
     that saw nothing and started from no state, then the output hook) and its residual rows
-    (`finished_rows`); the output is the shifted sums' ratio, which the shift leaves. Behind the switch, that
-    ratio the derived forms' (`dew.algebra.forms.derived`, `_derived_output`), a guarded state's live rows
-    taken from its unshifted sums as ever. A `normalized` state's sums are its output already (a merge of
-    finished states, `finished_merged`): zero where it holds no mass."""
+    (`finished_rows`); the output is the shifted sums' ratio, which the shift leaves, the derived forms'
+    (`_derived_output`), a guarded state's live rows taken from its unshifted sums as ever. A `normalized`
+    state's sums are its output already (a merge of finished states, `finished_merged`): zero where it holds
+    no mass."""
     m, denominator = finished_rows(spec, state, initial=initial)
-    if normalized:
-        out = jnp.where(expand(state.total > 0, state.acc), state.acc, 0.0)
-    elif derived_on():
-        out = _derived_output(spec, state)
-    else:
-        out = output_of(state.acc, state.total, guarded=spec.guarded or initial)
+    out = (jnp.where(expand(state.total > 0, state.acc), state.acc, 0.0) if normalized
+           else _derived_output(spec, state))
     fields = state.guard
     if fields is not None:
         bounded = finite(fields.plain_total)
@@ -1933,7 +1896,7 @@ def value_parts(weights: jax.Array, dtype) -> Parts:
 
 
 def softmax_of(logits: jax.Array, values: jax.Array, *, base2: bool, keys_first: bool = False,
-               held: bool = False, raw: float | None = None) -> jax.Array:
+               held: bool = False, raw: float | None = None, guarded: bool = True) -> jax.Array:
     """Attention's math on a template's formed tiles, whole (theme A's declaration, `declaration`): each
     query's softmax over its `logits` (scaled, in the exponent's base, -inf at each key it does not see, as
     `modify` forms them; `[rows, keys]`, or `[keys, rows]` where the tile holds its keys first, a decode
@@ -1944,7 +1907,9 @@ def softmax_of(logits: jax.Array, values: jax.Array, *, base2: bool, keys_first:
     element, and the anchor grows with the walk (a walked correction `exp(k_carried - k_now)` at most 1). The
     accurate form's (`declaration`'s `natural`) holds its largest's weight to 1 (`held`, `weights`), or, over
     raw products (`Forward.raw`), scales each difference by their `raw` scale after the subtraction, its
-    exponential the one its declaration names."""
+    exponential the one its declaration names. A query's total held from 0 where one may see no key
+    (`guarded`: `Forward.guarded`, a state from an initial one), its weighted sums over it plainly elsewhere,
+    as the hand finish divides (`output_of`)."""
     exponent = jnp.exp2 if base2 else jnp.exp
     keys_axis = 0 if keys_first else 1
     m = jnp.max(logits, axis=keys_axis)
@@ -1955,34 +1920,34 @@ def softmax_of(logits: jax.Array, values: jax.Array, *, base2: bool, keys_first:
         difference = difference * np.float32(raw)
     p = exponent(jnp.where(logits < anchor, difference, 0.0) if held else difference)
     total = jnp.sum(p, axis=keys_axis)
-    over = jnp.where(total == 0, 1.0, total)
+    over = jnp.where(total == 0, 1.0, total) if guarded else total
     subscripts, per_query = ("kq,kd->dq", over[None, :]) if keys_first else ("qk,kd->qd", over[:, None])
     summed = float32_einsum(subscripts, p.astype(values.dtype), values, preferred_element_type=jnp.float32)
     return summed / per_query
 
 
 def declaration(*, base2: bool, keys_first: bool = False, factor: float | None = None, natural: bool = False,
-                raw: float | None = None):
+                raw: float | None = None, guarded: bool = True):
     """Attention's forward as theme A's declaration (`dew.algebra.derive.Reduction`): `softmax_of` over the
     template's formed tiles, walked along the keys, its exponent the base the template folds (`folds`: 2
     where it folds `log2(e)` into its logits), its tile keys first where the mainloop holds it so; over the
     tile's raw products times `factor` where the mainloop gives them (`Keys.products`, `logits_of`), so the
     derivation may take their maximum and scale it once (`rules`' positive scale out of a maximum), the
     hand step's 62 fewer multiplies a step at Qwen3's tile, its exponent's argument one fused multiply-add a
-    logit (`rules._contracted`). Its derived forms stand beside this module's (`plain_step`, `merge`,
-    `finish`), behind the one switch (`dew.algebra.forms.derived`, `derived_forms`), which they replace
-    only on par with them against float64 and no slower in the kernel (docs/design/algebra.md). The accurate
-    form's (`natural`, `Forward.natural`) declares its exponential (`natural_exp`) and its rescale
+    logit (`rules._contracted`). Its derived forms (`derived_forms`) are what this module's walk computes
+    by (`plain_step`, `merge`, `finish`), on par with XLA's against float64 (docs/design/algebra.md). The
+    accurate form's (`natural`, `Forward.natural`) declares its exponential (`natural_exp`) and its rescale
     (`natural_carried`, its exponent compensated), which the derivation evaluates as they are and rewrites
     none: over scaled logits its largest weight held to 1 (`softmax_of`'s `held`), over raw products
     (`Forward.raw`) each difference scaled by their `raw` scale, which the exponential carries and the
-    rescale compensates."""
+    rescale compensates. Its total is held from 0 where a query may see no key (`guarded`, `softmax_of`).
+    """
     tile = ("keys", "rows") if keys_first else ("rows", "keys")
 
     def walked(logits, values):
         scaled = logits if factor is None else logits * np.float32(factor)
         return softmax_of(scaled, values, base2=base2, keys_first=keys_first, held=natural and raw is None,
-                          raw=raw)
+                          raw=raw, guarded=guarded)
 
     if natural:
         stated = {"exponential": natural_exp,
@@ -1999,23 +1964,25 @@ def declaration(*, base2: bool, keys_first: bool = False, factor: float | None =
 
 @functools.cache
 def derived_forms(base2: bool, keys_first: bool = False, factor: float | None = None, natural: bool = False,
-                  raw: float | None = None) -> derive.Derived:
-    """The forward's derived forms (`declaration`'s), the template's behind the switch
-    (`dew.algebra.forms.derived`): `plain_step`, `merge` and `finish` take them in place of their own; a
+                  raw: float | None = None, guarded: bool = True) -> derive.Derived:
+    """The forward's derived forms (`declaration`'s), which `plain_step`, `merge` and `finish` compute by; a
     step over raw products, their `factor` (`declaration`). The fast form's are the fast class's; the
     accurate form's (`natural`) the accurate class's, which admits no reordering past the error-free rules."""
     from dew.algebra import SATURATION
-    declared = declaration(base2=base2, keys_first=keys_first, factor=factor, natural=natural, raw=raw)
+    declared = declaration(base2=base2, keys_first=keys_first, factor=factor, natural=natural, raw=raw,
+                           guarded=guarded)
     return derive.derive(declared, accurate=natural, saturation=SATURATION)
 
 
 def _form_key(spec: Forward) -> tuple:
     """The derived forms' key's part past the fold and the products' factor (`derived_forms`): the accurate
     form's natural and a raw product's scale (`Forward.raw`), a raw fold's the factor its difference takes
-    (`Forward.subtracted`), the fast form's none."""
+    (`Forward.subtracted`), the fast form's none; and whether a query may see no key (`Forward.guarded`, or a
+    state from an initial one), whose finish holds its total from 0, as the hand finish's (`finish`)."""
+    guarded = spec.guarded or spec.initial
     if spec.natural:
-        return (True, spec.scale if spec.raw else None)
-    return (False, float(np.float32(spec.scale * LOG2E))) if spec.raw else ()
+        return (True, spec.scale if spec.raw else None, guarded)
+    return (False, float(np.float32(spec.scale * LOG2E)) if spec.raw else None, guarded)
 
 
 def _slotted(key: tuple, shapes: Mapping) -> tuple[str, ...]:
@@ -2109,7 +2076,11 @@ def _derived_merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     """`merge` by the derived forms (`_stated`'s), over the states' rows whatever their leading axes
     (`_rows`): a guarded state's sums joined as the template joins them (`_guarded_merge`) over the
     factors the forms evaluate, through the forms' merge hook."""
-    flat, other = _rows(first), _rows(second)
+    # A state's maximum at the forms' floor (`LEAST`): a residual's row of no key gives it back -inf
+    # (`finished_rows`), the forms' arithmetic NaN from it, as `resumed` takes an initial state's.
+    floored = [state._replace(m=jnp.maximum(state.m, LEAST).astype(state.m.dtype))
+               for state in (first, second)]
+    flat, other = _rows(floored[0]), _rows(floored[1])
     key, shapes = _stated(spec, flat)
     fields = _slotted(key, shapes)
     joined: list[Partial] = []
