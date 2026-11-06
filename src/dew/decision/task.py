@@ -435,11 +435,7 @@ class Decide(SavedRunTask, InItsForm):
 
         directory, record, step = run.directory, run.record, run.step
         variables = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        if ema is None:
-            with Checkpoints(directory) as checkpoints:
-                averaged = checkpoints.stored(step).get("ema") is not None
-        else:
-            averaged = ema
+        averaged = run.averaged(ema)
         backbone = saved_model(record, dtype).build()
         task = cls._recorded(directory, record, backbone, variables, Weights(step, averaged), dtype)
         task = replace(task, variables=_served(task.model, task.variables))

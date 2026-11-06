@@ -20,7 +20,7 @@ model beside other networks (a JEPA encoder beside its predictor) selects.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, ClassVar, Self
 
@@ -119,6 +119,9 @@ class ReleasedRun(SavedRun):
     safetensors beside them, the average its export chose. Every task loads it as it loads its run
     (`SavedRunTask.from_saved`), so a release reads as the run it was written of."""
 
+    average: bool = False
+    """Whether its variables are the run's average (`SavedRun.averaged`)."""
+
     @classmethod
     def of(cls, directory: str | Path) -> Self:
         """The run step the release in `directory` holds; a directory that holds none is refused."""
@@ -130,8 +133,17 @@ class ReleasedRun(SavedRun):
         if task is None or "run" not in task:
             raise ValueError(f"{directory} holds no native release: its release record states no run "
                              "(`dew export` of a run writes one)")
-        return cls.declared(str(directory), earlier_shapes(named_fields(task["run"], "run")),
+        held = cls.declared(str(directory), earlier_shapes(named_fields(task["run"], "run")),
                             integer(task["step"], "step"))
+        return replace(held, average=task.get("averaged") is True)
+
+    def averaged(self, ema: bool | None) -> bool:
+        """Whether its variables are the run's average, as its export wrote them; an `ema` asked is
+        refused (`variables`)."""
+        if ema is not None:
+            raise ValueError("a release holds the weights its export chose (`dew export --ema`); load the "
+                             "run itself to choose its average")
+        return self.average
 
     def variables(self, *, ema: bool | None, mesh: MeshSpec | Mesh | None = None,
                   layout: Layout | None = None, param_dtype: DTypeLike | None = None,
@@ -167,16 +179,17 @@ def write_run_release(run: SavedRun, destination: str | Path, *, ema: bool | Non
 
     records = step_records(json_value(run.record, "artifact"), run.directory, run.step)
     written(run.variables(ema=ema, mesh=mesh, layout=layout), run.record, run.step,
-            [(path, path.relative_to(run.directory)) for path in records], destination)
+            [(path, path.relative_to(run.directory)) for path in records], destination,
+            averaged=run.averaged(ema))
 
 
 def written(variables: Variables, record: Mapping[str, object], step: int,
             records: Sequence[tuple[epath.Path, PurePath]], destination: str | Path, *,
-            max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
+            averaged: bool = False, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
     """A native release in `destination`: `variables` as safetensors, `<collection>/<path>` the name of each
     leaf, read home a tensor at a time (`save_sharded`), each of `records` copied to its place, and the
     release record of the run `record` declares at `step` (0 for a model released outside a run), whose
-    model states the dtype it computes in."""
+    model states the dtype it computes in, and whether `variables` are its average."""
     from dew.config.release import Release
 
     root = Path(destination)
@@ -185,7 +198,7 @@ def written(variables: Variables, record: Mapping[str, object], step: int,
     for source, place in records:
         (root / place).parent.mkdir(parents=True, exist_ok=True)
         (root / place).write_bytes(source.read_bytes())
-    Release(task={"run": json_value(record, "run"), "step": step}).write(root)
+    Release(task={"run": json_value(record, "run"), "step": step, "averaged": averaged}).write(root)
 
 
 class ReleasesModel:

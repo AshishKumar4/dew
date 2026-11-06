@@ -402,6 +402,16 @@ class SavedRun:
         """The objective class the run trained, which its record names (`declared_objective`)."""
         return declared_objective(self.record)
 
+    def averaged(self, ema: bool | None) -> bool:
+        """Whether the variables `variables(ema=ema)` reads are the run's average: `ema` where given, else
+        whether the step stored one."""
+        from dew.checkpoints import Checkpoints
+
+        if ema is not None:
+            return ema
+        with Checkpoints(self.directory) as checkpoints:
+            return checkpoints.stored(self.step).get("ema") is not None
+
     def variables(self, *, ema: bool | None, mesh: MeshSpec | Mesh | None = None,
                   layout: Layout | None = None, param_dtype: DTypeLike | None = None,
                   parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS) -> Variables:
