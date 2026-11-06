@@ -552,6 +552,13 @@ def _recomputed(op, seen: set) -> int:
                       if not isinstance(operand.owner, ir.Block))
 
 
+def _issues_product(op) -> bool:
+    """Whether `op` issues a matrix product (mma.sync's, a warpgroup's or tcgen05's assembly)."""
+    return (op.name.removeprefix(PREFIX) == "llvm.inline_asm" and "asm_string" in op.attributes
+            and re.search(r"\b(mma\.sync|wgmma\.mma_async|tcgen05\.mma)\b",
+                          ir.StringAttr(op.attributes["asm_string"]).value) is not None)
+
+
 def _read_in_outer_loop(op) -> bool:
     """Whether a result of `op` is read inside a loop that `op` lies outside of."""
     def inside(loop) -> bool:
@@ -592,6 +599,30 @@ class _Pass:
         self.open: dict = {}
         # Each block's open run's products whose values the threads wrote to shared memory since it opened.
         self.stored: dict = {}
+        self.order: dict = {}
+        self.issued: list[int] = []
+
+    def ordered(self, function) -> None:
+        """Each op of `function` by its place in program order (`order`), and the places of its products
+        (`issued`), which `_read_past_products` reads."""
+        self.order, self.issued = {}, []
+
+        def visit(inner):
+            self.order[inner] = len(self.order)
+            if _issues_product(inner):
+                self.issued.append(self.order[inner])
+            return ir.WalkResult.ADVANCE
+
+        function.walk(visit)
+
+    def _read_past_products(self, op) -> bool:
+        """Whether a result of `op` is read past a product issued after it (`ordered`)."""
+        made = self.order.get(op)
+        if made is None:
+            return False
+        later = [place for place in self.issued if place > made]
+        return bool(later) and any(self.order.get(use.owner.operation, -1) > later[0]
+                                   for result in op.results for use in result.uses)
 
     def _streamed(self, op, name: str) -> bool:
         if not _elementwise(op, name):
@@ -689,9 +720,13 @@ class _Pass:
                 self.mma_words = max(self.mma_words, words)
         self.atoms.making = f"{name}:{str(op.results[0].type)[:28]}" if len(op.results) else name
         produced = list(op.results)
-        if (name not in FREE and self._rematerialized(op, name) and _read_in_outer_loop(op)
+        if (name not in FREE and self._rematerialized(op, name)
+                and (_read_in_outer_loop(op) or self._read_past_products(op))
                 and _recomputed(op, set()) > RECOMPUTED):
-            # Hoisted out of a loop that reads it, and longer than ptxas recomputes: kept in registers.
+            # Hoisted out of a loop that reads it, or read past the products issued after it (a walk's steps
+            # laid out straight, between its prologue's address and its epilogue's store), and longer than
+            # ptxas recomputes: kept in registers (sm80's exactly summed forward at one step: an address made
+            # before its products and read after them held, spilled 8 bytes at a 128 cap, NS4331 c).
             for value in produced:
                 self.atoms.of[value] = self._kept(value)
                 if self.atoms.of[value] and all(atom is None for atom in self.atoms.of[value]):
@@ -1071,6 +1106,7 @@ def kernel_peaks(module_bytes: bytes, compiler: Compiler | None = None) -> list[
             if not op.operation.regions:
                 continue
             peak, run = Peak(), _Pass(divergent, compiler)
+            run.ordered(op.operation)
             for nested_region in op.operation.regions:
                 for block in nested_region.blocks:
                     run.block(block, set(), peak, 0)
