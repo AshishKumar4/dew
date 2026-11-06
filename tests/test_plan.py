@@ -904,10 +904,12 @@ def a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monk
     """With room for four microbatches when a delta rule recomputes its memory alone, which no
     recomputation needs more than, the plan is four at that half rung: no plan splits the batch further
     at a rung where the half rung fits it, and the search asks each split there after it misses. The
-    delta rule runs its port (`chosen`), whatever the generation's row names: the half rung recomputes
-    the memory the port names (`checkpoint_name`), and the portable route, an A10's, names none."""
+    delta rule runs its port (`chosen`), whatever the generation's row names, at the default product
+    precision its fp32 products are declared at (`recurrence_chunk._port_precision`; the suite's lanes
+    configure 'highest'): the half rung recomputes the memory the port names (`checkpoint_name`), and the
+    portable route, an A10's, names none."""
     half = "all_but_delta_memory"
-    with chosen(gated_delta_rule="fla"):
+    with chosen(gated_delta_rule="fla"), jax.default_matmul_precision("default"):
         free(monkeypatch, needs(monkeypatch, lm(split=4, remat=half, **DELTA)))
         trainer = lm(**DELTA)
         state, _, _ = trainer.place()

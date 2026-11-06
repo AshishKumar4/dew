@@ -400,8 +400,10 @@ def _gradient_holds_check_1(name, regime):
 
 def ssd_port(hooks, *args, **kwargs):
     """`chunk` with its rated scan on mamba_ssm's kernels (`recurrence_chunk.SCAN`'s 'pallas', the SSD
-    port), interpreted off a GPU as the CPU suite runs a port a call names."""
-    with generation.chosen(ssd="pallas"):
+    port), interpreted off a GPU as the CPU suite runs a port a call names, at the default product
+    precision its fp32 products are declared at (`recurrence_chunk._port_precision`; the suite's lanes
+    configure 'highest')."""
+    with generation.chosen(ssd="pallas"), jax.default_matmul_precision("default"):
         return chunk(hooks, *args, **kwargs)
 
 
