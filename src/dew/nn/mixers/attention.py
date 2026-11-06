@@ -1398,8 +1398,8 @@ class CausalSelfAttention(nn.Module):
             key_groups = {name: held[rows:].reshape(pieces, width) for name, held in groups.items()}
         # Each query's keys up to its own slot, widened by the groups it reads whole as a prefill's are
         # (`visibility_mask`: a block or an image holding its key runs on to its end).
-        keep = visibility_mask(width, keys.shape[1], True, None, key_valid=real, query_slots=slots,
-                               **key_groups)
+        keep = visibility_mask(width, keys.shape[1], causal=True, sliding_window=None, key_valid=real,
+                               query_slots=slots, **key_groups)
         # A padding query reads one key, so its (unused) output stays finite.
         keep = keep | ((prompt < 0)[:, None, :, None] & (jnp.arange(keep.shape[-1]) == 0))
         prefilled = scaled_dot_product_attention(

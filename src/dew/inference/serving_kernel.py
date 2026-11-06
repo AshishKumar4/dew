@@ -463,7 +463,8 @@ def _mixed_step(model: nn.Module, params: Variables, pad_id: int, placement: Pla
     # and at padding, as a prefill of their own reads them.
     fields = admission.prompts.token_fields
     groups = {name: jnp.concatenate([jnp.full((rows,), -1, jnp.int32),
-                                     jnp.where(valid, jnp.asarray(fields[name], jnp.int32), -1).reshape(-1)])[None]
+                                     jnp.where(valid, jnp.asarray(fields[name], jnp.int32), -1).reshape(-1)
+                                     ])[None]
               for name in GROUPS if name in fields}
     (_, logits), updated = model.apply(
         {**params, "cache": decoder.cache}, flat[None], scored[None], decode=True,

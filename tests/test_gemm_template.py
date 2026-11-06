@@ -399,6 +399,39 @@ def test_a_stacked_matrix_is_read_in_place_at_a_layer(generation_name):
                         truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, out=jnp.float64)))
 
 
+@pytest.mark.parametrize("layer", [0, 3], ids=["first", "last"])
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+def test_a_stacked_layers_product_is_the_product_over_that_layers_matrices_alone(generation_name, layer):
+    """A layer of a stacked `[layers, groups, depth, width]` matrix picked by an index (`gemm`'s `layer`),
+    the stack's first or last, its groups one empty and its rows past them unrouted, is the call over that
+    layer's matrices alone, bit for bit: its product, its input gradient, and the stack's gradient, that
+    call's kernel gradient at the layer and zero at every other. The launches take the layer's groups, as
+    the call alone does, and read its matrices where they lie in the stack, so they tile, split and sum as
+    that call does, and an unrouted row reads no layer's matrix. The gradients run eagerly, as the Mosaic
+    interpreters' ordered callbacks need."""
+    layers, groups, rows, depth, width = 4, 3, 256, 64, 128
+    sizes, at = jnp.asarray([150, 0, 70], jnp.int32), jnp.asarray(layer, jnp.int32)
+    rng = np.random.default_rng(1342)
+    x = jnp.asarray(rng.normal(size=(rows, depth)), jnp.bfloat16)
+    stack = jnp.asarray(rng.normal(size=(layers, groups, depth, width)) / 8, jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16)
+
+    def stacked(x, stack):
+        return gemm.gemm(x, stack, sizes, layer=at, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+
+    def alone(x, matrices):
+        return gemm.gemm(x, matrices, sizes, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+
+    with generation.assumed(generation_name):
+        out, d_x, d_stack = with_gradients(stacked)(x, stack, cotangent)
+        expected, expected_x, expected_matrices = with_gradients(alone)(x, stack[layer], cotangent)
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(expected))
+    np.testing.assert_array_equal(np.asarray(d_x), np.asarray(expected_x))
+    np.testing.assert_array_equal(np.asarray(d_stack[layer]), np.asarray(expected_matrices))
+    others = np.delete(np.asarray(d_stack, np.float32), layer, axis=0)
+    np.testing.assert_array_equal(others, np.zeros_like(others))
+
+
 @runs("sm80")
 def test_an_empty_rows_undefined_derivative_reaches_no_shared_gradient():
     """A row past the routed ones whose mean square is zero has no defined derivative of `rsqrt`; it

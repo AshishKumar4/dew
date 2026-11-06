@@ -287,6 +287,17 @@ def test_packing_a_calls_heads_into_its_rows_is_undone_by_unpacking():
     np.testing.assert_array_equal(row_spans.per_query().start, np.repeat(np.asarray(spans.start), 4, axis=1))
 
 
+
+def test_a_packed_steps_spans_mean_its_rows_own_to_every_reader():
+    """A decode step's packed rows keep one interval a position (`KeySpans.per_span`); every mainloop and the
+    reference read them as each row's own: the reference over the packed rows and spans is the reference over
+    the same rows with an interval a row, bit for bit (row 4487)."""
+    query, key, value, _ = _drawn(4, 8, 2, jnp.float32)(0)
+    rows, packed_spans, _ = attention_decode.packed(query, _spans(4), 2)
+    assert packed_spans.per_span == 4
+    np.testing.assert_array_equal(template.reference(rows, key, value, packed_spans),
+                                  template.reference(rows, key, value, packed_spans.per_query()))
+
 def _states(logits: jax.Array, values: jax.Array, cuts) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Each slice's softmax state over its keys `cuts[s]` to `cuts[s + 1]`, and one more of no key: its output
     normalized `[B, S, Q, KV, Dv]`, its maximum and denominator `[B, KV, S, Q]`."""

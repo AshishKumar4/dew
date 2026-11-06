@@ -26,6 +26,7 @@ import gemm_matrix as matrix
 import jax
 import jax.numpy as jnp
 import join_matrix
+import low_rank_matrix
 import numpy as np
 import pytest
 import test_gemm_blackwell as gemm_blackwell
@@ -147,6 +148,13 @@ def test_the_fused_gemm_matrix_holds_on_this_gpu():
     and consumers fused into the template's stages on par with the same region's stages and product in XLA at
     every pair of axis values the fusion serves, each cell on its own GPU."""
     run_cells(cells_of(fused_matrix.a_fused_gemm_training_step_is_on_par))
+
+
+def test_the_low_rank_matrix_holds_on_this_gpu():
+    """The adapted product's check-1 matrix (tests/kernel_matrix.py): a LoRA-adapted projection's training
+    step with its base product and update fused on par with them apart at every pair of axis values the fused
+    form serves, each cell on its own GPU."""
+    run_cells(cells_of(low_rank_matrix.an_adapted_projections_training_step_is_on_par))
 
 
 def test_the_join_matrix_holds_on_this_gpu():

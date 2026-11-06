@@ -150,7 +150,8 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
         del interpret
         return acc + value.astype(jnp.float32)
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False) -> jax.Array:
+        del interpret
         if then is not None:
             then()
         return _product(lhs, rhs)

@@ -5,9 +5,11 @@ GPU that a process has to itself (dew.nn.kernels.tuning)."""
 
 import dataclasses
 import functools
+import gc
 import json
 import os
 import time
+import weakref
 from pathlib import Path
 
 import jax
@@ -21,6 +23,7 @@ from reference_error import equations
 from dew.nn.activations import gated_product
 from dew.nn.kernels import generation, norm_swiglu, tuning
 from dew.nn.norms import stream_rms_normalized
+from dew.telemetry import compiles
 
 
 def seam(x, branch, scale):
@@ -549,24 +552,33 @@ def _doubled(x):
     return 2 * x
 
 
-@pytest.mark.parametrize(("made", "cached"), [(lambda: _doubled, True), (lambda: _Scaled(2.0), True),
-                                              (lambda: _Holding(jnp.ones(3)), False),
-                                              (lambda: jnp.tanh, False)],
+@pytest.mark.parametrize(("made", "cached", "made_here"),
+                         [(lambda: _doubled, True, False), (lambda: _Scaled(2.0), True, True),
+                          (lambda: _Holding(jnp.ones(3)), False, True), (lambda: jnp.tanh, False, False)],
                          ids=["function", "dataclass", "array-holding-object", "jitted-callable"])
-def test_a_launch_lowered_once_traces_again_only_for_a_hook_that_may_hold_an_array(made, cached):
-    """`tuning.lowered_once` traces a launch once for a static hook it may hold (a function of no closure,
-    a dataclass of values), and again each call for one that may reach an array (a callable object's
-    attributes, which no check sees, a jitted function's among them): run uncached, it keeps nothing
-    alive. (Each hook made in the test: an array drawn as the module loads would start JAX's backend before
-    a worker process joins its pool, `tuning_worker`.)"""
+def test_a_launch_lowered_once_keeps_its_program_only_for_a_hook_it_may_hold(made, cached, made_here):
+    """`tuning.lowered_once` keeps a launch's program for a static hook it may hold (a function of no closure,
+    a dataclass of values), holding the hook: its second call traces nothing (JAX's trace events). One that
+    may reach an array (a callable object's attributes, which no check sees, a jitted function's among them)
+    runs the launch itself, and once the caller lets it go nothing the launch kept holds it. Every call
+    computes the hook's value. (Each hook made in the test: an array drawn as the module loads would start
+    JAX's backend before a worker process joins its pool, `tuning_worker`.)"""
     hook = made()
-    traced = []
 
     @tuning.lowered_once(("hook",))
     def launch(x, *, hook):
-        traced.append(1)
         return hook(x)
 
-    for _ in range(2):
-        jax.block_until_ready(launch(jnp.ones(4), hook=hook))
-    assert len(traced) == (1 if cached else 2)
+    x = jnp.arange(4.0)
+    first = launch(x, hook=hook)
+    with compiles.Compiles(None) as again:
+        second = jax.block_until_ready(launch(x, hook=hook))
+    assert jnp.array_equal(first, hook(x)) and jnp.array_equal(second, first)
+    if cached:
+        assert not [program for program in again.programs if program.kind == "traced"]
+    if made_here:
+        # Let go by the caller: the kept program holds a hook it keys on; a launch run uncached holds none.
+        kept = weakref.ref(hook)
+        del hook
+        gc.collect()
+        assert (kept() is not None) == cached

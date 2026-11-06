@@ -3,11 +3,14 @@ codes' fields, its cheapest instruction form found by the price-ordered search a
 the decoded registers read as the consumer reads them, values its format defines."""
 
 import dataclasses
+import itertools
 
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 import pytest
+from map_judge import sharded
 
 from dew.algebra import bits
 
@@ -255,3 +258,84 @@ def test_a_forms_ptx_decodes_on_the_gpu_as_its_form_does(name):
     decoded = jax.jit(_inline_decode(form))(jnp.asarray(words.astype(np.uint32)))
     for got, expected in zip(decoded, form.decoded(words), strict=True):
         np.testing.assert_array_equal(np.asarray(got).astype(np.uint64), expected)
+
+
+MINIFLOATS = {"e4m3": (bits.E4M3, ml_dtypes.float8_e4m3fn), "e5m2": (bits.E5M2, ml_dtypes.float8_e5m2),
+              "e2m1": (bits.E2M1, ml_dtypes.float4_e2m1fn)}
+"""Each encode's minifloat and ml_dtypes' type of it, the reference's."""
+
+SLICES = 64
+"""All 2^32 fp32 words, cut into this many slices of 2^26 a map task's unit."""
+
+
+def reference_codes(words: np.ndarray, minifloat: bits.Minifloat, dtype) -> np.ndarray:
+    """ml_dtypes' round-to-nearest-even cast of fp32 `words` (uint32 bits) saturated first to the largest
+    finite value (the satfinite cvt's semantics), as uint32 codes; a NaN the minifloat's NaN code (whose
+    payload ml_dtypes chooses otherwise: e5m2's quiet 0x7E) with its sign, e2m1's its largest."""
+    x = words.view(np.float32)
+    largest = np.uint32(minifloat.largest_float32).view(np.float32)
+    codes = np.clip(x, -largest, largest).astype(dtype).view(np.uint8).astype(np.uint32)
+    codes &= np.uint32((1 << minifloat.width) - 1)
+    nan = minifloat.largest if minifloat.nan is None else minifloat.nan
+    signed = np.uint32(nan) | (words >> np.uint32(31)) << np.uint32(minifloat.width - 1)
+    return np.where(np.isnan(x), signed, codes)
+
+
+@pytest.mark.shards(units=192, per_task=8)
+def test_each_encode_is_the_reference_cast_on_every_fp32_word():
+    """Each of e4m3's, e5m2's and e2m1's encodes (`bits.encoded`) is ml_dtypes' round-to-nearest-even cast
+    saturated to its largest finite value on every one of the 2^32 fp32 words, a NaN as its NaN code: a
+    proof by exhaustion (row 4050)."""
+    cases = list(itertools.product(MINIFLOATS, range(SLICES)))
+    assert len(cases) == 192, "the shards mark counts each slice of each encode"
+
+    def checked(start: int, stop: int) -> int:
+        for name, index in cases[start:stop]:
+            minifloat, dtype = MINIFLOATS[name]
+            words = np.arange(index << 26, (index + 1) << 26, dtype=np.uint64).astype(np.uint32)
+            got = bits.encoded(words, minifloat, np)
+            want = reference_codes(words, minifloat, dtype)
+            differ = np.flatnonzero(got != want)
+            assert differ.size == 0, (name, [(hex(int(words[i])), int(got[i]), int(want[i]))
+                                             for i in differ[:4]])
+        return stop - start
+
+    sharded("every fp32 word's encode", checked, len(cases))
+
+
+def test_an_nvfp4_tile_packed_from_its_encode_decodes_to_its_rounded_values():
+    """fp32 values encoded to e2m1 (`bits.encoded`) and packed eight a word (`bits.packed`), with a block
+    scale of 1 (an e4m3 scale of 2^8, `NVFP4_OWED`), decode (`nvfp4_decoded`) to their e2m1 rounding: the
+    pack is the stored NVFP4 order the decode reads, in jax.numpy as a kernel's portable path runs it."""
+    rng = np.random.default_rng(4050)
+    x = rng.standard_normal((64, 8)).astype(np.float32) * 3
+    codes = bits.encoded(jnp.asarray(x).view(jnp.uint32), bits.E2M1)
+    words = bits.packed(codes.T, bits.E2M1).T
+    scales = jnp.full((4, 8), 2.0 ** 8, ml_dtypes.float8_e4m3fn)
+    decoded = np.asarray(bits.nvfp4_decoded(words, scales), np.float32)
+    rounded = np.clip(x, -6, 6).astype(ml_dtypes.float4_e2m1fn).astype(np.float32)
+    np.testing.assert_array_equal(decoded, rounded)
+
+
+def test_an_nvfp4_quantized_tile_takes_each_blocks_least_scale_and_decodes_to_its_rounding():
+    """An fp32 tile quantized to NVFP4 (`bits.nvfp4_quantized`), a block of zeros and a block whose values
+    span six decades among them: its tensor scale its largest magnitude over 6 * 448, each block's scale the
+    least e4m3 at or above the block's largest over 6 times it (at most e4m3's largest), and its decode
+    (`nvfp4_decoded`, times `NVFP4_OWED`) each value over its scales rounded to e2m1 times its block's
+    scale, exactly (row 4050)."""
+    rng = np.random.default_rng(4050)
+    x = (rng.standard_normal((64, 8)) * 10.0 ** rng.integers(-3, 3, (64, 8))).astype(np.float32)
+    x[16:32, 3] = 0
+    words, scales, tensor = bits.nvfp4_quantized(jnp.asarray(x))
+    largest = np.float32(np.abs(x).max())
+    np.testing.assert_array_equal(np.asarray(tensor), largest / np.float32(6 * 448))
+    table = np.arange(0x7F, dtype=np.uint8).view(ml_dtypes.float8_e4m3fn).astype(np.float32)
+    ratio = np.abs(x).reshape(4, 16, 8).max(axis=1) / (np.float32(6) * np.asarray(tensor))
+    # The largest block's ratio is 448 up to its rounding, which may pass it: its scale is e4m3's largest.
+    least = table[np.minimum(np.searchsorted(table, ratio), table.size - 1)]
+    np.testing.assert_array_equal(np.asarray(scales, np.float32), least)
+    each = np.repeat(least, 16, axis=0) * np.asarray(tensor)
+    quotient = np.where(each > 0, x / np.where(each > 0, each, 1), 0).astype(np.float32)
+    rounded = np.clip(quotient, -6, 6).astype(ml_dtypes.float4_e2m1fn).astype(np.float32)
+    decoded = np.asarray(bits.nvfp4_decoded(words, scales), np.float32) * np.float32(bits.NVFP4_OWED)
+    np.testing.assert_array_equal(decoded, rounded * np.repeat(least, 16, axis=0))

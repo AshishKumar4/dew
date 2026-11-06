@@ -1271,9 +1271,9 @@ class Issuer[Accumulator](abc.ABC):
         or registers."""
 
     @abc.abstractmethod
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False) -> jax.Array:
         """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, its value, with `then` issued while the
-        product runs."""
+        product runs; `interpret`, as `products`' (an instruction no CPU rule lowers computed as its sum)."""
 
     @abc.abstractmethod
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:

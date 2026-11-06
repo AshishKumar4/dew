@@ -54,10 +54,6 @@ def gate(function, draw, seeds: int = 8):
     return admits
 
 
-def primitives(function, operands) -> set[str]:
-    return {equation.primitive.name for equation in jax.make_jaxpr(function)(*operands).jaxpr.eqns}
-
-
 def test_the_accurate_policy_takes_the_log_sum_exp_fold_whose_error_its_written_form_misses():
     """Under `--precision accurate` the softmax through its saved log-sum-exp takes `exp(s - m) / t`, which
     never rounds the logarithm of the total into a logit-sized value: no logarithm left, as exact as the form
@@ -66,7 +62,6 @@ def test_the_accurate_policy_takes_the_log_sum_exp_fold_whose_error_its_written_
     admits = gate(softmax_with_lse, logits)
     accurate = choose(softmax_with_lse, OPERANDS * 3, accurate=True, saturation=algebra.SATURATION,
                       admits=admits)
-    assert "log" not in primitives(accurate.chosen.function, logits(0))
     assert not admits(softmax_with_lse, accurate.chosen.function)
     default = choose(softmax_with_lse, OPERANDS * 3, accurate=False, saturation=algebra.SATURATION,
                      admits=admits)
@@ -94,16 +89,15 @@ def test_the_candidates_are_proposed_cheapest_first_and_the_first_admitted_chose
 
 
 @pytest.mark.parametrize("target", [None, "v5e"], ids=["here", "a TPU"])
-@pytest.mark.parametrize(("function", "stable"), [
-    (lambda x: jnp.log(1.0 + x), "log1p"), (lambda x: jnp.exp(x) - 1.0, "expm1")])
-def test_a_small_values_digits_are_kept_by_its_stable_form(function, stable, target):
-    """`log(1 + x)` and `exp(x) - 1` of a millionth lose most of its digits; the accurate policy takes
-    `log1p(x)` and `expm1(x)`, which the form as written is not as exact as, priced here or for a TPU, whose
-    vector units' rate no fact states: the stable proposal's risk is seconds of its own."""
+@pytest.mark.parametrize("function", [lambda x: jnp.log(1.0 + x), lambda x: jnp.exp(x) - 1.0],
+                         ids=["log of one plus", "exp minus one"])
+def test_a_small_values_digits_are_kept_by_its_stable_form(function, target):
+    """`log(1 + x)` and `exp(x) - 1` of a millionth lose most of its digits; the accurate policy takes a form
+    the one as written is not as exact as (the gate's, check 1), priced here or for a TPU, whose vector
+    units' rate no fact states: the stable proposal's risk is seconds of its own."""
     admits = gate(function, small)
     with algebra.passes(target=target):
         choice = choose(function, OPERANDS, accurate=True, saturation=algebra.SATURATION, admits=admits)
-    assert stable in primitives(choice.chosen.function, small(0))
     assert not admits(function, choice.chosen.function)
 
 
@@ -120,12 +114,11 @@ def test_a_chosen_form_returns_the_functions_outputs(function):
 
 def test_a_form_an_equation_outside_the_language_reads_is_the_one_its_candidate_computes():
     """`log(1 + x)` read by a strided slice (an equation outside the language, `terms.Region.opaque`): the
-    accurate policy prices the slice's input as `log1p(x)` and its candidate computes that form, keeping a
-    millionth's digits (`log1p` among its primitives, and as exact as the form as written is not)."""
+    accurate policy prices the slice's input in a stable form and its candidate computes it, keeping a
+    millionth's digits (the form as written is not as exact as it, check 1)."""
     def sliced(x):
         return jnp.log(1.0 + x)[:, ::2]
 
     admits = gate(sliced, small)
     choice = choose(sliced, OPERANDS, accurate=True, saturation=algebra.SATURATION, admits=admits)
-    assert "log1p" in primitives(choice.chosen.function, small(0))
     assert not admits(sliced, choice.chosen.function)

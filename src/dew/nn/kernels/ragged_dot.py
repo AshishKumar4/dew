@@ -89,13 +89,15 @@ class GMMGroupLookupMetadata(typing.NamedTuple):
   row_it2it_in_group: jax.Array  # mapping between the first grid dim and which
                                  # chunk in the group we're computing
   total_row_its: jax.Array       # first grid dim upper bound / number of chunks
+  first_matrix: jax.Array        # Dew: [1], the stack's matrix group 0 reads, group g reading it plus g
 
 
 def _make_gmm_group_metadata(
-  group_sizes: jax.Array, m: int, chunk_m: int
+  group_sizes: jax.Array, m: int, chunk_m: int, first: jax.Array | None = None
 ) -> GMMGroupLookupMetadata:
   """Split large groups into chunks to let several SMs work on one group. For
-  ragged_dot, not trans_ragged_dot."""
+  ragged_dot, not trans_ragged_dot. Dew: `first`, the matrix of a stack of
+  more matrices than groups that group 0 reads (`gmm`)."""
   group_sizes = group_sizes.astype(np.int32)
   g: int = group_sizes.size
   blocks_per_group = (
@@ -124,6 +126,7 @@ def _make_gmm_group_metadata(
       row_it2group=row_it2group,
       row_it2it_in_group=row_it2it_in_group,
       total_row_its=jnp.sum(blocks_per_group, dtype=np.int32),
+      first_matrix=jnp.zeros((1,), np.int32) if first is None else jnp.reshape(first, (1,)).astype(np.int32),
   )
 
 
@@ -163,6 +166,8 @@ def _gpu_ragged_dot_kernel(
   out_refs = refs[len(prologue_axes) + len(epilogue_axes):]
   i, j = pl.program_id(0), pl.program_id(1)
   pid = SimpleNamespace(i=i, j=j, gi=group_metadata_ref.row_it2group[i])
+  # Dew: the group's matrix, from the stack's first the groups read (`gmm`'s `first`).
+  matrix = group_metadata_ref.first_matrix[0] + pid.gi
   size = jax.tree.map(partial(np.array, dtype=np.int32), size)
 
   local_inc = chunk_m * group_metadata_ref.row_it2it_in_group[pid.i]
@@ -198,10 +203,10 @@ def _gpu_ragged_dot_kernel(
         x = jnp.where(mask, prologue(x, *tiles), 0)
       if not trans_rhs:
         mask = inner_mask[:, None] & rhs_cols_mask[None, :]
-        A = _load(A_ref.at[pid.gi, inner_idx, rhs_cols_idx], mask=mask)
+        A = _load(A_ref.at[matrix, inner_idx, rhs_cols_idx], mask=mask)
       else:
         mask = rhs_cols_mask[:, None] & inner_mask[None, :]
-        A = _load(A_ref.at[pid.gi, rhs_cols_idx, inner_idx], mask=mask)
+        A = _load(A_ref.at[matrix, rhs_cols_idx, inner_idx], mask=mask)
       x, A = x.astype(compute_dtype), A.astype(compute_dtype)
       dim_nums = (
           (((1,), (0,)), ((), ()))  # normal matmul product x @ y
@@ -301,6 +306,7 @@ def gmm(
   epilogue_axes: tuple = (),
   out_dtypes: tuple | None = None,
   exact_sums: bool = False,
+  first: jax.Array | None = None,
 ) -> jax.Array | tuple[jax.Array, ...]:
   """Compute grouped matmul on GPU via a Pallas lowering.
 
@@ -308,7 +314,9 @@ def gmm(
   `epilogue(acc, *side_tiles)` each fp32 accumulator tile, returning one output or a tuple of them
   (`out_dtypes`). Each side operand's dimensions follow the launch axes its `*_axes` entry names
   (`_side_tile`): 'rows' and 'depth' for the prologue's, 'rows' and 'columns' for the epilogue's.
-  `exact_sums` adds each depth step's product into the fp32 sum by an IEEE add (`_summed`)."""
+  `exact_sums` adds each depth step's product into the fp32 sum by an IEEE add (`_summed`). `first`, an
+  int32 scalar, makes `A` a stack of more matrices than `group_sizes` has groups, group `g` reading matrix
+  `first + g` where it lies (a banked layer's experts); the grid is the groups'."""
 
   msg = "This gmm kernel only supports either (m, k) x (g, k, n) -> (m, n) "
   msg += f"or (m, k) x (g, n, k) -> (m, n), but got {x.shape=} {A.shape=}"
@@ -316,12 +324,13 @@ def gmm(
     raise ValueError(msg)
   msg = f"Group sizes {group_sizes.shape=} must match first dimension of "
   msg += f"{A.shape=}"
-  if not A.shape[:1] == group_sizes.shape:
+  # Dew: a stack read from its `first` matrix holds more matrices than groups.
+  if not (A.shape[:1] == group_sizes.shape if first is None else A.shape[0] >= group_sizes.shape[0]):
     raise ValueError(msg)
   n = A.shape[-1] if not trans_rhs else A.shape[-2]
   Ak = A.shape[-2] if not trans_rhs else A.shape[-1]
   assert Ak == x.shape[1], msg
-  size = RaggedDotSizes(m=x.shape[0], k=x.shape[1], n=n, g=A.shape[0])
+  size = RaggedDotSizes(m=x.shape[0], k=x.shape[1], n=n, g=group_sizes.shape[0])
 
   # normalize the block sizes for GPU
   block_m, block_k, block_n = (
@@ -330,12 +339,12 @@ def gmm(
   )
   block_k, block_n = max(block_k, 16), max(block_n, 16)
 
-  A_spec = pl.BlockSpec((size.g, size.k, block_n), lambda i, j: (0, 0, j))
+  A_spec = pl.BlockSpec((A.shape[0], size.k, block_n), lambda i, j: (0, 0, j))
   if trans_rhs:  # transposed spec
-    A_spec = pl.BlockSpec((size.g, block_n, size.k), lambda i, j: (0, j, 0))
+    A_spec = pl.BlockSpec((A.shape[0], block_n, size.k), lambda i, j: (0, j, 0))
 
   group_metadata = _make_gmm_group_metadata(
-    group_sizes=group_sizes, m=size.m, chunk_m=chunk_m
+    group_sizes=group_sizes, m=size.m, chunk_m=chunk_m, first=first
   )
   sides = (*prologue_operands, *epilogue_operands)
   in_specs = [

@@ -26,7 +26,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import sympy
-from egglog import declarations as decl
+from egglog import EGraph, Vec, declarations as decl, i64, set_
 from jax import lax
 
 from dew.algebra import carry, cost, rules, terms
@@ -644,9 +644,15 @@ def test_every_shape_fact_is_the_shape_its_term_computes(name, index, rule):
     matched, conditions, actions = _parts(rule)
     proven = 0
     if matched is None:
-        # The matrix fact: any term of two axes.
+        # The matrix fact, applied: a term the facts give each shape is a matrix exactly where an array of
+        # that shape has two axes.
         for shape in SHAPES:
-            assert (len(shape) == 2) == (np.ones(shape).ndim == 2)
+            graph = EGraph()
+            term = terms.Term.leaf(i64(0))
+            graph.register(set_(rules.shape(term)).to(Vec[i64](*(i64(extent) for extent in shape))))
+            graph.run(rules.FACTS.saturate())
+            matrix = graph.check_bool(rules.matrix(term))
+            assert matrix == (np.ones(shape).ndim == 2), (shape, f"{name}[{index}]")
             proven += 1
     else:
         for evaluated, value in _instantiations(matched, conditions, symbolic=False):
