@@ -4,6 +4,7 @@ route serves, and nothing it does not: main's GPU tier runs its cells after a pu
 whose axes, or whose route's support, change fails here until its cases are regenerated
 (`kernel_matrix.covering`)."""
 
+import importlib
 import itertools
 import subprocess
 import sys
@@ -11,6 +12,8 @@ from pathlib import Path
 
 import kernel_matrix
 import pytest
+
+from dew.nn.kernels import generation
 
 TESTS = Path(__file__).resolve().parent
 
@@ -49,3 +52,15 @@ def test_every_matrix_flow_is_a_test_its_tier_selects(flows, tier):
     found = {line.strip() for line in collected.stdout.splitlines()}
     missing = sorted(set(flows) - found)
     assert not missing, (missing, collected.stdout[-2000:], collected.stderr[-2000:])
+
+
+def test_every_kernel_choice_is_run_under_test_by_a_familys_matrix():
+    """Every choice a dispatch reports (`generation.CHOICES`) is a kernel some family's matrix runs under
+    test: the families' CHOICES, each its cell module's, together are `generation.CHOICES` (row 184), so a
+    choice added without a matrix fails here. A fused kernel that runs inside another's (a GEMM's prologue
+    in the product) may be two families'."""
+    modules = (importlib.import_module(module) for module, _ in kernel_matrix.CELLS.values())
+    declared = set().union(*(module.CHOICES for module in modules))
+    assert declared == generation.CHOICES, (
+        f"choices no family's matrix runs: {sorted(generation.CHOICES - declared)}; "
+        f"declared, not choices: {sorted(declared - generation.CHOICES)}")

@@ -588,6 +588,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     prologue and group zeroing, `registers`)."""
     FP8: ClassVar[bool] = False
     """Whether the launch multiplies FP8 operands (`_fp8`): a forward product's alone."""
+    STEPS: ClassVar[tuple[int, ...] | None] = None
+    """The depths its stage takes where its stage is its own (a packed matrix's decode,
+    `MosaicPackedGmm`); None: its family's (`mosaic.Family.depths`)."""
 
     def eligible(self, ba, target) -> bool:
         first, second = (value.dtype for name, value in ba.arguments.items()
@@ -727,7 +730,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                     or config.block_m % (family.role_rows * config.warpgroups)
                     or config.block_n % family.column_unit(dtype)
                     or not family.stores_columns(config.block_n, self._stored_rows(ba, config))
-                    or config.block_k not in family.depths(dtype)
+                    or config.block_k not in (self.STEPS or family.depths(dtype))
                     or not all(family.shares_rows(rows, config.warpgroups)
                                for rows in self._streamed_rows(ba, config)))
 
@@ -777,7 +780,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                                   multiprocessors=_multiprocessors(target), target=target,
                                   candidate=lambda tile: (self.candidate(ba, tile, target)
                                                           and (admits is None or admits(tile))),
-                                  launch_of=lambda tile: self.launch_of(ba, tile), grouped=depth is not None)
+                                  launch_of=lambda tile: self.launch_of(ba, tile), grouped=depth is not None,
+                                  depths=self.STEPS)
 
     def neighbours(self, ba, config: mosaic_gpu.Tiles) -> tuple[mosaic_gpu.Tiles, ...]:
         # The derived tile with one of its choices moved a step either way: a stage more or fewer, the
@@ -1066,6 +1070,37 @@ class MosaicGmm(_Mosaic):
                               prologue_operands=prologue_operands, epilogue_operands=epilogue_operands,
                               dense=dense, paired=paired, exact_sums=exact_sums,
                               **hooks.kernel_options()), None
+
+
+@dataclasses.dataclass(frozen=True)
+class MosaicPackedGmm(MosaicGmm):
+    """`MosaicGmm` of an NVFP4 matrix (`gemm.nvfp4_product`'s packed kernel, row 3621), planned on the call it
+    stands for (bfloat16 rows times a bfloat16 matrix read transposed): its matrix streamed as its words and
+    block scales and each stage decoded in place into the consumer's buffers (`mosaic_gpu.gmm`'s `scales`),
+    so its tile takes `mosaic_gpu.NVFP4_STEP`-deep steps, whole 64-column tiles, the decode's shared memory
+    and registers, and no cluster, split, swap or hook."""
+
+    STEPS: ClassVar[tuple[int, ...] | None] = (mosaic_gpu.NVFP4_STEP,)
+
+    def _allocations(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> mosaic_gpu.Allocations:
+        return mosaic_gpu.gmm_allocations(
+            config, family, dtype=ba.arguments['tokens'].dtype, rhs_dtype=jnp.uint32, transpose_rhs=True,
+            prologue_axes=(), prologue_dtypes=(), epilogue_axes=(), epilogue_dtypes=(),
+            dtypes=(ba.arguments['out_dtype'],), packed=True)
+
+    def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
+        return (config.cluster == 1 and config.splits == 1 and not config.swapped and config.block_n % 64 == 0
+                and super().candidate(ba, config, target))
+
+    def _swapped(self, ba, target):
+        # Its matrix is packed: no swapped orientation reads it.
+        del ba, target
+
+    def registers(self, ba, config: mosaic_gpu.Tiles) -> int:
+        # Beside the plain product's live set, a step's decode holds a 128-depth group's words, the code
+        # being decoded and the stage's block scales, each a `[block_n, 16]` register tile over a role's
+        # threads (`mosaic_gpu._stage_decoded`).
+        return super().registers(ba, config) + 3 * config.block_n * 16 // resources.THREADS
 
 
 @dataclasses.dataclass(frozen=True)
