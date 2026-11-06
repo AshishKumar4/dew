@@ -98,7 +98,8 @@ def _run[Words: (np.ndarray, jax.Array)](steps: Sequence[BitStep], outputs: Sequ
     """Each output (`outputs`, 0 the stored word, `i + 1` step `i`'s) of `steps` over `words`, uint32 arrays
     of `xp` (NumPy, or `jax.numpy` for a kernel's portable path): the one evaluation of a form's steps, as
     each instruction computes it, its shifts in 32 bits."""
-    values = [words]
+    # Each value the type of `words`, which `xp`'s operations keep and no checker follows through them.
+    values: list = [words]
     for step in steps:
         first = values[step.args[0]] if step.args else xp.zeros_like(words)
         amount = xp.uint32(step.immediate)
