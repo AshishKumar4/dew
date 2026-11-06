@@ -205,9 +205,12 @@ def weighted_total(x: jax.Array, weights: jax.Array, axis=None) -> tuple[jax.Arr
 def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     """`product` plus `bias` broadcast over its leading axes, in the dtype their addition promotes
     to, as flax's layer adds them.
-    Rounding the product and the bias once together, as torch's addmm does, wrote an fp32 product
-    and a pass of its own on every biased layer (a DiT-B step 17.5% slower on an A100), for a bf16
-    output 1.37 times torch's rounding, which the parity rule holds already.
+    Rounding a 16-bit product and a bias converted inside the step once together, as torch's addmm
+    does, wrote an fp32 product and a pass of its own on every biased layer (a DiT-B step 17.5% slower
+    on an A100), for a bf16 output 1.37 times torch's rounding, which the parity rule holds already:
+    XLA fuses an fp32 product's epilogue into its GEMM only where the bias is a parameter (row 634), so
+    a layer whose bias is stored at fp32 adds it to its fp32 product and rounds once
+    (`dew.nn.dense._rounds_once`), and a 16-bit bias adds here as flax adds it.
 
     JAX transposes a broadcast into a sum in the broadcast operand's dtype (jax-ml/jax#30310), so
     a bfloat16 bias added to bfloat16 products sums its gradient over every position in bfloat16,

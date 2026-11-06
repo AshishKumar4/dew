@@ -26,7 +26,7 @@ class _Backward:
     """A backward launch's static choices: its program's geometry, its forward's (`spec`: the call's form, the
     logits' scale and units, its score hook and initial state), its form, its consumers, whether it is
     interpreted, the score hook's parameter kinds (`kinds`), and whether the dK/dV program adds each tile's
-    dQ too (`fused`: the hookless fast form's one launch, dQ by atomic adds, D the forward's anchored one
+    dQ too (`fused`: the fast form's one launch, dQ by atomic adds, D the forward's anchored one
     unrefined)."""
 
     program: _Program[BackwardTiles]
@@ -89,14 +89,16 @@ def _score_params(family: mosaic.Family, refs, kinds: tuple[Kind, ...], row, hea
 
 def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, coords: algebra.Coords, whole,
                  shape: tuple[int, int], *, masked: bool | None) -> tuple[jax.Array, jax.Array]:
-    """A queries-first step's tile of a hookless fast-form call (`_fused_step`'s, `_coop_step`'s): its
+    """A queries-first step's tile of a fast-form call whose score hook, if any, takes no parameters
+    (`_fused_step`'s, `_coop_step`'s): its
     logits from the query slot taken by its power in registers (`_Backward.scaled`) against the resident
     keys (`resident`, `[bk, D]` and `[bk, Dv]` refs, a consumer's share of them where keys are shared), dP
     from the output-cotangent slot against the values, then `_scores` under the tile's queries' statistics
     `rows` (read before its products, which their loads run under: ET-A05AB5/6-h100, 2.05 against 2.32 ms
     read past them at Qwen3-8B causal) and `coords`, masked where `masked`, or where it is None chosen at run
     time, unmasked where every query sees the tile `whole`. Returns its weights narrowed for dV
-    (`algebra.value_weights`) and its score cotangents' one part in the operands' dtype (dK's and dQ's)."""
+    (`algebra.value_weights`), a dropping call's dropped (`algebra.drawn`), and its score cotangents through
+    the hook (`gradient.pulled`), one part in the operands' dtype (dK's and dQ's)."""
     family = walk.program.family
     (q_slot, do_slot), (keys, values) = slots, resident
     held = keys.transpose((1, 0))
@@ -106,8 +108,12 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
 
     def scores(*, masked: bool):
         # A tile every query sees whole (`masked` False) takes no mask (`_dq_step`'s choice).
-        exponentials, weights, cotangents, _, _ = _scores(walk, coords, (), s, dp, *rows, masked=masked)
-        return exponentials, weights, cotangents
+        exponentials, weights, cotangents, slopes, seen = _scores(walk, coords, (), s, dp, *rows,
+                                                                  masked=masked)
+        multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
+        if multiplier is not None:
+            exponentials, weights = exponentials * multiplier, weights * multiplier
+        return exponentials, weights, gradient.pulled(cotangents, slopes, seen, ())[0]
 
     if masked is None:
         exponentials, weights, cotangents = lax.cond(whole, functools.partial(scores, masked=False),
@@ -116,7 +122,7 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
         exponentials, weights, cotangents = scores(masked=masked)
     part = mosaic.unscaled_part(*algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype,
                                                          accurate=False))
-    return algebra.value_weights(exponentials, weights, do_slot.dtype), part
+    return algebra.value_weights(exponentials, weights, do_slot.dtype, walk.dropped), part
 
 
 def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak, total, anchor, delta,
@@ -160,18 +166,28 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
     exponentials, weights, cotangents = forms.mapped(tiles)
     return exponentials, weights, cotangents, slopes, seen
 
-def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, dq, columns=None) -> None:
+def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, dq, columns=None, *,
+              ticket: tuple | None = None) -> None:
     """A fused dK/dV consumer's tile `dq` added into dQ at its queries from `q_first` (`place` its row and
     head), its `columns` where it is a share of them (`pl.ds`), through its output stage, free until its dK
     and dV are stored (None where the family's adds read no stage, `Transport.adds_through_shared`);
     interpreted, into a copy of the consumer's own (`Family.added`). Where the stage holds several tiles'
     rows (its keys' rows twice a query tile's), a query tile's add takes the next slot of them in turn, so
     it waits for none of the earlier adds' reads of their own (`added`'s `pending`): FlashAttention 3's
-    dQ reduce runs off the consumers' path."""
+    dQ reduce runs off the consumers' path. With a `ticket` (deterministic mode: the semaphores counting
+    each query tile's adds, `[B, H, query tiles]`, and its key tile's turn), the add waits its turn and
+    completes before the next (`Family.ticketed`), so dQ sums its key tiles in their order."""
     row, head = place
     rows = dq.shape[0]
     view = dq_ref.at[index if walk.interpret else 0, row, pl.ds(q_first, rows), head]
     view = view if columns is None else view.at[:, columns]
+    family = walk.program.family
+    if ticket is not None:
+        ready, turn = ticket
+        smem = None if out_smem is None else out_smem.at[index, pl.ds(0, rows)]
+        family.ticketed(None if ready is None else ready.at[row, head, lax.div(q_first, rows)], turn,
+                        lambda: family.added(dq, view, walk.interpret, smem=smem))
+        return
     if out_smem is None:
         walk.program.family.added(dq, view, walk.interpret, smem=None)
         return

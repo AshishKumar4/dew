@@ -191,9 +191,10 @@ def flax_call(task: str, case: dict[str, np.ndarray], wide: bool, wanted) -> dic
 
 @contextlib.contextmanager
 def torch_drawing(noise, wide: bool):
-    """A PyTorch pipeline's calls at float32, or at float64 (`diffusers_extended_reference.truth`: built
-    and run in `torch_precision.float64`, DDIM's tables its module's own widened), every noise its call
-    draws the case's drawn `noise`."""
+    """A PyTorch pipeline's calls at float32, or at float64 (built and run in `torch_precision.float64`,
+    DDIM's tables its module's own widened, the image processor's NumPy too), every noise its call draws
+    the case's drawn `noise`."""
+    import flax_precision
     import torch
     from diffusers_wan_reference import float64_scheduler
     from torch_precision import float64
@@ -213,6 +214,8 @@ def torch_drawing(noise, wide: bool):
         if wide:
             scope.enter_context(float64())
             scope.enter_context(float64_scheduler(importlib.import_module("diffusers.schedulers.scheduling_ddim")))
+            # The image processor's pixels and mask, which it reads and normalizes in NumPy's float32.
+            scope.enter_context(flax_precision.float64(("diffusers.image_processor",), library="np"))
         scope.enter_context(torch.no_grad())
         yield
 
