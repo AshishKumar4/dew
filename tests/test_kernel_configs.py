@@ -916,30 +916,34 @@ def test_an_hoppers_blockwise_fp8_product_runs_the_template_named_for_it():
     assert route_failures(cases, compile_mosaic_kernels(cases, "sm90")) == []
 
 
-def _nvfp4_projected():
-    """An NVFP4 projection (`gemm.nvfp4_product`, Llama-3-8B's up: 4096 deep, 14336 wide) through its packed
-    kernel named, 64 rows."""
+def _nvfp4_projected(rows: int, named: str | None):
+    """An NVFP4 projection of `rows` rows (`gemm.nvfp4_product`, Llama-3-8B's up: 4096 deep, 14336 wide),
+    its kernel `named`, else the selector's."""
     from dew.nn.kernels import gemm
 
     matrix = gemm.NvFp4.of(jnp.zeros((4096, 14336), jnp.float32), jnp.ones((256, 14336), jnp.float8_e4m3fn),
                            1.0)
 
-    def product(rows):
-        with generation.chosen(nvfp4="packed"):
-            return gemm.nvfp4_product(rows, matrix, out_dtype=jnp.bfloat16)
+    def product(lhs):
+        with generation.chosen(**({} if named is None else {"nvfp4": named})):
+            return gemm.nvfp4_product(lhs, matrix, out_dtype=jnp.bfloat16)
 
-    return product, (jax.ShapeDtypeStruct((64, 4096), jnp.bfloat16),)
+    return product, (jax.ShapeDtypeStruct((rows, 4096), jnp.bfloat16),)
 
 
-def test_an_amperes_nvfp4_product_compiles_its_packed_kernel():
-    """An NVFP4 projection, its packed kernel named, compiled for a compile-only A100: its program launches
-    the template's product (`kernel_compile.Expected`, its route evidence), which ptxas compiles: its E4M3
-    block scales decoded by integer arithmetic (`mosaic_gpu._e4m3_values`), where their FP8 conversion took
-    sm89's `cvt .e4m3x2` and an A100's ptxas refused the kernel (W8-a100, M-NS-8; row 3621)."""
+@pytest.mark.parametrize(("rows", "named"), [(64, "packed"), (16, None)], ids=["named", "decode-cell"])
+def test_an_amperes_nvfp4_product_compiles_and_runs_its_packed_kernel(rows, named):
+    """An NVFP4 projection on a compile-only A100, its packed kernel named, or at a decode step's rows with no
+    kernel named (`gemm.NVFP4_CELLS`' A100 decode cell, receipt W13-a100-4-M-NS-8b-a100: 2.6-3.6x the matrix
+    decoded once a call): its program launches the template's packed product (`kernel_compile.Expected`, its
+    route evidence), which ptxas compiles, its E4M3 block scales decoded by integer arithmetic
+    (`mosaic_gpu._e4m3_values`) where their FP8 conversion took sm89's `cvt .e4m3x2` and an A100's ptxas
+    refused the kernel (W8-a100, M-NS-8; row 3621)."""
     from kernel_compile import Expected, compile_mosaic_kernels, route_failures
 
     expected = Expected(axes=(("data", 1),), specs=(None,), launches=frozenset({"dew_gmm"}))
-    cases = [support.KernelCase("nvfp4 packed", _nvfp4_projected, expected=expected)]
+    cases = [support.KernelCase(f"nvfp4 {rows} rows", functools.partial(_nvfp4_projected, rows, named),
+                                expected=expected)]
     assert route_failures(cases, compile_mosaic_kernels(cases, "sm80")) == []
 
 

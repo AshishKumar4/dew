@@ -210,7 +210,8 @@ def _chain(consumer, values, acc) -> cost.Work:
     closed = jax.make_jaxpr(consumer)(values, acc)
     work = cost.Work()
     for eqn in closed.jaxpr.eqns:
-        elements = float(sum(math.prod(var.aval.shape) for var in eqn.outvars if hasattr(var.aval, 'shape')))
+        elements = float(sum(math.prod(shape) for var in eqn.outvars
+                             if (shape := getattr(var.aval, 'shape', None)) is not None))
         name = eqn.primitive.name
         work = work + (cost.Work(exponentials=elements) if name in TRANSCENDENTAL
                        else cost.Work(conversions=elements) if name == 'convert_element_type'

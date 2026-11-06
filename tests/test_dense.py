@@ -291,6 +291,18 @@ BIASED_SEEDS = {False: 8, True: 8}
 DenseGeneral, sized by `seeds_for` paired with Dew's projection on the CPU and an A100."""
 
 
+def _torch_linear(dtype):
+    """torch's nn.Linear in `dtype` over the drawn inputs, kernel and bias, its output as float64:
+    `run(x, kernel, bias)`."""
+    import torch
+
+    def run(x, kernel, bias):
+        weight, shift, inputs = (torch.tensor(np.asarray(a, np.float64)).to(dtype)
+                                 for a in (kernel.T, bias, x))
+        return torch.nn.functional.linear(inputs, weight, shift).double().numpy()
+    return as_given(run)
+
+
 @pytest.mark.parametrize("general", [False, True], ids=["dense", "general"])
 def test_a_biased_bf16_projection_is_as_exact_as_torchs(general):
     """A bfloat16 projection with a bias, Llama's and Qwen's query, key and value, is on par with
@@ -311,15 +323,8 @@ def test_a_biased_bf16_projection_is_as_exact_as_torchs(general):
         params = {"params": {"kernel": kernel.astype(jnp.bfloat16), "bias": bias.astype(jnp.bfloat16)}}
         return layer.apply(params, x.astype(jnp.bfloat16))
 
-    def linear(dtype):
-        def run(x, kernel, bias):
-            weight, shift, inputs = (torch.tensor(np.asarray(a, np.float64)).to(dtype)
-                                     for a in (kernel.T, bias, x))
-            return torch.nn.functional.linear(inputs, weight, shift).double().numpy()
-        return as_given(run)
-
-    assert_as_exact(projected, linear(torch.bfloat16), draw, "projection", seeds=BIASED_SEEDS[general],
-                    truth_fn=linear(torch.float64))
+    assert_as_exact(projected, _torch_linear(torch.bfloat16), draw, "projection", seeds=BIASED_SEEDS[general],
+                    truth_fn=_torch_linear(torch.float64))
 
 
 @pytest.mark.parametrize("general", [False, True], ids=["dense", "general"])
@@ -345,15 +350,8 @@ def test_a_bf16_projection_with_an_fp32_bias_rounds_its_product_and_bias_once(ge
                              "bias": jnp.asarray(bias, jnp.float32)}}
         return layer.apply(params, jnp.asarray(x, jnp.bfloat16))
 
-    def linear(dtype):
-        def run(x, kernel, bias):
-            weight, shift, inputs = (torch.tensor(np.asarray(a, np.float64)).to(dtype)
-                                     for a in (kernel.T, bias, x))
-            return torch.nn.functional.linear(inputs, weight, shift).double().numpy()
-        return as_given(run)
-
-    assert_as_exact(projected, linear(torch.bfloat16), draw, "fp32-biased projection",
-                    seeds=BIASED_SEEDS[general], truth_fn=linear(torch.float64))
+    assert_as_exact(projected, _torch_linear(torch.bfloat16), draw, "fp32-biased projection",
+                    seeds=BIASED_SEEDS[general], truth_fn=_torch_linear(torch.float64))
 
 
 def test_an_adapter_adds_its_branch_to_the_layers_rounded_output():
