@@ -96,7 +96,9 @@ def media_inputs(pixels) -> dict[str, torch.Tensor]:
     from transformers.models.gemma4.image_processing_pil_gemma4 import convert_image_to_patches
 
     pixels = torch.as_tensor(pixels)
-    patches = torch.stack([torch.as_tensor(convert_image_to_patches(image.numpy(), 2)) for image in pixels[:, 0]])
+    # Patched in float64, which holds every narrower float exactly (NumPy holds no bfloat16), then cast back.
+    patches = torch.stack([torch.as_tensor(convert_image_to_patches(image.to(torch.float64).numpy(), 2))
+                           for image in pixels[:, 0]])
     positions = torch.tensor([[[0, 0], [1, 0], [0, 1], [1, 1]]]).expand(len(pixels), -1, -1)
     return {"pixel_values": patches.to(pixels.dtype), "image_position_ids": positions}
 
