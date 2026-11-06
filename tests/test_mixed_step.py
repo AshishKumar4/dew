@@ -48,7 +48,19 @@ FEATURES = {"plain": {}, "no qk norm": {"qk_norm": False}, "projection norm": {"
             "exclusive, no rope": {"mixer": AttentionMixer(nope=True, exclusive_self_attention=True)},
             "sinks": {"attention_sinks": True},
             "window": {"layer_types": ("local", "global"),
-                       "kinds": {"local": LayerKind(window=3), "global": LayerKind()}}}
+                       "kinds": {"local": LayerKind(window=3), "global": LayerKind()}},
+            "int8 cache": {"quantized": "int8"}, "fp8 cache": {"quantized": "float8_e4m3fn"}}
+"""Each attention feature the mixed call takes; a `quantized` one the cache's (`KVCache.quantized`)."""
+
+
+def featured(feature: str, **layout) -> dict:
+    """The tiny decoder's overrides for `feature` (`FEATURES`), its cache laid out by `layout` and the
+    feature's."""
+    overrides = dict(FEATURES[feature])
+    quantized = overrides.pop("quantized", None)
+    if layout or quantized:
+        overrides["kv_cache"] = KVCache(**layout, quantized=quantized)
+    return overrides
 
 
 @pytest.mark.parametrize("paged", [False, True], ids=["dense", "paged"])
@@ -62,8 +74,7 @@ def test_a_mixed_call_decodes_and_prefills_as_the_separate_calls_do(continuing, 
     piece reads its row's cache or, starting the row, its own keys, under
     each attention feature the mixed call takes, over a dense cache or a
     page pool (row 3 writing through its own pages)."""
-    pool = {"kv_cache": KVCache(page_size=4, pages=ROWS * 4)} if paged else {}
-    model = tiny(**FEATURES[feature], **pool)
+    model = tiny(**featured(feature, **({"page_size": 4, "pages": ROWS * 4} if paged else {})))
     params = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
     cache = prefilled(model, params)
     fed = jnp.asarray([7, 9, 0, 0], jnp.int32)
@@ -88,8 +99,8 @@ def test_a_mixed_call_decodes_and_prefills_as_the_separate_calls_do(continuing, 
     for layer, held in mixed["cache"].items():
         attention = held["self_attn"]
         np.testing.assert_array_equal(attention["cache_index"], [4, 6, 0, 4])
-        if paged:
-            continue  # the pool's pages: the logits read them, and `cache_index` is checked
+        if paged or "quantized" in FEATURES[feature]:
+            continue  # the pool's pages or codes: the logits read them, and `cache_index` is checked
         for name in ("cached_key", "cached_value"):
             written = np.asarray(attention[name])
             decoded_rows = np.asarray(stepped["cache"][layer]["self_attn"][name])[:2]
@@ -103,7 +114,7 @@ WIDE = {"head_dim": 64, "max_seq_len": 128, "dtype": jnp.bfloat16}
 """The template's decode at head width 64 over 128 slots a row, bf16: what its Mosaic mainloop takes."""
 
 
-@pytest.mark.parametrize("feature", ["plain", "sinks", "window"])
+@pytest.mark.parametrize("feature", ["plain", "sinks", "window", "int8 cache"])
 @pytest.mark.parametrize("paged", [False, True], ids=["dense", "paged"])
 @pytest.mark.parametrize("continuing", [True, False])
 def test_a_mixed_call_through_one_template_work_list_is_on_par_interpreted(continuing, paged, feature):
@@ -117,7 +128,7 @@ def test_a_mixed_call_through_one_template_work_list_is_on_par_interpreted(conti
 
     from dew.nn.kernels import generation
 
-    pool = {"kv_cache": KVCache(page_size=16, pages=ROWS * 8)} if paged else {}
+    layout = {"page_size": 16, "pages": ROWS * 8} if paged else {}
     fed = jnp.asarray([7, 9, 0, 0], jnp.int32)
     prompt = jnp.asarray([0, 0, 11, 12, 13, 14], jnp.int32)
     tokens = jnp.concatenate([fed, prompt, jnp.zeros(WIDTH, jnp.int32)])[None]
@@ -138,7 +149,7 @@ def test_a_mixed_call_through_one_template_work_list_is_on_par_interpreted(conti
                                    method=CausalTransformer.states_and_logits_at)[0][1]
         return logits
 
-    model = tiny(**WIDE, **pool, **FEATURES[feature])
+    model = tiny(**WIDE, **featured(feature, **layout))
 
     def draw(seed):
         return (model.init(jax.random.key(seed), jnp.zeros((1, 4), jnp.int32)),)
@@ -148,8 +159,8 @@ def test_a_mixed_call_through_one_template_work_list_is_on_par_interpreted(conti
                     truth_fn=mixed(float64_twin(model.clone(attention_impl="xla"))))
 
 
-REFUSALS = {"plain": {}, "alibi": {"position_embedding": "alibi"},
-            "shared keys": {"kv_shared_layers": (1,)}, "int8 cache": {"kv_cache": KVCache(quantized="int8")}}
+REFUSALS = {"plain": {}, "alibi": {"position_embedding": "alibi"}, "shared keys": {"kv_shared_layers": (1,)},
+            "grouped pool": {"kv_cache": KVCache(page_size=4, pages=ROWS * 4, groups=2)}}
 
 
 @pytest.mark.parametrize("case", list(REFUSALS))
@@ -157,7 +168,7 @@ def test_a_model_says_whether_its_layers_run_the_mixed_call_as_they_do(case):
     """The model answers for every layer it builds, unbound and untraced
     (`mixed_admission_refusal`): it names a reason exactly where a layer's
     mixed call refuses to run, and None where the call runs. ALiBi, shared
-    keys and a quantized cache are refused; plain attention runs."""
+    keys and a pool split into groups are refused; plain attention runs."""
     model = tiny(**REFUSALS[case])
     refusal = model.mixed_admission_refusal()
     params = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
