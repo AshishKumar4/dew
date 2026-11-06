@@ -87,12 +87,14 @@ def scanned(fn, starts):
     return lambda *inputs: fn(*inputs, starts=starts)[0]
 
 
-def the_template_is_as_exact_as_the_portable_scan(case: str, packed: bool, dtype=jnp.bfloat16):
-    """`case`'s output and every input's gradient through the template on par from float64 with the portable
-    scan's, over check 1's fewest draws."""
+def the_template_is_as_exact_as_the_portable_scan(case: str, packed: bool, dtype=jnp.bfloat16,
+                                                  tiles: selective.Tiles | None = None):
+    """`case`'s output and every input's gradient through the template, at `tiles` where given (else the
+    device's plan), on par from float64 with the portable scan's, over check 1's fewest draws."""
     shape = SHAPES[case]
     family = mosaic_sm90.WGMMA if INTERPRETED else bundles.of(generation.device_generation(), dtype)
-    template = functools.partial(selective.selective_scan, family=family, interpret=INTERPRETED)
+    planned = {} if tiles is None else {"chunk": tiles.chunk, "plan": (tiles.positions, tiles.resident)}
+    template = functools.partial(selective.selective_scan, family=family, interpret=INTERPRETED, **planned)
 
     def draws(seed):
         inputs, _, dy = draw(dtype, seed, *shape, packed)
@@ -427,12 +429,13 @@ def _bound(length: int):
     return selective.SELECTIVE.bind(*operands, interpret=True)
 
 
+@pytest.mark.check1_shards(seeds=8, per_task=4)
 def test_a_spill_steps_the_kernel_that_spilled():
     """`Selective.derived` past a compile's spill (`report.refuse`, a refusals scope): a backward kernel that
-    spilled halves the backward's tokens, its residency the planner's at their registers, the forward's
-    chunk kept; a forward kernel's spill, whose registers no tile sets, leaves the call no config (rows 3851,
-    3861)."""
-    bound = _bound(2048)
+    spilled gives the call another config, legal and not the one refused, under which its output and every
+    input's gradient are on par from float64 with the portable scan's (check 1); a forward kernel's spill,
+    whose registers no tile sets, leaves the call no config (rows 3851, 3861)."""
+    bound = _bound(SHAPES["interpreted"][1])
     target = generation.gpu_target('sm90')
     with generation.assumed(target):
         derived = selective.SELECTIVE.derived(bound, target)
@@ -443,10 +446,9 @@ def test_a_spill_steps_the_kernel_that_spilled():
         with report.refusals():
             report.refuse([(identity, derived, {'selective_scan'})])
             assert selective.SELECTIVE.derived(bound, target) is None
-    facts = generation.gpu_target(generation.INTERPRETED_GENERATION)
-    fewer = derived.positions // 2
-    assert stepped == selective.Tiles(derived.chunk, fewer,
-                                      selective.backward_programs(selective.backward_registers(fewer), facts))
+        assert stepped is not None and stepped != derived
+        assert selective.SELECTIVE.legal(bound, stepped, target)
+    the_template_is_as_exact_as_the_portable_scan("interpreted", packed=False, tiles=stepped)
 
 
 @pytest.mark.parametrize('length', [129, 2048], ids=['129 tokens', '2048 tokens'])
