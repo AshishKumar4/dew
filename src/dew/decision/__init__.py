@@ -72,7 +72,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     )
     from dew.decision.rows import NONE_OF_THE_ABOVE, Encoding
     from dew.decision.scoring import Brier, Combined, LogLoss, RankedProbability, ScoringRule, Spherical
-    from dew.decision.task import TASK_FILE, Budget, Decide, Usage, Weights
+    from dew.decision.task import TASK_FILE, Budget, Decide, Finalists, Knockout, Usage, Weights
 
 _EXPORTS = {
     "AURC": "dew.decision.metrics",
@@ -103,11 +103,13 @@ _EXPORTS = {
     "Encoding": "dew.decision.rows",
     "EntropyConfidence": "dew.decision.questions",
     "Example": "dew.decision.data",
+    "Finalists": "dew.decision.task",
     "Framing": "dew.decision.layout",
     "Group": "dew.decision.data",
     "GroupedExamples": "dew.decision.data",
     "Head": "dew.decision.head",
     "Instructions": "dew.decision.layout",
+    "Knockout": "dew.decision.task",
     "JevConfidence": "dew.decision.questions",
     "JointLayout": "dew.decision.layout",
     "JointSchemaHead": "dew.decision.head",
@@ -191,6 +193,7 @@ __all__ = [
     "Encoding",
     "EntropyConfidence",
     "Example",
+    "Finalists",
     "Framing",
     "Group",
     "GroupedExamples",
@@ -199,6 +202,7 @@ __all__ = [
     "JevConfidence",
     "JointLayout",
     "JointSchemaHead",
+    "Knockout",
     "LabelReadout",
     "Labels",
     "Laid",
