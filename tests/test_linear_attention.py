@@ -872,7 +872,8 @@ def test_the_decode_kernel_keeps_the_kernel_contract_on_a_mesh(axis, split):
 
     from dew.nn.linear import decode_gated_delta_rule
 
-    rows, H, D = 4, 4, 32
+    # A model's 128 keys and values a head, as the template's step takes them (a thread a value column).
+    rows, H, D = 4, 4, 128
     active = jnp.asarray([True, False, True, False])
 
     def draw(seed):
@@ -919,7 +920,7 @@ def test_the_decode_step_keeps_the_kernel_contract_on_a_mesh_for_each_decay(form
 
     from dew.nn.linear import stepped_per_shard
 
-    rows, heads, groups, width = 4, 4, 2, 32
+    rows, heads, groups, width = 4, 4, 2, 128
     keyed = form == "a decay a key dimension"
     hooks = KEYED if keyed else RATED
     active = jnp.asarray([True, False, True, False])
@@ -1003,7 +1004,7 @@ def test_a_cached_layer_traced_for_a_jvp_decodes_its_token(staged):
     `generation.linear_tangent`), which the in-place launch does not give (row 2395)."""
     from dew.nn.kernels.generation import assumed
 
-    layer, variables, cache, token = fused_case(4, 32, 2, jnp.float32, jnp.float32)
+    layer, variables, cache, token = fused_case(4, 128, 2, jnp.float32, jnp.float32)
 
     def step(token):
         return layer.apply({**variables, "cache": cache}, token, MixerCall(decode=True), mutable=["cache"])[0]
@@ -1018,7 +1019,7 @@ def test_the_fused_decode_step_leaves_an_idle_row_alone():
     """A row the fused step marks idle: its history and state as they were, bitwise, and its output
     zeros, beside an active row that moves."""
 
-    layer, variables, cache, token = fused_case(4, 32, 2, jnp.float32, jnp.float32)
+    layer, variables, cache, token = fused_case(4, 128, 2, jnp.float32, jnp.float32)
     operands = fused_inputs(layer, variables, cache, token)
     out, history, state = jax.jit(functools.partial(
         fused_step, epsilon=layer.norm_eps, activation=layer.gate_activation,
@@ -1044,7 +1045,7 @@ def test_the_fused_decode_step_computes_the_layers_token(held):
     read in fp32, its state against the unfused token's written back `held`; its history bit for bit the
     unfused token's, and its state's dtype the one it holds. A GPU's widths are its flow's
     (tests/test_gpu_recurrence.py)."""
-    heads, width, rows = 4, 32, 3
+    heads, width, rows = 4, 128, 3
     layer = fused_case(heads, width, rows, jnp.float32, held)[0]
     wide = layer.clone(dtype=jnp.float64)
     step = MixerCall(decode=True)
@@ -1082,7 +1083,7 @@ def test_a_layer_choosing_the_fused_step_allocates_its_cache_as_the_unfused_one(
     step needs before the first token."""
     from dew.nn.kernels.generation import assumed, chosen
 
-    module = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=32, head_v_dim=32,
+    module = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=128, head_v_dim=128,
                            dtype=jnp.bfloat16)
     x = jnp.zeros((2, 1, 64), jnp.bfloat16)
     unfused = jax.eval_shape(lambda: nn.unbox(module.init(jax.random.key(0), x, MixerCall(decode=True))))
