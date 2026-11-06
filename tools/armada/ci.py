@@ -339,16 +339,20 @@ def contents(name: str) -> bytes:
     it is downloaded here or not, so a planner that never fetches it keys it as a task does. An execution
     limit a run read (followed.py's `LIMITS`: "limit:cpu", "limit:memory") is the one binding this process
     (host.py's `limit`): a row green on 4 vCPUs is not reused on 8, nor on a planner, which reads its own (row
-    1998, 2026-10-28). A path a run probed (followed.py's `PROBED`: "probe:" and the path) is its kind
-    where it is a directory, whose probe never reads its entries, and as read otherwise."""
+    1998, 2026-10-28). A path a run probed (followed.py's `PROBED`: "probe:" and the path) is what a
+    probe answers of it (`probed`), never its bytes, which no probe reads. An import's search of a checkout
+    directory for a name (followed.py's `LOOKUP`) is what that search finds there (`looked_up`)."""
     if name.startswith("limit:"):
         return hashlib.sha256(host().limit(name).encode()).digest()
-    if name.startswith("probe:"):
-        probed = name.removeprefix("probe:")
-        return b"directory" if Path(probed).is_dir() else contents(probed)
+    if name.startswith(followed.PROBED):
+        return probed(Path(name.removeprefix(followed.PROBED)))
+    if name.startswith(followed.LOOKUP):
+        return looked_up(Path(name.removeprefix(followed.LOOKUP)))
     if followed.CODE in name:
         path, _, executed = name.partition(followed.CODE)
-        return unit(path, executed) if Path(path).is_file() else b"missing"
+        if not Path(path).is_file():
+            return b"missing"
+        return code_of(path) if executed == followed.WHOLE else unit(path, executed)
     if name.startswith("import:"):
         # A top-level module a run imported (followed.py's `IMPORTED`): whether a helper under tests/, which
         # leads sys.path, would shadow it, a module or a package of that name.
@@ -366,6 +370,35 @@ def contents(name: str) -> bytes:
                          if not entry.name.startswith(".") and not built(entry))
         return hashlib.sha256("\n".join(entries).encode()).digest()
     return b"missing"
+
+
+def probed(path: Path) -> bytes:
+    """What an existence or size probe (followed.py's `PROBES`) answers of `path`: missing, a directory, or a
+    file with its size and whether it executes, the stat a probe reads beside its kind. Its bytes are none
+    of it: a file's edit of the same size reruns no prober, which reads it only by opening it, its own input;
+    its times are no checkout's to keep (train 668: a helper's comment edit re-keyed its 458 probers)."""
+    if path.is_dir():
+        return b"directory"
+    if not path.is_file():
+        return b"missing"
+    stat = path.stat()
+    return f"file {stat.st_size} {int(bool(stat.st_mode & 0o111))}".encode()
+
+
+def looked_up(looked: Path) -> bytes:
+    """What an import of name `looked.name` finds in directory `looked.parent`: the entries there of that
+    name, a module of any suffix (source, bytecode, an extension) or a package, and a package's __init__ of
+    any suffix, which decides whether it is a regular package or a namespace's portion; none of any other
+    name (train 668: a module added under nn/backbones re-keyed the 589 rows that imported its siblings)."""
+    directory = looked.parent
+    if not directory.is_dir():
+        return b"missing"
+    found = sorted(entry.name for entry in directory.iterdir() if not built(entry) and (
+        entry.name == looked.name or entry.name.startswith(f"{looked.name}.")))
+    if looked.is_dir() and not looked.is_symlink():
+        found += sorted(f"{looked.name}/{entry.name}" for entry in looked.iterdir()
+                        if entry.name.partition(".")[0] == "__init__" and not built(entry))
+    return hashlib.sha256("\n".join(found).encode()).digest()
 
 
 @dataclasses.dataclass
@@ -392,7 +425,7 @@ class Reading:
 
     def read(self, path: str) -> bytes:
         module, _, executed = path.partition(followed.CODE)
-        if not executed or not Path(module).is_file():
+        if not executed or executed == followed.WHOLE or not Path(module).is_file():
             return contents(path)
         if module not in self.modules:
             self.modules[module] = units(module)
@@ -422,29 +455,32 @@ def cache_key(common: str, name: str, split: str, depends: list[str],
 
 
 def inputs(name: str, depends: list[str]) -> list[str]:
-    """What test file `name`'s key covers, given that its run executed or read `depends`: those, and each
-    directory under src/ or tools/ that holds a module it executed, however deep, whose entries name the
-    modules an import there finds: a module added beside one it imported (which shadows it, or which an
-    import it tried now finds), or an __init__.py added to a namespace package on the way to one, which
-    executes as the import passes, changes its key; one added to a package it never imported does not.
-    tools/ itself is among them, as a test puts it, or a directory under it, on sys.path and imports a tool
-    by its name, which a package added there shadows; src/'s own entries every key covers (`shared`). The
+    """What test file `name`'s key covers, given that its run executed or read `depends`: those, its own code
+    whole (followed.py's `WHOLE`), and the import lookups that found each module it executed under src/ or
+    tools/ (`lookups`): a module or package of its name added beside one it imported (which shadows it), or an
+    __init__.py added to a namespace package on the way to one, which executes as the import passes, changes
+    its key; a module of another name added beside it does not, unless an import its run tried and failed
+    looks for that name (followed.py's `missed`). tools/ is searched so, as a test puts it, or a directory
+    under it, on sys.path and imports a tool by its name; src/'s own entries every key covers (`shared`). The
     harness's own modules (tools/armada/, which runs every test process and records it, `SHARED`) are no
-    import of a test's, so their directories are none of its inputs (the maintainer, 2026-10-29: tools/'s
-    entries keyed every row, and train 296's one added tool reran 1,794 of 1,795)."""
-    return sorted({name, *(path for path in depends if not built_input(path)),
-                   *(package for path in depends for package in packages(path.partition(followed.CODE)[0]))})
+    import of a test's, so their lookups are none of its inputs (the maintainer, 2026-10-29: train 296's one
+    added tool reran 1,794 of 1,795; train 668: one module added to nn/backbones re-keyed 589 rows)."""
+    own = f"{name}{followed.CODE}{followed.WHOLE}"
+    return sorted({own, *(path for path in depends if not built_input(path)),
+                   *(looked for path in depends for looked in lookups(path.partition(followed.CODE)[0]))})
 
 
 @functools.cache
-def packages(path: str) -> tuple[str, ...]:
-    """The directories under src/ or tools/ above module `path` whose entries an import of it reads
-    (`inputs`), none for any other path. A function of the path's text alone, kept: a plan asks it of each of
-    a row's ~3,000 inputs for every row."""
+def lookups(path: str) -> tuple[str, ...]:
+    """The import lookups that find module `path` under src/ or tools/ (followed.py's `LOOKUP`), its own name
+    in its directory and each package's name on the way down to it, none for any other path. A function of
+    the path's text alone, kept: a plan asks it of each of a row's ~3,000 inputs for every row."""
     if not path.startswith(("src/", "tools/")) or not path.endswith(".py") or path.startswith(HARNESS):
         return ()
-    return tuple(str(parent) for parent in Path(path).parents
-                 if parent.parts[:1] in (("src",), ("tools",)) and parent != Path("src"))
+    module = Path(path)
+    found = module.parent if module.name == "__init__.py" else module.with_suffix("")
+    return tuple(f"{followed.LOOKUP}{step}" for step in (found, *found.parents)
+                 if len(step.parts) > 1 and step.parts[0] in ("src", "tools"))
 
 
 @functools.cache
@@ -453,7 +489,8 @@ def built_input(path: str) -> bool:
     build's output (an editable install's metadata, bytecode) is the environment's, which the locks key
     (`shared`): a planner's checkout has none (train 300's plan reused none of 501 files). Kept, as
     `packages` is."""
-    return built(Path(path.removeprefix("probe:").partition(followed.CODE)[0]))
+    named = path.removeprefix(followed.PROBED).removeprefix(followed.LOOKUP)
+    return built(Path(named.partition(followed.CODE)[0]))
 
 
 @functools.cache
