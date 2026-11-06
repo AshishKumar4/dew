@@ -12,11 +12,13 @@ tile's keys with the algebra's online softmax; two builders shape the step for i
   template forward's grid (`MosaicForward.splits`), as many as the GPU holds at once (the derived
   config's resident programs a multiprocessor, from its registers and its shared memory, times the
   multiprocessors; no fitted table), so one row's long cache fills the GPU. No query or span is copied.
-- the merge: the slices' softmax states, each its output normalized in fp32, its maximum and its
-  denominator, combined with the call's initial state (a sink, `Initial`) as one more by the algebra's
-  fold over states (`algebra.merged_slices`), one sum a row, deterministic.
+- the merge: the slices' softmax states combined with the call's initial state (a sink, `Initial`), in
+  a fixed order, deterministic: in the launch by the last slice's program where the family waits across
+  programs (`MosaicForward.merges`, `Family.fixed_up`), else by the algebra's fold over their fp32 states in
+  XLA (`algebra.merged_slices`).
 
-No arithmetic of its own past the merge: the walk, the hooks and the guards are the template forward's.
+No arithmetic of its own: the walk, the hooks, the guards and the merge are the template forward's and its
+algebra's.
 """
 
 import dataclasses
@@ -37,6 +39,7 @@ from dew.nn.kernels.templates.attention import (
     prescale,
     ungrouped_rows,
 )
+from dew.nn.kernels.templates.attention_mosaic_program import bundle_of
 
 
 def packable(hooks: Hooks | None) -> bool:
@@ -105,45 +108,52 @@ def packed(query: jax.Array, spans: KeySpans, kv_heads: int, initial: Initial | 
 
 @dataclasses.dataclass(frozen=True)
 class Plan:
-    """A decode step's work list as the derivation shapes it: the forward's config (`attention_mosaic.Tiles`)
-    and the slices each query tile's keys are cut into (`MosaicForward.splits`)."""
+    """A decode step's work list as the derivation shapes it: the forward's config (`attention_mosaic.Tiles`),
+    the slices each query tile's keys are cut into (`MosaicForward.splits`) and whether the launch merges them
+    itself (`MosaicForward.merges`), its output the rows' whole in the query's dtype."""
 
     config: attention_mosaic.Tiles
     slices: int
+    merges: bool
 
 
 def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
          scale: float | None, target: generation.GpuTarget, table: jax.Array | None = None,
          sources: jax.Array | None = None) -> Plan | None:
-    """The work list of a packed call (`packed`) on `target`: the forward's derived config at the key tile
-    its memory-bound walk streams at least (`MosaicForward.streaming`) and its slices; None where no launch
-    of it derives.
+    """The work list of a packed call (`packed`) under its `hooks` (its initial state among them) on `target`:
+    the forward's derived config at the key tile its memory-bound walk streams at least
+    (`MosaicForward.streaming`) and its slices; None where no launch of it derives.
     One where the programs already fill the multiprocessors (a slice's merge would cost and its keys gain
-    nothing), or where no split launch derives (its slices' fp32 outputs staged beside the query's: a
-    256-wide bf16 step's 64-key tile needed 234,576 bytes of an H100's 232,448, dd-d256), whose one slice
-    a row finishes in the query's dtype through the query's stage. Else as many as its programs'
-    residency holds at once (`Family.programs`, its registers; its shared memory's), but each slice at
-    least twice its ring's stages of key tiles: a shorter slice's walk spends its prologue's loads, `stages`
-    tiles, without as many steps of products to hide them (ET-DECODE2-h100: 32 slices of one key tile each,
-    at batch 1 over 4096 keys, took 22 us where cuDNN's whole step took 13)."""
-    split = _streamed(query, key, value, spans, hooks, scale=scale, target=target, table=table,
-                      sources=sources, out_dtype=jnp.float32)
-    if split is None:
-        whole = _streamed(query, key, value, spans, hooks, scale=scale, target=target, table=table,
-                          sources=sources, out_dtype=None)
-        return None if whole is None else Plan(whole[0], 1)
-    config, op, ba = split
+    nothing). Else as many as its programs' residency holds at once (`MosaicForward.resident`: its
+    registers', its shared memory's), but each slice at least twice its ring's stages of key tiles: a shorter
+    slice's walk spends its prologue's loads, `stages` tiles, without as many steps of products to hide them
+    (ET-DECODE2-h100: 32 slices of one key tile each, at batch 1 over 4096 keys, took 22 us where cuDNN's
+    whole step took 13). Where the family waits across programs (`Family.fixes_up`), the launch merges the
+    slices in the last one's program, the initial state with them (`MosaicForward.merges`); elsewhere each
+    slice writes its fp32 state, which XLA merges (`algebra.merged_slices`), at a config derived for them."""
+    found = _streamed(query, key, value, spans, hooks, scale=scale, target=target, table=table,
+                      sources=sources, out_dtype=None)
+    if found is None:
+        return None
+    config, op, ba = found
     processors = target.multiprocessors or 1
     tiles = math.ceil(query.shape[1] / (config.consumers * config.block_q))
     programs = query.shape[0] * query.shape[2] * tiles
     if programs >= processors:
-        return Plan(config, 1)
-    resident = op.resident(ba, config, target)
+        return Plan(config, 1, False)
+    if not bundle_of(config, query.dtype).fixes_up:
+        walked = None if hooks is None else dataclasses.replace(hooks, initial=None)
+        found = _streamed(query, key, value, spans, walked, scale=scale, target=target, table=table,
+                          sources=sources, out_dtype=jnp.float32)
+        if found is None:
+            return Plan(config, 1, False)
+        config, op, ba = found
     longest = math.ceil(spans.keys / config.block_k) // (2 * config.stages)
     # The most slices whose programs the device holds at once, none past it: one program past them waits a
     # whole walk for a slot (ceil(132 / 8) = 17 slices of one row's 8 key heads is 136 programs, 4 of them a
-    # second wave as long as the first).
-    return Plan(config, max(1, min(processors * resident // programs, longest)))
+    # second wave as long as the first), and a merging launch's every program resident.
+    slices = max(1, min(processors * op.resident(ba, config, target) // programs, longest))
+    return Plan(config, slices, slices > 1 and bundle_of(config, query.dtype).fixes_up)
 
 
 def _streamed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None,
@@ -179,43 +189,37 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     or a paged cache's pools `[KV, P, page, D]` and their page table, `table`: each
     row's keys where it maps them), the keys `spans` `[B, T]` leaves each query under `hooks` (`packable`), as
     `attention.reference` computes it, `[B, T, H, Dv]` in the query's dtype: packed (`packed`), its keys
-    sliced over the derived work list (`plan`) on the template's forward in fp32 with its rows
-    (`attention_mosaic.forward`'s `splits`), merged with the initial state (`merged`) and unpacked; a row of
-    one slice finished by its own walk from the initial state, in the query's dtype. Its
-    logits folded where the algebra folds them, the rows the fold's reach or the headroom guard rewalks
-    walked again natural in one more launch over those rows alone, with no branch read on the host
-    (`MosaicForward.masked`, row 1978)."""
+    sliced over the derived work list (`plan`) on the template's forward (`attention_mosaic.forward`'s
+    `splits`), the slices merged with the initial state in the launch where its family waits across programs
+    (`merges`), else in XLA from their fp32 states (`algebra.merged_slices`), and unpacked. Its logits folded
+    where the algebra folds them, the rows the fold's reach or the headroom guard rewalks walked again
+    natural over those rows alone, with no branch read on the host (`MosaicForward.masked`, row 1978)."""
     hooks = Hooks() if hooks is None else hooks
     if not packable(hooks):
         raise NotImplementedError("the template's decode packs no query-placed hook, parameter, output "
                                   "hook or dropout (`packable`)")
     heads, kv_heads = query.shape[2], (key.shape[2] if table is None else key.shape[0])
     rows, row_spans, initial = packed(query, spans, kv_heads, hooks.initial)
-    walked = dataclasses.replace(hooks, initial=None)
+    whole = dataclasses.replace(hooks, initial=initial)
     target = generation.gpu_target()
-    work = plan(rows, key, value, row_spans, walked, scale=scale, target=target, table=table, sources=sources)
+    work = plan(rows, key, value, row_spans, whole, scale=scale, target=target, table=table, sources=sources)
     if work is None:
-        raise NotImplementedError(f"the template's forward derives no decode step's config on {target}")
-    if work.slices == 1:
-        # One slice a row: its walk merges the initial state itself (`algebra.merge`) and finishes its rows in
-        # the query's dtype, no merge past it (its fp32 rows and their merge took 45 of B128's 820 us at
-        # 4096 keys, ET-DECODE6-h100).
-        whole = dataclasses.replace(hooks, initial=initial)
-        found = _streamed(rows, key, value, row_spans, whole, scale=scale, target=target, table=table,
-                          sources=sources, out_dtype=None)
-        if found is None:
-            raise NotImplementedError(f"the template's forward derives no decode step's config on {target}")
-        work = Plan(found[0], 1)
+        raise NotImplementedError(f"the template's decode derives no config on {target}")
+    form = {"scale": scale, "natural": False, "interpret": interpret, "masked": True, "table": table,
+            "sources": sources, "subtracted": True}
+    if work.slices == 1 or work.merges:
+        # A row's walk, or its slices merged in the launch, from the initial state, finished in the query's
+        # dtype, no merge past it (its fp32 rows and their merge took 45 of B128's 820 us at 4096 keys,
+        # ET-DECODE6-h100; XLA's merge of the slices, four fusions, ~6.9 us of B1's step, ET-DPROF-h100).
         with tuning.pinned({attention_mosaic.MosaicForward: work.config}):
-            out = attention_mosaic.forward(rows, key, value, row_spans, whole, scale=scale, natural=False,
-                                           residuals=Kept.NONE, interpret=interpret, masked=True, table=table,
-                                           sources=sources, subtracted=True)
+            out = attention_mosaic.forward(rows, key, value, row_spans, whole, residuals=Kept.NONE,
+                                           splits=work.slices, merges=work.merges, **form)
         return ungrouped_rows(out, heads)
+    walked = dataclasses.replace(hooks, initial=None)
     with tuning.pinned({attention_mosaic.MosaicForward: work.config}):
         out, maximum, total = attention_mosaic.forward(
-            rows, key, value, row_spans, walked, scale=scale, natural=False, residuals=Kept.OUTPUT,
-            interpret=interpret, out_dtype=jnp.float32, masked=True, splits=work.slices, table=table,
-            sources=sources, subtracted=True)[:3]
+            rows, key, value, row_spans, walked, residuals=Kept.OUTPUT, out_dtype=jnp.float32,
+            splits=work.slices, **form)[:3]
     merged_rows = algebra.merged_slices(_spec(rows, row_spans, walked, scale=scale), out, maximum, total,
                                         initial)
     return ungrouped_rows(merged_rows, heads).astype(query.dtype)
