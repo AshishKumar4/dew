@@ -452,7 +452,8 @@ class SourceLayout:
 def source_layout(model: object, *, config: Mapping[str, object] | None = None) -> SourceLayout | Unwritable:
     """The layout `model` is written in as its family's release, or what it cannot write (`Unwritable`):
     the one answer every writer asks (a run's export, a bundle's save, a decision's release). A decoder's
-    family is the one its fields match (`hf_decoders.export_config`), its config the one it writes there,
+    family is the one its fields match (`hf_decoders.export_config`; a differential extension's, the
+    decoder's it extends, folded as it is written), its config the one it writes there,
     read back as the same model (`refuse_lossy_export`), and every parameter and router state a route of
     the family's writes (`decoder_parts.unrouted`). `config` is a loaded source's own config.json, which a
     save writes as published, its representability still the model's."""
@@ -466,22 +467,29 @@ def source_layout(model: object, *, config: Mapping[str, object] | None = None) 
     if not isinstance(model, CausalTransformer):
         return Unwritable(f"no family writes a {type(model).__name__}")
     decoder = from_record(CausalTransformer, model)
-    if decoder.cross_attention is not None or decoder.dex is not None:
-        return Unwritable("cross-attention and DEX have no layout in any family")
+    if decoder.cross_attention is not None:
+        return Unwritable("cross-attention has no layout in any family")
+    # A differential extension is folded into each layer's output projection as it is written
+    # (`Pretrained.export`): the layout is the decoder's it extends.
+    base = decoder.with_dex(None)
     try:
-        written = hf_decoders.export_config(decoder)
+        written = hf_decoders.export_config(base)
     except decoder_parts.ExportRefused as refusal:
         return Unwritable(str(refusal))
     family = hf_decoders.families()[str(written['model_type'])]
-    shapes = jax.eval_shape(lambda: decoder.init(jax.random.key(0), jnp.ones((1, 1), jnp.int32)))
-    missing = decoder_parts.unrouted(family, decoder, shapes)
+    shapes = jax.eval_shape(lambda: base.init(jax.random.key(0), jnp.ones((1, 1), jnp.int32)))
+    missing = decoder_parts.unrouted(family, base, shapes)
     if missing:
         return Unwritable(f"{', '.join('/'.join(path) for path in missing)} has no tensor in the "
                           f"{family.export_model_type} layout")
-    stated = written if config is None else config
-    return SourceLayout(stated, {},
-                        lambda variables: hf_decoders.export_decoder_weights(decoder, variables, stated),
-                        hf_decoders.release_code(decoder))
+
+    def tensors(variables: Mapping[str, object]) -> Mapping[str, object]:
+        # The bundle's own export: its storage read as layers, the extension folded, the family's writer.
+        from dew.interop.pretrained import PretrainedDecoder
+
+        return PretrainedDecoder.from_model(decoder, variables).export()
+
+    return SourceLayout(written if config is None else config, {}, tensors, hf_decoders.release_code(base))
 
 
 __all__ = ["INDEX", "Condition", "Config", "Copy", "Leaf", "Path", "Prefixed", "Rebased", "Renames",
