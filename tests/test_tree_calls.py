@@ -171,6 +171,28 @@ def test_a_latent_attention_tree_call_reads_each_token_as_its_path_decoded_alone
     assert_reads_paths(model, tree, "kimi linear tree")
 
 
+def test_a_latent_attention_cached_call_reads_by_its_runs_past_its_queries_validity():
+    """A latent attention's cached call that states its key runs reads by them alone, its queries' validity
+    replaced as the standard attention's is (`call_visibility`): a padded query reads the keys its runs
+    name that the cache holds, bit for bit as a real query at the same position whose runs name those
+    alone, rather than none."""
+    model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=16, dtype="float32",
+                              mixer={"class": "mla", "fields": MLA})
+    ids = jax.random.randint(jax.random.key(0), (2, PROMPT + BLOCK), 0, VOCAB)
+    params = model.init(jax.random.key(1), ids)
+    cache = {**params, "cache": cached(model, params, ids[:, :PROMPT])}
+    block, runs = ids[:, PROMPT:], chain_runs(2, PROMPT, BLOCK)
+    placed = jnp.broadcast_to(PROMPT + jnp.arange(BLOCK), (2, BLOCK))
+    padded, _ = model.apply(cache, block, decode=True, mutable=["cache"], attention_key_runs=runs,
+                            rotary_positions=placed, attention_mask=jnp.asarray([[1, 1, 0]] * 2, bool))
+    # The last query's runs without its own slot, which a padded token's call leaves unwritten.
+    narrowed = runs.at[:, BLOCK - 1, 0, 1].set(PROMPT + BLOCK - 1)
+    real, _ = model.apply(cache, block, decode=True, mutable=["cache"], attention_key_runs=narrowed,
+                          rotary_positions=placed)
+    np.testing.assert_array_equal(np.asarray(padded[:, -1]), np.asarray(real[:, -1]))
+
+
 def assert_reads_paths(model: CausalTransformer, tree: tuple[int, ...], label: str) -> None:
     """`model`'s tree call over `tree` past a cached prompt, each token at its depth's position and its
     attention's keys at theirs, on par with each token's root-to-token path decoded as a plain cached call
