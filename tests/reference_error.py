@@ -68,6 +68,7 @@ import functools
 import hashlib
 import itertools
 import math
+import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 
@@ -252,15 +253,22 @@ def _one_draws_program(fn, arguments):
     return fn.fn, jax.tree.map(lambda leaf: leaf[0], arguments)
 
 
-WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
+CENSUS = "DEW_GATE_CENSUS"
+"""The environment variable whose being set runs check 1's arms with YNNPACK's fusions on (WITHOUT_YNN
+empty), as CPU users compile them: the census the whole suite runs every fifth publish, each red it finds
+filed and judged Dew's or XLA:CPU's (row 4471; docs/design/testing.md, "the YNNPACK switch")."""
+
+WITHOUT_YNN = {} if os.environ.get(CENSUS) else {"xla_cpu_experimental_ynn_fusion_type": ""}
 """XLA:CPU's compiler options with every YNNPACK fusion off (dots, reductions, element-wise and layout
 ops alike), so that a program runs on XLA's own code, compiled for the host's instruction set with no
 dispatch at run time. YNNPACK picks its microkernels at run time by that instruction set, and both
 the interpreted SSD kernel and XLA's scan fuse parts of themselves to it by default, which moved
 check 1 between the two across PARITY by host; without the fusions the verdicts held on two hosts
 of different instruction sets, though the bits still part with the host (docs/performance.md, "The
-SSD kernel's host check 1 without YNNPACK"). The empty list, not the documented `-individual_dot`,
-because compiler options take no such spelling and that one leaves a scan's reductions fused."""
+SSD kernel's host check 1 without YNNPACK"); and XLA:CPU's own fusion choices (a reduction split across
+devices taking XLA's, one device's YNNPACK's, row 4520; YNNPACK's narrow dot without FMA, 4522) are not
+Dew's arithmetic. The empty list, not the documented `-individual_dot`, because compiler options take no
+such spelling and that one leaves a scan's reductions fused. The census (`CENSUS`) runs without it."""
 
 
 def without_ynn(fn, **jit_options):
@@ -1451,7 +1459,6 @@ site's stage-two rate from, every attempt counted, and which sites' local errors
 
 def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str], ynn: str | None = None) -> None:
     import json
-    import os
 
     path = os.environ.get(STAGES_LOG)
     if path:

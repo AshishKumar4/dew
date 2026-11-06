@@ -56,6 +56,25 @@ def test_without_ynn_computes_what_xla_cpu_computes_with_every_ynnpack_fusion_of
             np.testing.assert_array_equal(np.asarray(value), theirs[name], err_msg=name)
 
 
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
+def test_the_census_runs_the_gates_arms_as_xla_cpu_compiles_them_for_users(tmp_path):
+    """Under the census (`CENSUS` set), `without_ynn` compiles a program as plain `jax.jit` does, YNNPACK's
+    fusions on: each of tests/ynn_programs.py's programs gives, bit for bit, what it gives jitted in a
+    process of XLA:CPU's defaults (row 4471)."""
+    import ynn_programs
+    from reference_error import CENSUS
+
+    out, ours = tmp_path / "theirs.npz", tmp_path / "ours.npz"
+    subprocess.run([sys.executable, str(Path(ynn_programs.__file__)), str(out)], check=True)
+    census = "import sys, numpy as np, ynn_programs; from reference_error import without_ynn; " \
+        "np.savez(sys.argv[1], **{k: np.asarray(v) for k, v in ynn_programs.outputs(without_ynn).items()})"
+    subprocess.run([sys.executable, "-c", census, str(ours)], check=True,
+                   cwd=Path(ynn_programs.__file__).parent, env={**os.environ, CENSUS: "1"})
+    with np.load(out) as theirs, np.load(ours) as found:
+        for name in theirs:
+            np.testing.assert_array_equal(found[name], theirs[name], err_msg=name)
+
+
 def one_key_draw(seed):
     """bf16 queries [2, 5, 4, 32] over a single key and value of two heads."""
     rng = np.random.default_rng([1698, 1, seed])
