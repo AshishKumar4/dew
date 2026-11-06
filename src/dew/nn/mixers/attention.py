@@ -177,8 +177,19 @@ def call_visibility(metadata: AttentionMetadata, rotary_positions, *, batch: int
     (`AttentionMetadata.key_runs`), a windowed layer windowing each run over the key positions the call
     gives, its queries read at them too where they are its own tokens, or a cached call's at its rotary
     positions through a mask. `key_places` are where the keys are read otherwise."""
-    if metadata.pairwise_mask is None and metadata.key_runs is None:
+    if metadata.pairwise_mask is None and metadata.key_runs is None and metadata.entered is None:
         return None
+    if metadata.entered is not None and (metadata.key_runs is not None
+                                         or metadata.pairwise_mask is not None):
+        raise ValueError("a call states what its tokens read once: by the documents they enter, key runs "
+                         "or a pairwise mask")
+    if metadata.entered is not None:
+        # Its runs over the call's own tokens, each key read at its own position, as a windowed layer
+        # windows them.
+        assert metadata.coordinates is not None
+        given = metadata.coordinates.positions
+        metadata = dataclasses.replace(metadata, key_runs=metadata.entered.runs(),
+                                       key_positions=metadata.key_positions if given is None else given)
     key_positions = metadata.key_positions
     if key_positions is not None and key_positions.shape != (batch, keys):
         raise ValueError("attention_key_positions must be [B, keys]")
@@ -295,9 +306,10 @@ class CausalSelfAttention(nn.Module):
     `kv_store`, post rope and norm, and keeps no cache.
     """
     reads: ClassVar[frozenset[str]] = frozenset({"pairwise_mask", "key_positions", "key_runs",
-                                                 "position_bias", "admitted"})
-    """Every `MIXING` field of its call (`dew.nn.inputs.MixerCall`): it masks by a pairwise mask or key
-    runs, places keys, adds a position bias and runs a server's mixed step."""
+                                                 "position_bias", "admitted", "entered"})
+    """Every `MIXING` field of its call (`dew.nn.inputs.MixerCall`): it masks by a pairwise mask, key
+    runs or the documents a document enters (`Entered.runs`), places keys, adds a position bias and runs a
+    server's mixed step."""
 
     ctx: MixerContext
     """The layer's geometry and attention policies, as the backbone resolves
@@ -1360,6 +1372,7 @@ class CausalSelfAttention(nn.Module):
         position bias is refused by name rather than run without them."""
         carried = [name for name, given in (("a pairwise mask", metadata.pairwise_mask),
                                             ("key runs", metadata.key_runs),
+                                            ("entered documents", metadata.entered),
                                             ("key positions", metadata.key_positions),
                                             ("a position bias", metadata.position_bias)) if given is not None]
         if carried:
@@ -1559,6 +1572,7 @@ class CausalSelfAttention(nn.Module):
             return False
         return metadata is None or (
             metadata.pairwise_mask is None and metadata.key_runs is None and metadata.position_bias is None
+            and metadata.entered is None
             and all(getattr(metadata, name) is None for name in self._group_fields()))
 
     def _output(self, attention, gate, batch: int, length: int, own_value, progress):
@@ -1671,7 +1685,7 @@ class QSASelfAttention(CausalSelfAttention):
     """`CausalSelfAttention` under QSA (`qsa`), which reads no pairwise mask or key runs: either may hide a
     key from one query that sees it from another, where QSA pools each key once (`qsa_selection`)."""
 
-    reads: ClassVar[frozenset[str]] = CausalSelfAttention.reads - {"pairwise_mask", "key_runs"}
+    reads: ClassVar[frozenset[str]] = CausalSelfAttention.reads - {"pairwise_mask", "key_runs", "entered"}
 
 
 @dataclasses.dataclass(frozen=True)

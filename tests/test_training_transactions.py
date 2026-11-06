@@ -40,7 +40,8 @@ class Tiny(Objective[Ratio | Terms, None]):
 
     def loss(self, variables, batch, step):
         w = variables["params"]["w"]
-        noise = jax.random.uniform(step.key, batch["y"].shape) * .03
+        # Drawn in float32, as a float64 truth's run draws it too.
+        noise = jax.random.uniform(step.key, batch["y"].shape, jnp.float32) * .03
         prediction = (w + noise + variables["stats"]["seen"] * .01
                       + step.ema["stats"]["seen"] * .1 + step.step * .02)
         errors = (prediction - batch["y"]) ** 2

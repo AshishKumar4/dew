@@ -15,6 +15,7 @@ from reference_error import assert_as_exact
 
 from dew.nn import precision
 from dew.nn.blocks import table_rows
+from dew.nn.dense import Dense
 from dew.nn.kernels import gemm, generation
 
 
@@ -141,6 +142,29 @@ def test_an_adapted_product_holds_every_reverse_order(edge):
 
     assert_contract(adapted, primals, direction, cotangent, f"an adapted product {edge}", truth_fn=plain,
                     plain_fn=plain, without=FORWARD_ORDERS)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_once_rounded_biased_layer_holds_every_order(edge):
+    """A bfloat16 Dense whose bias is stored at fp32 (its product summed in fp32, the bias added and the sum
+    rounded once: `dense._widened`'s declared tangent): every order, in the inputs, the kernel and the bias,
+    finite wherever float64 is a normal float32 and wherever the plain formula (JAX's derivatives of the
+    fp32 product plus the bias, rounded once) is, at values whose products near float32's ends."""
+    layer = Dense(16, dtype=jnp.bfloat16, param_dtype=jnp.float32)
+    primals = normal_draw(634, (8, 16), (16, 16), (16,), scale=EDGES[edge])
+    direction = normal_draw(635, (8, 16), (16, 16), (16,), scale=EDGES[edge])
+    (cotangent,) = normal_draw(636, (8, 16))
+
+    def dense(x, kernel, bias):
+        return layer.apply({"params": {"kernel": kernel, "bias": bias}}, x.astype(jnp.bfloat16))
+
+    def plain(x, kernel, bias):
+        product = jax.lax.dot(x.astype(jnp.bfloat16), kernel.astype(jnp.bfloat16),
+                              preferred_element_type=jnp.float32)
+        return (product + bias).astype(jnp.bfloat16)
+
+    assert_contract(dense, primals, direction, cotangent, f"a once-rounded biased layer {edge}",
+                    plain_fn=plain)
 
 
 @pytest.mark.parametrize("edge", EDGES)
