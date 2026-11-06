@@ -1599,22 +1599,20 @@ def the_backward_is_on_par_under_every_score_hook_on_an_h100(hooks, form):
 
 def _counted(fn, *arrays) -> tuple[float, float]:
     """The model's share of the Mosaic launches' work `fn` lowers for an H100 each declares
-    (`instrumentation.MODEL_FLOPS`) and the hardware's work each states (`_stated_flops`: none unsized)."""
-    import re
-
-    from dew.telemetry.instrumentation import _MODEL_FLOPS, _stated_flops
+    (`instrumentation.MODEL_FLOPS`) and the hardware's work each states (its cost estimate), as the lowered
+    program's structured reader reads them (`lowered.kernel_launches`, each launch times the calls a call
+    of the program makes)."""
+    from dew.nn.kernels.lowered import kernel_launches
 
     # Lowered deviceless for an H100 whatever the host, so a GPU host of another generation lowers no TMA
     # of its own.
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        text = jax.jit(fn).trace(*arrays).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
-    launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
-    assert launches and all(_stated_flops(line) is not None for line in launches)
-    declared = [_MODEL_FLOPS.search(line) for line in launches]
-    assert all(declared)
-    return (sum(float(found.group(1)) for found in declared if found),
-            sum(_stated_flops(line) or 0.0 for line in launches))
+        lowered = jax.jit(fn).trace(*arrays).lower(lowering_platforms=("cuda",))
+    launches = [(call, times) for call, times in kernel_launches(lowered) if call.kind == "mosaic_gpu"]
+    assert launches and all(call.flops is not None and call.model_flops is not None for call, _ in launches)
+    return (sum((call.model_flops or 0.0) * times for call, times in launches),
+            sum((call.flops or 0.0) * times for call, times in launches))
 
 
 @pytest.mark.parametrize("causal, queries, keys, pairs", [

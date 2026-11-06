@@ -17,7 +17,7 @@ from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import stablehlo
 
 from dew.nn.kernels.templates import report
-from dew.telemetry.instrumentation import call_weights, counted_trips, custom_call_kind
+from dew.telemetry.instrumentation import MODEL_FLOPS, call_weights, counted_trips, custom_call_kind
 
 
 @dataclass(frozen=True)
@@ -29,8 +29,9 @@ class KernelCall:
     lowers under, its kernel's hash where its location names none; any other call's target), a Pallas
     kernel's IR as Pallas serialized it (Triton IR, or Mosaic's module bytecode), its `config` (Triton's
     warps and stages, a Mosaic GPU kernel's hash), the FLOPs its kernel states (its cost estimate), None
-    where it states none, and the launch that traced a Mosaic GPU kernel, which its location's name carried
-    (`report.named`), None where it carried none."""
+    where it states none, the launch that traced a Mosaic GPU kernel, which its location's name carried
+    (`report.named`), None where it carried none, and the model's share of the work it states, which its
+    launch declares (`instrumentation.MODEL_FLOPS`, a frontend attribute), None where it declares none."""
 
     kind: str | None
     name: str
@@ -38,6 +39,7 @@ class KernelCall:
     config: str
     flops: float | None
     launch: str | None = None
+    model_flops: float | None = None
 
 
 @dataclass(frozen=True)
@@ -238,12 +240,21 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
         named = _kernel_name(operation.location)
         # A call whose location names no kernel is named by its kernel's hash, apart from every other.
         return KernelCall(kind, named[0] if named else hashed, ir.StringAttr(config["module"]).value_bytes,
-                          hashed, stated.get("flops"), named[1] if named else None)
+                          hashed, stated.get("flops"), named[1] if named else None, _model_flops(operation))
     if kind == "mosaic_tpu":
         config = json.loads(ir.StringAttr(attributes["backend_config"]).value)["custom_call_config"]
         return KernelCall(kind, ir.StringAttr(attributes["kernel_name"]).value, config["body"].encode(), "",
                           config.get("cost_estimate", {}).get("flops"))
     return KernelCall(kind, target, b"", "", None)
+
+
+def _model_flops(operation: ir.Operation) -> float | None:
+    """The model's share of the work a call states, as its launch declares it (`instrumentation.MODEL_FLOPS`,
+    one of its frontend attributes), None where it declares none."""
+    if "mhlo.frontend_attributes" not in operation.attributes:
+        return None
+    declared = ir.DictAttr(operation.attributes["mhlo.frontend_attributes"])
+    return float(ir.StringAttr(declared[MODEL_FLOPS]).value) if MODEL_FLOPS in declared else None
 
 
 def _kernel_name(location: ir.Location) -> tuple[str, str | None] | None:
