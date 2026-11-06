@@ -20,7 +20,6 @@ import ml_dtypes
 import numpy as np
 import pytest
 from flax import linen as nn
-from float64_terms import float64_forward
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     as_given,
@@ -89,12 +88,20 @@ def recorded_site(site: str, inputs_of, truth_fn):
 
 def segmented(config, mels, lengths):
     """The clips cut into segments of `audio_segment_size` frames, as tokenize_audio_batch cuts them, and
-    each segment's span."""
+    each segment's span; `lengths` on the host, so the cuts are static where the mels are traced."""
     size = config.audio_segment_size
+    lengths = [int(length) for length in lengths]
     segments = [(clip, start) for clip, length in enumerate(lengths) for start in range(0, length, size)]
-    padded = np.pad(mels, ((0, 0), (0, size), (0, 0)))
-    return (np.stack([padded[clip, start:start + size] for clip, start in segments]),
+    padded = jnp.pad(mels, ((0, 0), (0, size), (0, 0)))
+    return (jnp.stack([padded[clip, start:start + size] for clip, start in segments]),
             jnp.asarray([min(size, lengths[clip] - start) for clip, start in segments], jnp.int32))
+
+
+def float64_of(tree):
+    """`tree` with its floating leaves in float64, for a module's float64 twin."""
+    with jax.enable_x64(new_val=True):
+        return jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64 if np.issubdtype(
+            np.asarray(leaf).dtype, np.floating) else None), tree)
 
 
 @pytest.mark.parametrize("prefix, bound", [("", 256000), ("bounded_", 30)])
@@ -110,18 +117,30 @@ def test_the_tokenizer_s_features_and_codes_are_the_reference_s(prefix, bound):
 
     def mels_of(inputs):
         width = max(lengths)
-        return np.stack([np.pad(inputs[f"mel_{clip}"], ((0, width - length), (0, 0)))
-                         for clip, length in enumerate(lengths)])
+        return jnp.stack([jnp.pad(inputs[f"mel_{clip}"], ((0, width - length), (0, 0)))
+                          for clip, length in enumerate(lengths)])
+
+    # The pooled entries each segment holds, which its span alone decides: read on the host once.
+    _, spans = segmented(config, np.zeros((len(lengths), max(lengths), config.tokenizer.n_mels)), lengths)
+    shape = (len(spans), config.audio_segment_size, config.tokenizer.n_mels)
+    kept = np.flatnonzero(np.asarray(encoder.apply(held, np.zeros(shape, np.float32), spans,
+                                                   batch_longest(spans, config))[1]).reshape(-1))
+
+    def entries(features):
+        return features.reshape(-1, features.shape[-1])[kept]
 
     def ours(inputs):
         mels, spans = segmented(config, mels_of(inputs), lengths)
-        features, valid = encoder.apply(held, mels, spans, batch_longest(spans, config))
-        return {"features": np.asarray(features)[np.asarray(valid)]}
+        return {"features": entries(encoder.apply(held, mels, spans, batch_longest(spans, config))[0])}
+
+    wide_held, wide_encoder = float64_of(held), encoder.clone(dtype=jnp.float64)
 
     def wide(inputs):
-        mels, spans = segmented(config, mels_of(inputs), lengths)
-        (features, valid), _ = float64_forward(encoder, held, mels, spans, batch_longest(spans, config))
-        return {"features": np.asarray(features)[np.asarray(valid)]}
+        with jax.enable_x64(new_val=True):
+            mels, spans = segmented(config, mels_of(inputs), lengths)
+            features, _ = wide_encoder.apply(wide_held, jnp.asarray(mels, jnp.float64), spans,
+                                             batch_longest(spans, config))
+            return {"features": entries(features)}
 
     site = f"{'bounded ' if prefix else ''}tokenizer features"
     draw, reference, truth, seeds = recorded_site(site, generator().mels_draw, wide)
@@ -151,16 +170,19 @@ def test_the_audio_encoder_is_as_exact_as_the_reference():
 
     def codes_and_counts(inputs):
         codes = [inputs[f"codes_{clip}"] for clip in range(len(lengths))]
-        return (np.stack([np.pad(c, ((0, max(lengths) - len(c)), (0, 0))) for c in codes]),
+        return (jnp.stack([jnp.pad(c, ((0, max(lengths) - length), (0, 0)))
+                           for c, length in zip(codes, lengths, strict=True)]),
                 np.asarray(lengths, np.int32))
 
     def clips(out):
         """Each clip's real groups, in order."""
-        out = np.asarray(out)
-        return {"encoded": np.concatenate([out[clip, :count] for clip, count in enumerate(groups)])}
+        return {"encoded": jnp.concatenate([out[clip, :count] for clip, count in enumerate(groups)])}
+
+    wide_held, wide_encoder = float64_of(held), encoder.clone(dtype=jnp.float64)
 
     def wide(inputs):
-        return clips(float64_forward(encoder, held, *codes_and_counts(inputs))[0])
+        with jax.enable_x64(new_val=True):
+            return clips(wide_encoder.apply(wide_held, *codes_and_counts(inputs)))
 
     draw, reference, truth, seeds = recorded_site("audio encoder", generator().codes_draw, wide)
     assert_as_exact(as_given(lambda index, inputs: clips(encoder.apply(held, *codes_and_counts(inputs)))),
