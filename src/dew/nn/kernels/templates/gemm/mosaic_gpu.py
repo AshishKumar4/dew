@@ -1054,7 +1054,7 @@ def _stage_decoded(words, scales, out, interpret: bool) -> None:
 
     def loaded(ref):
         return ref[...] if layout is None else plgpu.load(ref, layout=layout, optimized=False)
-    owed = loaded(scales).astype(jnp.float32) * jnp.float32(1 / bits.NVFP4_OWED)
+    owed = _e4m3_values(loaded(scales)) * jnp.float32(1 / bits.NVFP4_OWED)
     which = jax.lax.broadcasted_iota(jnp.int32, owed.shape, 1)
     for group, group_words in enumerate(words):
         for code, lane in enumerate(_nvfp4_lanes(loaded(group_words))):
@@ -1062,6 +1062,21 @@ def _stage_decoded(words, scales, out, interpret: bool) -> None:
             # column slice of a register tile has no layout).
             scale = jnp.sum(jnp.where(which == 8 * group + code, owed, 0.0), axis=1)
             out[:, pl.ds(128 * group + 16 * code, 16)] = (lane * scale[:, None]).astype(jnp.bfloat16)
+
+
+def _e4m3_values(codes: jax.Array) -> jax.Array:
+    """Dew: E4M3 codes (float8_e4m3fn) as float32 by integer arithmetic, exactly: a normal code's exponent
+    (rebiased, 7 to 127) and mantissa moved into an fp32 pattern, a subnormal code's mantissa times 2^-9,
+    its sign kept. No FP8 conversion, which takes sm89's `cvt ... .e4m3x2`: an A100's ptxas refused the
+    packed NVFP4 kernel's scales cast so (W8-a100, M-NS-8). The NaN code (no block scale holds it) reads
+    as 480."""
+    word = jax.lax.bitcast_convert_type(codes, jnp.uint8).astype(jnp.uint32)
+    exponent, mantissa = (word >> jnp.uint32(3)) & jnp.uint32(0xF), word & jnp.uint32(0x7)
+    sign = (word & jnp.uint32(0x80)) << jnp.uint32(24)
+    normal = jax.lax.bitcast_convert_type(
+        sign | ((exponent + jnp.uint32(120)) << jnp.uint32(23)) | (mantissa << jnp.uint32(20)), jnp.float32)
+    subnormal = mantissa.astype(jnp.float32) * jnp.float32(2.0 ** -9)
+    return jnp.where(exponent == 0, jnp.where(sign != 0, -subnormal, subnormal), normal)
 
 
 def _nvfp4_lanes(words: jax.Array) -> list[jax.Array]:
