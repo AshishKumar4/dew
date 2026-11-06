@@ -2323,7 +2323,8 @@ class DecisionInputs:
     def collate(cls, rows: Sequence[Encoded], pad: int, *, questions: int | None = None,
                 options: int | None = None, option_slots: int | None = None,
                 context_length: int | None = None,
-                attention: "tuple[tuple[tuple[int, ...], ...], int] | None" = None) -> "DecisionInputs":
+                attention: "tuple[tuple[tuple[int, ...], ...], int] | None" = None,
+                width: int | None = None) -> "DecisionInputs":
         """Right-pad `rows` into one batch (`pad_token_rows`), one row a window, its question
         and option slots to the widest.
 
@@ -2333,7 +2334,8 @@ class DecisionInputs:
         rounded up to `OPTION_TILE`, where that is fewer than the grid's slots.
         With a `context_length`, each row's context (`Encoded.context`, none
         where it holds none) is padded to that many tokens. Rows in streams are read as their layout's
-        `attention` says (`Layout.attention`).
+        `attention` says (`Layout.attention`). `width` pads the rows to that many tokens, a shape a caller
+        keeps fixed, which no row may exceed.
         """
         parallel = rows[0].positions is not None
         if any((row.positions is not None) != parallel for row in rows):
@@ -2354,7 +2356,7 @@ class DecisionInputs:
         if streamed:
             fields["streams"] = [row.streams or () for row in rows]
         tokens, padded = pad_token_rows([row.tokens for row in rows], pad_id=pad, padding_side="right",
-                                        fields=fields or None)
+                                        fields=fields or None, width=width)
         valid = padded.get(VALIDITY_FIELD, np.ones(tokens.shape, bool))
         count = max(questions or 1, *(len(row.questions) for row in rows))
         width = max(options or 1, *(len(laid.options) for row in rows for laid in row.questions))
