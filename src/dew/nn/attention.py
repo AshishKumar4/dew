@@ -57,7 +57,7 @@ from .kernels import decode_attention, generation
 from .kernels.generation import Route, bf16_dot_runs
 from .kernels.selection import select, selected
 from .kernels.templates import attention as template, attention_route
-from .precision import asks_default_precision, at_least_fp32, capped_logits, float32_einsum
+from .precision import at_least_fp32, capped_logits, exact_products, float32_einsum
 from .sharding import SCORES, sequence_shards
 from .visibility import window_sides
 
@@ -854,12 +854,15 @@ def reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits:
     """Whether a call asks for arithmetic only the reference path performs.
 
     The four are what every fused kernel's requirements refuse
-    (`attention_kernels`' arithmetic requirement): a matmul precision other
-    than DEFAULT (a higher one, a dot algorithm or a preset of one), a
+    (`attention_kernels`' arithmetic requirement): a matmul precision, stated
+    or the run's configured one, that whole products of the query's dtype
+    with fp32 sums do not compute (`exact_products`: a dot algorithm that
+    narrows the operands or widens them; any level, a 16-bit operand's
+    exact products at 'highest' among them), a
     softmax outside fp32, a compute dtype other than the inputs', and logits
     formed from queries and keys widened to at least fp32 (`wide_logits`).
     """
-    return (not asks_default_precision(precision)
+    return (not exact_products(precision, query.dtype)
             or not force_fp32_for_softmax
             or (dtype is not None and jnp.dtype(dtype) != query.dtype)
             or wide_logits)
