@@ -153,8 +153,7 @@ def forward(x, taps, bias, valid, documents, *, first: int, width: int, head: in
                              grid=(rows, pl.cdiv(length, TOKENS), width // scan.THREADS),
                              grid_names=("rows", "tokens", "channels"), warpgroups=1, interpret=interpret,
                              family=family.name, name=name, scratch=(scan.scratch(),))
-    with jax.named_scope(name):
-        return launched(*(operand for operand in operands if operand is not None))
+    return launched(*(operand for operand in operands if operand is not None))
 
 
 def backward(x, taps, bias, valid, documents, dy, *, first: int, width: int, head: int | None,
@@ -218,6 +217,5 @@ def backward(x, taps, bias, valid, documents, dy, *, first: int, width: int, hea
     launched = mosaic.kernel(entry, out_type=out_type, grid=(rows, blocks, width // scan.THREADS),
                              grid_names=("rows", "tokens", "channels"), warpgroups=1, interpret=interpret,
                              family=family.name, name=name, scratch=(scan.scratch(),))
-    with jax.named_scope(name):
-        dx, dw, db = launched(*(operand for operand in operands if operand is not None), dy)
+    dx, dw, db = launched(*(operand for operand in operands if operand is not None), dy)
     return dx, jnp.sum(dw, axis=(0, 1)), jnp.sum(db, axis=(0, 1))
