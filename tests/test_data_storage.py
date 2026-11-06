@@ -608,3 +608,57 @@ def test_an_open_files_size_and_digest_are_its_bytes_whatever_store_opened_it(op
     fsspec.filesystem("memory" if opened == "memory" else "file").pipe_file(path, payload)
     with fsspec.open(path, "rb") as handle:
         assert object_info(handle) == object_info(payload)
+
+
+class _Observed:
+    """Each process's mirror counters as it last read a row, written to `directory` by its process id: a
+    loading worker's, which the reading process cannot see itself."""
+
+    def __init__(self, directory):
+        self.directory = str(directory)
+
+    def __call__(self, row):
+        from dew.data.storage import mirror_metrics
+
+        Path(self.directory, f"{os.getpid()}.json").write_text(json.dumps(mirror_metrics()))
+        return row
+
+
+@pytest.mark.parametrize("workers", [2, "auto"])
+def test_a_runs_mirror_metrics_count_its_loading_workers_reads(tmp_path, workers):
+    """A store read through Dew's mirror by loading workers: each worker opens its shards through its own
+    process's mirror, and the run's statistics count every one of those opens beside the reading
+    process's own (row 4339), each worker's counters carried by the position it hands the reader."""
+    import numpy as np
+
+    from dew.data import Loading, Memory
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+    from dew.data.pipeline import Pipeline
+    from dew.data.sinks import export
+    from dew.data.storage import mirror_metrics
+
+    root = tmp_path / "records"
+    export(Memory([{"id": np.int64(index)} for index in range(40)]), str(root), format="array_record",
+           rows_per_shard=2)
+    observed = tmp_path / "observed"
+    observed.mkdir()
+    # An ArrayRecord shard's physical size is far past its two small records: room for every reader's pin.
+    source = Files(f"dewcache::file://{root}", storage_options={
+        "dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": 64 << 20}})
+    loader = compile(Pipeline(source).map(_Observed(observed)).repeat(1).batch(1), read="streamed",
+                     loading=Loading(workers=workers, max_workers=2, threads=1, read_buffer=1,
+                                     worker_buffer=1, cache=False))
+    reader = loader.train(DataPartition())
+    try:
+        assert len(list(reader)) == 40
+        statistics = dict(loader.statistics())
+    finally:
+        reader.close()
+    opens = [counts.get("data/mirror/hits", 0) + counts.get("data/mirror/misses", 0)
+             for counts in (json.loads(path.read_text()) for path in observed.glob("*.json")
+                            if path.stem != str(os.getpid()))]
+    assert sum(opens) > 0
+    own = mirror_metrics()
+    assert statistics["data/mirror/hits"] + statistics["data/mirror/misses"] == (
+        own["data/mirror/hits"] + own["data/mirror/misses"] + sum(opens))
