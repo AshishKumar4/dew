@@ -177,7 +177,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     widest = min(width, family.widest_product or width)
     unit = family.column_unit(dtype)
     swizzled = math.lcm(unit, mosaic.SWIZZLE_BYTES // jnp.dtype(dtype).itemsize)
-    columns = ([block_n for block_n in range(widest - widest % swizzled, 0, -swizzled) if width % block_n == 0]
+    columns = ([block_n for block_n in range(widest - widest % swizzled, 0, -swizzled)
+                if width % block_n == 0]
                or [block_n for block_n in range(widest - widest % unit, 0, -unit) if width % block_n == 0])
     steps = [step for step in depths or family.depths(dtype) if depth is None or depth % step == 0]
     busy = 1 + family.loads_ahead + family.in_flight
