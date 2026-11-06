@@ -72,7 +72,7 @@ def derivative_seams(relative: str, tree: ast.Module) -> Iterator[tuple[str, str
         holder = parents.get(call)
         if (isinstance(call.func, ast.Call) or id(call) in decorators
                 or (isinstance(holder, ast.Call) and holder.args[:1] == [call]
-                    and _call_name(holder.func) == "partial")):
+                    and _call_name(holder.func) == "partial" and _call_name(call.func) == "partial")):
             # A partial's maker is the partial's: the outer call is the one seam.
             return None
         return "linear_tangent" if _call_name(call.func) == "linear_tangent" else _maker_of(call)
