@@ -1395,31 +1395,27 @@ def architecture_pass_figure():
 
 
 def architecture_derived_figure():
-    """How a template's algebra is derived from a declaration, behind one switch."""
+    """How a template's algebra is derived from a declaration."""
     label = ("The derivation of a Reduction: the declaration is traced at one tile into terms, facts mark "
              "the walked sums and maxima, the step, merge and finish readings saturate under the decoupled "
              "rules, and extraction priced by the tile walk yields init, step, merge and finish, or "
-             "refuses. The switch dew._cache.DERIVED, off by default, chooses the derived forms or the "
-             "hand-written ones for the template's plain_step, merge and finish.")
+             "refuses. The template's plain_step, merge and finish compute by the derived forms.")
     parts = [
         ("declaration", ["a Reduction:", "softmax(s)·v by keys"], "plain", (16, 16, 172, 81), 0),
         ("traced at a tile", ["terms; facts mark", "walked sums, maxima"], "dew", (200, 16, 172, 81), 1),
         ("saturate", ["step, merge, finish;", "decoupled rules"], "dew", (384, 16, 172, 81), 2),
         ("extract", ["priced by the tile", "walk, or refused"], "dew", (568, 16, 176, 81), 3),
         ("Derived", ["init, step, merge,", "finish"], "dew", (568, 143, 176, 81), 4),
-        ("dew._cache.DERIVED", ["one switch,", "off by default"], "elsewhere", (272, 143, 240, 81), 5),
-        ("hand-written forms", ["attention_algebra,", "recurrence_algebra"], "plain", (16, 143, 220, 81), 4),
-        ("plain_step, merge, finish", [], "plain", (196, 252, 392, 40), 6),
+        ("plain_step, merge, finish", [], "plain", (352, 252, 392, 40), 5),
     ]
 
     def wide(svg: Figure) -> None:
         for x1, y1, x2, y2 in ((188, 56, 198, 56), (372, 56, 382, 56), (556, 56, 566, 56),
-                               (656, 97, 656, 141), (568, 183, 514, 183), (236, 183, 270, 183),
-                               (392, 224, 392, 250)):
+                               (656, 97, 656, 141), (656, 224, 656, 250)):
             svg.arrow(x1, y1, x2, y2)
 
-    drawn("architecture-derived", label, (760, 300), parts, wide, flows=range(6),
-          headings={4: "DERIVED, OR HAND-WRITTEN"})
+    drawn("architecture-derived", label, (760, 300), parts, wide, flows=range(5),
+          headings={4: "DERIVED"})
 
 
 def architecture_cost_figure():

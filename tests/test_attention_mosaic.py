@@ -27,7 +27,6 @@ from reference_error import as_given, assert_as_exact, widened
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
 from test_attention_triton import BACKWARD_SEEDS, HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
 
-from dew.algebra import forms as algebra_forms
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
@@ -506,37 +505,22 @@ def test_the_forward_is_on_par_interpreted(call, dtype):
 
 
 @INTERPRETS
-@pytest.mark.parametrize("form", ["default", "fused", "fused-keys-first"])
 @pytest.mark.parametrize("call", CALLS)
-def test_the_backward_by_its_derived_forms_is_on_par_interpreted(call, form):
-    """The fast backward, each of its launches' tile weights and score cotangents the derived forms behind the
-    switch (`dew.algebra.forms.derived`, `attention_backward_algebra.derived_cotangents`: queries first and
-    keys first), under Mosaic GPU's interpreter: the gradients on par with the reference (check 1), as the
-    hand-written forms' are (`test_the_backward_is_on_par_interpreted`)."""
-    with algebra_forms.derived():
-        _check_backward(call, SHAPES["interpreted"], form=form, interpret=True,
-                        width=FORM_WIDTHS.get(form, 128))
+def test_a_dropping_backward_is_on_par_over_every_call_interpreted(call):
+    """The default backward of each call that drops, the dropout multipliers an operand of its derived tile
+    cotangents: on par with the reference (check 1)."""
+    _check_backward(call, SHAPES["interpreted"], form="default", interpret=True, drop=True)
 
 
 @INTERPRETS
 @pytest.mark.parametrize("call", CALLS)
-def test_a_dropping_backward_by_its_derived_forms_is_on_par_interpreted(call):
-    """The default backward of a call that drops, its tile weights and score cotangents the derived forms
-    behind the switch, the dropout multipliers an operand of theirs: on par with the reference (check 1)."""
-    with algebra_forms.derived():
-        _check_backward(call, SHAPES["interpreted"], form="default", interpret=True, drop=True)
-
-
-@INTERPRETS
-@pytest.mark.parametrize("call", CALLS)
-def test_the_forward_by_its_derived_forms_is_on_par_interpreted(call):
-    """The forward over fp16 operands (a plain walk, of no headroom guard or compensation, which the derived
-    forms serve) under the run's fast forms, the base-2 fold, its walk's step, merge and finish the derived
-    forms behind the switch (`dew.algebra.forms.derived`, `attention_algebra.derived_forms`), its weighted
-    values' sums in the mainloop's accumulator (`Keys.accumulate`), under Mosaic GPU's interpreter: on par
-    with the reference (check 1), as the hand-written forms are (`test_the_forward_is_on_par_interpreted`)."""
+def test_the_fast_forward_is_on_par_interpreted(call):
+    """The forward over fp16 operands (a plain walk, of no headroom guard or compensation) under the run's
+    fast forms, the base-2 fold, its walk's step, merge and finish the derived forms
+    (`attention_algebra.derived_forms`), its weighted values' sums in the mainloop's accumulator
+    (`Keys.accumulate`), under Mosaic GPU's interpreter: on par with the reference (check 1)."""
     fast = dataclasses.replace(generation.numerics(), forms="fast")
-    with generation.run_precision(fast), algebra_forms.derived():
+    with generation.run_precision(fast):
         _check_forward(call, jnp.float16, SHAPES["interpreted"], natural=False, interpret=True)
 
 
@@ -1160,20 +1144,19 @@ def test_a_shared_key_backward_over_a_partial_key_tile_is_on_par_with_the_refere
 
 
 @INTERPRETS
-@pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
-def test_a_common_walks_holder_wholly_past_the_keys_reads_none(derived):
+def test_a_common_walks_holder_wholly_past_the_keys_reads_none():
     """The fast backward's one launch fed by its consumers (`wgmma.fed`, each consumer 64 of a slot's
     queries, walking the slot's common range) over 64 keys at 64-key tiles, its second key holder wholly
     padding, under the interpreter: every real logit -128 and the padding's 0, which weighs exp(128), past
     fp32's largest, against zero keys and values. The gradients are finite, as the reference's, the holder
-    past the call's keys masked (`attention_algebra.Forward.walked_keys`), under either forms."""
+    past the call's keys masked (`attention_algebra.Forward.walked_keys`)."""
     query = jnp.zeros((1, 64, 1, 64), jnp.bfloat16).at[..., 0].set(128.0)
     key = jnp.zeros((1, 64, 1, 64), jnp.bfloat16).at[..., 0].set(-1.0)
     value = jnp.zeros_like(key)
     dout = jnp.zeros_like(query).at[..., 0].set(1.0)
     spans = template.spans(64, 64, 1)
     fast = dataclasses.replace(generation.numerics(), forms="fast")
-    with generation.run_precision(fast), algebra_forms.derived(derived), _device(interpret=True):
+    with generation.run_precision(fast), _device(interpret=True):
         residuals = attention_mosaic.forward(query, key, value, spans, None, interpret=True, scale=1.0,
                                              residuals=template.Kept.SPLIT)[1:]
         with _pinned(backward=attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family="wgmma.fed")):

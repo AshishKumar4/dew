@@ -6,8 +6,7 @@ the one switch the templates take their derived forms behind (`derived`)."""
 
 from __future__ import annotations
 
-import contextlib
-from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import NamedTuple, Protocol
 
 import jax
@@ -16,7 +15,6 @@ from egglog import get_callable_args
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
-from dew._cache import DERIVED
 from dew.algebra import program, terms
 from dew.nn import programs
 from dew.nn.precision import float32_dot_general
@@ -228,21 +226,6 @@ def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
             outs = bound(equation, map(read, equation.invars))
         env.update(zip(equation.outvars, outs, strict=True))
     return [read(atom) for atom in jaxpr.outvars]
-
-
-@contextlib.contextmanager
-def derived(on: bool = True) -> Iterator[None]:
-    """Within the block, the templates take their algebra's derived forms (`derive`, `scan`) where they hold
-    them in place of their hand-written ones (`on`), or the hand-written ones: a context of JAX's trace
-    (`dew._cache.DERIVED`), so a program held across the switch traces afresh. The one switch the derived and
-    hand-written forms swap behind, which check 1 drives both ways (docs/design/algebra.md §6.9)."""
-    with DERIVED(on):
-        yield
-
-
-def derived_on() -> bool:
-    """Whether the templates take their derived forms here (`derived`)."""
-    return bool(DERIVED.value)
 
 
 def evaluated(region: terms.Region, form: terms.Term, leaves: Sequence,
