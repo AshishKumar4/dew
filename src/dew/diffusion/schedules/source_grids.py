@@ -449,19 +449,33 @@ def _lambda_grid(policy: SourcePolicy, betas: np.ndarray, steps: int) -> tuple[n
 
 
 def _flow_sigmas(policy: SourcePolicy, steps: int, sigma_min: float) -> tuple[np.ndarray, np.ndarray, float]:
-    """`use_flow_sigmas`: the shifted flow path from 1 - 1/T down, one point
-    dropped at the clean end, whatever the spacing and lambda clipping.
+    """`use_flow_sigmas`: the class's own walk of the shifted flow path (`SourcePolicy.flow_walk`),
+    whatever the spacing and lambda clipping.
 
     DPM-Solver's `sigma_min` terminal is still its beta table's first
     sigma, and UniPC's the grid's own last one, as each source appends.
     """
-    assert policy.flow_shift is not None
-    shift = policy.flow_shift
-    rising = 1.0 - np.linspace(1, 1 / policy.train_steps, steps + 1)
-    sigmas = np.flip(static_shift(shift, rising))[:-1].copy()
+    assert policy.flow_shift is not None and policy.flow_walk is not None
+    sigmas = policy.flow_walk(policy.flow_shift, policy.train_steps, steps)
     terminal = (0.0 if policy.terminal == "zero"
                 else float(sigmas[-1]) if policy.grid_terminal else sigma_min)
     return np.append(sigmas, terminal), np.trunc(sigmas * policy.train_steps), 1.0
+
+
+def flow_from_clean(shift: float, train_steps: int, steps: int) -> np.ndarray:
+    """DPM-Solver multistep's flow walk: `steps` points of the path from 1 - 1/T down, its clean end
+    dropped, shifted (`static_shift`)."""
+    rising = 1.0 - np.linspace(1, 1 / train_steps, steps + 1)
+    return np.flip(static_shift(shift, rising))[:-1].copy()
+
+
+def flow_from_noise(shift: float, train_steps: int, steps: int) -> np.ndarray:
+    """UniPC's flow walk, Diffusers 0.39.0's: `steps` points of the path from 1 down, short of 1/T,
+    shifted, a first sigma of 1 moved 1e-6 below it, where the step's log alpha is infinite."""
+    sigmas = static_shift(shift, np.linspace(1, 1 / train_steps, steps + 1)[:-1])
+    if np.fabs(sigmas[0] - 1) < 1e-6:
+        sigmas[0] -= 1e-6
+    return sigmas
 
 
 def _sigma_grid(policy: SourcePolicy, betas: np.ndarray, steps: int) -> tuple[np.ndarray, np.ndarray, float]:

@@ -1,4 +1,4 @@
-"""Native Wan 2.1 against the actual Diffusers 0.34.0 objects it reconstructs.
+"""Native Wan 2.1 against the actual Diffusers objects it reconstructs, at the release the test extra pins.
 
 `tools/diffusers_wan_reference.py` builds tiny `WanTransformer3DModel`
 instances with every parameter moved off its initialization, saves each with
