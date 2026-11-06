@@ -151,11 +151,11 @@ CASES = (
     ('sm90', 'write gate', 'derived', 'float32', 'one'),
     ('sm90', 'rated scan', 'pallas', 'bfloat16', 'packed'),
     ('sm80', 'gated delta net', 'xla', 'bfloat16', 'one'),
-    ('sm90', 'write gate', 'mosaic_gpu', 'float32', 'packed'),
+    ('sm90', 'rated scan', 'mosaic_gpu', 'float32', 'packed'),
     ('sm80', 'kimi delta attention', 'derived', 'bfloat16', 'one'),
-    ('sm80', 'rated scan', 'mosaic_gpu', 'bfloat16', 'one'),
     ('sm90', 'gated delta net', 'derived', 'bfloat16', 'one'),
     ('sm90', 'rated scan', 'xla', 'bfloat16', 'one'),
+    ('sm80', 'rated scan', 'mosaic_gpu', 'bfloat16', 'one'),
 )
 
 TPU_CASES = (
