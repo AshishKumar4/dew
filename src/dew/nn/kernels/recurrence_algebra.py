@@ -1215,8 +1215,8 @@ def key_system_back(d_system, lower: Tile, dtype, issue: Issue) -> jax.Array:
 
 def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.Array], columns: int,
                            gates: Callable[[int], tuple], reference: Callable[[int, int], tuple],
-                           summed: Callable[..., jax.Array], *, chunk: int,
-                           emit: Callable[[str, int, int, jax.Array], None], sub: int = SUB,
+                           summed: Callable[..., jax.Array], staged: Callable[[jax.Array], object], *,
+                           chunk: int, emit: Callable[[str, int, int, jax.Array], None], sub: int = SUB,
                            shifted: "Shifted | None" = None,
                            lower: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
                            d_loads: list | None = None) -> None:
@@ -1228,10 +1228,12 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
     `[C, BK]` fp32. Each sub-chunk `s` takes its first token's prefix as the common point, as the forward
     did: `dP` against the keys gated up from it to its end (`k exp2(g_ref - g)`), kept on the rows of `s`
     and gated down by `exp2(g - g_ref)`; `dP^T` against the rows of `s` gated down to it, each key's then
-    gated up from it, zero past its end ('pairs'). The sub-chunks are a rolled loop, the rows' and keys'
-    gradients carried across it, the gated rows formed as their product stages them and the keys' products
-    into one accumulator (`summed`): unrolled, every sub-chunk's tiles at once, an H100's launch spilled
-    1756 bytes a thread (kda-gate3 at ee3734584).
+    gated up from it, zero past its end ('pairs'): the pairs' gradients' rows of `s` against the gated
+    rows' own, each pairs' rows gated down staged once a key block (`staged(value)`; `d_pairs` staged as
+    they come), each a tile whose `rows(start, count)` a product takes, so the keys' products' depth is a
+    sub-chunk's, not the chunk's of masked rows. The sub-chunks are a rolled loop, the rows' and keys'
+    gradients carried across it, the keys' products into one accumulator (`summed`): unrolled, every
+    sub-chunk's tiles at once, an H100's launch spilled 1756 bytes a thread (kda-gate3 at ee3734584).
 
     Where `shifted` is given (no declared floor, `factored_range`), the factored products take the keys
     before each sub-chunk alone and each sub-chunk's own pairs are each their own decay
@@ -1242,8 +1244,9 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
         index, _ = _grid(prefix[0].shape)
         down = between(prefix, _laid_references(reference, c, index, chunk, sub))
         key = keys(c)
+        gated_rows = [staged(row(c) * down) for row in rows]
 
-        def turn(s, carried, c=c, prefix=prefix, index=index, down=down, key=key):
+        def turn(s, carried, c=c, prefix=prefix, index=index, key=key, gated_rows=gated_rows):
             d_rows, d_keys = carried
             place = s * sub
             whole, fraction = separated(*reference(s, c))
@@ -1254,8 +1257,9 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
             raised_keys = key * up
             d_rows = tuple(total + jnp.where(within, summed([("pairs", d_pair, raised_keys)]), 0.0)
                            for total, d_pair in zip(d_rows, d_pairs, strict=True))
-            gated = summed([("pairs", d_pair.T, lambda row=row: jnp.where(within, row(c) * down, 0.0))
-                            for d_pair, row in zip(d_pairs, rows, strict=True)], shape=index.shape)
+            gated = summed([("pairs", d_pair.rows(place, sub).T, down_rows.rows(place, sub))
+                            for d_pair, down_rows in zip(d_pairs, gated_rows, strict=True)],
+                           shape=index.shape)
             return d_rows, d_keys + up * gated
 
         zero = jnp.zeros(index.shape, jnp.float32)

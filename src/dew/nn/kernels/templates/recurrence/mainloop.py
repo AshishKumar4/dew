@@ -1201,8 +1201,7 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                 """The keys gated up in `keyed`'s parts, a sub-chunk's rows read transposed."""
                 parts = product.formed(up, len(keyed)) if len(keyed) > 1 else (up,)
                 refs = tuple(family.staged(part, ref) for part, ref in zip(parts, keyed, strict=True))
-                return lambda start, count: Parts(tuple(ref.at[pl.ds(start, count)] for ref in refs),
-                                                  jnp.float32).T
+                return lambda start, count: Parts(refs, jnp.float32).rows(start, count).T
 
             pairs = algebra.key_block_pairs(rows, operand("keys"), prefix, at_token,
                                             Issuer(call, {"pairs": gated}).summed, staged, chunk=CHUNK,
