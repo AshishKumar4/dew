@@ -350,7 +350,7 @@ def test_a_parquet_stream_read_by_more_shares_than_files_publishes_its_fill(tmp_
     read = compile(Pipeline(store()).map(filled).cache(cache).batch(4), read="streamed", loading=READ,
                    epochs=1)
     read_ids = []
-    shares = stores + 1
+    shares = 2 * stores
     for share in range(shares):
         stream = read.train(DataPartition(share, shares))
         try:
