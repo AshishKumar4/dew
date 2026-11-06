@@ -8,7 +8,7 @@ of one launch (row 3613's fixed costs of a launch and of the balanced tail's par
     python tools/device_facts.py --out facts.json
 
 Each point reads an array of N bytes once (its sum, `read`) or reads and writes it (`copy`), after a write of
-twice the L2 that evicts it (`cold`); CUPTI times the kernel alone (`jax.experimental.mosaic.gpu.profiler`),
+twice the L2 that evicts it (`cold`); CUPTI times the kernel alone (`dew.telemetry.benchmark.device_time`),
 the median of `--repeats` after `--warmup`. An H200's read, measured so, ramps from 2.6 TB/s at 16.8 MB to
 4.5 at 805 MB over a 2.5-2.8 us fixed cost, which a peak bandwidth alone prices as free at small transfers.
 
@@ -29,10 +29,9 @@ import statistics
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.experimental.mosaic.gpu import profiler
 
 from dew.nn.kernels import generation
-from dew.telemetry.benchmark import samples
+from dew.telemetry.benchmark import device_time, samples
 
 SIZES = tuple(2 ** power for power in range(20, 31))
 """The bytes each point streams: 1 MiB to 1 GiB, by doubling."""
@@ -44,17 +43,16 @@ ROUND_TRIPS = (16, 64, 256, 1024)
 """The rounds each hand-off kernel's two programs make, each one hand-off."""
 
 
-def timed(fn, args, *, flush, warmup: int, repeats: int) -> float:
-    """The median device seconds of `fn`'s kernels over `repeats` calls after `warmup`, each call after
-    `flush` evicts the L2 (CUPTI times `fn`'s kernels alone)."""
-    cupti = profiler.Cupti(finalize=False)
+def timed(fn, args, *, flush=None, evictor=None, warmup: int, repeats: int) -> float:
+    """The median device seconds of `fn`'s kernels over `repeats` calls after `warmup`, each call, where
+    `flush` is given, in a program that first writes `evictor` through the L2, so it reads from HBM (CUPTI
+    times `fn`'s kernels alone, the flush's left out)."""
     seconds = []
-    for index in range(warmup + repeats):
-        jax.block_until_ready(flush())
-        _, read = cupti.measure(fn, aggregate=False)(*args)
-        if index >= warmup:
-            seconds.append(sum(ms for _, ms in read or []) / 1e3)
-    profiler.Cupti().measure(fn, aggregate=False)(*args)
+    with device_time() as device:
+        for index in range(warmup + repeats):
+            measured = device.seconds(fn, *args, before=flush, before_args=(evictor,))
+            if index >= warmup:
+                seconds.append(measured)
     return statistics.median(seconds)
 
 
@@ -114,12 +112,12 @@ def main() -> None:
         x = jnp.ones((size // 2,), jnp.bfloat16)
         row = {"bytes": size}
         for name, fn, moved in (("read", read, size), ("copy", copy, 2 * size)):
-            seconds = timed(fn, (x,), flush=lambda: flush(evictor), warmup=args.warmup, repeats=args.repeats)
+            seconds = timed(fn, (x,), flush=flush, evictor=evictor, warmup=args.warmup, repeats=args.repeats)
             row[name] = {"seconds": seconds, "bytes_per_second": moved / seconds}
         rows.append(row)
         print(json.dumps(row), flush=True)
     tiny = jnp.ones((256,), jnp.float32)
-    least = timed(copy, (tiny,), flush=lambda: tiny, warmup=args.warmup, repeats=args.repeats)
+    least = timed(copy, (tiny,), warmup=args.warmup, repeats=args.repeats)
     chains = [(length, statistics.median(samples(chained(length), tiny, warmup=args.warmup,
                                                  repeats=args.repeats)))
               for length in CHAINS]
@@ -128,8 +126,8 @@ def main() -> None:
              "chain": {"launch_seconds": float(slope), "call_seconds": float(intercept),
                        "points": [{"kernels": length, "seconds": seconds} for length, seconds in chains]}}
     if generation.gpu_target().architecture.tma:
-        trips = [(count, timed(handed_off(count), (), flush=lambda: tiny, warmup=args.warmup,
-                               repeats=args.repeats)) for count in ROUND_TRIPS]
+        trips = [(count, timed(handed_off(count), (), warmup=args.warmup, repeats=args.repeats))
+                 for count in ROUND_TRIPS]
         hop, _ = np.polyfit([count for count, _ in trips], [seconds for _, seconds in trips], 1)
         facts["handoff"] = {"seconds": float(hop), "points": [{"round_trips": count, "seconds": seconds}
                                                               for count, seconds in trips]}

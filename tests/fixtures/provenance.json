@@ -131,14 +131,6 @@
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "hf/modernbert-tiny/hidden_bf16.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/modernbert-tiny/hidden_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "attention_bf16.npz": {
    "tool": "tools/numerics_reference.py",
    "sources": [
@@ -3610,22 +3602,6 @@
    "tool": "tools/v_loss_reference.py",
    "sources": [{"repo": "google-research/google-research", "version": "adb2c533488cc9b27b3878c7e34603a95f4540ef", "runs": "fetched"}, {"repo": "jax-ml/jax", "version": "0.11.2.post3", "runs": "jax"}],
    "note": "diffusion_distillation's Model.training_losses for a v model under constant weighting (x MSE), discrete over improved-diffusion's 1000-step cosine table, in float32 and float64 on the same float32 noise, around an affine stand-in; images and weights are inputs."
-  },
-  "vae/contract.npz": {
-   "tool": "tools/autoencoder_contract_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/diffusers",
-     "version": "0.39.0",
-     "runs": "diffusers"
-    },
-    {
-     "repo": "pytorch/pytorch",
-     "version": "2.14.0",
-     "runs": "torch"
-    }
-   ],
-   "note": "Over vae/sd3-tiny: SD3 img2img's retrieve_latents (DiagonalGaussianDistribution.sample) and normalization per frame, vae.decode of the normalized means taken back SD3's way, and the posterior past its clamp; draws are JAX's normal for key 7 handed through randn_tensor; float32 and float64 (widened)."
   },
   "vae/encoder.npz": {
    "tool": "tools/vae_encoder_reference.py",

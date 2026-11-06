@@ -11,6 +11,7 @@ import dataclasses
 import importlib
 import importlib.metadata
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -117,14 +118,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seeds", type=int)
-    parser.add_argument("--redraw", type=int)
     parser.add_argument("--calibrate", action="store_true")
     args = parser.parse_args()
     if args.calibrate:
         calibrate(args.output, SITES)
         return
-    if args.seeds is None or args.redraw is None or args.seeds <= 0 or args.redraw < 0:
-        parser.error("seeds must be positive and redraw nonnegative")
+    if args.seeds is None or args.seeds <= 0:
+        parser.error("seeds must be positive")
+    sys.path.insert(0, str(ROOT / "tests"))
+    from check1_wire import REDRAW, staged_units
+
     require_reference_transformers()
     torch.set_num_threads(1)
     torch.set_float32_matmul_precision("highest")
@@ -159,7 +162,7 @@ def main():
         (args.output / "readout.json").write_text(json.dumps(
             {"readout": "head", "head_dim": 8, "n_slots": len(labels), "attention": "noncausal"}))
         draws, requests, outputs = [], [], {site: {"reference": [], "truth": []} for site in SITES}
-        for seed in range(args.seeds * (1 + args.redraw)):
+        for seed in range(staged_units(args.seeds)):
             inputs, request = draw(seed, tokenizer, prompt, schema, readout)
             draws.append(inputs)
             requests.append(request)
@@ -174,7 +177,7 @@ def main():
                     outputs[f"{attention}_{mode}"]["truth"].append(exact[mode])
         arrays = {"precision": np.asarray("ieee")}
         for site, paired in outputs.items():
-            arrays[f"{site}.redraw"] = np.asarray(args.redraw)
+            arrays[f"{site}.redraw"] = np.asarray(REDRAW)
             arrays.update({f"{site}.input.{name}": np.stack([given[name] for given in draws])
                            for name in draws[0]})
             for arm, values in paired.items():
@@ -187,7 +190,7 @@ def main():
                       "prompt_files": PROMPT_FILES, "patch_sha256": PATCH_SHA256,
                       "style": dataclasses.asdict(prompt.DEFAULT_STYLE), "thinking": False,
                       "source": SOURCE.relative_to(ROOT).as_posix(), "seeds": args.seeds,
-                      "redraw": args.redraw, "head_seed": 43, "precision": "ieee", "device": "cpu",
+                      "redraw": REDRAW, "head_seed": 43, "precision": "ieee", "device": "cpu",
                       "packages": {name: importlib.metadata.version(name) for name in
                                    ("transformers", "torch", "numpy", "safetensors", "pydantic")}}
         (args.output / "source.json").write_text(json.dumps(provenance, indent=2) + "\n")
