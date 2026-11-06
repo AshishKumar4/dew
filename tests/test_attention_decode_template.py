@@ -274,6 +274,50 @@ def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, pa
                     seeds=SEEDS)
 
 
+
+@INTERPRETS
+@pytest.mark.parametrize("layout", ["dense", "paged-16"])
+@pytest.mark.parametrize("stored", ["int8", "float8_e4m3fn"])
+@pytest.mark.parametrize("device", ["sm90", "sm80"])
+def test_a_decode_step_over_a_quantized_cache_is_on_par_interpreted(layout, stored, device):
+    """A decode step over a quantized cache (`dew.nn.kv_cache.quantize`: codes a token and head, each with its
+    fp32 scale), its codes read and dequantized in the walk (`attention_decode.attend`'s `scales`, ledger
+    3624), dense or in pages of 16 keys several to a key tile, on par with the reference path over the keys
+    and values the cache dequantizes them to (check 1), as an H100 and an A100 run it."""
+    from dew.nn.kv_cache import dequantize, quantize
+
+    positions, heads, kv_heads = CALLS["one-query"]
+    spans = _spans(positions)
+    page = 16
+    per_row = KEYS // page
+    table = jnp.asarray(np.random.default_rng(7).permutation(2 * per_row).reshape(2, per_row), jnp.int32)
+
+    def pooled(rows):
+        # `[B, K, KV, ...]` as a pool `[KV, P, page, ...]` holding row `b`'s page `j` at `table[b, j]`.
+        held = jnp.moveaxis(rows.reshape(len(LENGTHS), per_row, page, *rows.shape[2:]), 3, 0)
+        pool = jnp.zeros((kv_heads, 2 * per_row, page, *rows.shape[3:]), rows.dtype)
+        return pool.at[:, table].set(held)
+
+    def ours(query, key, value):
+        (k_codes, k_scale), (v_codes, v_scale) = (quantize(array, stored) for array in (key, value))
+        scales = tuple(jnp.swapaxes(scale, 1, 2) for scale in (k_scale, v_scale))
+        with generation.assumed(device):
+            if layout == "dense":
+                return attention_decode.attend(query, k_codes, v_codes, spans, interpret=True, scales=scales)
+            return attention_decode.attend(query, pooled(k_codes), pooled(v_codes), spans, interpret=True,
+                                           table=table, scales=scales)
+
+    def reference(query, key, value):
+        dequantized = (dequantize(*quantize(array, stored), query.dtype) for array in (key, value))
+        return template.reference(query, *dequantized, spans)
+
+    def draw(seed: int):
+        query, key, value, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(seed)
+        return query, key, value
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"quantized decode {layout} {stored} {device}",
+                    seeds=SEEDS)
+
 def test_packing_a_calls_heads_into_its_rows_is_undone_by_unpacking():
     """A key head's group of query heads as its rows (`packed`) and back (`template.ungrouped_rows`): the
     query as it was, each packed row's keys its query's."""
