@@ -414,7 +414,7 @@ class MosaicForward(_Mainloop[Tiles]):
 
             for columns in _column_blocks_of(family, query.dtype, ba.arguments["value"].shape[3]):
                 def tiles(rows: int, walked: int, consumers: int, family=family, columns=columns) -> Tiles:
-                    return Tiles(rows, walked, 2, consumers, family.name, columns=columns)
+                    return Tiles(rows, walked, 2, consumers, family=family.name, columns=columns)
 
                 config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles,
                                   lambda config: self._launch_legal(ba, config, target), overlapped=True,
