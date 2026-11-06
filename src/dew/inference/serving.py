@@ -149,7 +149,7 @@ from dew.nn.inputs import (
 )
 from dew.nn.kernels import generation
 from dew.nn.kernels.options import Fetched, compiler_options, program as outer_program
-from dew.nn.kv_cache import GROUPS, ROUNDING_KEYS, KVCache, is_paged, leaf_name, row_axis
+from dew.nn.kv_cache import GROUPS, POOLED, ROUNDING_KEYS, KVCache, is_paged, leaf_name, row_axis
 from dew.nn.precision import Numerics
 from dew.nn.progress import END, Progress
 from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
@@ -384,6 +384,11 @@ class DenseRows:
         """A dense cache shares nothing across rows to invalidate."""
 
 
+def _nbytes(leaf) -> int:
+    """A cache leaf's bytes, an array's or its shape's."""
+    return int(np.prod(leaf.shape)) * np.dtype(leaf.dtype).itemsize
+
+
 class PagedRows:
     """The host side of a paged cache: one `Pages` ledger per group hands out its part of the pool.
 
@@ -422,11 +427,16 @@ class PagedRows:
         it again, and the pages are named under its digest."""
         if not is_paged(cache):
             raise ValueError("the model did not take the paged layout: none of its layers keeps a page table")
-        if any(part.prefix_cache for part in self.pages) and any(
-                row_state(path) for path, _ in jax.tree_util.tree_leaves_with_path(cache)):
+        leaves = jax.tree_util.tree_leaves_with_path(cache)
+        if any(part.prefix_cache for part in self.pages) and any(row_state(path) for path, _ in leaves):
+            # A state gives way to a host slot as a reclaimed page does, as many as the bytes of the pages'
+            # host slots hold: a row's state is a whole recurrent memory, a page a few tokens' keys.
+            page = sum(_nbytes(leaf) // leaf.shape[row_axis(path) + 1] for path, leaf in leaves
+                       if leaf_name(path) in POOLED)
+            state = sum(_nbytes(leaf) // leaf.shape[row_axis(path)] for path, leaf in leaves
+                        if row_state(path))
             for part in self.pages:
-                # A state gives way to a host slot as a reclaimed page does, as many as the pages'.
-                part.states = States(self.states, host=part.host)
+                part.states = States(self.states, host=part.host * page // state)
 
     @property
     def stateful(self) -> bool:
@@ -791,7 +801,9 @@ class Server:
         prefix pages in host memory, split over the groups: a cached page the
         pool reclaims goes to the host first, and a prompt that shares it reads
         it back into a fresh page before its prefill (`dew.inference.pages`), so
-        a prefix cache holds more than the device's pages.
+        a prefix cache holds more than the device's pages. Where rows keep a
+        state beside their pages, a state giving way goes to the host too, as
+        many states as the bytes of `host_pages` pages hold.
 
         `prefill_mesh` prefills the admitted prompts on a mesh of their own,
         as MaxEngine's and vLLM's disaggregated serving does: the server keeps
