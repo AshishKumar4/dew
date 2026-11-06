@@ -256,8 +256,8 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         their elements themselves."""
         return self.dtype.itemsize <= 2
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
-        out = self.products(self.zeros(shape), lhs, rhs, interpret=False)
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False) -> jax.Array:
+        out = self.products(self.zeros(shape), lhs, rhs, interpret=interpret)
         if then is not None:
             then()
         return out

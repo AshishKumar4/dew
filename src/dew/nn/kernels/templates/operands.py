@@ -11,6 +11,7 @@ from typing import Protocol
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import pallas as pl
 
 from dew.nn.kernels.templates import mosaic, product
 
@@ -39,6 +40,11 @@ class Parts:
     @property
     def T(self) -> "Parts":
         return Parts((ref.T for ref in self.refs), self.dtype)
+
+    def rows(self, start, count: int) -> "Parts":
+        """Its rows `start` to `start + count`, each part's: a product of a block of them, the rest of the
+        tile staged once for the others (KDA's pairs, a key sub-chunk's)."""
+        return Parts((ref.at[pl.ds(start, count)] for ref in self.refs), self.dtype)
 
     def astype(self, dtype) -> "Parts":
         """The tile as `dtype`'s, which a product takes it as: its own dtype alone."""

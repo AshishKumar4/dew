@@ -89,6 +89,7 @@ def within(keys: jax.Array, start: jax.Array, end: jax.Array,
 def dense(spans: KeySpans) -> jax.Array:
     """Whether each key is visible to each query (`within`), every one: `[B, Q, K]` boolean, by broadcasting
     alone, so a batch-sharded call's spans take no gather."""
+    spans = spans.per_query()
     keys = jnp.arange(spans.keys)[None, None, :]
     ids = (None if spans.query_ids is None or spans.key_ids is None
            else (spans.query_ids[:, :, None], spans.key_ids[:, None, :]))
@@ -101,6 +102,7 @@ def dense(spans: KeySpans) -> jax.Array:
 def reads(spans: KeySpans) -> jax.Array:
     """Whether each query sees a key, `[B, Q]`: one of its intervals holds one, of its document where the
     call has ids, counted among that document's keys in index order however the documents lie (`_runs`)."""
+    spans = spans.per_query()
     start, end = spans.start, spans.end
     runs = start.ndim == 3
     if spans.query_ids is None or spans.key_ids is None:
@@ -461,6 +463,7 @@ def block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
     run: each run's tile envelope over a block's queries and its tiles every query of the block sees whole,
     the envelopes merged into their sorted union where a call has several (`_merged`), the widest run's
     whole tiles the block's, and each key block read by the query blocks some range of which holds it."""
+    spans = spans.per_query()
     runs = spans.start.ndim == 3
     keys = spans.keys
     key_blocks = -(-keys // block_k)
@@ -1093,11 +1096,12 @@ class PaddedCall:
 
 
 def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
-                block: int, table: jax.Array | None = None, *, query_block: int | None = None
-                ) -> PaddedCall:
+                block: int, table: jax.Array | None = None, *, query_block: int | None = None,
+                by_position: bool = False) -> PaddedCall:
     """A call's one padding for every mainloop of the template (`PaddedCall`): its queries and keys at
     whole `block`s (a backend's largest tile), its queries at whole `query_block`s instead where a launch
-    walks no key block of its own over them (an inference forward's), its head widths at powers of two. A
+    walks no key block of its own over them (an inference forward's), its head widths at powers of two, its
+    spans an interval a query unless the caller's programs read them `by_position` (`KeySpans.per_span`). A
     paged call's (`table`, its page table) `key` and `value` are its pools `[KV, P, page, D]`, flattened,
     padded in their widths alone: its keys are its table's slots, whole blocks where its page is."""
     queries, width = query.shape[1], query.shape[3]
@@ -1128,7 +1132,11 @@ def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
         padded_key, padded_value = pool(key, padded_d), pool(value, padded_dv)
     else:
         padded_key, padded_value = pad(key, padded_k, padded_d), pad(value, padded_k, padded_dv)
-    # Intervals each of several queries' (a decode step's packed positions) stay a position each.
+    # Intervals each of several queries' (a decode step's packed positions) stay a position each where the
+    # caller's programs read them by position (`by_position`: the Mosaic forward's); an interval a query
+    # elsewhere.
+    if not by_position:
+        spans = spans.per_query()
     start, end = ((spans.start, spans.end) if spans.per_span > 1
                   else (pad_rows(spans.start, padded_q), pad_rows(spans.end, padded_q)))
     return PaddedCall(pad(query, padded_q, padded_d), padded_key, padded_value, start, end,
