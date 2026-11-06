@@ -2385,17 +2385,17 @@ TOOLKIT_FAMILIES = ("import jax\n"
                     "class RingFamily[A](Family): ...\n"
                     "class Pieces: ...\n"
                     "TILE_ROWS = 8\n")
-"""A toolkit's `mosaic.py` for SLOP028's checkouts: a family's classes, a value class and a constant."""
+"""A toolkit's `mosaic.py` for SLOP029's checkouts: a family's classes, a value class and a constant."""
 
 TOOLKIT_BUNDLES = ("from sparx.nn.kernels.templates import mosaic\n"
                    "class Wgmma(mosaic.RingFamily[jax.Array]): ...\n"
                    "WGMMA = Wgmma()\n"
                    "LIMIT = int(4)\n")
-"""A toolkit's `mosaic_sm90.py` for SLOP028's checkouts: a bundle's class, the bundle, another constant."""
+"""A toolkit's `mosaic_sm90.py` for SLOP029's checkouts: a bundle's class, the bundle, another constant."""
 
 
 def test_a_template_asking_which_family_it_runs_on_is_reported(tmp_path):
-    """SLOP028: a template asks no family's class (`isinstance`, `issubclass`, through a tuple too), name (a
+    """SLOP029: a template asks no family's class (`isinstance`, `issubclass`, through a tuple too), name (a
     family's `name`, a tile's `family`) or identity (a bundle the toolkit holds); a toolkit value's class, a
     toolkit constant and a fact are not reported, nor the same questions in the toolkit's own modules."""
     template = ("from sparx.nn.kernels.templates import mosaic, mosaic_sm90\n"
@@ -2414,7 +2414,7 @@ def test_a_template_asking_which_family_it_runs_on_is_reported(tmp_path):
                "src/sparx/nn/kernels/templates/mosaic_sm90.py": TOOLKIT_BUNDLES}
     path = "src/sparx/nn/kernels/templates/attention.py"
     assert _linted(tmp_path / "template", {**toolkit, path: template}) == [
-        (path, line, "SLOP028") for line in (4, 5, 6, 7, 8, 9)]
+        (path, line, "SLOP029") for line in (4, 5, 6, 7, 8, 9)]
     composed = template.replace("def plan", "def of")
     bundles = "src/sparx/nn/kernels/templates/bundles.py"
     assert _linted(tmp_path / "toolkit", {**toolkit, bundles: composed}) == []

@@ -72,7 +72,7 @@ Scope is per rule, because the rules are not all about the same thing:
   launch point's (`nn/kernels/launches.py`), which holds each launch to the
   per-shard boundary (`sharding.per_shard`), so no route launches a kernel over
   operands an automatic mesh axis splits (rows 1897, 1923, 4077).
-- SLOP028 is about the templates of `src/<package>/nn/kernels/templates`: none
+- SLOP029 is about the templates of `src/<package>/nn/kernels/templates`: none
   asks which family it runs on, by the class of a family, an issuer or a
   transport of the toolkit (`isinstance`, `issubclass`), by a family's name
   (`family.name`, a tile's `family`) or by a bundle of the toolkit (`is`, `==`
@@ -2004,19 +2004,19 @@ def pallas_launches(module: Module) -> Iterator[Finding]:
 
 
 TEMPLATES = "nn/kernels/templates/"
-"""The templates' package of `src/<package>` (SLOP028)."""
+"""The templates' package of `src/<package>` (SLOP029)."""
 
 TOOLKIT = ("mosaic", "mosaic_sm80", "mosaic_sm90", "mosaic_sm100", "mosaic_tpu", "bundles")
-"""The template toolkit's modules in `TEMPLATES` (SLOP028): its families, their issuers and transports, and
+"""The template toolkit's modules in `TEMPLATES` (SLOP029): its families, their issuers and transports, and
 the bundles a device composes of them, which alone name them."""
 
 FAMILY_ROOTS = frozenset({"mosaic.Family", "mosaic.Issuer", "mosaic.Transport"})
-"""The toolkit classes a family's class reaches through its bases (SLOP028)."""
+"""The toolkit classes a family's class reaches through its bases (SLOP029)."""
 
 
 @functools.cache
 def _families(root: Path, package: str) -> tuple[frozenset[str], frozenset[str]]:
-    """SLOP028: the toolkit's classes (`module.Class`, `TOOLKIT`'s modules) whose bases reach a family, an
+    """SLOP029: the toolkit's classes (`module.Class`, `TOOLKIT`'s modules) whose bases reach a family, an
     issuer or a transport (`FAMILY_ROOTS`), and the bundles it holds (`module.NAME`, a module's name bound to
     such a class's instance), read from the toolkit's source under `root`."""
     bases: dict[str, list[str]] = {}
@@ -2045,7 +2045,7 @@ def _families(root: Path, package: str) -> tuple[frozenset[str], frozenset[str]]
 
 
 def family_checks(module: Module) -> Iterator[Finding]:
-    """SLOP028: a template's question of which family it runs on: an `isinstance` or `issubclass` of a
+    """SLOP029: a template's question of which family it runs on: an `isinstance` or `issubclass` of a
     toolkit family's class (`_family_classes`), a comparison of a family's name (`family.name`, a tile's
     `family`) or of a bundle the toolkit holds (`mosaic_sm90.WGMMA`), read through the imports of its scope,
     anywhere in `TEMPLATES` but the toolkit's own modules (`TOOLKIT`)."""
@@ -2066,7 +2066,7 @@ def family_checks(module: Module) -> Iterator[Finding]:
         if asked and len(node.args) == 2:
             kinds = node.args[1].elts if isinstance(node.args[1], ast.Tuple) else [node.args[1]]
             if any(of_toolkit(kind, table) in classes for kind in kinds):
-                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP028",
+                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP029",
                               "asks a family's class; ask the fact it turns on, which the families state")
         elif isinstance(node, ast.Compare) and all(
                 isinstance(op, (ast.Eq, ast.NotEq, ast.In, ast.NotIn, ast.Is, ast.IsNot)) for op in node.ops):
@@ -2074,7 +2074,7 @@ def family_checks(module: Module) -> Iterator[Finding]:
             named = any(_named(operand).endswith(("family.name", ".family")) for operand in operands)
             bundle = any(of_toolkit(operand, table) in bundles for operand in operands)
             if named or bundle:
-                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP028",
+                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP029",
                               "asks which family it runs on by name; ask the fact it turns on, which the "
                               "families state")
 
