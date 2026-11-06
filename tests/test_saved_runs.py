@@ -90,31 +90,35 @@ def extracted(tmp_path: Path, recorded: str, kind: str) -> Path:
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, recorded, kind):
     """A kind's run saved at an earlier main rebuilds from its record, in the compute it recorded, and,
-    where its objective declares a saved task and the run recorded the declaration, pins its last
-    checkpoint and loads as that task, which answers a request. The corpus's JEPA runs, each saved
-    before a JEPA encoder had a release (row 4313, `dew.inference.models.SavedModel`), recorded none,
-    and pinning one is refused for that."""
+    where its objective declared a saved task then and the run recorded that declaration, pins its last
+    checkpoint and loads as that task, which answers a request. A run whose objective declared none at its
+    main recorded none (the corpus's JEPA runs, saved before a JEPA encoder had a release: row 4313,
+    `dew.inference.models.SavedModel`), so pinning it is refused; resuming it saves a step that declares
+    one (`test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint`)."""
     run = extracted(tmp_path, recorded, kind)
     recorded_run = RunConfig.load(str(run))
     seen = evidence(recorded, kind)
     task = objectives[recorded_run.objective.name].saved_task
+    with Checkpoints(str(run)) as checkpoints:
+        last = checkpoints.latest
+        declared = checkpoints.artifact(last) is not None
     if seen is not None:
         assert recorded_run.compute_dtype() == seen["compute"]
-        if task is not None and seen["version"] >= PRODUCTS:
+        if seen["version"] >= PRODUCTS:
+            # A run that declared its task recorded what one request multiplied, and one that declared
+            # none recorded nothing.
+            assert (seen["products"] is not None) == declared
+        if declared and seen["version"] >= PRODUCTS:
             # The task loaded multiplies as the one the run saved did: one request's products, module by
             # module, in the dtypes they multiplied in then.
             found = computed(run)
             assert found["products"] == unpacked(seen["products"], found["packs"])
-    with Checkpoints(str(run)) as checkpoints:
-        last = checkpoints.latest
-        declared = checkpoints.artifact(last) is not None
-    assert declared == (task is not None and kind != "jepa")
     if declared:
         saved = SavedRun.pinned(str(run))
         assert saved.step == last
         answered(task.from_run(str(run)))
-    elif task is not None:
-        with pytest.raises(ValueError, match="declares no inference record"):
+    else:
+        with pytest.raises(ValueError):
             SavedRun.pinned(str(run))
 
 
@@ -166,8 +170,9 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
         assert consumed is None or consumed > seen["consumed"]
         assert not clocked or consumed == recorded_run.trainer.examples
         # The model the resumed fit trained computes as the saved one did: the task its new step saves.
+        # Where its main recorded them: a run whose objective declared no task then recorded none.
         task = objectives[recorded_run.objective.name].saved_task
-        if task is not None and seen["version"] >= PRODUCTS:
+        if task is not None and seen["version"] >= PRODUCTS and seen["products"] is not None:
             found = computed(run, int(state.step))
             assert found["products"] == unpacked(seen["products"], found["packs"])
         # The step the resumed fit compiled, at the rung it was admitted at.
