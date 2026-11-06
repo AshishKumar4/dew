@@ -19,7 +19,7 @@ import contextlib
 import functools
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, NotRequired, TypedDict
+from typing import TYPE_CHECKING, ClassVar, NotRequired, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -37,6 +37,8 @@ from dew.rl.simulator import Simulator, branched, rollout_start, simulator_rollo
 from dew.rl.surrogate import clipped_surrogate_terms
 
 if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
+
     from dew.state import TrainState
 
 _MIN_STD = 1e-3
@@ -133,7 +135,7 @@ class ControlPPOObjective(ReleasesModel, Objective[Ratio]):
         self.variables = unboxed(variables)
         self.reads = reads
 
-    settings = ControlSettings
+    settings: ClassVar[type[DataclassInstance] | None] = ControlSettings
 
     def task_settings(self) -> ControlSettings:
         """The observation policy a released policy reads (`ControlSettings`)."""
