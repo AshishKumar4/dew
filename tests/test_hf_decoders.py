@@ -252,16 +252,10 @@ def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name,
     (ids,) = draw(0)
     ours = np.asarray(loaded.model.apply(loaded.variables, ids))
     loaded.save(tmp_path / "export")
-    exports = [tmp_path / "export"]
-    if name == "nemotron-h-tiny":
-        # Nemotron-H writes its hybrid pattern only from its source (`preserve_source_layout`):
-        # written from the model alone, the export refuses rather than drop the pattern.
-        with pytest.raises(ValueError):
-            PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / "from_model")
-    else:
-        # Written from the model and its variables alone too, as a trained run exports.
-        PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / "from_model")
-        exports.append(tmp_path / "from_model")
+    # Written from the model and its variables alone too, as a trained run exports: Nemotron-H's hybrid
+    # pattern among its fields (`nemotron_h.CONFIG`).
+    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / "from_model")
+    exports = [tmp_path / "export", tmp_path / "from_model"]
     for export in exports:
         again = Pretrained.load(export, dtype="float32", attention_impl="reference")
         reloaded = np.asarray(again.model.apply(again.variables, ids))

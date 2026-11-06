@@ -54,6 +54,7 @@ from dew.nn.vision import (
     projector_variables,
     qwen35,
     siglip,
+    tower_layout,
     tower_variables,
 )
 from dew.registry import projectors, towers
@@ -285,13 +286,13 @@ def test_a_gemma4_tower_writes_back_the_config_it_was_read_from(name):
     published = json.loads((FIXTURES / name / "config.json").read_text())
     vision = published.get("vision_config", published)
     tower = towers.from_record(gemma4.translate_gemma4_vision_config(published))
-    written = gemma4.export_gemma4_vision_config(tower)
+    written = tower_layout("gemma4").vision_config(tower)
     assert {key: (value, vision[key]) for key, value in written.items() if vision[key] != value} == {}
     assert towers.from_record(gemma4.translate_gemma4_vision_config(written)) == tower
     unset = dataclasses.replace(tower, head_dim=None, rope_theta=50.0, standardize=False,
                                 use_clipped_linears=True, hidden_act="gelu")
     assert towers.from_record(gemma4.translate_gemma4_vision_config(
-        gemma4.export_gemma4_vision_config(unset))) == (
+        tower_layout("gemma4").vision_config(unset))) == (
         dataclasses.replace(unset, head_dim=unset.hidden_size // unset.num_heads))
     # The base reads alike from rope_parameters under either spelling of its type and from the flat
     # field; the decoders' 'none' alias is no type of the towers' reference.
