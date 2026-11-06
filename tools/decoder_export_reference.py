@@ -92,6 +92,9 @@ class Case:
     conversion_type: str | None = None
     rate: float = RATE
     orders: bool = False
+    text_only: bool = False
+    """Whether the case is a bundle's language model alone (`Pretrained.load`'s `text_only`), its
+    towers retained by name and written back byte for byte: a decoder export's claims are the decoder's."""
 
 
 CASES = (
@@ -106,7 +109,7 @@ CASES = (
     Case("kimi_k2", "kimi-k2-tiny", balance_rate=1e-2,
          reference_class="DeepseekV3ForCausalLM"),
     Case("kimi_k25", "kimi-k25-tiny", balance_rate=1e-2,
-         reference_class="Kimi_K25ForConditionalGeneration"),
+         reference_class="Kimi_K25ForConditionalGeneration", text_only=True),
     Case("llama4_text", "llama4-tiny"),
     Case("olmo3", "olmo3-yarn-tiny"),
     Case("qwen3_next", "qwen3-next-tiny", mtp_weight=0.3, orders=True),
@@ -177,15 +180,17 @@ def stepped(objective, ids: np.ndarray, rate: float):
     return Trainer(objective, optax.sgd(rate), key=jax.random.key(SEED)).fit(data, steps=1, log_every=1)
 
 
-def trained_export(directory: Path, export: Path, train: Callable[[Pretrained, np.ndarray], TrainState]
-                   ) -> tuple[Pretrained, np.ndarray, Variables, Pretrained]:
-    """The checkpoint in `directory` loaded, trained one step on its own ids (`train`), its trained
-    weights written back into the source's own tensor names at `export`, and the export loaded."""
+def trained_export(directory: Path, export: Path, train: Callable[[Pretrained, np.ndarray], TrainState], *,
+                   text_only: bool = False) -> tuple[Pretrained, np.ndarray, Variables, Pretrained]:
+    """The checkpoint in `directory` loaded (a bundle's language model alone where `text_only`), trained
+    one step on its own ids (`train`), its trained weights written back into the source's own tensor names
+    at `export`, and the export loaded as the checkpoint was."""
     ids = np.load(directory / "input_ids.npy")
-    source = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
+    source = Pretrained.load(str(directory), dtype="float32", attention_impl="reference", text_only=text_only)
     trained = train(source, ids).variables
     source.save(export, variables=trained)
-    return source, ids, trained, Pretrained.load(str(export), dtype="float32", attention_impl="reference")
+    return source, ids, trained, Pretrained.load(str(export), dtype="float32", attention_impl="reference",
+                                                 text_only=text_only)
 
 
 def _text_half_prefixes(model) -> tuple[str, ...]:
@@ -434,7 +439,8 @@ def glm5_prediction_logits(case: Case, directory: Path, ids: np.ndarray) -> np.n
 def round_trip(case: Case, workspace: Path) -> RoundTrip:
     """`case` loaded, trained for one step, exported and read back."""
     directory, export = FIXTURES / case.fixture, workspace / case.name
-    source, ids, trained, reloaded = trained_export(directory, export, functools.partial(train, case))
+    source, ids, trained, reloaded = trained_export(directory, export, functools.partial(train, case),
+                                                    text_only=case.text_only)
     return RoundTrip(source=source, trained=trained, export=export, ids=ids,
                      ours=logits(source, trained, ids), reloaded=reloaded,
                      theirs=reference_logits(case, export, ids),

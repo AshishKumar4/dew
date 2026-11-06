@@ -1,0 +1,59 @@
+{
+  "image_processor": {
+    "do_convert_rgb": true,
+    "do_normalize": true,
+    "do_rescale": true,
+    "do_resize": true,
+    "image_mean": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "image_processor_type": "Kimi_K25ImageProcessor",
+    "image_std": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "max_patches": 256,
+    "merge_size": 2,
+    "patch_size": 2,
+    "resample": 3,
+    "rescale_factor": 0.00392156862745098,
+    "size": {
+      "max_height": 32,
+      "max_width": 32
+    }
+  },
+  "processor_class": "Kimi_K25Processor",
+  "video_processor": {
+    "do_convert_rgb": true,
+    "do_normalize": true,
+    "do_rescale": true,
+    "do_resize": true,
+    "do_sample_frames": true,
+    "fps": 2,
+    "image_mean": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "image_std": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "max_patches": 4096,
+    "merge_size": 2,
+    "patch_size": 2,
+    "resample": 3,
+    "rescale_factor": 0.00392156862745098,
+    "return_metadata": false,
+    "size": {
+      "max_height": 512,
+      "max_width": 512
+    },
+    "temporal_patch_size": 4,
+    "video_processor_type": "Kimi_K25VideoProcessor"
+  }
+}

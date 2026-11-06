@@ -212,6 +212,28 @@ def test_an_lfm3_vl_wrapper_loads_whole_and_its_language_model_alone(tmp_path):
     np.testing.assert_array_equal(np.asarray(reread.model.apply(reread.variables, ids)), expected)
 
 
+def test_an_lfm3_vl_trunk_read_or_built_resolves_its_defaults_and_cadence_one_way():
+    """LFM3-VL's trunk takes its defaults from its value alone (`Lfm3VlVision`, row 4400): a config that
+    states a depth and nothing else reads as the value built at that depth, its cadence the release's over
+    that depth (two convolutions, then attention and convolution in turn), as one built directly at any
+    depth has; a cadence it states is kept, and one of another length or an unknown kind is refused as
+    the config is read."""
+    from dew.nn.vision.lfm3 import Lfm3VlVision, translate_lfm3_vl_vision_config
+    from dew.registry import towers
+
+    read = translate_lfm3_vl_vision_config({"vision_config": {"num_hidden_layers": 6}})
+    built = towers.from_record(read)
+    assert built == Lfm3VlVision(num_hidden_layers=6)
+    assert built.kinds == ("conv", "conv", "full_attention", "conv", "full_attention", "conv")
+    stated = ["full_attention", "conv", "conv"]
+    kept = translate_lfm3_vl_vision_config({"vision_config": {"num_hidden_layers": 3, "layer_types": stated}})
+    assert towers.from_record(kept).kinds == tuple(stated)
+    for wrong in ({"num_hidden_layers": 4, "layer_types": stated},
+                  {"num_hidden_layers": 3, "layer_types": ["conv", "conv", "sliding_attention"]}):
+        with pytest.raises(ValueError):
+            translate_lfm3_vl_vision_config({"vision_config": wrong})
+
+
 @pytest.mark.network
 def test_the_released_lfm3_vl_and_d1_headers_load_whole_or_refuse_d1s_attention():
     """LiquidAI/LFM3-VL-2B loads whole, its trunk, projector and language model, from its safetensors
