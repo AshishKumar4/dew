@@ -382,11 +382,12 @@ class _Triton(_GroupedLaunch[Tile]):
         """The contraction one step of `tile` takes, the dot's K."""
 
     def staged_bytes(self, ba, config: Tile, target) -> int:
-        # Pallas Triton's pipeline holds `stages - 1` depth steps, and on Hopper `stages` where it
-        # pipelines a wgmma, which reads one step while the next loads; an A100 and an H100 refuse
-        # exactly those bytes, so a Hopper tile is sized for the larger. The prologue's side tiles load
-        # in the same steps.
-        held = 0 if target.wgmma else 1
+        # Pallas Triton's pipeline holds `stages - 1` depth steps, and `stages` where its MMA reads shared
+        # memory asynchronously (Hopper's wgmma, Blackwell's tcgen05), one step read while the next loads;
+        # an A100 and an H100 refuse exactly those bytes, and a B200 refused 262,160 bytes for a dense fp32
+        # tile counted at `stages - 1` (gate-2738-gemm-b200, row 4449). The prologue's side tiles load in
+        # the same steps.
+        held = 0 if target.wgmma or generation.family(target.generation) == 'tcgen05' else 1
         step = self.loaded(config) * jnp.dtype(ba.arguments['tokens'].dtype).itemsize + _side_tile_bytes(
             ba.arguments['prologue_operands'], ba.arguments['hooks'].prologue_axes, self.extents(config))
         # A contraction of one step has no loop whose dead stages the output's layout conversion reuses:

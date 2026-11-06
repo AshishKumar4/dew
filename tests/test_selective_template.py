@@ -139,23 +139,12 @@ def test_the_template_holds_its_hardest_regimes_interpreted(regime):
                     truth_fn=jax.jit(with_gradients(scanned(portable, starts))))
 
 
-@pytest.mark.check1_shards(seeds=8, per_task=4)
-def test_the_template_with_owned_partials_is_as_exact_as_the_portable_scan_interpreted(monkeypatch):
-    """`the_template_is_as_exact_as_the_portable_scan` over packed documents where the backward's programs
-    own their partial sums and walk their channels in turn (`Scan.owned`, a run asking its reductions
-    ordered)."""
-    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_deterministic_ops=true")
-    the_template_is_as_exact_as_the_portable_scan("interpreted", packed=True)
-
-
-@pytest.mark.gpu(reason="the backward's atomic adds land in a GPU's order, which an interpreter fixes")
-def test_the_backward_repeats_its_state_gradients_bit_for_bit_where_reductions_are_ordered(monkeypatch):
-    """The template's backward over 512 channels, 16 of them to each partial buffer (`selective.PARTIALS`),
-    under a run asking its reductions ordered (`--xla_gpu_deterministic_ops`, the CUDA test lane's): B's
-    and C's gradients bit for bit the same over repeated runs of one compiled step, the step's other
-    gradients too. With every channel adding atomically, the channels sharing a buffer added in whatever
-    order their programs ran (row 4392)."""
-    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_deterministic_ops=true")
+@pytest.mark.gpu(reason="a GPU's programs run in its own order, which an interpreter fixes")
+def test_the_backward_repeats_its_gradients_bit_for_bit():
+    """The template's backward over 512 channels, several to each partial buffer (`selective.partials_of`):
+    every gradient bit for bit the same over repeated runs of one compiled step, as check 1's pairing of an
+    arm's draws takes it. With every channel adding atomically into 32 buffers, B's gradient differed in its
+    last bits between two runs on an H100 (rows 4392, 4448)."""
     shape = (1, 256, 512, 16)
     family = bundles.of(generation.device_generation(), jnp.float32)
     template = functools.partial(selective.selective_scan, family=family)

@@ -13,7 +13,6 @@ backward does."""
 
 import dataclasses
 import functools
-import math
 from typing import ClassVar
 
 import jax
@@ -23,7 +22,6 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew._devices import deterministic_ops_requested
 from dew.nn import derivatives
 from dew.nn.kernels import generation, recurrence_algebra as algebra, tuning
 from dew.nn.kernels.templates import base, mosaic, report, resources, scan as block_scan
@@ -57,9 +55,9 @@ class Scan:
     packed: bool = False
     entered: bool = False
     launch: str | None = None
-    owned: bool = False
-    """Whether the backward's programs own their partial sums, the run asking its reductions ordered
-    (`backward`)."""
+    partials: int = 1
+    """The buffers a row's B and C gradients are added into, a backward program owning each
+    (`partials_of`)."""
 
     @property
     def chunks(self) -> int:
@@ -219,10 +217,23 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
 
 
 PARTIALS = 32
-"""The buffers B's and C's gradients are added into across the channels, a channel's its index modulo
-them, then summed (XLA's reduction): each buffer adds a 32nd of the channels in turn, where one buffer's
-sequential adds put B's gradient 1.95 times the portable scan's distance from float64 with a document
-starting at every chunk (the interpreted regime test); the adds a buffer takes fewer, as contended."""
+"""The fewest buffers B's and C's gradients are added into across a row's channels, a channel's its index
+modulo them, then summed (XLA's reduction): one buffer's sequential adds put B's gradient 1.95 times the
+portable scan's distance from float64 with a document starting at every chunk (the interpreted regime
+test), a 32nd of the channels a buffer on par (`partials_of`)."""
+
+
+def partials_of(rows: int, channels: int, states: int, target: generation.GpuTarget, resident: int) -> int:
+    """The buffers a row's B and C gradients are added into (`backward`), a program owning each and walking
+    its channels in turn, so the sums are the same on every run: the fewest dividing the channels, at least
+    `PARTIALS`, whose programs fill a wave of `target` at `resident` programs a multiprocessor, no more than
+    keep them within the input gradient's memory (2 states a buffer to a channel) where that allows
+    `PARTIALS`. Atomic adds into 32 buffers left B's gradient differing in its last bits across two runs on
+    one H100, so no check-1 pairing held it (gate-2738-recurrence3-h100, row 4448)."""
+    wave = -(-(target.multiprocessors or 1) * resident // rows)
+    cap = max(PARTIALS, channels // (2 * states))
+    divisors = [p for p in range(1, channels + 1) if channels % p == 0 and p <= cap]
+    return min((p for p in divisors if p >= max(PARTIALS, wave)), default=max(divisors))
 
 
 BACKWARD_VECTORS = 12
@@ -303,37 +314,30 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
     last): `q_t = a_t (C_t dy_t + q_{t+1})`, the cotangent a token passes the state before it, so
     `g_t = C_t dy_t + q_{t+1}` the state's own, its decay `a_t = exp2(dt_t rate)` (zero at a document's
     first token). The channel's gradients sum over its states in registers; the states' B and C gradients
-    sum over the channels in global memory, each program's added atomically (mamba_ssm's atomicAdd), a
-    block's tokens across the threads so a warp's adds are adjacent (cub's BlockedToStriped), into one of
-    `PARTIALS` buffers, which XLA sums. Where a run asks its reductions ordered
-    (`--xla_gpu_deterministic_ops`, the CUDA test lane's), a program owns a buffer and walks the channels it
-    holds in their order, adding plainly: the atomic adds of the channels sharing a buffer land in any
-    order, and a step repeated on the same schedule differed in B's and C's gradients' last bits (row
-    4392)."""
+    sum over the channels in global memory, into the row's buffers (`Scan.partials`, `partials_of`), which
+    XLA sums: a program owns a buffer and walks the channels it holds in their order, adding plainly, so the
+    gradients are the same on every run. mamba_ssm's atomic adds land in any order: added atomically into
+    32 buffers, a step repeated on the same schedule differed in B's and C's gradients' last bits (rows
+    4392, 4448)."""
     _, channels, length = x.shape
     states, positions = b.shape[1], block_positions(length, scan.positions)
     blocks = length // positions
     interpret = scan.interpret
     layout = block_scan.blocked(positions)
-    owned = scan.owned
-    partials = math.gcd(PARTIALS, channels) if owned else min(PARTIALS, channels)
-    # A program's channels: its own where the adds are atomic, else every `partials`-th from its buffer's.
-    turns = channels // partials if owned else 1
+    partials = scan.partials
+    # A program's channels: every `partials`-th from its buffer's.
+    turns = channels // partials
 
     def entry(x_ref, dt_ref, b_ref, c_ref, parameters_ref, entered_ref, resets_ref, dy_ref, dfinal_ref,
-              dbc_ref, dx_ref, ddt_ref, da_ref, dd_ref, dstate_ref, exchanged, staged, carried):
+              dbc_ref, dx_ref, ddt_ref, da_ref, dd_ref, dstate_ref, exchanged, carried):
         row = lax.axis_index("rows")
 
         def load(ref):
             return plgpu.load(ref, layout=layout, optimized=False).astype(jnp.float32)
 
         def added(ref, value):
-            """`value` added to `ref`: plainly where the program owns it (or interpreted), else atomically,
-            across the threads (`block_scan.to_striped`), a warp's adds adjacent."""
-            if interpret or owned:
-                plgpu.store(ref, load(ref) + value, optimized=False)
-                return
-            plgpu.atomic_add(ref, block_scan.to_striped(value, staged), optimized=False)
+            """`value` added to `ref`, which the program owns."""
+            plgpu.store(ref, load(ref) + value, optimized=False)
 
         def block(i, d_skip, *, channel):
             k = blocks - 1 - i
@@ -400,8 +404,7 @@ def _backward_launched(entry, x, dt, b, c, parameters, entered, resets, dy, dfin
     """`backward`'s launch of its program `entry`, a row's `programs` a program each, and its outputs:
     `(dx, ddt, db, dc, dA, dD, dstate)`, B's and C's gradients summed over their `partials` buffers."""
     rows, channels, _ = x.shape
-    states, positions = b.shape[1], block_positions(x.shape[2], scan.positions)
-    interpret = scan.interpret
+    states, interpret = b.shape[1], scan.interpret
     sized = jax.ShapeDtypeStruct
     out_type = (sized(x.shape, jnp.float32), sized(x.shape, jnp.float32),
                 sized((rows, states, channels), jnp.float32), sized((rows, channels), jnp.float32),
@@ -410,8 +413,7 @@ def _backward_launched(entry, x, dt, b, c, parameters, entered, resets, dy, dfin
                              grid_names=("rows", "channels"),
                              warpgroups=1, interpret=interpret, family=scan.family.name,
                              name="selective_scan_backward", resident=scan.resident,
-                             scratch=(block_scan.scratch(), block_scan.exchange_scratch(positions),
-                                      plgpu.SMEM((2, states), jnp.float32)))
+                             scratch=(block_scan.scratch(), plgpu.SMEM((2, states), jnp.float32)))
     def accumulated(refs):
         """The launch's outputs written to `refs`, B's and C's gradients added to theirs from zero, one ref
         of both (a leading axis of them: two refs of equal zeros are one value to XLA, which a fusion
@@ -444,8 +446,8 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
     (`block_positions`), which starts from a chunk's entering state the forward keeps."""
     # The backward's plan its caller derived (`Selective.derived`), else this device's, interpreted the
     # interpreted bundle's generation's (`generation.INTERPRETED_GENERATION`).
-    positions, resident = plan or backward_plan(generation.gpu_target(
-        generation.INTERPRETED_GENERATION if interpret else None))
+    target = generation.gpu_target(generation.INTERPRETED_GENERATION if interpret else None)
+    positions, resident = plan or backward_plan(target)
     if block_scan.THREADS * positions % chunk:
         raise ValueError(f"a chunk of {chunk} tokens divides no backward block of "
                          f"{block_scan.THREADS * positions}: its blocks start at no kept state")
@@ -460,7 +462,7 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
                 else jnp.swapaxes(jnp.asarray(state, jnp.float32), 1, 2))
     scan = Scan(rows, padded, channels, states, chunk, block, family, positions, resident, interpret,
                 packed=starts is not None, launch=report.launch_digest(),
-                owned=deterministic_ops_requested())
+                partials=partials_of(rows, channels, states, target, resident))
     y, final = _scan(pad(x), pad(dt), jnp.asarray(A, jnp.float32), pad(B), pad(C),
                      jnp.asarray(D, jnp.float32), entering, resets, scan)
     return y[:, :length], jnp.swapaxes(final, 1, 2).astype(x.dtype)
