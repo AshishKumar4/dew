@@ -688,7 +688,7 @@ def _empty(family: mosaic.Family, shape: tuple[int, int], live: jax.Array | None
     """`algebra.started`'s empty state of a walk's `[bq, Dv]` sums (`shape`) in the family's layouts,
     headroomed at the guard's `live` rows."""
     rows = shape[0]
-    start = algebra.Partial(family.zeros(shape), family.full((rows,), -jnp.inf), family.zeros((rows,)))
+    start = algebra.Partial(family.zeros(shape), family.full((rows,), algebra.LEAST), family.zeros((rows,)))
     return start if live is None else algebra.headroomed(start, live)
 
 

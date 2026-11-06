@@ -348,9 +348,21 @@ def imported(parts: tuple[jax.Array, ...]) -> Partial:
     return Partial(acc, m, total, Guard(shift, reach, plain, plain_total, jnp.zeros(total.shape, jnp.bool_)))
 
 
+LEAST = float(jnp.finfo(jnp.float32).min)
+"""A walk's running maximum before any key: fp32's least finite value, the derived forms' floor of it
+(`dew.algebra.forms`' init), which every state a step or a merge meets is at or above. A row still at it
+saw no key (`unseen`); its factor onto a key's maximum underflows to 0 as -inf's did, onto another unseen
+state's is 1 over zero sums, so every row's bits are what -inf gave."""
+
+
+def unseen(m: jax.Array) -> jax.Array:
+    """Whether each row of a running maximum `m` saw no key: at the walk's start (`LEAST`), or below it."""
+    return m <= LEAST
+
+
 def empty(rows: int, width: int) -> Partial:
-    """The softmax before any key: `merge`'s identity."""
-    return Partial(jnp.zeros((rows, width), jnp.float32), jnp.full((rows,), -jnp.inf, jnp.float32),
+    """The softmax before any key: `merge`'s identity, its maximum `LEAST`."""
+    return Partial(jnp.zeros((rows, width), jnp.float32), jnp.full((rows,), LEAST, jnp.float32),
                    jnp.zeros((rows,), jnp.float32))
 
 
@@ -465,7 +477,7 @@ def reached(maxima: jax.Array, *, unseen: bool) -> jax.Array:
     sees a key, so it is a row whose products all passed fp32 below zero, past every reach
     (`attention_mosaic_forward._prepared`'s raw products)."""
     reach = jnp.where(jnp.isnan(maxima), jnp.inf, jnp.abs(maxima))
-    return jnp.where(maxima == -jnp.inf, 0.0, reach) if unseen else reach
+    return jnp.where(maxima <= LEAST, 0.0, reach) if unseen else reach
 
 
 type Launch[O] = Callable[..., tuple[O, jax.Array, jax.Array]]
@@ -850,10 +862,13 @@ def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array, *,
     """The softmax resumed from a state `(m, total, acc)` (`Hooks.initial`: sinks, a resumed partial),
     its maximum taken to base 2 where the step's logits are; on the guarded path (`live`, the rows that
     may shift, `guarded`) those rows' sums shifted as their size needs (`needed`: `acc`'s largest
-    magnitude is its denominator times a bound on the values it weighed)."""
+    magnitude is its denominator times a bound on the values it weighed). A row of no key (a maximum of
+    -inf: a padded row, a slice carrying no sink) resumes at the walk's start (`LEAST`), exact for every
+    other."""
     m, total, acc = (array.astype(jnp.float32) for array in (m, total, acc))
     if spec.base2:
         m = raw_maximum(m, spec.scale) if spec.raw else base2_maximum(m)
+    m = jnp.maximum(m, LEAST)
     if live is None:
         return Partial(acc, m, total)
     held = headroom_of(Partial(acc, m, total), live)
@@ -952,7 +967,7 @@ def places_read(spec: Forward, *, masked: bool, hooked: tuple[bool, bool], dropp
 
 def _safe(spec: Forward, m: jax.Array) -> jax.Array:
     """`m`, with 0 for a query that has seen nothing where one can (`Forward.guarded`)."""
-    return jnp.where(m == -jnp.inf, 0.0, m) if spec.guarded else m
+    return jnp.where(unseen(m), 0.0, m) if spec.guarded else m
 
 
 def peak(spec: Forward, m: jax.Array, s: jax.Array, products: jax.Array | None = None, *, axis: int = -1
@@ -1272,7 +1287,7 @@ def anchored(spec: Forward, start: Partial, arg: Argmax) -> Carry:
     the walk's final maximum, the larger of its own and the keys', which no tile moves, and no key's weight
     yet."""
     m = jnp.maximum(start.m, arg.peak)
-    factor = carried(spec, start.m, jnp.where(m == -jnp.inf, 0.0, m))
+    factor = carried(spec, start.m, jnp.where(unseen(m), 0.0, m))
     nothing = jnp.zeros_like(start.total)
     return Partial(expand(factor, start.acc) * start.acc, m, factor * start.total), arg, nothing, nothing
 
@@ -1338,7 +1353,7 @@ def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], 
         # The initial state's factor to the walk's maximum, in the walk's own units, at most 1: folded, its
         # maximum taken to base 2 as the walk resumed from it (`resumed`), whose own may round back below it.
         m0 = initial[0].astype(jnp.float32)
-        carried = jnp.where(m0 == -jnp.inf, 0.0,
+        carried = jnp.where(unseen(m0), 0.0,
                             jnp.exp2(jnp.minimum(base2_maximum(m0) - state.m, 0.0)) if spec.base2
                             else jnp.exp(jnp.minimum(m0 - maximum, 0.0)))
         share = carried, initial[1]
@@ -1529,7 +1544,7 @@ def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     if derived_on():
         return _derived_merge(spec, first, second)
     m = jnp.maximum(first.m, second.m)
-    safe = jnp.where(m == -jnp.inf, 0.0, m)
+    safe = jnp.where(unseen(m), 0.0, m)
     factors = carried(spec, first.m, safe), carried(spec, second.m, safe)
     if first.guard is None and second.guard is None:
         a, b = factors
@@ -1582,7 +1597,7 @@ def merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     if derived_on():
         return _derived_merged(spec, stacked, axis)
     m = jnp.max(stacked.m, axis=axis)
-    factors = carried(spec, stacked.m, jnp.expand_dims(jnp.where(m == -jnp.inf, 0.0, m), axis))
+    factors = carried(spec, stacked.m, jnp.expand_dims(jnp.where(unseen(m), 0.0, m), axis))
     if stacked.guard is None:
         acc = jnp.sum(expand(factors, stacked.acc) * stacked.acc, axis=axis)
         return Partial(acc, m, jnp.sum(factors * stacked.total, axis=axis))
@@ -1617,12 +1632,12 @@ def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool) -> jax.A
 
 def finished_rows(spec: Forward, state: Partial, *, initial: bool) -> tuple[jax.Array, jax.Array]:
     """The block's residual rows (`finish`'s): the maximum (0 for a query that saw nothing and started from no
-    state, as the reference's) in the units the backward recomputes its logits in, natural, or raw products
-    where the forward's are (`Forward.raw`), the products of the query its call's power of two took
+    state, as the reference's; -inf for one that saw nothing elsewhere, the walk's start `LEAST` given back
+    as the residual's convention) in the units the backward recomputes its logits in, natural, or raw
+    products where the forward's are (`Forward.raw`), the products of the query its call's power of two took
     (`Forward.prescale`), and the denominator, unshifted (`room`)."""
     m = state.m if spec.raw else spec.naturalized(state.m)
-    if spec.guarded or initial:
-        m = jnp.where(m == -jnp.inf, 0.0, m)
+    m = jnp.where(unseen(state.m), 0.0 if spec.guarded or initial else -jnp.inf, m)
     fields = state.guard
     if fields is None:
         return m, state.total

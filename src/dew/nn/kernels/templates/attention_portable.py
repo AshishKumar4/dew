@@ -259,7 +259,8 @@ def padded_walk(spec: algebra.Forward, call: PaddedCall, hooks: Hooks, *, block_
     if hooks.initial is not None:
         state = hooks.initial
         widened = ((0, 0),) * 3 + ((0, call.value.shape[-1] - state.acc.shape[-1]),)
-        initial = call.rows(state.m, -jnp.inf), call.rows(state.total), jnp.pad(call.rows(state.acc), widened)
+        initial = (call.rows(state.m, algebra.LEAST), call.rows(state.total),
+                   jnp.pad(call.rows(state.acc), widened))
     return forward(
         spec, call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
         call.score_params, tuple(param.kind for param in hooks.score_params), call.output_params,
