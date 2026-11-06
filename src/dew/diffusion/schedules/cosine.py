@@ -78,9 +78,12 @@ class CosineGeneralNoiseScheduler(GeneralizedNoiseScheduler):
     forms sigma^2 as 1 / (1 + (1 - sigma^2) / sigma^2), whose sum cancels as sigma grows, so its
     float32 weight is 4e-4 off at the default grid's top and 2% off at a sigma of 640.
 
-    `t_of_sigma`, which FlaxDiff leaves unwritten, divides as IEEE division does (`divided`), not as
-    XLA's product with the reciprocal of the constant: that product rounds the time 1.7 times as far
-    from float64 as the formula in NumPy's float32 at a kappa of 2."""
+    `t_of_sigma`, which FlaxDiff leaves unwritten, takes the angle above the grid's bottom as one
+    arctangent, atan(a) - atan(b) = atan((a - b) / (1 + a b)) for a b > 0, where the formula's
+    difference of two angles cancels near the bottom (1.6 times as far from float64 as the formula
+    with each operation rounded to float32 at a kappa of 0.5, 1.25 times as one arctangent), and
+    divides as IEEE division does (`divided`), not as XLA's product with the reciprocal of the
+    constant."""
 
     def __init__(self, sigma_min: float = 0.02, sigma_max: float = 80.0, kappa: float = 1.0,
                  sigma_data: float = 1.0):
@@ -99,8 +102,9 @@ class CosineGeneralNoiseScheduler(GeneralizedNoiseScheduler):
         return jnp.tan(self.theta_min + times(t) * (self.theta_max - self.theta_min)) / self.kappa
 
     def t_of_sigma(self, sigma):
-        angle = jnp.arctan(times(sigma) * self.kappa)
-        return divided(angle - self.theta_min, self.theta_max - self.theta_min)
+        tangent, bottom = times(sigma) * self.kappa, math.tan(self.theta_min)
+        angle = jnp.arctan(divided(tangent - bottom, 1 + tangent * bottom))
+        return divided(angle, self.theta_max - self.theta_min)
 
     def weight(self, t):
         return 1 + divided(jnp.square(self.sigmas(t)), self.sigma_max ** 2)
