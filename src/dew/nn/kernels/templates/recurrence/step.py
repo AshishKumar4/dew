@@ -20,7 +20,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import recurrence
+from dew.nn.kernels import recurrence, tuning
 from dew.nn.kernels.templates import mosaic, scan
 from dew.nn.precision import L2NORM_EPS, rms_weighted
 
@@ -65,10 +65,12 @@ def serves(hooks: recurrence.Hooks, operands: recurrence.Step) -> bool:
     return fits(operands.state.shape, hooks.output is not None)
 
 
+@tuning.lowered_once(("hooks", "dtype", "family", "interpret"))
 def step(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: mosaic.Family,
          interpret: bool = False):
     """`recurrence.step`'s launch on Mosaic GPU: `(output [rows, Hv, Dv], the moved history or None,
-    state')`, the state as it is held, an idle row's (`Step.active`) as it came and its output zeros."""
+    state')`, the state as it is held, an idle row's (`Step.active`) as it came and its output zeros. Lowered
+    once a configuration (`tuning.lowered_once`), as a model's layers' identical steps share it."""
     given = recurrence.read(hooks, operands)
     state = given['state']
     # A row's entry a head, `[rows, Hv]`, as the token's step takes its write gate and scalar decay.

@@ -20,6 +20,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import mosaic, scan
 
 TOKENS = 64
@@ -119,6 +120,14 @@ def _named(kernel: str, first: int, width: int) -> str:
     return f"{kernel}_{first}_{width}"
 
 
+STATIC = ("first", "width", "head", "activation", "eps", "dtype", "family", "interpret")
+"""A piece's launch's static arguments (`tuning.lowered_once`): its channels, its norm and activation, its
+output's dtype, its bundle; every other argument an array or None. Lowered once a configuration: a model's
+layers' identical convs were each lowered again (two Mamba layers six Mosaic calls to one's four,
+jsf-r06p)."""
+
+
+@tuning.lowered_once(STATIC)
 def forward(x, taps, bias, valid, documents, *, first: int, width: int, head: int | None, activation: bool,
             eps: float, dtype, family: mosaic.Family, interpret: bool = False):
     """A piece's output `[B, T, width]` of `x`'s channels `first` to `first + width`, convolved by `taps`
@@ -156,6 +165,7 @@ def forward(x, taps, bias, valid, documents, *, first: int, width: int, head: in
     return launched(*(operand for operand in operands if operand is not None))
 
 
+@tuning.lowered_once(STATIC)
 def backward(x, taps, bias, valid, documents, dy, *, first: int, width: int, head: int | None,
              activation: bool, eps: float, family: mosaic.Family, interpret: bool = False):
     """A piece's gradients: its channels' input gradient `[B, T, width]` fp32, and its tap and bias
