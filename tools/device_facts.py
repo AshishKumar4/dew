@@ -50,7 +50,7 @@ def timed(fn, args, *, flush=None, evictor=None, warmup: int, repeats: int) -> f
     seconds = []
     with device_time() as device:
         for index in range(warmup + repeats):
-            measured = device.seconds(fn, *args, before=flush, before_args=(evictor,))
+            measured = device.seconds(fn, *args, evict=flush, evicting=evictor)
             if index >= warmup:
                 seconds.append(measured)
     return statistics.median(seconds)
