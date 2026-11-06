@@ -371,7 +371,8 @@ def main() -> None:
                                else trainer.step_flops.hardware),
         "mfu": None if peak_rate is None else work.training_flops_per_step * window.timed_steps
             / window_seconds / (peak_rate * devices),
-        "memory": {"peak_allocated_bytes": [int(s.get("peak_bytes_in_use", 0)) for s in stats]},
+        # A device's peak it does not state is None, never a 0 it did not measure.
+        "memory": {"peak_allocated_bytes": [s.get("peak_bytes_in_use") for s in stats]},
     }
     if args.profile_steps:
         write_record(args.out, record)
