@@ -15,6 +15,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.inference.engine import Engine, Kind, Timed
     from dew.inference.images import DenoisingInputs, ImageRequest, Images, TextToImage
     from dew.inference.loading import pipeline
+    from dew.inference.models import ModelSettings, SavedModel
     from dew.inference.nccl import NCCLPush
     from dew.inference.rollouts import (
         Draw,
@@ -39,6 +40,7 @@ _EXPORTS = {
     "DenoisingInputs": "dew.inference.images", "ImageRequest": "dew.inference.images",
     "Images": "dew.inference.images",
     "TextToImage": "dew.inference.images",
+    "ModelSettings": "dew.inference.models", "SavedModel": "dew.inference.models",
     "RunProcessor": "dew.inference.tasks", "pipeline": "dew.inference.loading",
     "NCCLPush": "dew.inference.nccl",
     "Draw": "dew.inference.rollouts", "InfrastructureError": "dew.inference.rollouts",
@@ -69,6 +71,7 @@ __all__ = [
     "Kind",
     "LayerBanks",
     "MaskedGeneration",
+    "ModelSettings",
     "NCCLPush",
     "NativeRolloutServer",
     "OllamaCompletion",
@@ -80,6 +83,7 @@ __all__ = [
     "RunProcessor",
     "SafetensorsBanks",
     "SafetensorsReload",
+    "SavedModel",
     "Scoring",
     "ScoringRequest",
     "ScoringServer",

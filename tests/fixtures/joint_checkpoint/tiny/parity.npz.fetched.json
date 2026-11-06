@@ -1,0 +1,9 @@
+{
+ "bytes": 104814211,
+ "license": "apache-2.0",
+ "path": "recordings/c124e9f1c12dacceb15e56155f9781cbb83bc34cb090cc127776e344b537a158.npz",
+ "reference": "https://huggingface.co/Cloudflare/clef",
+ "repo": "dewml/fixtures",
+ "revision": "da32357f814fdf8a9997653e029aad67ad4c1b24",
+ "sha256": "c124e9f1c12dacceb15e56155f9781cbb83bc34cb090cc127776e344b537a158"
+}

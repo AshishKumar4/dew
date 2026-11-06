@@ -339,17 +339,17 @@ def dew(dtype, inputs) -> dict[str, jax.Array]:
 
 def test_a_joint_release_scores_as_its_own_code_under_the_float64_rule(tmp_path):
     """Every question of every case over drawn head weights, as exact as the release's float32 run
-    against its float64 run (check 1): the head alone on the release's own fp32 backbone states, and Dew's
-    Qwen 3.5 and the head end to end."""
+    against its float64 run (check 1): Dew's Qwen 3.5 and the head end to end."""
     if triton_runs():
         on_fla(tmp_path)
         return
-    # The quickstart request with two images, the vision tower included, rides row 4610: XLA:CPU's plain
-    # float32 P @ V over 1,296 memory tokens (upstream) puts it 1.85 times the reference's error as users
-    # compile; a GPU holds it, at the `joint-fla` site.
+    # The head alone on the release's states is the release-parity harness's site
+    # (tests/test_release_parity.py, the `joint` parity recording). The quickstart request with two images,
+    # the vision tower included, rides row 4610: XLA:CPU's plain float32 P @ V over 1,296 memory tokens
+    # (upstream) puts it 1.85 times the reference's error as users compile; a GPU holds it, at `joint-fla`.
     fixture, site, seeds = recorded()
     assert_as_exact_as_recorded(fixture, site, seeds, draw, dew, "the joint release's option logits",
-                                leaves=("head", "joint"))
+                                leaves=("joint",))
 
 
 def test_a_padded_batch_scores_every_row_as_it_scores_alone():
@@ -709,3 +709,34 @@ def test_a_joint_release_reads_images_as_its_own_model_does(tmp_path):
     shown = {option: round(float(p), 4) for option, p in zip(seen.options, seen.probabilities, strict=True)}
     assert served["answers"]["department"]["probabilities"] == shown
     assert decide.systemone(request)["answers"] != served["answers"]
+
+
+def test_a_joint_release_exports_with_the_layout_and_calibration_it_was_given(tmp_path):
+    """The joint head's files state no layout, so a release whose layout is not its default (a window of
+    its own, a framing of its rows) exports it beside them (`dew.config.Release`) and reads it back,
+    answering as it did; its calibration goes with it where it has one (row 4310), and the numerics its task
+    traces under, which the release's files state none of. The Qwen3.5 backbone's bundle writes through its
+    source's own config (a trained task's export of one is row 4525)."""
+    from dew.decision.calibration import Abstention
+    from dew.decision.layout import Framing
+    from dew.nn.precision import ACCURATE
+
+    release = tmp_path / "release"
+    release.mkdir()
+    for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
+        (release / source.name).symlink_to(source.resolve())
+    bundle = Pretrained.load(release, dtype="float32", attention_impl="xla")
+    layout = replace(bundle.layout, max_len=2048, framing=Framing(system="Decide from the schema.",
+                                                                   prefill="", thinking=False))
+    chosen = replace(bundle, layout=layout, calibration=replace(bundle.calibration,
+                                                                abstention=Abstention(default=0.99)),
+                     numerics=ACCURATE)
+    chosen.save(tmp_path / "saved")
+    restored = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="xla")
+    assert restored.layout == layout and restored.calibration == chosen.calibration
+    assert Decide.of(restored, name="release").precision == ACCURATE
+    request = CASES["quickstart"]
+    assert (Decide.of(restored, name="release").systemone(request, details=True)
+            == Decide.of(chosen, name="release").systemone(request, details=True))
+    assert (tmp_path / "saved" / "joint_head.safetensors").is_file()
+

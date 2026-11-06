@@ -51,7 +51,6 @@ from dew.decision.layout import (
     Encoded,
     Laid,
     Layout,
-    MarkerLayout,
     QuestionLayout,
     Specials,
     render,
@@ -408,6 +407,17 @@ class Decide(SavedRunTask, InItsForm):
         return step_calibrations(directory, step)
 
     @classmethod
+    def publishes(cls, run: SavedRun) -> bool:
+        """Whether the format its head is released in states `run`'s backbone: one with cross-attention
+        layers (a decision context's encoder read through them) none states, so its export is its run's
+        native release (`dew.inference.models.write_run_release`)."""
+        from dew.inference.tasks import saved_model
+        from dew.interop.pretrained import source_states
+
+        # The record's model is the backbone the head reads (`from_saved`).
+        return source_states(saved_model(run.record, None).build())
+
+    @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: "MeshSpec | Mesh | None" = None,
                    layout: "Placement | None" = None, dtype: DTypeLike | None = None,
                    param_dtype: DTypeLike | None = None) -> Self:
@@ -425,11 +435,7 @@ class Decide(SavedRunTask, InItsForm):
 
         directory, record, step = run.directory, run.record, run.step
         variables = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        if ema is None:
-            with Checkpoints(directory) as checkpoints:
-                averaged = checkpoints.stored(step).get("ema") is not None
-        else:
-            averaged = ema
+        averaged = run.averaged(ema)
         backbone = saved_model(record, dtype).build()
         task = cls._recorded(directory, record, backbone, variables, Weights(step, averaged), dtype)
         task = replace(task, variables=_served(task.model, task.variables))
@@ -501,24 +507,29 @@ class Decide(SavedRunTask, InItsForm):
     def save_pretrained(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
         """Write this task as a released checkpoint, which `from_pretrained` reads back.
 
-        A ModernBERT backbone under Laya's head and layout is written in Laya's
-        layout (`LayaCheckpoint.save`), the files llama.cpp's converter and
-        `/v1/systemone` server read too. The calibration's temperatures go with
-        it, held within their bounds as this task applies them, so that a reader
-        which does not hold them answers as this task does. A binning map or
-        abstention thresholds, which that layout has no place for, are refused
-        rather than dropped.
+        The files are those of the format its head is released in (`Head.release_format`): Laya's layout
+        for a `DecisionHead` (`LayaCheckpoint.save`, the files llama.cpp's converter and `/v1/systemone`
+        server read too), the joint head's for a `JointSchemaHead`, the slot readout's for a
+        `LabelReadout` or a `SlotReadout` (`PretrainedDecision.of`). What a format's files cannot state,
+        the task's own layout and a calibration beyond temperatures, goes beside them in the release
+        (`dew.config.Release`), which the one decision loader reads back over them
+        (`dew.decision.release`), so a task of any layout it was trained with exports and loads as the
+        task it is. The calibration's temperatures go into Laya's file held within their bounds as this
+        task applies them, so that a reader which does not hold them answers as this task does.
         """
-        if self.calibration.binning is not None or self.calibration.abstention is not None:
-            raise ValueError("a released checkpoint keeps temperatures alone; save the binning and "
-                             "abstention into a run with `save` instead")
-        if not isinstance(self.layout, MarkerLayout) or not isinstance(self.tokenizer, HFTokenizer):
-            raise ValueError("Laya's layout is a MarkerLayout over a Hugging Face tokenizer")
-        applied = self.calibration.temperatures.applied()
-        types = applied.types
+        if self.model.head.release_format != "laya":
+            from dew.decision.sources import PretrainedDecision
+
+            PretrainedDecision.of(self).save(directory, max_shard_size=max_shard_size)
+            return
+        if not isinstance(self.tokenizer, HFTokenizer):
+            raise ValueError("a released checkpoint holds the files of a Hugging Face tokenizer, and this "
+                             f"task's is a {type(self.tokenizer).__name__}")
+        if not isinstance(self.layout, QuestionLayout):
+            raise ValueError(f"Laya's head reads rows a QuestionLayout lays out, not a "
+                             f"{type(self.layout).__name__}")
         LayaCheckpoint(self.model, self.variables, self.layout, self.tokenizer, self.specials,
-                       (types.get("choice", 1.0), types.get("score", 1.0), types.get("noul", 1.0)),
-                       dict(applied.buckets)).save(directory, max_shard_size=max_shard_size)
+                       self.calibration, self.precision).save(directory, max_shard_size=max_shard_size)
 
     def save(self, directory: str) -> None:
         """Write this task's calibration, budget and name into the run `directory`.
