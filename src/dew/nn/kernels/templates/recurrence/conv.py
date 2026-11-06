@@ -32,13 +32,20 @@ def fits(width: int, head: int | None) -> bool:
     return width % scan.THREADS == 0 and head in (None, scan.THREADS)
 
 
+
+def _kept(kept, value: jax.Array) -> jax.Array:
+    """`value` where the scalar `kept` holds, else zeros: the condition laid over the vector as it is
+    (Mosaic GPU's warpgroup semantics broadcast no scalar implicitly, a `jnp.where`'s condition or branch)."""
+    laid = (jnp.zeros_like(value) + jnp.asarray(kept, jnp.float32)) != 0.0
+    return jnp.where(laid, value, jnp.zeros_like(value))
+
 def _loaded(ref, row, token, columns, length: int):
     """`ref`'s `[THREADS]` channels at `token` of `row`, fp32, zero before the row's first and past its
     last."""
     inside = (token >= 0) & (token < length)
     at = ref.at[row, jnp.clip(token, 0, length - 1), columns]
     value = plgpu.load(at, layout=scan.blocked(scan.THREADS), optimized=False).astype(jnp.float32)
-    return jnp.where(inside, value, 0.0)
+    return _kept(inside, value)
 
 
 def _owner(documents_ref, row, token, length: int):
@@ -96,7 +103,7 @@ class _Piece:
         document = self.owner(token)
         found = [self.input(token - self.count + 1 + tap) for tap in range(self.count)]
         owners = [self.owner(token - self.count + 1 + tap) for tap in range(self.count)]
-        return [jnp.where(theirs == document, value, 0.0)
+        return [_kept(theirs == document, value)
                 for value, theirs in zip(found, owners, strict=True)]
 
     def preactivation(self, window):
@@ -125,7 +132,7 @@ def forward(x, taps, bias, valid, documents, *, first: int, width: int, head: in
             out, _ = _activated(piece.preactivation(piece.window(t)), activation)
             if head is not None:
                 out = out * _scale(out, eps, exchanged, interpret)
-            out = jnp.where(piece.kept(t), out, 0.0)
+            out = _kept(piece.kept(t), out)
 
             @pl.when(t < length)
             def _():
@@ -163,7 +170,7 @@ def backward(x, taps, bias, valid, documents, dy, *, first: int, width: int, hea
             """`t`'s pre-activation gradient from its output's, through the norm and the SiLU."""
             pre = piece.preactivation(window)
             out, gate = _activated(pre, activation)
-            grad = jnp.where(piece.kept(t), _loaded(dy_ref, piece.row, t, piece.local, length), 0.0)
+            grad = _kept(piece.kept(t), _loaded(dy_ref, piece.row, t, piece.local, length))
             if head is not None:
                 scale = _scale(out, eps, exchanged, interpret)
                 unit = out * scale
@@ -178,13 +185,13 @@ def backward(x, taps, bias, valid, documents, dy, *, first: int, width: int, hea
             window = piece.window(t)
             grad, document = gradient(t, window), piece.owner(t)
             owned = (t < piece.start + TOKENS) & (t < length)
-            sums = [*(total + jnp.where(owned, grad * inputs, 0.0)
+            sums = [*(total + _kept(owned, grad * inputs)
                       for total, inputs in zip(sums[:-1], window, strict=True)),
-                    sums[-1] + jnp.where(owned, grad, 0.0)]
+                    sums[-1] + _kept(owned, grad)]
             reads = [grad, *later]
             dx = zero
             for shift, (value, theirs) in enumerate(zip(reads, [document, *owners], strict=True)):
-                dx = dx + jnp.where(theirs == document, value, 0.0) * piece.taps[count - 1 - shift]
+                dx = dx + _kept(theirs == document, value) * piece.taps[count - 1 - shift]
 
             @pl.when(owned)
             def _():

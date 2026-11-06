@@ -461,7 +461,7 @@ def test_the_short_conv_holds_every_order(edge):
         return jax.nn.silu(summed)
 
     assert_contract(kernel, primals, direction, cotangent, f"the short conv {edge}", truth_fn=plain,
-                    plain_fn=plain)
+                    plain_fn=plain, without=INTERPRETED_REMAT)
 
 
 def _gated(h, q, k, v, g, beta):
