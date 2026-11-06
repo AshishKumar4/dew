@@ -18,3 +18,14 @@ def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():
     with pytest.raises(LessFinite):
         assert_contract(lambda x: jnp.sqrt(x * x), x, direction, cotangent, "a squared root",
                         plain_fn=jnp.abs)
+
+
+def test_the_contract_refuses_a_bfloat16_formula_less_finite_than_the_plain_one():
+    """The same refusal where the formula's values are bfloat16 (row 4499): the squared root overflows
+    bfloat16's range where |x| does not, and its leaves are held as a float32 formula's are."""
+    x = (jnp.asarray([2.0**70, -3.0, 2.0**-70], jnp.bfloat16),)
+    direction = (jnp.ones((3,), jnp.bfloat16),)
+    cotangent = jnp.ones((3,), jnp.bfloat16)
+    with pytest.raises(LessFinite):
+        assert_contract(lambda x: jnp.sqrt(x * x), x, direction, cotangent, "a bf16 squared root",
+                        plain_fn=jnp.abs)
