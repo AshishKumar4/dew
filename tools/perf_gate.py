@@ -496,6 +496,11 @@ COMPILE_TARGETS = {"a100": ("sm80", 40, "A100"), "h100": ("sm90", 80, "H100")}
 multiprocessors `dew.training.ahead.built_target` states, its memory in GiB, the planner's capacity, and the
 device its sized steps run on (`STEP_HARDWARE`). A declared target, not the live run's program: a live run
 plans on its allocator's own pool, which its record keeps."""
+AHEAD_ATTENTION = "xla"
+"""The attention every arm's step compiles with ahead of its run: the route a GPU takes (FlashAttention's
+custom call, the template) lowers on no compile-only GPU (ledger 4616), so each offline row is the step's
+compile with XLA's attention in place of its attention kernel, the same in every arm and named so in the
+row (`compile_battery`), until that route lowers without a device (Main, 2026-11-06)."""
 UNSUPPORTED = "unsupported: "
 """A compile's sample whose program is not the target's: a kernel this host cannot lower ran as another
 (`AheadOfTime.substituted`), so the row is not judged (`verdict`)."""
@@ -505,8 +510,8 @@ from benchmark_cases import Case
 from benchmark_models import build_trainer, global_batch
 from dew.training.ahead import compile_ahead, compile_only_gpus
 case = Case(**json.loads(sys.argv[1]))
-generation, capacity = sys.argv[2], int(sys.argv[3])
-trainer = build_trainer(case)
+generation, capacity, attention = sys.argv[2], int(sys.argv[3]), sys.argv[4]
+trainer = build_trainer(case, attention)
 trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus(generation, trainer.device_mesh.devices.size,
                                                                 capacity)))
 ahead = compile_ahead(trainer, global_batch(case), capacity)
@@ -522,7 +527,8 @@ lowered in place of the target's, and the plan it selected, a diagnostic beside 
 def compile_battery(args: argparse.Namespace) -> int:
     """Each step of `--kind`'s planned and compiled ahead of its run, for one compile-only GPU of its
     generation (`COMPILE_TARGETS`), XLA's autotuning off as no GPU is attached to time a candidate
-    (docs/design/training.md), in the three arms and their rounds as `run` measures (`arms_of`, `rounds`),
+    (docs/design/training.md), its attention XLA's in every arm (`AHEAD_ATTENTION`), each row named so,
+    in the three arms and their rounds as `run` measures (`arms_of`, `rounds`),
     every arm's every round a process of its own with an empty compile cache: each sample a cold plan and
     compile, which the GPU's rounds load from their caches. Each tree compiles in the environment of
     `--lock`, the lock of the GPU run it stands beside (its `lock`), whose compiler the GPU run's programs
@@ -536,7 +542,8 @@ def compile_battery(args: argparse.Namespace) -> int:
     trees = dict(spec.split("=", 1) for spec in (args.base, args.head))
     (base, base_path), (head, head_path) = ((name, Path(path)) for name, path in trees.items())
     pythons, unbuilt = environments(((base, base_path), (head, head_path)), args.lock, args.environments)
-    cases = {f"compile {name.removeprefix('step ')}": case for name, case in STEP_CASES.items()
+    cases = {f"compile {name.removeprefix('step ')} ({AHEAD_ATTENTION} attention)": case
+             for name, case in STEP_CASES.items()
              if (not args.only or any(word in name for word in args.only))
              and device in STEP_HARDWARE.get(name, device)}
     rows = [Row(name, "s", "", floor=COMPILE_FLOOR) for name in cases]
@@ -560,8 +567,8 @@ def compile_battery(args: argparse.Namespace) -> int:
                     continue
                 with tempfile.TemporaryDirectory(dir=work) as cache:
                     done = _run(path, pythons[tree], "", [str(script), json.dumps(case), generation,
-                                                          str(gib << 30)], head_path / "tools", 3600,
-                                Path(cache) / "compiles")
+                                                          str(gib << 30), AHEAD_ATTENTION],
+                                head_path / "tools", 3600, Path(cache) / "compiles")
                 if done.returncode != 0:
                     taken[name] = f"not run: {done.stderr[-400:]}"
                     continue

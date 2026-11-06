@@ -516,7 +516,9 @@ def test_the_servers_compiles_are_measured_cold_in_every_arm_and_round(gate, tmp
 def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round_and_refuses_a_substituted_program(
         gate, tmp_path, monkeypatch):
     """`compile` plans and compiles each of a kind's steps ahead of its run for one compile-only GPU of the
-    kind's generation and memory, in each tree's environment of the lock the GPU run used, three arms a
+    kind's generation and memory, its attention XLA's in every arm and named so in the row (ledger 4616:
+    the GPU's attention route lowers on no compile-only GPU), in each tree's environment of the lock the GPU
+    run used, three arms a
     round in an order kept, every sample a process of its own with an empty compile cache: a head whose
     planning takes half as long again regresses past COMPILE_FLOOR, and a step whose program substituted a
     kernel is unsupported, failing the gate as the gate's own; each sample's selected plan is kept. A step
@@ -547,24 +549,25 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round_and_refuses_a_
     assert gate.compile_battery(args) == 0
     results = json.loads(out.read_text())
     assert results["target"] == {"kind": "h100", "generation": "sm90", "capacity_gib": 80, "lock": "cuda12"}
-    assert [row["name"] for row in results["rows"]] == ["compile lm-dense 4x1024", "compile lm-moe 4x1024"]
+    dense, moe = "compile lm-dense 4x1024 (xla attention)", "compile lm-moe 4x1024 (xla attention)"
+    assert [row["name"] for row in results["rows"]] == [dense, moe]
     assert len(compiled) == 2 * 3 * 6
-    assert {tuple(argv) for _, argv, _, _ in compiled} == {("sm90", str(80 << 30))}
+    assert {tuple(argv) for _, argv, _, _ in compiled} == {("sm90", str(80 << 30), "xla")}
     assert len({cache for _, _, cache, _ in compiled}) == len(compiled)
     assert not any(made for *_, made in compiled)
     assert {tree for tree, *_ in compiled} == {"main", "head"}
     assert built and all(python.parent.parent.name.startswith("cuda12-") for _, python in built)
     assert len(results["orders"]) == 6 and all(len(set(order)) == 3 for order in results["orders"])
-    assert results["plans"]["head"][0]["compile lm-dense 4x1024"] == {"split": 1, "rows": 4}
+    assert results["plans"]["head"][0][dense] == {"split": 1, "rows": 4}
     verdicts = tmp_path / "verdicts.json"
     assert gate.report(SimpleNamespace(results=out, table=None, claim=False, verdicts=str(verdicts))) == 1
     states = {name: row["state"] for name, row in json.loads(verdicts.read_text())["rows"].items()}
-    assert states == {"compile lm-dense 4x1024": "regressed", "compile lm-moe 4x1024": "unsupported"}
+    assert states == {dense: "regressed", moe: "unsupported"}
     a100 = SimpleNamespace(**{**vars(args), "kind": "a100", "rounds": 1, "only": ["finetune"],
                               "out": str(tmp_path / "a100.json")})
     assert gate.compile_battery(a100) == 0
     assert [row["name"] for row in json.loads(Path(a100.out).read_text())["rows"]] == [
-        "compile finetune-1.7b 1x2048"]
+        "compile finetune-1.7b 1x2048 (xla attention)"]
     monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_autotune_level=4")
     with pytest.raises(SystemExit, match="autotuning"):
         gate.compile_battery(args)
@@ -579,22 +582,21 @@ TINY = {"architecture": "causal_transformer", "dtype": "float32", "batch_size": 
 def test_a_step_is_planned_ahead_for_an_absent_gpu_and_a_kernel_this_host_cannot_lower_is_named(
         gate, tmp_path):
     """The compile ahead's own process (`COMPILED`), run as `compile` runs it: a decoder's step planned and
-    compiled for one compile-only sm90 GPU of a stated memory, here with no GPU attached, its planner's
-    seconds and selected plan reported; its attention routed to FlashAttention, which this host's
-    environment holds no wheel of (the CPU lock's), runs as XLA's, which it names as substituted, so the
-    gate never takes that program for the GPU's."""
+    compiled for one compile-only sm90 GPU of a stated memory, here with no GPU attached, with XLA's
+    attention (`AHEAD_ATTENTION`), its planner's seconds and selected plan reported and nothing substituted;
+    with the attention a GPU routes to, FlashAttention, which lowers on no compile-only GPU (ledger 4616),
+    it runs as XLA's, which it names as substituted, so the gate never takes that program for the GPU's."""
     script = gate._script(tmp_path / "compiled.json", gate.COMPILED)
 
-    def compiled(config: dict) -> dict:
-        case = json.dumps({**TINY, "config": {**TINY["config"], **config}})
-        done = gate._run(ROOT, Path(sys.executable), "", [str(script), case, "sm90", str(1 << 30)],
-                         ROOT / "tools", 900, tmp_path / config.get("attention_impl", "auto"))
+    def compiled(attention: str) -> dict:
+        argv = [str(script), json.dumps(TINY), "sm90", str(1 << 30), attention]
+        done = gate._run(ROOT, Path(sys.executable), "", argv, ROOT / "tools", 900, tmp_path / attention)
         assert done.returncode == 0, done.stderr[-3000:]
         return json.loads(done.stdout.strip().splitlines()[-1])
 
-    xla = compiled({"attention_impl": "xla"})
-    assert xla["seconds"] > 0 and xla["substituted"] == [] and xla["plan"]["split"] == 1
-    routed = compiled({})
+    ahead = compiled(gate.AHEAD_ATTENTION)
+    assert ahead["seconds"] > 0 and ahead["substituted"] == [] and ahead["plan"]["split"] == 1
+    routed = compiled("auto")
     assert any("flash ran as xla" in each for each in routed["substituted"]), routed
 
 
