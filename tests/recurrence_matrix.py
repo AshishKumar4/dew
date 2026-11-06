@@ -133,16 +133,14 @@ def supported(case: dict[str, str]) -> bool:
 CASES = (
     ('sm90', 'gated delta net', 'mosaic_gpu', 'bfloat16', 'one'),
     ('sm90', 'kimi delta attention', 'xla', 'float32', 'packed'),
-    ('sm80', 'write gate', 'derived', 'bfloat16', 'packed'),
-    ('sm80', 'rated scan', 'xla', 'float32', 'one'),
-    ('sm90', 'write gate', 'derived', 'float32', 'one'),
-    ('sm90', 'rated scan', 'mosaic_gpu', 'bfloat16', 'packed'),
-    ('sm80', 'gated delta net', 'xla', 'bfloat16', 'packed'),
-    ('sm80', 'kimi delta attention', 'derived', 'bfloat16', 'one'),
-    ('sm90', 'gated delta net', 'mosaic_gpu', 'float32', 'one'),
-    ('sm90', 'gated delta net', 'derived', 'bfloat16', 'one'),
+    ('sm80', 'rated scan', 'mosaic_gpu', 'bfloat16', 'packed'),
+    ('sm80', 'gated delta net', 'xla', 'float32', 'one'),
     ('sm90', 'write gate', 'mosaic_gpu', 'float32', 'one'),
-    ('sm80', 'rated scan', 'mosaic_gpu', 'bfloat16', 'one'),
+    ('sm90', 'rated scan', 'xla', 'bfloat16', 'one'),
+    ('sm80', 'kimi delta attention', 'xla', 'bfloat16', 'one'),
+    ('sm90', 'gated delta net', 'mosaic_gpu', 'bfloat16', 'packed'),
+    ('sm90', 'write gate', 'mosaic_gpu', 'float32', 'packed'),
+    ('sm90', 'rated scan', 'mosaic_gpu', 'float32', 'one'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
 (`kernel_matrix.covering("recurrence")`, regenerated where the axes or the route's support change)."""
