@@ -99,7 +99,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post60,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post61,<0.12.1`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of its native code, post45's, which post46's to post60's Python fixes left as it was, carrying the Mosaic GPU fixes below that live in them, and the index serves them too. Every other package, jaxlib included, comes from PyPI. The fixes:
@@ -125,6 +125,7 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - A compile-only Mosaic GPU target, one that states its compute capability or, stating none, another GPU's kind (an H100 lowered on an A100's host), is held to its own default shared memory limit, not the attached device's.
 - A transformation keeps a wide dtype its trace already holds, while a Python type asked of a wide value still narrows as a user's request.
 - Pallas's Mosaic GPU interpreter transfers a thread map's constants and inputs to the device once, shared by its threads.
+- Pallas's Mosaic GPU interpreter runs a thread map's role body with every argument it was traced with, so a Blackwell causal forward's role threads compile there.
 - Pallas's Mosaic GPU slices, applies pointwise ops to and broadcasts a unit row or column of a tiled array.
 - Mosaic GPU's CP_ASYNC copies a head's `[S, D]` block of `[B, S, H, D]`, a squeezed dimension between sliced ones, under a tile transform.
 - Mosaic GPU's `emit_pipeline` carries its ring slots rather than recomputing them each step.
