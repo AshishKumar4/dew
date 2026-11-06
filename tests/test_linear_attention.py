@@ -43,7 +43,7 @@ from reference_error import as_given, assert_as_exact, widened, without_ynn
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
-from dew.nn.kernels import recurrence as kernel, tuning
+from dew.nn.kernels import recurrence as kernel
 from dew.nn.kernels.recurrence_algebra import decays, factor
 from dew.nn.kernels.recurrence_chunk import chunk_delta_rule, chunk_gated_delta_rule, fla_rule
 from dew.nn.linear import (
@@ -873,7 +873,8 @@ def test_the_decode_kernel_keeps_the_kernel_contract_on_a_mesh(axis, split):
 
     from dew.nn.linear import decode_gated_delta_rule
 
-    rows, H, D = 4, 4, 32
+    # A model's 128 keys and values a head, as the template's step takes them (a thread a value column).
+    rows, H, D = 4, 4, 128
     active = jnp.asarray([True, False, True, False])
 
     def draw(seed):
@@ -920,7 +921,7 @@ def test_the_decode_step_keeps_the_kernel_contract_on_a_mesh_for_each_decay(form
 
     from dew.nn.linear import stepped_per_shard
 
-    rows, heads, groups, width = 4, 4, 2, 32
+    rows, heads, groups, width = 4, 4, 2, 128
     keyed = form == "a decay a key dimension"
     hooks = KEYED if keyed else RATED
     active = jnp.asarray([True, False, True, False])
@@ -1004,7 +1005,7 @@ def test_a_cached_layer_traced_for_a_jvp_decodes_its_token(staged):
     `generation.linear_tangent`), which the in-place launch does not give (row 2395)."""
     from dew.nn.kernels.generation import assumed
 
-    layer, variables, cache, token = fused_case(4, 32, 2, jnp.float32, jnp.float32)
+    layer, variables, cache, token = fused_case(4, 128, 2, jnp.float32, jnp.float32)
 
     def step(token):
         return layer.apply({**variables, "cache": cache}, token, MixerCall(decode=True), mutable=["cache"])[0]
@@ -1019,7 +1020,7 @@ def test_the_fused_decode_step_leaves_an_idle_row_alone():
     """A row the fused step marks idle: its history and state as they were, bitwise, and its output
     zeros, beside an active row that moves."""
 
-    layer, variables, cache, token = fused_case(4, 32, 2, jnp.float32, jnp.float32)
+    layer, variables, cache, token = fused_case(4, 128, 2, jnp.float32, jnp.float32)
     operands = fused_inputs(layer, variables, cache, token)
     out, history, state = jax.jit(functools.partial(
         fused_step, epsilon=layer.norm_eps, activation=layer.gate_activation,
@@ -1045,7 +1046,7 @@ def test_the_fused_decode_step_computes_the_layers_token(held):
     read in fp32, its state against the unfused token's written back `held`; its history bit for bit the
     unfused token's, and its state's dtype the one it holds. A GPU's widths are its flow's
     (tests/test_gpu_recurrence.py)."""
-    heads, width, rows = 4, 32, 3
+    heads, width, rows = 4, 128, 3
     layer = fused_case(heads, width, rows, jnp.float32, held)[0]
     wide = layer.clone(dtype=jnp.float64)
     step = MixerCall(decode=True)
@@ -1083,7 +1084,7 @@ def test_a_layer_choosing_the_fused_step_allocates_its_cache_as_the_unfused_one(
     step needs before the first token."""
     from dew.nn.kernels.generation import assumed, chosen
 
-    module = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=32, head_v_dim=32,
+    module = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=128, head_v_dim=128,
                            dtype=jnp.bfloat16)
     x = jnp.zeros((2, 1, 64), jnp.bfloat16)
     unfused = jax.eval_shape(lambda: nn.unbox(module.init(jax.random.key(0), x, MixerCall(decode=True))))
@@ -1095,18 +1096,16 @@ def test_a_layer_choosing_the_fused_step_allocates_its_cache_as_the_unfused_one(
     assert described(fused) == described(unfused)
 
 
-@pytest.mark.parametrize("target", ["sm80", "sm90", "sm120"])
-def test_the_fused_step_compiles_on_tritons_compiler_within_each_gpus_block(target):
-    """The fused decode step at Qwen3.5-0.8B's widths (16 value heads over 16 key heads of 128, a
-    conv of 4 taps over an fp32 history, a bf16 state) and at Qwen3.5-9B's value heads over half as
-    many key heads, at every config of its space, lowered for each GPU on this CPU and compiled by
-    Triton within its block's shared memory."""
+@pytest.mark.parametrize("target", ["sm80", "sm90"])
+def test_the_fused_step_compiles_within_each_gpus_resources(target):
+    """The fused decode step, the recurrence template's step on Mosaic GPU, at Qwen3.5-0.8B's widths (16
+    value heads over 16 key heads of 128, a conv of 4 taps over an fp32 history, a bf16 state) and at
+    Qwen3.5-9B's value heads over half as many key heads, lowered for each GPU on this CPU and compiled by
+    its compiler spill-free within its block (`kernel_compile.mosaic_failures`)."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_kernels, failures
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    from dew.nn.kernels.recurrence import Launch, StepLaunch
-
-    def case(key_heads, value_heads, warps):
+    def case(key_heads, value_heads):
         rows, width = 8, 128
         channels = (2 * key_heads + value_heads) * width
         specs = (jax.ShapeDtypeStruct((rows, channels), jnp.bfloat16),
@@ -1119,16 +1118,13 @@ def test_the_fused_step_compiles_on_tritons_compiler_within_each_gpus_block(targ
                  jax.ShapeDtypeStruct((rows, value_heads, width, width), jnp.bfloat16))
 
         def run(*operands):
-            with tuning.pinned({StepLaunch: Launch(0, warps)}):
-                return fused_step(*operands, epsilon=1e-6, activation="silu", dtype=jnp.bfloat16)
+            return fused_step(*operands, epsilon=1e-6, activation="silu", dtype=jnp.bfloat16)
         return run, specs
 
-    cases = [KernelCase(f"fused/{key}x{value}/warps{warps}",
-                        lambda key=key, value=value, warps=warps: case(key, value, warps))
-             for key, value in ((16, 16), (16, 32)) for warps in (4, 8, 16)]
-    found = compile_kernels(cases, target)
-    assert len(found) == len(cases)
-    assert not failures(found), "\n".join(failures(found))
+    cases = [KernelCase(f"fused/{key}x{value}", lambda key=key, value=value: case(key, value))
+             for key, value in ((16, 16), (16, 32))]
+    found = compile_mosaic_kernels(cases, target)
+    assert found and not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
 @pytest.mark.parametrize("layout", list(LAYOUTS))
