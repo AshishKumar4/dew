@@ -249,16 +249,16 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                 return named(*given, *made[:len(outputs)])
 
             spaces = [pltpu.SMEM if at < scalars else pl.ANY for at in range(len(values))]
-            results = launches.pallas_call(
+            written = launches.pallas_call(
                 program, name=name or self.name, out_shape=(*outputs, *aliased), grid=grid,
                 in_specs=[pl.BlockSpec(memory_space=space) for space in spaces],
                 out_specs=[pl.BlockSpec(memory_space=pl.ANY)] * (len(outputs) + len(aliased)),
                 input_output_aliases={at: len(outputs) + k for k, at in enumerate(places)},
                 compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",) * len(grid)),
                 interpret=pltpu.InterpretParams() if interpret else False, cost_estimate=cost)(*values)
-            for at, result in zip(places, results[len(outputs):], strict=True):
-                operands[at][...] = result
-            return jax.tree.unflatten(structure, results[:len(outputs)])
+            for at, added in zip(places, written[len(outputs):], strict=True):
+                operands[at][...] = added
+            return jax.tree.unflatten(structure, written[:len(outputs)])
 
         return launched
 
