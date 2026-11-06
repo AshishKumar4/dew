@@ -92,6 +92,7 @@ from dew.sampling.decoding import (
     Typical,
 )
 from dew.sampling.strategies import DecodeOps, DecoderState, Draws, Sample, Speculative, Strategy
+from dew.sampling.trees import TreeBlock
 
 ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
 
@@ -568,19 +569,23 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     recorded = [] if blocks is None else ["prediction_inputs"]
     original = rebuild_position(model)
 
-    def run(state: DecoderState, tokens: jax.Array, valid: jax.Array, *, rebuilds: bool = True
-            ) -> tuple[DecoderState, jax.Array, jax.Array | None]:
+    def run(state: DecoderState, tokens: jax.Array, valid: jax.Array, *, rebuilds: bool = True,
+            tree: TreeBlock | None = None) -> tuple[DecoderState, jax.Array, jax.Array | None]:
         width = tokens.shape[1]
+        # A tree's tokens each read the row's prefix and their own ancestors, at their depths' places
+        # (`TreeBlock`); a chain's each its predecessors, at the places the rows reach.
+        visibility = {} if tree is None else {"attention_key_runs": tree.runs()}
+        places = (tree.positions() if tree is not None else None if state.positions is None else
+                  state.positions[:, None] + jnp.arange(width)[None, :])
 
         def append(valid):
-            # The step's tokens laid out once (`Coordinates`): the real ones, at the places the rows reach.
-            laid = laid_out(tokens.shape, valid=valid, positions=None if state.positions is None else
-                            state.positions[:, None] + jnp.arange(width)[None, :])
+            # The step's tokens laid out once (`Coordinates`): the real ones, at their places.
+            laid = laid_out(tokens.shape, valid=valid, positions=places)
             return model.apply(
                 {**params, "cache": state.cache}, jnp.where(valid, tokens, pad_id),
                 decode=True, coordinates=laid, mutable=["cache", *recorded], rngs=None,
                 method="states_and_logits" if exposed else None, capture_intermediates=False, **at,
-                **adapter_field(state.adapters))
+                **adapter_field(state.adapters), **visibility)
 
         history, lengths, drafts, rebuilt = state.tokens, state.lengths, state.drafts, None
         if original is not None and history is not None and lengths is not None:
