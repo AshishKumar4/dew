@@ -652,6 +652,9 @@ dew.decision.config.Letters
   labels: Labels = dew.decision.layout.Labels()
   count: int | None = None
   untied: bool = False
+dew.decision.layout.Again
+  parts: tuple[Literal['instructions', 'options'], ...] = ('instructions', 'options')
+  over: int = 0
 dew.decision.layout.AnswerCue
   template: str = 'Answer with one letter: {labels}.'
   many: str = 'Answer with one label: {labels}.'
@@ -670,6 +673,7 @@ dew.decision.layout.Instructions
   defaults: collections.abc.Mapping[str, str] = builtins.dict()
   span: Literal['instructions', 'header'] = 'instructions'
   stream: str = 'row'
+  values: dew.decision.layout.Values = Values(indexed=None, item='[{index}] {value}', start=0, empty=None, names='as_is')
 dew.decision.layout.Labels
   cue: str = '\nAnswer:'
   variants: tuple[str, ...] = (' {}',)
@@ -685,8 +689,16 @@ dew.decision.layout.OptionLines
   criteria: collections.abc.Mapping[str, str] = builtins.dict()
   marker: Literal['none', 'before', 'after'] = 'none'
   noul_first: Literal['true', 'false'] = 'true'
+  values: dew.decision.layout.Values = Values(indexed=None, item='[{index}] {value}', start=0, empty=None, names='as_is')
 dew.decision.layout.Reads
   table: tuple[tuple[str, str, How], ...]
+dew.decision.layout.RequestSummary
+  line: str = '{index}. {name} ({kind}): {instructions}'
+  current: str | None = None
+  join: str = '\n'
+  options_join: str = ', '
+  render: Render = 'entry'
+  values: dew.decision.layout.Values = Values(indexed=None, item='[{index}] {value}', start=0, empty=None, names='as_is')
 dew.decision.layout.Schema
   stream: str = 'row'
 dew.decision.layout.Special
@@ -695,8 +707,21 @@ dew.decision.layout.State
   render: Render = 'compact'
   keep: Literal['start', 'end', 'all', 'end_if_conversation'] = 'start'
   max_tokens: int | None = None
+  values: dew.decision.layout.Values = Values(indexed=None, item='[{index}] {value}', start=0, empty=None, names='as_is')
+  turns: dew.decision.layout.Turns | None = None
 dew.decision.layout.Text
   text: str
+dew.decision.layout.Turns
+  open: str = '<|{role}|>\n'
+  close: str = '\n'
+  roles: collections.abc.Mapping[str, str] = builtins.dict()
+  content: Render = 'state'
+dew.decision.layout.Values
+  indexed: int | None = None
+  item: str = '[{index}] {value}'
+  start: int = 0
+  empty: str | None = None
+  names: Literal['as_is', 'words', 'lower'] = 'as_is'
 dew.diffusion.discrete.MDLM
   mask_id: int
   eps: float = 0.001

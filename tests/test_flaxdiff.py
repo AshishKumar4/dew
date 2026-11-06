@@ -14,6 +14,7 @@ import numpy as np
 import orbax.checkpoint as ocp
 import pytest
 from flax.traverse_util import unflatten_dict
+from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
 
 from dew.interop.flaxdiff import (
     hybrid_dit_fields,
@@ -115,50 +116,61 @@ def test_checkpoint_selects_last_or_best_and_live_or_averaged_weights(reference,
     assert np.max(np.abs(published - data["output"])) < TOLERANCE
 
 
-def test_a_run_imported_by_from_flaxdiff_samples_what_flaxdiffs_preview_did(tmp_path):
-    """tools/flaxdiff_pipeline_reference.py ran FlaxDiff's own preview
-    sampling (3e3497e) of a tiny SimpleUDiT run over the tiny SD pipeline's
-    CLIP and VAE: `EulerAncestralSampler` on `KarrasVENoiseScheduler` with
-    `KarrasPredictionTransform`, guidance 3, 200 steps of its own grid, then
-    the decode and the clip, on Dew's random draws. `TextToImage.from_flaxdiff`
-    reads the same checkpoint and the run config FlaxDiff logs, and its call
-    holds tests/reference_error.py's rule against FlaxDiff's images: as the
-    run sampled, its towers in bfloat16, and with the towers in float32 on
-    both sides, where their rounding (5.2e-3 rms from float64 in FlaxDiff's
-    own run, against 2.3e-6 without it) no longer hides a sampler
-    difference. A failure with a large ratio after a change to how Dew
-    draws its noise needs the tool rerun."""
+def flaxdiff_tasks(tmp_path: Path) -> tuple:
+    """`TextToImage.from_flaxdiff` on the run tools/flaxdiff_pipeline_reference.py samples (its weights in
+    reference.npz, the run config FlaxDiff logs): as the run sampled, its towers in bfloat16, and with the
+    towers in float32, where their rounding (5.2e-3 rms from float64 in FlaxDiff's own run, against 2.3e-6
+    without it) no longer hides a sampler difference."""
     from dataclasses import replace
-
-    from one_draw import assert_as_exact_as_the_reference
 
     from dew.inference import TextToImage
     from dew.interop.flaxdiff import _towers
-    from tools.flaxdiff_pipeline_reference import KEY, PROMPTS, checkpoint, run_config, towers
+    from tools.flaxdiff_pipeline_reference import checkpoint, recorded, run_config, towers
 
-    with np.load(Path(__file__).parent / "fixtures" / "flaxdiff_pipeline" / "reference.npz") as stored:
-        recorded = {name: stored[name] for name in stored.files}
-    meta = json.loads(recorded.pop("meta").tobytes())
-    weights = unflatten_dict({name.removeprefix("params/"): value for name, value in recorded.items()
-                              if name.startswith("params/")}, sep="/")
+    meta, weights, start = recorded()
     clip, vae = towers(tmp_path)
     checkpoint(tmp_path / "1", weights)
     task = TextToImage.from_flaxdiff(tmp_path / "1", run_config(meta["input_config"], clip, vae),
                                      jax_version=meta["jax_version"])
-    np.testing.assert_allclose(task.prepare(list(PROMPTS), key=KEY).noise, recorded["start"], rtol=1e-6)
-
-    def sampled(task):
-        return np.clip(np.asarray(task(list(PROMPTS), key=KEY).images), -1, 1)
-
-    truth = recorded["fp64.images"]
-    assert_as_exact_as_the_reference(sampled(task), recorded["as_run.images"], truth, "as run")
     (keyword,) = task.inputs.conditions
     condition, autoencoder = _towers(str(clip), "", str(vae), "float32")
     wide = replace(task, inputs=replace(task.inputs, conditions={keyword: condition}),
                    autoencoder=autoencoder,
                    variables={**task.variables, "encoders": {keyword: condition.encoder.params},
                               "autoencoder": autoencoder.params})
-    assert_as_exact_as_the_reference(sampled(wide), recorded["fp32_towers.images"], truth, "float32 towers")
+    return task, wide, start
+
+
+def sampled_pair(tasks: tuple, key: int) -> dict[str, np.ndarray]:
+    """Both tasks' images (`flaxdiff_tasks`) at `key`, clipped as FlaxDiff's preview clips them."""
+    from tools.flaxdiff_pipeline_reference import PROMPTS
+
+    task, wide, _ = tasks
+    return {name: np.clip(np.asarray(chosen(list(PROMPTS), key=key).images), -1, 1)
+            for name, chosen in (("as_run", task), ("fp32_towers", wide))}
+
+
+def test_a_run_imported_by_from_flaxdiff_samples_what_flaxdiffs_preview_did(tmp_path):
+    """tools/flaxdiff_pipeline_reference.py ran FlaxDiff's own preview
+    sampling (3e3497e) of a tiny SimpleUDiT run over the tiny SD pipeline's
+    CLIP and VAE: `EulerAncestralSampler` on `KarrasVENoiseScheduler` with
+    `KarrasPredictionTransform`, guidance 3, 200 steps of its own grid, then
+    the decode and the clip, on Dew's random draws, over check 1's seeds,
+    each the key of Dew's own call. `TextToImage.from_flaxdiff` reads the
+    same checkpoint and the run config FlaxDiff logs, and its images are as
+    exact as FlaxDiff's float32 run against its float64 one, as the run
+    sampled and with the towers in float32 on both sides (`flaxdiff_tasks`).
+    A failure with a large ratio after a change to how Dew draws its noise
+    needs the tool rerun."""
+    from tools.flaxdiff_pipeline_reference import KEY, PROMPTS, draw
+
+    seeds_file = Path(__file__).parent / "fixtures" / "flaxdiff_pipeline" / "seeds.npz"
+    tasks = flaxdiff_tasks(tmp_path)
+    np.testing.assert_allclose(tasks[0].prepare(list(PROMPTS), key=KEY).noise, tasks[2], rtol=1e-6)
+    seeds = declared_seeds(seeds_file)["flaxdiff"]
+    drawn, reference, truth = indexed_recording(recording(seeds_file), "flaxdiff", seeds, inputs_of=draw)
+    assert_as_exact(as_given(lambda index, inputs: sampled_pair(tasks, int(inputs["key"]))), reference, drawn,
+                    "FlaxDiff's preview", seeds=seeds, truth_fn=truth)
 
 
 def flaxdiff_run(**change) -> dict:

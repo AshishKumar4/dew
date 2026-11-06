@@ -236,7 +236,9 @@ def test_complex_weights_descend_and_resume_where_the_whole_run_lands(tmp_path, 
 
     # The same four updates in Optax's own loop over the same batch, complex64 as the trainer's, and
     # the closed form in complex128, which both are held to over drawn targets (check 1), real and
-    # imaginary parts alike.
+    # imaginary parts alike. Optax descends a complex weight along its gradient's conjugate, JAX's
+    # gradient of a real loss being the conjugate of its steepest ascent (row 4496: unconjugated, the
+    # reference ascended).
     @jax.jit
     def optax_descent(target):
         batch = {'target': jnp.broadcast_to(target, (8, COMPLEX_WIDTH))}
@@ -244,7 +246,7 @@ def test_complex_weights_descend_and_resume_where_the_whole_run_lands(tmp_path, 
         def update(carry, _):
             weight, state = carry
             loss = ComplexSquared().loss
-            grads = jax.grad(lambda w: loss({'params': {'weight': w}}, batch, None)[0])(weight)
+            grads = jnp.conj(jax.grad(lambda w: loss({'params': {'weight': w}}, batch, None)[0])(weight))
             updates, state = optax.sgd(.1).update(grads, state, weight)
             return (optax.apply_updates(weight, updates), state), None
 

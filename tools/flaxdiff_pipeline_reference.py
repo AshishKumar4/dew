@@ -29,6 +29,12 @@ as FlaxDiff ran (towers in bfloat16), with the towers in float32, and the
 truth, everything in float64.
 
     PYTHONPATH=src python tools/flaxdiff_pipeline_reference.py
+
+writes the run's weights and Dew's initial state at KEY, which the test reads; with `--seeds`, the
+preview sampling over check 1's seeds, each the key of Dew's own call (`seeded`), to
+tests/fixtures/flaxdiff_pipeline/seeds.npz.
+
+    PYTHONPATH=src:tests python tools/flaxdiff_pipeline_reference.py --seeds
 """
 
 from __future__ import annotations
@@ -137,7 +143,7 @@ class TorchCLIP:
         return types.SimpleNamespace(last_hidden_state=jnp.asarray(values, getattr(jnp, self.dtype)))
 
 
-def draws(step: Path, config: dict) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
+def draws(step: Path, config: dict, key: int = KEY) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
     """Dew's own call on the run: its initial state, each ancestral step's
     unit noise in order, and its images. The call runs the task's own solver,
     `EulerAncestral`, through one that records, step by step, the noise it
@@ -163,8 +169,8 @@ def draws(step: Path, config: dict) -> tuple[np.ndarray, list[np.ndarray], np.nd
             jax.debug.callback(lambda value: noise.append(np.asarray(value)), drawn, ordered=True)
             return self.solver.step(x, t, t_next, denoised, eps, state, key, process, denoise)
 
-    images = np.asarray(task(list(PROMPTS), key=KEY, solver=Recording(task.solver)).images)
-    start = np.asarray(task.prepare(list(PROMPTS), key=KEY).noise)
+    images = np.asarray(task(list(PROMPTS), key=key, solver=Recording(task.solver)).images)
+    start = np.asarray(task.prepare(list(PROMPTS), key=key).noise)
     return start, noise, images
 
 
@@ -218,7 +224,8 @@ def flaxdiff_samples(weights, clip: Path, vae: Path, unit, noise, *, towers: str
     return np.asarray(samples, np.float64 if wide else np.float32)
 
 
-def main() -> None:
+def imported() -> None:
+    """FlaxDiff's pinned source importable (`fetch`)."""
     sys.path[:0] = [str(ROOT)]
     sys.path.insert(0, str(fetch()))
     # FlaxDiff's `StableDiffusionVAE` imports Diffusers' Flax SD pipeline and
@@ -227,6 +234,69 @@ def main() -> None:
     pipeline = types.ModuleType("diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion")
     pipeline.FlaxStableDiffusionPipeline = None
     sys.modules.setdefault(pipeline.__name__, pipeline)
+
+
+def sampled(weights, clip: Path, vae: Path, start: np.ndarray, noise: list[np.ndarray]) -> tuple[dict, dict]:
+    """FlaxDiff's images from Dew's draws `start` and `noise`: as the run sampled (towers in bfloat16) and
+    with its towers in float32, and their truth, everything in float64."""
+    scale = float(EDM(regime="latent")().sampler_schedule.prior_scale())
+    unit = (start / np.float32(scale)).astype(np.float32)
+    images = {name: flaxdiff_samples(weights, clip, vae, unit, noise, towers=precision, wide=False)
+              for name, precision in (("as_run", "bfloat16"), ("fp32_towers", "float32"))}
+    with jax.enable_x64(new_val=True):
+        exact = flaxdiff_samples(weights, clip, vae, unit.astype(np.float64),
+                                 [draw.astype(np.float64) for draw in noise], towers="float64", wide=True)
+    return images, dict.fromkeys(images, exact)
+
+
+def draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's inputs: the key of Dew's own call, whose initial state and ancestral noise both runs read."""
+    return {"key": np.asarray(seed, np.int32)}
+
+
+def seeded() -> None:
+    """The preview sampling over the seeds check 1 draws (`draw`, `record_case`), the run's weights those
+    reference.npz holds: each seed's images as run and with float32 towers, and their float64 truth, whole,
+    in seeds.npz."""
+    from recorded_references import provenance, record_case, save
+    from test_flaxdiff import flaxdiff_tasks, sampled_pair
+
+    imported()
+    meta, weights, _ = recorded()
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        clip, vae = towers(root)
+        step = root / "1"
+        checkpoint(step, weights)
+        config = run_config(meta["input_config"], clip, vae)
+        tasks = flaxdiff_tasks(root / "dew")
+
+        def evaluate(inputs):
+            start, noise, _ = draws(step, config, int(inputs["key"]))
+            return sampled(weights, clip, vae, start, noise)
+
+        arrays = record_case("flaxdiff", draw, evaluate, store_inputs=False,
+                             dew=lambda inputs: sampled_pair(tasks, int(inputs["key"])))
+    written = save(FIXTURE.with_name("seeds.npz"), {**arrays, "provenance": provenance(
+        "AshishKumar4/FlaxDiff", COMMIT, "cpu", "python tools/flaxdiff_pipeline_reference.py --seeds",
+        jax=jax.__version__)}, reference=f"AshishKumar4/FlaxDiff {COMMIT}",
+        license="the owner's own code")
+    print(f"{written}: {sorted(arrays)}")
+
+
+def recorded() -> tuple[dict, dict, np.ndarray]:
+    """reference.npz as `main` left it: its meta, the run's weights as a tree, and Dew's initial state at
+    KEY."""
+    from flax.traverse_util import unflatten_dict
+
+    with np.load(FIXTURE) as stored:
+        weights = unflatten_dict({name.removeprefix("params/"): stored[name] for name in stored.files
+                                  if name.startswith("params/")}, sep="/")
+        return json.loads(stored["meta"].tobytes()), weights, stored["start"]
+
+
+def main() -> None:
+    imported()
     from flaxdiff.inputs import CLIPTextEncoder, DiffusionInputConfig
     from flaxdiff.models.simple_vit import SimpleUDiT
     from transformers import AutoTokenizer, CLIPTextConfig
@@ -254,17 +324,8 @@ def main() -> None:
         step = root / "1"
         checkpoint(step, weights)
         start, noise, ours = draws(step, run_config(serialized, clip, vae))
-
-        scale = float(EDM(regime="latent")().sampler_schedule.prior_scale())
-        unit = (start / np.float32(scale)).astype(np.float32)
+        images, exact = sampled(weights, clip, vae, start, noise)
         arrays = {"start": start}
-        for name, precision in (("as_run", "bfloat16"), ("fp32_towers", "float32")):
-            arrays[f"{name}.images"] = flaxdiff_samples(weights, clip, vae, unit, noise, towers=precision,
-                                                        wide=False)
-        with jax.enable_x64(new_val=True):
-            arrays["fp64.images"] = flaxdiff_samples(weights, clip, vae, unit.astype(np.float64),
-                                                     [draw.astype(np.float64) for draw in noise],
-                                                     towers="float64", wide=True)
 
     serialized["conditions"][0]["encoder"]["modelname"] = None
     meta = {"input_config": serialized, "jax_version": jax.__version__, "flaxdiff": COMMIT}
@@ -274,11 +335,12 @@ def main() -> None:
     from tools.reference_source import saved_fixture
 
     saved_fixture(FIXTURE, arrays, meta)
-    for name, images in (("FlaxDiff as run", arrays["as_run.images"]),
-                         ("FlaxDiff, float32 towers", arrays["fp32_towers.images"]), ("Dew as run", ours)):
-        gap = float(np.sqrt(np.mean((np.clip(images, -1, 1) - arrays["fp64.images"]) ** 2)))
+    runs = (("FlaxDiff as run", images["as_run"]), ("FlaxDiff, float32 towers", images["fp32_towers"]),
+            ("Dew as run", ours))
+    for name, found in runs:
+        gap = float(np.sqrt(np.mean((np.clip(found, -1, 1) - exact["as_run"]) ** 2)))
         print(f"{name}: {gap:.3g} rms from float64")
 
 
 if __name__ == "__main__":
-    main()
+    seeded() if sys.argv[1:] == ["--seeds"] else main()

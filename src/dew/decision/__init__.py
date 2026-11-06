@@ -25,6 +25,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.decision.head import DecisionHead, Head, JointSchemaHead, LabelReadout, SlotReadout
     from dew.decision.laya import LayaCheckpoint
     from dew.decision.layout import (
+        Again,
         AnswerCue,
         DecisionInputs,
         Encoded,
@@ -39,12 +40,15 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
         OptionLines,
         QuestionLayout,
         QuestionSegment,
+        RequestSummary,
         Schema,
         Segment,
         Specials,
         State,
         StateFirstLayout,
         Text,
+        Turns,
+        Values,
         render,
     )
     from dew.decision.metrics import AURC, ECE, Accuracy, Answered, MacroF1, ScoredQuestions
@@ -68,7 +72,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     )
     from dew.decision.rows import NONE_OF_THE_ABOVE, Encoding
     from dew.decision.scoring import Brier, Combined, LogLoss, RankedProbability, ScoringRule, Spherical
-    from dew.decision.task import TASK_FILE, Budget, Decide, Usage, Weights
+    from dew.decision.task import TASK_FILE, Budget, Decide, Finalists, Knockout, Usage, Weights
 
 _EXPORTS = {
     "AURC": "dew.decision.metrics",
@@ -79,6 +83,7 @@ _EXPORTS = {
     "Abstention": "dew.decision.calibration",
     "Accuracy": "dew.decision.metrics",
     "Answer": "dew.decision.questions",
+    "Again": "dew.decision.layout",
     "AnswerCue": "dew.decision.layout",
     "Answered": "dew.decision.metrics",
     "Binning": "dew.decision.calibration",
@@ -98,11 +103,13 @@ _EXPORTS = {
     "Encoding": "dew.decision.rows",
     "EntropyConfidence": "dew.decision.questions",
     "Example": "dew.decision.data",
+    "Finalists": "dew.decision.task",
     "Framing": "dew.decision.layout",
     "Group": "dew.decision.data",
     "GroupedExamples": "dew.decision.data",
     "Head": "dew.decision.head",
     "Instructions": "dew.decision.layout",
+    "Knockout": "dew.decision.task",
     "JevConfidence": "dew.decision.questions",
     "JointLayout": "dew.decision.layout",
     "JointSchemaHead": "dew.decision.head",
@@ -122,6 +129,7 @@ _EXPORTS = {
     "QuestionLayout": "dew.decision.layout",
     "QuestionSegment": "dew.decision.layout",
     "RankedProbability": "dew.decision.scoring",
+    "RequestSummary": "dew.decision.layout",
     "Schema": "dew.decision.layout",
     "Score": "dew.decision.questions",
     "ScoreAnswer": "dew.decision.questions",
@@ -137,7 +145,9 @@ _EXPORTS = {
     "Temperatures": "dew.decision.calibration",
     "Text": "dew.decision.layout",
     "TopProbability": "dew.decision.questions",
+    "Turns": "dew.decision.layout",
     "Usage": "dew.decision.task",
+    "Values": "dew.decision.layout",
     "Weights": "dew.decision.task",
     "bucket": "dew.decision.calibration",
     "corpus": "dew.decision.data",
@@ -162,6 +172,7 @@ __all__ = [
     "TASK_FILE",
     "Abstention",
     "Accuracy",
+    "Again",
     "Answer",
     "AnswerCue",
     "Answered",
@@ -182,6 +193,7 @@ __all__ = [
     "Encoding",
     "EntropyConfidence",
     "Example",
+    "Finalists",
     "Framing",
     "Group",
     "GroupedExamples",
@@ -190,6 +202,7 @@ __all__ = [
     "JevConfidence",
     "JointLayout",
     "JointSchemaHead",
+    "Knockout",
     "LabelReadout",
     "Labels",
     "Laid",
@@ -206,6 +219,7 @@ __all__ = [
     "QuestionLayout",
     "QuestionSegment",
     "RankedProbability",
+    "RequestSummary",
     "Schema",
     "Score",
     "ScoreAnswer",
@@ -221,7 +235,9 @@ __all__ = [
     "Temperatures",
     "Text",
     "TopProbability",
+    "Turns",
     "Usage",
+    "Values",
     "Weights",
     "bucket",
     "corpus",
