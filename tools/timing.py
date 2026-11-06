@@ -39,6 +39,9 @@ TOOLS = Path(__file__).resolve().parent
 INSTRUMENT = TOOLS.parent / "src/dew/telemetry/benchmark.py"
 """The window's own device timer, which every arm's process loads by its path (`instrument`), never its
 tree's: one instrument for every arm, whatever the arm's commit holds."""
+ROUNDS = 5
+"""A case's rounds unless it names its own: an arm's range and the A/A band are its rounds' ratios, which three
+leave coarse enough for one outlier round to set the band."""
 NCU_SECTIONS = ("SpeedOfLight", "MemoryWorkloadAnalysis", "SchedulerStats", "WarpStateStats", "LaunchStats",
                 "Occupancy")
 """The Nsight Compute sections a profile reads unless its case names its own."""
@@ -262,7 +265,7 @@ def run(manifest: dict, out: Path, repo: Path) -> int:
                                                 "arm": arm})
                         units.append({"key": key, "index": index, "cell": cell, "arm": arm,
                                       "process": worker_of, "built": answer})
-                for round_ in range(case.get("rounds", 3)):
+                for round_ in range(case.get("rounds", ROUNDS)):
                     facts = gpu()
                     for index, _ in enumerate(case["cells"]):
                         mine = [unit for unit in units if unit["index"] == index]
