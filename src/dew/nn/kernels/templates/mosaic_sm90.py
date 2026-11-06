@@ -10,7 +10,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import mosaic, resources
+from dew.nn.kernels.templates import fed, mosaic, resources
 
 
 class WgmmaIssuer(mosaic.Issuer):
@@ -197,8 +197,8 @@ WGMMA = Wgmma()
 """The wgmma family's bundle."""
 
 
-class WgmmaFed(mosaic.ConsumerFed, Wgmma):
-    """wgmma's bundle without a producer: its consumers feed their own rings (`mosaic.ConsumerFed`), each
+class WgmmaFed(fed.ConsumerFed, Wgmma):
+    """wgmma's bundle without a producer: its consumers feed their own rings (`fed.ConsumerFed`), each
     at its program's entry registers, the layout a tile whose consumers need more than a producer leaves
     them takes."""
 

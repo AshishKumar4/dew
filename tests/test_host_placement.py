@@ -31,6 +31,7 @@ import optax
 import pytest
 from affine_run import BATCH, Counting, Features, Spread, val_batches
 from flax import linen as nn
+from layout_parity import layouts_agree
 from model_support import float64_twin
 from process_support import run_pool
 from reference_error import assert_as_exact
@@ -64,6 +65,23 @@ def fit(layout, directory, steps, optimizer=None, **options):
     return state
 
 
+def trained(layout, seed, steps, optimizer=None, **options):
+    """`steps` updates of the affine model from the start `seed` draws, without evaluation or checkpoints:
+    a check-1 arm's run (`layouts_agree`), in float64 where the process runs in it."""
+    wide = jax.config.read("jax_enable_x64")
+
+    def stream(partition):
+        def held(value):
+            floating = np.issubdtype(np.asarray(value).dtype, np.floating)
+            return np.asarray(value, np.float64) if wide and floating else value
+        return (jax.tree.map(held, batch) for batch in Counting())
+
+    trainer = Trainer(Features(), optimizer or optax.adam(0.1), key=jax.random.key(int(seed)),
+                      layout=layout, **options)
+    return trainer.fit(Loader(train=stream, val=None, records=None, batch=BATCH), steps=steps,
+                       log_every=steps)
+
+
 def identical(left, right):
     return all(np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(
         jax.tree.leaves(left), jax.tree.leaves(right), strict=True))
@@ -74,35 +92,35 @@ def memory_kinds(tree):
 
 
 def test_host_resident_state_trains_the_same_model(tmp_path):
+    """A run whose optimizer state and average sit in host memory trains the model, moments and average
+    the device-resident run trains, by check 1 over drawn starts, the device's run in float64 the truth."""
+    layouts_agree(lambda layout, seed: trained(layout, seed, 4), lambda seed: (np.int32(seed),),
+                  "four updates with the optimizer state and average in host memory", HOST, DEVICE)
     on_device = fit(DEVICE, tmp_path / "device", 4)
     on_host = fit(HOST, tmp_path / "host", 4)
     assert memory_kinds(on_host.opt_state) == memory_kinds(on_host.ema) == {"pinned_host"}
     assert memory_kinds(on_host.variables) == memory_kinds(on_device.opt_state) == {"device"}
-    assert identical(on_host.variables, on_device.variables)
-    assert identical(on_host.opt_state, on_device.opt_state)
-    assert identical(on_host.ema, on_device.ema)
 
 
 def test_host_resident_state_trains_the_same_model_over_a_scaled_window(tmp_path):
     """A window of two microbatches commits under a conditional, and a dynamically scaled loss admits it
     on the finiteness of the whole committed state: each reads every leaf of the host-resident state at
     once, which its commit then stages as one chunk (`dew.training.staging`), and a clipped Adam's run
-    trains the model, moments and average the device-resident run trains, bit for bit."""
+    trains the model, moments and average the device-resident run trains, by check 1 over drawn starts."""
     options = {"optimizer": optax.chain(optax.clip_by_global_norm(1.0), optax.adam(0.1)), "accumulation": 2,
                "dynamic_scale": True}
-    on_device = fit(DEVICE, tmp_path / "device", 4, **options)
+    layouts_agree(lambda layout, seed: trained(layout, seed, 4, **options), lambda seed: (np.int32(seed),),
+                  "a scaled window of two microbatches with the state in host memory", HOST, DEVICE)
     on_host = fit(HOST, tmp_path / "host", 4, **options)
     assert memory_kinds(on_host.opt_state) == memory_kinds(on_host.ema) == {"pinned_host"}
-    assert identical(on_host.variables, on_device.variables)
-    assert identical(on_host.opt_state, on_device.opt_state)
-    assert identical(on_host.ema, on_device.ema)
 
 
 def test_host_resident_state_resumes_from_its_checkpoint(tmp_path):
+    """A host-resident run resumed from its checkpoint continues as the run that never stopped, bit for bit:
+    one program over restored values."""
     saved = fit(HOST, tmp_path / "host", 4)
-    fit(DEVICE, tmp_path / "device", 4)
     resumed = fit(HOST, tmp_path / "host", 6)
-    reference = fit(DEVICE, tmp_path / "device", 6)
+    reference = fit(HOST, tmp_path / "whole", 6)
     assert int(resumed.step) == 6
     assert memory_kinds(resumed.opt_state) == memory_kinds(resumed.ema) == {"pinned_host"}
     assert identical(resumed.variables, reference.variables)

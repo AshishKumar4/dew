@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable, Hashable, Mapping
+from typing import TypedDict, cast
 
 import jax
 import jax.numpy as jnp
@@ -130,6 +131,14 @@ class Draws:
     ended: jax.Array
     behavior: jax.Array
     raw: jax.Array
+
+
+class GroupKeywords(TypedDict, total=False):
+    """A prefill's group keywords of the model's own call (`kv_cache.GROUPS`' names), each where its pieces
+    carry it: the tokens' image and block groups."""
+
+    image_groups: jax.Array
+    block_groups: jax.Array
 
 
 def _base_rows(model: nn.Module, rows: int) -> jax.Array | None:
@@ -486,10 +495,10 @@ def _mixed_step(model: nn.Module, params: Variables, pad_id: int, placement: Pla
     # The pieces' tokens' image and block groups where they carry them (`GROUPS`), -1 at the fed rows' tokens
     # and at padding, as a prefill of their own reads them.
     fields = admission.prompts.token_fields
-    groups = {name: jnp.concatenate([jnp.full((rows,), -1, jnp.int32),
-                                     jnp.where(valid, jnp.asarray(fields[name], jnp.int32), -1).reshape(-1)
-                                     ])[None]
-              for name in GROUPS if name in fields}
+    groups = cast(GroupKeywords, {
+        name: jnp.concatenate([jnp.full((rows,), -1, jnp.int32),
+                               jnp.where(valid, jnp.asarray(fields[name], jnp.int32), -1).reshape(-1)])[None]
+        for name in GROUPS if name in fields})
     (_, logits), updated = model.apply(
         {**params, "cache": decoder.cache}, flat[None], scored[None], decode=True,
         coordinates=coordinates(flat[None].shape, valid=real[None]), **groups,

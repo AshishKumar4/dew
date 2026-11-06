@@ -16,6 +16,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from diffusers_scheduler_pipeline_reference import SCHEDULERS
 from native_diffusion_worker import GROUPS, groups, leaves
 
 from dew.diffusion.schedules.source import SourceSchedule
@@ -372,6 +373,11 @@ def qualified(name, source, reference, meta, key, label=""):
                                                    leaves=("start",))
         assert_as_exact(dew(("start",), bypassed=True), recorded, drawn, f"{label}{name} bypassed start",
                         seeds=seeds, truth_fn=truth)
+        # And on par with Dew's own start from the pixels, whose Diffusers' start may be the farther: the
+        # recorded walk's seeds, its truth recorded at those alone (a paired sizing draws past them).
+        assert_as_exact(dew(("start",), bypassed=True), dew(("start",)), drawn,
+                        f"{label}{name} bypassed start against the pixels' start", seeds=seeds,
+                        truth_fn=truth)
     # The same walk through the task facade: the same images.
     given, null, process, times = selection(source, meta)
     task = source.text_to_image()
@@ -421,7 +427,7 @@ def pipeline_arms(site, root=None):
     return RECORDINGS / f"{task}-{group}.npz", draw_for(task), dew, held
 
 
-GRID_SEEDS = {name: 8 for name in ("pndm-prk", "pndm-plms", "lms", "lms-v", "lms-karras", "euler", "dpm")}
+GRID_SEEDS = dict.fromkeys(SCHEDULERS, 8)
 """Each source grid's declared seeds for check 1 of the SD pipeline's walk over it, sized by `seeds_for` paired
 with Dew's walk as its recording ran it (tools/venv_reference.py's `native-grid-<name>`)."""
 

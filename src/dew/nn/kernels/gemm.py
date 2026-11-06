@@ -32,6 +32,7 @@ accumulator only where the epilogue's VJP reads it.
 
 import dataclasses
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -308,9 +309,35 @@ NVFP4_ROW = 'ledger 3621'
 @dataclasses.dataclass(frozen=True)
 class PackedCase:
     """An NVFP4 product as its selector reads it (`NVFP4`): the tile the template's packed launch plans for
-    it on the target (`grouped_matmul.MosaicPackedGmm`), None where it plans none."""
+    it on the target (`grouped_matmul.MosaicPackedGmm`), None where it plans none, and its `rows`."""
 
     tile: mosaic_gpu.Tiles | None
+    rows: int
+
+    @property
+    def cell(self) -> tuple[str, str]:
+        """The cell a receipt measures (`selection.Celled`): the device's generation and whether the call is
+        decode-sized (at most `NVFP4_DECODE_ROWS` rows, the packed matrix's bytes its time) or a prefill."""
+        return (generation.device_generation(),
+                'decode' if self.rows <= NVFP4_DECODE_ROWS else 'prefill')
+
+
+NVFP4_DECODE_ROWS = 64
+"""The most rows a decode-sized NVFP4 call has (`PackedCase.cell`): the receipts' largest decode row count."""
+
+PACKED_FASTER = ("W13-a100-4-M-NS-8b-a100 (base/kernels 8d23bb9872, CUPTI, arms rotated): Llama-3-8B's "
+                 "q/o, up and down projections at 1, 16 and 64 rows on an A100-SXM4-40GB, the packed kernel "
+                 "0.119-0.398 ms against the matrix decoded once a call's 0.309-1.418 (2.6-3.6x), its "
+                 "temporary memory 0.66-3.7 MB against 71-250 MB; at 4096 rows 4.4-4.7x slower, each row "
+                 "tile decoding the matrix again")
+"""The receipt behind the packed NVFP4 kernel's declared cell (`NVFP4_CELLS`)."""
+
+NVFP4_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
+    ('sm80', 'decode'): ('packed', PACKED_FASTER),
+}
+"""The NVFP4 product's declared cells (`selection.Op.declared`), (device generation, call size) to the
+packed kernel and its receipt: a literal of them, which the selector reads and thresh's declared-set seam
+registers (.thresh/thresh.cue)."""
 
 
 NVFP4: selection.Op[PackedCase] = selection.Op('nvfp4', (
@@ -319,14 +346,12 @@ NVFP4: selection.Op[PackedCase] = selection.Op('nvfp4', (
             'planned', lambda case: case.tile is not None, "the template plans no tile of the packed "
             "product here: a Mosaic GPU family's, its depth whole 256s and its width whole 64-column tiles",
             NVFP4_ROW),
-        selection.Requirement(
-            'measured', lambda case: False, "no receipt yet has the in-stage decode beat the decoded "
-            "matrix's product", NVFP4_ROW, kind='measured'))),
-    selection.Kernel('xla', (), generic=True)))
-"""An NVFP4 product's selector (`nvfp4_product`): the template's mainloop decoding each stage of the packed
-matrix in place (`mosaic_gpu.gmm`'s `scales`) where named (`generation.chosen(nvfp4='packed')`) and planned,
-which passes the measured requirement no receipt has met yet; else the matrix decoded once a call and its
-product (`gemm`)."""
+        )),
+    selection.Kernel('xla', (), generic=True)), lambda case: 'xla', declared=NVFP4_CELLS)
+"""An NVFP4 product's selector (`nvfp4_product`): the matrix decoded once a call and its product (`gemm`),
+but the template's mainloop decoding each stage of the packed matrix in place (`mosaic_gpu.gmm`'s `scales`)
+where a receipt measured it faster (a decode-sized call on an A100: `NVFP4_CELLS`) or it is named
+(`generation.chosen(nvfp4='packed')`), and it plans a tile."""
 
 
 def nvfp4_product(lhs: jax.Array, matrix: NvFp4, *, out_dtype, interpret_on_cpu: bool = False) -> jax.Array:
@@ -346,7 +371,7 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, *, out_dtype, interpret_on_cpu:
                         interpret=interpret_on_cpu, dense=True, exact_sums=True)
     target = generation.gpu_target()
     tile = launch.derived(bound, target) if launch.eligible(bound, target) else None
-    if selection.select(NVFP4, PackedCase(tile)).kernel == 'packed':
+    if selection.select(NVFP4, PackedCase(tile, math.prod(rows.shape[:-1]))).kernel == 'packed':
         assert tile is not None, "the selector names the packed kernel where it plans a tile"
         summed = _packed(rows, matrix.words, matrix.scales, tile, interpret_on_cpu)
     else:
@@ -445,6 +470,7 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
                                 multiprocessors=launch._launched(tile, interpret_on_cpu),
                                 interpret=grouped_matmul.INTERPRETED if interpret_on_cpu else False,
                                 exact_sums=True, step_scales=(row_scales, column_scales))
+        assert isinstance(summed, jax.Array), "an unpaired product has one output"
     else:
         # Each product of two FP8 values is exact in bfloat16's range and in fp32.
         matrices = jnp.swapaxes(kernel, 1, 2).astype(jnp.bfloat16)

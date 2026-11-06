@@ -630,6 +630,18 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         del streams, lo, hi, first, between
 
+    def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
+                    walk: Callable[..., R], *, between=None) -> R:
+        # Two consumers run one collective pipeline (`thread_axis`), whose barriers pair their steps: each
+        # walks every streamed step, its step masking those outside its own range, as a consumer-fed
+        # family's do (`ConsumerFed.walk_own`; a causal attention program's two consumers reach different
+        # diagonals, and their own walks hung, M-ET-15b). One consumer walks its own.
+        if streams.pipeline.consumers == 1:
+            return super().walk_own(streams, views, own, streamed, wg, walk, between=between)
+        del views, own, wg, between
+        lo, hi = streamed
+        return walk(streams, lo, hi, lo)
+
     def loaded(self, copies, *, issued: jax.Array | bool = True, axes: tuple | None = None) -> None:
         # Through registers (no TMA before Hopper), in a layout of the tile's rank: a side vector's the
         # accumulator's vector layout of the axis it follows (its rows', `row`, read as `s[:, None]`; its

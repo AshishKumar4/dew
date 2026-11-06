@@ -32,22 +32,30 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     stated,
     transposed_swizzles,
 )
-from dew.nn.kernels.templates.attention_mosaic_scores import _Backward, _dq_added, _score_params, _scores
+from dew.nn.kernels.templates.attention_mosaic_scores import (
+    _Backward,
+    _dq_added,
+    _relay_tiles,
+    _relayed,
+    _score_params,
+    _scores,
+)
 
 
 def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
                      stages: int, columns: int = 1, tiled: bool = False) -> tuple[list, dict]:
-    """The dK/dV program's allocations as `Family.scoped` takes them, in `_dkv_launch`'s order: its
-    consumers' resident keys and values; dK's output stage and dV's (the one stage where the widths agree),
-    fp32, each its program's share of the `columns`; each consumer's stage for its key gradients' sums; the
-    two loads' barriers; a fused launch's (`BackwardTiles.fused`) staged score cotangents and dQ tile each
-    consumer's; where its logits' queries are staged (`BackwardTiles.staged_logits`) one slot's of them and
-    their two turns; where a score hook's tile parameter is `tiled`, each consumer's stage for its tile
-    gradients' adds (`Family.added`); and its query and output-cotangent streams, and its logits' queries'
-    unless staged, in `stages` slots (`Family.streams`). On a layout whose consumers feed their rings
-    (`split_queries`) the consumers share one key block, held once, and each takes its share of a slot's
-    queries: every block a product of theirs reads staged at the swizzle their share's contraction takes
-    (`mosaic.swizzle_for`)."""
+    """The dK/dV program's allocations as `Family.scoped` takes them, in `_dkv_launch`'s order: its consumers'
+    resident keys and values; dK's output stage and dV's (the one stage where the widths agree), fp32, each
+    its program's share of the `columns`; each consumer's stage for its key gradients' sums; the two loads'
+    barriers; a fused launch's (`BackwardTiles.fused`) staged score cotangents and dQ tile each consumer's;
+    where its logits' queries are staged (`BackwardTiles.staged_logits`) one slot's of them and their two
+    turns; where a score hook's tile parameter is `tiled`, each consumer's stage for its tile gradients' adds
+    (`Family.added`); each consumer's relay tile where its weights and score cotangents reach dV's and dK's
+    products through shared memory (`Family.relay_bytes`, `_relayed`); and its query and output-cotangent
+    streams, and its logits' queries' unless staged, in `stages` slots (`Family.streams`). On a layout whose
+    consumers feed their rings (`split_queries`) the consumers share one key block, held once, and each takes
+    its share of a slot's queries: every block a product of theirs reads staged at the swizzle their share's
+    contraction takes (`mosaic.swizzle_for`)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     split = split_queries(family)
     holders, rows = (1, block_q // consumers) if split else (consumers, block_q)
@@ -90,6 +98,7 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
         blocks["logits"] = ((block_q, width), dtype)
     if tiled:
         scoped.append(plgpu.SMEM((consumers, block_k, rows), jnp.float32))
+    scoped += _relay_tiles(family, consumers, block_k, rows, dtype)
     if config.shared_dq:
         # Its queries' statistics streamed beside them, read from their stage where a step uses each
         # (FlashAttention 3's LSE and dPsum): held a step in registers they took 80 of a consumer's.
@@ -568,6 +577,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
         dq_ref, dk_ref, dv_ref = outputs
         q_ref, k_ref, v_ref, do_ref, *stat_refs = inputs
         k_smem, v_smem, out_smem, dv_smem, rows_smem, k_loaded, v_loaded, *rest = held
+        relayed = family.relay_bytes(block_k, count) > 0
+        relay, rest = (rest[-1:], rest[:-1]) if relayed else ([], rest)
         tile_stage, rest = (rest[-1], rest[:-1]) if tiled else (None, rest)
         tiles = program.tiles
         fused = 2 + 2 * tiles.shared_dq + 2 * tiles.producer_dq if walk.fused else 0
@@ -599,7 +610,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                       else program.readers(k_first, q_steps, spans_of, row)[:2])
             part = (index * count, count) if split else (0, block_q)
             stage = _logits_stage(family, consumers, logits_stages, index)
-            step = _consumer_step(walk, (row, head), k_first, index, holder, part, stage, shares,
+            step = _consumer_step(_relayed(walk, relay, index), (row, head), k_first, index, holder, part,
+                                  stage, shares,
                                   refs=(tile_refs, tile_stage, spans_of, drop_of, score_refs, k_smem, v_smem,
                                         dq_ref, fused_stages),
                                   statistics=None if program.tiles.shared_dq else rows_of)

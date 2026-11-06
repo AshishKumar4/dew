@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from entered_support import LAYOUTS, assert_entered_as_own_rows
 from flax import linen as nn
 from model_support import decode_through
 from reference_error import (
@@ -530,3 +531,13 @@ def test_a_gated_norm_broadcasts_its_gate_in_either_order(scale_wide):
                     else normalized.astype(jnp.float64) * weight.astype(jnp.float64)).astype(jnp.float64)
         np.testing.assert_array_equal(np.asarray(first.apply({"params": {"weight": weight}}, x[:1], wide)),
                                       np.asarray(expected))
+
+
+@pytest.mark.parametrize("layout", list(LAYOUTS))
+def test_documents_that_enter_another_read_its_state_and_history_as_their_own_rows_do(layout):
+    """The Mamba-2 layer over rows of shared parts and the documents that enter them gives each document's
+    tokens, and the gradients through them, what its own row of the part it enters and itself gives
+    (check 1; `entered_support`, row 1506), a document of one token through the chunked scan."""
+    hidden = mamba2_layer_draw(0)["hidden"]
+    assert_entered_as_own_rows(mamba2_layer(), mamba2_layer_params(mamba2_layer_draw(0)), hidden.shape[-1],
+                               layout, "Mamba-2")

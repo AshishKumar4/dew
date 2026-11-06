@@ -14,7 +14,7 @@ import dataclasses
 import jax.numpy as jnp
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import mosaic, mosaic_sm80, mosaic_sm90, mosaic_sm100, mosaic_tpu
+from dew.nn.kernels.templates import fed, mosaic, mosaic_sm80, mosaic_sm90, mosaic_sm100, mosaic_tpu
 
 INTERPRETED = mosaic_sm90.WGMMA
 """The bundle Mosaic GPU's interpreter runs a template's mainloop by off a GPU of a family a bundle claims (a
@@ -23,9 +23,9 @@ compute)."""
 
 
 @dataclasses.dataclass(frozen=True)
-class MmaFed(mosaic_sm80.MmaIssuer, mosaic.ConsumerFed):
+class MmaFed(mosaic_sm80.MmaIssuer, fed.ConsumerFed):
     """mma.sync's issuer and register home (`mosaic_sm80.MmaIssuer`) on TMA rings its consumer feeds
-    (`mosaic.ConsumerFed`): consumer Blackwell's (sm120), whose mma.sync moves its blocks by TMA and has no
+    (`fed.ConsumerFed`): consumer Blackwell's (sm120), whose mma.sync moves its blocks by TMA and has no
     warpgroup MMA, composed from the two and no template's. One consumer a program, as mma.sync's on an
     A100, where two programs a multiprocessor ran faster than two consumers (CONSUMERS1, CONSUMERS3);
     unmeasured on sm120."""

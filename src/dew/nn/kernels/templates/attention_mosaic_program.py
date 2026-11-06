@@ -64,6 +64,15 @@ def few_rows(family: mosaic.Family, rows: int | None) -> bool:
     return family.specialized(padded, family.role_rows) != family
 
 
+def fewer_rows(family: mosaic.Family) -> tuple[int, ...]:
+    """The consumer rows below a role's a backward launch takes on `family`, largest first: whole divisors of
+    the role's rows in the issuer's, each one its warps arrange themselves by (`Issuer.specialized`:
+    mma.sync's two warps of 16 rows at 32, its register operands then relayed through shared memory where
+    they cross warps, `Issuer.relay_bytes`); none on a family whose role is one issuer's rows (wgmma's)."""
+    return tuple(rows for rows in range(family.role_rows - family.rows, 0, -family.rows)
+                 if family.role_rows % rows == 0 and family.specialized(rows, rows) != family)
+
+
 def qualified(family: mosaic.Family, rows: int | None = None) -> bool:
     """Whether the attention mainloop runs a launch of `rows` rows on `family`: a qualified bundle
     (`QUALIFIED`), or one taking them at tiles of fewer rows than its role's (`few_rows`)."""
@@ -103,14 +112,25 @@ def bundle_of(tiles: "Tiles | BackwardTiles", dtype) -> mosaic.Family:
     a call derives is the qualification's (`layouts`), so a config pinned on a family not yet qualified (an
     A100's mma.sync, its resource witness) resolves too. A forward's family is arranged for its consumer's
     share, `block_q` x `block_k` (`Issuer.specialized`, as the GEMM's: mma.sync's warps by the share, whose
-    default 64-row atom no 32-row consumer's operands cast to); a backward's launches hold differing
-    shares."""
+    default 64-row atom no 32-row consumer's operands cast to); a backward's as `backward_family` arranges
+    it."""
     # Every bundle the device issues (a launch of a row each ranks them all, `bundles.layouts`).
     found = {family.name: family for family in bundles.layouts(generation.gpu_target().generation, dtype, 1)}
     family = found.get(tiles.family)
     if family is None:
         raise ValueError(f"{tiles}: this device's attention bundles are {sorted(found)}")
-    return family.specialized(tiles.block_q, tiles.block_k) if isinstance(tiles, Tiles) else family
+    if isinstance(tiles, Tiles):
+        return family.specialized(tiles.block_q, tiles.block_k)
+    return backward_family(family, tiles)
+
+
+def backward_family(family: mosaic.Family, tiles: "BackwardTiles") -> mosaic.Family:
+    """`family` arranged for a backward's `tiles`, whose launches transpose them (dQ's rows its queries,
+    dK/dV's its keys): by their smaller side where that is fewer rows than a role's (`fewer_rows`), else as
+    the family stands (four warps along a role's rows hold whole rows of the accumulators the products then
+    read from registers)."""
+    side = min(tiles.block_q, tiles.block_k)
+    return family.specialized(side, side) if side < family.role_rows else family
 """The instruction families this mainloop runs on (`generation.family`), each by its bundle: wgmma's. A
 family without one (mma.sync's, until its thin mainloop) takes another mainloop (`MosaicForward.eligible`,
 `MosaicBackward.eligible`)."""
