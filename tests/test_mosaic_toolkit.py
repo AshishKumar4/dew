@@ -869,3 +869,61 @@ def test_an_accumulator_feeds_the_next_product_on_any_warp_split(rows, m_warps):
     with generation.assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
         jax.jit(functools.partial(_chained, m_warps=m_warps, interpret=False)).trace(*shapes).lower(
             lowering_platforms=("cuda",))
+
+
+CODES = (64, 64)
+"""A quantized stage's rows and depth."""
+
+
+def _converted(codes, scale, *, generation_name: str, interpret):
+    """`codes` (int8 or e4m3) converted into a bf16 tile through a family's `converted`, each row scaled by
+    `scale`, and copied out: on an A100's mma.sync and an H100's fed warpgroup MMA."""
+    from dew.nn.kernels.templates import bundles, resources
+
+    family = bundles.of(generation_name, jnp.bfloat16)
+
+    def body(codes_gmem, scale_gmem, out_gmem):
+        def scoped(codes_smem, into):
+            mosaic.copied(codes_gmem, codes_smem)
+            mosaic.synced(interpret is not False)
+            row_scale = scale_gmem[...] if interpret is not False else family.rows_of(scale_gmem)
+            family.converted(codes_smem, into, interpret is not False, row_scale=row_scale)
+            mosaic.synced(interpret is not False)
+            mosaic.store_rows(into, out_gmem, 0, 0, jnp.int32(CODES[0]), 0, CODES[0], copy=mosaic.coalesced,
+                              widest=resources.copied_rows(CODES[1], jnp.bfloat16))
+
+        # A fed family's kernel runs on a thread axis, which its scoped allocations name.
+        threaded = {"collective_axes": "wg"} if generation_name == "sm90" else {}
+        pl.run_scoped(scoped, mosaic.plain(CODES, codes.dtype), mosaic.plain(CODES, jnp.bfloat16), **threaded)
+
+    out = jax.ShapeDtypeStruct(CODES, jnp.bfloat16)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="converted")(codes, scale)
+
+
+def _codes(dtype):
+    """Codes of `dtype` and per-row power-of-two scales, so each converted value is exact in bf16."""
+    keys = jax.random.split(jax.random.key(6), 2)
+    codes = jax.random.randint(keys[0], CODES, -8, 8).astype(dtype)
+    return codes, jnp.exp2(jax.random.randint(keys[1], (CODES[0],), -3, 4).astype(jnp.float32))
+
+
+@pytest.mark.parametrize("dtype", [jnp.int8, jnp.float8_e4m3fn])
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+def test_a_quantized_stage_converts_into_the_tile_its_products_read(generation_name, dtype):
+    """Int8 and e4m3 codes in shared memory converted into a bf16 tile, each row scaled in fp32: exactly
+    `codes * scale` interpreted (on a CPU) or on a GPU of the generation, and lowered for one on any host."""
+    codes, scale = _codes(dtype)
+    expected = np.asarray(codes, np.float32) * np.asarray(scale)[:, None]
+    if jax.default_backend() == "cpu":
+        np.testing.assert_array_equal(
+            np.asarray(_converted(codes, scale, generation_name=generation_name, interpret=INTERPRETED),
+                       np.float32), expected)
+        shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (codes, scale)]
+        mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
+        with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
+            jax.jit(functools.partial(_converted, generation_name=generation_name, interpret=False)).trace(
+                *shapes).lower(lowering_platforms=("cuda",))
+    elif generation.device_generation() == generation_name:
+        converted = _converted(codes, scale, generation_name=generation_name, interpret=False)
+        np.testing.assert_array_equal(np.asarray(converted, np.float32), expected)
