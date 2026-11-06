@@ -1206,7 +1206,7 @@ def _write(path: Path, drawn: Drawn, meta: dict[str, Any]) -> None:
     """`drawn` and `meta` in one file, written whole or not at all, every array at its own dtype."""
     import numpy as np
 
-    from dew.files import replacing
+    from dew._files import replacing
 
     arrays = {f"gradient/{name}": value for name, value in drawn.gradient.items()}
     arrays |= {f"record/{name}/{place}": value for name, examples in drawn.record.items()
@@ -1860,13 +1860,13 @@ def prepared(models: Sequence[str], *, dtype: str, seeds: int | Mapping[str, int
     seeds the reference's first draw alone (`ran`), with the reference's FLOPs, computed into
     `references` where missing; whether every model's is there."""
     sys.path.insert(0, str(REPO / "tests"))
-    from reference_error import REDRAW
+    from check1_wire import staged_units
 
     whole = True
     for model in models:
         started = time.perf_counter()
         count = seeds if isinstance(seeds, int) else seeds[model]
-        draws = (1 + REDRAW) * count * (windows if isinstance(windows, int) else windows.get(model, 1))
+        draws = staged_units(count) * (windows if isinstance(windows, int) else windows.get(model, 1))
         try:
             _, reference = model_case(model, dtype, mixture, objective)
             judge = Judge(reference, references, model)

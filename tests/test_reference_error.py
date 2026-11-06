@@ -13,7 +13,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from one_draw import assert_as_exact_as_the_reference, assert_leaves_as_exact
+from check1_wire import staged_units
+from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
     MOST_SEEDS,
@@ -389,7 +390,7 @@ def sharded_site(monkeypatch, root, shards, site):
     """`site()` run as armada runs a sharded site: a map task for each range of `shards` (DRAWS), its
     records under `root` (RECORDS), then their judge (POOL over `root`); what each map task's run
     returned and what the judge's did."""
-    from map_judge import DRAWS, POOL, RECORDS
+    from check1_wire import DRAWS, POOL, RECORDS
 
     drawn = []
     for index, (start, stop) in enumerate(shards):
@@ -865,9 +866,9 @@ def test_an_arm_compiled_outside_the_gates_policy_is_refused():
 def test_a_float64_truth_runs_as_one_compiled_program():
     """The gate compiles a JAX truth (`_truth_program`) from its first call on, never running it eagerly, so
     a seed's truth is the same whichever seed a process draws first, and its values are the eager truth's
-    own. A NumPy truth (it cannot be traced, and returns host values) runs as given, and so do a truth
-    `as_given`, one compiled already and a window loop's by its own; a check over a compiled truth judges
-    as over the eager one."""
+    own. A truth doing host work fails at its first call unless its site states it (`as_given`, ledger 3198);
+    a truth `as_given`, one compiled already and a window loop's by its own run as they are; a check over a
+    compiled truth judges as over the eager one."""
     from arm_arithmetic import Truth
     from reference_error import _truth_program, _Windowed, as_given, over_windows
 
@@ -884,13 +885,11 @@ def test_a_float64_truth_runs_as_one_compiled_program():
         assert calls == [True]
         np.testing.assert_array_equal(first["y"], later["y"])
         np.testing.assert_allclose(first["y"], truth(x, w)["y"], rtol=1e-14)
-        numpy = _truth_program(lambda x, w: {"y": np.asarray(x) @ np.asarray(w)})
-        numpy(x, w)
-        assert numpy.run.wrapped is numpy.fn
-        # A truth that widens its inputs on the host and returns JAX values fails at its first call.
-        hosted = _truth_program(lambda x, w: truth(np.asarray(x, np.float64), np.asarray(w, np.float64)))
-        with pytest.raises(jax.errors.TracerArrayConversionError):
-            hosted(x, w)
+        # A truth that does host work, NumPy's or a widening on the host, fails at its first call, unstated.
+        for hosted in (lambda x, w: {"y": np.asarray(x) @ np.asarray(w)},
+                       lambda x, w: truth(np.asarray(x, np.float64), np.asarray(w, np.float64))):
+            with pytest.raises(jax.errors.TracerArrayConversionError):
+                _truth_program(hosted)(x, w)
     # A truth run as given, or compiled already, is itself, its programs unrewritten.
     given = as_given(truth)
     assert _truth_program(given).wrapped is given and _truth_program(_product).wrapped is _product
@@ -1095,8 +1094,6 @@ def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
     assert distance(dew, truth) <= FACTOR * distance(reference, truth)
     with pytest.raises(AssertionError):
         assert_as_exact_as_the_reference(dew, reference, truth, "small row")
-    with pytest.raises(AssertionError):
-        assert_leaves_as_exact({"rows": dew}, {"rows": reference}, {"rows": truth})
 
 
 def test_a_row_that_cancels_is_held_to_what_it_sums():
@@ -1118,10 +1115,10 @@ def test_a_row_that_cancels_is_held_to_what_it_sums():
         return truth + noise
 
     reference, further = rounded(), rounded(10.0)
-    assert_leaves_as_exact({"dq": rounded()}, {"dq": reference}, {"dq": truth}, terms={"dq": terms})
+    assert_as_exact_as_the_reference(rounded(), reference, truth, "dq", terms=terms)
     assert distance(further, truth) <= FACTOR * distance(reference, truth)
     with pytest.raises(AssertionError):
-        assert_leaves_as_exact({"dq": further}, {"dq": reference}, {"dq": truth}, terms={"dq": terms})
+        assert_as_exact_as_the_reference(further, reference, truth, "dq", terms=terms)
 
 
 def test_a_row_of_float64_zero_is_held_to_the_references_own_row():
@@ -1368,6 +1365,20 @@ def test_check_one_holds_dew_exact_where_the_reference_is_exact_on_every_seed():
     assert raised.type is GateFailure
 
 
+@pytest.mark.parametrize("shape", [(), (3,), (2, 3)], ids=["scalar", "vector", "matrix"])
+def test_check_one_holds_dew_exact_where_the_reference_is_exact_below_squares_float64_holds(shape):
+    """A float64 reference exact on a truth of 1e-200, and a Dew arm that returns zero there: Dew's error
+    squares to zero in float64 and was read as exact (row 4498); it misses the exact reference, so the
+    site fails, at a leaf of every rank."""
+    def draw(seed):
+        return (np.full(shape, 1e-200 * (1 + seed)),)
+
+    with pytest.raises(AssertionError) as raised:
+        assert_as_exact(as_given(lambda x: {"y": np.zeros_like(x)}), as_given(lambda x: {"y": x}), draw,
+                        "below squares", seeds=8, truth_fn=as_given(lambda x: {"y": x}))
+    assert raised.type is GateFailure
+
+
 @pytest.mark.parametrize("rank", [1, 2])
 def test_check_one_fails_a_value_that_is_not_finite(rank):
     """A NaN in Dew's leaf fails, whatever the pooled errors would read, a vector's (which has no rows
@@ -1485,7 +1496,7 @@ def test_a_recording_keeps_the_larger_count_sized_on_another_backend(planned):
                                         summary=True, start=256)
     seeds = int(recorded["site.seeds"])
     assert seeds >= 256
-    assert len(recorded["site.input_digest"]) == (1 + REDRAW) * seeds
+    assert len(recorded["site.input_digest"]) == staged_units(seeds)
     drawn, reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw,
                                                 truth_fn=product)
     assert_as_exact(lambda index, inputs: product(inputs), reference, drawn, "larger backend",
@@ -2020,7 +2031,8 @@ def test_a_truths_sketch_rounds_alike_in_any_order_and_refuses_an_overflowing_or
     block of SKETCH_BLOCK summed from its other end as another host may; a
     truth recomputed far past float64's range is refused, not passed on an infinite bound; and an empty
     leaf's evidence is exact, its reference's dtype kept."""
-    from reference_error import SKETCH, _sign_bits, leaf_summary, sketch_rounding, truth_sketch
+    from reference_error import leaf_summary
+    from truth_sketch import SKETCH, _sign_bits, sketch_rounding, truth_sketch
 
     rng = np.random.default_rng(7)
     truth = rng.normal(size=4096)
@@ -2148,7 +2160,7 @@ def test_a_truths_sketch_is_its_exact_signed_sums_within_its_rounding(size):
     bit for bit where they do not)."""
     import math
 
-    from reference_error import SKETCH, _sign_bits, sketch_rounding, truth_sketch
+    from truth_sketch import SKETCH, _sign_bits, sketch_rounding, truth_sketch
 
     rng = np.random.default_rng(size)
     values = rng.standard_normal(size) * 10.0 ** rng.uniform(-30, 30, size)
@@ -2288,6 +2300,7 @@ def rounded_apart(arm: int, factor: float = 1.0, *, every: int = 1):
     return run
 
 
+@as_given
 def exact_value(x, scale, sizes):
     return np.asarray(x, np.float64)
 
@@ -2367,6 +2380,7 @@ def stacked_arm(arm: int, factor: float = 1.0, every: int = 0):
     return run
 
 
+@as_given
 def exact_rows(x, scale, sizes):
     return {"rows": np.asarray(x, np.float64)}
 

@@ -38,6 +38,7 @@ from reference_error import assert_as_exact
 from dew.data.dataset import Loader
 from dew.inference.banks import CheckpointBanks, HeldBanks
 from dew.nn.backbones.decoder_stack import StackView
+from dew.nn.kv_cache import row_axis
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.sampling.text import Sampling, generate
@@ -216,9 +217,11 @@ def test_a_host_resident_bank_decodes_through_the_cache_it_allocates(shape):
     continuation as the resident banks, out of a cache the fetched run
     allocated and wrote itself.
 
-    The cache comes back out per layer with the batch on its first axis,
-    which is what a caller between two steps holds and what the banking must
-    not change.
+    The cache comes back out as the store holds the stack, each run's
+    layers one bank under the run's name and a run of one per layer, the
+    batch after a bank's layers and first elsewhere (`row_axis`): what a
+    caller between two steps holds, which the next step reads and writes
+    where it lies.
     """
     _, scanned, variables, tokens = pair(**SHAPES[shape])
     resident, on_host = stores(scanned, variables)
@@ -229,10 +232,9 @@ def test_a_host_resident_bank_decodes_through_the_cache_it_allocates(shape):
         np.asarray(generate(scanned, resident, tokens, 4, key=0, sampling=greedy).tokens))
 
     cache = scanned.apply(on_host, 2, method="init_cache", mutable=["cache"])[1]["cache"]
-    depth = SHAPES[shape]["num_layers"]
-    assert sorted(cache) == sorted(f"layers_{index}" for index in range(depth))
+    assert sorted(cache) == sorted(name for name in on_host["params"] if name.startswith("layers_"))
     assert memory_kinds(cache) == {"device"}
-    assert {leaf.shape[0] for leaf in jax.tree.leaves(cache)} == {2}
+    assert {leaf.shape[row_axis(path)] for path, leaf in jax.tree_util.tree_leaves_with_path(cache)} == {2}
 
 
 def test_a_layout_offloads_only_the_layers_it_names():
@@ -337,6 +339,47 @@ def test_a_pool_reads_its_own_shards_of_a_host_resident_bank(tmp_path):
         # parameter axes.
         assert all(value["spec"].startswith("P(None") for value in banks.values())
         assert any(value["shard"] != value["shape"] for value in banks.values())
+
+
+def test_a_banked_store_packed_for_serving_or_adapted_exports_as_its_layers_do(tmp_path):
+    """A scanned decoder's banked store (`HeldBanks.place`) exports as the plain decoder's per-layer tree
+    does, tensor for tensor: packed for serving (`inference_projections`, its q, k and v one kernel a bank's
+    row splits back as it is written, `StoredRow.split`), and under a LoRA adapter the export merges into
+    its kernels as it writes them (`Adapter.merge` over a bank's rows, `Deferred`, ledger 4103)."""
+    from safetensors.numpy import load_file
+
+    from dew.batch import thaw
+    from dew.inference.projections import inference_projections
+    from dew.interop.pretrained import PretrainedDecoder
+    from dew.lora import LoRA
+
+    plain, scanned, variables, _ = pair(num_layers=3)
+    banked = HeldBanks(variables).place(scanned, layout=DEVICE)
+
+    def written(model, tree, name):
+        PretrainedDecoder.from_model(model, tree).save(tmp_path / name)
+        return load_file(tmp_path / name / "model.safetensors")
+
+    expected = written(plain, variables, "plain")
+    packed = written(scanned, inference_projections(scanned, banked), "packed")
+    assert packed.keys() == expected.keys()
+    for key, tensor in expected.items():
+        np.testing.assert_array_equal(packed[key], tensor, err_msg=key)
+    # Factors drawn whole, so each merge moves its kernel (a fresh adapter's B is zero), the base and the
+    # factors one collection, as the bank holds them.
+    spec = LoRA(rank=2, modules=("q_proj", "v_proj"))
+    lone = PretrainedDecoder.from_model(plain, variables).adapt(spec, key=1)
+    stacked = PretrainedDecoder.from_model(scanned, variables).adapt(spec, key=1)
+    rng = np.random.default_rng(4103)
+    tuned = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jnp.asarray(rng.normal(size=leaf.shape) / 4, leaf.dtype)
+        if str(getattr(path[-1], "key", "")) == "lora_B" else leaf, thaw(lone.variables))
+    lone.save(tmp_path / "lone", variables=tuned)
+    stacked.save(tmp_path / "adapted", variables=HeldBanks(tuned).place(stacked.model, layout=DEVICE))
+    merged, adapted = (load_file(tmp_path / name / "model.safetensors") for name in ("lone", "adapted"))
+    assert adapted.keys() == merged.keys()
+    for key, tensor in merged.items():
+        np.testing.assert_array_equal(adapted[key], tensor, err_msg=key)
 
 
 @pytest.mark.parametrize("kind", ["root", "multimodal"])

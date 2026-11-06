@@ -28,15 +28,15 @@ import numpy as np
 from jax.core import ShapedArray
 
 from dew import algebra
+from dew._devices import xla_flag
 from dew._records import JSON
 from dew.algebra.terms import parameter_key, parameters_key
 from dew.batch import Batch
 from dew.data.dataset import rows_of
-from dew.devices import xla_flag
 from dew.distributed.placement import placed_bytes
 from dew.mesh import DATA_AXIS, FSDP_AXIS, row_axes
 from dew.nn.kernels.generation import _compute_capability, gpu_target
-from dew.nn.programs import bodies, computed
+from dew.nn.programs import bodies, computed, opaque
 from dew.objectives.base import Objective
 from dew.state import TrainState
 from dew.training.compiled_program import (
@@ -203,8 +203,70 @@ def derived_terms(loss: Callable, params, arguments: Sequence, *, platform: str,
 def simplified(program: jcore.Jaxpr, platform: str, lowering: str | None = None) -> jcore.Jaxpr:
     """`program` as XLA compiles it for `platform`, as JAX lowers it for `lowering` (`compiled`;
     `platform`'s own name where none is given, a GPU's CUDA's), each equation that repeats another one
-    (`deduplicated`) and each sum into a scatter (`folded`) as XLA's simplifiers make them."""
-    return folded(deduplicated(compiled(program, lowering or LOWERED.get(platform, platform))))
+    (`deduplicated`), each sum into a scatter (`folded`) and, on a GPU, each sum a product computes
+    (`biased`) as XLA's simplifiers and its GEMM rewriter make them, the rewriter a GPU's alone, in every
+    program it runs, a loop's body among them, as XLA's passes run over every computation (`throughout`)."""
+    gemm = biased if platform == "gpu" else (lambda each: each)
+    return throughout(lambda each: gemm(folded(deduplicated(each))),
+                      compiled(program, lowering or LOWERED.get(platform, platform)))
+
+
+def throughout(rewrite: Callable[[jcore.Jaxpr], jcore.Jaxpr], program: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`program` rewritten by `rewrite`, and so each program its equations run (a loop's body, a
+    conditional's branches), each rewritten once however many equations run it."""
+    made: dict[int, tuple[jcore.Jaxpr, jcore.Jaxpr]] = {}
+
+    def within(value):
+        if isinstance(value, jcore.Jaxpr):
+            if (held := made.get(id(value))) is not None and held[0] is value:
+                return held[1]
+            # A native kernel's program is no computation XLA's passes run over (`opaque`).
+            inner = rewrite(value.replace(eqns=[equation if opaque(equation) else equation.replace(params={
+                key: within(param) for key, param in equation.params.items()}) for equation in value.eqns]))
+            made[id(value)] = (value, inner)
+            return inner
+        if type(value) in (tuple, list):
+            return type(value)(within(each) for each in value)
+        return value
+
+    return within(program)
+
+
+def biased(program: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`program` with each sum of a cuBLAS product (`cublas_product`) read by that sum alone and a value of
+    its type the product's own: a product of three operands, the sum's addend its third, run where the
+    sum ran, as XLA's GEMM rewriter folds the sum into the GEMM, its bias (`FuseMatrixBiasAdd`,
+    xla/backends/gpu/transforms/gemm_rewriter.cc: a GEMM of one user, its beta 1), which writes in the
+    bias's buffer where nothing else reads it (`in_place`). A tiled head's weight gradient adds each
+    tile's product to its loop's carry: Qwen3.5-4B's step under 'full' at two microbatches was derived
+    holding each tile's 2.37 GiB product beside the carry, which XLA's GEMM writes in (row 4089)."""
+    producers = {out: equation for equation in program.eqns for out in equation.outvars}
+    readers = collections.Counter(value for equation in program.eqns for value in equation.invars
+                                  if isinstance(value, jcore.Var))
+    readers.update(value for value in program.outvars if isinstance(value, jcore.Var))
+    dropped: set[int] = set()
+    replaced: dict[int, jcore.JaxprEqn] = {}
+    for equation in program.eqns:
+        if equation.primitive.name not in ("add", "add_any") or len(equation.invars) != 2:
+            continue
+        out = equation.outvars[0]
+        first, second = equation.invars
+        for made, addend in ((first, second), (second, first)):
+            if not isinstance(made, jcore.Var) or not isinstance(addend, jcore.Var):
+                continue
+            product = producers.get(made)
+            if (product is None or not cublas_product(product) or len(product.invars) != 2
+                    or readers[made] != 1 or made.aval != out.aval or addend.aval != out.aval
+                    or not isinstance(out.aval, ShapedArray) or np.issubdtype(out.aval.dtype, np.integer)
+                    or id(product) in dropped):
+                continue
+            dropped.add(id(product))
+            replaced[id(equation)] = product.replace(invars=[*product.invars, addend], outvars=[out])
+            break
+    if not replaced:
+        return program
+    return program.replace(eqns=[replaced.get(id(equation), equation) for equation in program.eqns
+                                 if id(equation) not in dropped])
 
 
 def folded(program: jcore.Jaxpr) -> jcore.Jaxpr:
@@ -251,10 +313,14 @@ def folded(program: jcore.Jaxpr) -> jcore.Jaxpr:
 
 
 def zero(value: jcore.Var | jcore.Literal, producers: Mapping) -> bool:
-    """Whether `value` is a zero: a literal zero, or one broadcast."""
+    """Whether `value` is a zero: a literal zero, or one broadcast, cast or laid out otherwise (`bitcast`):
+    a scanned head's zero carry, which its loop of one turn, run inline (`compiled_program.once`), reads
+    unstacked."""
     producer = producers.get(value) if isinstance(value, jcore.Var) else None
-    if producer is not None and producer.primitive.name == "broadcast_in_dim":
+    while producer is not None and producer.invars and (
+            producer.primitive.name in ("broadcast_in_dim", "convert_element_type") or bitcast(producer)):
         value = producer.invars[0]
+        producer = producers.get(value) if isinstance(value, jcore.Var) else None
     return isinstance(value, jcore.Literal) and not np.any(np.asarray(value.val))
 
 
@@ -500,19 +566,23 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
         made = [out for out in equation.outvars
                 if out in last and frontier.buffered(out) and out not in carried]
         made_bytes = sum(map(device_share, made))
-        # A scatter writes its result in the buffer of the base it reads last (`in_place`).
+        # A scatter or a product with a bias writes its result in a buffer it reads last (`in_place`).
         taken = in_place(frontier, equation, held, last, index)
         if made or not frontier.fusing(equation):
             inner = max((peak_bytes(body, platform, workspace, Slicing.entering(equation, body),
                                     returned_carry(equation, body)) for body in bodies(equation)), default=0)
-            operands = sum(map(device_share, unfused(frontier, equation)))
+            made_for = unfused(frontier, equation)
+            operands = sum(map(device_share, made_for))
             products = 0 if not cublas_product(equation) else (
                 workspace.sliced if sliced.fused(equation) else workspace.each)
             # A loop's results (its stacked outputs, its carry) are held beside each turn's own; a call's
             # results are what its body returns.
             running = (looped(frontier, last, index, equation, made, carried) + inner
                        if equation.primitive.name in LOOPS else max(inner, made_bytes) - taken)
-            most = max(most, live + running + operands + products)
+            # The fusions that make its operands run before it, each buffer they alone read freed with them
+            # (`freed`): the most is theirs, or its own past them.
+            freed = sum(map(device_share, dying(frontier, equation, made_for, held, last, index)))
+            most = max(most, live + operands, live - freed + running + operands + products)
         held.update(made)
         live += made_bytes
         for done in [value for value in held if last[value] == index]:
@@ -541,24 +611,52 @@ def unfused(frontier: Frontier, equation: jcore.JaxprEqn) -> set[jcore.Var]:
     return {value for value in equation.invars if computed(value) and frontier.made_for(value)}
 
 
+def dying(frontier: Frontier, equation: jcore.JaxprEqn, made_for: set[jcore.Var], held: set, last: Mapping,
+          index: int) -> set[jcore.Var]:
+    """The buffers the program holds (`held`) that the fusions making `equation`'s operands (`made_for`,
+    `unfused`) read last, the equation, the program's `index`th, reading none of them itself: each such
+    fusion is a kernel of its own XLA runs before the equation, past which a buffer no other instruction
+    reads is freed (its live range ending at its last use, `HloLiveRange`,
+    xla/hlo/utils/hlo_live_range.cc). A head's weight-gradient product reads the logits' cotangent, which
+    XLA computes from the logits a recomputed head holds behind its barrier and frees them: Qwen3.5-4B's
+    step at four microbatches was derived holding both, 0.95 GiB over XLA's 7.42 (row 4089)."""
+    if not made_for:
+        return set()
+    direct = frontier.reading([value for value in equation.invars
+                               if computed(value) and value not in made_for])
+    return {buffer for buffer in frontier.reading(made_for)
+            if buffer in held and last.get(buffer) == index and buffer not in direct}
+
+
 def in_place(frontier: Frontier, equation: jcore.JaxprEqn, held: set, last: Mapping, index: int) -> int:
-    """The bytes of the buffer the scatter `equation`, the program's `index`th, writes its result in: its
-    base's, the one buffer the program holds (`held`) that the base is or views (`Frontier.reading`), where
-    it reads that buffer last, its indices and updates read none of it, and it is its result's size, as
-    XLA shares a scatter's first operand's
-    buffer with its result (`HloDataflowAnalysis::CanShareOperandBufferWithUser`,
-    xla/hlo/analysis/hlo_dataflow_analysis.cc); none for any other equation."""
-    if not equation.primitive.name.startswith("scatter") or not equation.invars:
+    """The bytes of the buffer `equation`, the program's `index`th, writes its result in: a scatter's
+    base's, or a product's bias's (`biased`), the one buffer the program holds (`held`) that it is or views
+    (`Frontier.reading`), where the equation reads that buffer last, its other operands read none of it,
+    and it is its result's size, as XLA shares a scatter's first operand's buffer with its result
+    (`HloDataflowAnalysis::CanShareOperandBufferWithUser`, xla/hlo/analysis/hlo_dataflow_analysis.cc) and
+    a GEMM's bias's that nothing else reads, before it or after (`FuseMatrixBiasAdd`'s `can_overwrite_bias`,
+    xla/backends/gpu/transforms/gemm_rewriter.cc); none for any other equation."""
+    name = equation.primitive.name
+    if name.startswith("scatter") and equation.invars:
+        at = 0
+    elif name == "dot_general" and len(equation.invars) == 3:
+        at = 2
+    else:
         return 0
-    base = equation.invars[0]
+    base = equation.invars[at]
     if not computed(base) or equation.invars.count(base) != 1 or frontier.made_for(base):
         return 0
     kept = frontier.reading([base])
     if len(kept) != 1:
         return 0
     (buffer,) = kept
-    # Its indices and updates read none of that buffer, which a scatter in place would overwrite under them.
-    if buffer not in held or last.get(buffer) != index or buffer in frontier.reading(equation.invars[1:]):
+    # Its other operands read none of that buffer, which writing it in place would overwrite under them.
+    others = [value for number, value in enumerate(equation.invars) if number != at]
+    if buffer not in held or last.get(buffer) != index or buffer in frontier.reading(others):
+        return 0
+    # A GEMM writes in its bias only where the product is the bias's one reader (`can_overwrite_bias`),
+    # whatever read it before.
+    if at == 2 and {frontier.readers[base], frontier.readers[buffer]} != {1}:
         return 0
     if device_share(buffer) != device_share(equation.outvars[0]):
         return 0

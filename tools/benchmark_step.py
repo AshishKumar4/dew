@@ -69,10 +69,10 @@ import jax
 import numpy as np
 import tyro
 
-from dew.files import write_atomically
+from dew._files import write_atomically
 from dew.nn.attention import AttentionImpl
 from dew.nn.flops import MissingFlopsCount
-from dew.pool import joins_pool, pool_cluster
+from dew._pool import joins_pool, pool_cluster
 from dew.registry import models
 from dew.telemetry.benchmark import carried
 from dew.telemetry.profile import Profiler
@@ -195,7 +195,7 @@ class BenchmarkConfig:
     alone. This is the packed loader's batch, which reroutes attention off the
     fused kernel."""
     profile_dir: str | None = None
-    """Trace `profile_steps` more steps into this directory with jax.profiler
+    """Trace `profile_steps` more steps under this directory with `dew.Profiler`
     after the timed windows, and read the device timeline back into the row:
     the fraction of the window the device was busy, kernels per step and
     kernel milliseconds per step by category. The trace itself stays on disk

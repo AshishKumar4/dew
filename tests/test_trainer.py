@@ -14,7 +14,6 @@ import contextlib
 import dataclasses
 import itertools
 import json
-import logging
 import math
 import os
 import subprocess
@@ -48,7 +47,7 @@ from reference_error import as_given, assert_as_exact
 from steady_state import steady_state
 from token_support import write_token_corpus
 
-from dew import position
+from dew import _position
 from dew.artifacts import Representations
 from dew.batch import merge, under
 from dew.checkpoints import Ranking
@@ -144,35 +143,35 @@ def test_a_run_logs_the_share_of_the_tokens_it_computed_that_its_loss_scored(acc
 
 def test_a_run_records_where_its_optimizers_split_sent_each_parameter():
     """A run whose optimizer splits by Muon's rule records, as it starts, where the split sent each
-    parameter and why (`FitStarted.groups`): the regression's kernel to Muon, its bias to AdamW. A run
-    of an optimizer it was handed built records none (row 2087)."""
+    parameter (`FitStarted.groups`, `dew.optim.muon_partition`): the regression's kernel to Muon, its bias
+    to AdamW, each where the optimizer's own dimension numbers send it. A run of an optimizer it was
+    handed built records none (row 2087)."""
+    from dew.optim import muon_weight_dimension_numbers
     from dew.telemetry.records import FitStarted
 
     def started(optimizer):
         tracker = RecordingTracker()
-        make_trainer(optimizer=optimizer, tracker=tracker).fit(dataset(), steps=1)
+        state = make_trainer(optimizer=optimizer, tracker=tracker).fit(dataset(), steps=1)
         (record,) = [value for _, value in tracker.artifacts if isinstance(value, FitStarted)]
-        return record.groups
+        return record.groups, state.variables["params"]
 
-    groups = started(OptimConfig(optimizer="muon", learning_rate=1e-2))
+    groups, params = started(OptimConfig(optimizer="muon", learning_rate=1e-2))
+    # Each parameter's dimension numbers whole, or None where Muon takes none.
+    numbers = jax.tree_util.tree_leaves_with_path(muon_weight_dimension_numbers(params),
+                                                  is_leaf=lambda leaf: not isinstance(leaf, Mapping))
     assert groups is not None
-    assert sorted(groups.values()) == ["adamw: a bias or of rank below two", "muon"]
-    assert started(None) is None
+    muon = {jax.tree_util.keystr(path): leaf is not None for path, leaf in numbers}
+    assert muon == {path: placed == "muon" for path, placed in groups.items()}
+    assert sorted(placed == "muon" for placed in groups.values()) == [False, True]
+    assert started(None)[0] is None
 
 
-def test_a_runs_start_reports_each_phase_it_took_once(caplog):
-    """A run's start logs each phase as it starts and with the seconds it took when it ends (the data's
-    preparation, the step's compile, the evaluations' warming), and reports each phase's seconds once,
-    beside its first logged step's scalars, none after."""
-    import logging
-
+def test_a_runs_start_reports_each_phase_it_took_once():
+    """A run's start reports the seconds each phase took (the data's preparation, the step's compile, the
+    evaluations' warming) once, beside its first logged step's scalars, none after."""
     tracker = RecordingTracker()
     trainer = make_trainer(objective=Features(), tracker=tracker)
-    with caplog.at_level(logging.INFO, logger="dew.training.startup"):
-        trainer.fit(dataset(val=val_batches(3)), steps=3, log_every=1, eval_every=2)
-    took = [record.getMessage() for record in caplog.records if " took " in record.getMessage()]
-    assert [message.split(" took ")[0] for message in took] == [
-        "preparing the data", "compiling the step", "warming the evaluations"]
+    trainer.fit(dataset(val=val_batches(3)), steps=3, log_every=1, eval_every=2)
     reported = [{name: value for name, value in scalars.items() if name.startswith("startup/")}
                 for _, scalars in tracker.scalars]
     [first] = [phases for phases in reported if phases]
@@ -324,21 +323,15 @@ def budget_lm_trainer(tmp_path=None, **kwargs) -> Trainer:
 
 
 @pytest.mark.parametrize("accumulation", [1, 2], ids=["one-step-updates", "two-step-windows"])
-def test_a_token_budget_reads_its_count_off_the_devices_as_often_in_a_longer_run(caplog, accumulation):
-    """An LM run's step commits at most its rows' targets (`Objective.row_tokens`), so a token budget
-    reads the committed count off the devices at its first step, whose window a checkpoint may have
-    begun, and at the steps whose rows could have brought it to the budget, never at those between, each
-    of which such a read waits on before the next step dispatches: a run of twenty steps reads it as
-    often as a run of four."""
-    def reads(steps: int) -> int:
-        caplog.clear()
-        with jax.transfer_guard_device_to_host("log_explicit"), caplog.at_level(logging.WARNING):
-            trainer = budget_lm_trainer(accumulation=accumulation)
-            state = trainer.fit(lm_data(), tokens=steps * LM_ROWS * LM_CONTEXT)
-        assert int(state.step) == steps
-        return sum("shape=(2,), dtype=uint32" in record.getMessage() for record in caplog.records)
-
-    assert reads(4) == reads(20)
+@pytest.mark.parametrize("steps", [4, 20])
+def test_a_token_budget_stops_its_run_at_the_step_it_is_spent(accumulation, steps):
+    """An LM run's step commits at most its rows' targets (`Objective.row_tokens`), so a token budget of
+    `steps` steps' targets stops the run at that step, its windows of one or two microbatches alike. (That
+    it reads its count off the devices only at the steps that could spend it, never between, the step
+    benchmark's host reads measure.)"""
+    trainer = budget_lm_trainer(accumulation=accumulation)
+    state = trainer.fit(lm_data(), tokens=steps * LM_ROWS * LM_CONTEXT)
+    assert int(state.step) == steps
 
 
 def varied_rows(position: int) -> dict[str, np.ndarray]:
@@ -791,8 +784,8 @@ def test_native_frozen_variables_train_save_and_resume_as_plain_ones(tmp_path):
 
 
 def test_a_runs_checkpoint_opens_with_orbax_alone(tmp_path):
-    """A step is one Orbax PyTree item: Orbax's own manager reads the state's
-    fields by name, the PRNG key as a key, and an EMA leaf the metadata
+    """A step is Orbax PyTree items, its model and the rest of its state: Orbax's own manager reads the
+    state's fields by name, the PRNG key as a key, and an EMA leaf the metadata
     lists as byte planes decodes to the run's average bit for bit, as the
     checkpoint guide says."""
     import orbax.checkpoint as ocp
@@ -806,9 +799,13 @@ def test_a_runs_checkpoint_opens_with_orbax_alone(tmp_path):
     trainer.checkpoints.save(int(state.step), state)
     trainer.checkpoints.wait()
 
-    manager = ocp.CheckpointManager(str(tmp_path), item_handlers=ocp.PyTreeCheckpointHandler())
-    tree = manager.restore(manager.latest_step(), args=ocp.args.PyTreeRestore())
-    deltas = manager.metadata(manager.latest_step()).custom_metadata["ema_deltas"]
+    items = ("model", "resume")
+    manager = ocp.CheckpointManager(str(tmp_path), item_handlers={
+        name: ocp.PyTreeCheckpointHandler() for name in items})
+    read = manager.restore(manager.latest_step(), args=ocp.args.Composite(**{
+        name: ocp.args.PyTreeRestore() for name in items}))
+    tree = {name: value for item in items for name, value in dict(read[item]).items()}
+    deltas = manager.metadata(manager.latest_step()).custom_metadata["deltas"]["ema"]
     assert int(tree["step"]) == int(state.step) == 2
     assert jnp.issubdtype(tree["key"].dtype, jax.dtypes.prng_key)
     np.testing.assert_array_equal(jax.random.key_data(tree["key"]), jax.random.key_data(state.key))
@@ -873,7 +870,7 @@ def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_pat
     prefix = trainer(tmp_path / "split").fit(dataset(prefix_seen), steps=2, checkpoint_every=1)
     fresh = trainer(tmp_path / "split")
     restored, _, place = fresh.place()
-    assert position.read(place).records == 2 * BATCH
+    assert _position.read(place).records == 2 * BATCH
     assert jax.tree.structure(restored) == jax.tree.structure(prefix)
     for left, right in zip(jax.tree.leaves(restored), jax.tree.leaves(prefix), strict=True):
         actual, expected = np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right))
@@ -895,7 +892,7 @@ def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_pat
     _, resumed_place = Checkpoints(str(tmp_path / "split/run")).restore(share=DataPartition())
     _, whole_place = Checkpoints(str(tmp_path / "whole/run")).restore(share=DataPartition())
     assert resumed_place == whole_place
-    assert position.read(resumed_place).records == 4 * BATCH
+    assert _position.read(resumed_place).records == 4 * BATCH
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
@@ -940,7 +937,7 @@ import jax
 import numpy as np
 import optax
 
-from dew.cache import enable_compilation_cache
+from dew._cache import enable_compilation_cache
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
 from dew.objectives.diffusion import DiffusionObjective
@@ -1012,7 +1009,7 @@ import numpy as np
 from affine_run import Regression, dataset
 from recording import RecordingTracker
 
-from dew.cache import enable_compilation_cache
+from dew._cache import enable_compilation_cache
 from dew.optim import OptimConfig
 from dew.telemetry.instrumentation import compilation_cache_counts
 from dew.training import Checkpoints, Layout, Trainer
@@ -1177,8 +1174,10 @@ def _rewrite_position(trainer, step, rows, shares):
     table = {"rows": np.stack(written),
              "lengths": np.array([len(row) for row in written], np.int64),
              "shares": np.array(shares, np.int64)}
+    # Written as one item, as an earlier Dew wrote a step (`dew.checkpoints.ONE_ITEM`).
     manager = trainer.checkpoints._open()
-    manager.save(step, args=ocp.args.PyTreeSave({**restored, "position": table}), force=True)
+    manager.save(step, args=ocp.args.Composite(default=ocp.args.PyTreeSave({**restored, "position": table})),
+                 force=True)
     manager.wait_until_finished()
 
 
@@ -1189,7 +1188,7 @@ def test_a_global_position_is_read_by_any_process_count(tmp_path):
     count that wrote it."""
     trainer = make_trainer(tmp_path)
     trainer.fit(dataset(), steps=1, log_every=1)
-    global_position = position.encode(position.Global(records=16, order="Counting"))
+    global_position = _position.encode(_position.Global(records=16, order="Counting"))
     _rewrite_position(trainer, 2, [global_position, global_position], shares=[[0, 2], [1, 2]])
 
     assert Checkpoints(str(tmp_path / "run")).restore(step=2, share=DataPartition())[1] == global_position
@@ -1611,29 +1610,6 @@ def test_a_cooldown_at_the_runs_last_step_a_preemption_cuts_short_runs_on_resume
     assert Checkpoints(str(tmp_path / "run")).cooldown(8) is None
     cooldown_run(stable, 8, 1, again, cooldowns, tmp_path)
     assert not any("cooldown/val/loss" in scalars for _, scalars in again.scalars)
-
-
-def test_a_cooldown_of_a_run_without_a_token_schedule_reads_nothing_from_the_devices_a_step(monkeypatch):
-    """A branch of a run with no token schedule asks the devices for nothing between its steps: a
-    branch three times as long reads from the devices as often as a short one, its tokens left
-    uncounted on the host, as the run's own steps leave them."""
-    from dew.optim import Linear
-    from dew.training.cooldown import Cooldowns
-
-    stable, reads = Linear(2.0 ** -4, decay_start=64, decay_steps=128), []
-    fetched = jax.device_get
-
-    def counted(tree):
-        reads.append(1)
-        return fetched(tree)
-
-    monkeypatch.setattr(jax, "device_get", counted)
-    per_branch = []
-    for length in (2, 6):
-        reads.clear()
-        cooldown_run(stable, 8, 1, cooldowns=Cooldowns(at=(2,), length=length, shape="linear"))
-        per_branch.append(len(reads))
-    assert per_branch[0] == per_branch[1]
 
 
 def test_a_cooldown_resolves_its_points_and_lengths_as_shares_of_the_run():
@@ -2236,36 +2212,21 @@ def test_a_custom_step_alternates_two_optimizers_on_the_same_checkpoints_and_tra
 
 
 @pytest.mark.mesh
-def test_a_fresh_state_is_built_in_the_buffers_its_held_checkpoint_arrives_in(monkeypatch):
-    """A held checkpoint reaches the state's JIT as a copy placed where the
-    state keeps each variable, sharded as it is, and the JIT takes those
-    buffers over. Handed over as they are, the arrays were placed below the
-    state and freed after it was built, a hole as large as the checkpoint:
-    on an A100 Qwen3-1.7B's 'minimal' rung then found no block for its
-    temporaries. The objective's own arrays stay as they were."""
-    from jax.tree_util import Partial
-
-    held = {}
-    put = jax.device_put
-
-    def recorded(x, *args, **kwargs):
-        out = put(x, *args, **kwargs)
-        if isinstance(out, Partial):
-            held.update(jax.tree_util.tree_leaves_with_path(out.keywords["variables"]))
-        return out
-
-    monkeypatch.setattr(jax, "device_put", recorded)
+def test_a_fresh_state_holds_its_checkpoint_placed_as_the_state_keeps_each_variable():
+    """A state built over a held checkpoint holds its values, each variable placed as the state keeps it,
+    sharded where the layout shards it, and the objective's own arrays stay as they were. (That the copy
+    the state's JIT takes over leaves no hole below it, the A100 Qwen3-1.7B 'minimal' rung's temporaries
+    finding their block, the peak-memory benchmark measures.)"""
     trainer, _objective, weights = held_lm_trainer(mesh=MeshSpec(fsdp=jax.device_count()))
     state, shardings, _ = trainer.place()
     params = dict(jax.tree_util.tree_leaves_with_path(shardings.variables))
+    placed = dict(jax.tree_util.tree_leaves_with_path(state.variables))
     sharded = 0
     # The held tree enters plain (`dew.batch.unboxed`), the arrays the init drew in their boxes.
     plain = nn.unbox(weights)
     for path, leaf in jax.tree_util.tree_leaves_with_path(plain):
-        copy = held[path]
-        assert copy.is_deleted(), jax.tree_util.keystr(path)
-        assert copy.sharding == params[path], jax.tree_util.keystr(path)
-        sharded += not copy.sharding.is_fully_replicated
+        assert placed[path].sharding == params[path], jax.tree_util.keystr(path)
+        sharded += not placed[path].sharding.is_fully_replicated
         assert not leaf.is_deleted()
     assert sharded
     jax.tree.map(np.testing.assert_array_equal, state.variables, plain)

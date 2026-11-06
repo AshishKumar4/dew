@@ -1521,6 +1521,7 @@ towers: Aliases[type[TowerBase], TowerBase] = Aliases("tower", {
     "llama4": "dew.nn.vision.llama4:Llama4Vision",
     "mimo": "dew.nn.vision.mimo:MiMoVision",
     "mimo_audio": "dew.nn.mimo_audio:MiMoAudio",
+    "moonvit": "dew.nn.vision.moonvit:MoonViT",
     "muse_glimmer": "dew.nn.vision.muse_glimmer:MuseGlimmerVision",
     "qwen3_5": "dew.nn.vision.qwen35:Qwen35Vision",
     "siglip": "dew.nn.vision.siglip:SiglipVision",
@@ -1533,6 +1534,8 @@ projectors: Aliases[type[ProjectorBase], ProjectorBase] = Aliases("projector", {
     "lfm3_vl": "dew.nn.vision.lfm3:Lfm3VlProjector",
     "llama4": "dew.nn.vision.llama4:Llama4Projector",
     "mimo": "dew.nn.vision.mimo:MiMoProjector",
+    "moonvit": "dew.nn.vision.moonvit:MoonViTProjector",
+    "moonvit_v2": "dew.nn.vision.moonvit:MoonViTProjectorV2",
     "muse_glimmer": "dew.nn.vision.muse_glimmer:MuseGlimmerProjector",
     "qwen3_5": "dew.nn.vision.qwen35:Qwen35Projector",
 }, base="dew.nn.vision.common:ProjectorBase")
@@ -1550,7 +1553,7 @@ schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {
 runs: Aliases[type[RunConfig], RunConfig] = Aliases("run", {
     "decision": "dew.decision.config:DecisionRunConfig",
     "diffusion": "dew.config.diffusion:DiffusionRunConfig",
-    "env": "dew.objectives.rl.config:EnvRunConfig",
+    "env": "dew.config.env:EnvRunConfig",
     "jepa": "dew.config.jepa:JepaRunConfig",
     "lm": "dew.config.lm:LMRunConfig",
     "world_model": "dew.config.world_model:WorldModelRunConfig",
@@ -1565,12 +1568,12 @@ envs: Aliases[type | Callable[..., Configured], Any] = Aliases("env", {
     "playground": "dew.rl.playground:Playground.load",
     "skydreamer": "dew.rl.skydreamer:SkyDreamerRace",
 }, base="dew.rl.env:Env")
-"""The environments an environment run names (`dew.objectives.rl.config.EnvConfig`): a JAX `Env` class, a
+"""The environments an environment run names (`dew.config.env.EnvConfig`): a JAX `Env` class, a
 host `Simulator` class, or a function or classmethod that returns one; any other by its import path."""
 rollouts: Aliases[type[DreamerRollout] | type[ControlRollout], DreamerRollout | ControlRollout] = Aliases(
     "rollout", {"control": "dew.objectives.rl.control:ControlRollout",
                 "dreamer": "dew.objectives.rl.dreamer:DreamerRollout"})
-"""The rollouts an environment run collects its batches with (`dew.objectives.rl.config.RolloutConfig`)."""
+"""The rollouts an environment run collects its batches with (`dew.config.env.RolloutConfig`)."""
 
 
 KINDS: tuple[Aliases, ...] = (models, presets, solvers, encoders, metrics, objectives, mixers, towers,

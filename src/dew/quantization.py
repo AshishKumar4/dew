@@ -10,7 +10,7 @@ usual, then wraps it before the objective ever sees it. A direct
 public rule query (`qwix.pallas.get_current_rule`) and leave a matched
 product to Qwix. Quantize a model once, through either path. A direct
 call's traces are not keyed apart from the plain model's as
-`Quantization.apply`'s are (`dew.cache.QUANTIZED_TRACE`), so a jitted helper
+`Quantization.apply`'s are (`dew._cache.QUANTIZED_TRACE`), so a jitted helper
 the two share needs Qwix's `disable_jit=True`. A run that sets
 `--trainer.quantization` passes the objective to `RunConfig.train` instead,
 and the model the objective holds is wrapped there, before anything
@@ -71,10 +71,10 @@ from flax import core, linen as nn
 from flax.core import meta
 from flax.traverse_util import flatten_dict, unflatten_dict
 
+from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Coordinates, unboxed
-from dew.cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.nn.dense import _contractions, _linear_site
-from dew.nn.derivatives import surrogate
+from dew.nn.derivatives import contracted, surrogate
 from dew.nn.kernels.generation import backend, linear_map
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import accumulated, at_least_fp32, correctly_rounded_divide
@@ -618,7 +618,8 @@ def _frozen_fp8_tangent(primals, tangents, value):
     return linear_map(tangent, transposed, residuals, tangents[0])
 
 
-frozen_fp8_product = surrogate(_frozen_fp8_value, _frozen_fp8_tangent)
+frozen_fp8_product = contracted("test_a_frozen_fp8_product_holds_every_order")(
+    surrogate(_frozen_fp8_value, _frozen_fp8_tangent))
 """`x @ kernel` in float32, `[M, in]` by a frozen kernel packed as `frozen_fp8_leaves`: FP8 products
 forward and for `x`'s gradient, and no gradient for the kernel, which is frozen. A surrogate
 (`dew.nn.derivatives.surrogate`): forward mode (`jax.jvp`, MeanFlow's target) takes the input's tangent
@@ -1008,13 +1009,13 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
     are settled (`dew.nn.kernels.tuning`): the sites decide which kernels a
     rank's train state holds packed, so ranks timing their own would build
     different states. A process beside other work on its GPU measures
-    unfairly (`dew.cache.measures_picks`) and is refused, where a recorded
+    unfairly (`dew._cache.measures_picks`) and is refused, where a recorded
     `InputQuantization` reproduces the choice instead. Every rank looks the
     sites up in its own tree first, and the pool agrees on what they found,
     so a rank whose tree lacks one is refused with its peers rather than
     leaving them at the measurement's agreement.
     """
-    from dew import _coordination, cache
+    from dew import _cache, _coordination
     from dew.nn.kernels.generation import device_generation, fp8_tensor_cores
 
     variables = unboxed(variables)
@@ -1032,7 +1033,7 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
         generation = device_generation()
         if not fp8_tensor_cores(generation):
             raise ValueError(f"{generation} has no FP8 tensor cores to run a frozen base in FP8 on")
-        if not cache.measures_picks():
+        if not _cache.measures_picks():
             raise ValueError("frozen FP8 sites are measured on a GPU the process holds alone, and this "
                              "one shares its GPU (AUTOTUNE_CACHE_MODE_READ, as gpu-run -n 0.5 sets): "
                              "measure on a whole GPU, or pass the InputQuantization a run recorded")
@@ -1294,7 +1295,8 @@ def _grouped_convolution_gradient() -> type:
     # The integer convolution, differentiated as the float one at its dequantized operands: a surrogate,
     # whose value carries the quantized operands so the forward quantizes once (a static-scale
     # activation's running statistics update once a step).
-    quantized_training = surrogate(_qt_forward, straight_through, nondiff_argnums=tuple(range(2, 11)))
+    quantized_training = contracted("test_a_quantized_convolution_holds_every_order_it_takes")(
+        surrogate(_qt_forward, straight_through, nondiff_argnums=tuple(range(2, 11))))
 
     class GroupedConvolutionGradient(qwix.QtProvider):
         """Differentiates a quantized grouped convolution, which Qwix's

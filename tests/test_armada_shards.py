@@ -259,7 +259,7 @@ def test_sites_past_one_judges_jobs_inputs_together_are_planned_and_one_past_it_
         return f"import pytest\n\n@pytest.mark.{mark}\ndef test_site():\n    pass\n"
 
     # Two sites a Python, each within one job's inputs and past them together on every Python.
-    seeds = ci.MAX_INPUTS // (2 * (1 + ci.REDRAW))
+    seeds = ci.MAX_INPUTS // (2 * ci.check1_wire().staged_units(1))
     units = ci.MAX_INPUTS - 1
     written(tmp_path, {"test_a.py": marked(f"check1_shards(seeds={seeds}, per_task=1)"),
                        "test_b.py": marked(f"shards(units={units}, per_task=1)")})
@@ -299,10 +299,6 @@ def test_a_judge_judges_its_map_tasks_pooled_draws_from_its_inputs_and_refuses_a
     and a judge that pools whatever its inputs hold (ARMADA_INPUTS) and passes, the site's row green; the
     file's own row runs the rest of the file alone. A judge whose inputs miss a map task's seeds is refused
     (the gate's PoolRefused), never judged."""
-    from check1_statistics import REDRAW
-    from map_judge import DRAWS, POOL, RECORDS
-
-    assert (ci.DRAWS, ci.RECORDS, ci.POOL, ci.REDRAW) == (DRAWS, RECORDS, POOL, REDRAW)
     out = site_checkout(tmp_path, f"""import sys
 from pathlib import Path
 
@@ -544,6 +540,27 @@ def test_a_judge_green_on_its_first_stage_is_kept_though_its_later_map_tasks_nev
     ran = replanned_once_its_draws_change(ci, tmp_path)
     [again] = [entry for entry in ran if "after" in entry]
     assert len(again["after"]) == 3 and len(ran) == 4
+
+
+def test_a_trains_fold_keeps_the_whole_suite_cells_its_batch_set_aside(ci, tmp_path):
+    """A train's batch sets its files' whole_suite cells aside (collected, not run: train CI never runs
+    them), and its fold keeps their recorded times while it takes the times of the tests it ran: only the
+    whole suite's run times a cell, and the next whole run plans it by them (row 4377: a train's fold
+    dropped a 1108 s cell, which the whole run then packed as 478 s). A whole verdict, which runs the
+    cell, times it."""
+    written(tmp_path, {"test_cells.py": "def test_light():\n    pass\n"})
+    git(tmp_path, "init", "-q")
+    git(tmp_path, "add", "tests")
+    git(tmp_path, "commit", "-qm", "the cells")
+    cell, light = "tests/test_cells.py::test_heavy", "tests/test_cells.py::test_light"
+    record = {light: 1.0, cell: 1108.0}
+    batch = {"sha": git(tmp_path, "rev-parse", "HEAD").strip(), "rows": [
+        {"name": "3.12:tests/test_cells.py", "exitCode": 0, "seconds": 2.0, "whole_suite": [cell],
+         "tests": {light: 1.0, "tests/test_cells.py::test_new": 1.0}}]}
+    assert ci.folded(record, batch, 120.0) == {**record, "tests/test_cells.py::test_new": 1.0}
+    whole = {**batch, "rows": [{**batch["rows"][0], "seconds": 1113.0,
+                                "tests": {light: 1.0, cell: 1110.0, "tests/test_cells.py::test_new": 1.0}}]}
+    assert ci.folded(record, whole, 120.0) == {light: 1.0, cell: 1110.0, "tests/test_cells.py::test_new": 1.0}
 
 
 def test_a_sites_judge_and_map_tasks_leave_its_files_cut_and_recorded_times_as_they_were(ci, tmp_path):

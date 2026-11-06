@@ -383,7 +383,7 @@ def test_each_files_record_is_its_own_where_files_share_a_process(ci, tmp_path, 
 
 def test_a_release_runs_none_of_the_files_that_digest_dews_source_again(ci, tmp_path, monkeypatch,
                                                                          cache_worker):
-    """`dew.cache.package_digest` names the records Dew's caches look for (the rung cache's, a verified
+    """`dew._cache.package_digest` names the records Dew's caches look for (the rung cache's, a verified
     mapping's, a saved source's export) by every source file of the package, so a file that calls it runs
     again for any edit to Dew, which a cache hit may have hidden from it, but not for a release's version
     (`dew._version`), which no code computes from: train 396 reused 1 of 2,279 rows for its version bump."""
@@ -394,7 +394,7 @@ def test_a_release_runs_none_of_the_files_that_digest_dews_source_again(ci, tmp_
     (package / "_version.py").write_text('__version__ = "0.2.0"\n')
     (package / "spare.py").write_text("def spare():\n    return 1\n")
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
-        "test_digested.py": ON_SRC + "from dew.cache import package_digest\n"
+        "test_digested.py": ON_SRC + "from dew._cache import package_digest\n"
                                      "def test_digested():\n    assert package_digest()\n"}, {})
     assert reused() == [True]
     (package / "_version.py").write_text('__version__ = "0.3.0"\n')

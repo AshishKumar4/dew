@@ -85,7 +85,7 @@ def test_a_conditional_s3_write_is_the_filesystems_own_request():
 @pytest.mark.parametrize("publish", ["write", "put_if_absent"])
 def test_a_local_publication_has_a_plain_writes_mode_and_a_failed_one_leaves_nothing(tmp_path, monkeypatch,
                                                                                        publish):
-    """A local write, plain or conditional, publishes by one rename (dew.files.write_atomically): the file
+    """A local write, plain or conditional, publishes by one rename (dew._files.write_atomically): the file
     has the mode a plain write gives under the umask, not a temporary file's private one, and a write
     that fails leaves no temporary beside its target."""
     target = tmp_path / "value"
@@ -443,6 +443,20 @@ def test_distinct_transport_misses_download_concurrently_within_the_shared_budge
     with ThreadPoolExecutor(2) as pool:
         assert list(pool.map(read, paths)) == [path.encode() for path in paths]
     assert cache.metrics()["downloaded_bytes"] == sum(len(path) for path in paths)
+    # A run's data metrics report its process's mirrors beside its corpora's (row 4299).
+    from dew.data import Loading, Memory
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+    from dew.data.pipeline import Pipeline
+
+    loader = compile(Pipeline(Memory([{"id": 0}])).repeat(1).batch(1), read="indexed",
+                     loading=Loading(workers=0, threads=1, read_buffer=1))
+    reader = loader.train(DataPartition())
+    try:
+        list(reader)
+    finally:
+        reader.close()
+    assert loader.statistics()["data/mirror/downloaded_bytes"] >= sum(len(path) for path in paths)
 
 
 def test_url_chain_reads_and_writes_memory(tmp_path):
@@ -594,3 +608,116 @@ def test_an_open_files_size_and_digest_are_its_bytes_whatever_store_opened_it(op
     fsspec.filesystem("memory" if opened == "memory" else "file").pipe_file(path, payload)
     with fsspec.open(path, "rb") as handle:
         assert object_info(handle) == object_info(payload)
+
+
+class _Observed:
+    """Each process's mirror counters as it last read a row, written to `directory` by its process id: a
+    loading worker's, which the reading process cannot see itself."""
+
+    def __init__(self, directory):
+        self.directory = str(directory)
+
+    def __call__(self, row):
+        from dew.data.storage import mirror_metrics
+
+        Path(self.directory, f"{os.getpid()}.json").write_text(json.dumps(mirror_metrics()))
+        return row
+
+
+COUNTED = ("data/mirror/hits", "data/mirror/misses", "data/mirror/downloaded_bytes")
+"""The mirror counters a run's statistics hold to the processes' own, each counted exactly."""
+
+
+def _mirrored_store(tmp_path):
+    """Forty records in twenty ArrayRecord shards, read through a fresh Dew mirror, each row's process's
+    counters observed (`_Observed`) in `tmp_path / "observed"`."""
+    import numpy as np
+
+    from dew.data import Memory
+    from dew.data.pipeline import Pipeline
+    from dew.data.sinks import export
+
+    root = tmp_path / "records"
+    export(Memory([{"id": np.int64(index)} for index in range(40)]), str(root), format="array_record",
+           rows_per_shard=2)
+    # An ArrayRecord shard's physical size is far past its two small records: room for every reader's pin.
+    source = Files(f"dewcache::file://{root}", storage_options={
+        "dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": 64 << 20}})
+    return Pipeline(source).map(_Observed(tmp_path / "observed"))
+
+
+def _workers_counters(observed) -> dict[str, float]:
+    """The mirror counters every loading worker last observed, summed over the workers."""
+    summed = dict.fromkeys(COUNTED, 0.0)
+    for path in observed.glob("*.json"):
+        if path.stem != str(os.getpid()):
+            for name in COUNTED:
+                summed[name] += json.loads(path.read_text()).get(name, 0.0)
+    return summed
+
+
+@pytest.mark.parametrize("elastic", [False, True])
+@pytest.mark.parametrize("read", ["streamed", "indexed"])
+@pytest.mark.parametrize("workers", [2, "auto"])
+def test_a_runs_mirror_metrics_count_its_loading_workers_reads(tmp_path, workers, read, elastic):
+    """A store read through Dew's mirror by loading workers, per share or elastically: each worker opens its
+    shards through its own process's mirror, and the run's statistics count each of those opens and their
+    bytes beside the reading process's own (row 4339), each worker's counters carried by the position it
+    hands the reader."""
+    from dew.data import Loading
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+    from dew.data.storage import mirror_metrics
+
+    (tmp_path / "observed").mkdir()
+    chain = _mirrored_store(tmp_path).repeat(1).batch(1)
+    loader = compile(chain.elastic() if elastic else chain, read=read,
+                     loading=Loading(workers=workers, max_workers=2, threads=1, read_buffer=1,
+                                     worker_buffer=1, cache=False))
+    reader = loader.train(DataPartition())
+    try:
+        assert len(list(reader)) == 40
+        statistics = dict(loader.statistics())
+    finally:
+        reader.close()
+    workers_did = _workers_counters(tmp_path / "observed")
+    assert workers_did["data/mirror/misses"] > 0
+    own = mirror_metrics()
+    assert {name: statistics[name] for name in COUNTED} == {name: own[name] + workers_did[name]
+                                                            for name in COUNTED}
+
+
+def test_a_reader_restored_mid_read_counts_its_own_workers_mirror_reads_alone(tmp_path):
+    """A read restored from a position saved mid-read counts what its own workers' mirrors do, not what
+    the saving read's workers did, which the position carries (row 4339)."""
+    from dew.data import Loading
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+    from dew.data.storage import mirror_metrics
+
+    (tmp_path / "observed").mkdir()
+    chain = _mirrored_store(tmp_path).repeat(1).batch(1)
+    loading = Loading(workers=2, threads=1, read_buffer=1, worker_buffer=1, cache=False)
+    # The observing step names no identity, so the read resumes where it left off without proving it.
+    first = compile(chain, read="streamed", loading=loading, resume="non-exact").train(DataPartition())
+    try:
+        # One row left, which one worker reads: the other is spent, and Grain keeps the position the
+        # restore handed it.
+        for _ in range(39):
+            next(first)
+        saved = first.get_state()
+    finally:
+        first.close()
+    for path in (tmp_path / "observed").glob("*.json"):
+        path.unlink()
+    loader = compile(chain, read="streamed", loading=loading, resume="non-exact")
+    reader = loader.train(DataPartition())
+    try:
+        reader.set_state(saved)
+        assert len(list(reader)) == 1
+        statistics = dict(loader.statistics())
+    finally:
+        reader.close()
+    own, workers_did = mirror_metrics(), _workers_counters(tmp_path / "observed")
+    assert {name: statistics[name] for name in COUNTED} == {name: own[name] + workers_did[name]
+                                                            for name in COUNTED}

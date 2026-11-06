@@ -188,6 +188,35 @@ def test_qwen35_logits_match_the_reference_implementation():
     assert difference < 5e-4, f"max |logit difference| {difference:.3e}"
 
 
+@pytest.mark.parametrize("depth", [0, 1], ids=["trunk", "prediction-layer"])
+def test_a_qwen35_model_written_without_its_source_states_its_hybrid_fields_and_reloads(depth, tmp_path):
+    """A Qwen3.5 model written from the model alone (`PretrainedDecoder.from_model`, a trained or scratch
+    one holding no source config) states its delta net's geometry, its rotary's fraction and its
+    prediction depth, which the generic export writes none of, and writes its delta net's tensors and
+    its prediction layer's under their own names (`mtp.*`); so it reloads to its own variables, logits
+    and prediction logits, bit for bit (ledger 4533). The prediction layer's case is a scratch model of
+    the fixture's geometry with one, drawn whole."""
+    from dew.interop.pretrained import PretrainedDecoder
+
+    loaded = Pretrained.load(FIXTURES / "qwen35-tiny", dtype="float32", attention_impl="reference",
+                             text_only=True)
+    ids = jnp.arange(1, 9, dtype=jnp.int32)[None]
+    model, variables = loaded.model, loaded.variables
+    if depth:
+        model = model.clone(num_nextn_predict_layers=depth)
+        variables = nn.unbox(model.init(jax.random.key(4533), ids))
+    PretrainedDecoder.from_model(model, variables).save(tmp_path / "export")
+    restored = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
+    assert flat_tree(restored.variables).keys() == flat_tree(variables).keys()
+    for path, leaf in flat_tree(variables).items():
+        np.testing.assert_array_equal(np.asarray(flat_tree(restored.variables)[path]), np.asarray(leaf))
+    np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, ids)),
+                                  np.asarray(model.apply(variables, ids)))
+    if depth:
+        np.testing.assert_array_equal(np.asarray(prediction_logits(restored.model, restored.variables, ids)),
+                                      np.asarray(prediction_logits(model, variables, ids)))
+
+
 def test_a_qwen35_checkpoint_decodes_as_it_scores_in_parallel():
     """The loaded weights through the cache: a prefill and single-token steps on par with the parallel
     forward at each step's width from float64 over drawn rows (check 1, ledger 2739)."""

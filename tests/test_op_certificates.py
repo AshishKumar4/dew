@@ -211,25 +211,29 @@ def test_the_exp_enclosure_holds_its_proven_bound():
     assert worst <= oc.EXP_BOUND, float(worst)
 
 
+def _midpoints_near(estimate, fmt: oc.Format) -> np.ndarray:
+    """The midpoint of `fmt`'s grid nearest each of `estimate` (positive, normal in `fmt`)."""
+    spacing = np.ldexp(1.0, np.frexp(estimate)[1] - 1 - (fmt.precision - 1))
+    return (np.floor(estimate / spacing) + 0.5) * spacing
+
+
 @pytest.mark.parametrize("fmt", FORMATS, ids=lambda fmt: fmt.name)
-def test_the_interval_path_decides_what_the_enclosure_leaves(fmt, monkeypatch):
-    """With the enclosures' bound widened to half `fmt`'s precision, most elements are left undecided
-    and mpmath's interval exp and 2^x decide them, as interval arithmetic does on its own."""
+@pytest.mark.parametrize("name", ["exp", "exp2"])
+def test_an_enclosure_that_straddles_a_midpoint_is_decided_by_the_argument_alone(fmt, name):
+    """The oracles' last resort (`_enclosure_rounded`): an element whose enclosure rounds two ways is
+    decided by interval arithmetic of its argument alone, whatever the enclosure held. A synthetic
+    regression of that path: it hands the helper an enclosure centred on the midpoint nearest each
+    argument's value, which rounds two ways, and the result is the argument's own rounding, as interval
+    arithmetic rounds it. Whether any fp32 or bf16 argument reaches the path through `exp_rounded` or
+    `exp2_rounded` at EXP_BOUND is not established here (ledger 4397)."""
     rng = np.random.default_rng(9)
-    sample = oc.exact_cast(rng.uniform(-100.0, 80.0, 200), fmt)
-    sample = sample[sample != np.rint(sample)]
-    exp_expected = _interval_rounded(lambda iv, x: iv.exp(x), sample, fmt)
-    exp2_expected = _interval_rounded(lambda iv, x: iv.exp(x * iv.log(2)), sample, fmt)
-    monkeypatch.setattr(oc, "EXP_BOUND", 2.0 ** -(fmt.precision // 2))
-    opened = []
-    interval_precision = oc.interval_precision
-    monkeypatch.setattr(oc, "interval_precision", lambda precision: opened.append(precision) or
-                        interval_precision(precision))
-    for oracle, expected in ((oc.exp_rounded, exp_expected), (oc.exp2_rounded, exp2_expected)):
-        opened.clear()
-        assert not oc.mismatches(oracle(sample, fmt), expected, fmt).any()
-        # Each undecided element opens one interval context or more.
-        assert len(opened) > len(sample) // 2, (oracle.__name__, len(opened), len(sample))
+    sample = oc.exact_cast(rng.uniform(-80.0, 80.0, 64), fmt)
+    sample = sample[(sample != np.rint(sample)) & (sample != 0)]
+    exact = (lambda iv, x: iv.exp(x)) if name == "exp" else (lambda iv, x: iv.exp(x * iv.log(2)))
+    centre = _midpoints_near(np.exp(sample) if name == "exp" else np.exp2(sample), fmt)
+    inside = np.ones(sample.shape, bool)
+    found = oc._enclosure_rounded(sample, centre, np.zeros_like(centre), inside, ~inside, exact, name, fmt)
+    assert not oc.mismatches(found, _interval_rounded(exact, sample, fmt), fmt).any()
 
 
 def test_the_exp2_enclosure_holds_its_proven_bound():

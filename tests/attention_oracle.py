@@ -12,6 +12,8 @@ import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
+from float64_terms import float64_terms
+from reference_error import assert_as_exact, widened, with_gradients
 
 from dew.nn.attention import scaled_dot_product_attention
 
@@ -65,11 +67,13 @@ def reference(query, key, value, **kwargs):
                            precision=jax.lax.Precision.HIGHEST, **kwargs)
 
 
-def kept(q_len, k_len, *, causal=False, sliding_window=None, window=None, mask=None, segment_ids=None):
+def kept(q_len, k_len, *, causal=False, sliding_window=None, window=None, mask=None, segment_ids=None,
+         key_segment_ids=None):
     """The keys each query keeps, `[B or 1, 1, q, k]`: k <= q; a causal window's
     w most recent, or without causality the keys within w - 1 of the query; the
     `window` `(left, right)` reaches, -1 bounding neither side; the explicit
-    mask; equal segment ids, none for padding."""
+    mask; equal segment ids, none for padding, the keys' own (`key_segment_ids`)
+    where they are packed apart from the queries'."""
     rows, cols = np.arange(q_len)[:, None], np.arange(k_len)[None, :]
     keep = np.ones((1, 1, q_len, k_len), bool)
     if causal:
@@ -87,8 +91,9 @@ def kept(q_len, k_len, *, causal=False, sliding_window=None, window=None, mask=N
         keep = keep & np.asarray(mask, bool)
     if segment_ids is not None:
         ids = np.asarray(segment_ids)
+        keys = ids if key_segment_ids is None else np.asarray(key_segment_ids)
         # Segment 0 is padding, which belongs to no document (`document_mask`).
-        keep = keep & (ids[:, None, :, None] == ids[:, None, None, :]) & (ids[:, None, :, None] != 0)
+        keep = keep & (ids[:, None, :, None] == keys[:, None, None, :]) & (ids[:, None, :, None] != 0)
     return keep
 
 
@@ -229,3 +234,53 @@ def exact_value_and_grads(query, key, value, sinks=None, live=None, softcap=None
                 for x in (query, key, value, sinks)]
         (_, out), grads = jax.value_and_grad(loss, argnums=argnums, has_aux=True)(*wide)
         return [np.asarray(x) for x in (out, *grads)]
+
+
+ATTENTION_SEEDS = 8
+"""A fused kernel's declared check-1 seeds against a reference kernel (`attention_on_par`), sized by
+`seeds_for` paired on the GPU it runs on."""
+
+
+def attention_on_par(fused, reference, draw, label: str, *, keep=None, truth=None, split=tuple,
+                     seeds: int = ATTENTION_SEEDS):
+    """`fused`'s output and its inputs' gradients (`with_gradients`; an attention call of `(query, key,
+    value[, sinks])` and the output's cotangent drawn last), as `split` lays them out (a leaf a document's
+    rows), on par with `reference`'s over `draw`'s inputs (check 1). With `keep`, the keys each query keeps
+    (`kept`), the truth is attention written out over them (`exact_attention`) and every entry is sized by
+    the terms attention's float64 gradients carry through their cancellation (`attention_terms`: a query
+    that keeps one key has a logit gradient of float64 zero, which a fused kernel forms from its rounded
+    output), a sink's gradient by the truth's own terms. Without, `truth` is the truth and each row is sized
+    by its final sums' terms (a call whose keys this file does not lay out, every query keeping many). A
+    packed call's tokens, one run `[T, H, D]`, are read as a batch of one."""
+    def batched(fn):
+        def run(*arrays):
+            if arrays[0].ndim == 4:
+                return fn(*arrays)
+            found = fn(*(None if x is None else x[None] if x.ndim == 3 else x for x in arrays))
+            return [x[0] if x.ndim == 4 else x for x in found]
+        return run
+
+    def program(attend):
+        return lambda *inputs: split(tuple(with_gradients(attend)(*inputs)))
+
+    if keep is None:
+        assert_as_exact(jax.jit(program(fused)), jax.jit(program(reference)), draw, label, seeds=seeds,
+                        truth_fn=program(truth), terms=True)
+        return
+
+    def exact(query, key, value, *sinks):
+        return batched(lambda q, k, v, s: [exact_attention(q, k, v, s, keep=keep)])(
+            query, key, value, *(sinks or (None,)))[0]
+
+    def terms(*inputs):
+        query, key, value, *rest = inputs
+        sinks = rest[0] if len(rest) == 2 else None
+        found = batched(lambda q, k, v, s, dy: attention_terms(q, k, v, dy, keep, sinks=s)[:4])(
+            query, key, value, sinks, rest[-1])
+        if sinks is not None:
+            with jax.enable_x64(new_val=True):
+                found = [*found, float64_terms(with_gradients(exact), *widened(inputs))[1][4]]
+        return split(tuple(found))
+
+    assert_as_exact(jax.jit(program(fused)), jax.jit(program(reference)), draw, label, seeds=seeds,
+                    truth_fn=program(exact), terms=terms)

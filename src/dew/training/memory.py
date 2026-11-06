@@ -21,10 +21,10 @@ from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding
 
 from dew import communicators
+from dew._devices import gpu_free_bytes, xla_flag
 from dew._records import JSON, integer, integers, json_value, listed, record
 from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
-from dew.devices import gpu_free_bytes, xla_flag
 from dew.distributed.placement import parameter_axes
 from dew.mesh import batch_axes, mesh_axes
 from dew.nn.kernels.generation import backend, device_generation, gpu_target

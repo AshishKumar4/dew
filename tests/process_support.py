@@ -3,8 +3,10 @@
 import argparse
 import contextlib
 import http.server
+import itertools
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -29,7 +31,7 @@ READ_ONLY = "--xla_gpu_experimental_autotune_cache_mode=AUTOTUNE_CACHE_MODE_READ
 
 def keeping_picks() -> str:
     """This process's XLA flags without the cuda lane's deterministic-ops flag: a process keeps and
-    measures picks only without it (`dew.cache.keeps_picks`)."""
+    measures picks only without it (`dew._cache.keeps_picks`)."""
     return without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))
 
 
@@ -241,7 +243,7 @@ def assert_exits_cleanly(program: str) -> None:
 
 def dew_train(directory, environment: Mapping[str, str], *arguments: str) -> None:
     """`dew train *arguments` run from `directory` in `environment`, as a user types it; it must succeed."""
-    finished = subprocess.run([sys.executable, "-m", "dew.cli.main", "train", *arguments],
+    finished = subprocess.run([sys.executable, "-m", "dew._cli.main", "train", *arguments],
                               cwd=directory, env=environment, capture_output=True, text=True, timeout=900)
     assert finished.returncode == 0, f"--- stdout ---\n{finished.stdout}\n--- stderr ---\n{finished.stderr}"
 
@@ -253,6 +255,21 @@ def logged_losses(run_directory) -> list[float]:
 
     reports = LocalTracker(Path(run_directory) / "tracking").scalars()
     return [values["train/loss"] for _, values in reports if "train/loss" in values]
+
+
+def raised(done: subprocess.CompletedProcess) -> dict[str, list[str]]:
+    """The errors the processes of `done` ended with, by type, each with its messages: every traceback's
+    closing line (Python's `Type: message` after its frames, a chained error's cause among them), read from
+    stdout and stderr with a rank's `[N] ` prefix (`dew launch`'s) taken off; none where no traceback was
+    printed. A refusal's test reads its error here, where its exit status alone a crash would pass."""
+    lines = [re.sub(r"^\[\d+\] ", "", line) for line in (done.stdout + "\n" + done.stderr).splitlines()]
+    found: dict[str, list[str]] = {}
+    for previous, line in itertools.pairwise(lines):
+        named, _, message = line.partition(": ")
+        # An error's type, a class's name (`ValueError`, `dew.mesh.LayoutRefused`), at the line's start.
+        if previous.startswith("  ") and re.fullmatch(r"(\w+\.)*[A-Z][a-z]\w*", named):
+            found.setdefault(named, []).append(message)
+    return found
 
 
 def running(pid: int) -> bool:

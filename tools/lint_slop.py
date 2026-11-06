@@ -72,6 +72,19 @@ Scope is per rule, because the rules are not all about the same thing:
   launch point's (`nn/kernels/launches.py`), which holds each launch to the
   per-shard boundary (`sharding.per_shard`), so no route launches a kernel over
   operands an automatic mesh axis splits (rows 1897, 1923, 4077).
+- SLOP028 is about `src/<package>`: every custom derivative (`DERIVATIVE_MAKERS`:
+  JAX's custom_jvp and custom_vjp, Dew's declaring functions and linear_tangent)
+  declares at its seam the contract that holds it, `contracted(test)` of
+  `dew.nn.derivatives`, decorating it or wrapping its making call: `test` the
+  name of exactly one test function of tests/test_contracts_*.py
+  (`assert_contract`: every order finite against its float64 truth and an
+  independent plain formula) (row 4411; `lint_derivatives`).
+- SLOP029 is about `tests`: no test's every assertion is that a process
+  failed, read from its exit status alone (a `returncode`, `subprocess.call`
+  or `os.system` unequal to 0, equal to 1, an uncaught error's, or tested for
+  truth),
+  which a crash passes as well as the refusal it is after; it asserts the
+  state the refusal reports or leaves (bible §7's class 7).
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -83,7 +96,8 @@ it), to know which classes are models. It sees what Python spells, not what
 dynamic dispatch reaches; behaviour across models is the capability matrix's
 proof (tests/test_capability_matrix.py).
 SLOP011 and SLOP012 read each name through the imports of its own lexical
-scope (tools/lint_scopes.py).
+scope (tools/lint_scopes.py). SLOP008, SLOP011, SLOP015 and SLOP029, bible
+§7's banned assertions, are tools/lint_assertions.py's.
 SLOP018 reads one module: a function deals with what leaves the process where
 it names such a module (`EXTERNAL`) or calls a function of the module, or a
 method reached from `self`, that does; work handed to a future is another's.
@@ -104,6 +118,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import enum
 import functools
 import hashlib
 import io
@@ -113,11 +128,13 @@ import re
 import subprocess
 import sys
 import tokenize
-from collections.abc import Iterable, Iterator, Mapping, Sequence, Set
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import lint_assertions as assertion_rules
+import lint_derivatives as derivative_rules
 import lint_promotions as promotion_rules
 import lint_scopes as scopes
 import lint_tolerances as tolerance_rules
@@ -169,17 +186,11 @@ WARNING_FILTERS = {"warnings.simplefilter", "warnings.filterwarnings", "warnings
 # that asks one of our own values whether it kept its contract.
 PROBE_ROOTS = {"jax", "jnp", "np", "numpy", "environ", "os", "sys", "flags", "importlib"}
 PROBE_ATTRS = {"sharding", "dtype", "shape", "device", "devices"}
-# The seams a test is allowed to replace, because the real one leaves the process.
-SEAMS = ("subprocess", "socket", "urllib", "request", "http", "download", "hub", "hf_hub",
-         "time", "sleep", "monotonic", "perf_counter", "open", "path", "os.", "environ",
-         "fetch", "client", "urlopen", "snapshot")
 NARROWERS = {"Mapping", "MutableMapping", "dict", "Dict", "Sequence", "list", "tuple", "str",
              "int", "float", "bool", "bytes"}
 # The hooks Python documents as set by assignment.
 INTERPRETER_HOOKS = {"sys.excepthook", "sys.unraisablehook", "sys.displayhook", "sys.breakpointhook",
                      "threading.excepthook"}
-# The calls that hand a test a function's source text.
-SOURCE_READERS = {"inspect.getsource", "inspect.getsourcelines", "inspect.getsourcefile"}
 # What a layer's call is handed by its block, which it may not take and drop.
 CALL_ARGUMENTS = {"decode", "kv_store", "attention_metadata", "call"}
 # Process-wide state a module must not change while it is imported.
@@ -187,15 +198,32 @@ GLOBAL_WRITES = ("config.update", "environ.setdefault", "environ.update", "puten
                  "mark_as_parsed", "register_event_listener", "filterwarnings", "simplefilter")
 
 
+class Ratchet(enum.Enum):
+    """Why SLOP020 holds the tolerance inventory (`ratchet`, `tolerances`), which a finding names beside its
+    message (`Finding.ratchet`)."""
+
+    ADDS = "a commit adds a file's entry"
+    RAISES = "a commit raises a file's count"
+    RENAMED_APART = "a merge keeps one entry under the two names its parents renamed it to"
+    REMOVES = "a commit removes the inventory"
+    SHALLOW = "the checkout's history is shallow"
+    UNREADABLE = "git cannot read the checkout's history"
+    STALE = "a file holds fewer comparisons than its entry counts"
+
+
 @dataclass(frozen=True)
 class Finding:
-    """One finding, printed as `path:line:col: SLOPxxx message`."""
+    """One finding, printed as `path:line:col: SLOPxxx message`; a ratchet's also names why (`ratchet`),
+    the commit it holds (`commit`, `HEAD` against its base) and the file whose entry it holds (`file`)."""
 
     path: str
     line: int
     col: int
     code: str
     message: str
+    ratchet: Ratchet | None = None
+    commit: str = ""
+    file: str = ""
 
     def __str__(self) -> str:
         return f"{self.path}:{self.line}:{self.col}: {self.code} {self.message}"
@@ -220,22 +248,12 @@ class Module:
         return self.relative.startswith(f"src/{self.package}/")
 
 
-def _named(node: ast.expr | None) -> str:
-    """The dotted spelling of a name or attribute, or "" for anything else."""
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        head = _named(node.value)
-        return f"{head}.{node.attr}" if head else node.attr
-    return ""
-
-
 def _mapping_kind(node: ast.expr) -> str:
     """"open" for a dictionary type that promises nothing, "boundary" for the
     read-only mapping of unnarrowed values, "" for anything else."""
     if not isinstance(node, ast.Subscript):
         return ""
-    container = _named(node.value).rsplit(".", 1)[-1]
+    container = scopes.dotted(node.value).rsplit(".", 1)[-1]
     if container not in MAPPINGS | {"MappingProxyType", "Sequence", "tuple"}:
         return ""
     # A mapping names its key and its value; a sequence names one element, and
@@ -244,7 +262,7 @@ def _mapping_kind(node: ast.expr) -> str:
     arguments = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
     if len(arguments) not in (1, 2):
         return ""
-    pair = (container, _named(arguments[-1]).rsplit(".", 1)[-1])
+    pair = (container, scopes.dotted(arguments[-1]).rsplit(".", 1)[-1])
     return "open" if pair in OPEN_VALUES else "boundary" if pair in BOUNDARY_MAPPING else ""
 
 
@@ -269,7 +287,7 @@ def _widest(node: ast.expr, skip: set[int]) -> Iterator[ast.expr]:
     for child in ast.walk(node):
         if id(child) in skip or not isinstance(child, ast.Name | ast.Attribute):
             continue
-        if _named(child).rsplit(".", 1)[-1] in {"Any", "object"}:
+        if scopes.dotted(child).rsplit(".", 1)[-1] in {"Any", "object"}:
             yield child
 
 
@@ -281,13 +299,13 @@ def _parses(function: ast.FunctionDef | ast.AsyncFunctionDef, parameter: str) ->
     actually is, and anything else raises with the expectation named. Passing
     an `object` along without narrowing it is still SLOP001.
     """
-    if function.returns is None or _named(function.returns).rsplit(".", 1)[-1] in {"object", "Any"}:
+    if function.returns is None or scopes.dotted(function.returns).rsplit(".", 1)[-1] in {"object", "Any"}:
         return False
-    tested = any(isinstance(node, ast.Call) and _named(node.func) in {"isinstance", "issubclass"}
-                 and node.args and _named(node.args[0]) == parameter
+    tested = any(isinstance(node, ast.Call) and scopes.dotted(node.func) in {"isinstance", "issubclass"}
+                 and node.args and scopes.dotted(node.args[0]) == parameter
                  for node in ast.walk(function))
     refuses = any(isinstance(node, ast.Raise)
-                  or (isinstance(node, ast.Call) and _named(node.func).endswith("refuse"))
+                  or (isinstance(node, ast.Call) and scopes.dotted(node.func).endswith("refuse"))
                   for node in ast.walk(function))
     return tested and refuses
 
@@ -297,14 +315,14 @@ def _alias_value(node: ast.stmt) -> tuple[str, ast.expr] | None:
     if isinstance(node, ast.TypeAlias) and isinstance(node.name, ast.Name):
         return node.name.id, node.value
     if (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
-            and _named(node.annotation).rsplit(".", 1)[-1] == "TypeAlias" and node.value):
+            and scopes.dotted(node.annotation).rsplit(".", 1)[-1] == "TypeAlias" and node.value):
         return node.target.id, node.value
     generic = isinstance(node, ast.Assign) and isinstance(node.value, ast.Subscript) and isinstance(
         node.value.value, ast.Name | ast.Attribute)
     if (isinstance(node, ast.Assign) and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
             and (isinstance(node.value, ast.BinOp) or generic)
-            and any(_named(name).rsplit(".", 1)[-1] in {"Any", "object"}
+            and any(scopes.dotted(name).rsplit(".", 1)[-1] in {"Any", "object"}
                     for name in _outside_calls(node.value))):
         return node.targets[0].id, node.value
     return None
@@ -343,7 +361,7 @@ def contracts(module: Module) -> Iterator[Finding]:
                                  f"alias {name} is an open dictionary; name the keys it carries")
                 for wide in _widest(target, claimed):
                     yield report(wide, "SLOP001",
-                                 f"alias {name} resolves to {_named(wide)}; it promises nothing")
+                                 f"alias {name} resolves to {scopes.dotted(wide)}; it promises nothing")
             continue
         if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
@@ -354,10 +372,10 @@ def contracts(module: Module) -> Iterator[Finding]:
                              f"{name} is an open dictionary; name the keys it carries, "
                              f"take one of Variables, Batch, or read it as Mapping[str, object]")
             for wide in _widest(annotation, claimed):
-                if _named(wide) == "object" and (name in {"cause", "error"}
+                if scopes.dotted(wide) == "object" and (name in {"cause", "error"}
                                                  or _parses(node, name)):
                     continue
-                yield report(wide, "SLOP001", f"{name} is annotated {_named(wide)}; "
+                yield report(wide, "SLOP001", f"{name} is annotated {scopes.dotted(wide)}; "
                                               f"declare the type the code relies on")
 
 
@@ -420,10 +438,10 @@ def probes(module: Module) -> Iterator[Finding]:
         for node in scopes.own(function or module.tree):
             if not isinstance(node, ast.Call):
                 continue
-            name = _named(node.func)
+            name = scopes.dotted(node.func)
             if name in {"getattr", "hasattr"} and len(node.args) >= 2:
                 attribute = node.args[1].value if isinstance(node.args[1], ast.Constant) else None
-                root = _named(node.args[0]).split(".")[0]
+                root = scopes.dotted(node.args[0]).split(".")[0]
                 if not isinstance(attribute, str) or attribute in PROBE_ATTRS:
                     continue
                 if root in PROBE_ROOTS | modules or (name == "getattr" and len(node.args) < 3):
@@ -431,12 +449,12 @@ def probes(module: Module) -> Iterator[Finding]:
                 yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP004",
                               f"{name} probes .{attribute} for a contract; declare it")
             elif name == "isinstance" and len(node.args) == 2:
-                subject = _named(node.args[0])
+                subject = scopes.dotted(node.args[0])
                 kinds = (node.args[1].elts if isinstance(node.args[1], ast.Tuple)
                          else [node.args[1]])
                 if subject not in declared or not kinds:
                     continue
-                if all(_named(kind).rsplit(".", 1)[-1] in NARROWERS for kind in kinds):
+                if all(scopes.dotted(kind).rsplit(".", 1)[-1] in NARROWERS for kind in kinds):
                     yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP004",
                                   f"{subject} is declared {declared[subject]}; the isinstance "
                                   f"selects a path its own type already decided")
@@ -462,7 +480,7 @@ def _declared(function: ast.AST | None, unions: set[str]) -> dict[str, str]:
     for name, annotation in written.items():
         if isinstance(annotation, ast.BinOp) or name == "return":
             continue
-        spelling = _named(annotation) or _named(getattr(annotation, "value", None))
+        spelling = scopes.dotted(annotation) or scopes.dotted(getattr(annotation, "value", None))
         if spelling and "." not in spelling and spelling not in unions | opaque:
             resolved[name] = spelling
     return resolved
@@ -481,7 +499,7 @@ def _union_aliases(tree: ast.Module) -> set[str]:
             name, target = node.targets[0].id, node.value
         else:
             continue
-        head = _named(target) or _named(getattr(target, "value", None))
+        head = scopes.dotted(target) or scopes.dotted(getattr(target, "value", None))
         if isinstance(target, ast.BinOp) or head.rsplit(".", 1)[-1] in {"Union", "Optional"}:
             aliases.add(name)
     return aliases
@@ -528,7 +546,7 @@ def _reported(handler: ast.ExceptHandler) -> bool:
     for node in ast.walk(handler):
         if isinstance(node, ast.Raise):
             return True
-        if isinstance(node, ast.Call) and _named(node.func).endswith("add_note"):
+        if isinstance(node, ast.Call) and scopes.dotted(node.func).endswith("add_note"):
             return True
         if handler.name is None:
             continue
@@ -547,14 +565,14 @@ def swallowed(module: Module) -> Iterator[Finding]:
     spelling, so it is.
     """
     for node in ast.walk(module.tree):
-        if (isinstance(node, ast.Call) and _named(node.func).endswith("suppress")
-                and any(_named(kind) in {"Exception", "BaseException"} for kind in node.args)):
+        if (isinstance(node, ast.Call) and scopes.dotted(node.func).endswith("suppress")
+                and any(scopes.dotted(kind) in {"Exception", "BaseException"} for kind in node.args)):
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP006",
                           "suppress(Exception) hides every failure; name the ones this handles")
         if not isinstance(node, ast.ExceptHandler):
             continue
-        kinds = ([_named(kind) for kind in node.type.elts] if isinstance(node.type, ast.Tuple)
-                 else [_named(node.type)] if node.type is not None else ["bare except"])
+        kinds = ([scopes.dotted(kind) for kind in node.type.elts] if isinstance(node.type, ast.Tuple)
+                 else [scopes.dotted(node.type)] if node.type is not None else ["bare except"])
         broad = node.type is None or any(kind in {"Exception", "BaseException"} for kind in kinds)
         empty = len(node.body) == 1 and isinstance(node.body[0], ast.Pass)
         nothing = (len(node.body) == 1 and isinstance(node.body[0], ast.Return)
@@ -606,69 +624,6 @@ def _labels(module: Module, line: int, word: str) -> bool:
         head = stripped.split("=")[0].strip() if "=" in stripped else ""
         return head.split(":")[0].strip() == word and bool(head)
     return False
-
-
-def _patched(node: ast.Call, table: dict[str, str]) -> str:
-    """What a patching call replaces, as a dotted path: `mock.patch("a.b")`'s
-    string; `patch.object(owner, "b")`'s and `monkeypatch.setattr(owner, "b",
-    ...)`'s or `monkeypatch.setattr("a.b", ...)`'s attribute, its owner read
-    through the scope's imports (`scopes.resolved`), however it was imported or
-    aliased; `monkeypatch.setitem(mapping, ...)`'s and `delitem`'s mapping,
-    which a module's table or registry is. "" for any other call."""
-    name = _named(node.func)
-    first = node.args[0]
-    spelled = first.value if isinstance(first, ast.Constant) and isinstance(first.value, str) else None
-    if name.endswith(("mock.patch", ".patch")) or name == "patch":
-        return spelled or ""
-    if name.endswith(("patch.object", "monkeypatch.setattr", "monkeypatch.delattr")):
-        if spelled is not None:
-            return spelled
-        attribute = node.args[1] if len(node.args) > 1 else None
-        attribute_name = (attribute.value if isinstance(attribute, ast.Constant)
-                          and isinstance(attribute.value, str) else "*")
-        owner = scopes.resolved(first, table)
-        return f"{owner}.{attribute_name}" if owner else ""
-    if name.endswith(("monkeypatch.setitem", "monkeypatch.delitem")):
-        return scopes.resolved(first, table)
-    return ""
-
-
-def _seam(target: str) -> bool:
-    """Does `target` leave the process: does it hold one of `SEAMS` as whole parts
-    between its dots and underscores, so `dew.cli.tpu.time.sleep` and
-    `dew.interop.sources.snapshot` do and `dew.training.narrow.narrowed_paths` does not?
-    A private attribute is its owner's: of a seam's owner it leaves the process as
-    the owner does (`dew._coordination.os._exit`), and of a first-party object it
-    never does, whatever it is named (`dew.checkpoints.Checkpoints._open`): it is the
-    code under test, and the boundary it reaches is observed there instead (an audit
-    hook, a process of its own)."""
-    owner, _, name = target.rpartition(".")
-    if name.startswith("_"):
-        # A seam's own private attribute: its owner a standard library module the target reaches by
-        # name, as `os` in `dew._coordination.os._exit`, where `Hub` in `...hub.Hub._selected` is not.
-        held = owner.rpartition(".")[2]
-        return held in sys.stdlib_module_names and _seam(owner)
-    words = [word for word in re.split(r"[._]", target.lower()) if word]
-    for seam in SEAMS:
-        parts = [word for word in re.split(r"[._]", seam) if word]
-        if any(words[start:start + len(parts)] == parts for start in range(len(words))):
-            return True
-    return False
-
-
-def mocks(module: Module) -> Iterator[Finding]:
-    """SLOP008: a first-party module, or a table or registry it holds, replaced
-    instead of a seam taken."""
-    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
-        if not isinstance(node, ast.Call) or not node.args:
-            continue
-        target = _patched(node, dict(table))
-        if not target.startswith(f"{module.package}."):
-            continue
-        if _seam(target):
-            continue
-        yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP008",
-                      f"patches {target}; the fix is a seam the test can pass a double to")
 
 
 JAX_PRIVATE = {
@@ -775,9 +730,8 @@ def _module_name(module: Module) -> str:
 
 
 def _parent(module: Module) -> list[str]:
-    """The package a module's relative imports start from, as its parts."""
-    name = _module_name(module)
-    return name.split(".") if module.path.name == "__init__.py" else name.split(".")[:-1]
+    """The package a module's relative imports start from, as its parts (`scopes.package_of`)."""
+    return scopes.package_of(_module_name(module), module.path.name == "__init__.py")
 
 
 def _aliased(node: ast.stmt) -> tuple[str, ast.expr] | None:
@@ -799,7 +753,7 @@ def _members(body: Sequence[ast.stmt]) -> set[str]:
         if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef):
             declared.add(statement.name)
             declared |= {node.attr for node in ast.walk(statement) if isinstance(node, ast.Attribute)
-                         and isinstance(node.ctx, ast.Store) and _named(node.value) == "self"}
+                         and isinstance(node.ctx, ast.Store) and scopes.dotted(node.value) == "self"}
         elif not isinstance(statement, ast.ClassDef):
             declared |= {node.id for node in [statement, *scopes.own(statement)]
                          if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
@@ -861,9 +815,10 @@ class ModelIndex:
             return set().union(*(self._symbol(module, element, seen) for element in node.elts))
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
             return self._symbol(module, node.left, seen) | self._symbol(module, node.right, seen)
-        if isinstance(node, ast.Subscript) and _named(node.value).rsplit(".", 1)[-1] in {"Union", "Optional"}:
+        if (isinstance(node, ast.Subscript)
+                and scopes.dotted(node.value).rsplit(".", 1)[-1] in {"Union", "Optional"}):
             return self._symbol(module, node.slice, seen)
-        spelled = _named(node)
+        spelled = scopes.dotted(node)
         if not spelled:
             return set()
         head, _, rest = spelled.partition(".")
@@ -911,7 +866,7 @@ def _flax_members() -> set[str]:
 def _identity(node: ast.AST) -> ast.expr | None:
     """The class an identity test names: `isinstance(x, C)`, `issubclass(x, C)`,
     `type(x) is C`, `x.__class__ == C`, `type(x) in (C, D)`, `case C()`."""
-    if (isinstance(node, ast.Call) and _named(node.func) in {"isinstance", "issubclass"}
+    if (isinstance(node, ast.Call) and scopes.dotted(node.func) in {"isinstance", "issubclass"}
             and len(node.args) == 2):
         return node.args[1]
     if isinstance(node, ast.MatchClass):
@@ -920,7 +875,7 @@ def _identity(node: ast.AST) -> ast.expr | None:
             node.ops[0], ast.Is | ast.IsNot | ast.Eq | ast.NotEq | ast.In | ast.NotIn):
         left, right = node.left, node.comparators[0]
         for subject, other in ((left, right), (right, left)):
-            if (isinstance(subject, ast.Call) and _named(subject.func) == "type") or (
+            if (isinstance(subject, ast.Call) and scopes.dotted(subject.func) == "type") or (
                     isinstance(subject, ast.Attribute) and subject.attr == "__class__"):
                 return other
     return None
@@ -963,13 +918,13 @@ def boundaries(module: Module, models: ModelIndex) -> Iterator[Finding]:
         member, receiver = None, None
         if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
             member, receiver = node.attr, node.value
-        elif (isinstance(node, ast.Call) and _named(node.func) in {"getattr", "hasattr", "setattr"}
+        elif (isinstance(node, ast.Call) and scopes.dotted(node.func) in {"getattr", "hasattr", "setattr"}
                 and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant)):
             member, receiver = node.args[1].value, node.args[0]
         if (isinstance(member, str) and member in models.private
                 and module.relative not in models.private[member]
-                and _named(receiver) not in {"self", "cls"}
-                and not (isinstance(receiver, ast.Call) and _named(receiver.func) == "super")):
+                and scopes.dotted(receiver) not in {"self", "cls"}
+                and not (isinstance(receiver, ast.Call) and scopes.dotted(receiver.func) == "super")):
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP010",
                           f"reads {member}, private to a model; ask for a public capability instead")
 
@@ -977,197 +932,9 @@ def boundaries(module: Module, models: ModelIndex) -> Iterator[Finding]:
 def _script_guard(node: ast.If) -> bool:
     """`if __name__ == "__main__":`, whose body runs only as a script."""
     test = node.test
-    return (isinstance(test, ast.Compare) and _named(test.left) == "__name__"
+    return (isinstance(test, ast.Compare) and scopes.dotted(test.left) == "__name__"
             and len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq)
             and isinstance(test.comparators[0], ast.Constant) and test.comparators[0].value == "__main__")
-
-
-CAPTURED = {"readouterr", "text", "messages", "records"}
-"""What pytest's capsys, capfd and caplog fixtures hand a test of the output it captured."""
-
-
-def _captured(node: ast.expr, names: Set[str]) -> bool:
-    """Is `node` output a test captured: `capsys.readouterr()`'s or capfd's, its `.out` or `.err`,
-    caplog's `.text`, `.messages` or `.records`, or a name of `names`, bound to one of them, or its
-    `.out` or `.err`?"""
-    if isinstance(node, ast.Attribute) and node.attr in ("out", "err"):
-        node = node.value
-    if isinstance(node, ast.Name):
-        return node.id in names
-    if isinstance(node, ast.Call):
-        node = node.func
-    return (isinstance(node, ast.Attribute) and node.attr in CAPTURED
-            and isinstance(node.value, ast.Name) and node.value.id in ("capsys", "capfd", "caplog"))
-
-
-def _held(tree: ast.Module) -> dict[int, frozenset[str]]:
-    """The names bound to captured output (`_captured`) where each node of a function's own scope is:
-    a name the function binds to it, or unpacks it into, until it binds that name again to anything
-    else (a parse of it, say); added to, it stays captured. An item or attribute assigned binds no
-    name."""
-    held: dict[int, frozenset[str]] = {}
-    for function in ast.walk(tree):
-        if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
-            continue
-        # A binding takes effect once its statement's value has been read: at the statement's end.
-        events: list[tuple[int, int, int, ast.AST]] = []
-        for node in scopes.own(function):
-            if isinstance(node, ast.Assign | ast.AnnAssign | ast.AugAssign):
-                events.append((node.end_lineno or node.lineno, node.end_col_offset or 0, id(node), node))
-            elif isinstance(node, ast.Compare | ast.Call):
-                events.append((node.lineno, node.col_offset, id(node), node))
-        names: set[str] = set()
-        for *_, node in sorted(events, key=lambda event: event[:3]):
-            if not isinstance(node, ast.Assign | ast.AnnAssign | ast.AugAssign):
-                held[id(node)] = frozenset(names)
-                continue
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            bound = {name.id for target in targets for name in ast.walk(target)
-                     if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store)}
-            if node.value is not None and _captured(node.value, names):
-                names |= bound
-            elif not isinstance(node, ast.AugAssign):
-                names -= bound
-    return held
-
-
-def _spelled_in_captured(node: ast.AST, names: Set[str]) -> bool:
-    """Does `node` look for a sentence in captured output: a string the source spells, compared
-    with `in` against it, or counted in it?"""
-    if isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], ast.In | ast.NotIn):
-        return (isinstance(node.left, ast.Constant) and isinstance(node.left.value, str)
-                and _captured(node.comparators[0], names))
-    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "count"
-            and _captured(node.func.value, names) and bool(node.args)
-            and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str))
-
-
-def _errors(function: ast.FunctionDef | ast.AsyncFunctionDef,
-            raises: Set[int]) -> tuple[frozenset[str], frozenset[str]]:
-    """The names a test binds to an error it caught: an `except` clause's, and the target of a
-    block whose context is one of the `pytest.raises` calls `raises` holds by id, whose `.value`
-    the error is."""
-    nodes = list(scopes.own(function))
-    caught = {node.name for node in nodes if isinstance(node, ast.ExceptHandler) and node.name}
-    raised = {item.optional_vars.id for node in nodes if isinstance(node, ast.With | ast.AsyncWith)
-              for item in node.items if isinstance(item.optional_vars, ast.Name)
-              and id(item.context_expr) in raises}
-    return frozenset(caught), frozenset(raised)
-
-
-RENDERINGS = frozenset({"plain", "table", "render", "renderable", "getvalue", "readouterr", "out", "err",
-                        "stdout", "stderr", "text"})
-"""The attributes and methods a rendering's text is read through (a rich Text's `plain`, a table's
-`table()`, captured output): the values SLOP011's layout rule reads (`_rendered`)."""
-
-
-def _rendered(expr: ast.expr) -> bool:
-    """Is `expr` a rendering's text: read through RENDERINGS, its lines (`.splitlines()`) or a str()
-    of something, as a parsed value (`json.loads`) is not?"""
-    while isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute) and expr.func.attr in (
-            "splitlines", "strip", "rstrip", "lstrip"):
-        expr = expr.func.value
-    if isinstance(expr, ast.Call):
-        if _named(expr.func) == "str":
-            return True
-        expr = expr.func
-    return isinstance(expr, ast.Attribute) and expr.attr in RENDERINGS
-
-
-def _laid_out(expr: ast.expr) -> bool:
-    """Is `expr` a rendering's layout spelled out: a string, or a list or tuple of strings, holding a
-    run of two or more spaces between its words, a frozen line of a table or panel whose spacing is
-    the snapshot (row 1878)? Its content claims are words, numbers and column ends, asserted as such."""
-    texts = [expr] if isinstance(expr, ast.Constant) else (
-        list(expr.elts) if isinstance(expr, ast.List | ast.Tuple) else [])
-    return any(isinstance(text, ast.Constant) and isinstance(text.value, str)
-               and re.search(r"\S {2,}\S", text.value) is not None for text in texts)
-
-
-def _worded(node: ast.AST, caught: Set[str], raised: Set[str]) -> bool:
-    """Does `node` look for a sentence the source spells in a process's `stdout` or `stderr`, by
-    `in`, `startswith`, `endswith` or `count`, or match a caught error's text (`str` or `repr` of
-    it) so or by `==`? A process's whole output compared, or parsed first, is the value it reports."""
-    def output(expr: ast.expr) -> bool:
-        return isinstance(expr, ast.Attribute) and expr.attr in ("stdout", "stderr")
-
-    def error(expr: ast.expr) -> bool:
-        if not (isinstance(expr, ast.Call) and _named(expr.func) in ("str", "repr") and len(expr.args) == 1):
-            return False
-        held = expr.args[0]
-        return (isinstance(held, ast.Name) and held.id in caught) or (
-            isinstance(held, ast.Attribute) and held.attr == "value" and isinstance(held.value, ast.Name)
-            and held.value.id in raised)
-
-    def spelled(expr: ast.expr) -> bool:
-        return isinstance(expr, ast.Constant) and isinstance(expr.value, str)
-
-    if isinstance(node, ast.Compare) and len(node.ops) == 1:
-        left, right = node.left, node.comparators[0]
-        if isinstance(node.ops[0], ast.In | ast.NotIn):
-            return spelled(left) and (output(right) or error(right))
-        return isinstance(node.ops[0], ast.Eq | ast.NotEq) and (
-            (spelled(left) and error(right)) or (spelled(right) and error(left)))
-    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-            and node.func.attr in ("startswith", "endswith", "count")
-            and (output(node.func.value) or error(node.func.value))
-            and bool(node.args) and spelled(node.args[0]))
-
-
-def wording(module: Module) -> Iterator[Finding]:
-    """SLOP011: a test that checks wording or source text instead of behaviour: an error's or a
-    warning's text matched, a sentence looked for in captured output, in a caught error's text or
-    in a process's output, or source text read. A name is read through the imports of its own
-    scope, so `pytest.raises` imported under another name is `pytest.raises`."""
-    named = list(scopes.scoped(module.tree.body, {}, _parent(module)))
-    raises = {id(node) for node, table in named
-              if isinstance(node, ast.Call) and scopes.resolved(node.func, table) == "pytest.raises"}
-    for function in ast.walk(module.tree):
-        if isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
-            caught, raised = _errors(function, raises)
-            for node in scopes.own(function):
-                if _worded(node, caught, raised):
-                    yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
-                                  "looks for a sentence in an error's or a process's text; assert its "
-                                  "type, its exit status or the value it reports")
-                elif (isinstance(node, ast.Compare) and len(node.ops) == 1
-                      and isinstance(node.ops[0], ast.Eq | ast.NotEq)
-                      and ((_laid_out(node.left) and _rendered(node.comparators[0]))
-                           or (_laid_out(node.comparators[0]) and _rendered(node.left)))):
-                    yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
-                                  "freezes a rendering's spacing; assert its words, numbers and column "
-                                  "ends")
-    held = _held(module.tree)
-    for node, table in named:
-        if isinstance(node, ast.expr) and _spelled_in_captured(node, held.get(id(node), frozenset())):
-            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
-                          "looks for a sentence in captured output; assert the state it reports")
-        if isinstance(node, ast.Call):
-            called = scopes.resolved(node.func, table)
-            if called in ("pytest.raises", "pytest.warns") and any(keyword.arg == "match"
-                                                                   for keyword in node.keywords):
-                raised = "an error" if called == "pytest.raises" else "a warning"
-                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
-                              f"matches {raised}'s wording; assert that it is raised, not its text")
-            elif called in SOURCE_READERS:
-                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
-                              "reads source text; test what the code does")
-        elif (isinstance(node, ast.Constant) and isinstance(node.value, str)
-              and node.value.startswith(f"src/{module.package}/") and node.value.endswith(".py")):
-            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
-                          f"names {node.value}; test what the code does, not its source")
-
-
-def skips(module: Module) -> Iterator[Finding]:
-    """SLOP015: a test that skips when its own package fails to import."""
-    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
-        if not (isinstance(node, ast.Call) and scopes.resolved(node.func, table) == "pytest.importorskip"):
-            continue
-        named = [*node.args[:1], *(keyword.value for keyword in node.keywords if keyword.arg == "modname")]
-        if (named and isinstance(named[0], ast.Constant) and isinstance(name := named[0].value, str)
-                and (name == module.package or name.startswith(f"{module.package}."))):
-            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP015",
-                          f"skips when {name} fails to import; import it, so a broken import fails")
 
 
 def patches(module: Module) -> Iterator[Finding]:
@@ -1175,7 +942,7 @@ def patches(module: Module) -> Iterator[Finding]:
     for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
         if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store | ast.Del):
             owner, attribute = node.value, node.attr
-        elif (isinstance(node, ast.Call) and _named(node.func) in ("setattr", "delattr")
+        elif (isinstance(node, ast.Call) and scopes.dotted(node.func) in ("setattr", "delattr")
               and len(node.args) > 1):
             owner, named = node.args[:2]
             spelled = isinstance(named, ast.Constant) and isinstance(named.value, str)
@@ -1215,10 +982,10 @@ def imports(module: Module) -> Iterator[Finding]:
     """SLOP013: importing the module changes process-wide state."""
     for node in _executed(_module_level(module.tree.body)):
         if isinstance(node, ast.Assign):
-            written = any(isinstance(target, ast.Subscript) and _named(target.value).endswith("environ")
-                          for target in node.targets)
+            written = any(isinstance(target, ast.Subscript)
+                          and scopes.dotted(target.value).endswith("environ") for target in node.targets)
         elif isinstance(node, ast.Call):
-            written = _named(node.func).endswith(GLOBAL_WRITES)
+            written = scopes.dotted(node.func).endswith(GLOBAL_WRITES)
         else:
             continue
         if written:
@@ -1237,7 +1004,7 @@ def _assigned_mixing(inputs: Path) -> frozenset[str]:
     if not inputs.is_file():
         return frozenset()
     for node in ast.parse(inputs.read_text()).body:
-        if (isinstance(node, ast.Assign) and any(_named(target) == "MIXING" for target in node.targets)
+        if (isinstance(node, ast.Assign) and any(scopes.dotted(target) == "MIXING" for target in node.targets)
                 and isinstance(node.value, ast.Tuple)):
             return frozenset(item.value for item in node.value.elts if isinstance(item, ast.Constant))
     return frozenset()
@@ -1246,9 +1013,10 @@ def _assigned_mixing(inputs: Path) -> frozenset[str]:
 def _declared_reads(value: ast.expr | None) -> frozenset[str] | str | None:
     """A `reads` declaration's names, "tokenwise" for `TOKENWISE`, or None
     where it is spelled some other way, which this rule cannot read."""
-    if _named(value) == "TOKENWISE":
+    if scopes.dotted(value) == "TOKENWISE":
         return "tokenwise"
-    if not (isinstance(value, ast.Call) and _named(value.func) == "frozenset" and len(value.args) <= 1):
+    if not (isinstance(value, ast.Call) and scopes.dotted(value.func) == "frozenset"
+            and len(value.args) <= 1):
         return None
     if not value.args:
         return frozenset()
@@ -1273,7 +1041,7 @@ def calls(module: Module) -> Iterator[Finding]:
         taken = {argument.arg for argument in (*function.args.args, *function.args.kwonlyargs)}
         declarations = [statement for statement in cls.body
                         if isinstance(statement, ast.Assign | ast.AnnAssign) and statement.value is not None
-                        and any(_named(target) == "reads" for target in
+                        and any(scopes.dotted(target) == "reads" for target in
                                 (statement.targets if isinstance(statement, ast.Assign)
                                  else [statement.target]))]
         declared = _declared_reads(declarations[-1].value) if declarations else frozenset()
@@ -1507,12 +1275,12 @@ EXTERNAL = ("subprocess.", "socket.", "ssl.", "select.", "urllib.", "http.", "re
             "aiohttp.", "grpc.", "huggingface_hub.", "fsspec.", "gcsfs.", "google.", "boto3.", "botocore.",
             "filelock.", "multiprocessing.", "concurrent.futures.ProcessPoolExecutor.", "os.kill.",
             "os.killpg.", "os.waitpid.", "os.waitid.", "os.fork.", "os.posix_spawn.", "jax.distributed.",
-            "dew.cleanup.signal_group.", "dew.cleanup.exit_code.", "dew.cleanup.groups_ended.",
-            "dew.cleanup.end_group.", "dew.cleanup.process_group.",
+            "dew._cleanup.signal_group.", "dew._cleanup.exit_code.", "dew._cleanup.groups_ended.",
+            "dew._cleanup.end_group.", "dew._cleanup.process_group.",
             "IPython.display.display.", "IPython.display.update_display.", "IPython.display.clear_output.")
 """What leaves the process: a subprocess, the network, a remote service, another process (a
 notebook's frontend, which IPython's display functions publish to over the kernel's socket; its
-representations, such as `HTML`, are built in the process; a process group `dew.cleanup` signals)."""
+representations, such as `HTML`, are built in the process; a process group `dew._cleanup` signals)."""
 
 
 WAITS = {"wait", "wait_for", "join", "get", "put", "acquire"}
@@ -1698,7 +1466,7 @@ def _retrying(loop: ast.For | ast.While) -> bool:
         counted = {name.id for name in ast.walk(loop.target) if isinstance(name, ast.Name)}
         handling = {id(node) for attempt, _ in attempts for handler in attempt.handlers
                     for node in _executed(handler.body)}
-        if not (isinstance(loop.iter, ast.Call) and _named(loop.iter.func) == "range") or any(
+        if not (isinstance(loop.iter, ast.Call) and scopes.dotted(loop.iter.func) == "range") or any(
                 isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in counted
                 and id(node) not in handling
                 for node in _executed(loop.body)):
@@ -1901,7 +1669,7 @@ def detections(module: Module) -> Iterator[Finding]:
         if not isinstance(node, ast.ExceptHandler) or node.type is None:
             continue
         caught = node.type.elts if isinstance(node.type, ast.Tuple) else [node.type]
-        kinds = [scopes.resolved(kind, table) or _named(kind) for kind in caught]
+        kinds = [scopes.resolved(kind, table) or scopes.dotted(kind) for kind in caught]
         detected = any(kind.removeprefix("builtins.") in DETECTED for kind in kinds)
         if detected and _outcomes(node.body) != {"raise"}:
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP019",
@@ -2083,7 +1851,7 @@ def _inventory_at(checkout: Path, commit: str) -> dict | None:
 
 def _loosened(checkout: Path, commit: str, parent: str, mine: dict, theirs: dict,
               authorized: dict[str, int] | None = None,
-              grants: dict[str, int] | None = None) -> Iterator[tuple[str, str]]:
+              grants: dict[str, int] | None = None) -> Iterator[tuple[str, Ratchet, str]]:
     """How `commit`'s inventory `mine` is looser than `parent`'s `theirs`: each file it adds or whose
     count it raises, and how. A file renamed between them carries its entry. Where the
     commit changes SLOP020's reading (`RULE`), a file it leaves unchanged may be added or raised: what
@@ -2100,10 +1868,10 @@ def _loosened(checkout: Path, commit: str, parent: str, mine: dict, theirs: dict
             grants[name] = max(grants.get(name, 0), entry["comparisons"])
         if kept is None:
             if not grown:
-                yield name, f"adds {name}"
+                yield name, Ratchet.ADDS, f"adds {name}"
             continue
         if entry["comparisons"] > kept["comparisons"] and not grown:
-            yield name, f"raises {name}'s count"
+            yield name, Ratchet.RAISES, f"raises {name}'s count"
 
 
 @functools.cache
@@ -2139,7 +1907,7 @@ def _lineage(checkout: Path, walk: list[tuple[str, list[str]]]) -> dict[str, dic
     return lineage
 
 
-def _merge_loosens(name: str, per_parent: list[dict]) -> str | None:
+def _merge_loosens(name: str, per_parent: list[dict]) -> tuple[Ratchet, str] | None:
     """How a commit loosens the file `name` against all its parents at once (`_loosened` against each,
     `per_parent`), or None: its count past every parent's (each parent's own raise judged at its own
     commit, so one parent's allows it)."""
@@ -2148,7 +1916,7 @@ def _merge_loosens(name: str, per_parent: list[dict]) -> str | None:
     return None
 
 
-def _duplicated(lineage: dict[str, frozenset[str]]) -> Iterator[str]:
+def _duplicated(lineage: dict[str, frozenset[str]]) -> Iterator[tuple[str, str]]:
     """A merge keeping one entry under two names (its parents having renamed it apart): each name's
     count is that one entry's allowance, so together they hold it twice."""
     by_origin: dict[str, list[str]] = {}
@@ -2157,8 +1925,9 @@ def _duplicated(lineage: dict[str, frozenset[str]]) -> Iterator[str]:
             by_origin.setdefault(origin, []).append(name)
     for origin, names in sorted(by_origin.items()):
         if len(names) > 1:
-            yield (f"keeps the entry made as {origin.split(':', 1)[1]} as {' and '.join(names)}, its parents "
-                   f"having renamed it apart")
+            made = origin.split(':', 1)[1]
+            yield made, (f"keeps the entry made as {made} as {' and '.join(names)}, its parents "
+                         f"having renamed it apart")
 
 
 def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
@@ -2186,11 +1955,11 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
         fresh = set(_git(checkout, "rev-list", "HEAD", f"^{merged}").split()) if merged else None
     except (subprocess.CalledProcessError, FileNotFoundError) as error:
         yield Finding(INVENTORY, 1, 1, "SLOP020", "holds the inventory to its history, which git cannot "
-                      f"read here ({error}); run with the repository's history")
+                      f"read here ({error}); run with the repository's history", Ratchet.UNREADABLE)
         return
     if shallow:
         yield Finding(INVENTORY, 1, 1, "SLOP020", "holds the inventory to its history, and this checkout is "
-                      "shallow: fetch it whole (`git fetch --unshallow`)")
+                      "shallow: fetch it whole (`git fetch --unshallow`)", Ratchet.SHALLOW)
         return
     head_id = _git(checkout, "rev-parse", "HEAD").strip()
     head = _inventory_at(checkout, head_id)
@@ -2212,11 +1981,11 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
             if mine is None:
                 walked.append(Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} removes the inventory "
                                       f"its parent {parent[:9]} kept; an empty inventory stays, as "
-                                      f"`files: {{}}`"))
+                                      f"`files: {{}}`", Ratchet.REMOVES, commit[:9]))
                 continue
             granting = grants if fresh is None or commit in fresh else None
             found = _loosened(checkout, commit, parent, mine, theirs, grants=granting)
-            loosened.append((parent, dict(found)))
+            loosened.append((parent, {name: (kind, text) for name, kind, text in found}))
         if not loosened:
             continue
         against = ("its parent " if len(loosened) == 1 else "its parents ") + ", ".join(
@@ -2224,18 +1993,22 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
         for name in sorted({name for _, found in loosened for name in found}):
             why = _merge_loosens(name, [found for _, found in loosened])
             if why:
-                walked.append(Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} against {against} {why}"))
+                kind, text = why
+                walked.append(Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} against {against} {text}",
+                                      kind, commit[:9], name))
         if len(loosened) > 1 and mine is not None:
-            walked += [Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} {why}")
-                       for why in _duplicated(lineage.get(commit, {}))]
+            walked += [Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} {text}", Ratchet.RENAMED_APART,
+                               commit[:9], made)
+                       for made, text in _duplicated(lineage.get(commit, {}))]
     if merged is not None:
         kept = _inventory_at(checkout, merged)
         if kept is not None and head is None:
             yield Finding(INVENTORY, 1, 1, "SLOP020",
-                          f"HEAD removes the inventory {base}'s {merged[:9]} keeps")
+                          f"HEAD removes the inventory {base}'s {merged[:9]} keeps", Ratchet.REMOVES, "HEAD")
         elif kept is not None:
-            for _, why in _loosened(checkout, head_id, merged, head, kept, authorized=grants):
-                yield Finding(INVENTORY, 1, 1, "SLOP020", f"HEAD against {base}'s {merged[:9]} {why}")
+            for name, kind, text in _loosened(checkout, head_id, merged, head, kept, authorized=grants):
+                yield Finding(INVENTORY, 1, 1, "SLOP020", f"HEAD against {base}'s {merged[:9]} {text}", kind,
+                              "HEAD", name)
     yield from walked
 
 
@@ -2272,7 +2045,8 @@ def tolerances(module: Module) -> Iterator[Finding]:
             yield Finding(module.relative, 1, 1, "SLOP020",
                           f"{INVENTORY} counts {entry['comparisons']} tolerance comparisons here and "
                           f"the file holds {len(found)}: "
-                          + ("remove its entry" if not found else f"lower it to {len(found)}"))
+                          + ("remove its entry" if not found else f"lower it to {len(found)}"),
+                          Ratchet.STALE, file=module.relative)
             return
         else:
             return
@@ -2281,16 +2055,31 @@ def tolerances(module: Module) -> Iterator[Finding]:
                       f"{what} compares floats within a tolerance ({why}); {gate}")
 
 
+def derivative_contracts(module: Module) -> Iterator[Finding]:
+    """SLOP028: every custom derivative of `module` declares the contract that holds it
+    (`derivative_rules.missing`)."""
+    checkout = module.path.parents[len(Path(module.relative).parts) - 1]
+    for line, col, message in derivative_rules.missing(module.relative, module.tree, checkout):
+        yield Finding(module.relative, line, col, "SLOP028", message)
+
+
 CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections, compile_points,
-                  pallas_launches)
+                  pallas_launches, derivative_contracts)
 UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private)
+
+
+def assertions(module: Module) -> Iterator[Finding]:
+    """SLOP008, SLOP011, SLOP015 and SLOP029: bible §7's banned assertions in a test (`assertion_rules`)."""
+    for rule in assertion_rules.RULES:
+        for line, col, code, message in rule(module, _parent(module)):
+            yield Finding(module.relative, line, col, code, message)
 
 
 def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]:
     """Every rule that applies to this file, in code order. SLOP010 reads
     `models`, the package's index, or this file's own without one."""
     rules = (*CONTRACT_RULES, *UNIVERSAL_RULES) if module.is_source else UNIVERSAL_RULES
-    rules = (*rules, mocks, wording, skips) if module.relative.startswith("tests/") else (*rules, patches)
+    rules = (*rules, assertions) if module.relative.startswith("tests/") else (*rules, patches)
     rules = (*rules, tolerances, divisions) if module.is_source else (*rules, tolerances, promotions)
     findings = [finding for rule in rules for finding in rule(module)]
     if module.is_source:

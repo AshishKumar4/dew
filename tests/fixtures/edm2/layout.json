@@ -1,0 +1,277 @@
+{
+ "out_gain": [],
+ "emb_fourier.freqs": [
+  8
+ ],
+ "emb_fourier.phases": [
+  8
+ ],
+ "emb_noise.weight": [
+  16,
+  8
+ ],
+ "emb_label.weight": [
+  16,
+  4
+ ],
+ "enc.8x8_conv.weight": [
+  8,
+  4,
+  3,
+  3
+ ],
+ "enc.8x8_block0.emb_gain": [],
+ "enc.8x8_block0.conv_res0.weight": [
+  8,
+  8,
+  3,
+  3
+ ],
+ "enc.8x8_block0.emb_linear.weight": [
+  8,
+  16
+ ],
+ "enc.8x8_block0.conv_res1.weight": [
+  8,
+  8,
+  3,
+  3
+ ],
+ "enc.4x4_down.emb_gain": [],
+ "enc.4x4_down.conv_res0.weight": [
+  8,
+  8,
+  3,
+  3
+ ],
+ "enc.4x4_down.emb_linear.weight": [
+  8,
+  16
+ ],
+ "enc.4x4_down.conv_res1.weight": [
+  8,
+  8,
+  3,
+  3
+ ],
+ "enc.4x4_block0.emb_gain": [],
+ "enc.4x4_block0.conv_res0.weight": [
+  16,
+  16,
+  3,
+  3
+ ],
+ "enc.4x4_block0.emb_linear.weight": [
+  16,
+  16
+ ],
+ "enc.4x4_block0.conv_res1.weight": [
+  16,
+  16,
+  3,
+  3
+ ],
+ "enc.4x4_block0.conv_skip.weight": [
+  16,
+  8,
+  1,
+  1
+ ],
+ "enc.4x4_block0.attn_qkv.weight": [
+  48,
+  16,
+  1,
+  1
+ ],
+ "enc.4x4_block0.attn_proj.weight": [
+  16,
+  16,
+  1,
+  1
+ ],
+ "dec.4x4_in0.emb_gain": [],
+ "dec.4x4_in0.conv_res0.weight": [
+  16,
+  16,
+  3,
+  3
+ ],
+ "dec.4x4_in0.emb_linear.weight": [
+  16,
+  16
+ ],
+ "dec.4x4_in0.conv_res1.weight": [
+  16,
+  16,
+  3,
+  3
+ ],
+ "dec.4x4_in0.attn_qkv.weight": [
+  48,
+  16,
+  1,
+  1
+ ],
+ "dec.4x4_in0.attn_proj.weight": [
+  16,
+  16,
+  1,
+  1
+ ],
+ "dec.4x4_in1.emb_gain": [],
+ "dec.4x4_in1.conv_res0.weight": [
+  16,
+  16,
+  3,
+  3
+ ],
+ "dec.4x4_in1.emb_linear.weight": [
+  16,
+  16
+ ],
+ "dec.4x4_in1.conv_res1.weight": [
+  16,
+  16,
+  3,
+  3
+ ],
+ "dec.4x4_block0.emb_gain": [],
+ "dec.4x4_block0.conv_res0.weight": [
+  16,
+  32,
+  3,
+  3
+ ],
+ "dec.4x4_block0.emb_linear.weight": [
+  16,
+  16
+ ],
+ "dec.4x4_block0.conv_res1.weight": [
+  16,
+  16,
+  3,
+  3
+ ],
+ "dec.4x4_block0.conv_skip.weight": [
+  16,
+  32,
+  1,
+  1
+ ],
+ "dec.4x4_block0.attn_qkv.weight": [
+  48,
+  16,
+  1,
+  1
+ ],
+ "dec.4x4_block0.attn_proj.weight": [
+  16,
+  16,
+  1,
+  1
+ ],
+ "dec.4x4_block1.emb_gain": [],
+ "dec.4x4_block1.conv_res0.weight": [
+  16,
+  24,
+  3,
+  3
+ ],
+ "dec.4x4_block1.emb_linear.weight": [
+  16,
+  16
+ ],
+ "dec.4x4_block1.conv_res1.weight": [
+  16,
+  16,
+  3,
+  3
+ ],
+ "dec.4x4_block1.conv_skip.weight": [
+  16,
+  24,
+  1,
+  1
+ ],
+ "dec.4x4_block1.attn_qkv.weight": [
+  48,
+  16,
+  1,
+  1
+ ],
+ "dec.4x4_block1.attn_proj.weight": [
+  16,
+  16,
+  1,
+  1
+ ],
+ "dec.8x8_up.emb_gain": [],
+ "dec.8x8_up.conv_res0.weight": [
+  16,
+  16,
+  3,
+  3
+ ],
+ "dec.8x8_up.emb_linear.weight": [
+  16,
+  16
+ ],
+ "dec.8x8_up.conv_res1.weight": [
+  16,
+  16,
+  3,
+  3
+ ],
+ "dec.8x8_block0.emb_gain": [],
+ "dec.8x8_block0.conv_res0.weight": [
+  8,
+  24,
+  3,
+  3
+ ],
+ "dec.8x8_block0.emb_linear.weight": [
+  8,
+  16
+ ],
+ "dec.8x8_block0.conv_res1.weight": [
+  8,
+  8,
+  3,
+  3
+ ],
+ "dec.8x8_block0.conv_skip.weight": [
+  8,
+  24,
+  1,
+  1
+ ],
+ "dec.8x8_block1.emb_gain": [],
+ "dec.8x8_block1.conv_res0.weight": [
+  8,
+  16,
+  3,
+  3
+ ],
+ "dec.8x8_block1.emb_linear.weight": [
+  8,
+  16
+ ],
+ "dec.8x8_block1.conv_res1.weight": [
+  8,
+  8,
+  3,
+  3
+ ],
+ "dec.8x8_block1.conv_skip.weight": [
+  8,
+  16,
+  1,
+  1
+ ],
+ "out_conv.weight": [
+  3,
+  8,
+  3,
+  3
+ ]
+}

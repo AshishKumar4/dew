@@ -2,9 +2,10 @@
 seeds in the environment its code runs under (tools/remote_code_reference.py --record, the draws
 tests/remote_code_draws.py's): Liquid's LFM3 (LiquidAI/LFM3-1.7B@40ebe0a, transformers 5.18.0),
 MiMo-V2.6 (XiaomiMiMo/MiMo-V2.6-Pro-MOPD@6a7f202, 5.1.0, the last whose masks its code calls), its decoder
-alone and whole with its ViT, its audio encoder over its folder's tokenizer and the prediction layer vLLM
-composes of its modules, Dream (Dream-org/Dream-v0-Base-7B@6572adb, 4.46.3) and LLaDA
-(GSAI-ML/LLaDA-8B-Base@0f2787f, 4.46.3), each over a tiny random-weight checkpoint."""
+alone, with sliding layers of their own heads and width, and whole with its ViT, its audio encoder over
+its folder's tokenizer and the prediction layer vLLM composes of its modules, Dream
+(Dream-org/Dream-v0-Base-7B@6572adb, 4.46.3) and LLaDA (GSAI-ML/LLaDA-8B-Base@0f2787f, 4.46.3), each over
+a tiny random-weight checkpoint."""
 
 import json
 from pathlib import Path
@@ -28,7 +29,8 @@ def test_a_decoder_computes_its_releases_outputs_at_each_recorded_site(name, sit
     tied head) over a packed row whose first documents are shorter than a convolution's history, through
     the decode cache in chunks, its parameter gradients under a drawn cotangent, its logits after one SGD
     step on the rows' next-token cross-entropy (a real update, the tied embedding and head stepped once)
-    and, with its convolutions' bias, over left-padded rows (ledgers 2039, 2040); MiMo-V2.6's whole over
+    and, with its convolutions' bias, over left-padded rows (ledgers 2039, 2040); MiMo-V2.6's decoder whose
+    sliding layers attend in their own geometry (ledger 4290); MiMo-V2.6's whole over
     rows a drawn image, a drawn video's frames or drawn audio clips fill, and its prediction layer's logits
     (row 357)."""
     source = Pretrained.load(FIXTURES / name, dtype='float32', attention_impl='reference')
@@ -44,7 +46,8 @@ def test_a_decoder_computes_its_releases_outputs_at_each_recorded_site(name, sit
 
 
 OPENED = {"lfm3-tiny": "transformers==5.18.0", "lfm3-biased-tiny": "transformers==5.18.0",
-          "lfm3-vl-tiny": "transformers==5.18.0", "mimo-v2-tiny": "transformers==5.1.0"}
+          "lfm3-vl-tiny": "transformers==5.18.0", "mimo-v2-tiny": "transformers==5.1.0",
+          "mimo-v2-sliding-tiny": "transformers==5.1.0"}
 """Each fixture whose export opens through its release's code, by the transformers that code runs under,
 which the whole suite's run overlays on the suite's own for its check alone (`release_env`): LFM3's
 native export carries it (`DecoderFamily.release_code`); MiMo-V2's and LFM3-VL's, which transformers
@@ -107,15 +110,37 @@ def test_an_export_opens_through_its_releases_own_code_as_the_release_does(name,
     assert all(checks.values()), checks
 
 
-def test_a_release_test_outside_its_overlay_fails_naming_the_overlay():
-    """A release_env test run by an interpreter without the package its mark pins fails before it runs,
-    naming the overlay that holds it (`uv run --with <requirement>`), where the release's own loader failed
-    opaquely in its subprocess (row 3576); an interpreter that holds it runs the test."""
+@pytest.mark.parametrize("pinned", ["held", "other", "absent", "held wheel", "other wheel"])
+def test_a_release_test_outside_its_overlay_fails_naming_the_overlay(tmp_path, pinned):
+    """A release_env test run by an interpreter without the package its mark pins, a requirement or the
+    wheel's path CI's release task overlays (tools/armada/ci.py `pytest_command`), fails before it runs,
+    naming CI's release operation over its file, where the release's own loader failed opaquely in its
+    subprocess (row 3576); an interpreter that holds it runs the test. Run as pytest runs a marked test,
+    through the suite's own hooks (tests/conftest.py, loaded as the run's plugin) and its markers
+    (pyproject.toml)."""
+    import os
+    import subprocess
+    import sys
     from importlib.metadata import version
 
+    held = version("packaging")
+    requirement = {"held": f"packaging=={held}", "other": "packaging==0.0.1", "absent": "dew-absent==1.0",
+                   "held wheel": str(tmp_path / f"packaging-{held}-py3-none-any.whl"),
+                   "other wheel": str(tmp_path / "packaging-0.0.1-py3-none-any.whl")}[pinned]
+    test = tmp_path / "test_marked.py"
+    test.write_text(f"import pytest\n\n\n@pytest.mark.release_env({requirement!r})\ndef test_marked():\n"
+                    "    pass\n")
+    tests = Path(__file__).resolve().parent
+    run = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "conftest",
+                          "-c", str(tests.parent / "pyproject.toml"), "--rootdir", str(tmp_path), str(test)],
+                         capture_output=True, text=True, cwd=tmp_path, check=False,
+                         env={**os.environ, "PYTHONPATH": os.pathsep.join(
+                             filter(None, (str(tests), os.environ.get("PYTHONPATH"))))})
     from conftest import release_unheld
 
-    unheld = release_unheld("transformers==0.0.1")
-    assert unheld is not None and "uv run --with 'transformers==0.0.1'" in unheld
-    assert release_unheld("dew-absent-package==1.0") is not None
-    assert release_unheld(f"transformers=={version('transformers')}") is None
+    unheld = release_unheld(requirement, "test_marked.py::test_marked")
+    assert run.returncode == (0 if unheld is None else 1), run.stdout[-2000:]
+    assert (unheld is None) == pinned.startswith("held")
+    if unheld is not None:
+        assert unheld.command[:3] == ("python", "tools/armada/ci.py", "release")
+        assert {f"--requirement={requirement}", "--tests=test_marked.py"} <= set(unheld.command)

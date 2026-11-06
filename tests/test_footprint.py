@@ -140,15 +140,16 @@ def test_a_fused_value_a_product_reads_is_held_while_it_multiplies():
     """A value XLA's fusion would recompute is held where a matrix product reads it, which takes its
     operands from memory: the exponentials of the rows, a product's operand, and the cotangent of the
     product's hyperbolic tangent, the weight's gradient's operand, are both held beside that gradient as
-    it is computed, with the product the cotangent is recomputed from."""
+    it is computed. The product the cotangent is computed from is not: the fusion making the cotangent
+    runs before the gradient's product and frees it, its last reader (`dying`)."""
     rows, weights = jax.ShapeDtypeStruct((8, 16), jnp.float32), jax.ShapeDtypeStruct((16, 32), jnp.float32)
 
     def loss(weights, rows):
         return jnp.sum(jnp.tanh(jnp.exp(rows) @ weights)), ()
 
-    # The gradient (16 x 32), the exponentials (8 x 16), the cotangent and the product (8 x 32 each).
+    # The gradient (16 x 32), the exponentials (8 x 16) and the cotangent (8 x 32).
     assert gradient_peak(loss, weights, (rows,), platform="gpu", workspace=Workspace(0, 0)).bytes == (
-        16 * 32 + 8 * 16 + 2 * 8 * 32) * 4
+        16 * 32 + 8 * 16 + 8 * 32) * 4
 
 
 def test_a_gradient_a_fused_chain_computes_is_held():
@@ -397,10 +398,15 @@ def test_a_gradient_added_to_a_zero_carry_holds_the_gradient_alone():
     def carried(logits, hidden):
         return jnp.zeros((4096, 256), jnp.float32) + product(logits, hidden)
 
+    # And a zero read through a view and a cast, as a loop of one turn reads its zero carry unstacked.
+    def unstacked(logits, hidden):
+        (zeros,) = jnp.unstack(jnp.zeros((1, 4096, 256), jnp.bfloat16).astype(jnp.float32), axis=0)
+        return zeros + product(logits, hidden)
+
     def peak(function):
         return peak_bytes(simplified(jax.make_jaxpr(function)(*shapes).jaxpr, "gpu"), "gpu", Workspace(0, 0))
 
-    assert peak(carried) == peak(product)
+    assert peak(carried) == peak(unstacked) == peak(product)
 
 
 def test_a_scatter_whose_updates_read_its_base_holds_them_apart():
@@ -447,6 +453,93 @@ def test_a_scatter_whose_updates_read_its_base_holds_them_apart():
 
     assert peak(into_input, jax.ShapeDtypeStruct((size,), jnp.float32)) >= (10 + 1) * size * 4
     assert peak(into_view, jax.ShapeDtypeStruct((size // 256, 256), jnp.float32)) >= (10 + 1) * size * 4
+
+
+def test_a_loops_carry_summed_with_a_product_holds_no_product_beside_it():
+    """A sum of a cuBLAS product and a value of its type is the product's own, as XLA's GEMM rewriter folds
+    the sum into the GEMM as its bias (`FuseMatrixBiasAdd`, its beta 1), in a loop's body too: a tiled
+    head's weight gradient adding each tile's product to its loop's carry holds what a loop writing each
+    product into its carry holds, where the derivation held each tile's product beside the carry
+    (Qwen3.5-4B's step under 'full' at two microbatches, 2.37 GiB a tile: row 4089)."""
+    from dew.training.footprint import peak_bytes, simplified
+
+    width, vocab, tokens, tiles = 256, 4096, 512, 4
+    shapes = (jax.ShapeDtypeStruct((tiles, tokens, width), jnp.float32),
+              jax.ShapeDtypeStruct((tiles, tokens, vocab), jnp.float32))
+
+    def product(tile):
+        hidden, cotangents = tile
+        return jax.lax.dot_general(hidden, cotangents, (((0,), (0,)), ((), ())))
+
+    def summed(hidden, cotangents):
+        return jax.lax.scan(lambda carried, tile: (carried + product(tile), None),
+                            jnp.zeros((width, vocab), jnp.float32), (hidden, cotangents))[0]
+
+    def written(hidden, cotangents):
+        return jax.lax.scan(lambda carried, tile: (product(tile), None),
+                            jnp.zeros((width, vocab), jnp.float32), (hidden, cotangents))[0]
+
+    def peak(function):
+        return peak_bytes(simplified(jax.make_jaxpr(function)(*shapes).jaxpr, "gpu"), "gpu", Workspace(0, 0))
+
+    assert peak(summed) == peak(written)
+
+
+def test_a_products_operand_computed_from_a_held_value_frees_it():
+    """A product's operand that a fused chain computes from a value held behind a barrier is a kernel of its
+    own, run before the product, past which the held value no other instruction reads is freed: a head's
+    weight gradient reading the logits' cotangent, computed from the logits a recomputed head holds,
+    holds what one reading a cotangent held itself holds, where the derivation held the logits and the
+    cotangent at once (Qwen3.5-4B's step at four microbatches, 0.95 GiB over XLA's 7.42: row 4089)."""
+    from dew.training.footprint import peak_bytes, simplified
+
+    tokens, width, vocab = 256, 512, 4096
+    shapes = (jax.ShapeDtypeStruct((tokens, width), jnp.float32),
+              jax.ShapeDtypeStruct((width, vocab), jnp.float32))
+
+    def cotangent(logits):
+        return (jnp.exp(logits.astype(jnp.float32)) * 2.0).astype(jnp.bfloat16)
+
+    def gradient(cotangents, hidden):
+        return jax.lax.dot_general(cotangents, hidden.astype(jnp.bfloat16), (((0,), (0,)), ((), ())),
+                                   preferred_element_type=jnp.float32)
+
+    def from_logits(hidden, weights):
+        logits = jax.lax.optimization_barrier((hidden @ weights).astype(jnp.bfloat16))
+        return gradient(cotangent(logits), hidden)
+
+    def held_cotangent(hidden, weights):
+        return gradient(jax.lax.optimization_barrier(cotangent(hidden @ weights)), hidden)
+
+    def peak(function):
+        return peak_bytes(simplified(jax.make_jaxpr(function)(*shapes).jaxpr, "gpu"), "gpu", Workspace(0, 0))
+
+    assert peak(from_logits) == peak(held_cotangent)
+
+
+def test_a_gemm_writes_in_its_bias_only_where_it_is_its_one_reader():
+    """A GEMM computing a sum writes in its bias only where it is the bias's one reader, whatever read the
+    bias before it (`FuseMatrixBiasAdd`'s `can_overwrite_bias`): a bias a reduction read first is held
+    beside the sum, one matrix more than where the GEMM reads it alone (review of row 4089)."""
+    from dew.training.footprint import peak_bytes, simplified
+
+    square = jax.ShapeDtypeStruct((512, 512), jnp.float32)
+
+    def alone(a, b, x, y):
+        return a @ b + x @ y
+
+    def read_before(a, b, x, y):
+        bias = x @ y
+        total = jnp.sum(bias)
+        return a @ b + bias, total
+
+    def peak(function):
+        return peak_bytes(simplified(jax.make_jaxpr(function)(square, square, square, square).jaxpr, "gpu"),
+                          "gpu", Workspace(0, 0))
+
+    matrix = 512 * 512 * 4
+    # The bias and the sum beside it, and the reduction's scalar the program returns.
+    assert (peak(alone), peak(read_before)) == (matrix, 2 * matrix + 4)
 
 
 def test_a_transposed_input_returned_flat_is_a_copy():
@@ -562,11 +655,12 @@ def test_a_gradient_states_its_peak_a_bound_from_below_where_a_nested_ragged_pro
 def test_a_derived_peak_is_of_the_program_the_algebra_pass_makes_of_the_step():
     """The algebra pass rewrites the program a step compiles (`algebra.rewritten_program`,
     docs/design/algebra.md §6.7): two products of one operand summed become one product of it with the
-    summed others, so the forward holds one 256 x 1024 product, not two, and the backward reads one. The
-    derived peak and residuals are that program's (row 3445): below the unrewritten program's, which the
-    pass turned off (`algebra.passes`) derives."""
+    summed others, and the derivation reads that program (row 3445), one product forward where the
+    pass turned off (`algebra.passes`) leaves two. Both hold what XLA's compile of each holds: XLA folds
+    one product of the two into the other's GEMM as its bias (`biased`), so the pass saves the product's
+    work and no memory (each compiled for an H100, 3,145,728 bytes of temporaries either way)."""
     from dew import algebra
-    from dew.training.footprint import derived_terms
+    from dew.training.footprint import derived_terms, traced_gradient
 
     def loss(weights, x):
         shared = jnp.tanh(x)
@@ -577,12 +671,14 @@ def test_a_derived_peak_is_of_the_program_the_algebra_pass_makes_of_the_step():
     x = jax.ShapeDtypeStruct((256, 64), jnp.float32)
 
     def derived():
+        program, _, _ = traced_gradient(loss, weights, (x,))
         residuals, peak = derived_terms(loss, weights, (x,), platform="gpu", workspace=Workspace(0, 0))
-        return residuals, peak.bytes
+        forward = [equation for equation in program.eqns if equation.primitive.name == "dot_general"
+                   and equation.outvars[0].aval.shape == (256, 1024)]
+        return len(forward), residuals, peak.bytes
 
     rewritten = derived()
     with algebra.passes(on=False):
         plain = derived()
-    product = 256 * 1024 * 4
-    assert rewritten[0] <= plain[0] - product and rewritten[1] <= plain[1] - product, (rewritten, plain)
-
+    assert (rewritten[0], plain[0]) == (1, 2), (rewritten, plain)
+    assert rewritten[1:] == plain[1:], (rewritten, plain)

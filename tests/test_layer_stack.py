@@ -22,7 +22,7 @@ import pytest
 import selection_margins
 from arm_arithmetic import float64_held
 from flax import linen as nn
-from model_support import largest_difference, stepped_decode
+from model_support import flat_tree, largest_difference, stepped_decode, steps_from
 from reference_error import (
     FEWEST_SEEDS,
     GateFailure,
@@ -279,6 +279,7 @@ class ScanCase:
 
     def arms(self):
         """The scanned stack's measured run and the plain loop's, and the plain loop's float64 truth."""
+        @as_given
         def truth(ids, cotangent):
             with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
                 if "truth" not in self.runs:
@@ -538,8 +539,10 @@ def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_t
     array) hands each layer it reads a layer at a time the run's expert kernels whole and the layer's
     index, which the grouped matmul reads in place (`dew.nn.moe.Layered`): the step's loop takes every
     expert stack as a constant, whole, and copies none of them a layer at a time (no slice of a stack's
-    shape is taken in it). Its steps decode as exactly as the plain loop's, both from the loop's own
-    float64 steps (check 1). A call keeping every collection open writes none of the kernels back."""
+    shape is taken in it); every other leaf of the bank it reads in the iteration that reads it, none
+    staged a layer ahead in the loop's carry, which a bank in host memory alone needs. Its steps decode as
+    exactly as the plain loop's, both from the loop's own float64 steps (check 1). A call keeping every
+    collection open writes none of the kernels back."""
     ids = jax.random.randint(jax.random.key(2), (2, 8), 0, VOCAB)
     routed = {"experts": 4, "top_k": 2, "expert_features": 16, "layers": tuple(range(4))}
     scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True, mixture=routed)
@@ -561,9 +564,14 @@ def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_t
               for equation in equations(scan.params["jaxpr"])
               if equation.primitive.name in ("dynamic_slice", "slice", "gather")}
     assert any(stacks <= whole for whole in handed) and not stacks & slices
+    carried = {tuple(operand.aval.shape) for scan in loops
+               for operand in scan.params["ft_in"].update(scan.invars).unpack()[1]}
+    layer = {tuple(leaf.shape[1:]) for leaf in jax.tree.leaves(banked["params"]["layers_0_3"])}
+    assert not layer & carried, layer & carried
 
     draw = drawn_ids(0x1342, 8)
 
+    @as_given
     def truth(ids):
         with jax.enable_x64(new_val=True):
             wide = tiny(num_layers=4, max_seq_len=16, mixture=routed, dtype=jnp.float64)
@@ -574,6 +582,73 @@ def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_t
 
     assert_as_exact(steps(scanned, banked), steps(plain, variables), draw, "banked MoE decode steps",
                     seeds=BANKED_EXPERT_SEEDS, truth_fn=truth)
+
+
+BANKED_DECODE_SEEDS = 8
+"""The banked decode's check-1 seeds, sized by `seeds_for` on armada."""
+
+
+def test_a_banked_decode_keeps_its_cache_banked_and_reads_its_layers_as_the_per_layer_cache():
+    """A scanned MoE stack decoding over a banked store (`HeldBanks.place`) allocates its decode cache as
+    the store holds the run's weights, the run's layers one array under the run's name, and every later
+    call reads and writes that bank where it lies, each layer's keys and values at the call's own slots,
+    rather than stacking the layers' caches into a bank and cutting them apart again each call. A prefill
+    and single-token steps over it decode as the same stack's calls over the plain loop's per-layer cache,
+    which the stack stacks and unstacks each call: their logits and each layer's cached keys and values,
+    both from the plain loop's own float64 decode (check 1), two compiled programs being two orders of
+    sums; and each layer of the bank holds the per-layer cache's slots and cursor, exactly."""
+    routed = {"experts": 4, "top_k": 2, "expert_features": 16, "layers": tuple(range(4))}
+    scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True, mixture=routed)
+    plain = tiny(num_layers=4, max_seq_len=16, mixture=routed)
+    variables = plain.init(jax.random.key(0), jnp.zeros((2, 10), jnp.int32))
+    banked = HeldBanks(variables).place(scanned)
+    first = jnp.zeros((2, 1), jnp.int32)
+    allocated = scanned.apply(banked, first, decode=True, mutable=["cache"])[1]["cache"]
+    assert "layers_0_3" in allocated and not any(f"layers_{index}" in allocated for index in range(4))
+
+    def decoded(model, store, cache):
+        """A prefill of five tokens, then a token a call: every call's logits, and each layer's cache they
+        leave, a bank's by its rows, by the layer's leaf."""
+        @jax.jit
+        def run(ids):
+            prefilled, state = model.apply({**store, "cache": cache}, ids[:, :5], decode=True,
+                                           mutable=["cache"])
+            steps, left = steps_from(model, store, state["cache"], ids[:, 5:])
+            layers = ([jax.tree.map(lambda bank, index=index: bank[index], left["layers_0_3"])
+                       for index in range(4)] if "layers_0_3" in left
+                      else [left[f"layers_{index}"] for index in range(4)])
+            held = {f"layers_{index}.{path}": leaf for index, layer in enumerate(layers)
+                    for path, leaf in flat_tree(layer).items()}
+            return {"logits": jnp.concatenate([prefilled, steps], axis=1), **held}
+        return run
+
+    def floating(run):
+        """`run`'s floating outputs, which check 1 judges."""
+        return lambda ids: {name: value for name, value in run(ids).items()
+                            if jnp.issubdtype(value.dtype, jnp.floating)}
+
+    per_layer = scanned.init(jax.random.key(0), first, decode=True)["cache"]
+    bank, layers = decoded(scanned, banked, allocated), decoded(scanned, banked, per_layer)
+    def integral(run):
+        """`run`'s slots and cursors, which both arms hold exactly."""
+        return {name: np.asarray(value) for name, value in run(drawn_ids(0x4550, 10)(0)[0]).items()
+                if not jnp.issubdtype(value.dtype, jnp.floating)}
+
+    exact, held = integral(layers), integral(bank)
+    assert exact and held.keys() == exact.keys(), (sorted(held), sorted(exact))
+    for name, value in exact.items():
+        np.testing.assert_array_equal(held[name], value, err_msg=name)
+
+    @as_given
+    def truth(ids):
+        with jax.enable_x64(new_val=True):
+            wide = tiny(num_layers=4, max_seq_len=16, mixture=routed, dtype=jnp.float64)
+            cache = wide.init(jax.random.key(0), first, decode=True)["cache"]
+            return {name: np.asarray(value) for name, value in
+                    floating(decoded(wide, widened(variables), cache))(ids).items()}
+
+    assert_as_exact(floating(bank), floating(layers), drawn_ids(0x4550, 10), "banked decode",
+                    seeds=BANKED_DECODE_SEEDS, truth_fn=truth)
 
 
 SOURCE_SCAN_SEEDS = 8
@@ -718,6 +793,7 @@ def float64_layer_states(model, variables):
     every lane keeps for float64, as a function of token rows: the truth."""
     wide, held = model.clone(dtype=jnp.float64), widened(variables)
 
+    @as_given
     def states(ids):
         with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
             return [np.asarray(state) for state in layer_states(wide, held, np.asarray(ids))]

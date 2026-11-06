@@ -1,8 +1,9 @@
 """Wall-clock timing of calls: `samples`, which every benchmark tool in Dew measures independent
 calls with, `carried`, which times calls that carry a state from one to the next, `benchmark`,
 which lays out many calls' timings as a table, and `compared`, which reads two calls against each
-other by their paired ratio; and the process's resident memory as the kernel reports it
-(`resident_memory`), which the memory benchmarks read.
+other by their paired ratio; a GPU call's own kernels' device time, as CUPTI reads it
+(`device_time`), which the kernel tuner and the kernel benchmarks read; and the process's resident
+memory as the kernel reports it (`resident_memory`), which the memory benchmarks read.
 
 A run is timed from the call to the moment its output is ready on the devices
 (`jax.block_until_ready`), so an asynchronous dispatch is timed as the work it
@@ -13,13 +14,15 @@ timed, a jitted function bound to its inputs: nothing is jitted here.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import html
 import math
 import statistics
 import time
-from collections.abc import Callable, Hashable, Mapping
+from collections.abc import Callable, Hashable, Iterator, Mapping
 from fractions import Fraction
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -106,6 +109,142 @@ def largest_difference(left, right) -> float:
     implementation's outputs sit from another's."""
     return max(float(jnp.max(jnp.abs(a.astype(jnp.float32) - b.astype(jnp.float32))))
                for a, b in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True))
+
+
+class KernelTime(NamedTuple):
+    """One kernel a call launched and its device time, as CUPTI read it (`DeviceTime.kernels`)."""
+
+    name: str
+    milliseconds: float
+
+
+class CuptiHeld(RuntimeError):
+    """CUPTI's one subscription is another subscriber's, a profile capture's or Nsight's, so no device
+    time is read (`device_time`): the kernel tuner keeps a launch's derived config until a later compile,
+    and a benchmark reports it."""
+
+
+EVICTION_BYTES = 256 << 20
+"""The bytes an eviction reads (`eviction`, `behind`): over twice the L2 of every GPU Dew targets (an
+H100's 50 MB, a B200's 126 MB), so a read of them leaves none of a timed call's operands in it."""
+
+
+def eviction() -> jax.Array:
+    """The buffer an eviction reads: `EVICTION_BYTES` of zeros, on the default device."""
+    return jnp.zeros(EVICTION_BYTES // 4, jnp.float32)
+
+
+def behind(call: Callable) -> Callable:
+    """The program that runs `call(*args)` behind an eviction, a read of `evicting` (`eviction`): called
+    as `(evicting, args)`, the call waits for the read (an optimization barrier) and both outputs are
+    returned, so the compiler keeps it. A timing that needs its operands out of the cache times this
+    program and leaves the read's kernels out (`DeviceTime.behind`): CUPTI reads a call after an untimed
+    run of it, which refills a cache an eviction run before the call emptied."""
+    def run(evicting, args):
+        evicted, args = jax.lax.optimization_barrier((jnp.sum(evicting), args))
+        return evicted, call(*args)
+    return run
+
+
+class NoKernels(ValueError):
+    """A call CUPTI read none of its own kernels of (`DeviceTime`), whose time would read as zero."""
+
+
+class DeviceTime:
+    """The device time of each GPU call `device_time`'s session reads: its own kernels' as CUPTI times
+    them, from their start to their end on the device, which no host dispatch or other process's work
+    enters. The caller composes the operands each call reads and the statistic it reports.
+
+    CUPTI reads a call after running it once untimed (Mosaic GPU's profiler warms what it times), so a
+    call is timed warm; one timed out of the cache runs behind an eviction in one program (`behind`)."""
+
+    def __init__(self, cupti):
+        self._cupti = cupti
+        self._subscribed = False
+        self._joined: dict[Callable, Callable] = {}
+        self._evicting: jax.Array | None = None
+        self._evicted: frozenset[str] | None = None
+
+    def kernels(self, fn: Callable, *args, evicted: bool = False) -> tuple[KernelTime, ...]:
+        """Each kernel one call of `fn(*args)` launched, in launch order, with its device milliseconds,
+        once its output is ready. A call that launched none is refused (`NoKernels`): its time would read
+        as zero. `evicted` runs the call behind the session's eviction in one program (`behind`), its
+        kernels left out, so its operands are read from memory, not the cache."""
+        if not evicted:
+            return self._read(fn, *args)
+        if fn not in self._joined:
+            from dew.nn.kernels.options import owned_program
+
+            self._joined[fn] = owned_program(behind(fn))
+        if self._evicting is None:
+            self._evicting = eviction()
+        return self.behind(self._joined[fn], self._evicting, *args)
+
+    def behind(self, program: Callable, evicting: jax.Array, *args) -> tuple[KernelTime, ...]:
+        """The kernels of one call of `program`, a call run behind a read of `evicting` (`behind`,
+        compiled by its caller: the kernel tuner compiles one a config), but the read's own, which a read
+        alone names once. A call none of whose own CUPTI read is refused (`NoKernels`)."""
+        if self._evicted is None:
+            from dew.nn.kernels.options import owned_program
+
+            self._evicted = frozenset(kernel.name for kernel in self._read(owned_program(jnp.sum), evicting))
+        timed = tuple(kernel for kernel in self._read(program, evicting, args)
+                      if kernel.name not in self._evicted)
+        if not timed:
+            raise NoKernels(f"{program} launched no kernel CUPTI timed apart from its eviction's")
+        return timed
+
+    def seconds(self, fn: Callable, *args, evicted: bool = False) -> float:
+        """One call's device seconds, its kernels' summed (`kernels`)."""
+        return sum(kernel.milliseconds for kernel in self.kernels(fn, *args, evicted=evicted)) / 1e3
+
+    def _read(self, fn: Callable, *args) -> tuple[KernelTime, ...]:
+        """CUPTI's reading of one call (`kernels`), refusing a call of no kernel."""
+        # Each read subscribes CUPTI, which only a finalizing read detaches from the process (`_detach`),
+        # whether this one reads, launches nothing or fails.
+        self._subscribed = True
+        try:
+            _, read = self._cupti.measure(fn, aggregate=False)(*args)
+        except RuntimeError as error:
+            if "another subscriber" in str(error):
+                raise CuptiHeld(str(error)) from error
+            raise
+        if not read:
+            raise NoKernels(f"{fn} launched no kernel CUPTI timed, so it has no device time")
+        return tuple(KernelTime(name, milliseconds) for name, milliseconds in read)
+
+    def _detach(self) -> None:
+        """Detach CUPTI from the process with a finalizing read of a call that runs nothing, so a profiler
+        can subscribe after and no call of the caller's runs again; a session that read nothing, or whose
+        subscription another holds (`CuptiHeld`), has nothing to detach."""
+        from jax.experimental.mosaic.gpu import profiler
+
+        if not self._subscribed:
+            return
+        try:
+            profiler.Cupti().measure(_nothing, aggregate=False)()
+        except RuntimeError as error:
+            if "another subscriber" not in str(error):
+                raise
+
+
+def _nothing() -> None:
+    """A call that launches no kernel, which a session's finalizing read runs (`DeviceTime._detach`)."""
+
+
+@contextlib.contextmanager
+def device_time() -> Iterator[DeviceTime]:
+    """A session of GPU device timing (`DeviceTime`): CUPTI subscribed for each call it reads and
+    detached from the process when it ends, however it ends, so a profile capture or Nsight can
+    subscribe after. CUPTI takes one subscriber; where another holds it, a read raises `CuptiHeld`.
+    Dew's one reader of CUPTI (Mosaic GPU's profiler's `Cupti`)."""
+    from jax.experimental.mosaic.gpu import profiler
+
+    session = DeviceTime(profiler.Cupti(finalize=False))
+    try:
+        yield session
+    finally:
+        session._detach()
 
 
 def samples[T](fn: Callable[..., T], *args, warmup: int = 3, repeats: int = 10,
@@ -251,4 +390,5 @@ def benchmark[T](calls: Mapping[Hashable, Callable[[], T]], *, warmup: int = 1,
     return Benchmark(seconds, outputs)
 
 
-__all__ = ["Benchmark", "Comparison", "benchmark", "carried", "compared", "samples"]
+__all__ = ["EVICTION_BYTES", "Benchmark", "Comparison", "CuptiHeld", "DeviceTime", "KernelTime", "NoKernels",
+           "behind", "benchmark", "carried", "compared", "device_time", "eviction", "samples"]

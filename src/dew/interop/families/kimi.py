@@ -33,9 +33,11 @@ configuration_kimi_k3.py are unchanged since the initial commit c5d1dd4) is
 a vision wrapper, `KimiK3ForConditionalGeneration`, around a text decoder
 whose config is also `kimi_linear` and which K3's own modeling_kimi_linear.py
 computes. Without pixels the wrapper embeds the ids and runs the language
-model as it is (modeling_kimi_k3.py:1145-1218), so the text half is the
-model here; its tower and projector tensors map to nothing and export writes
-their bytes back. K3's decoder adds to Kimi Linear's:
+model as it is (modeling_kimi_k3.py:1145-1218), so a text-only load's model
+is the text half, its tower and projector tensors kept for export as their
+bytes; the bundle reads whole as K2.5's does (`_kimi_k3_wrapper`), MoonViT
+with K3's options and its PatchMergerMLPV2 (`dew.nn.vision.moonvit`). K3's
+decoder adds to Kimi Linear's:
 
 - the full-rank KDA output gate and the lower-bounded forget gate
   (`use_full_rank_gate`, `gate_lower_bound`), and a sigmoid output gate on
@@ -67,6 +69,7 @@ from dew.interop.decoder_parts import (
     IGNORED_FIELDS,
     KDA_LEAVES,
     MOE_NAMES,
+    NO_AUDIO,
     SERIALIZED_ENCODER_FIELDS,
     SERIALIZED_TEXT_FIELDS,
     DecoderFamily,
@@ -75,6 +78,7 @@ from dew.interop.decoder_parts import (
     Leaves,
     MixtureFields,
     SituFields,
+    WrapperFields,
     context_lengths,
     dew_path,
     record_float,
@@ -89,6 +93,7 @@ from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
+from dew.nn.vision.moonvit import translate_moonvit_config, translate_moonvit_projector_config
 
 # KimiLinearConfig's __init__ arguments (configuration_kimi.py:11-52 of
 # Kimi-Linear-48B-A3B-Instruct at e1df551).
@@ -322,6 +327,20 @@ def _kimi_k3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     return _decoder(text, tied, capacity)
 
 
+def _kimi_k3_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
+    """Read a Kimi K3 bundle whole (the release's KimiK3ForConditionalGeneration at f831ab6): its decoder
+    as the text half reads it (`_kimi_k3_config`), read by this family (`hf_decoders.language_family`),
+    MoonViT with K3's options and its PatchMergerMLPV2 (`dew.nn.vision.moonvit`), and the media
+    placeholder each of an item's projected merge blocks fills (`media_placeholder_token_id`,
+    modeling_kimi_k3.py:958-1090)."""
+    text = _kimi_k3_config(hf_config, used)
+    return {'model_type': 'kimi_k3', 'text_model_type': 'kimi_k3', 'text': text,
+            'tower': translate_moonvit_config(hf_config),
+            'projector': translate_moonvit_projector_config(hf_config, record_int(text, 'emb_features')),
+            'image_token_id': record_int(hf_config, 'media_placeholder_token_id'),
+            'tokens_per_image': None, 'video_token_id': None, 'extra_placeholder_ids': (), **NO_AUDIO}
+
+
 _KIMI_LEAVES: Leaves = {'model.output_attn_res_norm.weight': ('output_res', 'scale'),
                         'model.output_attn_res_proj.weight': ('output_res', 'kernel')}
 _KIMI_LAYER_LEAVES: Leaves = {
@@ -362,14 +381,16 @@ def _kimi_k3_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | 
     """Return the variables-tree path of one Kimi K3 tensor: the decoder under
     `language_model.model.*`, the head at `language_model.lm_head.weight`
     (model.safetensors.index.json at f831ab6), and nothing for the tower and
-    projector."""
+    projector; the bundle's language model reads its own the same, past
+    `language_model.` (`hf_decoders.language_family`)."""
     if name.startswith(('vision_tower.', 'mm_projector.')):
         return None
-    if name == 'language_model.lm_head.weight':
-        return dew_path('lm_head.weight', config)
-    if not name.startswith('language_model.model.'):
+    name = name.removeprefix('language_model.')
+    if name == 'lm_head.weight':
+        return dew_path(name, config)
+    if not name.startswith('model.'):
         raise ValueError(f"unknown tensor name {name!r}")
-    return _decoder_path(name.removeprefix('language_model.model.'), config)
+    return _decoder_path(name.removeprefix('model.'), config)
 
 
 def _kimi_linear_prepare(tensors: Mapping[str, Stored],
@@ -449,4 +470,5 @@ KIMI_K3 = DecoderFamily(
     zero_padded=_KDA_ZERO_PADDED,
     preserve_source_layout=True,
     tied_head_names=('language_model.lm_head.weight', 'language_model.model.embed_tokens.weight'),
+    wrapper=_kimi_k3_wrapper,
 )

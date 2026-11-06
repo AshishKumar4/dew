@@ -575,6 +575,11 @@ def _query_key_split(call: Call) -> int:
         _, scope, _, _ = shared_allocation(call, tiles, (), _query_key_landing(call, call.value_width // vq))
         return resources.shared_bytes(call.family, scope(1))
 
+    if not call.interpret:
+        # Compiled, a split's weights' gradient lands zero, interpreted right (an fp32 call's at a 32-wide
+        # split on an H100, dw-split-h100-7ac824e06, row 4346): the whole row, or past the block's shared
+        # memory no fast backward (`template.backward_holds`), the call's training the port's.
+        return call.value_width
     budget = generation.shared_budget(call.target)
     return next((vq for vq in whole_blocks(call.value_width, call.block) if streamed(vq) <= budget),
                 call.block)

@@ -126,22 +126,31 @@ from collections.abc import Container, Mapping, Sequence
 from pathlib import Path
 
 
-def _beside(name: str):
-    """tools/armada/`name`.py, the module beside this file, loaded by its path: this file runs as a
-    script and is loaded by the tests, and puts nothing on sys.path."""
-    spec = importlib.util.spec_from_file_location(f"armada_{name}", Path(__file__).with_name(f"{name}.py"))
+def _loaded(path: Path):
+    """The module at `path`, loaded by its path: this file runs as a script and is loaded by the tests, and
+    puts nothing on sys.path. Its neighbours here, and the gate's standard-library contract the plan shares
+    (tests/check1_wire.py)."""
+    spec = importlib.util.spec_from_file_location(f"armada_{path.stem}", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-child_groups = _beside("child_groups")
-session = _beside("session")
-coverage_report = _beside("coverage_report")
-r2 = _beside("r2")
-watched = _beside("watched")
-followed = _beside("followed")
+HERE = Path(__file__).resolve().parent
+@functools.cache
+def check1_wire():
+    """Check 1's map and judge contract, its one owner (tests/check1_wire.py): what runs a site's test as a
+    map task (DRAWS, RECORDS), as their judge (POOL), a judge's ask for its later map tasks (LATER), its
+    stages log (STAGES) and the units its stages draw (`staged_units`). Loaded where a plan shards a site,
+    so a checkout of the harness alone (a page generator's scratch copy) imports this file."""
+    return _loaded(HERE.parents[1] / "tests" / "check1_wire.py")
+child_groups = _loaded(HERE / "child_groups.py")
+session = _loaded(HERE / "session.py")
+coverage_report = _loaded(HERE / "coverage_report.py")
+r2 = _loaded(HERE / "r2.py")
+watched = _loaded(HERE / "watched.py")
+followed = _loaded(HERE / "followed.py")
 SETTLE = 30.0
 """Seconds a task's process group has, after SIGKILL, to be reaped and gone: inside armada's own timeout
 with the default deadline and grace (session.DEADLINE + session.GRACE + 30 + the reader's 10 < .armada.json's
@@ -310,8 +319,14 @@ FETCHED = ".fetched.json"
 def built(path: Path) -> bool:
     """Whether `path` is a build's output, never an input: compiled bytecode, or an editable install's
     metadata (setuptools' <name>.egg-info), which a task's environment writes into its checkout and a
-    planner's lacks."""
-    return "__pycache__" in path.parts or any(part.endswith(".egg-info") for part in path.parts)
+    planner's lacks; or a directory holding nothing else, as a package a commit deleted leaves its bytecode
+    in a checkout the environment's snapshot carries across commits, which a planner's clean tree lacks (train
+    636: src/dew/cli/, its __pycache__ alone, listed in src/dew's entries, keyed every task's rows apart from
+    their plan's, and two tasks ran 120 kept rows each past their deadline)."""
+    if "__pycache__" in path.parts or any(part.endswith(".egg-info") for part in path.parts):
+        return True
+    return path.is_dir() and not path.is_symlink() and all(
+        entry.name.startswith(".") or built(entry) for entry in path.iterdir())
 
 
 def contents(name: str) -> bytes:
@@ -1019,20 +1034,6 @@ either as armada's map and judge (`site_entries`): map tasks of P units each ove
 its work take, and one judge."""
 SITE_MARK = re.compile(r"\bmark\.(?:" + "|".join(SHARDS) + r")\b")
 """A site's mark as a test file's source spells it (`sites`), which a file that holds none never parses."""
-REDRAW = 4
-"""Check 1's REDRAW (tests/check1_statistics.py, which the plan cannot import: it has no JAX): a site its
-first stage leaves undecided draws REDRAW times its declared seeds further, so its map tasks together draw
-seeds 0 to (1 + REDRAW) times the declared count."""
-DRAWS, RECORDS, POOL, LATER = "DEW_CHECK1_DRAWS", "DEW_CHECK1_RECORDS", "DEW_CHECK1_POOL", "DEW_CHECK1_LATER"
-"""What runs a site's test as a map task, which takes the units DRAWS names (`start:stop`) and writes what
-they give into the directory RECORDS names, judging nothing, or as their judge, which pools the records
-under POOL and judges them as a test that took every unit itself would (tests/map_judge.py's
-`record_units` and `pooled_units`): a check-1 site its seeds' draws (tests/reference_error.py), and a test
-marked `shards` the units of its own work, given alike. A judge whose judgement needs units its later map
-tasks draw writes the file LATER names (`ask_later`), and its row asks for them (armada's `more`)."""
-STAGES = "DEW_CHECK1_STAGES"
-"""Check 1's stages log (tests/reference_error.py's STAGES_LOG, which the plan cannot import: it has no
-JAX): the file a judge appends each judgement it completes to, its stage among it (`later_judged`)."""
 LATER_JUDGED = "check1_later"
 """A check-1 site judge's row's word that its judgement needed its later map tasks (`later_judged`), which the
 next plan reads to draw them in the first wave (`eager_sites`)."""
@@ -1111,8 +1112,8 @@ def marked_sites(name: str, text: str) -> dict[str, Mark]:
         if (not mark.args and len(counts) == len(mark.keywords) and set(counts) in allowed
                 and all(type(count) is int and count > 0 for count in counts.values()) and test not in found):
             declared = counts[SHARDS[kind]]
-            units = (1 + REDRAW) * declared if kind == "check1_shards" else declared
-            weighed = (1 + REDRAW) * counts.get("conditioning", 0)
+            units = check1_wire().staged_units(declared) if kind == "check1_shards" else declared
+            weighed = check1_wire().staged_units(counts.get("conditioning", 0))
             found[test] = Mark(units, counts["per_task"], mark.lineno, declared, weighed,
                                counts.get("conditioning_per_task", 0))
             read.add(id(mark.func))
@@ -1531,9 +1532,12 @@ def site_environment(site: re.Match | None) -> dict[str, str]:
         stages_file().unlink(missing_ok=True)
         # Check 1 appends to its log where the directory is (`_logged`).
         stages_file().parent.mkdir(parents=True, exist_ok=True)
-        return {POOL: str(armada_dir("ARMADA_INPUTS", INPUTS)), LATER: str(later_file()),
-                STAGES: str(stages_file())}
-    return {DRAWS: f"{site['start']}:{site['stop']}", RECORDS: str(armada_dir("ARMADA_ARTIFACTS", ARTIFACTS))}
+        wire = check1_wire()
+        return {wire.POOL: str(armada_dir("ARMADA_INPUTS", INPUTS)), wire.LATER: str(later_file()),
+                wire.STAGES: str(stages_file())}
+    wire = check1_wire()
+    return {wire.DRAWS: f"{site['start']}:{site['stop']}",
+            wire.RECORDS: str(armada_dir("ARMADA_ARTIFACTS", ARTIFACTS))}
 
 
 def asked(site: re.Match | None) -> dict[str, bool]:
@@ -2146,7 +2150,9 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
     times of the run that recorded it. Each train folds main's CI so (the land queue), and nothing else
     writes the record. A site its file's marks shard (`sites`) keeps its entries: its judge's row times
     its pooling, no measure of its draws, so its map tasks are weighed by armada's measures of them, never
-    by the record (`site_entries`), and a judge armada did not run is a row of its task's name."""
+    by the record (`site_entries`), and a judge armada did not run is a row of its task's name. A
+    whole_suite cell a row set aside (its `whole_suite` names it, its `tests` do not: a train's batch)
+    keeps its entry too."""
     changed = set(subprocess.run(["git", "diff", "--name-only", verdict["sha"], "--", "tests"], check=True,
                                  capture_output=True, text=True).stdout.split())
     rows: dict[str, list[dict]] = {}
@@ -2172,8 +2178,12 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
             continue
         observed = {node: seconds for row_ in held for node, seconds in row_["tests"].items()}
         marked = sites(name)
-        own = {node: seconds for node, seconds in kept.items()
-               if node.split("::")[0] == name and session.test_name(node) not in marked}
+        # Its whole_suite cells its rows set aside (collected, not run: a train's batch) keep their times,
+        # which only the whole suite's run observes (row 4377: a train's fold dropped a 1108 s cell the
+        # whole run then packed cold).
+        aside = {node for row_ in held for node in row_.get("whole_suite", [])} - observed.keys()
+        own = {node: seconds for node, seconds in kept.items() if node.split("::")[0] == name
+               and session.test_name(node) not in marked and node not in aside}
         if stale(own, observed, sum(row_["seconds"] for row_ in held), max(counts, default=1), target):
             kept = {node: seconds for node, seconds in kept.items() if node not in own}
             kept.update({node: round(seconds, 3) for node, seconds in observed.items()})

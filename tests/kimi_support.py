@@ -15,7 +15,6 @@ from residual_orders import model_axes, permuted
 from scipy.special import log_softmax
 from tool_support import run_from
 
-from dew.batch import Variables
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
@@ -25,8 +24,9 @@ from dew.sampling import Sampling, generate
 
 
 def kimi_source(directory: Path) -> tuple[Pretrained, ModelInputs, dict[str, np.ndarray]]:
-    """The fixture loaded in float32, its two rows (one left-padded) and its reference arrays."""
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    """The fixture's decoder loaded in float32, a K3 bundle's language model alone (`text_only`), its two
+    rows (one left-padded) and its reference arrays."""
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference", text_only=True)
     reference = ieee_fixture(directory / "reference.npz") | ieee_fixture(directory / "numerics.npz")
     inputs = ModelInputs(jnp.asarray(reference["input_ids"], jnp.int32),
                          {"attention_mask": jnp.asarray(reference["attention_mask"], bool)})
@@ -87,7 +87,7 @@ def recorded_dew(directory: Path, leaves: tuple[str, ...]):
             with jax.ensure_compile_time_eval():
                 if "float32" not in loaded:
                     narrow = Pretrained.load(directory, dtype="float32", param_dtype="float32",
-                                             attention_impl="reference")
+                                             attention_impl="reference", text_only=True)
                     loaded["float32"] = narrow.model, narrow.variables
                 model, variables = loaded["float32"]
                 widened = jax.tree.map(lambda leaf: jnp.asarray(leaf, name)
@@ -104,20 +104,27 @@ def recorded_dew(directory: Path, leaves: tuple[str, ...]):
     return dew
 
 
-def assert_update_as_exact(source, directory: Path) -> Variables:
-    """One all-parameter SGD step at the reference's learning rate: the loss within 1e-5 of the
-    reference's, and the updated logits as exact over the fixture's residual orders as the
-    reference's own (`assert_as_exact_over_orders`). Returns the stepped variables."""
+def sgd_step(source):
+    """The fixture's loss over its rows and one all-parameter SGD step of it at the reference's learning
+    rate, as functions of the parameters."""
     loaded, inputs, reference = source
     objective = LMObjective(loaded, inputs.tokens.shape[1] - 1, ema_decay=None, pad_id=0)
     step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
-
     loss = parameter_loss(objective, loaded.variables, {"text": inputs}, step)
 
     def stepped(params):
         gradient = jax.grad(loss)(params)
         return jax.tree.map(lambda weight, grad: weight - reference["learning_rate"] * grad, params, gradient)
 
+    return loss, stepped
+
+
+def assert_update_as_exact(source, directory: Path) -> None:
+    """One all-parameter SGD step at the reference's learning rate (`sgd_step`): the loss within 1e-5 of
+    the reference's, and the updated logits as exact over the fixture's residual orders as the
+    reference's own (`assert_as_exact_over_orders`)."""
+    loaded, inputs, reference = source
+    loss, stepped = sgd_step(source)
     value = jax.jit(loss)(loaded.variables["params"])
     np.testing.assert_allclose(value, reference["loss"], atol=1e-5, rtol=0)
     valid = reference["attention_mask"].astype(bool)
@@ -129,22 +136,21 @@ def assert_update_as_exact(source, directory: Path) -> Variables:
     mine = [distance(np.asarray(updated(permuted(loaded.variables, order, axes)["params"]))[valid], truth)
             for order in drawn["orders"]]
     assert_as_exact_over_orders(mine, drawn["updated_logits"], "updated logits")
-    return {**loaded.variables, "params": jax.jit(stepped)(loaded.variables["params"])}
 
 
 def exported(source, directory: Path, written: Path) -> tuple[dict, dict, dict, dict]:
-    """The model stepped once (`assert_update_as_exact`) and saved to `written` with the config
-    `directory` ships: the stepped weights and the reloaded ones, flat by dotted name, and the tensors
-    it wrote and the ones `directory` ships, by name."""
+    """The model stepped once (`sgd_step`, whose numerics `assert_update_as_exact` holds) and saved to
+    `written` with the config `directory` ships: the stepped weights and the reloaded ones, flat by
+    dotted name, and the tensors it wrote and the ones `directory` ships, by name."""
     from flax.traverse_util import flatten_dict
     from safetensors.numpy import load_file
 
     loaded, _, _ = source
-    variables = assert_update_as_exact(source, directory)
+    variables = {**loaded.variables, "params": jax.jit(sgd_step(source)[1])(loaded.variables["params"])}
     loaded.save(written, variables=variables)
     assert (json.loads((written / "config.json").read_text())
             == json.loads((directory / "config.json").read_text()))
-    restored = Pretrained.load(written, dtype="float32", attention_impl="reference")
+    restored = Pretrained.load(written, dtype="float32", attention_impl="reference", text_only=True)
     return (flatten_dict(dict(variables), sep="."), flatten_dict(dict(restored.variables), sep="."),
             load_file(str(written / "model.safetensors")), load_file(str(directory / "model.safetensors")))
 

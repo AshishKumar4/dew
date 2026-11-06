@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
@@ -36,7 +36,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax.core import FrozenDict
 
-from dew._coordination import agreed, collective_host
+from dew._coordination import agreed, agreed_reads, reading_home
 from dew._records import JSON, finite, record as section
 from dew.batch import Variables, thaw, token_id
 from dew.nn.inputs import key_seed, request_key
@@ -338,7 +338,8 @@ def _native_draw(prompt: tuple[int, ...], generation: Generation[np.ndarray], ve
 
 
 class NativeRolloutServer:
-    """Serves rollouts from Dew's `Server`, stepped by an `Engine` of its own.
+    """Serves rollouts from Dew's `Server`, stepped by an `Engine` of its own, or where the server's mesh
+    spans several processes (`pooled`) by the run itself, every process together (`waited`).
 
     The engine orders weight loads with the server's steps, so a load happens
     between two steps. A submission waits for a load in progress but not for a
@@ -363,6 +364,9 @@ class NativeRolloutServer:
     def __init__(self, server: Server, *, version: int = 0):
         self._build: Callable[[Variables, int], Server] | None = None
         self._sampling = server.sampling
+        self._failure: BaseException | None = None
+        self._woken = threading.Event()
+        """Set by a pooled server's submissions and by the futures a round waits on (`waited`)."""
         self._served(server, version)
         self._loading = threading.Lock()
         self._futures = threading.Lock()
@@ -377,7 +381,7 @@ class NativeRolloutServer:
         the run draws its weights. Its version before then is -1, behind every update."""
         server = cls.__new__(cls)
         server._build, server._sampling, server._server, server._engine = build, sampling, None, None
-        server._version = -1
+        server._version, server._failure, server._woken = -1, None, threading.Event()
         server._loading, server._futures = threading.Lock(), threading.Lock()
         server._outstanding, server._closed, server._started = set(), False, False
         return server
@@ -403,7 +407,11 @@ class NativeRolloutServer:
                              "Server.from_task)")
         self._server: Server | None = server
         self._version = version
-        self._engine: Engine | None = Engine(server, name="dew-rollout-server")
+        # A server whose mesh spans several processes is stepped by every one of them together, on the
+        # run's own thread (`waited`); one of one process by an engine's thread.
+        self._engine: Engine | None = None if server.pooled else Engine(server, name="dew-rollout-server")
+        if server.pooled:
+            server.arrived = self._woken.set
 
     @property
     def sampling(self) -> Sampling:
@@ -412,8 +420,13 @@ class NativeRolloutServer:
     @property
     def engine(self) -> Engine | None:
         """The engine that steps the server, and orders a load with its steps; None for a deferred server
-        not yet loaded."""
+        not yet loaded, and for a pooled one, which the run steps (`waited`)."""
         return self._engine
+
+    @property
+    def pooled(self) -> bool:
+        """Whether the server's mesh spans several processes, which step it together (`waited`)."""
+        return self._server is not None and self._server.pooled
 
     @property
     def version(self) -> int:
@@ -429,13 +442,14 @@ class NativeRolloutServer:
         ids, budget = _prompt(prompt), _budget(max_new_tokens)
         future: Future[Draw] = Future()
         with self._futures:
-            if self._engine is None or self._server is None:
+            if self._server is None:
                 raise RuntimeError("a deferred rollout server draws once its first version is loaded")
-            if self._engine.failure is not None:
-                raise RuntimeError("the rollout server stopped") from self._engine.failure
+            failure = self._failure if self._engine is None else self._engine.failure
+            if failure is not None:
+                raise RuntimeError("the rollout server stopped") from failure
             if self._closed:
                 raise RuntimeError("the rollout server is closed")
-            if not self._started:
+            if self._engine is not None and not self._started:
                 self._engine.start()
                 self._started = True
             self._outstanding.add(future)
@@ -484,7 +498,6 @@ class NativeRolloutServer:
                 self._served(self._build(owned, version), version)
             return
         server, engine = self._server, self._engine
-        assert engine is not None, "a served server has its engine"
         # A version is the updates the run committed (`Snapshot.updates`), which a model that reads the
         # run's progress draws at (`Server.reload`).
         at = Progress(jnp.asarray(version, jnp.int32))
@@ -495,7 +508,60 @@ class NativeRolloutServer:
                 server.reload(thaw(variables), progress)
                 self._version = version
 
-        engine.reload(loading)
+        if engine is None:
+            # A pooled server reloads on the run's thread, between the steps it takes there (`waited`), at
+            # the same point of the run on every process.
+            loading()
+        else:
+            engine.reload(loading)
+
+    def waited(self, pending: Callable[[], Sequence[Future]]) -> None:
+        """Return once `pending`, read afresh as draws finish, gives no future: as each finishes where an
+        engine steps the server, and for a pooled server stepped with every process of its mesh, on the
+        calling thread, until no process waits on one. Every process calls it at the same point of its run
+        with the futures it waits on, none for a process that waits on nothing. Each round agrees whether
+        any process's server holds work, which every process then steps (`Server.step`), and else waits
+        for its own futures' work beside the server (a reward scored, an environment stepped) to finish one
+        or to submit a draw. The steps run where the run's other programs run, in the same order on every
+        process: a thread of their own would enter the mesh's collectives in another order on each, and
+        its agreements interleave with the run's (ledger 4279). A step that fails on any process stops the
+        server on every one, each step's outcome agreed before the next round (`agreed`), every request it
+        holds settled with the failure (`Server.fail`)."""
+        server = self._server
+        if server is None or not server.pooled:
+            while live := pending():
+                wait(live, return_when=FIRST_COMPLETED)
+            return
+        watched: set[Future] = set()
+
+        def word() -> dict[str, JSON]:
+            live = pending()
+            for future in live:
+                if future not in watched:
+                    watched.add(future)
+                    future.add_done_callback(lambda _: self._woken.set())
+            return {"busy": server.busy, "waits": bool(live)}
+
+        while True:
+            # Cleared before the round reads its futures and its server, so a draw finished or submitted
+            # after the read wakes the wait below.
+            self._woken.clear()
+            held, said = agreed_reads("rollout round", (word() for _ in range(1)), lambda held: held)
+            words = [each for each in said if isinstance(each, dict)]
+            assert held is not None and len(words) == len(said), "a round's word is read on every process"
+            if not any(each["waits"] for each in words):
+                return
+            if any(each["busy"] for each in words):
+                # Its outcome agreed before any process reads the next round: a step that fails on one
+                # process fails on every one (`agreed`'s PeerFailure), each failing its own server.
+                try:
+                    agreed("rollout step", server.step)
+                except BaseException as failure:
+                    self._failure = failure
+                    server.fail(failure)
+                    raise
+            elif held["waits"]:
+                self._woken.wait()
 
     def close(self) -> None:
         """Stop after the step in progress; every draw still outstanding fails."""
@@ -517,18 +583,13 @@ def _served(variables: Variables, dtype: jnp.dtype) -> Variables:
                         thaw(variables))
 
 
-def _published(source: Pretrained, variables: Variables, dtype: jnp.dtype, *,
-               phase: str) -> Pretrained | None:
+def _published(source: Pretrained, variables: Variables, dtype: jnp.dtype) -> Pretrained:
     """`source` holding `variables` in place of its own tree, each of its trees (a composite release's
-    readout beside its backbone, `Pretrained.map_variables`) cast to the serving `dtype` and gathered
-    home on process 0, which alone returns it: what a publisher exports or saves there. Every process
-    of a pool calls it, as every tree of a pool's placement may hold another process's shards."""
-    def gathered(tree: Variables) -> Variables:
-        held = collective_host(_served(tree, dtype), phase=phase, held_by="first")
-        return {} if held is None else held
-
-    published = replace(source, variables=variables).map_variables(gathered)
-    return published if jax.process_index() == 0 else None
+    readout beside its backbone, `Pretrained.map_variables`) cast to the serving `dtype` where it is
+    placed, on its devices: what a publisher exports or saves, a tensor at a time, each read home by the
+    pool together inside `reading_home` as the writer reads it, so no host holds the whole tree (ledger
+    4370). Every process of a pool exports it alike."""
+    return replace(source, variables=variables).map_variables(lambda tree: _served(tree, dtype))
 
 
 @dataclass(frozen=True)
@@ -538,7 +599,7 @@ class SafetensorsReload:
     `source.save` writes the weights, the derived config and the tokenizer
     files into `directory`, the directory every replica was launched on (a
     shared one when replicas span hosts). Floating-point leaves are cast to
-    `dtype` first. The source's writers replace each file whole (`dew.files.replacing`) and
+    `dtype` first. The source's writers replace each file whole (`dew._files.replacing`) and
     publish a sharded index last, so no engine reads a half-written file. `engines` are the
     replicas' root URLs, not their `/v1` API URLs, and `timeout` bounds each
     HTTP call in seconds. The push fails if a call answers with any status
@@ -560,12 +621,12 @@ class SafetensorsReload:
     directory.
 
     A failed push raises an error that names every replica that did not take
-    the version. Every process of a pool calls the push.
-    `collective_host(held_by="first")` gathers the served tree to process 0,
-    which writes and publishes it, with every other tree the source writes
-    beside it (a decision release's readout, `_published`), and an agreement
-    point raises a failure on every process, so the others do not hang at the
-    next collective.
+    the version. Every process of a pool calls the push: each runs the same
+    writer over the served tree and every other tree the source writes beside
+    it (a decision release's readout, `_published`), reading each tensor home
+    together as it is written (`reading_home`), and process 0 alone writes the
+    weights and publishes them; an agreement point raises a failure on every
+    process, so the others do not hang at the next collective.
     """
 
     source: Pretrained
@@ -584,8 +645,9 @@ class SafetensorsReload:
 
         Every process of a pool calls it.
         """
-        published = _published(self.source, variables, jnp.dtype(self.dtype), phase="weight export gather")
-        agreed("weight export", lambda: None if published is None else published.save(self.directory))
+        published = _published(self.source, variables, jnp.dtype(self.dtype))
+        with reading_home("weight export", writes=jax.process_index() == 0):
+            agreed("weight export", lambda: published.save(self.directory))
 
     def __call__(self, variables: Variables, version: int) -> None:
         self.write(variables)

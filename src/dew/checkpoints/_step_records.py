@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import jax
 import numpy as np
 
-from dew import position
+from dew import _position
 from dew._coordination import from_every_process
 from dew._records import JSON
 from dew.mesh import LogicalAxes
@@ -20,12 +20,13 @@ if TYPE_CHECKING:
     from dew.data.dataset import DataPartition
 
 
-def step_record(deltas: list[str], control: dict | None, rung: JSON, artifact: JSON,
+def step_record(deltas: Mapping[str, list[str]], control: dict | None, rung: JSON, artifact: JSON,
                 boxed: Mapping[tuple[str, ...], LogicalAxes] | None) -> dict:
-    """What a persistent and a local save both record of a step: its EMA deltas, its control
-    state, its rung, its inference artifact and its boxed axes."""
-    return {"ema_deltas": deltas, "control": copy.deepcopy(control or {}), "rung": rung, "artifact": artifact,
-            "boxed": boxed_record(boxed)}
+    """What a persistent and a local save both record of a step: the leaves of each average it stores as
+    their differences from their weights, by the average's name, its control state, its rung, its inference
+    artifact and its boxed axes."""
+    return {"deltas": dict(deltas), "control": copy.deepcopy(control or {}), "rung": rung,
+            "artifact": artifact, "boxed": boxed_record(boxed)}
 
 
 def boxed_record(boxed: Mapping[tuple[str, ...], LogicalAxes] | None) -> list[dict[str, list[str | None]]]:
@@ -74,7 +75,7 @@ def read_position(table: dict, where: str, share: DataPartition) -> bytes:
 
     A global position is a record count over an order that is the same at
     any partition, so every row is a valid position for every reader;
-    `dew.position` declares that property and `read_position` relies on it.
+    `dew._position` declares that property and `read_position` relies on it.
     A share's own offset resumes only readers of that same share, whichever
     processes they are, and any other reader is refused with the shares named.
     """
@@ -82,7 +83,7 @@ def read_position(table: dict, where: str, share: DataPartition) -> bytes:
     # Row order, not set order: bytes hash differently per interpreter, and
     # which of the refusals below a broken checkpoint gets is a diagnostic.
     rows = [_row(table, index) for index in range(written)]
-    if position.translates(rows[0]):
+    if _position.translates(rows[0]):
         if any(row != rows[0] for row in rows[1:]):
             raise ValueError(
                 f"The checkpoint at {where} holds a global data position that "
@@ -100,7 +101,7 @@ def read_position(table: dict, where: str, share: DataPartition) -> bytes:
             f"{sorted(set(held))} (index, count), and this reader reads share "
             f"{share.index} of {share.count}. A position is where one share of "
             f"the data stopped and cannot be translated to another share, so "
-            f"resume it on a mesh whose processes read those shares: {position.PER_SHARE}.")
+            f"resume it on a mesh whose processes read those shares: {_position.PER_SHARE}.")
     if any(row != mine[0] for row in mine[1:]):
         raise ValueError(
             f"The checkpoint at {where} holds positions for share {share.index} "

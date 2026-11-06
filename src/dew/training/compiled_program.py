@@ -444,7 +444,14 @@ def _evaluated(offsets: Sequence, counting: Sequence[jcore.JaxprEqn], counter, t
     # The evaluator computes on the host, outside any mesh a plan for compile-only devices sets.
     with jax.set_mesh(None), jax.ensure_compile_time_eval():
         for equation in reversed(reading):
-            out = equation.primitive.bind(*map(read, equation.invars), **equation.params)
+            operands = list(map(read, equation.invars))
+            if equation.primitive.name == "dot_general" and len(operands) == 3:
+                # A product with its bias, as the derivation reads a sum XLA's GEMM computes
+                # (`footprint.biased`): the product of the first two, plus the third.
+                *operands, bias = operands
+                out = equation.primitive.bind(*operands, **equation.params) + bias
+            else:
+                out = equation.primitive.bind(*operands, **equation.params)
             values.update(zip(equation.outvars, out if equation.primitive.multiple_results else [out],
                               strict=True))
     return [int(read(offset)) for offset in offsets]

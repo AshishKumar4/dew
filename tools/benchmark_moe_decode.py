@@ -14,9 +14,9 @@ import statistics
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.experimental.mosaic.gpu import profiler
 
 from dew.nn.kernels import gemm, generation
+from dew.telemetry.benchmark import device_time
 
 MODELS = {
     "qwen3-30b-a3b": {"hidden": 2048, "intermediate": 768, "experts": 128, "top_k": 8},
@@ -44,17 +44,12 @@ def routings(tokens: int, experts: int, top_k: int, seed: int) -> list[np.ndarra
 
 
 def timed(fn, arguments: list[tuple]) -> list[float]:
-    """Each call's device seconds (CUPTI, its kernels alone), one call an argument tuple, after one warm
-    call of each."""
-    for args in arguments:
-        jax.block_until_ready(fn(*args))
-    cupti = profiler.Cupti(finalize=False)
-    seconds = []
-    for args in arguments:
-        _, read = cupti.measure(fn, aggregate=False)(*args)
-        seconds.append(sum(ms for _, ms in read or []) / 1e3)
-    profiler.Cupti().measure(fn, aggregate=False)(*arguments[0])
-    return seconds
+    """Each call's device seconds (CUPTI, its kernels alone), one call an argument tuple, each behind an
+    eviction in its own program (`dew.telemetry.benchmark.behind`), so the active experts' weights it reads
+    come from HBM, as a decode step's freshly drawn routing reads them; a model's experts
+    at one token fit an H100's L2, which a warm call of the same routing would leave them in."""
+    with device_time() as device:
+        return [device.seconds(fn, *args, evicted=True) for args in arguments]
 
 
 def main() -> None:

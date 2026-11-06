@@ -22,7 +22,7 @@ import optax
 from flax.training.early_stopping import EarlyStopping
 from jax.sharding import Mesh
 
-from dew import position
+from dew import _position
 from dew._coordination import agreed, agreed_next, agreed_reads, pool_size
 from dew._records import JSON, integers
 from dew.batch import CLOSES_WINDOW, CONSUMED_COUNT, EXAMPLES_CONSUMED, VALID_ROWS, Batch, ConsumedCount
@@ -977,7 +977,7 @@ def stage_reached(plan: FitPlan, run: FitRun) -> tuple[PhasedStream, bytes, int]
     state = None if run.train is None else run.train.source_state
     if ends is None or state is None:
         return None
-    stage = len(position.read(state).completed)
+    stage = len(_position.read(state).completed)
     if stage >= len(ends) - 1 or (committed := run.clock.read) < (end := ends[stage] or 0):
         return None
     assert run.train is not None and run.partition is not None

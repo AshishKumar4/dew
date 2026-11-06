@@ -23,7 +23,7 @@ import numpy as np
 from jax.custom_derivatives import zero_from_primal
 
 from dew.batch import PROBES
-from dew.nn.derivatives import Surrogate, declared_derivative
+from dew.nn.derivatives import Surrogate, contracted, declared_derivative
 from dew.nn.sharding import in_pipeline_stage
 
 INSPECTED = "inspected"
@@ -187,7 +187,8 @@ def _tapped_backward(histogram, saved, cotangent):
     return cotangent, terms, zero_from_primal(where), zero_from_primal(scale)
 
 
-tapped = declared_derivative(Surrogate(), _passed, _tapped_forward, _tapped_backward, nondiff_argnums=(4,))
+tapped = contracted("test_a_probes_tap_holds_its_orders")(
+    declared_derivative(Surrogate(), _passed, _tapped_forward, _tapped_backward, nondiff_argnums=(4,)))
 
 
 @contextlib.contextmanager

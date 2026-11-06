@@ -57,9 +57,9 @@ import numpy as np
 from jax.experimental import serialize_executable
 
 from dew import communicators
+from dew._cache import uncached
 from dew._records import JSON, record
 from dew.batch import Batch
-from dew.cache import uncached
 from dew.nn.kernels.generation import (
     GpuTarget,
     assumed,
@@ -748,7 +748,7 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         # A resumed run's step compiles at the rung its checkpoint records, as its resume would.
         trainer._resume_rung(trainer.checkpoints.rung(start.resume))
     # A TPU topology's executable loads onto no client here: the persistent cache neither reads an entry
-    # for it nor writes one (`dew.cache.uncached`).
+    # for it nor writes one (`dew._cache.uncached`).
     on = generation if stated is None else stated
     with assumed(on), uncached() if on_tpus else contextlib.nullcontext(), routes() as taken:
         target = gpu_target()

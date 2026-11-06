@@ -54,6 +54,7 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 )
 
 from dew.nn.attention_kernels import SPLASH_BLOCK, SPLASH_LANES
+from dew.nn.derivatives import contracted
 from dew.nn.kernels import generation, launches
 from dew.nn.kernels.options import program
 
@@ -1100,6 +1101,7 @@ def _dkv(
 _NONDIFF = ("blocks", "call")
 
 
+@contracted("test_a_fused_attention_kernel_holds_its_reverse_orders")
 @functools.partial(jax.custom_vjp, nondiff_argnames=_NONDIFF)
 def _attention(
     fwd_mask_info: mask_info_lib.MaskInfo,

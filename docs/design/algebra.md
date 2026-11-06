@@ -224,7 +224,7 @@ fitted to them, and a rule set ships only with measured receipts.
     builds gets the pass: `options.program` for evaluation and loads, `Objective.program` for the
     host-master step's forward and the evaluation, rollout and sample programs, and the serving kernel's step and
     decode programs, whose tuner lowers and compiles the same function.
-  - The resident training step, `Trainer._jitted`'s `owned_program(step, …)` (`dew.training.trainer`), which every
+  - The resident training step, `step_program`'s `owned_program(step, …)` (`dew.training._candidates`), which every
     default `dew train` runs and the planner compiles through `compiled_if_it_fits`, is such an outer program, and so does every objective's step it builds, an RL update's included.
   - The host-master phases (`dew.training.transaction`) and the RL rollouts (`dew.objectives.rl.control`,
     `dreamer`, `dew.rl.simulator`, `dew.rl.flight`, `dew.rl.hyperlux`) jit theirs the same way: the rollout over
@@ -550,7 +550,7 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   every node it prices, and the chosen DAG is extracted by egglog with every chosen node free. Over the
   algebra's and the templates' test derivations it priced no template's form below greedy's and took twice its
   time, so greedy stays the default. The test suite holds each derivation's greedy choice to the exact optimum
-  (`dew.cache.Passes.checked`); a declaration greedy prices dearer is refused there until it is extracted
+  (`dew._cache.Passes.checked`); a declaration greedy prices dearer is refused there until it is extracted
   exactly (`derive.Reduction.exact`).
 - A price states itself as levels compared in order (`extract.Linear`). Each level is the larger of its
   pieces, each a sum over the chosen nodes, and its nodes' largest peak (a span), plus what the nodes add
@@ -654,12 +654,12 @@ def rewritten(fn: Callable, *, saturation: Saturation, static_argnums=(), static
     # `dew.algebra.rewritten_program` bind `SATURATION`
 
 @dataclass(frozen=True)
-class Passes:                         # dew.cache
+class Passes:                         # dew._cache
     on: bool = True                   # the pass runs
     target: str | None = None         # the GpuTarget whose facts it prices for; None: the process's own
     checked: bool = False             # each derivation's greedy extraction held to the exact optimum
 
-ALGEBRA = jax.make_user_context(default_value=Passes())   # dew.cache, in JAX's trace context
+ALGEBRA = jax.make_user_context(default_value=Passes())   # dew._cache, in JAX's trace context
 
 @contextlib.contextmanager
 def passes(on: bool = True, target: str | None = None) -> Iterator[None]: ...   # sets ALGEBRA
@@ -678,7 +678,7 @@ class Rewrite:                        # one region's
   program's own; a static argument keeps the program's Python control flow concrete (a rollout's length, a
   policy's `random`).
 - The pass sits where a function is jitted (§2): `OuterProgram._jitted` jits `rewritten(fn)`, so `lower`,
-  `trace`, `compiled` and every relowering read one program; `Trainer._jitted` jits the rewritten step, the
+  `trace`, `compiled` and every relowering read one program; `dew.training._candidates.step_program` jits the rewritten step, the
   host-master phases and the rollouts theirs. `footprint`'s `make_jaxpr` traces the same rewritten function.
 - A region is a window cluster (`program._windows`): each head a rule may lower the price at with the
   equations of the language that make its operands, `WINDOW` deep, windows that share an equation joined up to

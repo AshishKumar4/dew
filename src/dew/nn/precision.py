@@ -41,7 +41,14 @@ from flax.typing import Dtype, PrecisionLike
 from jax.extend import core
 from jax.typing import DTypeLike
 
-from dew.nn.derivatives import Protected, bound_span, declared_derivative, declared_tangent, surrogate
+from dew.nn.derivatives import (
+    Protected,
+    bound_span,
+    contracted,
+    declared_derivative,
+    declared_tangent,
+    surrogate,
+)
 from dew.nn.nested import nested
 from dew.nn.programs import equations
 from dew.nn.sharding import explicit_spec
@@ -235,47 +242,22 @@ def broadcast_summed(value: jax.Array, shape: tuple[int, ...], dimensions: tuple
     return spread_value.astype(value.dtype if dtype is None else dtype)
 
 
-def _doubled(value: jax.Array, shape: tuple[int, ...], axes: tuple[int, ...]) -> jax.Array:
-    """`value` broadcast to `shape` over its size-one `axes` by doubling: along each axis each entry is
-    paired with itself until the axis is covered, then cut to it, so JAX's transpose at any order sums a
-    cotangent over that axis pairwise, neighbours added level by level, and a cotangent split into
-    blocks over devices adds within each until a block is one entry. The broadcast's transpose is
-    XLA's reduction, which a CPU sums in an order up to twice torch's error at a few hundred rows of
-    16 channels (ledger 1698's Z-Image bias); the pairs' tree is under torch's at every size measured,
-    in the reduction's time."""
-    for axis in axes:
-        count = shape[axis]
-        while value.shape[axis] < count:
-            paired = jnp.stack([value, value], axis=axis + 1)
-            # The doubled axis keeps the value's placement, an Explicit axis's on a size-one one among it.
-            doubled = (*value.shape[:axis], 2 * value.shape[axis], *value.shape[axis + 1:])
-            value = jax.lax.reshape(paired, doubled, out_sharding=explicit_spec(value))
-        value = jax.lax.slice_in_dim(value, 0, count, axis=axis)
-    return value
-
-
 def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
     """`value` broadcast to `shape`, whose transpose, the sum of a cotangent over every position the
     value spread over (a bias's gradient), a CPU running wide arithmetic (`WIDE_CPU_ARITHMETIC`, Dew's
     tests) takes in float64 and rounds once, as it sums a float32 product (`accumulated`): there the
-    broadcast is the outer product of ones and the value, whose transpose is a product. Elsewhere,
-    or where `accumulated` leaves a product its own sum, a CPU spreads a floating value by doubling
-    (`_doubled`), so its transpose sums pairwise in the value's dtype, and an accelerator broadcasts
-    it, whose transpose JAX sums in the value's dtype. A value an Explicit axis places along an axis it
-    spreads over (never a bias, whose leading axes `biased` adds) is broadcast: neither form keeps that
-    placement on a dropped or doubled size-one axis."""
+    broadcast is the outer product of ones and the value, whose transpose is a product. Everywhere
+    else, and where `accumulated` leaves a product its own sum (`FP32_SUMS`, a quantized model's
+    trace), it is the broadcast, whose transpose JAX sums in the value's dtype, as a user's process
+    sums it on every platform (ledger 3197). A value an Explicit axis places along an axis it spreads
+    over (never a bias, whose leading axes `biased` adds) is broadcast: the outer product does not keep
+    that placement on a dropped size-one axis."""
     axes = tuple(axis for axis, (size, total) in enumerate(zip(value.shape, shape, strict=True))
                  if size == 1 and total != 1)
     placed = explicit_spec(value)
-    if not axes or (placed is not None and any(placed.spec[axis] is not None for axis in axes)):
+    if (not axes or (placed is not None and any(placed.spec[axis] is not None for axis in axes))
+            or not _sums_in_float64(value)):
         return jnp.broadcast_to(value, shape)
-    if not _sums_in_float64(value):
-        if not jnp.issubdtype(value.dtype, jnp.floating):
-            return jnp.broadcast_to(value, shape)
-        # A CPU sums the transpose pairwise (`_doubled`); an accelerator's reduction is a tree already.
-        return jax.lax.platform_dependent(
-            value, cpu=functools.partial(_doubled, shape=tuple(shape), axes=axes),
-            default=functools.partial(jnp.broadcast_to, shape=tuple(shape)))
     kept = tuple(axis for axis in range(len(shape)) if axis not in axes)
 
     def outer(value: jax.Array) -> jax.Array:
@@ -338,8 +320,8 @@ def products_dtype(*operands) -> jnp.dtype | None:
 
 def _intercepted() -> bool:
     """Whether this thread traces a quantized model's method, whose products Qwix owns
-    (`dew.cache.QUANTIZED_TRACE`, which jit's cache keys on)."""
-    from dew.cache import QUANTIZED_TRACE
+    (`dew._cache.QUANTIZED_TRACE`, which jit's cache keys on)."""
+    from dew._cache import QUANTIZED_TRACE
 
     return QUANTIZED_TRACE.value is not None
 
@@ -545,7 +527,8 @@ def _summed_wide(product: Callable, preferred_element_type, *operands) -> jax.Ar
             return tuple(transposed(index) for index in live)
 
     # Forward mode differentiates `summed` as it traces, inside its scope; reverse mode runs `pulled`.
-    wide = linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True)
+    wide = contracted("test_a_wide_cpu_sum_of_products_holds_every_order")(
+        linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True))
     return jax.lax.platform_dependent(*operands, cpu=wide, default=narrow)
 
 
@@ -977,7 +960,8 @@ def _divide_jvp(primals, tangents):
     return correctly_rounded_divide(*primals), jax.jvp(jnp.divide, primals, tangents)[1]
 
 
-correctly_rounded_divide = declared_tangent(Protected(), _correctly_rounded_divide, _divide_jvp)
+correctly_rounded_divide = contracted("test_the_precision_seams_hold_every_order")(
+    declared_tangent(Protected(), _correctly_rounded_divide, _divide_jvp))
 
 
 def divided(numerator, rate):
@@ -1134,7 +1118,8 @@ def _compensated_sum_jvp(axes: tuple[int, ...], primals: tuple[jax.Array],
     return _compensated_sum(primals[0], axes), jnp.sum(tangents[0], axes)
 
 
-_compensated_sum = declared_tangent(Protected(), _compensated, _compensated_sum_jvp, nondiff_argnums=(1,))
+_compensated_sum = contracted("test_the_precision_seams_hold_every_order")(
+    declared_tangent(Protected(), _compensated, _compensated_sum_jvp, nondiff_argnums=(1,)))
 
 def _rounded(x: jax.Array, dtype: Dtype) -> jax.Array:
     """The value `x` takes in `dtype`, held in `x`'s own dtype (`rounded_operand`'s value).
@@ -1150,8 +1135,9 @@ def _rounded(x: jax.Array, dtype: Dtype) -> jax.Array:
     return jax.lax.optimization_barrier(x.astype(dtype)).astype(x.dtype)
 
 
-rounded_operand = surrogate(_rounded, lambda dtype, primals, tangents, value: tangents[0],
-                            nondiff_argnums=(1,))
+rounded_operand = contracted("test_the_precision_seams_hold_every_order")(
+    surrogate(_rounded, lambda dtype, primals, tangents, value: tangents[0],
+              nondiff_argnums=(1,)))
 """The value `x` takes in `dtype`, held in `x`'s own dtype (`_rounded`), with a straight-through
 derivative (`dew.nn.derivatives.surrogate`): its tangent is `x`'s, never rounded a second time."""
 
@@ -1302,7 +1288,8 @@ def bf16_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers) -> jax.A
     def forward(lhs, rhs):
         return typed(lhs, rhs, numbers)
 
-    return linear_tangent(lambda lhs, rhs: (forward(lhs, rhs), ()), pulled, forward)(lhs, rhs)
+    return contracted("test_a_bf16_dot_holds_every_order")(
+        linear_tangent(lambda lhs, rhs: (forward(lhs, rhs), ()), pulled, forward))(lhs, rhs)
 
 
 def _transposed(cotangent, operands, numbers, side: int, product) -> jax.Array:
@@ -1364,6 +1351,7 @@ def at_default_precision[Output](fn: Callable[..., Output]) -> Callable[..., Out
             return pullback(cotangent)
 
     # A protected span: the precision it holds is the kernels' own, which no rewrite may change.
+    @contracted("test_a_default_precision_call_holds_every_order_it_takes")
     @functools.partial(declared_derivative, Protected(), forward=forward, backward=backward)
     def run(*args):
         with jax.default_matmul_precision('default'):

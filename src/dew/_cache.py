@@ -1,0 +1,444 @@
+"""Where Dew keeps what it caches on disk, and JAX's persistent compilation cache.
+
+Kept apart from the telemetry and the loaders that read it, so the
+interop, config and inference modules take their cache paths without
+importing the FLOP accounting.
+"""
+
+import contextlib
+import dataclasses
+import functools
+import hashlib
+import importlib.metadata
+import os
+import sys
+import threading
+from collections.abc import Callable, Iterator
+from pathlib import Path
+
+import jax
+
+from dew._devices import deterministic_ops_requested, xla_flag
+
+
+def dew_cache_dir() -> str:
+    """Dew's cache directory: `$XDG_CACHE_HOME/dew`, else ~/.cache/dew."""
+    return os.path.expanduser(
+        os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join("~", ".cache"), "dew")
+    )
+
+
+VERSION_FILE = "_version.py"
+"""The release's version (`dew._version`), which no code of Dew's computes from: no part of its
+implementation."""
+
+
+@functools.cache
+def package_digest() -> str:
+    """The digest of Dew's own implementation, every source file of `dew` by its path and contents, the
+    release's version (`VERSION_FILE`) not read: what a cache of what Dew's code computed keys on, so that any
+    change of that code computes it again and a release computes nothing again. Read once a process."""
+    package = Path(__file__).parent
+    digest = hashlib.sha256()
+    for path in sorted(package.rglob("*.py")):
+        if path.relative_to(package) != Path(VERSION_FILE):
+            digest.update(str(path.relative_to(package)).encode() + b"\0" + path.read_bytes())
+    return digest.hexdigest()
+
+
+def dew_config_dir() -> Path:
+    """Dew's configuration directory, which every configuration file of Dew's is read from:
+    `$DEW_CONFIG_DIR`, else `$XDG_CONFIG_HOME/dew`, else ~/.config/dew."""
+    override = os.environ.get("DEW_CONFIG_DIR")
+    if override:
+        return Path(override)
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    return (Path(xdg) if xdg else Path.home() / ".config") / "dew"
+
+
+@dataclasses.dataclass(frozen=True)
+class HubAnswer[Answer]:
+    """An answer of the Hub's (`hub_answer`): `value`, and whether it was `recorded`, read back
+    from an earlier answer with the Hub offline."""
+
+    value: Answer
+    recorded: bool
+
+
+def hub_answer[Answer](question: tuple[str, ...], ask: Callable[[], Answer]) -> HubAnswer[Answer]:
+    """The Hub's answer to `question`: `ask`'s, recorded where answers are kept (DEW_HUB_ANSWERS
+    when set, else `hub/` in Dew's cache), or with the Hub offline, where `ask` raises
+    OfflineModeIsEnabled as every Hub call does under HF_HUB_OFFLINE, the answer last recorded
+    (`recorded_hub_answer`). What an online run pinned (a revision's commit, a commit's files) so
+    resolves the same offline; a question never answered online raises the offline error."""
+    import json
+
+    from huggingface_hub.errors import OfflineModeIsEnabled
+
+    from dew._files import write_atomically
+
+    try:
+        value = ask()
+    except OfflineModeIsEnabled:
+        recorded = recorded_hub_answer(question)
+        if recorded is None:
+            raise
+        return recorded
+    record = _hub_record(question)
+    os.makedirs(os.path.dirname(record), exist_ok=True)
+    write_atomically(record, json.dumps({"question": list(question), "answer": value}))
+    return HubAnswer(value, recorded=False)
+
+
+def recorded_hub_answer(question: tuple[str, ...]) -> HubAnswer | None:
+    """The answer `hub_answer` last recorded to `question`, or None where it recorded none."""
+    import json
+
+    record = _hub_record(question)
+    if not os.path.isfile(record):
+        return None
+    with open(record) as recorded:
+        held = json.load(recorded)
+    return HubAnswer(held["answer"], recorded=True) if held["question"] == list(question) else None
+
+
+def _hub_record(question: tuple[str, ...]) -> str:
+    """Where `question`'s answer is recorded: a file named by the hash of its parts, which no
+    revision's text can steer outside the answers' directory; the record holds the question
+    beside the answer."""
+    import hashlib
+    import json
+
+    answers = os.environ.get("DEW_HUB_ANSWERS") or os.path.join(dew_cache_dir(), "hub")
+    return os.path.join(answers, hashlib.sha256(json.dumps(list(question)).encode()).hexdigest() + ".json")
+
+
+def default_compilation_cache_dir() -> str:
+    """Where compiled executables go unless a run names somewhere else.
+
+    The directory JAX is configured with (`jax_compilation_cache_dir`, which
+    JAX_COMPILATION_CACHE_DIR sets) when there is one, so a machine keeps one
+    cache for every entry point. Otherwise Python minors have separate
+    defaults: jax 0.11.2 compresses with Python 3.14's stdlib zstd but names
+    the codec "zlib" in the key, which says "zstandard" only for the
+    zstandard package (`jax._src.compilation_cache.get_cache_key`), so an
+    older interpreter sharing the directory would read those bytes with the
+    wrong codec. Hosts of every CPU class share it: Dew's JAX build keys a
+    CPU program by the host's CPU (0.12.0.1.post13), which XLA:CPU compiles
+    for, so no host reads a program that does not link there. Explicit paths
+    passed to enable_compilation_cache remain unchanged.
+    """
+    if jax.config.jax_compilation_cache_dir:
+        return jax.config.jax_compilation_cache_dir
+    return os.path.join(dew_cache_dir(), 'xla', f"python{sys.version_info.major}.{sys.version_info.minor}")
+
+
+def beside_compilation_cache(variable: str, name: str) -> Path | None:
+    """Where a record every process sharing the persistent compilation cache shares lives (a step's rungs):
+    the environment `variable` when set, else `name` in the directory JAX is
+    configured with (`jax_compilation_cache_dir`), or nowhere when the process keeps no cache."""
+    if path := os.environ.get(variable):
+        return Path(path)
+    cache = jax.config.jax_compilation_cache_dir
+    return None if not cache else Path(cache) / name
+
+
+_UNCACHED = threading.RLock()
+"""Held while the process's cache is set up again (`enable_compilation_cache`) or turned off for a while
+(`uncached`), so neither restores a setting the other made; one thread may do both, nested."""
+
+
+def enable_compilation_cache(path: str):
+    """Persist compiled executables so restarts skip XLA compilation, and the
+    GPU autotuner's picks beside them.
+
+    The dominant cost of a restart-heavy TPU workflow, where every run otherwise
+    recompiles the same step function from scratch.
+
+    XLA's GPU compile measures each fusion's candidate kernels on the device.
+    The picks go to `<path>/autotune/jaxlib-<version>`, one file a fusion keyed
+    by the fusion and the GPU model, for this XLA alone, so a later compile of
+    the same fusions takes them without measuring. A process beside other work
+    on its GPU would measure unfairly, so it reads them and adds none
+    (`gpu-run -n 0.5` sets XLA's AUTOTUNE_CACHE_MODE_READ). Neither the
+    directory nor the mode is in JAX's cache key, so a run and a process
+    that compiled its programs ahead of it share executables. XLA reads its
+    flags at the first compile; a directory the run names is kept, and a
+    process whose first compile named one keeps its picks there.
+
+    A directory named after the process first compiled holds the programs
+    compiled after: JAX's cache is settled again at the next compile.
+
+    A run under `--xla_gpu_deterministic_ops` keeps no picks (`keeps_picks`):
+    jax 0.11.2's XLA measures nothing there and gives each instruction the
+    first configuration that compiles, but would still take a stored pick
+    over that one, so such a run names an empty directory.
+    """
+    from jax.experimental.compilation_cache import compilation_cache
+
+    os.makedirs(path, exist_ok=True)
+    with _UNCACHED:
+        moved = jax.config.jax_compilation_cache_dir not in (None, path)
+        jax.config.update('jax_compilation_cache_dir', path)
+        if moved:
+            # JAX settles its cache at the process's first compile and keeps it; `reset_cache` forgets
+            # it, so the next compile settles it again, under the directory named first, so no compile
+            # between the two settles it on the old one; a compile on another thread already settling
+            # it is waited for, under JAX's own initialization lock (Dew's JAX build, row 2836).
+            compilation_cache.reset_cache()
+    # The autotuner's picks follow the policy above, through XLA_FLAGS; JAX's own placement of them
+    # in the cache directory would name one directory for every jaxlib and write picks from a
+    # process this policy keeps to reading (`jax._src.compiler.get_compile_options`).
+    jax.config.update('jax_persistent_cache_enable_xla_caches', 'none')
+    # JAX's defaults skip small and fast compilations; a run's many small programs (its schedule, its
+    # metrics, its data's transforms) each compile again on every restart without them, so every
+    # program is cached, unless the user named a threshold (JAX_PERSISTENT_CACHE_MIN_*), which is theirs.
+    if 'JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES' not in os.environ:
+        jax.config.update('jax_persistent_cache_min_entry_size_bytes', -1)
+    if 'JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS' not in os.environ:
+        jax.config.update('jax_persistent_cache_min_compile_time_secs', 0.0)
+    flags = os.environ.get('XLA_FLAGS', '')
+    if '--xla_gpu_per_fusion_autotune_cache_dir' not in flags:
+        picks = autotune_dir(path) if keeps_picks() else ''
+        if picks:
+            os.makedirs(picks, exist_ok=True)
+        os.environ['XLA_FLAGS'] = f"{flags} --xla_gpu_per_fusion_autotune_cache_dir={picks}".strip()
+
+
+@contextlib.contextmanager
+def uncached() -> Iterator[None]:
+    """Compile with JAX's persistent cache neither read nor written: an executable compiled for devices
+    this process does not have (a TPU topology's, `dew.training._lowering`) deserializes onto no client
+    here, so an entry read back for it fails, as under `jax_raise_persistent_cache_errors`, and an
+    entry written for it could never load.
+
+    JAX settles whether a process uses its cache at its first compile and keeps that; its
+    `reset_cache` forgets it, so the compiles inside settle it again with the cache turned off, and
+    the next one after with the setting as it was. Compiles on other threads meanwhile go without the
+    cache, and calls on two threads take turns, so neither restores the setting the other made."""
+    from jax.experimental.compilation_cache import compilation_cache
+
+    with _UNCACHED:
+        enabled = jax.config.jax_enable_compilation_cache
+        jax.config.update('jax_enable_compilation_cache', val=False)
+        compilation_cache.reset_cache()
+        try:
+            yield
+        finally:
+            jax.config.update('jax_enable_compilation_cache', val=enabled)
+            compilation_cache.reset_cache()
+
+
+def autotune_dir(path: str) -> str:
+    """Where the GPU picks of the executables cached under `path` go, for this
+    jaxlib alone: XLA's per fusion, and Dew's kernels' beside them
+    (`kernel_picks_path`). jaxlib pins XLA, Triton and Mosaic, which each
+    pick's speed depends on."""
+    return os.path.join(path, 'autotune', f"jaxlib-{importlib.metadata.version('jaxlib')}")
+
+
+def kernel_picks_path(device_kind: str) -> str:
+    """The file of Dew's kernel configs measured on GPUs of `device_kind`
+    (`dew.nn.kernels.tuning`), beside XLA's picks in the cache this process
+    compiles to, one file a jax: Pallas lowers a kernel in jax, which a
+    release moves without jaxlib, so a store shared by every jax kept each
+    fork's copy of a GPU's picks that every other jax's read parsed (row 3837)."""
+    name = device_kind.lower().replace(' ', '_').replace('/', '_')
+    return os.path.join(autotune_dir(default_compilation_cache_dir()), 'kernels', f"jax-{jax.__version__}",
+                        f"{name}.json")
+
+
+KERNEL_TUNES = jax.make_user_context(0)
+"""How many times this process's kernel picks changed (`dew.nn.kernels.tuning.tune`):
+a context JAX keys its trace and compile caches on, so a program lowered
+after picks change traces again. Made at `import dew`, as JAX makes a user
+context only beside no other JAX call."""
+
+@dataclasses.dataclass(frozen=True)
+class Passes:
+    """Whether the algebra pass rewrites the programs Dew compiles (`dew.algebra.passes`), the GPU whose
+    facts it prices them for (a `GpuTarget` name; None for the process's own), and whether each template
+    derivation's greedy extraction is held to the exact optimum (`checked`, the test suite's oracle,
+    `dew.algebra.extract.cheapest`)."""
+
+    on: bool = True
+    target: str | None = None
+    checked: bool = False
+
+
+ALGEBRA = jax.make_user_context(default_value=Passes())
+"""The algebra pass's switch (`Passes`), keyed on as `KERNEL_TUNES` is: a program a switch traced is never run
+under another, and the accuracy gate opens it per arm (docs/design/algebra.md §6.7)."""
+
+DERIVED = jax.make_user_context(default_value=False)
+"""Whether the templates take their algebra's derived forms (`dew.algebra.forms.derived`) in place of their
+hand-written ones, keyed on as `ALGEBRA` is: a program traced under one set of forms is never run under the
+other, and check 1 drives both (docs/design/algebra.md §6.9)."""
+
+KERNEL_LAUNCHES = jax.make_user_context(default_value=False)
+"""Whether a traced kernel launch carries tokamax's description of itself
+(`dew.nn.kernels.tuning.launches`), keyed on as `KERNEL_TUNES` is. Only a
+lowering made to read its launches out of carries it, never a step's: jaxlib
+0.11.2 writes a compiled program holding it to the persistent cache and cannot
+read it back ("Invalid metadata payload id")."""
+
+KERNEL_SEEN = jax.make_user_context(default_value=None)
+"""The collection a lowering records its kernel launches into as it traces them
+(`dew.nn.kernels.tuning.seen`): JAX keys its trace caches on its identity, so a
+trace cached before traces, and records, again. The program is the same, and so
+is its key in the persistent cache, which reads no user context."""
+
+KERNEL_ROUTES = jax.make_user_context(())
+"""The collections each open `dew.nn.kernels.generation.routes` block records its dispatches' routes
+into: JAX keys its trace caches on their identities, as on `KERNEL_SEEN`'s, so a trace cached before
+traces, and reports its routes, again."""
+
+KERNEL_PINS = jax.make_user_context(())
+"""The `(kernel, config)` pairs `dew.nn.kernels.tuning.pinned` holds in this
+thread, keyed on as `KERNEL_TUNES` is."""
+
+KERNEL_ASSUMED = jax.make_user_context(default_value=None)
+"""The device `dew.nn.kernels.generation.assumed` stands in for in this thread (`generation.Assumption`:
+its generation and its facts where given them), keyed on as `KERNEL_TUNES` is, so a program traced for one
+device's launches traces again for another's."""
+
+KERNEL_CHOICES = jax.make_user_context(())
+"""The `(choice, kernel)` pairs `dew.nn.kernels.generation.chosen` holds in
+this thread, keyed on as `KERNEL_TUNES` is, so a program traced before a
+choice traces again within it."""
+
+NUMERICS = jax.make_user_context(default_value=None)
+"""The run's numerics `dew.nn.kernels.generation.run_precision` holds in this thread
+(`dew.nn.precision.Numerics`, None outside any), keyed on as `KERNEL_TUNES` is, so a program traced under one
+run's numerics, its outputs' dtype and its ops' forms, traces again under another's."""
+
+QUANTIZED_TRACE = jax.make_user_context(default_value=None)
+"""What a quantized model's methods trace under, its provider's kind and spec
+(`dew.quantization`), keyed on as `KERNEL_TUNES` is. Qwix intercepts
+`jax.lax.dot_general` by swapping its code while a wrapped method runs, and
+`jnp.matmul`, `jnp.dot` and the other contractions that reach it are jitted,
+so a trace of one taken under the swap holds its quantized product, which JAX's
+cache would hand a later plain call of the same shapes, and a plain trace a
+quantized call. In this context their traces are kept apart."""
+
+
+INTERCEPTED = jax.make_user_context(default_value=False)
+"""Whether Dew installed a layer interceptor in this trace: adapters, input QDQ and Qwix retain
+their individual projection calls. This is independent of Qwix's arithmetic trace key above."""
+
+
+def keeps_picks() -> bool:
+    """Whether this process reads and stores GPU picks, XLA's and the
+    kernels' alike: not under `--xla_gpu_deterministic_ops`, whose kernels
+    must stay the same between a run and its resumption while other runs
+    measure into the cache. There XLA takes the first configuration that
+    compiles (`enable_compilation_cache`) and Dew's kernels their heuristic
+    ones (`dew.nn.kernels.tuning`), the same in every process."""
+    return not deterministic_ops_requested()
+
+
+def measures_picks() -> bool:
+    """Whether this process may measure GPU picks and store them, XLA's and
+    the kernels' alike: where it keeps picks at all (`keeps_picks`), and
+    not beside other work on its GPU, where `gpu-run -n 0.5` asks XLA to
+    read its picks and write none (AUTOTUNE_CACHE_MODE_READ), since a
+    measurement there is unfair."""
+    mode = xla_flag('xla_gpu_experimental_autotune_cache_mode')
+    return keeps_picks() and mode != 'AUTOTUNE_CACHE_MODE_READ'
+
+
+def persist_compilations() -> None:
+    """Point XLA at the on-disk executable cache, unless a directory is set or JAX's cache is
+    turned off.
+
+    A run compiles its step for seconds to minutes, a loaded task the first time its shapes are
+    seen (a minute for a text-to-image sample on an A100), and every restart compiles them again
+    without it. A process Dew readies for training turns it on (`dew.training.runtime.
+    ready_process`, from `prepare_process` or the first `fit`), and a task where it is loaded,
+    `dew.pipeline` or a saved run's record (`dew.inference.tasks.SavedRun.pinned`). JAX's own switch,
+    JAX_ENABLE_COMPILATION_CACHE=false (`jax_enable_compilation_cache`), turns it off. JAX writes
+    entries from process 0 alone, so a pool takes the directory only where every process reads it
+    as one (`_shared_by_pool`): caches apart would find a step on one process and compile it on
+    another, which waits for ever for its peers. Each process keys a step by its own topology, so a
+    CPU pool's other processes, whose topologies are their own devices, compile what process 0
+    loads (docs/guides/multi-node.md). Reading the settings is what makes it idempotent and what
+    leaves a trainer's own directory, or a caller's, alone.
+
+    JAX settles whether a process uses the cache at its first compile: one that compiled with the
+    cache turned off keeps it off, and one that compiled before any directory was set takes this
+    one. XLA reads the autotuner's flags (`enable_compilation_cache`) as the backend opens, so a
+    process whose backend is open keeps its executables here and measures its picks again.
+    """
+    if jax.config.jax_compilation_cache_dir or not jax.config.jax_enable_compilation_cache:
+        return
+    from dew._coordination import pool_size
+
+    directory = default_compilation_cache_dir()
+    if pool_size() > 1 and not _shared_by_pool(directory):
+        return
+    enable_compilation_cache(directory)
+
+
+@functools.cache
+def _shared_by_pool(directory: str) -> bool:
+    """Whether every process of the pool reads `directory` as one (`seen_by_every_process`)."""
+    from dew._coordination import seen_by_every_process
+
+    return all(seen_by_every_process(directory))
+
+
+def hub_storage(repo: str, *, repo_type: str = "model") -> Path:
+    """The Hub cache's folder of `repo`, as huggingface_hub lays it out: its refs and snapshots."""
+    from huggingface_hub import constants
+    from huggingface_hub.file_download import repo_folder_name
+
+    return Path(constants.HF_HUB_CACHE) / repo_folder_name(repo_id=repo, repo_type=repo_type)
+
+
+def hub_ref(repo: str, revision: str | None, *, repo_type: str = "model") -> Path:
+    """The Hub cache's ref file of `revision` of `repo` (its default branch's where None), the commit
+    huggingface_hub, or `hub_commit`, last wrote for it."""
+    from huggingface_hub import constants
+
+    return hub_storage(repo, repo_type=repo_type) / "refs" / (revision or constants.DEFAULT_REVISION)
+
+
+def hub_commit(repo: str, revision: str | None, *, repo_type: str = "model") -> HubAnswer[str]:
+    """The commit `revision` of the Hub's `repo` names now, its default branch's where None, as a run
+    records it. Online the Hub's answer (`hub_answer`), written to the Hub cache's ref of the revision as
+    huggingface_hub writes it on a download, so another process sharing the cache resolves it alike.
+    Offline, both `recorded`: a dataset's the answer recorded online, which every other record of its
+    commit is keyed by (its listing and shard facts), else the cache's ref (`hub_ref`); a model's the
+    cache's ref over a recorded answer, since its files offline are the cache's snapshot of the ref,
+    whichever tool moved it."""
+    from huggingface_hub import HfApi, constants
+    from huggingface_hub.errors import OfflineModeIsEnabled
+
+    from dew._files import write_atomically
+
+    branch = revision or constants.DEFAULT_REVISION
+    # The keys earlier runs recorded: a model's default branch as main, a dataset's as HEAD.
+    question = (("commit", repo, branch) if repo_type == "model"
+                else (f"{repo_type} commit", repo, revision or "HEAD"))
+
+    def ask() -> str:
+        listed = HfApi().model_info if repo_type == "model" else HfApi().dataset_info
+        listing = listed(repo, revision=revision)
+        if listing.sha is None:
+            raise ValueError(f"HF {repo!r} did not resolve {branch} to a commit")
+        return listing.sha
+
+    ref = hub_ref(repo, revision, repo_type=repo_type)
+    try:
+        answer = hub_answer(question, ask)
+    except OfflineModeIsEnabled:
+        if not ref.is_file():
+            raise
+        return HubAnswer(ref.read_text().strip(), recorded=True)
+    if answer.recorded and repo_type == "model" and ref.is_file():
+        return HubAnswer(ref.read_text().strip(), recorded=True)
+    if not answer.recorded and branch != answer.value and (
+            not ref.is_file() or ref.read_text().strip() != answer.value):
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        write_atomically(ref, answer.value)
+    return answer

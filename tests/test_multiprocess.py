@@ -46,8 +46,8 @@ from process_support import (
 from test_whole_validation import POOLED
 from token_support import Corpus, write_token_corpus
 
+from dew._position import ENVELOPE
 from dew.checkpoints import FROZEN_STORE
-from dew.position import ENVELOPE
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -301,6 +301,46 @@ def test_a_decision_release_partitioned_over_a_pool_publishes_its_readout(tmp_pa
     assert_same_stored_tensors(written_tensors(tmp_path / "served"), written_tensors(tmp_path / "saved"))
     assert_same_stored_tensors(dumped_params(tmp_path / "out" / "process0.json"),
                                {name: np.asarray(value) for name, value in host.export().items()})
+
+
+@pytest.mark.distributed
+def test_a_pool_refuses_serving_from_one_processs_engine_before_it_compiles(tmp_path):
+    """Over two processes, an engine over a scoring server whose weights span both is refused by name on
+    every process before any program compiles (row 4361)."""
+    reports = run_pool("served_refusals", tmp_path, 2, timeout=120,
+                       script=Path(__file__).with_name("serving_pool_worker.py"))
+    for report in reports:
+        assert "an engine steps kinds of one process" in report["scoring"], report
+        assert report["compiled"] == 0, report
+
+
+@pytest.mark.distributed
+def test_a_pool_draws_its_rollouts_ahead_from_one_server_it_steps_together(tmp_path):
+    """A GRPO run over two processes whose rollouts are served (`RolloutScheduler.served`) draws them from
+    one server over both processes' devices, which every process steps together on its run's own thread
+    as each call admits its groups, with no engine thread, and reloads at each push (row 4279): both
+    train three updates, each call admitting a group of every task, and a batch submitted a step ahead
+    trails the trainer's weights by the third (a lag above 0)."""
+    reports = run_pool("served_rollout", tmp_path, 2, timeout=300,
+                       script=Path(__file__).with_name("serving_pool_worker.py"))
+    for report in reports:
+        assert report["step"] == 3 and report["pooled"] and report["engines"] == [], report
+        assert report["groups"] == [4, 4, 4], report
+        assert max(report["lags"]) > 0, report
+
+
+@pytest.mark.distributed
+def test_a_pooled_servers_step_failing_on_one_process_stops_it_on_every_one(tmp_path):
+    """A served GRPO run over two processes whose server's step fails on one process alone fails on both,
+    neither left waiting on a round the other never reads: the failing process raises its own error, the
+    other hears it at the step's agreement (`PeerFailure`), and each server then refuses a draw as
+    stopped (row 4279's review)."""
+    reports = run_pool("served_step_failure", tmp_path, 2, timeout=300,
+                       script=Path(__file__).with_name("serving_pool_worker.py"))
+    assert reports[1]["raised"].startswith("RuntimeError: an injected step failure"), reports
+    assert reports[0]["raised"].startswith("PeerFailure"), reports
+    for report in reports:
+        assert report["stopped"] is not None and "stopped" in report["stopped"], report
 
 
 def document_corpus(directory: Path, documents: int, length) -> Corpus:
@@ -924,7 +964,7 @@ def replicated_flags(run_dir: Path, steps: int) -> dict:
 @pytest.fixture(scope="module")
 def replicated_checkpoint(tmp_path_factory):
     """Two processes' elastic fit over a filtered stream, saved after `POOL_STEPS` steps."""
-    from dew.position import REPLICATED
+    from dew._position import REPLICATED
 
     directory = tmp_path_factory.mktemp("replicated-checkpoint")
     reports = run_pool("fit", directory / "out", 2, **replicated_flags(directory / "run", POOL_STEPS))
@@ -1403,15 +1443,16 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
     single = run_worker("rollout", tmp_path / "single.json", fsdp_size=1)
 
     assert [report["arrivals"] for report in reports] == [[0, 1], [0, 1]]
-    for report in reports:
-        assert "vocabulary" in report["invalid_errors"]["token"]
-        assert "prompt_length" in report["invalid_errors"]["length"]
-        assert "single JAX PRNG key" in report["invalid_errors"]["key"]
-        assert "memory address" in report["invalid_errors"]["component"]
+    # Every rank refuses each rank-local invalid input, both returning from it (the worker fails on one
+    # accepted), by its category whatever its words: rank 1, whose input it is, as invalid, and rank 0 as
+    # its peer's failure.
+    faults = ("token", "length", "key", "component")
+    assert [report["invalid_errors"] for report in reports] == [dict.fromkeys(faults, "PeerFailure"),
+                                                              dict.fromkeys(faults, "ValueError")]
     # Over weights on no mesh, rank 1's zero prompt length is its own refusal
     # and rank 0 samples its rows without hearing of it.
     assert reports[0]["meshless"] == {"rows": 2 * len(reports[0]["prompt_lengths"])}
-    assert "prompt_length" in reports[1]["meshless"]["refused"]
+    assert reports[1]["meshless"] == {"refused": "ValueError"}
     assert all(report["sampled_seconds"] < 300 for report in reports)
     for report in reports:
         assert report["process_count"] == 2
@@ -1654,7 +1695,8 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
         assert first[event]["scores"] == second[event]["scores"]
     assert first["normal"]["scores"]["val/mean"] == first["repeat"]["scores"]["val/mean"]
     assert first["normal"]["scores"]["val/mean"] == first["untracked"]["scores"]["val/mean"]
-    for report in reports:
+    # Reports come in rank order (`run_pool`).
+    for rank, report in enumerate(reports):
         events = report["results"]["normal"]["events"]
         scoring = [key for kind, key in events if kind == "score"]
         preview = [key for kind, key in events if kind == "preview"]
@@ -1667,11 +1709,18 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
         # Process 0 holds one batch and process 1 two: process 0 covers the
         # second with its first's rows marked repeats, so the pass reads all 12.
         assert report["results"]["uneven"]["scores"]["evaluation/counts/val/coordinated_batches"] == 2
-        for phase in ("metric", "preview", "finalize", "log", "render", "construct", "next"):
-            assert "error" in report["results"][phase], (phase, report)
+        # Each injected failure keeps its category on the rank it was injected on, which raises it noted;
+        # its peer raises the agreement's own refusal of it (row 4506).
+        for phase, injected, at in (("metric", "InjectedValueError", 0), ("preview", "InjectedValueError", 0),
+                                    ("finalize", "InjectedValueError", 0), ("log", "InjectedValueError", 0),
+                                    ("render", "InjectedValueError", 0), ("construct", "InjectedOSError", 1),
+                                    ("next", "InjectedOSError", 1)):
+            failed = report["results"][phase]
+            # The injected failure itself on its own rank; the agreement's refusal, or a peer's, on the other.
+            allowed = {(injected, True)} if rank == at else {("RuntimeError", False), ("PeerFailure", False)}
+            assert (failed["error"], failed["own"]) in allowed, (phase, report)
             if phase != "construct":
                 assert phase in report["closed"]
-        assert "iterator next failed" in report["results"]["next"]["error"]
         assert report["results"]["empty"] == {"scores": {}, "events": []}
         assert report["results"]["no_consumer"] == {"scores": {}, "events": []}
         assert "no_consumer" not in report["closed"]
@@ -1680,10 +1729,15 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
         for invalid in ("mismatch", "duplicates"):
             assert "error" in report["results"][invalid]
             assert report["results"][invalid]["events"] == []
+        # A resource rank 0 deleted fails there, as the deleted array's own error, and its peer by the
+        # agreement; a gather plan the ranks differ on is refused on every rank, each its own refusal.
         for failure in ("deleted_first", "deleted_later", "deleted_batch", "deleted_preview"):
-            assert "deleted" in report["results"][failure]["error"]
+            failed = report["results"][failure]
+            allowed = ((("RuntimeError", True),) if rank == 0
+                       else (("RuntimeError", False), ("PeerFailure", False)))
+            assert (failed["error"], failed["own"]) in allowed, (failure, report)
             assert failure in report["closed"]
-        assert "gather plan differs between the processes" in report["results"]["mismatched_plan"]["error"]
+        assert report["results"]["mismatched_plan"]["error"] == "ValueError", report
 
 
 @pytest.mark.distributed

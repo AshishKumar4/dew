@@ -665,7 +665,13 @@ class FitSearch[LossT, EffectsT]:
     refusal, which changes the configs its kernels take, clears it (`measured`)."""
     under: dict[str, int] = dataclasses.field(default_factory=dict)
     """By remat rung (`remat_rung`), the most bytes a compile there needed past its derived headroom: a
-    candidate there is judged to fit only where its derived headroom holds that much more."""
+    candidate there is judged to fit only where its derived headroom holds that much more, in proportion
+    to its derived temporaries (`missed_at`, `shortfall`)."""
+    missed_at: dict[str, int] = dataclasses.field(default_factory=dict)
+    """By remat rung, the derived temporaries of the compile that set its `under`: what the derivation
+    misses grows with what it derives, a step's activations with its microbatch, so a split of half the
+    rows misses about half as much (a 64-token test step on a CPU: 963 KB short at one microbatch, 0.6 MB
+    to spare at two, which a shortfall taken whole judged short and compiled four)."""
     overstated: set[str] = dataclasses.field(default_factory=set)
     """The remat rungs (`remat_rung`) a compile fit at that the derivation judged short: its refusals
     there rule no compile out (`refused`)."""
@@ -873,18 +879,36 @@ class FitSearch[LossT, EffectsT]:
         """Whether the step at `split` at the objective's rung is likely to fit, which orders the compiles
         past a miss (`planned`): as the derivation judges it, corrected by what the compiles measured;
         as the compiles' forecast guesses where the derivation cannot judge (`judged_likely`)."""
-        return judged_likely(self.judgment(split), self.under.get(self.remat_rung(), 0),
+        return judged_likely(self.judgment(split), self.shortfall(split),
                              forecast=self.forecast.likely(self.rung(), split))
 
-    def learned(self, foreseen: int | None, measured: int | None, fit: bool) -> None:
-        """What a compile at the objective's remat teaches the derivation's next judgments there: the
-        headroom it `measured` short of the one `foreseen` corrects them (`under`), and a compile that fit
-        where the derivation, so corrected, judged it short rules its refusals out (`overstated`)."""
+    def shortfall(self, split: int) -> int:
+        """The bytes a step at `split` at the objective's remat is judged to need past its derived headroom
+        (`under`): the most a compile there missed, scaled by the step's derived temporaries against that
+        compile's (`missed_at`), or whole where either is not derived."""
         rung = self.remat_rung()
-        if foreseen is not None and fit and foreseen - self.under.get(rung, 0) < 0:
+        under, missed = self.under.get(rung, 0), self.missed_at.get(rung)
+        footprint = self.footprints.get(self.candidate_key(split, self.narrow))
+        temporaries = None if footprint is None else footprint.temporaries
+        if not under or not missed or temporaries is None:
+            return under
+        return under * temporaries // missed
+
+    def learned(self, foreseen: int | None, measured: int | None, *, fit: bool, split: int,
+                temporaries: int | None) -> None:
+        """What a compile at the objective's remat at `split` teaches the derivation's next judgments there:
+        the headroom it `measured` short of the one `foreseen` corrects them (`under`), in proportion to the
+        derived `temporaries` it was short of (`missed_at`), and a compile that fit where the derivation, so
+        corrected, judged it short rules its refusals out (`overstated`)."""
+        rung = self.remat_rung()
+        if foreseen is not None and fit and foreseen - self.shortfall(split) < 0:
             self.overstated.add(rung)
-        if foreseen is not None and measured is not None and foreseen > measured:
-            self.under[rung] = max(self.under.get(rung, 0), foreseen - measured)
+        if foreseen is not None and measured is not None and foreseen - measured > self.under.get(rung, 0):
+            self.under[rung] = foreseen - measured
+            if temporaries:
+                self.missed_at[rung] = temporaries
+            else:
+                self.missed_at.pop(rung, None)
 
     def refused(self, split: int) -> bool:
         """Whether the derivation judges the step at `split` short past a miss, corrected by what a compile
@@ -895,7 +919,7 @@ class FitSearch[LossT, EffectsT]:
         if rung in self.overstated:
             return False
         derived = self.judgment(split)
-        return derived is not None and derived - self.under.get(rung, 0) < 0
+        return derived is not None and derived - self.shortfall(split) < 0
 
     def judging(self) -> bool:
         """Whether every process's devices judge a derived footprint (`memory.judged`) at the search's
@@ -1004,7 +1028,8 @@ class FitSearch[LossT, EffectsT]:
         foreseen = pooled_headroom(None if candidate.footprint is None else derived_headroom(
             candidate.footprint, local_devices(self.mesh), self.capacity, candidate.built))
         probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, derived_headroom=foreseen)
-        self.learned(foreseen, pooled_headroom(headroom), fit)
+        self.learned(foreseen, pooled_headroom(headroom), fit=fit, split=split,
+                     temporaries=None if candidate.footprint is None else candidate.footprint.temporaries)
         if foreseen is not None and (foreseen >= 0) != fit:
             # A derived peak bounded from below (`Footprint.exact`) admits provisionally: its miss names
             # the need the compile found, which a sourced rule is to reach.

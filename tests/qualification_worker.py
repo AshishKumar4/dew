@@ -26,15 +26,16 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
+from dew._files import write_atomically
 from dew.checkpoints import Checkpoints
 from dew.data import Loading, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, GlobalStream
 from dew.data.sources.tokens import TokenFiles
-from dew.files import write_atomically
 from dew.interop import Pretrained
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
+from dew.state import without_empty_window
 from dew.telemetry.instrumentation import compilation_cache_counts
 from dew.training import Trainer
 from dew.training.runtime import prepare_process
@@ -75,7 +76,10 @@ def write_reference(path: Path, source, variables, probe, step) -> None:
 
 def state_arrays(state, restored) -> dict[str, np.ndarray]:
     """The final state's leaves by path, each finite, after checking that the
-    checkpoint restores every one bit for bit in its own dtype."""
+    checkpoint restores every one it holds bit for bit in its own dtype: all
+    but an accumulation window that holds no microbatch, which a step saved
+    between updates leaves out and a resume allocates again (row 4309)."""
+    state = without_empty_window(state)
     arrays = {}
     for path, leaf in jax.tree_util.tree_flatten_with_path(state)[0]:
         value = jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf

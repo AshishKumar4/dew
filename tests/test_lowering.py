@@ -679,7 +679,8 @@ def test_a_fused_epilogues_intermediates_never_reach_global_memory(generation):
     calls = custom_calls(lowered)
     launches = [call for call in calls if custom_call_kind(call.target) in ("triton", "mosaic_gpu")]
     assert len(launches) == 1, [call.target for call in calls]
-    assert f"tensor<{rows}x{width}xf32>" not in lowered.as_text()
+    # No operation materializes the product in float32: the epilogue reads it within the kernel.
+    assert ((rows, width), "f32") not in result_types(lowered)
 
 
 @pytest.mark.parametrize("generation", GPUS)
@@ -1288,10 +1289,36 @@ def test_a_batchs_token_layout_split_over_its_tokens_compiles_no_loop_a_token():
     split = NamedSharding(mesh, PartitionSpec(None, "sequence"))
     shapes = (jax.ShapeDtypeStruct((4, 8192), jnp.int32, sharding=split),
               jax.ShapeDtypeStruct((4, 8192), jnp.bool_, sharding=split))
-    program = jax.jit(layout, in_shardings=(split, split)).lower(*shapes).compile().as_text()
-    assert not re.findall(r"\bwhile\(", program), re.findall(r"known_trip_count[^\n]*", program)[:4]
+    from dew.telemetry.instrumentation import hlo_instructions
+
+    compiled = jax.jit(layout, in_shardings=(split, split)).lower(*shapes).compile()
+    program = hlo_instructions(compiled.as_text())
+    loops = [name for name, instruction in program.items() if instruction.op == "while"]
+    assert not loops, loops
 
 
+
+
+def result_types(lowered: jax.stages.Lowered) -> set[tuple[tuple[int, ...], str]]:
+    """The shape and element type of every array an operation of `lowered`'s StableHLO module results in,
+    its every function's and region's operations included."""
+    from jax.extend.mlir import ir
+
+    found = set()
+
+    def walked(operation) -> None:
+        for result in operation.results:
+            if isinstance(result.type, ir.RankedTensorType):
+                ranked = ir.RankedTensorType(result.type)
+                found.add((tuple(ranked.shape), str(ranked.element_type)))
+        for region in operation.regions:
+            for block in region.blocks:
+                for nested in block.operations:
+                    walked(nested.operation)
+
+    for operation in lowered.compiler_ir("stablehlo").body.operations:
+        walked(operation.operation)
+    return found
 
 
 # ------------------------------------------------------------------ a TPU topology, compiled ahead here
@@ -1400,13 +1427,13 @@ def test_a_resumed_run_compiles_ahead_for_a_tpu_topology_where_its_checkpoint_le
 
 def test_a_topology_compile_neither_reads_nor_writes_the_persistent_cache(tmp_path, monkeypatch):
     """The executable a TPU topology's compile makes loads onto no client here, so the persistent cache
-    is out of its way (`dew.cache.uncached`): a cache that a program here writes to gains nothing from
+    is out of its way (`dew._cache.uncached`): a cache that a program here writes to gains nothing from
     the topology's compile, and the next program here writes to it again. The trainer is built before
     the cache is read, as its key is drawn by a program of this host's, which the cache keeps (ledger
     3174: alone in its process the test saw that program's entries)."""
     from jax.experimental.compilation_cache import compilation_cache
 
-    from dew.cache import enable_compilation_cache
+    from dew._cache import enable_compilation_cache
     from dew.training.ahead import compile_ahead
 
     monkeypatch.setenv("XLA_FLAGS", os.environ.get("XLA_FLAGS", ""))

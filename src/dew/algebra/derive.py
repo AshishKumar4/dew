@@ -57,11 +57,11 @@ from egglog import (
 )
 from egglog.bindings import EggSmolError
 
+from dew._cache import ALGEBRA
 from dew.algebra import cost, extract, program, rules, terms
 from dew.algebra.cost import Work
 from dew.algebra.forms import Accumulated, Added, Derived, Merged, Refused, evaluated, evaluator, inlined
 from dew.algebra.terms import Term
-from dew.cache import ALGEBRA
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
 
@@ -84,7 +84,7 @@ class Reduction:
     ranges: Mapping[str, float] = dataclasses.field(default_factory=dict)
     exact: bool = False
     """Whether its forms are extracted exactly (`extract.cheapest`): a declaration whose greedy extraction the
-    test suite's oracle finds dearer than the optimum (`dew.cache.Passes.checked`)."""
+    test suite's oracle finds dearer than the optimum (`dew._cache.Passes.checked`)."""
     exponential: Callable[..., jax.Array] | None = None
     """The implementation of its exponential (`exponent`'s base), `exponential(x, scale=1.0)`, `exp(x scale)`
     in the reals, which its walk's every exponential of that base evaluates by, an exponential of a
@@ -602,7 +602,7 @@ def context() -> tuple:
     mesh hold its avals in their literals (a sharded step's bound under a local one's mesh refused to lower),
     and are priced for one target (`cost.target`), under one run's numerics and one matmul precision, with
     the extractor oracle on or off (`Passes.checked`). Not the whole trace context, whose identity-keyed
-    collections (`dew.cache.KERNEL_ROUTES`, `KERNEL_SEEN`) are new in each lowering: every lowering derived
+    collections (`dew._cache.KERNEL_ROUTES`, `KERNEL_SEEN`) are new in each lowering: every lowering derived
     again and the cache grew without end."""
     return (jax.sharding.get_abstract_mesh(), cost.target(), generation.numerics(),
             jax.config.jax_default_matmul_precision, ALGEBRA.value.checked)

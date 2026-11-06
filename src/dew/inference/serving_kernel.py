@@ -24,7 +24,7 @@ from jax.sharding import Mesh, NamedSharding
 
 from dew.batch import VALIDITY_FIELD, Variables, coordinates, real_slots
 from dew.inference.tasks import cache_sized
-from dew.lora import adapter_names, selected
+from dew.lora import adapter_names
 from dew.mesh import logical_spec
 from dew.nn.attention_blocks import CROSS_KEY, CROSS_VALUE
 from dew.nn.cross_attention import CROSS_CACHE
@@ -40,6 +40,7 @@ from dew.nn.kv_cache import (
     grouped,
     is_paged,
     leaf_name,
+    row_axis,
     with_rounding_keys,
 )
 from dew.nn.progress import END, Progress, progressed
@@ -49,15 +50,16 @@ from dew.sampling import decoding
 from dew.sampling.decoding import LogitsTransform, StepState
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import DecoderState, Speculative, block_step, row_step
-from dew.sampling.text import decode_ops, prediction_depths, prefill_state, rounding_keys
+from dew.sampling.text import adapter_field, decode_ops, prediction_depths, prefill_state, rounding_keys
 
 
 @struct.dataclass
 class Slots:
     """The device state of every slot.
 
-    `decoder` holds the model's cache, `[slots, capacity, ...]` per leaf, and
-    logits per row. A drawing row's cache holds every token but its last
+    `decoder` holds the model's cache, `[slots, capacity, ...]` per leaf, its
+    layers first under a run's bank (`dew.nn.kv_cache.row_axis`), and logits
+    per row. A drawing row's cache holds every token but its last
     draw, which the next step feeds before it draws (`_advanced`), and its
     logits are the ones that draw came from; a row seated this step holds
     its prompt, whose logits score its first draw. `tokens` and `valid` are the
@@ -71,9 +73,8 @@ class Slots:
     caps them, `active` marks the rows still drawing, and `keys` holds each
     row's PRNG key data. `automaton` is each row's grammar state under a
     guided policy, zero (the start) on admission, and unread otherwise.
-    `adapter` is each row's adapter of an adapter set's model, its place in
-    the set's names, -1 for the base alone (`dew.lora.selected`), and unread
-    by any other model.
+    A row's adapter of an adapter set's model rides its decoder state
+    (`DecoderState.adapters`), -1 in a free slot.
     """
 
     decoder: DecoderState
@@ -84,7 +85,6 @@ class Slots:
     active: jax.Array
     keys: jax.Array
     automaton: jax.Array
-    adapter: jax.Array
 
 @struct.dataclass
 class Admission:
@@ -95,7 +95,12 @@ class Admission:
     marks the rows whose piece ends their prompt: those start drawing this
     step, and `history` with `history_valid` is their whole prompt
     right-aligned in `capacity` slots, for the transforms to read. `adapters`
-    is each row's adapter (`Slots.adapter`)."""
+    is each row's adapter, its place in an adapter set's names, -1 for the
+    base model alone (`DecoderState.adapters`). `prefilled`, where the server
+    prefills on a mesh of its own (`Server.from_task`'s `prefill_mesh`), is
+    the rows' prefilled decoder state and their real slots that program
+    left (`Dense.rows_prefilled`), moved to the decoding mesh; None, the
+    step prefills them itself."""
 
     prompts: ModelInputs
     slots: jax.Array
@@ -107,6 +112,7 @@ class Admission:
     history: jax.Array
     history_valid: jax.Array
     adapters: jax.Array
+    prefilled: tuple[DecoderState, jax.Array] | None = None
 
 
 @struct.dataclass
@@ -122,6 +128,17 @@ class Draws:
     ended: jax.Array
     behavior: jax.Array
     raw: jax.Array
+
+
+def _base_rows(model: nn.Module, rows: int) -> jax.Array | None:
+    """`rows` rows of the base model alone, -1 each, for an adapter set's model (`DecoderState.adapters`);
+    None for a model of no set, which reads no rows' adapters."""
+    return jnp.full((rows,), -1, jnp.int32) if adapter_names(model) else None
+
+
+def _rows_of(model: nn.Module, admission: Admission) -> jax.Array | None:
+    """The admitted rows' adapters for an adapter set's model, None for a model of no set."""
+    return admission.adapters if adapter_names(model) else None
 
 
 def drafting_depths(model: nn.Module, plan: Speculative | None) -> int | None:
@@ -140,23 +157,28 @@ def opened(model: nn.Module, params: Variables, pad_id: int, slots: int, capacit
     ops = decode_ops(model, params, pad_id, drafting_depths(model, plan))
     blank = ModelInputs(jnp.zeros((slots, 1), jnp.int32),
                         {VALIDITY_FIELD: jnp.zeros((slots, 1), bool)})
+    adapters = _base_rows(model, slots)
+
     def blank_prefill():
-        with selected(jnp.full((slots,), -1, jnp.int32)):
-            return prefill_state(model, params, blank, ops)[0]
+        return prefill_state(model, params, blank, ops, adapters=adapters)[0]
 
     _, decoder = jax.eval_shape(checkify.checkify(blank_prefill, errors=checkify.user_checks))
     keys = jax.random.key_data(jax.random.key(0, impl=impl))
-    return Slots(jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype), decoder),
+    # A free slot's adapter is the base model alone.
+    return Slots(dataclasses.replace(jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype), decoder),
+                                     adapters=adapters),
                  jnp.zeros((slots, 2 * capacity), jnp.int32),
                  jnp.zeros((slots, 2 * capacity), bool),
                  jnp.zeros((slots,), jnp.int32), jnp.zeros((slots,), jnp.int32),
                  jnp.zeros((slots,), bool),
                  jnp.zeros((slots, *keys.shape), keys.dtype),
-                 jnp.zeros((slots,), jnp.int32), jnp.full((slots,), -1, jnp.int32))
+                 jnp.zeros((slots,), jnp.int32))
 
 
-def _placed(resident: jax.Array, incoming: jax.Array, rows: jax.Array, groups: int) -> jax.Array:
-    """`incoming`'s rows written into `resident` at `rows`, group by group.
+def _placed(resident: jax.Array, incoming: jax.Array, rows: jax.Array, groups: int,
+            axis: int = 0) -> jax.Array:
+    """`incoming`'s rows written into `resident` at `rows`, group by group, the rows on `axis` of both (a
+    cache leaf's `row_axis`: a run's bank holds its layers first).
 
     Slots and incoming rows fall into `groups` equal groups in order, and
     `rows` counts within each group; a row at the group's size is dropped.
@@ -166,25 +188,27 @@ def _placed(resident: jax.Array, incoming: jax.Array, rows: jax.Array, groups: i
     lands in the first slots of its rows.
     """
     words, fresh = as_words(resident), as_words(incoming.astype(resident.dtype))
-    window = tuple(slice(0, fresh.shape[axis]) if fresh.shape[axis] != words.shape[axis]
-                   else slice(None) for axis in range(1, fresh.ndim))
+    window = tuple(slice(0, fresh.shape[other]) if fresh.shape[other] != words.shape[other]
+                   else slice(None) for other in range(fresh.ndim) if other != axis)
 
     def place(resident: jax.Array, incoming: jax.Array, rows: jax.Array) -> jax.Array:
-        rows = jnp.where(rows < resident.shape[0], rows, DROPPED)
-        return resident.at[(rows, *window)].set(incoming, mode="drop")
+        rows = jnp.where(rows < resident.shape[axis], rows, DROPPED)
+        return resident.at[(*window[:axis], rows, *window[axis:])].set(incoming, mode="drop")
 
-    placed = jax.vmap(place)(*(grouped(leaf, 0, groups) for leaf in (words, fresh, rows)))
+    placed = jax.vmap(place, in_axes=(axis, axis, 0), out_axes=axis)(
+        grouped(words, axis, groups), grouped(fresh, axis, groups), grouped(rows, 0, groups))
     return from_words(placed.reshape(words.shape), resident.dtype)
 
 
-def _taken(resident: jax.Array, rows: jax.Array, groups: int) -> jax.Array:
-    """`resident`'s rows at `rows`, group by group, as `_placed` writes them; a row at the
-    group's size reads zeros."""
+def _taken(resident: jax.Array, rows: jax.Array, groups: int, axis: int = 0) -> jax.Array:
+    """`resident`'s rows at `rows`, group by group, as `_placed` writes them, the rows on `axis`; a row
+    at the group's size reads zeros."""
     def take(resident: jax.Array, rows: jax.Array) -> jax.Array:
-        return jnp.take(resident, rows, axis=0, mode="fill", fill_value=0)
+        return jnp.take(resident, rows, axis=axis, mode="fill", fill_value=0)
 
-    taken = jax.vmap(take)(grouped(resident, 0, groups), grouped(rows, 0, groups))
-    return taken.reshape(rows.shape[0], *resident.shape[1:])
+    taken = jax.vmap(take, in_axes=(axis, 0), out_axes=axis)(grouped(resident, axis, groups),
+                                                             grouped(rows, 0, groups))
+    return taken.reshape(*resident.shape[:axis], rows.shape[0], *resident.shape[axis + 1:])
 
 
 def _seated(state: Slots, decoder: DecoderState, real: jax.Array, admission: Admission, groups: int) -> Slots:
@@ -202,7 +226,7 @@ def _seated(state: Slots, decoder: DecoderState, real: jax.Array, admission: Adm
                  place(state.valid, jnp.pad(admission.history_valid, padding)),
                  place(state.step, fresh), place(state.budget, admission.budgets),
                  place(state.active, real & admission.final), place(state.keys, admission.keys),
-                 place(state.automaton, fresh), place(state.adapter, admission.adapters))
+                 place(state.automaton, fresh))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -237,18 +261,50 @@ class Dense:
         capacity's f32 scores. A row's slots past the prompt keep a former
         occupant's keys, past the cursor the prefill sets.
         """
-        narrow = cache_sized(model, admission.prompts.tokens.shape[1])
-        with selected(admission.adapters):
-            fresh, real = prefill_state(narrow, params, admission.prompts,
-                                        decode_ops(narrow, params, pad_id, drafting_depths(model, self.plan),
-                                                   progress),
-                                        rounding=rounding_keys(jax.random.wrap_key_data(admission.keys,
-                                                                                        impl=self.prng)),
-                                        progress=progress)
-        def place(resident: jax.Array, incoming: jax.Array) -> jax.Array:
-            return _placed(resident, incoming, admission.slots, self.groups)
+        fresh, real = (self.rows_prefilled(model, params, pad_id, admission, progress)
+                       if admission.prefilled is None else _rows_first(*admission.prefilled, back=True))
 
-        return jax.tree.map(place, state.decoder, fresh), real
+        def place(path: tuple[jax.tree_util.KeyEntry, ...], resident: jax.Array,
+                  incoming: jax.Array) -> jax.Array:
+            return _placed(resident, incoming, admission.slots, self.groups, row_axis(path))
+
+        return jax.tree_util.tree_map_with_path(place, state.decoder, fresh), real
+
+
+    def rows_prefilled(self, model: nn.Module, params: Variables, pad_id: int, admission: Admission,
+                       progress: Progress = END) -> tuple[DecoderState, jax.Array]:
+        """The admitted prompts' own decoder state, their rows prefilled over a fresh cache at their bucket
+        width, and their real slots: what `prefilled` seats, which a server that prefills on a mesh of its
+        own runs there and moves (`Admission.prefilled`)."""
+        narrow = cache_sized(model, admission.prompts.tokens.shape[1])
+        ops = decode_ops(narrow, params, pad_id, drafting_depths(model, self.plan), progress)
+        rounding = rounding_keys(jax.random.wrap_key_data(admission.keys, impl=self.prng))
+        return prefill_state(narrow, params, admission.prompts, ops, rounding=rounding, progress=progress,
+                             adapters=_rows_of(model, admission))
+
+
+def _prefilled_rows(model: nn.Module, params: Variables, pad_id: int, placement: Dense, admission: Admission,
+                    progress: Progress) -> tuple[DecoderState, jax.Array]:
+    return _rows_first(*placement.rows_prefilled(model, params, pad_id, admission, progress))
+
+
+def _rows_first(decoder: DecoderState, real: jax.Array, *,
+                back: bool = False) -> tuple[DecoderState, jax.Array]:
+    """A prefilled admission's state as it moves between meshes (`Admission.prefilled`): every leaf's rows
+    first, a run's bank's past its layers (`row_axis`) moved before them, so the admission's one row
+    sharding places it as every admission leaf; `back`, each leaf again as its model holds it."""
+    def moved(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.Array) -> jax.Array:
+        axis = row_axis(path)
+        return leaf if not axis else jnp.moveaxis(leaf, 0, axis) if back else jnp.moveaxis(leaf, axis, 0)
+
+    return jax.tree_util.tree_map_with_path(moved, decoder), real
+
+
+def prefill_program() -> OuterProgram:
+    """The program a server that prefills on a mesh of its own runs there (`Dense.rows_prefilled`), over
+    the admission where its caller places it on that mesh (`Server._prefilled_elsewhere`): its state rows
+    first (`_rows_first`), as the admission travels."""
+    return outer_program(_prefilled_rows, static_argnums=(0, 2, 3))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -280,36 +336,39 @@ class Paged:
         scattered back to the rows' slots.
         """
         rows = admission.cursors.shape[0]
+        adapters = _rows_of(model, admission)
         # The cache's allocation runs the model too (a forward over a dummy token): under the rows' adapters.
-        with selected(admission.adapters):
-            allocated = with_rounding_keys(
-                model.apply(params, rows, method="init_cache", mutable=["cache"])[1]["cache"],
-                rounding_keys(jax.random.wrap_key_data(admission.keys, impl=self.prng)))
+        allocated = with_rounding_keys(
+            model.apply(params, rows, method="init_cache", mutable=["cache"],
+                        **adapter_field(adapters))[1]["cache"],
+            rounding_keys(jax.random.wrap_key_data(admission.keys, impl=self.prng)))
         continues = admission.cursors > 0
 
         def view(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.Array, fresh: jax.Array) -> jax.Array:
             name = leaf_name(path)
+            # The rows' tables and cursors, every layer's alike under a run's bank, its layers first
+            # (`row_axis`).
             if name == TABLE:
-                return admission.tables
+                return jnp.broadcast_to(admission.tables, fresh.shape)
             if name in ROW_CURSORS:
                 # A text row's next position is its count of tokens (`dew.nn.kv_cache.POSITION`).
-                return admission.cursors
+                return jnp.broadcast_to(admission.cursors, fresh.shape)
             if name in POOLED:
                 return leaf
-            held = _taken(leaf, admission.slots, self.groups)
-            return jnp.where(continues.reshape(rows, *(1,) * (held.ndim - 1)), held, fresh)
+            axis = row_axis(path)
+            held = _taken(leaf, admission.slots, self.groups, axis)
+            return jnp.where(continues.reshape(rows, *(1,) * (held.ndim - axis - 1)), held, fresh)
 
         cache = jax.tree_util.tree_map_with_path(view, state.decoder.cache, allocated)
-        with selected(admission.adapters):
-            fresh, real = prefill_state(model, params, admission.prompts,
-                                        decode_ops(model, params, pad_id, drafting_depths(model, self.plan),
-                                                   progress), cache=cache, progress=progress)
+        ops = decode_ops(model, params, pad_id, drafting_depths(model, self.plan), progress)
+        fresh, real = prefill_state(model, params, admission.prompts, ops, cache=cache, progress=progress,
+                                    adapters=adapters)
 
         def merged(path: tuple[jax.tree_util.KeyEntry, ...], resident: jax.Array,
                    updated: jax.Array) -> jax.Array:
             if leaf_name(path) in POOLED:
                 return updated
-            return _placed(resident, updated, admission.slots, self.groups)
+            return _placed(resident, updated, admission.slots, self.groups, row_axis(path))
 
         return jax.tree_util.tree_map_with_path(merged, state.decoder, fresh), real
 
@@ -354,8 +413,7 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
         decoder = _mixed_step(model, params, pad_id, placement, state.decoder, last, fed, admission, progress)
     else:
         ops = decode_ops(model, params, pad_id, None, progress)
-        with selected(state.adapter):
-            decoder = ops.advance(state.decoder, last, fed)
+        decoder = ops.advance(state.decoder, last, fed)
     if admission is not None and not mixed:
         # Only a row seated this step draws without feeding; with no admission
         # every drawing row fed, and the step's logits replace the held ones
@@ -373,7 +431,7 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
     # A row stops at its own budget here, where `Sample` scans one budget for every row.
     return (Slots(decoder, committed.tokens, committed.valid, committed.step, state.budget,
                   drawn & ~stopped & (committed.step < state.budget), state.keys,
-                  state.automaton if drew.automaton is None else drew.automaton, state.adapter),
+                  state.automaton if drew.automaton is None else drew.automaton),
             Draws(drew.token[:, None], drawn[:, None], stopped, drawn & drew.finished.ended,
                   drew.behavior[:, None], drew.raw[:, None]))
 
@@ -396,13 +454,12 @@ def _speculated(model: nn.Module, params: Variables, pad_id: int, placement: Pla
     view = StepState(state.tokens, state.valid, state.step, state.active,
                      jax.random.wrap_key_data(state.keys, impl=placement.prng), prompt_width=capacity,
                      budget=state.budget)
-    with selected(state.adapter):
-        block = block_step(state.decoder, view, jnp.zeros_like(view.active), plan, ops,
-                           decoding.chain(transforms), decoding.finish(stopping), state.budget)
+    block = block_step(state.decoder, view, jnp.zeros_like(view.active), plan, ops,
+                       decoding.chain(transforms), decoding.finish(stopping), state.budget)
     drawn, kept = state.active, block.kept
     committed = block.step
     return (Slots(block.state, committed.tokens, committed.valid, committed.step, state.budget,
-                  committed.active, state.keys, state.automaton, state.adapter),
+                  committed.active, state.keys, state.automaton),
             Draws(block.tokens, kept & drawn[:, None], drawn & block.stopped, drawn & block.terminated,
                   jnp.where(kept, block.behavior, 0.0), jnp.where(kept, block.raw, 0.0)))
 
@@ -536,7 +593,8 @@ def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
 
     Every leaf holds one row per slot on axis zero (`activation_batch`),
     except a paged cache's pool, `[kv_heads, pages, page_size, ...]`, whose
-    `pages` split over the same axes, one part per group of rows. Keys,
+    `pages` split over the same axes, one part per group of rows, and a cache
+    leaf under a run's bank, whose layers come first, whole (`row_axis`). Keys,
     values and their scales keep their heads where the key and value
     projections leave them (`activation_kv`), and the logits their
     vocabulary (`activation_vocab`), as a row's cross-attention keys and
@@ -554,14 +612,16 @@ def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
     def cached(
         path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.ShapeDtypeStruct | jax.Array
     ) -> NamedSharding:
+        # A run's bank holds its layers first, each layer's axes after them, whole (`row_axis`).
+        layers = (None,) * row_axis(path)
         if leaf_name(path) in (CROSS_KEY, CROSS_VALUE):
             # A row's context keys and values, its heads where the key and value projections leave them.
-            return placed(leaf, "activation_batch", None, "activation_kv")
+            return placed(leaf, *layers, "activation_batch", None, "activation_kv")
         if leaf_name(path) not in POOLED:
-            return placed(leaf, "activation_batch")
+            return placed(leaf, *layers, "activation_batch")
         if paged:
-            return placed(leaf, "activation_kv", "pages")
-        return placed(leaf, "activation_batch", None, "activation_kv")
+            return placed(leaf, *layers, "activation_kv", "pages")
+        return placed(leaf, *layers, "activation_batch", None, "activation_kv")
 
     rows = jax.tree.map(lambda leaf: placed(leaf, "activation_batch"), state)
     return rows.replace(decoder=rows.decoder.replace(
@@ -576,8 +636,9 @@ def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
 
     The matrix half is donated so XLA updates the cache in place instead of
     copying it. `rows` places every leaf of an admission, whose rows come
-    group by group, the way the slots are placed; None leaves them where they
-    are. `options` are the program's own XLA options beside the run's
+    group by group, the way the slots are placed (a prefilled admission's state
+    rows first, `_rows_first`); None leaves them where they are. `options` are
+    the program's own XLA options beside the run's
     (`decode_programs`: the model's `dew.nn.kernels.options.compiler_options`,
     and the admitting step's); pass XLA_FLAGS to change the backend's
     defaults. See docs/performance.md for the measurements.
@@ -665,10 +726,15 @@ def _restored(resident: Slots, carried: Slots, states: Variables, slots: jax.Arr
     as it is; a slot past the rows is dropped."""
     state = joined(resident, carried)
 
-    def restored(held, leaf):
-        return leaf if held is None else leaf.at[slots].set(held[entries].astype(leaf.dtype), mode="drop")
+    def restored(path, held, leaf):
+        if held is None:
+            return leaf
+        # A run's bank holds its layers first, both in the store and in the slots (`row_axis`).
+        layers = (slice(None),) * row_axis(path)
+        return leaf.at[(*layers, slots)].set(held[(*layers, entries)].astype(leaf.dtype), mode="drop")
 
-    cache = jax.tree.map(restored, states, state.decoder.cache, is_leaf=lambda x: x is None)
+    cache = jax.tree_util.tree_map_with_path(restored, states, state.decoder.cache,
+                                             is_leaf=lambda x: x is None)
     return split_donated(dataclasses.replace(state, decoder=dataclasses.replace(state.decoder, cache=cache)))
 
 
@@ -676,11 +742,62 @@ def _captured(states: Variables, resident: Slots, carried: Slots, slots: jax.Arr
               entries: jax.Array) -> Variables:
     """`states` with `entries` set to the row state leaves' `slots` rows (`row_state`); an entry past the
     store is dropped."""
-    def captured(held, leaf):
-        return None if held is None else held.at[entries].set(leaf[slots].astype(held.dtype), mode="drop")
+    def captured(path, held, leaf):
+        if held is None:
+            return None
+        layers = (slice(None),) * row_axis(path)
+        return held.at[(*layers, entries)].set(leaf[(*layers, slots)].astype(held.dtype), mode="drop")
 
     cache = joined(resident, carried).decoder.cache
-    return jax.tree.map(captured, states, cache, is_leaf=lambda x: x is None)
+    return jax.tree_util.tree_map_with_path(captured, states, cache, is_leaf=lambda x: x is None)
+
+
+def _pages_axis(path: tuple[jax.tree_util.KeyEntry, ...]) -> int:
+    """The axis a paged pool's leaf at `path` (`POOLED`) holds its pages on: `[heads, pages, page_size,
+    ...]`, its run's layers first under a bank (`row_axis`)."""
+    return row_axis(path) + 1
+
+
+def _read_pages(resident: Slots, carried: Slots, pages: jax.Array) -> Variables:
+    """The pool's `pages`, each leaf's `[len(pages), ...]`, a page's every other axis after it, its heads
+    and under a bank its run's layers (`_pages_axis`), so the host keeps each page alike; None off the
+    pool."""
+    return jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jnp.moveaxis(jnp.take(leaf, pages, axis=_pages_axis(path)), _pages_axis(path), 0)
+        if leaf_name(path) in POOLED else None, joined(resident, carried).decoder.cache)
+
+
+def page_shapes(resident: Slots, carried: Slots, count: int) -> Variables:
+    """The shapes `count` of the pool's pages take as `_read_pages` reads them."""
+    return jax.eval_shape(_read_pages, resident, carried, jax.ShapeDtypeStruct((count,), jnp.int32))
+
+
+def _written_pages(resident: Slots, carried: Slots, pages: jax.Array, held: Variables) -> tuple[Slots, Slots]:
+    """The state with the pool's `pages`, `[groups, count]`, each group's own, set to `held`'s, each leaf
+    `[groups, count, ...]`, a group's pages in its row, each as `_read_pages` reads it; a page past the pool
+    is dropped."""
+    state = joined(resident, carried)
+
+    def written(path, leaf, values):
+        if values is None:
+            return leaf
+        axis = _pages_axis(path)
+        flat = jnp.moveaxis(values.reshape(-1, *values.shape[2:]), 0, axis)
+        return leaf.at[(*(slice(None),) * axis, pages.reshape(-1))].set(flat.astype(leaf.dtype), mode="drop")
+
+    cache = jax.tree_util.tree_map_with_path(written, state.decoder.cache, held, is_leaf=lambda x: x is None)
+    return split_donated(dataclasses.replace(state, decoder=dataclasses.replace(state.decoder, cache=cache)))
+
+
+def page_programs(formats: Formats, rows: NamedSharding | None) -> tuple[OuterProgram, OuterProgram]:
+    """The programs that move a paged pool's pages between the resident state, kept in `formats`, and the
+    host (`dew.inference.pages.Transfers`): reading pages out, and writing pages in, the pages handed in a
+    row per group placed as the server's admitted rows are (`rows`), the resident matrices donated. JAX
+    writes no slice into an array in host memory, so the host keeps the pages it reads."""
+    resident, carried = split_donated(formats)
+    return (outer_program(_read_pages, in_shardings=(resident, carried, None)),
+            outer_program(_written_pages, donate_argnums=(0,), in_shardings=(resident, carried, None, rows),
+                          out_shardings=(resident, carried)))
 
 
 def state_programs(formats: Formats, states: Variables) -> tuple[OuterProgram, OuterProgram]:

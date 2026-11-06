@@ -7,6 +7,10 @@ locks	sh tools/lock_environment.sh && git diff --exit-code --stat locks/
 flake8	"$PYTHON" -m flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --extend-exclude=.venv*
 ruff	"$PYTHON" -m ruff check $ruff_inputs
 slop	JAX_PLATFORMS=cpu "$PYTHON" tools/lint_slop.py
+# Dew's layering contracts, read from the source's imports (docs/design/architecture.md).
+layers	"$PYTHON" tools/lint_layers.py
+# A released version keeps the notes it shipped, and new entries go under ## Unreleased (row 3050).
+changelog	"$PYTHON" tools/changelog_released.py check
 # The ratchet reads the inventory's whole history, which a shallow checkout fetches first.
 ratchet	sh tools/base_history.sh && "$PYTHON" tools/lint_slop.py --ratchet --base="$BASE"
 # No forecasts in the prose and messages a change adds (the bible).

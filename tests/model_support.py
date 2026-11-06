@@ -30,6 +30,16 @@ TINY_DECODER = {"emb_features": 32, "num_layers": 2, "num_heads": 4, "mlp_featur
 its own vocabulary and any field its claim turns on."""
 
 
+def recorded_site(path: Path, site: str, inputs_of, truth_fn):
+    """A summarized recording's `site` at `path` (`tools/recorded_references.record_case`): its draw,
+    recorded reference and truth over its declared seeds, Dew's float64 run `truth_fn` its truth, held to
+    the recording's sketch (`indexed_recording`), and the seed count."""
+    from reference_error import declared_seeds, indexed_recording, recording
+
+    seeds = declared_seeds(path)[site]
+    return (*indexed_recording(recording(path), site, seeds, inputs_of=inputs_of, truth_fn=truth_fn), seeds)
+
+
 def model_draw(model, shape: tuple[int, ...], vocab: int):
     """Check 1's draw for `model` (tests/reference_error.py): a seed's variables and `shape` tokens below
     `vocab`, the variables initialized compiled."""
@@ -437,12 +447,18 @@ def prediction_logits(model, variables, tokens):
 def stepped_decode(model, variables, ids):
     """`ids` decoded a token a call through the cache one token's call allocates, the calls one program
     under a scan: the steps' logits `[B, S, V]` and the cache they leave."""
+    cache = nn.unbox(model.init(jax.random.key(0), ids[:, :1], decode=True))["cache"]
+    return steps_from(model, variables, cache, ids)
+
+
+def steps_from(model, variables, cache, ids):
+    """`ids` decoded a token a call from `cache`, the calls one program under a scan: the steps' logits
+    `[B, S, V]` and the cache they leave."""
     def step(cache, column):
         logits, state = model.apply({**variables, "cache": cache}, column[:, None], decode=True,
                                     mutable=["cache"])
         return state["cache"], logits[:, 0]
 
-    cache = nn.unbox(model.init(jax.random.key(0), ids[:, :1], decode=True))["cache"]
     cache, steps = jax.lax.scan(step, cache, jnp.moveaxis(jnp.asarray(ids), 1, 0))
     return jnp.moveaxis(steps, 0, 1), cache
 
@@ -458,3 +474,15 @@ def moved(tree, key: jax.Array, scale: float):
         (leaf + scale * jax.random.normal(each, leaf.shape)).astype(leaf.dtype)
         if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
         for leaf, each in zip(leaves, keys, strict=True)])
+
+
+def encoded_form(quantization, tensors, names):
+    """Dense `tensors` with each of `names` written in `quantization`'s stored form, as a checkpoint of
+    that format holds them and a test builds one: each weight's stored tensors (`encode`) in its place,
+    every other tensor as it is. A loaded source's export writes them back by `requantize`, which reads
+    the stored tensors' specs from the source."""
+    names = set(names)
+    out = {name: tensor for name, tensor in tensors.items() if name not in names}
+    for name in sorted(names):
+        out.update(quantization.encode(name, np.asarray(tensors[name])))
+    return out

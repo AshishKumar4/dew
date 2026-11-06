@@ -15,7 +15,7 @@ import threading
 import time
 import tomllib
 import urllib.parse
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, NamedTuple, Protocol, TypedDict, runtime_checkable
@@ -31,10 +31,10 @@ from huggingface_hub.file_download import REGEX_COMMIT_HASH
 from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 from s3fs import S3FileSystem
 
+from dew._cache import dew_cache_dir
+from dew._files import write_atomically
 from dew._records import JSON, json_value, record, text
-from dew.cache import dew_cache_dir
 from dew.data.retention import LocalRetention, evictable, read_pin
-from dew.files import write_atomically
 
 
 class PreconditionFailed(FileExistsError):
@@ -343,6 +343,69 @@ class BoundedFileCache(WholeFileCacheFileSystem):
             "downloaded_bytes": self._dew_downloaded,
             "wait_seconds": self._dew_wait,
         }
+
+
+def mirror_metrics() -> dict[str, float]:
+    """What this process's mirrors (`dewcache::`) did, summed over every one it opened, as a run logs it
+    beside its data metrics (`data/mirror/...`, row 4299): none where it opened none."""
+    held = [mirror.metrics() for mirror in BoundedFileCache._cache.values()]
+    if not held:
+        return {}
+    return {f"data/mirror/{name}": float(sum(stats[name] for stats in held)) for name in held[0]}
+
+
+MIRRORED = "dew_mirror"
+"""The key under which a loading worker's position carries its process's mirror counters
+(`dew.data.readers.WorkerMirrors`): `{"process": <its process>, "counts": mirror_metrics()}`."""
+
+MIRRORS = "dew_mirrors"
+"""The key under which a position that reads its loading workers' positions without keeping them (an
+elastic read's order, `dew.data.elastic_order`) carries their mirror counters, by process."""
+
+
+def carried_mirrors(state: Mapping[str, object] | Sequence[object] | None) -> dict[str, dict[str, float]]:
+    """Each loading worker's mirror counters a reader's position carries (`MIRRORED`, `MIRRORS`), by the
+    worker's process, each its latest: cumulative, so a worker's counters count once."""
+    found: dict[str, dict[str, float]] = {}
+    if isinstance(state, Mapping):
+        node = state.get(MIRRORED)
+        if isinstance(node, Mapping) and isinstance(node.get("process"), str):
+            found[str(node["process"])] = _counted(node["counts"])
+        held = state.get(MIRRORS)
+        if isinstance(held, Mapping):
+            found.update({str(process): _counted(counts) for process, counts in held.items()})
+        for value in state.values():
+            if isinstance(value, (Mapping, list, tuple)):
+                found.update(carried_mirrors(value))
+    elif isinstance(state, (list, tuple)):
+        for value in state:
+            if isinstance(value, (Mapping, list, tuple)):
+                found.update(carried_mirrors(value))
+    return found
+
+
+def _counted(counts: object) -> dict[str, float]:
+    """Mirror counters as a position carries them (`mirror_metrics`), by name."""
+    if not isinstance(counts, Mapping):
+        raise ValueError(f"a position's mirror counters are a mapping, not {counts!r}")
+    return {str(name): float(value) for name, value in counts.items()}
+
+
+def without_mirrors(state: JSON) -> JSON:
+    """A position, as JSON, with the mirror counters it carries emptied: a read's metrics, not its place,
+    which a saved position keeps none of (`carried_mirrors`); the position itself as it is."""
+    match state:
+        case dict():
+            emptied = {key: without_mirrors(value) for key, value in state.items()}
+            if isinstance(state.get(MIRRORED), dict):
+                emptied[MIRRORED] = {"process": "saved", "counts": {}}
+            if isinstance(state.get(MIRRORS), dict):
+                emptied[MIRRORS] = {}
+            return emptied
+        case list():
+            return [without_mirrors(value) for value in state]
+        case _:
+            return state
 
 
 # Registered as this module loads, which reads no configuration, so `dewcache::` URLs open through
@@ -792,10 +855,10 @@ def _hub_commit(fs: HfFileSystem, path: str) -> tuple[str, str]:
 @functools.cache
 def _registered() -> None:
     """Register the profiles the storage config names (DEW_STORAGE_CONFIG, else storage.toml in Dew's
-    configuration directory, `dew.cache.dew_config_dir`) with fsspec, once, as the first store
+    configuration directory, `dew._cache.dew_config_dir`) with fsspec, once, as the first store
     resolves: the configuration is read where it is first used, so a broken one fails that store,
     not the import."""
-    from dew.cache import dew_config_dir
+    from dew._cache import dew_config_dir
 
     named = os.environ.get("DEW_STORAGE_CONFIG")
     config = Path(named).expanduser() if named else dew_config_dir() / "storage.toml"

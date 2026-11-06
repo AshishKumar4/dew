@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
+import uuid
 from collections.abc import Callable, Iterator, Mapping
 from types import MappingProxyType
 from typing import Literal
@@ -11,7 +13,7 @@ from typing import Literal
 import grain.python as pygrain
 import numpy as np
 
-from dew import position
+from dew import _position
 from dew._records import json_value, record
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS, Batch
 from dew.data.dataset import (
@@ -30,6 +32,7 @@ from dew.data.dataset import (
 from dew.data.mixing import CorpusCounts, data_metrics, state_counts
 from dew.data.pipeline import HostStep, Map
 from dew.data.plan import COUNTERS, Plan, earlier_position
+from dew.data.storage import MIRRORED, carried_mirrors, mirror_metrics, without_mirrors
 
 READER_FIELDS = (EXAMPLES_CONSUMED, VALID_ROWS)
 """A batch's fields its reader owns, which a host step after the batch neither reads nor writes
@@ -127,10 +130,47 @@ class _CanonicalPass:
 
 @dataclasses.dataclass
 class _Published:
-    """A position a reader published, and its counts (`state_counts`) once they are asked."""
+    """A position a reader published, and its counts (`state_counts`) once they are asked, with the mirror
+    counters of the workers of a reader it closed or restored past (`retired`): one object, which a
+    publication replaces whole, so a reading on another thread sees a consistent pair."""
 
     state: Mapping[str, object] | None
     read: Mapping[str, CorpusCounts] | None = None
+    retired: Mapping[str, dict[str, float]] = dataclasses.field(default_factory=dict)
+
+
+class WorkerMirrors(pygrain.IterDataset[Batch]):
+    """A loading worker's rows as they are, its position carrying what its own process's mirrors did
+    (`mirror_metrics`): Grain's worker queue hands the reading process each row's position, and the
+    reading process sees no worker's mirror itself, so a run's statistics count a worker's mirror reads
+    from the position its reader last published (`_Statistics`, row 4339)."""
+
+    def __init__(self, parent: pygrain.IterDataset[Batch]):
+        super().__init__(parent)
+        self._rows = parent
+
+    def __iter__(self) -> pygrain.DatasetIterator[Batch]:
+        return _WorkerMirrorsIterator(iter(self._rows))
+
+
+class _WorkerMirrorsIterator(pygrain.DatasetIterator[Batch]):
+    def __init__(self, parent: pygrain.DatasetIterator[Batch]):
+        super().__init__(parent)
+        self._read = parent
+        # This process's one iterator, named apart from every other worker's and a later one's.
+        self._process = f"{os.getpid()}:{uuid.uuid4().hex}"
+
+    def __next__(self) -> Batch:
+        return next(self._read)
+
+    def get_state(self) -> Mapping[str, object]:
+        return {"parent": self._read.get_state(),
+                MIRRORED: {"process": self._process, "counts": mirror_metrics()}}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        # A position a worker saved before it carried its mirrors' counters is its rows' alone (row 4339).
+        # Carried to 1.0 (ledger 1552).
+        self._read.set_state(record(state["parent"], "worker position") if MIRRORED in state else state)
 
 
 @dataclasses.dataclass
@@ -150,8 +190,16 @@ class _PublishedCounts:
             published.read = MappingProxyType({} if state is None else state_counts(state))
         return published.read
 
+    @property
+    def mirrors(self) -> dict[str, dict[str, float]]:
+        """Every loading worker's mirror counters this reader's positions carried (`carried_mirrors`), a
+        closed reader's workers' among them."""
+        published = self.published
+        return {**published.retired, **carried_mirrors(published.state)}
+
     def publish(self, state: Mapping[str, object] | None) -> None:
-        self.published = _Published(state)
+        retired = self.mirrors if state is None else self.published.retired
+        self.published = _Published(state, retired=retired)
 
 
 class _PerShare(Forwarding):
@@ -230,14 +278,16 @@ class _PerShare(Forwarding):
         if state is None:
             state = self._reader().get_state()
             self._publish(state)
+        # The position alone: the loading workers' mirror counters it carried are this read's metrics, not
+        # its place (`without_mirrors`), so every reader of an elastic read saves one position.
         saved = {"dew_data_plan": self._plan.record(), "counters": COUNTERS, "iterator": state}
         # A mix's captured positions are shared mappings (`SharedMapping`), written as the records they
         # read as.
-        return json.dumps(json_value({position.REPLICATED: saved} if self._replicated else saved,
-                                     "data position")).encode()
+        return json.dumps(without_mirrors(json_value({_position.REPLICATED: saved} if self._replicated
+                                                     else saved, "data position"))).encode()
 
     def set_state(self, state: bytes) -> None:
-        held = position.replicated(state)
+        held = _position.replicated(state)
         if self._replicated != (held is not None):
             raise ValueError(
                 "this read is elastic, and the saved position is one share's own offset; resume it with the "
@@ -274,9 +324,18 @@ class _Statistics:
     def __init__(self, counts: Mapping[str, CorpusCounts]):
         self._counts = counts
         self._published: list[_PublishedCounts] = []
+        # A global-order read's positions, read for its loading workers' mirrors alone (`mirrored`).
+        self._mirrored: list[_PublishedCounts] = []
 
     def observe(self, stream: _PerShare) -> None:
         self._published.append(stream._statistics)
+
+    def mirrored(self) -> Callable[[Mapping[str, object] | None], None]:
+        """Where a global-order read hands each position it reads (`dew.data.dataset.GlobalStream`), for
+        its loading workers' mirror counters (`WorkerMirrors`)."""
+        published = _PublishedCounts()
+        self._mirrored.append(published)
+        return published.publish
 
     def __call__(self) -> Mapping[str, float]:
         """The metrics of every corpus: the counts of the prefix a memory read ran, followed by
@@ -285,7 +344,16 @@ class _Statistics:
         read = {name: counts for published in self._published for name, counts in published.counts.items()}
         merged = {name: counts.followed(read.pop(name)) if name in read else counts
                   for name, counts in self._counts.items()}
-        return data_metrics([*merged.values(), *read.values()])
+        # What this process's mirrors did beside them (`mirror_metrics`, row 4299), and each loading
+        # worker's, which its readers' positions carried (`WorkerMirrors`, row 4339).
+        mirrored = [mirror_metrics(), *(counts for published in (*self._published, *self._mirrored)
+                                        for process, counts in published.mirrors.items()
+                                        if not process.startswith(f"{os.getpid()}:"))]
+        summed: dict[str, float] = {}
+        for counts in mirrored:
+            for name, value in counts.items():
+                summed[name] = summed.get(name, 0.0) + float(value)
+        return {**data_metrics([*merged.values(), *read.values()]), **summed}
 
 
 @dataclasses.dataclass(frozen=True)

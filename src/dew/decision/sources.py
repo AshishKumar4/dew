@@ -18,7 +18,7 @@ from dew.batch import Variables
 from dew.data.text import HFTokenizer
 from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
 from dew.interop.pretrained import Pretrained
-from dew.interop.safetensors_io import MAX_SHARD_SIZE
+from dew.interop.safetensors_io import MAX_SHARD_SIZE, joined_tensors
 from dew.nn.attention import AttentionImpl
 from dew.registry import dtype_name, import_path
 
@@ -136,14 +136,12 @@ def _export_laya(bundle: PretrainedDecision, variables: Mapping[str, object] | N
 
 
 def joined_release(backbone: Mapping[str, np.ndarray], readout: Mapping[str, np.ndarray], files: str
-                   ) -> dict[str, np.ndarray]:
-    """A release's backbone tensors and its readout's, which it writes apart (`files`), as one set by
-    name; a name both hold is refused, since one set cannot hold the two tensors under it."""
-    shared = backbone.keys() & readout.keys()
-    if shared:
-        raise ValueError(f"the release's backbone and readout ({files}) both name {sorted(shared)}, which "
-                         "one set of tensors by name cannot hold; save the release instead")
-    return {**backbone, **readout}
+                   ) -> Mapping[str, np.ndarray]:
+    """A release's backbone tensors and its readout's, which it writes apart (`files`), as one table by
+    name, each built from its own as it is read (`joined_tensors`, ledger 4370); a name both hold is
+    refused before any is read, since one table cannot hold the two tensors under it (save the release
+    instead)."""
+    return joined_tensors({"the release's backbone": backbone, f"its readout ({files})": readout})
 
 
 class DecisionSource(SourceKind):
