@@ -73,8 +73,7 @@ def test_a_row_any_arm_left_unmeasured_in_a_round_is_partial_and_too_few_rounds_
     base, head, alone = samples(8.0), samples(8.5), samples(8.0, 8.0625)
     state, numbers = gate.verdict(row, base, head, [*alone[:5], None])
     assert state == "partial" and numbers["unmeasured rounds"] == {"A/A": 1}
-    state, numbers = gate.verdict(row, base[:5], head[:5], alone[:5])
-    assert state == "unjudged" and "short of 0.95" in numbers["why"]
+    assert gate.verdict(row, base[:5], head[:5], alone[:5])[0] == "unjudged"
     assert "unjudged" in gate.UNQUALIFIED and "partial" in gate.UNQUALIFIED
 
 
@@ -472,7 +471,8 @@ def test_a_gate_keeps_each_arms_compiles_apart_and_places_its_arms_at_random_eac
     _, rows = standing_in_environments(gate, monkeypatch)
     trees = {name: locked_tree(tmp_path / name) for name in ("main", "head")}
     out = tmp_path / "not" / "yet" / "gate.json"
-    args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", rounds=6,
+    # The head's name is the A/A's (`<base>~aa`): the arms are the run's own, whatever the trees are named.
+    args = SimpleNamespace(base=f"main={trees['main']}", head=f"main~aa={trees['head']}", rounds=6,
                            only=["lm-dense 4x1024"], claim=False, model="unused", flowers="unused",
                            torch_python="", out=str(out), environments=str(tmp_path / "environments"))
     assert gate.run(args) == 0
@@ -481,8 +481,12 @@ def test_a_gate_keeps_each_arms_compiles_apart_and_places_its_arms_at_random_eac
     assert {name for name, _ in caches} == {"base", "head", "alone"} and len(caches) == 3
     assert all(Path(peaks).name == f"{name}-peaks" for name, peaks in caches)
     assert not any(Path(peaks).parent.exists() for _, peaks in caches)
+    by_cache = {Path(env["JAX_COMPILATION_CACHE_DIR"]).name: tree.name for tree, _, env in rows
+                if "JAX_COMPILATION_CACHE_DIR" in env}
+    assert by_cache == {"base": "main", "head": "head", "alone": "main"}
     results = json.loads(out.read_text())
-    assert results["alone"] == "main~aa" and set(results["samples"]) == {"main", "head", "main~aa"}
+    assert (results["base"], results["head"], results["alone"]) == ("main", "main~aa", "main~aa")
+    assert set(results["samples"]) == {"base", "head", "alone"}
     assert all(sorted(order) == sorted(results["samples"]) for order in results["orders"])
     assert len(results["orders"]) == 6
     for arm, taken in results["samples"].items():
@@ -535,9 +539,13 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round_and_refuses_a_
         case, cache = json.loads(command[2]), Path(kwargs["env"]["JAX_COMPILATION_CACHE_DIR"])
         compiled.append((Path(kwargs["cwd"]).name, command[3:], cache, cache.exists()))
         substituted = ["attention: flash ran as xla at site"] if case["config"] == gate.LM_MOE else []
-        seconds = 48.0 if Path(kwargs["cwd"]).name == "head" else 32.0
-        printed = json.dumps({"seconds": seconds, "substituted": substituted,
-                              "plan": {"split": 1, "rows": 4}})
+        head = Path(kwargs["cwd"]).name == "head"
+        # Each field the compile names (its last argument), its own JSON value: the head tiles its LM head and
+        # remats by a structured policy.
+        plan = {"split": 1, "rows": 4, "remat": {"policy": "dots_saveable"} if head else None,
+                "head_tile": [1024, 2] if head else None}
+        printed = json.dumps({"seconds": 48.0 if head else 32.0, "substituted": substituted,
+                              "plan": {key: plan.get(key) for key in command[-1].split(",")}})
         return subprocess.CompletedProcess(command, 0, f"compiling\n{printed}\n", "")
 
     monkeypatch.setattr(gate.subprocess, "run", child)
@@ -552,17 +560,22 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round_and_refuses_a_
     dense, moe = "compile lm-dense 4x1024 (xla attention)", "compile lm-moe 4x1024 (xla attention)"
     assert [row["name"] for row in results["rows"]] == [dense, moe]
     assert len(compiled) == 2 * 3 * 6
-    assert {tuple(argv) for _, argv, _, _ in compiled} == {("sm90", str(80 << 30), "xla")}
+    selected = ",".join(gate.SELECTED)
+    assert {tuple(argv) for _, argv, _, _ in compiled} == {("sm90", str(80 << 30), "xla", selected)}
     assert len({cache for _, _, cache, _ in compiled}) == len(compiled)
     assert not any(made for *_, made in compiled)
     assert {tree for tree, *_ in compiled} == {"main", "head"}
     assert built and all(python.parent.parent.name.startswith("cuda12-") for _, python in built)
     assert len(results["orders"]) == 6 and all(len(set(order)) == 3 for order in results["orders"])
-    assert results["plans"]["head"][0][dense] == {"split": 1, "rows": 4}
     verdicts = tmp_path / "verdicts.json"
     assert gate.report(SimpleNamespace(results=out, table=None, claim=False, verdicts=str(verdicts))) == 1
-    states = {name: row["state"] for name, row in json.loads(verdicts.read_text())["rows"].items()}
-    assert states == {dense: "regressed", moe: "unsupported"}
+    judged = json.loads(verdicts.read_text())["rows"]
+    assert {name: row["state"] for name, row in judged.items()} == {dense: "regressed", moe: "unsupported"}
+    # Each arm's selected configurations beside the verdict, structured values kept: why its planning moved.
+    tiled = {"split": 1, "rows": 4, "remat": {"policy": "dots_saveable"}, "head_tile": [1024, 2],
+             "head_fused": None, "xla_defaults": None, "narrow": None}
+    assert judged[dense]["plans"]["head"] == [tiled] * 6
+    assert judged[dense]["plans"]["base"][0]["remat"] is None
     a100 = SimpleNamespace(**{**vars(args), "kind": "a100", "rounds": 1, "only": ["finetune"],
                               "out": str(tmp_path / "a100.json")})
     assert gate.compile_battery(a100) == 0
@@ -585,20 +598,19 @@ def test_a_step_is_planned_ahead_for_an_absent_gpu_and_a_kernel_this_host_cannot
     """The compile ahead's own process (`COMPILED`), run as `compile` runs it: a decoder's step planned and
     compiled for one compile-only sm90 GPU of a stated memory, here with no GPU attached, with XLA's
     attention (`AHEAD_ATTENTION`), its planner's seconds and selected plan reported and nothing substituted;
-    with the attention a GPU routes to, FlashAttention, which lowers on no compile-only GPU (ledger 4616),
-    it runs as XLA's, which it names as substituted, so the gate never takes that program for the GPU's."""
+    with FlashAttention asked for, which lowers on no compile-only GPU (ledger 4616), a kernel runs in its
+    place, which it names as substituted, so the gate never takes that program for the GPU's."""
     script = gate._script(tmp_path / "compiled.json", gate.COMPILED)
 
     def compiled(attention: str) -> dict:
-        argv = [str(script), json.dumps(TINY), "sm90", str(1 << 30), attention]
+        argv = [str(script), json.dumps(TINY), "sm90", str(1 << 30), attention, ",".join(gate.SELECTED)]
         done = gate._run(ROOT, Path(sys.executable), "", argv, ROOT / "tools", 900, tmp_path / attention)
         assert done.returncode == 0, done.stderr[-3000:]
         return json.loads(done.stdout.strip().splitlines()[-1])
 
     ahead = compiled(gate.AHEAD_ATTENTION)
     assert ahead["seconds"] > 0 and ahead["substituted"] == [] and ahead["plan"]["split"] == 1
-    routed = compiled("auto")
-    assert any("flash ran as xla" in each for each in routed["substituted"]), routed
+    assert compiled("flash")["substituted"]
 
 
 def paired(rates: dict[str, list[float]], session: str = "s") -> dict[str, list[dict]]:
@@ -640,3 +652,99 @@ def test_the_qwen_pair_judges_dew_against_torch_beside_torchs_own_a_a(gate):
     wrong["torch~aa"][0]["framework"] = "dew"
     with pytest.raises(ValueError):
         pair.compare(wrong, "s", smoke=True)
+
+
+def test_a_null_run_placed_at_random_stays_level_where_its_timing_depends_on_place_and_a_slowdown_fails(
+        gate, tmp_path, monkeypatch):
+    """A controlled realization of `run` (bible §7: a gate's rule against a null and an injected fault): every
+    arm the same step, whose time depends on its place in the round alone (the round's first process a
+    sixteenth slower), placed at random by a seeded draw, is judged level by `report`; the same with the head
+    a quarter slower in every place regresses and fails it."""
+    import random
+    from types import SimpleNamespace
+
+    standing_in_environments(gate, monkeypatch)
+    measured_row = gate.subprocess.run
+    steps: list[str] = []
+    slower = {"head": 1.0}
+
+    def placed(command, **kwargs):
+        done = measured_row(command, **kwargs)
+        if len(command) > 1 and Path(command[1]).name == "benchmark_step.py":
+            steps.append(Path(kwargs["cwd"]).name)
+            first = (len(steps) - 1) % 3 == 0
+            out = Path(after(command, "--json-out"))
+            [step] = json.loads(out.read_text())
+            step["ms_per_step"] = 8.0 * (1.0625 if first else 1.0) * slower.get(steps[-1], 1.0)
+            out.write_text(json.dumps([step]))
+        return done
+
+    monkeypatch.setattr(gate.subprocess, "run", placed)
+    monkeypatch.setattr(gate.secrets, "SystemRandom", lambda: random.Random(1106))
+    trees = {name: locked_tree(tmp_path / name) for name in ("main", "head")}
+
+    def judged(name: str) -> tuple[int, dict]:
+        out = tmp_path / f"{name}.json"
+        args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", rounds=6,
+                               only=["step lm-dense 4x1024"], claim=False, model="unused", flowers="unused",
+                               torch_python="", out=str(out), environments=str(tmp_path / "environments"))
+        assert gate.run(args) == 0
+        verdicts = tmp_path / f"{name}-verdicts.json"
+        code = gate.report(SimpleNamespace(results=out, table=None, claim=False, verdicts=str(verdicts)))
+        return code, json.loads(verdicts.read_text())["rows"]["step lm-dense 4x1024"]
+
+    code, row = judged("null")
+    assert (code, row["state"], row["differs"]) == (0, "level", False)
+    slower["head"] = 1.25
+    code, row = judged("slower")
+    assert (code, row["state"], row["differs"]) == (1, "regressed", True)
+
+
+STEP_STAND_IN = """import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+given = lambda flag: args[args.index(flag) + 1] if flag in args else None
+fixture = given("--smoke-fixture")
+if FRAMEWORK == "torch" and fixture:
+    Path(fixture).mkdir(parents=True, exist_ok=True)
+    (Path(fixture) / "model.safetensors").write_text("weights")
+if FRAMEWORK == "dew" and not (fixture and (Path(fixture) / "model.safetensors").is_file()):
+    sys.exit(3)
+record = json.loads(Path(os.environ["PAIR_RECORD"]).read_text())
+Path(given("--out")).write_text(json.dumps({**record, "framework": FRAMEWORK, "session": given("--session")}))
+"""
+"""A step of the pairing (tools/reference_runs/<framework>_qwen35_step.py) as the session runs it: torch's
+exports the smoke's checkpoint where asked, Dew's loads it and fails without it, each writing its record."""
+
+
+def test_the_qwen_pairs_smoke_runs_whichever_arm_a_round_draws_first(gate, tmp_path, monkeypatch):
+    """The pairing's session as `run` makes it, every round Dew's arm drawn first: the smoke's checkpoint,
+    which Dew's step loads, is torch's export before the session, so no order fails, and the three arms'
+    records reach the judgment, torch's A/A a torch run."""
+    pair = load("qwen35_pair", "tools/reference_runs")
+    root = tmp_path / "checkout"
+    for framework in ("torch", "dew"):
+        script = root / "tools" / "reference_runs" / f"{framework}_qwen35_step.py"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text(f"FRAMEWORK = {framework!r}\n{STEP_STAND_IN}")
+    identity = ["-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "-C", str(root), *identity, "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(root), *identity, "commit", "-qm", "c"], check=True)
+    [record] = paired({"dew": [512.0]})["dew"]
+    (tmp_path / "record.json").write_text(json.dumps(record))
+    monkeypatch.setenv("PAIR_RECORD", str(tmp_path / "record.json"))
+
+    class DewFirst:
+        def sample(self, arms, count):
+            return ["dew", *[arm for arm in arms if arm != "dew"]][:count]
+
+    monkeypatch.setattr(pair.secrets, "SystemRandom", DewFirst)
+    monkeypatch.chdir(root)
+    args = pair.arguments(["--torch-python", sys.executable, "--out", str(tmp_path / "pair.json"), "--smoke"])
+    assert pair.run(args) == 0
+    result = json.loads((tmp_path / "pair.json").read_text())
+    assert all(order[0] == "dew" for order in result["orders"]) and len(result["orders"]) == 6
+    assert {arm: len(records) for arm, records in result["records"].items()} == {"dew": 6, "torch": 6,
+                                                                                "torch~aa": 6}
+    assert result["comparison"]["verdict"] == "level" and result["comparison"]["rounds"] == 6

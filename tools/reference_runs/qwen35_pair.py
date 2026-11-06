@@ -164,27 +164,36 @@ def run(args) -> int:
         command += ["--smoke", "--dtype", "float32"]
     counted = subprocess.run(command, cwd=root, env=environment, check=True)
     result["commands"].append({"argv": command, "returncode": counted.returncode})
+    fixture = directory / "tiny"
+
+    def step(arm: str, out: Path, *extra: str) -> int:
+        """`arm`'s step in a fresh process, its record at `out`, as its framework runs it (`framework_of`)."""
+        framework = framework_of(arm)
+        script = root / "tools/reference_runs" / f"{framework}_qwen35_step.py"
+        if not script.is_file():
+            script = Path(__file__).resolve().with_name(script.name)
+        command = [args.torch_python if framework == "torch" else args.dew_python, str(script),
+                   "--out", str(out), "--work", str(work), "--seed", str(args.seed), "--session", session,
+                   *(["--smoke", "--warmup", "3", "--steps", "4"] if args.smoke else []), *extra]
+        done = subprocess.run(command, cwd=root, env=environment, check=False)
+        result["commands"].append({"argv": command, "returncode": done.returncode})
+        return done.returncode
+
+    # A smoke's tiny checkpoint, seeded, exported by torch's step before the session, so that whichever arm a
+    # round draws first, Dew's step loads the weights torch's start from.
+    if args.smoke and step("torch", directory / "fixture.json", "--smoke-fixture", str(fixture)):
+        result["error"] = "torch's step did not export the smoke's checkpoint"
+        write_record(args.out, result)
+        return 1
     places = secrets.SystemRandom()
     result["orders"] = []
     for round_ in range(args.rounds):
         order = places.sample(ARMS, len(ARMS))
         result["orders"].append(order)
         for arm in order:
-            framework = framework_of(arm)
             out = directory / f"{round_}-{arm}.json"
-            script = root / "tools/reference_runs" / f"{framework}_qwen35_step.py"
-            if not script.is_file():
-                script = Path(__file__).resolve().with_name(script.name)
-            command = [args.torch_python if framework == "torch" else args.dew_python,
-                       str(script),
-                       "--out", str(out), "--work", str(work), "--seed", str(args.seed), "--session", session]
-            if args.smoke:
-                command += ["--smoke", "--smoke-fixture", str(directory / f"tiny-{round_}"),
-                            "--warmup", "3", "--steps", "4"]
-            done = subprocess.run(command, cwd=root, env=environment, check=False)
-            result["commands"].append({"argv": command, "returncode": done.returncode})
-            if done.returncode:
-                result["error"] = f"{arm} round {round_} exited {done.returncode}"
+            if step(arm, out, *(["--smoke-fixture", str(fixture)] if args.smoke and arm == "dew" else [])):
+                result["error"] = f"{arm} round {round_} exited {result['commands'][-1]['returncode']}"
                 write_record(args.out, result)
                 return 1
             records[arm].append(json.loads(out.read_text()))

@@ -320,10 +320,14 @@ Each step's compile is judged ahead of its run, on any host (`perf_gate.py compi
 planned and compiled for one compile-only GPU of a kind's generation and memory (an A100's sm80 at
 40 GiB, an H100's sm90 at 80 GiB; `dew.training.ahead.compile_ahead`), XLA's autotuning off as no
 GPU is attached, in the environment of the lock the GPU run used, every arm's every round a process
-of its own with an empty compile cache, judged as above against its 25% floor. Its row is the
-planner's seconds, every compile included, for the unchanged step, whatever plan each arm selects,
-which the results keep beside it. A step whose program substituted a kernel this host cannot lower
-(FlashAttention without its wheel, cuDNN with no GPU attached) is *unsupported*, never judged. The
+of its own with an empty compile cache, judged as above against its 25% floor. The attention route a
+GPU takes, FlashAttention's custom call or the template, lowers on no compile-only GPU yet (ledger
+4616), so every arm compiles its step with XLA's attention in its place: the row, named `(xla
+attention)`, is the step's compile without its attention kernel's, the same program in every arm, until
+that route lowers without a device. Its row is the planner's seconds, every compile included, for the
+unchanged step, whatever plan each arm selects; each arm's selected configuration (its split, rows,
+rematerialization and head tiling) stays beside the verdict. A step whose program still substituted a
+kernel this host cannot lower (cuDNN with no GPU attached) is *unsupported*, never judged. The
 battery runs once for each release candidate on a Colab A100, and as an A/B, base against head, for
 a deliberate change to a hot path (a kernel, the trainer's step, the input pipeline); a promotion
 to main does not run it. Each table is kept in `tools/measurements/perf_gate/<head>-vs-<base>.md`:

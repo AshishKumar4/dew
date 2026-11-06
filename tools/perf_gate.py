@@ -432,7 +432,7 @@ def run(args: argparse.Namespace) -> int:
     # The A/A arm is the base again: its tree, environment and settings.
     arms = arms_of(base, head, base_path, head_path)
     results = {"base": base, "head": head, "alone": f"{base}{ALONE}", "rounds": args.rounds,
-               "rows": [row.__dict__ for row in rows], "samples": {arm: [] for arm in arms}, "orders": [],
+               "rows": [row.__dict__ for row in rows], "samples": {arm: [] for arm in ARMS}, "orders": [],
                "claim": claiming, "head settings": settings, "lock": lock,
                "environments": {name: str(python.parent.parent) for name, python in pythons.items()},
                "seconds": {"first round": 0.0, "later rounds": 0.0}}
@@ -445,18 +445,22 @@ def run(args: argparse.Namespace) -> int:
             tree, path = arms[arm]
             if tree in unbuilt:
                 return dict.fromkeys((row.name for row in rows if not row.head_only), unbuilt[tree])
-            return measure(path, pythons[tree], args, head_path / "tools", arm == head and round_ == 0,
-                           Path(caches) / ("head" if arm == head else "alone" if arm != base else "base"),
-                           settings=settings if arm == head else None)
+            return measure(path, pythons[tree], args, head_path / "tools", arm == "head" and round_ == 0,
+                           Path(caches) / arm, settings=settings if arm == "head" else None)
 
         rounds(args, results, sample)
     return report(argparse.Namespace(results=args.out, table=None, claim=True)) if claiming else 0
 
 
+ARMS = ("base", "head", "alone")
+"""A run's three arms (`arms_of`), as its samples, orders and plans key them, whatever its trees are named."""
+
+
 def arms_of(base: str, head: str, base_path: Path, head_path: Path) -> dict[str, tuple[str, Path]]:
-    """A run's three arms by name, each its tree's name and path: the base, the head, and the base again
-    (`<base>~aa`), whose ratios to the base each round are the run's own noise (`verdict`)."""
-    return {base: (base, base_path), head: (head, head_path), f"{base}{ALONE}": (base, base_path)}
+    """A run's three arms (`ARMS`), each its tree's name and path: the base, the head, and the base again (its
+    A/A, named `<base>~aa` in the results' `alone`), whose ratios to the base each round are the run's own
+    noise (`verdict`)."""
+    return dict(zip(ARMS, ((base, base_path), (head, head_path), (base, base_path)), strict=True))
 
 
 def environments(trees: tuple[tuple[str, Path], ...], lock: str, cache: str) -> tuple[dict, dict]:
@@ -515,12 +519,16 @@ trainer = build_trainer(case, attention)
 trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus(generation, 1, capacity)))
 ahead = compile_ahead(trainer, global_batch(case), capacity)
 print(json.dumps({"seconds": ahead.planned_seconds, "substituted": list(ahead.substituted),
-                  "plan": {key: value for key, value in (ahead.plan or {}).items()
-                           if not isinstance(value, (list, dict))}}))
+                  "plan": {key: (ahead.plan or {}).get(key) for key in sys.argv[5].split(",")}}))
 """
 """A step's planning and compile ahead of its run, for compile-only GPUs of a generation (`compile`): the
 seconds the planner took, its derivations and every compile (`AheadOfTime.planned_seconds`), the kernels it
-lowered in place of the target's, and the plan it selected, a diagnostic beside the row."""
+lowered in place of the target's, and the configuration it selected (`SELECTED`), a diagnostic beside the
+row."""
+SELECTED = ("split", "rows", "remat", "head_tile", "head_fused", "xla_defaults", "narrow")
+"""The fields of a compiled plan that name the configuration its planner selected (dew.training.planning's
+admitted record), kept with their own values beside each compile's seconds: a head that plans otherwise shows
+it."""
 
 
 def compile_battery(args: argparse.Namespace) -> int:
@@ -548,8 +556,8 @@ def compile_battery(args: argparse.Namespace) -> int:
     rows = [Row(name, "s", "", floor=COMPILE_FLOOR) for name in cases]
     arms = arms_of(base, head, base_path, head_path)
     results = {"base": base, "head": head, "alone": f"{base}{ALONE}", "rounds": args.rounds,
-               "rows": [row.__dict__ for row in rows], "samples": {arm: [] for arm in arms}, "orders": [],
-               "plans": {arm: [] for arm in arms}, "target": {"kind": args.kind, "generation": generation,
+               "rows": [row.__dict__ for row in rows], "samples": {arm: [] for arm in ARMS}, "orders": [],
+               "plans": {arm: [] for arm in ARMS}, "target": {"kind": args.kind, "generation": generation,
                                                               "capacity_gib": gib, "lock": args.lock},
                "seconds": {"first round": 0.0, "later rounds": 0.0}}
     beside = Path(args.out).resolve().parent
@@ -565,9 +573,10 @@ def compile_battery(args: argparse.Namespace) -> int:
                     taken[name] = unbuilt[tree]
                     continue
                 with tempfile.TemporaryDirectory(dir=work) as cache:
-                    done = _run(path, pythons[tree], "", [str(script), json.dumps(case), generation,
-                                                          str(gib << 30), AHEAD_ATTENTION],
-                                head_path / "tools", 3600, Path(cache) / "compiles")
+                    argv = [str(script), json.dumps(case), generation, str(gib << 30), AHEAD_ATTENTION,
+                            ",".join(SELECTED)]
+                    done = _run(path, pythons[tree], "", argv, head_path / "tools", 3600,
+                                Path(cache) / "compiles")
                 if done.returncode != 0:
                     taken[name] = f"not run: {done.stderr[-400:]}"
                     continue
@@ -673,7 +682,7 @@ def report(args: argparse.Namespace) -> int:
     `--verdicts`, each row's state and numbers as JSON, which a runner acts on where the gate ran, in the
     head's environment (dew-ops' perf runs)."""
     results = json.loads(Path(args.results).read_text())
-    base, head, alone = results["base"], results["head"], results["alone"]
+    base, head = results["base"], results["head"]
     # A round a run never reached counts as unmeasured, so an interrupted run is partial.
     rounds = results.get("rounds", max(map(len, results["samples"].values())))
     samples = {name: [*taken, *[{}] * (rounds - len(taken))] for name, taken in results["samples"].items()}
@@ -687,9 +696,15 @@ def report(args: argparse.Namespace) -> int:
                       if claimed(row) and row.name not in included)
     for spec in results["rows"]:
         row = Row(**spec)
-        state, numbers = verdict(row, *([sample.get(row.name) for sample in samples[arm]]
-                                        for arm in (base, head, alone)))
-        verdicts[row.name] = {"state": state, "unit": row.unit, "gated": row.gated, **numbers}
+        state, numbers = verdict(row, *([sample.get(row.name) for sample in samples[arm]] for arm in ARMS))
+        # A compile's plans, each arm's selected configurations, beside its verdict: why its planning moved.
+        selected = {arm: [plans[row.name] for plans in results.get("plans", {}).get(arm, [])
+                          if row.name in plans] for arm in ARMS}
+        verdicts[row.name] = {"state": state, "unit": row.unit, "gated": row.gated, **numbers,
+                              **({"plans": selected} if any(selected.values()) else {})}
+        if selected["base"] and any(plan != selected["base"][0] for plans in selected.values()
+                                    for plan in plans):
+            state += " (its arms planned otherwise: the verdicts' plans)"
         if (state in (*UNQUALIFIED, "broken", "failed") or (state == "regressed" and row.gated)
                 or (claiming and claimed(row) and state in
                     ("not measured on this hardware", "not compared"))):
