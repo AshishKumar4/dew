@@ -31,6 +31,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import recurrence_matrix as matrix
 import selective_support
 import test_fla_gdn as fla_gdn
 import test_mamba_ssd as mamba_ssd
@@ -41,7 +42,7 @@ import test_recurrence_template_stability as template_stability
 import test_selective_template as selective_template
 import test_short_conv as short_conv
 from delta_rule_support import fused_step
-from gpu_flow import Cell, run_cells, when
+from gpu_flow import Cell, cells_of, run_cells, when
 from jax.sharding import NamedSharding, PartitionSpec
 from model_support import decode_through
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, with_gradients
@@ -359,3 +360,10 @@ def test_the_recurrences_run_on_this_gpu(family):
     """A family's recurrence cells on this GPU (`gpu_flow.run_cells`), each one's failure kept and all raised
     together; every direct mainloop call keeps its own bound."""
     run_cells(FAMILIES[family]())
+
+
+def test_the_recurrence_matrix_holds_on_this_gpu():
+    """The recurrence's check-1 matrix (tests/kernel_matrix.py): the chunked op's training step, its kernel
+    named, on par with the recurrence a token at a time at every pair of axis values the route serves, each
+    cell on its own GPU."""
+    run_cells(cells_of(matrix.a_recurrences_training_step_is_on_par))
