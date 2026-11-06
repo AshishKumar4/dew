@@ -26,6 +26,14 @@ Each array file stores fp32 and float64 references, IEEE products.
 `--record-audio` writes `mimo-audio-tiny/recording.npz`: the fixture's tokenizer encoder's pooled features
 of drawn mels (`mels_draw`), its batches whole and bounded at 30 frames, and its audio encoder over drawn
 codes (`codes_draw`), summarized over seeds for check 1.
+
+`--record-images` writes `mimo-v2-vl-tiny/processor.npz`: the release ships no processor, and vLLM's MiMo
+processor (`VLLM_PROCESSOR` at `VLLM_COMMIT`) is the reference Dew's own (dew.interop.mimo_media) is held
+to: drawn raw images' patch rows (`images_draw`) at each of IMAGE_SIZES, summarized over seeds for check 1,
+the sides it resizes a table of image sizes to, and the tokens of a prompt around an image under the
+fixture's tokenizer.
+
+    PYTHONPATH=src:tests python tools/mimo_reference.py --record-images
 """
 
 import argparse
@@ -67,6 +75,15 @@ AUDIO = {"audio_channels": 4, "group_size": 4, "input_local_dim": 32, "input_loc
          "rope_theta": 640000, "partial_rotary_factor": 1.0, "add_post_norm": True, "projection_layers": 2,
          "out_hidden_size": 24, "speech_vocab_size": "20", "speech_zeroemb_idx": "16",
          "audio_segment_size": 20, "input_local_hidden_dropout": 0.0}
+
+VLLM_COMMIT = "d254f6a9bdbb1afe3e6ca5b858ef4b06e547405f"
+VLLM_PROCESSOR = "vllm/transformers_utils/processors/mimo_v2_omni.py"
+VLLM_DIGEST = "73b9e11e4d82ec1b82336cb0c60e705fedd42cdef6376fbb79a0758eb5f21c6a"
+"""vLLM's MiMo processor, a file that runs on torch, PIL and transformers alone."""
+
+IMAGE_SIZES = ((5, 20), (13, 27))
+"""The sides of each recorded site's drawn images: one below a merged patch (8), scaled up to it, and one
+resized up in its height and down in its width."""
 
 LENGTHS = (45, 13)
 """Mel frames of two clips: one cut into segments of 20, 20 and 5 frames, one of 13. Their
@@ -432,6 +449,71 @@ def write_mimo_audio_tiny() -> None:
     print(AUDIO_FIXTURE, sorted(p.name for p in AUDIO_FIXTURE.iterdir()))
 
 
+def images_draw(height: int, width: int):
+    """The draw of a site of `height` x `width` raw images: a seed's `[height, width, 3]` uint8 image."""
+    def draw(seed: int) -> dict[str, np.ndarray]:
+        rng = np.random.default_rng([0x4289, height, width, seed])
+        return {"image": rng.integers(0, 256, (height, width, 3), dtype=np.uint8)}
+    return draw
+
+
+def record_mimo_images() -> None:
+    """vLLM's MiMo processor over the fixture's processor_config and vision geometry: each drawn image's
+    patch rows (`_transform_single`, then `_flatten_visual`) in float32, and in float64 its own resize
+    and standardization of the image read as float64, its constants built in float64; the sides it
+    resizes a table of sizes to (`_smart_resize`); and `process`'s tokens of text, an image and text."""
+    import torch.nn.functional as F
+    from PIL import Image
+    from recorded_references import provenance, record_case, save
+    from reference_source import github, loaded
+    from torch_precision import float64
+    from transformers import AutoTokenizer
+
+    module = loaded("mimo_v2_omni", github("vllm-project/vllm", VLLM_COMMIT, VLLM_PROCESSOR, VLLM_DIGEST))
+    directory = FIXTURES / "mimo-v2-vl-tiny"
+    config = json.loads((directory / "config.json").read_text())
+    vision, held = config["vision_config"], config["processor_config"]
+    tokenizer = AutoTokenizer.from_pretrained(str(directory))
+    processor = module.MiMoOmniProcessor.from_hf_config(tokenizer, SimpleNamespace(**config)).mimo_processor
+    factor = processor.patch_size * processor.merge_size
+    least, most = processor._img_kw["min_pixels"], processor._img_kw["max_pixels"]
+
+    def evaluate(inputs):
+        image = inputs["image"]
+        narrow, _, _ = module._transform_single(Image.fromarray(image), factor, least, most)
+        rows, columns = module._smart_resize(*image.shape[:2], factor, least, most)
+        # The reference's constants are cached per device, in the dtype they were first built in.
+        module._mean_std_cache.clear()
+        with float64():
+            wide = F.interpolate(torch.from_numpy(image).permute(2, 0, 1)[None].double(), (rows, columns),
+                                 mode="bilinear", align_corners=False)
+            wide = module._standardize(wide).squeeze(0)
+        module._mean_std_cache.clear()
+        return ({"patches": processor._flatten_visual(narrow, "image")[0].double().numpy()},
+                {"patches": processor._flatten_visual(wide, "image")[0].numpy()})
+
+    arrays = {key: value for height, width in IMAGE_SIZES
+              for key, value in record_case(f"mimo image patches {height}x{width}", images_draw(height, width),
+                                            evaluate, store_inputs=False, summary=True).items()}
+    sides = [(height, width) for height in (1, 3, 8, 13, 40, 300, 2000) for width in (2, 8, 17, 64, 900)
+             if max(height, width) / min(height, width) <= 200]
+    resized = np.asarray([module._smart_resize(height, width, factor, least, most)
+                          for height, width in sides])
+    image = images_draw(*IMAGE_SIZES[1])(0)["image"]
+    contents = [module.Content(type="text", content="w1 w2"),
+                module.Content(type="image", content=module.ImageInput(image=Image.fromarray(image))),
+                module.Content(type="text", content="w0")]
+    ids = processor.process(contents).input_ids.numpy()
+    written = save(directory / "processor.npz", {
+        **arrays, "sides": np.asarray(sides), "resized": resized, "prompt_ids": ids,
+        "provenance": provenance(f"vllm-project/vllm/{VLLM_PROCESSOR}", VLLM_COMMIT, "cpu",
+                                 "PYTHONPATH=src:tests python tools/mimo_reference.py --record-images",
+                                 torch=torch.__version__, patch=vision["patch_size"],
+                                 least=least, most=most, processor_config=held)},
+        reference=f"vllm-project/vllm@{VLLM_COMMIT}", license="apache-2.0")
+    print(f"{written}: {sorted(arrays)}, {len(sides)} sides, {ids.shape[-1]} prompt ids")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mel", action="store_true", help="write mimo-audio-tiny/mel.npz, under torchaudio")
@@ -439,7 +521,12 @@ def main() -> None:
                         help="record mimo-vision-tiny's tower and merger over seeds")
     parser.add_argument("--record-audio", action="store_true",
                         help="record mimo-audio-tiny's tokenizer and audio encoder over seeds")
+    parser.add_argument("--record-images", action="store_true",
+                        help="record vLLM's MiMo processor over raw images, mimo-v2-vl-tiny/processor.npz")
     arguments = parser.parse_args()
+    if arguments.record_images:
+        record_mimo_images()
+        return
     if arguments.record_audio:
         record_mimo_audio()
         return

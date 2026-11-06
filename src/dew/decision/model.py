@@ -175,10 +175,21 @@ class DecisionModel(HeadedModel):
                         rngs: dict[str, jax.Array] | None = None, progress: Progress = END,
                         opened: Sequence[str] = ()) -> tuple[jax.Array, Variables]:
         """The option logits (`logits`), and what the row's pass sowed into the `opened` collections
-        (`dew.objectives.base.Step.sown`)."""
+        (`dew.objectives.base.Step.sown`): the backbone's, and the attention logit maxima (`qk`) of the
+        backbone and the head each under its own parameters' name, which each applies apart, so a
+        QK-Clip finds every layer's maxima where it finds its weights (row 1608)."""
         states, spanned, sown = self._read(variables, inputs, media=media, train=train, rngs=rngs,
                                            progress=progress, opened=opened)
         head = thaw(part(variables, "head"))
+        clipped = "qk" in opened
+        head_sown: dict = {}
+
+        def applied(*args, **kwargs) -> jax.Array:
+            if not clipped:
+                return _array(self.head.apply(head, *args, **kwargs))
+            out, held = self.head.apply(head, *args, mutable=["qk"], **kwargs)
+            head_sown.update(held)
+            return _array(out)
         # The questions' spans are pooled from the pass that holds them: the context's, where it holds
         # them. A head that pools none reads a question in its context through the cross-attention alone.
         spans = spanned if self.head.pools_spans else None
@@ -189,15 +200,16 @@ class DecisionModel(HeadedModel):
             # A head drawn from the vocabulary rows reads no table after its draw.
             table = None if self.head.draws_from_rows else self.output_table(variables)
             logits = _array(
-                self.head.apply(head, states, inputs, table, tied=tied, train=train, rngs=rngs)
+                applied(states, inputs, table, tied=tied, train=train, rngs=rngs)
                 if spans is None else
-                self.head.apply(head, states, inputs, table, tied=tied, spanned=spans, train=train,
-                                rngs=rngs))
+                applied(states, inputs, table, tied=tied, spanned=spans, train=train, rngs=rngs))
         else:
             table = self.table(variables) if self.head.reads_table else None
             logits = _array(
-                self.head.apply(head, states, inputs, table, train=train, rngs=rngs) if spans is None
-                else self.head.apply(head, states, inputs, table, spanned=spans, train=train, rngs=rngs))
+                applied(states, inputs, table, train=train, rngs=rngs) if spans is None
+                else applied(states, inputs, table, spanned=spans, train=train, rngs=rngs))
+        if clipped:
+            sown = {**sown, "qk": {"backbone": sown.get("qk", {}), "head": head_sown.get("qk", {})}}
         return jnp.where(inputs.options, logits, -jnp.inf), sown
 
     def readout_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,

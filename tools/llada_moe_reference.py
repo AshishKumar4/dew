@@ -35,16 +35,10 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import reference_worker
 import torch
 from reference_source import config_lookups, record_padding
-from remote_code_reference import (
-    FIXTURES,
-    RELEASES as REGISTERED,
-    received,
-    released_classes,
-    released_model,
-    send,
-)
+from remote_code_reference import FIXTURES, RELEASES as REGISTERED, released_classes, released_model
 from safetensors.torch import save_file
 from torch_precision import float64, float64_twin
 
@@ -91,20 +85,23 @@ def released_logits(model, ids, visible):
 
 
 def serve(name: str) -> None:
-    """The release's side: its fp32 and float64 forwards of each draw the pipe brings."""
+    """The release's side (over tools/reference_worker.py's frames): its fp32 and float64 forwards of each
+    draw the recorder sends."""
     REGISTERED.update(RELEASES)
     with tempfile.TemporaryDirectory() as workspace, torch.no_grad():
         native = released_model(name, Path(workspace) / 'fp32').float()
         # Its float64 twin (`float64_twin`): built inside `float64`, its constructor's tables float64's.
         wide = float64_twin(native, lambda: released_model(name, Path(workspace) / 'f64'))
-        while True:
-            request = received(sys.stdin.buffer)
+
+        def run(request: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
             ids = torch.from_numpy(request['ids'].astype(np.int64))
             visible = request.get('visible')
             reference = released_logits(native, ids, visible)
             with float64():
                 truth = released_logits(wide, ids, visible)
-            send(sys.stdout.buffer, {'reference': reference, 'truth': truth})
+            return reference_worker.paired({'logits': reference}, {'logits': truth})
+
+        reference_worker.serve(run, frames=True)
 
 
 def record(name: str, release_python: str) -> None:
@@ -119,16 +116,8 @@ def record(name: str, release_python: str) -> None:
     from dew.interop import Pretrained
 
     repo, revision = RELEASES[name][:2]
-    worker = subprocess.Popen([release_python, __file__, '--serve', name], stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE)
     fields = llada_fields(name, 2, 16)
     mask = {} if not fields else {'visible': np.asarray(fields['attention_pairwise_mask'])[0]}
-
-    def evaluate(inputs):
-        send(worker.stdin, {'ids': inputs['ids'], **mask})
-        returned = received(worker.stdout)
-        return {'logits': returned['reference']}, {'logits': returned['truth']}
-
     source = Pretrained.load(FIXTURES / name, dtype='float32', attention_impl='reference')
 
     def forward(inputs):
@@ -139,11 +128,12 @@ def record(name: str, release_python: str) -> None:
     def wide_forward(inputs):
         return {'logits': wide_model.apply(wide_variables, inputs['ids'], **fields)}
 
-    try:
+    with reference_worker.session([release_python, __file__, '--serve', name]) as worker:
+        def evaluate(inputs):
+            return reference_worker.arms(worker.ask({'ids': inputs['ids'], **mask}))
+
         arrays = record_case(name, lambda seed: llada_draw(seed, source.model.vocab_size), evaluate, forward,
                              truth_proxy=wide_forward, store_inputs=False, summary=True)
-    finally:
-        worker.kill()
     versions = subprocess.run([release_python, '-c', 'import torch, transformers; '
                                'print(transformers.__version__, torch.__version__)'],
                               capture_output=True, text=True, check=True).stdout.split()

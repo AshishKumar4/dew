@@ -15,13 +15,15 @@ import jax
 @dataclass(frozen=True)
 class Program:
     """One program a block needed: `traced` (its jaxpr) or `compiled` (by the backend, or fetched
-    from the persistent compilation cache), its function's name, its seconds, and where it was asked
-    for, the innermost frame outside JAX's and this module's."""
+    from the persistent compilation cache), its function's name, its seconds, where it was asked
+    for, the innermost frame outside JAX's and this module's, and the thread that made it, which a
+    compile at once runs on its own (`report.compiled_at_once`)."""
 
     kind: str
     name: str
     seconds: float
     where: str
+    thread: str = ""
 
 
 EVENTS: Mapping[str, str] = {"/jax/core/compile/jaxpr_trace_duration": "traced",
@@ -139,4 +141,5 @@ class Compiles:
                           if "/jax/" not in frame.filename and "/jaxlib/" not in frame.filename
                           and frame.filename != __file__ and "contextlib" not in frame.filename), None)
             where = "?" if frame is None else f"{frame.filename}:{frame.lineno}"
-            self.programs.append(Program(kind, str(metadata.get("fun_name")), duration_secs, where))
+            self.programs.append(Program(kind, str(metadata.get("fun_name")), duration_secs, where,
+                                         threading.current_thread().name))

@@ -789,6 +789,32 @@ def _written_pages(resident: Slots, carried: Slots, pages: jax.Array, held: Vari
     return split_donated(dataclasses.replace(state, decoder=dataclasses.replace(state.decoder, cache=cache)))
 
 
+def _copied_pages(resident: Slots, carried: Slots, sources: jax.Array,
+                  targets: jax.Array) -> tuple[Slots, Slots]:
+    """The state with each pool page of `targets` set to its page of `sources` (a shared segment's last
+    page into the fresh page a prompt sharing it writes past it, `dew.inference.pages.Transfers.copies`),
+    pages of the pool's global index; a target past the pool is dropped."""
+    state = joined(resident, carried)
+
+    def copied(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.Array) -> jax.Array:
+        if leaf_name(path) not in POOLED:
+            return leaf
+        axis = _pages_axis(path)
+        taken = jnp.take(leaf, jnp.clip(sources, 0, leaf.shape[axis] - 1), axis=axis)
+        return leaf.at[(*(slice(None),) * axis, targets)].set(taken, mode="drop")
+
+    cache = jax.tree_util.tree_map_with_path(copied, state.decoder.cache)
+    return split_donated(dataclasses.replace(state, decoder=dataclasses.replace(state.decoder, cache=cache)))
+
+
+def copy_program(formats: Formats) -> OuterProgram:
+    """The program that copies pool pages onto others in the resident state, kept in `formats`
+    (`_copied_pages`), the resident matrices donated."""
+    resident, carried = split_donated(formats)
+    return outer_program(_copied_pages, donate_argnums=(0,), in_shardings=(resident, carried, None, None),
+                         out_shardings=(resident, carried))
+
+
 def page_programs(formats: Formats, rows: NamedSharding | None) -> tuple[OuterProgram, OuterProgram]:
     """The programs that move a paged pool's pages between the resident state, kept in `formats`, and the
     host (`dew.inference.pages.Transfers`): reading pages out, and writing pages in, the pages handed in a
@@ -811,6 +837,46 @@ def state_programs(formats: Formats, states: Variables) -> tuple[OuterProgram, O
     return (outer_program(_restored, donate_argnums=(0,), in_shardings=restore,
                           out_shardings=(resident, carried)),
             outer_program(_captured, donate_argnums=(0,), in_shardings=capture, out_shardings=placed))
+
+
+def _read_entries(states: Variables, entries: jax.Array) -> Variables:
+    """A row state store's `entries` (`state_programs`' store), each leaf's `[len(entries), ...]`, its run's
+    layers after (`row_axis`), so the host keeps each entry alike; None off the store."""
+    def read(path, leaf):
+        return None if leaf is None else jnp.moveaxis(jnp.take(leaf, entries, axis=row_axis(path)),
+                                                      row_axis(path), 0)
+
+    return jax.tree_util.tree_map_with_path(read, states, is_leaf=lambda x: x is None)
+
+
+def entry_shapes(states: Variables, count: int) -> Variables:
+    """The shapes `count` of a row state store's entries take as `_read_entries` reads them."""
+    return jax.eval_shape(_read_entries, states, jax.ShapeDtypeStruct((count,), jnp.int32))
+
+
+def _written_entries(states: Variables, entries: jax.Array, held: Variables) -> Variables:
+    """`states` with its `entries`, `[groups, count]`, each group's own, set to `held`'s, each leaf
+    `[groups, count, ...]` as `_read_entries` reads it; an entry past the store is dropped."""
+    def written(path, leaf, values):
+        if leaf is None:
+            return None
+        axis = row_axis(path)
+        flat = jnp.moveaxis(values.reshape(-1, *values.shape[2:]), 0, axis)
+        places = (*(slice(None),) * axis, entries.reshape(-1))
+        return leaf.at[places].set(flat.astype(leaf.dtype), mode="drop")
+
+    return jax.tree_util.tree_map_with_path(written, states, held, is_leaf=lambda x: x is None)
+
+
+def entry_programs(states: Variables, rows: NamedSharding | None) -> tuple[OuterProgram, OuterProgram]:
+    """The programs that move a row state store's entries, placed as `states` is, between the device and
+    the host (`dew.inference.pages.States`' spills and uploads): reading entries out, and writing entries
+    in, the entries handed in a row per group placed as the server's admitted rows are (`rows`), the store
+    donated."""
+    placed = jax.tree.map(lambda leaf: leaf.sharding, states)
+    return (outer_program(_read_entries, in_shardings=(placed, None)),
+            outer_program(_written_entries, donate_argnums=(0,), in_shardings=(placed, None, rows),
+                          out_shardings=placed))
 
 
 def opened_in(formats: Formats) -> OuterProgram:

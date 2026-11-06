@@ -1161,6 +1161,114 @@ def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
         assert np.linalg.norm(updated) < np.linalg.norm(before)
 
 
+class Attention(nn.Module):
+    """One attention layer that sows its per-head logit maxima where the `qk` collection is open, as Dew's
+    attention does (`max_logits`, `kv_heads`, `head_dim`), its query and key projections named as QK-Clip
+    finds them (`dew.optim.QK_PROJECTIONS`)."""
+
+    heads: int = 2
+    width: int = 4
+
+    @nn.compact
+    def __call__(self, tokens):
+        rows = tokens.shape[0]
+        query, key, value = (nn.Dense(self.heads * self.width, name=name)(tokens).reshape(
+            rows, -1, self.heads, self.width) for name in ("q_proj", "k_proj", "v_proj"))
+        logits = jnp.einsum("bqhd,bkhd->bhqk", query, key) / np.sqrt(self.width)
+        self.sow("qk", "max_logits", jnp.max(logits, axis=(2, 3)).astype(jnp.float32))
+        self.sow("qk", "kv_heads", jnp.asarray(self.heads))
+        self.sow("qk", "head_dim", jnp.asarray(self.width))
+        attended = jnp.einsum("bhqk,bkhd->bqhd", jax.nn.softmax(logits), value)
+        return attended.reshape(rows, -1, self.heads * self.width)
+
+
+class Attending(nn.Module):
+    """A denoiser of one attention layer over its pixels (`Attention`)."""
+
+    @nn.compact
+    def __call__(self, sample, time, *, train=False, **_):
+        rows = sample.shape[0]
+        tokens = nn.Dense(8)(sample.reshape(rows, -1, sample.shape[-1])) + nn.Dense(8)(time[:, None, None])
+        return nn.Dense(sample.shape[-1])(Attention(name="attention")(tokens)).reshape(sample.shape)
+
+
+@pytest.mark.parametrize("kind", ["decision", "supervised", "diffusion"])
+def test_every_objective_carries_live_qk_statistics_to_muonclip(kind, tmp_path):
+    """A decision, a supervised and a continuous diffusion run return the attention logit maxima their model
+    sowed (`Aux.qk_stats`, `Step.observed`), nested where QK-Clip finds each layer's weights (a decision's
+    under its backbone), so a run under 'muonclip' takes its update with the clip firing, checkpoints and
+    resumes, where each refused its first update (row 1608: the objective returned no maxima)."""
+    from decision_support import decision_rows
+    from test_decision_objective import INTENT, LAYOUT, SPECIALS, TOKENIZER, tiny_backbone
+    from test_training_telemetry import Repeated
+
+    from dew.checkpoints import Checkpoints
+    from dew.data.dataset import DataPartition, Loader
+    from dew.decision import DecisionObjective, Example
+    from dew.diffusion import presets
+    from dew.inputs import Field, InputSpec
+    from dew.objectives.base import Step
+    from dew.objectives.diffusion import DiffusionObjective
+    from dew.objectives.supervised import CrossEntropy, Supervised
+    from dew.training import Trainer
+    from dew.training.transaction import compact_qk
+
+    if kind == "decision":
+        # QK-Clip bounds the logits of a backbone that norms none of its queries and keys.
+        objective = DecisionObjective(tiny_backbone().clone(qk_norm=False), tokenizer=TOKENIZER,
+                                      specials=SPECIALS, layout=LAYOUT)
+
+        def rows(text):
+            examples = [Example(f"{text} {index}", {"team": INTENT}, {"team": "billing"})
+                        for index in range(8)]
+            return next(iter(decision_rows(examples, 8, objective=objective.data()).train(DataPartition())))
+
+        batch, other = rows("charged twice"), rows("the site is down since this morning")
+        clipped = ("backbone", "layers_0")
+    elif kind == "supervised":
+        objective = Supervised(tiny_decoder(num_layers=1), CrossEntropy(labels="text"),
+                               inputs=InputSpec(Field("text", (8,))))
+        batch, other = ({"text": np.random.default_rng(seed).integers(0, 32, (8, 8)).astype(np.int32)}
+                        for seed in (7, 8))
+        clipped = ("layers_0",)
+    else:
+        objective = DiffusionObjective(Attending(), process=presets.Flow(),
+                                       inputs=InputSpec(Field("image", (4, 4, 3))), ema_decay=None,
+                                       guidance=None)
+        batch, other = ({"image": np.random.default_rng(seed).integers(0, 256, (8, 4, 4, 3), dtype=np.uint8)}
+                        for seed in (9, 10))
+        clipped = ("attention",)
+    optimizer = OptimConfig(optimizer="muonclip", learning_rate=0., optimizer_opts={"qk_clip_threshold": .01})
+    trainer = Trainer(objective, optimizer.build(2), key=jax.random.key(0))
+    initial = trainer.initial_state()
+    asked = Step(jnp.array(0), jax.random.key(1), None, qk_stats=True)
+
+    def maxima(rows):
+        _, aux = objective.loss(initial.variables, rows, asked)
+        assert aux.qk_stats is not None
+        observed = compact_qk(aux.qk_stats)
+        for name in clipped:
+            observed = observed[name]
+        return np.asarray((observed["self_attn"] if kind != "diffusion" else observed)["max_logits"][0])
+
+    # The maxima are the step's own: none held over from the model's initialization, where the diffusion
+    # model's layer sows them too, so another batch's are others.
+    assert "qk" not in initial.variables
+    sown = maxima(batch)
+    assert np.max(sown) > .01
+    assert not np.array_equal(sown, maxima(other))
+    final, *_ = trainer.compile(initial, batch)(initial, batch)
+    assert int(final.updates) == 1
+    # And through a run's checkpoint and its resume, the second update clipped as the first.
+    data = Loader(lambda partition: Repeated(batch), None, None, 8)
+    checkpoints = str(tmp_path / "run")
+    Trainer(objective, optimizer.build(2), key=0, checkpoints=Checkpoints(checkpoints)).fit(
+        data, steps=1, log_every=1, checkpoint_every=1)
+    resumed = Trainer(objective, optimizer.build(2), key=0, checkpoints=Checkpoints(checkpoints)).fit(
+        data, steps=2, log_every=1, checkpoint_every=1)
+    assert int(resumed.updates) == 2
+
+
 def program_of(closed) -> tuple:
     """A traced program as its equations' primitives and parameters, in order, and every constant it
     holds, its literals and its captured arrays: two traces are one program where these agree."""

@@ -718,7 +718,7 @@
    "lane": "Training"
   },
   "tools/check_native_diffusion.py": {
-   "comparisons": 5,
+   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tools/classic_gpt_reference.py": {
