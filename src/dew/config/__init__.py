@@ -1541,7 +1541,7 @@ class RunConfig:
         writes without encoding the chains."""
         with registry.recording():
             return {field.name: to_record(getattr(self, field.name), declared_type(type(self), field.name))
-                    for field in dataclasses.fields(self) if field.name not in _CHAINS}
+                    for field in dataclasses.fields(self) if field.name not in (*_CHAINS, "data_plan_version")}
 
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
