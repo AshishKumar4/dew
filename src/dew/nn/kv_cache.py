@@ -853,23 +853,37 @@ are the gathered attention's, through the attention dispatch (`gpu_paged`), so n
 kernel nor forward mode limits it."""
 
 def _template_tiles(case: PagedCase) -> bool:
-    """Whether the attention template's decode reads `case`'s pages: its Mosaic mainloop qualified on the
-    GPU's family for the query's dtype (`attention_mosaic_program.bundle`), and its key tiles whole in a
-    page or a page's keys whole in its tiles, one copy a page (`attention_mosaic._pages_hold` over the
-    family's key extents, `attention_mosaic_program.extents`)."""
-    from dew.nn.kernels.templates import attention_mosaic, attention_mosaic_program
+    """Whether the attention template's decode reads `case`'s pool: its work list derives a launch for the
+    step on the GPU (`attention_decode.plan`), a key tile whole in a page or a page's keys whole in its
+    tiles where its family copies them in pieces, within its shared memory (a tile of 16-key pages an
+    A100's copies join, which no tile of its holds at width 128, dd-q5p4), at one row of 64 pages."""
+    from dew.nn.kernels.templates import attention as template, attention_decode
 
     if backend() != "gpu":
         return False
-    # One query a row: a key head's query heads its packed rows (`attention_decode.packed`).
-    family = attention_mosaic_program.bundle(generation.gpu_target().generation, case.dtype,
-                                             case.heads // case.kv_heads)
-    if family is None or case.page_size is None:
-        # A dense cache's codes read as its rows lie (`template_quantized`).
-        return family is not None
-    # Every key tile the family's copies move (a page's keys whole in it), else one of the page's.
-    tiles = attention_mosaic_program.extents(family, case.dtype, family.copy_extent or case.page_size)
-    return any(attention_mosaic._pages_hold(case.page_size, tile, family) for tile in tiles)
+    page = case.page_size or 16
+    keys, rows = 64 * page, 1
+    query = jax.ShapeDtypeStruct((rows, 1, case.heads, case.head_dim), case.dtype)
+    stored = case.dtype if case.quantized is None else jnp.dtype(case.quantized)
+    if case.page_size is None:
+        key = jax.ShapeDtypeStruct((rows, keys, case.kv_heads, case.head_dim), stored)
+        table = None
+    else:
+        key = jax.ShapeDtypeStruct((case.kv_heads, keys // page, page, case.head_dim), stored)
+        table = jax.ShapeDtypeStruct((rows, keys // page), jnp.int32)
+    scale = jax.ShapeDtypeStruct((rows, case.kv_heads, keys), jnp.float32)
+    scales = None if case.quantized is None else (scale, scale)
+    derived = []
+
+    def planned(query, key, table, scales):
+        spans = template.spans(1, keys, rows, lengths=jnp.full((rows,), keys, jnp.int32))
+        packed, row_spans, _ = attention_decode.packed(query, spans, case.kv_heads)
+        derived.append(attention_decode.plan(packed, key, key, row_spans, None, scale=None,
+                                             target=generation.gpu_target(), table=table, scales=scales))
+        return query
+
+    jax.eval_shape(planned, query, key, table, scales)
+    return derived[0] is not None
 
 
 def _converts(stored: KVDtype) -> bool:
@@ -889,7 +903,7 @@ TEMPLATE_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
                 lambda case: f"the template's decode reads a 16-bit query over pages of its dtype or of "
                              f"codes it dequantizes, not {case.dtype} over {case.pool}", row='ledger 3624'),
     Requirement('tiles', _template_tiles,
-                lambda case: f"the attention template's decode reads no key tile of pages of "
+                lambda case: f"the attention template's decode derives no launch over pages of "
                              f"{case.page_size} keys on this GPU", row='ledger 3648'),
     Requirement('head_shards', lambda case: case.kv_heads % case.head_shards == 0,
                 "a mesh splits the query heads past the pool's key heads, whose pages the kernel reads "
