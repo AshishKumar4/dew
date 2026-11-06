@@ -127,7 +127,9 @@ def test_exchange_preserves_placed_expert_and_width_gradients():
     x, weights, indices = (jax.device_put(value, token_spec) for value in (x, weights, indices))
     specs = ((NamedSharding(mesh, P()), token_spec), (parameter_specs, token_spec, token_spec))
     with jax.set_mesh(mesh):
-        expected = jax.jit(jax.value_and_grad(functools.partial(objective, model, indices),
+        # The global dispatch named: the default exchanges on this expert mesh.
+        named = model.clone(dispatch='global')
+        expected = jax.jit(jax.value_and_grad(functools.partial(objective, named, indices),
                             (0, 1, 2), has_aux=True), out_shardings=specs)(parameters, x, weights)
         actual = jax.jit(jax.value_and_grad(functools.partial(
             objective, model.clone(dispatch='exchange'), indices),
