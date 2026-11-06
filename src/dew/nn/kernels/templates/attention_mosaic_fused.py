@@ -193,12 +193,12 @@ def _turns(family: mosaic.Family, interpret: bool, dq_tiles: tuple, dkv_tiles: t
 def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans: _Spans | None,
                   drop: Dropout | None, *, walk: _Backward) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The fast form's one launch of a call whose score hook, if any, takes no parameters
-    (`BackwardTiles.fused`), dropping where `drop` draws (under the dropping call's D,
-    `gradient.centre_finish`), on the dQ launch's layout: each consumer's `block_k` keys of a query head
-    resident, walked by the query tiles that see them, streamed with their output cotangents through a ring
-    each, queries first (`_fused_step`), under the first pass's D and the forward's denominator (each query
-    tile's streamed beside it, `STATISTICS`), each tile's dQ added into dQ atomically (`Family.added`); where
-    key heads are shared, each query head's dK and dV added into its key head's own (FlashAttention 3's
+    (`BackwardTiles.fused`), dropping where `drop` draws (under the dropping call's D, the forward's dropped
+    split sums', `gradient.split_delta`), on the dQ launch's layout: each consumer's `block_k` keys of a query
+    head resident, walked by the query tiles that see them, streamed with their output cotangents through a
+    ring each, queries first (`_fused_step`), under the first pass's D and the forward's denominator (each
+    query tile's streamed beside it, `STATISTICS`), each tile's dQ added into dQ atomically (`Family.added`);
+    where key heads are shared, each query head's dK and dV added into its key head's own (FlashAttention 3's
     grouped epilogue, hopper/epilogue_bwd.hpp's CollectiveEpilogueBwdGQA: Qwen3-8B's step 1.7% the faster
     causal, 1.3% full, ET-GQA1-h100, where XLA summed fp32 copies a query head's), into one ref of both
     (`_fused_called`), else stored (their zeros cost an ungrouped D64 step 1.7%). Returns dQ `[B, Qp, H, D]`,
