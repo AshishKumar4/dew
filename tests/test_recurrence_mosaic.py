@@ -875,13 +875,13 @@ def test_two_launches_whose_padded_lengths_meet_name_their_own_kernels():
     assert all(len(found) == 2 for found in named.values()), named
 
 
-@pytest.mark.parametrize('kernel', ['recurrence_states', 'recurrence_reverse'], ids=['forward', 'backward'])
+@pytest.mark.parametrize('kernel', ['recurrence_scan', 'recurrence_states', 'recurrence_reverse'],
+                         ids=['forward', 'training forward', 'backward'])
 def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
-    """A compile that refused the 27B gated delta net's joined tiles on an H100 (`report.spilled`: a kernel
-    spilled), the training call's and the forward's apart (`Tiles.forward`): the derivation gives the call a
-    narrower training block, which it takes (`fits`), and the forward's too where a forward launch spilled,
-    which runs at both; a refusal of the joined tiles once matched none of the rules' candidates, and the
-    call found none (`Unfitted`)."""
+    """A compile that refused the 27B gated delta net's derived tiles on an H100 (`report.spilled`: a kernel
+    spilled), its forward's walk (`mainloop._scan`), its training forward's or its backward's: the derivation
+    steps the refused tiles down, which the call takes (`fits`); a refusal of the joined tiles once matched
+    none of the rules' candidates, and the call found none (`Unfitted`)."""
     args = resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 4096)
     bound = template.MOSAIC.bind(*args, None, bound=1.0)
     with report.refusals(), generation.assumed('sm90'):
@@ -890,10 +890,9 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
         report.refuse([(report._identity(template.MOSAIC, bound), first, {kernel})])
         stepped = template.MOSAIC.derived(bound, target)
         taken = template.MOSAIC.fits(bound, target)
-    assert first.forward is not None and stepped is not None and taken == (stepped,)
-    assert stepped.block_v < first.block_v
-    narrower = (stepped.forward or stepped).block_v < first.forward.block_v
-    assert narrower == (kernel == 'recurrence_states')
+    assert stepped is not None and taken == (stepped,)
+    # The refused tiles' block or ring stepped down (`_staged` takes the next ring a refusal leaves).
+    assert (stepped.block_v, stepped.stages) < (first.block_v, first.stages)
 
 
 def test_a_refusal_under_the_remat_rung_reaches_the_route():
@@ -959,8 +958,8 @@ class Unbudgeted(template.Mosaic):
         del ba, config
         return True
 
-    def states_held(self, ba, tiles, target) -> int:
-        return max(super().states_held(ba, tiles, target), 1)
+    def states_held(self, ba, tiles, target, *, training: bool = False) -> int:
+        return max(super().states_held(ba, tiles, target, training=training), 1)
 
 
 NEIGHBOURS = 3
@@ -1215,25 +1214,25 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
 
 def test_a_gated_delta_nets_ring_and_residency_are_one_choice():
     """The 27B gated delta net at one row of 4,096 tokens on an H100 (sm90 stated) derives its value blocks 32
-    wide five deep, its states launch one program a multiprocessor: its plans priced by the bytes they hold in
-    flight (`resources.hidden`), where the most programs first took two one deep and then narrowed the block
-    to 16, the forward 1.4 to 1.5 times as long (FS-RESIDENT-WINDOW1-h100)."""
+    wide in a ring more than one deep, its walk one program a multiprocessor: its plans priced by the bytes
+    they hold in flight (`resources.hidden`), where the most programs first took two one deep and then
+    narrowed the block to 16, the forward 1.4 to 1.5 times as long (FS-RESIDENT-WINDOW1-h100)."""
     op = template.MOSAIC
     with generation.assumed("sm90"):
         target = generation.gpu_target()
         ba = op.bind(*resource_operands("qwen3.5-27b-gdn", jnp.bfloat16, 1, 4096), None, max_segments=None,
                      floor=None)
         tiles = op.derived(ba, target)
-        assert tiles is not None and (tiles.block_v, tiles.stages) == (32, 5)
+        assert tiles is not None and tiles.block_v == 32 and tiles.stages > 1
         assert op.states_held(ba, tiles, target) == 1
 
 
 @lowers('sm90')
 def test_a_training_launchs_backward_kernels_carry_its_launch():
     """The gated delta rule's 16-bit training step on the template lowered for an H100: its fast backward's
-    kernels, which JAX traces on the pullback after the launch's scope ended, carry the launch that traced
-    its forward (`report.relaunched`), so a compile that finds one spilling refuses that launch and steps
-    its training tiles (row 3851)."""
+    kernels, which JAX traces on the pullback after the launch's scope ended and a forward alone does not
+    run, carry the launch that traced its forward (`report.relaunched`), so a compile that finds one
+    spilling refuses that launch and steps its training tiles (row 3851)."""
     from kernel_compile import lowered_for
 
     from dew.nn.kernels.lowered import kernel_calls
@@ -1254,6 +1253,6 @@ def test_a_training_launchs_backward_kernels_carry_its_launch():
                 if found.kind == 'mosaic_gpu'}
 
     forward, training = launches(call), launches(trained)
-    assert set(forward) < set(training), (forward, training)
+    assert set(training) - set(forward), (forward, training)
     assert len(set(training.values())) == 1 and None not in training.values(), training
 

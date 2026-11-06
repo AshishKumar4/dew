@@ -34,7 +34,7 @@ the portable math's issuer is XLA's (`portable`), a kernel's its own dot."""
 
 import functools
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import NamedTuple, Protocol
 
 import jax
@@ -277,7 +277,7 @@ PAIR_FLOOR = -124.0
 
 PAIR_CEILING = 120.0
 """The largest power of two `_scaled` scales by, where it holds: the pairs past a token (a decay's inverse,
-which every caller masks) stay finite, and a key gated up from its sub-chunk's start (`key_decayed_pairs`)
+which every caller masks) stay finite, and a key gated up from its sub-chunk's start (`key_block_pairs`)
 reaches it at most (`factored_range`)."""
 
 
@@ -906,7 +906,7 @@ def chunk_output(queries: Load, entered: Load, columns: int, gate, low, scores, 
 def factored_range(floor: float, sub: int = SUB) -> bool:
     """Whether a decay a key dimension whose every token's log decay is at least `floor` (natural log, a
     layer's declared lower bound: Kimi delta attention's -5) factors over `sub`-token sub-chunks
-    (`key_decayed_pairs`): a sub-chunk's widest range in base 2, `-floor sub log2(e)`, under the largest power
+    (`key_block_pairs`): a sub-chunk's widest range in base 2, `-floor sub log2(e)`, under the largest power
     of two a decay scales by (`PAIR_CEILING`), so a key gated up from its sub-chunk's start is exact."""
     return -floor * sub * math.log2(math.e) < PAIR_CEILING
 
@@ -926,60 +926,59 @@ def _laid_references(reference: Callable[[int, int], tuple], c, index: jax.Array
     return jax.lax.fori_loop(0, chunk // sub, laid, (jnp.zeros(index.shape, jnp.float32),) * 2)
 
 
-def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], jax.Array], columns: int,
-                      gates: Callable[[int], tuple],
-                      reference: Callable[[int, int], tuple], summed: Callable[..., jax.Array], *,
-                      chunk: int, strict: bool, rolled: bool, sub: int = SUB,
-                      shifted: "Shifted | None" = None):
-    """A chunk's pairs' products under a decay a key dimension `[C, C]` fp32, `sum_k r_ik k_jk exp2(g_ik -
-    g_jk)` for `j <= i` (`j < i` where `strict`), zero elsewhere: the rows `rows(c)` (the queries, or the
-    write-gated keys) and keys `keys(c)` of each key block `c` of `columns`, fp32, `gates(c)` its prefix
-    halves, over a chunk of `chunk` tokens. Each sub-chunk `s` of `sub` rows takes its first token's prefix
-    `reference(s, c)` (a column's vectors) as its pairs' common point: its rows gated down to it,
-    `r exp2(g - g_ref)`, against every key up to its end gated up from it, `k exp2(g_ref - g)`, one product a
-    sub-chunk and key block ('pairs'): fla_kda's sub-chunk factoring, its diagonal sub-chunks' too, which a
-    declared floor bounds (`factored_range`). Each factor is of the separated prefix (`between`), its exponent
-    within a sub-chunk's range of zero down the rows (and up the keys); past it every pair's value is zero.
-    The products accumulate in one sum as fla_kda's into its `b_A` (`summed`, an iterable of `(name, lhs,
-    rhs)` taken a product at a time): each its own sum, added after, they were live together (Kimi delta
-    attention's intra launch, 1170 registers a thread on an A100, 519 on an H100). The key blocks are a
-    rolled loop where `rolled`, else unrolled.
+def key_block_pairs(rows: Sequence[jax.Array], keys: jax.Array, prefix: tuple, at: Callable[[int], tuple],
+                    summed: Callable[..., jax.Array], *, chunk: int, diagonal: bool,
+                    sub: int = SUB) -> list[jax.Array]:
+    """A chunk's pairs' products under a decay a key dimension, one key block's for each of `rows` (the
+    queries, the write-gated keys; fp32) against the same `keys` (fp32), its prefix halves `prefix`,
+    unmasked `[C, C]` fp32 each, their factors formed once for all of them: `sum_k r_ik k_jk exp2(g_ik -
+    g_jk)` for row `i` in sub-chunk `s` and key `j` in sub-chunk `t <= s` (`t < s` without the
+    `diagonal`), zero for `t > s`. The pair's decay splits at `s`'s first token `G_s` and `t`'s last
+    `E_t`, `exp2(g_i - G_s) exp2(G_s - E_t) exp2(E_t - g_j)`: the rows gated down to their own sub-chunk's
+    start and the keys up to their own's end, each one tile's exponentials whatever the outputs; the
+    middle factor a key's vector a pair of sub-chunks (`between` of `at(token)`, the prefix halves at a
+    token as a column's vectors), laid over the rows of `s`; one product a key sub-chunk `t` and output,
+    the keys of `t` against every row ('pairs', `summed`, an iterable of `(name, lhs, rhs)` into one
+    accumulator). Every exponent is at most zero but the diagonal's middle factor, `G_s - E_s` within a
+    sub-chunk's range, which a declared floor bounds (`factored_range`; without one the diagonal is
+    `key_diagonal_pairs`'). Kimi delta attention's two intra launches gated their keys up once a
+    sub-chunk, ten tile exponentials a key block, 72% of their instructions fp32 (kda-stalls-h100 at
+    11704365b)."""
+    whole = separated(*prefix)
+    index, _ = _grid(prefix[0].shape)
+    blocks = chunk // sub
 
-    Where `shifted` is given (no declared floor bounds the call, `factored_range`), each sub-chunk's factored
-    product takes the keys before it alone, its factors' exponents at most zero at any decay, and its own
-    keys' pairs are each their own decay (`key_diagonal_pairs`): fla_kda's token-parallel diagonal
-    (chunk_kda_fwd_intra_token_parallel), finite wherever the recurrence is."""
-    def products(s, c, prefix, down):
-        place = s * sub
-        start_whole, start_fraction = separated(*reference(s, c))
-        start = start_whole[None, :], start_fraction[None, :]
-        index, _ = _grid(prefix[0].shape)
-        # Each operand formed as its product stages it (`summed` calls it), so one is live at a time.
-        before = index < (place if shifted is not None else place + sub)
-        yield ("pairs", lambda: jnp.where((index >= place) & (index < place + sub), down, 0.0),
-               lambda: Transposed(jnp.where(before, keys(c) * between(start, prefix), 0.0)))
+    def laid(halves: Callable[[int], tuple], since: int = 0) -> tuple:
+        """`halves(s)` laid over the rows of each sub-chunk `s` from `since` on, zero above."""
+        found = (jnp.zeros(index.shape, jnp.float32),) * 2
+        for s in range(since, blocks):
+            found = tuple(jnp.where(index >= s * sub, half[None, :], under)
+                          for half, under in zip(halves(s), found, strict=True))
+        return found
 
-    def block(c, total):
-        # A key block's prefix read once, before its sub-chunks' turns, which are rolled: each one's addresses
-        # live within its own turn. Its rows gated down at once, each to its own sub-chunk's first token:
-        # gated a sub-chunk at a time, every row was gated for each, and the exponentials were two thirds of
-        # the launch (the intra launch 1.51 ms on an H100, 0.53 without them).
-        prefix = separated(*gates(c))
-        index, _ = _grid(prefix[0].shape)
-        down = rows(c) * between(prefix, _laid_references(reference, c, index, chunk, sub))
-        return jax.lax.fori_loop(0, chunk // sub, lambda s, total: (
-            total + summed(products(s, c, prefix, down), shape=(chunk, chunk))), total)
+    starts = [separated(*at(s * sub)) for s in range(blocks)]
+    ends = [separated(*at(s * sub + sub - 1)) for s in range(blocks)]
+    down = between(whole, laid(starts.__getitem__))
+    gated = [row * down for row in rows]
+    up = keys * between(laid(ends.__getitem__), whole)
 
-    total = jnp.zeros((chunk, chunk), jnp.float32)
-    if rolled:
-        total = jax.lax.fori_loop(0, columns, block, total)
-    else:
-        for c in range(columns):
-            total = block(c, total)
-    if shifted is not None:
-        total = total + key_diagonal_pairs(rows, shifted, columns, gates, chunk=chunk, strict=strict, sub=sub)
-    lag = _lags(total.shape)
-    return jnp.where(lag > 0 if strict else lag >= 0, total, 0.0)
+    def middle(t: int) -> jax.Array:
+        """`exp2(G_s - E_t)` on the rows of each sub-chunk `s` from `t` (past it without the diagonal), zero
+        above."""
+        first = t if diagonal else t + 1
+        factor = jnp.zeros(index.shape, jnp.float32)
+        for s in range(first, blocks):
+            factor = jnp.where(index >= s * sub, between(starts[s], ends[t])[None, :], factor)
+        return factor
+
+    def products(row: jax.Array):
+        for t in range(blocks):
+            within = (index >= t * sub) & (index < t * sub + sub)
+            # Each operand formed as its product stages it (`summed` calls it), so one is live at a time.
+            yield ("pairs", lambda t=t: row * middle(t),
+                   lambda within=within: Transposed(jnp.where(within, up, 0.0)))
+
+    return [summed(products(row), shape=(chunk, chunk)) for row in gated]
 
 
 Shifted = Callable[[int], Callable[[jax.Array], tuple]]
@@ -1221,20 +1220,20 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
                            shifted: "Shifted | None" = None,
                            lower: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
                            d_loads: list | None = None) -> None:
-    """`key_decayed_pairs`' transpose, its sub-chunk factoring the same: for each pairs' gradient
-    `d_pairs[p]` `[C, C]` (a tile, causal or strict as its pairs were, zero elsewhere, scaled as they were)
-    of rows `rows[p](c)` against the same keys `keys(c)` fp32, each key block `c`'s gradients to `emit`:
-    `('rows', p, c, d)` the rows' `sum_j dP_ij k_j exp2(g_i - g_j)` and `('keys', 0, c, d)` the keys',
-    summed over the pairs, `sum_p sum_i dP_ij r_i exp2(g_i - g_j)`, each `[C, BK]` fp32. Each sub-chunk `s`
-    takes its first token's prefix as the common point, as the forward does: `dP` against the keys gated up
-    from it to its end (`k exp2(g_ref - g)`), kept on the rows of `s` and gated down by `exp2(g - g_ref)`;
-    `dP^T` against the rows of `s` gated down to it, each key's then gated up from it, zero past its end
-    ('pairs'). As `key_decayed_pairs` takes its own, the sub-chunks are a rolled loop, the rows' and keys'
+    """The transpose of a chunk's factored pairs (`key_block_pairs`'), each at its sub-chunk's first token:
+    for each pairs' gradient `d_pairs[p]` `[C, C]` (a tile, causal or strict as its pairs were, zero
+    elsewhere, scaled as they were) of rows `rows[p](c)` against the same keys `keys(c)` fp32, each key
+    block `c`'s gradients to `emit`: `('rows', p, c, d)` the rows' `sum_j dP_ij k_j exp2(g_i - g_j)` and
+    `('keys', 0, c, d)` the keys', summed over the pairs, `sum_p sum_i dP_ij r_i exp2(g_i - g_j)`, each
+    `[C, BK]` fp32. Each sub-chunk `s` takes its first token's prefix as the common point, as the forward
+    did: `dP` against the keys gated up from it to its end (`k exp2(g_ref - g)`), kept on the rows of `s`
+    and gated down by `exp2(g - g_ref)`; `dP^T` against the rows of `s` gated down to it, each key's then
+    gated up from it, zero past its end ('pairs'). The sub-chunks are a rolled loop, the rows' and keys'
     gradients carried across it, the gated rows formed as their product stages them and the keys' products
-    into one accumulator (`summed`): unrolled, every sub-chunk's tiles at once, an H100's launch spilled 1756
-    bytes a thread (kda-gate3 at ee3734584).
+    into one accumulator (`summed`): unrolled, every sub-chunk's tiles at once, an H100's launch spilled
+    1756 bytes a thread (kda-gate3 at ee3734584).
 
-    Where `shifted` is given (no declared floor, `key_decayed_pairs`'), the factored products take the keys
+    Where `shifted` is given (no declared floor, `factored_range`), the factored products take the keys
     before each sub-chunk alone and each sub-chunk's own pairs are each their own decay
     (`key_diagonal_pairs_back`, `lower` moving a tile's rows up to the keys they belong to, `d_loads` the
     pairs' gradients' loads where `d_pairs` are tiles in memory)."""

@@ -220,9 +220,9 @@ def _local_back(q, k, do, hi, lo, taken, call: Call, *, scale: float):
     bytes a thread on an H100's."""
     width, value_width, family = call.width, call.value_width, call.family
     given, grads = call.given, _value_grads(call)
-    # A value row a block at a time, from the whole width down to whole blocks (`Call.block`).
+    # A value row a block at a time, from the whole width down to whole value tiles (`Call.value_block`).
     vb = fitting_block(call, functools.partial(_local_back_held, call),
-                       functools.partial(_local_back_staged, call), call.value_width, call.block)
+                       functools.partial(_local_back_staged, call), call.value_width, call.value_block)
 
     def program(at, q_ref, k_ref, do_ref, hi_ref, lo_ref, column_hi_ref, column_lo_ref, taken_ref, dv_ref, *,
                 streams, staging, landing):
@@ -576,7 +576,7 @@ def _query_key_split(call: Call) -> int:
         return resources.shared_bytes(call.family, scope(1))
 
     budget = generation.shared_budget(call.target)
-    return next((vq for vq in whole_blocks(call.value_width, call.block) if streamed(vq) <= budget),
+    return next((vq for vq in whole_blocks(call.value_width, call.value_block) if streamed(vq) <= budget),
                 call.block)
 
 
