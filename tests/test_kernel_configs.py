@@ -325,6 +325,36 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhaust
         assert report.refused_launches() == refused
 
 
+
+@lowers("sm90")
+def test_programs_compiled_at_once_sharing_a_spilling_launch_keep_what_compiles_in_turn_keep():
+    """Two programs sharing a template launch whose first config spills, compiled at once
+    (`report.compiled_at_once`): the first's compile refuses that config and steps it down; the second,
+    lowered before that refusal committed, is lowered again past it, so both keep the stepped tile and the
+    refusals are those compiling them in turn leaves, the second neither refusing the first config again
+    nor stepping its own past the kept one (review of the concurrent compiles)."""
+    from dew.nn.kernels.templates import report
+    from dew.training.ahead import compile_only_gpus
+
+    devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
+    mesh = generation.gpu_mesh(devices, "sm90")
+    outcomes = {}
+    for mode in ("turn", "once"):
+        traced = []
+        lowered = _lowering(*_spilling_forward(Uncounted(), 4096, devices), traced)
+        with report.refusals(), generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+            programs = [(lowered(), None, lowered) for _ in range(2)]
+            if mode == "turn":
+                kept = [report.compiled(programs[0][0], relower=lowered)]
+                again = lowered()
+                kept.append(report.compiled(again, relower=lowered))
+            else:
+                kept = report.compiled_at_once(programs)
+            outcomes[mode] = ([executable.as_text() for executable in kept],
+                              [config for _, config, _ in report.refused_launches()])
+    assert outcomes["once"] == outcomes["turn"]
+    assert len(outcomes["turn"][1]) == 1
+
 @lowers("sm90")
 def test_a_compile_beside_other_threads_mosaic_compiles_reads_only_its_own_kernels():
     """A run compiles its programs from several threads at once (scoring's pass shapes, row 2790). A compile
