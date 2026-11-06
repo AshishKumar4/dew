@@ -1305,8 +1305,8 @@ def test_a_hooked_backward_in_one_launch_holds_check_1_interpreted(hooks, form, 
     cotangents taken back through the cap's slope (`gradient.pulled`) before dQ's and dK's products; or
     under sinks, the softmax's initial state, whose gradient the first pass's D and the keys' share of the
     weights give: every gradient the reference's (check 1) over causal packed documents under a window,
-    under the interpreter."""
-    _check_hooked_backward(hooks, form=form, interpret=True)
+    under the interpreter, heads as wide as the form takes (`FORM_WIDTHS`)."""
+    _check_hooked_backward(hooks, form=form, interpret=True, width=FORM_WIDTHS.get(form, 64))
 
 
 @INTERPRETS
