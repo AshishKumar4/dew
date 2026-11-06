@@ -188,7 +188,7 @@ def test_a_run_over_one_state_trains_and_its_task_asks_a_requests_questions_in_o
     with pytest.raises(ValueError):
         trained(run, tmp_path, "hybrid")
     run = dataclasses.replace(run, pretrained=str(GEMMA))
-    trained(run, tmp_path, "shared")
+    trained(run, tmp_path, "shared", trainer={"checkpoint_final": True})
     decide = Decide.from_run(str(tmp_path / "runs" / "shared"))
     assert decide.layout.shared_state == 3
     [row] = decide.layout.rows(decide.tokenizer, decide.specials, STATES[0], QUESTIONS)
