@@ -1637,6 +1637,11 @@ class Transport[Allocated, Opened](abc.ABC):
         family streams from a role of its own (`roles`)."""
         return consumers
 
+    def program_index(self, name: str) -> jax.Array:
+        """The program's coordinate on its launch grid's axis `name` (`kernel`'s `grid_names`): Mosaic GPU
+        names a grid's axes as a mesh's, read by `lax.axis_index`."""
+        return lax.axis_index(name)
+
     @abc.abstractmethod
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,

@@ -652,6 +652,10 @@ that call's kernel. A kernel named for a call it does not take raises `dew.kerne
 `ValueError` carrying the op (`choice`), the kernel and every requirement the call fails (`refusals`),
 rather than running another kernel in silence.
 
+A run's `RunConfig.kernels` (`--kernels attention xla`) is the block it enters around everything it traces,
+its steps', evaluations' and samples' (`RunConfig.traced`, beside its recorded precision). Its record keeps
+the choice, so a resume runs the kernels the run ran.
+
 ## Configuration and registries
 
 Code builds every model, preset, solver, dataset and metric from its class. A record names a class by its import path, `{"class": "dew.nn.backbones.dit:SimpleDiT", "fields": {...}}`, and a function as `{"function": "optax:adamw"}`; `RunConfig.from_dict` and `ModelConfig.build` import what a record names. Where a person writes a record or a flag, `dew.registry` maps short aliases (`simple_dit`) to those paths.
