@@ -62,7 +62,7 @@ from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers import AttentionMixer, MixerBase
 from dew.nn.rope import RopeScaling, YarnScaling
 from dew.nn.sharding import drawn_axes
-from dew.registry import from_record, to_record
+from dew.registry import Configured, from_record, to_record
 
 if TYPE_CHECKING:
     from dew.diffusion.discrete import Confident, Unmask
@@ -972,15 +972,26 @@ def unwritten(why: str) -> ConfigPart[CausalTransformer]:
     return ConfigPart(lambda hf_config, used, record: record, write)
 
 
-def expect(key: str, why: str, *, value: object) -> ConfigPart[CausalTransformer]:
-    """A key the family's reference computes only at `value` (its class's default where unstated),
-    refused at any other, saying `why`; written as nothing."""
+def expect(key: str, why: str, *, value: Configured, stated: bool = False) -> ConfigPart[CausalTransformer]:
+    """A key the family's reference computes only at `value`, refused at any other, saying `why`: its
+    class's default where unstated, written as nothing; or, where the class defaults to another
+    (`stated`: K2 Horizon's per-head q/k norm), refused unless stated and written."""
     def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
         used.add(key)
-        if hf_config.get(key, value) != value:
+        if (hf_config.get(key) if stated else hf_config.get(key, value)) != value:
             refuse(key, f'{why}; requires {value!r}')
         return record
-    return ConfigPart(read, lambda model: {})
+    return ConfigPart(read, lambda model: {key: value} if stated else {})
+
+
+def remote_code(repo: str, module: str, name: str) -> ConfigPart[CausalTransformer]:
+    """A family whose reference is its release's own code, which transformers has no class for: read as
+    nothing, written as the `auto_map` the released configs name it by, `repo`'s `configuration_{module}`
+    and `modeling_{module}` classes (`{name}Config`, `{name}Model`, `{name}ForCausalLM`)."""
+    return ConfigPart(lambda hf_config, used, record: record, lambda model: {'auto_map': {
+        'AutoConfig': f'{repo}--configuration_{module}.{name}Config',
+        'AutoModel': f'{repo}--modeling_{module}.{name}Model',
+        'AutoModelForCausalLM': f'{repo}--modeling_{module}.{name}ForCausalLM'}})
 
 
 @dataclass(frozen=True)

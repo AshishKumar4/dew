@@ -26,6 +26,7 @@ from dew.interop.decoder_parts import (
     decoder_layout,
     native_layer_types,
     refuse,
+    remote_code,
     spelled,
 )
 from dew.interop.layouts import ConfigLayout, ConfigPart, constant
@@ -85,11 +86,7 @@ OURO_CONFIG = ConfigLayout(
     decoder_layout(DecoderSpelling(reads=frozenset({'layer_types', 'sliding_window'}),
                                    undeclared=frozenset({'attention_bias'}), ramps=('llama3',))),
     constant('sandwich_norms', value=True), ConfigPart(_ouro_loop, _ouro_loop_written),
-    # The release's own code, which transformers has no class for.
-    ConfigPart(lambda hf_config, used, record: record, lambda model: {'auto_map': {
-        'AutoConfig': f'{_REMOTE}--configuration_ouro.OuroConfig',
-        'AutoModel': f'{_REMOTE}--modeling_ouro.OuroModel',
-        'AutoModelForCausalLM': f'{_REMOTE}--modeling_ouro.OuroForCausalLM'}}))
+    remote_code(_REMOTE, 'ouro', 'Ouro'))
 """Ouro's config, both ways."""
 
 
