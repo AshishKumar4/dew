@@ -187,6 +187,35 @@ def test_a_decode_steps_slices_merged_in_the_launch_rewalk_rows_whose_sums_pass_
                     "a decode step's slices merged in the launch past fp32's largest", seeds=SEEDS)
 
 
+@INTERPRETS
+@pytest.mark.parametrize("merges", [False, True], ids=["after", "in-launch"])
+def test_slices_whose_outputs_sum_past_fp32s_largest_merge_to_their_attention_interpreted(merges):
+    """A decode step cut into 8 slices a row, each slice's 64 keys one whose logit is 30 and whose values near
+    bf16's largest: no slice's sums pass fp32's largest, but their outputs, each near 3e38, sum past it, so
+    their merge weighs each output by its share of the masses before its product (row 4526,
+    `algebra.finished_merged`), after the launch or in it: on par with jax's own attention, which normalizes
+    its weights before their product (check 1)."""
+    lengths = (DECODE_KEYS, DECODE_KEYS)
+    spans = _decode_spans(lengths)
+    dominant = jnp.arange(DECODE_KEYS) % 64 == 0
+
+    def outputs_near_the_largest(seed: int):
+        query, key, value = _decode_draw(seed)
+        query = jnp.zeros_like(query).at[..., 0].set(1.0)
+        key = jnp.where(dominant[None, :, None, None] & (jnp.arange(64) == 0), 240.0, key).astype(key.dtype)
+        large = jax.random.uniform(jax.random.key(seed + 1), value.shape, jnp.float32, 2.9e38, 3.3e38)
+        value = jnp.where(dominant[None, :, None, None], large, value).astype(value.dtype)
+        return query, key, value
+
+    def reference(query, key, value):
+        return jax.nn.dot_product_attention(query, key, value, implementation="xla",
+                                            key_value_seq_lengths=jnp.asarray(lengths, jnp.int32))
+
+    assert_as_exact(jax.jit(functools.partial(_slices_merged, spans=spans, merges=merges)),
+                    as_given(jax.jit(reference)), outputs_near_the_largest,
+                    "slices whose outputs sum past fp32's largest", seeds=SEEDS)
+
+
 @functools.partial(jax.jit, static_argnames="slices")
 def _sliced_step(query, key, value, lengths, *, slices: int):
     """A decode step of rows `lengths` long, its keys cut into `slices` slices a row at the decode plan's
