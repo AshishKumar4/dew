@@ -124,51 +124,79 @@ class CuptiHeld(RuntimeError):
     and a benchmark reports it."""
 
 
+EVICTION_BYTES = 256 << 20
+"""The bytes an eviction reads (`eviction`, `behind`): over twice the L2 of every GPU Dew targets (an
+H100's 50 MB, a B200's 126 MB), so a read of them leaves none of a timed call's operands in it."""
+
+
+def eviction() -> jax.Array:
+    """The buffer an eviction reads: `EVICTION_BYTES` of zeros, on the default device."""
+    return jnp.zeros(EVICTION_BYTES // 4, jnp.float32)
+
+
+def behind(call: Callable) -> Callable:
+    """The program that runs `call(*args)` behind an eviction, a read of `evicting` (`eviction`): called
+    as `(evicting, args)`, the call waits for the read (an optimization barrier) and both outputs are
+    returned, so the compiler keeps it. A timing that needs its operands out of the cache times this
+    program and leaves the read's kernels out (`DeviceTime.behind`): CUPTI reads a call after an untimed
+    run of it, which refills a cache an eviction run before the call emptied."""
+    def run(evicting, args):
+        evicted, args = jax.lax.optimization_barrier((jnp.sum(evicting), args))
+        return evicted, call(*args)
+    return run
+
+
+class NoKernels(ValueError):
+    """A call CUPTI read none of its own kernels of (`DeviceTime`), whose time would read as zero."""
+
+
 class DeviceTime:
     """The device time of each GPU call `device_time`'s session reads: its own kernels' as CUPTI times
     them, from their start to their end on the device, which no host dispatch or other process's work
     enters. The caller composes the operands each call reads and the statistic it reports.
 
     CUPTI reads a call after running it once untimed (Mosaic GPU's profiler warms what it times), so a
-    call is timed warm: an eviction the caller runs before it is refilled before the timed run. An
-    eviction a timing needs runs inside the timed program (`kernels`' `before`)."""
+    call is timed warm; one timed out of the cache runs behind an eviction in one program (`behind`)."""
 
     def __init__(self, cupti):
         self._cupti = cupti
         self._subscribed = False
-        self._joined: dict[tuple[Callable, Callable], Callable] = {}
-        self._evictions: dict[Callable, frozenset[str]] = {}
+        self._joined: dict[Callable, Callable] = {}
+        self._evicting: jax.Array | None = None
+        self._evicted: frozenset[str] | None = None
 
-    def kernels(self, fn: Callable, *args, before: Callable | None = None,
-                before_args: tuple = ()) -> tuple[KernelTime, ...]:
+    def kernels(self, fn: Callable, *args, evicted: bool = False) -> tuple[KernelTime, ...]:
         """Each kernel one call of `fn(*args)` launched, in launch order, with its device milliseconds,
-        once its output is ready. A call that launched none is refused: its time would read as zero.
-
-        `before(*before_args)`, an eviction (an L2 flush), runs in the timed program ahead of the call,
-        which waits for it (an optimization barrier), so each run, the untimed one's and the timed one's,
-        finds what it evicts gone; its own kernels, which it launches read alone once, are left out."""
-        if before is None:
+        once its output is ready. A call that launched none is refused (`NoKernels`): its time would read
+        as zero. `evicted` runs the call behind the session's eviction in one program (`behind`), its
+        kernels left out, so its operands are read from memory, not the cache."""
+        if not evicted:
             return self._read(fn, *args)
-        if before not in self._evictions:
-            self._evictions[before] = frozenset(kernel.name for kernel in self._read(before, *before_args))
-        if (fn, before) not in self._joined:
-            from dew.nn.kernels.options import program
+        if fn not in self._joined:
+            from dew.nn.kernels.options import owned_program
 
-            def joined(evicting, called):
-                _, called = jax.lax.optimization_barrier((before(*evicting), called))
-                return fn(*called)
-            self._joined[fn, before] = program(joined)
-        evicting = self._evictions[before]
-        timed = tuple(kernel for kernel in self._read(self._joined[fn, before], before_args, args)
-                      if kernel.name not in evicting)
+            self._joined[fn] = owned_program(behind(fn))
+        if self._evicting is None:
+            self._evicting = eviction()
+        return self.behind(self._joined[fn], self._evicting, *args)
+
+    def behind(self, program: Callable, evicting: jax.Array, *args) -> tuple[KernelTime, ...]:
+        """The kernels of one call of `program`, a call run behind a read of `evicting` (`behind`,
+        compiled by its caller: the kernel tuner compiles one a config), but the read's own, which a read
+        alone names once. A call none of whose own CUPTI read is refused (`NoKernels`)."""
+        if self._evicted is None:
+            from dew.nn.kernels.options import owned_program
+
+            self._evicted = frozenset(kernel.name for kernel in self._read(owned_program(jnp.sum), evicting))
+        timed = tuple(kernel for kernel in self._read(program, evicting, args)
+                      if kernel.name not in self._evicted)
         if not timed:
-            raise ValueError(f"{fn} launched no kernel CUPTI timed apart from its eviction's")
+            raise NoKernels(f"{program} launched no kernel CUPTI timed apart from its eviction's")
         return timed
 
-    def seconds(self, fn: Callable, *args, before: Callable | None = None, before_args: tuple = ()) -> float:
+    def seconds(self, fn: Callable, *args, evicted: bool = False) -> float:
         """One call's device seconds, its kernels' summed (`kernels`)."""
-        kernels = self.kernels(fn, *args, before=before, before_args=before_args)
-        return sum(kernel.milliseconds for kernel in kernels) / 1e3
+        return sum(kernel.milliseconds for kernel in self.kernels(fn, *args, evicted=evicted)) / 1e3
 
     def _read(self, fn: Callable, *args) -> tuple[KernelTime, ...]:
         """CUPTI's reading of one call (`kernels`), refusing a call of no kernel."""
@@ -182,7 +210,7 @@ class DeviceTime:
                 raise CuptiHeld(str(error)) from error
             raise
         if not read:
-            raise ValueError(f"{fn} launched no kernel CUPTI timed, so it has no device time")
+            raise NoKernels(f"{fn} launched no kernel CUPTI timed, so it has no device time")
         return tuple(KernelTime(name, milliseconds) for name, milliseconds in read)
 
     def _detach(self) -> None:
@@ -362,5 +390,5 @@ def benchmark[T](calls: Mapping[Hashable, Callable[[], T]], *, warmup: int = 1,
     return Benchmark(seconds, outputs)
 
 
-__all__ = ["Benchmark", "Comparison", "CuptiHeld", "DeviceTime", "KernelTime", "benchmark", "carried",
-           "compared", "device_time", "samples"]
+__all__ = ["EVICTION_BYTES", "Benchmark", "Comparison", "CuptiHeld", "DeviceTime", "KernelTime", "NoKernels",
+           "behind", "benchmark", "carried", "compared", "device_time", "eviction", "samples"]

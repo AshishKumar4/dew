@@ -44,12 +44,12 @@ def routings(tokens: int, experts: int, top_k: int, seed: int) -> list[np.ndarra
 
 
 def timed(fn, arguments: list[tuple]) -> list[float]:
-    """Each call's device seconds (CUPTI, its kernels alone), one call an argument tuple, warm: after one
-    call of each, and the untimed run CUPTI's reading makes of it (`dew.telemetry.benchmark.DeviceTime`)."""
-    for args in arguments:
-        jax.block_until_ready(fn(*args))
+    """Each call's device seconds (CUPTI, its kernels alone), one call an argument tuple, each behind an
+    eviction in its own program (`dew.telemetry.benchmark.behind`), so the active experts' weights it reads
+    come from HBM, as a decode step's freshly drawn routing reads them; a model's experts
+    at one token fit an H100's L2, which a warm call of the same routing would leave them in."""
     with device_time() as device:
-        return [device.seconds(fn, *args) for args in arguments]
+        return [device.seconds(fn, *args, evicted=True) for args in arguments]
 
 
 def main() -> None:

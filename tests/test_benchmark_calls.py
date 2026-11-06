@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from sampling_gate import FALSE_RED
 
-from dew.telemetry.benchmark import CuptiHeld, benchmark, device_time
+from dew.telemetry.benchmark import CuptiHeld, behind, benchmark, device_time, eviction
 
 
 class Slow:
@@ -250,10 +250,12 @@ def test_device_time_reads_a_calls_kernels_and_hands_cupti_to_a_profiler_however
     with device_time() as device:
         with pytest.raises(ValueError):
             device.kernels(lambda: None)
-        flush = jax.jit(lambda evictor: evictor + 1.0)
-        evicting = {kernel.name for kernel in device.kernels(flush, x)}
-        behind = device.kernels(matmul, x, before=flush, before_args=(x,))
-        assert behind and not evicting & {kernel.name for kernel in behind}
+        buffer = eviction()
+        evicting = {kernel.name for kernel in device.kernels(jax.jit(jnp.sum), buffer)}
+        # The eviction runs in the program its call is timed in, which the compiler keeps.
+        assert evicting & {kernel.name for kernel in device.kernels(jax.jit(behind(matmul)), buffer, (x,))}
+        timed = device.kernels(matmul, x, evicted=True)
+        assert timed and not evicting & {kernel.name for kernel in timed}
     profiler = Profiler(tmp_path)
     with profiler, device_time() as device:
         jax.block_until_ready(matmul(x))

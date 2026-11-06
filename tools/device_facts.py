@@ -7,8 +7,8 @@ of one launch (row 3613's fixed costs of a launch and of the balanced tail's par
 
     python tools/device_facts.py --out facts.json
 
-Each point reads an array of N bytes once (its sum, `read`) or reads and writes it (`copy`), after a write of
-twice the L2 that evicts it (`cold`); CUPTI times the kernel alone (`dew.telemetry.benchmark.device_time`),
+Each point reads an array of N bytes once (its sum, `read`) or reads and writes it (`copy`), behind
+the eviction its program runs first (`cold`, `dew.telemetry.benchmark.behind`); CUPTI times the kernel alone,
 the median of `--repeats` after `--warmup`. An H200's read, measured so, ramps from 2.6 TB/s at 16.8 MB to
 4.5 at 805 MB over a 2.5-2.8 us fixed cost, which a peak bandwidth alone prices as free at small transfers.
 
@@ -43,14 +43,14 @@ ROUND_TRIPS = (16, 64, 256, 1024)
 """The rounds each hand-off kernel's two programs make, each one hand-off."""
 
 
-def timed(fn, args, *, flush=None, evictor=None, warmup: int, repeats: int) -> float:
-    """The median device seconds of `fn`'s kernels over `repeats` calls after `warmup`, each call, where
-    `flush` is given, in a program that first writes `evictor` through the L2, so it reads from HBM (CUPTI
-    times `fn`'s kernels alone, the flush's left out)."""
+def timed(fn, args, *, cold: bool = False, warmup: int, repeats: int) -> float:
+    """The median device seconds of `fn`'s kernels over `repeats` calls after `warmup`, each call, `cold`,
+    behind an eviction in its own program, so it reads from HBM (CUPTI times `fn`'s kernels alone, the
+    eviction's left out; `dew.telemetry.benchmark.behind`)."""
     seconds = []
     with device_time() as device:
         for index in range(warmup + repeats):
-            measured = device.seconds(fn, *args, before=flush, before_args=(evictor,))
+            measured = device.seconds(fn, *args, evicted=cold)
             if index >= warmup:
                 seconds.append(measured)
     return statistics.median(seconds)
@@ -103,8 +103,6 @@ def main() -> None:
     args = parser.parse_args()
     device = jax.devices()[0]
     l2 = int(getattr(device, "l2_cache_size", 0) or 64 * 2 ** 20)
-    evictor = jnp.zeros((2 * l2 // 4,), jnp.float32)
-    flush = jax.jit(lambda x: x + 1.0)
     read = jax.jit(lambda x: jnp.sum(x, dtype=jnp.float32))
     copy = jax.jit(lambda x: x + jnp.asarray(1, x.dtype))
     rows = []
@@ -112,7 +110,7 @@ def main() -> None:
         x = jnp.ones((size // 2,), jnp.bfloat16)
         row = {"bytes": size}
         for name, fn, moved in (("read", read, size), ("copy", copy, 2 * size)):
-            seconds = timed(fn, (x,), flush=flush, evictor=evictor, warmup=args.warmup, repeats=args.repeats)
+            seconds = timed(fn, (x,), cold=True, warmup=args.warmup, repeats=args.repeats)
             row[name] = {"seconds": seconds, "bytes_per_second": moved / seconds}
         rows.append(row)
         print(json.dumps(row), flush=True)
