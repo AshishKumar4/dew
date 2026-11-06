@@ -178,7 +178,11 @@ def call_visibility(metadata: AttentionMetadata, rotary_positions, *, batch: int
     window of the query's rotary position where the call gives the keys' positions; else its key runs
     (`AttentionMetadata.key_runs`), a windowed layer windowing each run over the key positions the call
     gives, its queries read at them too where they are its own tokens, or a cached call's at its rotary
-    positions through a mask. `key_places` are where the keys are read otherwise."""
+    positions through a mask; a tree call's runs (`AttentionMetadata.tree_parents`), which it must carry.
+    `key_places` are where the keys are read otherwise."""
+    if metadata.tree_parents is not None and metadata.key_runs is None:
+        raise ValueError("a tree call's attention is masked by its key runs, each token's cache and "
+                         "ancestors (attention_key_runs)")
     if metadata.pairwise_mask is None and metadata.key_runs is None:
         return None
     key_positions = metadata.key_positions
@@ -297,9 +301,10 @@ class CausalSelfAttention(nn.Module):
     `kv_store`, post rope and norm, and keeps no cache.
     """
     reads: ClassVar[frozenset[str]] = frozenset({"pairwise_mask", "key_positions", "key_runs",
-                                                 "position_bias", "admitted"})
+                                                 "position_bias", "admitted", "tree_parents"})
     """Every `MIXING` field of its call (`dew.nn.inputs.MixerCall`): it masks by a pairwise mask or key
-    runs, places keys, adds a position bias and runs a server's mixed step."""
+    runs, places keys, adds a position bias and runs a server's mixed step; a tree call masks it by its
+    key runs (`call_visibility`)."""
 
     ctx: MixerContext
     """The layer's geometry and attention policies, as the backbone resolves

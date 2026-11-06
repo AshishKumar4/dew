@@ -68,7 +68,15 @@ from dew.nn.kernels import recurrence, recurrence_algebra
 from dew.nn.kernels.generation import triton_runs
 from dew.nn.kernels.recurrence import Hooks
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
-from dew.nn.linear import DepthwiseConv1d, decode_step, held_scan, over_sequence, sequence_conv
+from dew.nn.linear import (
+    DepthwiseConv1d,
+    call_tree,
+    decode_step,
+    held_scan,
+    over_sequence,
+    sequence_conv,
+    tree_scan,
+)
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum, rms_statistics, rms_weighted
@@ -221,7 +229,9 @@ class Mamba2(nn.Module):
     (`recurrence_algebra.entering`); decoding and padded rows are refused there.
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset()
+    reads: ClassVar[frozenset[str]] = frozenset({"tree_parents", "key_runs", "key_positions"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's and the key runs and positions
+    of its attention beside it (`dew.nn.linear.call_tree`): on a tree each token's path (`tree_scan`)."""
     """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): a recurrence reads every earlier token
     of its document, with no mask or bias to narrow it."""
 
@@ -361,6 +371,13 @@ class Mamba2(nn.Module):
             state_size=self.state_size, chunk_size=self.chunk_size,
             time_step_limit=self.time_step_limit)
         shards = sequence_shards()
+        tree = call_tree(attention_metadata)
+        if tree is not None:
+            def rule(convolved, step, held):
+                return scan(convolved, dt=step, heads=heads, held=held)
+
+            out = tree_scan(self, mixed, taps, bias, tree, rule, (dt,), state_dtype=wide, dtype=compute)
+            return self.out_proj(self._gated(out, gate))
         if shards > 1:
             if decode:
                 raise LayoutRefused(

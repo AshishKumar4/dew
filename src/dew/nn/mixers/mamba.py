@@ -45,7 +45,7 @@ from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
 from dew.nn.kernels import recurrence_algebra, recurrence_chunk
-from dew.nn.linear import DepthwiseConv1d, held_scan
+from dew.nn.linear import DepthwiseConv1d, call_tree, held_scan, tree_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, float32_einsum
@@ -111,9 +111,9 @@ class Mamba(nn.Module):
     (`segment_ids`) run as if alone.
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset()
-    """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): a recurrence reads every earlier token
-    of its document, with no mask or bias to narrow it."""
+    reads: ClassVar[frozenset[str]] = frozenset({"tree_parents", "key_runs", "key_positions"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's and the key runs and positions
+    of its attention beside it (`dew.nn.linear.call_tree`): on a tree each token's path (`tree_scan`)."""
 
     emb_features: int
     intermediate_size: int
@@ -202,9 +202,16 @@ class Mamba(nn.Module):
         # casts them, or in the model's own dtype where it is wider.
         wide = at_least_fp32(mixed.dtype)
         taps, bias = self.conv1d()
-        out = held_scan(self, mixed, taps, bias, self._scan,
-                        (self.intermediate_size, self.state_size),
-                        decode=decode, coordinates=tokens, state_dtype=wide, conv_dtype=wide, dtype=wide)
+        tree = call_tree(attention_metadata)
+        if tree is not None:
+            def rule(convolved, held):
+                return self._scan(convolved, starts=None, valid=None, held=held)
+
+            out = tree_scan(self, mixed, taps, bias, tree, rule, (), state_dtype=wide, dtype=wide)
+        else:
+            out = held_scan(self, mixed, taps, bias, self._scan,
+                            (self.intermediate_size, self.state_size),
+                            decode=decode, coordinates=tokens, state_dtype=wide, conv_dtype=wide, dtype=wide)
         if out is None:
             # Allocation only: init_cache's dummy token must not consume a
             # position or leave state behind.
