@@ -55,16 +55,22 @@ class Traffic:
     """What a product's output tiles read a step and how fast the device serves it, which a tail's pricing
     reads (`balanced`): the tiles' grid as the walk orders them (`planar_snake`'s `shape`, its columns the
     minor dimension, `band` tiles wide), a step's operand block of a tile row (`row_bytes`, the left
-    operand's) and of a tile column (`column_bytes`, the right's), one MMA step (`step_seconds`), the
-    device memory's rate (`bandwidth`) and the L2's bytes (`l2_bytes`), within whose rounds a block read
-    again is a hit; none where unknown."""
+    operand's) and of a tile column (`column_bytes`, the right's), one MMA step on a multiprocessor alone
+    (`step_seconds`), the multiprocessors the programs share (`multiprocessors`: programs beyond them take
+    their steps in turn), the device memory's rate (`bandwidth`) and the L2's bytes (`l2_bytes`), within
+    whose rounds a block read again is a hit; none where unknown."""
     grid: tuple[int, int]
     band: int
     row_bytes: int
     column_bytes: int
     step_seconds: float
+    multiprocessors: int
     bandwidth: float
     l2_bytes: int | None
+
+    def issued(self, programs: int) -> float:
+        """The seconds `programs` programs' one MMA step each takes, sharing the multiprocessors."""
+        return self.step_seconds * -(-programs // self.multiprocessors)
 
 
 def balanced(tiles: int, steps: int, programs: int, traffic: Traffic, *,
@@ -96,7 +102,7 @@ def _walked(steps: int, rows: np.ndarray, columns: np.ndarray, traffic: Traffic)
     """The seconds the tail's tiles (at `rows`, `columns`) take walked together: each of their `steps`
     reading every distinct row's and column's block once, its MMA step or those bytes, whichever longer."""
     read = len(np.unique(rows)) * traffic.row_bytes + len(np.unique(columns)) * traffic.column_bytes
-    return steps * max(traffic.step_seconds, read / traffic.bandwidth)
+    return steps * max(traffic.issued(len(rows)), read / traffic.bandwidth)
 
 
 def _rounds(tail: Tail, rows: np.ndarray, columns: np.ndarray, traffic: Traffic) -> float:
@@ -121,7 +127,9 @@ def _rounds(tail: Tail, rows: np.ndarray, columns: np.ndarray, traffic: Traffic)
         first = np.ones(len(block), dtype=bool)
         first[1:] = (block[1:] != block[:-1]) | (read[1:] - read[:-1] > window)
         missed += np.bincount(read[first], minlength=rounds) * size
-    return float(np.maximum(traffic.step_seconds, missed / traffic.bandwidth).sum())
+    active = np.bincount(turn, minlength=rounds)
+    issued = traffic.step_seconds * -(-active // traffic.multiprocessors)
+    return float(np.maximum(issued, missed / traffic.bandwidth).sum())
 
 
 def ordered(tail: Tail | None, index: tuple, programs: int, interpreted: bool) -> tuple:

@@ -1558,8 +1558,9 @@ def step_seconds(tiles: Tiles, target) -> float | None:
 
 def balanced_tail(tiles: Tiles, grid: tuple[int, int], steps: int, itemsizes: tuple[int, int], target,
                   programs: int) -> tail_of.Tail | None:
-    """A dense product's last wave balanced over `programs` (`tail.balanced`) at `tiles` over its output
-    tiles' `grid` and `steps` a tile, priced from the target's facts: its MMA step (`step_seconds`), its
+    """A dense product's last wave balanced over `programs` (`tail.balanced`, the launch's: its
+    multiprocessors times `tiles.programs`) at `tiles` over its output tiles' `grid` and `steps` a tile,
+    priced from the target's facts: its MMA step (`step_seconds`), its
     memory's rate and L2 (`GpuTarget.memory_rate`, `l2_bytes`), its operands' blocks a step (`itemsizes`,
     the left's and the right's) and its hand-off (`handoff_steps`); walked where the target states no
     rate."""
@@ -1568,7 +1569,8 @@ def balanced_tail(tiles: Tiles, grid: tuple[int, int], steps: int, itemsizes: tu
         return None
     left, right = itemsizes
     traffic = tail_of.Traffic(grid, tiles.grid_block_n, tiles.block_m * tiles.block_k * left,
-                              tiles.block_n * tiles.block_k * right, step, rate, target.l2_bytes)
+                              tiles.block_n * tiles.block_k * right, step,
+                              target.multiprocessors or programs, rate, target.l2_bytes)
     return tail_of.balanced(grid[0] * grid[1], steps, programs, traffic,
                             handoff_steps=handoff_steps(tiles, target))
 
