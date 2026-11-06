@@ -659,10 +659,10 @@ class Speculative:
         """The most tokens a block emits a row: its candidates and the one after them."""
         return self.block + 1
 
-    @property
-    def reach(self) -> int:
-        """The tokens a block's candidates take a row past its last."""
-        return self.block
+    def walks(self, ops: DecodeOps, budget: int) -> int:
+        """The most blocks a row walks a token in: across the model's cache rebuild, until its candidates
+        are past it."""
+        return 0 if ops.crosses is None else min(self.block, budget)
 
     def stepped(self, state: DecoderState, step: StepState, terminated: jax.Array, ops: DecodeOps,
                 transform, stopping, budget: int | jax.Array) -> Block:
@@ -1039,10 +1039,12 @@ class TreeSpeculative:
         """The most tokens a block emits a row: the root, a path to the deepest node and the one after it."""
         return int(self.shape.depths.max()) + 2
 
-    @property
-    def reach(self) -> int:
-        """The tokens a block's verify takes a row past its last: the root and every node."""
-        return self.shape.nodes + 1
+    def walks(self, ops: DecodeOps, budget: int) -> int:
+        """The most blocks a row walks a token in: across the model's cache rebuild until its tree is past
+        it, and every one where its cache holds no room for the tree (`tree_step`)."""
+        if ops.capacity is not None:
+            return budget
+        return 0 if ops.crosses is None else min(self.shape.nodes + 1, budget)
 
     def stepped(self, state: DecoderState, step: StepState, terminated: jax.Array, ops: DecodeOps,
                 transform, stopping, budget: int | jax.Array) -> Block:
@@ -1165,9 +1167,8 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
     empty = Draws(jnp.zeros((rows, budget), jnp.int32), jnp.zeros((rows, budget), bool),
                   jnp.zeros((rows, budget), jnp.float32), jnp.zeros((rows, budget), jnp.float32),
                   jnp.zeros(rows, bool))
-    # Each block emits two tokens a row at least, but a row's walk across a rebuild, one a block over at
-    # most as many blocks as its candidates reach.
-    walks = 0 if ops.crosses is None else min(plan.reach, budget)
+    # Each block emits two tokens a row at least, but a row's walk, one a block (`Speculative.walks`).
+    walks = plan.walks(ops, budget)
     blocks = -(-(budget + walks) // 2)
     out = lax.scan(outer, _SpeculativeCarry(state, start, empty), None, length=blocks)[0].out
     return dataclasses.replace(out, behavior_log_probs=jnp.where(out.valid, out.behavior_log_probs, 0.0),
