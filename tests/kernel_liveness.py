@@ -604,24 +604,27 @@ class _Pass:
 
     def ordered(self, function) -> None:
         """Each op of `function` by its place in program order (`order`), and the places of its products
-        (`issued`), which `_read_past_products` reads."""
+        (`issued`), which `_read_past_products` reads. Keyed by each op's hash, its handle's address: a
+        Python reference to every op outliving its module leaves the context's live-operation map stale,
+        so a later module's op at a freed address comes back detached (row 1971's census, 416 kernels in
+        one process failing to lower)."""
         self.order, self.issued = {}, []
 
         def visit(inner):
-            self.order[inner] = len(self.order)
+            self.order[hash(inner)] = len(self.order)
             if _issues_product(inner):
-                self.issued.append(self.order[inner])
+                self.issued.append(len(self.order) - 1)
             return ir.WalkResult.ADVANCE
 
         function.walk(visit)
 
     def _read_past_products(self, op) -> bool:
         """Whether a result of `op` is read past a product issued after it (`ordered`)."""
-        made = self.order.get(op)
+        made = self.order.get(hash(op.operation))
         if made is None:
             return False
         later = [place for place in self.issued if place > made]
-        return bool(later) and any(self.order.get(use.owner.operation, -1) > later[0]
+        return bool(later) and any(self.order.get(hash(use.owner.operation), -1) > later[0]
                                    for result in op.results for use in result.uses)
 
     def _streamed(self, op, name: str) -> bool:
