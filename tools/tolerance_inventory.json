@@ -401,10 +401,6 @@
    "comparisons": 25,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_lora_peft.py": {
-   "comparisons": 4,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_lpips.py": {
    "comparisons": 3,
    "lane": "Training"
