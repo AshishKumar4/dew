@@ -806,3 +806,62 @@ def test_a_consumer_launched_at_each_residency_its_family_admits_raises_to_the_g
         cap = model.cap(programs, honored=True)
         assert (kernel["raised"], kernel["spilled"]) == (cap, 0), (programs, record.get("error"), kernel)
         assert kernel["registers"] <= cap
+
+
+RELAYED = 64
+"""A relayed product's depth and columns."""
+
+
+def _chained(a, b, c, *, m_warps: int, interpret: bool):
+    """`(a @ b) @ c` by mma.sync, the second product reading the first's accumulator as its register left
+    operand: on `m_warps` warps along the rows (`MmaIssuer.specialized`'s split), relayed through a tile the
+    consumer binds where they split its columns (`relaying`), stored through registers."""
+    from dew.nn.kernels.templates import mosaic_sm80, resources
+
+    family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16), m_warps=m_warps)
+    rows = a.shape[0]
+
+    def body(a_gmem, b_gmem, c_gmem, out_gmem):
+        def scoped(a_smem, b_smem, c_smem, relay, out_smem):
+            a_smem[...], b_smem[...], c_smem[...] = a_gmem[...], b_gmem[...], c_gmem[...]
+            mosaic.synced(interpret)
+            issuer = family.relaying(relay)
+            first = issuer.product(a_smem, b_smem, (rows, RELAYED), interpret=interpret)
+            out = issuer.product(first.astype(jnp.bfloat16), c_smem, (rows, RELAYED), interpret=interpret)
+            plgpu.store(out_smem, out, optimized=False)
+            mosaic.synced(interpret)
+            mosaic.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(rows), 0, rows, copy=mosaic.coalesced,
+                              widest=resources.copied_rows(RELAYED, jnp.float32))
+
+        pl.run_scoped(scoped, plgpu.SMEM((rows, RELAYED), jnp.bfloat16),
+                      *(plgpu.SMEM((RELAYED, RELAYED), jnp.bfloat16) for _ in range(2)),
+                      plgpu.SMEM((rows, RELAYED), jnp.bfloat16), plgpu.SMEM((rows, RELAYED), jnp.float32))
+
+    out = jax.ShapeDtypeStruct((rows, RELAYED), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="chained")(a, b, c)
+
+
+def _chained_operands(rows: int):
+    """Small integers whose chained products are exact in fp32, the first's (at most 128) in bf16."""
+    keys = jax.random.split(jax.random.key(5), 3)
+    return (jax.random.randint(keys[0], (rows, RELAYED), -2, 3).astype(jnp.bfloat16),
+            *(jax.random.randint(key, (RELAYED, RELAYED), -1, 2).astype(jnp.bfloat16) for key in keys[1:]))
+
+
+@pytest.mark.parametrize(("rows", "m_warps"), [(16, 1), (32, 2), (64, 4)])
+def test_an_accumulator_feeds_the_next_product_on_any_warp_split(rows, m_warps):
+    """An mma.sync accumulator read as the next product's left operand, its warps split along its columns
+    (one or two along its rows) or not (four): lowered for an A100 on any host, and on a GPU exactly `(a @
+    b) @ c` (each warp's columns relayed through the bound tile, where no register cast crosses warps)."""
+    a, b, c = _chained_operands(rows)
+    if jax.default_backend() == "gpu":
+        f32 = [np.asarray(x, np.float32) for x in (a, b, c)]
+        np.testing.assert_array_equal(np.asarray(_chained(a, b, c, m_warps=m_warps, interpret=False)),
+                                      (f32[0] @ f32[1]) @ f32[2])
+        return
+    shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (a, b, c)]
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
+    with generation.assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(functools.partial(_chained, m_warps=m_warps, interpret=False)).trace(*shapes).lower(
+            lowering_platforms=("cuda",))
