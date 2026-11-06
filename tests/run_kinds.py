@@ -221,8 +221,14 @@ def lettered(root: Path, drawn: bool) -> RunConfig:
 
 def shared(root: Path, drawn: bool) -> RunConfig:
     """A decision run of a fresh letter readout over the tiny Gemma's text decoder, whose every layer reads a
-    row's key runs, its rows asking a request's questions over one copy of its state (`shared_state`)."""
-    return dataclasses.replace(lettered(root, drawn), pretrained=str(GEMMA_TINY), shared_state=3)
+    row's key runs, its rows asking a request's questions over one copy of its state (`shared_state`), its
+    labels words of that tokenizer's vocabulary (`token4`...), which spells "A" to "D" as one unknown
+    token."""
+    run = lettered(root, drawn)
+    assert isinstance(run.head, Letters)
+    labels = dataclasses.replace(run.head.labels, names=("token4", "token5", "token6", "token7"))
+    return dataclasses.replace(run, pretrained=str(GEMMA_TINY), shared_state=3,
+                               head=dataclasses.replace(run.head, labels=labels))
 
 
 def merged(root: Path, drawn: bool) -> RunConfig:
