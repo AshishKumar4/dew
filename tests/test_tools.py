@@ -1955,8 +1955,9 @@ def test_a_mosaic_gpu_kernel_outside_the_launch_point_is_reported(tmp_path):
 def test_each_form_of_a_custom_derivative_is_a_seam():
     """SLOP028's scan (`derivative_seams`) on each form a seam takes, and what makes it: a decorator, one
     within functools.partial, an assignment of a call, an annotated one, a nested function's, a
-    linear_tangent call within an expression, a surrogate's declaration, assigned or decorating, and a
-    declaring builder's, its kind read from its first argument; a plain function is none."""
+    linear_tangent call within an expression, a surrogate's declaration, assigned or decorating, a
+    declaring builder's, its kind read from its first argument, and a maker's call returned and called
+    at once or passed on (row 4450); a plain function is none."""
     import ast
 
     rules = load("lint_derivatives")
@@ -1975,12 +1976,15 @@ def test_each_form_of_a_custom_derivative_is_a_seam():
         "h = derivatives.declared_tangent(derivatives.Protected(), p, rule, nondiff_argnums=(1,))\n"
         "@functools.partial(declared_tangent, KernelGlue(), tangent=rule)\n"
         "def k(x): return x\n"
+        "def returned(x):\n    return surrogate(f, g)(x)\n"
+        "def passed(p):\n    return wrap(jax.custom_jvp(p))\n"
         "def plain(x): return x\n")
     assert {seam: maker for seam, maker, _, _ in rules.derivative_seams("m.py", ast.parse(text))} == {
         "m.py::a": "custom_jvp", "m.py::b": "custom_vjp", "m.py::c": "custom_jvp", "m.py::d": "custom_vjp",
         "m.py::outer.inner": "custom_vjp", "m.py::tangent.linear_tangent": "linear_tangent",
         "m.py::e": "surrogate", "m.py::f": "surrogate", "m.py::g": "declared_derivative:Surrogate",
-        "m.py::h": "declared_tangent:Protected", "m.py::k": "declared_tangent:KernelGlue"}
+        "m.py::h": "declared_tangent:Protected", "m.py::k": "declared_tangent:KernelGlue",
+        "m.py::returned.surrogate": "surrogate", "m.py::passed.custom_jvp": "custom_jvp"}
 
 
 def test_a_custom_derivative_without_its_contract_is_reported(tmp_path):
