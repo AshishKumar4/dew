@@ -19,8 +19,12 @@ from dew.nn.precision import l2norm
 if TYPE_CHECKING:
     from kernel_compile import Expected
 
-COMPILED_SHAPES = {name: CASES[name] for name in ("0.8b", "9b", "27b", "wide keys")}
-"""The shapes every declared config compiles at (`gdn_cases`): the training shapes and the widest keys."""
+COMPILED_SHAPES = {**{name: CASES[name] for name in ("0.8b", "9b", "27b")},
+                   "wide keys": {**CASES["wide keys"], "width": fla_gdn.WIDEST_KEYS,
+                                 "columns": fla_gdn.WIDEST}}
+"""The shapes every declared config compiles at (`gdn_cases`): the training shapes, and the widest keys and
+values the port declares it takes (`fla_gdn.WIDEST_KEYS`, `fla_gdn.WIDEST`), so the compile boundary moves
+with the declared support."""
 
 
 class KernelCase(NamedTuple):
