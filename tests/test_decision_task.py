@@ -941,3 +941,40 @@ def test_an_averaged_task_of_any_layout_saves_reloads_and_serves_as_it_was(decid
     Decide.from_run(directory).save(directory)
     with pytest.raises(ValueError):
         task.save(runs[0])
+
+
+
+def test_a_tournaments_rounds_are_asked_from_the_whole_request(decide):
+    """Each round of a tournament asks its questions from the request it plays (`Decide.__call__`'s
+    `request`), so a row that summarizes its request (`RequestSummary`) summarizes the request the caller
+    asked, not the round's own pieces: its answer is the rounds asked so (review of row 4482)."""
+    from dew.decision.layout import RequestSummary, Text
+
+    request = CASES["many_options"]
+    question = Question.from_wire(request["questions"]["intent"])
+    assert isinstance(question, Choice)
+    asked = {"intent": question}
+    summary = RequestSummary(line="{index}. {name} ({kind}): {instructions}")
+    summarized = replace(decide, layout=replace(decide.layout, segments=(summary, Text("\n"),
+                                                                          *decide.layout.written)))
+    described = dict(zip(question.options, question.descriptions, strict=True))
+    groups = [question.options[0:4], question.options[4:8], question.options[8:11], question.options[11:14]]
+    played = {f"intent/{part}": Choice(question.instructions,
+                                       {option: described[option] for option in group})
+              for part, group in enumerate(groups)}
+    rounds = summarized(request["state"], played, request=asked)
+    winners = [rounds[f"intent/{part}"].choice for part in range(len(groups))]
+    finalists = Choice(question.instructions, {option: described[option] for option in winners})
+    final = summarized(request["state"], {"intent": finalists}, request=asked)["intent"]
+    answer = summarized.tournament(request["state"], asked, rounds=Knockout(group=4))["intent"]
+    assert answer.options == final.options
+    assert answer.probabilities.tolist() == final.probabilities.tolist()
+
+
+def test_options_knocked_out_with_no_probability_share_the_residual_evenly():
+    """A knock-out whose knocked-out options all took nothing in their group round shares the residual
+    evenly among them, as its rule states (`knockout_combine`; review of row 4483)."""
+    from dew.decision.task import _knocked_out
+
+    combined = _knocked_out({"a": 0.75, "b": 0.25}, {"a": 0.5, "b": 0.5, "c": 0.0, "d": 0.0}, 0.01)
+    assert combined["a"] > combined["b"] > combined["c"] == combined["d"] > 0
