@@ -227,15 +227,15 @@ def fla_precision() -> str:
     from fla.ops.gated_delta_rule import chunk_fwd
     from torch_precision import recorded_matmuls
 
+    solve = chunk_fwd.SOLVE_TRIL_DOT_PRECISION
     return recorded_matmuls(FLA_TRIL_PRECISION=os.environ.get("FLA_TRIL_PRECISION", "ieee"),
-                            **{"the intra-chunk solve": str(getattr(chunk_fwd.SOLVE_TRIL_DOT_PRECISION, "value",
-                                                                    chunk_fwd.SOLVE_TRIL_DOT_PRECISION))})
+                            **{"the intra-chunk solve": str(getattr(solve, "value", solve))})
 
 
-def images() -> None:
-    from PIL import Image
+def released():
+    """The release read from OUT over its backbone: the release's module, the backbone's processor, the
+    backbone, the joint head, the model they make and its float64 twin (`joint_twin`)."""
     from safetensors.torch import load_file
-    from torch_precision import float64
     from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
     upstream, model_class = upstream_module()
@@ -245,8 +245,15 @@ def images() -> None:
     head_config = json.loads((OUT / "joint_head_config.json").read_text())
     head = upstream.JointSchemaHead(**head_config).eval()
     head.load_state_dict(load_file(OUT / "joint_head.safetensors"), strict=True)
-    model = model_class(backbone, head).eval()
-    exact = joint_twin(model_class, upstream, backbone, head, head_config)
+    return (upstream, processor, backbone, head, model_class(backbone, head).eval(),
+            joint_twin(model_class, upstream, backbone, head, head_config))
+
+
+def images() -> None:
+    from PIL import Image
+    from torch_precision import float64
+
+    upstream, processor, _, _, model, exact = released()
     request = json.loads((ROOT / "tests" / "fixtures" / "laya" / "cases.json").read_text())["quickstart"]
     pictures = [Image.fromarray(array) for array in np.load(BACKBONE / "images.npy")]
     encoded = upstream.encode_record(processor.tokenizer, {**as_upstream(request), "images": pictures},
@@ -348,23 +355,13 @@ def parity() -> None:
     from recorded_references import provenance, record_case, save
     from reference_releases import require
     from reference_source import git_head
-    from safetensors.torch import load_file
     from torch_precision import float64
-    from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
     require("transformers")
     torch.set_num_threads(1)
     torch.set_float32_matmul_precision("highest")
-    upstream, model_class = upstream_module()
-    processor = AutoProcessor.from_pretrained(BACKBONE)
+    upstream, processor, backbone, head, model, exact = released()
     tokenizer, pad = processor.tokenizer, processor.tokenizer.pad_token_id
-    backbone = Qwen3_5ForConditionalGeneration.from_pretrained(BACKBONE, dtype=torch.float32,
-                                                               attn_implementation="eager").eval()
-    head_config = json.loads((OUT / "joint_head_config.json").read_text())
-    head = upstream.JointSchemaHead(**head_config).eval()
-    head.load_state_dict(load_file(OUT / "joint_head.safetensors"), strict=True)
-    model = model_class(backbone, head).eval()
-    exact = joint_twin(model_class, upstream, backbone, head, head_config)
     table = backbone.get_output_embeddings().weight
     with float64():
         exact_table = exact.language_model.get_output_embeddings().weight
