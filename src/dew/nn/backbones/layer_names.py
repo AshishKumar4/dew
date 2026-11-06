@@ -13,7 +13,7 @@ import jax
 import numpy as np
 
 from dew._coordination import read_home
-from dew.batch import Variables, merge
+from dew.batch import Variables, merge, thaw
 from dew.nn.protocols import BankedStacks, StagedStacks
 
 
@@ -155,7 +155,8 @@ def stored_layers(model, variables: Variables, *, banks: bool = False) -> Variab
         def held(node) -> bool:
             return isinstance(node, Mapping) and 'stages' in node
     elif banks and stages == 1 and isinstance(model, BankedStacks):
-        sites, cut = model.bank_sites(variables), stored_rows
+        # The model plans its runs from the store whole, a trainer's split of its frozen leaves joined.
+        sites, cut = model.bank_sites(thaw(variables)), stored_rows
 
         def held(node) -> bool:
             return isinstance(node, Mapping) and any(len(group_layers(name) or ()) > 1 for name in node)
