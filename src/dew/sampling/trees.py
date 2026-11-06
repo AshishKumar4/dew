@@ -63,6 +63,12 @@ class TreeShape:
             found[parent + 1].append(node)
         return tuple(tuple(each) for each in found)
 
+    @property
+    def fed_parents(self) -> tuple[int, ...]:
+        """Each fed token's parent among the fed tokens, the root's -1 (the row's last cached token), as a
+        cached call states its tree (`dew.nn.inputs.AttentionMetadata.tree`)."""
+        return (-1, *(parent + 1 for parent in self.parents))
+
     def ancestry(self, node: int) -> tuple[int, ...]:
         """Node `node`'s path from the root's child down to itself."""
         path = []
@@ -85,6 +91,18 @@ class TreeBlock(NamedTuple):
         """Each fed token's place `[rows, 1 + N]`: the root's `base`, a node's its depth past it."""
         depths = np.concatenate([[0], self.shape.depths])
         return self.base[:, None] + jnp.asarray(depths)[None, :]
+
+    def key_positions(self, capacity: int | None) -> jax.Array:
+        """Each of a row's `capacity` cache slots' place `[rows, capacity]`
+        (`AttentionMetadata.key_positions`): the prefix's slots counted back from the root's place, a
+        node's slot its depth past the root's. A tree is verified over a bounded cache."""
+        assert capacity is not None, "a tree verifies over a cache of bounded capacity"
+        rows = self.cursor.shape[0]
+        slots = jnp.arange(capacity)[None, :]
+        places = self.base[:, None] - self.cursor[:, None] + slots
+        nodes = self.cursor[:, None] + 1 + jnp.arange(self.shape.nodes)[None, :]
+        depths = self.base[:, None] + jnp.asarray(self.shape.depths)[None, :]
+        return places.at[jnp.arange(rows)[:, None], nodes].set(depths, mode="drop").astype(jnp.int32)
 
     def runs(self) -> jax.Array:
         """Each fed token's key runs `[rows, 1 + N, R, 2]` (`AttentionMetadata.key_runs`), over the cache's
