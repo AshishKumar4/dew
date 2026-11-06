@@ -47,6 +47,7 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     _forward_allocations,
     _plain_forward,
     _trained_forward,
+    certified_walk,
     guarded_columns,
     guarded_tiles,
 )
@@ -673,6 +674,20 @@ def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     (`MosaicForward.declined`)."""
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
     return op.declined(op.bind(*args, residuals=residuals, interpret=False), generation.gpu_target())
+
+
+def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
+              *, scale: float | None = None, natural: bool = NATURAL, interpret: bool = False):
+    """The forward's certify form at the tiles its call derives (`MosaicForward.derived`), its walk the plain
+    one (no P·V a step late): `certified_walk`'s output and its state after each key tile. Off in
+    production; tests/attention_witness.py holds each state to one step's enclosure of the one before."""
+    op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
+    ba = op.bind(*args, residuals=Kept.NONE, interpret=interpret)
+    config = op.derived(ba, generation.gpu_target())
+    if config is None:
+        raise ValueError("no config of the Mosaic mainloop holds the call")
+    return certified_walk(query, key, value, spans, hooks or Hooks(), scale=op.scale, natural=op.natural,
+                          tiles=config, interpret=interpret)
 
 
 def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
