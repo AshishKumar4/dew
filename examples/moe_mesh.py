@@ -48,7 +48,6 @@ from dew.inference import RunProcessor, TextGeneration
 from dew.inference.serving import Server
 from dew.mesh import logical_spec
 from dew.nn.backbones import CausalTransformer, Mixture
-from dew.nn.moe import resolved_dispatch
 from dew.nn.sharding import RESIDUAL
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
@@ -67,7 +66,7 @@ class Config:
     dispatch: str = "auto"
     """`exchange` sends each token to the device that holds its expert (all-to-all);
     `global` computes every expert where the token is, and needs no expert axis; `auto`, the model's
-    default, exchanges on an expert axis that divides the experts (`dew.nn.moe.resolved_dispatch`)."""
+    default, exchanges on an expert axis that divides the experts, which the run records as it ran."""
     experts: int = 8
     top_k: int = 2
     steps: int = 300
@@ -228,10 +227,6 @@ def main(config: Config) -> None:
     kernel = state.variables["params"]["layers_0"]["mlp"]["experts"]["gate_proj"]["kernel"]
     print(f"Expert kernel {kernel.shape} placed as {kernel.sharding.spec}")
     shards = mesh.shape["expert"]
-    # The dispatch the model runs on this mesh, its own default resolved as it resolves it.
-    dispatch = resolved_dispatch(config.dispatch, config.experts, shards)
-    where = placement(mesh, kernel, (config.batch_size, config.sequence_length, 64), trainer.layout,
-                      dispatch)
     # The compiled step returns no routing, so a second forward over the
     # step's parameters and inputs reads the routers' sown selections.
     selections = jax.jit(lambda params, tokens: model.apply(params, tokens, mutable=["router"])[1]["router"])
@@ -243,6 +238,11 @@ def main(config: Config) -> None:
         operations, groups = all_to_all_ops(trainer.executable.as_text())
         print(f"The compiled training step holds {operations} all-to-all operations"
               + (f" over {groups}" if groups else ""))
+        # The dispatch the model ran on this mesh, as its compiled step shows it: `auto`, the model's
+        # default, exchanges where an expert axis divides the experts.
+        dispatch = "exchange" if operations else "global"
+        where = placement(mesh, kernel, (config.batch_size, config.sequence_length, 64), trainer.layout,
+                          dispatch)
         for current in range(1, config.steps + 1):
             # LMObjective predicts text[:, 1:] from text[:, :-1].
             inputs = batch["text"][:, :-1]
