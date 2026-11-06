@@ -810,8 +810,7 @@ def _filled(stage: Artifact) -> Cache:
 
 def _fill(pipeline: Pipeline, source: Source, at: int, read: Read,
           version: int) -> tuple[Cache, Manifest, _Prefix]:
-    """The cache stage at `at`, the manifest its fill is keyed by at data plan `version`, and the record
-    steps before it that fill it, from which memory, indexed and streamed reads all open the cache."""
+    """The cache stage at `at`, its fill's key at plan `version`, and the record steps that fill it."""
     artifact, prefix = pipeline.stages[at], pipeline.stages[:at]
     if not isinstance(artifact, Artifact):
         raise ValueError(f"stage {at} of {_name(pipeline)} is not a cache")
