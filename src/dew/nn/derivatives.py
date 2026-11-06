@@ -34,6 +34,8 @@ from jax.custom_derivatives import CustomVJPPrimal, SymbolicZero
 from jax.extend import core as jax_core
 from jax.extend.core import create_call_primitive
 
+from dew.nn import programs
+
 __all__ = [
     "Algebra",
     "KernelGlue",
@@ -123,24 +125,21 @@ def bound_span[Result](kind: Kind, function: Callable[..., Result], *,
         bound = signature.bind(*args, **kwargs)
         operands = [arg for position, arg in enumerate(bound.args) if position not in fixed]
         # A forward's primal under `symbolic_zeros` (`CustomVJPPrimal`) is its array, its flag bound in.
-        leaves, structure = jax.tree.flatten((operands, bound.kwargs),
-                                             is_leaf=lambda leaf: isinstance(leaf, CustomVJPPrimal))
-        traced = [index for index, leaf in enumerate(leaves) if isinstance(_array(leaf), jax.Array)]
-        if not traced:
+        held, fill = programs.holes((operands, bound.kwargs),
+                                    lambda leaf: isinstance(_array(leaf), jax.Array),
+                                    is_leaf=lambda leaf: isinstance(leaf, CustomVJPPrimal))
+        if not held:
             return function(*args, **kwargs)
 
         def span(*arrays):
-            filled = list(leaves)
-            for index, array in zip(traced, arrays, strict=True):
-                filled[index] = (CustomVJPPrimal(array, leaves[index].perturbed)
-                                 if isinstance(leaves[index], CustomVJPPrimal) else array)
-            given, named = jax.tree.unflatten(structure, filled)
+            given, named = fill([CustomVJPPrimal(array, leaf.perturbed) if isinstance(leaf, CustomVJPPrimal)
+                                 else array for leaf, array in zip(held, arrays, strict=True)])
             positional, rest = [], iter(given)
             for position, arg in enumerate(bound.args):
                 positional.append(arg if position in fixed else next(rest))
             return function(*positional, **named)
 
-        return marked(kind, span)(*(_array(leaves[index]) for index in traced))
+        return marked(kind, span)(*map(_array, held))
     return call
 
 
