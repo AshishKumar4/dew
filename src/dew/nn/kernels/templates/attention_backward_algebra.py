@@ -39,9 +39,12 @@ def softmax_cotangents(logits, products, peak, total, anchor, delta, keep=None, 
     if at_anchor is not None:
         about = jnp.where(at_anchor, 0.0, about)
     weights = e * over
-    # The fast form's cotangents from the weights it forms anyway (FlashAttention's order, 16 multiplies a
-    # tile fewer on the fused dK/dV launch, ET-CONFLICTS-h100); the accurate form's normalized last.
-    cotangents = (e * ((about - per_query(delta)) * over) if accurate
+    # Each mainloop's hand form's order: Mosaic's fast form takes its cotangents from the weights it forms
+    # anyway (FlashAttention's order, 16 multiplies a tile fewer on the fused dK/dV launch,
+    # ET-CONFLICTS-h100); a form that holds its anchor (portable's and Triton's, the accurate form) scales
+    # each cotangent before the denominator, so a weight below float32's least subnormal (e times 1/T) is no
+    # zero where its cotangent is not (the fp32 small-weight edge, 2.77e7 times the reference's error).
+    cotangents = (e * ((about - per_query(delta)) * over) if accurate or at_anchor is not None
                   else weights * (about - per_query(delta)))
     return e, weights, gradient.where_seen(seen, cotangents, 0.0)
 
