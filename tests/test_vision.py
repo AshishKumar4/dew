@@ -482,20 +482,21 @@ def test_a_moonvit_pools_frames_finitely_beside_a_padded_item():
 def test_a_bicubic_resize_weighs_each_pixel_as_torch_does_in_its_inputs_dtype(dtype, antialias):
     """A bicubic resize (`torch_bicubic_resize`, a vision tower's position table, REPA's and RAE's
     preprocessing) weighs each source pixel as torch's `F.interpolate(mode="bicubic")` does, in the
-    dtype its input computes in, float64's for a float64 input: each unit image of seven rows resized to
-    five and to eleven is torch's same resize, bit for bit, its one nonzero pixel reading out that
-    pixel's weight in each output row, where float32 weights left a float64 resize rounded at 1e-8."""
+    dtype its input computes in, float64's for a float64 input: each unit image of seven rows (three
+    columns wide, which a resize to three columns weighs by one) resized to five and to eleven rows is
+    torch's same resize, bit for bit, its one nonzero row reading out that row's weight in each output
+    row, where float32 weights left a float64 resize rounded at 1e-8."""
     import torch
 
     from dew.nn.blocks import torch_bicubic_resize
 
     for size_out in (5, 11):
-        units = np.eye(7).reshape(7, 7, 1, 1)
+        units = np.eye(7)[:, :, None, None].repeat(3, axis=2)
         with jax.enable_x64(new_val=True):
-            ours = np.asarray(torch_bicubic_resize(jnp.asarray(units, dtype), size_out, 1,
+            ours = np.asarray(torch_bicubic_resize(jnp.asarray(units, dtype), size_out, 3,
                                                    antialias=antialias))
         theirs = torch.nn.functional.interpolate(
-            torch.tensor(units.transpose(0, 3, 1, 2), dtype=getattr(torch, dtype)), size=(size_out, 1),
+            torch.tensor(units.transpose(0, 3, 1, 2), dtype=getattr(torch, dtype)), size=(size_out, 3),
             mode="bicubic", align_corners=False, antialias=antialias).numpy().transpose(0, 2, 3, 1)
         assert ours.dtype == theirs.dtype
         np.testing.assert_array_equal(ours, theirs, err_msg=f"7 to {size_out}")
