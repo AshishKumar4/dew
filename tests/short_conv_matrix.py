@@ -26,11 +26,11 @@ from dew.nn.linear import causal_conv1d
 CHOICES = frozenset({"short_conv"})
 """The generation.CHOICES entries the family's cells run (row 184)."""
 
-KERNELS = {"short_conv": frozenset({"pallas"})}
-"""The kernels each choice's cells run under test (row 4513): Dew's Triton conv."""
+KERNELS = {"short_conv": frozenset({"mosaic_gpu"})}
+"""The kernels each choice's cells run under test (row 4513): the recurrence template's conv."""
 
-KERNEL = "pallas"
-"""The conv's kernel each cell holds to XLA's: Dew's Triton kernels (`short_conv.conv`)."""
+KERNEL = "mosaic_gpu"
+"""The conv's kernel each cell holds to XLA's: the recurrence template's (`short_conv.conv`)."""
 
 
 def _routed(kernel: str):
