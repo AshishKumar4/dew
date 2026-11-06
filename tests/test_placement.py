@@ -27,17 +27,6 @@ from dew.training import Trainer
 RULES = Layout().axis_rules
 
 
-def splits(name: str) -> list[tuple[str, ...]]:
-    """The mesh axes each of `name`'s rules splits a dimension over, in precedence order, fsdp's with the
-    sequence axis it splits beside (`state_spec`)."""
-    found = []
-    for rule, assignment in RULES:
-        if rule == name and assignment is not None:
-            axes = mesh_axes(assignment)
-            found.append((*axes, SEQUENCE_AXIS) if FSDP_AXIS in axes else axes)
-    return found
-
-
 def assert_placed(name: str, tree, placement, mesh, table=None) -> None:
     """Each leaf of `tree`, as `placement` places it on `mesh`, holds the layout's invariants for the axes its
     module declares (`declared`, read through `table` where the run's table names them)."""
@@ -49,7 +38,7 @@ def assert_placed(name: str, tree, placement, mesh, table=None) -> None:
         assert sharding.memory_kind == "device", where
         spec = tuple(sharding.spec)
         assert len(spec) <= leaf.ndim, (where, spec)
-        per_dim = [mesh_axes(entry) for entry in spec]
+        per_dim = [mesh_axes(entry) for entry in spec] + [()] * (leaf.ndim - len(spec))
         used = [axis for entry in per_dim for axis in entry]
         assert len(used) == len(set(used)), (where, spec)
         assert set(used) <= set(mesh.axis_names) and not set(used) & set(UNSPLIT_AXES), (where, spec)
@@ -71,28 +60,28 @@ def assert_placed(name: str, tree, placement, mesh, table=None) -> None:
             else:
                 assert not used, (where, spec)
         else:
-            # Every split, fsdp's among them, is one its dimension's declared axis's rules name
-            # (`dew.mesh.logical_spec`: a declared leaf takes no shape fallback).
-            for dim, entry in enumerate(per_dim):
-                ruled = {axis for split in splits(named[dim]) for axis in split} if named[dim] else set()
-                assert set(entry) <= ruled, (where, named, spec)
-            # And a leaf one of whose dimensions its name's first rule splits, dividing it, is split.
-            wanted = [first_split(name, size, mesh) for name, size in zip(named, leaf.shape, strict=True)]
-            assert used or not any(wanted), (where, named, spec)
+            # Each dimension is split by the first rule of its name, in the layout's order, whose live axes
+            # divide it and are held by no other dimension: none stays whole while such a rule is left, none
+            # is split by a later rule or over axes no rule of its name names (`dew.mesh.logical_spec`: a
+            # declared leaf takes no shape fallback, and flax gives each axis to one dimension).
+            for dim, (entry, size) in enumerate(zip(per_dim, leaf.shape, strict=True)):
+                held = {axis for other, axes in enumerate(per_dim) if other != dim for axis in axes}
+                assert entry == first_free(named[dim], size, mesh, held), (where, named, spec)
 
 
-def first_split(name: str | None, size: int, mesh) -> tuple[str, ...]:
-    """The live mesh axes the first rule of `name` that splits anything on `mesh` names, where they divide
-    `size`; empty for an undeclared dimension, a name whose first such rule keeps it whole, or one that does
-    not divide it (`dew.mesh.logical_spec` drops a rule whose axes are all of size one)."""
+def first_free(name: str | None, size: int, mesh, held: set[str]) -> tuple[str, ...]:
+    """The live mesh axes of the first rule of `name` on `mesh` whose axes divide `size` and none of which
+    `held` holds, in the rule's order; empty for an undeclared dimension, a name whose rule keeping it whole
+    comes first, or one no such rule is left of (`dew.mesh.logical_spec` drops the axes of size one and sets
+    aside a rule that does not divide its dimension)."""
     for rule, assignment in RULES if name is not None else ():
         if rule != name:
             continue
         if assignment is None:
             return ()
         live = tuple(axis for axis in mesh_axes(assignment) if mesh.shape.get(axis, 1) > 1)
-        if live:
-            return live if size % math.prod(mesh.shape[axis] for axis in live) == 0 else ()
+        if live and not set(live) & held and size % math.prod(mesh.shape[axis] for axis in live) == 0:
+            return live
     return ()
 
 
