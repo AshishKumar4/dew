@@ -43,9 +43,10 @@ def test_the_fp8_preset_names_the_recipe_and_keeps_the_runs_dtypes():
 def test_the_routers_gates_and_head_never_reach_the_fp8_projection():
     """Under the 'fp8' numerics a model's forward routes each projection by its role (the routes its trace
     reports, `generation.routes`): every attention projection, the dense feed-forward's, the shared
-    expert's and the experts' three take the recipe, seventeen in all; the shared expert's gate and the
-    untied head keep the run's dtypes, each route naming its role, and the router, whose scores are an fp32
-    einsum, the norms and the embedding reach no product the recipe reads."""
+    expert's and the experts' three take the recipe, seventeen in all; the shared expert's gate keeps the
+    run's dtypes, its route naming its role, and the router, whose scores are an fp32 einsum, the untied
+    head, whose product keeps its fp32 result, the norms and the embedding reach no product the recipe
+    reads."""
     model = mixed()
     tokens = jnp.asarray(np.random.default_rng(0).integers(0, VOCAB, (2, 64)), jnp.int32)
     params = jax.eval_shape(model.init, jax.random.key(0), tokens)
@@ -54,8 +55,7 @@ def test_the_routers_gates_and_head_never_reach_the_fp8_projection():
     recipe = [route for route in found if route.choice == "blockwise_fp8"]
     kept = sorted(str(route.refusal) for route in recipe if route.kernel == "unquantized")
     taken = [route for route in recipe if route.kernel != "unquantized"]
-    assert kept == ["a role-less projection keeps the run's dtypes under blockwise_fp8",
-                    "a shared_gate projection keeps the run's dtypes under blockwise_fp8"], kept
+    assert kept == ["a shared_gate projection keeps the run's dtypes under blockwise_fp8"], kept
     # Layer 0: q, k, v, o and the dense gate, up and down; layer 1: q, k, v, o, the shared expert's three
     # and the experts' gate, up and down.
     assert len(taken) == 17, [route.site for route in taken]
@@ -115,7 +115,8 @@ def step(model):
     cross entropy over the drawn tokens."""
     def loss(params, tokens):
         with generation.run_precision(FP8):
-            logits = model.apply(params, tokens[:, :-1]).astype(jnp.float32)
+            logits = model.apply(params, tokens[:, :-1])
+        logits = logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
         picked = jnp.take_along_axis(jax.nn.log_softmax(logits), tokens[:, 1:, None], axis=-1)
         return -jnp.mean(picked)
     return loss
