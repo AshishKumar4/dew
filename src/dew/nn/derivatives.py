@@ -49,7 +49,7 @@ __all__ = [
 ]
 
 
-def contracted[Function](test: str) -> Callable[[Function], Function]:
+def contracted[Function](test: str, /) -> Callable[[Function], Function]:
     """A custom derivative's contract, declared where the derivative is made: `test`, the name of the one
     test function of tests/test_contracts_*.py that holds every order of it finite against its float64
     truth and an independent plain formula. The function it decorates or wraps is returned unchanged;
