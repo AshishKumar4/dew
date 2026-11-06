@@ -969,6 +969,34 @@ def test_an_hoppers_blockwise_fp8_kernel_gradient_runs_the_template_named_for_it
     assert route_failures(cases, compile_mosaic_kernels(cases, "sm90")) == []
 
 
+def _gathered_projection():
+    """Qwen3-30B-A3B's gate projection (2048 deep, 768 wide, 128 experts) of 8192 tokens' eight routed rows,
+    gathered from the tokens by a table (`gmm`'s `gather`), on an H100's derived template tile."""
+    from dew.nn.kernels import grouped_matmul
+
+    tiles = mosaic_gpu.Tiles(128, 128, 64, 4, 1, warpgroups=2, family="wgmma")
+
+    def product(tokens, table, matrices, sizes):
+        launched = grouped_matmul.MosaicGmm()._launched(tiles, False)
+        return mosaic_gpu.gmm(tokens, matrices, sizes, tiles=tiles, transpose_rhs=False,
+                              out_dtype=jnp.bfloat16, multiprocessors=launched, gather=table)
+
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    int32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.int32)
+    return product, (bf16((8192, 2048)), int32((65536,)), bf16((128, 2048, 768)), int32((128,)))
+
+
+def test_an_hoppers_gathered_projection_compiles_its_rows_a_copy_a_row():
+    """A grouped projection whose rows are gathered from the tokens by a table, compiled for a compile-only
+    H100: its program launches the template's grouped product (`kernel_compile.Expected`, its route
+    evidence), its rows' 1-row copies landing in the stage's swizzled rows (`Ring.parts`; row 1376)."""
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    expected = Expected(axes=(("data", 1),), specs=(None,) * 4, launches=frozenset({"dew_gmm"}))
+    cases = [support.KernelCase("gathered projection", _gathered_projection, expected=expected)]
+    assert route_failures(cases, compile_mosaic_kernels(cases, "sm90")) == []
+
+
 def test_each_triton_call_needs_a_launch_of_its_own():
     """A program's Triton calls, one named as another begins and one made twice, compiled for a compile-only
     A100: with every launch line XLA writes, the gate reads their shared bytes; without one of the two

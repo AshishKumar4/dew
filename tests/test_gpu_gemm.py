@@ -6,6 +6,8 @@ one process (`gpu_flow`), each cell its own file's property:
   routes a row (test_grouped_gemm).
 - The blockwise FP8 kernel gradient (rows contiguous, step scales) holds check 1 on an H100
   (test_gemm_blockwise).
+- A gathered grouped product (its rows a table's, a copy a row) holds check 1 on an H100
+  (test_gemm_template; row 1376).
 - The template takes gpt-oss's 2880-wide projection, its ragged stores' one-row rungs, as exactly as XLA's
   (test_grouped_gemm; row 4474).
 - A ring streams tiles of their own trip counts, and consumers feeding their own ring split a step, on an
@@ -133,6 +135,7 @@ def test_the_gemm_kernels_run_on_this_gpu():
              grouped_gemm.the_template_takes_a_gpt_oss_width_as_exactly_as_xla),
         Cell("the blockwise FP8 kernel gradient is on par",
              gemm_blockwise.a_blockwise_kernel_gradient_is_on_par, "sm90"),
+        Cell("a gathered grouped product is on par", gemm_template.a_gathered_product_is_on_par, "sm90"),
         *(Cell(f"CUTLASS runs a mapped projection as exactly as XLA where chosen: "
                f"{'shared' if shared else 'mapped'} matrices",
                functools.partial(grouped_gemm.cutlass_runs_a_mapped_projection_as_exactly_as_xla_where_chosen,
