@@ -1523,11 +1523,13 @@ def _weighted_staged(call: Call, keyed: int) -> tuple:
 
 
 def _weighted_values_held(call: Call) -> Held:
-    """`_weighted_values`' consumer thread: the inverse, a value tile and its product, the product's
-    fragments."""
+    """`_weighted_values`' consumer thread: the inverse, a value tile, its write-gated fp32 copy beside the
+    product's accumulator (`algebra.weighted`, as `_weighted_held` states a value block's), the product's
+    fragments. Its gated copy unstated, an H100's ptxas asked 58 registers of the 48 its residency left
+    (jsf-kdaintra6)."""
     held, vb = dataclasses.replace(call.held, rows=call.rows), call.value_block
-    return Held(phases=(held_tile(held, CHUNK, CHUNK) + held_tile(call.given, CHUNK, vb) + [f32(CHUNK, vb)]
-                        + fragments(call, (held, CHUNK, CHUNK), (call.given, CHUNK, vb)),))
+    products = held_tile(held, CHUNK, CHUNK) + held_tile(call.given, CHUNK, vb) + [f32(CHUNK, vb)] * 2
+    return Held(phases=(products + fragments(call, (held, CHUNK, CHUNK), (call.given, CHUNK, vb)),))
 
 
 @lowered_once
