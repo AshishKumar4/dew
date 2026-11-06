@@ -67,7 +67,8 @@ def check_schedule(ref, case):
     config = json.loads(str(ref[case + ".config"]))
     policy = SourceSchedule.from_config(config)
     # The table is a function of the config alone, with no draw to vary: the source's float32 table to
-    # the bit, or, rescaled for zero terminal SNR, its float64 table rounded once (`published_betas`).
+    # the bit, or, rescaled for zero terminal SNR, its float64 table rounded once (`published_betas`),
+    # held so by docs/design/testing.md's exact-table rule (row 4569).
     table = ref[case + (".betas.fp64" if config.get("rescale_betas_zero_snr", False) else ".betas")]
     np.testing.assert_array_equal(policy.betas, table.astype(np.float32), err_msg=f"{case} betas")
     process, times = policy.sampling(STEPS)
