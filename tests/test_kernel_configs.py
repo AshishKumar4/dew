@@ -943,6 +943,32 @@ def test_an_amperes_nvfp4_product_compiles_its_packed_kernel():
     assert route_failures(cases, compile_mosaic_kernels(cases, "sm80")) == []
 
 
+def _blockwise_gradient():
+    """A blockwise-scaled FP8 MoE projection's kernel gradient (`gemm.blockwise_fp8_kernel_gradient`: 2048
+    deep, 768 wide, eight experts of 4 to 12 whole 128-row blocks) through the template named."""
+    from dew.nn.kernels import gemm
+
+    def gradient(lhs_t, rhs_t, row_scales, column_scales):
+        with generation.chosen(blockwise_fp8="mosaic_gpu"):
+            return gemm.blockwise_fp8_kernel_gradient(lhs_t, rhs_t, jnp.asarray([4, 12, 8, 4, 4, 8, 8, 16]),
+                                                      row_scales, column_scales, out_dtype=jnp.float32)
+
+    fp8 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float8_e4m3fn)
+    f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
+    return gradient, (fp8((2048, 8192)), fp8((768, 8192)), f32((64, 2048)), f32((64, 768)))
+
+
+def test_an_hoppers_blockwise_fp8_kernel_gradient_runs_the_template_named_for_it():
+    """A blockwise-scaled FP8 kernel gradient, the template named, compiled for a compile-only H100: its
+    program launches the template's kernel gradient (`kernel_compile.Expected`, its route evidence; row
+    4518)."""
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    expected = Expected(axes=(("data", 1),), specs=(None,) * 4, launches=frozenset({"dew_tgmm"}))
+    cases = [support.KernelCase("blockwise fp8 gradient", _blockwise_gradient, expected=expected)]
+    assert route_failures(cases, compile_mosaic_kernels(cases, "sm90")) == []
+
+
 def test_each_triton_call_needs_a_launch_of_its_own():
     """A program's Triton calls, one named as another begins and one made twice, compiled for a compile-only
     A100: with every launch line XLA writes, the gate reads their shared bytes; without one of the two
