@@ -274,7 +274,7 @@ class SlotSource(SourceKind):
             directory, SlotSource.layout(max_len=released_length(directory, SLOT_WINDOW), labels=labels,
                                          blocks=blocks), Calibration(), kind=QuestionLayout)
         read = layout.labels or labels
-        ids = read.ids(tokenizer, min(count, len(read.names)))
+        ids = read.ids(tokenizer, min(count, read.capacity(tokenizer)))
         head = (SlotHeadSource({"class": import_path(LabelReadout), "fields": {
                     "label_ids": [list(row) for row in ids]}}, _path)
                 if mode == "slot_lm" else SlotHeadSource({"class": import_path(SlotReadout), "fields": {
