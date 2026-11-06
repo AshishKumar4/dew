@@ -45,13 +45,7 @@ from dew.objectives.base import OMITTED, Aux, EMASpec, Omitted, Ratio, Shown, So
 from dew.objectives.lm.chunked import final_read, refuse_without_logits
 from dew.objectives.lm.head import HeadedObjective
 from dew.objectives.lm.objective import batch_text, text_preview
-from dew.objectives.routing import (
-    ExpertBalance,
-    RoutedStatistics,
-    apply_routed,
-    reduce_routed,
-    refuse_fixed_router,
-)
+from dew.objectives.routing import ExpertBalance, RoutedStatistics, apply_routed, reduce_routed
 from dew.sampling.walks import sample
 
 if TYPE_CHECKING:
@@ -148,7 +142,6 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         self.model = model
         self.process = process
         self.seq_len = seq_len
-        refuse_fixed_router(model, balance, self.variables)
         self.balance = balance
         self.use_head(head_chunks, head_tile)
         self.solver = solver
