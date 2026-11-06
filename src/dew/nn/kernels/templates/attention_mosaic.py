@@ -477,14 +477,10 @@ class MosaicForward(_Mainloop[Tiles]):
         unit = family.column_unit(query.dtype)
         widths = [whole // 2 ** halved for halved in range(whole.bit_length())
                   if whole % 2 ** halved == 0 and (whole // 2 ** halved) % unit == 0]
-        # An fp32 call's on one consumer, as its guarded walk is (`guarded_tiles`): its weights' parts beside
-        # the natural exponential's terms (a training forward's at 64 x 64 on two, width 64, spilled 48
-        # bytes on an H100 where its model priced 174 of 240).
-        most = 1 if self.parts > 1 else config.consumers
         relaunches = (dataclasses.replace(config, block_k=block, consumers=consumers, natural_form=True,
                                           columns=None if columns == whole else columns)
                       for columns in widths
-                      for consumers in range(most, 0, -1)
+                      for consumers in range(config.consumers, 0, -1)
                       for block in walked_extents(family, query.dtype, config.block_k)
                       if config.block_k % block == 0)
         relaunch = next((tiles for tiles in relaunches if self._launch_legal(ba, tiles, target)), None)
