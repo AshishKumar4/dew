@@ -15,7 +15,7 @@ transformers 5 ships no Flax CLIP, so a Flax text tower is read through its
 PyTorch twin alone, and the Flax pipelines themselves cannot be built here.
 
 `flax_unet` is the declared Flax UNet as a JAX function, `unet_predictor` runs the
-declared UNet (Flax or PyTorch) on the host, and `denoiser_prediction` a
+declared UNet (Flax or PyTorch) on the host, and `denoiser` a
 declared PyTorch denoiser, in float32 or in float64 (`torch_precision.float64`
 for PyTorch, x64 and `flax_precision.float64` for Flax), for a forward the
 caller holds Dew's to by tests/reference_error.py's rule.
@@ -195,13 +195,20 @@ def unet_predictor(export: Path, *, wide: bool = False):
     return predict
 
 
-def denoiser_prediction(export: Path, call, *, wide: bool = False) -> np.ndarray:
-    """`call(model, tensor)` on the declared PyTorch denoiser, in float32 or
-    (`wide`) float64: `tensor` turns an array into a tensor of the model's
-    dtype, and `call` returns the prediction as an array."""
+def denoiser(export: Path, call, *, wide: bool = False):
+    """The declared PyTorch denoiser, loaded once in float32 or (`wide`)
+    float64, as a function of a draw's inputs: `call(model, tensor, *inputs)`
+    on it, `tensor` turning an array into a tensor of the model's dtype, and
+    `call` returning the prediction as an array."""
     [name] = [name for name in weighted_components(export) if name in DENOISERS]
     dtype = torch.float64 if wide else torch.float32
     with precision(wide):
         model = load(export, name, dtype)
-        with torch.no_grad():
-            return np.asarray(call(model, lambda value: torch.from_numpy(np.asarray(value)).to(dtype)))
+
+    def predict(*inputs):
+        def tensor(value):
+            return torch.from_numpy(np.asarray(value)).to(dtype)
+
+        with precision(wide), torch.no_grad():
+            return np.asarray(call(model, tensor, *inputs))
+    return predict

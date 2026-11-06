@@ -261,24 +261,32 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
     # Diffusers' own classes read the export: every component cleanly, the
     # pipeline whole, and its transformer recomputes the trained forward on
     # the packed latent with FluxPipeline's own position ids.
+    from diffusion_support import assert_export_recomputes
+
     from tools import diffusers_consumer as consumer
 
     consumer.assert_components_load(export)
+    forward = jax.jit(lambda drawn: loaded.model.apply({"params": state.variables["params"]}, drawn, times,
+                                                       condition))
 
-    def call(model, tensor):
+    def draw(seed):
+        """A latent of the pipeline's shape, its values drawn."""
+        return (np.random.default_rng([4441, seed]).standard_normal(latent.shape).astype(np.float32),)
+
+    def call(model, tensor, drawn):
         # Imported after the consumer, which restores the transformers names
         # Diffusers' pipeline modules read.
         from diffusers import FluxPipeline
 
         positions = FluxPipeline._prepare_latent_image_ids(1, grid, grid, "cpu", model.dtype)
-        output = model(hidden_states=tensor(packed), encoder_hidden_states=tensor(condition.context),
+        output = model(hidden_states=tensor(packed(np.asarray(drawn))),
+                       encoder_hidden_states=tensor(condition.context),
                        pooled_projections=tensor(condition.pooled), timestep=tensor(times) / 1000,
                        guidance=tensor(condition.guidance), img_ids=positions,
                        txt_ids=tensor(np.zeros((condition.context.shape[1], 3)))).sample
         return unpacked(output.numpy(), grid, grid)
 
-    assert_as_exact_as_the_reference(np.asarray(trained), consumer.denoiser_prediction(export, call),
-                                     consumer.denoiser_prediction(export, call, wide=True), "trained Flux")
+    assert_export_recomputes(export, forward, call, draw, "trained Flux")
 
 
 def test_each_records_guidance_reaches_the_model_and_survives_the_shared_seams(
