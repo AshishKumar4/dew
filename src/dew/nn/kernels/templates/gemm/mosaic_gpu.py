@@ -498,8 +498,11 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         # Dew: a product of no depth sums nothing, its rows zeros through the epilogue on whole arrays (its
         # hooks are a tile's elementwise arithmetic), with no launch: a walk of no steps has no block of the
         # matrix to view (JAX 0.12 refuses a zero-extent slice).
+        # Its side operands by group read at each row as XLA's program reads them (`axes.at_rows`, row 4489).
         zeros = (jnp.zeros((rows, n), jnp.float32),) * accumulators
-        values = zeros if epilogue is None else epilogue(*zeros, *epilogue_operands)
+        by_row = tuple(axes.at_rows(side, side_axes, group_sizes, rows) if axes.GROUPS in side_axes else side
+                       for side, side_axes in zip(epilogue_operands, epilogue_axes, strict=True))
+        values = zeros if epilogue is None else epilogue(*zeros, *by_row)
         values = values if isinstance(values, tuple) else (values,)
         outs = tuple(value.astype(dtype) for value, dtype in zip(values, dtypes, strict=True))
         return outs if out_dtypes else outs[0]

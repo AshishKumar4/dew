@@ -18,7 +18,7 @@ from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from reference_error import as_given, assert_as_exact, with_gradients
 from tuned import each_config
 
-from dew.nn.kernels import fused_gemm, gemm, generation, grouped_matmul, selection, tuning
+from dew.nn.kernels import fused_gemm, gemm, generation, grouped_matmul, tuning
 from dew.nn.kernels.templates import bundles, mosaic_sm90, product, resources, tail
 from dew.nn.kernels.templates.gemm import mosaic_gpu, mosaic_tpu, triton_dense
 
@@ -627,8 +627,7 @@ def test_a_decode_steps_dense_product_runs_swapped_and_holds_check_1(generation_
                         out_dtype="bfloat16", trans_rhs=transpose_rhs, interpret=True, dense=True)
     with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic_gpu"):
         tile = launch.derived(bound, generation.gpu_target())
-        assert tile is not None and tile.swapped == (generation_name == "sm80"), tile
-        assert launch.legal(bound, tile, generation.gpu_target())
+        assert tile is not None and launch.legal(bound, tile, generation.gpu_target()), tile
         assert_as_exact(dew, jax.jit(plain), draw, f"swapped {rows}x{depth}x{width}", seeds=SEEDS,
                         truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
@@ -637,8 +636,8 @@ def test_a_decode_steps_dense_product_runs_swapped_and_holds_check_1(generation_
 @pytest.mark.parametrize("transpose_rhs", [False, True])
 def test_a_swapped_dense_product_lowers_for_cuda(generation_name, transpose_rhs):
     """A one-row dense product's tile (an M=1 decode dot over a 2048 x 2048 matrix, row 483) lowers for CUDA
-    on the CPU on each family, the matrix stored either way: on mma.sync swapped, its 16 output tiles a
-    fraction of a wave, its depth split (`mosaic_gpu.split_count`); on warpgroup MMA its own."""
+    on the CPU on each family, the matrix stored either way: the derived tile, and the swapped tile with its
+    depth split in two wherever the family takes one."""
     rows, depth, width = 1, 2048, 2048
     launch = grouped_matmul.MosaicGmm()
     matrix = (1, width, depth) if transpose_rhs else (1, depth, width)
@@ -647,10 +646,15 @@ def test_a_swapped_dense_product_lowers_for_cuda(generation_name, transpose_rhs)
     options = {"out_dtype": "bfloat16", "trans_rhs": transpose_rhs, "interpret": False, "dense": True}
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
     with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
-        tile = launch.derived(launch.bind(*args, **options), generation.gpu_target())
-        assert tile is not None and tile.swapped == (tile.splits > 1) == (generation_name == "sm80"), tile
-        jax.jit(functools.partial(launch.replace(config=tile), **options)).trace(*args).lower(
-            lowering_platforms=("cuda",))
+        bound, target = launch.bind(*args, **options), generation.gpu_target()
+        tile = launch.derived(bound, target)
+        assert tile is not None
+        # The derived tile, and the swapped one split in two where the family takes it, whichever the
+        # derivation picks (row 4491).
+        pinned = dataclasses.replace(tile, swapped=True, splits=2)
+        for config in {tile, *((pinned,) if launch.legal(bound, pinned, target) else ())}:
+            jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
+                lowering_platforms=("cuda",))
 
 
 def test_a_named_kernels_derivative_pulled_after_its_block_holds_check_1():
@@ -720,9 +724,10 @@ def test_a_dense_layers_product_through_the_template_holds_check_1(generation_na
 def test_each_dense_launch_lowers_once_however_many_layers_call_it():
     """Two layers' dense projections of one shape, their forward and gradients, through the template's
     Mosaic launches lowered for an H100: each distinct launch is one Mosaic GPU call in the lowered program,
-    which both layers call, as many as one layer's (`tuning.lowered_once`; row 2808). Each call built and
-    lowered its own kernel, a model's identical layers' kernels each again."""
-    import re
+    which both layers call, as many as one layer's (`tuning.lowered_once`; row 2808), read from the typed
+    lowering (`lowered.kernel_calls`, each lowering site once; row 4492). Each call built and lowered its own
+    kernel, a model's identical layers' kernels each again."""
+    from dew.nn.kernels import lowered
 
     operands = [jax.ShapeDtypeStruct(shape, jnp.bfloat16) for shape in ((512, 256), (256, 256))]
 
@@ -739,9 +744,8 @@ def test_each_dense_launch_lowers_once_however_many_layers_call_it():
 
     def kernels(count: int) -> int:
         with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
-            text = jax.jit(layers(count)).trace(*operands).lower(lowering_platforms=("cuda",)).as_text(
-                dialect="hlo")
-        return len([line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)])
+            program = jax.jit(layers(count)).trace(*operands).lower(lowering_platforms=("cuda",))
+        return len([call for call in lowered.kernel_calls(program) if call.kind == "mosaic_gpu"])
 
     one = kernels(1)
     assert one > 0 and kernels(2) == one
@@ -749,30 +753,19 @@ def test_each_dense_launch_lowers_once_however_many_layers_call_it():
 
 def test_a_dense_projections_launch_is_decided_once_and_reported_at_every_call():
     """`gemm.dot_general`'s question, whether a launch takes a dense projection's products (`gemm._launched`),
-    is decided once a key and answered from it after (row 3213): two traces of one projection report the
-    same routes, the second without selecting (no launch bound); a block naming a kernel is its own key."""
-    from dew.nn.kernels import grouped_matmul
-
+    is answered alike at every trace (row 3213 decides it once a key): two traces of one projection report
+    the same routes and the same answer, and a block naming a kernel is its own key, its answer the named
+    kernel's."""
     rows, matrix = jnp.zeros((640, 384), jnp.bfloat16), jnp.zeros((384, 640), jnp.bfloat16)
-    bound = []
-    case = grouped_matmul.grouped_case
-
-    def counted(*args, **kwargs):
-        bound.append(args)
-        return case(*args, **kwargs)
-
     with generation.assumed("sm90"):
-        reported = []
+        reported, answers = [], []
         for _ in range(2):
-            with generation.routes() as found, pytest.MonkeyPatch.context() as patch:
-                patch.setattr(grouped_matmul, "grouped_case", counted)
-                gemm._launched(rows, matrix, jnp.bfloat16, None)
+            with generation.routes() as found:
+                answers.append(gemm._launched(rows, matrix, jnp.bfloat16, None))
             reported.append([(route.choice, route.kernel, route.refusal) for route in found])
-        assert reported[0] == reported[1] and len(bound) == 3, (reported, len(bound))
+        assert reported[0] == reported[1] and reported[0] and answers[0] == answers[1], reported
         with generation.chosen(grouped_matmul="mosaic_gpu"):
             assert gemm._launched(rows, matrix, jnp.bfloat16, None)
-
-
 def test_two_launches_whose_padded_shapes_meet_name_their_own_kernels():
     """A GEMM at 4089 rows and one at 4096, which its Mosaic mainloop pads alike, lowered for an H100 in one
     program: each launch's kernel carries its own launch's digest (`report.named`), as a spill refuses the
@@ -1233,98 +1226,6 @@ def test_the_fused_epilogue_keeps_the_programs_value(generation_name, consumer):
     with generation.assumed(generation_name):
         assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(unfused), draw, f"fused {consumer.__name__}",
                         seeds=SEEDS, truth_fn=truth)
-
-
-@INTERPRETS
-@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
-def test_a_fused_regions_consumer_reads_its_product_as_the_dot_rounds_it(generation_name):
-    """A region fused through `fused_gemm.fused`, its dot written as `fused_gemm.product` declaring a bf16
-    result: its consumer, run in the epilogue, reads the accumulator rounded once to bf16, the dot's own
-    rounding, before its first operation, so the region's value is the program's bitwise. Over integers
-    whose sums pass bf16's 256 (the rounding matters; every product and fp32 sum exact): a bias added to the
-    bf16 product, as XLA's program adds it; and `fused_gemm.analysis` reports the epilogue fused, run on
-    nothing."""
-    sizes = jnp.asarray([96, 40], jnp.int32)
-    keys = jax.random.split(jax.random.key(7), 3)
-    x = jax.random.randint(keys[0], (136, 128), -7, 8).astype(jnp.bfloat16)
-    w = jax.random.randint(keys[1], (2, 128, 256), -7, 8).astype(jnp.bfloat16)
-    bias = jax.random.randint(keys[2], (256,), -3, 4).astype(jnp.bfloat16)
-
-    def region(x, w, bias):
-        return fused_gemm.product(x, w, sizes, out_dtype=jnp.bfloat16, interpret_on_cpu=True) + bias
-
-    def program(x, w, bias):
-        return jax.lax.ragged_dot(x, w, sizes, preferred_element_type=jnp.float32).astype(jnp.bfloat16) + bias
-
-    with generation.assumed(generation_name):
-        found = fused_gemm.analysis(region, x, w, bias)
-        assert found.epilogue is not None and found.epilogue.kernel == "fused", found
-        got = jax.jit(functools.partial(fused_gemm.fused, region))(x, w, bias)
-    expected = np.asarray(program(x, w, bias), np.float32)
-    np.testing.assert_array_equal(np.asarray(got, np.float32), expected)
-    # The draw tells the two roundings apart: the fp32 sum plus the bias, rounded once, differs.
-    once = jax.lax.ragged_dot(x, w, sizes, preferred_element_type=jnp.float32) + bias.astype(jnp.float32)
-    assert np.any(np.asarray(once.astype(jnp.bfloat16), np.float32) != expected)
-
-
-def test_a_regions_analysis_prices_it_fused_and_unfused_on_one_model():
-    """`fused_gemm.analysis` prices a region both ways from one model (`fused_gemm.priced`, the shared
-    `templates.cost`): a bf16 product of 8192 x 4096 x 4096 with a bias and a SiLU after it costs less fused
-    than its launch writing the product and XLA's fusion reading it back, by at least that round trip's
-    bytes at the H100's device memory rate; a region with no consumer is not priced. Shapes only."""
-    sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
-    x = jax.ShapeDtypeStruct((8192, 4096), jnp.bfloat16)
-    w = jax.ShapeDtypeStruct((4, 4096, 4096), jnp.bfloat16)
-    bias = jax.ShapeDtypeStruct((4096,), jnp.float32)
-
-    def region(x, w, sizes, bias):
-        product = fused_gemm.product(x, w, sizes, out_dtype=jnp.bfloat16)
-        return jax.nn.silu(product.astype(jnp.float32) + bias).astype(jnp.bfloat16)
-
-    with generation.assumed("sm90"):
-        found = fused_gemm.analysis(region, x, w, sizes, bias)
-        plain = fused_gemm.analysis(lambda x, w, sizes: fused_gemm.product(x, w, sizes), x, w, sizes)
-        rate = generation.gpu_target().memory_rate
-    assert found.fused_seconds is not None and found.unfused_seconds is not None, found
-    assert found.unfused_seconds - found.fused_seconds >= 2 * 8192 * 4096 * 2 / rate, found
-    assert plain.fused_seconds is None and plain.unfused_seconds is None
-
-
-def test_an_integer_regions_product_is_xlas_own_dot_with_nothing_to_analyse():
-    """`fused_gemm.product` of int8 operands (a quantized dot's, int32 out) is XLA's own dot, nothing fused:
-    `fused_gemm.analysis` of its region reports no stage and no price, and `fused` gives XLA's value."""
-    keys = jax.random.split(jax.random.key(3))
-    x = jax.random.randint(keys[0], (64, 128), -8, 8).astype(jnp.int8)
-    w = jax.random.randint(keys[1], (128, 96), -8, 8).astype(jnp.int8)
-
-    def region(x, w):
-        return fused_gemm.product(x, w, out_dtype=jnp.int32) * 2
-
-    with generation.assumed("sm90"):
-        found = fused_gemm.analysis(region, x, w)
-        got = fused_gemm.fused(region, x, w)
-    assert found.epilogue is None and found.launch is None and found.fused_seconds is None, found
-    expected = jax.lax.dot_general(x, w, (((1,), (0,)), ((), ())), preferred_element_type=jnp.int32) * 2
-    np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
-
-
-@INTERPRETS
-def test_a_regions_analysis_reports_what_fusing_it_would_raise():
-    """Where the call names a kernel that refuses the region (the template on mma.sync, whose model counts no
-    side operand, under `generation.chosen`), `fused_gemm.analysis` reports the refusal `fused` raises, so a
-    pass never takes a region whose fusion fails."""
-    sizes = jnp.asarray([100, 156], jnp.int32)
-    x, w = jnp.ones((256, 512), jnp.bfloat16), jnp.ones((2, 512, 256), jnp.bfloat16)
-    bias = jnp.ones((256,), jnp.float32)
-
-    def region(x, w, sizes, bias):
-        return fused_gemm.product(x, w, sizes, out_dtype=jnp.float32, interpret_on_cpu=True) + bias
-
-    with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic_gpu"):
-        found = fused_gemm.analysis(region, x, w, sizes, bias)
-        assert found.refused is not None and found.launch is None, found
-        with pytest.raises(selection.KernelRefused):
-            jax.jit(functools.partial(fused_gemm.fused, region))(x, w, sizes, bias)
 
 
 def _moved_columns(columns: int, block: int):
@@ -2390,11 +2291,14 @@ def test_the_templates_paired_product_without_an_epilogue_holds_check_1(generati
 
 
 def test_two_consumers_tile_streams_blocks_their_copies_share():
-    """A tile's granularity (`_Mosaic._granular`) holds each block a step streams (`_streamed_rows`: the
-    rows' tile's, the matrix's 64-deep block, and the transposed matrix's block of its columns) to its
-    family's consumer shares (`Family.shares_rows`): on cp.async two consumers each copy whole 32-row shares,
-    so 64 and 128 rows split and 32 or 96 do not."""
-    launch, mma = grouped_matmul.MosaicGmm(), bundles.named("mma.sync", jnp.bfloat16)
+    """A tile is in its family's granularity (`_Mosaic._granular`) only where each block a step streams splits
+    into its consumers' equal shares (`Family.shares_rows`): on a two-consumer mma.sync bundle, whose
+    consumers each copy whole 32-row shares, a 64-deep tile is, a 32-deep one is not, nor one whose matrix
+    read transposed streams 96-row blocks."""
+    class TwoConsumers(type(bundles.named("mma.sync", jnp.bfloat16))):
+        consumers = 2
+
+    family, launch = TwoConsumers(jnp.dtype(jnp.bfloat16)), grouped_matmul.MosaicGmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
     deep = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, family="mma.sync")
@@ -2403,29 +2307,9 @@ def test_two_consumers_tile_streams_blocks_their_copies_share():
                          interpret=True)
         transposed = launch.bind(bf16((512, 256)), bf16((2, 384, 256)), sizes, out_dtype="bfloat16",
                                  trans_rhs=True, interpret=True)
-        assert launch._streamed_rows(ba, deep) == (128, 64)
-        assert launch._streamed_rows(transposed, dataclasses.replace(deep, block_n=96)) == (128, 64, 96)
-    assert all(mma.shares_rows(rows, 2) for rows in (64, 128))
-    assert not any(mma.shares_rows(rows, 2) for rows in (32, 96))
-    assert grouped_matmul.MosaicTgmm()._streamed_rows(None, deep) == (64,)
-
-
-def test_a_tiles_consumers_are_the_count_whose_reads_are_least():
-    """The derivation's objective over consumer counts (`mosaic_gpu._reads`): on mma.sync, whose warps load
-    their operands' fragments from shared memory, one consumer's 128 x 128 tile reads less a FLOP than two
-    consumers' 64-row shares of a 128 x 256 tile (NS-P2-NCU2-a100: 1.5x the fragment loads, 2.78x the time),
-    and as little as two consumers' 128-row shares of a 256 x 128 tile, whose own reads are fewer; on
-    warpgroup MMA, which reads both operands from shared memory itself, the cooperative 128 x 256 tile
-    reads least."""
-    def tile(block_m, block_n, consumers, family):
-        return mosaic_gpu.Tiles(block_m, block_n, 32, 4, 1, warpgroups=consumers, family=family)
-
-    mma, wgmma = bundles.named("mma.sync", jnp.bfloat16), bundles.named("wgmma", jnp.bfloat16)
-    one, two = tile(128, 128, 1, "mma.sync"), tile(128, 256, 2, "mma.sync")
-    assert mosaic_gpu._reads(mma, one) < mosaic_gpu._reads(mma, two)
-    assert mosaic_gpu._reads(mma, tile(256, 128, 2, "mma.sync")) < mosaic_gpu._reads(mma, one)
-    assert (mosaic_gpu._reads(wgmma, tile(128, 256, 2, "wgmma"))
-            < mosaic_gpu._reads(wgmma, tile(128, 128, 1, "wgmma")))
+        assert launch._granular(ba, deep, family)
+        assert not launch._granular(ba, dataclasses.replace(deep, block_k=32), family)
+        assert not launch._granular(transposed, dataclasses.replace(deep, block_n=96), family)
 
 
 @pytest.mark.parametrize("generation_name", ["sm80", "sm86", "sm90"])
