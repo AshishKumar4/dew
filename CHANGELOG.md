@@ -7,6 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A hybrid decision model (Qwen3.5's gated delta net, Kimi delta attention, Mamba-2) reads a request's state once
+  a row too (`--shared-state`): each question starts from the shared state's final recurrent memory and conv
+  tail, decided as its own row decides it.
 - A distillation under a host layout (`Layout(host=("variables",))`) keeps its frozen teacher as it keeps
   a frozen stack: each scanned run of the teacher's layers, its frozen split's beside its params, is one
   bank beside the accelerator, which the teacher's forward reads a layer at a time, where the whole

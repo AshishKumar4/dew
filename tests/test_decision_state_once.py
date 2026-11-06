@@ -6,6 +6,7 @@ once and each question's."""
 
 import copy
 import dataclasses
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -14,7 +15,7 @@ import pytest
 from reference_error import as_given, assert_as_exact, widened, without_ynn
 from test_decision_context import windows_of
 from test_decision_letters_context import LABELS, STATES
-from test_decision_streams import SPECIALS, TOKENIZER, in_streams
+from test_decision_streams import LLAMA, SPECIALS, TOKENIZER, in_streams
 
 from dew.batch import unboxed
 from dew.data.text import ByteTokenizer
@@ -166,13 +167,18 @@ def scored(objective, windows, variables) -> dict[str, np.ndarray]:
     return dict(sorted(logits.items()))
 
 
-@pytest.mark.parametrize("siblings", [False], ids=["apart"])
-def test_a_row_over_one_state_decides_each_question_as_its_own_row_does(siblings):
+HYBRID = Path(__file__).parent / "fixtures" / "hf" / "qwen35-tiny"
+"""A byte-vocabulary Qwen3.5: three gated delta net layers and one of full attention, a conv of four taps."""
+
+
+@pytest.mark.parametrize("source", [LLAMA, HYBRID], ids=["attention", "hybrid"])
+def test_a_row_over_one_state_decides_each_question_as_its_own_row_does(source):
     """Rows of a request's questions over one state, two requests a window, decide each question's options as
     its own row does in a window of its own, through the unmodified objective (check 1, over drawn
-    parameters, float64 truth)."""
-    shared = in_streams(dataclasses.replace(SHARED, siblings=siblings), segments=2)
-    alone = in_streams(OWN, segments=1)
+    parameters, float64 truth): over attention alone, and over a hybrid whose recurrent layers start each
+    question from the state's final memory and conv tail (row 1506)."""
+    shared = in_streams(SHARED, segments=2, source=source)
+    alone = in_streams(OWN, segments=1, source=source)
     rows = examples()
     windows = {"shared": windows_of(shared, rows, count=8), "alone": windows_of(alone, rows, count=24)}
     held = max(len(np.flatnonzero(owner == 1)) for batch in windows["shared"]
@@ -195,13 +201,11 @@ def test_a_row_over_one_state_decides_each_question_as_its_own_row_does(siblings
 
 
 def test_a_run_over_one_state_trains_and_its_task_asks_a_requests_questions_in_one_row(tmp_path):
-    """A decision run of a letter readout over a causal source whose every layer reads key runs, its rows
-    asking a request's questions over one state (`shared_state`), trains a step; the task loaded from its run
-    lays a request's three questions in one row and answers each with one of its options. Over a source whose
-    recurrent layers read no key runs (Qwen3.5's gated delta net), the run is refused, as its rows' streams
-    would be read as one sequence (until a document enters from a given memory, row 1506)."""
+    """A decision run of a letter readout over a hybrid source (Qwen3.5's gated delta net beside full
+    attention), its rows asking a request's questions over one state (`shared_state`), trains a step; the
+    task loaded from its run lays a request's three questions in one row and answers each with one of its
+    options. With `siblings`, whose reads no recurrent memory states, the run is refused (row 1506)."""
     from run_kinds import QWEN_TINY, lettered, trained
-    from test_decision_streams import GEMMA
 
     from dew.data import Memory
     from dew.decision import Decide, decisions
@@ -210,8 +214,7 @@ def test_a_run_over_one_state_trains_and_its_task_asks_a_requests_questions_in_o
     run = dataclasses.replace(lettered(tmp_path, drawn=False), data=rows, validation=None, shared_state=3)
     assert run.pretrained == str(QWEN_TINY)
     with pytest.raises(ValueError):
-        trained(run, tmp_path, "hybrid")
-    run = dataclasses.replace(run, pretrained=str(GEMMA))
+        trained(dataclasses.replace(run, siblings=True), tmp_path, "siblings")
     trained(run, tmp_path, "shared", trainer={"checkpoint_final": True})
     decide = Decide.from_run(str(tmp_path / "runs" / "shared"))
     assert decide.layout.shared_state == 3

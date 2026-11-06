@@ -75,7 +75,12 @@ question, the state there, once, and each question's own part after it (`_shared
 
 - **Reading.** The row's streams (§2a): the shared part is stream 0, reading itself causally; question `k`
   is stream `k`, reading the shared part whole and itself causally, and with `siblings` each question before
-  it whole. The layout lowers that table itself (`Layout.attention`, `n + 1` streams).
+  it whole. The layout lowers that table itself (`Layout.attention`, `n + 1` streams). With `siblings` off
+  the model states the row as documents each question's enters, the shared part's (`dew.batch.Entered`,
+  `dew.decision.shared_state.entered_documents`): attention reads them as runs, and a recurrent mixer
+  (gated delta net, Kimi delta attention, Mamba-2) runs the shared parts first, from zero, and then each
+  question from its shared part's final memory and after its last conv tokens (`dew.nn.linear.entered_scan`),
+  so a hybrid backbone reads the state once too, at twice a per-document scan's work a layer.
 - **Positions.** Each question's part keeps the positions its own row lays it at, from the shared part's
   end (`Encoded.positions`, carried as the parallel layout's are), so with `siblings` off it decides as its
   own row does: the tests hold this to check 1 against each question's own row.
@@ -84,9 +89,9 @@ question, the state there, once, and each question's own part after it (`_shared
   and a question whose own row cuts the state keeps a row of its own.
 - **Refusals.** It takes the place of parallel options, blocks, a row's own reads and a question written to
   its context, each of which sets what a token reads; a head that reads one question a row
-  (`Head.one_question`, Laya's) refuses its rows as it refuses a joint row's; a backbone whose recurrent
-  mixers read no key runs refuses them (`MixerCall`) until a document can enter from a given memory (row
-  1506).
+  (`Head.one_question`, Laya's) refuses its rows as it refuses a joint row's; a head whose own layers attend
+  across a row's questions (`Head.reads_apart`) refuses them; a recurrent backbone refuses `siblings`, whose
+  reads no memory states (`MixerCall`), and a decode step or a sequence axis, which split a row's documents.
 
 ## 3. The head reads the main pass
 

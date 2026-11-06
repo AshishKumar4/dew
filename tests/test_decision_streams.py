@@ -68,10 +68,11 @@ JOINT_QUESTIONS = {"pick": Choice("Which one?", ["a", "b", "c"]), "close": Choic
 ROWS = ["one two three", "four five", "six seven eight nine", "ten eleven", "twelve", "thirteen fourteen"]
 
 
-def in_streams(layout: Layout, segments: int = 1) -> DecisionObjective:
-    """A decision over the tiny Llama whose rows stand in `layout`'s streams, at most `segments` rows a
-    window: a joint row's head, or a lettered row's readout of its letters."""
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=1024)
+def in_streams(layout: Layout, segments: int = 1, source: Path = LLAMA) -> DecisionObjective:
+    """A decision over `source` (the tiny Llama, else another byte-vocabulary source) whose rows stand in
+    `layout`'s streams, at most `segments` rows a window: a joint row's head, or a lettered row's readout of
+    its letters."""
+    source = Pretrained.load(source, dtype="float32", attention_impl="reference", max_seq_len=1024)
     width, dtype = DecisionModel.head_size(source.model)
     head = (JointSchemaHead(width, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
             if layout is JOINT else LabelReadout(features=width, label_ids=(), dtype=dtype, count=4))
