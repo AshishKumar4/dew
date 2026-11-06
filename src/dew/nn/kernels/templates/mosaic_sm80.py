@@ -588,7 +588,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 # empty grid).
                 continue
 
-            def body(indices, *refs, step=step, lo=lo, joins=None):
+            def body(indices, *refs, joins: dict, step=step, lo=lo):
                 (index,), (carried, accumulators) = indices, refs[-1]
                 landed, slots = iter(refs[:-1]), {}
                 for name in names:
