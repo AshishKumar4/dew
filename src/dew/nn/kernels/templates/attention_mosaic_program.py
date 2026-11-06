@@ -78,14 +78,20 @@ def bundle_of(tiles: "Tiles | BackwardTiles", dtype) -> mosaic.Family:
     a call derives is the qualification's (`layouts`), so a config pinned on a family not yet qualified (an
     A100's mma.sync, its resource witness) resolves too. A forward's family is arranged for its consumer's
     share, `block_q` x `block_k` (`Issuer.specialized`, as the GEMM's: mma.sync's warps by the share, whose
-    default 64-row atom no 32-row consumer's operands cast to); a backward's launches hold differing
-    shares."""
+    default 64-row atom no 32-row consumer's operands cast to); a backward's at its smaller share, its
+    warps along their rows as far as it allows."""
     # Every bundle the device issues (a launch of a row each ranks them all, `bundles.layouts`).
     found = {family.name: family for family in bundles.layouts(generation.gpu_target().generation, dtype, 1)}
     family = found.get(tiles.family)
     if family is None:
         raise ValueError(f"{tiles}: this device's attention bundles are {sorted(found)}")
-    return family.specialized(tiles.block_q, tiles.block_k) if isinstance(tiles, Tiles) else family
+    if isinstance(tiles, Tiles):
+        return family.specialized(tiles.block_q, tiles.block_k)
+    # A backward's products transpose their logits (dQ's rows its queries, dK/dV's its keys), one layout
+    # for both: its warps along the rows as far as the smaller share allows, each product's share whole
+    # (a 32-row walked tile on mma.sync's default 64-row atom cast to no layout).
+    keys = tiles.block_k // tiles.consumers if tiles.shared_keys else tiles.block_k
+    return family.specialized(min(tiles.block_q, keys), family.column_unit(dtype))
 """The instruction families this mainloop runs on (`generation.family`), each by its bundle: wgmma's. A
 family without one (mma.sync's, until its thin mainloop) takes another mainloop (`MosaicForward.eligible`,
 `MosaicBackward.eligible`)."""
