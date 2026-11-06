@@ -84,6 +84,11 @@ def point(x) -> Iv:
     return Iv(x, x)
 
 
+def held_iv(x) -> Iv:
+    """`x` as an interval: an enclosure as it is, a record as its point."""
+    return x if isinstance(x, Iv) else point(x)
+
+
 def _outward(lo, hi) -> Iv:
     return Iv(np.nextafter(lo, -np.inf), np.nextafter(hi, np.inf))
 
@@ -418,23 +423,25 @@ def output(q, k, entering, values, exponents: Exponents, scale: float, lane: Lan
     products = blocked(point(q), point(np.asarray(k).T), lane, parts=(given, given))
     scores = fp32(mul(products, exponents.pairs(lane)), lane)
     scores = staged(where(_lags() >= 0, scores, point(np.zeros((CHUNK, CHUNK)))), lane)
-    memory = blocked(point(q), point(entering), lane, parts=(given, held))
+    memory = blocked(point(q), held_iv(entering), lane, parts=(given, held))
     decay = exponents.raised(lane)
     memory = fp32(mul(memory, Iv(decay.lo[:, None], decay.hi[:, None])), lane)
     factor = point(np.float32(scale))
-    local = dot(scores, point(values), lane, parts=(held, held))
+    local = dot(scores, held_iv(values), lane, parts=(held, held))
     return fp32(add(fused(mul(memory, factor), lane), fused(mul(local, factor), lane)), lane)
 
 
-def keys_gated_enclosures(step: "Step", scale: float, lane: Lane) -> dict[str, Iv]:
+def keys_gated_enclosures(step: "Step", scale: float, lane: Lane,
+                          entering: Iv | None = None) -> dict[str, Iv]:
     """`enclosures` of a chunk whose write gate takes the keys' side (`mainloop.Call.gated_keys`, Mamba2's SSD
     under the fast forms): the memory it leaves, fp32 (`algebra.keys_gated_carried`: the carry decayed to the
     chunk's end, plus each key row gated in fp32 by its write gate times its decay to the end and rounded to
     the values' dtype, against the values as given), and its output before its store (`chunk_scores` with
     each key column scaled by its write gate before the scores round, `chunk_output`). The scores' tile is a
     derived form (`algebra.derived_tile`), its products, decays and gates multiplied in either association:
-    their enclosure is both's hull."""
+    their enclosure is both's hull. `entering` is the memory its output reads, by default the stored `h`."""
     exponents = Exponents.of(step.g)
+    entering = point(step.h) if entering is None else entering
     gate = fp32(mul(exponents.gated(lane), point(step.beta)), lane)
     keys = staged(fp32(mul(point(step.k), Iv(gate.lo[:, None], gate.hi[:, None])), lane), lane)
     write = dot(Iv(keys.lo.T, keys.hi.T), point(step.v), lane, parts=(lane.held, lane.given))
@@ -447,12 +454,40 @@ def keys_gated_enclosures(step: "Step", scale: float, lane: Lane) -> dict[str, I
     scores = hull(fp32(mul(fp32(mul(products, pairs), lane), columns), lane),
                   fp32(mul(products, fp32(mul(pairs, columns), lane)), lane))
     scores = staged(where(_lags() >= 0, scores, point(np.zeros((CHUNK, CHUNK)))), lane)
-    memory = fp32(mul(blocked(point(step.q), point(step.h), lane, parts=(lane.given, lane.held)),
+    memory = fp32(mul(blocked(point(step.q), entering, lane, parts=(lane.given, lane.held)),
                       Iv(decay.lo[:, None], decay.hi[:, None])), lane)
     factor = point(np.float32(scale))
     local = dot(scores, point(step.v), lane, parts=(lane.held, lane.given))
     output = fp32(add(fused(mul(memory, factor), lane), fused(mul(local, factor), lane)), lane)
     return {"h": leaving, "o": out(output, lane)}
+
+
+def walk_enclosures(step: "Step", scale: float, lane: Lane, *, write: str) -> dict[str, Iv]:
+    """`enclosures` of a chunk of the fused inference walk (`mainloop._scan`, a 16-bit call no gradient
+    follows, under a decay a head), whose records are its inverse (the delta rule's, `_solved`'s), its output
+    and the memory it leaves: the memory it enters in its registers, staged as the memories' form for its
+    products, the walk's corrected values from it (`_scan_corrected`: under the delta rule
+    `(I + L) (beta (v - exp2(g) k S))`, the keys' prediction from the memory decayed to each token, its
+    difference from the values write-gated and corrected by the stored inverse; the gated values without
+    it; the values as given where the keys take the gate), and the output and leaving memory from them."""
+    exponents = Exponents.of(step.g)
+    entering = staged(step.carry, lane)
+    if write == "keys":
+        return keys_gated_enclosures(step, scale, lane, entering)
+    found = {}
+    if write == "delta":
+        found["a"] = staged(inverse(step.k, step.beta, exponents, lane), lane)
+        predicted = blocked(point(step.k), entering, lane, parts=(lane.given, lane.held))
+        decay = exponents.raised(lane)
+        decayed = fused(mul(Iv(decay.lo[:, None], decay.hi[:, None]), neg(predicted)), lane)
+        difference = fp32(add(point(step.v), decayed), lane)
+        scaled = fp32(mul(difference, point(np.asarray(step.beta)[:, None])), lane)
+        lower = dot(point(step.a), staged(scaled, lane), lane, parts=(lane.held, lane.held))
+        corrected = fp32(add(scaled, lower), lane)
+    else:
+        corrected = fp32(mul(point(step.v), point(np.asarray(step.beta)[:, None])), lane)
+    output_ = output(step.q, step.k, entering, staged(corrected, lane), exponents, scale, lane)
+    return {**found, "h": carried(step.carry, corrected, step.k, exponents, lane), "o": out(output_, lane)}
 
 
 def values_gated_enclosures(step: "Step", scale: float, lane: Lane) -> dict[str, Iv]:
@@ -618,6 +653,9 @@ VALUES_GATED_RECORDS = ("c", "o", "h", "leaving")
 (`values_gated_enclosures`)."""
 WRITES = {"delta": RECORDS, "keys": KEYS_GATED_RECORDS, "values": VALUES_GATED_RECORDS}
 """Each write's records (`Run.write`)."""
+WALKED = {"delta": ("a", "o", "leaving"), "keys": ("o", "leaving"), "values": ("o", "leaving")}
+"""Each write's records in the fused inference walk (`walk_enclosures`), which stores no memory a chunk enters
+and no weighted keys or corrected values."""
 """The records the witness holds (`enclosed`)."""
 
 
@@ -674,6 +712,8 @@ class Run:
     """The parts its operands are given in (`Lane.given`)."""
     wide: bool
     """Whether it is an fp32 call (`Lane.wide`)."""
+    walked: bool
+    """Whether it is the fused inference walk's (`walk_enclosures`), its records `WALKED`'s."""
 
     @property
     def chunks(self) -> int:
@@ -717,7 +757,7 @@ def laid_chunks(length: int, starts, max_segments: int | None) -> np.ndarray:
 
 def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = None,
              floor: float | None = None, carried: bool = True, delta: bool = True,
-             rounded: bool | None = None) -> Run:
+             rounded: bool | None = None, walked: bool = False) -> Run:
     """The records of the gated delta rule's training call on the template, forced (`generation.chosen`) at
     JAX's own default precision as a model trains it: `mainloop.kept_forward` at the tiles the route takes
     (`tuning.seen`), its output and final memory bit for bit the route's training forward's (the certify
@@ -733,7 +773,9 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     `rounded` as the route's fast forms round it unless given (a 16-bit call's keys then take the write
     gate, `mainloop.Call.gated_keys`; unrounded, Lightning's, its values held in parts). An fp32 call's
     operands and passed values are held in parts as the mainloop holds them (`Lane.held`, `Lane.given`),
-    each record their sum."""
+    each record their sum. `walked`, the inference forward no gradient follows: a 16-bit call's under a decay
+    a head runs its fused walk (`mainloop._scan`, `kept_forward` keeping nothing), whose records are its
+    inverse, output and final memory (`WALKED`)."""
     import jax
     import jax.numpy as jnp
 
@@ -769,15 +811,16 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
 
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
         with tuning.seen() as launches:
-            # The training forward: the primal of the route's VJP, as a training step runs it.
-            o, final = jax.jit(lambda *x: jax.vjp(route, *x)[0])(*operands)
+            # The training forward: the primal of the route's VJP, as a training step runs it; or the
+            # inference forward.
+            o, final = jax.jit(route if walked else lambda *x: jax.vjp(route, *x)[0])(*operands)
         [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
                    if isinstance(op, template.Mosaic)]
 
         def kept(*x, starts=starts):
             return jax.jit(lambda *x: mainloop.kept_forward(
                 *x, tiles=tiles, starts=starts, max_segments=max_segments, floor=floor, scale=scale,
-                delta=delta, rounded=rounded, family=family,
+                delta=delta, rounded=rounded, family=family, keeps=not walked,
                 interpret=generation.backend() != "gpu"))(*x)
 
         kept_o, kept_final, (a, (w, h, c)) = kept(*operands)
@@ -795,6 +838,13 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                 for first, count in table[:-1]] if carried else []
     # The chunks the launches lay out (a packed call's every sequence's, its worst case's), of which the
     # call's come first.
+    if walked:
+        # The walk stores no memories, weighted keys or corrected values (`WALKED`), each chunk its own.
+        assert starts is None and jnp.dtype(dtype).itemsize == 2, "the walk is a 16-bit call's, unpacked"
+        laid = chunks
+        w = np.zeros((held * laid * CHUNK, heads * key_width))
+        h, c = (np.zeros((held * laid * heads * key_width, value_width)),
+                np.zeros((held * laid * CHUNK, heads * value_width)))
     laid = np.shape(h)[0] // (held * heads * key_width)
     if not delta:
         # No inverse or weighted keys of its own, nor corrected values where its keys take the gate.
@@ -820,7 +870,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     begins = np.asarray([first > 0 and (starts is not None and bool(np.asarray(starts)[0, first]))
                          for first, _ in table])
     return Run(**hosted_operands, a=chunked(a, CHUNK), w=chunked(w, key_width), h=memories, scale=scale,
-               write=write, held=held, given=given, wide=bool(wide),
+               write=write, held=held, given=given, wide=bool(wide), walked=walked,
                c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
                begins=begins)
 
@@ -860,8 +910,8 @@ def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
     """Each record's enclosure `[N, H, ...]` (`enclosures`), each chunk's step from the fp32 memory it enters:
     `a`, `w`, `c`, `o`; `h`, the memory each chunk enters as stored; and `leaving`, the fp32 memory it
     leaves."""
-    enclose = {"delta": enclosures, "keys": keys_gated_enclosures,
-               "values": values_gated_enclosures}[run.write]
+    writes = {"delta": enclosures, "keys": keys_gated_enclosures, "values": values_gated_enclosures}
+    enclose = functools.partial(walk_enclosures, write=run.write) if run.walked else writes[run.write]
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide)
     found: dict[str, list] = {}
     for n in range(run.chunks):
@@ -878,13 +928,13 @@ def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
 def records(run: Run) -> dict[str, np.ndarray]:
     """Each record `[N, H, ...]`, as `enclosed` names them."""
     held = {"a": run.a, "w": run.w, "c": run.c, "o": run.o, "h": run.h, "leaving": run.carries[1:]}
-    return {name: held[name] for name in WRITES[run.write]}
+    return {name: held[name] for name in (WALKED if run.walked else WRITES)[run.write]}
 
 
 def witness(run: Run, lane: Lane) -> dict:
     """Whether each record of `run` lies inside its step's enclosure (`enclosed`), by record `[N, H, ...]`."""
     found, recorded_ = enclosed(run, lane), records(run)
-    return {name: within(recorded_[name], found[name]) for name in found}
+    return {name: within(recorded_[name], found[name]) for name in recorded_}
 
 
 def refusals(faulty: Run, claimed: Run, lane: Lane) -> dict[str, tuple[np.ndarray, np.ndarray]]:
@@ -894,7 +944,7 @@ def refusals(faulty: Run, claimed: Run, lane: Lane) -> dict[str, tuple[np.ndarra
     from native_certificates import separated
 
     truth, fault, found = enclosed(claimed, lane), enclosed(faulty, lane), records(faulty)
-    return {name: (within(found[name], truth[name]), separated(truth[name], fault[name])) for name in truth}
+    return {name: (within(found[name], truth[name]), separated(truth[name], fault[name])) for name in found}
 
 
 def rounded_cumsums(g) -> np.ndarray:
@@ -993,16 +1043,17 @@ def cumsum_refusals(operands: tuple, lane: Lane) -> dict[str, tuple[np.ndarray, 
     return refusals(faulty, dataclasses.replace(faulty, g=hosted(operands)["g"]), lane)
 
 
-def handed_refusals(operands: tuple, truth: Run, at: int, lane: Lane) -> tuple[np.ndarray, np.ndarray]:
-    """A state rounded to bf16 where fp32 is held: the call over the chunks from `at` on, from the fp32 memory
-    `truth`'s chunks before it leave rounded to bf16, its first chunk's leaving memory held to the step from
-    the memory unrounded (`refusals`)."""
+def handed_refusals(operands: tuple, truth: Run, at: int, lane: Lane, *,
+                    walked: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """A state rounded to bf16 where fp32 is held: the call over the chunks from `at` on (the fused inference
+    walk's where `walked`), from the fp32 memory `truth`'s chunks before it leave rounded to bf16, its first
+    chunk's leaving memory held to the step from the memory unrounded (`refusals`)."""
     import jax.numpy as jnp
     import ml_dtypes as dtypes
 
     carry = truth.carries[at]
     handed = np.asarray(np.asarray(carry, np.float32).astype(dtypes.bfloat16), np.float32)
-    tail = recorded(*(x[:, at * CHUNK:] for x in operands[:5]), jnp.asarray(handed)[None])
+    tail = recorded(*(x[:, at * CHUNK:] for x in operands[:5]), jnp.asarray(handed)[None], walked=walked)
     claimed = dataclasses.replace(tail, carries=np.concatenate([carry[None], tail.carries[1:]]))
     return refusals(tail, claimed, lane)["leaving"]
 
@@ -1104,9 +1155,10 @@ def assert_keys_gated_witnessed(lane: Lane, heads: int = 1) -> None:
     assert_refusals(refusals(faulty, dataclasses.replace(faulty, **hosted(operands)), lane), UNGATED_SHARES)
 
 
-PARTS_SHARES = {"o": 0.5, "leaving": 0.5}
-"""The least share of each record at which a call whose values are held in parts, run at bf16 instead, is
-refused."""
+PARTS_SHARES = {"h": 0.9, "c": 0.9, "o": 0.8}
+"""The least share of each record at which an fp32 call whose values are held in parts, run at bf16 instead,
+is refused: its stored memories and corrected values (99% of them over two draws, interpreted at 5dd8e1788)
+and its outputs (89%); the fp32 memory it leaves carries the call's own rounding as much (41-44%)."""
 
 
 def assert_parts_witnessed(lane: Lane, heads: int = 1) -> None:
@@ -1128,3 +1180,20 @@ def assert_parts_witnessed(lane: Lane, heads: int = 1) -> None:
     held = {"write": claimed.write, "held": claimed.held, "given": claimed.given, "wide": True}
     as_claimed = dataclasses.replace(narrow, **hosted(wide, given=claimed.given), **held)
     assert_refusals(refusals(narrow, as_claimed, lane), PARTS_SHARES)
+
+
+def assert_walk_witnessed(lane: Lane, heads: int = 1) -> None:
+    """The step witness of the fused inference walk (`walk_enclosures`, `mainloop._scan`): a bf16 call of
+    three chunks no gradient follows, with the delta rule and without it (its keys taking the write gate, and
+    unrounded), every record each keeps inside its step's enclosure; and the walk run from a memory rounded to
+    bf16 where fp32 is held refused (`handed_refusals`, `HANDED_SHARE`)."""
+    operands = draw(0, "mild", heads=heads)
+    for run in (recorded(*operands, walked=True), recorded(*operands, delta=False, walked=True),
+                recorded(*operands, delta=False, rounded=False, walked=True)):
+        held = witness(run, lane)
+        for name in WALKED[run.write]:
+            assert np.all(held[name]), (run.write, name, np.mean(held[name]))
+    from native_certificates import assert_refused
+
+    slow = draw(1, "slow", chunks=2, heads=heads)
+    assert_refused(*handed_refusals(slow, recorded(*slow, walked=True), 1, lane, walked=True), HANDED_SHARE)

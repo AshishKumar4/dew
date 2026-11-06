@@ -789,6 +789,14 @@ def test_the_recurrence_step_witness_holds_values_passed_in_parts_and_refuses_th
 
 
 @INTERPRETS
+def test_the_recurrence_step_witness_holds_the_fused_inference_walk_and_refuses_a_rounded_carry():
+    """The step witness (row 2084 (e)) of the fused inference walk (`rw.assert_walk_witnessed`): a bf16 call
+    no gradient follows, with the delta rule and without it, every record it keeps inside its step's
+    enclosure, and the walk from a memory rounded to bf16 where fp32 is held refused."""
+    rw.assert_walk_witnessed(rw.interpreted_lane())
+
+
+@INTERPRETS
 def test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16():
     """The step witness's faults on the interpreted mainloop, each refused where it lands
     (`rw.assert_carry_faults_refused`): a dropped carry and a state rounded to bf16 where fp32 is held."""
