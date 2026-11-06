@@ -927,13 +927,14 @@ def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci,
     armada starts after recalling one (ARMADA_RESUME, the artifacts the recalled attempt kept, #4544) sets
     those aside and runs the rest: its row green with every test's seconds, the earlier attempt's among them,
     its progress carrying them for a later recall, and no record written, as no record holds the earlier
-    attempt's opens."""
+    attempt's opens. It sets aside exactly those tests, never one whose id theirs begins (pytest's --deselect
+    matches by prefix: train 671's review)."""
     (tmp_path / "tests/test_resumed.py").write_text(
         "from pathlib import Path\n"
         "def test_first():\n"
         "    with Path('ran').open('a') as ran: ran.write('first ')\n"
-        "def test_second():\n"
-        "    with Path('ran').open('a') as ran: ran.write('second ')\n")
+        "def test_first_again():\n"
+        "    with Path('ran').open('a') as ran: ran.write('again ')\n")
     interpreter(tmp_path, "3.12")
     url, stored, _ = cache_worker
     cached(monkeypatch, url)
@@ -945,8 +946,9 @@ def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci,
     assert row["exitCode"] == 0, row["output"]
     progress = tmp_path / "artifacts" / "progress.jsonl"
     kept = [json.loads(line)["node"] for line in progress.read_text().splitlines()]
-    assert kept == ["tests/test_resumed.py::test_first", "tests/test_resumed.py::test_second"]
-    # The next, recalled after its first test: that one set aside, the second run, both in its row.
+    assert kept == ["tests/test_resumed.py::test_first", "tests/test_resumed.py::test_first_again"]
+    # The next, recalled after its first test: that one set aside, the one its name begins run, both in
+    # its row.
     (tmp_path / "resume").mkdir()
     (tmp_path / "resume" / "progress.jsonl").write_text(progress.read_text().splitlines()[0] + "\n")
     progress.unlink()
@@ -955,8 +957,8 @@ def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci,
     stored.clear()
     [row] = armada_task(ci, monkeypatch, out, policy="off")
     assert row["exitCode"] == 0, row["output"]
-    assert (tmp_path / "ran").read_text() == "second "
-    assert set(row["tests"]) == {"tests/test_resumed.py::test_first", "tests/test_resumed.py::test_second"}
+    assert (tmp_path / "ran").read_text() == "again "
+    assert set(row["tests"]) == {f"tests/test_resumed.py::test_first{end}" for end in ("", "_again")}
     assert [json.loads(line)["node"] for line in progress.read_text().splitlines()] == kept
     assert stored == {}
 
