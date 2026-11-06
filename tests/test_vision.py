@@ -31,6 +31,7 @@ Tolerances and the differences actually observed, fp32 on CPU:
 
 import dataclasses
 import fractions
+import functools
 import json
 import math
 from pathlib import Path
@@ -479,54 +480,37 @@ def test_a_moonvit_pools_frames_finitely_beside_a_padded_item():
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(gradient))
 
 
-def exact_bicubic_weights(size_in: int, size_out: int, antialias: bool
-                          ) -> tuple[list[list[fractions.Fraction]], list[list[float]], int]:
+def exact_bicubic_weights(size_in: int, size_out: int, antialias: bool) -> list[list[fractions.Fraction]]:
     """The `[size_out][size_in]` weights of torch's bicubic resize along one axis (`align_corners=False`),
-    exactly, the magnitudes of the terms each one's arithmetic sums (each argument's terms, as `|x|`,
-    through the cubic's terms), and the most roundings any one takes: without antialiasing the cubic of
-    a = -3/4 on the four taps about each half-pixel source position, clamped at the border (the scale, its
-    product, the half and the floor subtracted, a tap's offset, Horner's six steps, and up to three sums
-    at the border); with it the cubic of a = -1/2 over the support widened by the shrink, normalized by
-    its total (the scale, the center, the tap's offset, its half and stretch, Horner's six steps, the
-    total's sums and the division) (`dew.nn.blocks.torch_bicubic_resize`, torch's upsample_bicubic2d)."""
+    exactly: without antialiasing the cubic of a = -3/4 on the four taps about each half-pixel source
+    position, clamped at the border; with it the cubic of a = -1/2 over the support widened by the
+    shrink, normalized by its total (`dew.nn.blocks.torch_bicubic_resize`, torch's upsample_bicubic2d)."""
     half = fractions.Fraction(1, 2)
     scale = fractions.Fraction(size_in, size_out)
     weights = [[fractions.Fraction(0)] * size_in for _ in range(size_out)]
-    magnitudes = [[0.0] * size_in for _ in range(size_out)]
-    roundings = 14
     for row in range(size_out):
         if antialias:
             stretch, center = max(scale, 1), scale * (row + half)
             low = max(math.floor(center - 2 * stretch + half), 0)
             high = min(math.floor(center + 2 * stretch + half), size_in)
-            taps, terms = {}, {}
+            taps = {}
             for tap in range(low, high):
-                x, size = abs((tap - center + half) / stretch), (tap + center + half) / stretch
+                x = abs((tap - center + half) / stretch)
                 taps[tap] = ((3 * half * x - 5 * half) * x * x + 1 if x < 1 else
                              ((-x * half + 5 * half) * x - 4) * x + 2 if x < 2 else 0)
-                # Either branch's terms, the one the computed argument takes beside the exact one's.
-                terms[tap] = max(3 * half * size ** 3 + 5 * half * size ** 2 + 1,
-                                 half * size ** 3 + 5 * half * size ** 2 + 4 * size + 2)
-            total, summed = sum(taps.values()), sum(terms.values())
+            total = sum(taps.values())
             for tap, weight in taps.items():
                 weights[row][tap] = weight / total
-                magnitudes[row][tap] = float((terms[tap] + abs(weight / total) * summed) / total)
-            roundings = max(roundings, 11 + len(taps))
             continue
         a = fractions.Fraction(-3, 4)
         source = scale * (row + half) - half
         index = math.floor(source)
         t = source - index
-        size = scale * (row + half) + half + abs(index) + 1
         for tap, x in zip(range(index - 1, index + 3), (t + 1, t, 1 - t, 2 - t), strict=True):
             near = ((a + 2) * x - (a + 3)) * x * x + 1
             far = ((a * x - 5 * a) * x + 8 * a) * x - 4 * a
-            place = min(max(tap, 0), size_in - 1)
-            weights[row][place] += near if x <= 1 else far
-            magnitudes[row][place] += float(max(abs(a + 2) * size ** 3 + abs(a + 3) * size ** 2 + 1,
-                                                abs(a) * size ** 3 + 5 * abs(a) * size ** 2
-                                                + 8 * abs(a) * size + 4 * abs(a)))
-    return weights, magnitudes, roundings
+            weights[row][min(max(tap, 0), size_in - 1)] += near if x <= 1 else far
+    return weights
 
 
 @pytest.mark.parametrize("antialias", [False, True], ids=["plain", "antialiased"])
@@ -535,21 +519,26 @@ def test_a_float64_bicubic_resize_weighs_each_pixel_in_float64(antialias, size_o
     """A float64 bicubic resize (`torch_bicubic_resize`, REPA's and RAE's preprocessing, a vision tower's
     position table) weighs each source pixel in float64, as torch's resize of a float64 input does (row
     4445): each unit image of seven rows (three columns wide, which a resize to three columns weighs by
-    one, exactly) resized to five or eleven rows reads out every weight of its row, each within float64's
-    own roundings of its arithmetic of its exact value (`exact_bicubic_weights`,
-    `assert_within_rounding`). Weights built in float32 sit near 1e-8 from it, far past the bound."""
-    from reference_error import assert_within_rounding
+    one, exactly) resized to five or eleven rows reads out every weight of its row, within float64's
+    rounding of its own computation of their exact values (`exact_bicubic_weights`,
+    `assert_computes_the_oracle`): its host chain (the source coordinate, the cubic's Horner steps, and the
+    border's tap sum or the antialiased total and its division) and the resize's contraction
+    (`chain_roundings`). Weights built in float32 sit near 1e-8 from them, far past the bound."""
+    from reference_error import assert_computes_the_oracle, chain_roundings
 
     from dew.nn.blocks import torch_bicubic_resize
 
     size_in = 7
-    exact, magnitudes, roundings = exact_bicubic_weights(size_in, size_out, antialias)
     units = np.eye(size_in)[:, :, None, None].repeat(3, axis=2)
     with jax.enable_x64(new_val=True):
-        ours = np.asarray(torch_bicubic_resize(jnp.asarray(units), size_out, 3, antialias=antialias))
+        resize = functools.partial(torch_bicubic_resize, height=size_out, width=3, antialias=antialias)
+        ours = np.asarray(resize(jnp.asarray(units)))
+        contraction = chain_roundings(jax.make_jaxpr(resize)(jnp.asarray(units)))
     assert ours.dtype == np.float64
+    taps = math.ceil(4 * max(size_in / size_out, 1)) + 2
+    host = 3 + 3 + 6 + taps + 1 if antialias else 4 + 1 + 6 + 3
+    exact = np.asarray([[float(weight) for weight in row] for row in exact_bicubic_weights(
+        size_in, size_out, antialias)])
     # Pixel by row, each column the same weight.
-    read = ours[..., 0].transpose(1, 0, 2)
-    assert_within_rounding(read, np.asarray(exact, dtype=object)[..., None].repeat(3, axis=2),
-                           np.asarray(magnitudes)[..., None].repeat(3, axis=2), roundings, np.float64,
-                           f"bicubic weights, {size_in} to {size_out} rows")
+    assert_computes_the_oracle(ours[..., 0].transpose(1, 0, 2), exact[..., None].repeat(3, axis=2),
+                               f"bicubic weights, {size_in} to {size_out} rows", roundings=host + contraction)
