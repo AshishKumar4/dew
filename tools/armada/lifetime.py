@@ -199,6 +199,7 @@ def boot() -> None:
             write(SHARED, file[len(root):])
     importer = followed.imports(lambda item: write(owner(), item))
     sys.meta_path.insert(0, importer)
+    sys.meta_path.append(followed.missed(lambda item: write(owner(), item), root))
     followed.opening(kept, root)
     sys.monitoring.use_tool_id(TOOL, "dew-test-cache")
     sys.monitoring.register_callback(TOOL, sys.monitoring.events.PY_START, started)

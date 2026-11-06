@@ -27,7 +27,7 @@ and writes them back.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from types import MappingProxyType
 
 from dew import _records
@@ -57,7 +57,7 @@ from dew.interop.decoder_parts import (
     spelled,
     translated,
 )
-from dew.interop.families.deepseek import deepseek_layout, deepseek_mixture
+from dew.interop.families.deepseek import V3_ROUTER, deepseek_experts
 from dew.interop.layouts import (
     INDEX,
     Config,
@@ -72,6 +72,7 @@ from dew.interop.layouts import (
     unread,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.mimo_audio import AUDIO_TOKENIZER, translate_mimo_audio_config
 from dew.nn.mixers.mlp import MLPMixer
@@ -125,20 +126,25 @@ def _attention(*, scale: float | None) -> tuple[ConfigField[CausalTransformer], 
             ConfigField('attention_dropout', 'attention_dropout_rate', 0.0, parse=_records.number))
 
 
-def _mixture(hf: Mapping[str, object], count: int, used: set[str],
-             sparse: tuple[int, ...]) -> NativeFields | None:
-    """DeepSeek V3's routed experts on the `sparse` layers: sigmoid scores, a
-    balancing bias, grouped choice and renormalized top-k weights. A config
-    that states experts no layer routes to builds dense layers alone, as the
-    reference does; its expert fields are read all the same."""
-    if hf.get('n_routed_experts') is None and not sparse:
-        return None
-    # A null scaling is the reference's 1.0.
-    stated = {**hf, 'routed_scaling_factor': hf.get('routed_scaling_factor') or 1.0}
-    if not sparse:
-        deepseek_layout(stated, count, used, sparse_layers=sparse)
-        return None
-    return deepseek_mixture(stated, count, used, sparse_layers=sparse)
+def _experts(routed: Callable[[Mapping[str, object], set[str]], tuple[int, ...]],
+             schedule: Callable[[CausalTransformer], Mapping[str, object]]
+             ) -> ConfigLayout[CausalTransformer]:
+    """Both MiMo-V2 configs' routed experts, both ways: DeepSeek V3's (`deepseek_experts`: sigmoid scores, a
+    balancing bias, grouped choice and renormalized top-k weights) on the layers the config's schedule
+    routes (`routed`, written back by `schedule`). A config that states no experts, or experts no layer
+    routes to, builds dense layers alone, as the reference does. Their shared experts are none, which the
+    releases state null."""
+    def placed(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+        layers = routed(hf_config, used)
+        if record.get('mixture') is not None:
+            record['mixture'] = NativeFields(Mixture, {**_records.record(record['mixture'], 'mixture'),
+                                                       'layers': layers})
+        return record
+
+    def present(hf_config: Mapping[str, object]) -> bool:
+        return hf_config.get('n_routed_experts') is not None and bool(routed(hf_config, set()))
+    return ConfigLayout(deepseek_experts(V3_ROUTER, present),
+                        ConfigPart(placed, lambda model: {**schedule(model), 'n_shared_experts': None}))
 
 
 _MIMO_V2_FLASH_ROUTES = Table(
@@ -147,20 +153,6 @@ _MIMO_V2_FLASH_ROUTES = Table(
     Route('model.mtp.{rest}', None, MappingProxyType({'rest': Slot(r'.+')})),
     spelled(_NAMES))
 """MiMo-V2-Flash's names: the shared map under the family's (`_NAMES`)."""
-
-
-def _experts(model: CausalTransformer) -> Mapping[str, object]:
-    """Both MiMo-V2 configs' routed experts (`_mixture`), each None without a mixture."""
-    mixture = model.mixture
-    return {
-        'moe_intermediate_size': None if mixture is None else mixture.expert_features,
-        'n_routed_experts': None if mixture is None else mixture.experts,
-        'num_experts_per_tok': None if mixture is None else mixture.top_k,
-        'routed_scaling_factor': None if mixture is None else mixture.scaling,
-        'n_group': None if mixture is None else mixture.groups,
-        'topk_group': None if mixture is None else mixture.groups_per_token,
-        'norm_topk_prob': True,
-    }
 
 
 def _matches(fields: CausalTransformer) -> bool:
@@ -268,11 +260,15 @@ def _flash_sinks(hf_config: Mapping[str, object], used: set[str], record: Decode
     return record
 
 
-def _flash_mixture(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
-    count = _records.integer(record['num_layers'], 'num_layers')
-    used.update(('mlp_layer_types', 'norm_topk_prob'))
-    record['mixture'] = _mixture(hf_config, count, used, _flash_sparse(hf_config, count))
-    return record
+def _flash_routed(hf_config: Mapping[str, object], used: set[str]) -> tuple[int, ...]:
+    used.add('mlp_layer_types')
+    return _flash_sparse(hf_config, _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers'))
+
+
+def _flash_schedule(model: CausalTransformer) -> Mapping[str, object]:
+    routed = set(model.sparse_layers) if model.mixture is not None else set()
+    return {'mlp_layer_types': ['sparse' if index in routed else 'dense'
+                                for index in range(model.num_layers)]}
 
 
 MIMO_V2_FLASH_CONFIG = ConfigLayout(
@@ -282,9 +278,7 @@ MIMO_V2_FLASH_CONFIG = ConfigLayout(
     integer('v_head_dim', 'value_head_dim', 128), *_attention(scale=0.707),
     ConfigPart(_check_released, lambda model: {}),
     ConfigPart(_flash_sinks, lambda model: {}),
-    ConfigPart(_flash_mixture, lambda model: {
-        'mlp_layer_types': ['sparse' if model.mixture is not None and index in model.sparse_layers
-                            else 'dense' for index in range(model.num_layers)], **_experts(model)}))
+    _experts(_flash_routed, _flash_schedule))
 """MiMo-V2-Flash's config, both ways."""
 
 
@@ -574,13 +568,9 @@ def _v2_kinds_written(model: CausalTransformer) -> Mapping[str, object]:
         'num_nextn_predict_layers': model.num_nextn_predict_layers}
 
 
-def _v2_mixture(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
-    count = _records.integer(record['num_layers'], 'num_layers')
-    _, routed = _layer_flags(hf_config, used, count)
-    experts = hf_config.get('n_routed_experts') is not None
-    record['mixture'] = _mixture(hf_config, count, used,
-                                 tuple(index for index, routes in enumerate(routed) if routes and experts))
-    return record
+def _v2_routed(hf_config: Mapping[str, object], used: set[str]) -> tuple[int, ...]:
+    layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    return tuple(index for index, routes in enumerate(_layer_flags(hf_config, used, layers)[1]) if routes)
 
 
 MIMO_V2_CONFIG = ConfigLayout(
@@ -593,7 +583,9 @@ MIMO_V2_CONFIG = ConfigLayout(
                                    defaults={'layernorm_epsilon': 1e-6, 'num_attention_heads': 32}),
                    rope=plain_rope_part(default_factor=1.0, reference='MiMoV2RotaryEmbedding')),
     ConfigPart(_v2_values, lambda model: {'v_head_dim': model.value_head_dim}), *_attention(scale=None),
-    ConfigPart(_v2_kinds, _v2_kinds_written), ConfigPart(_v2_mixture, _experts), unread(*_V2_UNREAD))
+    ConfigPart(_v2_kinds, _v2_kinds_written),
+    # The routed layers' schedule is the layers' own (`_v2_layers_written`).
+    _experts(_v2_routed, lambda model: {}), unread(*_V2_UNREAD))
 """MiMo-V2.6's config, the authors' own (MiMoV2Config, configuration_mimo_v2.py at 6a7f202), both ways."""
 
 

@@ -175,15 +175,16 @@ def activation_part(key: str = 'hidden_act') -> ConfigPart[CausalTransformer]:
     return ConfigPart(_read_activation, lambda model: {key: hf_activation(model.mlp)})
 
 
-def inert(key: str, why: str, *, neutral: Configured = None) -> ConfigPart[CausalTransformer]:
+def inert[Model](key: str, why: str, *, neutral: Configured = None) -> ConfigPart[Model]:
     """A key the reference reads to no effect at `neutral` (or absent, or null), refused at any other
     value, saying `why`; written as nothing."""
-    def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+    def read(hf_config: Mapping[str, object], used: set[str],
+             record: NativeFields[Model]) -> NativeFields[Model]:
         used.add(key)
         if hf_config.get(key) not in (None, neutral):
             refuse(f"{key}={hf_config[key]!r}", why)
         return record
-    return ConfigPart(read, lambda model: {})
+    return ConfigPart(read, lambda model: {}, keys=(key,))
 
 
 def read_only(translate: Callable[[Mapping[str, object], set[str]], DecoderFields],
@@ -206,16 +207,20 @@ def unwritten(why: str) -> ConfigPart[CausalTransformer]:
     return ConfigPart(lambda hf_config, used, record: record, write)
 
 
-def expect(key: str, why: str, *, value: Configured, stated: bool = False) -> ConfigPart[CausalTransformer]:
+def expect[Model](key: str, why: str, *, value: Configured, written: bool = False,
+                  required: bool = False) -> ConfigPart[Model]:
     """A key the family's reference computes only at `value`, refused at any other, saying `why`: its
-    class's default where unstated, written as nothing; or, where the class defaults to another
-    (`stated`: K2 Horizon's per-head q/k norm), refused unless stated and written."""
-    def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+    class's default where unstated, or, where the class defaults to another (`required`: K2 Horizon's
+    per-head q/k norm), refused unless stated; written as `value` where readers take another where it is
+    unstated (`written`: vLLM's DeepSeek router reads a softmax where no `scoring_func` is), else as
+    nothing."""
+    def read(hf_config: Mapping[str, object], used: set[str],
+             record: NativeFields[Model]) -> NativeFields[Model]:
         used.add(key)
-        if (hf_config.get(key) if stated else hf_config.get(key, value)) != value:
+        if (required and key not in hf_config) or hf_config.get(key, value) != value:
             refuse(key, f'{why}; requires {value!r}')
         return record
-    return ConfigPart(read, lambda model: {key: value} if stated else {})
+    return ConfigPart(read, lambda model: {key: value} if written else {}, keys=(key,))
 
 
 def remote_code(repo: str, module: str, name: str) -> ConfigPart[CausalTransformer]:
@@ -442,7 +447,7 @@ def biases(key: str, *, default: bool) -> ConfigPart[CausalTransformer]:
         biased = config_flag(hf_config, key, default=default)
         record.update(mlp_bias=biased, attention_bias=biased)
         return record
-    return ConfigPart(read, lambda model: {key: model.attention_bias})
+    return ConfigPart(read, lambda model: {key: model.attention_bias}, keys=(key,))
 
 
 def four_wide(key: str) -> ConfigPart[CausalTransformer]:
@@ -453,17 +458,17 @@ def four_wide(key: str) -> ConfigPart[CausalTransformer]:
         record['mlp_features'] = _records.integer(
             hf_config.get(key) or 4 * _records.integer(record['emb_features'], 'hidden_size'), key)
         return record
-    return ConfigPart(read, lambda model: {key: model.hidden_features})
+    return ConfigPart(read, lambda model: {key: model.hidden_features}, keys=(key,))
 
 
 def kind_mixer[Mixer](kind: str, name: str, mixer: type[Mixer], layout: ConfigLayout[Mixer], *,
                       fixed: Mapping[str, Configured] | None = None) -> ConfigPart[CausalTransformer]:
     """The mixer the layers of `kind` hold (a hybrid's delta net, SSD or lightning attention), its keys
     `layout`'s, both ways: read into the kind's record as the `mixers` registry's `name` beside what the
-    family's reference fixes of it (`fixed`), its keys read as nothing where no layer is of the kind;
-    written from the mixer the kind holds."""
+    family's reference fixes of it (`fixed`), its keys read as nothing where no layer or prediction step
+    is of the kind; written from the mixer the kind holds."""
     def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
-        if kind not in _records.strings(record['layer_types'], 'layer_types'):
+        if kind not in _record_kinds(record):
             used.update(layout.names())
             return record
         fields = layout.read(hf_config, used, NativeFields(mixer, {}))
@@ -475,9 +480,18 @@ def kind_mixer[Mixer](kind: str, name: str, mixer: type[Mixer], layout: ConfigLa
         return record
 
     def write(model: CausalTransformer) -> Mapping[str, object]:
-        held = model.kind_of(kind).mixer if kind in model.per_layer_types else None
+        steps = (model.mtp_layer_type, model.mtp_feedforward_type)
+        held = model.kind_of(kind).mixer if kind in (*model.per_layer_types, *steps) else None
         return layout.write(held) if isinstance(held, mixer) else {}
     return ConfigPart(read, write)
+
+
+def _record_kinds(record: DecoderFields) -> set[str]:
+    """The kinds a translated record's layers and its prediction steps hold (`mtp_layer_type`,
+    `mtp_feedforward_type`: Nemotron-H's step builds blocks of kinds no trunk layer need hold)."""
+    steps = (record.get('mtp_layer_type'), record.get('mtp_feedforward_type'))
+    return {*_records.strings(record['layer_types'], 'layer_types'),
+            *(_records.text(kind, 'mtp_layer_type') for kind in steps if kind is not None)}
 
 
 def kinds_among(kinds: tuple[str, ...], why: str) -> ConfigPart[CausalTransformer]:
@@ -544,15 +558,19 @@ TRAINING_ROUTER = unread('output_router_logits', 'router_aux_loss_coef')
 """A router's training controls, which a forward reads to no effect."""
 
 
-def _mixture(model: CausalTransformer) -> Mixture | None:
-    return model.mixture
+def stated_experts(model: CausalTransformer) -> Mixture | None:
+    """The model's routed experts as a config states them: their width the model's feed-forward's where
+    they name none of their own (`Mixture.expert_features`)."""
+    mixture = model.mixture
+    return None if mixture is None else dataclasses.replace(
+        mixture, expert_features=mixture.expert_features or model.hidden_features)
 
 
 def experts(*fields: ConfigEntry[Mixture], present: Callable[[Mapping[str, object]], bool] | None = None
             ) -> Nested[CausalTransformer, Mixture]:
     """A model's routed experts (`Mixture`), their keys `fields`, under its `mixture` (none where
     `present`, of the source config, says the config routes no layer)."""
-    return Nested('mixture', Mixture, ConfigLayout(*fields), _mixture, present=present)
+    return Nested('mixture', Mixture, ConfigLayout(*fields), stated_experts, present=present)
 
 
 LOCAL_EXPERTS = ConfigLayout(experts(integer('num_local_experts', 'experts'),

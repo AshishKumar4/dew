@@ -418,8 +418,10 @@ class Pretrained:
             bundle = replace(PretrainedDecoder.from_model(decoder, variables, tokenizer=tokenizer,
                                                           generation_config=generation), processor=processor)
             if isinstance(held, MaskedSettings):
+                # A masked run's model is a decoder: no wrapper denoises.
                 bundle = PretrainedMaskedDecoder(
-                    decoder, bundle.variables, bundle.processor, bundle.config, bundle.source,
+                    from_record(CausalTransformer, model), bundle.variables, bundle.processor, bundle.config,
+                    bundle.source,
                     bundle.model_config, bundle.generation_config,
                     export_adapter=bundle.export_adapter, tokenizer=bundle.tokenizer)
         elif trained is models["diffusion_gemma"]:

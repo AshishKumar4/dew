@@ -479,10 +479,11 @@ class ConfigPart[Model]:
 
     read: ConfigRead[Model]
     write: ConfigWrite[Model]
+    keys: tuple[str, ...] = ()
+    """The keys its read reads (`names`), which it marks read itself (`used`) where it reads them."""
 
     def names(self) -> tuple[str, ...]:
-        """None by name: a part's keys are its read's own, which it marks read (`used`)."""
-        return ()
+        return self.keys
 
 
 @dataclass(frozen=True)
@@ -546,7 +547,7 @@ def unread[Model](*keys: str) -> ConfigPart[Model]:
              record: NativeFields[Model]) -> NativeFields[Model]:
         used.update(keys)
         return record
-    return ConfigPart(read, lambda model: {})
+    return ConfigPart(read, lambda model: {}, keys=keys)
 
 
 @dataclass(frozen=True, eq=False)

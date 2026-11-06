@@ -26,10 +26,12 @@ from dew.interop.decoder_config import (
     decoder_layout,
     expect,
     experts,
+    flag,
     integer,
     place_ropes,
     read_only,
     rope_part,
+    stated_experts,
     unwritten,
     written_ropes,
 )
@@ -68,9 +70,13 @@ from dew.interop.decoder_parts import (
 )
 from dew.interop.layouts import (
     INDEX,
+    REQUIRED,
     Config,
+    ConfigEntry,
+    ConfigField,
     ConfigLayout,
     ConfigPart,
+    Nested,
     Prefixed,
     Route,
     Routes,
@@ -90,6 +96,7 @@ from dew.nn.dspark import DSpark
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mla import MLAMixer
 from dew.nn.vision.moonvit import translate_moonvit_config, translate_moonvit_projector_config
+from dew.registry import Configured
 
 # MiniMaxM2Config's default_theta (configuration_minimax_m2.py:74).
 _MINIMAX_M2_SPELLING = RopeSpelling(theta=5000000.0)
@@ -167,86 +174,6 @@ _MINIMAX_M2_NAMES = (
 )
 
 
-def deepseek_mixture(hf_config: Mapping[str, object], layers: int, used: set, *,
-                     sparse_layers: tuple[int, ...] | None = None,
-                     reads_norm_topk: bool = False) -> MixtureFields:
-    """Read a DeepSeek V3 MoE config into the mixture record.
-
-    The reference selects on the biased sigmoid scores inside the best
-    groups, each scored by its two best experts, and renormalises.
-    `norm_topk_prob: false` would leave the weights unnormalised, which the
-    V3 reference never does, so it refuses naming the field; a router that
-    reads the flag (GLM-5's) passes `reads_norm_topk`. `sparse_layers` is a
-    family's own schedule (`deepseek_layout`).
-    """
-    used.update(('norm_topk_prob', 'topk_method', 'scoring_func'))
-    scoring = hf_config.get('scoring_func', 'sigmoid')
-    if scoring != 'sigmoid':
-        refuse(f"scoring_func {scoring!r}",
-                "dew's router scores softmax, sigmoid or sqrtsoftplus, and "
-                "this family's reference scores sigmoid")
-    norm_topk = hf_config.get('norm_topk_prob', True)
-    if not isinstance(norm_topk, bool):
-        refuse('norm_topk_prob', 'expected a boolean')
-    if not (norm_topk or reads_norm_topk):
-        refuse("norm_topk_prob=False",
-                "DeepseekV3TopkRouter always renormalises the top-k weights")
-    method = hf_config.get('topk_method')
-    if method is not None and method != 'noaux_tc':
-        refuse(f"topk_method {method!r}",
-                "the reference selects with the bias and the group limit, "
-                "which is what noaux_tc names")
-    return NativeFields(Mixture, {
-        **deepseek_layout(hf_config, layers, used, sparse_layers=sparse_layers),
-        'score_function': 'sigmoid',
-        **({'norm_topk_prob': norm_topk} if reads_norm_topk else {}),
-        'groups': _records.integer(hf_config.get('n_group') or 1, 'n_group'),
-        'groups_per_token': _records.integer(hf_config.get('topk_group') or 1, 'topk_group'),
-        'bias': True,
-    })
-
-
-def _deepseek_v2_mixture(hf_config: Mapping[str, object], layers: int,
-                         used: set) -> MixtureFields:
-    """Read a DeepSeek V2 MoE config into the mixture record.
-
-    `DeepseekV2TopkRouter` softmaxes the logits, selects greedily or inside
-    the best groups scored by their best expert, and never renormalises. It
-    reads no `norm_topk_prob`. The released `false` translates and a `true`
-    refuses.
-    """
-    used.update(('norm_topk_prob', 'topk_method', 'scoring_func'))
-    scoring = hf_config.get('scoring_func', 'softmax')
-    if scoring != 'softmax':
-        refuse(f"scoring_func {scoring!r}", "DeepseekV2TopkRouter softmaxes its logits")
-    if hf_config.get('norm_topk_prob', False):
-        refuse("norm_topk_prob=True",
-                "DeepseekV2TopkRouter never renormalises the top-k weights")
-    method = hf_config.get('topk_method', 'greedy')
-    if method not in ('greedy', 'group_limited_greedy'):
-        refuse(f"topk_method {method!r}",
-                "DeepseekV2TopkRouter selects greedy or group_limited_greedy")
-    groups = _records.integer(hf_config.get('n_group') or 1, 'n_group')
-    per_token = _records.integer(hf_config.get('topk_group') or 1, 'topk_group')
-    if method == 'greedy' and (groups, per_token) != (1, 1):
-        refuse(f"n_group {groups} with topk_method 'greedy'",
-                "the greedy selection ignores the groups")
-    return NativeFields(Mixture, {
-        **deepseek_layout(hf_config, layers, used),
-        'score_function': 'softmax',
-        'norm_topk_prob': False,
-        'groups': groups,
-        'groups_per_token': per_token,
-        'group_score': 'max',
-    })
-
-
-LAYOUT_FIELDS = ('n_routed_experts', 'num_local_experts', 'num_experts_per_tok', 'routed_scaling_factor',
-                  'n_group', 'topk_group', 'n_shared_experts', 'moe_intermediate_size',
-                  'first_k_dense_replace', 'moe_layer_freq', 'mlp_layer_types', 'aux_loss_alpha', 'seq_aux')
-"""The fields every DeepSeek mixture reads (`deepseek_layout`)."""
-
-
 def deepseek_routed(hf_config: Mapping[str, object], layers: int, used: set) -> tuple[int, ...]:
     """The layers a DeepSeek MoE routes: those past the first `first_k_dense_replace`.
 
@@ -276,211 +203,242 @@ def deepseek_routed(hf_config: Mapping[str, object], layers: int, used: set) -> 
     return tuple(range(first_k, layers))
 
 
-def deepseek_layout(hf_config: Mapping[str, object], layers: int,
-                     used: set, *, sparse_layers: tuple[int, ...] | None = None) -> MixtureFields:
-    """Read the expert counts, widths and sparse layers every DeepSeek MoE shares.
-
-    The first `first_k_dense_replace` layers stay dense and the rest route
-    (`deepseek_routed`). `aux_loss_alpha`
-    and `seq_aux` shape the training loss alone and no forward pass reads
-    them; a run sets them on LMObjective, whose `aux_loss_alpha` and
-    `seq_aux` compute V2's balance loss. A family with an explicit per-layer
-    schedule supplies sparse_layers and reuses only the expert geometry.
-    """
-    used.update(LAYOUT_FIELDS)
-    experts = hf_config.get('n_routed_experts',
-                            hf_config.get('num_local_experts'))
-    if experts is None:
-        refuse("n_routed_experts",
-                "a DeepSeek MoE layer needs its expert count")
-    sparse = deepseek_routed(hf_config, layers, used) if sparse_layers is None else sparse_layers
-    shared = _records.integer(hf_config.get('n_shared_experts', 0) or 0, 'n_shared_experts')
-    shared_features = 0
-    if shared:
-        width = hf_config.get('moe_intermediate_size')
-        if width is None:
-            refuse("moe_intermediate_size",
-                    "the shared experts need their width")
-        shared_features = shared * _records.integer(width, 'moe_intermediate_size')
-    return native_fields(Mixture)(
-        experts=_records.integer(experts, 'n_routed_experts'),
-        top_k=_records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok'),
-        layers=sparse,
-        scaling=_records.number(hf_config.get('routed_scaling_factor', 1.0), 'routed_scaling_factor'),
-        shared_features=shared_features,
-        expert_features=_records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size'),
-    )
-
-
 DEEPSEEK_DECODER = decoder_layout(rope=rope_part(PLAIN_SPELLING, ramps=('yarn', 'llama3'), per_kind=False))
 """The shared decoder as DeepSeek V2's, V3's and V3.2's configs state it, both ways."""
 
 
-def _read_mla(hf_config: Mapping[str, object], used: set[str], config: DecoderFields, *,
-              sparse: bool, points_head_dim: bool = True) -> DecoderFields:
-    """The MLA block of a DeepSeek V2, V3 or V3.2 config (`mla_export` writes it back): its layers
-    (`sparse` picks V3.2's, every layer deepseek_sparse_attention, its lightning indexer's geometry among
-    the mixer's) and the MLA `mixer` record."""
-    layer_types = _records.strings(config.get('layer_types'), 'layer_types')
-    model_type = hf_config['model_type']
-    layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
-    sparse_name = ('deepseek_sparse_attention'
-                   if sparse else 'full_attention')
-    if hf_config.get('layer_types') is None:
-        # Neither released config names its pattern. V3 is dense MLA
-        # throughout and V3.2 sparse attention throughout.
-        layer_types = (sparse_name,) * layers
-        config['layer_types'] = layer_types
-    for entry in layer_types:
-        if entry != sparse_name:
-            refuse(f"layer_types entry {entry!r}",
-                    f"a {model_type} model mixes no attention kinds: "
-                    f"every layer is {sparse_name}")
-    nope = _records.integer(hf_config['qk_nope_head_dim'], 'qk_nope_head_dim')
-    rope = _records.integer(hf_config['qk_rope_head_dim'], 'qk_rope_head_dim')
-    head_dim = hf_config.get('head_dim') if points_head_dim else None
-    if head_dim is not None and _records.integer(head_dim, 'head_dim') != rope:
-        refuse(f"head_dim {head_dim!r}",
-                "DeepSeek points head_dim at the rope slice, "
-                f"which is {rope} wide here")
-    derived = hf_config.get('qk_head_dim')
-    if derived is not None and _records.integer(derived, 'qk_head_dim') != nope + rope:
-        refuse(f"qk_head_dim {derived!r}",
-                f"it derives as qk_nope_head_dim + qk_rope_head_dim, "
-                f"which is {nope + rope} here")
-    v_dim = hf_config.get('v_head_dim')
-    if v_dim is None:
-        refuse("v_head_dim",
-                "the values need their width, and no default keeps a "
-                "checkpoint's layout")
-    kv_rank = hf_config.get('kv_lora_rank')
-    if kv_rank is None:
-        refuse("kv_lora_rank",
-                "the latent needs its width, and no default keeps a "
-                "checkpoint's layout")
-    interleave = hf_config.get('rope_interleave', True)
-    if sparse and interleave is not True:
-        refuse(f"rope_interleave {interleave!r}",
-                "the V3.2 reference always rotates interleaved pairs; a "
-                "flag saying otherwise describes no released model")
-    index: dict[str, int] | None = None
-    if sparse:
-        index = {
-            'index_topk': _records.integer(hf_config['index_topk'], 'index_topk'),
-            'index_n_heads': _records.integer(hf_config['index_n_heads'], 'index_n_heads'),
-            'index_head_dim': _records.integer(hf_config['index_head_dim'], 'index_head_dim'),
-        }
-        used.update(('index_topk', 'index_n_heads', 'index_head_dim'))
-    # The released checkpoints ship the prediction depth as the layer past
-    # the trunk, model.layers.61.* (1564 of DeepSeek-V3's 91991 tensors,
-    # 1571 of V3.2-Exp's 92425): `DEEPSEEK_ROUTES` reads it. transformers
-    # builds no MTP module and saves the trunk alone, and a model builds
-    # the depths its weights hold (`dew.interop.pretrained`).
-    config['num_nextn_predict_layers'] = record_int(hf_config, 'num_nextn_predict_layers', 0)
-    # The fp8 scales name the stored dtype. dew loads the dequantized
-    # weights, and the reader names an unreadable dtype where it meets one.
-    # ep_size is a runtime parallel hint.
-    used.update(('num_nextn_predict_layers', 'num_mtp_layers'))
-    used.update(('quantization_config', 'ep_size'))
-    used.update(('qk_nope_head_dim', 'qk_rope_head_dim', 'v_head_dim',
-                 'kv_lora_rank', 'q_lora_rank', 'qk_head_dim',
-                 'rope_interleave'))
-    config.update(
-        head_dim=nope + rope,
-        mixer={
-            'class': 'mla', 'fields': {
-            'q_lora_rank': (None if hf_config.get('q_lora_rank') is None
-                            else _records.integer(hf_config['q_lora_rank'], 'q_lora_rank')),
-            'kv_lora_rank': _records.integer(kv_rank, 'kv_lora_rank'),
-            'qk_nope_head_dim': nope,
-            'qk_rope_head_dim': rope,
-            'v_head_dim': _records.integer(v_dim, 'v_head_dim'),
-            'rope_interleave': bool(interleave),
-            'index_topk': None if index is None else index['index_topk'],
-            'index_n_heads': None if index is None else index['index_n_heads'],
-            'index_head_dim': (None if index is None
-                               else index['index_head_dim']),
-        }},
-    )
-    return config
+def _or_one(value: Configured, key: str) -> int:
+    """A group count, one where a config states it null."""
+    return _records.integer(value or 1, key)
 
 
-def _read_experts(hf_config: Mapping[str, object], used: set[str], config: DecoderFields, *,
-                  mixture: Callable[[Mapping[str, object], int, set], MixtureFields]) -> DecoderFields:
-    """A DeepSeek MoE's routed experts (`mixture`, the family's own reader; `deepseek_moe_export` writes them
-    back): a schedule whose dense layers are all of them routes nothing, as the reference builds it, and
-    the mixture's fields then describe nothing it computes."""
-    layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
-    routed = deepseek_routed(hf_config, layers, used)
-    if not routed:
-        used.update((*LAYOUT_FIELDS, 'norm_topk_prob', 'topk_method', 'scoring_func'))
-    config['mixture'] = mixture(hf_config, layers, used) if routed else None
-    return config
+def _scaling(value: Configured, key: str) -> float:
+    """The routed weights' scale, the reference's 1.0 where a config states it null."""
+    return _records.number(1.0 if value is None else value, key)
 
 
-def deepseek_layout_of(*, sparse: bool = False,
-                       mixture: Callable[[Mapping[str, object], int, set], MixtureFields] = deepseek_mixture,
-                       points_head_dim: bool = True) -> ConfigLayout[CausalTransformer]:
-    """A DeepSeek V2, V3 or V3.2 config, both ways: the shared decoder (`DEEPSEEK_DECODER`), the MLA block
-    and its prediction depths, and the routed experts (`mixture`, the family's reader). A class that points
-    head_dim at the rope slice whatever the config says (`points_head_dim` False: GlmMoeDsaConfig's) reads
-    no head_dim."""
-    decoder = DEEPSEEK_DECODER if points_head_dim else decoder_layout(
-        DecoderSpelling(fixed={'head_dim': None}),
-        rope=rope_part(PLAIN_SPELLING, ramps=('yarn', 'llama3'), per_kind=False))
-    return ConfigLayout(
-        decoder,
-        ConfigPart(partial(_read_mla, sparse=sparse, points_head_dim=points_head_dim),
-                   lambda model: {**mla_export(model),
-                                  'num_nextn_predict_layers': model.num_nextn_predict_layers}),
-        ConfigPart(partial(_read_experts, mixture=mixture), deepseek_moe_export))
+def _shared_experts(hf_config: Mapping[str, object], used: set[str],
+                    record: MixtureFields) -> MixtureFields:
+    """The shared experts, a count of the routed width (`n_shared_experts`, none where unstated or null)."""
+    used.add('n_shared_experts')
+    shared = _records.integer(hf_config.get('n_shared_experts', 0) or 0, 'n_shared_experts')
+    record['shared_features'] = shared * _records.integer(record['expert_features'], 'moe_intermediate_size')
+    return record
 
 
-def deepseek_moe_export(model: CausalTransformer, *, scheduled: bool = True) -> Mapping[str, object]:
-    """`deepseek_layout` and `deepseek_mixture` backwards, V3's sigmoid router (`_deepseek_v2_mixture`'s
-    softmax one where the mixture scores so): the routed experts' count, top-k and width, the shared ones
-    as a count of that width, the routed weights' scale and groups and how they are picked, and, where
-    `scheduled` (DeepSeek's own config), the dense layers before the routed ones
-    (`first_k_dense_replace`, `deepseek_routed`), every layer where the model routes none."""
-    mixture = model.mixture
-    if mixture is None:
-        return {'first_k_dense_replace': model.num_layers} if scheduled else {}
-    width = mixture.expert_features or model.hidden_features
-    if mixture.shared_features % width:
+def _shared_count(mixture: Mixture) -> Mapping[str, object]:
+    width = mixture.expert_features
+    if width is None or mixture.shared_features % width:
         refuse_export('mixture.shared_features', 'DeepSeek counts whole shared experts of the routed width')
-    softmax = mixture.score_function == 'softmax'
-    fields: dict[str, object] = {
-        'n_routed_experts': mixture.experts, 'num_experts_per_tok': mixture.top_k,
-        'moe_intermediate_size': width, 'n_shared_experts': mixture.shared_features // width,
-        'routed_scaling_factor': mixture.scaling, 'n_group': mixture.groups,
-        'topk_group': mixture.groups_per_token, 'norm_topk_prob': mixture.norm_topk_prob,
-        'scoring_func': mixture.score_function,
-        'topk_method': (('greedy' if mixture.groups == 1 else 'group_limited_greedy') if softmax
-                        else 'noaux_tc')}
-    if scheduled:
-        routed = tuple(model.sparse_layers)
-        first = model.num_layers - len(routed)
-        if routed != tuple(range(first, model.num_layers)):
-            refuse_export('mixture.layers', 'DeepSeek routes every layer past its first dense ones')
-        fields['first_k_dense_replace'] = first
-    return fields
+    return {'n_shared_experts': mixture.shared_features // width}
 
 
-def mla_export(model: CausalTransformer) -> Mapping[str, object]:
-    """`deepseek_config`'s MLA backwards: the latents' ranks, the query and key heads' rotated and unrotated
-    widths (`head_dim` the rotated slice, as DeepSeek points it), the values', and the lightning indexer's
-    geometry where the mixer selects keys (V3.2's)."""
+def _sigmoid_router(hf_config: Mapping[str, object], used: set[str],
+                    record: MixtureFields) -> MixtureFields:
+    """DeepSeek V3's router: it selects on the biased sigmoid scores inside the best groups, each scored by
+    its two best experts (`noaux_tc`)."""
+    used.update(('scoring_func', 'topk_method'))
+    scoring = hf_config.get('scoring_func', 'sigmoid')
+    if scoring != 'sigmoid':
+        refuse(f"scoring_func {scoring!r}", "dew's router scores softmax, sigmoid or sqrtsoftplus, and this "
+                                            "family's reference scores sigmoid")
+    method = hf_config.get('topk_method')
+    if method is not None and method != 'noaux_tc':
+        refuse(f"topk_method {method!r}",
+               "the reference selects with the bias and the group limit, which is what noaux_tc names")
+    record.update(score_function='sigmoid', bias=True)
+    return record
+
+
+V3_ROUTER: tuple[ConfigEntry[Mixture], ...] = (
+    ConfigPart(_sigmoid_router, lambda mixture: {'scoring_func': 'sigmoid', 'topk_method': 'noaux_tc'},
+               keys=('scoring_func', 'topk_method')),
+    expect('norm_topk_prob', 'DeepseekV3TopkRouter always renormalises the top-k weights', value=True,
+           written=True))
+"""DeepSeek V3's router, both ways: sigmoid scores and their bias (`_sigmoid_router`), the top-k weights
+always renormalised. `norm_topk_prob: false` would leave them unnormalised, which the V3 reference never
+does; a router that reads the flag (GLM-5's) declares it in place of the expectation."""
+
+GLM_ROUTER: tuple[ConfigEntry[Mixture], ...] = (
+    V3_ROUTER[0], flag('norm_topk_prob', 'norm_topk_prob', default=True))
+"""DeepSeek V3's router as GLM-5's reads it: the top-k weights renormalised where `norm_topk_prob` says."""
+
+
+def _softmax_router(hf_config: Mapping[str, object], used: set[str],
+                    record: MixtureFields) -> MixtureFields:
+    """DeepSeek V2's router: `DeepseekV2TopkRouter` softmaxes the logits, selects greedily or inside the
+    best groups scored by their best expert, and never renormalises. It reads no `norm_topk_prob`: the
+    released `false` translates and a `true` refuses."""
+    used.update(('scoring_func', 'topk_method', 'norm_topk_prob'))
+    scoring = hf_config.get('scoring_func', 'softmax')
+    if scoring != 'softmax':
+        refuse(f"scoring_func {scoring!r}", "DeepseekV2TopkRouter softmaxes its logits")
+    if hf_config.get('norm_topk_prob', False):
+        refuse("norm_topk_prob=True", "DeepseekV2TopkRouter never renormalises the top-k weights")
+    method = hf_config.get('topk_method', 'greedy')
+    if method not in ('greedy', 'group_limited_greedy'):
+        refuse(f"topk_method {method!r}", "DeepseekV2TopkRouter selects greedy or group_limited_greedy")
+    if method == 'greedy' and (record['groups'], record['groups_per_token']) != (1, 1):
+        refuse(f"n_group {record['groups']} with topk_method 'greedy'",
+               "the greedy selection ignores the groups")
+    record.update(score_function='softmax', norm_topk_prob=False, group_score='max')
+    return record
+
+
+V2_ROUTER: tuple[ConfigEntry[Mixture], ...] = (ConfigPart(
+    _softmax_router, lambda mixture: {
+        'scoring_func': 'softmax', 'norm_topk_prob': False,
+        'topk_method': 'greedy' if mixture.groups == 1 else 'group_limited_greedy'},
+    keys=('scoring_func', 'topk_method', 'norm_topk_prob')),)
+"""DeepSeek V2's router, both ways (`_softmax_router`)."""
+
+
+def deepseek_experts(router: tuple[ConfigEntry[Mixture], ...], present: Callable[[Mapping[str, object]], bool]
+                     | None) -> Nested[CausalTransformer, Mixture]:
+    """A DeepSeek MoE's routed experts, both ways: their count, top-k and width, the shared ones as a count
+    of that width, the routed weights' scale and groups, and how `router` scores and picks them; none
+    where `present`, of the source config, says no layer routes (their keys then describe nothing the
+    reference computes). Their layers are the family's schedule's (`DENSE_FIRST`, GLM's and MiMo's own).
+    `aux_loss_alpha` and `seq_aux` shape the training loss alone and no forward pass reads them; a run
+    sets them on LMObjective, whose `aux_loss_alpha` and `seq_aux` compute V2's balance loss."""
+    return Nested('mixture', Mixture, ConfigLayout(
+        integer('n_routed_experts', 'experts', REQUIRED, 'num_local_experts'),
+        integer('num_experts_per_tok', 'top_k'), integer('moe_intermediate_size', 'expert_features'),
+        ConfigPart(_shared_experts, _shared_count, keys=('n_shared_experts',)),
+        ConfigField('routed_scaling_factor', 'scaling', 1.0, parse=_scaling),
+        ConfigField('n_group', 'groups', 1, parse=_or_one),
+        ConfigField('topk_group', 'groups_per_token', 1, parse=_or_one), *router,
+        unread('aux_loss_alpha', 'seq_aux')), stated_experts, present=present)
+
+
+def routes_some(hf_config: Mapping[str, object]) -> bool:
+    """Whether a DeepSeek MoE config routes any layer (`deepseek_routed`)."""
+    layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    return bool(deepseek_routed(hf_config, layers, set()))
+
+
+def _dense_first(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+    routed = deepseek_routed(hf_config, _records.integer(record['num_layers'], 'num_layers'), used)
+    if record.get('mixture') is not None:
+        record['mixture'] = NativeFields(Mixture, {**_records.record(record['mixture'], 'mixture'),
+                                                   'layers': routed})
+    return record
+
+
+def _dense_first_written(model: CausalTransformer) -> Mapping[str, object]:
+    if model.mixture is None:
+        return {'first_k_dense_replace': model.num_layers}
+    routed = tuple(model.sparse_layers)
+    first = model.num_layers - len(routed)
+    if routed != tuple(range(first, model.num_layers)):
+        refuse_export('mixture.layers', 'DeepSeek routes every layer past its first dense ones')
+    return {'first_k_dense_replace': first}
+
+
+DENSE_FIRST = ConfigPart(_dense_first, _dense_first_written,
+                         keys=('first_k_dense_replace', 'moe_layer_freq', 'mlp_layer_types'))
+"""A DeepSeek MoE's schedule, both ways: the dense layers before the routed ones (`first_k_dense_replace`,
+`deepseek_routed`), every layer where the model routes none."""
+
+V3_EXPERTS = ConfigLayout(deepseek_experts(V3_ROUTER, routes_some), DENSE_FIRST)
+"""DeepSeek V3's routed experts and their schedule, both ways."""
+
+
+def _mla(model: CausalTransformer) -> MLAMixer:
     mixer = model.mixer
     if not isinstance(mixer, MLAMixer):
         refuse_export('mixer', 'a DeepSeek layer attends by multi-head latent attention')
-    return {'q_lora_rank': mixer.q_lora_rank, 'kv_lora_rank': mixer.kv_lora_rank,
-            'qk_nope_head_dim': mixer.qk_nope_head_dim, 'qk_rope_head_dim': mixer.qk_rope_head_dim,
-            'qk_head_dim': mixer.qk_nope_head_dim + mixer.qk_rope_head_dim,
-            'head_dim': mixer.qk_rope_head_dim,
-            'v_head_dim': mixer.v_head_dim, 'rope_interleave': mixer.rope_interleave,
-            **({} if mixer.index_topk is None else {
-                'index_topk': mixer.index_topk, 'index_n_heads': mixer.index_n_heads,
-                'index_head_dim': mixer.index_head_dim})}
+    return mixer
+
+
+def _optional_integer(value: Configured, key: str) -> int | None:
+    return None if value is None else _records.integer(value, key)
+
+
+def mla_fields(*, sparse: bool) -> ConfigLayout[MLAMixer]:
+    """The MLA block of a DeepSeek V2, V3 or V3.2 config, both ways: the latents' ranks, the query and key
+    heads' rotated and unrotated widths and the values', and where it selects keys (`sparse`: V3.2's,
+    whose reference always rotates interleaved pairs) its lightning indexer's geometry."""
+    interleave = (expect('rope_interleave', 'the V3.2 reference always rotates interleaved pairs',
+                         value=True, written=True)
+                  if sparse else flag('rope_interleave', 'rope_interleave', default=True))
+    return ConfigLayout(
+        ConfigField('q_lora_rank', 'q_lora_rank', None, parse=_optional_integer),
+        integer('kv_lora_rank', 'kv_lora_rank'), integer('qk_nope_head_dim', 'qk_nope_head_dim'),
+        integer('qk_rope_head_dim', 'qk_rope_head_dim'), integer('v_head_dim', 'v_head_dim'), interleave,
+        *((integer('index_topk', 'index_topk'), integer('index_n_heads', 'index_n_heads'),
+           integer('index_head_dim', 'index_head_dim')) if sparse else ()))
+
+
+def _mla_layers(hf_config: Mapping[str, object], used: set[str], record: DecoderFields, *,
+                sparse: bool) -> DecoderFields:
+    """Every layer the one attention kind: neither released config names its pattern, V3 dense MLA
+    throughout and V3.2 sparse attention throughout."""
+    kind = 'deepseek_sparse_attention' if sparse else 'full_attention'
+    if hf_config.get('layer_types') is None:
+        record['layer_types'] = (kind,) * _records.integer(record['num_layers'], 'num_layers')
+    for entry in _records.strings(record['layer_types'], 'layer_types'):
+        if entry != kind:
+            refuse(f"layer_types entry {entry!r}",
+                   f"a {hf_config['model_type']} model mixes no attention kinds: every layer is {kind}")
+    return record
+
+
+def _mla_heads(hf_config: Mapping[str, object], used: set[str], record: DecoderFields, *,
+               points_head_dim: bool) -> DecoderFields:
+    """The heads' width, the MLA's unrotated and rotated slices together (`qk_head_dim` where stated):
+    DeepSeek points `head_dim` at the rope slice (a class that points it whatever the config says,
+    `points_head_dim` False, GlmMoeDsaConfig's, reads none)."""
+    used.add('qk_head_dim')
+    mixer = _records.record(_records.record(record['mixer'], 'mixer')['fields'], 'mixer fields')
+    nope = _records.integer(mixer['qk_nope_head_dim'], 'qk_nope_head_dim')
+    rope = _records.integer(mixer['qk_rope_head_dim'], 'qk_rope_head_dim')
+    head_dim = hf_config.get('head_dim') if points_head_dim else None
+    if head_dim is not None and _records.integer(head_dim, 'head_dim') != rope:
+        refuse(f"head_dim {head_dim!r}",
+               f"DeepSeek points head_dim at the rope slice, which is {rope} wide here")
+    derived = hf_config.get('qk_head_dim')
+    if derived is not None and _records.integer(derived, 'qk_head_dim') != nope + rope:
+        refuse(f"qk_head_dim {derived!r}",
+               f"it derives as qk_nope_head_dim + qk_rope_head_dim, which is {nope + rope} here")
+    record['head_dim'] = nope + rope
+    return record
+
+
+def _mla_heads_written(model: CausalTransformer) -> Mapping[str, object]:
+    mixer = _mla(model)
+    return {'qk_head_dim': mixer.qk_nope_head_dim + mixer.qk_rope_head_dim,
+            'head_dim': mixer.qk_rope_head_dim}
+
+
+def mla_block(*, sparse: bool, points_head_dim: bool = True) -> ConfigLayout[CausalTransformer]:
+    """A DeepSeek V2, V3 or V3.2 attention block, both ways: its layers (`_mla_layers`), its MLA mixer
+    (`mla_fields`) and its heads' width (`_mla_heads`), and its prediction depths. The released checkpoints
+    ship a depth as the layer past the trunk, model.layers.61.* (1564 of DeepSeek-V3's 91991 tensors, 1571
+    of V3.2-Exp's 92425): `DEEPSEEK_ROUTES` reads it. transformers builds no MTP module and saves the trunk
+    alone, and a model builds the depths its weights hold (`dew.interop.pretrained`). The fp8 scales name
+    the stored dtype: Dew loads the dequantized weights, and the reader names an unreadable dtype where it
+    meets one; ep_size is a runtime parallel hint."""
+    return ConfigLayout(
+        ConfigPart(partial(_mla_layers, sparse=sparse), lambda model: {}),
+        Nested('mixer', MLAMixer, mla_fields(sparse=sparse), _mla,
+               build=lambda fields: {'class': 'mla', 'fields': fields}),
+        ConfigPart(partial(_mla_heads, points_head_dim=points_head_dim), _mla_heads_written),
+        integer('num_nextn_predict_layers', 'num_nextn_predict_layers', 0),
+        unread('num_mtp_layers', 'quantization_config', 'ep_size'))
+
+
+def deepseek_layout_of(*, sparse: bool = False, router: tuple[ConfigEntry[Mixture], ...] = V3_ROUTER,
+                       points_head_dim: bool = True) -> ConfigLayout[CausalTransformer]:
+    """A DeepSeek V2, V3 or V3.2 config, both ways: the shared decoder (`DEEPSEEK_DECODER`), the MLA block
+    and its prediction depths (`mla_block`), and the routed experts (`router` their router's) on the layers
+    past the dense ones (`DENSE_FIRST`). A class that points head_dim at the rope slice whatever the config
+    says (`points_head_dim` False: GlmMoeDsaConfig's) reads no head_dim."""
+    decoder = DEEPSEEK_DECODER if points_head_dim else decoder_layout(
+        DecoderSpelling(fixed={'head_dim': None}),
+        rope=rope_part(PLAIN_SPELLING, ramps=('yarn', 'llama3'), per_kind=False))
+    return ConfigLayout(decoder, mla_block(sparse=sparse, points_head_dim=points_head_dim),
+                        deepseek_experts(router, routes_some), DENSE_FIRST)
 
 
 # The text half of a Kimi K2.5 wrapper, by the model_type its text_config
@@ -1309,7 +1267,7 @@ DEEPSEEK_V32 = DecoderFamily(
 
 DEEPSEEK_V2 = DecoderFamily(
     ('deepseek_v2',),
-    deepseek_layout_of(mixture=_deepseek_v2_mixture),
+    deepseek_layout_of(router=V2_ROUTER),
     lambda fields: (
         isinstance(fields.mixer, MLAMixer)
         and (mixture := fields.mixture) is not None
