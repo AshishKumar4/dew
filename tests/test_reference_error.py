@@ -2452,3 +2452,10 @@ def test_a_float64_computation_is_held_within_its_own_roundings():
     exact = Fraction(1) + Fraction(1, 2**53) + Fraction(1, 2**120)
     assert_within_rounding(np.asarray([1 - 3 * 2.0**-53]), np.asarray([exact], object), np.asarray([1.0]), 4,
                            np.float64, "below the midpoint's rounding")
+    # An error past the bound by less than its own ulp fails, compared exactly.
+    from dew._accuracy import reduction_bound
+
+    bound = float(reduction_bound(np.asarray([1.0]), 2, np.float64)[0] / 2)
+    beyond = np.asarray([Fraction(1) - Fraction(bound) - Fraction(1, 2**200)], object)
+    with pytest.raises(AssertionError):
+        assert_within_rounding(np.asarray([1.0]), beyond, np.asarray([1.0]), 2, np.float64, "just past")

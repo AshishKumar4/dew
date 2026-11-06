@@ -630,16 +630,20 @@ def assert_within_rounding(computed, exact, magnitudes, roundings: int, dtype, l
     `dtype`'s unit roundoff; half `reduction_bound`'s two-sided bound): a bound derived from the arithmetic
     alone, for a claim no float64 reference can hold, a float64 computation's own accuracy. `exact` is the
     exact value (each a `fractions.Fraction`, or a float64 that holds it exactly)."""
-    # The error taken exactly, the exact value never rounded on the way: its float64 rounding alone would
-    # add half its ulp to the error, past the bound of a result rounded once.
-    error = np.asarray([float(abs(fractions.Fraction(float(found)) - fractions.Fraction(value)))
-                        for found, value in zip(np.ravel(np.asarray(computed, np.float64)), np.ravel(exact),
-                                                strict=True)]).reshape(np.shape(exact))
-    bound = reduction_bound(magnitudes, roundings, dtype) / 2
-    worst = float(np.broadcast_to(bound, error.shape).max())
-    assert within(error, bound), (f"{label}: {int(np.sum(error > bound))} values past gamma_{roundings} of "
-                                  f"their magnitudes in {np.dtype(dtype).name}, the worst "
-                                  f"{float(error.max()):.3e} against {worst:.3e}")
+    # The error and its comparison exact, nothing rounded on the way: rounding the exact value would add half
+    # its ulp to the error, and rounding the error could put it on the bound.
+    found = np.ravel(np.asarray(computed, np.float64))
+    bound = np.ravel(np.broadcast_to(reduction_bound(magnitudes, roundings, dtype) / 2, np.shape(exact)))
+    error = [abs(fractions.Fraction(value) - fractions.Fraction(truth)) if np.isfinite(value) else None
+             for value, truth in zip(found, np.ravel(exact), strict=True)]
+    past = [index for index, (wrong, allowed) in enumerate(zip(error, bound, strict=True))
+            if wrong is None or not np.isfinite(allowed) or wrong > fractions.Fraction(float(allowed))]
+    worst = max(past, key=lambda index: float("inf") if error[index] is None else float(error[index]),
+                default=None)
+    assert worst is None, (f"{label}: {len(past)} values past gamma_{roundings} of their magnitudes in "
+                           f"{np.dtype(dtype).name}, the worst {found[worst]!r} off by "
+                           f"{float('nan') if error[worst] is None else float(error[worst]):.3e} against "
+                           f"{float(bound[worst]):.3e}")
 
 
 RESOLUTION = 1024 * float(np.finfo(np.float64).eps)
