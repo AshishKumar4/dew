@@ -130,28 +130,47 @@ def test_a_started_command_that_cannot_execute_raises_its_error_as_popen_does_an
     assert raised.value.filename == "a-program-no-path-holds"
 
 
-def test_a_started_command_meets_the_signals_popen_restores_as_popen_leaves_them():
-    """Popen restores the signals Python ignores (SIGPIPE, SIGXFSZ) to their defaults in the process it
-    executes; the command `start` executes behind its gate meets them so too: one that sends itself SIGPIPE
-    ends by it, as under Popen, where an ignored SIGPIPE would let it run on."""
-    command = ["sh", "-c", "kill -PIPE $$; exit 3"]
-    assert subprocess.run(command, timeout=60).returncode == -signal.SIGPIPE
-    started = start(command)
-    try:
-        assert started.wait(timeout=60) == -signal.SIGPIPE
-    finally:
-        stop(started)
+@pytest.mark.parametrize(("disposition", "restore"),
+                         [("SIG_IGN", True), ("SIG_IGN", False), ("SIG_DFL", False)])
+def test_a_started_command_meets_sigpipe_as_popen_leaves_it(disposition, restore):
+    """The command `start` executes behind its gate, a Python process that ignores SIGPIPE, meets SIGPIPE
+    as Popen leaves it: at its default where Popen restores it (`restore_signals`), and without that as its
+    owner holds it, ignored where it is ignored and at its default where it is: one that sends itself
+    SIGPIPE ends by it, or runs on to its own exit. Its owner here a process of its own, which sets the
+    disposition."""
+    program = ("import signal, subprocess, sys\n"
+               "from dew._cleanup import start, stop\n"
+               f"signal.signal(signal.SIGPIPE, signal.{disposition})\n"
+               "command = ['sh', '-c', 'kill -PIPE $$; exit 3']\n"
+               f"plain = subprocess.run(command, restore_signals={restore}).returncode\n"
+               f"started = start(command, restore_signals={restore})\n"
+               "print(plain, started.wait(timeout=60))\n"
+               "stop(started)\n")
+    done = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=120)
+    ended = -signal.SIGPIPE if restore or disposition == "SIG_DFL" else 3
+    assert done.stdout == f"{ended} {ended}\n", done.stdout + done.stderr
 
 
 class Interrupted(Exception):
     """What a caller's deadline, or a Ctrl-C, raises in a start under way."""
 
 
-def test_a_start_interrupted_before_its_command_runs_leaves_no_group_behind(tmp_path):
-    """An interruption that reaches `start` while its group starts (in its Popen, or while its gate is
-    released and executes the command) stops the group: its command, once it runs, does not outlive the
-    start that raised, though its owner, the test, runs on. Alarms at a millisecond apart land across the
-    start's steps."""
+def lifelines() -> int:
+    """How many lifelines this process has started that still run (zombies, which have no command line,
+    aside)."""
+    found = 0
+    for entry in Path("/proc").iterdir():
+        with contextlib.suppress(OSError, IndexError):
+            parent = int((entry / "stat").read_text().rpartition(")")[2].split()[1])
+            found += parent == os.getpid() and b"_cleanup.py" in (entry / "cmdline").read_bytes()
+    return found
+
+
+def test_a_start_interrupted_before_its_command_runs_leaves_nothing_behind(tmp_path):
+    """An interruption that reaches `start` while its group starts (in its lifeline's or its gate's Popen,
+    or while its gate is released and executes the command) leaves nothing of it: its command, once it
+    runs, does not outlive the start that raised, though its owner, the test, runs on, and no lifeline of
+    it nor descriptor it opened is left. Alarms a millisecond apart land across the start's steps."""
     armed = {"on": False}
 
     def interrupt(number: int, frame: object) -> None:
@@ -160,6 +179,7 @@ def test_a_start_interrupted_before_its_command_runs_leaves_no_group_behind(tmp_
 
     previous = signal.signal(signal.SIGALRM, interrupt)
     interrupted, survivors = 0, []
+    descriptors, held = len(os.listdir("/proc/self/fd")), lifelines()
     try:
         for step in range(40):
             recorded = tmp_path / f"{step}.pid"
@@ -182,7 +202,12 @@ def test_a_start_interrupted_before_its_command_runs_leaves_no_group_behind(tmp_
                 os.kill(pid, signal.SIGKILL)
     finally:
         signal.signal(signal.SIGALRM, previous)
+    # A lifeline let go ends on its own pipe's close, a moment after.
+    deadline = time.monotonic() + 30
+    while lifelines() > held and time.monotonic() < deadline:
+        time.sleep(0.1)
     assert interrupted and not survivors
+    assert (len(os.listdir("/proc/self/fd")), lifelines()) == (descriptors, held)
 
 
 def test_threads_starting_their_first_groups_at_once_in_a_process_without_dew_all_start_them(tmp_path):
