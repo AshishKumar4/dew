@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from decision_support import drawn_weights
 from reference_error import GateFailure, Inconclusive, as_given, assert_as_exact, indexed_recording, recording
 from reference_runs import assert_as_exact_as_recorded
 
@@ -83,25 +84,14 @@ def laid(parallel: bool) -> tuple[DecisionInputs, ...]:
 
 
 def draw(seed: int) -> dict[str, np.ndarray]:
-    """A seed's weights for the tiny checkpoint's model: kernels and embeddings at their initializer's
-    scale, norms' scales about one and biases off zero, under Dew's paths (`dew.`) and Laya's names
-    (`param.`, `dew.decision.laya.laya_tensors`), the requests the fixture's cases."""
-    from flax.traverse_util import flatten_dict, unflatten_dict
+    """A seed's weights for the tiny checkpoint's model (`drawn_weights`), under Dew's paths (`dew.`) and
+    Laya's names (`param.`, `dew.decision.laya.laya_tensors`), the requests the fixture's cases."""
+    from flax.traverse_util import unflatten_dict
 
     from dew.decision.laya import laya_tensors
 
-    rng = np.random.default_rng([1557, 7, seed])
     checkpoint = tiny()
-    drawn = {}
-    for path, value in flatten_dict(checkpoint.variables).items():
-        shape = np.shape(value)
-        if path[-1] == "scale":
-            leaf = rng.normal(1.0, 0.3, shape)
-        elif path[-1] == "bias":
-            leaf = rng.normal(0.0, 0.3, shape)
-        else:
-            leaf = rng.normal(0.0, 1.0, shape) / np.sqrt(np.prod(shape[:-1]))
-        drawn[path] = leaf.astype(np.float32)
+    drawn = drawn_weights(checkpoint.variables, np.random.default_rng([1557, 7, seed]))
     tensors, _ = laya_tensors(checkpoint.model, unflatten_dict(drawn))
     return {**{f"dew.{'/'.join(path)}": value for path, value in drawn.items()},
             **{f"param.{name}": np.asarray(tensors[name], np.float32) for name in tensors}}
@@ -176,7 +166,6 @@ REAL_FIXTURE = FIXTURES / "real" / "seeds.npz"
 REAL_SEEDS = 8
 """The released checkpoint's declared seeds, sized by `seeds_for` paired as the recording confirmed them
 (tools/venv_reference.py's `laya-real` site)."""
-REAL_OUTPUTS = OUTPUTS
 WORDS = ("account", "billing", "charge", "refund", "march", "payment", "rent", "today", "cancel", "issue",
          "please", "fix", "error", "login", "password", "upgrade", "plan", "price", "invoice", "card",
          "bank", "late", "again", "twice", "need", "help", "now", "team", "support", "reply", "order",

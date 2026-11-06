@@ -1,26 +1,29 @@
 """A joint-head release's layout and head against the release's own code, under the float64 rule.
 
-The release and its commit are tests/fixtures/joint_checkpoint/tiny/source.json's,
-and tools/joint_checkpoint_reference.py wrote the fixtures from its code."""
+The release and its commit are tests/fixtures/joint_checkpoint/tiny/source.json's;
+tools/joint_checkpoint_reference.py wrote the fixtures from its code, and tools/joint_worker.py ran it over
+drawn head weights for the recordings (`FIXTURE`, `FLA_FIXTURE`)."""
 
 import base64
+import functools
 import io
 import json
 import shutil
+import tempfile
 from dataclasses import replace
 from pathlib import Path
 
 import lane_environment
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from decision_support import decision_rows
-from float64_terms import float64_forward
+from decision_support import decision_rows, drawn_weights
 from interop_support import allocated_bytes, written_tensors
-from one_draw import assert_as_exact_as_the_reference
 from PIL import Image
-from reference_error import ieee_fixture
+from reference_error import as_given, assert_as_exact, indexed_recording, recording
+from reference_runs import assert_as_exact_as_recorded
 from safetensors.numpy import load_file
 
 from dew.checkpoints import Checkpoints
@@ -42,9 +45,13 @@ from dew.decision import (
 )
 from dew.decision.calibration import softmax
 from dew.decision.images import Images
+from dew.decision.joint_checkpoint import head_tensors
 from dew.decision.layout import JOINT_SEGMENTS
+from dew.decision.model import DecisionModel
+from dew.decision.sources import PretrainedDecision
 from dew.interop import Pretrained
 from dew.nn.kernels.generation import triton_runs
+from dew.objectives.base import joined
 from dew.training.trainer import Trainer
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -173,113 +180,158 @@ def test_a_joint_schema_read_in_context_is_the_schema_the_row_holds(tokenizer):
                                                                      read.media)
 
 
-def head_logits(tokenizer: HFTokenizer) -> tuple[np.ndarray, ...]:
-    """Dew's head, the release's fp32 head, its float64 head, and the terms
-    Dew's float64 head sums for each logit (`float64_forward`), all on the
-    same fp32 backbone states, over every question of every case. Each case
-    runs alone, padded to the cases' widest layout, so every case is one
-    program, compiled once, and padding reaches none of the head's pooling
-    (`test_a_padded_batch_scores_every_row_as_it_scores_alone`)."""
-    loaded = Pretrained.load(TINY, dtype="float32", attention_impl="xla")
-    table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
-    # Dew's head compiled, as a served task's pass runs it.
-    head = jax.jit(loaded.model.apply)
-    found, reference, truth, terms = [], [], [], []
-    rows = laid_out(tokenizer)
-    widest = DecisionInputs.collate([row for _, row in rows.values()], 0)
+SITE, FIXTURE = "joint", TINY / "joint.npz"
+FLA_FIXTURE = TINY / "joint-fla.npz"
+"""The recordings of tools/venv_reference.py's `joint` and `joint-fla` sites (tools/joint_worker.py), the
+release's own code over drawn head weights: its torch math on the CPU, and on a CUDA GPU over fla's own
+chunked rule, the algorithm Dew's Gated DeltaNet runs wherever Dew's Triton kernels run (`GATED_DELTA`),
+so the reference that runs where Dew runs (`recorded`)."""
+OUTPUTS = ("head", "joint", "images")
+"""The leaves `dew` gives, every question's option logits of every case concatenated in the cases' order:
+the head alone on the release's fp32 backbone states (states.npz), Dew's Qwen 3.5 and the head end to
+end, and the quickstart request with the backbone fixture's two images, the vision tower included."""
+
+
+def recorded() -> tuple[Path, str, int]:
+    """The recording the reference runs where Dew runs, its site and its seeds."""
+    fixture, site = (FLA_FIXTURE, "joint-fla") if triton_runs() else (FIXTURE, SITE)
+    return fixture, site, int(recording(fixture)[f"{site}.seeds"])
+
+
+@functools.cache
+def release(dtype: str) -> PretrainedDecision:
+    """The joint head beside its Qwen 3.5 backbone (`released`), loaded once for each dtype."""
+    with tempfile.TemporaryDirectory() as directory:
+        return Pretrained.load(released("joint", Path(directory) / "release"), dtype=dtype, param_dtype=dtype,
+                               attention_impl="xla")
+
+
+@functools.cache
+def laid() -> tuple:
+    """What `dew` reads as constants, made on the host: each case's row (the task's layout), collated
+    together padded to the widest, with its stored fp32 states padded alike; each row collated alone;
+    and the quickstart's row with the two images, collated, and its media."""
+    bundle = release("float32")
+    tokenizer, specials = bundle.decision_tokenizer, bundle.specials
+    rows = []
+    for request in CASES.values():
+        questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
+        rows += bundle.layout.rows(tokenizer, specials, request["state"], questions)
+    request = CASES["quickstart"]
+    pictures = [Image.fromarray(array) for array in np.load(BACKBONE / "images.npy")]
+    media = Images.of(bundle.processor, pictures, bundle.processor.image_text())
+    [pictured] = bundle.layout.rows(tokenizer, specials, request["state"], {
+        name: Question.from_wire(wire) for name, wire in request["questions"].items()}, media=media.tokens)
+    with jax.ensure_compile_time_eval():
+        widest = jax.tree.map(np.asarray, DecisionInputs.collate(rows, 0))
+        alone = tuple(jax.tree.map(np.asarray, DecisionInputs.collate([row], 0)) for row in rows)
+        seen = (jax.tree.map(np.asarray, DecisionInputs.collate([pictured], 0)),
+                jax.tree.map(np.asarray, media.inputs(bundle.processor, pictured)))
     length = widest.tokens.shape[1]
-    with np.load(TINY / "states.npz") as states, np.load(TINY / "logits.npz") as logits:
-        for index, (case, (_, row)) in enumerate(rows.items()):
-            inputs = jax.tree.map(lambda leaf, at=index: leaf[at:at + 1], widest)
-            padded = np.pad(states[case], ((0, length - len(states[case])), (0, 0)))[None]
-            given = (loaded.variables, padded, inputs, table)
-            scores = head(*given)
-            _, summed = float64_forward(loaded.model, *given)
-            for slot, laid in enumerate(row.questions):
-                key = f"{case}/{laid.name}"
-                found.append(np.asarray(scores)[0, slot, :len(laid.options)])
-                terms.append(np.asarray(summed)[0, slot, :len(laid.options)])
-                reference.append(logits[key])
-                truth.append(logits[f"{key}/head64"])
-    return tuple(map(np.concatenate, (found, reference, truth, terms)))
+    with np.load(TINY / "states.npz") as states:
+        padded = np.stack([np.pad(states[case], ((0, length - len(states[case])), (0, 0))) for case in CASES])
+    return rows, pictured, widest, padded, alone, seen
 
 
-def test_the_stored_joint_head_matches_its_release_under_the_float64_rule(tokenizer):
-    """Every question of every case, read off the same fp32 backbone states,
-    held to twice the release's own head's fp32 distance from its float64
-    run (measured: 1.42 times)."""
-    found, reference, truth, terms = head_logits(tokenizer)
-    assert_as_exact_as_the_reference(found, reference, truth, "stored joint head logits", terms=terms)
+def draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's weights for the joint head (`drawn_weights`), under Dew's paths (`dew.`) and the release's
+    names (`param.`, `dew.decision.joint_checkpoint.head_tensors`), the requests the fixture's cases."""
+    from flax.traverse_util import unflatten_dict
+
+    drawn = drawn_weights(release("float32").head_variables, np.random.default_rng([1557, 9, seed]))
+    tensors = head_tensors(unflatten_dict(drawn)["params"])
+    return {**{f"dew.{'/'.join(path)}": value for path, value in drawn.items()},
+            **{f"param.{name}": np.asarray(tensors[name], np.float32) for name in tensors}}
 
 
-def test_a_padded_batch_scores_every_row_as_it_scores_alone(tokenizer):
+def head_variables(dtype, inputs) -> dict:
+    from flax.traverse_util import unflatten_dict
+
+    return unflatten_dict({tuple(key.removeprefix("dew.").split("/")): jnp.asarray(value, dtype)
+                           for key, value in inputs.items() if key.startswith("dew.")})
+
+
+def options(scores, rows) -> jax.Array:
+    """Each row's questions' option logits out of `[B, Q, K]` scores, concatenated in order."""
+    return jnp.concatenate([scores[index, slot, :len(laid.options)]
+                            for index, row in enumerate(rows) for slot, laid in enumerate(row.questions)])
+
+
+def heads(dtype, inputs, *, together: bool = False) -> jax.Array:
+    """The head alone at `dtype` under a draw's weights on the release's fp32 states, each case alone
+    padded to the widest, or all `together` in one batch."""
+    bundle, variables = release(jnp.dtype(dtype).name), head_variables(dtype, inputs)
+    rows, _, widest, padded, _, _ = laid()
+    table = jnp.asarray(load_file(BACKBONE / "model.safetensors")["lm_head.weight"], dtype)
+    states = jnp.asarray(padded, dtype)
+    if together:
+        return options(bundle.head.apply(variables, states, widest, table), rows)
+    return jnp.concatenate([options(bundle.head.apply(variables, states[at:at + 1], jax.tree.map(
+        lambda leaf, at=at: leaf[at:at + 1], widest), table), [row]) for at, row in enumerate(rows)])
+
+
+def dew(dtype, inputs) -> dict[str, jax.Array]:
+    """Dew's `OUTPUTS` at `dtype` under a draw's head weights."""
+    bundle = release(jnp.dtype(dtype).name)
+    model = DecisionModel(bundle.model, bundle.head)
+    variables = joined({"backbone": bundle.variables, "head": head_variables(dtype, inputs)})
+    rows, pictured, _, _, alone, (seen, media) = laid()
+    whole = jnp.concatenate([options(model.logits(variables, row), [encoded])
+                             for encoded, row in zip(rows, alone, strict=True)])
+    return {"head": heads(dtype, inputs), "joint": whole,
+            "images": options(model.logits(variables, seen, media=media), [pictured])}
+
+
+def test_a_joint_release_scores_as_its_own_code_under_the_float64_rule():
+    """Every question of every case over drawn head weights, as exact as the release's float32 run
+    against its float64 run (check 1): the head alone on the release's own fp32 backbone states, Dew's
+    Qwen 3.5 and the head end to end, and the quickstart request with two images, the vision tower
+    included."""
+    fixture, site, seeds = recorded()
+    assert_as_exact_as_recorded(fixture, site, seeds, draw, dew, "the joint release's option logits")
+
+
+def test_a_padded_batch_scores_every_row_as_it_scores_alone():
     """All five cases in one batch, padded to the longest row and the most
     questions and options: padding reaches none of the head's pooling or
-    attention, so each question scores as it does alone."""
-    loaded = Pretrained.load(TINY, dtype="float32", attention_impl="xla")
+    attention, so the batch is held to the release's one-row runs under the
+    same rule, and the head's gradient through the table is finite."""
+    fixture, site, seeds = recorded()
+    drawn, reference, truth = indexed_recording(
+        recording(fixture), site, seeds, inputs_of=draw, leaves=("head",),
+        truth_fn=lambda inputs: {"head": heads(jnp.float64, inputs, together=True)})
+    batched = jax.jit(lambda inputs: {"head": heads(jnp.float32, inputs, together=True)})
+    assert_as_exact(as_given(lambda index, inputs: batched(inputs)), reference, drawn,
+                    "batched joint head logits", seeds=seeds, truth_fn=truth)
+
+    bundle = release("float32")
+    _, _, widest, padded, _, _ = laid()
     table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
-    rows = laid_out(tokenizer)
-    inputs = DecisionInputs.collate([row for _, row in rows.values()], 0)
-    with np.load(TINY / "states.npz") as states:
-        length = inputs.tokens.shape[1]
-        padded = np.stack([np.pad(states[case], ((0, length - len(states[case])), (0, 0))) for case in rows])
-        batched = np.asarray(loaded.model.apply(loaded.variables, padded, inputs, table))
-        for index, (case, (_, row)) in enumerate(rows.items()):
-            alone = np.asarray(loaded.model.apply(loaded.variables, states[case][None],
-                                                 DecisionInputs.collate([row], 0), table))
-            for slot, laid in enumerate(row.questions):
-                width = len(laid.options)
-                np.testing.assert_allclose(batched[index, slot, :width], alone[0, slot, :width], atol=2e-5)
 
     def total(rows_of_table):
-        scores = loaded.model.apply(loaded.variables, padded, inputs, rows_of_table)
+        scores = bundle.head.apply(bundle.head_variables, padded, widest, rows_of_table)
         return jax.numpy.sum(jax.numpy.where(jax.numpy.isfinite(scores), scores, 0.0))
 
     gradient = np.asarray(jax.grad(total)(jax.numpy.asarray(table)))
     assert np.all(np.isfinite(gradient)) and np.any(gradient)
 
 
-def joint_logits(decide) -> np.ndarray:
-    """Dew's logits of every question the cases lay out, in the fixture's order, each case's pass the
-    task's own, as a served request scores it (`Decide.scored`)."""
-    found = []
-    for request in CASES.values():
-        questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
-        [row] = decide.layout.rows(decide.tokenizer, decide.specials, request["state"], questions)
-        [scores] = decide.scored([row])
-        found += [scores[slot, :len(laid.options)] for slot, laid in enumerate(row.questions)]
-    return np.concatenate(found)
-
-
 def test_a_joint_release_answers_as_its_own_model(tmp_path):
     """`Decide.from_pretrained` reads a joint-head release, the Qwen 3.5
-    backbone with the head beside it. Dew's backbone and head together are
-    held to twice the release's own fp32 model's distance from its float64
-    run, and `systemone`, with the release's confidence (the top
-    probability), gives each option the probability the release's fp32
-    logits give it, within the fourth decimal both round to.
-
-    Where the device's target row names the delta rule's port, Dew's Gated
-    DeltaNet runs fla's algorithm, one plain fp32 decay prefix per chunk, not
-    the release's torch math: there the reference is the same release with
-    HF's Qwen 3.5 on fla's own kernels (logits_fla.npz,
-    tools/joint_checkpoint_reference.py --fla)."""
+    backbone with the head beside it, and `systemone`, with the release's
+    confidence (the top probability), gives each option the probability the
+    release's fp32 logits give it, within the fourth decimal both round to."""
     for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
         (tmp_path / source.name).symlink_to(source.resolve())
     decide = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), confidence=TopProbability())
     layouts = json.loads((TINY / "layouts.json").read_text())
-    keys, reference, truth = [], [], []
     with np.load(TINY / "logits.npz") as logits:
         for case, request in CASES.items():
             questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
             [row] = decide.layout.rows(decide.tokenizer, decide.specials, request["state"], questions)
             answers = decide.systemone(request)["answers"]
             for laid, kept in zip(row.questions, layouts[case]["questions"], strict=True):
-                key = f"{case}/{laid.name}"
-                keys.append(key)
-                reference.append(logits[key])
-                truth.append(logits[f"{key}/f64"])
-                probabilities = softmax(logits[key].astype(np.float64), 1.0)
+                probabilities = softmax(logits[f"{case}/{laid.name}"].astype(np.float64), 1.0)
                 expected = dict(zip(kept["option_ids"], probabilities, strict=True))
                 answer = answers[laid.name]
                 given = ({"true": answer["noul"]} if answer["type"] == "noul" else answer["probabilities"])
@@ -287,12 +339,6 @@ def test_a_joint_release_answers_as_its_own_model(tmp_path):
                     assert abs(value - expected[option]) <= 1e-4, (case, laid.name, option)
                 if answer["type"] != "noul":
                     assert answer["confidence"] == max(given.values())
-    # The delta rule's forward runs on the port wherever Dew's Triton kernels run (`GATED_DELTA`).
-    if triton_runs():
-        on_fla = ieee_fixture(TINY / "logits_fla.npz")
-        reference = [on_fla[key] for key in keys]
-    assert_as_exact_as_the_reference(joint_logits(decide), np.concatenate(reference), np.concatenate(truth),
-                                     "the joint head over Dew's Qwen 3.5")
 
 
 def test_a_joint_release_saves_as_the_release_it_was_read_from(tmp_path):
@@ -575,10 +621,8 @@ def test_two_joint_release_runs_average_into_a_task_that_reloads(joint_runs):
 
 def test_a_joint_release_reads_images_as_its_own_model_does(tmp_path):
     """A request's images, laid out before the state by the backbone's own
-    processor as the release's `systemone` lays them out: the same token ids,
-    and logits held to twice the release's fp32 model's distance from its
-    float64 run,
-    the vision tower included. `systemone` reads them as data URLs."""
+    processor as the release's `systemone` lays them out: the same token ids.
+    `systemone` reads them as data URLs."""
     for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
         (tmp_path / source.name).symlink_to(source.resolve())
     decide = Decide.from_pretrained(tmp_path, attention_impl="xla")
@@ -590,15 +634,6 @@ def test_a_joint_release_reads_images_as_its_own_model_does(tmp_path):
     [row] = decide.layout.rows(decide.tokenizer, decide.specials, request["state"], questions,
                                media=media.tokens)
     assert list(row.tokens) == json.loads((TINY / "images.json").read_text())["ids"]
-    scores = np.asarray(decide.model.logits(decide.variables, DecisionInputs.collate([row], 0),
-                                            media=media.inputs(decide.processor, row)))
-    with np.load(TINY / "images.npz") as logits:
-        names = [laid.name for laid in row.questions]
-        found = [scores[0, slot, :len(laid.options)] for slot, laid in enumerate(row.questions)]
-        reference = [logits[name] for name in names]
-        truth = [logits[f"{name}/f64"] for name in names]
-        assert_as_exact_as_the_reference(np.concatenate(found), np.concatenate(reference),
-                                         np.concatenate(truth), "joint head over Dew's Qwen 3.5, with images")
 
     def url(picture: Image.Image) -> str:
         encoded = io.BytesIO()

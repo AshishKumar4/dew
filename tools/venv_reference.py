@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
 sys.path.insert(0, str(ROOT / "tools"))
 
+JOINT_RELEASE = "the joint-head release tests/fixtures/joint_checkpoint/tiny/source.json names"
 SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py",
                   "reference": "danijar/dreamerv3 e01491fad6434b2245a3b8ca201dd7faedcc458c",
                   "license": "MIT"},
@@ -39,6 +40,12 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                        "reference": "NandhaKishorM/laya a4a8921afebfd852bba0000475cfb6ab737a124c on "
                                     "convaiinnovations/laya 7b928d828b7b0e022f929d9bd2e44165aa270148",
                        "license": "Apache-2.0", "distribution": ("transformers", "5.16.1")},
+         "joint": {"test": "test_decision_joint_checkpoint", "worker": "joint_worker.py",
+                   "reference": JOINT_RELEASE, "license": "Apache-2.0",
+                   "distribution": ("transformers", "5.16.1")},
+         "joint-fla": {"test": "test_decision_joint_checkpoint", "worker": "joint_worker.py",
+                       "prefix": "FLA_", "device": "cuda", "reference": JOINT_RELEASE, "license": "Apache-2.0",
+                       "distribution": ("fla-core", "0.5.2")},
          "kimi-k3": {"test": "test_kimi_k3", "worker": "kimi_worker.py", "device": "cuda",
                      "reference": "moonshotai/Kimi-K3 f831ab66814297da540d832a5235f8e904f29d06",
                      "license": "other (kimi-k3)", "distribution": ("fla-core", "0.5.2")},
@@ -47,7 +54,7 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                                       "e1df551a447157d4658b573f9a695d57658590e9",
                          "license": "MIT", "distribution": ("fla-core", "0.4.0")}}
 """Each site's test module (its `FIXTURE`, `draw`, `dew` and `OUTPUTS`, each named with the site's
-`prefix` where it shares its module with another site, `REAL_FIXTURE`), worker and reference, the
+`prefix` where it differs from the module's other site's, `REAL_FIXTURE`), worker and reference, the
 distribution and version its environment must hold, where the reference is one, the device its worker's
 float32 run takes, the CPU unless named, and `host` where its `dew` runs on the host as given (inputs a
 traced program cannot read, a request's text)."""
@@ -62,7 +69,7 @@ def main() -> None:
     known = SITES[site]
     test = importlib.import_module(known["test"])
     prefix = known.get("prefix", "")
-    fixture, draw, run, outputs = (getattr(test, f"{prefix}{name}")
+    fixture, draw, run, outputs = (getattr(test, f"{prefix}{name}", None) or getattr(test, name)
                                    for name in ("FIXTURE", "draw", "dew", "OUTPUTS"))
     if "distribution" in known:
         name, wanted = known["distribution"]
