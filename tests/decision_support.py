@@ -36,5 +36,5 @@ def drawn_weights(variables, rng: np.random.Generator) -> dict[tuple[str, ...], 
             leaf = rng.normal(0.0, 0.3, shape)
         else:
             leaf = rng.normal(0.0, 1.0, shape) / np.sqrt(np.prod(shape[:-1]))
-        drawn[path] = leaf.astype(np.float32)
+        drawn[path] = np.asarray(leaf, np.float32)
     return drawn
