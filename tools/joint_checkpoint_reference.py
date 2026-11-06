@@ -266,7 +266,7 @@ def images() -> None:
     np.savez(OUT / "images.npz", **logits)
 
 
-ROWS, QUESTIONS, OPTIONS, WIDTH = 2, 3, 6, 1024
+ROWS, QUESTIONS, OPTIONS, WIDTH = 2, 3, 6, 1536
 """A parity seed's requests, the most questions a request asks and options a question offers, and the
 tokens a laid-out request is padded to."""
 PICTURES, SIDE = 2, 64
