@@ -123,9 +123,6 @@ class DataExport:
         format = self.format or ("array_record" if self.tokenizer is not None else "parquet")
         if self.tokenizer is not None and format != "array_record":
             raise ValueError("token exports must use --format array_record")
-        if self.tokenizer is not None and self.plan_version is not None:
-            raise ValueError("a token export reads its documents at this Dew's data plan version; give "
-                             "--plan-version to a record export")
         pipeline = chain_of(self.data, self.branch)
         version = PLAN_VERSIONS[-1] if self.plan_version is None else self.plan_version
         if self.tokenizer is not None:
@@ -133,7 +130,7 @@ class DataExport:
 
             manifest = export_tokens(pipeline, self.destination, self.tokenizer, eos=self.eos,
                                      rows_per_shard=self.rows_per_shard, read=self.read,
-                                     provision=self.provision)
+                                     provision=self.provision, plan_version=version)
         else:
             rows = iterate(pipeline, read=self.read, provision=self.provision, plan_version=version)
             manifest = export(rows, self.destination, format=format, rows_per_shard=self.rows_per_shard)

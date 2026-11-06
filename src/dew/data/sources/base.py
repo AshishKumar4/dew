@@ -129,13 +129,26 @@ class ShardManifest:
     `counted`, where the shards state no rows that their store can count,
     returns each one's rows, given the reads it may make at once, which a read
     that needs them reads then (`sized`): a streamed Parquet store's files'
-    from their footers, which a read that needs none never reads."""
+    from their footers, which a read that needs none never reads.
+
+    `fixed_parts` states that `subdivide` cuts the same parts whatever its
+    count, the store's own finer shards (a Parquet store's row groups): a
+    stream read by them keys its fill by them, which its publication reads as
+    the store's (`parts`, `dew.data.generation`)."""
 
     shards: tuple[Shard, ...]
     reader: ShardOpener
     subdivide: Callable[[int], tuple[Shard, ...]] | None = None
     index_ordered: bool = False
     counted: Callable[[int], tuple[int, ...]] | None = None
+    fixed_parts: bool = False
+
+    def parts(self) -> tuple[Shard, ...]:
+        """The store's finer shards its subdivision always cuts (`fixed_parts`); none where it cuts by
+        count, or cuts none."""
+        if not self.fixed_parts or self.subdivide is None:
+            return ()
+        return self.subdivide(len(self.shards))
 
     def sized(self, reads: int) -> ShardManifest:
         """The manifest with each shard's rows its store counts (`counted`), `reads` at once (its reading's

@@ -15,17 +15,14 @@ import fsspec
 import grain.python as grain
 import numpy as np
 import pytest
-from data_support import Keeps
+from data_support import LATEST, Keeps
 from storage_support import moto_bucket
 
 from dew.data.cache import Abandoned, Cache
 from dew.data.pipeline import Rejected
-from dew.data.plan import PLAN_VERSIONS, Manifest, StepIdentity
+from dew.data.plan import Manifest, StepIdentity
 from dew.data.sources import Memory
 from dew.data.storage import Store
-
-LATEST = PLAN_VERSIONS[-1]
-"""The data plan version a new run reads by, whose shards a manifest here names."""
 
 
 def _key(source: object = "memory", *, revision: str = "test", clean: bool = True,

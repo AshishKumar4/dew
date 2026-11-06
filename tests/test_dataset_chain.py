@@ -12,7 +12,7 @@ from pathlib import Path
 import grain.python as grain
 import numpy as np
 import pytest
-from data_support import Questioned, WideDraw
+from data_support import LATEST, Questioned, WideDraw
 from sampling_gate import assert_draws_as_declared
 
 from dew.batch import EXAMPLES_CONSUMED
@@ -22,9 +22,6 @@ from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition, GlobalStream
 from dew.data.pipeline import Configured, ObjectiveData, Pipeline, Rejected
 from dew.data.plan import PLAN_VERSIONS, Manifest
-
-LATEST = PLAN_VERSIONS[-1]
-"""The data plan version a new run reads by, whose shards a manifest here names."""
 
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
 
@@ -318,7 +315,6 @@ def fetched_generation(chain, directory):
     manifest publication records, filled once through the cache."""
     from dew.data.analysis import _cache_manifest
     from dew.data.compile import _prepared
-    from dew.data.plan import PLAN_VERSIONS
 
     (prepared,) = _prepared((chain,), "indexed", provision=False)
     source = prepared.source

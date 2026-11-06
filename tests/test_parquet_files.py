@@ -8,6 +8,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from data_support import LATEST
 from fsspec.implementations.memory import MemoryFileSystem
 
 from dew.data import Loading
@@ -313,3 +314,94 @@ def test_dew_data_publish_publishes_a_parquet_stream_at_the_plan_version_it_name
         made[version] = (published["dependency"], published["manifest"])
         assert made[version] == (again.manifest["dependency"], again.manifest["manifest"])
     assert made[9] != made[10]
+
+
+def test_a_parquet_stream_read_by_more_shares_than_files_publishes_its_fill(tmp_path):
+    """A cached stream of a Parquet store of one file, read whole by two shares, fills it by its row groups
+    and publishes them as the store's own shards (`ShardManifest.parts`), so a later read of the store
+    through the cache reads the generation back, running no step, where it refilled every run (train 654's
+    review, row 4581)."""
+    from test_data_cache import Offset
+
+    from dew.data.cache import Cache
+    from dew.data.compile import iterate
+
+    root = tmp_path / "store"
+    root.mkdir()
+    pq.write_table(pa.Table.from_pylist([{"id": row} for row in range(GROUPS * ROWS)]),
+                   root / "part-00.parquet", row_group_size=ROWS)
+    cache = Cache(str(tmp_path / "cache"))
+    filled, reading = Offset(10), Offset(10)
+    read = compile(Pipeline(Files(str(root), format="parquet")).map(filled).cache(cache).batch(4),
+                   read="streamed", loading=READ, epochs=1)
+    read_ids = set()
+    for share in range(2):
+        stream = read.train(DataPartition(share, 2))
+        try:
+            read_ids |= set(ids(stream))
+        finally:
+            stream.close()
+    assert read_ids == set(range(GROUPS * ROWS))
+    rows = iterate(Pipeline(Files(str(root), format="parquet")).map(reading).cache(cache), read="streamed")
+    assert sorted(int(row["value"]) for row in rows) == [row + 10 for row in range(GROUPS * ROWS)]
+    assert sorted(filled.calls) == list(range(GROUPS * ROWS)) and reading.calls == []
+
+
+def test_a_parquet_store_reads_each_footer_once_however_many_reads_count_its_rows():
+    """Every read that counts a streamed Parquet store's rows (a bound, a placed read, a pass's count, a
+    publication: `ShardManifest.sized`) reads each file's footer once for the store, the first: the counts
+    are the store's, kept for the reads after (train 654's review, row 4582)."""
+    import fsspec
+
+    url = written("counted-once").replace("memory://", "opening://", 1)
+    fsspec.register_implementation("opening", Opening, clobber=True)
+    Opening.opened.clear()
+    store = Files(url, format="parquet")
+    first = store.manifest(LATEST).sized(2)
+    opened = len(Opening.opened)
+    again = store.manifest(LATEST).sized(2)
+    counts = [GROUPS * ROWS] * FILES
+    assert [shard.rows for shard in first.shards] == [shard.rows for shard in again.shards] == counts
+    assert len(Opening.opened) == opened and len(set(Opening.opened)) == FILES
+
+
+@pytest.mark.parametrize("version", [5, 11])
+def test_a_read_by_a_plan_version_this_dew_reads_by_none_of_is_refused(version):
+    """Every read builds by its data plan version (`dew.data.compile._build`): a pass, a publication and an
+    export at one this Dew reads by none of is refused, as a run's compile is, where 11 read as 10 and 5 as
+    8 (train 654's review, row 4583); a publication of it is refused where a version it read as already
+    published the store's generation too, which it would have returned."""
+    from uuid import uuid4
+
+    from dew.data.cache import Cache
+    from dew.data.compile import iterate, publish
+
+    chain = Pipeline(Files(written(f"version-{version}"), format="parquet"))
+    with pytest.raises(ValueError):
+        next(iter(iterate(chain, plan_version=version)))
+    cache = Cache(f"memory://parquet-files-refused-{uuid4().hex}")
+    with pytest.raises(ValueError):
+        publish(chain, cache, plan_version=version)
+    publish(chain, cache, plan_version=10 if version > 10 else 8)
+    with pytest.raises(ValueError):
+        publish(chain, cache, plan_version=version)
+
+
+def test_a_token_export_reads_its_documents_by_the_plan_version_it_names(tmp_path):
+    """`dew data export --tokenizer --plan-version` exports a store's documents as tokens read by that plan
+    version, as `dew.data.text.export_tokens(plan_version=)` does, where it was refused; a version this Dew
+    reads by none of is refused (train 654's review, row 4584)."""
+    from token_support import export_byte_tokens
+
+    from dew.data.compile import iterate
+    from dew.data.sources import TokenFiles
+
+    documents = ["one", "two words", "three of them"]
+    for name in ("nine", "eleven"):
+        (tmp_path / name).mkdir()
+    exported = export_byte_tokens(tmp_path / "nine", documents, "--plan-version", "9")
+    read = [bytes(row["text"][:-1].astype(np.uint8)).decode() for row in iterate(Pipeline(TokenFiles(
+        str(exported))), read="streamed")]
+    assert read == documents
+    with pytest.raises(ValueError):
+        export_byte_tokens(tmp_path / "eleven", documents, "--plan-version", "11")
