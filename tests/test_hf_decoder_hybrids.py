@@ -188,6 +188,25 @@ def test_qwen35_logits_match_the_reference_implementation():
     assert difference < 5e-4, f"max |logit difference| {difference:.3e}"
 
 
+def test_a_qwen35_model_written_without_its_source_states_its_hybrid_fields_and_reloads(tmp_path):
+    """A Qwen3.5 model written from the model alone (`PretrainedDecoder.from_model`, a trained or scratch
+    one holding no source config) states its delta net's geometry, its rotary's fraction and its
+    prediction depth, which the generic export writes none of, and writes its delta net's tensors under
+    their own names; so it reloads to its own variables and logits, bit for bit (ledger 4533)."""
+    fixture = "qwen35-tiny"
+    from dew.interop.pretrained import PretrainedDecoder
+
+    loaded = Pretrained.load(FIXTURES / fixture, dtype="float32", attention_impl="reference", text_only=True)
+    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / "export")
+    restored = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
+    assert flat_tree(restored.variables).keys() == flat_tree(loaded.variables).keys()
+    for path, leaf in flat_tree(loaded.variables).items():
+        np.testing.assert_array_equal(np.asarray(flat_tree(restored.variables)[path]), np.asarray(leaf))
+    ids = jnp.arange(1, 9, dtype=jnp.int32)[None]
+    np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, ids)),
+                                  np.asarray(loaded.model.apply(loaded.variables, ids)))
+
+
 def test_a_qwen35_checkpoint_decodes_as_it_scores_in_parallel():
     """The loaded weights through the cache: a prefill and single-token steps on par with the parallel
     forward at each step's width from float64 over drawn rows (check 1, ledger 2739)."""
