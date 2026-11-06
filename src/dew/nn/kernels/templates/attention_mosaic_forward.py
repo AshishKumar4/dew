@@ -711,9 +711,9 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     # The queries' intervals and ids read once, before the walk (`_query_bounds`).
     held = None if spans is None else _query_bounds(family, spans, row, first, tiles.block_q)
 
-    def scored(index, slots):
+    def scored(index, slots, product=None):
         return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
-                       hooks=hooks, drawn=hooked.drop is not None, held=held)
+                       hooks=hooks, drawn=hooked.drop is not None, held=held, product=product)
 
     def value_of(slots):
         # The value slot, once the partner's products are issued: its turn on the tensor cores is over when
@@ -756,70 +756,13 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
                             initial=(start.acc,))
         return algebra.Partial(acc, *rows), None
 
-    dtype = views["values"][0].dtype
     deferred = tiles.deferred and guard is None and residuals is None
-
-    def deferred_step(index, slots, carry, accumulators, *, issues_before: bool):
-        # FlashAttention 3's step (`values_deferred`): the tile's `Q Kᵀ` issued fresh into the walk's own
-        # accumulator, then the step before's P·V, its weights carried and its value slot held past it
-        # (`Family.walk`'s `held_past`); the tensor cores the partner's once both are issued; the logits read
-        # once their product is done, the P·V running on under the softmax; the sums taken to the tile's
-        # maximum once it is done, this tile's weights carried to the next step. The sums' operations and
-        # their order are the plain step's: the step before's product added, then the factor.
-        m, total, weights = carry
-        acc, logits_acc = accumulators
-
-        def product():
-            nonlocal acc, logits_acc
-            logits_acc = family.products(logits_acc, q, slots["keys"].transpose((1, 0)), interpret,
-                                         accumulate=False)
-            if issues_before:
-                acc = issued_into(family, acc, (weights,), slots.previous("values"), interpret)
-            turn()
-            return family.read(logits_acc, pending=1 if issues_before else 0)
-
-        _, coords, logits, products = _scored(program, spec, q, index, slots, first, spans, hooked,
-                                              (row, head), whole, turn, hooks=hooks, drawn=False, held=held,
-                                              product=product)
-        taken = {}
-
-        def accumulate(sums, scale, parts, value):
-            # The tile's weights taken for the next step's product, the sums rescaled
-            # (`Family.rescaled_products` of no parts).
-            del value
-            (taken["weights"],) = parts
-            return family.rescaled_products(sums, scale, (), None, interpret)
-
-        def value_slot():
-            # The step before's P·V done where the step first reads its values, past its softmax and before
-            # its weights are narrowed (FlashAttention 3's `warpgroup_wait<0>` before `convert_type_out`): a
-            # register the P·V reads is never written while it runs, which ptxas would serialize.
-            family.settled()
-            return slots["values"]
-
-        tile = algebra.Operand((tiles.block_k, value_width), dtype, value_slot)
-        keys = algebra.Keys(coords, logits, tile, dot, accumulate, products)
-        state = algebra.plain_step(spec, algebra.Partial(acc, m, total), keys)
-        return (state.m, state.total, taken["weights"]), (state.acc, logits_acc)
-
-    def deferred_walk(streams, lo, hi, counted):
-        # Its first step issues no P·V before it; `finish` issues the last one's (`Family.walk`).
-        def finish(carry, accumulators, kept):
-            acc, logits_acc = accumulators
-            return carry, (issued_into(family, acc, (carry[2],), kept["values"], interpret), logits_acc)
-
-        segments = ((functools.partial(deferred_step, issues_before=False), lo, lo + 1),
-                    (functools.partial(deferred_step, issues_before=True), lo + 1, hi))
-        none = family.zeros((tiles.block_q, tiles.block_k)).astype(dtype)
-        (m, total, _), (acc, _) = family.walk(
-            streams, segments, (start.m, start.total, none),
-            ((tiles.block_q, value_width), (tiles.block_q, tiles.block_k)), interpret, first=counted,
-            initial=(start.acc, None), held_past=("values",), finish=finish)
-        return algebra.Partial(acc, m, total), None
 
     def walked(streams, lo, hi, counted):
         if deferred:
-            return deferred_walk(streams, lo, hi, counted)
+            return _deferred_walk(spec, family, tiles, q, start, scored, dot, turn, streams, (lo, hi),
+                                  counted, value_width=value_width, dtype=views["values"][0].dtype,
+                                  interpret=interpret)
         if residuals is None:
             return inference(_walk_of(family, streams, lo, hi, counted, interpret=interpret))
         assert anchors is not None
@@ -842,6 +785,69 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     family.stored((family.as_row(state.m), family.as_row(overflowed)), status_views, smem=row_smem)
     _stored_walk(program, spec, state, trained, hooked, (row, head, first), hooks=hooks, residuals=residuals,
                  out=(out_view, out_smem), rows=(finished, row_smem))
+
+def _deferred_walk(spec: algebra.Forward, family: mosaic.Family, tiles: Tiles, q, start: algebra.Partial,
+                   scored: Callable, dot: Callable, turn: Callable, streams, bounds: tuple, counted, *,
+                   value_width: int, dtype, interpret: bool) -> tuple:
+    """A consumer's plain inference walk of the key tiles `bounds` with each tile's P·V issued a step late
+    (`Tiles.deferred`, `values_deferred`), from `start`: FlashAttention 3's step, the tile's `Q Kᵀ` issued
+    fresh into the walk's own accumulator, then the step before's P·V, its weights carried and its value
+    slot held past it (`Family.walk`'s `held_past`); the tensor cores the partner's once both are issued
+    (`turn`); the logits read once their product is done (`scored`'s `product`), the P·V running on under
+    the softmax; the sums taken to the tile's maximum once it is done. The sums' operations and their order
+    are the plain step's: the step before's product added, then the factor. Its first step issues no P·V
+    before it; `finish` issues the last one's. Returns the walk's state and no residuals (`_consumer`'s
+    `walked`)."""
+    lo, hi = bounds
+
+    def deferred_step(index, slots, carry, accumulators, *, issues_before: bool):
+        m, total, weights = carry
+        acc, logits_acc = accumulators
+
+        def product():
+            nonlocal acc, logits_acc
+            logits_acc = family.products(logits_acc, q, slots["keys"].transpose((1, 0)), interpret,
+                                         accumulate=False)
+            if issues_before:
+                acc = issued_into(family, acc, (weights,), slots.previous("values"), interpret)
+            turn()
+            return family.read(logits_acc, pending=1 if issues_before else 0)
+
+        _, coords, logits, products = scored(index, slots, product)
+        taken = {}
+
+        def accumulate(sums, scale, parts, value):
+            # The tile's weights taken for the next step's product, the sums rescaled
+            # (`Family.rescaled_products` of no parts).
+            del value
+            (taken["weights"],) = parts
+            return family.rescaled_products(sums, scale, (), None, interpret)
+
+        def value_slot():
+            # The step before's P·V done where the step first reads its values, past its softmax and before
+            # its weights are narrowed (FlashAttention 3's `warpgroup_wait<0>` before `convert_type_out`): a
+            # register the P·V reads is never written while it runs, which ptxas would serialize.
+            family.settled()
+            return slots["values"]
+
+        tile = algebra.Operand((tiles.block_k, value_width), dtype, value_slot)
+        keys = algebra.Keys(coords, logits, tile, dot, accumulate, products)
+        state = algebra.plain_step(spec, algebra.Partial(acc, m, total), keys)
+        return (state.m, state.total, taken["weights"]), (state.acc, logits_acc)
+
+    def finish(carry, accumulators, kept):
+        acc, logits_acc = accumulators
+        return carry, (issued_into(family, acc, (carry[2],), kept["values"], interpret), logits_acc)
+
+    segments = ((functools.partial(deferred_step, issues_before=False), lo, lo + 1),
+                (functools.partial(deferred_step, issues_before=True), lo + 1, hi))
+    none = family.zeros((tiles.block_q, tiles.block_k)).astype(dtype)
+    (m, total, _), (acc, _) = family.walk(
+        streams, segments, (start.m, start.total, none),
+        ((tiles.block_q, value_width), (tiles.block_q, tiles.block_k)), interpret, first=counted,
+        initial=(start.acc, None), held_past=("values",), finish=finish)
+    return algebra.Partial(acc, m, total), None
+
 
 
 def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partial, trained: tuple | None,
@@ -1165,6 +1171,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
             else:
                 status, out_view, finished = block.inference(refs.written, finishes)
                 if column_blocks > 1:
+                    assert column is not None  # a launch of several column blocks reads its own
                     out_view = out_view.at[:, pl.ds(column * value_width, value_width)]
             _consumer(program, spec, index, refs.q.at[row, pl.ds(block.first, block_q), head], out_view,
                       status, *stages, refs.out_smem.at[index], refs.row_smem.at[index], streams, views, turn,
@@ -1188,22 +1195,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
         else:
             pl.when(_walked_program(program, walks, lax.axis_index("batch"), queries))(scoped_body)
 
-    # The products this launch issues (`stated`), and the model's of them it owns (`modelled`): the forward's
-    # two, a peak walk's `Q K^T`, a training walk's `P V` beside its `Q K^T` recomputed, a block of an
-    # inference call's columns its `P V` and its share of `Q K^T` (`shared_by`); a rerun (a guarded launch,
-    # the fold's natural walk) none, as the FLOP count bounds a conditional by every branch, which would
-    # count the call's work twice every step where it reruns at most rarely.
-    columns = width if peaks else width + value_width
-    owned_value = 0 if peaks else value_width
-    owned_query = 0 if training and not peaks else width
-    cost = (stated(spec, batch, heads, columns, query, key, value,
-                   tile_walk=TileWalk((queries, keys_count), (block_q, block_k), consumers,
-                                      common=family.feeds_itself)) if counted
-            else estimate(0))
-    query_share = modelled(spec, batch, heads, spec.queries or queries, owned_query)
-    value_share = modelled(spec, batch, heads, spec.queries or queries, owned_value)
-    model = (0 if not counted else None if query_share is None or value_share is None
-             else query_share // shared_by + value_share)
+    cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,
+                                peaks=peaks, training=training, counted=counted, shared_by=shared_by)
     grid = (heads * column_blocks, queries // pair * splits, batch)
     return family.kernel(entry, out_type=out_type, grid=grid,
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
@@ -1212,3 +1205,27 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                          reducing_warpgroups=reducing(family, consumers, hooks.score_mod, hooks.output_mod,
                                                       guarded=read.guard is not None)
                          )(query, key, value, *leaves)
+
+
+def _launch_flops(spec: algebra.Forward, family: mosaic.Family, query, key, value, keys_count: int,
+                  value_width: int, tiles: Tiles, *, peaks: bool, training: bool, counted: bool,
+                  shared_by: int) -> tuple:
+    """A launch's cost and the model's FLOPs it owns (`_launched`'s `cost` and `model_flops`): the products it
+    issues (`stated`), and the model's of them it owns (`modelled`): the forward's two, a peak walk's
+    `Q K^T`, a training walk's `P V` beside its `Q K^T` recomputed, a block of an inference call's columns
+    its `P V` and its share of `Q K^T` (`shared_by`); a rerun (a guarded launch, the fold's natural walk)
+    none, as the FLOP count bounds a conditional by every branch, which would count the call's work twice
+    every step where it reruns at most rarely."""
+    batch, queries, heads, width = query.shape
+    columns = width if peaks else width + value_width
+    owned_value = 0 if peaks else value_width
+    owned_query = 0 if training and not peaks else width
+    cost = (stated(spec, batch, heads, columns, query, key, value,
+                   tile_walk=TileWalk((queries, keys_count), (tiles.block_q, tiles.block_k), tiles.consumers,
+                                      common=family.feeds_itself)) if counted
+            else estimate(0))
+    query_share = modelled(spec, batch, heads, spec.queries or queries, owned_query)
+    value_share = modelled(spec, batch, heads, spec.queries or queries, owned_value)
+    model = (0 if not counted else None if query_share is None or value_share is None
+             else query_share // shared_by + value_share)
+    return cost, model

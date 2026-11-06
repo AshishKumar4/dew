@@ -457,9 +457,11 @@ def _derived_dq(formed, q, do, q_pos, m, anchor, delta, total, lo, hi, draw, cho
                                        summed=summed)
             return state, sums
         k_tile = tiles["k"]
-        sums, _, (factor, keyed) = gradient.dq_issued(sums, weights, cotangents, slopes, seen, k_tile.dtype,
-                                                      total, scale=grad_scale, kinds=score_kinds,
-                                                      summed=summed, accurate=True)
+        sums, _, issued = gradient.dq_issued(sums, weights, cotangents, slopes, seen, k_tile.dtype, total,
+                                             scale=grad_scale, kinds=score_kinds, summed=summed,
+                                             accurate=True)
+        assert issued is not None  # the accurate form's keyed sums
+        factor, keyed = issued
         held = sums.keyed if factor is None else algebra.expand(factor, sums.keyed) * sums.keyed
         return state, sums._replace(keyed=held + algebra.summed_products(keyed, k_tile, interpreted_dot))
 
