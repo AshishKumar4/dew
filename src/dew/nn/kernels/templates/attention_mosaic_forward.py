@@ -189,31 +189,35 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
     walks whatever its legality (a resource witness lowers as pinned)."""
     def held(candidate: Tiles) -> bool:
         rows, block = candidate.block_q, candidate.block_k
+        # Priced in the layout the guarded launch takes at its share (`bundle_of`).
+        arranged = family.specialized(rows, block)
         carried = [(rows, columns, jnp.float32)] * 2 + [(rows, 4 * GUARD_ROWS, jnp.float32)]
         logits, sums = [(rows, block, jnp.float32)] * 2, [(rows, columns, jnp.float32)] * 2
-        fragments = _products(family, dtype, (rows, width, block, logits, False, True),
+        fragments = _products(arranged, dtype, (rows, width, block, logits, False, True),
                               (rows, block, columns, logits[:1] + sums, True, False), narrow=candidate.narrow,
-                              lhs_swizzle=query_swizzle(family))
+                              lhs_swizzle=query_swizzle(arranged))
         # Its keys' magnitudes read from the value tile (`Family.key_magnitudes`) beside the logits, a phase
         # of their own: ptxas holds the tile's load apart from the step's sums (counted beside them as well,
         # every A100 guarded tile was refused, gate80 46 of 96 against 70; the A100's guarded launch at width
         # 64 still spills 40 bytes counted apart, its decode path the Triton mainloop's until it does not).
         magnitudes = [logits[0], (columns, block, jnp.float32)]
-        live = resources.live_registers(family, carried, logits + sums, magnitudes, *fragments)
-        if family.operands_in_registers:
+        live = resources.live_registers(arranged, carried, logits + sums, magnitudes, *fragments)
+        if arranged.operands_in_registers:
             # Its products' fragments loaded beside the step's tiles, which they read (mma.sync: priced
             # apart, the guarded launch at 64 x 64 on two consumers, width 128, held 244 and spilled 208 to
             # 248 bytes on an A100 under every hook, FS-GUARD80-2; beside them it prices 372, so no
             # 64-column tile of its holds it there and the plain launch is illegal at width 128).
-            live = max(live, *(resources.live_registers(family, carried, logits + sums + phase)
+            live = max(live, *(resources.live_registers(arranged, carried, logits + sums + phase)
                                for phase in fragments))
-        return live <= family.registers(candidate.consumers)
+        return live <= arranged.registers(candidate.consumers)
 
     blocks = [block for block in key_extents(family, dtype, tiles.block_k) if tiles.block_k % block == 0]
     queries = [rows for rows in extents(family, dtype, tiles.block_q) if tiles.block_q % rows == 0]
+    # Its key blocks copied by its consumers together where its family's copies split them
+    # (`Transport.shares_rows`: two mma.sync consumers' cp.async in whole 64-row parts).
     candidates = (dataclasses.replace(tiles, block_q=rows, block_k=block, consumers=consumers, narrow=narrow)
                   for rows in queries for consumers in range(tiles.consumers, 0, -1) for block in blocks
-                  for narrow in stagings(family))
+                  if family.shares_rows(block, consumers) for narrow in stagings(family))
     ranked = list(candidates)
     return next((candidate for candidate in ranked if held(candidate)), None if held_only else ranked[-1])
 
@@ -392,7 +396,8 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
             guard = _Guard(flags.rows)
             launched = _launch(
                 q, k, v, guarded_spans, held._replace(output=()), guard, spec=form, hooks=_unhooked(hooks),
-                tiles=guarded, family=family, training=False, interpret=interpret, columns=first,
+                tiles=guarded, family=bundle_of(guarded, q.dtype), training=False, interpret=interpret,
+                columns=first,
                 splits=rewalk_splits, table=paged, sources=sources,
                 out_dtype=jnp.float32 if hooked_blocks else out_dtype,
                 finishes=finishes, column_width=columns.shape[-1] if first is not None else None,
