@@ -36,9 +36,9 @@ from dew.nn.kernels.templates.attention import (
     takes_output_residuals,
 )
 
-PLAIN_TILE = attention_triton.BLOCK
-"""The plain-JAX mainloop's tile: the query and key blocks a call walks, and the padding it takes to whole
-blocks. It is the Triton mainloop's largest tile (`attention_triton.BLOCK`)."""
+PLAIN = attention_portable.Tiles(attention_triton.BLOCK, attention_triton.BLOCK, attention_triton.BLOCK)
+"""The plain-JAX mainloop's config: the query and key blocks a call walks, and the padding it takes to whole
+blocks, each the Triton mainloop's largest tile (`attention_triton.BLOCK`)."""
 
 Residuals = tuple[jax.Array, jax.Array, jax.Array, Split]
 """A training forward's residuals, which both backwards read: each query's running maximum and denominator
@@ -208,8 +208,8 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     if mainloop == 'triton':
         return attention_triton.forward(query, key, value, spans, _spread(hooks, query), residuals=kept,
                                         **form)
-    return attention_portable.attend(query, key, value, spans, hooks, block_q=PLAIN_TILE, block_k=PLAIN_TILE,
-                                     pad=PLAIN_TILE, residuals=residuals, **form)
+    return attention_portable.xla_mainloop(PLAIN, query, key, value, spans, hooks, residuals=residuals,
+                                           **form)
 
 
 def _attend_backward(config: _Config, saved: tuple, dout: jax.Array) -> tuple:
@@ -247,8 +247,7 @@ def _backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         return dataclasses.replace(grads, score_params=tuple(
             shared_sum(grad, param) for grad, param in zip(grads.score_params, hooks.score_params,
                                                            strict=True)))
-    return attention_portable.backward(*call, block_q=PLAIN_TILE, block_k=PLAIN_TILE, pad=PLAIN_TILE,
-                                       residuals=residuals, rounded=rounded, **form)
+    return attention_portable.backward(PLAIN, *call, residuals=residuals, rounded=rounded, **form)
 
 
 def _spread(hooks: Hooks, query: jax.Array) -> Hooks:

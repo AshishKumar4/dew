@@ -144,7 +144,7 @@ SCALE = DEPTH ** -0.5
 SPANS = {"full": {}, "causal": {"causal": True},
          # Its first queries before the keys' start: rows of no key.
          "started": {"causal": True, "starts": jnp.array([LENGTH // 8])}}
-TILES = {"block_q": BLOCK, "block_k": BLOCK, "pad": BLOCK, "scale": SCALE}
+TILES = attention_portable.Tiles(BLOCK, BLOCK, BLOCK)
 
 
 def backward_draw(seed):
@@ -181,7 +181,8 @@ def forward_rows(form: str):
 
     def run(q, k, v, d):
         q4, k4, v4 = (x[None, :, None] for x in (q, k, v))
-        out, m, total, anchor, split = attention_portable.attend(q4, k4, v4, spans, residuals=True, **TILES)
+        out, m, total, anchor, split = attention_portable.xla_mainloop(TILES, q4, k4, v4, spans,
+                                                                       residuals=True, scale=SCALE)
         delta = jnp.sum(d * out[0, :, 0].astype(jnp.float32), axis=-1)
         return (m, total, anchor, split), m[0, 0], total[0, 0], delta
 
@@ -335,8 +336,9 @@ forward's step, merge and finish whatever walk the training step takes), and a d
 @pytest.mark.parametrize("call", list(CALLS))
 @pytest.mark.parametrize("form", ["full", "causal"])
 def test_the_portable_mainloop_computes_attention(form, call, numerics, dtype):
-    """The plain-JAX mainloop's forward (`attention_portable.attend`) over fp16 operands (a plain walk, of no
-    compensation or guard) and fp32 ones (its running sums compensated, its plain walk under the headroom
+    """The plain-JAX mainloop's forward (`attention_portable.xla_mainloop`) over fp16 operands (a plain walk,
+    of no compensation or guard) and fp32 ones (its running sums compensated, its plain walk under the
+    headroom
     guard's), each of which the derived forms serve, under the run's fast forms or its accurate ones (natural
     logits, the largest weight held to 1 and the rescale compensated, which the declaration states), its
     walk's step, merge and finish the derived forms, the product of its weights with the values its own
@@ -352,9 +354,9 @@ def test_the_portable_mainloop_computes_attention(form, call, numerics, dtype):
 
     def ours(q, k, v, words):
         with fast(numerics):
-            out = attention_portable.attend(q[None, :, None], k[None, :, None], v[None, :, None], spans,
-                                            hooks(words), residuals=residuals, natural=numerics == "accurate",
-                                            **TILES)
+            out = attention_portable.xla_mainloop(TILES, q[None, :, None], k[None, :, None], v[None, :, None],
+                                                  spans, hooks(words), residuals=residuals,
+                                                  natural=numerics == "accurate", scale=SCALE)
         return (out[0] if residuals else out)[0, :, 0]
 
     def reference(q, k, v, words):
@@ -380,8 +382,8 @@ def test_the_portable_mainloop_differentiates_attention(form):
 
     def ours(q, k, v, dout):
         with fast():
-            grads = attention_portable.backward(q[None, :, None], k[None, :, None], v[None, :, None], spans,
-                                                None, dout[None, :, None], **TILES)
+            grads = attention_portable.backward(TILES, q[None, :, None], k[None, :, None], v[None, :, None],
+                                                spans, None, dout[None, :, None], scale=SCALE)
         return grads.query[0, :, 0], grads.key[0, :, 0], grads.value[0, :, 0]
 
     def reference(q, k, v, dout):
@@ -397,14 +399,17 @@ def test_the_portable_mainloop_differentiates_attention(form):
                     f"portable backward {form}", seeds=16)
 
 
-def one_key(dtype, query, key, value, dout, *, scale: float = SCALE):
+ONE_KEY = attention_portable.Tiles(8, 8, 8)
+"""The plain-JAX mainloop's tiles over a call of one query (`one_key`)."""
+
+
+def one_key(dtype, query, key, value, dout):
     """A call's operands of one query and `len(key)` keys, each a row of width 8 (`[1, n, 1, 8]`)."""
     def laid(rows):
         rows = np.asarray(rows, np.float64).reshape(len(rows), -1)
         return jnp.asarray(np.pad(rows, ((0, 0), (0, 8 - rows.shape[1])))[None, :, None, :], dtype)
 
-    return laid(query), laid(key), laid(value), laid(dout), {"block_q": 8, "block_k": 8, "pad": 8,
-                                                             "scale": scale}
+    return laid(query), laid(key), laid(value), laid(dout)
 
 
 def test_a_derived_backward_of_one_key_gives_an_exactly_zero_query_gradient():
@@ -412,10 +417,10 @@ def test_a_derived_backward_of_one_key_gives_an_exactly_zero_query_gradient():
     cotangent `P (dP - D)` is zero, `dP` the reference's `1 + 2^-8` and `D` the output's row sum, so its
     query's gradient is exactly zero, as the reference's is, under the derived backward too: its `dP`
     accumulates in fp32 (one rounded to bf16 is 1, and its cotangent -2^-8)."""
-    query, key, value, dout, tiles = one_key(jnp.bfloat16, [[1.0]], [[1.0]], [[1.0, 2.0 ** -8]], [[1.0, 1.0]])
+    query, key, value, dout = one_key(jnp.bfloat16, [[1.0]], [[1.0]], [[1.0, 2.0 ** -8]], [[1.0, 1.0]])
     spans = template.spans(1, 1, 1)
     with fast():
-        grads = attention_portable.backward(query, key, value, spans, None, dout, **tiles)
+        grads = attention_portable.backward(ONE_KEY, query, key, value, spans, None, dout, scale=SCALE)
     np.testing.assert_array_equal(np.asarray(grads.query, np.float32), 0.0)
 
 
@@ -424,14 +429,14 @@ def test_a_derived_backward_masks_an_empty_querys_overflowing_product():
     query's output cotangent 4 there: its product `dP` is 2^129, past fp32's largest, beside a weight of 0.
     Under the derived backward every gradient is finite, as the reference's are: the cotangents are masked
     where a query sees no key (`softmax_cotangents`, as `grad_scores`), not multiplied by its zero weight."""
-    query, key, value, dout, tiles = one_key(jnp.float32, [[0.0], [0.0]], [[0.0]], [[2.0 ** 127]],
+    query, key, value, dout = one_key(jnp.float32, [[0.0], [0.0]], [[0.0]], [[2.0 ** 127]],
                                              [[0.0], [4.0]])
     spans = template.KeySpans(jnp.asarray([[0, 1]], jnp.int32), jnp.asarray([[1, 1]], jnp.int32), None, None,
                               keys=1)
     _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, None), query, key, value)
     assert all(np.isfinite(np.asarray(grad)).all() for grad in pull(dout))
     with fast():
-        grads = attention_portable.backward(query, key, value, spans, None, dout, **tiles)
+        grads = attention_portable.backward(ONE_KEY, query, key, value, spans, None, dout, scale=SCALE)
     assert all(np.isfinite(np.asarray(grad)).all() for grad in (grads.query, grads.key, grads.value))
 
 
@@ -441,14 +446,14 @@ def test_a_query_a_hook_empties_takes_no_cotangent():
     cotangent 4 there: its `dO Vᵀ` is 2^129, past fp32's largest, beside weights of 0. Every gradient is
     finite, as the reference's: the query takes no cotangent
     (`attention.launch_arguments`)."""
-    query, key, value, dout, tiles = one_key(jnp.float32, [[0.0], [0.0]], [[0.0]], [[2.0 ** 127]],
+    query, key, value, dout = one_key(jnp.float32, [[0.0], [0.0]], [[0.0]], [[2.0 ** 127]],
                                              [[0.0], [4.0]])
     hooks = template.Hooks(score_mod=first_query_only)
     spans = template.spans(2, 1, 1)
     _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, hooks), query, key, value)
     assert all(np.isfinite(np.asarray(grad)).all() for grad in pull(dout))
     with fast():
-        grads = attention_portable.backward(query, key, value, spans, hooks, dout, **tiles)
+        grads = attention_portable.backward(ONE_KEY, query, key, value, spans, hooks, dout, scale=SCALE)
     assert all(np.isfinite(np.asarray(grad)).all() for grad in (grads.query, grads.key, grads.value))
 
 
@@ -463,13 +468,13 @@ def test_a_derived_backward_scales_its_cotangents_before_their_products():
     output's cotangent 1 and the scale 1/4: the score cotangents are 2 and -2, whose products with the keys
     at the scale give a query gradient of 2^127, finite as the reference's, where their unscaled sum 2^129
     overflows (bible §6)."""
-    query, key, value, dout, tiles = one_key(jnp.float32, [[0.0]], [[2.0 ** 127], [-(2.0 ** 127)]],
-                                             [[4.0], [-4.0]], [[1.0]], scale=0.25)
+    query, key, value, dout = one_key(jnp.float32, [[0.0]], [[2.0 ** 127], [-(2.0 ** 127)]],
+                                             [[4.0], [-4.0]], [[1.0]])
     spans = template.spans(1, 2, 1)
     _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, None, scale=0.25), query, key, value)
     assert all(np.isfinite(np.asarray(grad)).all() for grad in pull(dout))
     with fast():
-        grads = attention_portable.backward(query, key, value, spans, None, dout, **tiles)
+        grads = attention_portable.backward(ONE_KEY, query, key, value, spans, None, dout, scale=0.25)
     assert all(np.isfinite(np.asarray(grad)).all() for grad in (grads.query, grads.key, grads.value))
 
 
@@ -486,12 +491,12 @@ def test_a_derived_forward_keeps_an_fp16_weight_its_dropout_multiplies_finite():
                         jnp.uint32)
     hooks = template.Hooks(drop=template.Dropout(words, jnp.arange(1, dtype=jnp.int32),
                                                  jnp.arange(1, dtype=jnp.int32), rate))
-    query, key, value, _, tiles = one_key(jnp.float16, [[0.0]], [[0.0], [0.0]], [[2.0 ** -10] * 8] * 2,
+    query, key, value, _ = one_key(jnp.float16, [[0.0]], [[0.0], [0.0]], [[2.0 ** -10] * 8] * 2,
                                           [[0.0]])
     spans = template.spans(1, 2, 1)
     assert np.isfinite(np.asarray(template.reference(query, key, value, spans, hooks))).all()
     with fast():
-        out = attention_portable.attend(query, key, value, spans, hooks, **tiles)
+        out = attention_portable.xla_mainloop(ONE_KEY, query, key, value, spans, hooks, scale=SCALE)
     assert np.isfinite(np.asarray(out)).all()
 
 
@@ -502,9 +507,8 @@ def test_a_derived_backward_at_a_scale_of_zero_gives_zero_query_and_key_gradient
     query, key, value, dout = (jnp.asarray(rng.standard_normal((1, LENGTH, 1, DEPTH)), jnp.float32)
                                for _ in range(4))
     spans = template.spans(LENGTH, LENGTH, 1)
-    tiles = {**TILES, "scale": 0.0}
     with fast():
-        grads = attention_portable.backward(query, key, value, spans, None, dout, **tiles)
+        grads = attention_portable.backward(TILES, query, key, value, spans, None, dout, scale=0.0)
     np.testing.assert_array_equal(np.asarray(grads.query), 0.0)
     np.testing.assert_array_equal(np.asarray(grads.key), 0.0)
     assert np.isfinite(np.asarray(grads.value)).all()
@@ -519,8 +523,8 @@ from dew.nn.kernels.templates import attention as template, attention_portable
 operands = [jnp.full((1, 16, 1, 8), 0.1 * (index + 1), jnp.float16) for index in range(3)]
 fast = dataclasses.replace(generation.numerics(), forms="fast")
 with generation.run_precision(fast):
-    out = attention_portable.attend(*operands, template.spans(16, 16, 1), block_q=8, block_k=8, pad=8,
-                                    residuals=True)
+    out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), *operands,
+                                          template.spans(16, 16, 1), residuals=True)
 print(bool(jnp.all(jnp.isfinite(out[0]))))
 """
 """A fresh process's first derived walk: a training call's forward, its step the training walk's own."""
@@ -553,8 +557,8 @@ def test_a_derived_backward_masks_its_hook_cotangents_where_padding_reads_no_key
     temperature = template.Param(jnp.ones((1, 1, 1), jnp.float32), template.Kind.QUERY)
     hooks = template.Hooks(score_mod=tempered, score_params=(temperature,))
     with fast():
-        grads = attention_portable.backward(query, key, value, spans, hooks, dout, block_q=8, block_k=8,
-                                            pad=8)
+        grads = attention_portable.backward(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                            hooks, dout)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(grads))
 
 

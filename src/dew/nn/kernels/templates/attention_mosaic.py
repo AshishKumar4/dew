@@ -807,7 +807,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     `[B, K, Hk, D]` and `value` `[B, K, Hk, Dv]`, and the keys `spans` leaves each query under `hooks`, as
     `dew.nn.kernels.templates.attention.reference` computes it; with `residuals` `Kept.SPLIT` the training
     forward's, its output with the backward's residuals as every mainloop's training forward gives them
-    (`attention_portable.attend(residuals=True)`): the maxima and denominators `[B, H, Q]`, each query's
+    (`attention_portable.xla_mainloop(residuals=True)`): the maxima and denominators `[B, H, Q]`, each query's
     anchor key `[B, H, Q]` int32 and the split sums (`Split`); `Kept.OUTPUT` the same residuals of the
     inference walk, which keeps its output for the backward's D in place of an anchor (`output_split`,
     `takes_output_residuals`). `natural` keeps the logits natural

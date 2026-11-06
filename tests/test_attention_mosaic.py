@@ -456,8 +456,8 @@ def test_the_plain_jax_backward_takes_the_kept_outputs_residuals():
         with _device(interpret=True):
             residuals = attention_mosaic.forward(query, key, value, spans, residuals=template.Kept.OUTPUT,
                                                  interpret=True)[1:]
-        grads = attention_portable.backward(query, key, value, spans, None, dout, block_q=64, block_k=64,
-                                            pad=64, residuals=residuals)
+        grads = attention_portable.backward(attention_portable.Tiles(64, 64, 64), query, key, value, spans,
+                                            None, dout, residuals=residuals)
         return grads.query, grads.key, grads.value
 
     def reference(query, key, value, dout):

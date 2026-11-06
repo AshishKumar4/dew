@@ -321,8 +321,8 @@ def probe(words: jax.Array, queries: int, keys: int, batch: int, heads: int, *, 
     key = jnp.zeros((batch, keys, heads, 8), jnp.float32)
     value = jnp.broadcast_to(jnp.eye(keys, dtype=jnp.float32)[None, :, None, :], (batch, keys, heads, keys))
     spans = template.spans(queries, keys, batch)
-    out = attention_portable.attend(query, key, value, spans, hooked(words, batch, heads), block_q=block[0],
-                                    block_k=block[1], pad=8)
+    out = attention_portable.xla_mainloop(attention_portable.Tiles(block[0], block[1], 8), query, key, value,
+                                          spans, hooked(words, batch, heads))
     return out > 0
 
 
@@ -364,8 +364,8 @@ def test_a_kept_anchor_at_twice_the_weight_stays_finite_where_the_reference_does
     key = jnp.zeros((1, 2, 1, 8), jnp.float32)
     value = jnp.stack([jnp.full((8,), 2.0 ** 127), jnp.zeros((8,))])[None, :, None, :]
     spans = template.spans(1, 2, 1)
-    dew = attention_portable.attend(query, key, value, spans, hooked(words, 1, 1, 0.5), block_q=8,
-                                    block_k=8, pad=8)
+    dew = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                          hooked(words, 1, 1, 0.5))
     ref = reference_attention(query, key, value, dropout_rate=0.5, dropout_seed=words)
     assert bool(jnp.all(jnp.isfinite(ref)))
     assert bool(jnp.all(jnp.isfinite(dew)))
@@ -383,8 +383,8 @@ def test_bf16_values_at_two_to_the_124_under_a_steep_draw_stay_finite_where_the_
     key = jnp.zeros((1, 64, 1, 8), jnp.bfloat16)
     value = jnp.full((1, 64, 1, 8), 2.0 ** 124, jnp.bfloat16)
     spans = template.spans(1, 64, 1)
-    dew = attention_portable.attend(query, key, value, spans, hooked(words, 1, 1, 0.95), block_q=8,
-                                    block_k=8, pad=8)
+    dew = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                          hooked(words, 1, 1, 0.95))
     ref = reference_attention(query, key, value, dropout_rate=0.95, dropout_seed=words)
     assert bool(jnp.all(jnp.isfinite(ref)))
     assert bool(jnp.all(jnp.isfinite(dew)))
@@ -400,8 +400,8 @@ def test_fp16_values_at_two_to_the_minus_ten_under_a_near_total_draw_stay_finite
     key = jnp.zeros((1, 2, 1, 8), jnp.float16)
     value = jnp.full((1, 2, 1, 8), 2.0 ** -10, jnp.float16)
     spans = template.spans(1, 2, 1)
-    dew = attention_portable.attend(query, key, value, spans, hooked(words, 1, 1, rate), block_q=8,
-                                    block_k=8, pad=8)
+    dew = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                          hooked(words, 1, 1, rate))
     ref = reference_attention(query, key, value, dropout_rate=rate, dropout_seed=words)
     assert bool(jnp.all(jnp.isfinite(ref)))
     assert bool(jnp.all(jnp.isfinite(dew)))
@@ -424,9 +424,8 @@ def test_identical_keys_give_an_exactly_zero_query_gradient_on_the_portable_main
     reference's is. A first D from the forward's narrowed dropped weights leaves dQ off zero (-3.26e-4)."""
     words = first_seed(RATE, 2, lambda kept: bool(kept.all()))
     query, key, value, dout = identical_keys(0, 3, 2, jnp.bfloat16)
-    grads = attention_portable.backward(query, key, value, template.spans(3, 2, ROWS),
-                                        hooked(words, ROWS, HEADS), dout, block_q=8, block_k=8,
-                                        pad=attention_triton.BLOCK)
+    grads = attention_portable.backward(attention_portable.Tiles(8, 8, attention_triton.BLOCK), query, key,
+                                        value, template.spans(3, 2, ROWS), hooked(words, ROWS, HEADS), dout)
     np.testing.assert_array_equal(np.asarray(grads.query, np.float32), np.zeros(query.shape, np.float32))
 
 
@@ -554,8 +553,8 @@ def test_three_identical_keys_give_an_exactly_zero_query_gradient_on_the_portabl
     query, key, value, dout = three_identical_keys()
     dq = reference_query_gradient(query, key, value, dout, words, 0.5)
     np.testing.assert_array_equal(np.asarray(dq, np.float32), np.zeros(query.shape, np.float32))
-    grads = attention_portable.backward(query, key, value, template.spans(1, 3, 1), hooked(words, 1, 1, 0.5),
-                                        dout, block_q=8, block_k=8, pad=attention_triton.BLOCK)
+    grads = attention_portable.backward(attention_portable.Tiles(8, 8, attention_triton.BLOCK), query, key,
+                                        value, template.spans(1, 3, 1), hooked(words, 1, 1, 0.5), dout)
     np.testing.assert_array_equal(np.asarray(grads.query, np.float32), np.zeros(query.shape, np.float32))
 
 
@@ -566,8 +565,8 @@ def test_finite_products_whose_raw_sum_overflows_keep_a_finite_query_gradient_on
     query, key, value, dout = overflowing_keys()
     dq = reference_query_gradient(query, key, value, dout, words, 0.5)
     assert bool(np.all(np.isfinite(np.asarray(dq, np.float32))))
-    grads = attention_portable.backward(query, key, value, template.spans(1, 3, 1), hooked(words, 1, 1, 0.5),
-                                        dout, block_q=8, block_k=8, pad=attention_triton.BLOCK)
+    grads = attention_portable.backward(attention_portable.Tiles(8, 8, attention_triton.BLOCK), query, key,
+                                        value, template.spans(1, 3, 1), hooked(words, 1, 1, 0.5), dout)
     assert bool(np.all(np.isfinite(np.asarray(grads.query, np.float32))))
 
 
@@ -595,8 +594,8 @@ def test_a_resumed_state_of_a_large_denominator_keeps_a_finite_dropping_backward
     np.testing.assert_array_equal(np.asarray(expected[0]), 0)
     np.testing.assert_array_equal(np.asarray(expected[1]), 0)
     assert bool(np.all(np.isfinite(np.asarray(expected[2]))))
-    grads = attention_portable.backward(query, key, value, spans, hooks, dout, block_q=8, block_k=8,
-                                        pad=attention_triton.BLOCK, accurate=accurate)
+    grads = attention_portable.backward(attention_portable.Tiles(8, 8, attention_triton.BLOCK), query, key,
+                                        value, spans, hooks, dout, accurate=accurate)
     # The query's and key's gradients are their score cotangents times a zero key and query: exactly zero
     # where those are finite.
     np.testing.assert_array_equal(np.asarray(grads.query), 0)

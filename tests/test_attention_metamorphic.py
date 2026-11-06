@@ -48,8 +48,8 @@ def _dense_draw(seed: int, queries: int = QUERIES):
 
 def _portable(query, key, value, spans):
     # The plain-JAX mainloop at 32-query and 32-key tiles, padded as the route pads a call.
-    return attention_portable.attend(query, key, value, spans, block_q=32, block_k=32,
-                                     pad=attention_triton.BLOCK)
+    return attention_portable.xla_mainloop(attention_portable.Tiles(32, 32, attention_triton.BLOCK), query,
+                                           key, value, spans)
 
 
 @DENSE
