@@ -535,6 +535,20 @@ def merged_slices(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.
     return finish(spec, merged(spec, state, axis=1), initial=True)[0]
 
 
+def rewalks(spec: Forward, maxima: jax.Array | None, over: jax.Array | None
+            ) -> tuple[jax.Array | None, Forward]:
+    """The rows a plain launch's guards walk again (`walked_launches`), from its rows' running `maxima` and
+    whether their weighted values `over`flowed, and the form they walk in: where the fold reaches
+    (`Forward.reaches`), those whose maximum passes `FOLD_REACH` (`reached`: a padded query's -inf, a row
+    that reads nothing, as a slice's of no keys) or that overflowed, in the natural form (`unfolded`); else
+    those that overflowed, in the call's. A launch's programs state them so of their own rows; given no
+    maxima, the form alone."""
+    if spec.reaches:
+        live = None if maxima is None else (reached(maxima, unseen=spec.form == "spans") >= FOLD_REACH) | over
+        return live, unfolded(spec)
+    return over, spec
+
+
 def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Array, O, O], O], *,
                        masked: bool = False, in_place: bool = False) -> O:
     """`walked`'s guards over whole launches, for a mainloop whose program walks its keys once (a producer
@@ -566,13 +580,12 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
     prologue."""
     if masked or in_place:
         outputs, maxima, over = launch(spec, None)
-        if spec.reaches:
-            # A padded query's maximum is -inf, a row that reads nothing, as is a slice's row of no keys.
-            live, form = (reached(maxima, unseen=spec.form == "spans") >= FOLD_REACH) | over, unfolded(spec)
-        elif spec.headroom:
-            live, form = over, spec
-        else:
+        if not (spec.reaches or spec.headroom):
             return outputs
+        # A launch whose programs state its rows' rewalk flags themselves (`rewalks`) gives them in its
+        # overflows' place and no maxima: no array operation between the launches (ET-DPROF-h100: the two
+        # fusions forming them took 6.3 us of a batch-1 decode step's 30.7).
+        live, form = (over, rewalks(spec, None, None)[1]) if maxima is None else rewalks(spec, maxima, over)
         if in_place:
             held = jax.tree.map(jax.new_ref, outputs)
             launch(form, live, into=held)
