@@ -186,6 +186,10 @@ def test_tree_speculation_draws_as_greedy_decoding_does(kind, stop):
     np.testing.assert_array_equal(tokens, np.asarray(plain.tokens)[:, 3:])
     np.testing.assert_array_equal(np.sum(np.asarray(drawn.valid), axis=1), np.asarray(plain.lengths))
     np.testing.assert_array_equal(np.asarray(drawn.terminated), np.asarray(plain.terminated))
+    if stop == "eos":
+        # The rows finish at different steps, the first on its EOS.
+        lengths = np.sum(np.asarray(drawn.valid), axis=1)
+        assert lengths[0] != lengths[1], lengths
 
 
 def test_a_tree_past_its_rows_cache_walks_as_greedy_decoding_does():
