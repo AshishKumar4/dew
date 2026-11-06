@@ -783,9 +783,10 @@ class GatedDeltaNet(nn.Module):
     `fix_query_key_value_ordering` does (modeling_qwen3_next.py:540-586).
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset()
-    """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): a recurrence reads every earlier token
-    of its document, with no mask or bias to narrow it."""
+    reads: ClassVar[frozenset[str]] = frozenset({"tree"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's alone: a recurrence reads every
+    earlier token of its document, with no mask or bias to narrow it, and on a tree its path's
+    (`tree_conv`, `tree_rule`)."""
 
     emb_features: int
     num_k_heads: int
@@ -982,6 +983,19 @@ class GatedDeltaNet(nn.Module):
         return token
 
     @nn.compact
+    def _tree(self, mixed, g, beta, tree: tuple[int, ...], heads, widths, wide):
+        """A tree call's convolved tokens and recurrence (`tree_conv`, `tree_rule`): each token on its path,
+        from the row's held history and state past the root, the cache left as it was."""
+        if not self.has_variable('cache', 'recurrent_state'):
+            raise ValueError("a tree call reads a row's cache, which a decode call allocates first")
+        history = self.get_variable('cache', 'conv_state')
+        held = self.get_variable('cache', 'recurrent_state').astype(wide)
+        convolved = tree_conv(mixed, self.conv1d()[0], None, history, tree, parts=heads, dtype=wide)
+        query, key, value = (self._split_heads(part, width)
+                             for part, width in zip(convolved, widths, strict=True))
+        query, key = (repeat_kv_heads(x, self.num_v_heads) for x in (query, key))
+        return tree_rule(recurrent_gated_delta_rule, tree, (query, key, value, g, beta), held)
+
     def __call__(self, x, call: MixerCall = PLAIN_CALL):
         decode, attention_metadata = call.decode, call.metadata
         B, S, _ = x.shape
@@ -1047,7 +1061,10 @@ class GatedDeltaNet(nn.Module):
         stored, conv = self._stored(operand)
         heads = ((key_dim, self.head_k_dim), (key_dim, self.head_k_dim), (self.value_features, None))
         shards = sequence_shards()
-        if shards > 1:
+        tree = None if attention_metadata is None else attention_metadata.tree
+        if tree is not None:
+            out = self._tree(mixed, g, beta, tree, heads, widths, wide)
+        elif shards > 1:
             if decode:
                 raise LayoutRefused(f"a gated delta net under a sequence axis of {shards} runs whole "
                                     f"training sequences; a decode step holds one state per row. Decode on "
