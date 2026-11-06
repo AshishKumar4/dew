@@ -141,11 +141,12 @@ def compiler_options(*models: Held) -> dict[str, Option]:
     return options
 
 
-type Placements = (Sharding | Format | None | tuple[Placements, ...] | Mapping[str, Placements]
-                   | DataclassInstance)
+type Placements = (Sharding | Format | None | tuple[Placements, ...]
+                   | Mapping[str | tuple[str, ...], Placements] | DataclassInstance)
 """Where a program's arguments or results sit, as `jax.jit` takes them: one sharding, one format (a
 sharding and a layout), none (where they are), or a tree of them, one for each, a registered dataclass's
-among them (a server's resident slots)."""
+among them (a server's resident slots), a mapping's keys names or the paths of trees it holds (a state's
+frozen trees, `dew.state.apart`)."""
 
 
 class JitArguments(TypedDict, total=False):
