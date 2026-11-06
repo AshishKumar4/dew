@@ -11,14 +11,14 @@ import math
 from pathlib import Path
 
 import jax
+import jax.extend
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 from moe_support import assert_exchange_across_processes, objective, routing_case
-from one_draw import assert_as_exact_as_the_reference
-from reference_error import assert_computes_the_oracle
+from reference_error import as_given, assert_as_exact, assert_computes_the_oracle
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -61,6 +61,37 @@ def test_exchange_retains_outputs_and_all_differentiable_inputs(
     if skewed:
         for projection in actual[1][0]['params'].values():
             np.testing.assert_array_equal(projection['kernel'][top_k:], 0)
+
+
+def primitives(jaxpr: jax.extend.core.Jaxpr) -> list[str]:
+    """Every primitive `jaxpr` runs, its sub-jaxprs' (a shard_map's body, a scan's) included."""
+    names = []
+    for equation in jaxpr.eqns:
+        names.append(equation.primitive.name)
+        for value in equation.params.values():
+            for held in value if isinstance(value, (tuple, list)) else (value,):
+                if isinstance(held, jax.extend.core.ClosedJaxpr):
+                    names += primitives(held.jaxpr)
+                elif isinstance(held, jax.extend.core.Jaxpr):
+                    names += primitives(held)
+    return names
+
+
+@pytest.mark.parametrize("skewed", [False, True], ids=["even", "skewed"])
+def test_a_dropless_exchange_moves_its_rows_in_one_ragged_all_to_all_each_way(skewed):
+    """An expert mesh's dropless exchange sends each shard its rows in one `lax.ragged_all_to_all` and
+    takes them back in one more, the collective XLA runs, whatever the routing's skew: no rounds of
+    equal buckets, no loop over them (ledger 1711); its gradient moves its rows by the same collective."""
+    x, weights, indices = map(jnp.asarray, routing_case(24, 8, 2, skewed))
+    layer = ExpertMLP(8, 12, 8).clone(dispatch='exchange')
+    parameters = nn.unbox(ExpertMLP(8, 12, 8).init(jax.random.key(19), x, weights, indices))
+    with jax.set_mesh(MeshSpec(expert=4, fsdp=2).build()):
+        forward = primitives(jax.make_jaxpr(layer.apply)(parameters, x, weights, indices).jaxpr)
+        backward = primitives(jax.make_jaxpr(jax.grad(functools.partial(objective, layer, indices),
+                                                      has_aux=True))(parameters, x, weights).jaxpr)
+    assert forward.count("ragged_all_to_all") == 2 and "all_to_all" not in forward and "scan" not in forward
+    # JAX's transpose of the collective exchanges its offsets by an all_to_all of its own.
+    assert "ragged_all_to_all" in backward and "scan" not in backward
 
 
 def test_exchange_preserves_placed_expert_and_width_gradients():
@@ -202,55 +233,82 @@ def expert_loop(x, weights, indices, kept, parameters):
     return jnp.einsum("bskm,bsk->bsm", slots, weights * kept)
 
 
+CAPACITY_SEEDS = 16
+"""The dropping layer's declared check-1 seeds against the dropless one, sized by `seeds_for` paired on
+armada: 8 for every case and mesh but the tight case's global dispatch on one of them, 16."""
+
+
 @pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("spec", [MeshSpec(expert=2, fsdp=2), MeshSpec(expert=4)],
                          ids=["expert2-fsdp2", "expert4"])
 @pytest.mark.parametrize("dispatch", ["global", "exchange"])
 @pytest.mark.parametrize("case", ["whole-sequences", "short", "tight"])
 def test_capacity_drops_compute_maxtexts_experts(maxtext, case, dispatch, spec):
-    """The dropping layer, output and gradients (parameters, tokens and the
-    kept slots' weights), against the float64 expert loop over the slots
-    MaxText keeps, by the float64 rule against the dropless layer with the
-    dropped weights zeroed, whose own float64 run is first held to the loop.
-    A dropped slot's weight has no gradient."""
+    """The dropping layer, output and gradients (parameters, tokens and the kept slots' weights), over
+    drawn tokens and parameters at MaxText's routing, on par with the dropless layer with the dropped
+    weights zeroed from the float64 expert loop over the slots MaxText keeps (check 1), the dropless
+    layer's own float64 run first held to the loop. A dropped slot's weight has no gradient."""
     arrays, cases = maxtext
     shape = cases[case]
     indices, weights = arrays[f"{case}/indices"], arrays[f"{case}/weights"]
     kept = maxtext_kept(arrays, case)
-    x = np.random.default_rng(29).normal(size=(shape["batch"], shape["length"], 8)).astype(np.float32)
     dropless = ExpertMLP(shape["experts"], 12, 8)
-    parameters = nn.unbox(dropless.init(jax.random.key(19), x, weights, indices))
     gradient = functools.partial(jax.value_and_grad, argnums=(0, 1, 2), has_aux=True)
+    names = ["output", "down", "gate", "up", "tokens", "weights"]
 
     def run(module, values, given):
         out = jax.jit(gradient(functools.partial(objective, module, jnp.asarray(indices))))(*values, given)
         (_, output), grads = out
         return [np.asarray(leaf) for leaf in jax.tree.leaves((output, grads))]
 
-    reference = run(dropless, (parameters, x), np.where(kept, weights, 0).astype(np.float32))
-    with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf), jnp.float64), (parameters, x))
-        twin = run(dropless.clone(dtype=jnp.float64), wide, np.where(kept, weights, 0).astype(np.float64))
+    def held(leaves):
+        """The leaves check 1 reads, the weights' gradient at the slots kept."""
+        return {name: leaf[kept] if name == "weights" else leaf
+                for name, leaf in zip(names, leaves, strict=True)}
 
-        def loop(values, given):
-            out = expert_loop(values[1], given, indices, kept, values[0])
-            return jnp.sum(jnp.sin(out)), out
+    def draw(seed):
+        rng = np.random.default_rng([29, seed])
+        x = rng.normal(size=(shape["batch"], shape["length"], 8)).astype(np.float32)
+        return nn.unbox(dropless.init(jax.random.key(seed), x, weights, indices)), x
 
-        (_, output), grads = jax.value_and_grad(lambda p, xs, w: loop((p, xs), w), argnums=(0, 1, 2),
-                                                has_aux=True)(*wide, jnp.asarray(weights, jnp.float64))
-        truth = [np.asarray(leaf) for leaf in jax.tree.leaves((output, grads))]
-    with jax.set_mesh(spec.build(jax.devices()[:4])):
-        dropping = dropless.clone(dispatch=dispatch, capacity_factor=shape["factor"])
-        actual = run(dropping, (parameters, x), weights)
-    names = ["output", "down", "gate", "up", "tokens", "weights"]
-    for name, mine, theirs, wide_theirs, want in zip(names, actual, reference, twin, truth, strict=True):
-        if name == "weights":
-            np.testing.assert_array_equal(np.where(kept, 0, mine), 0)
-            mine, theirs, wide_theirs, want = (value[kept] for value in (mine, theirs, wide_theirs, want))
-        # The two projections' widths, the experts a token sums and the tokens a weight sums.
-        assert_computes_the_oracle(wide_theirs, want, f"{case} {name}",
+    def reference(parameters, x):
+        return held(run(dropless, (parameters, x), np.where(kept, weights, 0).astype(np.float32)))
+
+    def widened(parameters, x):
+        return jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf), jnp.float64), (parameters, x))
+
+    def twin(parameters, x):
+        with jax.enable_x64(new_val=True):
+            return held(run(dropless.clone(dtype=jnp.float64), widened(parameters, x),
+                            np.where(kept, weights, 0).astype(np.float64)))
+
+    def truth(parameters, x):
+        with jax.enable_x64(new_val=True):
+            def loop(values, given):
+                out = expert_loop(values[1], given, indices, kept, values[0])
+                return jnp.sum(jnp.sin(out)), out
+
+            (_, output), grads = jax.value_and_grad(lambda p, xs, w: loop((p, xs), w), argnums=(0, 1, 2),
+                                                    has_aux=True)(*widened(parameters, x),
+                                                                  jnp.asarray(weights, jnp.float64))
+            return held([np.asarray(leaf) for leaf in jax.tree.leaves((output, grads))])
+
+    def dropping(parameters, x):
+        with jax.set_mesh(spec.build(jax.devices()[:4])):
+            leaves = run(dropless.clone(dispatch=dispatch, capacity_factor=shape["factor"]), (parameters, x),
+                         weights)
+        np.testing.assert_array_equal(np.where(kept, 0, leaves[-1]), 0)
+        return held(leaves)
+
+    # The float64 twin computes the loop's oracle: the two projections' widths, the experts a token sums
+    # and the tokens a weight sums.
+    first, wanted = twin(*draw(0)), truth(*draw(0))
+    for name in names:
+        assert_computes_the_oracle(first[name], wanted[name], f"{case} {name}",
                                    roundings=8 + 12 + shape["top_k"] + shape["batch"] * shape["length"])
-        assert_as_exact_as_the_reference(mine, theirs, want, f"{case} {dispatch} {name}")
+    assert_as_exact(as_given(dropping), as_given(reference), draw,
+                    f"{case} {dispatch} capacity drops over {spec}",
+                    seeds=CAPACITY_SEEDS, truth_fn=as_given(truth))
 
 
 def test_exchange_collectives_work_across_two_real_processes(tmp_path):

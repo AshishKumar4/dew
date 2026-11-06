@@ -1324,6 +1324,22 @@ def prediction_path(name: str, prefix: str, index: int | str | None, declared: i
     return None if path is None else (path[0], f'{prefix}_{depth}', 'block', *path[2:])
 
 
+def prediction_name(dew_name: str, prefix: str, leaves: Mapping[str, tuple[str, ...]],
+                    block: Callable[[tuple[str, ...]], str | None]) -> tuple[int, str | None]:
+    """`prediction_path` backwards: the depth of `dew_name`, a leaf of prediction depth (or drafting
+    stage) `{prefix}_{d}` by its dotted path, and its tensor's name past its depth's stem, which the
+    family composes: its own leaf's in `leaves`, or its block's, which `block` names from the leaf's
+    path inside the block as the trunk's layer 0's (None for a leaf its release stores none of)."""
+    first, *rest = dew_name.split('.')
+    depth = int(first.removeprefix(f'{prefix}_'))
+    own = {path: name for name, path in leaves.items()}.get(tuple(rest))
+    if own is not None:
+        return depth, own
+    if not rest or rest[0] != 'block':
+        raise ValueError(f"{dew_name!r} is no parameter of a {prefix} depth")
+    return depth, block(tuple(rest[1:]))
+
+
 PREDICTION_INPUTS: Mapping[str, tuple[str, ...]] = {
     'enorm.weight': ('enorm', 'scale'), 'hnorm.weight': ('hnorm', 'scale'),
     'eh_proj.weight': ('eh_proj', 'kernel')}
@@ -1690,6 +1706,15 @@ def hf_tensor_name(dew_name: str, config: Mapping[str, object], *,
         if len(parts) == 3 and module == 'self_attn' and leaf == 'sinks':
             # A layer's learned sink logits, which `dew_path` reads under this name (`_V4_TENSORS`).
             return f'model.layers.{index}.self_attn.sinks'
+        types = config.get('layer_types')
+        if (module == 'self_attn' and types is not None
+                and _records.strings(types, 'layer_types')[int(index)] == 'linear_attention'):
+            # Qwen3.5's delta net under its own name, as `dew_path` reads it (`_LINEAR_PROJECTIONS`).
+            tail = tuple(parts[2:])
+            if len(tail) == 2 and tail[0] in _LINEAR_PROJECTIONS and leaf == 'kernel':
+                return f'model.layers.{index}.linear_attn.{tail[0]}.weight'
+            if tail in _LINEAR_LEAVES:
+                return f'model.layers.{index}.linear_attn.' + '.'.join(tail)
         theirs = {ours: hf for hf, ours in _norm_names(sandwich_norms).items()}
         if len(parts) == 3 and module in theirs and leaf in ('scale', 'bias'):
             return f'model.layers.{index}.{theirs[module]}.' + ('weight' if leaf == 'scale' else 'bias')

@@ -104,7 +104,7 @@ def exported(args) -> dict:
     def built(fields):
         """The decoder of `fields`, its variables, those placed across the pool, every layer's attention
         extended by DEX, and the placed decoder's bundle."""
-        model = models.build("causal_transformer", **fields)
+        model = models.build("causal_transformer", **fields, scan_layers=args.scan)
         variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32)))
         placed = HeldBanks(variables).place(model, mesh=MeshSpec(fsdp=args.fsdp_size),
                                             layout=Layout(min_shard=TINY_SHARD, tolerance=1.0))
@@ -190,8 +190,10 @@ def scoped_growth(modules) -> list[dict]:
 def released(args) -> dict:
     """A saved run's release read through `released_run` over a cache the pool shares, which writes it
     once, and its export through `dew export` to a destination the pool shares; the release written in
-    shards (`RELEASE_SHARD`), after an export of the run outside the cache, so the measured one finds its
-    programs compiled and its modules imported, and the same measure over the release held home."""
+    shards (`RELEASE_SHARD`), after two exports of the run outside the cache, so the measured one finds its
+    programs compiled, its modules imported and their executions' native storage taken (XLA CPU's buffers,
+    which the first run of a compiled program allocates and the measure would otherwise count), and the
+    same measure over the release held home."""
     import jax
     from safetensors.numpy import load_file
 
@@ -202,8 +204,11 @@ def released(args) -> dict:
     PretrainedDecoder.save = functools.partialmethod(PretrainedDecoder.save, max_shard_size=RELEASE_SHARD)
     rank = jax.process_index()
     scopes = scoped_growth(saved_sources)
-    warm = Path(args.run_dir).parent / f"warm{rank}"
-    saved_sources.export_run(saved_sources.pinned_run(args.run_dir), warm, publishes=rank == 0)
+    # The first export compiles; the second warms the already-compiled execution's native storage.
+    # Each restore and export ends before the measured restore, with neither warm tree held into it.
+    for attempt in range(2):
+        warm = Path(args.run_dir).parent / f"warm{attempt}-{rank}"
+        saved_sources.export_run(saved_sources.pinned_run(args.run_dir), warm, publishes=rank == 0)
     scopes.clear()
     release = saved_sources.released_run(args.run_dir)
     read = list(scopes)
@@ -226,6 +231,7 @@ MODES = {"exported": exported, "released": released}
 def main(argv=None) -> None:
     parser = worker_parser(MODES, __doc__)
     parser.add_argument("--run-dir", required=True)
+    parser.add_argument("--scan", action="store_true", help="the decoder scans its runs of like layers")
     serve_mode(MODES, parser.parse_args(argv))
 
 

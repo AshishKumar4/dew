@@ -1036,6 +1036,17 @@ def test_a_call_over_runs_is_on_par_interpreted(case, form):
 
 
 @INTERPRETS
+@pytest.mark.parametrize("score", [(), ("softcap",)], ids=["plain", "softcap"])
+@pytest.mark.parametrize("call", CALLS)
+def test_an_fp32_forward_walks_its_operands_bf16_parts_interpreted(call, score):
+    """An fp32 call's forward on the one mainloop (`MosaicForward.parts`): its operands as three bf16 parts
+    each, every product its parts' six (`product.terms`), on par with the reference path in fp32 (check
+    1), under no hook and a score hook."""
+    spans = template.spans(128, 128, 1, **CALLS[call])
+    _check_spans(f"{call} fp32 parts", spans, (1, 128, 2, 1), interpret=True, score=score, dtype=jnp.float32)
+
+
+@INTERPRETS
 @pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
 @pytest.mark.parametrize("call", CALLS)
 def test_a_call_of_whole_key_tiles_reads_no_padding_interpreted(call, backward):
@@ -1841,12 +1852,14 @@ def _forward_kernels(op, ba, config) -> dict:
 
 
 @COMPILES_ON_CPU
+@pytest.mark.parametrize("stored", ["bfloat16", "int8"])
 @pytest.mark.parametrize("width", [64, 128])
 @pytest.mark.parametrize("generation_name", GATED)
-def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, width):
+def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, width, stored):
     """A decode step (`attention_decode.attend`: its plain launch at the plan's streaming key tile and
     slices, `MosaicForward.streaming`, and its masked rewalk's launches), 32 query heads over 8 key heads
-    `width` wide, two rows of 4096 keys, lowered and compiled by ptxas for `generation_name` on this CPU
+    `width` wide, two rows of 4096 keys, its cache bf16 or int8 codes with their scales (each slot converted
+    in registers, `_Codes`), lowered and compiled by ptxas for `generation_name` on this CPU
     (tests/kernel_compile.py): every launch within its shared memory and spilling nothing (`mosaic_failures`),
     where the forward gate's prefill calls derive their own tiles."""
     from fla_gdn_support import KernelCase
@@ -1856,23 +1869,28 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, w
 
     rows, keys = 2, 4096
     query = jax.ShapeDtypeStruct((rows, 1, 32, width), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((rows, keys, 8, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, keys, 8, width), jnp.dtype(stored))
+    scale = jax.ShapeDtypeStruct((rows, 8, keys), jnp.float32)
+    quantized = stored != "bfloat16"
     spans = template.spans(1, keys, rows, lengths=jnp.asarray([keys, keys - 77], jnp.int32))
 
-    def decode(query, key, value):
-        return attention_decode.attend(query, key, value, spans)
+    def decode(query, key, value, *scales):
+        return attention_decode.attend(query, key, value, spans, scales=scales or None)
 
+    operands = (query, key, key, *((scale, scale) if quantized else ()))
     with generation.assumed(generation_name):
         # The plan's op over the packed rows, its launches' models (`_forward_kernels`).
-        zeros = [jnp.zeros(array.shape, array.dtype) for array in (query, key, key)]
+        zeros = [jnp.zeros(array.shape, array.dtype) for array in operands]
+        scales = tuple(zeros[3:]) or None
         rows, row_spans, _ = attention_decode.packed(zeros[0], spans, key.shape[2])
-        op, args = attention_mosaic._forward_call(rows, *zeros[1:], row_spans, None, scale=None,
-                                                  natural=False, out_dtype=jnp.float32, masked=True)
+        op, args = attention_mosaic._forward_call(rows, *zeros[1:3], row_spans, None, scale=None,
+                                                  natural=False, out_dtype=jnp.float32, masked=True,
+                                                  scales=scales)
         ba = op.bind(*args, residuals=template.Kept.OUTPUT, interpret=False)
-        config = attention_decode.plan(rows, *zeros[1:], row_spans, None, scale=None,
-                                       target=generation.gpu_target()).config
+        config = attention_decode.plan(rows, *zeros[1:3], row_spans, None, scale=None,
+                                       target=generation.gpu_target(), scales=scales).config
         found = compile_mosaic_kernels(
-            [KernelCase("decode", lambda: (decode, (query, key, key)), _forward_kernels(op, ba, config))],
+            [KernelCase("decode", lambda: (decode, operands), _forward_kernels(op, ba, config))],
             generation_name)
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
@@ -1903,6 +1921,37 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, w
         ba = op.bind(*args, residuals=training, interpret=False)
         config = op.derived(ba, generation.gpu_target())
         assert config is not None, f"the Mosaic forward derives no config {width} wide"
+        found = compile_mosaic_kernels(
+            [KernelCase("forward", lambda: (forward, (query, key, key)), _forward_kernels(op, ba, config))],
+            generation_name)
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("width", [64, 128])
+@pytest.mark.parametrize("generation_name", ["sm90"])
+def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_name, width):
+    """An fp32 call's inference forward (`MosaicForward.parts`: its operands bf16 parts) at its derived tiles
+    of a causal call `width` wide, lowered and compiled by ptxas for `generation_name` on this CPU: every
+    launch within its shared memory, spilling nothing, its register model's decision ptxas's."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    queries = 512
+    spans = template.spans(queries, queries, 1, causal=True)
+    query = jax.ShapeDtypeStruct((1, queries, 4, width), jnp.float32)
+    key = jax.ShapeDtypeStruct((1, queries, 2, width), jnp.float32)
+
+    def forward(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, None)
+
+    with generation.assumed(generation_name):
+        zeros = [jnp.zeros(array.shape, array.dtype) for array in (query, key, key)]
+        op, args = attention_mosaic._forward_call(*zeros, spans, None, scale=None,
+                                                  natural=attention_mosaic.NATURAL)
+        ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
+        config = op.derived(ba, generation.gpu_target())
+        assert config is not None, f"the Mosaic forward derives no fp32 config {width} wide"
         found = compile_mosaic_kernels(
             [KernelCase("forward", lambda: (forward, (query, key, key)), _forward_kernels(op, ba, config))],
             generation_name)

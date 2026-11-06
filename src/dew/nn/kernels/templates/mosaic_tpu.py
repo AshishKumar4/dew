@@ -135,9 +135,9 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
     def written(self, smem, value: jax.Array) -> None:
         smem[...] = value.astype(smem.dtype)
 
-    def products(self, acc: jax.Array, lhs, rhs, interpret: bool) -> jax.Array:
+    def products(self, acc: jax.Array, lhs, rhs, interpret: bool, *, accumulate: bool = True) -> jax.Array:
         del interpret
-        return acc + _product(lhs, rhs)
+        return acc + _product(lhs, rhs) if accumulate else _product(lhs, rhs)
 
     def settled(self, pending: int = 0) -> None:
         # Its products are synchronous: none is pending.
@@ -296,10 +296,13 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, held_past: tuple[str, ...] = (), finish: Callable | None = None
+                ) -> tuple[C, tuple[jax.Array, ...]]:
         # Each step's blocks awaited before it and the next step's copied while it multiplies; a segment
-        # of no steps copies nothing.
+        # of no steps copies nothing. Its products are synchronous: no stage outlives its step.
         del first, in_flight, unrolled, interpret
+        if held_past or finish is not None:
+            raise NotImplementedError(f"{self.name}'s steps give their stages back as each ends")
         names = tuple(streams.views)
         carry = (start, self.started(shapes, initial))
         for step, lo, hi in segments:
@@ -339,16 +342,15 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
     def load_barriers(self, count: int):
         return pltpu.SemaphoreType.DMA((count,))
 
-    def staging(self, name: str, shaped) -> dict:
-        # Each operand a tile reads whole, staged in VMEM for its one role (the GPU's up to two roles'
-        # shape kept, so a template indexes it alike), its copy's DMA semaphores.
-        shaped = list(shaped)
-        return {f'{name}_smems': [pltpu.VMEM((2, *shape), gmem.dtype) for shape, gmem in shaped],
-                f'{name}_barriers': [self.load_barriers(2) for _ in shaped]}
+    def staged_memory(self, shape: tuple[int, ...], dtype):
+        # Its one role's staging in VMEM (`staging` keeps the GPU's up to two roles' shape, so a template
+        # indexes it alike), its copies' DMA semaphores its `load_barriers`.
+        return pltpu.VMEM(shape, dtype)
 
     def meeting(self, consumers: int):
+        # One role: nothing to meet at (`meet` refuses), a program of two refused here first.
         _one(consumers)
-        return pltpu.SemaphoreType.REGULAR
+        raise NotImplementedError("a TPU program is one role: it meets no other")
 
     def meet(self, halves) -> None:
         raise NotImplementedError("a TPU program is one role: it meets no other")

@@ -73,7 +73,7 @@ import logging
 import math
 import time
 from collections import deque
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -98,7 +98,7 @@ from dew.batch import (
     token_validity,
 )
 from dew.inference.engine import Timed, Waiting, normalized, reloaded, settled
-from dew.inference.pages import Pages, States, prefix_hashes
+from dew.inference.pages import Pages, States, prefix_hashes, segment_hash
 from dew.inference.projections import pack_projections, packed_layout
 from dew.inference.serving_kernel import (
     Admission,
@@ -106,8 +106,11 @@ from dew.inference.serving_kernel import (
     Draws,
     Paged,
     Placement,
+    copy_program,
     decode_programs,
     dispatched,
+    entry_programs,
+    entry_shapes,
     joined,
     mixed_refusal,
     opened,
@@ -146,7 +149,7 @@ from dew.nn.inputs import (
 )
 from dew.nn.kernels import generation
 from dew.nn.kernels.options import Fetched, compiler_options, program as outer_program
-from dew.nn.kv_cache import GROUPS, ROUNDING_KEYS, KVCache, is_paged, leaf_name
+from dew.nn.kv_cache import GROUPS, ROUNDING_KEYS, KVCache, is_paged, leaf_name, row_axis
 from dew.nn.precision import Numerics
 from dew.nn.progress import END, Progress
 from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
@@ -311,6 +314,10 @@ class _Row:
     restore: int | None = None
     """The `States` entry the row's slot starts from after its shared prefix pages, before its first piece;
     None where it starts afresh."""
+    shared: int | None = None
+    """The prompt tokens the request declares a segment other requests share (`Server.submit`), whose
+    keys and state the server keeps at its end and reads there for a prompt that starts with it; None for
+    none."""
     snapshots: tuple[int, ...] = ()
     """The prompt lengths, page boundaries past its shared prefix, after which the row's state is kept for a
     later prompt that shares its pages (`PagedRows.boundaries`)."""
@@ -418,7 +425,8 @@ class PagedRows:
         if any(part.prefix_cache for part in self.pages) and any(
                 row_state(path) for path, _ in jax.tree_util.tree_leaves_with_path(cache)):
             for part in self.pages:
-                part.states = States(self.states)
+                # A state gives way to a host slot as a reclaimed page does, as many as the pages'.
+                part.states = States(self.states, host=part.host)
 
     @property
     def stateful(self) -> bool:
@@ -427,10 +435,14 @@ class PagedRows:
 
     def boundaries(self, row: _Row, size: int) -> tuple[int, ...]:
         """The page boundaries past the row's shared prefix after which its state is kept: its deepest
-        shareable one, the pages before its last token, and every `every` pages below it."""
+        shareable one, the pages before its last token, and every `every` pages below it; and the end of
+        the segment it declares shared, wherever it ends."""
         deepest = (len(row.prompt) - 1) // size
-        kept = {deepest, *(range(self.every, deepest, self.every) if self.every else ())}
-        return tuple(sorted(page * size for page in kept if page * size > row.prefilled))
+        kept = {page * size for page in {deepest, *(range(self.every, deepest, self.every) if self.every
+                                                     else ())}}
+        if row.shared is not None:
+            kept.add(row.shared)
+        return tuple(sorted(boundary for boundary in kept if boundary > row.prefilled))
 
     def refuse(self, length: int, budget: int) -> None:
         part = self.pages[0]
@@ -444,15 +456,16 @@ class PagedRows:
         seated: list[tuple[int, _Row]] = []
         taken = [0] * len(free)
         for row in list(queue):
-            if any(part.waits(row.prompt, row.salt) for part in self.pages):
-                # Another row writes this prompt's next page now: it reads that page once written.
+            if any(part.waits(row.prompt, row.salt, row.shared) for part in self.pages):
+                # Another row writes this prompt's next page, or its segment, now: it reads it once written.
                 continue
             open_groups = sorted((group for group, slots in enumerate(free) if taken[group] < len(slots)),
-                                 key=lambda group: (len(self.pages[group].shared(row.prompt, row.salt)),
+                                 key=lambda group: (len(self.pages[group].shared(row.prompt, row.salt,
+                                                                                 row.shared)),
                                                     self.pages[group].available), reverse=True)
             for group in open_groups:
                 part = self.pages[group]
-                reserved = part.reserve(row.prompt, len(row.prompt) + row.budget, row.salt)
+                reserved = part.reserve(row.prompt, len(row.prompt) + row.budget, row.salt, row.shared)
                 if reserved is not None:
                     row.pages, row.prefilled, entry, row.writing = reserved
                     row.restore = None if entry is None else group * self.states + entry
@@ -475,7 +488,7 @@ class PagedRows:
         where every key came from the weights served now, and not where it was seated before a
         reload and its earlier pieces kept the old weights' keys."""
         if row.weights == self.weights:
-            self.pages[row.group].publish(row.prompt, row.pages, row.salt)
+            self.pages[row.group].publish(row.prompt, row.pages, row.salt, row.shared)
         self.pages[row.group].written(row.writing)
         row.writing = ()
 
@@ -487,13 +500,16 @@ class PagedRows:
 
     def kept(self, row: _Row) -> int | None:
         """The `States` entry, global over the groups, that keeps the row's state after its prompt's first
-        `row.prefilled` tokens, a boundary its piece ended at; None where one is held already, or the
-        row's keys came from weights a reload replaced."""
+        `row.prefilled` tokens, a boundary its piece ended at, a page's or its shared segment's end
+        (`segment_hash`); None where one is held already, or the row's keys came from weights a reload
+        replaced."""
         part = self.pages[row.group]
         if part.states is None or row.weights != self.weights:
             return None
         pages = row.prefilled // part.size
-        entry = part.states.take(prefix_hashes(row.prompt, part.size, pages, row.salt)[-1])
+        entry = part.states.take(segment_hash(row.prompt, part.size, row.prefilled, row.salt)
+                                 if row.prefilled % part.size else
+                                 prefix_hashes(row.prompt, part.size, pages, row.salt)[-1])
         return None if entry is None else row.group * self.states + entry
 
     def reloaded(self) -> None:
@@ -702,18 +718,31 @@ class Server:
         rows = self.rows
         if isinstance(rows, PagedRows) and rows.stateful:
             entries = rows.states * self.groups
-            states = jax.tree_util.tree_map_with_path(
-                lambda path, leaf: jax.device_put(jnp.zeros((entries, *leaf.shape[1:]), leaf.dtype),
-                                                  leaf.sharding) if row_state(path) else None,
-                self.cache)
+
+            def store(path, leaf):
+                # Each entry where a slot's row is: a run's bank holds its layers first (`row_axis`).
+                axis = row_axis(path)
+                return jax.device_put(jnp.zeros((*leaf.shape[:axis], entries, *leaf.shape[axis + 1:]),
+                                                leaf.dtype), leaf.sharding) if row_state(path) else None
+
+            states = jax.tree_util.tree_map_with_path(store, self.cache)
             self._states = states
             self._restored, self._captured = map(Fetched, state_programs(formats, states))
+        self._host_states: dict[int, list[np.ndarray]] | None = None
+        """The row state store's host tier: each of this process's host slots, by the slot's global index,
+        its entry of each state leaf (`dew.inference.pages.States`); None without one."""
+        if self._states is not None and isinstance(rows, PagedRows) and rows.pages[0].host:
+            self._host_states = {}
+            self._read_entries, self._written_entries = map(Fetched, entry_programs(self._states,
+                                                                                    self._admitted))
         self._host: dict[int, list[np.ndarray]] | None = None
         """The prefix cache's host tier: each of this process's host slots, by the slot's global index, its
         page of each pool leaf (`dew.inference.pages.Transfers`); None without one."""
         if isinstance(rows, PagedRows) and rows.pages[0].host:
             self._host = {}
             self._read_pages, self._written_pages = map(Fetched, page_programs(formats, self._admitted))
+        if isinstance(rows, PagedRows) and rows.pages[0].prefix_cache:
+            self._copy_pages = Fetched(copy_program(formats))
 
     @contextlib.contextmanager
     def _context(self) -> Iterator[None]:
@@ -898,7 +927,7 @@ class Server:
         self.rows.reloaded()
 
     def submit(self, prompt: Prompt, max_new_tokens: int | None = None, *,
-               key: int | jax.Array, adapter: str | None = None) -> Ticket:
+               key: int | jax.Array, adapter: str | None = None, shared: int | None = None) -> Ticket:
         """Queue one request and return a ticket that resolves to its `Generation`.
 
         `prompt` is one text prompt, `ModelInputs` row or token row, without
@@ -917,13 +946,22 @@ class Server:
         adapter set's (`dew.lora.AdapterSet`), each row drawing under its own:
         a request draws what a task over that adapter alone draws, and the
         base model's where it names none.
+        `shared` declares the prompt's first `shared` tokens a segment other
+        requests share, wherever it ends (a decision's encoded state, each
+        question past it a request of its own): a paged server with
+        `prefix_cache` keeps the keys and the row state at its end, and a
+        request whose prompt starts with the same segment, declaring it too,
+        prefills only its rest, the page the segment ends inside copied into
+        its own (`dew.inference.pages.segment_hash`). Such requests submitted
+        together wait for the first to write it. A segment ends between two
+        tokens no group (a block, an image) holds both of.
         """
         # One row's key, folded the way `RowPlan.keys` folds row zero.
-        return self._enqueued(prompt, max_new_tokens, _seed(key, self.prng), 0, adapter)
+        return self._enqueued(prompt, max_new_tokens, _seed(key, self.prng), 0, adapter, shared)
 
     def _enqueued(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array,
-                  fold: int, adapter: str | None = None) -> Ticket:
-        row = self._prepared(prompt, max_new_tokens, seed, fold, adapter)
+                  fold: int, adapter: str | None = None, shared: int | None = None) -> Ticket:
+        row = self._prepared(prompt, max_new_tokens, seed, fold, adapter, shared)
         if row.budget:
             self._waiting.append(row)
         else:
@@ -934,7 +972,7 @@ class Server:
         return row.ticket
 
     def _prepared(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array, fold: int,
-                  adapter: str | None = None) -> _Row:
+                  adapter: str | None = None, shared: int | None = None) -> _Row:
         names = adapter_names(self.model)
         if adapter is not None and adapter not in names:
             raise ValueError(f"this server's model holds no adapter named {adapter!r}"
@@ -1009,8 +1047,24 @@ class Server:
                     hasher.update(held[:reach].tobytes())
                 hasher.update(tokens[:reach].tobytes())
             salt = hasher.digest()
+        if shared is not None:
+            self._check_segment(shared, len(tokens), groups)
         return _Row(tokens, budget, seed, fold, Ticket(), context=context, salt=salt, groups=groups,
-                    adapter=chosen)
+                    adapter=chosen, shared=shared)
+
+    def _check_segment(self, shared: int, length: int, groups: Mapping[str, np.ndarray]) -> None:
+        """Refuse a declared shared segment (`submit`'s) that no server of these rows keeps, that holds
+        none of the prompt's tokens or every one (the last is computed, its logits the first draw's), or
+        that ends inside a group, whose members' keys are computed together."""
+        if not isinstance(self.rows, PagedRows) or not self.rows.pages[0].prefix_cache:
+            raise ValueError("a shared segment is kept by a paged server with prefix_cache=True")
+        if not 0 < shared < length:
+            raise ValueError(f"a shared segment holds 1 to {length - 1} of the prompt's {length} tokens, "
+                             f"got {shared}")
+        for name, held in groups.items():
+            if np.intersect1d(held[:shared][held[:shared] >= 0], held[shared:]).size:
+                raise ValueError(f"the shared segment ends inside a group of {name}, whose members' keys are "
+                                 f"computed together")
 
     def _book_capture(self, slot: int, row: _Row) -> None:
         """Keep the state the call leaves in `slot` where the row's piece ends at a boundary it keeps
@@ -1087,10 +1141,16 @@ class Server:
         # seating's does; each process's captures and page copies come back with it.
         (admission, _), booked = self._agreed("serving admission", admitted, lambda held: held[1])
         captures = [tuple(pair) for held in booked for pair in held["captures"]]
-        spills, uploads = ([tuple(pair) for held in booked for pair in held[name]]
-                           for name in ("spills", "uploads"))
+        copies, spills, uploads, state_spills, state_uploads = (
+            [tuple(pair) for held in booked for pair in held[name]]
+            for name in ("copies", "spills", "uploads", "state_spills", "state_uploads"))
         with self._context():
+            # Spills read reclaimed pages before anything writes them (a copy's fresh page may be one), and
+            # a copy reads its segment's page after an upload lands it there.
             self._transferred(spills, uploads)
+            self._copied(copies)
+            # A state giving way goes to the host, and one a seated row reads comes back, before restores.
+            self._moved_states(state_spills, state_uploads)
             if restores:
                 self._resident, self._carried = self._restored(
                     self._resident, self._carried, self._states, *_padded(restores, self.slots, 0))
@@ -1130,51 +1190,105 @@ class Server:
     def _owed(self) -> dict[str, list[list[int]]]:
         """The page copies this process's seating owes (`dew.inference.pages.Transfers`), by the pool's and
         the host tier's global page and slot: its groups' pages and slots lie at their groups' offsets."""
-        if self._host is None:
-            return {"spills": [], "uploads": []}
-        assert isinstance(self.rows, PagedRows)
+        if not isinstance(self.rows, PagedRows):
+            return {"copies": [], "spills": [], "uploads": [], "state_spills": [], "state_uploads": []}
         per, host = self.rows.pages[0].count, self.rows.pages[0].host
         owed = [(group, self.rows.pages[group].drained()) for group in self._local]
-        return {"spills": [[group * per + page, group * host + slot] for group, held in owed
+        # The row states' moves, by the store's global entry and the host tier's global slot.
+        entries = self.rows.states
+        moved = [(group, (([], []) if part.states is None else part.states.drained()))
+                 for group, part in ((group, self.rows.pages[group]) for group in self._local)]
+        return {"copies": [[group * per + source, group * per + page] for group, held in owed
+                           for source, page in held.copies],
+                "spills": [[group * per + page, group * host + slot] for group, held in owed
                            for page, slot in held.spills],
                 "uploads": [[group * host + slot, group * per + page] for group, held in owed
-                            for slot, page in held.uploads]}
+                            for slot, page in held.uploads],
+                "state_spills": [[group * entries + entry, group * host + slot]
+                                 for group, (spills, _) in moved for entry, slot in spills],
+                "state_uploads": [[group * host + slot, group * entries + entry]
+                                  for group, (_, uploads) in moved for slot, entry in uploads]}
+
+    def _copied(self, copies: Sequence[tuple[int, int]]) -> None:
+        """Copy each shared segment's last page into the fresh page a prompt sharing it writes past the
+        segment (`dew.inference.pages.Transfers.copies`), after the spills and uploads (`_transferred`):
+        a copy's fresh page may be a reclaimed one a spill reads first, and its segment's page one an
+        upload lands; an admission's width a call so one program serves every step."""
+        if not copies:
+            return
+        assert isinstance(self.rows, PagedRows)
+        width = self.admission * self.rows.width
+        for start in range(0, len(copies), width):
+            sources, targets = (np.full(width, DROPPED, np.int32) for _ in range(2))
+            for index, (source, target) in enumerate(copies[start:start + width]):
+                sources[index], targets[index] = source, target
+            self._resident, self._carried = self._copy_pages(self._resident, self._carried, sources, targets)
 
     def _transferred(self, spills: Sequence[tuple[int, int]], uploads: Sequence[tuple[int, int]]) -> None:
         """Make the page copies every process's seating owes before the step's program writes any page: each
         reclaimed prefix page out to its host slot, then each shared one back from its slot into its fresh
-        page, a fixed number a call so one program of each serves every step. A process keeps the slots of
-        its own groups, and hands the pages written in a row per group, its groups' rows its own
-        (`_placed`), each group's at most as many as its share of an admission reads."""
+        page (`_host_moves`)."""
         if self._host is None:
             return
+
+        def write(pages: np.ndarray, held: Variables) -> None:
+            self._resident, self._carried = self._written_pages(self._resident, self._carried, pages, held)
+
+        self._host_moves(spills, uploads, self._host, phase="the prefix cache's spilled pages",
+                         read=lambda pages: self._read_pages(self._resident, self._carried, pages),
+                         write=write, shapes=lambda count: page_shapes(self._resident, self._carried, count))
+
+    def _moved_states(self, spills: Sequence[tuple[int, int]], uploads: Sequence[tuple[int, int]]) -> None:
+        """Make the row state moves every process's seating owes before the step's restores
+        (`dew.inference.pages.States`): each entry giving way out to its host slot, then each host state a
+        seated row reads back into its entry (`_host_moves`)."""
+        if self._host_states is None or self._states is None:
+            return
+        states = self._states
+
+        def write(entries: np.ndarray, held: Variables) -> None:
+            self._states = self._written_entries(self._states, entries, held)
+
+        self._host_moves(spills, uploads, self._host_states, phase="the prefix cache's spilled row states",
+                         read=lambda entries: self._read_entries(self._states, entries), write=write,
+                         shapes=lambda count: entry_shapes(states, count))
+
+    def _host_moves(self, spills: Sequence[tuple[int, int]], uploads: Sequence[tuple[int, int]],
+                    tier: dict[int, list[np.ndarray]], *, read: Callable[[np.ndarray], Variables],
+                    write: Callable[[np.ndarray, Variables], None], shapes: Callable[[int], Variables],
+                    phase: str) -> None:
+        """Move a device store's places (a pool's pages, a row state store's entries) to and from the host
+        `tier`: each spilled place out to its slot, `read` a fixed number a call, then each uploaded slot
+        back into its place, `write` a fixed number a call, so one program of each serves every step. A
+        process keeps the slots of its own groups, and hands the places written in a row per group, its
+        groups' rows its own (`_placed`), each group's at most as many as its share of an admission
+        reads."""
         assert isinstance(self.rows, PagedRows)
         host, width = self.rows.pages[0].host, self.admission * self.rows.width
         for start in range(0, len(spills), width):
             batch = spills[start:start + width]
-            pages, _ = _padded(batch, width, 1)
-            read = self._read_pages(self._resident, self._carried, pages)
-            # A pool's pages come home with every process agreeing; a server of one process's alone.
-            leaves = (jax.tree.leaves(collective_host(read, phase="the prefix cache's spilled pages"))
-                      if self.pooled else pinned_get(jax.tree.leaves(read)))
+            places, _ = _padded(batch, width, 1)
+            read_out = read(places)
+            # A pool's places come home with every process agreeing; a server of one process's alone.
+            leaves = (jax.tree.leaves(collective_host(read_out, phase=phase)) if self.pooled
+                      else pinned_get(jax.tree.leaves(read_out)))
             for index, (_, slot) in enumerate(batch):
                 if slot // host in self._local:
-                    self._host[slot] = [np.asarray(leaf)[:, index].copy() for leaf in leaves]
+                    tier[slot] = [np.asarray(leaf)[index].copy() for leaf in leaves]
         share = width // self.groups
         by_group = [[pair for pair in uploads if pair[0] // host == group] for group in range(self.groups)]
-        shapes = page_shapes(self._resident, self._carried, share)
+        held_shapes = shapes(share)
         for start in range(0, max(map(len, by_group)), share):
-            pages = np.full((self.groups, share), DROPPED, np.int32)
-            held = [np.zeros((len(self._local), *leaf.shape), leaf.dtype) for leaf in jax.tree.leaves(shapes)]
+            places = np.full((self.groups, share), DROPPED, np.int32)
+            held = [np.zeros((len(self._local), *leaf.shape), leaf.dtype)
+                    for leaf in jax.tree.leaves(held_shapes)]
             for group, pairs in enumerate(by_group):
-                for index, (slot, page) in enumerate(pairs[start:start + share]):
-                    pages[group, index] = page
+                for index, (slot, place) in enumerate(pairs[start:start + share]):
+                    places[group, index] = place
                     if group in self._local:
-                        for rows, held_page in zip(held, self._host[slot], strict=True):
-                            rows[self._local.index(group), :, index] = held_page
-            self._resident, self._carried = self._written_pages(
-                self._resident, self._carried, pages,
-                jax.tree.unflatten(jax.tree.structure(shapes), self._placed(held)))
+                        for rows, held_place in zip(held, tier[slot], strict=True):
+                            rows[self._local.index(group), index] = held_place
+            write(places, jax.tree.unflatten(jax.tree.structure(held_shapes), self._placed(held)))
 
     def run(self) -> None:
         """Step until every queued and running request has resolved. A step that fails stops the server:

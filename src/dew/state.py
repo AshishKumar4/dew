@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
@@ -14,7 +14,7 @@ from flax import struct
 from flax.training.dynamic_scale import DynamicScale
 from jax.typing import DTypeLike
 
-from dew.batch import FROZEN, Batch, Variables, merge
+from dew.batch import FROZEN, Batch, Variables, at_path, merge, placed_at, without
 from dew.optim import parameter_name
 
 if TYPE_CHECKING:
@@ -270,19 +270,25 @@ def drawn_in[LossT, EffectsT](variables: Variables, dtype: DTypeLike | None,
     return {**variables, "params": jax.tree_util.tree_map_with_path(stored, variables["params"])}
 
 
-def apart[State: TrainState](state: State) -> tuple[State, Variables | None]:
-    """`state` less its frozen tree (`variables[FROZEN]`), and the frozen tree, None where it holds
-    none: a step donates the first and reads the second, so the frozen arrays are one set of buffers
-    a run shares with the tree its objective holds (`together`). A state's shardings or shapes split
-    the same way."""
-    variables = state.variables
-    if FROZEN not in variables:
-        return state, None
-    moving = {collection: tree for collection, tree in variables.items() if collection != FROZEN}
-    return dataclasses.replace(state, variables=moving), variables[FROZEN]
+def apart[State: TrainState](state: State, at: Sequence[Sequence[str]] = ((FROZEN,),)
+                             ) -> tuple[State, dict[str, Variables]]:
+    """`state` less its frozen trees, and those trees by their paths, of the paths `at` names the ones it
+    holds: by default its frozen collection (`variables[FROZEN]`), and on a host run every tree it keeps
+    beside the accelerator (`dew.training.execution.frozen_trees`), a distillation's teacher too. A step
+    donates the first and reads the second, so the frozen arrays are one set of buffers a run shares
+    with the tree its objective holds (`together`), and a host run's compiled commit reads none of
+    them. A state's shardings or shapes split the same way, each tree named by its path joined by "/", as
+    a program's placements name a tree's entries."""
+    held = {"/".join(path): tree for path in at if (tree := at_path(state.variables, path)) is not None}
+    if not held:
+        return state, held
+    paths = [tuple(path.split("/")) for path in held]
+    return dataclasses.replace(state, variables=without(state.variables, paths)), held
 
 
-def together[State: TrainState](moving: State, frozen: Variables | None) -> State:
-    """The state `apart` split, its frozen tree the very arrays given."""
-    return moving if frozen is None else dataclasses.replace(moving, variables={**moving.variables,
-                                                                                FROZEN: frozen})
+def together[State: TrainState](moving: State, held: Mapping[str, Variables]) -> State:
+    """The state `apart` split, its frozen trees the very arrays given."""
+    variables = moving.variables
+    for path, tree in held.items():
+        variables = placed_at(variables, path.split("/"), tree)
+    return moving if not held else dataclasses.replace(moving, variables=variables)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
@@ -22,10 +23,12 @@ from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.nn.mimo_audio import MiMoAudio
 from dew.registry import towers
 
-PACKED_MEDIA = (*QWEN35_TYPES, 'muse_glimmer', 'lfm3_vl', 'mimo_v2')
+PACKED_MEDIA = (*QWEN35_TYPES, 'muse_glimmer', 'lfm3_vl', 'mimo_v2', 'kimi_k25', 'kimi_k3')
 """The wrappers whose processors pack images and videos alike, as runs of patch vectors beside their
 `(t, h, w)` grids, a video's frames each a run of its own (`Processor._qwen_frames`): Qwen 3.5's, Muse
-Glimmer's, LFM3-VL's and MiMo-V2.6's, whose towers attend and convolve within a frame."""
+Glimmer's, LFM3-VL's and MiMo-V2.6's, whose towers attend and convolve within a frame; and Kimi K2.5's
+and K3's, each item whole, whose tower attends over an item's frames and pools them
+(`TowerGeometry.pools_frames`)."""
 
 VIDEO_MEDIA = (*PACKED_MEDIA, *GEMMA4_TYPES)
 """The wrappers whose processors carry videos (`pixel_values_videos`): the packed ones and Gemma 4's,
@@ -63,6 +66,19 @@ class HostProcessor(Protocol):
     def apply_chat_template(self, conversation: Sequence[Mapping[str, object]],
                             **kwargs: JSON) -> str | Sequence[int] | Mapping[str, object]: ...
     def batch_decode(self, sequences: list[list[int]], *, skip_special_tokens: bool) -> list[str]: ...
+
+
+class MediasProcessor(Protocol):
+    """A processor whose public call takes its media as `medias` beside one `text` (Kimi K2.5's release's
+    KimiK25Processor), keeping one placeholder an item (`Processor._medias_fields`)."""
+
+    def __call__(self, *, medias: Sequence[Mapping[str, object]], text: str,
+                 return_tensors: str) -> Mapping[str, object]: ...
+
+
+def takes_medias(reference: HostProcessor | MediasProcessor) -> TypeGuard[MediasProcessor]:
+    """Whether a processor's public call takes `medias` (`MediasProcessor`), read from its signature."""
+    return "medias" in inspect.signature(type(reference).__call__).parameters
 
 
 def hosts(reference: PreTrainedTokenizerBase) -> TypeGuard[HostProcessor]:
@@ -266,10 +282,16 @@ class Processor:
             raise ValueError("this source ships no media processor")
         if not any((self.directory / name).exists() for name in ("processor_config.json",
                                                                  "preprocessor_config.json")):
-            # MiMo-V2.6 states its processing in its config.json (`processor_config`) and ships no code
-            # that runs it.
-            raise ValueError(f"{self.config.get('model_type')} ships no processor of its own, only its "
-                             "config's processor_config: hand the model its processed fields (`from_hf`)")
+            from transformers import PreTrainedTokenizerBase
+
+            if "processor_config" in self.config and isinstance(self.reference, PreTrainedTokenizerBase):
+                # MiMo-V2.6 states its processing in its config.json (`processor_config`) and ships no code
+                # that runs it: Dew's own, as vLLM's MiMo processor runs it (`dew.interop.mimo_media`).
+                from dew.interop.mimo_media import MiMoProcessor
+
+                return MiMoProcessor(self.reference, self.config)
+            raise ValueError(f"{self.config.get('model_type')} ships no processor of its own: hand the model "
+                             "its processed fields (`from_hf`)")
         from transformers import AutoProcessor
 
         options = {"backend": "pil"} if self.config.get("model_type") == "gemma3" else {}
@@ -287,11 +309,77 @@ class Processor:
 
     def media(self, *, images: Media | None = None,
               **kwargs: Unpack[ProcessorCall]) -> Mapping[str, object]:
-        """Return the source's media fields before Dew aligns them to model rows."""
+        """Return the source's media fields before Dew aligns them to model rows: its processor's own,
+        or, for a processor whose public call takes its media as `medias` (Kimi K2.5's release's), the
+        fields that call gives as the other processors give them (`_medias_fields`)."""
+        if takes_medias(self._media_reference):
+            return self._medias_fields(images, **kwargs)
         # An audio-only processor takes no images keyword at all.
         if images is None:
             return self._media_reference(**kwargs)
         return self._media_reference(images=images, **kwargs)
+
+    def _medias_fields(self, images: Media | Sequence[object] | None,
+                       **kwargs: Unpack[ProcessorCall]) -> dict[str, np.ndarray]:
+        """The fields of a processor whose public call takes `medias` and `text` (Kimi K2.5's release's
+        KimiK25Processor at 4d01dfe, kimi_k25_processor.py:72-119), as Dew reads every other's: each row
+        asked alone with its own images, its one placeholder an image expanded to the image's merge blocks
+        (one frame's, `pools_frames`), as the release's model expands it, the rows padded as the
+        tokenizer pads, and its `grid_thws` the images' `image_grid_thw`. A row's images are its entry of
+        `images` given one per row, or else the next of them in order, as many as its text's
+        placeholders; an array image is handed as the PIL image its call reads (`_to_pil` reads an image,
+        a path or bytes). Its videos are refused: its call decodes a video from its bytes alone
+        (`split_video_chunks`, with a reader of its own), which the source's processed fields stand for."""
+        if "videos" in kwargs or "audio" in kwargs:
+            raise ValueError(f"{type(self._media_reference).__name__} reads a video from its bytes and no "
+                             "audio: hand the model its processed fields (`from_hf`)")
+        from PIL import Image as PILImage
+
+        reference = self._media_reference
+        if not takes_medias(reference):
+            raise TypeError(f"{type(reference).__name__} takes no medias")
+        text = kwargs.get("text")
+        if text is None:
+            raise ValueError(f"{type(self._media_reference).__name__} takes its media with their text")
+        rows = [text] if isinstance(text, str) else list(text)
+        # One image (an array, a PIL image) or a sequence of them.
+        given: list[object] = ([] if images is None else list(images) if isinstance(images, Sequence)
+                               else [images])
+        per_row = len(rows) > 1 and len(given) == len(rows) and all(
+            isinstance(entry, Sequence) for entry in given)
+        image_id, _ = _media_token_ids(self.record)
+        blocks = self._merge_size() ** 2
+        tokens, pixels, grids = [], [], []
+        for index, row in enumerate(rows):
+            if per_row:
+                entry = given[index]
+                taken = list(entry) if isinstance(entry, Sequence) else [entry]
+            else:
+                count = int(np.count_nonzero(np.asarray(self.reference(text=row)["input_ids"]) == image_id))
+                taken, given = given[:count], given[count:]
+            medias = [{"type": "image", "image": PILImage.fromarray(np.asarray(image))
+                       if isinstance(image, np.ndarray) else image} for image in taken]
+            values = reference(medias=medias, text=row, return_tensors="np")
+            ids = np.asarray(values["input_ids"]).reshape(-1)
+            grid = np.asarray(values["grid_thws"]).reshape(-1, 3) if taken else np.zeros((0, 3), np.int64)
+            places = np.flatnonzero(ids == image_id)
+            if len(places) != len(grid):
+                raise ValueError(f"a row holds {len(places)} image placeholders and {len(grid)} images")
+            repeats = np.ones(ids.shape, np.int64)
+            repeats[places] = [int(np.prod(each)) // blocks // (int(each[0]) if self.pools_frames else 1)
+                               for each in grid]
+            tokens.append(np.repeat(ids, repeats))
+            if taken:
+                pixels.append(np.asarray(values["pixel_values"]))
+                grids.append(grid)
+        if not per_row and given:
+            raise ValueError(f"{len(given)} images are left over the rows' placeholders")
+        pad_id, side = _row_padding(self.reference)
+        padded, fields = pad_token_rows(tokens, pad_id=pad_id, padding_side=side)
+        if pixels:
+            fields = {**fields, "pixel_values": np.concatenate(pixels),
+                      "image_grid_thw": np.concatenate(grids)}
+        return {"input_ids": padded, **fields}
 
     def image_text(self) -> str:
         """The text one image stands as in a prompt, as this checkpoint's own chat template writes
@@ -346,6 +434,39 @@ class Processor:
                     for message in messages for content in (message.get("content"),)
                     if isinstance(content, Sequence) and not isinstance(content, str)
                     for part in content)
+        from dew.interop.mimo_media import MiMoProcessor
+
+        own = self._media_reference if media else None
+        if media and (takes_medias(self._media_reference) or isinstance(own, MiMoProcessor)):
+            # Its template writes each image part's placeholder, and its call reads the images beside the
+            # text (`_medias_fields`), as its own call over the messages does (kimi_k25_processor.py:103-119);
+            # MiMo-V2.6's own (`dew.interop.mimo_media`) reads the template's text and the images alike.
+            text = self.reference.apply_chat_template(messages, tokenize=False,
+                                                      add_generation_prompt=add_generation_prompt,
+                                                      **template_options)
+            if not isinstance(text, str):
+                raise TypeError("the source's chat template must render text")
+            parts = [ContentPart.parse(part, "chat") for message in messages
+                     for content in (message.get("content"),)
+                     if isinstance(content, Sequence) and not isinstance(content, str) for part in content
+                     if isinstance(part, Mapping)]
+            # An image part as the release's template and call read it: an `image` or `image_url` part, its
+            # image under either name (`_extract_medias_from_messages` reads `image_url` for both kinds).
+            kinds = sorted({part.type for part in parts if part.needs_processor} - {"image", "image_url"})
+            if kinds:
+                raise ValueError(f"{type(self._media_reference).__name__} reads images alone from a chat, "
+                                 f"not {kinds}: hand the model its processed fields (`from_hf`)")
+            images = []
+            for part in parts:
+                if part.type in ("image", "image_url"):
+                    held = [part.fields[name] for name in ("image", "image_url") if name in part.fields]
+                    if len(held) != 1:
+                        raise ValueError(f"an {part.type} part holds its image under one of image and "
+                                         f"image_url, not {sorted(part.fields)}")
+                    images.append(held[0])
+            if isinstance(own, MiMoProcessor):
+                return self._from_arrays(own(text=text, images=images))
+            return self._from_arrays(self._medias_fields(images, text=text))
         reference = self._media_reference if media else self.reference
         values = reference.apply_chat_template(
             messages, tokenize=True, return_dict=True, return_tensors=self._media_tensors if media else "np",
@@ -454,8 +575,16 @@ class Processor:
             audio_fields, audio_conditioning = self._audio(values, tokens)
             token_fields.update(audio_fields)
             conditioning = {**conditioning, **audio_conditioning}
-        if np.any(tokens < 0) or np.any(tokens >= self.vocab_size):
-            raise ValueError("input_ids must lie in the text vocabulary, including any hard media ranges")
+        # A placeholder its media fill reads no embedding row, so it may lie past the text vocabulary (Kimi
+        # K2.5's video placeholder), as its model zeroes it before the lookup.
+        filled = np.zeros(tokens.shape, bool)
+        for field in ("image_indices", "audio_indices"):
+            if field in token_fields:
+                filled |= np.asarray(token_fields[field]) >= 0
+        text = tokens[~filled]
+        if np.any(text < 0) or np.any(text >= self.vocab_size):
+            raise ValueError("input_ids must lie in the text vocabulary, including any hard media ranges, "
+                             "save the placeholders media fill")
         prepared = ModelInputs(jnp.asarray(tokens, jnp.int32), token_fields, conditioning)
         prepared.validate()
         return prepared
@@ -497,7 +626,9 @@ class Processor:
             chunks, grid, merge, runs = self._qwen_frames(values, tokens, runs)
             image_counts = np.array([len(row) for row in runs], np.int32)
             shape = (max(chunk.shape[0] for chunk in chunks), chunks[0].shape[-1])
-            selected = [np.arange(length) for length in np.prod(grid, axis=1) // merge ** 2]
+            # A pooling tower's item gives its first frame's merge blocks (`TowerGeometry.pools_frames`).
+            tokens_of = np.prod(grid[:, 1:] if self.pools_frames else grid, axis=1)
+            selected = [np.arange(length) for length in tokens_of // merge ** 2]
             capacity = shape[0] // merge ** 2
         elif "image_position_ids" in values or "video_position_ids" in values:
             chunks, patch_positions, selected, kernel = self._positioned_chunks(values, tokens, runs,
@@ -632,6 +763,14 @@ class Processor:
         }
         return {"audio_indices": jnp.asarray(indices)}, conditioning
 
+    @property
+    def pools_frames(self) -> bool:
+        """Whether the source's tower pools an item's frames into one frame's tokens
+        (`TowerGeometry.pools_frames`)."""
+        tower = self.record.get("tower")
+        return (tower is not None
+                and towers.from_record(_records.record(tower, "tower")).geometry().pools_frames)
+
     def _merge_size(self) -> int:
         """The merger's spatial merge, as the projector's translation reads it, the reference's
         default of 2 included: Qwen 3.5's merger names it `spatial_merge_size`, Muse Glimmer's
@@ -652,10 +791,11 @@ class Processor:
         views share the existing visual tower and merger without new weights.
         """
         merge = self._merge_size()
+        pooled = self.pools_frames
         streams = {}
         for pixel_name, grid_name, token_name, split in (
                 ("pixel_values", "image_grid_thw", "image_token_id", False),
-                ("pixel_values_videos", "video_grid_thw", "video_token_id", True)):
+                ("pixel_values_videos", "video_grid_thw", "video_token_id", not pooled)):
             if (pixel_name in values) != (grid_name in values):
                 raise ValueError(f"{pixel_name} and {grid_name} arrive together")
             if pixel_name not in values:
@@ -664,6 +804,9 @@ class Processor:
             if (grid.ndim != 2 or grid.shape[1] != 3 or not np.issubdtype(grid.dtype, np.integer)
                     or np.any(grid <= 0) or np.any(grid[:, 1:] % merge)):
                 raise ValueError(f"{grid_name} requires positive integer grids tiled by spatial_merge_size")
+            if pixels.ndim == 4:
+                # A patch as a convolution reads it, `[channels, height, width]`: its vector channels first.
+                pixels = pixels.reshape(pixels.shape[0], -1)
             if pixels.ndim != 2 or not np.issubdtype(pixels.dtype, np.floating):
                 raise ValueError(f"{pixel_name} must be floating packed patch vectors")
             if int(np.prod(grid, axis=1).sum()) != pixels.shape[0]:
@@ -681,7 +824,7 @@ class Processor:
             if type(token_id) is not int:
                 raise ValueError(f"{token_name} must be an integer")
             streams[token_id] = pieces
-        sizes = {token: [int(np.prod(grid)) // merge ** 2 for _, grid in pieces]
+        sizes = {token: [int(np.prod(grid[1:] if pooled else grid)) // merge ** 2 for _, grid in pieces]
                  for token, pieces in streams.items()}
         spans = _payload_spans(runs, tokens, sizes)
         ordered = _in_text_order(streams, tokens, spans)

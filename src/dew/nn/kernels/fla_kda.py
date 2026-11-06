@@ -57,8 +57,8 @@ from dew.nn.kernels.chunked_launch import (
 )
 from dew.nn.kernels.fla_gdn import _dot, _weighted_values
 
-SUB = 16
-"""fla's BC: the sub-chunk the intra-chunk kernels build their 16 x 16 blocks over."""
+SUB = algebra.SUB
+"""fla's BC: the sub-chunk the intra-chunk kernels build their 16 x 16 blocks over, the algebra's own."""
 
 
 def _intra_rows_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, lo_ref, aqk_ref, akk_ref, *, chunk: int,
@@ -988,8 +988,9 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, wide: bool,
     return (dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype), dg, db.astype(beta.dtype), dh0, None)
 
 
-chunk_kda = derivatives.declared_derivative(derivatives.KernelGlue(), _rule, _rule_fwd, _rule_bwd,
-                                            nondiff_argnums=(7, 8, 9, 10, 11))
+chunk_kda = derivatives.contracted("test_the_delta_rule_ports_hold_their_orders")(
+    derivatives.declared_derivative(derivatives.KernelGlue(), _rule, _rule_fwd, _rule_bwd,
+                                    nondiff_argnums=(7, 8, 9, 10, 11)))
 """fla's chunked Kimi delta attention on the ported kernels: `(o, final)` for `q`, `k` `[B, T, H, K]`
 (normalised as the caller wants them), `v` `[B, T, HV, V]`, the per-token natural log decay `g` `[B,
 T, HV, K]` fp32, `beta` `[B, T, HV]` and each row's initial memory `h0` `[B, HV, K, V]` fp32, the

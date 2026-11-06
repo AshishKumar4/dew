@@ -35,6 +35,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     launch_kernel,
     lowered_once,
     masks,
+    staged_parts,
     staging_tiles,
     stream_blocks,
     stream_tile,
@@ -401,9 +402,7 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
 
             def staged(value):
                 """A pairs' rows gated down staged once a key block in `_parted`'s form, its own set."""
-                buffers = next(staged_rows)
-                return Parts([family.staged(part, buffer) for part, buffer in
-                              zip(product.formed(value, parted.parts), buffers, strict=True)], jnp.float32)
+                return staged_parts(family, value, next(staged_rows))
 
             found = {}
             algebra.key_decayed_pairs_back(

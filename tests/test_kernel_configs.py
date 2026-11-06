@@ -309,6 +309,36 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhaust
         assert report.refused_launches() == refused
 
 
+
+@lowers("sm90")
+def test_programs_compiled_at_once_sharing_a_spilling_launch_keep_what_compiles_in_turn_keep():
+    """Two programs sharing a template launch whose first config spills, compiled at once
+    (`report.compiled_at_once`): the first's compile refuses that config and steps it down; the second,
+    lowered before that refusal committed, is lowered again past it, so both keep the stepped tile and the
+    refusals are those compiling them in turn leaves, the second neither refusing the first config again
+    nor stepping its own past the kept one (review of the concurrent compiles)."""
+    from dew.nn.kernels.templates import report
+    from dew.training.ahead import compile_only_gpus
+
+    devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
+    mesh = generation.gpu_mesh(devices, "sm90")
+    outcomes = {}
+    for mode in ("turn", "once"):
+        traced = []
+        lowered = _lowering(*_spilling_forward(Uncounted(), 4096, devices), traced)
+        with report.refusals(), generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+            programs = [(lowered(), None, lowered) for _ in range(2)]
+            if mode == "turn":
+                report.compiled(programs[0][0], relower=lowered)
+                report.compiled(lowered(), relower=lowered)
+            else:
+                report.compiled_at_once(programs)
+            # The configs each compile met spilling and whether it stepped past them, and the refusals left.
+            outcomes[mode] = ([(miss.config, miss.stepped) for miss in report.misses()],
+                              [config for _, config, _ in report.refused_launches()])
+    assert outcomes["once"] == outcomes["turn"]
+    assert outcomes["turn"][1]
+
 @lowers("sm90")
 def test_a_compile_beside_other_threads_mosaic_compiles_reads_only_its_own_kernels():
     """A run compiles its programs from several threads at once (scoring's pass shapes, row 2790). A compile
@@ -516,7 +546,8 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                               for rows_ in shares for depth in depths for programs in residencies
                               for stages in range(config.stages, 1, -1))
                     tile = next((tile for tile in staged
-                                 if tile is not None and launch.legal(ba, tile, target)), None)
+                                 if isinstance(tile, mosaic_gpu.Tiles) and launch.legal(ba, tile, target)),
+                                None)
                     if tile is not None:
                         configs[f"{name} x{consumers} {tile}"] = tile
             kernel = "dew_tgmm" if isinstance(launch, grouped_matmul.MosaicTgmm) else "dew_gmm"
@@ -530,11 +561,12 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
 
 
 def _replaced(config, **changes):
-    """`config` with `changes`, or None where its tile type refuses them (`mosaic_gpu.Tiles`' own checks)."""
+    """`config` with `changes`, or its tile type's refusal of them (`mosaic_gpu.Tiles`' own checks, a
+    `ValueError`), which a search passes over."""
     try:
         return dataclasses.replace(config, **changes)
-    except ValueError:
-        return None
+    except ValueError as refusal:
+        return refusal
 
 
 def _model(launch, ba, config) -> resources.RegisterModel:
@@ -856,6 +888,87 @@ def test_an_amperes_gpt_oss_projection_runs_the_template_named_for_it():
     assert route_failures(cases, compile_mosaic_kernels(cases, "sm80")) == []
 
 
+def _blockwise_projected():
+    """A blockwise-scaled FP8 MoE projection (`gemm.blockwise_fp8_product`, DeepSeek-V3's 1 x 128 rows and
+    128 x 128 weight blocks, eight experts) through the template named."""
+    from dew.nn.kernels import gemm
+
+    def product(rows, matrices, sizes, row_scales, column_scales):
+        with generation.chosen(blockwise_fp8="mosaic_gpu"):
+            return gemm.blockwise_fp8_product(rows, matrices, sizes, row_scales, column_scales,
+                                              out_dtype=jnp.bfloat16)
+
+    fp8 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float8_e4m3fn)
+    f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
+    return product, (fp8((4096, 2048)), fp8((8, 768, 2048)), jax.ShapeDtypeStruct((8,), jnp.int32),
+                     f32((16, 4096)), f32((8, 16, 6)))
+
+
+def test_an_hoppers_blockwise_fp8_product_runs_the_template_named_for_it():
+    """A blockwise-scaled FP8 MoE projection, the template named, compiled for a compile-only H100: its
+    program launches the template's grouped product, reading the experts' FP8 matrices whole
+    (`kernel_compile.Expected`, its route evidence; row 4518)."""
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    expected = Expected(axes=(("data", 1),), specs=(None,) * 5, launches=frozenset({"dew_gmm"}),
+                        shards={"dew_gmm": (8, 768, 2048)})
+    cases = [support.KernelCase("blockwise fp8", _blockwise_projected, expected=expected)]
+    assert route_failures(cases, compile_mosaic_kernels(cases, "sm90")) == []
+
+
+def _nvfp4_projected():
+    """An NVFP4 projection (`gemm.nvfp4_product`, Llama-3-8B's up: 4096 deep, 14336 wide) through its packed
+    kernel named, 64 rows."""
+    from dew.nn.kernels import gemm
+
+    matrix = gemm.NvFp4.of(jnp.zeros((4096, 14336), jnp.float32), jnp.ones((256, 14336), jnp.float8_e4m3fn),
+                           1.0)
+
+    def product(rows):
+        with generation.chosen(nvfp4="packed"):
+            return gemm.nvfp4_product(rows, matrix, out_dtype=jnp.bfloat16)
+
+    return product, (jax.ShapeDtypeStruct((64, 4096), jnp.bfloat16),)
+
+
+def test_an_amperes_nvfp4_product_compiles_its_packed_kernel():
+    """An NVFP4 projection, its packed kernel named, compiled for a compile-only A100: its program launches
+    the template's product (`kernel_compile.Expected`, its route evidence), which ptxas compiles: its E4M3
+    block scales decoded by integer arithmetic (`mosaic_gpu._e4m3_values`), where their FP8 conversion took
+    sm89's `cvt .e4m3x2` and an A100's ptxas refused the kernel (W8-a100, M-NS-8; row 3621)."""
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    expected = Expected(axes=(("data", 1),), specs=(None,), launches=frozenset({"dew_gmm"}))
+    cases = [support.KernelCase("nvfp4 packed", _nvfp4_projected, expected=expected)]
+    assert route_failures(cases, compile_mosaic_kernels(cases, "sm80")) == []
+
+
+def _blockwise_gradient():
+    """A blockwise-scaled FP8 MoE projection's kernel gradient (`gemm.blockwise_fp8_kernel_gradient`: 2048
+    deep, 768 wide, eight experts of 4 to 12 whole 128-row blocks) through the template named."""
+    from dew.nn.kernels import gemm
+
+    def gradient(lhs_t, rhs_t, row_scales, column_scales):
+        with generation.chosen(blockwise_fp8="mosaic_gpu"):
+            return gemm.blockwise_fp8_kernel_gradient(lhs_t, rhs_t, jnp.asarray([4, 12, 8, 4, 4, 8, 8, 16]),
+                                                      row_scales, column_scales, out_dtype=jnp.float32)
+
+    fp8 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float8_e4m3fn)
+    f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
+    return gradient, (fp8((2048, 8192)), fp8((768, 8192)), f32((64, 2048)), f32((64, 768)))
+
+
+def test_an_hoppers_blockwise_fp8_kernel_gradient_runs_the_template_named_for_it():
+    """A blockwise-scaled FP8 kernel gradient, the template named, compiled for a compile-only H100: its
+    program launches the template's kernel gradient (`kernel_compile.Expected`, its route evidence; row
+    4518)."""
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    expected = Expected(axes=(("data", 1),), specs=(None,) * 4, launches=frozenset({"dew_tgmm"}))
+    cases = [support.KernelCase("blockwise fp8 gradient", _blockwise_gradient, expected=expected)]
+    assert route_failures(cases, compile_mosaic_kernels(cases, "sm90")) == []
+
+
 def test_each_triton_call_needs_a_launch_of_its_own():
     """A program's Triton calls, one named as another begins and one made twice, compiled for a compile-only
     A100: with every launch line XLA writes, the gate reads their shared bytes; without one of the two
@@ -1092,3 +1205,38 @@ def test_refusals_cross_processes_only_through_an_explicit_handoff(tmp_path):
     handed = subprocess.run([sys.executable, "-c", handoff], check=True, env=environment,
                             input=exported, capture_output=True, text=True)
     assert json.loads(handed.stdout) == json.loads(exported)
+
+
+def test_programs_compiled_at_once_are_the_ones_compiled_in_turn():
+    """Programs compiled at once (`report.compiled_at_once`) keep, in turn, the executables compiling them
+    one after another keeps, in the order given, each making its first compile in a thread of its own
+    (`report.attempts`): those lowered in distinct MLIR contexts (here, each on a thread of its own, as JAX
+    lowers a thread's programs in one) and those sharing one alike, whose compiles JAX's cache key reads
+    without writing their context from 0.12.0.1.post54."""
+    import threading
+
+    from dew.nn.kernels.templates import report
+    from dew.telemetry.compiles import Compiles
+
+    square = jax.ShapeDtypeStruct((256, 256), jnp.float32)
+    functions = (lambda x, y: x @ y, lambda x, y: jnp.tanh(x) + y, lambda x, y: jnp.sum(x * y, axis=0))
+    apart: list = [None] * len(functions)
+
+    def lowered(index: int) -> None:
+        apart[index] = jax.jit(functions[index]).lower(square, square)
+    threads = [threading.Thread(target=lowered, args=(index,)) for index in range(len(functions))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    shared = [jax.jit(function).lower(square, square) for function in functions]
+    for lowerings in (apart, shared):
+        with Compiles(None) as compiles:
+            together = report.compiled_at_once([(lowered, None, lambda lowered=lowered: lowered)
+                                                for lowered in lowerings])
+        threads = [program.thread for program in compiles.programs if program.kind == "compiled"]
+        assert len(threads) == 3, threads
+        assert all(thread.startswith("dew-compile") for thread in threads), threads
+        alone = [report.compiled(lowered, relower=lambda lowered=lowered: lowered) for lowered in lowerings]
+        assert [executable.as_text() for executable in together] == [
+            executable.as_text() for executable in alone]

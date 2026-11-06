@@ -36,7 +36,7 @@ import jax
 import jax.numpy as jnp
 
 from dew._hashing import fmix32
-from dew.nn.derivatives import Protected
+from dew.nn.derivatives import Protected, contracted
 from dew.nn.kernels import generation, tuning
 from dew.nn.precision import at_least_fp32, compensated_sum, float32_einsum
 
@@ -620,9 +620,10 @@ def _spread_sinks(shape: tuple[int, int, int]) -> Callable:
     def spread(values: jax.Array) -> jax.Array:
         return jnp.broadcast_to(values[None, :, None], shape)
 
-    return generation.linear_tangent(lambda values: (spread(values), None),
-                                     lambda saved, operands, cotangent: (compensated_sum(cotangent, (0, 2)),),
-                                     spread, kind=Protected())
+    return contracted("test_a_heads_sinks_hold_every_order")(
+        generation.linear_tangent(lambda values: (spread(values), None),
+                                  lambda saved, operands, cotangent: (compensated_sum(cotangent, (0, 2)),),
+                                  spread, kind=Protected()))
 
 
 @dataclasses.dataclass(frozen=True)

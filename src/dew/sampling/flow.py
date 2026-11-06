@@ -22,7 +22,7 @@ from jax.typing import ArrayLike
 
 from dew.diffusion.process import Denoiser, Process
 from dew.diffusion.schedules import RectifiedFlow, expand
-from dew.nn.derivatives import Protected, declared_tangent
+from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.kernels.generation import linear_map
 from dew.nn.precision import at_least_fp32, divided
 
@@ -264,7 +264,8 @@ def _half_mahalanobis_jvp(primals, tangents):
             moved + _scaled(stretched, stretch_power - _half(stretch_power)))
 
 
-_half_mahalanobis = declared_tangent(Protected(), _half_mahalanobis_value, _half_mahalanobis_jvp)
+_half_mahalanobis = contracted("test_a_transitions_quadratic_term_holds_every_order")(
+    declared_tangent(Protected(), _half_mahalanobis_value, _half_mahalanobis_jvp))
 """The density's quadratic term (`_half_mahalanobis_value`), differentiated by its range-safe rule
 (`_half_mahalanobis_jvp`): numerics the algebra pass keeps as written."""
 
@@ -287,7 +288,8 @@ def _gaussian_kl_jvp(primals, tangents):
     return _gaussian_kl(*primals), linear_map(_kl_tangent, _kl_pullback, primals, tangents)
 
 
-_gaussian_kl = declared_tangent(Protected(), _gaussian_kl_value, _gaussian_kl_jvp)
+_gaussian_kl = contracted("test_a_transitions_kl_holds_every_order")(
+    declared_tangent(Protected(), _gaussian_kl_value, _gaussian_kl_jvp))
 """The KL of two transitions (`_gaussian_kl_value`), differentiated as one range-safe linear map
 (`_gaussian_kl_jvp`): numerics the algebra pass keeps as written."""
 

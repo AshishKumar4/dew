@@ -43,7 +43,7 @@ from jax._src.pallas.mosaic_gpu import (
 from jax.custom_derivatives import SymbolicZero
 from jax.experimental.pallas import mosaic_gpu as plgpu, tpu as pltpu
 
-from ..derivatives import Protected, declared_tangent, marked_call_p
+from ..derivatives import Protected, contracted, declared_tangent, marked_call_p
 from ..precision import at_least_fp32, rounded_operand
 from ..programs import equations
 from . import generation, selection, tuning
@@ -1879,6 +1879,38 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     return jnp.where(grouped, out, 0)
 
 
+SCALE_DEPTH = 128
+"""The depths one step scale covers (`step_scaled`): DeepSeek-V3's 1 x 128 activation and 128 x 128 weight
+blocks, an FP8 product's exactly summed step (row 4518)."""
+
+
+def step_scaled(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, row_scales: jax.Array,
+                column_scales: jax.Array, *, precision: PrecisionLike = None) -> jax.Array:
+    """Each group's rows of `tokens` `[rows, depth]` times its matrix of `kernel` `[groups, depth, width]`,
+    each `SCALE_DEPTH`-deep block's fp32 partial times its rows' scales (`row_scales`, `[depth / 128,
+    rows]`) and its group's column scales (`column_scales`, `[groups, depth / 128, width / c]`, each
+    scale `c` columns': 128 a weight block's, 1 a column's) before it is added into the fp32 sum, in the
+    blocks' order: a blockwise-scaled FP8 product's sum (DeepSeek-V3's recipe, row 4518), the GEMM
+    template's portable branch. The rows past the groups are zero."""
+    blocks, rows = row_scales.shape
+    groups, _, scaled = column_scales.shape
+    width = kernel.shape[2]
+    if tokens.shape[1] != blocks * SCALE_DEPTH or width % scaled:
+        raise ValueError(f"scales {row_scales.shape} and {column_scales.shape} do not cover a "
+                         f"{tokens.shape} x {kernel.shape} product in {SCALE_DEPTH}-deep blocks")
+    owner = jnp.minimum(jnp.repeat(jnp.arange(groups), group_sizes, total_repeat_length=rows), groups - 1)
+
+    def block(index, total):
+        lhs = jax.lax.dynamic_slice_in_dim(tokens, index * SCALE_DEPTH, SCALE_DEPTH, axis=1)
+        rhs = jax.lax.dynamic_slice_in_dim(kernel, index * SCALE_DEPTH, SCALE_DEPTH, axis=1)
+        partial = xla_ragged_dot(lhs, rhs, group_sizes, precision=precision,
+                                 preferred_element_type=jnp.float32)
+        columns = jnp.repeat(column_scales[:, index][owner], width // scaled, axis=1)
+        return total + partial * row_scales[index][:, None].astype(jnp.float32) * columns.astype(jnp.float32)
+
+    return jax.lax.fori_loop(0, blocks, block, jnp.zeros((rows, width), jnp.float32))
+
+
 def _portable_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
                 dtype: Dtype | None, precision: PrecisionLike, out_dtype: Dtype | None = None) -> jax.Array:
     """The grouped projection on `xla_ragged_dot`, in every differentiation mode: `x`'s rows `[rows, in]`
@@ -1935,7 +1967,8 @@ def _portable_projection_jvp(dtype: Dtype | None, precision: PrecisionLike, out_
     return output, tangent
 
 
-portable_projection = declared_tangent(Protected(), _portable_projection, _portable_projection_jvp,
-                                       nondiff_argnums=(3, 4, 5), symbolic_zeros=True)
+portable_projection = contracted("test_a_portable_grouped_projection_holds_every_order")(
+    declared_tangent(Protected(), _portable_projection, _portable_projection_jvp,
+                     nondiff_argnums=(3, 4, 5), symbolic_zeros=True))
 
 

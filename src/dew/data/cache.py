@@ -43,6 +43,7 @@ from dew.data.generation import (
 )
 from dew.data.once import LOCK, locked_cached_property
 from dew.data.pipeline import Record, Rejected, Volatile
+from dew.data.plan import filled_version
 from dew.data.retention import LocalRetention
 from dew.data.sinks import write_array_record
 from dew.data.sources.base import Shard, ShardOpener, Source
@@ -271,8 +272,9 @@ class Cache:
                 return computed
             # A transparent read computes its records in the form it saves with the cache read.
             return _CachedReader(reader, self, key, transform, _Computed(), source, transparent=True)
-        # The store's shards, counted once for every shard's writer (`_Writer._published`).
-        shards = None if source is None else len(source.manifest().shards)
+        # The store's shards, as the fill's key says it read them (`filled_version`), counted once for
+        # every shard's writer (`_Writer._published`).
+        shards = None if source is None else len(source.manifest(filled_version(key.fill)).shards)
         return _CachedReader(reader, self, key, transform,
                              None if published is None
                              else _Published(published, transform, self if self.optional else None), source,

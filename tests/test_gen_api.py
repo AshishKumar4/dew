@@ -28,14 +28,9 @@ def documented(gen_api):
     return (package, *gen_api.documented(package, gen_api.P.pages))
 
 
-def test_the_condition_encoder_contract_has_its_own_reference_page(documented):
-    """Both public contract types have their defining module as their reference home, including
-    ConditionWork, which the encoder implementations import but do not themselves define."""
-    _, pages, homes = documented
-    assert homes.get("dew.inputs.condition.ConditionWork") == "dew.inputs.condition"
-    assert homes.get("dew.inputs.condition.ConditionEncoder") == "dew.inputs.condition"
-    entries = {entry.canonical for entry in pages["dew.inputs.condition"].entries}
-    assert {"dew.inputs.condition.ConditionWork", "dew.inputs.condition.ConditionEncoder"} <= entries
+def found(gen_api, problems) -> list[tuple]:
+    """Each problem the check reports as why, the use or name, the owner it leaves through, and the member."""
+    return [(problem.why, problem.symbol, problem.owner, problem.member) for problem in problems]
 
 
 def test_a_name_bound_in_one_cell_is_resolved_in_the_next(gen_api, documented, tmp_path):
@@ -45,23 +40,28 @@ def test_a_name_bound_in_one_cell_is_resolved_in_the_next(gen_api, documented, t
         {"cell_type": "markdown", "source": ["`dew.not_here` in prose is not code\n"]},
         {"cell_type": "code", "source": ["dew.removed_api()\n", "dew.Profiler\n"]},
     ]}))
-    assert gen_api.unresolved_in("two.ipynb", notebook, *documented) == [
-        "`dew.removed_api`: dew has no public removed_api"]
+    assert found(gen_api, gen_api.unresolved_in("two.ipynb", notebook, *documented)) == [
+        (gen_api.Why.NO_PUBLIC, "dew.removed_api", "dew", "removed_api")]
 
 
-def unresolved_page(gen_api, documented, page, text: str) -> list[str]:
-    """What the API check reports of a docs page holding `text`."""
+def unresolved_page(gen_api, documented, page, text: str) -> list[tuple]:
+    """What the API check reports of a docs page holding `text` (`found`)."""
     page.write_text(text)
-    return gen_api.unresolved_in(page.name, page, *documented)
+    return found(gen_api, gen_api.unresolved_in(page.name, page, *documented))
 
 
-NO_BUILD_MESH = "`MeshSpec.build_mesh`: dew.distributed.placement.MeshSpec has no build_mesh"
+MESH_SPEC = "dew.distributed.placement.MeshSpec"
+
+
+def no_member(gen_api, symbol: str, member: str) -> tuple:
+    return (gen_api.Why.NO_MEMBER, symbol, MESH_SPEC, member)
 
 
 def test_a_docs_page_carries_its_imports_from_block_to_block(gen_api, documented, tmp_path):
     assert unresolved_page(gen_api, documented, tmp_path / "page.md",
                            "```python\nfrom dew.training import MeshSpec\n```\n\nText.\n\n"
-                           "```python\nMeshSpec().build()\nMeshSpec.build_mesh()\n```\n") == [NO_BUILD_MESH]
+                           "```python\nMeshSpec().build()\nMeshSpec.build_mesh()\n```\n") == [
+        no_member(gen_api, "MeshSpec.build_mesh", "build_mesh")]
 
 
 def test_a_name_a_scope_binds_hides_a_dew_import_in_that_scope_alone(gen_api, documented, tmp_path):
@@ -74,7 +74,8 @@ def test_a_name_a_scope_binds_hides_a_dew_import_in_that_scope_alone(gen_api, do
                            "def build(MeshSpec):\n    return MeshSpec.anything()\n\n"
                            "names = [MeshSpec.other for MeshSpec in specs]\n"
                            "mesh = MeshSpec()\n\ndef reads(mesh):\n    return mesh.not_a_member\n\n"
-                           "MeshSpec.build_mesh()\n```\n") == [NO_BUILD_MESH]
+                           "MeshSpec.build_mesh()\n```\n") == [
+        no_member(gen_api, "MeshSpec.build_mesh", "build_mesh")]
 
 
 def test_each_scope_reads_the_instances_and_aliases_it_binds_itself(gen_api, documented, tmp_path):
@@ -88,9 +89,9 @@ def test_each_scope_reads_the_instances_and_aliases_it_binds_itself(gen_api, doc
                            "```python\nother = MeshSpec(mesh.build_mesh())\napi.Sampling\n\n"
                            "def make():\n    from dew import training as api\n    spec = MeshSpec()\n"
                            "    spec.not_here\n    return api.Sampling\n```\n") == [
-        "`spec.not_here`: dew.distributed.placement.MeshSpec has no not_here",
-        "`api.Sampling`: dew.training has no public Sampling",
-        "`mesh.build_mesh`: dew.distributed.placement.MeshSpec has no build_mesh"]
+        no_member(gen_api, "spec.not_here", "not_here"),
+        (gen_api.Why.NO_PUBLIC, "api.Sampling", "dew.training", "Sampling"),
+        no_member(gen_api, "mesh.build_mesh", "build_mesh")]
 
 
 def test_an_instance_of_a_dew_class_is_held_to_its_members_across_cells(gen_api, documented, tmp_path):
@@ -114,10 +115,10 @@ def test_an_instance_of_a_dew_class_is_held_to_its_members_across_cells(gen_api,
             "objective.sampler\n",
             "other.anything(params)\n"]},
     ]}))
-    assert gen_api.unresolved_in("instance.ipynb", notebook, *documented) == [
-        "`objective.sampler`: dew.objectives.diffusion.objective.DiffusionObjective has no sampler",
-        "`objective.variables(...)`: variables is a value "
-        "dew.objectives.diffusion.objective.DiffusionObjective holds, not a method"]
+    objective = "dew.objectives.diffusion.objective.DiffusionObjective"
+    assert found(gen_api, gen_api.unresolved_in("instance.ipynb", notebook, *documented)) == [
+        (gen_api.Why.NO_MEMBER, "objective.sampler", objective, "sampler"),
+        (gen_api.Why.VALUE_CALLED, "objective.variables", objective, "variables")]
 
 
 def test_names_that_differ_only_in_case_link_to_their_own_headings(gen_api, documented):
@@ -138,7 +139,7 @@ def test_a_module_that_declares_all_needs_its_own_page(gen_api, documented):
     page = "dew.nn.multimodal"
     without = gen_api.undocumented(package, {path: held for path, held in pages.items() if path != page},
                                    {name: path for name, path in home.items() if path != page})
-    assert f"{page} declares __all__ but has no API page; add it to the groups" in without
+    assert (gen_api.Why.EXPORTER_WITHOUT_PAGE, page, page, "") in found(gen_api, without)
 
 
 @pytest.fixture

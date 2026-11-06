@@ -133,9 +133,10 @@ def test_a_cotangent_sum_is_an_elementwise_value_like_any_other():
         return jnp.sum(jnp.exp(wide) + jnp.sin(wide)), ()
 
     peak = gradient_peak(twice, weights, (HIDDEN,), platform="gpu", workspace=Workspace(0, 0)).bytes
-    # The product the exponential and the sine read, the cotangent sum made for the product that reads it,
-    # and the weights' gradient that product makes.
-    assert peak == 2 * PRODUCT + WIDTH * VOCAB * 4
+    # The product the exponential and the sine read, and the cotangent sum made from it for the product that
+    # reads it, as that sum's fusion runs; the weights' gradient the product makes after it frees the first
+    # (`dying`) and holds less.
+    assert peak == 2 * PRODUCT
 
 
 def test_a_gradient_the_step_updates_where_it_is_made_is_held_while_it_is_made():

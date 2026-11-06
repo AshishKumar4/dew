@@ -205,7 +205,7 @@ def check_stream(source, mesh: Mesh, microbatches: int, batch: int, *, rows: boo
     (`rows`; a rollout's are its own, checked where its step traces), and a
     ramp stage's, for a later stage, an hour in. A ramp reads each stage's
     batch whole; an accumulation window pools its stages' batches as it pools
-    any, but for a loss that replays its window's batches (`Trainer._prepared`).
+    any, but for a loss that replays its window's batches (`dew.training._candidates.prepared_for`).
     """
     if resumed:
         kept = isinstance(source, Checkpointable)
@@ -256,7 +256,8 @@ def microbatch_shapes(batch: Batch, split: int) -> Batch:
 
 STEP_BATCH = 2
 """Where a compiled train step takes its batch among its arguments: after the moving state and the
-frozen tree (`dew.state.apart`, `Trainer._jitted`), before the part of the step it runs."""
+frozen tree (`dew.state.apart`, `dew.training._candidates.step_program`), before the part of the step
+it runs."""
 
 
 def step_reads(executable: jax.stages.Compiled, signature: Signature) -> tuple[bool, ...]:
@@ -374,7 +375,7 @@ def placed_start(initial_state: Callable[[Initializer, jax.Array], TrainState], 
     frozen tree between them. One program builds the rest, a frozen leaf the init builds among it,
     taking the other held arrays over."""
     moving, frozen = apart(shardings)
-    if frozen is None or not through:
+    if not frozen or not through:
         taken, kept = placed_held(initializer, abstract.variables, shardings.variables, mesh)
         return taking_over(initial_state, taken, kept, shardings)(key)
     inputs = jax.tree.leaves(initializer)

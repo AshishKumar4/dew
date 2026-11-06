@@ -25,7 +25,7 @@ block, and that is where a linear-attention mixer goes.
 import dataclasses
 import functools
 import math
-from collections.abc import Hashable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import ClassVar, Literal, Self
 
 import jax
@@ -152,7 +152,7 @@ from .decoder_stack import (
     split_stages,
     stored_by_stage,
 )
-from .layer_names import group_layers, layer_index
+from .layer_names import fixed_router_owners, group_layers, layer_index
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, run_period, scan_groups
 from .looping import run_loop
 
@@ -1046,12 +1046,9 @@ class CausalTransformer(LinearProducts):
         """The multi-token prediction depths."""
         if not self.num_nextn_predict_layers:
             return []
-        # Prediction depths mirror whole-sequence hidden states, so their
-        # mixer builds from the full-attention kind where the pattern has
-        # one, else from the first layer's kind; the feed-forward routes
-        # like the last layer's (GLM 4.5 ships its depth with the trunk's
-        # experts) and is dense otherwise.
-        mtp_type = self.mtp_layer_type or ('full_attention' if 'full_attention' in types else types[0])
+        # Prediction depths mirror whole-sequence hidden states (`prediction_kind`); the feed-forward
+        # routes like the last layer's (GLM 4.5 ships its depth with the trunk's experts), else dense.
+        mtp_type = self.prediction_kind(types)
         prediction_mixer = kinds[mtp_type].mixer or mixer_spec
         if self.index_share_for_mtp_iteration and not prediction_mixer.shares_prediction_index:
             raise ValueError("index_share_for_mtp_iteration requires a prediction mixer that shares its "
@@ -1809,6 +1806,15 @@ class CausalTransformer(LinearProducts):
                 train=train, decode=decode, kv_store={} if self._provides else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata)
         banked = self.banked_collections()
+        allocating = not any(group_layers(name) for name in self.variables.get('cache', {}))
+        if decode and 'params' in banked and allocating:
+            # A decode over a store banked by run keeps the cache its layers allocate banked as the store
+            # keeps the weights, each run's layers one array under the run's name, as the run's scan carries
+            # it: every later call reads and writes it there, where a cache kept a layer at a time is
+            # stacked into the run's bank and cut apart again each call (at Qwen3-30B-A3B's layer shape, 8
+            # layers of 64 rows of 512 slots on an H100, 371 and 317 us a step, OM-1342-cache-base-2474a6e4c).
+            # A cache handed in a layer at a time goes back so.
+            banked = (*banked, 'cache')
         if stages == 1:
             if span is not None and banked:
                 raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
@@ -1961,8 +1967,10 @@ class CausalTransformer(LinearProducts):
         variables = {}
         for collection, tree in self.variables.items():
             if collection in banked:
-                variables[collection] = jax.tree.map(
-                    functools.partial(shapes, drop=stacked), tree[first])
+                # A banked cache holds no entry for a first layer that caches nothing.
+                if first in tree:
+                    variables[collection] = jax.tree.map(
+                        functools.partial(shapes, drop=stacked), tree[first])
                 continue
             held = {}
             if stacked and first in tree:
@@ -2396,6 +2404,16 @@ class CausalTransformer(LinearProducts):
         built = [(spec.kind.mixer or default, spec.kind.chunk)
                  for spec in self._layer_specs(types, kinds, default)]
         return tuple(chunk for mixer, chunk in built if mixer.reads_blocks)
+
+    @nn.nowrap
+    def prediction_kind(self, types: Sequence[str]) -> str:
+        """A prediction depth's mixer kind: `mtp_layer_type`, else full attention, else the first layer's."""
+        return self.mtp_layer_type or ('full_attention' if 'full_attention' in types else types[0])
+
+    @nn.nowrap
+    def fixed_routers(self) -> Mapping[str, Callable[[tuple[str, ...]], bool]]:
+        """Its routers whose weights are fixed, and their parameters (`layer_names.fixed_router_owners`)."""
+        return fixed_router_owners(self)
 
     @nn.nowrap
     def mixed_admission_refusal(self) -> str | None:

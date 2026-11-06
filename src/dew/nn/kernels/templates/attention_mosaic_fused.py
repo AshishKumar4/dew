@@ -49,8 +49,24 @@ def streams_statistics(family: mosaic.Family, config: BackwardTiles, width: int,
         family, launch_scope(family, allocations, 0, reduces=False)) <= limit
 
 
+def stores_typed(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int, *,
+                 grouped: bool) -> bool:
+    """Whether the fused launch at `config` stores dK and dV in the operands' `dtype` (`_fused_allocations`'
+    `typed`): where no key head is shared (not `grouped`, whose adds sum fp32) and its block holds the typed
+    stage beside its own allocations (the GPU's `shared_limit`, `launch_scope`: on a layout whose stage is
+    held across the walks, beside it, 32 KB at 64 x 64 and width 128 past an H100's 232,448 bytes,
+    fa9dbcf122);
+    else it stores fp32 and XLA converts them after the launch (11-06: 35 us of a step's glue)."""
+    if grouped:
+        return False
+    limit = generation.gpu_target().shared_limit
+    allocations = _fused_allocations(family, config, width, dtype, stages, typed=True)
+    return limit is None or resources.shared_bytes(
+        family, launch_scope(family, allocations, 0, reduces=False)) <= limit
+
+
 def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int, *,
-                       streamed: bool | None = None) -> tuple[list, dict, list]:
+                       streamed: bool | None = None, typed: bool = False) -> tuple[list, dict, list]:
     """The fused launch's allocations as `Family.scoped` takes them, in `_fused_launch`'s order: its
     consumers' resident keys and values; a tile's weights and score cotangents staged for the transposed
     products' left operands and dQ's; dK's and dV's output stage (fp32, the head widths equal,
@@ -65,7 +81,8 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
     46.2k against FlashAttention 3's 21.8k); and the output stage scoped after the walks where no add reads
     it,
     the walks' slots its memory (`Family.scoped`'s `after_walks`: two mma.sync consumers' 64 x 64 launch
-    then fits an A100, FS-4324-TWO2's 229,424 bytes held whole against its 166,912)."""
+    then fits an A100, FS-4324-TWO2's 229,424 bytes held whole against its 166,912); where dK and dV leave
+    `typed` (`stores_typed`), in `dtype` through a stage of their own after the walks, rounded once there."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     stage = plgpu.SMEM((consumers, max(block_q, block_k), width), jnp.float32)
     held = family.adds_through_shared
@@ -76,7 +93,8 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
         streamed = streams_statistics(family, config, width, dtype, stages)
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype),
               **({name: ((block_q,), kind) for name, kind in STATISTICS.items()} if streamed else {})}
-    return scoped, family.streams(blocks, stages, consumers), [] if held else [stage]
+    out = plgpu.SMEM((consumers, block_k, width), dtype) if typed else stage
+    return scoped, family.streams(blocks, stages, consumers), [] if held and not typed else [out]
 
 def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, whole, add_dq, index, slots,
                 carry, accumulators, *, masked: bool | None = None):
@@ -111,8 +129,9 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
 def _fused_out(family: mosaic.Family, sums: tuple, views: tuple, index, rows: int, stage, *, grouped: bool,
                interpret: bool) -> None:
     """A fused consumer `index`'s dK and dV `sums` out to their `views` through its rows of the output
-    `stage`: added into the key heads' sums where query heads share them (`grouped`), else stored; once the
-    walk's dQ adds have read the stage, whose slots they took (`_dq_added`)."""
+    `stage`: added into the key heads' sums where query heads share them (`grouped`), else stored in the
+    stage's dtype (`stores_typed`); once the walk's dQ adds have read the stage, whose slots they took
+    (`_dq_added`)."""
     if not interpret:
         family.store_wait(0)
     smem = stage.at[index, pl.ds(0, rows)]
@@ -120,7 +139,7 @@ def _fused_out(family: mosaic.Family, sums: tuple, views: tuple, index, rows: in
         for value, view in zip(sums, views, strict=True):
             family.added(value, view, interpret, smem=smem)
     else:
-        family.stored(sums, views, smem=smem)
+        family.stored(tuple(value.astype(stage.dtype) for value in sums), views, smem=smem)
 
 
 def _statistics(family: mosaic.Family, refs: list, row, head, block_q: int, *, streamed: bool
@@ -141,15 +160,16 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     each consumer's `block_k` keys of a query head resident, walked by the query tiles that see them,
     streamed with their output cotangents through a ring each, queries first (`_fused_step`), under the
     first pass's D and the forward's denominator (each query tile's streamed beside it, `STATISTICS`), each
-    tile's dQ added into dQ atomically
-    (`Family.added`); where key heads are shared, each query head's dK and dV added into its key head's own
+    tile's dQ added into dQ atomically (`Family.added`); where key heads are shared, each query head's dK and
+    dV added into its key head's own
     (FlashAttention 3's grouped epilogue, hopper/epilogue_bwd.hpp's CollectiveEpilogueBwdGQA: Qwen3-8B's step
     1.7% the faster causal, 1.3% full, ET-GQA1-h100, where XLA summed fp32 copies a query head's), else
     stored (their zeros cost an ungrouped D64 step 1.7%). The grouped adds' zeros are one ref of both
     (`mosaic.stacked_zeros`, `[2, B, Kp, KV, D]`): where XLA wraps the launch in a dynamic-slice fusion (a
     step's stacked forward rows, sliced for this launch's operands), two refs of equal zeros were one buffer,
     dK and dV each the sum of both (row 3180, ET-3180-PLAIN-h100). Returns dQ `[B, Qp, H, D]`, dK and dV
-    `[B, Kp, KV, D]`, fp32."""
+    `[B, Kp, KV, D]`: dQ fp32, dK and dV the keys' and values' dtype where it stores them so
+    (`stores_typed`), fp32 otherwise."""
     batch, queries, heads, width = query.shape
     keys_padded, kv_heads = key.shape[1], key.shape[2]
     program, consumers = walk.program, walk.consumers
@@ -221,15 +241,17 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
 
     stages = min(program.tiles.stages, q_steps)
     stats_streamed = streams_statistics(family, program.tiles, width, query.dtype, stages)
+    typed = stores_typed(family, program.tiles, width, query.dtype, stages, grouped=grouped)
     scoped, rings, after = _fused_allocations(family, program.tiles, width, query.dtype, stages,
-                                              streamed=stats_streamed)
+                                              streamed=stats_streamed, typed=typed)
 
     def entry(*refs):
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings, after_walks=tuple(after))
 
-    gradient = jax.ShapeDtypeStruct((batch, keys_padded, kv_heads, width), jnp.float32)
+    gradients = tuple(jax.ShapeDtypeStruct((batch, keys_padded, kv_heads, width),
+                                           array.dtype if typed else jnp.float32) for array in (key, value))
     launch = family.kernel(
-        entry, out_type=() if grouped else (gradient, gradient), grid=(heads, keys_padded // pair, batch),
+        entry, out_type=() if grouped else gradients, grid=(heads, keys_padded // pair, batch),
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math, name="attention_dkv_fused",
         # The products this launch issues (`stated`): its `S` recomputed, dP's, dV's, and each part of dK's
@@ -241,15 +263,23 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                                        common=family.feeds_itself)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              2 * width + 2 * value.shape[-1]))
-    # dQ added into zeros in place, and grouped dK and dV in one ref of both (`mosaic.stacked_zeros`): one
-    # copy, or dQ each consumer's own interpreted (`Family.added`), a consumer's keys its own.
-    copies = consumers if walk.interpret else 1
+    operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
+    return _fused_called(launch, operands, (shapes, groups), copies=consumers if walk.interpret else 1,
+                         grouped=grouped)
+
+
+def _fused_called(launch: Callable, operands: tuple, stacked: tuple, *, copies: int, grouped: bool
+                  ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """The fused launch called on its `operands` (`_fused_launch`'s): dQ added into zeros in place, and
+    grouped dK and dV in one ref of both (`mosaic.stacked_zeros`, `stacked` their shapes and grouping): one
+    copy of dQ, or each consumer's own interpreted (`Family.added`, `copies`), a consumer's keys its own."""
+    query = operands[0]
+    batch, queries, heads, width = query.shape
     dq = jax.new_ref(jnp.zeros((copies, batch, queries, heads, width), jnp.float32))
-    operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves, dq)
     if not grouped:
-        dk, dv = launch(*operands)
+        dk, dv = launch(*operands, dq)
         return jax.freeze(dq).sum(axis=0), dk, dv
-    dkv = mosaic.stacked_zeros(shapes, groups)
-    launch(*operands, *dkv)
-    dk, dv = mosaic.stacked_read(dkv, groups)
+    dkv = mosaic.stacked_zeros(*stacked)
+    launch(*operands, dq, *dkv)
+    dk, dv = mosaic.stacked_read(dkv, stacked[1])
     return jax.freeze(dq).sum(axis=0), dk, dv

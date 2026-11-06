@@ -82,7 +82,7 @@ class LaurelBlock(nn.Module):
     """
     rank: int
     emb_features: int
-    norm_eps: float = 1e-6
+    norm_eps: float | None = 1e-6
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -172,7 +172,7 @@ class AltUpLayer(nn.Module):
     # modeling_gemma3n.py, Gemma3nTextAltUp.
     spec: AltUp
     emb_features: int
-    norm_eps: float = 1e-6
+    norm_eps: float | None = 1e-6
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 

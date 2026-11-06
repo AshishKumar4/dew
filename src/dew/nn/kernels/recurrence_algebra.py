@@ -356,7 +356,8 @@ def _decays_tangent(primals, tangents):
                             linear_map(_ranged, _ranged_transpose, decay, dg))
 
 
-decays = derivatives.declared_tangent(derivatives.Protected(), _decays, _decays_tangent)
+decays = derivatives.contracted("test_the_chunked_delta_rule_holds_every_order")(
+    derivatives.declared_tangent(derivatives.Protected(), _decays, _decays_tangent))
 
 
 def factor(a, issue: Issue = portable):
@@ -451,8 +452,9 @@ def _decayed_product_tangent(name: str, issue: Issue, primals, tangents):
     return jnp.where(kept, product * decay, 0.0), jnp.where(kept, weighed, 0.0)
 
 
-_decayed_product = derivatives.declared_tangent(derivatives.Protected(), _decayed_primal,
-                                                  _decayed_product_tangent, nondiff_argnums=(0, 1))
+_decayed_product = derivatives.contracted("test_the_chunked_delta_rule_holds_every_order")(
+    derivatives.declared_tangent(derivatives.Protected(), _decayed_primal,
+                                   _decayed_product_tangent, nondiff_argnums=(0, 1)))
 
 
 def intra(key, keyed, pairs, issue: Issue = portable):
@@ -552,8 +554,9 @@ def _remembered_tangent(issue, name, primals, tangents):
     return remembered(decayed, entered, issue, name), issue(name, d_decayed, entered) + read
 
 
-remembered = derivatives.declared_tangent(derivatives.Protected(), _remembered, _remembered_tangent,
-                                          nondiff_argnums=(2, 3))
+remembered = derivatives.contracted("test_the_chunked_delta_rule_holds_every_order")(
+    derivatives.declared_tangent(derivatives.Protected(), _remembered, _remembered_tangent,
+                                 nondiff_argnums=(2, 3)))
 
 
 class Span(NamedTuple):
@@ -642,7 +645,17 @@ def peeled_transition(key, w, u, grown, last, kept, token, *, delta: bool, issue
 # them as they are, so two mainloops at the same tiles compute the same values.
 
 SUB = 16
-"""Rows of a sub-chunk: the diagonal blocks the triangular inverse is built from (fla's BC)."""
+"""Rows of a sub-chunk: the diagonal blocks the triangular inverse is built from, the reduction contract's,
+not a tile's: fla's BC, whose substitution order the template's and the portable math's inverse take on every
+GPU and every family, so check 1 pairs their numbers with the port's and the mainloops with each other (a
+family's product rows set its tiles, not this: wgmma takes 64 rows, mma.sync 16)."""
+
+class Staged(Protocol):
+    """A tile staged once in shared memory (`key_block_pairs`' and `key_decayed_pairs_back`' `staged`), a
+    block of whose rows a product reads at a time."""
+
+    def rows(self, start, count: int) -> "Tile": ...
+
 
 class Tile(Protocol):
     """A tile a mainloop holds in memory: an operand its products take as it is, transposed or read in
@@ -927,7 +940,7 @@ def _laid_references(reference: Callable[[int, int], tuple], c, index: jax.Array
 
 
 def key_block_pairs(rows: Sequence[jax.Array], keys: jax.Array, prefix: tuple, at: Callable[[int], tuple],
-                    summed: Callable[..., jax.Array], staged: Callable[[jax.Array], Callable], *, chunk: int,
+                    summed: Callable[..., jax.Array], staged: Callable[[jax.Array], Staged], *, chunk: int,
                     diagonal: bool, sub: int = SUB) -> list[jax.Array]:
     """A chunk's pairs' products under a decay a key dimension, one key block's for each of `rows` (the
     queries, the write-gated keys; fp32) against the same `keys` (fp32), its prefix halves `prefix`,
@@ -940,7 +953,7 @@ def key_block_pairs(rows: Sequence[jax.Array], keys: jax.Array, prefix: tuple, a
     token as a column's vectors), laid over the rows of `s`; one product a key sub-chunk `t` and output,
     the keys of `t` against every row into the columns of `t` alone ('pairs', `summed`, an iterable of
     `(name, lhs, rhs)` into an accumulator of a `shape`), the keys gated up staged once for every output's
-    (`staged(up)(start, count)`, the right operand of keys `start` to `start + count`): masked to their
+    (`staged(up).rows(start, count)`, the keys `start` to `start + count`, read transposed): masked to their
     sub-chunk, each product's right operand a whole chunk of keys, four products a chunk's width each and
     the keys staged again for each. Every exponent is at most zero but the diagonal's middle factor,
     `G_s - E_s` within a sub-chunk's range, which a declared floor bounds (`factored_range`; without one the
@@ -976,7 +989,7 @@ def key_block_pairs(rows: Sequence[jax.Array], keys: jax.Array, prefix: tuple, a
 
     def columns(row: jax.Array, t: int) -> jax.Array:
         # The left operand formed as its product stages it (`summed` calls it), so one is live at a time.
-        return summed([("pairs", lambda: row * middle(t), up(t * sub, sub))], shape=(chunk, sub))
+        return summed([("pairs", lambda: row * middle(t), up.rows(t * sub, sub).T)], shape=(chunk, sub))
 
     return [jnp.concatenate([columns(row, t) for t in range(blocks)], axis=1) for row in gated]
 
@@ -1215,7 +1228,7 @@ def key_system_back(d_system, lower: Tile, dtype, issue: Issue) -> jax.Array:
 
 def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.Array], columns: int,
                            gates: Callable[[int], tuple], reference: Callable[[int, int], tuple],
-                           summed: Callable[..., jax.Array], staged: Callable[[jax.Array], object], *,
+                           summed: Callable[..., jax.Array], staged: Callable[[jax.Array], Staged], *,
                            chunk: int, emit: Callable[[str, int, int, jax.Array], None], sub: int = SUB,
                            shifted: "Shifted | None" = None,
                            lower: Callable[[jax.Array, jax.Array], jax.Array] | None = None,

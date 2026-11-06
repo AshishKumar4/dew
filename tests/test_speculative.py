@@ -73,7 +73,10 @@ DSPARK = Path(__file__).parent / "fixtures" / "hf" / "deepseek-v4-dspark-tiny"
 def longrope_drafter():
     """The tiny DeepSeek V4-Flash-0731 (`DSPARK`) with its DSpark block drafter over a trunk of plain
     attention whose rotary switches tables past its sixth position (LongRoPE), the drafter's own sliding
-    V4 kind rotating under YaRN, which V4's attention takes where it refuses LongRoPE."""
+    V4 kind rotating under YaRN, which V4's attention takes where it refuses LongRoPE. Its trunk is the
+    three layers the drafter reads and one before them, where the checkpoint holds six: a rebuild
+    crosses every layer alike, and each fewer layer is less of the speculative program to compile
+    (ledger 4286)."""
     from dew.interop import Pretrained
     from dew.nn.backbones.layer_plan import LayerKind
     from dew.nn.mixers.attention import AttentionMixer
@@ -83,8 +86,18 @@ def longrope_drafter():
     drafter = model.dspark.layer_type
     head = model.head_dim or model.emb_features // model.num_heads
     pairs = int(head * (model.partial_rotary_factor or 1.0)) // 2
+    assert model.dspark is not None
+    layers = len(model.dspark.target_layers) + 1
+
+    def kept(indices: tuple[int, ...] | None) -> tuple[int, ...] | None:
+        return None if indices is None else tuple(index for index in indices if index < layers)
+
+    mixture = model.mixture and dataclasses.replace(model.mixture, layers=kept(model.mixture.layers),
+                                                    hash_layers=kept(model.mixture.hash_layers))
     return model.clone(
-        layer_types=("trunk",) * model.num_layers,
+        num_layers=layers, mixture=mixture,
+        dspark=dataclasses.replace(model.dspark, target_layers=tuple(range(1, layers))),
+        layer_types=("trunk",) * layers,
         kinds={"trunk": LayerKind(mixer=AttentionMixer()),
                drafter: dataclasses.replace(model.kinds[drafter], rope_scaling=YarnScaling(
                    factor=4.0, original_max_position_embeddings=8))},
@@ -364,19 +377,11 @@ def test_a_blocks_tokens_are_drawn_as_the_target_draws_them():
     target's float64 run gives the first token times the second's given it, at the sampling's temperature,
     over every pair of a 13-token vocabulary (the sampling gate). The draft is the model's own prediction
     depth, untrained, so it proposes off the target's law and the acceptance has to undo it."""
-    from reference_error import widened
     from sampling_gate import assert_draws_as_declared
 
     model = predictor()
-    prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
-    params = jax.jit(model.init)(jax.random.key(0), prompt)
+    prompt, params, chances = pair_law(model)
     vocab = model.vocab_size
-    with jax.enable_x64(new_val=True):
-        wide, wide_params = model.clone(dtype=jnp.float64), widened(params)
-        first = jax.nn.softmax(wide.apply(wide_params, prompt)[0, -1] / LAW_TEMPERATURE)
-        pairs = jnp.concatenate([jnp.broadcast_to(prompt, (vocab, 3)), jnp.arange(vocab)[:, None]], axis=1)
-        second = jax.nn.softmax(wide.apply(wide_params, pairs)[:, -1] / LAW_TEMPERATURE, axis=-1)
-        chances = np.asarray(first[:, None] * second).reshape(-1)
 
     rows = jnp.broadcast_to(prompt, (LAW_ROWS, 3))
 
@@ -387,3 +392,20 @@ def test_a_blocks_tokens_are_drawn_as_the_target_draws_them():
         return np.bincount(tokens[:, 0] * vocab + tokens[:, 1], minlength=vocab * vocab)
 
     assert_draws_as_declared(counts, chances, "a speculative block's first two tokens", seeds=LAW_SEEDS)
+
+
+def pair_law(model):
+    """A prompt of three tokens, `model`'s parameters drawn over it, and the chance of each pair of the
+    two tokens after it (`[V * V]`, the first's id times V plus the second's) at `LAW_TEMPERATURE`, from
+    the model's float64 run: the law a speculative strategy's first two draws are held to."""
+    from reference_error import widened
+
+    prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
+    params = jax.jit(model.init)(jax.random.key(0), prompt)
+    vocab = model.vocab_size
+    with jax.enable_x64(new_val=True):
+        wide, wide_params = model.clone(dtype=jnp.float64), widened(params)
+        first = jax.nn.softmax(wide.apply(wide_params, prompt)[0, -1] / LAW_TEMPERATURE)
+        pairs = jnp.concatenate([jnp.broadcast_to(prompt, (vocab, 3)), jnp.arange(vocab)[:, None]], axis=1)
+        second = jax.nn.softmax(wide.apply(wide_params, pairs)[:, -1] / LAW_TEMPERATURE, axis=-1)
+        return prompt, params, np.asarray(first[:, None] * second).reshape(-1)

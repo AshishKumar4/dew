@@ -40,6 +40,14 @@ paired with the kernels' arm on armada: the most any of its 16-bit geometries to
 """A delta rule's queries, keys and values on two 16-wide heads: the keys and queries normalised."""
 
 
+def training_draw(length: int, parts, dtype, seed: int):
+    """A training shape's draw of two rows by seed: the projection, the taps and the pieces' cotangents
+    (`operands`, `cotangents`). Two rows: a row's tokens are the distances' terms, and the 0.8b's eight held
+    28 GiB of an H100 at the float64 truth."""
+    x, weights, _, _ = operands(2, length, parts, dtype=dtype, seed=[1724, seed])
+    return x, weights, cotangents(x, parts, dtype, seed=[1725, seed])
+
+
 def operands(batch, length, parts, *, taps=4, dtype=jnp.bfloat16, bias=False, valid=False, seed=0):
     rng = np.random.default_rng(seed)
     channels = sum(width for width, _ in parts)
@@ -280,9 +288,7 @@ def the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, packed)
     (_, length), parts = CONV_SHAPES[model]
     segments = documents(2, length) if packed else None
 
-    def draw(seed):
-        x, weights, _, _ = operands(2, length, parts, dtype=dtype, seed=[1724, seed])
-        return x, weights, cotangents(x, parts, dtype, seed=[1725, seed])
+    draw = functools.partial(training_draw, length, parts, dtype)
 
     def conv(fn):
         def pieces_and_gradients(x, weights, grads):

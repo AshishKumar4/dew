@@ -511,16 +511,12 @@ def _packed(variables, groups) -> dict:
 
 
 @pytest.mark.parametrize("name", [name for name in PATHS if name in DECODERS])
-def test_packed_projections_serve_the_models_numbers(name):
-    """Every group a decoder declares packs: the packed variables still
-    declare the same groups, and give the same logits and the same cached
-    decode. One wider product can round apart from three (falcon-tiny's
-    logits moved by 1.2e-7, Kimi K2's by 7.2e-7, qwen3-next-tiny's by 1.8e-5
-    on another CPU), so the drawn tokens are the model's and the logits its
-    bits or as exact as them. A bidirectional decoder packs as a causal one does
-    and serves no decode step, so its logits alone are judged. The greedy decodes
-    run as the check runs its arms (`summed_as_run`), whose programs they share,
-    over the rows the checkpoint is read over (ledger 3868)."""
+def test_packed_projections_serve_the_models_draws(name):
+    """Every group a decoder declares packs: the packed variables still declare the same groups, and a
+    causal decoder's greedy decode over them draws the tokens the model's own variables draw, bit for
+    bit. The greedy decodes run as the check of their scores runs its arms (`summed_as_run`), whose
+    programs they share, over the rows the checkpoint is read over (ledger 3868); the scores themselves
+    are `test_packed_projections_score_as_the_model_does`'."""
     source, rows = loaded(name), tokens(name)
     model, variables = source.model, source.variables
     groups = model.inference_projection_groups(variables)
@@ -530,6 +526,26 @@ def test_packed_projections_serve_the_models_numbers(name):
                    for member, width in zip(group.members, group.widths, strict=True))
     packed = _packed(variables, groups)
     assert model.inference_projection_groups(packed) == groups
+    if not model.causal:
+        return
+    own = _programs(name, "model", (("decode", True),))
+    with summed_as_run():
+        _, drawn, _ = _greedy(own, variables, rows)
+        _, packed_drawn, _ = _greedy(own, packed, rows)
+    same(packed_drawn, drawn)
+
+
+@pytest.mark.parametrize("name", [name for name in PATHS if name in DECODERS])
+def test_packed_projections_score_as_the_model_does(name):
+    """A decoder's packed projections (`_packed`) give the logits and the cached decode its own
+    variables give. One wider product can round apart from three (falcon-tiny's logits moved by
+    1.2e-7, Kimi K2's by 7.2e-7, qwen3-next-tiny's by 1.8e-5 on another CPU), so the scores are judged
+    by check 1 from float64 over drawn prompts and forced continuations, not by their bits. A
+    bidirectional decoder packs as a causal one does and serves no decode step, so its logits alone are
+    judged."""
+    source = loaded(name)
+    model, variables = source.model, source.variables
+    packed = _packed(variables, model.inference_projection_groups(variables))
     label = f"{name} packed"
     if not model.causal:
         def logits(model, variables):
@@ -539,14 +555,9 @@ def test_packed_projections_serve_the_models_numbers(name):
                         seeds=CACHED_SEEDS, truth_fn=logits(float64_twin(model), widened(variables)))
         return
     call = (("decode", True),)
-    own = _programs(name, "model", call)
-    with summed_as_run():
-        _, drawn, _ = _greedy(own, variables, rows)
-        _, packed_drawn, _ = _greedy(own, packed, rows)
-    same(packed_drawn, drawn)
     reference, truth = _reference(name, call)
-    assert_as_exact(_scored(own, packed), reference, _continued(model), label, seeds=CACHED_SEEDS,
-                    truth_fn=truth)
+    assert_as_exact(_scored(_programs(name, "model", call), packed), reference, _continued(model), label,
+                    seeds=CACHED_SEEDS, truth_fn=truth)
 
 
 def _request() -> ModelInputs:

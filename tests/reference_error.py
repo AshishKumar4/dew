@@ -68,13 +68,14 @@ import functools
 import hashlib
 import itertools
 import math
+import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import Truth, summed_as_run, unrewritten, widened
+from arm_arithmetic import Truth, Unrewritten, summed_as_run, unrewritten, widened
 from check1_statistics import (
     CONFIDENCE,
     FACTOR,
@@ -189,6 +190,48 @@ class _Windowed:
                             for index in range(_window_count(arguments))])
 
 
+class _RunToRun:
+    """An arm whose outputs vary in their last bits from run to run on the same inputs (`run_to_run`):
+    the gate compiles `fn` as it compiles any arm (`_arms`) and judges each draw by the one run it makes."""
+
+    def __init__(self, fn, why: str):
+        self.fn, self.why = fn, why
+
+    def __call__(self, *inputs, **options):
+        return self.fn(*inputs, **options)
+
+    def __getattr__(self, name):
+        return getattr(self.fn, name)
+
+
+def _layers(fn):
+    """`fn` and every arm it adapts, outermost first: through a declaration (`_RunToRun`), a window loop
+    (`_Windowed`) and a reference's unrewritten scope (`Unrewritten`)."""
+    while True:
+        yield fn
+        if isinstance(fn, _RunToRun | _Windowed):
+            fn = fn.fn
+        elif isinstance(fn, Unrewritten):
+            fn = fn.wrapped
+        else:
+            return
+
+
+def _varies(fn) -> bool:
+    """Whether `fn`, or an arm it adapts, is declared to vary from run to run (`run_to_run`)."""
+    return any(isinstance(layer, _RunToRun) for layer in _layers(fn))
+
+
+def run_to_run(fn, why: str):
+    """`fn`, an arm declared to vary from run to run on a GPU on the same inputs, for `why`: an
+    accumulation in arrival order (atomic adds), which a deterministic form would make 2-2.7 times as slow
+    (row 4448, M-JS-5). Check 1 pairs it with the other arm within each draw's one run, as it pairs every
+    arm, and never holds it to a run of itself again (`_of_its_inputs`) but on a CPU, where its interpreted
+    program is a function of its inputs: a draw's evidence is one run's, and the redraw and every further
+    seed are runs of their own, so its spread across runs is the spread across draws check 1 weighs."""
+    return _RunToRun(fn, why)
+
+
 def over_windows(fn):
     """`fn`, an arm of one draw, run over `windows`' stacked arguments window by window, each window's
     arguments sliced from the stack, with its outputs stacked on their leading axis as host arrays.
@@ -210,15 +253,22 @@ def _one_draws_program(fn, arguments):
     return fn.fn, jax.tree.map(lambda leaf: leaf[0], arguments)
 
 
-WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
+CENSUS = "DEW_GATE_CENSUS"
+"""The environment variable whose being set runs check 1's arms with YNNPACK's fusions on (WITHOUT_YNN
+empty), as CPU users compile them: the census the whole suite runs every fifth publish, each red it finds
+filed and judged Dew's or XLA:CPU's (row 4471; docs/design/testing.md, "the YNNPACK switch")."""
+
+WITHOUT_YNN = {} if os.environ.get(CENSUS) else {"xla_cpu_experimental_ynn_fusion_type": ""}
 """XLA:CPU's compiler options with every YNNPACK fusion off (dots, reductions, element-wise and layout
 ops alike), so that a program runs on XLA's own code, compiled for the host's instruction set with no
 dispatch at run time. YNNPACK picks its microkernels at run time by that instruction set, and both
 the interpreted SSD kernel and XLA's scan fuse parts of themselves to it by default, which moved
 check 1 between the two across PARITY by host; without the fusions the verdicts held on two hosts
 of different instruction sets, though the bits still part with the host (docs/performance.md, "The
-SSD kernel's host check 1 without YNNPACK"). The empty list, not the documented `-individual_dot`,
-because compiler options take no such spelling and that one leaves a scan's reductions fused."""
+SSD kernel's host check 1 without YNNPACK"); and XLA:CPU's own fusion choices (a reduction split across
+devices taking XLA's, one device's YNNPACK's, row 4520; YNNPACK's narrow dot without FMA, 4522) are not
+Dew's arithmetic. The empty list, not the documented `-individual_dot`, because compiler options take no
+such spelling and that one leaves a scan's reductions fused. The census (`CENSUS`) runs without it."""
 
 
 def without_ynn(fn, **jit_options):
@@ -309,6 +359,8 @@ def _compiled(fn, compile, pairing=None, *, reference: bool = False):
     within it (`over_windows`), without YNNPACK's fusions, paired by `pairing` (`_Paired`); a `reference`
     unrewritten (`arm_arithmetic.unrewritten`)."""
     run = unrewritten if reference else _as_is
+    if isinstance(fn, _RunToRun):
+        return _RunToRun(_compiled(fn.fn, compile, pairing, reference=reference), fn.why)
     if _given(fn) or getattr(fn, "without_ynn", False):
         return run(fn)
     if getattr(fn, "dew_programs", False):
@@ -358,9 +410,8 @@ class _Paired:
 
 
 def _paired_arms(arms) -> list[_Paired]:
-    """The paired arms among `arms`, a window loop's inner arm for it."""
-    return [arm for arm in (arm.fn if isinstance(arm, _Windowed) else arm for arm in arms)
-            if isinstance(arm, _Paired)]
+    """The paired arms among `arms`, through every arm each adapts (`_layers`)."""
+    return [layer for arm in arms for layer in _layers(arm) if isinstance(layer, _Paired)]
 
 
 SWITCHED: list[dict] = []
@@ -397,6 +448,8 @@ def _ynn_decided(label: str, arms, inputs) -> None:
     _ynn_option_held()
     refused = None
     for arm in arms:
+        # Through a declaration alone: a window loop's arm takes each window's slices, which the draw is not.
+        arm = arm.fn if isinstance(arm, _RunToRun) else arm
         if not isinstance(arm, _Paired) or not hasattr(arm.without, "lower"):
             continue
         try:
@@ -707,6 +760,13 @@ def leaf_summaries(references, truths) -> list[RecordedLeaf]:
     return _summaries(references, _LaidTruths.of(truths))
 
 
+def _missed(mse, missed):
+    """Each mean squared error where its leaf `missed` its truth somewhere: a leaf whose every error is below
+    2^-537 squares to zero, so it takes the least positive float64 instead, and an arm that misses an exact
+    reference is never read as exact (check 1's exact-reference rule, `_judgement`)."""
+    return np.where((np.asarray(mse) == 0) & missed, np.nextafter(0.0, 1.0), mse)
+
+
 def rows_summary(rows, truth, *, finite: bool, dtype: str, mse: float | None = None) -> RecordedLeaf:
     """`leaf_summary` of a leaf from each row's RMS distance from its float64 truth `rows` alone, where the
     reference ran apart and kept those (a recorder whose outputs are too large to keep, its rows its
@@ -719,7 +779,7 @@ def rows_summary(rows, truth, *, finite: bool, dtype: str, mse: float | None = N
     held, rows = _LaidTruths.of([truth]), np.asarray(rows, np.float64)
     sized = held.sizes > 0
     logged = float(np.max(log_over(rows[sized], held.sizes[sized]))) if sized.any() else LOG_ZERO
-    return RecordedLeaf(float(np.mean(np.square(rows))) if mse is None else mse,
+    return RecordedLeaf(float(_missed(np.mean(np.square(rows)), np.any(rows != 0))) if mse is None else mse,
                         float(np.max(_over(rows[sized], held.sizes[sized]))) if sized.any() else 0.0,
                         np.flatnonzero(~sized), rows[~sized], finite=finite and bool(held.finite.all()),
                         dtype=dtype, zero_sizes=held.own[~sized], worst_log=logged)
@@ -834,6 +894,8 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
     finite = np.concatenate([np.isfinite(block).all(axis=1) for block in _blocks(values, held.runs)])
     errors = values - held.values
     mse = np.concatenate([np.mean(block, axis=1) for block in _blocks(np.square(errors), held.runs)])
+    mse = _missed(mse, np.concatenate([np.zeros(0, bool),
+                                       *((block != 0).any(axis=1) for block in _blocks(errors, held.runs))]))
     rows = np.concatenate([np.zeros(0), *map(_scaled_rms, _rows(errors, held.runs))])
     shares = np.concatenate([np.zeros(0), *map(_largest_share, _rows(errors, held.runs))])
     # Each laid leaf's rows, its first among them, and those sized past RESOLUTION.
@@ -914,9 +976,10 @@ def _repeat_promised() -> bool:
 def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
     """Raise unless `fn`, `name` of a check's arms, gives `first` again on the same `inputs`: an arm that
     draws a noise of its own, or reads state its last call left, compares Dew with a reference on draws no
-    seed pairs (ledger 2641). Asked only where a repeat is promised (`_repeat_promised`, ledger 2842); the
-    CPU lane runs every check-1 site, so each arm is held to it there."""
-    if not _repeat_promised():
+    seed pairs (ledger 2641). Asked only where a repeat is promised (`_repeat_promised`, ledger 2842), and
+    of an arm declared to vary from run to run (`run_to_run`) only on a CPU; the CPU lane runs every
+    check-1 site, so each arm is held to it there."""
+    if not _repeat_promised() or (_varies(fn) and jax.default_backend() != "cpu"):
         return
     if (where := _same_bits(first, fn(*inputs))) is not None:
         raise UnpairedDraw(f"{label}: {name} differs at {where} run again on the same inputs, so its output "
@@ -1396,7 +1459,6 @@ site's stage-two rate from, every attempt counted, and which sites' local errors
 
 def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str], ynn: str | None = None) -> None:
     import json
-    import os
 
     path = os.environ.get(STAGES_LOG)
     if path:

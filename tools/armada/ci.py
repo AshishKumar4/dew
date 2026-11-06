@@ -218,8 +218,8 @@ across the containers of an armada gang."""
 HARNESS = "tools/armada/"
 """The harness's directory: the recorder, plugins and cache client every test process runs, beside this file."""
 SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
-          "tools/armada/split.py", "tools/armada/executed.py", "tools/armada/followed.py",
-          "tools/armada/lifetime.py", "tools/armada/watched.py")
+          "src/dew/_cleanup.py", "tools/armada/split.py", "tools/armada/executed.py",
+          "tools/armada/followed.py", "tools/armada/lifetime.py", "tools/armada/watched.py")
 """The files every test file's key covers whole, beside every lock (a GPU node builds its environment
 from its CUDA lock), the environment's own inputs, which .armada.json names (`environment_files`),
 and .armada.json's parts a test process sees (`armada_seen`): what every test process runs or reads,
@@ -319,8 +319,14 @@ FETCHED = ".fetched.json"
 def built(path: Path) -> bool:
     """Whether `path` is a build's output, never an input: compiled bytecode, or an editable install's
     metadata (setuptools' <name>.egg-info), which a task's environment writes into its checkout and a
-    planner's lacks."""
-    return "__pycache__" in path.parts or any(part.endswith(".egg-info") for part in path.parts)
+    planner's lacks; or a directory holding nothing else, as a package a commit deleted leaves its bytecode
+    in a checkout the environment's snapshot carries across commits, which a planner's clean tree lacks (train
+    636: src/dew/cli/, its __pycache__ alone, listed in src/dew's entries, keyed every task's rows apart from
+    their plan's, and two tasks ran 120 kept rows each past their deadline)."""
+    if "__pycache__" in path.parts or any(part.endswith(".egg-info") for part in path.parts):
+        return True
+    return path.is_dir() and not path.is_symlink() and all(
+        entry.name.startswith(".") or built(entry) for entry in path.iterdir())
 
 
 def contents(name: str) -> bytes:
@@ -1687,7 +1693,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         expired, dump = True, dumped(done, stacks)
     # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
-    if left := child_groups.stop(done, interrupt=grace if expired else None, settle=SETTLE):
+    if left := child_groups.stop(done, grace=grace if expired else 0.0, interrupt=signal.SIGINT,
+                                 settle=SETTLE):
         print(f"processes {left} of the task's group still ran {SETTLE:.0f} s after SIGKILL", flush=True)
     # A process of the group still running may yet open a file: no record of this task keeps a key.
     closed = opens.closed()
@@ -2144,7 +2151,9 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
     times of the run that recorded it. Each train folds main's CI so (the land queue), and nothing else
     writes the record. A site its file's marks shard (`sites`) keeps its entries: its judge's row times
     its pooling, no measure of its draws, so its map tasks are weighed by armada's measures of them, never
-    by the record (`site_entries`), and a judge armada did not run is a row of its task's name."""
+    by the record (`site_entries`), and a judge armada did not run is a row of its task's name. A
+    whole_suite cell a row set aside (its `whole_suite` names it, its `tests` do not: a train's batch)
+    keeps its entry too."""
     changed = set(subprocess.run(["git", "diff", "--name-only", verdict["sha"], "--", "tests"], check=True,
                                  capture_output=True, text=True).stdout.split())
     rows: dict[str, list[dict]] = {}
@@ -2170,8 +2179,12 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
             continue
         observed = {node: seconds for row_ in held for node, seconds in row_["tests"].items()}
         marked = sites(name)
-        own = {node: seconds for node, seconds in kept.items()
-               if node.split("::")[0] == name and session.test_name(node) not in marked}
+        # Its whole_suite cells its rows set aside (collected, not run: a train's batch) keep their times,
+        # which only the whole suite's run observes (row 4377: a train's fold dropped a 1108 s cell the
+        # whole run then packed cold).
+        aside = {node for row_ in held for node in row_.get("whole_suite", [])} - observed.keys()
+        own = {node: seconds for node, seconds in kept.items() if node.split("::")[0] == name
+               and session.test_name(node) not in marked and node not in aside}
         if stale(own, observed, sum(row_["seconds"] for row_ in held), max(counts, default=1), target):
             kept = {node: seconds for node, seconds in kept.items() if node not in own}
             kept.update({node: round(seconds, 3) for node, seconds in observed.items()})

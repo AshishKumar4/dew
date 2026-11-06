@@ -41,7 +41,6 @@ from dew.nn import categorical
 from dew.nn.cross_attention import ContextEncoder, crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import ModelInputs
-from dew.nn.inspection import INSPECTED
 from dew.nn.protocols import CountedDecisions, CountedTraining, CrossAttending, ProjectionGroup, TokenModel
 from dew.objectives.base import (
     OMITTED,
@@ -56,6 +55,7 @@ from dew.objectives.base import (
     joined,
     model_rngs,
 )
+from dew.objectives.routing import refuse_fixed_router
 
 if TYPE_CHECKING:
     from dew.state import TrainState
@@ -278,6 +278,9 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             variables is OMITTED and isinstance(backbone, Pretrained)) else ()
         if variables is not OMITTED:
             held = variables
+        # Its backbone's routers train by the decision loss alone (`dew.objectives.routing`), over the
+        # backbone's own tree.
+        refuse_fixed_router(module, None, None if held is None else part(held, "backbone"))
         if tokenizer is None:
             raise ValueError("a decision model lays its rows out with a tokenizer; pass tokenizer=")
         if not 0.0 <= label_smoothing < 1.0:
@@ -400,7 +403,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training),
             progress=self.progress(step), opened=step.sown())
         loss, aux = self._charged(logits, inputs, batch)
-        return loss, replace(aux, inspected=sown.get(INSPECTED, {}) if step.watched is not None else None)
+        qk, inspected = step.observed(sown)
+        return loss, replace(aux, qk_stats=qk, inspected=inspected)
 
     def _charged(self, logits: jax.Array, inputs: DecisionInputs, batch: Batch
                  ) -> tuple[Ratio | Weighted, Aux]:

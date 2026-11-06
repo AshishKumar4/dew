@@ -30,13 +30,18 @@ from dew.registry import from_record
 from .precision import at_least_fp32
 
 
-def sinusoid_frequencies(count: int, divisor: float, *, dtype: DTypeLike, exponential: bool = False
-                         ) -> np.ndarray:
+def sinusoid_frequencies(count: int, divisor: float, *, dtype: DTypeLike, exponential: bool = False,
+                         powered: bool = False) -> np.ndarray:
     """`10000 ** (-i / divisor)` for i below `count`, an absolute sinusoidal table's frequencies, on the
     host in `dtype`: rounded once from float64 (`_base_powers`), or, `exponential`, as the published
     timestep embeddings form them, the whole exponent `i * -ln(10000)` in `dtype` before it is divided
     (the other order moves a sine by 1e-5 near timestep 1000) and its exp taken in float64 and rounded
-    once."""
+    once; or, `powered`, in `dtype` throughout, as MAE's `get_1d_sincos_pos_embed_from_grid` forms them
+    in float32 (MoonViT's time table)."""
+    if powered:
+        exponents = np.arange(count, dtype=dtype)
+        exponents /= divisor
+        return 1.0 / 10000**exponents
     if not exponential:
         return (1.0 / _base_powers(10000.0, np.arange(count, dtype=np.float64) / divisor)).astype(dtype)
     width = np.dtype(dtype).type
@@ -304,14 +309,17 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
 
 
 def axis_tables[P: (np.ndarray, jax.Array)](positions: P, axes: Sequence[int], theta: float, *,
-                                            dtype: DTypeLike, stored: DTypeLike | None = None
-                                            ) -> tuple[P, P]:
+                                            dtype: DTypeLike, stored: DTypeLike | None = None,
+                                            interleaved: bool = False) -> tuple[P, P]:
     """cos and sin of the rotary angles of ids on several axes: `[..., sum(axes) // 2]`.
 
     `positions` is `[..., len(axes)]`. Axis i turns its id at
     `inverse_frequencies(theta, axes[i])`, `axes[i] // 2` pairs, and the axes'
     angles concatenate in order: Flux's `EmbedND`, Wan's three-axis rope and
-    the vision towers' patch grids. The angles are computed in `dtype`. NumPy
+    the vision towers' patch grids; `interleaved` takes them in turn instead,
+    each axis's k-th angle beside the others' k-th, over axes of one width
+    (MoonViT's `Rope2DPosEmbRepeated`: a column's angle, then a
+    row's). The angles are computed in `dtype`. NumPy
     ids compute on the host, where `dtype` may be float64, as
     `FluxPosEmbed` computes its static grid; JAX ids compute on the device.
 
@@ -322,13 +330,17 @@ def axis_tables[P: (np.ndarray, jax.Array)](positions: P, axes: Sequence[int], t
     """
     angles = [positions[..., axis, None].astype(dtype) * inverse_frequencies(theta, dim, dtype=dtype)
               for axis, dim in enumerate(axes)]
+    if interleaved and len(set(axes)) > 1:
+        raise ValueError(f"interleaved axes take their angles in turn, so they are one width, not {axes}")
     if stored is not None:
         angles = [angle.astype(stored).astype(dtype) for angle in angles]
     table = dtype if stored is None else stored
     if isinstance(positions, np.ndarray):
-        joined = np.concatenate(angles, axis=-1)
+        joined = (np.stack(angles, axis=-1).reshape(*angles[0].shape[:-1], -1) if interleaved
+                  else np.concatenate(angles, axis=-1))
         return np.cos(joined).astype(table), np.sin(joined).astype(table)
-    joined = jnp.concatenate(angles, axis=-1)
+    joined = (jnp.stack(angles, axis=-1).reshape(*angles[0].shape[:-1], -1) if interleaved
+              else jnp.concatenate(angles, axis=-1))
     return jnp.cos(joined).astype(table), jnp.sin(joined).astype(table)
 
 
