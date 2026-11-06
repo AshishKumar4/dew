@@ -1831,10 +1831,11 @@ class Transport[Allocated, Opened](abc.ABC):
         return {f'{name}_smems': [self.staged_memory((2, *shape), gmem.dtype) for shape, gmem in shaped],
                 f'{name}_barriers': [self.load_barriers(2) for _ in shaped]}
 
-    def staged_memory(self, shape: tuple[int, ...], dtype):
-        """A scoped allocation of `shape` in the memory a program stages tiles in: a GPU's shared memory (a
-        TPU's VMEM)."""
-        return plgpu.SMEM(shape, dtype)
+    def staged_memory(self, shape: tuple[int, ...], dtype, swizzle: int | None = None):
+        """A scoped allocation of `shape` in the memory a program stages tiles in: a GPU's shared memory, its
+        rows at `swizzle` bytes (`staged`: the widest that fits where None, plain where `UNSWIZZLED`); a
+        TPU's VMEM, which its compiler tiles."""
+        return staged(shape, dtype, swizzle)
 
     def meeting(self, consumers: int) -> plgpu.Barrier:
         """The scoped allocation two consumers `meet` at: two barriers of `consumers` arrivals each."""
