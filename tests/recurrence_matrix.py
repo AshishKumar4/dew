@@ -84,9 +84,9 @@ def _step(case: dict[str, str]):
 
 
 def _wide(results):
-    """A call's output and final memory in fp32, as its cotangents are drawn: the cast's pullback rounds them
-    to the call's own dtypes."""
-    return jax.tree.map(lambda x: x.astype(jnp.float32), results)
+    """A call's output and final memory in at least fp32, as its cotangents are drawn (float64 in the truth,
+    which widens them): the cast's pullback rounds them to the call's own dtypes."""
+    return jax.tree.map(lambda x: x.astype(jnp.promote_types(x.dtype, jnp.float32)), results)
 
 
 @functools.cache
