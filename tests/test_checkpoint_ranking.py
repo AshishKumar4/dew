@@ -494,6 +494,41 @@ def test_a_save_returns_while_the_last_cuts_deletion_runs(tmp_path, monkeypatch)
     assert _items(directory, 2) == ['model']
 
 
+def test_a_failed_deletion_is_raised_where_the_run_joins_it_not_inside_a_save(tmp_path, monkeypatch):
+    """A cut step's deletion that failed is raised at the run's next projection, its `wait`, never inside
+    the save whose retention drops that step: Orbax asks the retention after it dispatches the save's
+    write, which a raise there would leave behind (row 4462). That save lands, the steps it drops go,
+    and the run's next wait still cuts the steps it keeps to their readers' items."""
+    import shutil
+
+    directory = tmp_path / 'run'
+    keep = Keep(latest=1, every=3, weights_only=True)
+    run = trainer(directory, keep=keep)
+    state = run.fit(dataclasses.replace(data(), val=None), steps=1, log_every=1)
+    checkpoints = run.checkpoints
+    # Step 2 is the run's best by its training loss, kept as its model once step 3 is the latest.
+    checkpoints.save(2, state.replace(step=jnp.int32(2)), None,
+                     ranking=Ranking('train/loss', .5, 'min', weights_only=True))
+    checkpoints.wait()
+    rmtree, failure = shutil.rmtree, OSError('the deletion failed')
+    monkeypatch.setattr(shutil, 'rmtree', lambda path, *args, **kwargs: (_ for _ in ()).throw(failure))
+    checkpoints.save(3, state.replace(step=jnp.int32(3)), None)
+    checkpoints.wait()
+    monkeypatch.setattr(shutil, 'rmtree', rmtree)
+    # Step 4 ranks better, so its retention drops step 2, whose cut's deletion failed, and keeps step 3
+    # for its periodic model alone.
+    checkpoints.save(4, state.replace(step=jnp.int32(4)), None,
+                     ranking=Ranking('train/loss', .1, 'min', weights_only=True))
+    with pytest.raises(OSError) as raised:
+        checkpoints.wait()
+    assert raised.value is failure
+    checkpoints.wait()
+    checkpoints.close()
+    assert {kept.step: kept.kind for kept in Checkpoints(str(directory), keep=keep).kept()} == {
+        3: 'weights', 4: 'state'}
+    assert _items(directory, 3) == ['model']
+
+
 def test_ranked_ties_keep_the_older_steps(tmp_path):
     """A ranking's best `top` steps are Orbax's `BestN` over the steps it scored: of tied scores the
     older steps are kept, and a step the ranking never scored is not among them. The run's own first

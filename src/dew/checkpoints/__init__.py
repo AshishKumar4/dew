@@ -736,10 +736,11 @@ class _RankedSteps(preservation.PreservationPolicy):
         held = self.roles(checkpoints, context)
         deleting = self.checkpoints._deleting
         # Orbax deletes a step no reader keeps once this save lands (its `_finalize`): one the last cut's
-        # deletion is still in waits for it first, any other leaves it running.
+        # deletion is still in waits for it to end first, any other leaves it running. Orbax asks after
+        # it dispatches the save's write, so what the deletion failed on waits for the run's next join.
         if deleting is not None and any(not held[checkpoint.step] and checkpoint.step in deleting[2]
                                         for checkpoint in checkpoints):
-            self.checkpoints._deleted()
+            deleting[0].join()
         newest = max((checkpoint.step for checkpoint in checkpoints), default=None)
         self.checkpoints._plan = None if newest is None else (newest, held)
         return [bool(held[checkpoint.step]) for checkpoint in checkpoints]
@@ -1409,14 +1410,19 @@ class Checkpoints:
         short reads as cut, and its leftovers go at the first projection of a later process. It runs where
         every process of the pool does, in `save`, `wait` and `close`, before the store's collection
         reads the steps' references (`_frozen`). Process 0 deletes behind the pool, which waits on it for
-        the cut alone: the next projection and `close` join it (`_deleted`), and a save whose retention
-        drops a step the deletion is still in waits for it there (`_RankedSteps.should_preserve`)."""
+        the cut alone: the next projection and `close` join it, raising what it failed on (`_deleted`),
+        and a save whose retention drops a step the deletion is still in waits for it to end there
+        (`_RankedSteps.should_preserve`)."""
         persistent = self._manager
-        plan, self._plan = self._plan, None
-        if persistent is None or plan is None:
+        if persistent is None:
+            self._plan = None
             return
-        # One deletion at a time: a new cut waits for the last.
+        if self._plan is None:
+            return
+        # One deletion at a time: a new cut waits for the last, whose failure is raised before this plan
+        # is taken, so the run's next wait or close still cuts to it.
         self._deleted()
+        plan, self._plan = self._plan, None
         persistent.wait_until_finished()
         newest, roles = plan
         cuts: dict[str, list[str]] = {}
