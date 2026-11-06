@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from one_draw import assert_as_exact_as_the_reference
+from reference_error import GateFailure, Inconclusive, as_given, assert_as_exact, indexed_recording, recording
 from reference_runs import assert_as_exact_as_recorded
 
 from dew.decision import Decide, DecisionInputs, Encoded, Question
@@ -133,8 +134,7 @@ def dew(dtype, inputs, *, typed: bool = True) -> dict:
             for layout in OUTPUTS}
 
 
-@pytest.mark.parametrize("parallel", [False, True])
-def test_laya_logits_match_laya_under_the_float64_rule(parallel):
+def test_laya_logits_match_laya_under_the_float64_rule():
     """Every case's option logits, sequential and parallel, over drawn weights, as exact as Laya's
     float32 run against its float64 run (check 1)."""
     assert_as_exact_as_recorded(FIXTURE, "laya", LAYA_SEEDS, draw, dew, "Laya's option logits")
@@ -142,10 +142,15 @@ def test_laya_logits_match_laya_under_the_float64_rule(parallel):
 
 def test_the_rule_catches_a_head_that_ignores_the_question_type():
     """The type embedding is the only place a choice and a noul differ in
-    the head; dropping it moves the logits past the rule."""
-    with pytest.raises(AssertionError):
-        assert_as_exact_as_recorded(FIXTURE, "laya", LAYA_SEEDS, draw,
-                                    functools.partial(dew, typed=False), "logits without the question type")
+    the head; dropping it moves the logits past the rule: check 1 decides
+    against it, the truth the typed head's own float64 run."""
+    drawn, reference, truth = indexed_recording(recording(FIXTURE), "laya", LAYA_SEEDS, inputs_of=draw,
+                                                truth_fn=lambda inputs: dew(jnp.float64, inputs))
+    untyped = jax.jit(lambda inputs: dew(jnp.float32, inputs, typed=False))
+    with pytest.raises(GateFailure) as failed:
+        assert_as_exact(as_given(lambda index, inputs: untyped(inputs)), reference, drawn,
+                        "logits without the question type", seeds=LAYA_SEEDS, truth_fn=truth)
+    assert not isinstance(failed.value, Inconclusive)
 
 
 def test_padded_rows_score_as_they_do_alone():
