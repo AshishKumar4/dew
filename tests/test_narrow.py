@@ -4,6 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from arm_arithmetic import summed_as_run
 from placement_parity import layouts_agree, x64
 
 from dew.checkpoints import _filled
@@ -451,8 +452,11 @@ def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads
     monkeypatch.setattr(jax.Device, "memory_stats", stats)
 
     def trained(*, copies, rows=8, longer=None, steps=0):
-        return _trained(optax.sgd(0.5), copies=copies, steps=steps, accumulation=2, split=1, remat="full",
-                        rows=rows, longer=longer)
+        # Sized under the arithmetic check 1 runs its arms in (`summed_as_run`), whose float32 dots compile
+        # to other footprints than the default precision's.
+        with summed_as_run():
+            return _trained(optax.sgd(0.5), copies=copies, steps=steps, accumulation=2, split=1,
+                            remat="full", rows=rows, longer=longer)
 
     def used(rows, *, copies):
         return free - trained(copies=copies, rows=rows)[2].plan["probes"][0]["headroom"]
