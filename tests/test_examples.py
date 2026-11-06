@@ -21,7 +21,7 @@ import pytest
 from lane_environment import outside_suite
 from diffusion_stubs import RES, TOKENS, StubText
 from PIL import Image
-from process_support import dew_train, logged_losses
+from process_support import dew_train, logged_losses, raised
 from test_inference import make_run
 from tool_support import load
 
@@ -489,6 +489,17 @@ def test_evaluate_and_serve_smoke_scores_a_diffusion_run_it_is_pointed_at(tmp_pa
     assert "clip_score" in report["images"]
     assert report["images"]["fid"] >= 0, "the offline FID did not score"
     assert "perplexity" not in report and not (tmp_path / "report" / "checkpoints").exists()
+
+
+def test_evaluate_and_serve_refuses_language_options_a_diffusion_run_alone_would_drop(tmp_path):
+    """Pointed at a diffusion run and no language run, the example refuses the options only a language run
+    reads, before it reads either run, rather than leave them out of its report unsaid."""
+    example = REPO_ROOT / "examples" / "evaluate_and_serve.py"
+    done = subprocess.run([sys.executable, str(example), "--image-run", str(tmp_path / "none"),
+                           "--tasks", "hellaswag", "--out", str(tmp_path)], cwd=REPO_ROOT,
+                          env=single_device(offline=True), capture_output=True, text=True, timeout=300)
+    assert [message.split(" score ")[0] for message in raised(done).get("ValueError", [])] == ["--tasks"]
+    assert not (tmp_path / "report.json").exists()
 
 
 @pytest.mark.network
