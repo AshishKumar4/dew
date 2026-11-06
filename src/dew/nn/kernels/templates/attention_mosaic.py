@@ -64,6 +64,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     extents,
     launch_scope,
     layouts,
+    query_rows,
     query_swizzle,
     reducing,
     refused,
@@ -94,7 +95,7 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     family's own swizzle do not fit fits them staged narrowest (`Tiles.narrow`), a wide stage's bandwidth
     traded for the larger tile; fewer consumers where no tile of the family's count holds the block (a GPU
     of a smaller one). `tiles(rows, walked, consumers)` builds the config. None where no tile fits."""
-    rows = extents(family, dtype, held)[-1]
+    rows = query_rows(family, dtype, held)
     most = family.consumers if overlapped else 1
     for consumers in range(max(1, min(most, -(-held // rows))), 0, -1):
         for extent in walked_extents(family, dtype, walked):
@@ -155,7 +156,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         process (`grouped_matmul._Mosaic.eligible`: the interpreter's callbacks are ordered effects, which a
         GPU process's lowering cannot carry), or no config fits the device (`derived`)."""
         name = generation.family(target.generation)
-        family = bundle(target.generation, ba.arguments["query"].dtype)
+        query = ba.arguments["query"]
+        family = bundle(target.generation, query.dtype, query.shape[1])
         if family is None:
             return Refusal('family', f"the Mosaic mainloop has no bundle for {name or target.generation} yet")
         if (reason := self.refusal(ba, family)) is not None:
@@ -185,7 +187,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
 
     def _family(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mosaic.Family | None:
         """The target's family's bundle where the launch takes the call there, else None."""
-        family = bundle(target.generation, ba.arguments["query"].dtype)
+        query = ba.arguments["query"]
+        family = bundle(target.generation, query.dtype, query.shape[1])
         return None if family is None or self.refusal(ba, family) is not None else family
 
     WALKED: ClassVar[str] = "block_k"
@@ -210,7 +213,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
 
     def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Config:
         target = generation.gpu_target()
-        family = bundle(target.generation, ba.arguments["query"].dtype)
+        query = ba.arguments["query"]
+        family = bundle(target.generation, query.dtype, query.shape[1])
         if family is not None and (reason := self.refusal(ba, family)):
             raise NotImplementedError(reason)
         config = self.derived(ba, target)
