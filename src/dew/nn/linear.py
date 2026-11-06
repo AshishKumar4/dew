@@ -982,7 +982,6 @@ class GatedDeltaNet(nn.Module):
 
         return token
 
-    @nn.compact
     def _tree(self, mixed, g, beta, tree: tuple[int, ...], heads, widths, wide):
         """A tree call's convolved tokens and recurrence (`tree_conv`, `tree_rule`): each token on its path,
         from the row's held history and state past the root, the cache left as it was."""
@@ -996,6 +995,7 @@ class GatedDeltaNet(nn.Module):
         query, key = (repeat_kv_heads(x, self.num_v_heads) for x in (query, key))
         return tree_rule(recurrent_gated_delta_rule, tree, (query, key, value, g, beta), held)
 
+    @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):
         decode, attention_metadata = call.decode, call.metadata
         B, S, _ = x.shape
