@@ -37,27 +37,60 @@ class Unit(enum.Enum):
 
 
 class BitOp(enum.Enum):
-    """An instruction of the vocabulary, each a GF(2)-linear map of its operands' words, as SASS names it, and
-    the pipes that can issue it (`units`). A shift's amount and a mask are immediates."""
+    """An instruction of the vocabulary, as SASS names it, and the pipes that can issue it (`units`). The
+    first four are GF(2)-linear maps of their operands' words (`linear`), a shift's amount and a mask
+    immediates: the linear search's (`synthesized`) and proof's (`proven`). The rest are the integer pipes'
+    arithmetic a form that is not linear takes (an encode's rounding and saturation), proven against its
+    reference on every word (row 4050); their immediate an operand where they take one."""
 
     SHR = "shf.r.u32"      # a logical right shift: SHF on the ALU, or IMAD.HI.U32 by 2^(32-c) on the FMA pipe
     ROTR = "shf.r.w.u32"   # a right rotation: SHF's funnel shift of the word with itself, the ALU's alone
     SHL = "shl"            # a left shift: SHF.L on the ALU, or IMAD.SHL (a multiply by 2^k) on the FMA pipe
     LOP3 = "lop3"          # a mask of the XOR of one or two values: LOP3, its mask an immediate
+    LOGIC = "lop3.lut"     # LOP3 of any truth table (`table`) over its values, the immediate the last operand
+    IADD3 = "iadd3"        # the sum of its values and the immediate, those `table` names negated
+    IMAD = "imad"          # its first value times the immediate, plus its second where it has one
+    MINMAX = "imnmx"       # the least of its two values, or of its value and the immediate (`table` 1 signed,
+                           # 2 the greatest)
+    SAR = "shf.r.s32"      # its value shifted right by the immediate, its sign bit filling
+    SHRV = "shf.r.u32.v"   # its first value shifted right by its second, 0 past 31 places (PTX clamps at 32)
+    SHLV = "shf.l.u32.v"   # its first value shifted left by its second, 0 past 31 places
+    CMP = "isetp"          # 1 where its first value compares to its second (or the immediate) as `table`
+                           # names (`_COMPARED`), else 0: ISETP and a SEL of it, two issues
+    SEL = "sel"            # its second value where its first is not 0, else its third: ISETP and SEL, two
+    PRMT = "prmt"          # each byte one of its two values' eight, the immediate's nibbles naming them
+                           # (0-7: literal selection; a nibble's sign-replicating bit is not taken)
 
     @property
     def units(self) -> tuple[Unit, ...]:
-        return (Unit.ALU,) if self in (BitOp.ROTR, BitOp.LOP3) else (Unit.ALU, Unit.FMA)
+        if self is BitOp.IMAD:
+            return (Unit.FMA,)
+        return (Unit.ALU, Unit.FMA) if self in (BitOp.SHR, BitOp.SHL) else (Unit.ALU,)
+
+    @property
+    def linear(self) -> bool:
+        return self in (BitOp.SHR, BitOp.ROTR, BitOp.SHL, BitOp.LOP3)
+
+    @property
+    def issues(self) -> int:
+        """Its instructions: a compare's or a select's two (an ISETP and a SEL), every other's one."""
+        return 2 if self in (BitOp.CMP, BitOp.SEL) else 1
+
+
+_COMPARED = ("lt", "le", "gt", "ge", "eq", "ne")
+"""A compare's predicates (`BitOp.CMP`), its `table`'s value; plus 8 signed."""
 
 
 class BitStep(NamedTuple):
     """One instruction of a form: `op` over the values at `args` (0 the stored word, `i + 1` step `i`'s), its
-    immediate (a shift's amount, a mask), and the unit it issues on."""
+    immediate (a shift's amount, a mask, an operand), the unit it issues on, and `table` (LOGIC's truth table
+    over its operands' tables 0xF0, 0xCC and 0xAA; IADD3's operands negated, a bit apiece)."""
 
     op: BitOp
     args: tuple[int, ...]
     immediate: int
     unit: Unit
+    table: int = 0
 
 
 def _run[Words: (np.ndarray, jax.Array)](steps: Sequence[BitStep], outputs: Sequence[int], words: Words,
@@ -67,17 +100,72 @@ def _run[Words: (np.ndarray, jax.Array)](steps: Sequence[BitStep], outputs: Sequ
     each instruction computes it, its shifts in 32 bits."""
     values = [words]
     for step in steps:
-        first, amount = values[step.args[0]], xp.uint32(step.immediate)
+        first = values[step.args[0]] if step.args else xp.zeros_like(words)
+        amount = xp.uint32(step.immediate)
+        operands = [values[arg] for arg in step.args]
         if step.op is BitOp.SHR:
             value = first >> amount
         elif step.op is BitOp.ROTR:
             value = (first >> amount) | (first << xp.uint32(WORD - step.immediate))
         elif step.op is BitOp.SHL:
             value = first << amount
-        else:
+        elif step.op is BitOp.LOP3:
             value = (first if len(step.args) == 1 else first ^ values[step.args[1]]) & amount
-        values.append(value)
+        elif step.op is BitOp.LOGIC:
+            value = _looked_up(step.table, [*operands, xp.full_like(first, amount)][:3], xp)
+        elif step.op is BitOp.IADD3:
+            value = amount + sum((xp.uint32(0) - operand if step.table >> index & 1 else operand)
+                                 for index, operand in enumerate(operands))
+        elif step.op is BitOp.IMAD:
+            value = first * amount + (operands[1] if len(operands) > 1 else xp.uint32(0))
+        elif step.op is BitOp.MINMAX:
+            pair = [*operands, xp.full_like(first, amount)][:2]
+            if step.table & 1:
+                pair = [value.astype(xp.int32) for value in pair]
+            value = (xp.maximum if step.table & 2 else xp.minimum)(*pair)
+        elif step.op is BitOp.SAR:
+            value = first.astype(xp.int32) >> xp.int32(step.immediate)
+        elif step.op in (BitOp.SHRV, BitOp.SHLV):
+            places = operands[1]
+            shifted = first >> xp.minimum(places, xp.uint32(WORD - 1)) if step.op is BitOp.SHRV \
+                else first << xp.minimum(places, xp.uint32(WORD - 1))
+            value = xp.where(places < xp.uint32(WORD), shifted, xp.uint32(0))
+        elif step.op is BitOp.CMP:
+            left, right = [*operands, xp.full_like(first, amount)][:2]
+            if step.table & 8:
+                left, right = left.astype(xp.int32), right.astype(xp.int32)
+            compared = {"lt": left < right, "le": left <= right, "gt": left > right, "ge": left >= right,
+                        "eq": left == right, "ne": left != right}[_COMPARED[step.table & 7]]
+            value = compared.astype(xp.uint32)
+        elif step.op is BitOp.SEL:
+            value = xp.where(first != xp.uint32(0), operands[1], operands[2])
+        else:
+            value = _permuted(operands, step.immediate, xp)
+        values.append(value.astype(xp.uint32))
     return tuple(values[index] for index in outputs)
+
+
+def _looked_up[Words: (np.ndarray, jax.Array)](table: int, operands: Sequence[Words], xp) -> Words:
+    """LOP3's `table` over `operands` (its first operand's truth table 0xF0, the second's 0xCC, the third's
+    0xAA), as the sum of its minterms: each set bit of the table the AND of each operand or its complement."""
+    a, b, c = (*operands, *[xp.zeros_like(operands[0])] * (3 - len(operands)))
+    value = xp.zeros_like(a)
+    for minterm in range(8):
+        if table >> minterm & 1:
+            value |= ((a if minterm & 4 else ~a) & (b if minterm & 2 else ~b) & (c if minterm & 1 else ~c))
+    return value
+
+
+def _permuted[Words: (np.ndarray, jax.Array)](operands: Sequence[Words], selector: int, xp) -> Words:
+    """PRMT's default mode over `operands` (the second the high word; the first again where it has one): each
+    byte `k` of the result the byte that `selector`'s nibble `k` names of the eight (0-3 the first's)."""
+    low, high = operands[0], operands[-1]
+    value = xp.zeros_like(low)
+    for k in range(4):
+        source = selector >> 4 * k & 7
+        word = low if source < 4 else high
+        value |= (word >> xp.uint32(8 * (source % 4)) & xp.uint32(0xFF)) << xp.uint32(8 * k)
+    return value
 
 
 def _bits(mask: int) -> list[int]:
@@ -202,7 +290,7 @@ class BitForm:
     @property
     def issues(self) -> dict[Unit, int]:
         """Its instructions on each unit."""
-        return {unit: sum(step.unit is unit for step in self.steps) for unit in Unit}
+        return {unit: sum(step.op.issues for step in self.steps if step.unit is unit) for unit in Unit}
 
     @property
     def depth(self) -> int:
@@ -242,8 +330,7 @@ class BitForm:
         lines = [f".reg .b32 {', '.join(names[value] for value in sorted(needed))};"] if needed else []
         for value in sorted(needed):
             step = self.steps[value - 1]
-            lines.append(_PTX[step.op, step.unit](names[value], [names[arg] for arg in step.args],
-                                                  step.immediate))
+            lines.append(_written(step, names[value], [names[arg] for arg in step.args]))
         lines.append(f"mov.b32 $0, {names[self.outputs[output]]};")
         return "{\n" + "\n".join(lines) + "\n}"
 
@@ -251,7 +338,7 @@ class BitForm:
     def price(self) -> tuple[int, int]:
         """Its busiest unit's issues, then its instructions (`Unit`: one rate): a decoder's words are many
         and independent, so its pipes' throughput prices it, not its chain's latency."""
-        return max(self.issues.values()), len(self.steps)
+        return max(self.issues.values()), sum(step.op.issues for step in self.steps)
 
 
 # LOP3's truth table of `c & (a ^ b)` and of `c & a`, over its operands' tables 0xF0, 0xCC and 0xAA (PTX ISA,
@@ -270,6 +357,41 @@ _PTX = {
         f"lop3.b32 {out}, {ins[0]}, {ins[1]}, {mask:#010x}, {_MASKED_XOR:#04x};" if len(ins) == 2
         else f"lop3.b32 {out}, {ins[0]}, {ins[0]}, {mask:#010x}, {_MASKED:#04x};"),
 }
+"""Each linear instruction as the PTX written for its pipe (`_written` the others, which read a step's
+table)."""
+
+
+def _written(step: BitStep, out: str, ins: Sequence[str]) -> str:
+    """Step `step` as PTX into `out` from `ins`: a linear one's `_PTX`; IADD3 as `add`/`sub` (ptxas issues one
+    IADD3), IMAD as `mad.lo`, UMIN as `min.u32`, SHRV as `shr.b32` by a register (PTX clamps its amount at
+    32), PRMT and LOGIC as themselves, the immediate their last operand."""
+    imm = f"{step.immediate:#x}"
+    if step.op.linear:
+        return _PTX[step.op, step.unit](out, ins, step.immediate)
+    if step.op is BitOp.LOGIC:
+        operands = [*ins, imm, imm][:3]
+        return f"lop3.b32 {out}, {', '.join(operands)}, {step.table:#04x};"
+    if step.op is BitOp.IADD3:
+        lines = [f"mov.b32 {out}, {imm};"]
+        lines += [f"{'sub' if step.table >> index & 1 else 'add'}.u32 {out}, {out}, {value};"
+                  for index, value in enumerate(ins)]
+        return " ".join(lines)
+    if step.op is BitOp.IMAD:
+        return f"mad.lo.u32 {out}, {ins[0]}, {imm}, {ins[1] if len(ins) > 1 else 0};"
+    if step.op is BitOp.MINMAX:
+        kind = f"{'max' if step.table & 2 else 'min'}.{'s32' if step.table & 1 else 'u32'}"
+        return f"{kind} {out}, {ins[0]}, {ins[1] if len(ins) > 1 else imm};"
+    if step.op is BitOp.SAR:
+        return f"shr.s32 {out}, {ins[0]}, {step.immediate};"
+    if step.op in (BitOp.SHRV, BitOp.SHLV):
+        return f"{'shr' if step.op is BitOp.SHRV else 'shl'}.b32 {out}, {ins[0]}, {ins[1]};"
+    if step.op is BitOp.CMP:
+        kind = f"{_COMPARED[step.table & 7]}.{'s32' if step.table & 8 else 'u32'}"
+        return (f"{{ .reg .pred p; setp.{kind} p, {ins[0]}, {ins[1] if len(ins) > 1 else imm}; "
+                f"selp.b32 {out}, 1, 0, p; }}")
+    if step.op is BitOp.SEL:
+        return f"{{ .reg .pred p; setp.ne.u32 p, {ins[0]}, 0; selp.b32 {out}, {ins[1]}, {ins[2]}, p; }}"
+    return f"prmt.b32 {out}, {ins[0]}, {ins[-1]}, {imm};"
 """Each instruction as the PTX written for its pipe: a shift or rotation as `shr`/`shl`/`shf`, which ptxas
 issues as SHF on the ALU, and a multiply by a power of two as `mul`, which it issues as IMAD on the FMA pipe
 (PTX ISA, "Integer Arithmetic Instructions"; Nsight Compute's pipelines). PTX fixes the arithmetic, not the
@@ -281,11 +403,14 @@ class Unproven(ValueError):
 
 
 def proven(transform: BitTransform, form: BitForm) -> None:
-    """Prove `form` computes `transform` on every input, or raise `Unproven`: every instruction of the
-    vocabulary is GF(2)-linear (`BitOp`), so the form and its encoder are linear maps, and two linear maps
-    that agree on each basis word agree on all 2^width; the input's every word is checked besides where it
-    has 16 bits or fewer. Bits outside a register's mask are proven zero by the same argument. A fixed
-    layout's encoder must be the identity: its form reads the input as stored."""
+    """Prove `form` computes `transform` on every input, or raise `Unproven`: a form of linear instructions
+    (`BitOp.linear`) and its encoder are linear maps, and two linear maps that agree on each basis word agree
+    on all 2^width; the input's every word is checked besides where it has 16 bits or fewer. Bits outside a
+    register's mask are proven zero by the same argument. A fixed layout's encoder must be the identity: its
+    form reads the input as stored. A form with an instruction that is not linear is proven against its
+    reference on every word instead (its consumer's test), never here."""
+    if not all(step.op.linear for step in form.steps):
+        raise Unproven(f"{transform.name}: a form not linear proves on every word, not on a basis")
     identity = tuple(1 << bit for bit in range(transform.width))
     if len(form.encoder) != transform.width or (not transform.free and form.encoder != identity):
         raise Unproven(f"{transform.name}: its form reads a stored word its layout does not store")
@@ -621,6 +746,53 @@ def encoded[Words: (np.ndarray, jax.Array)](x: Words, minifloat: Minifloat, xp=j
     code = xp.where(nan, word(nan_code), code)
     return code | sign << word(minifloat.width - 1)
 
+
+
+def encode_form(minifloat: Minifloat) -> BitForm:
+    """`encoded`'s instruction form for `minifloat`, a word to its code: the reference traced into the
+    vocabulary and superoptimized (`tools/superoptimize_bits.py`: each window of up to three steps replaced
+    by a cheaper program of one or two that Z3 proves equal on every input), from 41 issues to 37 for each
+    of e4m3, e5m2 and e2m1, the same program but for the minifloat's constants (its largest finite value,
+    its bias, its mantissa's width, its NaN code and its sign's place). Proven against `encoded` on every
+    fp32 word by its test; its PTX (`BitForm.ptx`) a kernel's inline encode on a family with no satfinite
+    cvt (sm80, sm86), where its consumer's timing decides it against the compiler's lowering of `encoded`."""
+    m = minifloat.mantissa
+    nan = minifloat.largest if minifloat.nan is None else minifloat.nan
+    alu = Unit.ALU
+    steps = (
+        BitStep(BitOp.SHR, (0,), 31, alu),                                  # 1 the sign
+        BitStep(BitOp.LOGIC, (0,), 0x7FFFFFFF, alu, 0xC0),                  # 2 the magnitude
+        BitStep(BitOp.MINMAX, (2,), minifloat.largest_float32, alu),        # 3 saturated finite
+        BitStep(BitOp.CMP, (2,), 0x7F800000, alu, 2),                       # 4 a NaN
+        BitStep(BitOp.SHR, (3,), 23, alu),                                  # 5 its biased exponent
+        BitStep(BitOp.IADD3, (5,), -(127 - minifloat.bias) & MASK, alu),    # 6 rebiased
+        BitStep(BitOp.LOGIC, (3,), 0x7FFFFF, alu, 0xC0),                    # 7 its fraction
+        BitStep(BitOp.CMP, (6,), 1, alu, 11),                               # 8 a normal result
+        BitStep(BitOp.MINMAX, (5,), 1, alu),                                # 9 a normal input
+        BitStep(BitOp.SHL, (9,), 23, alu),                                  # 10 its implicit bit
+        BitStep(BitOp.LOGIC, (10, 7), 0, alu, 0xFC),                        # 11 its significand
+        BitStep(BitOp.SEL, (8, 7, 11), 0, alu),
+        BitStep(BitOp.SHL, (6,), 23, alu),
+        BitStep(BitOp.LOGIC, (13, 7), 0, alu, 0xFC),
+        BitStep(BitOp.SEL, (8, 14, 12), 0, alu),                            # 15 the value rounded
+        BitStep(BitOp.IADD3, (6,), 24 - m, alu, 1),
+        BitStep(BitOp.MINMAX, (16,), 31, alu, 1),
+        BitStep(BitOp.IADD3, (), 23 - m, alu),
+        BitStep(BitOp.SEL, (8, 18, 17), 0, alu),                            # 19 its shift
+        BitStep(BitOp.IADD3, (19,), MASK, alu),
+        BitStep(BitOp.IADD3, (), 1, alu),
+        BitStep(BitOp.SHLV, (21, 20), 0, alu),
+        BitStep(BitOp.IADD3, (22, 15), MASK, alu),                          # 23 plus half less one
+        BitStep(BitOp.SHRV, (15, 19), 0, alu),
+        BitStep(BitOp.LOGIC, (24,), 1, alu, 0xC0),                          # 25 the tie's bit
+        BitStep(BitOp.IADD3, (23, 25), 0, alu),
+        BitStep(BitOp.SHRV, (26, 19), 0, alu),                              # 27 the code
+        BitStep(BitOp.IADD3, (), nan, alu),
+        BitStep(BitOp.SEL, (4, 28, 27), 0, alu),
+        BitStep(BitOp.SHL, (1,), minifloat.width - 1, alu),
+        BitStep(BitOp.LOGIC, (29, 30), 0, alu, 0xFC),                       # 31 signed
+    )
+    return BitForm(steps, (len(steps),), tuple(1 << bit for bit in range(WORD)))
 
 def packed[Words: (np.ndarray, jax.Array)](codes: Words, minifloat: Minifloat, xp=jnp) -> Words:
     """`codes` (uint32 a code, `[..., n]`) packed into uint32 words along the last axis, `[..., n * width /
