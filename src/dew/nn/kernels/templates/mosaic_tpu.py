@@ -14,6 +14,7 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -78,6 +79,8 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
 
     products_overlap = False
 
+    column_scratch = 0  # its column sums take no scratch
+
     _VALUES = "a TPU core holds no register layout: its values are Mosaic TPU's, in vregs or VMEM"
 
     @property
@@ -96,15 +99,45 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
     def lane_columns(self) -> int:
         raise NotImplementedError(self._VALUES)
 
+    # A tile, a row and a column are values: the members the GPU's issuers lay out are plain reads.
     def zeros(self, shape: tuple[int, ...]) -> jax.Array:
         return jnp.zeros(shape, jnp.float32)
+
+    def iota(self, shape: tuple[int, ...], dimension: int) -> jax.Array:
+        return lax.broadcasted_iota(jnp.int32, shape, dimension)
+
+    def column_offsets(self, shape: tuple[int, int]) -> tuple[jax.Array, jax.Array]:
+        # No lane decides a column: the index is its own offset.
+        return jnp.zeros((), jnp.int32), self.iota(shape, 1)
+
+    def rows_of(self, ref) -> jax.Array:
+        return ref[...]
+
+    def columns_of(self, ref) -> jax.Array:
+        return ref[...]
+
+    def tile_of(self, ref) -> jax.Array:
+        return ref[...]
+
+    def key_magnitudes(self, tile) -> jax.Array:
+        return jnp.max(jnp.abs(tile[...]), axis=1).astype(jnp.float32)
+
+    def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
+        del scratch, interpret
+        return value.sum(axis=0)
+
+    def as_row(self, vector: jax.Array) -> jax.Array:
+        return vector
+
+    def as_tile(self, value: jax.Array) -> jax.Array:
+        return value
 
     def written(self, smem, value: jax.Array) -> None:
         smem[...] = value.astype(smem.dtype)
 
     def products(self, acc: jax.Array, lhs, rhs, interpret: bool) -> jax.Array:
         del interpret
-        return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
+        return acc + _product(lhs, rhs)
 
     def settled(self, pending: int = 0) -> None:
         # Its products are synchronous: none is pending.
@@ -120,15 +153,15 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
         if then is not None:
             then()
-        return jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
+        return _product(lhs, rhs)
 
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
         del interpret
-        return jnp.dot(lhs, rhs[...], preferred_element_type=jnp.float32)
+        return _product(lhs, rhs)
 
     def register_products(self, acc: jax.Array, parts, rhs, interpret: bool) -> jax.Array:
         del interpret
-        return acc + sum(jnp.dot(part, rhs[...], preferred_element_type=jnp.float32) for part in parts)
+        return acc + sum(_product(part, rhs) for part in parts)
 
     def rescaled_products(self, acc: jax.Array, scale, parts, rhs, interpret: bool) -> jax.Array:
         return self.register_products(acc * scale, parts, rhs, interpret)
@@ -140,6 +173,10 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
     with the MXU's issuer (`MXU`)."""
 
     consumers = 1
+
+    bounded_loads = False  # a DMA past its operand's rows is refused, not filled with zeros
+
+    stores_through_registers = False
 
     copies_in_pieces = False
 
@@ -165,15 +202,17 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
-               reducing_warpgroups: int = 0, resident: int = 1) -> Callable:
+               reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0) -> Callable:
         # A program a core, its operands and outputs left in HBM for its walks' copies; no cluster.
         del grid_names, approx_math, reducing_warpgroups, resident, model_flops
         _one(consumers, clustered=cluster > 1)
 
         def launched(*operands):
+            # A table its programs read an element at a time in scalar memory, every other operand in HBM.
+            spaces = [pltpu.SMEM if at < scalars else pl.ANY for at in range(len(operands))]
             return launches.pallas_call(
                 entry, name=name or self.name, out_shape=out_type, grid=grid,
-                in_specs=[pl.BlockSpec(memory_space=pl.ANY)] * len(operands),
+                in_specs=[pl.BlockSpec(memory_space=space) for space in spaces],
                 out_specs=jax.tree.map(lambda _: pl.BlockSpec(memory_space=pl.ANY), out_type),
                 compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",) * len(grid)),
                 interpret=pltpu.InterpretParams() if interpret else False, cost_estimate=cost)(*operands)
@@ -299,6 +338,24 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
     def load_barriers(self, count: int):
         return pltpu.SemaphoreType.DMA((count,))
 
+    def staging(self, name: str, shaped) -> dict:
+        # Each operand a tile reads whole, staged in VMEM for its one role (the GPU's up to two roles'
+        # shape kept, so a template indexes it alike), its copy's DMA semaphores.
+        shaped = list(shaped)
+        return {f'{name}_smems': [pltpu.VMEM((2, *shape), gmem.dtype) for shape, gmem in shaped],
+                f'{name}_barriers': [self.load_barriers(2) for _ in shaped]}
+
+    def meeting(self, consumers: int):
+        _one(consumers)
+        return pltpu.SemaphoreType.REGULAR
+
+    def meet(self, halves) -> None:
+        raise NotImplementedError("a TPU program is one role: it meets no other")
+
+    def published(self) -> None:
+        # Its products read VMEM by its own loads: nothing to publish.
+        pass
+
     def stored(self, parts, views, *, smem, wait: bool = True) -> None:
         del wait
         for part, view in zip(parts, views, strict=True):
@@ -323,6 +380,29 @@ def _one(consumers: int, *, clustered: bool = False) -> None:
     """A TPU program is one role, and no cluster shares its blocks."""
     if consumers != 1 or clustered:
         raise NotImplementedError(f"a TPU program runs one role, not {consumers}, and no cluster")
+
+
+def _operand(operand) -> tuple[jax.Array, bool]:
+    """A product's operand as the MXU reads it: a value, or a VMEM block's (a ref, or a view of one read as
+    the transpose of its stored block, its last transform `.transpose((1, 0))`), and whether it is that
+    transpose, which the product contracts over rather than moving."""
+    if isinstance(operand, jax.Array):
+        return operand, False
+    transforms = operand.transforms if isinstance(operand, state_types.TransformedRef) else ()
+    if transforms and isinstance(transforms[-1], state_types.TransposeTransform):
+        if transforms[-1].permutation != (1, 0):
+            raise NotImplementedError(f"a TPU product reads a block or its transpose, not {transforms[-1]}")
+        return state_types.TransformedRef(operand.ref, transforms[:-1])[...], True
+    return operand[...], False
+
+
+def _product(lhs, rhs) -> jax.Array:
+    """`lhs @ rhs` in fp32 on the MXU, either operand read as the transpose of its stored block where it is
+    one (a contraction over its stored block's rows or columns, as the MXU takes it)."""
+    left, left_transposed = _operand(lhs)
+    right, right_transposed = _operand(rhs)
+    contracting = ((0 if left_transposed else 1,), (1 if right_transposed else 0,))
+    return lax.dot_general(left, right, (contracting, ((), ())), preferred_element_type=jnp.float32)
 
 
 def _unravel(flat, extents: tuple[int, ...]) -> tuple:

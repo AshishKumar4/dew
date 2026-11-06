@@ -1,7 +1,7 @@
 """The grouped GEMM template's kernels and their choice: Dew's Mosaic GPU grouped matmuls for Hopper
-(`dew.nn.kernels.templates.gemm.mosaic_gpu`), interpreted on the CPU, against float64 sums of the same
-rounded operands; the MoE dispatcher's implementations; and the cost model
-(`dew.nn.kernels.templates.cost`) on analytic launches."""
+(`dew.nn.kernels.templates.gemm.mosaic_gpu`), interpreted on the CPU, each output element held to its
+exact products (check 2's native GEMM contract, tests/native_certificates.py); the MoE dispatcher's
+implementations; and the cost model (`dew.nn.kernels.templates.cost`) on analytic launches."""
 
 import dataclasses
 import functools
@@ -11,15 +11,21 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from certified import lane
 from generation_support import INTERPRETS, interpreted_projection, lowers, runs
 from jax.sharding import Mesh
-from one_draw import assert_as_exact_as_the_reference
+from native_certificates import (
+    forward_products,
+    input_gradient_products,
+    kernel_gradient_products,
+    native_dot_holds,
+)
+from op_certificates import BFLOAT16, FLOAT16, FLOAT32
 from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 from dew.nn.moe import expert_projection
-from tools import grouped_oracle as oracle
 
 pytestmark = pytest.mark.kernel
 
@@ -49,26 +55,19 @@ def operands(sizes, dtype, seed=0):
     return x, w, dy, group
 
 
-def xla_products(x, w, dy, sizes, dtype, kernel_dtype):
-    """The portable projection's (`dew.nn.moe.expert_projection` on XLA) forward and gradients over the
-    same operands, `w` the master in `kernel_dtype`: each product summed in fp32 and rounded once."""
-    group_sizes = jnp.asarray(sizes, jnp.int32)
-    output, pullback = jax.vjp(lambda x, w: expert_projection(x, w, group_sizes, dtype, "xla", None),
-                               jnp.asarray(x, dtype), jnp.asarray(w, kernel_dtype))
-    return (output, *pullback(jnp.asarray(dy, dtype)))
-
-
 @INTERPRETS
 @pytest.mark.parametrize("sizes", list(SIZES), ids=list(SIZES))
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
 def test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla(sizes, dtype):
     """Both orientations of the forward, and the kernel gradient, interpreted on a CPU, at row blocks
-    groups share and blocks of their own: every product as exact as XLA's ragged dot from float64 sums of
-    the same rounded operands, unrouted rows and empty groups exactly zero."""
+    groups share and blocks of their own: every element a value its exact products admit summed in fp32
+    and rounded once (check 2's native GEMM contract, per element, so one draw holds every element),
+    unrouted rows and empty groups exactly zero."""
     sizes = SIZES[sizes]
     x, w, dy, group = operands(sizes, dtype)
-    truth = oracle.products(x, w, dy, sizes)
-    reference = xla_products(x, w, dy, sizes, dtype, jnp.float32)
+    fmt = FORMAT[dtype]
+    forward = forward_products(x[:sum(sizes)], w, sizes, fmt)
+    kernel_gradient = kernel_gradient_products(x, dy, sizes, fmt)
     arrays = [jnp.asarray(value, dtype) for value in (x, w, dy)]
     group_sizes = jnp.asarray(sizes, jnp.int32)
     # One warpgroup a tile at two row blocks, and two (CUTLASS's cooperative schedule; a pair of
@@ -81,24 +80,32 @@ def test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla(sizes
         matrix = jnp.swapaxes(arrays[1], 1, 2) if transpose else arrays[1]
         got = mosaic_gpu.gmm(arrays[0], matrix, group_sizes, tiles=tiles, transpose_rhs=transpose,
                              out_dtype=dtype, multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
-        check(got, reference[0], truth[0], group, f"forward {tiles} transpose={transpose}")
+        routed(got, group, forward, fmt, f"forward {tiles} transpose={transpose}")
     for tiles in (mosaic_gpu.Tiles(64, 64, 64, 2, 1, family='wgmma'),
                   mosaic_gpu.Tiles(64, 64, 128, 2, 1, family='wgmma'),
                   mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma'),
                   mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2, family='wgmma')):
         got = mosaic_gpu.tgmm(arrays[0], arrays[2], group_sizes, tiles=tiles, out_dtype=jnp.float32,
                               multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
-        check(got, reference[2], truth[2], None, f"kernel gradient {tiles}")
+        for index, products in enumerate(kernel_gradient):
+            held(got[index], products, FLOAT32, f"kernel gradient {tiles} of group {index}")
 
 
-def check(got, reference, truth, group, label):
+FORMAT = {jnp.bfloat16: BFLOAT16, jnp.float16: FLOAT16, jnp.float32: FLOAT32}
+
+
+def held(got, products, out, label):
+    """Every element of `got` a value its exact `products` admit, in `out` (`native_dot_holds`), at the
+    lane's flushing (an interpreted kernel's sums are XLA's on the CPU)."""
+    found = native_dot_holds(np.asarray(got, np.float64), products, out, lane().flushes)
+    assert np.all(found), f"{label}: {np.size(found) - np.count_nonzero(found)} elements past their products"
+
+
+def routed(got, group, products, out, label):
+    """A grouped product's routed rows held to their exact `products` (`held`), its unrouted rows zero."""
     got = np.asarray(got, np.float64)
-    if group is not None:
-        assert not np.any(got[group < 0]), f"{label}: an unrouted row is not zero"
-    if np.any(truth):
-        assert_as_exact_as_the_reference(got, np.asarray(reference, np.float64), truth, label)
-    else:
-        assert not np.any(got), f"{label}: every group is empty and the product is not zero"
+    assert not np.any(got[group < 0]), f"{label}: an unrouted row is not zero"
+    held(got[group >= 0], products, out, label)
 
 
 @INTERPRETS
@@ -107,13 +114,12 @@ def check(got, reference, truth, group, label):
                          ids=["one warpgroup", "cooperative"])
 def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out(tiles):
     """For each group, every other row (its neighbours' and the unrouted tail) holds inf in the rows and
-    NaN in the cotangent: the group's kernel gradient sums its own rows alone, finite and as exact as
-    XLA's over clean rows, one warpgroup a tile or two zeroing the stage both read (boundaries fall in
-    the first and the last row blocks)."""
+    NaN in the cotangent: the group's kernel gradient sums its own rows alone, each element a value its
+    clean rows' exact products admit, one warpgroup a tile or two zeroing the stage both read (boundaries
+    fall in the first and the last row blocks)."""
     sizes = [37, 100, 0, 40]
-    x, w, dy, group = operands(sizes, jnp.bfloat16, seed=3)
-    truth = oracle.kernel_gradient(x, dy, sizes)
-    reference = xla_products(x, w, dy, sizes, jnp.bfloat16, jnp.float32)[2]
+    x, _, dy, group = operands(sizes, jnp.bfloat16, seed=3)
+    kernel_gradient = kernel_gradient_products(x, dy, sizes)
     for kept, size in enumerate(sizes):
         if not size:
             continue
@@ -122,9 +128,7 @@ def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out(tiles):
         got = mosaic_gpu.tgmm(jnp.asarray(dirty_x, jnp.bfloat16), jnp.asarray(dirty_dy, jnp.bfloat16),
                               jnp.asarray(sizes, jnp.int32), tiles=tiles, out_dtype=jnp.float32,
                               multiprocessors=1, interpret=grouped_matmul.INTERPRETED)[kept]
-        assert np.all(np.isfinite(np.asarray(got))), f"group {kept}: a neighbour's row reached it"
-        assert_as_exact_as_the_reference(np.asarray(got, np.float64), np.asarray(reference[kept], np.float64),
-                                          truth[kept], f"kernel gradient of group {kept}")
+        held(got, kernel_gradient[kept], FLOAT32, f"kernel gradient of group {kept}")
 
 
 @lowers("sm90")
@@ -184,12 +188,11 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
                                                                                implementation: str):
     """The projection's kernels, interpreted on a CPU as the named generation runs them
     (`interpreted_projection`), each launch the
-    implementation `generation.chosen` names: its forward and both gradients as exact as XLA's, the input
-    gradient in the input's dtype and the kernel gradient in the master's."""
+    implementation `generation.chosen` names: its forward and both gradients each element a value its
+    exact products admit (check 2's native GEMM contract), the input gradient in the input's dtype and the
+    kernel gradient in the master's."""
     sizes = [0, 70, 1, 100, 0]
-    x, w, dy, _ = operands(sizes, jnp.bfloat16, seed=5)
-    forward, input_gradient, kernel_gradient = oracle.products(x, w, dy, sizes)
-    reference = xla_products(x, w, dy, sizes, jnp.bfloat16, jnp.float32)
+    x, w, dy, group = operands(sizes, jnp.bfloat16, seed=5)
     group_sizes = jnp.asarray(sizes, jnp.int32)
 
     def products(x, w):
@@ -201,10 +204,10 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
         # Mosaic's interpreter's ordered callbacks run eagerly: a jitted `linear_call` cannot carry them.
         y, dx, dw = (products if implementation == "mosaic_gpu" else jax.jit(products))(*operands_)
     assert (y.dtype, dx.dtype, dw.dtype) == (jnp.bfloat16, jnp.bfloat16, jnp.float32)
-    for label, got, theirs, truth in zip(("y", "dx", "dw"), (y, dx, dw), reference,
-                                         (forward, input_gradient, kernel_gradient), strict=True):
-        assert_as_exact_as_the_reference(np.asarray(got, np.float64), np.asarray(theirs, np.float64), truth,
-                                          label)
+    routed(y, group, forward_products(x[:sum(sizes)], w, sizes), BFLOAT16, "y")
+    routed(dx, group, input_gradient_products(dy[:sum(sizes)], w, sizes), BFLOAT16, "dx")
+    for index, held_products in enumerate(kernel_gradient_products(x, dy, sizes)):
+        held(dw[index], held_products, FLOAT32, f"dw of group {index}")
 
 
 def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
@@ -468,18 +471,17 @@ def test_a_cooperative_tile_refuses_what_its_consumers_cannot_compute(block_m, b
 @INTERPRETS
 def test_a_tile_of_192_columns_stages_every_column_it_writes():
     """A consumer stages its bf16 output in chunks of at most 128 columns that divide its tile: a 192-column
-    tile, one warpgroup or two, writes all of its columns, as exact as XLA's ragged dot from float64."""
+    tile, one warpgroup or two, writes all of its columns, each a value its exact products admit."""
     sizes = SIZES["ragged"]
-    x, w, dy, group = operands(sizes, jnp.bfloat16)
+    x, w, _, group = operands(sizes, jnp.bfloat16)
     wide = np.tile(w, (1, 1, 2))[..., :192]
-    truth = oracle.products(x, wide, np.tile(dy, (1, 2))[:, :192], sizes)
-    reference = xla_products(x, wide, np.tile(dy, (1, 2))[:, :192], sizes, jnp.bfloat16, jnp.float32)
+    forward = forward_products(x[:sum(sizes)], wide, sizes)
     for warpgroups in (1, 2):
         tiles = mosaic_gpu.Tiles(128, 192, 64, 2, 1, warpgroups=warpgroups, family='wgmma')
         got = mosaic_gpu.gmm(jnp.asarray(x, jnp.bfloat16), jnp.asarray(wide, jnp.bfloat16),
                              jnp.asarray(sizes, jnp.int32), tiles=tiles, transpose_rhs=False,
                              out_dtype=jnp.bfloat16, multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
-        check(got, reference[0], truth[0], group, f"forward {tiles}")
+        routed(got, group, forward, BFLOAT16, f"forward {tiles}")
 
 
 AMPERE_CLASS = jax.default_backend() == "cpu" or (
@@ -500,14 +502,12 @@ def ampere(generation_name: str = "sm80"):
 @pytest.mark.parametrize("sizes", [name for name in SIZES if any(SIZES[name])])
 def test_an_ampere_gpus_mosaic_and_triton_launches_are_each_as_exact_as_xla(sizes, out_dtype):
     """Without warpgroup MMA, the Mosaic GPU forward's mma.sync tile (`mosaic_gpu.derived`) and Triton's
-    launch, each named: as exact as XLA's ragged dot rounded to its output dtype from float64, unrouted
-    rows and empty groups included."""
-    x, w, dy, group = operands(SIZES[sizes], jnp.bfloat16)
-    truth = oracle.products(x, w, dy, SIZES[sizes])
+    launch, each named: every routed element a value its exact products admit, rounded once to its output
+    dtype, unrouted rows zero."""
+    x, w, _, group = operands(SIZES[sizes], jnp.bfloat16)
+    products = forward_products(x[:sum(SIZES[sizes])], w, SIZES[sizes])
     group_sizes = jnp.asarray(SIZES[sizes], jnp.int32)
     lhs, rhs = jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.bfloat16)
-    reference = grouped_matmul.xla_ragged_dot(lhs, rhs, group_sizes,
-                                              preferred_element_type=jnp.float32).astype(out_dtype)
 
     def forward(x, w):
         # The default precision: the suite's highest asks each step's sum apart, which mma.sync's tiles do
@@ -519,7 +519,8 @@ def test_an_ampere_gpus_mosaic_and_triton_launches_are_each_as_exact_as_xla(size
         with ampere(), generation.chosen(grouped_matmul=named):
             got = jax.jit(forward)(lhs, rhs)
         assert got.dtype == out_dtype
-        check(got, reference, truth[0], group, f"sm80 forward through {named} to {jnp.dtype(out_dtype)}")
+        routed(got, group, products, FORMAT[out_dtype],
+               f"sm80 forward through {named} to {jnp.dtype(out_dtype)}")
 
 
 @pytest.mark.skipif(not AMPERE_CLASS, reason="no mma.sync kernel this GPU and JAX lower")

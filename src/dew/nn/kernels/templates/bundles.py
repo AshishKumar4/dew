@@ -15,7 +15,7 @@ import dataclasses
 import jax.numpy as jnp
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import mosaic, mosaic_sm80, mosaic_sm90, mosaic_sm100
+from dew.nn.kernels.templates import mosaic, mosaic_sm80, mosaic_sm90, mosaic_sm100, mosaic_tpu
 
 INTERPRETED = mosaic_sm90.WGMMA
 """The bundle Mosaic GPU's interpreter runs a template's mainloop by off a GPU of a family a bundle claims (a
@@ -89,7 +89,7 @@ def named(name: str, dtype) -> mosaic.Family:
     for composed in (mosaic_sm80.Mma, MmaFed):
         if composed.name == name:
             return composed(jnp.dtype(dtype))
-    for bundle in (mosaic_sm90.WGMMA, mosaic_sm90.FED, mosaic_sm100.RINGS):
+    for bundle in (mosaic_sm90.WGMMA, mosaic_sm90.FED, mosaic_sm100.RINGS, mosaic_tpu.MXU):
         if bundle.name == name:
             return bundle
     raise ValueError(f"no Mosaic GPU bundle is named {name!r}")

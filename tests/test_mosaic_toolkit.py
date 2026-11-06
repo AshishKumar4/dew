@@ -735,6 +735,55 @@ def test_the_tpu_persistent_walk_lowers_for_a_v5e():
             lowering_platforms=("tpu",))
 
 
+def _gemm_on_a_tpu_core():
+    """The GEMM template's kernel bodies on a TPU core's bundle (`mosaic_tpu.MXU`), each `(call, operands,
+    expected)` at small integers, so each product is exact in fp32: a dense forward with a bias epilogue,
+    the grouped forward (three groups, one empty, rows past the routed ones zero) with its matrices stored
+    as they come and transposed, and the grouped kernel gradient."""
+    from dew.nn.kernels.templates.gemm import mosaic_gpu
+
+    rows, depth, width = 384, 512, 256
+    tiles = mosaic_gpu.Tiles(128, 128, 128, 2, 1, family="mxu")
+    keys = jax.random.split(jax.random.key(4), 4)
+    x = jax.random.randint(keys[0], (rows, depth), -3, 4).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[1], (3, depth, width), -3, 4).astype(jnp.bfloat16)
+    dy = jax.random.randint(keys[2], (rows, width), -3, 4).astype(jnp.bfloat16)
+    bias = jax.random.randint(keys[3], (width,), -3, 4).astype(jnp.float32)
+    sizes = jnp.asarray([100, 0, 250], jnp.int32)
+    xf, wf, dyf = (np.asarray(each, np.float32) for each in (x, w, dy))
+    unrouted = np.zeros((rows - 350, width), np.float32)
+    routed = np.concatenate([xf[:100] @ wf[0], xf[100:350] @ wf[2], unrouted])
+    grouped = functools.partial(mosaic_gpu.gmm, tiles=tiles, out_dtype=jnp.float32, multiprocessors=2)
+    return {
+        "dense bias": (functools.partial(mosaic_gpu.gmm, tiles=tiles, transpose_rhs=False,
+                                         out_dtype=jnp.float32, multiprocessors=1, dense=True,
+                                         epilogue=lambda acc, b: acc + b[None, :], epilogue_operands=(bias,),
+                                         epilogue_axes=(("columns",),)),
+                       (x, w[:1], None), xf @ wf[0] + np.asarray(bias)[None, :]),
+        "grouped": (functools.partial(grouped, transpose_rhs=False), (x, w, sizes), routed),
+        "grouped transposed": (functools.partial(grouped, transpose_rhs=True),
+                               (x, jnp.swapaxes(w, 1, 2), sizes), routed),
+        "kernel gradient": (functools.partial(mosaic_gpu.tgmm, tiles=tiles, out_dtype=jnp.float32,
+                                              multiprocessors=2), (x, dy, sizes),
+                            np.stack([xf[:100].T @ dyf[:100], np.zeros((depth, width), np.float32),
+                                      xf[100:350].T @ dyf[100:350]])),
+    }
+
+
+@pytest.mark.parametrize("case", ["dense bias", "grouped", "grouped transposed", "kernel gradient"])
+def test_the_gemms_kernel_bodies_run_on_a_tpu_core(case):
+    """Interpreted on any host, each of the GEMM template's kernel bodies on a TPU core's bundle gives its
+    product exactly, and it lowers for a TPU v5e, its devices abstract."""
+    from jax.sharding import AbstractDevice, AbstractMesh
+
+    call, operands, expected = _gemm_on_a_tpu_core()[case]
+    np.testing.assert_array_equal(np.asarray(call(*operands, interpret=True)), expected)
+    abstract = [None if each is None else jax.ShapeDtypeStruct(each.shape, each.dtype) for each in operands]
+    device = AbstractDevice(device_kind=generation.TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
+    with jax.sharding.use_abstract_mesh(AbstractMesh((1,), ("data",), abstract_device=device)):
+        jax.jit(call).trace(*abstract).lower(lowering_platforms=("tpu",))
+
+
 def test_a_consumer_launched_at_each_residency_its_family_admits_raises_to_the_gates_cap_spill_free():
     """A persistent warpgroup-MMA walk, one consumer beside its producer, launched at each residency its
     family admits a multiprocessor on an H100 (`RegisterModel.most`) and compiled as the GPU gate compiles
