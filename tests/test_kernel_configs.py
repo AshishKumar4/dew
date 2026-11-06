@@ -509,8 +509,8 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                                         programs=programs, cluster=config.cluster if consumers > 1 else 1)
                               for rows_ in shares for programs in residencies
                               for stages in range(config.stages, 1, -1))
-                    tile = next((tile for tile in staged if tile is not None and launch.legal(ba, tile, target)),
-                                None)
+                    tile = next((tile for tile in staged
+                                 if tile is not None and launch.legal(ba, tile, target)), None)
                     if tile is not None:
                         configs[f"{name} x{consumers} {tile}"] = tile
             kernel = "dew_tgmm" if isinstance(launch, grouped_matmul.MosaicTgmm) else "dew_gmm"
@@ -656,13 +656,23 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
 
 
 @functools.cache
+@functools.cache
+def _contract_cases(generation_name: str) -> list:
+    """Each launch form at each consumer count of a family's contract (`_gemm_mainloop_cases(
+    every_consumer_count=True)`), at the first projection whose rows give it a legal tile (two consumers'
+    rows past a few rows a MoE expert takes, mma.sync's)."""
+    found: dict = {}
+    for shape in GEMM_SHAPES:
+        for case in _gemm_mainloop_cases(generation_name, shape, every_consumer_count=True):
+            found.setdefault(case.name.split(" Tiles(")[0], case)
+    return list(found.values())
+
+
 def _family_cases(generation_name: str) -> list:
-    """The family contract's cases (`_gemm_mainloop_cases(every_consumer_count=True)` at the first
-    projection) the compile gate does not already hold (`_gate_cases`)."""
+    """The family contract's cases (`_contract_cases`) the compile gate does not already hold
+    (`_gate_cases`)."""
     held = {_kernel_of(case.name) for case in _gate_cases(generation_name)}
-    return [case for case in _gemm_mainloop_cases(generation_name, next(iter(GEMM_SHAPES)),
-                                                  every_consumer_count=True)
-            if _kernel_of(case.name) not in held]
+    return [case for case in _contract_cases(generation_name) if _kernel_of(case.name) not in held]
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
@@ -670,10 +680,10 @@ def test_each_family_emits_every_launch_form_at_each_consumer_count(generation_n
     """The whole contract a Mosaic GPU Family bundle offers its templates is present: every launch form it
     emits (`_emitted_forms`: plain and transposed right operands, 16-bit and fp32 stores, fixed and streamed
     side vectors and tiles, several outputs, the running sum) at one consumer and at the family's most
-    (`_gemm_mainloop_cases(every_consumer_count=True)`)."""
+    (`_contract_cases`)."""
     family = bundles.of(generation_name, jnp.bfloat16)
     assert family is not None
-    cases = _gemm_mainloop_cases(generation_name, next(iter(GEMM_SHAPES)), every_consumer_count=True)
+    cases = _contract_cases(generation_name)
     counts = sorted({1, family.consumers})
     expected = {f"{form} x{count}" for form in _emitted_forms(family) for count in counts}
     got = {case.name.split(" Tiles(")[0] for case in cases}
