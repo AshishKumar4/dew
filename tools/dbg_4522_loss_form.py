@@ -19,6 +19,19 @@ from dew.nn.categorical import label_terms
 from reference_error import with_gradients, widened
 
 
+def direct_loss(logits, targets, variant):
+    if variant == "batch-wide":
+        with jax.enable_x64(True):
+            return label_terms(logits.astype(jnp.float64), targets)[0].astype(logits.dtype)
+    if variant == "batch-log1p":
+        peak = jax.lax.stop_gradient(jnp.max(logits, axis=-1, keepdims=True))
+        label = jax.nn.one_hot(targets, logits.shape[-1], dtype=bool)
+        rest = jnp.sum(jnp.where(label, 0, jnp.exp(logits - peak)), axis=-1)
+        own = jnp.take_along_axis(logits, targets[:, None], axis=-1)[:, 0]
+        return jnp.where(own == peak[:, 0], jnp.log1p(rest), label_terms(logits, targets)[0])
+    return label_terms(logits, targets)[0]
+
+
 def make(kind, variant):
     def one(variables, hidden, targets, weights, ids):
         def loss(variables, hidden):
@@ -39,7 +52,7 @@ def make(kind, variant):
                 logits = t.MODEL.apply(
                     variables, t.MODEL.apply(variables, hidden[None], method="continuum_states"),
                     method="head_logits")[0]
-                losses = (label_terms(logits, targets)[0] if variant == "batch-categorical" else
+                losses = (direct_loss(logits, targets, variant) if variant != "batch-logsoftmax" else
                           -jnp.take_along_axis(jax.nn.log_softmax(logits), targets[:, None],
                                               axis=-1)[:, 0])
             return jnp.sum(weights * losses)
@@ -49,7 +62,8 @@ def make(kind, variant):
 
 kind = sys.argv[1] if len(sys.argv) > 1 else "documents"
 count = int(sys.argv[2]) if len(sys.argv) > 2 else 256
-variants = ("literal", "token-categorical", "batch-categorical", "batch-logsoftmax")
+variants = ("literal", "token-categorical", "batch-categorical", "batch-logsoftmax", "batch-wide",
+            "batch-log1p")
 programs = {(variant, mode): jax.jit(make(kind, variant), compiler_options=(
     {} if mode == "on" else {"xla_cpu_experimental_ynn_fusion_type": ""}))
     for variant in variants for mode in ("on", "off")}
