@@ -5,7 +5,8 @@
     "setup": "tools/armada/setup.sh",
     "install": "tools/armada/install.sh",
     "key": ["locks/cpu.txt", "tools/install_environment.sh", "tools/armada/install.sh",
-            "tools/armada/compiled.sh", "tests/fixtures/**/*.fetched.json"],
+            "tools/armada/compiled.sh", "tools/fetched_fixtures.py", ".python-version",
+            "tests/fixtures/**/*.fetched.json"],
     "smoke": ".venv-3.12/bin/python -c 'import dew' && .venv-3.14/bin/python -c 'import dew'"
   },
   "history": "full",
