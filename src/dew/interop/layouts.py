@@ -562,6 +562,9 @@ class Restated[Model]:
     fixed: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
     defaults: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
     """Shared keys at the class's own default where the config states none."""
+    undeclared: frozenset[str] = frozenset()
+    """Shared keys the family's class declares none of: read where a config states them, written as
+    nothing."""
 
     def read(self, hf_config: Mapping[str, object], used: set[str],
              record: NativeFields[Model]) -> NativeFields[Model]:
@@ -577,7 +580,7 @@ class Restated[Model]:
 
     def write(self, model: Model) -> Mapping[str, object]:
         return {self.keys.get(key, key): value for key, value in self.layout.write(model).items()
-                if key not in self.fixed}
+                if key not in self.fixed and key not in self.undeclared}
 
 
 @dataclass(frozen=True, eq=False)

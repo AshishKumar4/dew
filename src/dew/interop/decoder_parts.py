@@ -129,6 +129,30 @@ def fixed_attention_buffer(name: str, tensor: Stored, attention: str,
     return False
 
 
+def ungated(key: str, accepted: tuple[str, ...], family: str, *, default: str = 'gelu_new',
+            tanh: str = 'gelu_new', spelled: Mapping[str, str] | None = None
+            ) -> ConfigPart[CausalTransformer]:
+    """A classic family's ungated MLP activation under `key`, both ways (`ungated_mlp`, `hf_ungated`): the
+    names its reference reads (`accepted`, `default` where unstated), each an own spelling of transformers'
+    where `spelled` maps them (GPT-1's `afn` 'gelu' is OpenAI's tanh GELU), its tanh GELU written as
+    `tanh`."""
+    spelled = spelled or {}
+    back = {ours: own for own, ours in spelled.items()}
+
+    def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+        used.add(key)
+        stated = _records.text(hf_config.get(key, default) or default, key)
+        if spelled and stated not in spelled:
+            refuse(f'{key}={stated!r}', f"{family}'s MLP reads only {sorted(spelled)}")
+        record['mlp'] = ungated_mlp(spelled.get(stated, stated), accepted, key, family)
+        return record
+
+    def write(model: CausalTransformer) -> Mapping[str, object]:
+        name = hf_ungated(model.mlp, family, tanh=tanh)
+        return {key: back.get(name, name) if spelled else name}
+    return ConfigPart(read, write)
+
+
 def hf_ungated(mlp: GatedActivation | None, family: str, tanh: str = 'gelu_new') -> str:
     """The activation a classic `family`'s config names Dew's ungated `mlp`
     by, its tanh GELU spelled `tanh`; any other `mlp` is refused."""
@@ -977,12 +1001,15 @@ class DecoderSpelling:
     keys: Mapping[str, str] = dataclasses.field(default_factory=lambda: MappingProxyType({}))
     """The family's own keys for the shared geometry's (`Restated`: Qwen3.5-MoE's dense width is its
     experts', `moe_intermediate_size`)."""
-    activation: str = 'hidden_act'
-    """The key the class reads its activation under (Gemma 2's and later's `hidden_activation`)."""
+    activation: str | None = 'hidden_act'
+    """The key the class reads its gated activation under (Gemma 2's and later's `hidden_activation`);
+    None for a family with an ungated MLP, which declares its activation itself (`ungated`)."""
     fixed: Mapping[str, object] = dataclasses.field(default_factory=lambda: MappingProxyType({}))
     """Shared geometry the class fixes and states nowhere (`Restated`)."""
     defaults: Mapping[str, object] = dataclasses.field(default_factory=lambda: MappingProxyType({}))
     """The shared geometry's defaults where the class's differ from the shared reader's (`Restated`)."""
+    undeclared: frozenset[str] = frozenset()
+    """Shared keys the class declares none of, written as nothing (`Restated`)."""
     ramps: tuple[str, ...] | None = None
     tie_embeddings: bool = False
     qk_norm: bool = False
@@ -1191,10 +1218,12 @@ def decoder_layout(spelling: DecoderSpelling = PLAIN_DECODER, *,
     `rope_part` where None: a family that reads its rotary otherwise, a partial one, declares its own),
     the biases and tying its class declares, and what its reference fixes."""
     reads = spelling.reads
-    geometry = (DECODER_FIELDS if not spelling.keys and not spelling.fixed and not spelling.defaults
-                else Restated(DECODER_FIELDS, spelling.keys, spelling.fixed, spelling.defaults))
+    restated = spelling.keys or spelling.fixed or spelling.defaults or spelling.undeclared
+    geometry = (Restated(DECODER_FIELDS, spelling.keys, spelling.fixed, spelling.defaults,
+                         spelling.undeclared) if restated else DECODER_FIELDS)
     return ConfigLayout(
-        geometry, activation_part(spelling.activation), _layer_kinds(spelling),
+        geometry, *(() if spelling.activation is None else (activation_part(spelling.activation),)),
+        _layer_kinds(spelling),
         rope_part(spelling.rope, ramps=spelling.ramps) if rope is None else rope,
         *(_flag(name, name, default=False) if name in reads else constant(name, value=False)
           for name in ('attention_bias', 'mlp_bias')),

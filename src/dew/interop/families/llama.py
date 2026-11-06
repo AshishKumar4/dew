@@ -1,10 +1,11 @@
 """Translate Llama, Mistral and Mixtral, the dense block the other families vary.
 
-Llama's own config is the shared decoder's layout (`decoder_layout`) over the
-fields LlamaConfig declares, so what stands here is only what the variants add
-to it, each read and written by one declaration. Mistral adds a sliding window on every layer and drops the attention
-biases. Ministral names a pattern of sliding and full layers. Mixtral adds a
-softmax-routed feed-forward and the expert tensor names that routing brings.
+Llama's own config is the shared decoder's layout (`decoder_layout`) over
+the fields LlamaConfig declares, so what stands here is only what the
+variants add to it, each read and written by one declaration. Mistral adds a
+sliding window on every layer and drops the attention biases. Ministral names
+a pattern of sliding and full layers. Mixtral adds a softmax-routed
+feed-forward and the expert tensor names that routing brings.
 """
 
 from __future__ import annotations

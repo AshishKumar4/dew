@@ -19,12 +19,11 @@ from dew.interop.decoder_parts import (
     constant,
     fixed_attention_buffer,
     flag,
-    hf_ungated,
     inert,
     integer,
     refuse,
     spelled,
-    ungated_mlp,
+    ungated,
 )
 from dew.interop.layouts import (
     ConfigField,
@@ -41,29 +40,6 @@ from dew.interop.layouts import (
 from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
-
-
-def ungated_activation(key: str, accepted: tuple[str, ...], family: str,
-                       spelled: Mapping[str, str] | None = None, default: str = 'gelu_new',
-                       tanh: str = 'gelu_new') -> ConfigPart[CausalTransformer]:
-    """A classic family's ungated MLP activation under `key`, both ways (`ungated_mlp`, `hf_ungated`), the
-    names its reference reads (`accepted`), each an own spelling of transformers' where `spelled` maps
-    them (GPT-1's `afn` 'gelu' is OpenAI's tanh GELU), its tanh GELU written as `tanh`."""
-    spelled = spelled or {}
-    back = {ours: own for own, ours in spelled.items()}
-
-    def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
-        used.add(key)
-        stated = _records.text(hf_config.get(key, default), key)
-        if spelled and stated not in spelled:
-            refuse(f'{key}={stated!r}', f"{family}'s MLP reads only {sorted(spelled)}")
-        record['mlp'] = ungated_mlp(spelled.get(stated, stated), accepted, key, family)
-        return record
-
-    def write(model: CausalTransformer) -> Mapping[str, object]:
-        name = hf_ungated(model.mlp, family, tanh=tanh)
-        return {key: back.get(name, name) if spelled else name}
-    return ConfigPart(read, write)
 
 
 def _heads(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
@@ -122,7 +98,7 @@ def gpt2_layout(activation: ConfigPart[CausalTransformer]) -> ConfigLayout[Causa
                'summary_first_dropout', 'use_cache', 'task_specific_params'))
 
 
-GPT2_CONFIG = gpt2_layout(ungated_activation(
+GPT2_CONFIG = gpt2_layout(ungated(
     'activation_function', ('gelu_new', 'gelu_fast', 'gelu_pytorch_tanh', 'gelu', 'relu'), 'GPT-2'))
 """GPT-2's config, both ways."""
 
@@ -318,7 +294,7 @@ GPTJ = DecoderFamily(
 OPENAI_GPT_CONFIG = ConfigLayout(
     # GPT-1's blocks always scale by the head width and read none of GPT-2's other attention switches
     # (modeling_openai.py builds each Block with scale=True), whatever a config carries.
-    Restated(gpt2_layout(ungated_activation('afn', ('gelu_new', 'relu'), 'GPT-1',
+    Restated(gpt2_layout(ungated('afn', ('gelu_new', 'relu'), 'GPT-1',
                                             spelled={'gelu': 'gelu_new', 'relu': 'relu'}, default='gelu')),
              fixed={'n_inner': None, 'scale_attn_weights': True, 'scale_attn_by_inverse_layer_idx': False,
                     'reorder_and_upcast_attn': False, 'add_cross_attention': False},

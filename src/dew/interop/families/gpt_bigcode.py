@@ -4,8 +4,8 @@ queries, keys and values fused in one `c_attn`, multi-query by default."""
 from collections.abc import Mapping
 
 from dew import _records
-from dew.interop.decoder_parts import DecoderFamily, DecoderFields, grouped_qkv, refuse, spelled
-from dew.interop.families.gpt2 import GPT2_NAMES, gpt2_layout, ungated_activation
+from dew.interop.decoder_parts import DecoderFamily, DecoderFields, grouped_qkv, refuse, spelled, ungated
+from dew.interop.families.gpt2 import GPT2_NAMES, gpt2_layout
 from dew.interop.layouts import ConfigLayout, ConfigPart, unread
 
 
@@ -22,7 +22,7 @@ def _multi_query(hf_config: Mapping[str, object], used: set[str], record: Decode
 
 
 GPT_BIGCODE_CONFIG = ConfigLayout(
-    gpt2_layout(ungated_activation('activation_function',
+    gpt2_layout(ungated('activation_function',
                                    ('gelu_new', 'gelu_fast', 'gelu_pytorch_tanh', 'gelu', 'relu'),
                                    'GPTBigCode', tanh='gelu_pytorch_tanh')),
     ConfigPart(_multi_query, lambda model: {'multi_query': model.kv_heads == 1}),
