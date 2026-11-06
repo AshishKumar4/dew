@@ -176,7 +176,7 @@ class CallVisibility(NamedTuple):
 
 
 def call_visibility(metadata: AttentionMetadata, rotary_positions, *, batch: int, queries: int, keys: int,
-                    key_places, sliding_window: int | None) -> CallVisibility | None:
+                    key_places, sliding_window: int | None, cached: bool = False) -> CallVisibility | None:
     """A call's own visibility, None where it states none: its pairwise mask
     (`AttentionMetadata.pairwise_mask`), a windowed layer keeping each query to the keys within its
     window of the query's rotary position where the call gives the keys' positions; else its key runs
@@ -185,7 +185,7 @@ def call_visibility(metadata: AttentionMetadata, rotary_positions, *, batch: int
     positions, the window searched within each run (`template.spans`); a tree call's runs
     (`AttentionMetadata.tree_parents`), which it must carry. Its keys' validity
     (`AttentionMetadata.key_valid`) hides the keys it marks out from every query. `key_places` are where
-    the keys are read otherwise."""
+    the keys are read otherwise; a `cached` call's queries are not its keys."""
     if metadata.tree_parents is not None and metadata.key_runs is None:
         raise ValueError("a tree call's attention is masked by its key runs, each token's cache and "
                          "ancestors (attention_key_runs)")
@@ -223,8 +223,7 @@ def call_visibility(metadata: AttentionMetadata, rotary_positions, *, batch: int
     window = None if key_positions is None else sliding_window
     key_places = key_places if key_positions is None else key_positions
     # A cached call's queries are not its keys: they are read at their rotary positions.
-    query_places = (None if keys == queries
-                    else jnp.broadcast_to(jnp.asarray(rotary_positions), (batch, queries)))
+    query_places = jnp.broadcast_to(jnp.asarray(rotary_positions), (batch, queries)) if cached else None
     return CallVisibility(None, runs, window, key_places, query_places, valid)
 
 
@@ -1227,15 +1226,23 @@ class CausalSelfAttention(nn.Module):
             mask, runs, window, key_places, query_places, valid = own
             causal, documents, groups = False, None, _Groups()
         if self.ctx.attention_chunk is not None:
-            mask = dense_visibility(mask, documents, causal, window, valid, runs, places, key_places, S,
-                                    key.shape[-3], self.ctx.attention_chunk, block_groups=groups.block_groups,
-                                    image_groups=groups.image_groups)
+            counted = places if query_places is None else query_places
+            mask = self._chunked(mask, documents, causal, window, valid, runs, groups, counted, key_places, S,
+                                 key.shape[-3])
             causal, window, documents, groups, valid, runs = False, None, None, _Groups(), None, None
             implementation = masked()
         max_segments = (None if documents is None else 1 if isinstance(documents, CrossDocuments)
                         else coordinates_of(attention_metadata, B, S).max_segments)
         return _Masking(query, key, value, causal, window, mask, documents, max_segments, implementation,
                         cursor, starts, key_places, groups, valid, runs, query_places)
+
+    def _chunked(self, mask, documents, causal, window, valid, runs, groups: _Groups, places, key_places,
+                 queries: int, keys: int):
+        """A chunked layer's visibility as one mask (`dense_visibility`): the call's, each of its `queries`
+        and `keys` in the chunk of its place, the queries' `places` and the keys' `key_places`."""
+        return dense_visibility(mask, documents, causal, window, valid, runs, places, key_places, queries,
+                                keys, self.ctx.attention_chunk, block_groups=groups.block_groups,
+                                image_groups=groups.image_groups)
 
     def _selected(self, masking: _Masking, x, rotary_positions, places, append, decode: bool) -> _Masking:
         """`masking` reading each query's keys QSA picks among those it sees (`dew.nn.qsa`), as one mask.
@@ -1285,7 +1292,7 @@ class CausalSelfAttention(nn.Module):
         call's runs the one the layer chooses ('auto')."""
         own = None if metadata is None else call_visibility(
             metadata, rotary_positions, batch=B, queries=S, keys=keys, key_places=key_places,
-            sliding_window=self.ctx.sliding_window)
+            sliding_window=self.ctx.sliding_window, cached=decode)
         if own is not None and (own.mask is not None or decode or self.ctx.attention_impl != 'auto'):
             implementation = masked()
         return own, implementation

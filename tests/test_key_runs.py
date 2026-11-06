@@ -122,7 +122,8 @@ PROMPT, CALL = 6, 4
 def test_a_cached_call_reads_its_runs_and_its_keys_validity_as_the_mask_they_mean(kinds):
     """A cached call's key runs, the prompt's keys in the cache and the call's own, whose key positions
     restart between the two runs, beside its keys' validity with a gap inside each run, computes what it
-    computes under the mask the runs and the validity mean, bitwise on the one kernel (xla's), a windowed
+    computes under the mask the runs and the validity mean, as a pairwise mask beside that validity does,
+    bitwise on the one kernel (xla's), a windowed
     layer windowing each run over its own positions from the queries' (Block-SFT's denoising pass, row
     1538). A layer naming the template traces it on an A100, where the template refuses a mask by its
     inherent limit: the call builds none."""
@@ -155,6 +156,10 @@ def test_a_cached_call_reads_its_runs_and_its_keys_validity_as_the_mask_they_mea
     spanned = {"attention_key_runs": runs, "attention_key_valid": jnp.asarray(valid)}
     masked = read(decoder, attention_pairwise_mask=jnp.asarray(seen))
     np.testing.assert_array_equal(np.asarray(read(decoder, **spanned)), np.asarray(masked))
+    # A pairwise mask takes the keys' validity too.
+    paired = read(decoder, attention_pairwise_mask=jnp.asarray(dense(np.asarray(runs), slots)),
+                  attention_key_valid=jnp.asarray(valid))
+    np.testing.assert_array_equal(np.asarray(paired), np.asarray(masked))
     template = decoder.clone(dtype=jnp.bfloat16, attention_impl="template")
     with generation.assumed("sm80"):
         jax.eval_shape(lambda: read(template, **spanned))

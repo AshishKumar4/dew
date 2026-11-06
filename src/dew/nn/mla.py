@@ -935,7 +935,7 @@ class MultiHeadLatentAttention(LinearProducts):
         turned = jnp.broadcast_to(turned, shape)
         slots = jnp.broadcast_to(jnp.arange(total), (batch, total))
         own = call_visibility(metadata, turned, batch=batch, queries=length, keys=total, key_places=slots,
-                              sliding_window=self.sliding_window)
+                              sliding_window=self.sliding_window, cached=True)
         if own is None:
             return None
         mask, runs, window, key_places = own.mask, own.runs, own.window, own.key_places
