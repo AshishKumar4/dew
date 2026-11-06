@@ -106,22 +106,12 @@ def _laid(model, layout):
     return model.clone(text=model.text.with_kv_cache(layout))
 
 
-def test_a_canvas_over_a_paged_cache_matches_reference(system):
-    """A canvas whose encoder prefix sits in a paged cache reads it as a dense one does: its bare logits
-    held to the reference as `test_native_shared_model_forward_matches_reference` holds them (ledger
-    838)."""
-    model, variables, _, reference, _ = system
-    model = _laid(model, KVCache(page_size=4))
-    cache = prefill(model, variables, reference["prompt"])
-    bare = model.apply({**variables, "cache": cache}, reference["canvas"])
-    assert_as_exact_as_the_reference(bare, reference["bare"], reference["bare_f64"], "bare, paged")
-
-
-@pytest.mark.parametrize("quantized", ["int8", "float8_e4m3fn"])
-def test_a_canvas_over_a_quantized_cache_reads_it_alike_paged_or_dense(system, quantized):
-    """A canvas whose encoder prefix sits in a quantized cache (int8's keys stored rotated, its queries and
-    keys taken into the rotation) reads the same logits whether the cache is paged or dense: the stored
-    codes and scales are the same, only their places differ (ledger 838)."""
+@pytest.mark.parametrize("quantized", [None, "int8", "float8_e4m3fn"])
+def test_a_canvas_reads_its_cache_alike_paged_or_dense(system, quantized):
+    """A canvas whose encoder prefix sits in a paged cache, full precision or quantized (int8's keys stored
+    rotated, its queries and keys taken into the rotation), reads the same logits as over the dense cache of
+    the same layout, which `test_native_shared_model_forward_matches_reference` holds to the reference: the
+    stored values, codes and scales are the same, only their places differ (ledger 838)."""
     model, variables, _, reference, _ = system
 
     def logits(layout):
