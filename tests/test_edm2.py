@@ -21,7 +21,7 @@ from tool_support import run_from
 
 from dew.nn.backbones.edm2 import EDM2UNet
 from dew.nn.dit import TextContext
-from dew.nn.mp import MPConv, forced_weight_normalization, normalize
+from dew.nn.mp import MP_KERNEL, MPConv, forced_weight_normalization, normalize
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "edm2" / "seeds.npz"
 
@@ -224,3 +224,46 @@ def test_the_uncertainty_head_learns_each_levels_weighted_error():
             {"params": head, "constants": params["constants"][UNCERTAINTY]},
             schedule.model_time(times[:1]))[0]
         assert float(jnp.mean(jnp.asarray(errors)) * jnp.exp(-u)) == pytest.approx(0.5, rel=0.15)
+
+
+def test_edm2s_output_head_sums_in_the_runs_output_dtype():
+    """EDM2's final projection multiplies its bf16 compute's operands and sums them in the run's output
+    dtype, float32 by default, returning it (`MPConv`'s `out_dtype`, its convolution and its dense branch
+    alike), where sums in bf16 cast afterwards would round each one: within a float32 sum's distance of the
+    float64 sums of the same operands, far inside the bf16 sums'. A model of bf16 compute returns float32,
+    its time embedding in bf16 as every block it conditions reads it; one of no dtype computing in float64
+    returns float64."""
+    def sums(kernel_size: tuple[int, ...], x: jax.Array):
+        conv = MPConv(8, kernel_size)
+        params = conv.init(jax.random.key(1), x)
+        wide = conv.apply(params, x, 1.0, out_dtype=jnp.float32)
+        narrow = conv.apply(params, x, 1.0)
+        weight = normalize(params["params"][MP_KERNEL].astype(jnp.float32), compensated=True)
+        weight = (weight / np.sqrt(np.prod(params["params"][MP_KERNEL].shape[:-1]))).astype(x.dtype)
+        operands = x.astype(jnp.float64), weight.astype(jnp.float64)
+        if kernel_size:
+            truth = jax.lax.conv_general_dilated(*operands, (1, 1), "SAME",
+                                                 dimension_numbers=("NHWC", "HWIO", "NHWC"))
+        else:
+            truth = operands[0] @ operands[1]
+        return wide, narrow, truth
+
+    x = jnp.asarray(np.random.default_rng(3).normal(size=(2, 8, 8, 64)), jnp.bfloat16)
+    for kernel_size, operands in (((3, 3), x), ((), x.reshape(-1, 64))):
+        wide, narrow, truth = sums(kernel_size, operands)
+        assert wide.dtype == jnp.float32 and narrow.dtype == jnp.bfloat16
+        error = np.max(np.abs(np.asarray(wide, np.float64) - truth))
+        assert error < np.max(np.abs(np.asarray(narrow, np.float64) - truth)) / 16, kernel_size
+
+    model = EDM2UNet(output_channels=4, model_channels=16, channel_mult=(1,), num_blocks=1,
+                     attn_resolutions=(), channels_per_head=16, dtype=jnp.bfloat16)
+    images, time = jnp.ones((1, 8, 8, 4), jnp.float32), jnp.ones((1,), jnp.float32)
+    params = model.init(jax.random.key(0), images, time)
+    params = {**params, "params": {**params["params"], "out_gain": jnp.ones(())}}
+    out, held = model.apply(params, images, time, capture_intermediates=True, mutable=["intermediates"])
+    assert out.dtype == jnp.float32 and bool(jnp.any(out != 0))
+    assert held["intermediates"]["emb_noise"]["__call__"][0].dtype == jnp.bfloat16
+    with jax.enable_x64(new_val=True):
+        widened = jax.tree.map(lambda leaf: leaf.astype(jnp.float64), params)
+        out = model.clone(dtype=None).apply(widened, images.astype(jnp.float64), time.astype(jnp.float64))
+        assert out.dtype == jnp.float64
