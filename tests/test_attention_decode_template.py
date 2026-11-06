@@ -275,14 +275,16 @@ def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, pa
 
 
 
-QUANTIZED = [("sm90", "dense"), ("sm90", 16), ("sm80", "dense"), ("sm80", 128)]
-"""The quantized decode's devices and layouts: dense, and pages of 16 keys several to a key tile on an H100
-(an A100's copies load a step's tile whole, `Transport.copies_in_pieces`), of whole key tiles on an A100."""
+QUANTIZED = [(device, page, stored) for stored in ("int8", "float8_e4m3fn")
+             for device, page in (("sm90", "dense"), ("sm90", 16), ("sm80", "dense"), ("sm80", 128))
+             if stored == "int8" or device == "sm90"]
+"""The quantized decode's devices, layouts and codes: dense, and pages of 16 keys several to a key tile on an
+H100 (an A100's copies load a step's tile whole, `Transport.copies_in_pieces`), of whole key tiles on an
+A100; FP8 codes where the device converts them (`mosaic.converts`, sm_89 on)."""
 
 
 @INTERPRETS
-@pytest.mark.parametrize(("device", "page"), QUANTIZED)
-@pytest.mark.parametrize("stored", ["int8", "float8_e4m3fn"])
+@pytest.mark.parametrize(("device", "page", "stored"), QUANTIZED)
 def test_a_decode_step_over_a_quantized_cache_is_on_par_interpreted(device, page, stored):
     """A decode step over a quantized cache (`dew.nn.kv_cache.quantize`: codes a token and head, each with its
     fp32 scale), its codes read and dequantized in the walk (`attention_decode.attend`'s `scales`, ledger

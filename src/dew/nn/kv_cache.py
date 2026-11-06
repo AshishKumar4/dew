@@ -786,9 +786,9 @@ class PagedCase:
     """A decode step over a paged pool as the paged selector reads it (`PAGED`, `KVStore.case`): the
     query's `heads` over the pool's `kv_heads`, `head_dim` wide with values `value_dim` wide; the
     query's `dtype` and the `pool`'s; its `page_size` (None for a compact cache), the format it is
-    `quantized` in (None for none), its `groups`; how many ways a mesh splits the query heads (`head_shards`); the layer's
-    `softcap`; whether its arithmetic is the reference path's alone (`arithmetic`); the
-    `AttentionImpl` it `named`; whether it reads each row from its window's first key
+    `quantized` in (None for none), its `groups`; how many ways a mesh splits the query heads
+    (`head_shards`); the layer's `softcap`; whether its arithmetic is the reference path's alone
+    (`arithmetic`); the `AttentionImpl` it `named`; whether it reads each row from its window's first key
     (`windowed`); and whether the layer has attention sinks (`sinks`)."""
 
     heads: int

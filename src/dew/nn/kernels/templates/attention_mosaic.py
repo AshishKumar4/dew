@@ -320,8 +320,9 @@ class MosaicForward(_Mainloop[Tiles]):
         query, value = ba.arguments["query"], ba.arguments["value"]
         # A quantized call's codes converted where the device converts them (`mosaic.converts`: an FP8 cache
         # on sm_89 on), its call the gathered keys' path elsewhere.
-        codes = _codes_of(query, ba.arguments["key"])
-        if codes is not None and not mosaic.converts(codes):
+        codes = _codes_of(ba.arguments["key"], ba.arguments.get("scales"))
+        # Its values' converted tile one buffer a consumer, which no deferred P·V may still read (`_Codes`).
+        if codes is not None and (config.deferred or not mosaic.converts(codes)):
             return False
         family = bundle_of(config, query.dtype)
         # Its key tiles (the launch's, its natural rewalk's) split among the consumers that copy them
@@ -492,7 +493,7 @@ class MosaicForward(_Mainloop[Tiles]):
         allocations = _forward_allocations(family, config, width, value_width, query.dtype,
                                            ba.arguments.get("residuals") is Kept.SPLIT,
                                            min(config.stages, steps), out_dtype=out_dtype,
-                                           codes=_codes_of(query, ba.arguments["key"]))
+                                           codes=_codes_of(ba.arguments["key"], ba.arguments.get("scales")))
         # Its guarded launch reduces its keys' magnitudes across warps (`reducing`'s `guarded`).
         guarded = algebra.headroom(_computed(ba)) and ba.arguments.get("residuals") is not Kept.SPLIT
         return resources.shared_bytes(family, launch_scope(family, allocations, reducing(
@@ -676,10 +677,10 @@ def _keys(ba: tokamax.BoundArguments) -> int:
 
 
 def _computed(ba: tokamax.BoundArguments):
-    """The dtype a call's values are read in: the query's where they are quantized codes (`_codes_of`, their
-    `scales` given), their own otherwise."""
+    """The dtype a call's values are read in: the query's where they are quantized codes (their `scales`
+    given, `_codes_of`), their own otherwise."""
     query, value = ba.arguments["query"], ba.arguments["value"]
-    return query.dtype if _codes_of(query, ba.arguments["key"]) is not None else value.dtype
+    return query.dtype if ba.arguments.get("scales") is not None else value.dtype
 
 
 def _page(ba: tokamax.BoundArguments) -> int | None:
