@@ -103,11 +103,11 @@ uncaught error's, among them); one that asserts the state the refusal reports as
 own, or that a process ran (exit 0, its own checks inside it), is not."""
 
 
-CASES = {**ROW_1878_LINTS, **BANNED_ASSERTION_LINTS}
-"""Every table's cases, by code: no code is in two."""
+CASES = [(code, *case) for table in (ROW_1878_LINTS, BANNED_ASSERTION_LINTS)
+         for code, case in sorted(table.items())]
+"""Every table's cases: a code may have one in each."""
 
 
-@pytest.mark.parametrize("code", sorted(CASES))
-def test_each_lint_reports_its_cases_and_spares_the_rest(code, tmp_path):
-    files, where, lines = CASES[code]
+@pytest.mark.parametrize(("code", "files", "where", "lines"), CASES)
+def test_each_lint_reports_its_cases_and_spares_the_rest(code, files, where, lines, tmp_path):
     assert linted(tmp_path, files) == [(where, line, code) for line in lines]
