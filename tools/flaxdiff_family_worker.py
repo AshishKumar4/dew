@@ -120,8 +120,8 @@ def layout() -> dict[str, dict[str, list[int]]]:
     shapes = {}
     for case, (module, cls, config, image, text) in CASES.items():
         model = getattr(flaxdiff(wide=False)[module], cls)(**config)
-        variables = jax.eval_shape(model.init, jax.random.key(0), jnp.zeros((2, *image)), jnp.zeros(2),
-                                   jnp.zeros((2, *text)))
+        # Eagerly: FlaxDiff's scan orders read their permutations as NumPy.
+        variables = model.init(jax.random.key(0), jnp.zeros((2, *image)), jnp.zeros(2), jnp.zeros((2, *text)))
         shapes[case] = {"/".join(path): list(leaf.shape)
                         for path, leaf in sorted(flatten_dict(variables["params"]).items())}
     return shapes
@@ -129,8 +129,9 @@ def layout() -> dict[str, dict[str, list[int]]]:
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--layout"]:
+        shapes = layout()
         with open(sys.argv[2], "w") as out:
-            json.dump(layout(), out, indent=1)
+            json.dump(shapes, out, indent=1)
     elif len(sys.argv) == 2 and case_of(sys.argv[1]) in CASES:
         serve(lambda cases: answered(cases, functools.partial(applying, case_of(sys.argv[1]))))
     else:
