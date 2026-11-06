@@ -430,7 +430,7 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
     if valid is not None:
         # A zero step neither decays nor writes the state.
         step = jnp.where(valid[:, :, None], step, 0.0)
-    if length == 1 and axis is None:
+    if length == 1 and axis is None and entered is None:
         out, final = decoded_ssd(xs, step, A, B, C, D, held, starts)
     else:
         out, final = _chunked(xs, step, A, B, C, D, held, chunk_size, starts=starts, entered=entered)
