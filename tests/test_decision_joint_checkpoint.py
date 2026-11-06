@@ -218,7 +218,8 @@ def release(dtype: str) -> PretrainedDecision:
 def laid() -> tuple:
     """What `dew` reads as constants, made on the host: each case's row (the task's layout), collated
     together padded to the widest, with its stored fp32 states padded alike; each row collated alone;
-    and the quickstart's row with the two images, collated, and its media."""
+    and the quickstart's row with two images of the fixture's size, collated, and its media inputs'
+    tree, which a draw's pictures fill (`pictured_media`)."""
     bundle = release("float32")
     tokenizer, specials = bundle.decision_tokenizer, bundle.specials
     rows = []
@@ -243,13 +244,30 @@ def laid() -> tuple:
 
 def draw(seed: int) -> dict[str, np.ndarray]:
     """A seed's weights for the joint head (`drawn_weights`), under Dew's paths (`dew.`) and the release's
-    names (`param.`, `dew.decision.joint_checkpoint.head_tensors`), the requests the fixture's cases."""
+    names (`param.`, `dew.decision.joint_checkpoint.head_tensors`), and the quickstart's two pictures,
+    drawn at the backbone fixture's size, with Dew's processor's inputs of them (`media.`): the requests
+    are the fixture's cases. Drawn pictures, as the vision tower's rounding of one pair of images is
+    shared by every seed, which no count of seeds resolved (armada, 11-06)."""
     from flax.traverse_util import unflatten_dict
 
-    drawn = drawn_weights(release("float32").head_variables, np.random.default_rng([1557, 9, seed]))
+    rng = np.random.default_rng([1557, 9, seed])
+    drawn = drawn_weights(release("float32").head_variables, rng)
     tensors = head_tensors(unflatten_dict(drawn)["params"])
+    pictures = rng.integers(0, 256, np.load(BACKBONE / "images.npy").shape, dtype=np.uint8)
+    media = jax.tree.leaves(pictured_media(pictures))
     return {**{f"dew.{'/'.join(path)}": value for path, value in drawn.items()},
-            **{f"param.{name}": np.asarray(tensors[name], np.float32) for name in tensors}}
+            **{f"param.{name}": np.asarray(tensors[name], np.float32) for name in tensors},
+            "pictures": pictures, **{f"media.{index}": leaf for index, leaf in enumerate(media)}}
+
+
+def pictured_media(pictures: np.ndarray):
+    """Dew's processor's inputs of `pictures` for the quickstart's row (`laid`), on the host."""
+    bundle = release("float32")
+    pictured = laid()[1]
+    media = Images.of(bundle.processor, [Image.fromarray(array) for array in pictures],
+                      bundle.processor.image_text())
+    with jax.ensure_compile_time_eval():
+        return jax.tree.map(np.asarray, media.inputs(bundle.processor, pictured))
 
 
 def head_variables(dtype, inputs) -> dict:
@@ -283,7 +301,9 @@ def dew(dtype, inputs) -> dict[str, jax.Array]:
     bundle = release(jnp.dtype(dtype).name)
     model = DecisionModel(bundle.model, bundle.head)
     variables = joined({"backbone": bundle.variables, "head": head_variables(dtype, inputs)})
-    rows, pictured, _, _, alone, (seen, media) = laid()
+    rows, pictured, _, _, alone, (seen, template) = laid()
+    media = jax.tree.unflatten(jax.tree.structure(template), [
+        inputs[f"media.{index}"] for index in range(len(jax.tree.leaves(template)))])
     whole = jnp.concatenate([options(model.logits(variables, row), [encoded])
                              for encoded, row in zip(rows, alone, strict=True)])
     return {"head": heads(dtype, inputs), "joint": whole,

@@ -16,11 +16,12 @@ not on the globals it reads, so these kernels compile into a cache directory of 
 twin keeps the torch rule, which fla's kernels have no float64 of: both rules compute the same function.
 
 Each line on stdin is `IN OUT`, answered `done`. IN holds each case's head weights, `<case>.param.<name>`
-under their names in `joint_head.safetensors`. OUT gets each case's `<case>.reference.<leaf>` (float32)
+under their names in `joint_head.safetensors`, and its two `<case>.pictures`. OUT gets each case's
+`<case>.reference.<leaf>` (float32)
 and `<case>.truth.<leaf>` (float64), every question of every request of tests/fixtures/laya/cases.json
 concatenated in its order: `head`, the head alone on the backbone's fp32 states as states.npz stores them;
-`joint`, the backbone and the head end to end; and `images`, the quickstart request with the backbone
-fixture's two images (images.npy), laid out as the release's `systemone` lays them out.
+`joint`, the backbone and the head end to end; and `images`, the quickstart request with the case's
+pictures, laid out as the release's `systemone` lays them out.
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ from joint_checkpoint_reference import (
     joint_twin,
     upstream_module,
 )
+from PIL import Image
 from reference_worker import serve
 
 
@@ -100,7 +102,7 @@ def pictured(upstream, model, exact, processor, request: dict, pictures, device:
 
 def run(loaded, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Every case's `head`, `joint` and `images` logits under its head weights, in float32 and float64."""
-    upstream, model_class, processor, backbone, requests, states, pictures, device = loaded
+    upstream, model_class, processor, backbone, requests, states, device = loaded
     out = {}
     for name in sorted({key.split(".", 1)[0] for key in cases}):
         prefix = f"{name}.param."
@@ -116,6 +118,7 @@ def run(loaded, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         for leaf, single, wide in (("head", "/head", "/head64"), ("joint", "", "/f64")):
             out[f"{name}.reference.{leaf}"] = np.concatenate([logits[key + single] for key in keys])
             out[f"{name}.truth.{leaf}"] = np.concatenate([logits[key + wide] for key in keys])
+        pictures = [Image.fromarray(array) for array in np.asarray(cases[f"{name}.pictures"])]
         found, wide = pictured(upstream, model_class(backbone, head).eval(), exact, processor,
                                requests["quickstart"], pictures, device)
         out[f"{name}.reference.images"] = np.concatenate(found)
@@ -125,8 +128,7 @@ def run(loaded, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
 
 def load(site: str):
     """What every case reads: the release's code, the backbone fixture in fp32 on the site's device, its
-    processor, the requests, the stored fp32 states and the two images."""
-    from PIL import Image
+    processor, the requests and the stored fp32 states."""
     from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
     device = torch.device("cuda" if site == "joint-fla" else "cpu")
@@ -144,8 +146,7 @@ def load(site: str):
     requests = json.loads((ROOT / "tests" / "fixtures" / "laya" / "cases.json").read_text())
     with np.load(OUT / "states.npz") as stored:
         states = {case: stored[case] for case in stored.files}
-    pictures = [Image.fromarray(array) for array in np.load(BACKBONE / "images.npy")]
-    return upstream, model_class, processor, backbone, requests, states, pictures, device
+    return upstream, model_class, processor, backbone, requests, states, device
 
 
 if __name__ == "__main__":
