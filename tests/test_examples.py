@@ -474,10 +474,10 @@ def test_evaluate_and_serve_smoke_reports_perplexity_and_a_greedy_continuation(t
 
 
 def test_evaluate_and_serve_smoke_scores_a_diffusion_run_it_is_pointed_at(tmp_path):
-    """The image half, over the run the diffusion example trains. Both
-    metrics read a committed fixture instead of the checkpoint each default
-    names, so the pair scores with no download: the tiny CLIP, and the FID
-    extractor the smoke passes as `--inception-weights`."""
+    """The image half alone, over the run the diffusion example trains: pointed at a diffusion run and
+    no language run, the smoke scores that run and trains no language model. Both metrics read a
+    committed fixture instead of the checkpoint each default names, so the pair scores with no
+    download: the tiny CLIP, and the FID extractor the smoke passes as `--inception-weights`."""
     images = tmp_path / "images"
     smoke("train_flowers_tpu", images)
 
@@ -488,6 +488,7 @@ def test_evaluate_and_serve_smoke_scores_a_diffusion_run_it_is_pointed_at(tmp_pa
     report = json.loads((tmp_path / "report" / "report.json").read_text())
     assert "clip_score" in report["images"]
     assert report["images"]["fid"] >= 0, "the offline FID did not score"
+    assert "perplexity" not in report and not (tmp_path / "report" / "checkpoints").exists()
 
 
 @pytest.mark.network
