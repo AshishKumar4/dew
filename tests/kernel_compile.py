@@ -21,7 +21,10 @@ import subprocess
 import sys
 import tempfile
 import threading
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
+from typing import NamedTuple
 
 import compile_evidence
 import jax
@@ -30,6 +33,7 @@ import numpy as np
 from jax.experimental.mosaic.gpu import core as mgpu_core
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from kernel_liveness import Compiler, LoweredRegisters, lowered_registers
+from sharded import collective_axes
 
 from dew.nn.kernels import grouped_matmul
 from dew.nn.kernels.generation import assumed, capability, gpu_mesh, gpu_target
@@ -182,19 +186,40 @@ def staged_copy(shape: tuple[int, ...], dtype):
                         scratch_types=[plgpu.SMEM(shape, dtype), plgpu.Barrier(num_barriers=1)])
 
 
-def _device(generation: str) -> Mesh:
-    """A one-device mesh of a compile-only device of `generation`."""
-    return Mesh(np.array(compile_only_gpus(generation)), ("data",))
+class Expected(NamedTuple):
+    """What a public route's program shows compiled for a mesh of its GPUs (a case's `expected`): the mesh
+    (`axes`, each axis's devices), each positional argument's placement on it (`specs`, a `PartitionSpec`
+    each, None replicated), the launches it runs (`launches`, its kernel calls' names), an array a device's
+    call of a launch reads (`shards`, by launch: some call of it reads an operand of this shape, a shard's
+    where it runs per shard), and every collective it moves or sums by (`collectives`, each `(op, mesh
+    axes)`: exactly these, `sharded.collective_axes` of its compiled program). A case missing any of them,
+    or showing others, fails (`route_failures`)."""
+
+    axes: tuple[tuple[str, int], ...]
+    specs: tuple
+    launches: frozenset[str]
+    shards: Mapping[str, tuple[int, ...]] = MappingProxyType({})
+    collectives: frozenset[tuple[str, frozenset[str]]] = frozenset()
 
 
-def lowered_for(fn, args, generation: str):
-    """`fn` traced on `args`, its abstract leaves placed on a compile-only device of the CUDA `generation`
-    (`_device`), and lowered as on that GPU (`assumed`, `gpu_mesh`) within its block's shared memory: what XLA
-    compiles for it, never run."""
-    mesh = _device(generation)
-    replicated = NamedSharding(mesh, PartitionSpec())
-    placed = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=replicated)
-                          if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, args)
+def _device(generation: str, axes: tuple[tuple[str, int], ...] = (("data", 1),)) -> Mesh:
+    """A mesh of compile-only devices of `generation`, of `axes` (one device's by default)."""
+    sizes = tuple(size for _, size in axes)
+    devices = compile_only_gpus(generation, count=int(np.prod(sizes)))
+    return Mesh(np.array(devices).reshape(sizes), tuple(name for name, _ in axes))
+
+
+def lowered_for(fn, args, generation: str, expected: Expected | None = None):
+    """`fn` traced on `args`, its abstract leaves placed on compile-only devices of the CUDA `generation`
+    (`_device`: one, replicated, or `expected`'s mesh, each argument by its spec), and lowered as on that GPU
+    (`assumed`, `gpu_mesh`) within its block's shared memory: what XLA compiles for it, never run."""
+    mesh = _device(generation) if expected is None else _device(generation, expected.axes)
+    specs = (None,) * len(args) if expected is None else expected.specs
+    placed = tuple(jax.tree.map(
+        lambda leaf, sharding=NamedSharding(mesh, spec or PartitionSpec()):
+        jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding)
+        if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, arg)
+        for arg, spec in zip(args, specs, strict=True))
     # Deviceless Mosaic lowering defaults to Hopper's limit, not this target's.
     # Its bound checks the total allocation, including barriers outside the scratch estimate.
     with (assumed(generation), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)),
@@ -268,10 +293,11 @@ def _compiled(case, generation: str, record: dict,
     (`report.binaries`), `record['modules']` each one's kernel hash, by kernel name, and in `directory` the
     PTX Mosaic prints as it compiles, a `<kernel>.ptx` each."""
     fn, args = case.call()
+    expected = getattr(case, "expected", None)
     estimating = _printed(MOSAIC_GPU_DUMP_RESOURCES="1") if directory else contextlib.nullcontext([])
     try:
         with estimating as estimated:
-            lowered = lowered_for(fn, args, generation)
+            lowered = lowered_for(fn, args, generation, expected)
     except Exception as error:  # A case that does not lower is its own failure.
         # One a block's shared memory does not hold asks its bytes, as XLA's refusal of a Triton kernel does.
         refused = MOSAIC_REFUSED.search(str(error))
@@ -309,6 +335,8 @@ def _compiled(case, generation: str, record: dict,
             record["binaries"] = [dataclasses.asdict(found)
                                   for found in report.binaries(executable, decoded=True)]
             write_modules("".join(printed), directory)
+        if expected is not None:
+            record["route"] = _route(lowered, executable, _device(generation, expected.axes))
         return [path.read_text() for path in Path(dump).glob("*thunk_sequence.txt")], triton_kernels(lowered)
 
 
@@ -357,6 +385,50 @@ def write_modules(printed: str, directory: str) -> None:
         if path.exists():
             raise ValueError(f"two PTX modules of {path.stem}")
         path.write_text("//\n" + PTX_MODULE + part)
+
+
+def _route(lowered, executable, mesh: Mesh) -> dict:
+    """What a compiled route shows (`Expected`): its launches by name, the operands each of their calls
+    reads, and its collectives over `mesh`, JSON's types (a record a process of its own writes back)."""
+    calls = kernel_calls(lowered, unrun=True)
+    shards: dict[str, list] = {}
+    for call in calls:
+        shards.setdefault(call.name, []).append([list(shape) for shape in call.operands])
+    return {"launches": sorted(shards), "shards": shards,
+            "collectives": sorted([op, sorted(axes)]
+                                  for op, axes in collective_axes(executable.as_text(), mesh))}
+
+
+def route_failures(cases, found: list[dict]) -> list[str]:
+    """Each routed case (its `expected`) whose compiled program misses a launch it states, reads no shard it
+    states in any call of a launch, or moves or sums by collectives other than the plan's, or that left no
+    program to read: the route's own evidence, beside its kernels' resources."""
+    failed = []
+    for case, record in zip(cases, found, strict=True):
+        if (expected := getattr(case, "expected", None)) is None:
+            continue
+        if (route := record.get("route")) is None:
+            why = record.get("error", "none")
+            failed.append(f"{case.name}: no compiled program states its route ({why})")
+            continue
+        if missing := sorted(expected.launches - set(route["launches"])):
+            failed.append(f"{case.name}: no launch of {', '.join(missing)} (it ran {route['launches']})")
+        for name, shape in expected.shards.items():
+            calls = route["shards"].get(name, [])
+            if not any(list(shape) in operands for operands in calls):
+                failed.append(f"{case.name}: no call of {name} reads a {list(shape)} shard "
+                              f"(its calls read {calls})")
+        collectives = {(op, frozenset(axes)) for op, axes in route["collectives"]}
+        if collectives != expected.collectives:
+            failed.append(f"{case.name}: collectives {sorted(map(_named, collectives))}, where its plan "
+                          f"states {sorted(map(_named, expected.collectives))}")
+    return failed
+
+
+def _named(collective: tuple[str, frozenset[str]]) -> str:
+    """A collective as a failure names it: its op over its axes."""
+    op, axes = collective
+    return f"{op} over {'/'.join(sorted(axes)) or 'no axis'}"
 
 
 def mosaic_kernels(record: dict) -> list[dict]:
