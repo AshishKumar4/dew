@@ -262,8 +262,7 @@ class _Conv:
             pre = window[0] * weights[0]
             for inputs, weight in zip(window[1:], weights[1:], strict=True):
                 pre = pre + inputs * weight
-            # SiLU, its sigmoid one quotient (`short_conv._sigmoid`'s).
-            streams.append(pre if conv.activation is None else pre * (1.0 / (1.0 + jnp.exp(-pre))))
+            streams.append(pre if conv.activation is None else pre * _sigmoid(pre))
         return tuple(streams)
 
     def held(self):
@@ -295,8 +294,11 @@ def _staged(hooks, inputs, token: _Token, index: int, query, key, vectors, excha
     key_width = vectors.shape[2]
     layout = scan.blocked(key_width)
     if hooks.l2norm:
-        query = query * lax.rsqrt(scan.summed(query * query, exchanged, interpret=interpret) + L2NORM_EPS)
-        key = key * lax.rsqrt(scan.summed(key * key, exchanged, interpret=interpret) + L2NORM_EPS)
+        # `l2norm`'s scale, its root and quotient each rounded once (rsqrt's approximation 2 ulp off).
+        def scale(x):
+            return 1.0 / jnp.sqrt(scan.summed(x * x, exchanged, interpret=interpret) + L2NORM_EPS)
+
+        query, key = query * scale(query), key * scale(key)
         query = query * (key_width ** -0.5 if hooks.scale is None else hooks.scale)
     elif hooks.scale is not None:
         query = query * hooks.scale
@@ -318,15 +320,12 @@ def _gates(hooks, inputs, row, head, layout):
         return inputs[name][head].astype(jnp.float32)
 
     one = jnp.float32(1.0)
-    if hooks.gates is not None and hooks.gates.write == 'sigmoid' and hooks.gates.limit is None:
-        decay = jnp.exp(recurrence._gated_decay(scalar('gate'), headed('log_a'), headed('bias')))
-        return decay, jax.nn.sigmoid(scalar('beta'))
     if hooks.gates is not None:
-        rate = jax.nn.softplus(scalar('gate') + headed('bias'))
+        rate = _softplus(scalar('gate') + headed('bias'))
         if hooks.gates.limit is not None:
             rate = jnp.clip(rate, *hooks.gates.limit)
         decay = jnp.exp(-jnp.exp(headed('log_a')) * rate)
-        return decay, rate if hooks.gates.write == 'step' else jax.nn.sigmoid(scalar('beta'))
+        return decay, rate if hooks.gates.write == 'step' else _sigmoid(scalar('beta'))
     if hooks.rated:
         write = scalar('beta')
         return jnp.exp(headed('rate') * write), write
@@ -337,6 +336,19 @@ def _gates(hooks, inputs, row, head, layout):
         decay = plgpu.load(inputs['log_decay'].at[row, head], layout=layout, optimized=False)
         return jnp.exp(decay.astype(jnp.float32)), write
     return jnp.exp(scalar('log_decay')), write
+
+
+def _sigmoid(x):
+    """The sigmoid, one quotient (`short_conv._sigmoid`'s): Mosaic GPU lowers no logistic."""
+    return 1.0 / (1.0 + jnp.exp(-x))
+
+
+def _softplus(x):
+    """`jax.nn.softplus`, `max(x, 0) + log1p(exp(-|x|))`, its log1p as `log(u) y / (u - 1)` at `u = 1 + y`
+    (Goldberg's, within an ulp; `y` where `u` rounds to one): Mosaic GPU lowers no log1p."""
+    y = jnp.exp(-jnp.abs(x))
+    u = 1.0 + y
+    return jnp.maximum(x, 0.0) + jnp.where(u == 1.0, y, jnp.log(u) * (y / (u - 1.0)))
 
 
 def _stepped(hooks, held: list, value, vectors, write, token: _Token):
