@@ -78,7 +78,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_block_diffusion.py": {
-   "comparisons": 7,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_block_sft.py": {
@@ -174,7 +174,7 @@
    "lane": "Training"
   },
   "tests/test_deepseek_v41.py": {
-   "comparisons": 9,
+   "comparisons": 6,
    "lane": "Models, Serving & RL"
   },
   "tests/test_depthwise_conv.py": {
@@ -184,10 +184,6 @@
   "tests/test_device_image_augmentation.py": {
    "comparisons": 6,
    "lane": "Training"
-  },
-  "tests/test_diffusion_gemma_workflow.py": {
-   "comparisons": 2,
-   "lane": "Models, Serving & RL"
   },
   "tests/test_diffusion_objective.py": {
    "comparisons": 7,
@@ -210,11 +206,11 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_edm2.py": {
-   "comparisons": 5,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_end_to_end.py": {
-   "comparisons": 10,
+   "comparisons": 8,
    "lane": "Training"
   },
   "tests/test_engine_replay.py": {
@@ -418,7 +414,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_mdlm_reference.py": {
-   "comparisons": 5,
+   "comparisons": 1,
    "lane": "Training"
   },
   "tests/test_mesh_axes.py": {
@@ -518,10 +514,6 @@
    "lane": "Training"
   },
   "tests/test_pickle_sources.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_pipeline_streaming.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL"
   },

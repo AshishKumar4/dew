@@ -33,7 +33,6 @@ from dew.objectives.rl.sessions import (
     SEGMENT_IDS_KEY,
 )
 from dew.objectives.routing import ExpertBalance
-from dew.registry import parameter_type, parameters
 from dew.training import Trainer
 
 VOCAB = BALANCED_VOCAB
@@ -43,7 +42,6 @@ WIDTH = 9
 PAD = 4
 RATE = 0.05
 KINDS = ("grpo", "dpo", "ppo")
-CLASSES = {"grpo": GRPOObjective, "dpo": DPOObjective, "ppo": PPOObjective}
 CHAIN = np.arange(WIDTH) < WIDTH - 1
 """The columns a chain fills. Its last column is padding, so a chain's last token is
 an input that a padded row reads too, as an LM's shifted rows do."""
@@ -249,19 +247,11 @@ def test_tokens_that_train_nothing_add_nothing_to_a_policy_runs_router_counts(ki
         np.testing.assert_array_equal(got, want)
 
 
-@pytest.mark.parametrize("kind", KINDS)
-def test_a_json_record_rebuilds_a_policy_run_that_balances_its_routers(kind):
-    """A policy run's record holds its `balance` as the `ExpertBalance` it is, so the
-    record's JSON rebuilds the same run: its policy balances its routers, and the rebuilt
-    objective evaluates a loss. PPO is built around its critic, which a record does not
-    hold."""
-    balance = ExpertBalance(balance_rate=RATE, aux_loss_alpha=0.2)
-    config = ObjectiveConfig(kind, {"balance": balance})
-    saved = json.loads(json.dumps({"fields": config.fields, "defaults": config.defaults}))
-    rebuilt = ObjectiveConfig(kind, **saved)
-    assert rebuilt == config
+def _balances(kind: str, config: ObjectiveConfig, balance: ExpertBalance) -> None:
+    """The objective `config` builds, PPO's around its critic (which no record or flag holds): its policy
+    balances its routers by `balance` and evaluates a loss with their effects."""
     derived = {"critic": Critic()} if kind == "ppo" else {}
-    built = rebuilt.build(model=routed(WIDTH), seq_len=WIDTH - 1, **derived)
+    built = config.build(model=routed(WIDTH), seq_len=WIDTH - 1, **derived)
     policy = built.actor if kind == "ppo" else built
     assert policy.balance == balance
     variables = nn.unbox(built.init(jax.random.key(1)))
@@ -271,10 +261,30 @@ def test_a_json_record_rebuilds_a_policy_run_that_balances_its_routers(kind):
 
 
 @pytest.mark.parametrize("kind", KINDS)
-def test_a_policy_runs_balance_flag_reads_its_argument_as_an_expert_balance(kind):
-    """`--objective.balance` is a flag of each policy run, typed by the annotation of the
-    argument its class names (`dew.registry.parameters`): `ExpertBalance | None`, which a
-    record reads back as the `ExpertBalance` it is."""
-    named, _ = parameters(CLASSES[kind])
-    _, owner = named["balance"]
-    assert parameter_type(owner, "balance") == ExpertBalance | None
+def test_a_json_record_rebuilds_a_policy_run_that_balances_its_routers(kind):
+    """A policy run's record holds its `balance` as the `ExpertBalance` it is, so the
+    record's JSON rebuilds the same run: its policy balances its routers, and the rebuilt
+    objective evaluates a loss."""
+    balance = ExpertBalance(balance_rate=RATE, aux_loss_alpha=0.2)
+    config = ObjectiveConfig(kind, {"balance": balance})
+    saved = json.loads(json.dumps({"fields": config.fields, "defaults": config.defaults}))
+    rebuilt = ObjectiveConfig(kind, **saved)
+    assert rebuilt == config
+    _balances(kind, rebuilt, balance)
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_a_policy_runs_balance_flag_builds_a_policy_that_balances_its_routers(kind):
+    """`--objective.balance` on a policy run's command line (`LMRunConfig.cli`), the expert balance as
+    its JSON spec, gives the run's objective that `ExpertBalance`, whose policy balances its routers and
+    evaluates a loss with their effects (ledger 4495)."""
+    from dew.config.lm import LMRunConfig
+
+    balance = ExpertBalance(balance_rate=RATE, aux_loss_alpha=0.2)
+    spec = json.dumps({"class": "dew.objectives.routing:ExpertBalance",
+                       "fields": {"balance_rate": RATE, "aux_loss_alpha": 0.2}})
+    # A GRPO run trains on what its rollout draws, which it names.
+    rollout = ["--rollout.reward", "rl_support:completion_length"] if kind == "grpo" else []
+    objective = LMRunConfig.cli(["--objective", kind, "--objective.balance", spec, *rollout]).objective
+    assert isinstance(objective, ObjectiveConfig)
+    _balances(kind, objective, balance)

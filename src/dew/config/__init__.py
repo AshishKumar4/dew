@@ -52,6 +52,7 @@ from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._files import write_atomically
 from dew._records import JSON, duration, earlier_fields, is_share, recorded_duration
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
+from dew.config.release import Release
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.data import records
 from dew.data.compile import fitted
@@ -2418,6 +2419,6 @@ def looping(start: "Pretrained", steps: int | None, layers: tuple[int, int] | No
     return dataclasses.replace(start, model=looped)
 
 
-__all__ = ["DecoderRunConfig", "MetricConfig", "ObjectiveConfig", "Prepared", "RunConfig", "SourceOptions",
-           "TrainerConfig",
+__all__ = ["DecoderRunConfig", "MetricConfig", "ObjectiveConfig", "Prepared", "Release", "RunConfig",
+           "SourceOptions", "TrainerConfig",
            "flag_selected", "looping"]

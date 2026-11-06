@@ -51,6 +51,7 @@ from dew.nn.kernels.options import program
 from dew.nn.kv_cache import (
     gather_cache_rows,
     refuse_unassigned,
+    row_axis,
     with_rounding_keys,
     with_rounding_keys_of,
     write_cache,
@@ -601,8 +602,14 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
                 # A crossing row's tokens up to the change answer at the short table, the rest rebuilt.
                 answer, context = jax.tree.map(lambda fresh, held: _chosen(before, held, fresh),
                                                (fresh[0], fresh[3]), (ordinary[0], ordinary[3]))
-                return jax.tree.map(lambda fresh, held: _chosen(crossing, fresh, held),
-                                    (answer, fresh[1], fresh[2], context), ordinary)
+                answer, drafts, context = jax.tree.map(lambda fresh, held: _chosen(crossing, fresh, held),
+                                                       (answer, fresh[2], context),
+                                                       (ordinary[0], ordinary[2], ordinary[3]))
+                # A crossing row's cache, its rows past a run's bank's layers (`row_axis`).
+                cache = jax.tree_util.tree_map_with_path(
+                    lambda path, fresh, held: _chosen(crossing, fresh, held, row_axis(path)), fresh[1],
+                    ordinary[1])
+                return answer, cache, drafts, context
 
             answer, cache, drafts, context = (jax.lax.cond(jnp.any(crossing), rebuild, lambda: ordinary)
                                               if rebuilds else ordinary)
@@ -690,9 +697,11 @@ def _rebuilt(model: nn.Module, params: Variables, ops: DecodeOps, state: Decoder
     return jax.tree.map(lambda leaf: leaf[rows, slots], answer), reseeded.cache, reseeded.drafts, context
 
 
-def _chosen(where: jax.Array, chosen: jax.Array, otherwise: jax.Array) -> jax.Array:
-    """`chosen` where `where` holds over its leading axes, else `otherwise`."""
-    return jnp.where(where.reshape(*where.shape, *(1,) * (chosen.ndim - where.ndim)), chosen, otherwise)
+def _chosen(where: jax.Array, chosen: jax.Array, otherwise: jax.Array, axis: int = 0) -> jax.Array:
+    """`chosen` where `where` holds over its axes from `axis` (a cache leaf's rows, `row_axis`), else
+    `otherwise`."""
+    mask = where.reshape(*(1,) * axis, *where.shape, *(1,) * (chosen.ndim - axis - where.ndim))
+    return jnp.where(mask, chosen, otherwise)
 
 
 def _drafting(model: nn.Module, params: Variables, pad_id: int):

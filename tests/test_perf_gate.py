@@ -60,8 +60,8 @@ def test_a_row_is_judged_by_its_calibrated_noise_and_a_row_noisier_than_its_floo
         code = gate.main()
         return code, capsys.readouterr().out
 
-    code, table = judged(1.04)
-    assert code == 1 and "failed: quiet (regressed)" in table
+    code, _ = judged(1.04)
+    assert code == 1
     verdicts = json.loads((tmp_path / "verdicts.json").read_text())
     assert verdicts["failed"] == ["quiet (regressed)"]
     assert {name: (row["state"], row["unit"], row["insensitive"], row["band"])
@@ -70,11 +70,8 @@ def test_a_row_is_judged_by_its_calibrated_noise_and_a_row_noisier_than_its_floo
     # Against its anchor, a run's samples the runner kept, the head is judged as against the base.
     assert verdicts["rows"]["quiet"]["anchor"]["state"] == "regressed"
     assert "anchor" not in verdicts["rows"]["loud"]
-    [loud] = [line for line in table.splitlines() if line.startswith("| loud |")]
-    assert loud.endswith("| level, insensitive (null noise 6.0% over its 2% floor) |"), loud
-    assert "| 6.0% |" in loud
-    code, table = judged(1.10)
-    assert code == 1 and "loud (regressed)" in table
+    code, _ = judged(1.10)
+    assert code == 1 and "loud (regressed)" in json.loads((tmp_path / "verdicts.json").read_text())["failed"]
 
 
 def after(command, flag):

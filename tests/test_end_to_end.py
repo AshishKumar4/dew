@@ -4,6 +4,7 @@ official code (`tools/repae_reference.py`), one end-to-end step against
 trains the model and not the autoencoder, and the autoencoder's own loss
 trains it and not the model."""
 
+import functools
 import tarfile
 from dataclasses import replace
 from pathlib import Path
@@ -16,10 +17,18 @@ import optax
 import pytest
 from diffusion_stubs import label_table
 from flax import linen as nn
-from one_draw import assert_as_exact_as_the_reference
-from reference_error import assert_as_exact, assert_computes_the_oracle, chain_roundings
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_computes_the_oracle,
+    chain_roundings,
+    declared_seeds,
+    indexed_recording,
+    recording,
+)
 from test_lpips import drawn_weights
 from test_mean_flow import CLASSES
+from tool_support import run_from
 
 from dew.diffusion import presets
 from dew.eval.lpips import variables_from_torch
@@ -51,6 +60,7 @@ from dew.training import Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 STEPPED = np.load(FIXTURES / "repae" / "step.npz")
+SEEDS = FIXTURES / "repae" / "seeds.npz"
 
 
 L1_KL = {"perceptual_weight": 0.0, "discriminator_weight": 0.0}
@@ -372,7 +382,27 @@ def repae_step_f64(tmp_path_factory) -> SimpleNamespace:
 
 
 def _repae_step(tmp_path: Path, dtype) -> SimpleNamespace:
-    """`repae_step` at `dtype`, with the traced gradient's `chain_roundings`."""
+    """`repae_step` at `dtype` on the fixture's own draw, with the traced gradient's `chain_roundings`."""
+    built = _repae_task(tmp_path, dtype)
+    drawn = {"pixels": STEPPED["pixels"], "classes": STEPPED["classes"],
+             "posterior": STEPPED["draw/posterior"], "times": STEPPED["draw/times"],
+             "noise": STEPPED["draw/noise"], "dropped": STEPPED["dropped"]}
+    value, aux, gradients, tuned = _repae_run(built, drawn)
+    batch, tape = _repae_batch(built, drawn)
+    step = _repae_step_of(tape)
+
+    def loss(tree):
+        return built.task.scalar_loss({**built.variables, "params": tree}, batch, step)[0]
+
+    roundings = chain_roundings(jax.make_jaxpr(jax.grad(loss))(built.params))
+    return SimpleNamespace(task=built.task, variables=built.variables, params=built.params, batch=batch,
+                           step=step, value=value, aux=aux, gradients=gradients, roundings=roundings,
+                           tuned=tuned)
+
+
+def _repae_task(tmp_path: Path, dtype) -> SimpleNamespace:
+    """The step's task under `EndToEnd` at `dtype`, its variables and its parameters, the reference's weights
+    as the fixture carries them (`weights/`), and the running statistics REPA-E's `init_bn` starts from."""
 
     def cast(tree):
         def leaf_at(leaf):
@@ -405,36 +435,77 @@ def _repae_step(tmp_path: Path, dtype) -> SimpleNamespace:
     assert jax.tree.structure(params) == jax.tree.structure(variables["params"])
     variables = {**variables, LATENT_STATS: cast({"mean": STEPPED[f"bn/running_mean_before{tail}"],
                                                   "var": STEPPED[f"bn/running_var_before{tail}"]})}
-    batch = {"image": jnp.asarray(STEPPED["pixels"], dtype),
-             **inputs.tokenize([str(label) for label in STEPPED["classes"]])}
-    # The step reads train_repae's own posterior draw, times, noise and dropped labels by name
-    # (`Step.tape`), the floats tools/repae_reference.py drew and replayed, as it recorded them: a
-    # float drawn again here may round otherwise (bible: floats through a rounding chain are not
-    # bit-identical across programs), and the float64 rule would see one ulp of a draw.
-    rows = len(STEPPED["classes"])
-    assert STEPPED["draw/posterior"].shape == (rows, *task.latent_shape)
-    tape = {"posterior": jnp.asarray(STEPPED["draw/posterior"], jnp.float32),
-            "times": jnp.asarray(STEPPED["draw/times"], jnp.float32),
-            "noise": jnp.asarray(STEPPED["draw/noise"], jnp.float32),
-            "condition dropout": jnp.asarray(STEPPED["dropped"])}
-    step = Step(step=jnp.asarray(0), key=jax.random.key(int(STEPPED["key"])), ema=None, tape=tape)
 
-    def loss(tree):
-        return task.scalar_loss({**variables, "params": tree}, batch, step)
+    def stepped(tree, batch, tape):
+        step = _repae_step_of(tape)
 
-    def stepped(tree):
-        # The step, and the posterior sample and running statistics it reads, in one program.
+        def loss(tree):
+            return task.scalar_loss({**variables, "params": tree}, batch, step)
+
         (value, aux), gradients = jax.value_and_grad(loss, has_aux=True)(tree)
         tuned = task._end_to_end_latents({**variables, "params": tree}, unit_range(batch["image"]),
                                          jax.random.split(step.key, 5)[0], step, batch)
         return value, aux, gradients, tuned
 
-    # One compiled program, as a run's step is: run op by op, the step compiled each of its 2,900
-    # operations apart, most of the fixture's two minutes (row 3817).
-    value, aux, gradients, tuned = jax.jit(stepped)(params)
-    roundings = chain_roundings(jax.make_jaxpr(jax.grad(lambda tree: loss(tree)[0]))(params))
-    return SimpleNamespace(task=task, variables=variables, params=params, batch=batch, step=step, value=value,
-                           aux=aux, gradients=gradients, roundings=roundings, tuned=tuned)
+    return SimpleNamespace(task=task, variables=variables, params=params, inputs=inputs,
+                           labels=inputs.tokenize([str(label) for label in range(CLASSES)]),
+                           compiled=jax.jit(stepped))
+
+
+def _repae_batch(built: SimpleNamespace, drawn: dict) -> tuple[dict, dict]:
+    """A draw's batch and tape: its pixels and labels, and train_repae's own posterior draw, times, noise
+    and dropped labels, which the step reads by name (`Step.tape`), the floats tools/repae_reference.py
+    replayed, as it recorded them: a float drawn again here may round otherwise (bible: floats through a
+    rounding chain are not bit-identical across programs), and the float64 rule would see one ulp of a
+    draw."""
+    dtype = jax.tree.leaves(built.params)[0].dtype
+    # Each label's condition read from the table of every class's, so the step traces whole (a summarized
+    # recording counts its truth's roundings on its trace).
+    classes = jnp.asarray(drawn["classes"])
+    batch = {"image": jnp.asarray(drawn["pixels"], dtype),
+             **jax.tree.map(lambda table: jnp.asarray(table)[classes], built.labels)}
+    assert np.shape(drawn["posterior"]) == (len(drawn["classes"]), *built.task.latent_shape)
+    tape = {"posterior": jnp.asarray(drawn["posterior"], jnp.float32),
+            "times": jnp.asarray(drawn["times"], jnp.float32),
+            "noise": jnp.asarray(drawn["noise"], jnp.float32),
+            "condition dropout": jnp.asarray(drawn["dropped"])}
+    return batch, tape
+
+
+def _repae_step_of(tape: dict) -> Step:
+    return Step(step=jnp.asarray(0), key=jax.random.key(int(STEPPED["key"])), ema=None, tape=tape)
+
+
+def _repae_run(built: SimpleNamespace, drawn: dict):
+    """One step of `built` on a draw (`_repae_batch`): its loss, aux, gradients and the posterior sample and
+    running statistics it reads, in one program compiled once for `built` (`_repae_task`), as a run's step
+    is: run op by op, the step compiled each of its 2,900 operations apart, most of the fixture's two minutes
+    (row 3817)."""
+    return built.compiled(built.params, *_repae_batch(built, drawn))
+
+
+def repae_judged(built: SimpleNamespace, drawn: dict) -> dict:
+    """What check 1 judges of a step on a draw (tools/repae_reference.py's `judged`): the model's and the
+    projector's gradients, twice Dew's (Dew's L2 halves the denoising error and REPA's term with it), each
+    module's in torch's layout and name, and the posterior's sample its batch norm reads."""
+    _, _, gradients, tuned = _repae_run(built, drawn)
+    parts = {}
+    for name, path in LAYOUT:
+        held = gradients
+        for key in path:
+            held = held[key]
+        for leaf, gradient in held.items():
+            part = "bias" if leaf == "bias" else "weight"
+            parts[f"{name}.{part}"] = 2 * (torch_layout(gradient) if leaf == "kernel" else gradient)
+    return {**repae_reference().judged_parts(parts, jnp.concatenate), "sample": tuned.raw}
+
+
+@functools.cache
+def repae_reference():
+    """tools/repae_reference.py, whose seeded draw the recorded inputs are drawn again by, loaded as a
+    script from its directory."""
+    with run_from("repae_reference", "tools") as module:
+        return module
 
 
 def _flat(tree) -> np.ndarray:
@@ -475,27 +546,30 @@ def test_the_autoencoder_and_discriminator_gradients_are_train_repae_s_in_float6
                                    roundings=repae_step_f64.roundings)
 
 
-def test_a_repae_step_moves_the_model_as_train_repae_does(repae_step):
+def test_a_repae_step_moves_the_model_as_train_repae_does(tmp_path):
     """The model's and the projector's gradients are half the SiT update's,
-    as Dew's L2 halves the denoising error and REPA's term with it, each held
-    to the reference by the float64 rule: their path, the stand-in SiT's
-    tanh blocks, the latent's batch norm and REPA's cosine, has no kink."""
-    gradients = repae_step.gradients
-    for label, entries in (("the model's gradient", LAYOUT[:-3]), ("the projector's gradient", LAYOUT[-3:])):
-        dew, reference, truth = [], [], []
-        for name, path in entries:
-            held = gradients
-            for key in path:
-                held = held[key]
-            for leaf, gradient in held.items():
-                part = "bias" if leaf == "bias" else "weight"
-                gradient = np.asarray(gradient)
-                dew.append(2 * (torch_layout(gradient) if leaf == "kernel" else gradient))
-                reference.append(STEPPED[f"grad/{name}.{part}"])
-                truth.append(STEPPED[f"grad/{name}.{part}_f64"])
-        got, want, exact = (np.concatenate([np.ravel(part) for part in parts])
-                            for parts in (dew, reference, truth))
-        assert_as_exact_as_the_reference(got, want, exact, label)
+    as Dew's L2 halves the denoising error and REPA's term with it, and the
+    posterior's sample the batch norm reads, as exact as train_repae's
+    float32 run against its float64 run over drawn pixels, labels and the
+    step's draws (check 1, tools/repae_reference.py's recording): their
+    path, the stand-in SiT's tanh blocks, the latent's batch norm and REPA's
+    cosine, has no kink."""
+    seeds = declared_seeds(SEEDS)["repae"]
+    built = _repae_task(tmp_path / "f32", jnp.float32)
+
+    @functools.cache
+    def wide():
+        return _repae_task(tmp_path / "f64", jnp.float64)
+
+    def truth(inputs):
+        # On the CPU, as the reference's draws are replayed (`repae_step_f64`).
+        with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
+            return repae_judged(wide(), inputs)
+
+    drawn, reference, truth = indexed_recording(recording(SEEDS), "repae", seeds,
+                                                inputs_of=repae_reference().draw, truth_fn=truth)
+    assert_as_exact(as_given(lambda index, inputs: repae_judged(built, inputs)), reference, drawn,
+                    "one REPA-E step", seeds=seeds, truth_fn=truth)
 
 
 def test_a_repae_step_moves_the_running_statistics_as_train_repae_does(repae_step):
@@ -513,8 +587,6 @@ def test_a_repae_step_moves_the_running_statistics_as_train_repae_does(repae_ste
     statistics = aux.variables[LATENT_STATS]
     for name in ("mean", "var"):
         np.testing.assert_array_equal(np.asarray(tuned.statistics[name]), np.asarray(statistics[name]))
-    assert_as_exact_as_the_reference(np.asarray(tuned.raw), STEPPED["latents/sample"],
-                                     STEPPED["latents/sample_f64"], "the posterior's sample")
     before = {name: STEPPED[f"bn/running_{name}_before"] for name in ("mean", "var")}
     published = batch_norm(STEPPED["latents/sample_f64"], {name: STEPPED[f"bn/running_{name}_before_f64"]
                                                            for name in ("mean", "var")})

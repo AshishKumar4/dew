@@ -13,7 +13,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Mapping, Sequence
-from typing import ClassVar, NamedTuple
+from typing import ClassVar, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -49,6 +49,11 @@ def _layer_norm(dtype: Dtype | None, name: str) -> nn.Module:
                         dtype=dtype)(name=name)
 
 
+type ReleaseFormat = Literal["laya", "joint", "slots"]
+"""The formats a decision head is released in: Laya's checkpoint (`dew.decision.laya`), the joint head's
+(`dew.decision.joint_checkpoint`) and the slot readout's (`dew.decision.slot_source`)."""
+
+
 class Head(nn.Module):
     """What every decision head offers: its call, whether it reads the output
     table, and the record a run keeps of it.
@@ -75,6 +80,9 @@ class Head(nn.Module):
     questions at the host boundary (`validate_rows`)."""
     width_field: ClassVar[str] = "features"
     """The field holding the width of the states the head reads."""
+    release_format: ClassVar[ReleaseFormat | None] = None
+    """The release format the head is written in and read from (`Decide.save_pretrained`): Laya's
+    checkpoint, the joint head's or the slot readout's; None where no format holds it."""
 
     @nn.nowrap
     def tied_labels(self) -> tuple[tuple[int, ...], ...] | None:
@@ -131,6 +139,7 @@ class DecisionHead(Head):
     """
 
     one_question: ClassVar[bool] = True
+    release_format: ClassVar[ReleaseFormat | None] = "laya"
 
     features: int
     layers: int = 2
@@ -332,6 +341,7 @@ class JointSchemaHead(Head):
     precision: PrecisionLike = None
     attention_impl: AttentionImpl = "auto"
     reads_table: ClassVar[bool] = True
+    release_format: ClassVar[ReleaseFormat | None] = "joint"
     pools_spans: ClassVar[bool] = True
     width_field: ClassVar[str] = "hidden_size"
 
@@ -501,6 +511,7 @@ class LabelReadout(Head):
     dtype: Dtype | None = None
     count: int = 0
     reads_labels: ClassVar[bool] = True
+    release_format: ClassVar[ReleaseFormat | None] = "slots"
 
     @nn.nowrap
     def tied_labels(self) -> tuple[tuple[int, ...], ...] | None:
@@ -579,6 +590,7 @@ class SlotReadout(Head):
     slot_rows: int | None = None
     dtype: Dtype | None = None
     reads_labels: ClassVar[bool] = True
+    release_format: ClassVar[ReleaseFormat | None] = "slots"
     draws_from_rows: ClassVar[bool] = True
     pools_spans: ClassVar[bool] = True
 

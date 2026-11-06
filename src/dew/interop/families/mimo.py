@@ -250,15 +250,17 @@ def _matches(fields: CausalTransformer) -> bool:
 
 def _flash_matches(fields: CausalTransformer) -> bool:
     """MiMo-V2's geometry as MiMo-V2-Flash fixes it (MiMoV2FlashAttention): no sinks on the full layers,
-    and the sliding layers' sinks over twice the full layers' key heads. Another holds the authors' own
-    config (`MIMO_V2`)."""
+    and the sliding layers' sinks over twice the full layers' key heads, their query heads and width the
+    model's, which its config states no other of. Another holds the authors' own config (`MIMO_V2`)."""
     if not _matches(fields):
         return False
     types = set(fields.per_layer_types)
     if 'full_attention' in types and fields.kind_of('full_attention').sinks:
         return False
     sliding = fields.kind_of('sliding_attention') if 'sliding_attention' in types else None
-    return sliding is None or (sliding.sinks and sliding.num_kv_heads == 2 * fields.kv_heads)
+    return sliding is None or (sliding.sinks and sliding.num_kv_heads == 2 * fields.kv_heads
+                               and sliding.num_heads == fields.num_heads
+                               and sliding.head_dim == fields.features_per_head)
 
 
 MIMO_V2_FLASH = DecoderFamily(
@@ -348,16 +350,12 @@ def _mimo_v2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     layout = hf.get('attention_projection_layout') or 'split'
     if layout not in ('split', 'fused_qkv'):
         refuse(f'attention_projection_layout {layout!r}', "MiMoV2Attention stores 'split' or 'fused_qkv'")
-    for key, (stated, full) in swa.items():
-        if stated != full and slides:
-            refuse(f'{key} {stated}', f"Dew's sliding layers hold the full layers' {full}; "
-                                      'its kinds differ in key heads alone')
-        # A prediction layer's own kind takes its query heads and width; its values are the model's.
-        if stated != full and depths and key == 'swa_v_head_dim':
-            refuse(f'{key} {stated}', f"a prediction layer's values are the model's {full} wide")
-    if layout == 'fused_qkv' and swa_kv_heads != kv_heads and slides:
-        refuse('attention_projection_layout fused_qkv', 'its runs are one geometry for every layer here, '
-               f'not {kv_heads} key heads on the full layers and {swa_kv_heads} on the sliding ones')
+    # The sliding layers' kind, and a prediction layer's own, takes its query and key heads and width; its
+    # values are the model's, which no kind sets apart.
+    stated, full = swa['swa_v_head_dim']
+    if stated != full and (slides or depths):
+        refuse(f'swa_v_head_dim {stated}', f"a sliding or prediction layer's values are the model's {full} "
+                                           'wide')
     window = hf.get('sliding_window') or hf.get('sliding_window_size')
     if (hf.get('scoring_func') or 'sigmoid', hf.get('topk_method') or 'noaux_tc') != ('sigmoid', 'noaux_tc'):
         refuse('scoring_func and topk_method', "MiMoV2MoEGate implements sigmoid scores under 'noaux_tc'")
@@ -380,8 +378,10 @@ def _mimo_v2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
             kinds.setdefault(kind, native_fields(LayerKind)())['sinks'] = True
     if 'sliding_attention' in kinds:
         # A windowed kind rotates whole heads unless it states its own
-        # factor (`LayerKind`); MiMoV2Attention turns the same third of both.
-        kinds['sliding_attention'].update(num_kv_heads=swa_kv_heads, partial_rotary_factor=factor)
+        # factor (`LayerKind`); MiMoV2Attention turns the same third of both. Its query heads and width are
+        # the `swa_*` geometry, which a fused source's runs read by layer (`_layer_geometry`).
+        kinds['sliding_attention'].update(num_kv_heads=swa_kv_heads, partial_rotary_factor=factor,
+                                          num_heads=swa['swa_num_attention_heads'][0], head_dim=swa_head_dim)
     # A prediction depth attends with the sliding layers' kind, or where no trunk layer slides with a kind
     # of its own of the sliding geometry (its query and key heads, width, window, base, sinks and rotary),
     # over a dense feed-forward at `intermediate_size`. A checkpoint without its tensors holds none
@@ -408,17 +408,28 @@ def _mimo_v2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
                                   sparse=sparse)
 
 
-def _prediction_geometry(name: str, config: Mapping[str, object]) -> Mapping[str, object]:
-    """The geometry a fused projection's runs take for tensor `name`: a prediction layer's own kind's
-    query and key heads and width where it states them (`_PREDICTION_ATTENTION`), else the model's."""
-    if _prediction_depth(name, config) is None or config.get('mtp_layer_type') != _PREDICTION_ATTENTION:
+def _layer_geometry(name: str, config: Mapping[str, object]) -> Mapping[str, object]:
+    """The geometry a fused projection's runs take for tensor `name`: its layer's kind's query and key
+    heads and width where the kind states them, a sliding layer's (`swa_*`) or a prediction layer's
+    (`mtp_layer_type`), else the model's (ledger 4290)."""
+    depth, parts = _prediction_depth(name, config), name.split('.')
+    if depth is not None:
+        kind = _records.text(config['mtp_layer_type'], 'mtp_layer_type')
+    elif (len(parts) > 3 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
+          and config.get('layer_types') is not None):
+        kind = _records.strings(config['layer_types'], 'layer_types')[int(parts[2])]
+    else:
+        # Outside a layer, or a geometry stating no layer's kind: every layer's is the model's.
         return config
-    kind = _records.record(_records.record(config['kinds'], 'kinds')[_PREDICTION_ATTENTION], 'kind')
-    return {**config, **{field: kind[field] for field in ('num_heads', 'head_dim', 'num_kv_heads')
-                         if kind.get(field) is not None}}
+    kinds = _records.record(config.get('kinds') or {}, 'kinds')
+    if kind not in kinds:
+        return config
+    held = _records.record(kinds[kind], 'kind')
+    return {**config, **{field: held[field] for field in ('num_heads', 'head_dim', 'num_kv_heads')
+                         if held.get(field) is not None}}
 
 
-_FUSED_QKV = grouped_qkv('.self_attn.qkv_proj', owner=_prediction_geometry)
+_FUSED_QKV = grouped_qkv('.self_attn.qkv_proj', owner=_layer_geometry)
 
 _PREDICTION_FEEDFORWARD = 'prediction_feedforward'
 """The kind whose MLP mixer is the prediction depth's dense feed-forward, in no layer of the trunk."""

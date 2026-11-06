@@ -707,6 +707,13 @@ def leaf_summaries(references, truths) -> list[RecordedLeaf]:
     return _summaries(references, _LaidTruths.of(truths))
 
 
+def _missed(mse, missed):
+    """Each mean squared error where its leaf `missed` its truth somewhere: a leaf whose every error is below
+    2^-537 squares to zero, so it takes the least positive float64 instead, and an arm that misses an exact
+    reference is never read as exact (check 1's exact-reference rule, `_judgement`)."""
+    return np.where((np.asarray(mse) == 0) & missed, np.nextafter(0.0, 1.0), mse)
+
+
 def rows_summary(rows, truth, *, finite: bool, dtype: str, mse: float | None = None) -> RecordedLeaf:
     """`leaf_summary` of a leaf from each row's RMS distance from its float64 truth `rows` alone, where the
     reference ran apart and kept those (a recorder whose outputs are too large to keep, its rows its
@@ -719,7 +726,7 @@ def rows_summary(rows, truth, *, finite: bool, dtype: str, mse: float | None = N
     held, rows = _LaidTruths.of([truth]), np.asarray(rows, np.float64)
     sized = held.sizes > 0
     logged = float(np.max(log_over(rows[sized], held.sizes[sized]))) if sized.any() else LOG_ZERO
-    return RecordedLeaf(float(np.mean(np.square(rows))) if mse is None else mse,
+    return RecordedLeaf(float(_missed(np.mean(np.square(rows)), np.any(rows != 0))) if mse is None else mse,
                         float(np.max(_over(rows[sized], held.sizes[sized]))) if sized.any() else 0.0,
                         np.flatnonzero(~sized), rows[~sized], finite=finite and bool(held.finite.all()),
                         dtype=dtype, zero_sizes=held.own[~sized], worst_log=logged)
@@ -834,6 +841,8 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
     finite = np.concatenate([np.isfinite(block).all(axis=1) for block in _blocks(values, held.runs)])
     errors = values - held.values
     mse = np.concatenate([np.mean(block, axis=1) for block in _blocks(np.square(errors), held.runs)])
+    mse = _missed(mse, np.concatenate([np.zeros(0, bool),
+                                       *((block != 0).any(axis=1) for block in _blocks(errors, held.runs))]))
     rows = np.concatenate([np.zeros(0), *map(_scaled_rms, _rows(errors, held.runs))])
     shares = np.concatenate([np.zeros(0), *map(_largest_share, _rows(errors, held.runs))])
     # Each laid leaf's rows, its first among them, and those sized past RESOLUTION.

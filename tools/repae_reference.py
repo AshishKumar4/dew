@@ -42,7 +42,12 @@ float64 and in float32. After the step, `SiT.extract_latents_stats` gives
 the latent scale and bias the script's sampling denormalizes with; the
 posterior's sample `z`, which the batch norm reads, is kept too.
 
-    PYTHONPATH=src python tools/repae_reference.py
+seeds.npz, the same step over the seeds check 1 draws (`seeded`): each seed's
+pixels, labels and draws (`draw`, which the test draws again), the
+fixture's weights fixed, the model's and the projector's gradients and the
+posterior's sample (`judged`), summarized (`record_case`).
+
+    PYTHONPATH=src:tests python tools/repae_reference.py
 """
 
 from __future__ import annotations
@@ -405,9 +410,69 @@ def step() -> None:
           f"{sum(1 for name in arrays if name.startswith('grad/') and name.endswith('_f64'))} gradients")
 
 
+def draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's step inputs, which the test draws again: the pixels and labels, and the step's draws in Dew's
+    layout, the posterior's sample, the times, the noise and the label-dropout uniforms, with the rows they
+    drop."""
+    rng = np.random.default_rng([2121, seed])
+    latents = (BATCH, SIDE // DOWNSCALE, SIDE // DOWNSCALE, LATENT)
+    uniforms = rng.uniform(size=BATCH).astype(np.float32)
+    return {"pixels": rng.integers(0, 256, (BATCH, SIDE, SIDE, 3), dtype=np.uint8),
+            "classes": rng.integers(0, CLASSES, BATCH), "posterior": rng.standard_normal(latents, np.float32),
+            "times": rng.uniform(size=BATCH).astype(np.float32),
+            "noise": rng.standard_normal(latents, np.float32), "uniforms": uniforms,
+            "dropped": uniforms < DROPOUT}
+
+
+def judged_parts(parts: dict, concatenate=np.concatenate) -> dict:
+    """What check 1 judges of the SiT update's gradients, each module's by its torch name
+    (`model.<module>.<part>`): the model's and the projector's, each in one vector in their names' order."""
+    def vector(chosen):
+        return concatenate([parts[name].reshape(-1) for name in sorted(parts) if chosen(name)])
+
+    projector = "model.projectors."
+    return {"model": vector(lambda name: not name.startswith(projector)),
+            "projector": vector(lambda name: name.startswith(projector))}
+
+
+def judged(result: dict[str, np.ndarray], tail: str) -> dict[str, np.ndarray]:
+    """What check 1 judges of a step (`run`'s, float64 where `tail` is `_f64`): the model's and the
+    projector's gradients (`judged_parts`) and the posterior's sample."""
+    parts = {name.removeprefix("grad/").removesuffix(tail): value for name, value in result.items()
+             if name.startswith("grad/model.") and name.endswith(tail)}
+    return {**judged_parts(parts), "sample": result[f"latents/sample{tail}"]}
+
+
+def seeded() -> None:
+    """One step over the seeds check 1 draws (`draw`, `record_case`), the fixture's weights fixed, in float32
+    and float64, summarized: seeds.npz."""
+    import tempfile
+
+    from recorded_references import provenance, record_case, save
+    from test_end_to_end import _repae_task, repae_judged
+
+    drawn = weights()
+    built = _repae_task(Path(tempfile.mkdtemp()), jax.numpy.float32)
+
+    def stepped(inputs):
+        replayed = [inputs["posterior"].transpose(0, 3, 1, 2), inputs["times"].reshape(-1, 1, 1, 1),
+                    inputs["noise"].transpose(0, 3, 1, 2), inputs["uniforms"]]
+        return tuple(judged(run(dtype, drawn, inputs["pixels"], inputs["classes"], replayed), tail)
+                     for dtype, tail in ((torch.float32, ""), (torch.float64, "_f64")))
+
+    arrays = record_case("repae", draw, stepped, store_inputs=False, summary=True,
+                         dew=lambda inputs: repae_judged(built, inputs))
+    written = save(FIXTURE / "seeds.npz", {**arrays, "provenance": provenance(
+        "End2End-Diffusion/REPA-E", REPOSITORY, "cpu", "python tools/repae_reference.py",
+        torch=torch.__version__)}, reference="End2End-Diffusion/REPA-E",
+        license="MIT, fetched at record time")
+    print(f"{written}: {sorted(arrays)}")
+
+
 def main() -> None:
     regularizer()
     step()
+    seeded()
 
 
 if __name__ == "__main__":

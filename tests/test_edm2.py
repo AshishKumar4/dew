@@ -1,13 +1,13 @@
 """EDM2's magnitude-preserving U-Net and forced weight normalization.
 
-The fixtures are NVlabs/edm2's own `UNet` on a tiny configuration
-(`tools/edm2_reference.py`), with every zero-initialized gain drawn so that
-no branch is switched off: its output (unet.npz), and a few steps of its
-training in train mode, where each forward writes the normalized weights
-back (train.npz).
+The recording is NVlabs/edm2's own `UNet` on a tiny configuration
+(`tools/edm2_reference.py`) over drawn weights, every zero-initialized gain
+drawn so that no branch is switched off, and inputs: its output (`unet`), and
+a few steps of its training in train mode, where each forward writes the
+normalized weights back (`train`), each seed's inputs drawn again here.
 """
 
-import json
+import functools
 from pathlib import Path
 
 import jax
@@ -15,21 +15,30 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from one_draw import assert_as_exact_as_the_reference
+from reference_error import declared_seeds
+from reference_runs import assert_as_exact_as_recorded
+from tool_support import run_from
 
 from dew.nn.backbones.edm2 import EDM2UNet
 from dew.nn.dit import TextContext
 from dew.nn.mp import MPConv, forced_weight_normalization, normalize
 
-EDM2 = np.load(Path(__file__).resolve().parent / "fixtures" / "edm2" / "unet.npz")
-TRAIN = np.load(Path(__file__).resolve().parent / "fixtures" / "edm2" / "train.npz")
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "edm2" / "seeds.npz"
+
+
+@functools.cache
+def generator():
+    """tools/edm2_reference.py, whose seeded draw the recorded inputs are drawn again by, loaded as a
+    script from its directory."""
+    with run_from("edm2_reference", "tools") as module:
+        return module
 
 
 def converted(arrays, prefix: str = "weights/") -> dict:
     """The reference's state dict as this model's variables: dotted names to
     nested modules, `weight` to `mp_kernel` in channels-last order."""
     variables: dict = {"params": {}, "constants": {}}
-    for key in arrays.files:
+    for key in arrays:
         if not key.startswith(prefix):
             continue
         *path, leaf = key.removeprefix(prefix).split(".")
@@ -49,15 +58,26 @@ def converted(arrays, prefix: str = "weights/") -> dict:
     return variables
 
 
+def inputs_at(dtype, inputs) -> tuple:
+    """A draw's weights as this model's variables, and its input, noise labels, text and probe, at
+    `dtype`, channels last."""
+    cast = {name: jnp.asarray(value, dtype) for name, value in inputs.items()}
+    text = TextContext(hidden=cast["text"][:, None, :], mask=jnp.ones((2, 1), jnp.int32))
+    return (converted(cast), jnp.moveaxis(cast["x"], 1, -1), cast["noise_labels"], text,
+            jnp.moveaxis(cast["probe"], 1, -1))
+
+
+def unet_output(dtype, inputs) -> dict:
+    """The U-Net's output at `dtype` on a draw (`unet`'s leaf), channels first as the reference's."""
+    variables, x, noise, text, _ = inputs_at(dtype, inputs)
+    return {"output": jnp.moveaxis(edm2_unet(generator().CONFIG).apply(variables, x, noise, text), -1, 1)}
+
+
 def test_the_unet_is_edm2s_own():
-    config = json.loads(str(EDM2["config"]))
-    model = edm2_unet(config)
-    x = jnp.asarray(np.moveaxis(EDM2["x"], 1, -1), jnp.float32)
-    text = TextContext(hidden=jnp.asarray(EDM2["text"], jnp.float32)[:, None, :],
-                       mask=jnp.ones((2, 1), jnp.int32))
-    output = model.apply(converted(EDM2), x, jnp.asarray(EDM2["noise_labels"], jnp.float32), text)
-    assert_as_exact_as_the_reference(np.moveaxis(np.asarray(output), -1, 1), EDM2["output32"],
-                                     EDM2["output"], "edm2 unet")
+    """The U-Net's output, as exact as NVlabs/edm2's float32 run against its float64 run over drawn
+    weights and inputs (check 1)."""
+    assert_as_exact_as_recorded(FIXTURE, "unet", declared_seeds(FIXTURE)["unet"], generator().draw,
+                                unet_output, "edm2 unet")
 
 
 def edm2_unet(config: dict) -> EDM2UNet:
@@ -65,6 +85,35 @@ def edm2_unet(config: dict) -> EDM2UNet:
                     channel_mult=config["channel_mult"], num_blocks=config["num_blocks"],
                     attn_resolutions=config["attn_resolutions"],
                     channels_per_head=config["channels_per_head"])
+
+
+def trained(dtype, inputs) -> dict:
+    """The `train` site at `dtype` on a draw: from the draw's weights normalized, STEPS steps of the
+    reference's SGD under forced weight normalization, each step's output, and after the first every
+    stored weight and gain in one vector."""
+    reference = generator()
+    model = edm2_unet(reference.CONFIG)
+    variables, x, noise, text, probe = inputs_at(dtype, inputs)
+    params = jax.tree_util.tree_map_with_path(
+        lambda path, value: normalize(value, compensated=True) if path[-1].key == "mp_kernel" else value,
+        variables["params"])
+    optimizer = optax.chain(optax.sgd(reference.SGD["lr"]), forced_weight_normalization())
+    state = optimizer.init(params)
+
+    def loss(params):
+        output = model.apply({**variables, "params": params}, x, noise, text)
+        return jnp.sum(output * probe), output
+
+    found = {}
+    for index in range(reference.STEPS):
+        (_, output), grads = jax.value_and_grad(loss, has_aux=True)(params)
+        found[f"output_{index}"] = jnp.moveaxis(output, -1, 1)
+        if index:
+            found[f"stored_{index}"] = jnp.concatenate([jnp.ravel(leaf)
+                                                        for leaf in jax.tree_util.tree_leaves(params)])
+        updates, state = optimizer.update(grads, state, params)
+        params = optax.apply_updates(params, updates)
+    return found
 
 
 def test_forced_weight_normalization_trains_as_edm2_does():
@@ -76,39 +125,10 @@ def test_forced_weight_normalization_trains_as_edm2_does():
     a step's boundary apart, so from the reference's initial weights
     normalized, under the same SGD, they train alike: each step's output,
     and every stored weight and gain after it, as exact as the reference's
-    float32 trajectory by tests/reference_error.py's rule."""
-    config = json.loads(str(TRAIN["config"]))
-    sgd = json.loads(str(TRAIN["sgd"]))
-    model = edm2_unet(config)
-    variables = converted(TRAIN)
-    variables["params"] = jax.tree_util.tree_map_with_path(
-        lambda path, value: normalize(value) if path[-1].key == "mp_kernel" else value, variables["params"])
-    x = jnp.asarray(np.moveaxis(TRAIN["x"], 1, -1))
-    noise = jnp.asarray(TRAIN["noise_labels"])
-    text = TextContext(hidden=jnp.asarray(TRAIN["text"])[:, None, :], mask=jnp.ones((2, 1), jnp.int32))
-    probe = jnp.asarray(np.moveaxis(TRAIN["probe"], 1, -1))
-    optimizer = optax.chain(optax.sgd(sgd["lr"]), forced_weight_normalization())
-    state = optimizer.init(variables["params"])
-
-    def loss(params):
-        output = model.apply({**variables, "params": params}, x, noise, text)
-        return jnp.sum(output * probe), output
-
-    step = jax.jit(jax.value_and_grad(loss, has_aux=True))
-    params = variables["params"]
-    for index in range(int(TRAIN["steps"])):
-        (_, output), grads = step(params)
-        assert_as_exact_as_the_reference(np.moveaxis(np.asarray(output), -1, 1),
-                                         TRAIN[f"fp32/{index}/output"], TRAIN[f"fp64/{index}/output"],
-                                         f"step {index} output")
-        if index:
-            stored = [converted(TRAIN, f"{precision}/{index}/weights/")["params"]
-                      for precision in ("fp32", "fp64")]
-            leaves = [np.concatenate([np.ravel(leaf) for leaf in jax.tree_util.tree_leaves(tree)])
-                      for tree in (params, *stored)]
-            assert_as_exact_as_the_reference(*leaves, f"step {index} stored weights and gains")
-        updates, state = optimizer.update(grads, state, params)
-        params = optax.apply_updates(params, updates)
+    float32 trajectory against its float64 one over drawn weights and inputs
+    (check 1)."""
+    assert_as_exact_as_recorded(FIXTURE, "train", declared_seeds(FIXTURE)["train"], generator().draw,
+                                trained, "edm2 forced weight normalization")
 
 
 def test_forced_weight_normalization_keeps_every_kernel_at_unit_magnitude():
