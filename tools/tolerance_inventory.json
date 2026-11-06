@@ -234,7 +234,7 @@
    "lane": "Recurrence & Dory"
   },
   "tests/test_flaxdiff.py": {
-   "comparisons": 8,
+   "comparisons": 6,
    "lane": "Models, Serving & RL"
   },
   "tests/test_flaxdiff_family_source.py": {
