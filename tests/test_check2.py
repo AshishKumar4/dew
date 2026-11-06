@@ -804,6 +804,13 @@ def test_the_recurrence_step_witness_holds_the_delta_rules_fast_backward():
 
 
 @INTERPRETS
+def test_the_recurrence_step_witness_holds_a_decay_a_key_dimensions_fast_backward():
+    """The step witness (row 2084 (e)) of a decay a key dimension's fast backward
+    (`rw.assert_key_backward_witnessed`): every record each launch keeps inside its step's enclosure."""
+    rw.assert_key_backward_witnessed(rw.interpreted_lane())
+
+
+@INTERPRETS
 def test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16():
     """The step witness's faults on the interpreted mainloop, each refused where it lands
     (`rw.assert_carry_faults_refused`): a dropped carry and a state rounded to bf16 where fp32 is held."""
