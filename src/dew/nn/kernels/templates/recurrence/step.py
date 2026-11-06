@@ -262,6 +262,7 @@ class _Conv:
             pre = window[0] * weights[0]
             for inputs, weight in zip(window[1:], weights[1:], strict=True):
                 pre = pre + inputs * weight
+            # SiLU as the reference's, the input times its sigmoid.
             streams.append(pre if conv.activation is None else pre * _sigmoid(pre))
         return tuple(streams)
 
@@ -354,7 +355,7 @@ def _softplus(x):
 def _stepped(hooks, held: list, value, vectors, write, token: _Token):
     """`recurrence.update` over a block `held` (a `Dk` list of its `[heads, columns]` entries): the output,
     `q^T S'`, and the updated block, each key dimension's vectors read from `vectors` as each head's scalars
-    (`_key_entry`)."""
+    (`_key_entry`), each sum over the keys a pairwise tree (`_tree_sum`)."""
     key_width = len(held)
 
     def entry(which, k):
@@ -362,13 +363,17 @@ def _stepped(hooks, held: list, value, vectors, write, token: _Token):
 
     corrected = value
     if hooks.delta:
-        for k in range(key_width):
-            corrected = corrected - (entry(1, k) * entry(2, k)) * held[k]
+        corrected = value - _tree_sum([(entry(1, k) * entry(2, k)) * held[k] for k in range(key_width)])
     updated = [held[k] * entry(2, k) + (entry(1, k) * write) * corrected for k in range(key_width)]
-    out = jnp.zeros_like(value)
-    for k in range(key_width):
-        out = out + entry(0, k) * updated[k]
-    return out, updated
+    return _tree_sum([entry(0, k) * updated[k] for k in range(key_width)]), updated
+
+
+def _tree_sum(terms: list):
+    """`terms` summed pairwise, as XLA's reduction sums them: a thread's running sum of 128 keys' terms put
+    the fused step's output at 1.55 to 1.61 times the XLA form's distance from float64 (jsf-r06h)."""
+    while len(terms) > 1:
+        terms = [terms[i] + terms[i + 1] if i + 1 < len(terms) else terms[i] for i in range(0, len(terms), 2)]
+    return terms[0]
 
 
 def _epilogue(hooks, inputs, token: _Token, out, value, exchanged, *, interpret: bool):
