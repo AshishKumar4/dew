@@ -616,6 +616,14 @@ def the_recurrence_witness_refuses_rounded_cumulative_sums_and_an_off_by_one_bou
         rw.assert_step_faults_refused(mosaic_lane(), heads=2)
 
 
+def the_recurrence_witness_holds_a_decay_a_key_dimension_natively(generation_name):
+    """The native step witness under a decay a key dimension
+    (`recurrence_witness.assert_key_decays_witnessed`): a native bf16 call of two value heads, every record
+    inside its step's enclosure, and a kernel reading each token's mean decay for all its keys refused."""
+    with generation.assumed(generation_name):
+        rw.assert_key_decays_witnessed(mosaic_lane(), heads=2)
+
+
 def the_attention_templates_states_certify_natively_a_step_at_a_time(generation_name, mask):
     """Every online-softmax state the attention template's certify launch stores after a key tile, and its
     output, lies inside its step's enclosure on the state before it, under a causal or a full `mask`
@@ -679,6 +687,7 @@ def test_the_native_kernels_certify_on_this_gpu():
           for g in GENERATIONS),
         *(cell(the_recurrence_witness_refuses_rounded_cumulative_sums_and_an_off_by_one_boundary, g)
           for g in GENERATIONS),
+        *(cell(the_recurrence_witness_holds_a_decay_a_key_dimension_natively, g) for g in GENERATIONS),
         *(cell(the_attention_templates_states_certify_natively_a_step_at_a_time, g, mask)
           for g in GENERATIONS for mask in ("causal", "full")),
         *(cell(the_attention_witness_refuses_its_faults_natively, g)
