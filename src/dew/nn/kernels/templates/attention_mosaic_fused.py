@@ -9,7 +9,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew._devices import deterministic_ops_requested
 from dew.nn.kernels import generation, tuning
@@ -90,16 +89,17 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
     229,424 bytes held whole against its 166,912); where dK and dV leave `typed` (`stores_typed`), in `dtype`
     through a stage of their own after the walks, rounded once there."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
-    stage = plgpu.SMEM((consumers, max(block_q, block_k), width), jnp.float32)
+    stage = family.staged_memory((consumers, max(block_q, block_k), width), jnp.float32)
     held = family.adds_through_shared
-    scoped = [plgpu.SMEM((consumers, block_k, width), dtype), plgpu.SMEM((consumers, block_k, width), dtype),
-              plgpu.SMEM((consumers, 2, block_q, block_k), dtype), *([stage] if held else []),
+    scoped = [family.staged_memory((consumers, block_k, width), dtype),
+              family.staged_memory((consumers, block_k, width), dtype),
+              family.staged_memory((consumers, 2, block_q, block_k), dtype), *([stage] if held else []),
               family.load_barriers(consumers), family.load_barriers(consumers)]
     if streamed is None:
         streamed = streams_statistics(family, config, width, dtype, stages, reduced=reduced)
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype),
               **({name: ((block_q,), kind) for name, kind in STATISTICS.items()} if streamed else {})}
-    out = plgpu.SMEM((consumers, block_k, width), dtype) if typed else stage
+    out = family.staged_memory((consumers, block_k, width), dtype) if typed else stage
     return scoped, family.streams(blocks, stages, consumers), [] if held and not typed else [out]
 
 def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, whole, add_dq, index, slots,

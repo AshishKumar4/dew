@@ -7,7 +7,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import attention_algebra as algebra, attention_gradient as gradient, mosaic
@@ -44,10 +43,10 @@ def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, va
     dQ's product through shared memory (`Family.relay_bytes`, `_relayed`), and its key and value streams in
     `stages` slots (`Family.streams`)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
-    scoped = [plgpu.SMEM((consumers, block_q, width), dtype),
-              plgpu.SMEM((consumers, block_q, value_width), dtype),
-              plgpu.SMEM((consumers, block_q, width // config.columns), jnp.float32),
-              plgpu.SMEM((consumers, block_q), jnp.float32),
+    scoped = [family.staged_memory((consumers, block_q, width), dtype),
+              family.staged_memory((consumers, block_q, value_width), dtype),
+              family.staged_memory((consumers, block_q, width // config.columns), jnp.float32),
+              family.staged_memory((consumers, block_q), jnp.float32),
               family.load_barriers(consumers), family.load_barriers(consumers),
               *_relay_tiles(family, consumers, block_q, block_k, dtype)]
     blocks = {"keys": ((block_k, width), dtype), "values": ((block_k, value_width), dtype)}

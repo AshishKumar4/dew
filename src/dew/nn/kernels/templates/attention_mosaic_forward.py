@@ -147,7 +147,7 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     other, the query's and each slot's rows `parts` times theirs, a part a copy of its own, its query loads a
     barrier each."""
     consumers, block_q, block_k = tiles.consumers, tiles.block_q, tiles.block_k
-    scoped = [mosaic.staged((consumers, parts * block_q, width), dtype, query_swizzle(family)),
+    scoped = [family.staged_memory((consumers, parts * block_q, width), dtype, query_swizzle(family)),
               family.staged_memory((consumers, block_q), jnp.float32)]
     if residuals:
         scoped.append(family.staged_memory((consumers, block_q, value_width), jnp.float32))
@@ -159,12 +159,12 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
         scoped.append(family.staged_memory((consumers, block_q, value_width), jnp.float32))
     if codes is not None:
         # Quantized keys' and values' tiles as the products read them, a consumer's own (`Family.converted`).
-        scoped.append(mosaic.staged((consumers, block_k, width), dtype,
-                                    transposed_swizzles(tiles, "keys").get("keys")))
+        scoped.append(family.staged_memory((consumers, block_k, width), dtype,
+                                           transposed_swizzles(tiles, "keys").get("keys")))
         scoped.append(family.staged_memory((consumers, block_k, value_width), dtype))
     if relays(family, tiles, peaks=peaks):
         # The weights' way to the values' product where the family's warps split them (`Family.relaying`).
-        scoped.append(mosaic.plain((consumers, block_q, block_k), dtype))
+        scoped.append(family.staged_memory((consumers, block_q, block_k), dtype, mosaic.UNSWIZZLED))
     scoped += [family.load_barriers(consumers * parts), family.schedule(consumers)]
     # Its rings stage the keys and values as stored: quantized `codes` where given, an fp32 call's parts
     # one above the other.

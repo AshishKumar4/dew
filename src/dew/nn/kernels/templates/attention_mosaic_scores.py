@@ -87,7 +87,7 @@ def _relay_tiles(family: mosaic.Family, consumers: int, rows: int, depth: int, d
     (`Family.relay_bytes`: a family arranged by fewer rows than a role's, `bundle_of`); none elsewhere."""
     if not family.relay_bytes(rows, depth):
         return []
-    return [mosaic.plain((consumers, rows, depth), dtype)]
+    return [family.staged_memory((consumers, rows, depth), dtype, mosaic.UNSWIZZLED)]
 
 
 def _relayed(walk: _Backward, relay: list, index) -> _Backward:
