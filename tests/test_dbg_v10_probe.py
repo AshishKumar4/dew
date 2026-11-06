@@ -1,6 +1,7 @@
 """Scratch-only bounded diagnostics for the three v10 failures."""
 
 import itertools
+import faulthandler
 
 import grain.python as grain
 
@@ -10,6 +11,23 @@ from dew.data.dataset import DataPartition
 from dew.data.pipeline import Pipeline
 from dew.data.sources import Files
 from dew.data.storage import Store
+import test_parquet_files
+
+
+def test_locate_unbounded_ids(monkeypatch):
+    native = test_parquet_files.ids
+
+    def bounded(batches):
+        def checked():
+            for number, batch in enumerate(batches):
+                if number == 40:
+                    faulthandler.dump_traceback()
+                    raise AssertionError("ids consumed over 40 batches; tail is repeating")
+                yield batch
+        return native(checked())
+
+    monkeypatch.setattr(test_parquet_files, "ids", bounded)
+    test_parquet_files.test_a_parquet_streams_position_saved_under_plan_version_9_resumes_by_9_alone()
 
 
 def test_probe():
