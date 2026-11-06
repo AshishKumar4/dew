@@ -7,6 +7,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A streamed Parquet store reads file by file: its shards are its files, each read row group by row group,
+  its footer read as its reader reaches it, so a stream's first record waits for one file's footer, where it
+  waited for every one's (FineWeb-Edu's default configuration, 2410 files on the Hub: 196 s). This is data
+  plan version 10; a run saved under 9 resumes by 9, and `compile(..., plan_version=9)` reads such a
+  position. A raw Parquet store no longer states its row count in its facts, which took reading every
+  file's footer: a configured step reading `facts["rows"]` off one finds none. Its count is
+  `sum(shard.rows for shard in source.manifest(version).sized(threads).shards)`, read off the footers
+  then, and a Dew export (`dew data export`) states its count as before.
 - The `cuda12` and `cuda13` extras install `dew-cutlass` 0.1.0 (`dew-cutlass-cu12` or `dew-cutlass-cu13`, on
   Linux x86_64 and aarch64), Dew's build of CUTLASS's grouped GEMMs, whose kernels are Hopper's. On an sm90
   GPU (an H100, an H200 or a GH200) a mixture of experts' projection now runs CUTLASS on the two grouped cells

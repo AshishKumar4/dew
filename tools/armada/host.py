@@ -1,7 +1,8 @@
 """The host a process runs on, as the CI's records, the tests' shared compilation cache and its XLA
 bundles key it: a tool, not Dew's library, which keys nothing by its host."""
 
-import math
+import functools
+import importlib.util
 import os
 import platform
 import re
@@ -11,8 +12,18 @@ _X86 = ("vendor_id", "cpu family", "model")
 _ARM = ("CPU implementer", "CPU architecture", "CPU part")
 CPUINFO = Path("/proc/cpuinfo")
 """Linux's description of the host's processors."""
-LIMITS = {"cpu.max": "limit:cpu", "memory.max": "limit:memory"}
-"""The cgroup files that set a process's execution limits, by the input a run that read one keys (`limit`)."""
+
+
+@functools.cache
+def cgroups():
+    """Dew's raw cgroup (v2) reader, src/dew/data/cgroups.py, the standard library alone, loaded once by its
+    path where a limit is read: CI keys a host before Dew is importable (row 4161)."""
+    spec = importlib.util.spec_from_file_location(
+        "dew_cgroups", Path(__file__).resolve().parents[2] / "src" / "dew" / "data" / "cgroups.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def cgroup_root() -> Path:
@@ -22,20 +33,13 @@ def cgroup_root() -> Path:
 
 def limit(name: str) -> str:
     """The execution limit `name` names that binds this process ("limit:cpu", its CPU quota in vCPUs;
-    "limit:memory", its memory limit in bytes): the least over its own cgroup and each ancestor up to the root
-    (`cgroup_root`), as Dew's `Host.current` bounds a container by them, or "max" where none binds."""
+    "limit:memory", its configured memory limit in bytes): the least over its own cgroup and each ancestor up
+    to the root (`cgroup_root`), read by Dew's own reader (`cgroups`), or "max" where none binds. CI keys
+    the limit as configured; Dew's `Host.current` bounds loading by what the memory limit leaves."""
+    reader = cgroups()
+    read = {"limit:cpu": reader.cpus, "limit:memory": reader.memory}[name]
     root = cgroup_root()
-    own = Path("/proc/self/cgroup")
-    path = own.read_text().strip().rpartition("::")[2].lstrip("/") if own.is_file() else ""
-    level, found = root / path, []
-    file = next(file for file, input_name in LIMITS.items() if input_name == name)
-    while True:
-        text = (level / file).read_text().split() if (level / file).is_file() else ["max"]
-        if text[0] != "max":
-            found.append(math.ceil(int(text[0]) / int(text[1])) if file == "cpu.max" else int(text[0]))
-        if level == root or root not in level.parents:
-            break
-        level = level.parent
+    found = [value for level in reader.levels(reader.own(root), root) if (value := read(level)) is not None]
     return str(min(found)) if found else "max"
 
 
