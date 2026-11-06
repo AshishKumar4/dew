@@ -14,7 +14,7 @@ import dataclasses
 import jax.numpy as jnp
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import fed, mosaic, mosaic_sm100, mosaic_sm80, mosaic_sm90, mosaic_tpu
+from dew.nn.kernels.templates import fed, mosaic, mosaic_sm80, mosaic_sm90, mosaic_sm100, mosaic_tpu
 
 INTERPRETED = mosaic_sm90.WGMMA
 """The bundle Mosaic GPU's interpreter runs a template's mainloop by off a GPU of a family a bundle claims (a
