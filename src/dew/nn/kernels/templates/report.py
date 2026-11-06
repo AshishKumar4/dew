@@ -436,31 +436,13 @@ def attempted(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions |
 
 def attempts(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None]]
              ) -> list[Attempt]:
-    """Each of `programs` compiled once (`attempted`), in order, those of one MLIR context in turn and
-    those of distinct contexts at once, at most `COMPILE_THREADS` at a time; one context's alone in this
-    thread. A compile reads and writes its module's context (JAX's cache key strips each kernel's debug
-    information in it, setting the context's `allow_unregistered_dialects` around its parse,
-    `jax._src.cache_key`), and JAX lowers a thread's programs in one context, ten at a time
-    (`jax._src.interpreters.mlir.make_ir_context`): a Qwen3.5-4B step and its sampled step compiled at
-    once in their one context failed two runs in three (`MLIRError: 'stable_mosaic_gpu.func.func' op created
-    with unregistered dialect`)."""
-    groups: dict[int, list[int]] = {}
-    for index, (lowered, _) in enumerate(programs):
-        module = lowered.compiler_ir("stablehlo")
-        groups.setdefault(id(lowered if module is None else module.context), []).append(index)
-    found: list[Attempt | None] = [None] * len(programs)
-
-    def turn(indices: list[int]) -> None:
-        for index in indices:
-            found[index] = attempted(*programs[index])
-
-    if len(groups) < 2:
-        turn(list(range(len(programs))))
-    else:
-        with ThreadPoolExecutor(min(len(groups), COMPILE_THREADS), thread_name_prefix="dew-compile") as pool:
-            for each in [pool.submit(turn, indices) for indices in groups.values()]:
-                each.result()
-    return [attempt for attempt in found if attempt is not None]
+    """Each of `programs` compiled once (`attempted`), in order, all at once, at most `COMPILE_THREADS`
+    at a time; one alone in this thread. JAX's cache key reads a module's context without writing it from
+    0.12.0.1.post54 (pyproject's pin), so programs one thread lowered in one context compile together."""
+    if len(programs) < 2:
+        return [attempted(*program) for program in programs]
+    with ThreadPoolExecutor(min(len(programs), COMPILE_THREADS), thread_name_prefix="dew-compile") as pool:
+        return [each.result() for each in [pool.submit(attempted, *program) for program in programs]]
 
 
 def reads_binaries(lowered: jax.stages.Lowered) -> bool:
