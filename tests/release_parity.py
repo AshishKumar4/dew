@@ -43,12 +43,14 @@ class ReleaseParity:
 
 
 def assert_answers_as_its_engine(parity: ReleaseParity, scratch: Path) -> None:
-    """Load `parity`'s release through `Decide.from_pretrained`, lay each seed's requests out, assert the
-    rows the engine laid exactly (tokens, option spans, blocks), and judge its scores and the gradients the
-    recording holds by check 1."""
+    """Load `parity`'s release through Dew's public loader (`Pretrained.load`, `Decide.of`), lay each
+    seed's requests out, assert the rows the engine laid exactly (tokens, option spans, blocks), and judge
+    its scores and the gradients the recording holds by check 1."""
     from dew.decision import Decide, DecisionInputs, Question
+    from dew.interop import Pretrained
 
-    task = Decide.from_pretrained(parity.release(scratch), dtype="float32", attention_impl="reference")
+    # A release of an engine outside Dew states no task of Dew's: its bundle's (`Decide.of`).
+    task = Decide.of(Pretrained.load(parity.release(scratch), dtype="float32", attention_impl="reference"))
     seeds = declared_seeds(parity.recording)[parity.site]
     draw, reference, truth = indexed_recording(recording(parity.recording), parity.site, seeds)
     requests = json.loads(parity.requests.read_text())
