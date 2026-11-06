@@ -44,9 +44,12 @@ HEADER = ("Dew's public surface (tools/api_report.py). A moved line is an API ch
 
 
 def shown(value) -> str:
-    """`value`'s repr without memory addresses, a callable by its qualified name."""
+    """`value`'s repr without memory addresses, a callable by its qualified name, a set's members sorted (a
+    string's hash, and so a set's order, changes with each process)."""
     if inspect.isclass(value) or inspect.isfunction(value) or inspect.isbuiltin(value):
         return f"{getattr(value, '__module__', '?')}.{getattr(value, '__qualname__', repr(value))}"
+    if isinstance(value, (set, frozenset)):
+        return f"{type(value).__name__}({{{', '.join(sorted(shown(member) for member in value))}}})"
     return ADDRESS.sub("", repr(value))
 
 
@@ -195,7 +198,8 @@ def exported(name: str, value) -> list[str]:
     """The report's lines for `value`, exported as `name`: a module by its name, then each name its
     `__all__` exports, indented."""
     if inspect.ismodule(value):
-        listed = [line for member in sorted(value.__all__) for line in exported(member, getattr(value, member))]
+        listed = [line for member in sorted(value.__all__)
+                  for line in exported(member, getattr(value, member))]
         return [f"module {name}  [{value.__name__}]", *(f"  {line}" for line in listed)]
     if inspect.isclass(value):
         return [f"class {name}{signature(value)}  [{value.__module__}]", *members(value)]
