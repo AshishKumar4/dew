@@ -53,7 +53,7 @@ from ..mlp import GatedMLP
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, WEIGHT_SUM_EPSILON, SparseMLP
 from ..ngpt import NGPT, stepped
 from ..norms import GatedRMSNorm, LayerNorm, OffsetLayerNorm, RMSNorm
-from ..precision import float32_dot_general, scaled
+from ..precision import float32_dot_general, projection_role, scaled
 from ..protocols import ProjectionGroup, ReadsTrain, declared_groups, partitioned_routes, routed_children
 from ..sharding import RESIDUAL, constrain, declared
 
@@ -1015,13 +1015,14 @@ class DecoderBlock(nn.Module):
                              self.post_attention_layernorm(read) if self.wiring.pre_norms else read)
                 if self.wiring.normed_residual:
                     state = state._replace(x=mlp_input)
-            hidden = self.mlp(mlp_input,
-                              **self._feedforward_inputs(attention_metadata, mlp_input.shape),
-                              **({} if self.parallel is not None else routes),
-                              **({"train": train} if isinstance(self.mlp, ReadsTrain) and self.mlp.reads_train
-                                 else {}))
-            if self.parallel is not None:
-                hidden = self.moe(read, hidden, **routes)
+            with projection_role("mlp"):  # The feed-forward's projections, as a recipe takes them by role.
+                hidden = self.mlp(mlp_input,
+                                  **self._feedforward_inputs(attention_metadata, mlp_input.shape),
+                                  **({} if self.parallel is not None else routes),
+                                  **({"train": train} if isinstance(self.mlp, ReadsTrain)
+                                     and self.mlp.reads_train else {}))
+                if self.parallel is not None:
+                    hidden = self.moe(read, hidden, **routes)
             if self.wiring.output_norms:
                 hidden = self.mlp_output_norm(hidden)
             mlp_branch = self._branch(hidden, train, "mlp")
@@ -1266,17 +1267,18 @@ class DecoderBlock(nn.Module):
         if unread:
             raise ValueError(f"{type(self.self_attn).__name__} does not read the call's {', '.join(unread)}, "
                              "and would run it as if unset; give this layer a mixer that reads them")
-        return self.self_attn(
-            x,
-            call,
-            **routes,
-            **(
-                {"train": train}
-                if isinstance(self.self_attn, ReadsTrain) and self.self_attn.reads_train
-                else {}
-            ),
-            **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}),
-        )
+        with projection_role("mixer"):  # The mixer's projections, as a recipe takes them by role.
+            return self.self_attn(
+                x,
+                call,
+                **routes,
+                **(
+                    {"train": train}
+                    if isinstance(self.self_attn, ReadsTrain) and self.self_attn.reads_train
+                    else {}
+                ),
+                **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}),
+            )
 
     def _feedforward_inputs(self, attention_metadata, shape: tuple[int, ...]) -> dict:
         """The token ids for a hash-routed feed-forward, the media mask, when

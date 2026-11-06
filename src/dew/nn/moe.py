@@ -47,6 +47,8 @@ from .precision import (
     exact_float32,
     float32_dot_general,
     float32_einsum,
+    projection_role,
+    recipe_role,
     rounded_operand,
 )
 from .protocols import ProjectionGroup, Routes, declared_groups
@@ -575,6 +577,13 @@ def expert_projection(x: jax.Array, kernel: jax.Array | Layered, group_sizes: ja
     """
     stack, layer = (kernel.stack, kernel.layer) if isinstance(kernel, Layered) else (kernel, None)
     compute = canonicalize_dtype(x, stack, *(() if bias is None else (bias,)), dtype=dtype)
+    # The run's low-precision recipe takes the experts' product where their role takes it.
+    matrices = (stack if layer is None else stack[layer]).astype(compute)
+    with projection_role("experts"):
+        recipe = gemm.recipe_projection(jnp.asarray(x, compute), matrices, group_sizes, out_dtype=compute,
+                                        bias=None if bias is None else rounded_operand(bias, compute))
+    if recipe is not None:
+        return recipe
     with _named(implementation):
         return gemm.gemm(x, stack, group_sizes, compute=compute, out_dtype=compute, precision=precision,
                          layer=layer, **_biased(bias, compute))
@@ -609,7 +618,9 @@ def paired_projections(x: jax.Array, first: jax.Array | Layered, second: jax.Arr
     apart, the template pairing no stacked layer."""
     compute = canonicalize_dtype(x, *(kernel.stack if isinstance(kernel, Layered) else kernel
                                       for kernel in (first, second)), dtype=dtype)
-    if isinstance(first, Layered) or isinstance(second, Layered):
+    if (isinstance(first, Layered) or isinstance(second, Layered)
+            or recipe_role() is not None):
+        # A stack's layer, or a run's low-precision recipe, takes each product apart (`expert_projection`).
         return (expert_projection(x, first, group_sizes, compute, implementation, precision),
                 expert_projection(x, second, group_sizes, compute, implementation, precision))
     with _named(implementation):
@@ -1265,5 +1276,6 @@ class SparseMLP(nn.Module):
             return routed
         shared = self.shared_experts(x)
         if self.shared_gate:
-            shared = shared * jax.nn.sigmoid(self.shared_expert_gate(x))
+            with projection_role("shared_gate"):  # The gate keeps the run's dtypes under a recipe.
+                shared = shared * jax.nn.sigmoid(self.shared_expert_gate(x))
         return routed + shared
