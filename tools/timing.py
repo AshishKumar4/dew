@@ -391,8 +391,8 @@ WINDOW_MINUTES = 15
 
 def jobs(ref: str, manifests: dict[str, Path], name: str) -> dict:
     """One measurement window a GPU kind, as `dewops.node` takes them (`node submit`): each a timing
-    (`"kind"`), alone on its GPU, at `ref`, running this harness over that kind's manifest (beside the jobs' file,
-    which stages it as $SESSION/extra/<its name>), its minutes a minute for each 60 timed calls past
+    (`"kind"`), alone on its GPU, at `ref`, running this harness over that kind's manifest (beside the jobs'
+    file, which stages it as $SESSION/extra/<its name>), its minutes a minute for each 60 timed calls past
     `WINDOW_MINUTES` (the measurement lane batches every pending measurement of a kind into its window, bible
     §6)."""
     windows = []

@@ -108,8 +108,8 @@ def test_the_dense_cells_build_every_product_for_each_implementation_on_the_cpu(
 
 
 def test_one_window_a_gpu_kind_is_a_timing_job_running_its_kinds_manifest(tmp_path):
-    """`jobs` writes one measurement window a GPU kind, as `node submit` takes it: a timing, alone on its GPU, at
-    the ref, running the harness over that kind's manifest, its minutes grown with its timed calls."""
+    """`jobs` writes one measurement window a GPU kind, as `node submit` takes it: a timing, alone on its GPU,
+    at the ref, running the harness over that kind's manifest, its minutes grown with its timed calls."""
     small = {"cases": [{"name": "a", "builder": "b:c", "cells": [{}], "arms": [{"name": "x"}], "rounds": 1,
                         "repeats": 1}]}
     large = {"cases": [{**small["cases"][0], "cells": [{}] * 50, "arms": [{"name": "x"}, {"name": "y"}],
