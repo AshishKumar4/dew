@@ -113,24 +113,25 @@ class Plan:
 
 def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
          scale: float | None, target: generation.GpuTarget, table: jax.Array | None = None,
-         sources: jax.Array | None = None) -> Plan:
+         sources: jax.Array | None = None) -> Plan | None:
     """The work list of a packed call (`packed`) on `target`: the forward's derived config at the key tile
-    its memory-bound walk streams at least (`MosaicForward.streaming`) and its slices.
+    its memory-bound walk streams at least (`MosaicForward.streaming`) and its slices; None where no launch
+    of it derives.
     One where the programs already fill the multiprocessors (a slice's merge would cost and its keys gain
-    nothing). Else as many as its programs' residency holds at once (`Family.programs`, its
-    registers; its shared memory's), but each slice at least twice its ring's stages of key tiles: a shorter
-    slice's walk spends its prologue's loads, `stages` tiles, without as many steps of products to hide them
-    (ET-DECODE2-h100: 32 slices of one key tile each, at batch 1 over 4096 keys, took 22 us where cuDNN's
-    whole step took 13)."""
-    op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=False,
-                                              out_dtype=jnp.float32, masked=True, table=table,
-                                              sources=sources, subtracted=True)
-    ba = op.bind(*args, residuals=Kept.OUTPUT, interpret=False)
-    config = op.derived(ba, target)
-    if config is None:
-        raise NotImplementedError(f"the template's forward derives no decode step's config on {target}")
-    # A decode step's few rows a key head stream its keys (`MosaicForward.streaming`).
-    config = op.streaming(ba, config, target)
+    nothing), or where no split launch derives (its slices' fp32 outputs staged beside the query's: a
+    256-wide bf16 step's 64-key tile needed 234,576 bytes of an H100's 232,448, dd-d256), whose one slice
+    a row finishes in the query's dtype through the query's stage. Else as many as its programs'
+    residency holds at once (`Family.programs`, its registers; its shared memory's), but each slice at
+    least twice its ring's stages of key tiles: a shorter slice's walk spends its prologue's loads, `stages`
+    tiles, without as many steps of products to hide them (ET-DECODE2-h100: 32 slices of one key tile each,
+    at batch 1 over 4096 keys, took 22 us where cuDNN's whole step took 13)."""
+    split = _streamed(query, key, value, spans, hooks, scale=scale, target=target, table=table,
+                      sources=sources, out_dtype=jnp.float32)
+    if split is None:
+        whole = _streamed(query, key, value, spans, hooks, scale=scale, target=target, table=table,
+                          sources=sources, out_dtype=None)
+        return None if whole is None else Plan(whole[0], 1)
+    config, op, ba = split
     processors = target.multiprocessors or 1
     tiles = math.ceil(query.shape[1] / (config.consumers * config.block_q))
     programs = query.shape[0] * query.shape[2] * tiles
@@ -145,6 +146,20 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     # whole walk for a slot (ceil(132 / 8) = 17 slices of one row's 8 key heads is 136 programs, 4 of them a
     # second wave as long as the first).
     return Plan(config, max(1, min(processors * resident // programs, longest)))
+
+
+def _streamed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None,
+              target: generation.GpuTarget, table, sources, out_dtype):
+    """The forward's derived config for a packed call writing `out_dtype` (the query's where None) at the
+    key tile its walk streams at (`MosaicForward.streaming`), with its op and bound arguments; None where
+    none derives."""
+    op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=False,
+                                              out_dtype=out_dtype, masked=True, table=table,
+                                              sources=sources, subtracted=True)
+    ba = op.bind(*args, residuals=Kept.OUTPUT if out_dtype is not None else Kept.NONE, interpret=False)
+    config = op.derived(ba, target)
+    # A decode step's few rows a key head stream its keys (`MosaicForward.streaming`).
+    return None if config is None else (op.streaming(ba, config, target), op, ba)
 
 
 def merged(spec: algebra.Forward, out: jax.Array, maximum: jax.Array, total: jax.Array,
@@ -209,13 +224,18 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     walked = dataclasses.replace(hooks, initial=None)
     target = generation.gpu_target()
     work = plan(rows, key, value, row_spans, walked, scale=scale, target=target, table=table, sources=sources)
+    if work is None:
+        raise NotImplementedError(f"the template's forward derives no decode step's config on {target}")
     if work.slices == 1:
         # One slice a row: its walk merges the initial state itself (`algebra.merge`) and finishes its rows in
         # the query's dtype, no merge past it (its fp32 rows and their merge took 45 of B128's 820 us at
         # 4096 keys, ET-DECODE6-h100).
         whole = dataclasses.replace(hooks, initial=initial)
-        work = plan(rows, key, value, row_spans, whole, scale=scale, target=target, table=table,
-                    sources=sources)
+        found = _streamed(rows, key, value, row_spans, whole, scale=scale, target=target, table=table,
+                          sources=sources, out_dtype=None)
+        if found is None:
+            raise NotImplementedError(f"the template's forward derives no decode step's config on {target}")
+        work = Plan(found[0], 1)
         with tuning.pinned({attention_mosaic.MosaicForward: work.config}):
             out = attention_mosaic.forward(rows, key, value, row_spans, whole, scale=scale, natural=False,
                                            residuals=Kept.NONE, interpret=interpret, masked=True, table=table,
