@@ -793,6 +793,49 @@ def test_a_tpu_core_reads_its_hbm_operands_through_its_family():
             lowering_platforms=("tpu",))
 
 
+def _added_in_place(x, *, interpret):
+    """Three programs of a TPU core each adding `x * (its index + 1)` into one in-place ref's rows
+    (`VmemRings.added`, the ref a `jax.new_ref` the launch takes as an operand), beside an output each
+    program writes its index into: the ref after the launch, and the output."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    from dew.nn.kernels.templates import mosaic_tpu
+    family = mosaic_tpu.MXU
+    summed = jax.new_ref(jnp.zeros(x.shape, jnp.float32))
+
+    def body(x_hbm, summed_hbm, out_hbm):
+        index = family.program_index("programs")
+        family.added(family.tile_of(x_hbm) * (index + 1).astype(jnp.float32), summed_hbm, interpret,
+                     smem=None)
+
+        def write(held):
+            held[...] = jnp.full(held.shape, index, jnp.int32)
+            pltpu.sync_copy(held, out_hbm.at[pl.ds(index, 1)])
+
+        pl.run_scoped(write, pltpu.VMEM((1, 128), jnp.int32))
+
+    launch = family.kernel(body, out_type=jax.ShapeDtypeStruct((3, 128), jnp.int32), grid=(3,),
+                           grid_names=("programs",), consumers=1, interpret=interpret, name="added")
+    out = launch(x, summed)
+    return summed[...], out
+
+
+def test_a_tpu_cores_programs_add_into_an_in_place_ref_in_turn():
+    """Three programs of a TPU core adding into one ref the launch takes in place (a launch's dQ, its grouped
+    dK and dV), each read-modify-write through VMEM in turn: interpreted on any host, the ref holds the three
+    adds' sum exactly, and the launch's own output each program's row; lowered for a TPU v5e."""
+    from jax.sharding import AbstractDevice, AbstractMesh
+
+    x = jnp.arange(8 * 128, dtype=jnp.float32).reshape(8, 128)
+    summed, out = jax.jit(functools.partial(_added_in_place, interpret=True))(x)
+    np.testing.assert_array_equal(np.asarray(summed), np.asarray(x) * 6)
+    np.testing.assert_array_equal(np.asarray(out), np.repeat(np.arange(3, dtype=np.int32)[:, None], 128, 1))
+    device = AbstractDevice(device_kind=generation.TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
+    with jax.sharding.use_abstract_mesh(AbstractMesh((1,), ("data",), abstract_device=device)):
+        jax.jit(functools.partial(_added_in_place, interpret=False)).trace(
+            jax.ShapeDtypeStruct(x.shape, x.dtype)).lower(lowering_platforms=("tpu",))
+
+
 def _gemm_on_a_tpu_core():
     """The GEMM template's kernel bodies on a TPU core's bundle (`mosaic_tpu.MXU`), each `(call, operands,
     expected)` at small integers, so each product is exact in fp32: a dense forward with a bias epilogue,
