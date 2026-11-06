@@ -329,6 +329,16 @@ def mimo_generator():
         return module
 
 
+def wide_projection(projector, wide, grid, name: str):
+    """A recorded projector site's truth: `projector`'s float64 twin over `wide`, its variables in float64,
+    each row's merged entries of a seed's drawn trunk features, under `name`."""
+    def run(inputs):
+        with jax.enable_x64(new_val=True):
+            trunk = jnp.asarray(inputs["trunk"], jnp.float64)
+            return {name: real(projector.clone(dtype=jnp.float64).apply(wide, trunk), grid, 2)}
+    return run
+
+
 def widened(build):
     """`build()` run with float64 enabled, its arrays float64: a module's float64 twin and its variables."""
     with jax.enable_x64(new_val=True):
@@ -382,13 +392,8 @@ def test_mimo_merger_is_as_exact_as_the_reference(native):
     grid = np.asarray(mimo_generator().MIMO_GRIDS, np.int32)
     wide = widened(lambda: {"params": projector_variables("mimo", projector_tensors, "float64")[0]})
 
-    def wide_merged(inputs):
-        with jax.enable_x64(new_val=True):
-            trunk = jnp.asarray(inputs["trunk"], jnp.float64)
-            return {"merger": real(projector.clone(dtype=jnp.float64).apply(wide, trunk), grid, 2)}
-
     draw, reference, truth, seeds = recorded_site(MIMO_RECORDING, "mimo merger", mimo_generator().merger_draw,
-                                                  wide_merged)
+                                                  wide_projection(projector, wide, grid, "merger"))
     merged = jax.jit(lambda trunk: projector.apply(variables, trunk))
     assert_as_exact(as_given(lambda index, inputs: {"merger": real(merged(inputs["trunk"]), grid, 2)}),
                     reference, draw, "mimo merger", seeds=seeds, truth_fn=truth)
@@ -447,13 +452,9 @@ def test_muse_glimmer_projector_is_as_exact_as_the_reference():
     grid = np.asarray(muse_generator().MUSE_GRIDS, np.int32)
     wide = widened(lambda: {"params": projector_variables("muse_glimmer", routed, "float64")[0]})
 
-    def wide_projected(inputs):
-        with jax.enable_x64(new_val=True):
-            trunk = jnp.asarray(inputs["trunk"], jnp.float64)
-            return {"projector": real(projector.clone(dtype=jnp.float64).apply(wide, trunk), grid, 2)}
-
     draw, reference, truth, seeds = recorded_site(MUSE_RECORDING, "muse glimmer projector",
-                                                  muse_generator().trunk_draw, wide_projected)
+                                                  muse_generator().trunk_draw,
+                                                  wide_projection(projector, wide, grid, "projector"))
     projected = jax.jit(lambda trunk: projector.apply(variables, trunk))
     assert_as_exact(as_given(lambda index, inputs: {"projector": real(projected(inputs["trunk"]), grid, 2)}),
                     reference, draw, "muse glimmer projector", seeds=seeds, truth_fn=truth)

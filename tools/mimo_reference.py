@@ -234,19 +234,19 @@ def record_mimo_vision() -> None:
                 model.merger(torch.from_numpy(row[:int(np.prod(grid))]).to(dtype)).double().numpy()
                 for row, grid in zip(trunk, MIMO_GRIDS, strict=True)])}
 
-    def tower_case(inputs):
-        narrow_out = trunks(narrow, inputs["pixels"], torch.float32)
-        with float64():
-            return narrow_out, trunks(wide, inputs["pixels"], torch.float64)
-
-    def merger_case(inputs):
-        narrow_out = merged(narrow, inputs["trunk"], torch.float32)
-        with float64():
-            return narrow_out, merged(wide, inputs["trunk"], torch.float64)
+    def case(run, name):
+        """A site's float32 run and float64 twin over a seed's `name` input."""
+        def evaluate(inputs):
+            narrow_out = run(narrow, inputs[name], torch.float32)
+            with float64():
+                return narrow_out, run(wide, inputs[name], torch.float64)
+        return evaluate
 
     # Summarized: the test's float64 run is held to the truth's sketch (`indexed_recording`'s `truth_fn`).
-    arrays = {**record_case("mimo tower", vision_draw, tower_case, store_inputs=False, summary=True),
-              **record_case("mimo merger", merger_draw, merger_case, store_inputs=False, summary=True)}
+    arrays = {**record_case("mimo tower", vision_draw, case(trunks, "pixels"), store_inputs=False,
+                            summary=True),
+              **record_case("mimo merger", merger_draw, case(merged, "trunk"), store_inputs=False,
+                            summary=True)}
     written = save(directory / "recording.npz", {**arrays, "provenance": provenance(
         MIMO_REPO, MIMO_REVISION, "cpu",
         "PYTHONPATH=src:tests python tools/mimo_reference.py --record-vision",
